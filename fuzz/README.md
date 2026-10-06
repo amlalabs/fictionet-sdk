@@ -34,12 +34,13 @@ cargo +nightly fuzz list
 | `iec104` | arbitrary APDUs and constructed frames/ASDUs; checks chunking, sequence ranges, both object address layouts and write rollback | `stdlib::iec104`: I/S/U frames and sequential or explicit object addresses |
 | `rdp` | bounded arbitrary transport and plaintext bytes plus constructed values; checks chunking, TPKT/COTP composition, GCC/MCS fields, body limits and write rollback | `stdlib::rdp`: codec contracts, X.224, GCC and MCS |
 | `smtp` | command and reply streams, DATA bodies, and constructed values | `stdlib::smtp`: commands, multiline replies, dot-stuffing and bounded decoders |
-| `amqp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::amqp`: AMQP 0-9-1 |
+| `amqp` | bytes and constructed values, checked with codec contracts | `stdlib::amqp`: AMQP 0-9-1 |
 | `asn1` | BER/DER elements and writer scripts; checks framing, value readers, DER copies, bounds, and transactional writes | `stdlib::asn1`: ASN.1 BER and DER |
 | `bacnet` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::bacnet`: BACnet/IP |
 | `cotp` | TPKT streams, standalone TPDUs, and input bytes segmented as messages | `cotp`: chunking and EOF, bounded message assembly, class 0 negotiation, error replies, strict TPDU writes, and segmentation round trips |
-| `dhcpv6` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::dhcpv6`: DHCPv6 |
+| `dhcpv6` | bytes and constructed values, checked with codec contracts | `stdlib::dhcpv6`: DHCPv6 |
 | `enip` | arbitrary packet streams and CIP bodies plus constructed packets; checks chunking, packet policy, nested body round trips and write rollback | `stdlib::enip`: EtherNet/IP and CIP |
+| `coap` | datagrams, TCP streams, and constructed values, checked with codec contracts | `stdlib::coap`: CoAP and block transfers |
 | `fastcgi` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::fastcgi`: FastCGI |
 | `ftp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::ftp`: FTP |
 | `geneve` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::geneve`: Geneve |
@@ -54,7 +55,7 @@ cargo +nightly fuzz list
 | `memcache` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::memcache`: memcached |
 | `mime_multipart` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::mime_multipart`: MIME multipart bodies |
 | `mongodb` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::mongodb`: MongoDB |
-| `mqtt` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::mqtt`: MQTT 3.1.1 |
+| `mqtt` | bytes and constructed values, checked with codec contracts | `stdlib::mqtt`: MQTT 3.1.1 |
 | `mysql` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::mysql`: MySQL |
 | `nbns` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::nbns`: NetBIOS Name Service |
 | `nfs` | Procedure-selected NFS and MOUNT arguments and results, RPC streams, and constructed handles and names | `nfs`: argument and result round trips, handle and name limits, failure replies, RPC framing and EOF, and envelope writes |
@@ -80,7 +81,7 @@ cargo +nightly fuzz list
 | `spnego` | Bare and GSS-wrapped tokens plus constructed wrappers; checks framing, mechanism rules, round trips, and write refusal | `stdlib::spnego`: SPNEGO |
 | `ssh` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::ssh`: The SSH transport layer before encryption |
 | `stun` | TCP streams, UDP datagrams, standalone attributes, and constructed messages | `stun`: chunking and EOF, exact raw frame spans, strict attribute writes, canonical padding and fingerprints, Binding replies, and transaction IDs |
-| `syslog` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::syslog`: Syslog |
+| `syslog` | bytes and constructed values, checked with codec contracts | `stdlib::syslog`: Syslog |
 | `telnet` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::telnet`: Telnet |
 | `tftp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::tftp`: TFTP |
 | `tpkt` | TCP bytes with limits selected from the input, plus constructed headers, packets, and COTP messages | `tpkt` and `cotp::over_tpkt`: chunking and EOF, exact headers and packets, size limits, TPDU round trips, and segmented message assembly |

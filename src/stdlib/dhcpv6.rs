@@ -24,21 +24,15 @@
 //! [`Message::answer`], adds the addresses and prefixes it hands out, and
 //! sends [`Message::to_bytes`] back. Which addresses exist and who gets them
 //! is up to world code. For DHCPv6 over TCP, as leasequery uses, a
-//! [`Decoder`] splits the stream into messages.
-//!
-//! New TCP stacks use [`Frames`] with [`Stream`]. [`Decoder`] wraps that
-//! stack and keeps message errors recoverable. [`Wire`] reads and writes
-//! UDP [`Message`] values and length-prefixed TCP [`Frame`] values exactly.
-//! The old `to_bytes` and `to_tcp_bytes` writers keep their clipping rules.
+//! [`Stream<Frames>`](super::codec::Stream) splits the stream into messages.
 //!
 //! Every reader checks lengths and ranges, because the agent can send any
 //! bytes it likes. Options nest at most [`MAX_DEPTH`] deep; deeper ones are
-//! kept as raw bytes. Writers leave out what would not read back, so the
-//! bytes they make always parse; [`Message::try_to_bytes`] says when
-//! something was left out. A message that parses writes back to the same
-//! bytes.
+//! kept as raw bytes. Writers refuse fields that cannot be written unchanged.
+//! A message that parses writes back to the same bytes.
 //!
 //! ```
+//! use fictionet::stdlib::codec::Wire;
 //! use std::net::Ipv6Addr;
 //! use fictionet::stdlib::dhcpv6::{msg, opt, DhcpOption, Duid, IaAddr, IaNa, Message};
 //!
@@ -49,7 +43,7 @@
 //! solicit.options.push(DhcpOption::ElapsedTime(0));
 //! solicit.options.push(DhcpOption::IaNa(IaNa { iaid: 1, t1: 0, t2: 0, options: vec![] }));
 //! solicit.options.push(DhcpOption::Oro(vec![opt::DNS_SERVERS]));
-//! let datagram = solicit.to_bytes();
+//! let datagram = solicit.to_bytes().unwrap();
 //!
 //! // The server reads it and offers 2001:db8::10 in an Advertise.
 //! let server = Duid::en(32473, b"world");
@@ -63,7 +57,7 @@
 //! advertise.options.push(DhcpOption::DnsServers(vec!["2001:db8::53".parse().unwrap()]));
 //!
 //! // The client reads the offer.
-//! let offer = Message::parse(&advertise.to_bytes()).unwrap();
+//! let offer = Message::parse(&advertise.to_bytes().unwrap()).unwrap();
 //! assert_eq!(offer.msg_type, msg::ADVERTISE);
 //! assert_eq!(offer.transaction, 0x00ab_cdef);
 //! assert_eq!(offer.client_id(), Some(&client));
@@ -78,7 +72,7 @@
 use core::convert::Infallible;
 use std::net::Ipv6Addr;
 
-use super::codec::{Decode, Fail, Step, Stream, Wire};
+use super::codec::{Decode, Step, Wire};
 
 /// The UDP port DHCPv6 clients listen on.
 pub const CLIENT_PORT: u16 = 546;
@@ -95,10 +89,10 @@ pub const ALL_DHCP_SERVERS: Ipv6Addr = Ipv6Addr::new(0xff05, 0, 0, 0, 0, 0, 1, 3
 /// it.
 pub const MAX_MESSAGE: usize = 65_527;
 /// The longest message over TCP, where a 2-byte length comes before each
-/// message (RFC 5460, section 5.1). [`Decoder`] reads messages this long,
-/// and [`Message::to_tcp_bytes`] writes them.
+/// message (RFC 5460, section 5.1). [`Stream<Frames>`](super::codec::Stream) reads messages this long,
+/// and [`Frame`] writes them.
 pub const MAX_TCP_MESSAGE: usize = 65_535;
-/// The most bytes a [`Decoder`] holds that have not been taken out: one
+/// The most bytes a [`Stream<Frames>`](super::codec::Stream) holds that have not been taken out: one
 /// whole message over TCP and its length.
 pub const MAX_BUFFERED: usize = 2 + MAX_TCP_MESSAGE;
 /// The length of a client or server message's header: the type and the
@@ -252,7 +246,7 @@ pub mod hardware {
 
 /// A DHCP Unique Identifier: the bytes that name a client or a server,
 /// starting with a 2-byte type. A DUID is read only if it is
-/// [`MIN_DUID`] to [`MAX_DUID`] bytes long; writers leave out any other.
+/// [`MIN_DUID`] to [`MAX_DUID`] bytes long; writers refuse any other.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Duid(pub Vec<u8>);
 
@@ -305,6 +299,28 @@ impl Duid {
     /// Whether the DUID's length is one a message may carry.
     pub fn is_valid(&self) -> bool {
         (MIN_DUID..=MAX_DUID).contains(&self.0.len())
+    }
+}
+
+impl Wire for Duid {
+    type ParseError = ParseError;
+    type WriteError = WriteError;
+
+    /// Reads a DUID. Refuses lengths outside [`MIN_DUID`] through [`MAX_DUID`].
+    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
+        if !(MIN_DUID..=MAX_DUID).contains(&bytes.len()) {
+            return Err(ParseError::BadOption(opt::CLIENTID));
+        }
+        Ok(Self(bytes.to_vec()))
+    }
+
+    /// Appends a DUID. Refuses invalid lengths. Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+        if !self.is_valid() {
+            return Err(WriteError::Unwritable);
+        }
+        out.extend_from_slice(&self.0);
+        Ok(())
     }
 }
 
@@ -433,14 +449,14 @@ pub enum DhcpOption {
     /// Option 14: the client takes a Reply to its Solicit at once.
     RapidCommit,
     /// Option 15: the client's user classes, each as bytes. It holds at
-    /// least one; an empty list is refused, and writers leave it out.
+    /// least one; readers and writers refuse an empty list.
     UserClass(Vec<Vec<u8>>),
     /// Option 16: the client's vendor and its vendor classes.
     VendorClass {
         /// The vendor's IANA enterprise number.
         enterprise: u32,
         /// The vendor classes, each as bytes. It holds at least one; an
-        /// empty list is refused, and writers leave the option out.
+        /// empty list is refused by readers and writers.
         classes: Vec<Vec<u8>>,
     },
     /// Option 17: vendor-specific information.
@@ -449,7 +465,7 @@ pub enum DhcpOption {
         enterprise: u32,
         /// The vendor's options, unread. They must be a run of options, each
         /// a 2-byte code, a 2-byte length and that many bytes; other bytes
-        /// are refused, and writers leave the option out.
+        /// are refused by readers and writers.
         data: Vec<u8>,
     },
     /// Option 18: the relay agent's name for an interface, as bytes.
@@ -460,7 +476,7 @@ pub enum DhcpOption {
     /// Option 20: the client takes Reconfigure messages.
     ReconfigureAccept,
     /// Option 23: recursive DNS servers. It holds at least one; an empty
-    /// list is refused, and writers leave it out.
+    /// list is refused by readers and writers.
     DnsServers(Vec<Ipv6Addr>),
     /// Option 24: the domain search list, each name with dots between its
     /// labels and no dot at the end. The root is the empty string. Labels
@@ -525,15 +541,23 @@ impl DhcpOption {
     }
 }
 
+macro_rules! association_status {
+    ($($type:ty),+ $(,)?) => {$(
+        impl $type {
+            /// The status code inside this association, if present.
+            pub fn status(&self) -> Option<&StatusCode> {
+                find_status(&self.options)
+            }
+        }
+    )+};
+}
+
+association_status!(IaNa, IaTa, IaAddr, IaPd, IaPrefix);
+
 impl IaNa {
     /// The addresses inside.
     pub fn addresses(&self) -> impl Iterator<Item = &IaAddr> {
         self.options.iter().filter_map(|o| if let DhcpOption::IaAddr(a) = o { Some(a) } else { None })
-    }
-
-    /// The status code inside, if there is one.
-    pub fn status(&self) -> Option<&StatusCode> {
-        find_status(&self.options)
     }
 }
 
@@ -542,36 +566,12 @@ impl IaTa {
     pub fn addresses(&self) -> impl Iterator<Item = &IaAddr> {
         self.options.iter().filter_map(|o| if let DhcpOption::IaAddr(a) = o { Some(a) } else { None })
     }
-
-    /// The status code inside, if there is one.
-    pub fn status(&self) -> Option<&StatusCode> {
-        find_status(&self.options)
-    }
-}
-
-impl IaAddr {
-    /// The status code inside, if there is one.
-    pub fn status(&self) -> Option<&StatusCode> {
-        find_status(&self.options)
-    }
 }
 
 impl IaPd {
     /// The prefixes inside.
     pub fn prefixes(&self) -> impl Iterator<Item = &IaPrefix> {
         self.options.iter().filter_map(|o| if let DhcpOption::IaPrefix(p) = o { Some(p) } else { None })
-    }
-
-    /// The status code inside, if there is one.
-    pub fn status(&self) -> Option<&StatusCode> {
-        find_status(&self.options)
-    }
-}
-
-impl IaPrefix {
-    /// The status code inside, if there is one.
-    pub fn status(&self) -> Option<&StatusCode> {
-        find_status(&self.options)
     }
 }
 
@@ -641,25 +641,27 @@ impl Message {
     }
 
     /// A Relay-forward message that carries `inner`, as a relay agent
-    /// sends it. A relay agent that received `inner` from a client uses
-    /// hop count 0; one that received a Relay-forward uses its hop count
-    /// plus 1. If `inner` does not fit within [`MAX_MESSAGE`] beside the
-    /// relay header, the Relay Message option is left out when the message
-    /// is written; [`Message::try_to_bytes`] returns `None` for it.
-    pub fn relay_forward(inner: &Message, hop_count: u8, link_address: Ipv6Addr, peer_address: Ipv6Addr) -> Message {
-        Message {
+    /// sends it, with transaction ID 0. A relay agent that received `inner`
+    /// from a client uses hop count 0; one that received a Relay-forward
+    /// uses its hop count plus 1.
+    ///
+    /// Returns [`WriteError::Unwritable`] when `inner` cannot be written.
+    /// The outer message's [`Wire::write`] refuses it if it does not fit
+    /// within [`MAX_MESSAGE`].
+    pub fn relay_forward(
+        inner: &Message,
+        hop_count: u8,
+        link_address: Ipv6Addr,
+        peer_address: Ipv6Addr,
+    ) -> Result<Message, WriteError> {
+        Ok(Message {
             msg_type: msg::RELAY_FORW,
             transaction: 0,
             hop_count,
             link_address,
             peer_address,
-            options: vec![DhcpOption::RelayMessage(inner.to_bytes())],
-        }
-    }
-
-    /// Reads the message in `b`, one UDP datagram's payload.
-    pub fn parse(b: &[u8]) -> Result<Message, ParseError> {
-        Message::parse_within(b, MAX_MESSAGE)
+            options: vec![DhcpOption::RelayMessage(inner.to_bytes()?)],
+        })
     }
 
     /// Reads the message in `b`, refusing more than `limit` bytes.
@@ -688,25 +690,17 @@ impl Message {
         Ok(m)
     }
 
-    /// The message's bytes. An option that is malformed, or that does not
-    /// fit in what is left of [`MAX_MESSAGE`], is left out, as are list
-    /// items that do not fit and options nested deeper than
-    /// [`MAX_DEPTH`].
-    pub fn to_bytes(&self) -> Vec<u8> {
-        self.write_within(MAX_MESSAGE)
-    }
-
-    /// The message's bytes, or `None` if they would not read back as this
-    /// message: something was left out as [`Message::to_bytes`] describes,
-    /// options sit deeper than [`MAX_DEPTH`], or a field the message type
-    /// does not use is not zero.
-    pub fn try_to_bytes(&self) -> Option<Vec<u8>> {
-        let bytes = self.to_bytes();
-        (Message::parse(&bytes).ok()? == *self).then_some(bytes)
-    }
-
     /// The message's bytes, in at most `limit` bytes.
-    fn write_within(&self, limit: usize) -> Vec<u8> {
+    fn write_within(&self, limit: usize) -> Result<Vec<u8>, WriteError> {
+        if (self.is_relay() && self.transaction != 0)
+            || (!self.is_relay()
+                && (self.transaction > 0x00ff_ffff
+                    || self.hop_count != 0
+                    || self.link_address != Ipv6Addr::UNSPECIFIED
+                    || self.peer_address != Ipv6Addr::UNSPECIFIED))
+        {
+            return Err(WriteError::Unwritable);
+        }
         let mut out = Vec::new();
         out.push(self.msg_type);
         if self.is_relay() {
@@ -717,22 +711,8 @@ impl Message {
             out.extend_from_slice(&self.transaction.to_be_bytes()[1..]);
         }
         let budget = limit - out.len();
-        out.extend_from_slice(&encode_options(&self.options, 0, budget));
-        out
-    }
-
-    /// The message as DHCPv6 over TCP carries it: a 2-byte length, then
-    /// the message's bytes. The message may be up to [`MAX_TCP_MESSAGE`]
-    /// bytes long; past that, options are left out as in
-    /// [`Message::to_bytes`].
-    pub fn to_tcp_bytes(&self) -> Vec<u8> {
-        let bytes = self.write_within(MAX_TCP_MESSAGE);
-        // MAX_TCP_MESSAGE fits in 16 bits.
-        let len = u16::try_from(bytes.len()).unwrap_or(u16::MAX);
-        let mut out = Vec::with_capacity(2 + bytes.len());
-        out.extend_from_slice(&len.to_be_bytes());
-        out.extend_from_slice(&bytes);
-        out
+        out.extend_from_slice(&encode_options(&self.options, 0, budget).ok_or(WriteError::Unwritable)?);
+        Ok(out)
     }
 
     /// Whether this is a relay message: Relay-forward or Relay-reply.
@@ -822,23 +802,25 @@ impl Message {
 
     /// The Relay-reply that sends `inner` back through the relay agent
     /// that sent this Relay-forward. It copies the hop count, the link and
-    /// peer addresses, and the Interface-Id option if there is one. If
-    /// `inner` does not fit beside the Interface-Id within
-    /// [`MAX_MESSAGE`], the Relay Message option is left out.
-    pub fn relay_reply(&self, inner: &Message) -> Message {
+    /// peer addresses, and the Interface-Id option if there is one.
+    ///
+    /// Returns [`WriteError::Unwritable`] when `inner` cannot be written.
+    /// The outer message's [`Wire::write`] refuses it if it does not fit
+    /// within [`MAX_MESSAGE`].
+    pub fn relay_reply(&self, inner: &Message) -> Result<Message, WriteError> {
         let mut options = Vec::new();
         if let Some(id) = self.interface_id() {
             options.push(DhcpOption::InterfaceId(id.to_vec()));
         }
-        options.push(DhcpOption::RelayMessage(inner.to_bytes()));
-        Message {
+        options.push(DhcpOption::RelayMessage(inner.to_bytes()?));
+        Ok(Message {
             msg_type: msg::RELAY_REPL,
             transaction: 0,
             hop_count: self.hop_count,
             link_address: self.link_address,
             peer_address: self.peer_address,
             options,
-        }
+        })
     }
 }
 
@@ -847,11 +829,14 @@ impl Message {
 /// A field or option exceeds its limit, an option changes form when read,
 /// or a field unused by the message type is nonzero.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct WriteError;
+pub enum WriteError {
+    /// The value cannot be written without changing it.
+    Unwritable,
+}
 
 impl core::fmt::Display for WriteError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("DHCPv6 value cannot be represented without changing it")
+        f.write_str("DHCPv6 value cannot be written without changing it")
     }
 }
 
@@ -861,16 +846,15 @@ impl Wire for Message {
     type ParseError = ParseError;
     type WriteError = WriteError;
 
-    /// Reads one UDP message of at most [`MAX_MESSAGE`] bytes.
-    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
-        Self::parse(bytes)
+    /// Reads one UDP message. Refuses short headers, malformed options, and messages above [`MAX_MESSAGE`].
+    fn parse(b: &[u8]) -> Result<Message, ParseError> {
+        Message::parse_within(b, MAX_MESSAGE)
     }
 
-    /// Appends one UDP message. Leaves `out` unchanged on error.
-    /// The legacy [`Message::to_bytes`] keeps its clipping behavior.
+    /// Appends a UDP message. Refuses unused nonzero fields, invalid options,
+    /// excess nesting, and size limits. Leaves `out` unchanged on error.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
-        let bytes = self.try_to_bytes().ok_or(WriteError)?;
-        out.extend_from_slice(&bytes);
+        out.extend_from_slice(&self.write_within(MAX_MESSAGE)?);
         Ok(())
     }
 }
@@ -913,6 +897,7 @@ impl Wire for Frame {
     type WriteError = WriteError;
 
     /// Reads exactly one length-prefixed TCP message.
+    /// Refuses malformed messages, short prefixes or bodies, and trailing bytes.
     fn parse(bytes: &[u8]) -> Result<Self, FrameParseError> {
         let step = match Frames.decode(bytes, true) {
             Ok(step) => step,
@@ -925,12 +910,12 @@ impl Wire for Frame {
         }
     }
 
-    /// Appends a length-prefixed TCP message. Leaves `out` unchanged on error.
+    /// Appends a TCP message. Refuses unused nonzero fields, invalid options,
+    /// excess nesting, and size limits. Leaves `out` unchanged on error.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
-        let bytes = self.0.to_tcp_bytes();
-        if <Self as Wire>::parse(&bytes).as_ref() != Ok(self) {
-            return Err(WriteError);
-        }
+        let bytes = self.0.write_within(MAX_TCP_MESSAGE)?;
+        let len = u16::try_from(bytes.len()).map_err(|_| WriteError::Unwritable)?;
+        out.extend_from_slice(&len.to_be_bytes());
         out.extend_from_slice(&bytes);
         Ok(())
     }
@@ -938,11 +923,11 @@ impl Wire for Frame {
 
 /// Reads DHCPv6 TCP messages without retaining input bytes.
 ///
-/// Use with [`Stream`] for at most [`MAX_BUFFERED`] unread bytes. Each
+/// Use with [`Stream<Frames>`](super::codec::Stream) for at most [`MAX_BUFFERED`] unread bytes. Each
 /// two-byte length delimits one item. Malformed messages are error items,
 /// so the next message can still be read. Framing has no protocol errors.
 /// Partial prefixes and bodies return [`Step::Need`], including at EOF;
-/// the driver reports [`Fail::Truncated`]. UDP uses [`Wire`] on [`Message`].
+/// the driver reports [`Fail::Truncated`](super::codec::Fail::Truncated). UDP uses [`Wire`] on [`Message`].
 ///
 /// ```
 /// use fictionet::stdlib::{dhcpv6::{Frame, Frames, Message, msg}, codec::{Stream, Wire}};
@@ -981,63 +966,6 @@ impl Decode for Frames {
         let used = 2usize.saturating_add(usize::from(u16::from_be_bytes([a, b])));
         let Some(body) = input.get(2..used) else { return Ok(Step::Need) };
         Ok(Step::Item(Message::parse_within(body, MAX_TCP_MESSAGE), used))
-    }
-}
-
-/// Splits a stream of DHCPv6 over TCP into messages, as bulk leasequery
-/// (RFC 5460) and active leasequery (RFC 7653) send them: each message
-/// follows a 2-byte length. Feed it the bytes a connection reads, in order,
-/// and take messages out until it has none. A malformed message comes out
-/// as an error, and the messages after it still read, since the lengths
-/// keep the stream in step.
-///
-/// This compatibility wrapper uses [`Stream`] with [`Frames`].
-pub struct Decoder(Stream<Frames>);
-
-impl core::fmt::Debug for Decoder {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Decoder").field("buffered", &self.buffered()).finish()
-    }
-}
-
-impl Default for Decoder {
-    fn default() -> Self {
-        Self(Stream::new(Frames))
-    }
-}
-
-impl Decoder {
-    /// A decoder holding no bytes.
-    pub fn new() -> Decoder {
-        Decoder::default()
-    }
-
-    /// Takes bytes read from the connection, from the start of `bytes`,
-    /// and returns how many it took. It takes them all unless that would
-    /// make it hold more than [`MAX_BUFFERED`] bytes. Then take messages
-    /// out and feed it the rest. When it takes no bytes, it holds at least
-    /// one whole message, so a loop of feeding and taking out always ends.
-    #[must_use = "bytes past the count returned were not taken"]
-    pub fn feed(&mut self, bytes: &[u8]) -> usize {
-        self.0.push(bytes)
-    }
-
-    /// The next whole message, if one has come. It returns `None` when it
-    /// needs more bytes. Messages may be up to [`MAX_TCP_MESSAGE`] bytes
-    /// long.
-    pub fn next_message(&mut self) -> Option<Result<Message, ParseError>> {
-        self.0.next().map(|result| match result {
-            Ok(message) => message,
-            Err(Fail::Protocol(never)) => match never {},
-            // EOF is not exposed, and a complete length prefix guarantees
-            // progress at capacity. Keep driver faults non-panicking too.
-            Err(Fail::Truncated { .. } | Fail::Stuck { .. }) => Err(ParseError::Truncated),
-        })
-    }
-
-    /// How many bytes are held, waiting for the rest of a message.
-    pub fn buffered(&self) -> usize {
-        self.0.buffered()
     }
 }
 
@@ -1288,10 +1216,11 @@ fn parse_names(b: &[u8]) -> Option<Names> {
 /// A domain name in DNS wire form, or `None` if it cannot be one.
 fn encode_name(name: &str) -> Option<Vec<u8>> {
     // A name of n bytes takes n + 2 bytes in wire form.
-    if name.len() + 2 > MAX_NAME + usize::from(name.is_empty()) {
+    let size = name.len().checked_add(2)?;
+    if size > MAX_NAME + usize::from(name.is_empty()) {
         return None;
     }
-    let mut out = Vec::with_capacity(name.len() + 2);
+    let mut out = Vec::with_capacity(size);
     if !name.is_empty() {
         for label in name.split('.') {
             if label.is_empty() || label.len() > MAX_LABEL || !label.bytes().all(label_byte) {
@@ -1306,15 +1235,14 @@ fn encode_name(name: &str) -> Option<Vec<u8>> {
 }
 
 /// An option list at `depth`, in at most `budget` bytes. Options that are
-/// malformed or do not fit are left out.
-fn encode_options(options: &[DhcpOption], depth: usize, budget: usize) -> Vec<u8> {
+/// malformed or do not fit are refused.
+fn encode_options(options: &[DhcpOption], depth: usize, budget: usize) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     for o in options {
-        if let Some(bytes) = encode_option(o, depth, budget - out.len()) {
-            out.extend_from_slice(&bytes);
-        }
+        let bytes = encode_option(o, depth, budget.checked_sub(out.len())?)?;
+        out.extend_from_slice(&bytes);
     }
-    out
+    Some(out)
 }
 
 /// One option, header and body, in at most `budget` bytes, or `None` if it
@@ -1327,7 +1255,9 @@ fn encode_option(o: &DhcpOption, depth: usize, budget: usize) -> Option<Vec<u8>>
     }
     let code = o.code();
     // A last check, so nothing written fails to read.
-    parse_option(code, &body, depth).ok()?;
+    if parse_option(code, &body, depth).ok().as_ref() != Some(o) {
+        return None;
+    }
     let mut out = Vec::with_capacity(4 + body.len());
     out.extend_from_slice(&code.to_be_bytes());
     out.extend_from_slice(&(body.len() as u16).to_be_bytes());
@@ -1335,11 +1265,10 @@ fn encode_option(o: &DhcpOption, depth: usize, budget: usize) -> Option<Vec<u8>>
     Some(out)
 }
 
-/// An option's body, or `None` if it cannot fit in `max` bytes. Lists are
-/// cut to fit.
+/// An option's body, or `None` if it is invalid or cannot fit in `max` bytes.
 fn encode_body(o: &DhcpOption, depth: usize, max: usize) -> Option<Vec<u8>> {
     let nested = |options: &[DhcpOption], fixed: usize| {
-        if depth < MAX_DEPTH { encode_options(options, depth + 1, max.saturating_sub(fixed)) } else { Vec::new() }
+        if depth < MAX_DEPTH { encode_options(options, depth + 1, max.checked_sub(fixed)?) } else { None }
     };
     let mut out = Vec::new();
     match o {
@@ -1353,33 +1282,36 @@ fn encode_body(o: &DhcpOption, depth: usize, max: usize) -> Option<Vec<u8>> {
             out.extend_from_slice(&ia.iaid.to_be_bytes());
             out.extend_from_slice(&ia.t1.to_be_bytes());
             out.extend_from_slice(&ia.t2.to_be_bytes());
-            out.extend_from_slice(&nested(&ia.options, 12));
+            out.extend_from_slice(&nested(&ia.options, 12)?);
         }
         DhcpOption::IaTa(ia) => {
             out.extend_from_slice(&ia.iaid.to_be_bytes());
-            out.extend_from_slice(&nested(&ia.options, 4));
+            out.extend_from_slice(&nested(&ia.options, 4)?);
         }
         DhcpOption::IaAddr(a) => {
             out.extend_from_slice(&a.address.octets());
             out.extend_from_slice(&a.preferred.to_be_bytes());
             out.extend_from_slice(&a.valid.to_be_bytes());
-            out.extend_from_slice(&nested(&a.options, 24));
+            out.extend_from_slice(&nested(&a.options, 24)?);
         }
         DhcpOption::IaPd(ia) => {
             out.extend_from_slice(&ia.iaid.to_be_bytes());
             out.extend_from_slice(&ia.t1.to_be_bytes());
             out.extend_from_slice(&ia.t2.to_be_bytes());
-            out.extend_from_slice(&nested(&ia.options, 12));
+            out.extend_from_slice(&nested(&ia.options, 12)?);
         }
         DhcpOption::IaPrefix(p) => {
             out.extend_from_slice(&p.preferred.to_be_bytes());
             out.extend_from_slice(&p.valid.to_be_bytes());
             out.push(p.prefix_len);
             out.extend_from_slice(&p.prefix.octets());
-            out.extend_from_slice(&nested(&p.options, 25));
+            out.extend_from_slice(&nested(&p.options, 25)?);
         }
         DhcpOption::Oro(codes) => {
-            for c in codes.iter().take(max / 2) {
+            if codes.len() > max / 2 {
+                return None;
+            }
+            for c in codes {
                 out.extend_from_slice(&c.to_be_bytes());
             }
         }
@@ -1397,10 +1329,10 @@ fn encode_body(o: &DhcpOption, depth: usize, max: usize) -> Option<Vec<u8>> {
             push_fitting(&mut out, s.message.as_bytes(), max)?;
         }
         DhcpOption::RapidCommit | DhcpOption::ReconfigureAccept => {}
-        DhcpOption::UserClass(items) => push_counted(&mut out, items, max),
+        DhcpOption::UserClass(items) => push_counted(&mut out, items, max)?,
         DhcpOption::VendorClass { enterprise, classes } => {
             out.extend_from_slice(&enterprise.to_be_bytes());
-            push_counted(&mut out, classes, max);
+            push_counted(&mut out, classes, max)?;
         }
         DhcpOption::VendorOpts { enterprise, data } => {
             out.extend_from_slice(&enterprise.to_be_bytes());
@@ -1408,15 +1340,16 @@ fn encode_body(o: &DhcpOption, depth: usize, max: usize) -> Option<Vec<u8>> {
         }
         DhcpOption::ReconfigureMessage(m) => out.push(*m),
         DhcpOption::DnsServers(addrs) => {
-            for a in addrs.iter().take(max / 16) {
+            if addrs.len() > max / 16 {
+                return None;
+            }
+            for a in addrs {
                 out.extend_from_slice(&a.octets());
             }
         }
         DhcpOption::DomainList(names) => {
-            for wire in names.iter().filter_map(|n| encode_name(n)) {
-                if out.len() + wire.len() <= max {
-                    out.extend_from_slice(&wire);
-                }
+            for name in names {
+                push_fitting(&mut out, &encode_name(name)?, max)?;
             }
         }
         DhcpOption::InformationRefreshTime(v) | DhcpOption::SolMaxRt(v) | DhcpOption::InfMaxRt(v) => {
@@ -1437,16 +1370,14 @@ fn push_fitting(out: &mut Vec<u8>, data: &[u8], max: usize) -> Option<()> {
     Some(())
 }
 
-/// Appends items, each after a 2-byte length, while they fit in `max`
-/// bytes. Items longer than a length can say are left out.
-fn push_counted(out: &mut Vec<u8>, items: &[Vec<u8>], max: usize) {
+/// Appends counted items, refusing invalid lengths or a body over `max`.
+fn push_counted(out: &mut Vec<u8>, items: &[Vec<u8>], max: usize) -> Option<()> {
     for item in items {
-        let Ok(len) = u16::try_from(item.len()) else { continue };
-        if out.len() + 2 + item.len() <= max {
-            out.extend_from_slice(&len.to_be_bytes());
-            out.extend_from_slice(item);
-        }
+        let len = u16::try_from(item.len()).ok()?;
+        push_fitting(out, &len.to_be_bytes(), max)?;
+        push_fitting(out, item, max)?;
     }
+    Some(())
 }
 
 fn be32(b: &[u8], i: usize) -> u32 {
@@ -1462,6 +1393,10 @@ fn addr(b: &[u8], i: usize) -> Ipv6Addr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stdlib::codec::{
+        Stream, contract, pump,
+        test_support::{Lcg, decode_all, mutate},
+    };
 
     fn a(s: &str) -> Ipv6Addr {
         s.parse().unwrap()
@@ -1484,6 +1419,19 @@ mod tests {
     }
 
     #[test]
+    fn duid_wire_lengths() {
+        for len in [0, MIN_DUID - 1, MIN_DUID, MAX_DUID, MAX_DUID + 1] {
+            let bytes = vec![0; len];
+            let valid = (MIN_DUID..=MAX_DUID).contains(&len);
+            let expected = if valid { Ok(Duid(bytes.clone())) } else { Err(ParseError::BadOption(opt::CLIENTID)) };
+            assert_eq!(Duid::parse(&bytes), expected);
+            assert_eq!(Duid(bytes.clone()).to_bytes().is_ok(), valid);
+            contract::check_wire::<Duid>(&bytes);
+            contract::check_wire_value(&Duid(bytes));
+        }
+    }
+
+    #[test]
     fn solicit_example() {
         let m = Message::parse(&SOLICIT).unwrap();
         assert_eq!(m.msg_type, msg::SOLICIT);
@@ -1500,11 +1448,11 @@ mod tests {
                 DhcpOption::Oro(vec![opt::DNS_SERVERS, opt::DOMAIN_LIST]),
             ]
         );
-        assert_eq!(m.to_bytes(), SOLICIT);
+        assert_eq!(m.to_bytes().unwrap(), SOLICIT);
         // Built from fields, it makes the same bytes.
         let mut built = Message::new(msg::SOLICIT, 0x123456);
         built.options = m.options.clone();
-        assert_eq!(built.to_bytes(), SOLICIT);
+        assert_eq!(built.to_bytes().unwrap(), SOLICIT);
     }
 
     #[test]
@@ -1531,7 +1479,7 @@ mod tests {
             options: vec![DhcpOption::IaPrefix(prefix)],
         }));
         reply.options.push(DhcpOption::RapidCommit);
-        let bytes = reply.to_bytes();
+        let bytes = reply.to_bytes().unwrap();
         // The header, then Server ID (4 + 14), Client ID (4 + 10), IA_NA
         // (4 + 12 + IAADDR 28 + status 8), IA_PD (4 + 12 + IAPREFIX 29) and
         // Rapid Commit (4).
@@ -1546,7 +1494,7 @@ mod tests {
         assert!(bytes.windows(iaprefix.len()).any(|w| w == iaprefix));
         let back = Message::parse(&bytes).unwrap();
         assert_eq!(back, reply);
-        assert_eq!(back.to_bytes(), bytes);
+        assert_eq!(back.to_bytes().unwrap(), bytes);
         let ia = back.ia_na().next().unwrap();
         assert_eq!(ia.addresses().next().unwrap().address, a("2001:db8::1"));
         assert_eq!(ia.status().unwrap().message, "ok");
@@ -1562,9 +1510,10 @@ mod tests {
     #[test]
     fn relay_example() {
         let solicit = Message::parse(&SOLICIT).unwrap();
-        let mut forw = Message::relay_forward(&solicit, 0, a("2001:db8:0:1::1"), a("fe80::211:22ff:fe33:4455"));
+        let mut forw =
+            Message::relay_forward(&solicit, 0, a("2001:db8:0:1::1"), a("fe80::211:22ff:fe33:4455")).unwrap();
         forw.options.insert(0, DhcpOption::InterfaceId(b"eth0".to_vec()));
-        let bytes = forw.to_bytes();
+        let bytes = forw.to_bytes().unwrap();
         // RFC 8415, section 9: type, hop count, link address, peer address.
         assert_eq!(bytes[0], msg::RELAY_FORW);
         assert_eq!(bytes[1], 0);
@@ -1581,20 +1530,19 @@ mod tests {
         assert_eq!(read.relayed(), Some(Ok(solicit.clone())));
 
         // A second relay agent wraps it again.
-        let outer = Message::relay_forward(&read, 1, Ipv6Addr::UNSPECIFIED, a("2001:db8:0:1::1"));
-        let outer = Message::parse(&outer.to_bytes()).unwrap();
+        let outer = Message::relay_forward(&read, 1, Ipv6Addr::UNSPECIFIED, a("2001:db8:0:1::1")).unwrap();
+        let outer = Message::parse(&outer.to_bytes().unwrap()).unwrap();
         assert_eq!(outer.hop_count, 1);
         assert_eq!(outer.relayed().unwrap().unwrap().relayed().unwrap().unwrap(), solicit);
 
         // The server answers through the first relay agent.
         let advertise = solicit.answer(msg::ADVERTISE, &Duid::en(9, b"srv"));
-        let repl = read.relay_reply(&advertise);
+        let repl = read.relay_reply(&advertise).unwrap();
         assert_eq!(repl.msg_type, msg::RELAY_REPL);
         assert_eq!((repl.hop_count, repl.link_address, repl.peer_address), (0, read.link_address, read.peer_address));
         assert_eq!(repl.option(opt::INTERFACE_ID), Some(&DhcpOption::InterfaceId(b"eth0".to_vec())));
-        let back = Message::parse(&repl.to_bytes()).unwrap();
+        let back = Message::parse(&repl.to_bytes().unwrap()).unwrap();
         assert_eq!(back.relayed(), Some(Ok(advertise)));
-        // A client message carries no relayed message.
         assert_eq!(solicit.relayed(), None);
     }
 
@@ -1630,7 +1578,7 @@ mod tests {
         ];
         let mut m = Message::new(msg::REPLY, 0xffffff);
         m.options = options;
-        let bytes = m.to_bytes();
+        let bytes = m.to_bytes().unwrap();
         assert_eq!(Message::parse(&bytes), Ok(m.clone()));
         // The domain list in wire form (RFC 1035, section 3.1).
         let mut list = vec![0, 24, 0, 31, 7];
@@ -1669,7 +1617,7 @@ mod tests {
         long[4..8].copy_from_slice(&[0, 99, 0xff, 0xef]);
         assert_eq!(usize::from(u16::from_be_bytes([0xff, 0xef])), MAX_MESSAGE - 8);
         let m = Message::parse(&long).unwrap();
-        assert_eq!(m.to_bytes(), long);
+        assert_eq!(m.to_bytes().unwrap(), long);
     }
 
     #[test]
@@ -1764,45 +1712,49 @@ mod tests {
         max_name.push(0);
         assert_eq!(max_name.len(), MAX_NAME);
         let m = Message::parse(&with_option(opt::DOMAIN_LIST, &max_name)).unwrap();
-        assert_eq!(m.to_bytes(), with_option(opt::DOMAIN_LIST, &max_name));
+        assert_eq!(m.to_bytes().unwrap(), with_option(opt::DOMAIN_LIST, &max_name));
     }
 
     #[test]
     fn spec_review_cases() {
         // RFC 8415, section 21.15: a User Class option holds one or more
-        // instances, so an empty one is refused, and a writer leaves out a
-        // list with no items.
+        // instances, so readers and writers refuse a list with no items.
         assert_eq!(Message::parse(&with_option(opt::USER_CLASS, &[])), Err(ParseError::BadOption(opt::USER_CLASS)));
         assert!(Message::parse(&with_option(opt::USER_CLASS, &[0, 0])).is_ok());
         let mut m = Message::new(msg::SOLICIT, 1);
         m.options.push(DhcpOption::UserClass(vec![]));
         m.options.push(DhcpOption::UserClass(vec![vec![0; 70000]]));
-        assert_eq!(m.to_bytes(), [1, 0, 0, 1]);
+        for option in m.options {
+            let value = Message { options: vec![option], ..Message::new(msg::SOLICIT, 1) };
+            assert!(value.to_bytes().is_err());
+            contract::check_wire_value(&value);
+        }
         // Section 21.13: a status message is not null-terminated.
         let nul = with_option(opt::STATUS_CODE, &[0, 0, b'o', b'k', 0]);
         assert_eq!(Message::parse(&nul), Err(ParseError::BadOption(opt::STATUS_CODE)));
         assert!(Message::parse(&with_option(opt::STATUS_CODE, &[0, 0, 0, b'k'])).is_ok());
         let mut m = Message::new(msg::REPLY, 1);
         m.options.push(DhcpOption::StatusCode(StatusCode { code: 0, message: "ok\0".into() }));
-        assert_eq!(m.to_bytes(), [7, 0, 0, 1]);
+        for option in m.options {
+            let value = Message { options: vec![option], ..Message::new(msg::REPLY, 1) };
+            assert!(value.to_bytes().is_err());
+            contract::check_wire_value(&value);
+        }
     }
 
     #[test]
     fn relay_reply_with_a_long_interface_id() {
         // A Relay-forward whose Interface-Id leaves no room for the answer:
-        // the Relay-reply still reads, but without its Relay Message. The
-        // fuzz target used to expect it back whole.
-        let mut forw = Message::relay_forward(&Message::new(msg::SOLICIT, 1), 0, a("::1"), a("::2"));
+        // writing the Relay-reply must fail without dropping its message.
+        let mut forw = Message::relay_forward(&Message::new(msg::SOLICIT, 1), 0, a("::1"), a("::2")).unwrap();
         forw.options = vec![DhcpOption::InterfaceId(vec![7; MAX_MESSAGE - RELAY_HEADER_LEN - 4])];
-        let bytes = forw.to_bytes();
+        let bytes = forw.to_bytes().unwrap();
         assert_eq!(bytes.len(), MAX_MESSAGE);
         let read = Message::parse(&bytes).unwrap();
         let answer = Message::parse(&SOLICIT).unwrap().answer(msg::REPLY, &Duid::en(1, b"s"));
-        let repl = read.relay_reply(&answer);
-        let back = Message::parse(&repl.to_bytes()).unwrap();
-        assert_ne!(back, repl);
-        assert_eq!(back.relayed(), None);
-        assert_eq!(back.to_bytes(), repl.to_bytes());
+        let repl = read.relay_reply(&answer).unwrap();
+        assert!(repl.to_bytes().is_err());
+        contract::check_wire_value(&repl);
     }
 
     #[test]
@@ -1812,7 +1764,7 @@ mod tests {
         assert_eq!(solicit.requested_options(), [opt::DNS_SERVERS, opt::DOMAIN_LIST]);
         assert_eq!(Message::new(msg::SOLICIT, 1).requested_options(), [] as [u16; 0]);
         // A relay's Interface-Id, as bytes.
-        let mut forw = Message::relay_forward(&solicit, 0, a("::1"), a("::2"));
+        let mut forw = Message::relay_forward(&solicit, 0, a("::1"), a("::2")).unwrap();
         assert_eq!(forw.interface_id(), None);
         forw.options.push(DhcpOption::InterfaceId(b"eth1".to_vec()));
         assert_eq!(forw.interface_id(), Some(&b"eth1"[..]));
@@ -1826,34 +1778,19 @@ mod tests {
     }
 
     #[test]
-    fn decoder_takes_many_small_messages_in_linear_time() {
-        // A million empty frames, fed as fast as the decoder takes them.
-        // Dropping the bytes of each one as it is taken out would move the
-        // rest of the buffer every time.
+    fn stream_takes_many_small_messages_in_linear_time() {
         let n = 1_000_000;
-        let data = vec![0; 2 * n];
-        let mut d = Decoder::new();
-        let mut fed = 0;
+        let mut stream = Stream::new(Frames::new());
         let mut count = 0;
-        loop {
-            fed += d.feed(&data[fed..]);
-            assert!(d.buffered() <= MAX_BUFFERED);
-            let before = count;
-            while let Some(r) = d.next_message() {
-                assert_eq!(r, Err(ParseError::Short));
-                count += 1;
-            }
-            // At most half a frame waits for the next feed.
-            assert!(d.buffered() < 2);
-            if count == before {
-                break;
-            }
-        }
-        assert_eq!((fed, count, d.buffered()), (2 * n, n, 0));
-        // The bytes taken out are dropped on the next feed.
-        assert_eq!(d.feed(&[0, 4, 1, 0, 0, 7]), 6);
-        assert_eq!(d.buffered(), 6);
-        assert_eq!(d.next_message().unwrap().unwrap().transaction, 7);
+        pump(&mut stream, &vec![0; 2 * n], |m| {
+            assert_eq!(m, Err(ParseError::Short));
+            count += 1;
+        })
+        .unwrap();
+        assert_eq!(count, n);
+        assert_eq!(stream.buffered(), 0);
+        assert_eq!(stream.push(&[0, 4, 1, 0, 0, 7]), 6);
+        assert_eq!(stream.next().unwrap().unwrap().unwrap().transaction, 7);
     }
 
     #[test]
@@ -1866,8 +1803,9 @@ mod tests {
 
     #[test]
     fn every_truncated_prefix() {
-        let relay = Message::relay_forward(&Message::parse(&SOLICIT).unwrap(), 0, a("2001:db8::1"), a("fe80::1"));
-        for full in [SOLICIT.to_vec(), relay.to_bytes()] {
+        let relay =
+            Message::relay_forward(&Message::parse(&SOLICIT).unwrap(), 0, a("2001:db8::1"), a("fe80::1")).unwrap();
+        for full in [SOLICIT.to_vec(), relay.to_bytes().unwrap()] {
             let header = if full[0] == msg::RELAY_FORW { RELAY_HEADER_LEN } else { CLIENT_HEADER_LEN };
             // Where each top-level option ends.
             let mut ends = vec![header];
@@ -1882,52 +1820,32 @@ mod tests {
                     assert_eq!(r, Err(ParseError::Short), "{n}");
                 } else if ends.contains(&n) {
                     // Cut between options: a shorter message.
-                    assert_eq!(r.unwrap().to_bytes(), full[..n], "{n}");
+                    assert_eq!(r.unwrap().to_bytes().unwrap(), full[..n], "{n}");
                 } else {
                     assert_eq!(r, Err(ParseError::Truncated), "{n}");
                 }
             }
             // Over TCP, every prefix waits for more.
-            let framed = Message::parse(&full).unwrap().to_tcp_bytes();
+            let framed = Frame(Message::parse(&full).unwrap().clone()).to_bytes().unwrap();
+            contract::check_decode_with_alloc_limit(Frames::new, &framed, 2 * MAX_BUFFERED);
             for n in 0..framed.len() {
-                let mut d = Decoder::new();
-                assert_eq!(d.feed(&framed[..n]), n);
-                assert_eq!(d.next_message(), None, "{n}");
-                assert_eq!(d.buffered(), n);
+                assert_eq!(Frames::new().decode(&framed[..n], false), Ok(Step::Need));
             }
         }
     }
 
     #[test]
-    fn decoder_splits_a_stream() {
+    fn stream_splits_a_stream() {
         let first = Message::parse(&SOLICIT).unwrap();
         let second = first.answer(msg::REPLY, &Duid::en(1, b"s"));
-        let mut stream = first.to_tcp_bytes();
-        // A malformed message in between: 3 bytes is shorter than a header.
-        stream.extend_from_slice(&[0, 3, 1, 0, 0]);
-        stream.extend_from_slice(&second.to_tcp_bytes());
-        assert_eq!(&stream[..2], [0, SOLICIT.len() as u8]);
-        let mut d = Decoder::new();
-        let mut got = Vec::new();
-        for byte in &stream {
-            assert_eq!(d.feed(std::slice::from_ref(byte)), 1);
-            while let Some(m) = d.next_message() {
-                got.push(m);
-            }
-        }
-        assert_eq!(got, [Ok(first), Err(ParseError::Short), Ok(second)]);
-        assert_eq!(d.buffered(), 0);
-        // All at once gives the same.
-        let mut whole = Decoder::new();
-        assert_eq!(whole.feed(&stream), stream.len());
-        let again: Vec<_> = std::iter::from_fn(|| whole.next_message()).collect();
-        assert_eq!(again, got);
-        // An empty frame is an error, and the stream goes on.
-        let mut d = Decoder::new();
-        assert_eq!(d.feed(&[0, 0, 0, 4, 2, 0, 0, 1]), 8);
-        assert_eq!(d.next_message(), Some(Err(ParseError::Short)));
-        assert_eq!(d.next_message().unwrap().unwrap().transaction, 1);
-        assert_eq!(d.next_message(), None);
+        let mut bytes = Frame(first.clone()).to_bytes().unwrap();
+        bytes.extend_from_slice(&[0, 3, 1, 0, 0]);
+        bytes.extend_from_slice(&Frame(second.clone()).to_bytes().unwrap());
+        contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_BUFFERED);
+        assert_eq!(decode_all(Frames::new, &bytes), (vec![Ok(first), Err(ParseError::Short), Ok(second)], None));
+        let (messages, error) = decode_all(Frames::new, &[0, 0, 0, 4, 2, 0, 0, 1]);
+        assert_eq!(messages, [Err(ParseError::Short), Ok(Message::new(2, 1))]);
+        assert_eq!(error, None);
     }
 
     #[test]
@@ -1943,7 +1861,7 @@ mod tests {
         }
         let bytes = with_option(opt::IA_NA, &body);
         let m = Message::parse(&bytes).unwrap();
-        assert_eq!(m.to_bytes(), bytes);
+        assert_eq!(m.to_bytes().unwrap(), bytes);
         let mut depth = 0;
         let mut options = &m.options;
         while let Some(DhcpOption::IaNa(ia)) = options.first() {
@@ -1953,20 +1871,19 @@ mod tests {
         assert_eq!(depth, MAX_DEPTH);
         assert!(matches!(options.first(), Some(DhcpOption::Other { code: opt::IA_NA, .. })));
 
-        // Built deeper than that, the writer leaves the deep part out.
+        // A constructed value past the depth limit is refused.
         let mut o = DhcpOption::RapidCommit;
         for _ in 0..MAX_DEPTH * 3 {
             o = DhcpOption::IaNa(IaNa { iaid: 0, t1: 0, t2: 0, options: vec![o] });
         }
         let mut m = Message::new(msg::REPLY, 1);
         m.options.push(o);
-        let bytes = m.to_bytes();
-        assert_eq!(bytes.len(), 4 + 16 * (MAX_DEPTH + 1));
-        assert_eq!(Message::parse(&bytes).unwrap().to_bytes(), bytes);
+        assert!(m.to_bytes().is_err());
+        contract::check_wire_value(&m);
     }
 
     #[test]
-    fn writers_leave_out_what_would_not_read() {
+    fn writers_refuse_values_that_would_change() {
         let mut m = Message::new(msg::REPLY, 0x0100_0001);
         // The transaction ID keeps its low 24 bits.
         assert_eq!(m.transaction, 1);
@@ -1988,204 +1905,178 @@ mod tests {
             DhcpOption::Other { code: 1000, data: vec![0; 70000] },
             DhcpOption::RelayMessage(vec![0; MAX_MESSAGE]),
         ];
-        let bytes = m.to_bytes();
-        let back = Message::parse(&bytes).unwrap();
-        assert_eq!(back.transaction, 0x123456);
-        assert_eq!(
-            back.options,
-            [
-                DhcpOption::ElapsedTime(5),
-                DhcpOption::DomainList(vec!["ok.example".into()]),
-                DhcpOption::UserClass(vec![b"kept".to_vec()]),
-            ]
-        );
+        assert!(m.to_bytes().is_err());
+        for option in std::mem::take(&mut m.options) {
+            let value = Message { options: vec![option], ..Message::new(msg::REPLY, 1) };
+            assert!(value.to_bytes().is_err(), "{:?}", value.options);
+            contract::check_wire_value(&value);
+        }
+        for (option, fits) in [
+            (DhcpOption::DnsServers(vec![Ipv6Addr::LOCALHOST; 4094]), true),
+            (DhcpOption::DnsServers(vec![Ipv6Addr::LOCALHOST; 4095]), false),
+            (DhcpOption::Oro(vec![23; 32759]), true),
+            (DhcpOption::Oro(vec![23; 32760]), false),
+            (DhcpOption::StatusCode(StatusCode { code: 0, message: "x".repeat(70000) }), false),
+        ] {
+            let value = Message { options: vec![option], ..Message::new(msg::REPLY, 1) };
+            let mut out = vec![0x5a];
+            if fits {
+                value.write(&mut out).unwrap();
+                assert_eq!(Message::parse(&out[1..]), Ok(value.clone()));
+            } else {
+                assert_eq!(value.write(&mut out), Err(WriteError::Unwritable));
+                assert_eq!(out, [0x5a]);
+            }
+            contract::check_wire_value(&value);
+        }
 
-        // Lists are cut to fit, and the message stays within MAX_MESSAGE.
-        let mut big = Message::new(msg::REPLY, 0);
-        big.options.push(DhcpOption::DnsServers(vec![Ipv6Addr::LOCALHOST; 5000]));
-        big.options.push(DhcpOption::Oro(vec![23; 40000]));
-        big.options.push(DhcpOption::StatusCode(StatusCode { code: 0, message: "x".repeat(70000) }));
-        big.options.push(DhcpOption::Preference(1));
-        let bytes = big.to_bytes();
-        assert!(bytes.len() <= MAX_MESSAGE);
-        let back = Message::parse(&bytes).unwrap();
-        let DhcpOption::DnsServers(servers) = &back.options[0] else { panic!() };
-        // The servers fill all but 15 bytes, and 5 codes fit in those.
-        assert_eq!(servers.len(), (MAX_MESSAGE - 8) / 16);
-        assert_eq!(back.options[1], DhcpOption::Oro(vec![23; 5]));
-        // The status code and the preference no longer fit.
-        assert_eq!(back.options.len(), 2);
-        assert_eq!(bytes.len(), MAX_MESSAGE - 1);
-        assert_eq!(back.to_bytes(), bytes);
-
-        // A relay whose relayed message is too big leaves it out.
+        // A relay whose inner message does not fit is refused.
         let mut huge = Message::new(msg::SOLICIT, 0);
         huge.options.push(DhcpOption::Other { code: 1000, data: vec![0; MAX_MESSAGE - 8] });
-        assert_eq!(huge.to_bytes().len(), MAX_MESSAGE);
-        let forw = Message::relay_forward(&huge, 0, Ipv6Addr::UNSPECIFIED, Ipv6Addr::UNSPECIFIED);
-        let bytes = forw.to_bytes();
-        assert_eq!(bytes.len(), RELAY_HEADER_LEN);
-        assert_eq!(Message::parse(&bytes).unwrap().relayed(), None);
-        assert_eq!(forw.to_tcp_bytes().len(), 2 + RELAY_HEADER_LEN);
-    }
-
-    /// A small deterministic generator, so the fuzz tests repeat.
-    struct Lcg(u64);
-
-    impl Lcg {
-        fn next(&mut self) -> u32 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (self.0 >> 33) as u32
-        }
-        fn below(&mut self, n: usize) -> usize {
-            if n == 0 { 0 } else { self.next() as usize % n }
-        }
-        fn bytes(&mut self, n: usize) -> Vec<u8> {
-            (0..n).map(|_| self.next() as u8).collect()
-        }
-        fn some_bytes(&mut self, max: usize) -> Vec<u8> {
-            let n = self.below(max);
-            self.bytes(n)
-        }
+        assert_eq!(huge.to_bytes().unwrap().len(), MAX_MESSAGE);
+        let forw = Message::relay_forward(&huge, 0, Ipv6Addr::UNSPECIFIED, Ipv6Addr::UNSPECIFIED).unwrap();
+        assert!(forw.to_bytes().is_err());
+        assert!(Frame(forw).to_bytes().is_err());
     }
 
     /// A random option, sometimes malformed, nested up to `depth` more.
     fn random_option(r: &mut Lcg, depth: usize) -> DhcpOption {
         let nested = |r: &mut Lcg| {
-            if depth == 0 { Vec::new() } else { (0..r.below(3)).map(|_| random_option(r, depth - 1)).collect() }
+            if depth == 0 { Vec::new() } else { (0..r.index(3)).map(|_| random_option(r, depth - 1)).collect() }
         };
-        let addr = |r: &mut Lcg| Ipv6Addr::from(u128::from(r.next()) << 96 | u128::from(r.next()));
-        match r.below(30) {
-            0 => DhcpOption::ClientId(Duid(r.some_bytes(140))),
-            1 => DhcpOption::ServerId(Duid::en(r.next(), &[1, 2])),
-            2 => DhcpOption::IaNa(IaNa { iaid: r.next(), t1: r.next(), t2: r.next(), options: nested(r) }),
-            3 => DhcpOption::IaTa(IaTa { iaid: r.next(), options: nested(r) }),
+        let addr = |r: &mut Lcg| Ipv6Addr::from(u128::from(r.next() as u32) << 96 | u128::from(r.next() as u32));
+        match r.index(30) {
+            0 => DhcpOption::ClientId(Duid(r.bytes(140))),
+            1 => DhcpOption::ServerId(Duid::en(r.next() as u32, &[1, 2])),
+            2 => DhcpOption::IaNa(IaNa {
+                iaid: r.next() as u32,
+                t1: r.next() as u32,
+                t2: r.next() as u32,
+                options: nested(r),
+            }),
+            3 => DhcpOption::IaTa(IaTa { iaid: r.next() as u32, options: nested(r) }),
             4 => DhcpOption::IaAddr(IaAddr { address: addr(r), preferred: 1, valid: 2, options: nested(r) }),
-            5 => DhcpOption::IaPd(IaPd { iaid: r.next(), t1: 0, t2: 0, options: nested(r) }),
+            5 => DhcpOption::IaPd(IaPd { iaid: r.next() as u32, t1: 0, t2: 0, options: nested(r) }),
             6 => DhcpOption::IaPrefix(IaPrefix {
                 preferred: 1,
                 valid: 2,
-                prefix_len: r.below(140) as u8,
+                prefix_len: r.index(140) as u8,
                 prefix: addr(r),
                 options: nested(r),
             }),
-            7 => DhcpOption::Oro((0..r.below(10)).map(|_| r.next() as u16).collect()),
+            7 => DhcpOption::Oro((0..r.index(10)).map(|_| r.next() as u16).collect()),
             8 => DhcpOption::Preference(r.next() as u8),
             9 => DhcpOption::ElapsedTime(r.next() as u16),
-            10 => DhcpOption::RelayMessage(r.some_bytes(40)),
+            10 => DhcpOption::RelayMessage(r.bytes(40)),
             11 => DhcpOption::Auth(Auth {
                 protocol: 3,
                 algorithm: 1,
                 rdm: 0,
-                replay_detection: u64::from(r.next()),
-                info: r.some_bytes(20),
+                replay_detection: u64::from(r.next() as u32),
+                info: r.bytes(20),
             }),
             12 => DhcpOption::Unicast(addr(r)),
-            13 => DhcpOption::StatusCode(StatusCode { code: r.next() as u16, message: "nö".repeat(r.below(4)) }),
+            13 => {
+                DhcpOption::StatusCode(StatusCode { code: r.next() as u16, message: "nö".repeat(r.index(4)) })
+            }
             14 => DhcpOption::RapidCommit,
-            15 => DhcpOption::UserClass((0..r.below(4)).map(|_| r.some_bytes(6)).collect()),
-            16 => DhcpOption::VendorClass { enterprise: r.next(), classes: vec![r.some_bytes(5)] },
-            17 => DhcpOption::VendorOpts { enterprise: r.next(), data: r.some_bytes(9) },
-            18 => DhcpOption::InterfaceId(r.some_bytes(9)),
+            15 => DhcpOption::UserClass((0..r.index(4)).map(|_| r.bytes(6)).collect()),
+            16 => DhcpOption::VendorClass { enterprise: r.next() as u32, classes: vec![r.bytes(5)] },
+            17 => DhcpOption::VendorOpts { enterprise: r.next() as u32, data: r.bytes(9) },
+            18 => DhcpOption::InterfaceId(r.bytes(9)),
             19 => DhcpOption::ReconfigureMessage(r.next() as u8),
             20 => DhcpOption::ReconfigureAccept,
-            21 => DhcpOption::DnsServers((0..r.below(4)).map(|_| addr(r)).collect()),
+            21 => DhcpOption::DnsServers((0..r.index(4)).map(|_| addr(r)).collect()),
             22 => {
                 let names = ["a.b", "", "x..y", "-", "ä.com", "host_1.lab"];
-                DhcpOption::DomainList((0..r.below(4)).map(|_| names[r.below(names.len())].to_string()).collect())
+                DhcpOption::DomainList((0..r.index(4)).map(|_| names[r.index(names.len())].to_string()).collect())
             }
-            23 => DhcpOption::InformationRefreshTime(r.next()),
-            24 => DhcpOption::SolMaxRt(r.next()),
-            25 => DhcpOption::InfMaxRt(r.next()),
+            23 => DhcpOption::InformationRefreshTime(r.next() as u32),
+            24 => DhcpOption::SolMaxRt(r.next() as u32),
+            25 => DhcpOption::InfMaxRt(r.next() as u32),
             // Other options, some with known codes and any body.
-            _ => DhcpOption::Other { code: r.below(30) as u16, data: r.some_bytes(30) },
+            _ => DhcpOption::Other { code: r.index(30) as u16, data: r.bytes(30) },
         }
     }
 
     fn random_message(r: &mut Lcg) -> Message {
-        let mut m = Message::new(r.below(16) as u8, r.next());
-        m.transaction = r.next();
+        let mut m = Message::new(r.index(16) as u8, r.next() as u32);
+        m.transaction = r.next() as u32;
         m.hop_count = r.next() as u8;
-        m.link_address = Ipv6Addr::from(u128::from(r.next()));
-        m.options = (0..r.below(6)).map(|_| random_option(r, MAX_DEPTH + 2)).collect();
+        m.link_address = Ipv6Addr::from(u128::from(r.next() as u32));
+        m.options = (0..r.index(6)).map(|_| random_option(r, MAX_DEPTH + 2)).collect();
         m
     }
 
     #[test]
     fn fuzz_built_messages_read_back() {
-        let mut r = Lcg(0x5eed);
+        let mut r = Lcg::new(0x5eed);
         for _ in 0..3000 {
-            let m = random_message(&mut r);
-            let bytes = m.to_bytes();
-            assert!(bytes.len() <= MAX_MESSAGE);
-            let back = Message::parse(&bytes).unwrap_or_else(|e| panic!("{e}: {m:?}"));
-            assert_eq!(back.to_bytes(), bytes);
-            assert_eq!(back.msg_type, m.msg_type);
-            if !m.is_relay() {
-                assert_eq!(back.transaction, m.transaction & 0xff_ffff);
-                let ans = back.answer(msg::REPLY, &Duid::en(1, b"x"));
-                assert_eq!(Message::parse(&ans.to_bytes()), Ok(ans));
-            } else {
-                assert_eq!(back.hop_count, m.hop_count);
-                let repl = back.relay_reply(&m);
-                assert!(Message::parse(&repl.to_bytes()).is_ok());
+            let mut m = random_message(&mut r);
+            contract::check_wire_value(&m);
+            if r.coin() {
+                if m.is_relay() {
+                    m.transaction = 0;
+                } else {
+                    m.transaction &= 0xffffff;
+                    m.hop_count = 0;
+                    m.link_address = Ipv6Addr::UNSPECIFIED;
+                }
             }
-            let mut d = Decoder::new();
-            let framed = m.to_tcp_bytes();
-            assert_eq!(d.feed(&framed), framed.len());
-            assert_eq!(d.next_message(), Some(Ok(back)));
+            contract::check_wire_value(&m);
+            if let Ok(bytes) = m.to_bytes() {
+                let back = Message::parse(&bytes).unwrap();
+                assert_eq!(back, m);
+                if m.is_relay() {
+                    contract::check_wire_value(&back.relay_reply(&m).unwrap());
+                } else {
+                    contract::check_wire_value(&back.answer(msg::REPLY, &Duid::en(1, b"x")));
+                }
+            }
+            contract::check_wire_value(&Frame(m));
         }
     }
 
     #[test]
     fn fuzz_random_bytes() {
-        let mut r = Lcg(42);
+        let mut r = Lcg::new(42);
         let mut seeds = vec![SOLICIT.to_vec()];
-        for _ in 0..20 {
-            seeds.push(random_message(&mut r).to_bytes());
+        for _ in 0..100 {
+            let mut message = random_message(&mut r);
+            if message.is_relay() {
+                message.transaction = 0;
+            } else {
+                message.transaction &= 0xffffff;
+                message.hop_count = 0;
+                message.link_address = Ipv6Addr::UNSPECIFIED;
+                message.peer_address = Ipv6Addr::UNSPECIFIED;
+            }
+            if let Ok(bytes) = message.to_bytes() {
+                seeds.push(bytes);
+                if seeds.len() == 21 {
+                    break;
+                }
+            }
         }
+        assert_eq!(seeds.len(), 21);
+        assert!(seeds.iter().any(|bytes| Message::parse(bytes).unwrap().is_relay()));
         let mut accepted = 0;
         for round in 0..6000 {
-            let data = if round % 4 == 0 {
-                let n = r.below(80);
-                r.bytes(n)
-            } else {
-                let mut d = seeds[r.below(seeds.len())].clone();
-                for _ in 0..1 + r.below(4) {
-                    let n = d.len();
-                    match r.below(4) {
-                        0 if n > 0 => d[r.below(n)] = r.next() as u8,
-                        1 if n > 0 => d.truncate(r.below(n)),
-                        2 => d.insert(r.below(n + 1), r.next() as u8),
-                        _ => d.extend(r.some_bytes(6)),
-                    }
-                }
-                d
-            };
-            // As a datagram: whatever reads writes back the same bytes.
+            let mut data = if round % 4 == 0 { r.bytes(80) } else { seeds[r.index(seeds.len())].clone() };
+            for _ in 0..1 + r.index(4) {
+                mutate(&mut r, &mut data);
+            }
+            contract::check_wire::<Message>(&data);
+            contract::check_wire::<Frame>(&data);
             if let Ok(m) = Message::parse(&data) {
                 accepted += 1;
-                assert_eq!(m.to_bytes(), data);
+                assert_eq!(m.to_bytes().unwrap(), data);
                 if let Some(Ok(inner)) = m.relayed() {
-                    assert!(Message::parse(&inner.to_bytes()).is_ok());
+                    contract::check_wire_value(&inner);
                 }
             }
-            // As a TCP stream, whole and a byte at a time.
-            let mut whole = Decoder::new();
-            assert_eq!(whole.feed(&data), data.len());
-            let all: Vec<_> = std::iter::from_fn(|| whole.next_message()).collect();
-            let mut bytewise = Decoder::new();
-            let mut again = Vec::new();
-            for b in &data {
-                assert_eq!(bytewise.feed(std::slice::from_ref(b)), 1);
-                while let Some(m) = bytewise.next_message() {
-                    again.push(m);
-                }
-            }
-            assert_eq!(all, again);
-            assert_eq!(whole.buffered(), bytewise.buffered());
+            contract::check_decode_with_alloc_limit(Frames::new, &data, 2 * MAX_BUFFERED);
         }
-        // The mutations leave plenty of messages that still read.
         assert!(accepted > 500, "{accepted}");
     }
 
@@ -2197,10 +2088,10 @@ mod tests {
         let mut frame = vec![0xff, 0xff, 1, 0, 0, 1, 0x03, 0xe8, 0xff, 0xf7];
         frame.extend_from_slice(&body);
         assert_eq!(frame.len(), 2 + 65_535);
-        let mut d = Decoder::new();
-        assert_eq!(d.feed(&frame), frame.len());
-        let m = d.next_message().unwrap().unwrap();
-        assert_eq!(m.to_tcp_bytes(), frame);
+        let value = Frame::parse(&frame).unwrap();
+        assert_eq!(value.to_bytes().unwrap(), frame);
+        assert!(value.0.to_bytes().is_err());
+        contract::check_decode_with_alloc_limit(Frames::new, &frame, 2 * MAX_BUFFERED);
     }
 
     #[test]
@@ -2210,7 +2101,7 @@ mod tests {
         let bytes = with_option(opt::DOMAIN_LIST, &[1, b'.', 0]);
         let m = Message::parse(&bytes).unwrap();
         assert_eq!(m.options, [DhcpOption::Other { code: opt::DOMAIN_LIST, data: vec![1, b'.', 0] }]);
-        assert_eq!(m.to_bytes(), bytes);
+        assert_eq!(m.to_bytes().unwrap(), bytes);
     }
 
     #[test]
@@ -2232,7 +2123,11 @@ mod tests {
             DhcpOption::VendorOpts { enterprise: 1, data: vec![0] },
             DhcpOption::DnsServers(vec![]),
         ];
-        assert_eq!(m.to_bytes(), [7, 0, 0, 1]);
+        for option in m.options {
+            let value = Message { options: vec![option], ..Message::new(msg::REPLY, 1) };
+            assert!(value.to_bytes().is_err());
+            contract::check_wire_value(&value);
+        }
     }
 
     #[test]
@@ -2245,29 +2140,37 @@ mod tests {
     }
 
     #[test]
-    fn review_decoder_holds_a_bounded_number_of_bytes() {
-        let mut d = Decoder::new();
-        let chunk = [0u8; 4096];
-        let mut taken = 0;
-        for _ in 0..100 {
-            taken += d.feed(&chunk);
-        }
-        assert_eq!(taken, MAX_BUFFERED);
-        assert_eq!(d.buffered(), MAX_BUFFERED);
-        // Taking messages out makes room again.
-        assert_eq!(d.next_message(), Some(Err(ParseError::Short)));
-        assert_eq!(d.feed(&chunk), 2);
+    fn review_stream_holds_a_bounded_number_of_bytes() {
+        let mut stream = Stream::new(Frames::new());
+        assert_eq!(stream.push(&vec![0; 2 * MAX_BUFFERED]), MAX_BUFFERED);
+        assert_eq!(stream.buffered(), MAX_BUFFERED);
+        assert_eq!(stream.next(), Some(Ok(Err(ParseError::Short))));
+        assert_eq!(stream.push(&[0; 4096]), 2);
+        contract::check_decode_with_alloc_limit(Frames::new, &[0; 4096], 2 * MAX_BUFFERED);
     }
 
     #[test]
-    fn review_checked_writer_reports_what_is_left_out() {
+    fn relay_constructors_refuse_unwritable_inner_messages() {
+        let mut inner = Message::new(msg::SOLICIT, 1);
+        inner.transaction = 0x0100_0000;
+        assert_eq!(
+            Message::relay_forward(&inner, 0, Ipv6Addr::UNSPECIFIED, Ipv6Addr::UNSPECIFIED),
+            Err(WriteError::Unwritable)
+        );
+        let forward = Message::new(msg::RELAY_FORW, 0);
+        assert_eq!(forward.relay_reply(&inner), Err(WriteError::Unwritable));
+    }
+
+    #[test]
+    fn writer_refuses_relays_that_do_not_fit() {
         let mut huge = Message::new(msg::SOLICIT, 0);
         huge.options.push(DhcpOption::Other { code: 1000, data: vec![0; MAX_MESSAGE - 8] });
-        assert!(huge.try_to_bytes().is_some());
-        let forw = Message::relay_forward(&huge, 0, Ipv6Addr::UNSPECIFIED, Ipv6Addr::UNSPECIFIED);
-        assert_eq!(forw.try_to_bytes(), None);
+        assert!(huge.to_bytes().is_ok());
+        let forw = Message::relay_forward(&huge, 0, Ipv6Addr::UNSPECIFIED, Ipv6Addr::UNSPECIFIED).unwrap();
+        assert!(forw.to_bytes().is_err());
         let small =
-            Message::relay_forward(&Message::new(msg::SOLICIT, 1), 0, Ipv6Addr::UNSPECIFIED, Ipv6Addr::UNSPECIFIED);
-        assert_eq!(small.try_to_bytes(), Some(small.to_bytes()));
+            Message::relay_forward(&Message::new(msg::SOLICIT, 1), 0, Ipv6Addr::UNSPECIFIED, Ipv6Addr::UNSPECIFIED)
+                .unwrap();
+        assert!(small.to_bytes().is_ok());
     }
 }

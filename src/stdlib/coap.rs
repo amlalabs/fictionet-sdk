@@ -12,14 +12,9 @@
 //! Nothing here reads a socket. A world that plays a device reads each
 //! datagram it gets with [`Message::parse`], looks at its code, path and
 //! options, and sends back the bytes of [`Message::to_bytes`] for the
-//! reply. Over TCP it feeds the bytes it reads to a [`Decoder`] and gets
+//! reply. Over TCP it pushes the bytes it reads to a [`Stream<Frames>`](super::codec::Stream) and gets
 //! [`Frame`]s back. Which resources exist, and what they hold, is up to
 //! world code.
-//!
-//! New TCP stacks use [`Frames`] with [`super::codec::Stream`]. [`Wire`]
-//! reads and writes [`Message`] datagrams and [`Frame`] TCP units exactly.
-//! Its writers refuse clipping and reordering. The old `to_bytes` writers
-//! and [`Decoder`] keep their original behavior.
 //!
 //! Every reader checks lengths, because the agent can send any bytes it
 //! likes. A datagram that breaks the message format is an [`Error`]; a
@@ -29,6 +24,7 @@
 //! [`Message::bad_option`], as RFC 7252 section 5.4 describes.
 //!
 //! ```
+//! use fictionet::stdlib::codec::Wire;
 //! use fictionet::stdlib::coap::{Code, Message, Type, content_format};
 //!
 //! /// A pretend thermometer with one resource, /temp.
@@ -54,7 +50,7 @@
 //! let reply = answer(&request);
 //! // A piggybacked acknowledgement: 2.05 Content, the same ID and token,
 //! // Content-Format 0 (an empty value), then the payload.
-//! assert_eq!(reply.to_bytes(), [0x61, 0x45, 0x12, 0x34, 0x77, 0xc0, 0xff, b'2', b'1', b'.', b'5']);
+//! assert_eq!(reply.to_bytes().unwrap(), [0x61, 0x45, 0x12, 0x34, 0x77, 0xc0, 0xff, b'2', b'1', b'.', b'5']);
 //! ```
 
 use super::codec::{Decode, Step, Wire};
@@ -85,7 +81,7 @@ pub const MAX_FRAME_BODY: usize = 1 << 20;
 /// The longest TCP frame header: the length and token-length byte, a
 /// 4-byte extended length, and the code.
 pub const MAX_FRAME_HEADER: usize = 6;
-/// The most bytes a [`Decoder`] holds: one whole frame of the largest
+/// The most bytes a [`Stream<Frames>`](super::codec::Stream) holds: one whole frame of the largest
 /// size.
 pub const MAX_BUFFERED: usize = MAX_FRAME_HEADER + MAX_TOKEN + MAX_FRAME_BODY;
 /// The longest body an [`Assembler`] collects.
@@ -456,21 +452,32 @@ pub fn signal_option_format(code: Code, number: u16) -> Option<OptionFormat> {
     Some(OptionFormat { name, value, min, max, repeatable })
 }
 
-/// Reads an unsigned integer option value of up to 4 bytes. Leading zero
-/// bytes are allowed, as RFC 7252 asks of a receiver.
-pub fn decode_uint(value: &[u8]) -> Option<u32> {
-    if value.len() > 4 {
-        return None;
-    }
-    Some(value.iter().fold(0u32, |n, &b| n << 8 | u32::from(b)))
-}
+/// An unsigned CoAP option value, encoded in zero to four bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Uint(
+    /// The option's numeric value.
+    pub u32,
+);
 
-/// The shortest value for unsigned integer `n`: no leading zero bytes,
-/// so 0 is no bytes at all.
-pub fn encode_uint(n: u32) -> Vec<u8> {
-    let bytes = n.to_be_bytes();
-    let skip = bytes.iter().take_while(|&&b| b == 0).count();
-    bytes[skip..].to_vec()
+impl Wire for Uint {
+    type ParseError = Error;
+    type WriteError = core::convert::Infallible;
+
+    /// Reads one unsigned value. Refuses more than four bytes; leading zeros are accepted.
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        if bytes.len() > 4 {
+            return Err(Error::TooLong(bytes.len() as u64));
+        }
+        Ok(Self(bytes.iter().fold(0, |n, &byte| (n << 8) | u32::from(byte))))
+    }
+
+    /// Appends the shortest encoding. Every `u32` is writable; no value is refused.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Self::WriteError> {
+        let bytes = self.0.to_be_bytes();
+        let start = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len());
+        out.extend_from_slice(&bytes[start..]);
+        Ok(())
+    }
 }
 
 /// One option: its number and its value's bytes.
@@ -482,9 +489,21 @@ pub struct CoapOption {
     pub value: Vec<u8>,
 }
 
-/// A message's options, in order. A reader gives them sorted by number,
-/// with repeats in the order they came. A writer sorts them by number,
-/// keeping repeats in order, since the format can only go up.
+impl CoapOption {
+    /// An option carrying an unsigned value in its shortest encoding.
+    pub fn uint(number: u16, value: u32) -> Self {
+        let mut bytes = Vec::new();
+        match Uint(value).write(&mut bytes) {
+            Ok(()) => {}
+            Err(never) => match never {},
+        }
+        Self { number, value: bytes }
+    }
+}
+
+/// A message's options, sorted by number, with repeats in insertion order.
+/// Readers and setters preserve this order. Writers refuse decreasing numbers.
+/// Callers that change the public list must keep it sorted before writing.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Options(pub Vec<CoapOption>);
 
@@ -524,9 +543,11 @@ impl Options {
         self.get(number).is_some()
     }
 
-    /// Adds option `number` with `value`, after any already there.
+    /// Inserts option `number` with `value` after all options with the same
+    /// or a lower number. Keeps repeated values in insertion order.
     pub fn add(&mut self, number: u16, value: impl Into<Vec<u8>>) {
-        self.0.push(CoapOption { number, value: value.into() });
+        let at = self.0.partition_point(|o| o.number <= number);
+        self.0.insert(at, CoapOption { number, value: value.into() });
     }
 
     /// Removes every option `number`.
@@ -543,7 +564,7 @@ impl Options {
     /// The first value of option `number` read as an unsigned integer, or
     /// `None` if it is absent or longer than 4 bytes.
     pub fn uint(&self, number: u16) -> Option<u32> {
-        decode_uint(self.get(number)?)
+        Uint::parse(self.get(number)?).ok().map(|v| v.0)
     }
 
     /// The first value of registered option `number` read as an unsigned
@@ -556,12 +577,12 @@ impl Options {
         if value.len() < f.min || value.len() > f.max {
             return None;
         }
-        decode_uint(value)
+        Uint::parse(value).ok().map(|v| v.0)
     }
 
     /// Sets option `number` to the shortest bytes for `n`.
     pub fn set_uint(&mut self, number: u16, n: u32) {
-        self.set(number, encode_uint(n));
+        self.set(number, CoapOption::uint(number, n).value);
     }
 
     /// Every value of option `number` as text, or `None` if one is not
@@ -924,76 +945,6 @@ impl Message {
         Message { token: self.token.clone(), ..Message::new(kind, code, id) }
     }
 
-    /// Reads one datagram.
-    pub fn parse(b: &[u8]) -> Result<Message, Error> {
-        if b.len() > MAX_DATAGRAM {
-            return Err(Error::TooLong(b.len() as u64));
-        }
-        let (kind, code, message_id) = match peek_header(b) {
-            Some(h) => h,
-            None if b.len() < HEADER_LEN => return Err(Error::Truncated),
-            None => return Err(Error::Version(b[0] >> 6)),
-        };
-        let tkl = b[0] & 0x0f;
-        if usize::from(tkl) > MAX_TOKEN {
-            return Err(Error::TokenLength(tkl));
-        }
-        if code.is_empty() && (tkl != 0 || b.len() != HEADER_LEN) {
-            return Err(Error::EmptyWithContent);
-        }
-        if written_form(kind, code) != (kind, code) {
-            return Err(Error::TypeAndCode(kind, code));
-        }
-        if code.is_empty() {
-            return Ok(Message::new(kind, code, message_id));
-        }
-        let end = HEADER_LEN + usize::from(tkl);
-        let token = b.get(HEADER_LEN..end).ok_or(Error::Truncated)?.to_vec();
-        let (options, payload) = read_body(&b[end..])?;
-        Ok(Message { kind, code, message_id, token, options, payload })
-    }
-
-    /// The datagram's bytes. A type that does not allow the code is
-    /// written as RFC 7252 sections 4.2 and 4.3 allow: a Reset, or an ACK
-    /// whose code is not a response, as an empty message of its type, and
-    /// an empty NON as an empty CON (a ping). An empty message (code 0.00)
-    /// is the header alone. Otherwise a token over 8 bytes is cut to 8 and
-    /// option values to [`MAX_OPTION_VALUE`]; the options are sorted, and
-    /// past [`MAX_OPTIONS`] options, or [`MAX_DATAGRAM`] bytes, the rest
-    /// of the options and payload are left out. So [`Message::parse`]
-    /// reads back every datagram written. [`Message::try_to_bytes`] says
-    /// when something was changed or left out.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        self.write().0
-    }
-
-    /// The datagram's bytes, or `None` if [`Message::to_bytes`] would
-    /// change or leave out part of the message, or if it carries a Block1
-    /// or Block2 option with SZX 7, which RFC 7959 section 2.2 forbids
-    /// sending over UDP.
-    pub fn try_to_bytes(&self) -> Option<Vec<u8>> {
-        let (bytes, whole) = self.write();
-        (whole && self.bad_block().is_none()).then_some(bytes)
-    }
-
-    /// The bytes, and whether they hold the whole message unchanged.
-    fn write(&self) -> (Vec<u8>, bool) {
-        let (kind, code) = written_form(self.kind, self.code);
-        let mut whole = (kind, code) == (self.kind, self.code) && self.token.len() <= MAX_TOKEN;
-        let token: &[u8] = if code.is_empty() { &[] } else { &self.token[..self.token.len().min(MAX_TOKEN)] };
-        let mut out = Vec::with_capacity(HEADER_LEN + token.len());
-        out.push(VERSION << 6 | kind.bits() << 4 | token.len() as u8);
-        out.push(code.0);
-        out.extend_from_slice(&self.message_id.to_be_bytes());
-        out.extend_from_slice(token);
-        if code.is_empty() {
-            whole &= self.token.is_empty() && self.options.is_empty() && self.payload.is_empty();
-        } else {
-            whole &= write_body(&mut out, &self.options, &self.payload, MAX_DATAGRAM - HEADER_LEN - token.len());
-        }
-        (out, whole)
-    }
-
     /// The Block1 or Block2 option, if either has SZX 7. RFC 7959 section
     /// 2.2 reserves that size over UDP: a server answers a request that
     /// carries one with 4.00 Bad Request.
@@ -1068,7 +1019,7 @@ impl Frame {
     /// Reads the frame at the start of `b`. It returns `Ok(None)` if `b`
     /// holds only part of one, and otherwise the frame and how many bytes
     /// of `b` it took.
-    pub fn parse(b: &[u8]) -> Result<Option<(Frame, usize)>, Error> {
+    fn parse_prefix(b: &[u8]) -> Result<Option<(Frame, usize)>, Error> {
         let Some(&first) = b.first() else { return Ok(None) };
         let (nibble, tkl) = (first >> 4, first & 0x0f);
         if usize::from(tkl) > MAX_TOKEN {
@@ -1102,48 +1053,6 @@ impl Frame {
         let token = b[2 + ext..start].to_vec();
         let (options, payload) = read_body(&b[start..total])?;
         Ok(Some((Frame { code, token, options, payload }, total)))
-    }
-
-    /// The frame's bytes. A token over 8 bytes is cut to 8 and option
-    /// values to [`MAX_OPTION_VALUE`]; past [`MAX_OPTIONS`] options, or
-    /// [`MAX_FRAME_BODY`] bytes of body, the rest of the options and
-    /// payload are left out. So [`Frame::parse`] reads back every frame
-    /// written. [`Frame::try_to_bytes`] says when something was left out.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        self.write().0
-    }
-
-    /// The frame's bytes, or `None` if [`Frame::to_bytes`] would cut or
-    /// leave out part of the frame.
-    pub fn try_to_bytes(&self) -> Option<Vec<u8>> {
-        let (bytes, whole) = self.write();
-        whole.then_some(bytes)
-    }
-
-    /// The bytes, and whether they hold the whole frame unchanged.
-    fn write(&self) -> (Vec<u8>, bool) {
-        let token = &self.token[..self.token.len().min(MAX_TOKEN)];
-        let mut body = Vec::new();
-        let whole = write_body(&mut body, &self.options, &self.payload, MAX_FRAME_BODY) && self.token.len() <= MAX_TOKEN;
-        let len = body.len();
-        let tkl = token.len() as u8;
-        let mut out = Vec::with_capacity(MAX_FRAME_HEADER + token.len() + len);
-        if len < 13 {
-            out.push((len as u8) << 4 | tkl);
-        } else if len < 269 {
-            out.push(13 << 4 | tkl);
-            out.push((len - 13) as u8);
-        } else if len < 65_805 {
-            out.push(14 << 4 | tkl);
-            out.extend_from_slice(&((len - 269) as u16).to_be_bytes());
-        } else {
-            out.push(15 << 4 | tkl);
-            out.extend_from_slice(&((len - 65_805) as u32).to_be_bytes());
-        }
-        out.push(self.code.0);
-        out.extend_from_slice(token);
-        out.extend_from_slice(&body);
-        (out, whole)
     }
 
     /// Like [`Message::bad_option`]. In a signal frame, options are
@@ -1183,13 +1092,16 @@ impl core::error::Error for FrameParseError {}
 /// A CoAP value cannot be written without changing it.
 ///
 /// A field exceeds its limit, options are out of order, or the message
-/// type does not allow its contents. The legacy writers remain available.
+/// type does not allow its contents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct WriteError;
+pub enum WriteError {
+    /// The value cannot be written without changing it.
+    Unwritable,
+}
 
 impl core::fmt::Display for WriteError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("CoAP value cannot be represented without changing it")
+        f.write_str("CoAP value cannot be written without changing it")
     }
 }
 
@@ -1199,23 +1111,50 @@ impl Wire for Message {
     type ParseError = Error;
     type WriteError = WriteError;
 
-    /// Reads one datagram of at most [`MAX_DATAGRAM`] bytes.
-    fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        Self::parse(bytes)
+    /// Reads one UDP datagram. Refuses bad versions, token lengths, type/code pairs, empty content, malformed options, and size limits.
+    fn parse(b: &[u8]) -> Result<Message, Error> {
+        if b.len() > MAX_DATAGRAM {
+            return Err(Error::TooLong(b.len() as u64));
+        }
+        let (kind, code, message_id) = match peek_header(b) {
+            Some(h) => h,
+            None if b.len() < HEADER_LEN => return Err(Error::Truncated),
+            None => return Err(Error::Version(b[0] >> 6)),
+        };
+        let tkl = b[0] & 0x0f;
+        if usize::from(tkl) > MAX_TOKEN {
+            return Err(Error::TokenLength(tkl));
+        }
+        if code.is_empty() && (tkl != 0 || b.len() != HEADER_LEN) {
+            return Err(Error::EmptyWithContent);
+        }
+        if !valid_type_code(kind, code) {
+            return Err(Error::TypeAndCode(kind, code));
+        }
+        if code.is_empty() {
+            return Ok(Message::new(kind, code, message_id));
+        }
+        let end = HEADER_LEN + usize::from(tkl);
+        let token = b.get(HEADER_LEN..end).ok_or(Error::Truncated)?.to_vec();
+        let (options, payload) = read_body(&b[end..])?;
+        Ok(Message { kind, code, message_id, token, options, payload })
     }
 
-    /// Appends a datagram without clipping or sorting its fields.
-    /// Leaves `out` unchanged on error. Options accepted by the parser
-    /// remain writable; [`Message::bad_block`] is a separate UDP check.
+    /// Appends a datagram. Refuses invalid type/code pairs, empty content,
+    /// long tokens, unsorted options, and size limits. Leaves `out` unchanged
+    /// on error. [`Message::bad_block`] remains a separate UDP check.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
-        // Bound the legacy writer's temporary option list before staging.
-        if self.options.0.len() > MAX_OPTIONS {
-            return Err(WriteError);
+        if !valid_type_code(self.kind, self.code)
+            || self.token.len() > MAX_TOKEN
+            || (self.code.is_empty()
+                && (!self.token.is_empty() || !self.options.is_empty() || !self.payload.is_empty()))
+        {
+            return Err(WriteError::Unwritable);
         }
-        let bytes = self.to_bytes();
-        if Self::parse(&bytes).as_ref() != Ok(self) {
-            return Err(WriteError);
-        }
+        let mut bytes = vec![VERSION << 6 | self.kind.bits() << 4 | self.token.len() as u8, self.code.0];
+        bytes.extend_from_slice(&self.message_id.to_be_bytes());
+        bytes.extend_from_slice(&self.token);
+        write_body(&mut bytes, &self.options, &self.payload, MAX_DATAGRAM - HEADER_LEN - self.token.len())?;
         out.extend_from_slice(&bytes);
         Ok(())
     }
@@ -1226,25 +1165,40 @@ impl Wire for Frame {
     type WriteError = WriteError;
 
     /// Reads exactly one TCP frame, with at most [`MAX_FRAME_BODY`] body bytes.
+    /// Refuses long tokens, malformed options, incomplete frames, and trailing bytes.
     fn parse(bytes: &[u8]) -> Result<Self, FrameParseError> {
-        match Self::parse(bytes).map_err(FrameParseError::Frame)? {
+        match Self::parse_prefix(bytes).map_err(FrameParseError::Frame)? {
             Some((frame, used)) if used == bytes.len() => Ok(frame),
             Some(_) => Err(FrameParseError::Trailing),
             None => Err(FrameParseError::Truncated),
         }
     }
 
-    /// Appends a TCP frame without clipping or sorting its fields.
-    /// Leaves `out` unchanged on error.
+    /// Appends a TCP frame. Refuses long tokens, unsorted options, and size
+    /// limits. Leaves `out` unchanged on error.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
-        if self.options.0.len() > MAX_OPTIONS {
-            return Err(WriteError);
+        if self.token.len() > MAX_TOKEN {
+            return Err(WriteError::Unwritable);
         }
-        let bytes = self.to_bytes();
-        if <Self as Wire>::parse(&bytes).as_ref() != Ok(self) {
-            return Err(WriteError);
+        let mut body = Vec::new();
+        write_body(&mut body, &self.options, &self.payload, MAX_FRAME_BODY)?;
+        let len = body.len();
+        let tkl = self.token.len() as u8;
+        if len < 13 {
+            out.push((len as u8) << 4 | tkl);
+        } else if len < 269 {
+            out.push(13 << 4 | tkl);
+            out.push((len - 13) as u8);
+        } else if len < 65_805 {
+            out.push(14 << 4 | tkl);
+            out.extend_from_slice(&((len - 269) as u16).to_be_bytes());
+        } else {
+            out.push(15 << 4 | tkl);
+            out.extend_from_slice(&((len - 65_805) as u32).to_be_bytes());
         }
-        out.extend_from_slice(&bytes);
+        out.push(self.code.0);
+        out.extend_from_slice(&self.token);
+        out.extend_from_slice(&body);
         Ok(())
     }
 }
@@ -1252,10 +1206,9 @@ impl Wire for Frame {
 /// Reads CoAP over TCP frames without retaining input bytes.
 ///
 /// Use with [`super::codec::Stream`] for at most [`MAX_BUFFERED`] unread
-/// bytes. Header and body errors end the stream, as in [`Decoder`].
+/// bytes. Header and body errors end the stream.
 /// Partial frames return [`Step::Need`], including at EOF. The driver
 /// reports truncation. UDP datagrams use [`Wire`] on [`Message`] directly.
-/// The legacy decoder keeps its repeating errors.
 ///
 /// ```
 /// use fictionet::stdlib::{coap::{Frame, Frames}, codec::{Stream, Wire}};
@@ -1289,83 +1242,10 @@ impl Decode for Frames {
     }
 
     fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, Error> {
-        Ok(match Frame::parse(input)? {
+        Ok(match Frame::parse_prefix(input)? {
             Some((frame, used)) => Step::Item(frame, used),
             None => Step::Need,
         })
-    }
-}
-
-/// Splits a CoAP-over-TCP byte stream into frames. Feed it the bytes a
-/// connection reads, in order, and take frames out until it has none.
-#[derive(Clone, Debug, Default)]
-pub struct Decoder {
-    buf: Vec<u8>,
-    /// Where the bytes not yet taken out start. Bytes before it are
-    /// dropped in `feed` once they are half the buffer, so taking out many
-    /// small frames costs time in proportion to their bytes.
-    start: usize,
-    failed: Option<Error>,
-}
-
-impl Decoder {
-    /// A decoder holding no bytes.
-    pub fn new() -> Decoder {
-        Decoder::default()
-    }
-
-    /// Takes bytes read from the connection, from the start of `bytes`,
-    /// and returns how many it took. It takes them all unless that would
-    /// make it hold more than [`MAX_BUFFERED`] bytes. Then take frames out
-    /// with [`Decoder::next_frame`] and feed it the rest. Once it is full,
-    /// `next_frame` always gives a frame or an error, so a loop of feeding
-    /// and taking out always ends. After an [`Error`] the stream cannot be
-    /// read any further, and every byte is taken and dropped.
-    #[must_use = "bytes past the count returned were not taken"]
-    pub fn feed(&mut self, bytes: &[u8]) -> usize {
-        if self.failed.is_some() {
-            return bytes.len();
-        }
-        if self.start > 0 && self.start >= self.buf.len() / 2 {
-            self.buf.drain(..self.start);
-            self.start = 0;
-        }
-        let n = bytes.len().min(MAX_BUFFERED - self.buffered());
-        self.buf.extend_from_slice(&bytes[..n]);
-        n
-    }
-
-    /// The next whole frame, if one has come. It returns `None` when it
-    /// needs more bytes, and keeps returning the same error once the
-    /// stream has broken; a real peer then sends an Abort and closes the
-    /// connection.
-    pub fn next_frame(&mut self) -> Option<Result<Frame, Error>> {
-        if let Some(e) = self.failed {
-            return Some(Err(e));
-        }
-        match Frame::parse(&self.buf[self.start..]) {
-            Ok(Some((frame, used))) => {
-                self.start += used;
-                Some(Ok(frame))
-            }
-            Ok(None) => None,
-            Err(e) => {
-                self.failed = Some(e);
-                self.buf = Vec::new();
-                self.start = 0;
-                Some(Err(e))
-            }
-        }
-    }
-
-    /// How many bytes are held, waiting for the rest of a frame.
-    pub fn buffered(&self) -> usize {
-        self.buf.len() - self.start
-    }
-
-    /// Whether the stream has broken.
-    pub fn is_broken(&self) -> bool {
-        self.failed.is_some()
     }
 }
 
@@ -1571,16 +1451,13 @@ pub fn observe_is_newer(old: u32, new: u32, seconds_between: u64) -> bool {
     (v1 < v2 && v2 - v1 < half) || (v1 > v2 && v1 - v2 > half) || seconds_between > 128
 }
 
-/// The type and code a UDP message is written with: its own, unless RFC
-/// 7252 sections 4.2 and 4.3 forbid them together. A Reset, or an ACK
-/// whose code is not a response, becomes empty; an empty NON becomes an
-/// empty CON.
-fn written_form(kind: Type, code: Code) -> (Type, Code) {
+/// Whether RFC 7252 sections 4.2 and 4.3 allow this type and code together.
+fn valid_type_code(kind: Type, code: Code) -> bool {
     match kind {
-        Type::Reset => (kind, Code::EMPTY),
-        Type::Acknowledgement if !code.is_response() => (kind, Code::EMPTY),
-        Type::NonConfirmable if code.is_empty() => (Type::Confirmable, code),
-        _ => (kind, code),
+        Type::Reset => code.is_empty(),
+        Type::Acknowledgement => code.is_empty() || code.is_response(),
+        Type::NonConfirmable => !code.is_empty(),
+        Type::Confirmable => true,
     }
 }
 
@@ -1683,56 +1560,44 @@ fn ext(v: usize) -> (u8, Vec<u8>) {
     }
 }
 
-/// Writes options, sorted by number, and the payload, in at most
-/// `budget` bytes. The first [`MAX_OPTIONS`] options in sorted order are
-/// kept, so lower numbers, such as the conditions If-Match and
-/// If-None-Match, go before higher ones. What does not fit is left out,
-/// and it returns whether everything was written in full.
-fn write_body(out: &mut Vec<u8>, options: &Options, payload: &[u8], budget: usize) -> bool {
-    let mut sorted: Vec<&CoapOption> = options.0.iter().collect();
-    sorted.sort_by_key(|o| o.number);
-    let mut whole = sorted.len() <= MAX_OPTIONS;
-    sorted.truncate(MAX_OPTIONS);
-    let mut used = 0;
+fn write_body(out: &mut Vec<u8>, options: &Options, payload: &[u8], budget: usize) -> Result<(), WriteError> {
+    if options.0.len() > MAX_OPTIONS {
+        return Err(WriteError::Unwritable);
+    }
+    let mut used = 0usize;
     let mut prev = 0u16;
-    for o in sorted {
-        whole &= o.value.len() <= MAX_OPTION_VALUE;
-        let value = &o.value[..o.value.len().min(MAX_OPTION_VALUE)];
-        let (dn, dx) = ext(usize::from(o.number - prev));
-        let (ln, lx) = ext(value.len());
-        let size = 1 + dx.len() + lx.len() + value.len();
-        if size > budget - used {
-            whole = false;
-            break;
+    for o in &options.0 {
+        if o.value.len() > MAX_OPTION_VALUE {
+            return Err(WriteError::Unwritable);
         }
+        let delta = o.number.checked_sub(prev).ok_or(WriteError::Unwritable)?;
+        let (dn, dx) = ext(usize::from(delta));
+        let (ln, lx) = ext(o.value.len());
+        let size = 1 + dx.len() + lx.len() + o.value.len();
+        used = used.checked_add(size).filter(|&n| n <= budget).ok_or(WriteError::Unwritable)?;
         out.push(dn << 4 | ln);
         out.extend_from_slice(&dx);
         out.extend_from_slice(&lx);
-        out.extend_from_slice(value);
-        used += size;
+        out.extend_from_slice(&o.value);
         prev = o.number;
     }
-    whole & write_payload(out, payload, budget - used)
-}
-
-/// Writes the payload marker and as much of the payload as fits in `room`
-/// bytes, and returns whether all of it did.
-fn write_payload(out: &mut Vec<u8>, payload: &[u8], room: usize) -> bool {
-    if payload.is_empty() {
-        return true;
+    if !payload.is_empty() {
+        if payload.len().checked_add(1).filter(|&n| n <= budget - used).is_none() {
+            return Err(WriteError::Unwritable);
+        }
+        out.push(PAYLOAD_MARKER);
+        out.extend_from_slice(payload);
     }
-    if room < 2 {
-        return false;
-    }
-    let n = payload.len().min(room - 1);
-    out.push(PAYLOAD_MARKER);
-    out.extend_from_slice(&payload[..n]);
-    n == payload.len()
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stdlib::codec::{
+        Fail, Stream, contract, pump,
+        test_support::{Lcg, decode_all, mutate},
+    };
 
     fn get(path: &str, id: u16, token: &[u8]) -> Message {
         let mut m = Message::new(Type::Confirmable, Code::GET, id);
@@ -1747,7 +1612,7 @@ mod tests {
     #[test]
     fn header_layout() {
         let m = get("/temperature", 0x7d34, &[]);
-        let bytes = m.to_bytes();
+        let bytes = m.to_bytes().unwrap();
         // Ver 1, CON, TKL 0; GET; message ID; Uri-Path (delta 11, length 11).
         assert_eq!(&bytes[..5], &[0x40, 0x01, 0x7d, 0x34, 0xbb]);
         assert_eq!(&bytes[5..], b"temperature");
@@ -1762,7 +1627,7 @@ mod tests {
         resp.payload = b"22.3 C".to_vec();
         assert_eq!(resp.kind, Type::Acknowledgement);
         assert_eq!(resp.message_id, 0x7d34);
-        assert_eq!(resp.to_bytes(), [&[0x60, 0x45, 0x7d, 0x34, 0xff][..], b"22.3 C"].concat());
+        assert_eq!(resp.to_bytes().unwrap(), [&[0x60, 0x45, 0x7d, 0x34, 0xff][..], b"22.3 C"].concat());
         // A non-confirmable request gets a non-confirmable answer with the new ID.
         let non = Message { kind: Type::NonConfirmable, ..req };
         let r = non.reply(Code::CONTENT, 99);
@@ -1771,18 +1636,18 @@ mod tests {
 
     #[test]
     fn empty_messages() {
-        assert_eq!(Message::empty_ack(5).to_bytes(), [0x60, 0, 0, 5]);
-        assert_eq!(Message::reset(5).to_bytes(), [0x70, 0, 0, 5]);
-        assert_eq!(Message::ping(5).to_bytes(), [0x40, 0, 0, 5]);
+        assert_eq!(Message::empty_ack(5).to_bytes().unwrap(), [0x60, 0, 0, 5]);
+        assert_eq!(Message::reset(5).to_bytes().unwrap(), [0x70, 0, 0, 5]);
+        assert_eq!(Message::ping(5).to_bytes().unwrap(), [0x40, 0, 0, 5]);
         assert_eq!(Message::parse(&[0x70, 0, 0, 5]), Ok(Message::reset(5)));
         // An empty message with a token or bytes after the header.
         assert_eq!(Message::parse(&[0x41, 0, 0, 5, 1]), Err(Error::EmptyWithContent));
         assert_eq!(Message::parse(&[0x40, 0, 0, 5, 0xff]), Err(Error::EmptyWithContent));
-        // A writer leaves them out.
+        // A writer refuses the invalid content.
         let mut m = Message::reset(5);
         m.token = vec![1, 2];
         m.payload = vec![3];
-        assert_eq!(m.to_bytes(), [0x70, 0, 0, 5]);
+        assert!(m.to_bytes().is_err());
     }
 
     #[test]
@@ -1807,21 +1672,21 @@ mod tests {
         for (number, len) in [(12u16, 12usize), (13, 13), (268, 268), (269, 269), (65535, 1034)] {
             let mut m = Message::new(Type::NonConfirmable, Code::POST, 1);
             m.options.add(number, vec![0xaa; len]);
-            let bytes = m.to_bytes();
+            let bytes = m.to_bytes().unwrap();
             assert_eq!(Message::parse(&bytes), Ok(m), "{number} {len}");
         }
         // Delta 13 is nibble 13 and one byte of 0.
         let mut m = Message::new(Type::Confirmable, Code::GET, 0);
         m.options.add(13, Vec::new());
-        assert_eq!(&m.to_bytes()[4..], [0xd0, 0x00]);
+        assert_eq!(&m.to_bytes().unwrap()[4..], [0xd0, 0x00]);
         // Delta 269 is nibble 14 and two bytes of 0.
         let mut m = Message::new(Type::Confirmable, Code::GET, 0);
         m.options.add(269, Vec::new());
-        assert_eq!(&m.to_bytes()[4..], [0xe0, 0x00, 0x00]);
+        assert_eq!(&m.to_bytes().unwrap()[4..], [0xe0, 0x00, 0x00]);
         // The largest delta reaches 65535 exactly once.
         let mut m = Message::new(Type::Confirmable, Code::GET, 0);
         m.options.add(65535, Vec::new());
-        assert_eq!(&m.to_bytes()[4..], [0xe0, 0xfe, 0xf2]);
+        assert_eq!(&m.to_bytes().unwrap()[4..], [0xe0, 0xfe, 0xf2]);
     }
 
     #[test]
@@ -1856,24 +1721,24 @@ mod tests {
         m.options.add(option::URI_QUERY, b"x=1".to_vec());
         m.options.add(option::PROXY_URI, vec![b'a'; 300]);
         m.payload = b"hello".to_vec();
-        let bytes = m.to_bytes();
+        let bytes = m.to_bytes().unwrap();
         assert_eq!(Message::parse(&bytes), Ok(m));
         // A prefix ending at an option boundary is a whole shorter
         // message; one ending at the marker has no payload. Every other
         // prefix fails.
         for n in 0..bytes.len() {
             match Message::parse(&bytes[..n]) {
-                Ok(short) => assert_eq!(short.to_bytes(), &bytes[..n]),
+                Ok(short) => assert_eq!(short.to_bytes().unwrap(), &bytes[..n]),
                 Err(e) => assert!(matches!(e, Error::Truncated | Error::EmptyPayload), "{n}: {e}"),
             }
         }
         // A frame's prefixes all need more bytes.
         let f = Frame { code: Code::POST, token: vec![9; 8], options: m_options(), payload: vec![7; 400] };
-        let bytes = f.to_bytes();
+        let bytes = f.to_bytes().unwrap();
         for n in 0..bytes.len() {
-            assert_eq!(Frame::parse(&bytes[..n]), Ok(None), "{n}");
+            assert_eq!(Frame::parse(&bytes[..n]), Err(FrameParseError::Truncated), "{n}");
         }
-        assert_eq!(Frame::parse(&bytes), Ok(Some((f, bytes.len()))));
+        assert_eq!(Frame::parse(&bytes), Ok(f));
     }
 
     fn m_options() -> Options {
@@ -1885,6 +1750,30 @@ mod tests {
     }
 
     #[test]
+    fn setters_keep_options_in_number_order() {
+        let mut observe = get("/temp", 1, &[]);
+        observe.options.set_observe(0);
+        let mut block = Message::new(Type::Confirmable, Code::GET, 2);
+        block.options.set_block2(Block { num: 0, more: false, szx: 4 });
+        block.options.set_uri_path("/a/b");
+        let mut reply = observe.reply(Code::CONTENT, 3);
+        reply.options.set_max_age(10);
+        reply.options.set_content_format(0);
+        for message in [observe, block, reply] {
+            let bytes = message.to_bytes().unwrap();
+            assert_eq!(Message::parse(&bytes), Ok(message.clone()));
+            contract::check_wire_value(&message);
+        }
+        let mut options = Options::new();
+        options.add(option::URI_PATH, b"a".to_vec());
+        options.add(option::URI_QUERY, b"q=1".to_vec());
+        options.add(option::URI_PATH, b"b".to_vec());
+        options.set_uint(option::OBSERVE, 1);
+        assert_eq!(options.iter().map(|o| o.number).collect::<Vec<_>>(), [6, 11, 11, 15]);
+        assert_eq!(options.get_all(option::URI_PATH).collect::<Vec<_>>(), [b"a", b"b"]);
+    }
+
+    #[test]
     fn options_sort_and_typed_values() {
         let mut m = Message::new(Type::Confirmable, Code::PUT, 1);
         m.options.set_content_format(content_format::JSON);
@@ -1893,7 +1782,7 @@ mod tests {
         m.options.set_uri_path("/x//y/");
         m.options.set_observe(0x0100_0005);
         m.options.set_uint(option::MAX_AGE, 0);
-        let back = Message::parse(&m.to_bytes()).unwrap();
+        let back = Message::parse(&m.to_bytes().unwrap()).unwrap();
         let numbers: Vec<u16> = back.options.iter().map(|o| o.number).collect();
         assert_eq!(numbers, [6, 11, 11, 11, 11, 12, 14, 15]);
         assert_eq!(back.options.uri_path().as_deref(), Some("/x//y/"));
@@ -1904,10 +1793,10 @@ mod tests {
         assert_eq!(back.options.get(option::MAX_AGE), Some(&[][..]));
         assert_eq!(Message::new(Type::Confirmable, Code::GET, 0).options.uri_path().as_deref(), Some("/"));
         assert_eq!(Options::new().max_age(), 60);
-        assert_eq!(encode_uint(0), Vec::<u8>::new());
-        assert_eq!(encode_uint(0x1234), [0x12, 0x34]);
-        assert_eq!(decode_uint(&[0, 0, 1]), Some(1));
-        assert_eq!(decode_uint(&[1, 0, 0, 0, 0]), None);
+        assert_eq!(Uint(0).to_bytes().unwrap(), Vec::<u8>::new());
+        assert_eq!(Uint(0x1234).to_bytes().unwrap(), [0x12, 0x34]);
+        assert_eq!(Uint::parse(&[0, 0, 1]).ok().map(|v| v.0), Some(1));
+        assert_eq!(Uint::parse(&[1, 0, 0, 0, 0]).ok().map(|v| v.0), None);
         let mut o = Options::new();
         o.add(option::URI_PATH, vec![0xff]);
         assert_eq!(o.uri_path(), None);
@@ -2053,91 +1942,83 @@ mod tests {
         // Through a message and back.
         let mut m = Message::new(Type::Confirmable, Code::CREATED, 1);
         m.options = o.clone();
-        let back = Message::parse(&m.to_bytes()).unwrap();
+        let back = Message::parse(&m.to_bytes().unwrap()).unwrap();
         assert_eq!(back.options.location_path().as_deref(), Some("/logs/17"));
         assert_eq!(back.options.accept(), Some(60));
         assert_eq!((&o).into_iter().count(), o.len());
-        // A decoder can be copied mid-stream.
-        let mut d = Decoder::new();
-        assert_eq!(d.feed(&[0x01, 0xe2]), 2);
-        let mut e = d.clone();
-        assert_eq!(e.feed(&[0x42]), 1);
-        assert_eq!(d.next_frame(), None);
-        assert!(matches!(e.next_frame(), Some(Ok(_))));
+        let mut frames = Frames::new();
+        assert_eq!(frames.decode(&[0x01, 0xe2], false), Ok(Step::Need));
+        assert!(matches!(frames.clone().decode(&[0x01, 0xe2, 0x42], false), Ok(Step::Item(_, 3))));
     }
 
     #[test]
-    fn writers_keep_conditions_and_say_when_they_cut() {
-        // RFC 7252 section 5.10.8: If-None-Match makes a PUT conditional.
-        // Past MAX_OPTIONS options, the lowest numbers are kept, so the
-        // condition is not the one left out, and try_to_bytes refuses.
+    fn writers_preserve_conditions_and_refuse_changes() {
         let mut m = Message::new(Type::Confirmable, Code::PUT, 1);
+        m.options.add(option::IF_NONE_MATCH, Vec::new());
         for i in 0..MAX_OPTIONS {
             m.options.add(option::URI_QUERY, format!("k{i}").into_bytes());
         }
-        m.options.add(option::IF_NONE_MATCH, Vec::new());
         m.payload = b"new".to_vec();
-        let back = Message::parse(&m.to_bytes()).unwrap();
-        assert!(back.options.has(option::IF_NONE_MATCH));
-        assert_eq!(m.try_to_bytes(), None);
+        assert!(m.to_bytes().is_err());
+        contract::check_wire_value(&m);
         m.options.remove(option::URI_QUERY);
         m.options.add(option::URI_QUERY, b"k".to_vec());
-        assert_eq!(m.try_to_bytes(), Some(m.to_bytes()));
-        // A long token, a long value or a payload that does not fit.
+        let back = Message::parse(&m.to_bytes().unwrap()).unwrap();
+        assert!(back.options.has(option::IF_NONE_MATCH));
+        let mut invalid = vec![];
         let mut t = m.clone();
         t.token = vec![1; 9];
-        assert_eq!(t.try_to_bytes(), None);
+        invalid.push(t);
         let mut v = m.clone();
         v.options.add(option::PROXY_URI, vec![b'u'; MAX_OPTION_VALUE + 1]);
-        assert_eq!(v.try_to_bytes(), None);
+        invalid.push(v);
         let mut p = m.clone();
         p.payload = vec![0; MAX_DATAGRAM];
-        assert_eq!(p.try_to_bytes(), None);
-        // An empty message carrying a token or payload.
+        invalid.push(p);
         let mut e = Message::reset(1);
         e.payload = vec![1];
-        assert_eq!(e.try_to_bytes(), None);
-        assert_eq!(Message::reset(1).try_to_bytes(), Some(vec![0x70, 0, 0, 1]));
-        // Frames too.
+        invalid.push(e);
+        let mut e = Message::reset(1);
+        e.token = vec![1];
+        invalid.push(e);
+        let mut e = Message::reset(1);
+        e.options.add(1, vec![]);
+        invalid.push(e);
+        let mut unsorted = m.clone();
+        unsorted.options.0.reverse();
+        invalid.push(unsorted);
+        for value in invalid {
+            assert!(value.to_bytes().is_err());
+            contract::check_wire_value(&value);
+        }
+        assert_eq!(Message::reset(1).to_bytes().unwrap(), [0x70, 0, 0, 1]);
         let f = Frame { code: Code::PUT, token: vec![1; 9], options: Options::new(), payload: Vec::new() };
-        assert_eq!(f.try_to_bytes(), None);
+        assert!(f.to_bytes().is_err());
+        contract::check_wire_value(&f);
         let f = Frame { token: vec![1; 8], ..f };
-        assert_eq!(f.try_to_bytes(), Some(f.to_bytes()));
+        contract::check_wire_value(&f);
         let f = Frame { payload: vec![0; MAX_FRAME_BODY], ..f };
-        assert_eq!(f.try_to_bytes(), None);
+        assert!(f.to_bytes().is_err());
+        contract::check_wire_value(&f);
     }
 
     #[test]
-    fn decoder_holds_at_most_max_buffered() {
-        // A bad first byte, then far more bytes than one frame.
-        let mut d = Decoder::new();
-        let mut junk = vec![0u8; MAX_BUFFERED + 100];
-        junk[0] = 0x09;
-        assert_eq!(d.feed(&junk), MAX_BUFFERED);
-        assert!(d.buffered() <= MAX_BUFFERED);
-        assert_eq!(d.next_frame(), Some(Err(Error::TokenLength(9))));
-        assert_eq!(d.feed(&junk), junk.len());
-        assert_eq!(d.buffered(), 0);
-        // Many largest frames at once: feeding and taking out ends, and
-        // gives every frame.
-        let big = Frame { code: Code::CONTENT, token: vec![1; MAX_TOKEN], options: Options::new(), payload: vec![7; MAX_FRAME_BODY - 1] };
-        let one = big.to_bytes();
+    fn stream_holds_at_most_max_buffered() {
+        let mut junk = vec![0; MAX_BUFFERED + 100];
+        junk[0] = 9;
+        contract::check_decode_with_alloc_limit(Frames::new, &junk, 2 * MAX_BUFFERED);
+        assert_eq!(decode_all(Frames::new, &junk).1, Some(Fail::Protocol(Error::TokenLength(9))));
+        let big = Frame {
+            code: Code::CONTENT,
+            token: vec![1; MAX_TOKEN],
+            options: Options::new(),
+            payload: vec![7; MAX_FRAME_BODY - 1],
+        };
+        let one = big.to_bytes().unwrap();
         assert_eq!(one.len(), MAX_BUFFERED);
-        let stream = [&one[..], &one, &one].concat();
-        let mut d = Decoder::new();
-        let (mut at, mut got) = (0, 0);
-        while at < stream.len() || d.buffered() > 0 {
-            at += d.feed(&stream[at..]);
-            assert!(d.buffered() <= MAX_BUFFERED);
-            match d.next_frame() {
-                Some(f) => {
-                    assert_eq!(f.unwrap(), big);
-                    got += 1;
-                }
-                None => assert!(at == stream.len() && d.buffered() == 0),
-            }
-        }
-        assert_eq!(got, 3);
+        let bytes = one.repeat(3);
+        contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_BUFFERED);
+        assert_eq!(decode_all(Frames::new, &bytes), (vec![big; 3], None));
     }
 
     #[test]
@@ -2147,10 +2028,10 @@ mod tests {
         assert_eq!(MAX_DATAGRAM, 65_507);
         let mut m = Message::new(Type::NonConfirmable, Code::POST, 1);
         m.payload = vec![0; 65_530];
-        assert!(m.to_bytes().len() <= 65_507);
-        assert_eq!(m.try_to_bytes(), None);
+        assert!(m.to_bytes().is_err());
+        assert!(m.to_bytes().is_err());
         m.payload.truncate(65_507 - HEADER_LEN - 1);
-        assert_eq!(m.try_to_bytes().map(|b| b.len()), Some(65_507));
+        assert_eq!(m.to_bytes().map(|b| b.len()), Ok(65_507));
     }
 
     #[test]
@@ -2165,19 +2046,12 @@ mod tests {
         for ok in [[0x60, 0x45, 0, 1], [0x60, 0, 0, 1], [0x70, 0, 0, 1], [0x40, 0, 0, 1], [0x50, 0x01, 0, 1], [0x40, 0xe1, 0, 1]] {
             assert!(Message::parse(&ok).is_ok(), "{ok:?}");
         }
-        // Writers never send these forms, and try_to_bytes refuses them.
-        let ack_get = Message::new(Type::Acknowledgement, Code::GET, 1);
-        assert_eq!(ack_get.to_bytes(), [0x60, 0, 0, 1]);
-        assert_eq!(ack_get.try_to_bytes(), None);
-        let mut rst = Message::new(Type::Reset, Code::CONTENT, 1);
-        rst.payload = vec![1];
-        assert_eq!(rst.to_bytes(), [0x70, 0, 0, 1]);
-        assert_eq!(rst.try_to_bytes(), None);
-        let non = Message::new(Type::NonConfirmable, Code::EMPTY, 1);
-        assert_eq!(non.to_bytes(), [0x40, 0, 0, 1]);
-        assert_eq!(non.try_to_bytes(), None);
-        for m in [ack_get, rst, non] {
-            assert!(Message::parse(&m.to_bytes()).is_ok());
+        for (kind, code) in
+            [(Type::Acknowledgement, Code::GET), (Type::Reset, Code::CONTENT), (Type::NonConfirmable, Code::EMPTY)]
+        {
+            let m = Message::new(kind, code, 1);
+            assert!(m.to_bytes().is_err());
+            contract::check_wire_value(&m);
         }
     }
 
@@ -2249,7 +2123,8 @@ mod tests {
         let block = m.options.block1().unwrap();
         assert!(block.is_bert());
         assert_eq!(m.bad_block(), Some(option::BLOCK1));
-        assert_eq!(m.try_to_bytes(), None);
+        contract::check_wire_value(&m);
+        assert!(m.to_bytes().is_ok());
         let err = Assembler::new(100).push(block, &m.payload).unwrap_err();
         assert_eq!((err, err.code()), (BlockError::Size, Code::BAD_REQUEST));
         // Over TCP, after a CSM offering it, BERT is fine.
@@ -2315,7 +2190,7 @@ mod tests {
                 m.options.set_block1(block);
                 m.options.set_size1(body.len() as u32);
                 m.payload = chunk.to_vec();
-                let back = Message::parse(&m.to_bytes()).unwrap();
+                let back = Message::parse(&m.to_bytes().unwrap()).unwrap();
                 let done = a.push(back.options.block1().unwrap(), &back.payload).unwrap();
                 if done {
                     break;
@@ -2374,7 +2249,7 @@ mod tests {
         assert!(observe_is_newer(2, 1, 129));
         let mut m = get("/temp", 1, &[1]);
         m.options.set_uint(option::OBSERVE, observe::REGISTER);
-        let back = Message::parse(&m.to_bytes()).unwrap();
+        let back = Message::parse(&m.to_bytes().unwrap()).unwrap();
         assert_eq!(back.options.observe(), Some(observe::REGISTER));
         m.options.set(option::OBSERVE, vec![1, 0, 0, 0]);
         assert_eq!(m.options.observe(), None);
@@ -2389,115 +2264,100 @@ mod tests {
             [(11usize, 0xc0u8, 0usize), (12, 0xd0, 1), (267, 0xd0, 1), (268, 0xe0, 2), (65_803, 0xe0, 2), (65_804, 0xf0, 4)]
         {
             let f = Frame { code: Code::POST, token: Vec::new(), options: Options::new(), payload: vec![1; payload] };
-            let bytes = f.to_bytes();
+            let bytes = f.to_bytes().unwrap();
             assert_eq!(bytes[0], first, "{payload}");
             assert_eq!(bytes.len(), 1 + ext_len + 1 + 1 + payload);
-            assert_eq!(Frame::parse(&bytes), Ok(Some((f, bytes.len()))));
+            assert_eq!(Frame::parse(&bytes), Ok(f));
         }
         // RFC 8323 figure 7: a CSM with Max-Message-Size 1152.
         let csm = Frame::csm(1152, false);
-        assert_eq!(csm.to_bytes(), [0x30, 0xe1, 0x22, 0x04, 0x80]);
+        assert_eq!(csm.to_bytes().unwrap(), [0x30, 0xe1, 0x22, 0x04, 0x80]);
         let ping = Frame { token: vec![0x42], ..Frame::new(Code::PING) };
-        assert_eq!(ping.to_bytes(), [0x01, 0xe2, 0x42]);
-        assert_eq!(ping.pong().to_bytes(), [0x01, 0xe3, 0x42]);
+        assert_eq!(ping.to_bytes().unwrap(), [0x01, 0xe2, 0x42]);
+        assert_eq!(ping.pong().to_bytes().unwrap(), [0x01, 0xe3, 0x42]);
         let req = Frame { token: vec![1, 2], ..Frame::new(Code::GET) };
         assert_eq!(req.reply(Code::CONTENT).token, vec![1, 2]);
     }
 
     #[test]
     fn tcp_errors() {
-        assert_eq!(Frame::parse(&[0x09]), Err(Error::TokenLength(9)));
-        assert_eq!(Frame::parse(&[0xf0, 0, 0x10]), Ok(None));
-        assert_eq!(Frame::parse(&[0xf0, 0, 0x10, 0, 0]), Err(Error::TooLong(65_805 + 0x10_0000)));
-        assert_eq!(Frame::parse(&[0xf0, 0xff, 0xff, 0xff, 0xff]), Err(Error::TooLong(65_805 + 0xffff_ffff)));
-        assert_eq!(Frame::parse(&[0x10, 0x45, 0xff]), Err(Error::EmptyPayload));
-        assert_eq!(Frame::parse(&[0x10, 0x45, 0xf1]), Err(Error::ReservedNibble));
-        assert_eq!(Frame::parse(&[0x10, 0x45, 0x01]), Err(Error::Truncated));
+        assert_eq!(Frame::parse(&[0x09]), Err(FrameParseError::Frame(Error::TokenLength(9))));
+        assert_eq!(Frame::parse(&[0xf0, 0, 0x10]), Err(FrameParseError::Truncated));
+        assert_eq!(
+            Frame::parse(&[0xf0, 0, 0x10, 0, 0]),
+            Err(FrameParseError::Frame(Error::TooLong(65_805 + 0x10_0000)))
+        );
+        assert_eq!(
+            Frame::parse(&[0xf0, 0xff, 0xff, 0xff, 0xff]),
+            Err(FrameParseError::Frame(Error::TooLong(65_805 + 0xffff_ffff)))
+        );
+        assert_eq!(Frame::parse(&[0x10, 0x45, 0xff]), Err(FrameParseError::Frame(Error::EmptyPayload)));
+        assert_eq!(Frame::parse(&[0x10, 0x45, 0xf1]), Err(FrameParseError::Frame(Error::ReservedNibble)));
+        assert_eq!(Frame::parse(&[0x10, 0x45, 0x01]), Err(FrameParseError::Frame(Error::Truncated)));
         // An empty frame is allowed over TCP.
-        assert_eq!(Frame::parse(&[0x00, 0x00]), Ok(Some((Frame::new(Code::EMPTY), 2))));
-        let largest = Frame { code: Code::CONTENT, token: Vec::new(), options: Options::new(), payload: vec![0; 2 * MAX_FRAME_BODY] };
-        let bytes = largest.to_bytes();
+        assert_eq!(Frame::parse(&[0x00, 0x00]), Ok(Frame::new(Code::EMPTY)));
+        let mut largest = Frame {
+            code: Code::CONTENT,
+            token: Vec::new(),
+            options: Options::new(),
+            payload: vec![0; 2 * MAX_FRAME_BODY],
+        };
+        assert!(largest.to_bytes().is_err());
+        largest.payload.truncate(MAX_FRAME_BODY - 1);
+        let bytes = largest.to_bytes().unwrap();
         assert_eq!(bytes.len(), 1 + 4 + 1 + MAX_FRAME_BODY);
-        assert!(Frame::parse(&bytes).unwrap().is_some());
+        assert_eq!(Frame::parse(&bytes), Ok(largest));
     }
 
     #[test]
-    fn decoder_splits_a_stream() {
-        let a = Frame::csm(1152, true).to_bytes();
-        let mut b = Frame { token: vec![7; 8], ..Frame::new(Code::GET) };
-        b.options = m_options();
-        b.payload = vec![5; 300];
-        let b_bytes = b.to_bytes();
-        let stream = [&a[..], &b_bytes, &a].concat();
-        let mut d = Decoder::new();
-        let mut got = Vec::new();
-        for byte in &stream {
-            assert_eq!(d.feed(std::slice::from_ref(byte)), 1);
-            while let Some(f) = d.next_frame() {
-                got.push(f.unwrap());
-            }
-        }
-        assert_eq!(got, [Frame::csm(1152, true), b, Frame::csm(1152, true)]);
-        assert_eq!(d.buffered(), 0);
-        // A broken stream stays broken.
-        assert_eq!(d.feed(&[0x0c, 0xe2]), 2);
-        assert_eq!(d.next_frame(), Some(Err(Error::TokenLength(12))));
-        assert!(d.is_broken());
-        assert_eq!(d.feed(&a), a.len());
-        assert_eq!(d.next_frame(), Some(Err(Error::TokenLength(12))));
-        assert_eq!(d.buffered(), 0);
+    fn stream_splits_a_stream() {
+        let a = Frame::csm(1152, true);
+        let b = Frame { token: vec![7; 8], options: m_options(), payload: vec![5; 300], ..Frame::new(Code::GET) };
+        let bytes = [a.to_bytes().unwrap(), b.to_bytes().unwrap(), a.to_bytes().unwrap()].concat();
+        contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_BUFFERED);
+        assert_eq!(decode_all(Frames::new, &bytes), (vec![a, b, Frame::csm(1152, true)], None));
+        let mut stream = Stream::new(Frames::new());
+        assert_eq!(stream.push(&[0x0c, 0xe2]), 2);
+        assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::TokenLength(12)))));
+        assert_eq!(stream.push(&bytes), bytes.len());
+        assert_eq!(stream.next(), None);
     }
 
     #[test]
-    fn decoder_takes_many_small_frames_in_linear_time() {
-        let one = Frame { token: vec![1], ..Frame::new(Code::PING) }.to_bytes();
-        let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * 200_000).collect();
+    fn stream_takes_many_small_frames_in_linear_time() {
+        let bytes = Frame { token: vec![1], ..Frame::new(Code::PING) }.to_bytes().unwrap().repeat(200_000);
         let started = std::time::Instant::now();
-        let mut d = Decoder::new();
-        assert_eq!(d.feed(&stream), stream.len());
+        let mut stream = Stream::new(Frames::new());
         let mut n = 0;
-        while let Some(f) = d.next_frame() {
-            f.unwrap();
-            n += 1;
-        }
+        pump(&mut stream, &bytes, |_| n += 1).unwrap();
         assert_eq!(n, 200_000);
-        assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
+        assert!(started.elapsed().as_secs() < 5);
     }
 
     #[test]
-    fn writers_cap_what_they_write() {
-        let mut m = Message::new(Type::Confirmable, Code::POST, 1);
-        m.token = vec![1; 20];
-        m.options.add(1, vec![b'x'; 2000]);
-        for i in 0..200u16 {
-            m.options.add(i % 7 * 2 + 3, vec![b'x'; 500]);
-        }
-        m.payload = vec![0; 100_000];
-        let bytes = m.to_bytes();
-        assert_eq!(bytes.len(), MAX_DATAGRAM);
-        let back = Message::parse(&bytes).unwrap();
-        assert_eq!(back.token.len(), MAX_TOKEN);
-        assert_eq!(back.options.len(), MAX_OPTIONS);
-        assert_eq!(back.options.get(1).map(<[u8]>::len), Some(MAX_OPTION_VALUE));
-        assert_eq!(back.to_bytes(), bytes);
-        // Options that fill the datagram: the ones that do not fit are left out.
+    fn writers_refuse_oversized_values() {
         let mut m = Message::new(Type::Confirmable, Code::POST, 1);
         for _ in 0..MAX_OPTIONS {
             m.options.add(option::URI_PATH, vec![b'y'; MAX_OPTION_VALUE]);
         }
         m.payload = vec![1; 1000];
-        let bytes = m.to_bytes();
-        assert_eq!(bytes.len(), MAX_DATAGRAM);
-        let back = Message::parse(&bytes).unwrap();
-        assert!(back.options.len() < MAX_OPTIONS);
-        assert_eq!(back.to_bytes(), bytes);
-        // The same for frames.
-        let f = Frame { code: Code::POST, token: vec![2; 9], options: m.options.clone(), payload: vec![3; 2 * MAX_FRAME_BODY] };
-        let bytes = f.to_bytes();
-        let (back, used) = Frame::parse(&bytes).unwrap().unwrap();
-        assert_eq!(used, bytes.len());
-        assert_eq!(back.token.len(), MAX_TOKEN);
-        assert_eq!(back.to_bytes(), bytes);
+        assert!(m.to_bytes().is_err());
+        contract::check_wire_value(&m);
+        for f in [
+            Frame { token: vec![2; 9], ..Frame::new(Code::POST) },
+            Frame {
+                options: Options(vec![CoapOption { number: 1, value: vec![0; MAX_OPTION_VALUE + 1] }]),
+                ..Frame::new(Code::POST)
+            },
+            Frame {
+                options: Options(vec![CoapOption { number: 1, value: vec![] }; MAX_OPTIONS + 1]),
+                ..Frame::new(Code::POST)
+            },
+            Frame { payload: vec![3; 2 * MAX_FRAME_BODY], ..Frame::new(Code::POST) },
+        ] {
+            assert!(f.to_bytes().is_err());
+            contract::check_wire_value(&f);
+        }
     }
 
     #[test]
@@ -2522,25 +2382,12 @@ mod tests {
         }
     }
 
-    struct Lcg(u64);
-
-    impl Lcg {
-        fn next(&mut self) -> u32 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (self.0 >> 33) as u32
-        }
-
-        fn below(&mut self, n: u32) -> u32 {
-            self.next() % n
-        }
-    }
-
     /// Reads `b` every way this module can, checking what holds for any
     /// bytes.
     fn check_bytes(b: &[u8]) {
         if let Ok(m) = Message::parse(b) {
             // Encoding is canonical, so writing gives the same bytes.
-            assert_eq!(m.to_bytes(), b);
+            assert_eq!(m.to_bytes().unwrap(), b);
             let o = &m.options;
             let _ = (m.bad_option(), o.uri_path(), o.uri_query(), o.content_format(), o.accept(), o.max_age());
             let _ = (o.observe(), o.block1(), o.block2(), o.size1(), o.size2());
@@ -2552,7 +2399,7 @@ mod tests {
                 let back: Vec<&[u8]> = again.get_all(option::LOCATION_PATH).collect();
                 assert!(back == segments || (segments == [&b""[..]] && back.is_empty()), "{path}");
             }
-            let _ = m.reply(Code::CONTENT, 0).to_bytes();
+            let _ = m.reply(Code::CONTENT, 0).to_bytes().unwrap();
             // A path read writes back as the same segments, except one
             // empty segment, which reads as `/` like no segment at all.
             if let Some(path) = o.uri_path() {
@@ -2564,68 +2411,44 @@ mod tests {
             }
         }
         let _ = peek_header(b);
-        let mut whole = Decoder::new();
-        assert_eq!(whole.feed(b), b.len());
-        let mut frames = Vec::new();
-        while let Some(r) = whole.next_frame() {
-            frames.push(r);
-            if whole.is_broken() {
-                break;
-            }
-        }
-        let mut bytewise = Decoder::new();
-        let mut again = Vec::new();
-        for byte in b {
-            assert_eq!(bytewise.feed(std::slice::from_ref(byte)), 1);
-            while let Some(r) = bytewise.next_frame() {
-                again.push(r);
-                if bytewise.is_broken() {
-                    break;
-                }
-            }
-            if bytewise.is_broken() {
-                break;
-            }
-        }
-        assert_eq!(frames, again);
-        for f in frames.iter().flatten() {
-            let bytes = f.to_bytes();
-            assert_eq!(Frame::parse(&bytes), Ok(Some((f.clone(), bytes.len()))));
+        contract::check_wire::<Message>(b);
+        contract::check_wire::<Frame>(b);
+        contract::check_decode_with_alloc_limit(Frames::new, b, 2 * MAX_BUFFERED);
+        for f in decode_all(Frames::new, b).0 {
+            contract::check_wire_value(&f);
             let _ = (f.bad_option(), f.max_message_size(), f.pong());
         }
     }
 
     #[test]
     fn lcg_fuzz() {
-        let mut rng = Lcg(0xc0a9);
+        let mut rng = Lcg::new(0xc0a9);
         let mut seeds = Vec::new();
         let mut m = get("/sensors/temp", 0x1234, &[1, 2, 3]);
         m.options.set_block2(Block { num: 2, more: true, szx: 4 });
         m.options.set_observe(7);
         m.options.add(option::PROXY_URI, vec![b'p'; 300]);
         m.payload = b"payload".to_vec();
-        seeds.push(m.to_bytes());
-        seeds.push(Message::reset(9).to_bytes());
+        seeds.push(m.to_bytes().unwrap());
+        seeds.push(Message::reset(9).to_bytes().unwrap());
         let mut f = Frame { token: vec![4; 4], ..Frame::new(Code::PUT) };
         f.options = m_options();
         f.payload = vec![1; 20];
-        seeds.push([Frame::csm(1152, true).to_bytes(), f.to_bytes(), Frame::new(Code::PING).to_bytes()].concat());
+        seeds.push(
+            [
+                Frame::csm(1152, true).to_bytes().unwrap(),
+                f.to_bytes().unwrap(),
+                Frame::new(Code::PING).to_bytes().unwrap(),
+            ]
+            .concat(),
+        );
         for i in 0..6000 {
             let b: Vec<u8> = if i % 3 == 0 {
-                let len = rng.below(64) as usize;
-                (0..len).map(|_| rng.next() as u8).collect()
+                rng.bytes(64)
             } else {
-                let mut b = seeds[rng.below(seeds.len() as u32) as usize].clone();
-                for _ in 0..1 + rng.below(4) {
-                    if b.is_empty() {
-                        break;
-                    }
-                    let at = rng.below(b.len() as u32) as usize;
-                    match rng.below(3) {
-                        0 => b[at] = rng.next() as u8,
-                        1 => b.truncate(at),
-                        _ => b.insert(at, rng.next() as u8),
-                    }
+                let mut b = seeds[rng.index(seeds.len())].clone();
+                for _ in 0..1 + rng.index(4) {
+                    mutate(&mut rng, &mut b);
                 }
                 b
             };
@@ -2633,28 +2456,27 @@ mod tests {
         }
         // Random messages built from parts round trip exactly.
         for _ in 0..3000 {
-            let mut m = Message::new(Type::from_bits(rng.next() as u8), Code(1 + rng.below(255) as u8), rng.next() as u16);
-            m.token = (0..rng.below(9)).map(|_| rng.next() as u8).collect();
-            for _ in 0..rng.below(8) {
-                let len = [0, 1, 12, 13, 268, 269, 400][rng.below(7) as usize];
-                m.options.add(rng.next() as u16 >> rng.below(16), vec![rng.next() as u8; len]);
+            let mut m =
+                Message::new(Type::from_bits(rng.next() as u8), Code(1 + rng.index(255) as u8), rng.next() as u16);
+            if !valid_type_code(m.kind, m.code) {
+                m.kind = Type::Confirmable;
             }
-            m.payload = (0..rng.below(40)).map(|_| rng.next() as u8).collect();
-            let bytes = m.to_bytes();
+            m.token = rng.bytes(8);
+            for _ in 0..rng.index(8) {
+                let len = [0, 1, 12, 13, 268, 269, 400][rng.index(7)];
+                m.options.add(rng.next() as u16 >> rng.index(16), vec![rng.next() as u8; len]);
+            }
+            m.payload = rng.bytes(39);
+            contract::check_wire_value(&m);
+            let bytes = m.to_bytes().unwrap();
             let back = Message::parse(&bytes).unwrap();
-            if m.try_to_bytes().is_none() {
-                // A type that does not go with the code: written as RFC
-                // 7252 allows, and still read back.
-                assert_ne!(written_form(m.kind, m.code), (m.kind, m.code));
-                continue;
-            }
-            assert_eq!(m.try_to_bytes(), Some(bytes.clone()));
-            let mut sorted = m.options.0.clone();
-            sorted.sort_by_key(|o| o.number);
-            assert_eq!(back.options.0, sorted);
-            assert_eq!((&back.token, &back.payload), (&m.token, &m.payload));
-            let f = Frame { code: m.code, token: back.token, options: back.options, payload: back.payload };
-            check_bytes(&f.to_bytes());
+            assert_eq!((back.kind, back.code, back.message_id), (m.kind, m.code, m.message_id));
+            assert_eq!((&back.token, &back.options, &back.payload), (&m.token, &m.options, &m.payload));
+            let f = Frame { code: m.code, token: m.token, options: m.options, payload: m.payload };
+            contract::check_wire_value(&f);
+            let bytes = f.to_bytes().unwrap();
+            assert_eq!(Frame::parse(&bytes), Ok(f));
+            check_bytes(&bytes);
         }
     }
 }

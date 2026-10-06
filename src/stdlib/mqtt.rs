@@ -10,16 +10,12 @@
 //! type. This module follows the OASIS MQTT Version 3.1.1 standard
 //! (Plus Errata 01).
 //!
-//! Nothing here reads a socket. A world that plays a broker feeds the bytes
-//! it reads from a TCP connection to a [`Decoder`], gets [`Packet`]s back,
+//! Nothing here reads a socket. A world that plays a broker pushes the bytes
+//! it reads from a TCP connection to a [`Stream<Frames>`](super::codec::Stream), gets [`Packet`]s back,
 //! and writes the bytes of its replies, from [`Packet::to_bytes`], back to
 //! the connection. Which clients may connect, which topics exist, and who
 //! receives what is up to world code. [`topic_matches`] says whether a
 //! subscription's filter matches a topic name, as the standard defines it.
-//!
-//! New stacks use [`Frames`] with [`super::codec::Stream`]. [`Packet`]
-//! implements [`Wire`] for exact parsing and transactional writing.
-//! The legacy [`Decoder`] keeps its repeating errors.
 //!
 //! Every reader checks lengths, flags and strings, because the agent can
 //! send any bytes it likes. A packet that breaks the standard is an
@@ -30,26 +26,27 @@
 //! (protocol level 5) is not read here, and is that case.
 //!
 //! ```
-//! use fictionet::stdlib::mqtt::{topic_matches, ConnAck, ConnectReturnCode, Decoder, Packet, QoS, SubAck, SubAckCode};
+//! use fictionet::stdlib::codec::{Stream, Wire};
+//! use fictionet::stdlib::mqtt::{topic_matches, ConnAck, ConnectReturnCode, Frames, Packet, QoS, SubAck, SubAckCode};
 //!
-//! let mut decoder = Decoder::new();
+//! let mut decoder = Stream::new(Frames::new());
 //! // CONNECT: protocol "MQTT" level 4, clean session, keep alive 60 s, client "a".
-//! decoder.feed(&[0x10, 0x0d, 0, 4, b'M', b'Q', b'T', b'T', 4, 0x02, 0, 60, 0, 1, b'a']);
+//! let _ = decoder.push(&[0x10, 0x0d, 0, 4, b'M', b'Q', b'T', b'T', 4, 0x02, 0, 60, 0, 1, b'a']);
 //! // SUBSCRIBE, packet 1: the filter "a/#" at QoS 1.
-//! decoder.feed(&[0x82, 0x08, 0, 1, 0, 3, b'a', b'/', b'#', 1]);
+//! let _ = decoder.push(&[0x82, 0x08, 0, 1, 0, 3, b'a', b'/', b'#', 1]);
 //!
-//! let Some(Ok(Packet::Connect(connect))) = decoder.next_packet() else { panic!("not a CONNECT") };
+//! let Some(Ok(Packet::Connect(connect))) = decoder.next() else { panic!("not a CONNECT") };
 //! assert_eq!(connect.client_id, "a");
 //! assert_eq!(connect.keep_alive, 60);
 //! let reply = Packet::ConnAck(ConnAck { session_present: false, code: ConnectReturnCode::Accepted });
 //! assert_eq!(reply.to_bytes().unwrap(), [0x20, 0x02, 0, 0]);
 //!
-//! let Some(Ok(Packet::Subscribe(subscribe))) = decoder.next_packet() else { panic!("not a SUBSCRIBE") };
+//! let Some(Ok(Packet::Subscribe(subscribe))) = decoder.next() else { panic!("not a SUBSCRIBE") };
 //! assert_eq!(subscribe.filters, [("a/#".to_string(), QoS::AtLeastOnce)]);
 //! let granted = subscribe.filters.iter().map(|(_, qos)| SubAckCode::Granted(*qos)).collect();
 //! let reply = Packet::SubAck(SubAck { packet_id: subscribe.packet_id, codes: granted });
 //! assert_eq!(reply.to_bytes().unwrap(), [0x90, 0x03, 0, 1, 1]);
-//! assert!(decoder.next_packet().is_none());
+//! assert!(decoder.next().is_none());
 //!
 //! // A message published to "a/b/c" goes to this subscriber.
 //! assert!(topic_matches("a/#", "a/b/c"));
@@ -76,7 +73,7 @@ pub const MAX_REMAINING_LENGTH_BYTES: usize = 4;
 /// The longest packet: the first byte, four length bytes, and the largest
 /// remaining length.
 pub const MAX_PACKET: usize = 1 + MAX_REMAINING_LENGTH_BYTES + MAX_REMAINING_LENGTH;
-/// The longest packet a [`Decoder`] takes unless told otherwise: 1 MiB.
+/// The longest packet a [`Stream<Frames>`](super::codec::Stream) takes unless told otherwise: 1 MiB.
 pub const DEFAULT_MAX_PACKET: usize = 1 << 20;
 /// The longest UTF-8 string or binary field, in bytes: its length is a
 /// 16-bit number.
@@ -358,6 +355,8 @@ pub enum Packet {
 /// written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
+    /// The value cannot be written without changing it.
+    Unwritable,
     /// The packet type was 0 or 15, which are reserved.
     ReservedType(u8),
     /// The four flag bits were wrong for the packet type: not the fixed
@@ -370,10 +369,9 @@ pub enum Error {
     },
     /// The remaining length ran past four bytes.
     RemainingLength,
-    /// The packet is longer than the reader or writer allows.
+    /// The packet is longer than the reader allows.
     TooLarge {
-        /// The packet's length in bytes: the whole packet for a reader, the
-        /// remaining length for a writer.
+        /// The whole packet's length in bytes.
         size: usize,
         /// The most allowed.
         max: usize,
@@ -386,7 +384,7 @@ pub enum Error {
     Utf8,
     /// A string held the character U+0000, which MQTT forbids.
     NullChar,
-    /// A string or binary field to write was longer than [`MAX_STRING`]
+    /// A string or binary field was longer than [`MAX_STRING`]
     /// bytes. It holds the length.
     TooLong(usize),
     /// A CONNECT named a protocol other than MQTT.
@@ -407,9 +405,6 @@ pub enum Error {
     ReturnCode(u8),
     /// A packet identifier was 0.
     PacketIdZero,
-    /// A PUBLISH to write had a packet identifier at QoS 0, or none at QoS
-    /// 1 or 2.
-    PacketId,
     /// A topic name was empty or had a wildcard.
     TopicName,
     /// A topic filter was empty, or used a wildcard in a way the standard
@@ -426,6 +421,7 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Error::Unwritable => f.write_str("MQTT value cannot be written without changing it"),
             Error::ReservedType(t) => write!(f, "reserved packet type {t}"),
             Error::Flags { packet_type, flags } => {
                 write!(f, "flags {flags:#06b} not allowed on packet type {packet_type}")
@@ -445,7 +441,6 @@ impl std::fmt::Display for Error {
             Error::ConnAckFlags(b) => write!(f, "CONNACK flags {b:#010b} break the rules"),
             Error::ReturnCode(c) => write!(f, "reserved return code {c:#04x}"),
             Error::PacketIdZero => f.write_str("packet identifier 0"),
-            Error::PacketId => f.write_str("packet identifier does not fit the QoS"),
             Error::TopicName => f.write_str("topic name is empty or has a wildcard"),
             Error::TopicFilter => f.write_str("topic filter is empty or misuses a wildcard"),
             Error::EmptySubscription => f.write_str("no topic filters or return codes"),
@@ -460,7 +455,7 @@ impl std::error::Error for Error {}
 /// `b` holds only part of it, and otherwise the length and how many bytes
 /// it took. An encoding longer than it needs to be is read, as the 3.1.1
 /// standard does not forbid it.
-pub fn read_remaining_length(b: &[u8]) -> Result<Option<(usize, usize)>, Error> {
+fn read_remaining_length(b: &[u8]) -> Result<Option<(usize, usize)>, Error> {
     let mut value = 0usize;
     for (i, &byte) in b.iter().enumerate().take(MAX_REMAINING_LENGTH_BYTES) {
         value |= usize::from(byte & 0x7f) << (7 * i);
@@ -471,21 +466,43 @@ pub fn read_remaining_length(b: &[u8]) -> Result<Option<(usize, usize)>, Error> 
     if b.len() >= MAX_REMAINING_LENGTH_BYTES { Err(Error::RemainingLength) } else { Ok(None) }
 }
 
-/// Appends `n` as a remaining length, in as few bytes as it fits. A length
-/// over [`MAX_REMAINING_LENGTH`] is an error, and nothing is written.
-pub fn write_remaining_length(n: usize, out: &mut Vec<u8>) -> Result<(), Error> {
-    if n > MAX_REMAINING_LENGTH {
-        return Err(Error::TooLarge { size: n, max: MAX_REMAINING_LENGTH });
-    }
-    let mut n = n;
-    loop {
-        let byte = (n % 128) as u8;
-        n /= 128;
-        if n == 0 {
-            out.push(byte);
-            return Ok(());
+/// MQTT's base-128 remaining length, from zero through [`MAX_REMAINING_LENGTH`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RemainingLength(
+    /// The number of bytes following the fixed header.
+    pub usize,
+);
+
+impl Wire for RemainingLength {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads one length. Accepts encodings longer than necessary, as MQTT
+    /// 3.1.1 permits. Refuses incomplete, excessive, or trailing bytes.
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        match read_remaining_length(bytes)? {
+            Some((n, used)) if used == bytes.len() => Ok(Self(n)),
+            Some(_) => Err(Error::TrailingBytes),
+            None => Err(Error::Truncated),
         }
-        out.push(byte | 0x80);
+    }
+
+    /// Appends a length. Refuses values above [`MAX_REMAINING_LENGTH`].
+    /// Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        if self.0 > MAX_REMAINING_LENGTH {
+            return Err(Error::Unwritable);
+        }
+        let mut n = self.0;
+        loop {
+            let byte = (n % 128) as u8;
+            n /= 128;
+            if n == 0 {
+                out.push(byte);
+                return Ok(());
+            }
+            out.push(byte | 0x80);
+        }
     }
 }
 
@@ -699,7 +716,7 @@ fn put_packet_id(out: &mut impl Sink, id: u16) -> Result<(), Error> {
 }
 
 /// How many bytes the remaining length `n` takes, written as
-/// [`write_remaining_length`] writes it.
+/// [`RemainingLength`] writes it.
 fn remaining_length_len(n: usize) -> usize {
     match n {
         0..=127 => 1,
@@ -714,7 +731,7 @@ impl Packet {
     /// holds only part of one, and otherwise the packet and how many bytes
     /// of `b` it took. A bad first byte or remaining length is an error as
     /// soon as it arrives, before the rest of the packet.
-    pub fn parse(b: &[u8]) -> Result<Option<(Packet, usize)>, Error> {
+    fn parse_prefix(b: &[u8]) -> Result<Option<(Packet, usize)>, Error> {
         let Some((first, body)) = frame(b, MAX_PACKET)? else { return Ok(None) };
         let end = body.end;
         Ok(Some((parse_body(first, &b[body])?, end)))
@@ -741,27 +758,11 @@ impl Packet {
         }
     }
 
-    /// The packet's bytes. Whatever this returns, [`Packet::parse`] reads
-    /// back as the same packet. A packet that breaks a rule the reader
-    /// checks, such as a topic name with a wildcard, a packet identifier of
-    /// 0, a [`ConnAck`] with a session present on a refused connection, or
-    /// a field or packet over its size limit, is an error instead. The
-    /// size is checked before anything is allocated. A [`Decoder`] with a
-    /// smaller limit than [`MAX_PACKET`] may still refuse a large packet.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
-        let (flags, body) = self.measure()?;
-        let mut out = Vec::with_capacity(1 + remaining_length_len(body) + body);
-        out.push((self.packet_type() << 4) | flags);
-        write_remaining_length(body, &mut out)?;
-        self.write_body(&mut out)?;
-        Ok(out)
-    }
-
     /// How many bytes [`Packet::to_bytes`] writes, header included, or the
     /// error it returns. It allocates nothing, so a world can check a
     /// packet against a peer's limit before writing it.
     pub fn encoded_len(&self) -> Result<usize, Error> {
-        let (_, body) = self.measure()?;
+        let (_, body) = self.measure().map_err(|_| Error::Unwritable)?;
         Ok(1 + remaining_length_len(body) + body)
     }
 
@@ -834,7 +835,7 @@ impl Packet {
                 match (p.qos, p.packet_id) {
                     (QoS::AtMostOnce, None) => {}
                     (QoS::AtLeastOnce | QoS::ExactlyOnce, Some(id)) => put_packet_id(body, id)?,
-                    _ => return Err(Error::PacketId),
+                    _ => return Err(Error::Unwritable),
                 }
                 body.put(&p.payload);
             }
@@ -1011,17 +1012,26 @@ impl Wire for Packet {
     type WriteError = Error;
 
     /// Reads exactly one packet, bounded by [`MAX_PACKET`].
+    /// Refuses invalid headers or fields, incomplete packets, and trailing bytes.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        match Self::parse(bytes)? {
+        match Self::parse_prefix(bytes)? {
             Some((packet, used)) if used == bytes.len() => Ok(packet),
             Some(_) => Err(Error::TrailingBytes),
             None => Err(Error::Truncated),
         }
     }
 
-    /// Appends a packet. Leaves `out` unchanged on error.
+    /// Appends a packet. Refuses invalid topics, flags, identifiers, strings,
+    /// and size limits. Leaves `out` unchanged on error.
+    /// A [`Stream<Frames>`](super::codec::Stream) with a smaller limit may
+    /// still refuse a large packet. The size is checked before anything is allocated.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        out.extend_from_slice(&self.to_bytes()?);
+        let (flags, body) = self.measure().map_err(|_| Error::Unwritable)?;
+        let mut bytes = Vec::with_capacity(1 + remaining_length_len(body) + body);
+        bytes.push((self.packet_type() << 4) | flags);
+        RemainingLength(body).write(&mut bytes)?;
+        self.write_body(&mut bytes).map_err(|_| Error::Unwritable)?;
+        out.extend_from_slice(&bytes);
         Ok(())
     }
 }
@@ -1029,9 +1039,9 @@ impl Wire for Packet {
 /// Reads MQTT packets without retaining input bytes.
 ///
 /// Use with [`super::codec::Stream`] for bounded input and one-time errors.
-/// Header and body errors end the stream, as in the legacy [`Decoder`].
+/// Header and body errors end the stream.
 /// Partial packets return [`Step::Need`], including at EOF. The driver
-/// reports truncation. The legacy decoder keeps its repeating errors.
+/// reports truncation.
 ///
 /// ```
 /// use fictionet::stdlib::{mqtt::{Frames, Packet}, codec::{Stream, Wire}};
@@ -1090,113 +1100,13 @@ impl Decode for Frames {
     }
 }
 
-/// Splits an MQTT byte stream into packets. Feed it the bytes a connection
-/// reads, in order, and take packets out until it has none.
-#[derive(Debug)]
-pub struct Decoder {
-    buf: Vec<u8>,
-    /// Where the bytes not yet taken out start in `buf`. Taken bytes are
-    /// dropped in [`Decoder::feed`], once they are at least half of `buf`,
-    /// so a stream of many small packets costs linear time, not quadratic.
-    start: usize,
-    max_packet: usize,
-    failed: Option<Error>,
-}
-
-impl Default for Decoder {
-    fn default() -> Decoder {
-        Decoder::new()
-    }
-}
-
-impl Decoder {
-    /// A decoder holding no bytes, that takes packets up to
-    /// [`DEFAULT_MAX_PACKET`] bytes long.
-    pub fn new() -> Decoder {
-        Decoder::with_max_packet(DEFAULT_MAX_PACKET)
-    }
-
-    /// A decoder that takes packets up to `max` bytes long, header
-    /// included. `max` is clamped to between 2, the shortest packet, and
-    /// [`MAX_PACKET`].
-    pub fn with_max_packet(max: usize) -> Decoder {
-        Decoder { buf: Vec::new(), start: 0, max_packet: max.clamp(2, MAX_PACKET), failed: None }
-    }
-
-    /// The longest packet this decoder takes.
-    pub fn max_packet(&self) -> usize {
-        self.max_packet
-    }
-
-    /// Adds bytes read from the connection and returns how many it took.
-    /// It holds at most [`Decoder::capacity`] bytes not yet taken out, so
-    /// it may take fewer than it is given. Take packets out with
-    /// [`Decoder::next_packet`], then feed it the rest; once it is full,
-    /// `next_packet` always gives a packet or an error. After an [`Error`]
-    /// the stream cannot be read any further, and every byte is taken and
-    /// dropped.
-    pub fn feed(&mut self, bytes: &[u8]) -> usize {
-        if self.failed.is_some() {
-            return bytes.len();
-        }
-        if self.start > 0 && self.start * 2 >= self.buf.len() {
-            self.buf.drain(..self.start);
-            self.start = 0;
-        }
-        let n = bytes.len().min(self.capacity().saturating_sub(self.buffered()));
-        self.buf.extend_from_slice(&bytes[..n]);
-        n
-    }
-
-    /// The most bytes the decoder holds that have not been taken out: the
-    /// longest packet it takes, and never less than a first byte and the
-    /// longest remaining length, so a full decoder can always tell whether
-    /// the packet fits.
-    pub fn capacity(&self) -> usize {
-        self.max_packet.max(1 + MAX_REMAINING_LENGTH_BYTES)
-    }
-
-    /// The next whole packet, if one has come. It returns `None` when it
-    /// needs more bytes, and keeps returning the same error once the stream
-    /// has broken. A packet over the limit is an error as soon as its
-    /// header arrives. Taking packets out costs time in proportion to their bytes, however
-    /// small they are.
-    pub fn next_packet(&mut self) -> Option<Result<Packet, Error>> {
-        if let Some(e) = self.failed {
-            return Some(Err(e));
-        }
-        let held = &self.buf[self.start..];
-        let result = match frame(held, self.max_packet) {
-            Ok(None) => return None,
-            Ok(Some((first, body))) => {
-                let end = body.end;
-                let parsed = parse_body(first, &held[body]);
-                self.start += end;
-                if self.start == self.buf.len() {
-                    self.buf.clear();
-                    self.start = 0;
-                }
-                parsed
-            }
-            Err(e) => Err(e),
-        };
-        if let Err(e) = result {
-            self.failed = Some(e);
-            self.buf = Vec::new();
-            self.start = 0;
-        }
-        Some(result)
-    }
-
-    /// How many bytes are held, waiting for the rest of a packet.
-    pub fn buffered(&self) -> usize {
-        self.buf.len() - self.start
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stdlib::codec::{
+        Fail, Stream, contract, pump,
+        test_support::{Lcg, decode_all, mutate},
+    };
 
     fn connect_bytes() -> Vec<u8> {
         // The variable header from the standard's example in section
@@ -1208,7 +1118,7 @@ mod tests {
             body.extend_from_slice(field);
         }
         let mut out = vec![0x10];
-        write_remaining_length(body.len(), &mut out).unwrap();
+        RemainingLength(body.len()).write(&mut out).unwrap();
         out.extend_from_slice(&body);
         out
     }
@@ -1303,16 +1213,6 @@ mod tests {
         ]
     }
 
-    fn parse(b: &[u8]) -> Result<Packet, Error> {
-        match Packet::parse(b)? {
-            Some((p, used)) => {
-                assert_eq!(used, b.len());
-                Ok(p)
-            }
-            None => panic!("incomplete: {b:?}"),
-        }
-    }
-
     #[test]
     fn every_packet_type_reads_and_writes() {
         let samples = samples();
@@ -1320,7 +1220,7 @@ mod tests {
         types.dedup();
         assert_eq!(types, (1..=14).collect::<Vec<u8>>());
         for (packet, bytes) in samples {
-            assert_eq!(parse(&bytes), Ok(packet.clone()), "{packet:?}");
+            assert_eq!(Packet::parse(&bytes), Ok(packet.clone()), "{packet:?}");
             assert_eq!(packet.to_bytes().unwrap(), bytes, "{packet:?}");
         }
     }
@@ -1328,19 +1228,17 @@ mod tests {
     #[test]
     fn every_prefix_is_incomplete() {
         for (packet, bytes) in samples() {
+            contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * DEFAULT_MAX_PACKET);
             for n in 0..bytes.len() {
-                assert_eq!(Packet::parse(&bytes[..n]), Ok(None), "{packet:?} cut to {n}");
-                let mut d = Decoder::new();
-                d.feed(&bytes[..n]);
-                assert_eq!(d.next_packet(), None);
-                assert_eq!(d.buffered(), n);
+                assert_eq!(Packet::parse(&bytes[..n]), Err(Error::Truncated), "{packet:?} cut to {n}");
+                assert_eq!(Frames::new().decode(&bytes[..n], false), Ok(Step::Need));
             }
         }
     }
 
     #[test]
     fn connect_example() {
-        let Packet::Connect(c) = parse(&connect_bytes()).unwrap() else { panic!() };
+        let Packet::Connect(c) = Packet::parse(&connect_bytes()).unwrap() else { panic!() };
         assert_eq!(c, connect());
         // Trailing bytes after the password are not allowed.
         let mut b = connect_bytes();
@@ -1364,23 +1262,20 @@ mod tests {
         ];
         for (n, bytes) in cases {
             let mut out = Vec::new();
-            write_remaining_length(n, &mut out).unwrap();
+            RemainingLength(n).write(&mut out).unwrap();
             assert_eq!(out, bytes);
-            assert_eq!(read_remaining_length(bytes), Ok(Some((n, bytes.len()))));
+            assert_eq!(RemainingLength::parse(bytes), Ok(RemainingLength(n)));
             for k in 0..bytes.len() {
-                assert_eq!(read_remaining_length(&bytes[..k]), Ok(None));
+                assert_eq!(RemainingLength::parse(&bytes[..k]), Err(Error::Truncated));
             }
         }
-        assert_eq!(read_remaining_length(&[0xff, 0xff, 0xff, 0xff]), Err(Error::RemainingLength));
-        assert_eq!(read_remaining_length(&[0x80, 0x80, 0x80, 0x80, 0x01]), Err(Error::RemainingLength));
+        assert_eq!(RemainingLength::parse(&[0xff, 0xff, 0xff, 0xff]), Err(Error::RemainingLength));
+        assert_eq!(RemainingLength::parse(&[0x80, 0x80, 0x80, 0x80, 0x01]), Err(Error::RemainingLength));
         // A longer encoding than needed is still read.
-        assert_eq!(read_remaining_length(&[0x80, 0x00]), Ok(Some((0, 2))));
-        assert_eq!(Packet::parse(&[0xc0, 0x80, 0x00]), Ok(Some((Packet::PingReq, 3))));
+        assert_eq!(RemainingLength::parse(&[0x80, 0x00]), Ok(RemainingLength(0)));
+        assert_eq!(Packet::parse(&[0xc0, 0x80, 0x00]), Ok(Packet::PingReq));
         let mut out = Vec::new();
-        assert_eq!(
-            write_remaining_length(MAX_REMAINING_LENGTH + 1, &mut out),
-            Err(Error::TooLarge { size: MAX_REMAINING_LENGTH + 1, max: MAX_REMAINING_LENGTH })
-        );
+        assert_eq!(RemainingLength(MAX_REMAINING_LENGTH + 1).write(&mut out), Err(Error::Unwritable));
         assert!(out.is_empty());
         assert_eq!(Packet::parse(&[0x30, 0xff, 0xff, 0xff, 0xff]), Err(Error::RemainingLength));
     }
@@ -1454,7 +1349,7 @@ mod tests {
         // PUBLISH: QoS 3, and DUP at QoS 0.
         assert_eq!(Packet::parse(&[0x36]), Err(Error::Flags { packet_type: 3, flags: 6 }));
         assert_eq!(Packet::parse(&[0x38]), Err(Error::Flags { packet_type: 3, flags: 8 }));
-        assert!(Packet::parse(&[0x3b]).unwrap().is_none());
+        assert_eq!(Packet::parse(&[0x3b]), Err(Error::Truncated));
     }
 
     #[test]
@@ -1490,7 +1385,7 @@ mod tests {
         assert_eq!(Packet::parse(&[0x82, 7, 0, 1, 0, 2, b'a', b'#', 0]), Err(Error::TopicFilter));
         assert_eq!(
             Packet::parse(&[0xa2, 5, 0, 1, 0, 1, b'+']),
-            Ok(Some((Packet::Unsubscribe(Unsubscribe { packet_id: 1, filters: vec!["+".into()] }), 7)))
+            Ok(Packet::Unsubscribe(Unsubscribe { packet_id: 1, filters: vec!["+".into()] }))
         );
         assert_eq!(Packet::parse(&[0xa2, 6, 0, 1, 0, 2, b'+', b'a']), Err(Error::TopicFilter));
         assert_eq!(Packet::parse(&[0x82, 5, 0, 1, 0, 1, b'a']), Err(Error::Truncated));
@@ -1506,7 +1401,7 @@ mod tests {
         body.extend_from_slice(&[level, flags, 0, 60]);
         body.extend_from_slice(rest);
         let mut out = vec![0x10];
-        write_remaining_length(body.len(), &mut out).unwrap();
+        RemainingLength(body.len()).write(&mut out).unwrap();
         out.extend_from_slice(&body);
         out
     }
@@ -1514,7 +1409,7 @@ mod tests {
     #[test]
     fn connect_errors() {
         let id = [0, 1, b'a'];
-        assert!(parse(&connect_with(b"MQTT", 4, 0x02, &id)).is_ok());
+        assert!(Packet::parse(&connect_with(b"MQTT", 4, 0x02, &id)).is_ok());
         // MQTT 5, with its properties length, and MQTT 3.1.
         assert_eq!(Packet::parse(&connect_with(b"MQTT", 5, 0x02, &[0, 0, 1, b'a'])), Err(Error::UnsupportedVersion(5)));
         assert_eq!(Packet::parse(&connect_with(b"MQIsdp", 3, 0x02, &id)), Err(Error::UnsupportedVersion(3)));
@@ -1554,50 +1449,47 @@ mod tests {
             Packet::Publish(x).to_bytes()
         };
         assert!(p(&|_| {}).is_ok());
-        assert_eq!(p(&|x| x.packet_id = Some(1)), Err(Error::PacketId));
-        assert_eq!(p(&|x| x.qos = QoS::AtLeastOnce), Err(Error::PacketId));
+        assert_eq!(p(&|x| x.packet_id = Some(1)), Err(Error::Unwritable));
+        assert_eq!(p(&|x| x.qos = QoS::AtLeastOnce), Err(Error::Unwritable));
         assert_eq!(
             p(&|x| {
                 x.qos = QoS::AtLeastOnce;
                 x.packet_id = Some(0)
             }),
-            Err(Error::PacketIdZero)
+            Err(Error::Unwritable)
         );
-        assert_eq!(p(&|x| x.dup = true), Err(Error::Flags { packet_type: 3, flags: 8 }));
-        assert_eq!(p(&|x| x.topic = "a/#".into()), Err(Error::TopicName));
-        assert_eq!(p(&|x| x.topic = "a\0".into()), Err(Error::NullChar));
-        assert_eq!(p(&|x| x.topic = "a".repeat(MAX_STRING + 1)), Err(Error::TooLong(MAX_STRING + 1)));
+        assert_eq!(p(&|x| x.dup = true), Err(Error::Unwritable));
+        assert_eq!(p(&|x| x.topic = "a/#".into()), Err(Error::Unwritable));
+        assert_eq!(p(&|x| x.topic = "a\0".into()), Err(Error::Unwritable));
+        assert_eq!(p(&|x| x.topic = "a".repeat(MAX_STRING + 1)), Err(Error::Unwritable));
 
         let mut c = connect();
         c.username = None;
-        assert_eq!(Packet::Connect(c.clone()).to_bytes(), Err(Error::ConnectFlags(0xce & !0x80)));
+        assert_eq!(Packet::Connect(c.clone()).to_bytes(), Err(Error::Unwritable));
         c.password = None;
         c.will.as_mut().unwrap().topic = "+".into();
-        assert_eq!(Packet::Connect(c.clone()).to_bytes(), Err(Error::TopicName));
+        assert_eq!(Packet::Connect(c.clone()).to_bytes(), Err(Error::Unwritable));
         c.will = None;
         c.password = Some(vec![0; MAX_STRING + 1]);
         c.username = Some("u".into());
-        assert_eq!(Packet::Connect(c).to_bytes(), Err(Error::TooLong(MAX_STRING + 1)));
+        assert_eq!(Packet::Connect(c).to_bytes(), Err(Error::Unwritable));
 
-        assert_eq!(Packet::PubAck(0).to_bytes(), Err(Error::PacketIdZero));
-        assert_eq!(
-            Packet::Subscribe(Subscribe { packet_id: 1, filters: vec![] }).to_bytes(),
-            Err(Error::EmptySubscription)
-        );
+        assert_eq!(Packet::PubAck(0).to_bytes(), Err(Error::Unwritable));
+        assert_eq!(Packet::Subscribe(Subscribe { packet_id: 1, filters: vec![] }).to_bytes(), Err(Error::Unwritable));
         assert_eq!(
             Packet::Unsubscribe(Unsubscribe { packet_id: 1, filters: vec![] }).to_bytes(),
-            Err(Error::EmptySubscription)
+            Err(Error::Unwritable)
         );
         assert_eq!(
             Packet::Subscribe(Subscribe { packet_id: 1, filters: vec![("a#".into(), QoS::AtMostOnce)] }).to_bytes(),
-            Err(Error::TopicFilter)
+            Err(Error::Unwritable)
         );
         assert_eq!(
             Packet::Unsubscribe(Unsubscribe { packet_id: 1, filters: vec![String::new()] }).to_bytes(),
-            Err(Error::TopicFilter)
+            Err(Error::Unwritable)
         );
-        assert_eq!(Packet::SubAck(SubAck { packet_id: 0, codes: vec![] }).to_bytes(), Err(Error::PacketIdZero));
-        assert_eq!(Packet::SubAck(SubAck { packet_id: 1, codes: vec![] }).to_bytes(), Err(Error::EmptySubscription));
+        assert_eq!(Packet::SubAck(SubAck { packet_id: 0, codes: vec![] }).to_bytes(), Err(Error::Unwritable));
+        assert_eq!(Packet::SubAck(SubAck { packet_id: 1, codes: vec![] }).to_bytes(), Err(Error::Unwritable));
     }
 
     #[test]
@@ -1606,10 +1498,10 @@ mod tests {
         // than write a different value than it was given.
         let refused =
             Packet::ConnAck(ConnAck { session_present: true, code: ConnectReturnCode::BadUsernameOrPassword });
-        assert_eq!(refused.to_bytes(), Err(Error::ConnAckFlags(1)));
-        assert_eq!(refused.encoded_len(), Err(Error::ConnAckFlags(1)));
+        assert_eq!(refused.to_bytes(), Err(Error::Unwritable));
+        assert_eq!(refused.encoded_len(), Err(Error::Unwritable));
         let ok = Packet::ConnAck(ConnAck { session_present: false, code: ConnectReturnCode::BadUsernameOrPassword });
-        assert_eq!(parse(&ok.to_bytes().unwrap()), Ok(ok));
+        assert_eq!(Packet::parse(&ok.to_bytes().unwrap()), Ok(ok));
     }
 
     #[test]
@@ -1631,12 +1523,11 @@ mod tests {
             })
         };
         let over = publish(MAX_REMAINING_LENGTH - 2);
-        let too_large = Error::TooLarge { size: MAX_REMAINING_LENGTH + 1, max: MAX_REMAINING_LENGTH };
-        assert_eq!(over.encoded_len(), Err(too_large));
-        assert_eq!(over.to_bytes(), Err(too_large));
+        assert_eq!(over.encoded_len(), Err(Error::Unwritable));
+        assert_eq!(over.to_bytes(), Err(Error::Unwritable));
         drop(over);
         assert_eq!(publish(MAX_REMAINING_LENGTH - 3).encoded_len(), Ok(MAX_PACKET));
-        // A field error comes before the size check, as in to_bytes.
+        // Invalid fields are refused even when the packet fits the size limit.
         let mut bad = Publish {
             dup: false,
             qos: QoS::AtMostOnce,
@@ -1645,45 +1536,24 @@ mod tests {
             packet_id: None,
             payload: vec![],
         };
-        assert_eq!(Packet::Publish(bad.clone()).encoded_len(), Err(Error::TopicName));
+        assert_eq!(Packet::Publish(bad.clone()).encoded_len(), Err(Error::Unwritable));
         bad.topic = "t".into();
         assert_eq!(Packet::Publish(bad).encoded_len(), Ok(5));
     }
 
     #[test]
-    fn decoder_holds_at_most_its_capacity() {
-        // Many valid packets fed without taking any out: the decoder takes
-        // what fits and leaves the rest with the caller.
-        let mut d = Decoder::with_max_packet(2);
-        assert_eq!(d.capacity(), 1 + MAX_REMAINING_LENGTH_BYTES);
-        let stream = [0xc0u8, 0].repeat(1000);
-        let mut fed = 0;
-        let mut got = 0;
-        while fed < stream.len() {
-            let n = d.feed(&stream[fed..]);
-            assert!(d.buffered() <= d.capacity());
-            fed += n;
-            let mut progressed = n > 0;
-            while let Some(p) = d.next_packet() {
-                assert_eq!(p, Ok(Packet::PingReq));
-                got += 1;
-                progressed = true;
-            }
-            assert!(progressed, "stuck at {fed}");
-        }
-        assert_eq!(got, 1000);
-        // A full decoder always has a packet or an error to give: here a
-        // length that cannot fit a limit of 2.
-        let mut d = Decoder::with_max_packet(2);
-        assert_eq!(d.feed(&[0x30, 0x80, 0x80, 0x80, 0x01, 0, 0]), 5);
-        assert_eq!(d.next_packet(), Some(Err(Error::TooLarge { size: 2_097_157, max: 2 })));
-        // A broken decoder takes and drops every byte.
-        assert_eq!(d.feed(&[0; 100]), 100);
-        assert_eq!(d.buffered(), 0);
-        // The default decoder holds one packet's worth.
-        assert_eq!(Decoder::new().capacity(), DEFAULT_MAX_PACKET);
-        let mut d = Decoder::new();
-        assert_eq!(d.feed(&vec![0xc0; 2 * DEFAULT_MAX_PACKET]), DEFAULT_MAX_PACKET);
+    fn stream_holds_at_most_its_capacity() {
+        let bytes = [0xc0, 0].repeat(1000);
+        let make = || Frames::with_limit(2);
+        assert_eq!(make().capacity(), 5);
+        contract::check_decode_with_alloc_limit(make, &bytes, 10);
+        assert_eq!(decode_all(make, &bytes), (vec![Packet::PingReq; 1000], None));
+        assert_eq!(
+            make().decode(&[0x30, 0x80, 0x80, 0x80, 0x01], false),
+            Err(Error::TooLarge { size: 2_097_157, max: 2 })
+        );
+        let mut stream = Stream::new(Frames::new());
+        assert_eq!(stream.push(&vec![0xc0; 2 * DEFAULT_MAX_PACKET]), DEFAULT_MAX_PACKET);
     }
 
     #[test]
@@ -1706,81 +1576,68 @@ mod tests {
     }
 
     #[test]
-    fn decoder_splits_a_stream() {
+    fn stream_splits_a_stream() {
         let samples = samples();
-        let stream: Vec<u8> = samples.iter().flat_map(|(_, b)| b.clone()).collect();
-        let want: Vec<Packet> = samples.into_iter().map(|(p, _)| p).collect();
-        for piece in [1, 2, 3, 7, stream.len()] {
-            let mut d = Decoder::default();
-            let mut got = Vec::new();
-            for chunk in stream.chunks(piece) {
-                d.feed(chunk);
-                while let Some(p) = d.next_packet() {
-                    got.push(p.unwrap());
-                }
-            }
-            assert_eq!(got, want, "pieces of {piece}");
-            assert_eq!(d.buffered(), 0);
+        let bytes: Vec<_> = samples.iter().flat_map(|(_, b)| b.clone()).collect();
+        let want: Vec<_> = samples.into_iter().map(|(p, _)| p).collect();
+        contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * DEFAULT_MAX_PACKET);
+        assert_eq!(decode_all(Frames::new, &bytes), (want, None));
+    }
+
+    #[test]
+    fn stream_stays_broken() {
+        for (bytes, expected) in
+            [(&[0x00, 0xd0, 0][..], Error::ReservedType(0)), (&[0x40, 2, 0, 0, 0xc0, 0][..], Error::PacketIdZero)]
+        {
+            let mut stream = Stream::new(Frames::new());
+            assert_eq!(stream.push(&[0xc0, 0]), 2);
+            assert_eq!(stream.next(), Some(Ok(Packet::PingReq)));
+            assert_eq!(stream.push(bytes), bytes.len());
+            assert_eq!(stream.next(), Some(Err(Fail::Protocol(expected))));
+            assert_eq!(stream.push(&[0xc0, 0]), 2);
+            assert_eq!(stream.next(), None);
         }
     }
 
     #[test]
-    fn decoder_stays_broken() {
-        let mut d = Decoder::new();
-        d.feed(&[0xc0, 0, 0x00, 0xd0, 0]);
-        assert_eq!(d.next_packet(), Some(Ok(Packet::PingReq)));
-        assert_eq!(d.next_packet(), Some(Err(Error::ReservedType(0))));
-        d.feed(&[0xc0, 0]);
-        assert_eq!(d.next_packet(), Some(Err(Error::ReservedType(0))));
-        assert_eq!(d.buffered(), 0);
-        // A broken body breaks the stream too.
-        let mut d = Decoder::new();
-        d.feed(&[0x40, 2, 0, 0, 0xc0, 0]);
-        assert_eq!(d.next_packet(), Some(Err(Error::PacketIdZero)));
-        assert_eq!(d.next_packet(), Some(Err(Error::PacketIdZero)));
-        assert_eq!(d.buffered(), 0);
-    }
-
-    #[test]
-    fn decoder_takes_many_small_packets_in_linear_time() {
-        // 4 MiB of PINGREQs, fed at once. Moving the rest of the buffer
+    fn stream_takes_many_small_packets_in_linear_time() {
+        // 4 MiB of PINGREQs, pushed at once. Moving the rest of the buffer
         // down after each packet took about 23 s here (1.4 s for 1 MiB,
-        // optimized); taking them by offset takes milliseconds. The bound
-        // is loose so a slow machine still passes.
+        // optimized); taking them by offset takes milliseconds. The 5 s
+        // bound is loose so a slow machine still passes.
         let data = [0xc0u8, 0].repeat(1 << 21);
         let started = std::time::Instant::now();
-        let mut d = Decoder::with_max_packet(MAX_PACKET);
-        d.feed(&data[..data.len() - 1]);
+        let mut stream = Stream::new(Frames::new());
         let mut n = 0;
-        while let Some(p) = d.next_packet() {
-            assert_eq!(p, Ok(Packet::PingReq));
+        pump(&mut stream, &data[..data.len() - 1], |p| {
+            assert_eq!(p, Packet::PingReq);
             n += 1;
-        }
+        })
+        .unwrap();
         assert_eq!(n, (1 << 21) - 1);
-        assert_eq!(d.buffered(), 1);
-        d.feed(&[0]);
-        assert_eq!(d.buffered(), 2);
-        assert_eq!(d.next_packet(), Some(Ok(Packet::PingReq)));
-        assert_eq!(d.buffered(), 0);
-        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+        assert_eq!(stream.buffered(), 1);
+        assert_eq!(stream.push(&[0]), 1);
+        assert_eq!(stream.next(), Some(Ok(Packet::PingReq)));
+        assert_eq!(stream.buffered(), 0);
+        assert!(started.elapsed().as_secs() < 5);
     }
 
     #[test]
-    fn decoder_keeps_a_partial_packet_across_compaction() {
-        // Whole packets, then half of one; the next feed drops the taken
+    fn stream_keeps_a_partial_packet_across_compaction() {
+        // Whole packets, then half of one; the next push drops the taken
         // bytes and keeps the half.
-        let mut d = Decoder::new();
-        d.feed(&[0xc0, 0, 0xd0, 0, 0x40, 2, 0]);
-        assert_eq!(d.next_packet(), Some(Ok(Packet::PingReq)));
-        assert_eq!(d.next_packet(), Some(Ok(Packet::PingResp)));
-        assert_eq!(d.next_packet(), None);
+        let mut d = Stream::new(Frames::new());
+        let _ = d.push(&[0xc0, 0, 0xd0, 0, 0x40, 2, 0]);
+        assert_eq!(d.next(), Some(Ok(Packet::PingReq)));
+        assert_eq!(d.next(), Some(Ok(Packet::PingResp)));
+        assert_eq!(d.next(), None);
         assert_eq!(d.buffered(), 3);
-        d.feed(&[9, 0xe0]);
+        let _ = d.push(&[9, 0xe0]);
         assert_eq!(d.buffered(), 5);
-        assert_eq!(d.next_packet(), Some(Ok(Packet::PubAck(9))));
-        assert_eq!(d.next_packet(), None);
-        d.feed(&[0]);
-        assert_eq!(d.next_packet(), Some(Ok(Packet::Disconnect)));
+        assert_eq!(d.next(), Some(Ok(Packet::PubAck(9))));
+        assert_eq!(d.next(), None);
+        let _ = d.push(&[0]);
+        assert_eq!(d.next(), Some(Ok(Packet::Disconnect)));
         assert_eq!(d.buffered(), 0);
     }
 
@@ -1794,21 +1651,21 @@ mod tests {
     }
 
     #[test]
-    fn decoder_limits_packet_size() {
-        let mut d = Decoder::with_max_packet(10);
-        assert_eq!(d.max_packet(), 10);
+    fn stream_limits_packet_size() {
+        let mut d = Stream::new(Frames::with_limit(10));
+        assert_eq!(d.decoder().limit, 10);
         // A PUBLISH of 2 + 8 bytes fits; one of 2 + 9 is refused from its header.
-        d.feed(&[0x30, 8, 0, 1, b't', 1, 2, 3, 4, 5]);
-        assert!(matches!(d.next_packet(), Some(Ok(Packet::Publish(_)))));
-        d.feed(&[0x30, 9]);
-        assert_eq!(d.next_packet(), Some(Err(Error::TooLarge { size: 11, max: 10 })));
-        assert_eq!(Decoder::with_max_packet(0).max_packet(), 2);
-        assert_eq!(Decoder::with_max_packet(usize::MAX).max_packet(), MAX_PACKET);
-        assert_eq!(Decoder::new().max_packet(), DEFAULT_MAX_PACKET);
+        let _ = d.push(&[0x30, 8, 0, 1, b't', 1, 2, 3, 4, 5]);
+        assert!(matches!(d.next(), Some(Ok(Packet::Publish(_)))));
+        let _ = d.push(&[0x30, 9]);
+        assert_eq!(d.next(), Some(Err(Fail::Protocol(Error::TooLarge { size: 11, max: 10 }))));
+        assert_eq!(Frames::with_limit(0).limit, 2);
+        assert_eq!(Frames::with_limit(usize::MAX).limit, MAX_PACKET);
+        assert_eq!(Frames::new().limit, DEFAULT_MAX_PACKET);
         // The largest header is refused at once by the default limit.
-        let mut d = Decoder::new();
-        d.feed(&[0x30, 0xff, 0xff, 0xff, 0x7f]);
-        assert_eq!(d.next_packet(), Some(Err(Error::TooLarge { size: MAX_PACKET, max: DEFAULT_MAX_PACKET })));
+        let mut d = Stream::new(Frames::new());
+        let _ = d.push(&[0x30, 0xff, 0xff, 0xff, 0x7f]);
+        assert_eq!(d.next(), Some(Err(Fail::Protocol(Error::TooLarge { size: MAX_PACKET, max: DEFAULT_MAX_PACKET }))));
     }
 
     #[test]
@@ -1829,7 +1686,7 @@ mod tests {
             Error::ConnAckFlags(2),
             Error::ReturnCode(6),
             Error::PacketIdZero,
-            Error::PacketId,
+            Error::Unwritable,
             Error::TopicName,
             Error::TopicFilter,
             Error::EmptySubscription,
@@ -1846,120 +1703,53 @@ mod tests {
         );
     }
 
-    struct Lcg(u64);
-
-    impl Lcg {
-        fn next(&mut self) -> u32 {
-            self.0 = self.0.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
-            (self.0 >> 33) as u32
-        }
-
-        fn below(&mut self, n: usize) -> usize {
-            self.next() as usize % n.max(1)
-        }
-    }
-
-    /// Feeds `data` to `d` in pieces of `piece` bytes, taking packets out as
-    /// they come, until it ends or the stream breaks. It returns the
-    /// packets, the error if there was one, and the bytes still held.
-    fn run(d: &mut Decoder, data: &[u8], piece: usize) -> (Vec<Packet>, Option<Error>, usize) {
-        let mut packets = Vec::new();
-        for chunk in data.chunks(piece.max(1)) {
-            let mut rest = chunk;
-            loop {
-                let n = d.feed(rest);
-                assert!(d.buffered() <= d.capacity());
-                rest = &rest[n..];
-                let mut took = false;
-                while let Some(p) = d.next_packet() {
-                    match p {
-                        Ok(p) => packets.push(p),
-                        Err(e) => return (packets, Some(e), d.buffered()),
-                    }
-                    took = true;
-                }
-                if rest.is_empty() {
-                    break;
-                }
-                assert!(n > 0 || took, "a full decoder gave nothing");
-            }
-        }
-        (packets, None, d.buffered())
-    }
-
-    /// What every reader must hold for any bytes: no panic, a packet read
-    /// writes back to bytes that read the same, and a decoder fed in pieces
-    /// finds the same packets, error and leftover bytes as one fed all at
-    /// once, at the full limit and at a small one.
-    fn check(data: &[u8], piece: usize, small: usize) {
-        let (packets, error, held) = run(&mut Decoder::with_max_packet(MAX_PACKET), data, data.len());
-        assert_eq!(run(&mut Decoder::with_max_packet(MAX_PACKET), data, piece), (packets.clone(), error, held));
-        let whole = run(&mut Decoder::with_max_packet(small), data, data.len());
-        assert_eq!(run(&mut Decoder::with_max_packet(small), data, piece), whole);
-        if let Ok(Some((p, used))) = Packet::parse(data) {
-            assert!(used <= data.len());
-            assert_eq!(packets.first(), Some(&p));
-        }
-        for p in &packets {
-            let bytes = p.to_bytes().expect("a packet read can be written");
-            assert_eq!(p.encoded_len(), Ok(bytes.len()));
-            assert_eq!(parse(&bytes), Ok(p.clone()));
+    fn check(data: &[u8], small: usize) {
+        contract::check_wire::<Packet>(data);
+        contract::check_decode_with_alloc_limit(Frames::new, data, 2 * DEFAULT_MAX_PACKET);
+        let make = || Frames::with_limit(small);
+        contract::check_decode_with_alloc_limit(make, data, 2 * make().capacity());
+        for packet in decode_all(Frames::new, data).0 {
+            contract::check_wire_value(&packet);
+            assert_eq!(packet.encoded_len(), Ok(packet.to_bytes().unwrap().len()));
         }
     }
 
     #[test]
     fn random_bytes_never_panic_and_round_trip() {
-        let mut rng = Lcg(0x6d71_7474);
+        let mut rng = Lcg::new(0x6d71_7474);
         let samples = samples();
         let mut read = 0;
         for i in 0..4000 {
-            let data: Vec<u8> = if i % 2 == 0 {
-                // Bytes from scratch, with a first byte that is often a real type.
-                let n = rng.below(48);
-                let mut d: Vec<u8> = (0..n).map(|_| rng.next() as u8).collect();
-                if let Some(first) = d.first_mut()
-                    && rng.below(2) == 0
+            let mut bytes = if i % 2 == 0 {
+                let mut b = rng.bytes(48);
+                if let Some(first) = b.first_mut()
+                    && rng.coin()
                 {
                     *first &= 0xf3;
                 }
-                if d.len() > 1 && rng.below(2) == 0 {
-                    d[1] &= 0x3f;
+                if b.len() > 1 && rng.coin() {
+                    b[1] &= 0x3f;
                 }
-                d
+                b
             } else {
-                // A real packet with a few bytes changed, cut or added.
-                let mut d = samples[rng.below(samples.len())].1.clone();
-                for _ in 0..1 + rng.below(3) {
-                    match rng.below(3) {
-                        0 if !d.is_empty() => {
-                            let k = rng.below(d.len());
-                            d[k] = rng.next() as u8;
-                        }
-                        1 if !d.is_empty() => {
-                            let k = rng.below(d.len());
-                            d.truncate(k);
-                        }
-                        _ => d.push(rng.next() as u8),
-                    }
-                }
-                d
+                samples[rng.index(samples.len())].1.clone()
             };
-            if matches!(Packet::parse(&data), Ok(Some(_))) {
-                read += 1;
+            if i % 4 != 1 {
+                mutate(&mut rng, &mut bytes);
             }
-            check(&data, 1 + rng.below(5), rng.below(24));
+            read += usize::from(Packet::parse(&bytes).is_ok());
+            check(&bytes, rng.index(24));
         }
-        // The loop reaches real packets, not only errors.
         assert!(read > 200, "{read} packets read");
     }
 
     #[test]
     fn random_topics_match_themselves() {
-        let mut rng = Lcg(42);
+        let mut rng = Lcg::new(42);
         let alphabet = ['a', 'b', '/', '+', '#', '$', '\0'];
         for _ in 0..3000 {
             let make =
-                |rng: &mut Lcg| -> String { (0..rng.below(7)).map(|_| alphabet[rng.below(alphabet.len())]).collect() };
+                |rng: &mut Lcg| -> String { (0..rng.index(7)).map(|_| alphabet[rng.index(alphabet.len())]).collect() };
             let (filter, topic) = (make(&mut rng), make(&mut rng));
             let matched = topic_matches(&filter, &topic);
             if matched {
