@@ -65,6 +65,8 @@ macro_rules! protocols {
         pub mod ipp;
         #[path = "../src/stdlib/ipsec.rs"]
         pub mod ipsec;
+        #[path = "../src/stdlib/itch.rs"]
+        pub mod itch;
         #[path = "../src/stdlib/json.rs"]
         pub mod json;
         #[path = "../src/stdlib/kafka.rs"]
@@ -111,6 +113,8 @@ macro_rules! protocols {
         pub mod openvpn;
         #[path = "../src/stdlib/ospf.rs"]
         pub mod ospf;
+        #[path = "../src/stdlib/ouch.rs"]
+        pub mod ouch;
         #[path = "../src/stdlib/pcp.rs"]
         pub mod pcp;
         #[path = "../src/stdlib/pim.rs"]
@@ -320,4 +324,78 @@ fn copied_moldudp64_recovers_a_gap() {
     .unwrap();
     finish(&mut blocks, |m| messages.push(m)).unwrap();
     assert_eq!(messages, [b"c".to_vec()]);
+}
+
+#[test]
+fn copied_itch_frames_a_file_and_builds_a_book() {
+    // ITCH 5.0, 1.3.1: Add Order, then 1.4.1: Order Executed, each with a
+    // two-byte length in front as in a binary ITCH file.
+    let header = itch::Header {
+        locate: 3,
+        tracking: 0,
+        timestamp: itch::Timestamp::new(1).unwrap(),
+    };
+    let add = itch::AddOrder {
+        header,
+        order_ref: 5,
+        side: itch::Side::Sell,
+        shares: 100,
+        stock: itch::Alpha::right_padded("ZVZZT").unwrap(),
+        price: itch::Price4(10_000),
+    };
+    let executed = itch::OrderExecuted {
+        header,
+        order_ref: 5,
+        executed_shares: 40,
+        match_number: 1,
+    };
+    let mut file = Vec::new();
+    for m in [itch::Message::from(add), executed.into()] {
+        file.extend_from_slice(&(m.wire_len() as u16).to_be_bytes());
+        m.write(&mut file).unwrap();
+    }
+    let mut stream = Stream::new(itch::Messages::default());
+    let mut book = itch::Book::new(itch::BookConfig::default()).unwrap();
+    for chunk in file.chunks(7) {
+        pump(&mut stream, chunk, |m| {
+            book.apply(&m.unwrap()).unwrap();
+        })
+        .unwrap();
+    }
+    finish(&mut stream, |_| unreachable!()).unwrap();
+    assert_eq!(book.best_ask(3).unwrap().shares, 60);
+}
+
+#[test]
+fn copied_ouch_exchange_accepts_through_wire() {
+    let enter = ouch::EnterOrder {
+        user_ref: 1,
+        side: ouch::Side::Buy,
+        quantity: 10,
+        symbol: ouch::Alpha::right_padded("ZVZZT").unwrap(),
+        price: ouch::Price(10_000),
+        time_in_force: b'0',
+        display: b'Y',
+        capacity: b'A',
+        intermarket_sweep: b'N',
+        cross_type: b'N',
+        cl_ord_id: ouch::Alpha::right_padded("A1").unwrap(),
+        options: ouch::Options::default(),
+    };
+    let bytes = enter.to_bytes().unwrap();
+    let inbound = <ouch::Inbound as Wire>::parse(&bytes).unwrap();
+    let mut exchange = ouch::Exchange::new(ouch::ExchangeConfig::default()).unwrap();
+    let token = ouch::Token {
+        user_ref_idx: 0,
+        user_ref: 1,
+    };
+    assert_eq!(
+        exchange.receive(&inbound, 0),
+        [ouch::Action::Event(ouch::Event::EnterRequested(token))]
+    );
+    let accepted = exchange.accept(token, 1).unwrap().to_bytes().unwrap();
+    assert!(matches!(
+        <ouch::Outbound as Wire>::parse(&accepted),
+        Ok(ouch::Outbound::OrderAccepted(_))
+    ));
 }

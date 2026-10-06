@@ -760,3 +760,17 @@ path = "fuzz_targets/moldudp64.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "itch"
+path = "fuzz_targets/itch.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ouch"
+path = "fuzz_targets/ouch.rs"
+test = false
+doc = false
+bench = false
