@@ -511,9 +511,7 @@
 //! `serve` and change that part.
 
 
-use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::pin::Pin;
 use std::sync::Arc;
 
 use http::{Request, Response};
@@ -826,7 +824,7 @@ pub struct Proxy {
 impl tower_service::Service<Request<Body>> for Proxy {
     type Response = Response<hyper::body::Incoming>;
     type Error = Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Error>> + Send>>;
+    type Future = std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self::Response, Error>> + Send>>;
 
     fn poll_ready(&mut self, _task: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Error>> {
         std::task::Poll::Ready(Ok(()))

@@ -26,7 +26,7 @@ use fictionet::stdlib::httpd::{self, Http1, Router};
 use fictionet::stdlib::journal::{ConnInfo, Entry, Event, Fields, Journal, Level};
 use fictionet::stdlib::json;
 use fictionet::stdlib::modbus::{self, Exception, Frame, Request as MbRequest, Response as MbResponse};
-use fictionet::stdlib::net::{Host, Net};
+use fictionet::stdlib::net::Net;
 use fictionet::stdlib::route::Prefix;
 use fictionet::stdlib::scenario::Scenario;
 use fictionet::stdlib::serve::{
@@ -1022,6 +1022,7 @@ fn a_tower_service_runs_as_a_handler() {
 // TLS by name
 
 /// A server config for `names`, and roots that trust it.
+#[cfg(feature = "tokio")]
 fn tls_pair(names: &[&str]) -> (Arc<rustls::ServerConfig>, Arc<rustls::RootCertStore>) {
     let mut ca = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
     ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -1043,6 +1044,7 @@ fn tls_pair(names: &[&str]) -> (Arc<rustls::ServerConfig>, Arc<rustls::RootCertS
 }
 
 #[test]
+#[cfg(feature = "tokio")]
 fn net_routes_tls_by_name_to_each_service() {
     /// Answers each line in upper case.
     struct Upper;
@@ -1071,7 +1073,7 @@ fn net_routes_tls_by_name_to_each_service() {
             .journal(journal)
             .ipv4_only()
             .add_host(
-                Host::new("tls")
+                fictionet::stdlib::net::Host::new("tls")
                     .at(addr)
                     .tls(6514, Some("a.test"), move |_| ca.clone(), Arc::new(()), || Echo)
                     .tls(6514, Some("b.test"), move |_| cb.clone(), Arc::new(()), || Upper),
