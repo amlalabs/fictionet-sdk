@@ -19,11 +19,11 @@ use fictionet::prelude::*;
 use fictionet::stdlib::dns::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use fictionet::stdlib::dns::rr::{Name, RData, RecordType};
 use fictionet::stdlib::tls;
+use fictionet::stdlib::journal::{Entry, Fields, Journal};
 use fictionet::stdlib::{ConnError, Connection, dhcp, ip, tcp, udp, web};
 use fictionet::{Attacher, Cx, End, Interface, Packet, block_on, run};
 use http::{HeaderMap, Request, Response, StatusCode, Version};
 use http_body_util::{BodyExt, Empty, Full};
-use hyper::body::Incoming;
 use rcgen::{BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, RootCertStore};
@@ -121,10 +121,11 @@ const DUAL_ADDR: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 50);
 const DUAL_ADDR6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0x50, 0, 0, 0, 0, 0x10);
 const V6ONLY_ADDR6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0x50, 0, 0, 0, 0, 0x20);
 
-/// What `events.test` tells the event callback about a page, through the
+/// What `events.test` tells the journal about a page, through the
 /// response's extensions.
-#[derive(Clone, Debug, PartialEq)]
-struct Page(&'static str);
+fn page(kind: &'static str) -> Fields {
+    Fields::new().with("page", kind)
+}
 
 /// The size of `events.test/big`.
 const BIG: usize = 4 << 20;
@@ -134,7 +135,7 @@ fn events_site() -> axum::Router {
         .route(
             "/page",
             axum::routing::get(|Extension(t): Extension<web::Target>| async move {
-                (Extension(Page("article")), format!("page sni={:?}", t.sni))
+                (Extension(page("article")), format!("page sni={:?}", t.sni))
             }),
         )
         .route("/big", axum::routing::get(|| async { vec![b'x'; BIG] }))
@@ -152,7 +153,7 @@ fn events_site() -> axum::Router {
 /// - `inside.test`: asks for an address inside the sandboxes' subnet.
 /// - `broken.test`: a handler that fails.
 /// - `*.wild.test`: the plain service, each name its own automatic address.
-/// - `events.test`: axum, HTTPS, at 203.0.113.20. `/page` puts a [`Page`]
+/// - `events.test`: axum, HTTPS, at 203.0.113.20. `/page` puts a [`page`]
 ///   in its response's extensions; `/big` answers with 4 MiB; `/wait`
 ///   never answers.
 /// - `slow.test`: the same handler, HTTP only, an automatic address.
@@ -259,7 +260,7 @@ fn sites(cx: &Cx) -> TestSites {
 #[derive(Clone)]
 struct Plain(&'static str);
 
-impl tower_service::Service<Request<Incoming>> for Plain {
+impl tower_service::Service<Request<web::Body>> for Plain {
     type Response = Response<Full<Bytes>>;
     type Error = Infallible;
     type Future = std::future::Ready<Result<Self::Response, Infallible>>;
@@ -268,7 +269,7 @@ impl tower_service::Service<Request<Incoming>> for Plain {
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, request: Request<Incoming>) -> Self::Future {
+    fn call(&mut self, request: Request<web::Body>) -> Self::Future {
         let t = request.extensions().get::<web::Target>().expect("serve sets a Target");
         let body = format!("{} {} {} {} {:?} {}", self.0, t.scheme, t.host, t.port, request.version(), request.uri().path());
         std::future::ready(Ok(Response::new(Full::new(Bytes::from(body)))))
@@ -279,7 +280,7 @@ impl tower_service::Service<Request<Incoming>> for Plain {
 #[derive(Clone)]
 struct Broken;
 
-impl tower_service::Service<Request<Incoming>> for Broken {
+impl tower_service::Service<Request<web::Body>> for Broken {
     type Response = Response<Full<Bytes>>;
     type Error = std::io::Error;
     type Future = std::future::Ready<Result<Self::Response, std::io::Error>>;
@@ -288,7 +289,7 @@ impl tower_service::Service<Request<Incoming>> for Broken {
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, _: Request<Incoming>) -> Self::Future {
+    fn call(&mut self, _: Request<web::Body>) -> Self::Future {
         std::future::ready(Err(std::io::Error::other("broken on purpose")))
     }
 }
@@ -845,7 +846,7 @@ fn a_tls_site_with_plain_http_answers_port_80_itself() {
         let plain: Vec<_> = seen.iter().filter(|h| h.local.port() == 80).collect();
         assert_eq!(plain.len(), 2);
         for h in plain {
-            assert_eq!(h.answer, web::HttpAnswer::Handler);
+            assert_eq!(h.answer, HttpAnswer::Handler);
             assert_eq!(h.scheme, http::uri::Scheme::HTTP);
             assert_eq!(h.sni, None);
             assert_eq!(h.status, Some(StatusCode::OK));
@@ -2187,7 +2188,263 @@ fn a_client_that_half_closes_after_its_request_gets_the_response() {
 // Tests: events
 
 /// The log of events a test world keeps.
-type Log = Arc<std::sync::Mutex<Vec<web::Event>>>;
+type Log = Arc<std::sync::Mutex<Vec<Ev>>>;
+
+// The journal's entries, read back into the shape the old `web::Event`
+// had, so each test states what it checks the same way.
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Sandbox {
+    id: u64,
+    name: Arc<str>,
+    addr: Option<Ipv4Addr>,
+    addr_v6: Option<Ipv6Addr>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DnsAnswer {
+    Addr(IpAddr),
+    NoData,
+    NxDomain,
+    Error(u16),
+    None,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Dns {
+    sandbox: Sandbox,
+    tcp: bool,
+    name: Option<String>,
+    qtype: Option<u16>,
+    answer: DnsAnswer,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TlsOutcome {
+    Accepted { alpn: Option<Vec<u8>> },
+    Rejected,
+    Alert(u8),
+    Failed(String),
+    Closed,
+    TimedOut,
+    Aborted,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Tls {
+    sandbox: Sandbox,
+    conn: u64,
+    addr: IpAddr,
+    sni: Option<String>,
+    outcome: TlsOutcome,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HttpAnswer {
+    Handler,
+    Error,
+    Redirect,
+    Misdirected,
+    NoHost,
+    Cancelled,
+}
+
+#[derive(Clone, Debug)]
+struct Http {
+    sandbox: Sandbox,
+    conn: u64,
+    local: SocketAddr,
+    scheme: http::uri::Scheme,
+    sni: Option<String>,
+    host: Option<String>,
+    started: f64,
+    method: http::Method,
+    uri: http::Uri,
+    version: Version,
+    headers: HeaderMap,
+    answer: HttpAnswer,
+    status: Option<StatusCode>,
+    sent: u64,
+    complete: bool,
+    /// The `page` field a handler added.
+    page: Option<String>,
+    /// How many fields the handler added.
+    extra: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HttpErrorCause {
+    Protocol,
+    Timeout,
+    Transport,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HttpError {
+    sandbox: Sandbox,
+    conn: u64,
+    local: SocketAddr,
+    cause: HttpErrorCause,
+    detail: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockedWhy {
+    NotItsAddress,
+    OtherSandbox,
+    Broadcast,
+    Ipv6,
+    Malformed,
+    NoRoute,
+    ClosedPort,
+    TooManyConnections,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Blocked {
+    sandbox: Sandbox,
+    why: BlockedWhy,
+    protocol: Option<u8>,
+    src: Option<IpAddr>,
+    dst: Option<IpAddr>,
+    dst_port: Option<u16>,
+}
+
+#[derive(Clone, Debug)]
+enum Ev {
+    Attached { sandbox: Sandbox },
+    Bound { sandbox: Sandbox, by_dhcp: bool },
+    Detached { sandbox: Sandbox },
+    Dns(Dns),
+    Tls(Tls),
+    Http(Http),
+    HttpError(HttpError),
+    Blocked(Blocked),
+}
+
+/// A journal that keeps every entry in `log`, as an [`Ev`].
+fn keeping(log: Log) -> Journal {
+    let journal = Journal::new();
+    journal.subscribe(move |e| {
+        if let Some(ev) = ev(e) {
+            log.lock().unwrap_or_else(|p| p.into_inner()).push(ev);
+        }
+    });
+    journal
+}
+
+fn ev(e: &Entry) -> Option<Ev> {
+    let s = e.conn.sandbox.as_ref()?;
+    let sandbox = Sandbox { id: s.id, name: s.name.clone(), addr: s.addr, addr_v6: s.addr_v6 };
+    let text = |n: &str| e.str(n).map(str::to_owned);
+    let num = |n: &str| e.u64(n);
+    let conn = e.conn.id.unwrap_or(0);
+    let local = e.conn.local.unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
+    Some(match (e.event.service, e.event.kind) {
+        ("net", "attached") => Ev::Attached { sandbox },
+        ("net", "bound") => Ev::Bound { sandbox, by_dhcp: e.get("by_dhcp").and_then(|v| v.as_bool()) == Some(true) },
+        ("net", "detached") => Ev::Detached { sandbox },
+        ("dns", "query") => Ev::Dns(Dns {
+            sandbox,
+            tcp: e.get("tcp").and_then(|v| v.as_bool()) == Some(true),
+            name: text("name"),
+            qtype: num("qtype").map(|q| q as u16),
+            answer: match e.str("answer")? {
+                "addr" => DnsAnswer::Addr(e.str("addr")?.parse().ok()?),
+                "nodata" => DnsAnswer::NoData,
+                "nxdomain" => DnsAnswer::NxDomain,
+                "error" => DnsAnswer::Error(num("rcode")? as u16),
+                _ => DnsAnswer::None,
+            },
+        }),
+        ("tls", "handshake") => Ev::Tls(Tls {
+            sandbox,
+            conn,
+            addr: e.str("addr")?.parse().ok()?,
+            sni: text("sni"),
+            outcome: match e.str("outcome")? {
+                "accepted" => TlsOutcome::Accepted { alpn: text("alpn").map(String::into_bytes) },
+                "rejected" => TlsOutcome::Rejected,
+                "alert" => TlsOutcome::Alert(num("alert")? as u8),
+                "failed" => TlsOutcome::Failed(text("detail").unwrap_or_default()),
+                "closed" => TlsOutcome::Closed,
+                "timed_out" => TlsOutcome::TimedOut,
+                _ => TlsOutcome::Aborted,
+            },
+        }),
+        ("http", "request") => {
+            let mut headers = HeaderMap::new();
+            for pair in e.get("headers")?.as_array()? {
+                let pair = pair.as_array()?;
+                let name = http::HeaderName::from_bytes(pair[0].as_str()?.as_bytes()).ok()?;
+                headers.append(name, pair[1].as_str()?.parse().ok()?);
+            }
+            let standard = [
+                "scheme", "sni", "host", "method", "uri", "path", "query", "version", "headers", "started", "answer", "status",
+                "sent", "complete",
+            ];
+            Ev::Http(Http {
+                sandbox,
+                conn,
+                local,
+                scheme: e.str("scheme")?.parse().ok()?,
+                sni: text("sni"),
+                host: text("host"),
+                started: e.get("started")?.as_f64()?,
+                method: e.str("method")?.parse().ok()?,
+                uri: e.str("uri")?.parse().ok()?,
+                version: match e.str("version")? {
+                    "HTTP/2.0" => Version::HTTP_2,
+                    "HTTP/1.0" => Version::HTTP_10,
+                    _ => Version::HTTP_11,
+                },
+                headers,
+                answer: match e.str("answer")? {
+                    "handler" => HttpAnswer::Handler,
+                    "error" => HttpAnswer::Error,
+                    "redirect" => HttpAnswer::Redirect,
+                    "misdirected" => HttpAnswer::Misdirected,
+                    "no_host" => HttpAnswer::NoHost,
+                    _ => HttpAnswer::Cancelled,
+                },
+                status: num("status").and_then(|s| StatusCode::from_u16(s as u16).ok()),
+                sent: num("sent")?,
+                complete: e.get("complete").and_then(|v| v.as_bool()) == Some(true),
+                page: text("page"),
+                extra: e.event.fields.iter().filter(|(n, _)| !standard.contains(n)).count(),
+            })
+        }
+        ("http", "error") => Ev::HttpError(HttpError {
+            sandbox,
+            conn,
+            local,
+            cause: match e.str("cause")? {
+                "protocol" => HttpErrorCause::Protocol,
+                "timeout" => HttpErrorCause::Timeout,
+                _ => HttpErrorCause::Transport,
+            },
+            detail: text("detail").unwrap_or_default(),
+        }),
+        ("net", "blocked") => Ev::Blocked(Blocked {
+            sandbox,
+            why: match e.str("why")? {
+                "NotItsAddress" => BlockedWhy::NotItsAddress,
+                "OtherSandbox" => BlockedWhy::OtherSandbox,
+                "Broadcast" => BlockedWhy::Broadcast,
+                "Ipv6" => BlockedWhy::Ipv6,
+                "Malformed" => BlockedWhy::Malformed,
+                "NoRoute" => BlockedWhy::NoRoute,
+                "ClosedPort" => BlockedWhy::ClosedPort,
+                _ => BlockedWhy::TooManyConnections,
+            },
+            protocol: num("protocol").map(|p| p as u8),
+            src: text("src").and_then(|a| a.parse().ok()),
+            dst: text("dst").and_then(|a| a.parse().ok()),
+            dst_port: num("dst_port").map(|p| p as u16),
+        }),
+        _ => return None,
+    })
+}
 
 /// [`world`], with an event callback that keeps every event in a [`Log`].
 fn world_events<F, Fut>(f: F)
@@ -2201,7 +2458,7 @@ where
             let (attacher, attachments) = fictionet::attachments();
             let mut t = sites(&cx);
             let keep = log.clone();
-            t.sites = t.sites.on_event(move |_cx, e| keep.lock().unwrap_or_else(|p| p.into_inner()).push(e.clone()));
+            t.sites = t.sites.journal(keeping(keep));
             let env = t.serve_with(&cx, attachments)?;
             f(cx, attacher, env, log).await?;
             Err(Box::new(Done) as fictionet::Error)
@@ -2215,12 +2472,12 @@ where
 }
 
 /// The events so far that `pick` keeps.
-fn picked<T>(log: &Log, pick: impl FnMut(&web::Event) -> Option<T>) -> Vec<T> {
+fn picked<T>(log: &Log, pick: impl FnMut(&Ev) -> Option<T>) -> Vec<T> {
     log.lock().unwrap_or_else(|p| p.into_inner()).iter().filter_map(pick).collect()
 }
 
 /// Waits up to 5 s until `pick` keeps `n` events, and returns them.
-async fn wait_for<T>(cx: &Cx, log: &Log, n: usize, mut pick: impl FnMut(&web::Event) -> Option<T>) -> Vec<T> {
+async fn wait_for<T>(cx: &Cx, log: &Log, n: usize, mut pick: impl FnMut(&Ev) -> Option<T>) -> Vec<T> {
     for _ in 0..500 {
         let got = picked(log, &mut pick);
         if got.len() >= n {
@@ -2231,53 +2488,52 @@ async fn wait_for<T>(cx: &Cx, log: &Log, n: usize, mut pick: impl FnMut(&web::Ev
     panic!("fewer than {n} such events: {:#?}", log.lock().unwrap());
 }
 
-fn is(s: &web::Sandbox, name: &str, addr: Option<Ipv4Addr>) -> bool {
+fn is(s: &Sandbox, name: &str, addr: Option<Ipv4Addr>) -> bool {
     &*s.name == name && s.addr == addr
 }
 
-fn sandbox_of(e: &web::Event) -> Option<&web::Sandbox> {
+fn sandbox_of(e: &Ev) -> Option<&Sandbox> {
     Some(match e {
-        web::Event::Attached { sandbox, .. } | web::Event::Bound { sandbox, .. } | web::Event::Detached { sandbox, .. } => sandbox,
-        web::Event::Dns(d) => &d.sandbox,
-        web::Event::Tls(t) => &t.sandbox,
-        web::Event::Http(h) => &h.sandbox,
-        web::Event::HttpError(b) => &b.sandbox,
-        web::Event::Blocked(b) => &b.sandbox,
-        _ => return None,
+        Ev::Attached { sandbox, .. } | Ev::Bound { sandbox, .. } | Ev::Detached { sandbox, .. } => sandbox,
+        Ev::Dns(d) => &d.sandbox,
+        Ev::Tls(t) => &t.sandbox,
+        Ev::Http(h) => &h.sandbox,
+        Ev::HttpError(b) => &b.sandbox,
+        Ev::Blocked(b) => &b.sandbox,
     })
 }
 
-fn dns_seen(e: &web::Event) -> Option<web::Dns> {
+fn dns_seen(e: &Ev) -> Option<Dns> {
     match e {
-        web::Event::Dns(d) => Some(d.clone()),
+        Ev::Dns(d) => Some(d.clone()),
         _ => None,
     }
 }
 
-fn tls_seen(e: &web::Event) -> Option<web::Tls> {
+fn tls_seen(e: &Ev) -> Option<Tls> {
     match e {
-        web::Event::Tls(t) => Some(t.clone()),
+        Ev::Tls(t) => Some(t.clone()),
         _ => None,
     }
 }
 
-fn http_seen(e: &web::Event) -> Option<web::Http> {
+fn http_seen(e: &Ev) -> Option<Http> {
     match e {
-        web::Event::Http(h) => Some(h.clone()),
+        Ev::Http(h) => Some(h.clone()),
         _ => None,
     }
 }
 
-fn error_seen(e: &web::Event) -> Option<web::HttpError> {
+fn error_seen(e: &Ev) -> Option<HttpError> {
     match e {
-        web::Event::HttpError(b) => Some(b.clone()),
+        Ev::HttpError(b) => Some(b.clone()),
         _ => None,
     }
 }
 
-fn blocked_seen(e: &web::Event) -> Option<web::Blocked> {
+fn blocked_seen(e: &Ev) -> Option<Blocked> {
     match e {
-        web::Event::Blocked(b) => Some(b.clone()),
+        Ev::Blocked(b) => Some(b.clone()),
         _ => None,
     }
 }
@@ -2307,20 +2563,20 @@ fn events_attach_bind_and_detach() {
         assert_eq!(ack.message_type(), Some(dhcp::ACK));
 
         drop(a);
-        wait_for(&cx, &log, 1, |e| matches!(e, web::Event::Detached { .. }).then_some(())).await;
+        wait_for(&cx, &log, 1, |e| matches!(e, Ev::Detached { .. }).then_some(())).await;
 
         let of = |name: &str| picked(&log, |e| (&*sandbox_of(e)?.name == name).then(|| e.clone()));
         let a_events = of("a");
         assert_eq!(a_events.len(), 3, "{a_events:#?}");
-        assert!(matches!(&a_events[0], web::Event::Attached { sandbox, .. } if is(sandbox, "a", None) && sandbox.id == 1));
-        assert!(matches!(&a_events[1], web::Event::Bound { sandbox, by_dhcp: false, .. } if is(sandbox, "a", Some(me))));
-        assert!(matches!(&a_events[2], web::Event::Detached { sandbox, .. } if is(sandbox, "a", Some(me)) && sandbox.id == 1));
+        assert!(matches!(&a_events[0], Ev::Attached { sandbox, .. } if is(sandbox, "a", None) && sandbox.id == 1));
+        assert!(matches!(&a_events[1], Ev::Bound { sandbox, by_dhcp: false, .. } if is(sandbox, "a", Some(me))));
+        assert!(matches!(&a_events[2], Ev::Detached { sandbox, .. } if is(sandbox, "a", Some(me)) && sandbox.id == 1));
 
         let d_events = of("d");
-        assert!(matches!(&d_events[0], web::Event::Attached { sandbox, .. } if is(sandbox, "d", None) && sandbox.id == 2));
-        let bound: Vec<_> = d_events.iter().filter(|e| matches!(e, web::Event::Bound { .. })).collect();
+        assert!(matches!(&d_events[0], Ev::Attached { sandbox, .. } if is(sandbox, "d", None) && sandbox.id == 2));
+        let bound: Vec<_> = d_events.iter().filter(|e| matches!(e, Ev::Bound { .. })).collect();
         assert_eq!(bound.len(), 1, "{d_events:#?}");
-        assert!(matches!(bound[0], web::Event::Bound { sandbox, by_dhcp: true, .. } if is(sandbox, "d", Some(got))));
+        assert!(matches!(bound[0], Ev::Bound { sandbox, by_dhcp: true, .. } if is(sandbox, "d", Some(got))));
         Ok(())
     });
 }
@@ -2359,24 +2615,24 @@ fn events_name_each_attachment_by_id() {
         raw_connect(&cx, &mut a, me, SocketAddr::new(SECURE_ADDR.into(), 443), 30_001, &[]).await;
         let _ = cx.sleep(Duration::from_millis(100)).await;
         drop(a);
-        wait_for(&cx, &log, 1, |e| matches!(e, web::Event::Detached { .. }).then_some(())).await;
+        wait_for(&cx, &log, 1, |e| matches!(e, Ev::Detached { .. }).then_some(())).await;
 
         // The same name and address again: a new id.
         let mut a = attacher.attach("a").unwrap();
         let _ = raw_dns(&cx, &mut a, me, GATEWAY, "secure.test", 3).await.unwrap();
 
         let http = wait_for(&cx, &log, 1, http_seen).await;
-        assert_eq!((http[0].answer, http[0].status, http[0].complete), (web::HttpAnswer::Cancelled, None, false));
+        assert_eq!((http[0].answer, http[0].status, http[0].complete), (HttpAnswer::Cancelled, None, false));
         assert_eq!((http[0].sandbox.id, http[0].host.as_deref(), http[0].uri.path()), (1, Some("slow.test"), "/wait"));
         assert_eq!(http[0].local, SocketAddr::from((slow, 80)));
         let tls = wait_for(&cx, &log, 1, tls_seen).await;
-        assert_eq!((tls[0].sandbox.id, tls[0].outcome.clone()), (1, web::TlsOutcome::Aborted));
+        assert_eq!((tls[0].sandbox.id, tls[0].outcome.clone()), (1, TlsOutcome::Aborted));
         let dns = wait_for(&cx, &log, 3, dns_seen).await;
         let ids: Vec<u64> = dns.iter().map(|d| d.sandbox.id).collect();
         assert_eq!(ids, vec![1, 1, 2]);
         assert!(dns.iter().all(|d| is(&d.sandbox, "a", Some(me))));
         let attached = picked(&log, |e| match e {
-            web::Event::Attached { sandbox, .. } => Some(sandbox.id),
+            Ev::Attached { sandbox, .. } => Some(sandbox.id),
             _ => None,
         });
         assert_eq!(attached, vec![1, 2]);
@@ -2429,15 +2685,15 @@ fn events_for_dns_queries() {
         assert_eq!(
             summary,
             vec![
-                (false, Some("secure.test"), Some(1), web::DnsAnswer::Addr(SECURE_ADDR.into())),
+                (false, Some("secure.test"), Some(1), DnsAnswer::Addr(SECURE_ADDR.into())),
                 // Seen before: the callback does not run, the query is still an event.
-                (false, Some("secure.test"), Some(1), web::DnsAnswer::Addr(SECURE_ADDR.into())),
-                (false, Some("secure.test"), Some(28), web::DnsAnswer::Addr("2001:2::1".parse().unwrap())),
-                (false, Some("nope.test"), Some(1), web::DnsAnswer::NxDomain),
-                (true, Some("nope.test"), Some(1), web::DnsAnswer::NxDomain),
-                (false, None, None, web::DnsAnswer::Error(1)),
-                (false, None, None, web::DnsAnswer::Error(1)),
-                (false, None, None, web::DnsAnswer::None),
+                (false, Some("secure.test"), Some(1), DnsAnswer::Addr(SECURE_ADDR.into())),
+                (false, Some("secure.test"), Some(28), DnsAnswer::Addr("2001:2::1".parse().unwrap())),
+                (false, Some("nope.test"), Some(1), DnsAnswer::NxDomain),
+                (true, Some("nope.test"), Some(1), DnsAnswer::NxDomain),
+                (false, None, None, DnsAnswer::Error(1)),
+                (false, None, None, DnsAnswer::Error(1)),
+                (false, None, None, DnsAnswer::None),
             ]
         );
         assert_eq!(env.calls.load(Ordering::SeqCst), 2);
@@ -2513,13 +2769,13 @@ fn events_for_tls_handshakes() {
         let got = wait_for(&cx, &log, 7, tls_seen).await;
         assert!(got.iter().all(|t| is(&t.sandbox, "a", Some(me))), "{got:#?}");
         let summary: Vec<_> = got.iter().map(|t| (t.addr, t.sni.as_deref(), t.outcome.clone())).collect();
-        assert_eq!(summary[0], (IpAddr::V4(SECURE_ADDR), Some("secure.test"), web::TlsOutcome::Accepted { alpn: Some(b"h2".to_vec()) }));
-        assert_eq!(summary[1], (IpAddr::V4(SECURE_ADDR), None, web::TlsOutcome::Rejected));
-        assert_eq!(summary[2], (IpAddr::V4(SECURE_ADDR), Some("shared.test"), web::TlsOutcome::Rejected));
-        assert_eq!(summary[3], (IpAddr::V4(SECURE_ADDR), Some("secure.test"), web::TlsOutcome::Alert(48)));
-        assert_eq!(summary[4], (IpAddr::V4(EVENTS_ADDR), Some("events.test"), web::TlsOutcome::Accepted { alpn: Some(b"http/1.1".to_vec()) }));
-        assert_eq!(summary[5], (IpAddr::V4(SECURE_ADDR), None, web::TlsOutcome::Closed));
-        assert!(matches!(&summary[6], (_, None, web::TlsOutcome::Failed(_))), "{:?}", summary[6]);
+        assert_eq!(summary[0], (IpAddr::V4(SECURE_ADDR), Some("secure.test"), TlsOutcome::Accepted { alpn: Some(b"h2".to_vec()) }));
+        assert_eq!(summary[1], (IpAddr::V4(SECURE_ADDR), None, TlsOutcome::Rejected));
+        assert_eq!(summary[2], (IpAddr::V4(SECURE_ADDR), Some("shared.test"), TlsOutcome::Rejected));
+        assert_eq!(summary[3], (IpAddr::V4(SECURE_ADDR), Some("secure.test"), TlsOutcome::Alert(48)));
+        assert_eq!(summary[4], (IpAddr::V4(EVENTS_ADDR), Some("events.test"), TlsOutcome::Accepted { alpn: Some(b"http/1.1".to_vec()) }));
+        assert_eq!(summary[5], (IpAddr::V4(SECURE_ADDR), None, TlsOutcome::Closed));
+        assert!(matches!(&summary[6], (_, None, TlsOutcome::Failed(_))), "{:?}", summary[6]);
         // Connections are numbered in order, from 1.
         let conns: Vec<u64> = got.iter().map(|t| t.conn).collect();
         assert_eq!(conns, (1..=7).collect::<Vec<u64>>());
@@ -2556,14 +2812,14 @@ fn events_for_http_requests() {
         }
         let tls = wait_for(&cx, &log, 1, tls_seen).await.remove(0);
         let pages = wait_for(&cx, &log, 3, http_seen).await;
-        let mut last = before;
+        let mut last = before.since_start().as_secs_f64();
         for (h, path) in pages.iter().zip(["/page", "/page?x=1", "/page"]) {
             assert!(is(&h.sandbox, "a", Some(me)));
             assert_eq!(h.conn, tls.conn, "one connection");
-            assert_eq!((h.answer, h.status, h.version), (web::HttpAnswer::Handler, Some(StatusCode::OK), Version::HTTP_2));
+            assert_eq!((h.answer, h.status, h.version), (HttpAnswer::Handler, Some(StatusCode::OK), Version::HTTP_2));
             assert_eq!((h.method.clone(), h.uri.path_and_query().unwrap().as_str()), (http::Method::GET, path));
-            assert_eq!(h.extensions.get::<Page>(), Some(&Page("article")));
-            assert_eq!(h.extensions.len(), 1);
+            assert_eq!(h.page.as_deref(), Some("article"));
+            assert_eq!(h.extra, 1);
             assert_eq!((h.sent, h.complete), ("page sni=Some(\"events.test\")".len() as u64, true));
             assert_eq!((h.scheme.as_str(), h.host.as_deref(), h.sni.as_deref()), ("https", Some("events.test"), Some("events.test")));
             assert_eq!(h.local, SocketAddr::from((EVENTS_ADDR, 443)));
@@ -2572,8 +2828,8 @@ fn events_for_http_requests() {
         }
         // The connection's Tls event came first.
         let order = picked(&log, |e| match e {
-            web::Event::Tls(_) => Some("tls"),
-            web::Event::Http(_) => Some("http"),
+            Ev::Tls(_) => Some("tls"),
+            Ev::Http(_) => Some("http"),
             _ => None,
         });
         assert_eq!(order, vec!["tls", "http", "http", "http"]);
@@ -2592,15 +2848,15 @@ fn events_for_http_requests() {
         let got = wait_for(&cx, &log, 4, http_seen).await;
         let summary: Vec<_> = got
             .iter()
-            .map(|h| (h.answer, h.status.map(|s| s.as_u16()), h.host.clone(), h.local.port(), h.sni.clone(), h.extensions.len(), h.complete))
+            .map(|h| (h.answer, h.status.map(|s| s.as_u16()), h.host.clone(), h.local.port(), h.sni.clone(), h.extra, h.complete))
             .collect();
         assert_eq!(
             summary,
             vec![
-                (web::HttpAnswer::Redirect, Some(301), Some("secure.test".into()), 80, None, 0, true),
-                (web::HttpAnswer::Misdirected, Some(421), Some("unknown.test".into()), 80, None, 0, true),
-                (web::HttpAnswer::Error, Some(500), Some("broken.test".into()), 80, None, 0, true),
-                (web::HttpAnswer::NoHost, Some(400), None, 80, None, 0, true),
+                (HttpAnswer::Redirect, Some(301), Some("secure.test".into()), 80, None, 0, true),
+                (HttpAnswer::Misdirected, Some(421), Some("unknown.test".into()), 80, None, 0, true),
+                (HttpAnswer::Error, Some(500), Some("broken.test".into()), 80, None, 0, true),
+                (HttpAnswer::NoHost, Some(400), None, 80, None, 0, true),
             ]
         );
         assert_eq!(got[0].uri, "/x?y=1");
@@ -2646,7 +2902,7 @@ fn events_for_http_requests() {
         let waiting = send.send_request(Request::get("https://events.test/wait").body(Empty::new()).unwrap());
         assert!(timeout(&cx, Duration::from_millis(200), waiting).await.is_none(), "no answer to /wait");
         let got = wait_for(&cx, &log, 1, http_seen).await;
-        assert_eq!((got[0].answer, got[0].status, got[0].sent, got[0].complete), (web::HttpAnswer::Cancelled, None, 0, false));
+        assert_eq!((got[0].answer, got[0].status, got[0].sent, got[0].complete), (HttpAnswer::Cancelled, None, 0, false));
         assert_eq!(got[0].uri.path(), "/wait");
         assert_eq!(client.get("https", "events.test", "/page").await.status, StatusCode::OK);
         assert_eq!(wait_for(&cx, &log, 2, http_seen).await.len(), 2);
@@ -2668,7 +2924,7 @@ fn events_for_a_client_that_resets_mid_request() {
         assert!(picked(&log, http_seen).is_empty());
         raw.send(tcp_seg(me, 30_000, slow, 80, seq, ack, RST, &[]));
         let got = wait_for(&cx, &log, 1, http_seen).await;
-        assert_eq!((got[0].answer, got[0].status, got[0].complete), (web::HttpAnswer::Cancelled, None, false));
+        assert_eq!((got[0].answer, got[0].status, got[0].complete), (HttpAnswer::Cancelled, None, false));
         assert_eq!((got[0].version, got[0].host.as_deref()), (Version::HTTP_11, Some("slow.test")));
         // A reset is the client going away, not an HTTP error.
         let _ = cx.sleep(Duration::from_millis(100)).await;
@@ -2812,9 +3068,9 @@ fn events_for_bytes_that_are_not_http() {
         assert_eq!(
             summary,
             vec![
-                (SocketAddr::from((plain, 80)), web::HttpErrorCause::Protocol),
-                (SocketAddr::from((plain, 80)), web::HttpErrorCause::Protocol),
-                (SocketAddr::from((EVENTS_ADDR, 443)), web::HttpErrorCause::Transport),
+                (SocketAddr::from((plain, 80)), HttpErrorCause::Protocol),
+                (SocketAddr::from((plain, 80)), HttpErrorCause::Protocol),
+                (SocketAddr::from((EVENTS_ADDR, 443)), HttpErrorCause::Transport),
             ]
         );
         assert!(got.iter().all(|b| is(&b.sandbox, "a", Some(Ipv4Addr::new(10, 0, 0, 2))) && !b.detail.is_empty()));
@@ -2835,15 +3091,15 @@ fn events_for_clients_that_send_nothing() {
         let tls = wait_for_long(&cx, &log, tls_seen).await;
         let took = started.elapsed();
         assert!(took >= Duration::from_secs(10) && took < Duration::from_millis(10_500), "{took:?}");
-        assert_eq!((tls.sni.clone(), tls.outcome.clone()), (None, web::TlsOutcome::TimedOut));
+        assert_eq!((tls.sni.clone(), tls.outcome.clone()), (None, TlsOutcome::TimedOut));
         let bad = wait_for(&cx, &log, 1, error_seen).await;
-        assert_eq!((bad[0].local.port(), bad[0].cause), (80, web::HttpErrorCause::Timeout));
+        assert_eq!((bad[0].local.port(), bad[0].cause), (80, HttpErrorCause::Timeout));
         Ok(())
     });
 }
 
 /// Waits up to 12 s for the first event `pick` keeps.
-async fn wait_for_long<T>(cx: &Cx, log: &Log, mut pick: impl FnMut(&web::Event) -> Option<T>) -> T {
+async fn wait_for_long<T>(cx: &Cx, log: &Log, mut pick: impl FnMut(&Ev) -> Option<T>) -> T {
     for _ in 0..1200 {
         if let Some(t) = picked(log, &mut pick).into_iter().next() {
             return t;
@@ -2856,7 +3112,7 @@ async fn wait_for_long<T>(cx: &Cx, log: &Log, mut pick: impl FnMut(&web::Event) 
 #[test]
 fn events_for_blocked_packets() {
     world_events(|cx, attacher, _env, log| async move {
-        use web::BlockedWhy::*;
+        use BlockedWhy::*;
         let me = Ipv4Addr::new(10, 0, 0, 2);
         let mut raw = attacher.attach("a").unwrap();
 
@@ -3174,13 +3430,13 @@ fn https_http2_and_plain_http_over_ipv6() {
         assert_eq!(tls[0].addr, IpAddr::V6(DUAL_ADDR6));
         assert_eq!(tls[0].sandbox.addr_v6, Some(ME6));
         assert_eq!(tls[0].sandbox.addr, None);
-        assert_eq!((tls[4].addr, &tls[4].outcome), (IpAddr::V6(DUAL_ADDR6), &web::TlsOutcome::Rejected));
+        assert_eq!((tls[4].addr, &tls[4].outcome), (IpAddr::V6(DUAL_ADDR6), &TlsOutcome::Rejected));
         let http = wait_for(&cx, &log, 7, http_seen).await;
         assert_eq!(http[0].local, SocketAddr::new(DUAL_ADDR6.into(), 443));
         assert_eq!(http[2].local, SocketAddr::new(DUAL_ADDR.into(), 443));
         assert_eq!(http[2].sandbox.addr, Some(Ipv4Addr::new(10, 0, 0, 2)));
         let dns = wait_for(&cx, &log, 3, dns_seen).await;
-        assert_eq!(dns[0].answer, web::DnsAnswer::Addr(DUAL_ADDR6.into()));
+        assert_eq!(dns[0].answer, DnsAnswer::Addr(DUAL_ADDR6.into()));
         assert_eq!(dns[0].qtype, Some(28));
         Ok(())
     });
@@ -3241,7 +3497,7 @@ fn ipv6_pings_closed_ports_and_unknown_addresses() {
 #[test]
 fn ipv6_addresses_are_bound_to_one_sandbox() {
     world_events(|cx, attacher, _env, log| async move {
-        use web::BlockedWhy::*;
+        use BlockedWhy::*;
         let me4 = Ipv4Addr::new(10, 0, 0, 2);
         let mut a = attacher.attach("a").unwrap();
         // What a Linux sandbox sends first: a router solicitation from its
@@ -3289,14 +3545,14 @@ fn ipv6_addresses_are_bound_to_one_sandbox() {
 
         // One Bound for each family, and a Detached that names both.
         drop(a);
-        wait_for(&cx, &log, 1, |e| matches!(e, web::Event::Detached { .. }).then_some(())).await;
-        let a_events = picked(&log, |e| (&*sandbox_of(e)?.name == "a" && !matches!(e, web::Event::Blocked(_))).then(|| e.clone()));
+        wait_for(&cx, &log, 1, |e| matches!(e, Ev::Detached { .. }).then_some(())).await;
+        let a_events = picked(&log, |e| (&*sandbox_of(e)?.name == "a" && !matches!(e, Ev::Blocked(_))).then(|| e.clone()));
         assert_eq!(a_events.len(), 4, "{a_events:#?}");
-        let at = |e: &web::Event| sandbox_of(e).map(|s| (s.addr, s.addr_v6));
-        assert!(matches!(&a_events[1], web::Event::Bound { by_dhcp: false, .. }));
+        let at = |e: &Ev| sandbox_of(e).map(|s| (s.addr, s.addr_v6));
+        assert!(matches!(&a_events[1], Ev::Bound { by_dhcp: false, .. }));
         assert_eq!(at(&a_events[1]), Some((None, Some(ME6))));
         assert_eq!(at(&a_events[2]), Some((Some(me4), Some(ME6))));
-        assert!(matches!(&a_events[3], web::Event::Detached { .. }));
+        assert!(matches!(&a_events[3], Ev::Detached { .. }));
         assert_eq!(at(&a_events[3]), Some((Some(me4), Some(ME6))));
 
         // Now the address is free, and the second sandbox can take it.
@@ -3318,7 +3574,7 @@ where
         block_on(run(move |cx| async move {
             let (attacher, attachments) = fictionet::attachments();
             let keep = log.clone();
-            make().on_event(move |_cx, e| keep.lock().unwrap_or_else(|p| p.into_inner()).push(e.clone())).serve(&cx, attachments)?;
+            make().journal(keeping(keep)).serve(&cx, attachments)?;
             f(cx, attacher, log).await?;
             Err(Box::new(Done) as fictionet::Error)
         }))
@@ -3352,7 +3608,7 @@ fn an_ipv4_only_network_drops_ipv6_and_answers_aaaa_with_nodata() {
         raw.send(ping6(ME6, GATEWAY6, 1));
         assert!(recv_within(&cx, &mut raw, SHORT).await.is_none());
         let got = wait_for(&cx, &log, 1, blocked_seen).await;
-        assert_eq!((got[0].why, got[0].dst), (web::BlockedWhy::Ipv6, Some(IpAddr::V6(GATEWAY6))));
+        assert_eq!((got[0].why, got[0].dst), (BlockedWhy::Ipv6, Some(IpAddr::V6(GATEWAY6))));
         Ok(())
     });
 }
@@ -3616,7 +3872,7 @@ fn dns_makes_no_more_sites_than_the_limit() {
             let answer = raw_dns6(&cx, &mut raw, ME6, GATEWAY6, name, RecordType::AAAA).await.unwrap();
             assert_eq!(answer, (ResponseCode::ServFail, vec![]), "{name}");
         }
-        assert_eq!(picked(&log, dns_seen).iter().filter(|d| d.answer == web::DnsAnswer::Error(2)).count(), 3);
+        assert_eq!(picked(&log, dns_seen).iter().filter(|d| d.answer == DnsAnswer::Error(2)).count(), 3);
         // The first eight still answer, and have machines.
         let site0 = Ipv6Addr::from(u128::from("2001:2::".parse::<Ipv6Addr>().unwrap()) + 1);
         let answer = raw_dns6(&cx, &mut raw, ME6, GATEWAY6, "n0.test", RecordType::AAAA).await.unwrap();

@@ -1,5 +1,5 @@
-//! HTTP as `web::Sites` serves it (hyper's HTTP/1.1 and HTTP/2, through
-//! `http_serve`), reached the way a sandbox reaches it: a DNS lookup, a
+//! HTTP as `web::Sites` serves it (`httpd::Http1`, and hyper's HTTP/2, through
+//! `httpd::serve_connection`), reached the way a sandbox reaches it: a DNS lookup, a
 //! TCP connection to the site's machine, and TLS when the input asks for
 //! it. The request bytes are the fuzzer's. One more mode sends the bytes to
 //! the gateway's DNS server over TCP instead.

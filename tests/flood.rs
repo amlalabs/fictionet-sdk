@@ -22,7 +22,6 @@ use fictionet::stdlib::{ip, tcp, udp, web};
 use fictionet::{Attacher, Cx, End, Interface, Packet, block_on, run};
 use http::{Request, Response};
 use http_body_util::Full;
-use hyper::body::Incoming;
 
 const GATEWAY: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 const ME: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
@@ -33,7 +32,7 @@ const ACK: u8 = 0x10;
 #[derive(Clone)]
 struct Hello;
 
-impl tower_service::Service<Request<Incoming>> for Hello {
+impl tower_service::Service<Request<fictionet::stdlib::web::Body>> for Hello {
     type Response = Response<Full<Bytes>>;
     type Error = Infallible;
     type Future = std::future::Ready<Result<Self::Response, Infallible>>;
@@ -42,7 +41,7 @@ impl tower_service::Service<Request<Incoming>> for Hello {
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, _: Request<Incoming>) -> Self::Future {
+    fn call(&mut self, _: Request<fictionet::stdlib::web::Body>) -> Self::Future {
         std::future::ready(Ok(Response::new(Full::new(Bytes::from_static(b"hello\n")))))
     }
 }

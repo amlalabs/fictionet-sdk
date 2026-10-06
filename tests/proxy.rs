@@ -84,13 +84,17 @@ impl World {
                     })),
                     _ => None,
                 })
-                .on_event(move |_, event| {
-                    if let web::Event::Dns(d) = event
-                        && d.qtype == Some(1)
-                        && let Some(name) = &d.name
-                    {
-                        *queries2.lock().unwrap().entry(name.clone()).or_default() += 1;
-                    }
+                .journal({
+                    let journal = fictionet::stdlib::journal::Journal::new();
+                    journal.subscribe(move |e| {
+                        if e.is("dns", "query")
+                            && e.u64("qtype") == Some(1)
+                            && let Some(name) = e.str("name")
+                        {
+                            *queries2.lock().unwrap().entry(name.to_owned()).or_default() += 1;
+                        }
+                    });
+                    journal
                 })
                 .serve(&cx, attachments)?;
                 while !stop2.load(Ordering::SeqCst) {

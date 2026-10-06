@@ -38,7 +38,6 @@ use fictionet::stdlib::{self, ConnError, Connection, ip, tcp, tls, udp, web};
 use fictionet::{Attacher, Cx, End, Interface, Packet, RecvError, WorldSocket, block_on, listen, pair, run};
 use http::{Request, Response, StatusCode, Version};
 use http_body_util::{BodyExt, Empty, Full};
-use hyper::body::Incoming;
 use rcgen::{BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, RootCertStore};
@@ -767,7 +766,7 @@ struct HttpCase {
     body: usize,
     sites: usize,
     watch: Watch,
-    /// Whether the world sets a `Sites::on_event` callback (one that does
+    /// Whether the world sets a journal with a callback (one that does
     /// nothing).
     hooks: bool,
 }
@@ -775,14 +774,14 @@ struct HttpCase {
 #[derive(Clone)]
 struct Page(Bytes);
 
-impl tower_service::Service<Request<Incoming>> for Page {
+impl tower_service::Service<Request<fictionet::stdlib::web::Body>> for Page {
     type Response = Response<Full<Bytes>>;
     type Error = Infallible;
     type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
     fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
     }
-    fn call(&mut self, _: Request<Incoming>) -> Self::Future {
+    fn call(&mut self, _: Request<fictionet::stdlib::web::Body>) -> Self::Future {
         std::future::ready(Ok(Response::new(Full::new(self.0.clone()))))
     }
 }
@@ -831,7 +830,7 @@ fn http_row(t: &mut Table, reps: usize, case: HttpCase) {
         if case.h2 { "HTTP/2" } else { "HTTP/1.1" },
         case.sandboxes,
         if case.sites > 1 { format!(", {} sites", case.sites) } else { String::new() },
-        if case.hooks { ", on_event set" } else { "" },
+        if case.hooks { ", journal set" } else { "" },
         match case.watch {
             Watch::None => "",
             Watch::Graph => ", graph watched",
@@ -933,7 +932,9 @@ fn http_run(case: HttpCase) -> HttpRun {
             Some(web::Site::new(page.clone()).tls(move |_| config.clone()))
         });
         if case.hooks {
-            sites = sites.on_event(|_, _| {});
+            let journal = fictionet::stdlib::journal::Journal::new();
+            journal.subscribe(|_| {});
+            sites = sites.journal(journal);
         }
         sites.serve(&cx, attachments)?;
         let machines: Vec<Machine> =
@@ -1375,13 +1376,17 @@ fn proxy_run(burst: usize, sequential: usize) -> ((u64, f64), (u64, f64)) {
             finish(block_on(run(move |cx| async move {
                 let page = Page(Bytes::from_static(b"plain site\n"));
                 web::Sites::new(move |host: &str| (host == "plain.test").then(|| web::Site::new(page.clone()).plain_http()))
-                    .on_event(move |_, event| {
-                        if let web::Event::Dns(d) = event
-                            && let Some(name) = &d.name
-                            && d.qtype == Some(1)
-                        {
-                            *queries.lock().unwrap().entry(name.clone()).or_default() += 1;
-                        }
+                    .journal({
+                        let journal = fictionet::stdlib::journal::Journal::new();
+                        journal.subscribe(move |e| {
+                            if e.is("dns", "query")
+                                && let Some(name) = e.str("name")
+                                && e.u64("qtype") == Some(1)
+                            {
+                                *queries.lock().unwrap().entry(name.to_owned()).or_default() += 1;
+                            }
+                        });
+                        journal
                     })
                     .serve(&cx, attachments)?;
                 while !stop.load(Ordering::Acquire) {

@@ -6,11 +6,12 @@
 //! network around the answers: DNS, addresses, a router, one machine per
 //! address, TLS, and HTTP. You write only the sites.
 //!
-//! `Sites` is plain stdlib code, built from the same public pieces a world
-//! could use by hand: [`ip`](crate::stdlib::ip),
-//! [`route`](crate::stdlib::route), [`tcp`](crate::stdlib::tcp),
-//! [`udp`](crate::stdlib::udp), [`dns`](crate::stdlib::dns) and
-//! [`tls`](crate::stdlib::tls).
+//! `Sites` is a preset on [`net::Net`](crate::stdlib::net::Net): each site
+//! is a [`Host`](crate::stdlib::net::Host) with a DNS name per site and a
+//! [`Website`](crate::stdlib::net::Website) on ports 80 and 443, made when
+//! its name is first looked up. HTTP is
+//! [`httpd`](crate::stdlib::httpd), a service like any other. A world that
+//! needs other services next to its websites builds on `Net` directly.
 //!
 //! In this world, two sites are served by the world's own axum routers.
 //! `en.wikipedia.org` has the IPv4 and IPv6 addresses it has on the real
@@ -108,16 +109,20 @@
 //!   it gets an address or a machine. The name is not kept, so looking it
 //!   up again runs the callback again.
 //!
-//! To see which names the agent tried, watch the [`Dns`] events (see
+//! To see which names the agent tried, watch the `dns.query` events (see
 //! [Events](#events)).
 //!
 //! # Handlers
 //!
-//! A handler is any [`tower_service::Service`] that takes an
-//! `http::Request` and returns an `http::Response`. An `axum::Router` is
-//! one. So is a plain async function wrapped in `tower::service_fn`. So is
-//! `web::proxy()` (feature `tokio`, on by default), which forwards to the
-//! real site.
+//! [`Site::new`] takes any [`tower_service::Service`] that takes an
+//! `http::Request<web::Body>` and returns an `http::Response`. An
+//! `axum::Router` is one. So is a plain async function wrapped in
+//! `tower::service_fn`. So is `web::proxy()` (feature `tokio`, on by
+//! default), which forwards to the real site. [`Site::handler`] takes an
+//! [`httpd::Handler`](crate::stdlib::httpd::Handler) instead, such as an
+//! [`httpd::Router`](crate::stdlib::httpd::Router), whose handlers get plain
+//! byte bodies and no runtime. A request's body is read whole before the
+//! handler is called, up to 64 MiB; past that the answer is `413`.
 //!
 //! # Passing a site through to the real one
 //!
@@ -147,8 +152,8 @@
 //! as its names, so it covers `api.github.com` too. A name two levels
 //! deeper, such as `a.b.github.com`, needs a certificate of its own.
 //!
-//! The site's [`Http`] events show the request the agent sent and the
-//! answer it got. If the real site cannot be reached, the agent gets
+//! The site's `http.request` events show the request the agent sent and
+//! the answer it got. If the real site cannot be reached, the agent gets
 //! `502 Bad Gateway`.
 //!
 //! # What `serve` builds
@@ -236,7 +241,9 @@
 //!     80 too.
 //!   - a site without `tls`: served over plain HTTP on 80. A TLS handshake
 //!     for its name on 443 is rejected with `unrecognized_name`.
-//! - **HTTP/1.1 and HTTP/2** with hyper on every connection. Over TLS, the
+//! - **HTTP/1.0, HTTP/1.1 and HTTP/2** on every connection: HTTP/1 with
+//!   [`httpd::Http1`](crate::stdlib::httpd::Http1), HTTP/2 with hyper for
+//!   now. Over TLS, the
 //!   version is agreed in the handshake (ALPN): `serve` sets the ALPN list
 //!   of each config to `h2` and `http/1.1`, so a browser gets HTTP/2 and
 //!   `curl` gets what it asks for. Without TLS, the version is read from the
@@ -296,8 +303,8 @@
 //!   from an address inside the subnet, other than the subnet's first
 //!   address and the gateway. After that, the rules are the same as for
 //!   IPv4: other sources are dropped, and the address is free again when
-//!   the sandbox detaches. A sandbox gets one [`Bound`](Event::Bound) event
-//!   for each family.
+//!   the sandbox detaches. A sandbox gets one `net.bound` event for each
+//!   family.
 //! - **The kernel's own packets do no harm.** A Linux sandbox sends router
 //!   solicitations and multicast listener reports from its link-local
 //!   address as soon as `tun0` comes up. Packets to multicast addresses are
@@ -343,81 +350,66 @@
 //!
 //! Much of what the agent does never reaches a handler. `Sites` answers DNS,
 //! rejects TLS handshakes, sends redirects and `421`s, and drops packets on
-//! its own. A world that wants to know all of it sets a callback with
-//! [`on_event`](Sites::on_event), and `Sites` calls it with an [`Event`] for
-//! each of these:
+//! its own. A world that wants to know all of it gives `Sites` a
+//! [`Journal`] with [`journal`](Sites::journal), and gets one entry for each
+//! of these, in the shape every service uses
+//! ([`journal`](crate::stdlib::journal)):
 //!
-//! - a sandbox attaches, gets its address, or detaches;
-//! - every DNS message the server gets, over UDP or TCP, with its answer;
-//! - every TLS handshake on port 443, with its SNI and how it ended;
-//! - every HTTP request hyper hands to `Sites`, with who answered it, its
-//!   status and how much of the body was sent, also when the client gave up
-//!   before the answer;
-//! - every connection on port 80 or 443 that ended in an HTTP error;
-//! - every packet `Sites` itself drops or refuses, and why.
+//! - `net.attached`, `net.bound` (field `by_dhcp`, `addr`) and
+//!   `net.detached`: a sandbox attaches, gets an address, or detaches;
+//! - `dns.query`: every DNS message, over UDP or TCP, with its answer:
+//!   fields `tcp`, `name`, `qtype`, `answer` (`addr`, `nodata`, `nxdomain`,
+//!   `error` or `none`), `addr` and `rcode`;
+//! - `tls.handshake`: every TLS handshake on port 443, with `addr`, `sni`
+//!   and `outcome` (`accepted` with `alpn`, `rejected`, `alert` with
+//!   `alert`, `failed` with `detail`, `closed`, `timed_out` or `aborted`);
+//! - `http.request`: every HTTP request, with who answered it (`answer`:
+//!   `handler`, `error`, `redirect`, `misdirected`, `no_host` or
+//!   `cancelled`), its status, and how much of the body was sent, also
+//!   when the client gave up before the answer
+//!   ([`httpd`](crate::stdlib::httpd#events) lists the fields);
+//! - `http.error`: every connection on port 80 or 443 that ended in an HTTP
+//!   error (`cause`: `protocol`, `timeout` or `transport`);
+//! - `net.blocked`: every packet `Sites` itself drops or refuses, with
+//!   `why` (see [`BlockedWhy`](crate::stdlib::net::BlockedWhy)),
+//!   `protocol`, `src`, `dst` and `dst_port`.
 //!
-//! What the layers below `Sites` drop on their own is not reported. See
-//! [`Http`] and [`Blocked`] for which.
+//! Every entry names the sandbox it came from; entries about a connection
+//! carry its number, from 1, on both ports. A connection's `tls.handshake`
+//! comes before its requests. An event is made when the thing it reports
+//! ends, so HTTP/2 requests on one connection can end in any order; the
+//! `started` field gives when each arrived.
 //!
 //! One HTTPS request to a site with [`tls`](Site::tls), from its lookup to
 //! its events:
 //!
 #![doc = include_str!("../../docs/diagrams/sites-request.svg")]
 //!
-//! The callback is a plain function, not an async one. It runs inside the
-//! task that made the event, in the order `Sites` makes the events. Every
-//! task of a world runs on one thread, so a slow callback slows the whole
-//! world, for every sandbox, and the agent could time the delay. It must
-//! return quickly and must not block. Even a write to a buffered file can
-//! block when the buffer fills. Hand the event on instead, to a channel
-//! that never waits, and do the work elsewhere. [`Event`] is `Clone` for
-//! this:
+//! Callbacks set with [`Journal::subscribe`] run inside the task that made
+//! the entry. Every task of a world runs on one thread, so a slow callback
+//! slows the whole world. Hand the entry to a channel that never waits, and
+//! do the work elsewhere, or write the journal to a file with
+//! [`Journal::to_file`], which does that for you:
 //!
 //! ```
-//! # use std::sync::Arc;
-//! # use std::sync::atomic::{AtomicU64, Ordering};
-//! # use fictionet::{Attachments, Cx, Result, stdlib::web};
-//! # fn store(_: Option<http::StatusCode>, _: &http::Uri, _: Option<&str>) {}
+//! # use fictionet::{Attachments, Cx, Result, stdlib::{journal::Journal, web}};
 //! # fn site_for(_host: &str) -> Option<web::Site> { None }
 //! # fn world(cx: Cx, attachments: Attachments) -> Result {
-//! #[derive(Clone)]
-//! struct Page { stance: &'static str } // a handler's own field
-//!
-//! let (tx, rx) = std::sync::mpsc::sync_channel::<web::Event>(100_000);
-//! let lost = Arc::new(AtomicU64::new(0));
-//! std::thread::spawn(move || {
-//!     for event in rx {
-//!         if let web::Event::Http(http) = &event {
-//!             let stance = http.extensions.get::<Page>().map(|p| p.stance);
-//!             store(http.status, &http.uri, stance); // slow: a file, a database
-//!         }
-//!     }
-//! });
-//! let counter = lost.clone();
-//! web::Sites::new(site_for)
-//!     .on_event(move |_cx, event| {
-//!         if tx.try_send(event.clone()).is_err() {
-//!             counter.fetch_add(1, Ordering::Relaxed); // full: count it, never wait
-//!         }
-//!     })
-//!     .serve(&cx, attachments)?;
+//! let journal = Journal::new().to_file("/var/lib/fictionet/journal.jsonl")?;
+//! web::Sites::new(site_for).journal(journal.clone()).serve(&cx, attachments)?;
+//! // At the end of the sample: journal.lost() must be zero.
 //! # Ok(())
 //! # }
 //! ```
 //!
-//! An eval that needs every event checks the count of lost events at the
-//! end, and throws the sample away if it is not zero.
+//! A handler can add its own fields to its request's entry. It puts
+//! [`Fields`](crate::stdlib::journal::Fields) in the extensions of the
+//! response it returns. Response extensions are never sent to the agent.
+//! The FakeWiki eval in `examples/fakewiki` puts the kind and stance of
+//! each page there, so one log line holds what the agent asked for and what
+//! it was shown.
 //!
-//! A handler can add its own fields to its request's event. It puts them in
-//! the extensions of the response it returns, and they arrive in
-//! [`Http::extensions`]. Response extensions are never sent to the agent.
-//! Read them by type, with `get`, as above: the `Debug` output of
-//! `http::Extensions` shows only the types, not the values. The FakeWiki
-//! eval in `examples/fakewiki` puts
-//! the kind and stance of each page there, so one log line holds what the
-//! agent asked for and what it was shown.
-//!
-//! Events do not hold packets or bodies. A world that wants every packet
+//! Entries do not hold packets or bodies. A world that wants every packet
 //! puts a [`filter`](crate::stdlib::filter) between each sandbox and
 //! `Sites`, as [Changing the network around the
 //! sites](#changing-the-network-around-the-sites) shows. The
@@ -518,26 +510,21 @@
 //! such as how addresses are bound or how DNS answers, copy the code of
 //! `serve` and change that part.
 
-use std::future::{Future, poll_fn};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+use std::future::Future;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use bytes::{Buf, Bytes};
 use http::{Request, Response};
-use http_body_util::BodyExt;
-use http_body_util::combinators::UnsyncBoxBody;
-use hyper::body::Incoming;
-use tower_service::Service;
 
+pub use crate::stdlib::httpd::{Body, Target};
+use crate::stdlib::httpd::{self, Handler};
+use crate::stdlib::journal::Journal;
+use crate::stdlib::net::{Host, Net, Website};
 use crate::stdlib::route::Prefix;
 use crate::stdlib::tls::ServerConfig;
-use crate::time::Instant;
 use crate::{Attachments, Cx, Error};
-
-mod http_serve;
-mod names;
-mod net;
 
 /// Websites by hostname, and the network around them. See the
 /// [module docs](self).
@@ -547,11 +534,8 @@ pub struct Sites {
     subnet_v6: Prefix,
     ipv6: bool,
     max_sites: usize,
-    on_event: Option<Arc<OnEvent>>,
+    journal: Option<Journal>,
 }
-
-/// The callback given to [`Sites::on_event`].
-type OnEvent = dyn Fn(&Cx, &Event) + Send + Sync;
 
 /// The callback given to [`Sites::new`].
 type SiteFor = dyn Fn(&str) -> Option<Site> + Send + Sync;
@@ -574,22 +558,14 @@ impl Sites {
             subnet: Prefix { addr: Ipv4Addr::new(10, 0, 0, 0).into(), len: 24 },
             subnet_v6: Prefix { addr: Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0).into(), len: 64 },
             ipv6: true,
-            max_sites: net::MAX_SITES,
-            on_event: None,
+            max_sites: crate::stdlib::net::MAX_HOSTS,
+            journal: None,
         }
     }
 
-    /// Calls `on_event` with an [`Event`] for everything `Sites` does. See
-    /// [Events](self#events).
-    ///
-    /// `on_event` gets the context of the task that made the event, for
-    /// [`Cx::now`] and the like. It must return quickly and must not block.
-    /// Calling `on_event` again replaces the earlier callback.
-    pub fn on_event<F>(self, on_event: F) -> Sites
-    where
-        F: Fn(&Cx, &Event) + Send + Sync + 'static,
-    {
-        Sites { on_event: Some(Arc::new(on_event)), ..self }
+    /// Records everything `Sites` does in `journal`. See [Events](self#events).
+    pub fn journal(self, journal: Journal) -> Sites {
+        Sites { journal: Some(journal), ..self }
     }
 
     /// Sets the sandboxes' IPv4 or IPv6 subnet, whichever `subnet` is. The
@@ -612,8 +588,8 @@ impl Sites {
 
     /// Turns IPv6 off for the whole network. Sites then have only IPv4
     /// addresses, DNS answers AAAA queries with NODATA, and every IPv6
-    /// packet from a sandbox is dropped, with a [`Blocked`] event that
-    /// says [`BlockedWhy::Ipv6`].
+    /// packet from a sandbox is dropped, with a `net.blocked` event whose
+    /// `why` is `Ipv6`.
     ///
     /// Without this, the network is dual-stack: see [IPv6](self#ipv6).
     pub fn ipv4_only(self) -> Sites {
@@ -623,18 +599,32 @@ impl Sites {
     /// Sets how many names may have a site. The default is 20,000.
     ///
     /// Each name the callback gives a site is kept for the whole run, with
-    /// its machines: one for each address it has, unless it shares an
-    /// address with another site. A callback that opens a whole domain lets
-    /// the agent make a new site with every new name it looks up, so this
-    /// keeps the world's memory and tasks bounded. At the limit, a new name
-    /// still runs the callback. If it returns a site, that site is dropped
-    /// before it gets an address or a machine, DNS answers SERVFAIL, and the
-    /// [`Dns`] event says [`DnsAnswer::Error`]`(2)`. The name is not kept,
-    /// so looking it up again runs the callback again. Names that already
-    /// have a site, and names the callback turns down, are answered as
-    /// before.
+    /// its machines. At the limit, a new name still runs the callback. If it
+    /// returns a site, that site is dropped before it gets an address or a
+    /// machine, DNS answers SERVFAIL, and the `dns.query` event says
+    /// `error` with `rcode` 2. The name is not kept, so looking it up again
+    /// runs the callback again.
     pub fn max_sites(self, max_sites: usize) -> Sites {
         Sites { max_sites, ..self }
+    }
+
+    /// The network these sites run on, before it starts: to add hosts
+    /// with other services next to the websites.
+    pub fn into_net(self) -> Net {
+        let site_for = self.site_for;
+        let mut net = Net::new()
+            .group("web::Sites")
+            .subnet(self.subnet)
+            .subnet(self.subnet_v6)
+            .max_hosts(self.max_sites)
+            .resolve(move |name| site_for(name).map(|site| site.into_host(name)));
+        if !self.ipv6 {
+            net = net.ipv4_only();
+        }
+        if let Some(journal) = self.journal {
+            net = net.journal(journal);
+        }
+        net
     }
 
     /// Builds the network and starts it. Every sandbox in `attachments`,
@@ -646,54 +636,44 @@ impl Sites {
     ///
     /// Fails only if a [`subnet`](Sites::subnet) is not one it can use.
     pub fn serve(self, cx: &Cx, attachments: Attachments) -> Result<(), Error> {
-        let subnet_v6 = self.ipv6.then_some(self.subnet_v6);
-        net::serve(cx, self.site_for, self.subnet, subnet_v6, self.max_sites, self.on_event, attachments)
+        self.into_net().serve(cx, attachments)
     }
 }
 
 /// One website: a handler, and optionally an address and TLS.
 pub struct Site {
-    handler: Handler,
+    website: Website,
     at: Option<Ipv4Addr>,
     at_v6: Option<Ipv6Addr>,
     family: Family,
-    tls: Option<Arc<SiteTls>>,
-    plain_http: bool,
-    default_host: bool,
 }
 
-/// The body of every response `serve` sends.
-type Body = UnsyncBoxBody<Bytes, Error>;
-
-/// What a request turns into.
-type Reply = Pin<Box<dyn Future<Output = Result<Response<Body>, Error>> + Send>>;
-
-/// A site's handler, with its types erased.
-type Handler = Arc<dyn Fn(Request<Incoming>) -> Reply + Send + Sync>;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Family {
+    Both,
+    V4,
+    V6,
+}
 
 impl Site {
-    /// A site served by `handler`. See [Handlers](self#handlers).
-    pub fn new<S, B>(handler: S) -> Site
+    /// A site served by `service`, a tower service such as an
+    /// `axum::Router`. See [Handlers](self#handlers).
+    pub fn new<S, B>(service: S) -> Site
     where
-        S: Service<Request<Incoming>, Response = Response<B>> + Clone + Send + 'static,
+        S: tower_service::Service<Request<Body>, Response = Response<B>> + Clone + Send + 'static,
         S::Future: Send + 'static,
         S::Error: Into<Error>,
         B: http_body::Body + Send + 'static,
         B::Data: Send,
         B::Error: Into<Error>,
     {
-        // Each request gets its own clone, as tower expects. The mutex only
-        // guards the clone, so the handler need not be Sync.
-        let handler = Mutex::new(handler);
-        let handler: Handler = Arc::new(move |request| {
-            let mut service = handler.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            Box::pin(async move {
-                poll_fn(|task| service.poll_ready(task)).await.map_err(|e| -> Error { e.into() })?;
-                let response = service.call(request).await.map_err(|e| -> Error { e.into() })?;
-                Ok(response.map(|body| IntoBytes(Box::pin(body)).boxed_unsync()))
-            })
-        });
-        Site { handler, at: None, at_v6: None, family: Family::Both, tls: None, plain_http: false, default_host: false }
+        Site::handler(httpd::tower(service))
+    }
+
+    /// A site served by an [`httpd::Handler`], such as an
+    /// [`httpd::Router`](crate::stdlib::httpd::Router).
+    pub fn handler(handler: impl Handler) -> Site {
+        Site { website: Website::new(handler), at: None, at_v6: None, family: Family::Both }
     }
 
     /// Serves the site at `addr`, for example the address it has on the
@@ -731,9 +711,7 @@ impl Site {
     }
 
     /// Gives the site only an IPv4 address. DNS answers AAAA queries for
-    /// its name with NODATA, so clients connect over IPv4. Use it for a
-    /// site that has no IPv6 on the real internet, or to see how an agent
-    /// copes with one.
+    /// its name with NODATA, so clients connect over IPv4.
     pub fn ipv4_only(self) -> Site {
         Site { family: Family::V4, ..self }
     }
@@ -757,7 +735,7 @@ impl Site {
     where
         F: Fn(&Cx) -> Arc<ServerConfig> + Send + Sync + 'static,
     {
-        Site { tls: Some(Arc::new(SiteTls { config_for: Box::new(config_for), last: Mutex::new(None) })), ..self }
+        Site { website: self.website.tls(config_for), ..self }
     }
 
     /// Serves a site with [`tls`](Site::tls) over plain HTTP on port 80
@@ -767,13 +745,9 @@ impl Site {
     /// This is a site that never moved to HTTPS, or a machine that answers
     /// in plain text where the real site would redirect, as an attacker
     /// that strips TLS does. The handler tells the two kinds of request
-    /// apart by [`Target::scheme`]. Their events are [`Http`] events with
-    /// [`HttpAnswer::Handler`] either way.
-    ///
-    /// A site without `tls` is served over plain HTTP already, so this
-    /// changes nothing for it.
+    /// apart by [`Target::scheme`].
     pub fn plain_http(self) -> Site {
-        Site { plain_http: true, ..self }
+        Site { website: self.website.plain_http(), ..self }
     }
 
     /// Makes the site the default one at its address: it answers requests
@@ -790,539 +764,25 @@ impl Site {
     ///
     /// The first default site that appears at an address keeps the role.
     pub fn default_host(self) -> Site {
-        Site { default_host: true, ..self }
-    }
-}
-
-/// Which address families a site has. The last of [`Site::ipv4_only`] and
-/// [`Site::ipv6_only`] wins.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Family {
-    Both,
-    V4,
-    V6,
-}
-
-/// A handler's body, with its data as `Bytes` and its errors as [`Error`].
-/// It passes on the body's size hint, so hyper sends a `content-length`
-/// for a body whose length is known, as a real server would, instead of
-/// chunked encoding.
-struct IntoBytes<B>(Pin<Box<B>>);
-
-impl<B> http_body::Body for IntoBytes<B>
-where
-    B: http_body::Body,
-    B::Error: Into<Error>,
-{
-    type Data = Bytes;
-    type Error = Error;
-
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        task: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, Error>>> {
-        self.0.as_mut().poll_frame(task).map(|frame| {
-            frame.map(|r| {
-                r.map(|f| f.map_data(|mut data| data.copy_to_bytes(data.remaining()))).map_err(|e| e.into())
-            })
-        })
+        Site { website: self.website.default_host(), ..self }
     }
 
-    fn is_end_stream(&self) -> bool {
-        self.0.is_end_stream()
-    }
-
-    fn size_hint(&self) -> http_body::SizeHint {
-        self.0.size_hint()
-    }
-}
-
-/// A site's TLS: the world's callback, and the last config it returned
-/// with the ALPN list set, so a world that returns the same config every
-/// time does not pay for a copy on every handshake.
-struct SiteTls {
-    config_for: ConfigFor,
-    last: Mutex<Option<(Arc<ServerConfig>, Arc<ServerConfig>)>>,
-}
-
-/// The callback given to [`Site::tls`].
-type ConfigFor = Box<dyn Fn(&Cx) -> Arc<ServerConfig> + Send + Sync>;
-
-impl SiteTls {
-    /// The config for one handshake, with ALPN set to `h2` and `http/1.1`.
-    fn config(&self, cx: &Cx) -> Arc<ServerConfig> {
-        let given = (self.config_for)(cx);
-        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((from, with_alpn)) = &*last && Arc::ptr_eq(from, &given) {
-            return with_alpn.clone();
+    /// The site as a host of a [`Net`], named `name`.
+    pub fn into_host(self, name: &str) -> Host {
+        let mut host = Host::new(name).dns_name(name).web(self.website);
+        if let Some(a) = self.at {
+            host = host.at(a);
         }
-        let mut config = (*given).clone();
-        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-        let config = Arc::new(config);
-        *last = Some((given, config.clone()));
-        config
+        if let Some(a) = self.at_v6 {
+            host = host.at(a);
+        }
+        match self.family {
+            Family::Both => host,
+            Family::V4 => host.ipv4_only(),
+            Family::V6 => host.ipv6_only(),
+        }
     }
 }
-
-/// Where a request arrived: the scheme and port from the connection, the
-/// host from the request.
-///
-/// `serve` puts one in the extensions of every request before calling the
-/// handler. Extensions are a typed map inside an `http::Request` that code
-/// in the same process can read and write. They are never sent over the
-/// network.
-///
-/// The scheme, port and SNI come from the connection, not from headers the
-/// agent wrote: the scheme from whether the connection used TLS, the port
-/// from the port it arrived on. An HTTP/1.1 request line usually carries
-/// only a path, so the scheme is not in the request at all. The host is the
-/// one the request named, which the agent wrote. `Sites` routed the request
-/// by it only because a site with that name is at this address.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct Target {
-    /// `http` or `https`.
-    pub scheme: http::uri::Scheme,
-    /// The hostname the request was routed by, such as `github.com`: the
-    /// authority of its URI if it has one, else its `Host` header, in
-    /// lowercase, without a port or a trailing dot.
-    pub host: String,
-    /// The port the connection arrived on, such as 443.
-    pub port: u16,
-    /// The name the client sent in its TLS handshake (SNI), in lowercase,
-    /// without a trailing dot. `None` without TLS.
-    ///
-    /// It is always the name of a TLS site at this address, but it need not
-    /// be `host`. A client may send several hosts' requests over one
-    /// connection when their sites share an address and a certificate, as
-    /// browsers do with HTTP/2.
-    pub sni: Option<String>,
-}
-
-/// Something [`Sites`] did, given to the callback set with
-/// [`Sites::on_event`].
-///
-/// Each event names the sandbox it came from. Events come in the order
-/// `Sites` makes them. For one sandbox:
-///
-/// - `Attached` comes before any other event of it.
-/// - A connection's `Tls` event comes before its `Http` and `HttpError`
-///   events.
-/// - Events that end something begun before a detach, such as a request,
-///   a handshake or a DNS query over TCP, may come after its `Detached`.
-///   [`Sandbox::id`] tells them apart from a later sandbox with the same
-///   name and address.
-///
-/// One possible order of the events of one sandbox:
-///
-/// ```text
-/// Attached → Blocked → Bound → Dns → Tls → Http → Http → Detached → Http
-/// ↑                                  └─ connection 3 ┘              ↑
-/// first, always                                   connection 3 too: a request
-///                                                 begun before the detach,
-///                                                 ends as HttpAnswer::Cancelled
-/// ```
-///
-/// An event is made when the thing it reports ends. HTTP/2 requests on one
-/// connection run side by side and can end in any order. [`Http::started`]
-/// gives when each one arrived.
-// The variants differ in size, and events are not stored in bulk, so they
-// are not boxed.
-#[allow(clippy::large_enum_variant)]
-#[derive(Clone, Debug)]
-#[non_exhaustive]
-pub enum Event {
-    /// A sandbox attached. It has no address yet.
-    #[non_exhaustive]
-    Attached {
-        /// The sandbox.
-        sandbox: Sandbox,
-    },
-    /// One of a sandbox's addresses was bound: when DHCP acknowledged an
-    /// IPv4 address (`by_dhcp`), or by the first packet from a static
-    /// address. A dual-stack sandbox gets one `Bound` for each family. The
-    /// new address is in `sandbox.addr` or `sandbox.addr_v6`.
-    #[non_exhaustive]
-    Bound {
-        /// The sandbox, with its new address.
-        sandbox: Sandbox,
-        /// Whether DHCP gave the address.
-        by_dhcp: bool,
-    },
-    /// A sandbox detached. Its connections were reset, and its address is
-    /// free again.
-    #[non_exhaustive]
-    Detached {
-        /// The sandbox.
-        sandbox: Sandbox,
-    },
-    /// A DNS message, and its answer.
-    Dns(Dns),
-    /// A TLS handshake on port 443, from the TCP connection to its end.
-    Tls(Tls),
-    /// An HTTP request, when it has ended.
-    Http(Http),
-    /// A connection on port 80 or 443 that ended in an HTTP error.
-    HttpError(HttpError),
-    /// A packet from a sandbox that `Sites` dropped or refused.
-    Blocked(Blocked),
-}
-
-/// The sandbox an event came from.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct Sandbox {
-    /// The attachment, numbered from 1 in the order sandboxes attached to
-    /// this `Sites`. A name and an address can be used again after a
-    /// sandbox detaches. The id is never used again.
-    pub id: u64,
-    /// Its attachment's name, from [`Attachment::name`](crate::Attachment::name).
-    pub name: Arc<str>,
-    /// Its IPv4 address, once bound.
-    pub addr: Option<Ipv4Addr>,
-    /// Its IPv6 address, once bound.
-    ///
-    /// Events about a connection or a query carry the sandbox as it was
-    /// when the connection or query arrived. Its address in the family
-    /// the connection used is always set.
-    pub addr_v6: Option<Ipv6Addr>,
-}
-
-/// A DNS message to the gateway, and how `Sites` answered it.
-///
-/// Every message is one event: a UDP datagram, or one whole message over
-/// TCP. A name looked up twice makes two events, though the site callback
-/// runs only the first time. A TCP connection that closes in the middle of
-/// a message makes no event for it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct Dns {
-    /// The sandbox that sent it.
-    pub sandbox: Sandbox,
-    /// Whether the message came over TCP, rather than UDP.
-    pub tcp: bool,
-    /// The name asked for, in lowercase, without a trailing dot. `None` if
-    /// the message could not be read, or did not hold exactly one question.
-    pub name: Option<String>,
-    /// The DNS query type asked for: 1 for A, 28 for AAAA, and so on.
-    /// `None` when `name` is.
-    pub qtype: Option<u16>,
-    /// What `Sites` answered. It says nothing about whether the answer
-    /// reached the sandbox.
-    pub answer: DnsAnswer,
-}
-
-/// What `Sites` answered to a DNS message.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum DnsAnswer {
-    /// An A record (for an IPv4 address) or an AAAA record (for an IPv6
-    /// address) with this address.
-    Addr(IpAddr),
-    /// The name exists, but has no record of the type asked for.
-    NoData,
-    /// The name does not exist.
-    NxDomain,
-    /// An error with this response code: 1 (FORMERR) for a message that
-    /// could not be read or did not hold exactly one question, 2 (SERVFAIL)
-    /// for a new name the callback gave a site when the world already had
-    /// [`Sites::max_sites`] sites, 4 (NOTIMP) for an opcode other than
-    /// QUERY.
-    Error(u16),
-    /// No answer: the message was too broken to answer, or was not a query.
-    None,
-}
-
-/// A TLS handshake on port 443, from the moment the TCP connection is
-/// accepted to the end of the handshake.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct Tls {
-    /// The sandbox that sent it.
-    pub sandbox: Sandbox,
-    /// The connection, numbered from 1 for each `Sites`, on both ports.
-    /// The `Http` and `HttpError` events of this connection carry the same
-    /// number.
-    pub conn: u64,
-    /// The address of the machine the client connected to.
-    pub addr: IpAddr,
-    /// The name the client sent (SNI), in lowercase, without a trailing
-    /// dot. `None` if it sent none, or if no SNI could be read from what it
-    /// sent.
-    pub sni: Option<String>,
-    /// How the handshake ended.
-    pub outcome: TlsOutcome,
-}
-
-/// How a TLS handshake ended.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum TlsOutcome {
-    /// The handshake finished, with this protocol agreed by ALPN, such as
-    /// `h2`.
-    Accepted {
-        /// The protocol agreed by ALPN. `None` if none was.
-        alpn: Option<Vec<u8>>,
-    },
-    /// `Sites` refused it with `unrecognized_name`: no SNI, or no TLS site
-    /// with that name at this address.
-    Rejected,
-    /// The client sent this TLS alert, such as 48 (`unknown_ca`) when it
-    /// does not trust the world's certificate.
-    Alert(u8),
-    /// The bytes were not TLS, or broke the protocol. The text says how. It
-    /// is for people, and may change.
-    Failed(String),
-    /// The client closed the connection before the handshake finished.
-    Closed,
-    /// The handshake did not finish within 10 seconds of the connection
-    /// being accepted.
-    TimedOut,
-    /// `Sites` ended the connection first: the sandbox detached, or the
-    /// world stopped.
-    Aborted,
-}
-
-/// An HTTP request that hyper read and handed to `Sites`, and how it ended.
-///
-/// Every such request is exactly one event: those a handler answered,
-/// those `Sites` answered itself, and those whose client gave up before
-/// there was an answer.
-///
-/// Requests the HTTP layers refuse before handing them on make no `Http`
-/// event. HTTP/1.1 bytes hyper cannot parse end the connection, with an
-/// [`HttpError`] event. HTTP/2 streams the protocol layer resets as
-/// malformed, such as one whose length does not match its
-/// `content-length`, or whose headers are too large, are not reported.
-#[derive(Clone, Debug)]
-#[non_exhaustive]
-pub struct Http {
-    /// The sandbox that sent it.
-    pub sandbox: Sandbox,
-    /// The connection, as in [`Tls::conn`].
-    pub conn: u64,
-    /// The machine's address and port the connection arrived on.
-    pub local: SocketAddr,
-    /// `http` or `https`.
-    pub scheme: http::uri::Scheme,
-    /// The connection's SNI, as in [`Target::sni`]. `None` without TLS.
-    pub sni: Option<String>,
-    /// The host the request named, found as [`Target::host`] is, even when
-    /// no site has it. `None` when it named none.
-    pub host: Option<String>,
-    /// When `Sites` got the request, from [`Cx::now`]. The callback's own
-    /// `cx.now()` gives when it ended.
-    pub started: Instant,
-    /// The method, URI, version and headers, as hyper parsed them from the
-    /// client's request. The URI is usually only a path and query. Header
-    /// names are in lowercase. HTTP/2's pseudo-headers are in `method` and
-    /// `uri`, not in `headers`.
-    pub method: http::Method,
-    /// The URI, as above.
-    pub uri: http::Uri,
-    /// The HTTP version, as above.
-    pub version: http::Version,
-    /// The headers, as above.
-    pub headers: http::HeaderMap,
-    /// Who answered the request.
-    pub answer: HttpAnswer,
-    /// The status of the response. `None` when there was no response
-    /// ([`HttpAnswer::Cancelled`]).
-    pub status: Option<http::StatusCode>,
-    /// How many bytes of the response body were handed to the connection,
-    /// which takes more only as it makes room. This is what the world sent,
-    /// not what the agent read: when the client goes away early, the last
-    /// of these may not have reached it.
-    pub sent: u64,
-    /// Whether the end of the body was handed to the connection. `false`
-    /// if the client went away, or the body failed, before its end, and
-    /// when there was no response. A response with no body, such as one to
-    /// `HEAD`, is complete when it is sent.
-    pub complete: bool,
-    /// The extensions of the response the handler returned, which are
-    /// never sent to the agent. Empty when no handler answered. Read them
-    /// by type, with `get`: their `Debug` output shows only the types.
-    pub extensions: http::Extensions,
-}
-
-/// Who answered an HTTP request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum HttpAnswer {
-    /// The site's handler.
-    Handler,
-    /// `Sites`, because the handler failed: `500`, or `502` when `proxy()`
-    /// (feature `tokio`) could not reach the real site.
-    Error,
-    /// `Sites`, with a `301` redirect from http to https.
-    Redirect,
-    /// `Sites`, with `421`: no site with that host at this address and no
-    /// [default site](Site::default_host), or no TLS for the site on a TLS
-    /// connection.
-    Misdirected,
-    /// `Sites`, with `400`: the request named no host.
-    NoHost,
-    /// No response. The client reset the stream or the connection, closed
-    /// an HTTP/2 connection, or the sandbox detached, before the handler
-    /// returned, and the handler's future was dropped.
-    ///
-    /// An HTTP/1.1 client that only closes its side of the connection
-    /// while the handler works is taken to be half-closing (see
-    /// Half-close under Details): the handler goes on, and the request
-    /// ends with its answer.
-    Cancelled,
-}
-
-/// A connection on port 80 or 443 that ended in an HTTP error.
-///
-/// A connection that ends cleanly makes no `HttpError` event, with or
-/// without requests. Neither does the 30-second limit on HTTP/1.1 headers,
-/// which also ends connections left idle between requests, nor the client
-/// closing or resetting the connection: requests it cut off end as
-/// [`Http`] events with [`HttpAnswer::Cancelled`]. On port 443, a
-/// handshake that fails is a [`Tls`] event, not an `HttpError`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct HttpError {
-    /// The sandbox that sent it.
-    pub sandbox: Sandbox,
-    /// The connection, as in [`Tls::conn`].
-    pub conn: u64,
-    /// The machine's address and port the connection arrived on.
-    pub local: SocketAddr,
-    /// The kind of error.
-    pub cause: HttpErrorCause,
-    /// What went wrong, in words. The text is for people, and may change.
-    pub detail: String,
-}
-
-/// Why a connection ended in an HTTP error.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum HttpErrorCause {
-    /// The client's bytes were not HTTP, or broke the protocol.
-    Protocol,
-    /// On port 80, the client sent no bytes within 10 seconds of
-    /// connecting.
-    Timeout,
-    /// The TLS layer under HTTP failed after the handshake, such as on a
-    /// record that would not decrypt.
-    Transport,
-}
-
-/// A packet from a sandbox that `Sites` itself dropped or refused, for one
-/// of the reasons in [`BlockedWhy`].
-///
-/// Packets the layers below `Sites` drop on their own are not reported:
-/// UDP or TCP with a bad checksum, UDP for a full socket queue, TCP
-/// connection attempts past the backlog for one client, IP fragments that
-/// overlap or never complete, IPv6 extension headers that a host must
-/// refuse, DHCP messages that cannot be read, and IP protocols other than
-/// TCP, UDP and ICMP sent to a machine. Each fragment is checked against
-/// the sandbox's address and the other sandboxes' subnet on its own, and
-/// reported if it fails. [`BlockedWhy::NoRoute`] and
-/// [`BlockedWhy::ClosedPort`] are about where a packet goes, so a packet
-/// that arrives in fragments makes them once, when it is whole.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct Blocked {
-    /// The sandbox that sent it.
-    pub sandbox: Sandbox,
-    /// Why it was blocked.
-    pub why: BlockedWhy,
-    /// The IP protocol: 6 for TCP, 17 for UDP, 1 for ICMP, 58 for ICMPv6. `None` if the
-    /// packet is not IP.
-    pub protocol: Option<u8>,
-    /// The source address. `None` if the packet is not IP.
-    pub src: Option<std::net::IpAddr>,
-    /// The destination address. `None` if the packet is not IP.
-    pub dst: Option<std::net::IpAddr>,
-    /// The TCP or UDP destination port.
-    pub dst_port: Option<u16>,
-}
-
-/// Why `Sites` dropped or refused a packet.
-///
-/// Every blocked packet is one event: a client that retries, or scans
-/// 65,535 ports, makes one event per packet.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum BlockedWhy {
-    /// Its source was not the sandbox's address, or the static address it
-    /// tried to bind was not free. Dropped.
-    NotItsAddress,
-    /// It was for another sandbox's subnet address. Dropped.
-    OtherSandbox,
-    /// It was for a broadcast, multicast or unspecified address, and was
-    /// not DHCP. Dropped. This includes the IPv6 router solicitations and
-    /// multicast listener reports a Linux sandbox sends on its own.
-    Broadcast,
-    /// It was IPv6, on a network with IPv6 turned off
-    /// ([`Sites::ipv4_only`]). Dropped.
-    Ipv6,
-    /// It was not an IP packet, or its IPv4 or IPv6 header was broken.
-    /// Dropped.
-    Malformed,
-    /// No machine has its destination address. Answered with ICMP "host
-    /// unreachable", or ICMPv6 "address unreachable", except for packets
-    /// that must get no ICMP error, such as ICMP errors themselves.
-    NoRoute,
-    /// Its destination port is not served: TCP is answered with a RST, UDP
-    /// with ICMP "port unreachable". A RST sent to a closed port gets no
-    /// answer and makes no event.
-    ClosedPort,
-    /// A new TCP connection past the sandbox's limit per machine. Reset.
-    TooManyConnections,
-}
-
-/// Runs hyper's background work, such as HTTP/2 streams, as tasks in a
-/// region, with [`Cx::spawn`]. Private until a world needs its own hyper
-/// server.
-#[derive(Clone)]
-struct Executor {
-    cx: Cx,
-}
-
-impl Executor {
-    fn new(cx: &Cx) -> Executor {
-        Executor { cx: cx.clone() }
-    }
-}
-
-impl<F> hyper::rt::Executor<F> for Executor
-where
-    F: Future<Output = ()> + Send + 'static,
-{
-    fn execute(&self, work: F) {
-        // A stream's handler may wait on something outside the world, so the
-        // task also ends when the world stops.
-        self.cx.spawn(move |cx| async move {
-            let mut work = std::pin::pin!(work);
-            let mut stopping = std::pin::pin!(cx.cancelled());
-            poll_fn(|task| {
-                if work.as_mut().poll(task).is_ready() || stopping.as_mut().poll(task).is_ready() {
-                    return std::task::Poll::Ready(());
-                }
-                std::task::Poll::Pending
-            })
-            .await;
-            Ok(())
-        });
-    }
-}
-
-/// The error a handler returns when the site behind it could not be
-/// reached. `serve` answers it with `502 Bad Gateway` instead of `500`.
-#[derive(Debug)]
-struct BadGateway(String);
-
-impl std::fmt::Display for BadGateway {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "bad gateway: {}", self.0)
-    }
-}
-
-impl std::error::Error for BadGateway {}
 
 /// A handler that forwards each request to the real site, over the world's
 /// own network. Needs the `tokio` feature (on by default), and a tokio
@@ -1351,7 +811,7 @@ impl std::error::Error for BadGateway {}
 #[cfg(feature = "tokio")]
 #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
 pub fn proxy() -> Proxy {
-    Proxy { client: Arc::new(http_serve::proxy_client()) }
+    Proxy { client: Arc::new(proxy_client()) }
 }
 
 /// The handler made by [`proxy`].
@@ -1359,20 +819,84 @@ pub fn proxy() -> Proxy {
 #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
 #[derive(Clone)]
 pub struct Proxy {
-    client: Arc<http_serve::ProxyClient>,
+    client: Arc<ProxyClient>,
 }
 
 #[cfg(feature = "tokio")]
-impl Service<Request<Incoming>> for Proxy {
-    type Response = Response<Incoming>;
+impl tower_service::Service<Request<Body>> for Proxy {
+    type Response = Response<hyper::body::Incoming>;
     type Error = Error;
-    type Future = std::pin::Pin<Box<dyn Future<Output = Result<Response<Incoming>, Error>> + Send>>;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Error>> + Send>>;
 
     fn poll_ready(&mut self, _task: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Error>> {
         std::task::Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, request: Request<Incoming>) -> Self::Future {
-        Box::pin(http_serve::forward(self.client.clone(), request))
+    fn call(&mut self, request: Request<Body>) -> Self::Future {
+        Box::pin(forward(self.client.clone(), request))
     }
+}
+
+#[cfg(feature = "tokio")]
+type ProxyClient = hyper_util::client::legacy::Client<
+    hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
+    Body,
+>;
+
+#[cfg(feature = "tokio")]
+fn proxy_client() -> ProxyClient {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let connector = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_provider_and_webpki_roots(provider)
+        .expect("ring supports the default TLS versions")
+        .https_or_http()
+        .enable_http1()
+        .enable_http2()
+        .build();
+    hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new()).build(connector)
+}
+
+/// Headers that belong to one connection and are not passed on (RFC 9110,
+/// section 7.6.1).
+#[cfg(feature = "tokio")]
+const HOP_BY_HOP: [&str; 8] =
+    ["connection", "keep-alive", "proxy-connection", "transfer-encoding", "te", "trailer", "upgrade", "proxy-authorization"];
+
+#[cfg(feature = "tokio")]
+fn strip_hop_by_hop(headers: &mut http::HeaderMap) {
+    let named: Vec<String> = headers
+        .get_all(http::header::CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(',').map(|s| s.trim().to_ascii_lowercase()))
+        .collect();
+    for name in HOP_BY_HOP.iter().copied().chain(named.iter().map(String::as_str)) {
+        headers.remove(name);
+    }
+}
+
+/// Forwards one request to its [`Target`] over the world's own network.
+#[cfg(feature = "tokio")]
+async fn forward(client: Arc<ProxyClient>, request: Request<Body>) -> Result<Response<hyper::body::Incoming>, Error> {
+    use http::uri::Scheme;
+    let target = request
+        .extensions()
+        .get::<Target>()
+        .cloned()
+        .ok_or("web::proxy() serves only requests that web::Sites routed: there is no web::Target")?;
+    let (mut parts, body) = request.into_parts();
+    let default_port = (target.scheme == Scheme::HTTP && target.port == 80) || (target.scheme == Scheme::HTTPS && target.port == 443);
+    let authority = if default_port { target.host.clone() } else { format!("{}:{}", target.host, target.port) };
+    let path = parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
+    parts.uri = format!("{}://{}{}", target.scheme, authority, path).parse()?;
+    parts.version = http::Version::HTTP_11;
+    parts.extensions = http::Extensions::new();
+    strip_hop_by_hop(&mut parts.headers);
+    parts.headers.insert(http::header::HOST, authority.parse()?);
+    let mut response = client
+        .request(Request::from_parts(parts, body))
+        .await
+        .map_err(|e| httpd::BadGateway(format!("{}: {e}", target.host)))?;
+    strip_hop_by_hop(response.headers_mut());
+    Ok(response)
 }

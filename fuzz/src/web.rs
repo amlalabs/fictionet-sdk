@@ -12,7 +12,6 @@ use std::time::{Duration, UNIX_EPOCH};
 use bytes::Bytes;
 use http::{Request, Response};
 use http_body_util::{BodyExt, Full, Limited};
-use hyper::body::Incoming;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 use fictionet::stdlib::{tls, web};
@@ -39,7 +38,7 @@ pub fn cert() -> &'static (Vec<u8>, Vec<u8>) {
 #[derive(Clone)]
 struct Echo;
 
-impl tower_service::Service<Request<Incoming>> for Echo {
+impl tower_service::Service<Request<fictionet::stdlib::web::Body>> for Echo {
     type Response = Response<Full<Bytes>>;
     type Error = Infallible;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Infallible>> + Send>>;
@@ -48,7 +47,7 @@ impl tower_service::Service<Request<Incoming>> for Echo {
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, request: Request<Incoming>) -> Self::Future {
+    fn call(&mut self, request: Request<fictionet::stdlib::web::Body>) -> Self::Future {
         Box::pin(async move {
             let (parts, body) = request.into_parts();
             let n = match Limited::new(body, 1 << 20).collect().await {
@@ -67,7 +66,7 @@ impl tower_service::Service<Request<Incoming>> for Echo {
 #[derive(Clone)]
 struct Broken;
 
-impl tower_service::Service<Request<Incoming>> for Broken {
+impl tower_service::Service<Request<fictionet::stdlib::web::Body>> for Broken {
     type Response = Response<Full<Bytes>>;
     type Error = std::io::Error;
     type Future = std::future::Ready<Result<Self::Response, std::io::Error>>;
@@ -76,7 +75,7 @@ impl tower_service::Service<Request<Incoming>> for Broken {
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, _: Request<Incoming>) -> Self::Future {
+    fn call(&mut self, _: Request<fictionet::stdlib::web::Body>) -> Self::Future {
         std::future::ready(Err(std::io::Error::other("broken on purpose")))
     }
 }
@@ -105,9 +104,14 @@ pub fn serve(cx: &Cx) -> Attacher {
             _ => None,
         }
     })
-    .on_event(|_, e| {
-        // Format each event, as a world that logs them would.
-        let _ = format!("{e:?}");
+    .journal({
+        // Format each entry, as a world that logs them would.
+        let journal = fictionet::stdlib::journal::Journal::new();
+        journal.subscribe(|e| {
+            let _ = format!("{e:?}");
+            let _ = fictionet::stdlib::codec::Wire::to_bytes(&e.to_json());
+        });
+        journal
     });
     let (attacher, attachments) = attachments();
     sites.serve(cx, attachments).unwrap();

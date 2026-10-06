@@ -187,6 +187,7 @@ pub mod mysql;
 pub mod nbdgm;
 pub mod nbns;
 pub mod nbss;
+pub mod net;
 pub mod nfs;
 pub mod ntlmssp;
 pub mod ntp;
