@@ -1,10 +1,5 @@
 //! WHOIS: reading and writing queries and responses, with no I/O.
 //!
-//! New stacks use [`Queries`] and [`Responses`] with [`codec::Stream`].
-//! Queries accept CRLF and bare LF. Responses produce [`CollectedResponse`]
-//! at EOF, preserving the collector's truncation flag. [`codec::Wire`]
-//! writes query lines with CRLF and response bytes unchanged.
-//!
 //! WHOIS is how people and tools look up who holds a domain name, an IP
 //! block or an AS number. A client connects to a server over TCP, on port
 //! 43, and sends one line of text: the query, ended by CR LF. The server
@@ -25,13 +20,13 @@
 //! says to ask next: IANA's `refer:`, a registry's
 //! `Registrar WHOIS Server:`, and ARIN's `ReferralServer:`.
 //!
-//! Nothing here reads a socket. A world that plays a WHOIS server feeds
-//! the bytes it reads from a [`tcp`](crate::stdlib::tcp) connection to a
-//! [`QueryDecoder`], gets a [`Query`] back, writes a [`Response`]'s bytes
-//! and closes the connection. A world that plays a client writes a query
-//! and feeds what comes back to a [`ResponseDecoder`] until the server
-//! closes. Which names exist, who holds them, and where a referral points
-//! are up to world code.
+//! A world that plays a WHOIS server pushes query lines into
+//! [`Stream<Queries>`](super::codec::Stream), writes a [`Response`], and
+//! closes the connection. Query lines accept CRLF and bare LF. A client
+//! collects replies with [`Stream<Responses>`](super::codec::Stream) and
+//! calls `end` at connection close. The resulting [`CollectedResponse`]
+//! preserves the truncation flag. Names, owners, and referrals belong to
+//! world code.
 //!
 //! Every reader checks lengths, because the agent can send any bytes it
 //! likes. A query line longer than [`MAX_QUERY`] is an error, and the
@@ -41,17 +36,18 @@
 //! would refuse or read back as something else.
 //!
 //! ```
-//! use fictionet::stdlib::whois::{Field, Query, QueryDecoder, ReferralKind, Response, ResponseDecoder};
+//! use fictionet::stdlib::codec::{Stream, Wire, pump};
+//! use fictionet::stdlib::whois::{Field, Query, Queries, ReferralKind, Response, Responses};
 //!
 //! // A client asks the RIPE database about an address, with two flags.
 //! let query = Query::new("-B -T inetnum 193.0.0.1").unwrap();
-//! assert_eq!(query.to_bytes(), b"-B -T inetnum 193.0.0.1\r\n");
+//! assert_eq!(query.to_bytes().unwrap(), b"-B -T inetnum 193.0.0.1\r\n");
 //!
 //! // A registry reads a query for a name.
-//! let mut decoder = QueryDecoder::new();
+//! let mut decoder = Stream::new(Queries::new());
 //! let bytes = b"example.com\r\n";
-//! assert_eq!(decoder.feed(bytes), bytes.len());
-//! let got = decoder.next_query().unwrap().unwrap();
+//! assert_eq!(decoder.push(bytes), bytes.len());
+//! let got = decoder.next().unwrap().unwrap().unwrap();
 //! assert!(got.flags().is_empty());
 //! assert_eq!(got.terms(), "example.com");
 //!
@@ -67,10 +63,12 @@
 //! );
 //!
 //! // The client reads until the close, then finds where to ask next.
-//! let mut reader = ResponseDecoder::new();
-//! reader.feed(response.as_bytes());
-//! assert!(!reader.truncated());
-//! let response = reader.finish();
+//! let mut reader = Stream::new(Responses::new());
+//! pump(&mut reader, response.as_bytes(), |_| unreachable!()).unwrap();
+//! reader.end();
+//! let collected = reader.next().unwrap().unwrap();
+//! assert!(!collected.truncated);
+//! let response = collected.response;
 //! assert_eq!(response.fields().unwrap(), fields);
 //! let referral = response.referral().unwrap();
 //! assert_eq!(referral.kind, ReferralKind::RegistrarWhoisServer);
@@ -85,21 +83,17 @@ use std::borrow::Cow;
 pub const PORT: u16 = 43;
 /// The longest query line, in bytes, not counting its CR LF.
 pub const MAX_QUERY: usize = 1024;
-/// The most bytes a [`QueryDecoder`] holds that have not been taken out:
-/// one longest query line and its CR LF.
-pub const MAX_BUFFERED: usize = MAX_QUERY + 2;
-/// The longest response a [`ResponseDecoder`] keeps, and a [`Response`]
-/// may hold.
+/// The longest response retained by [`Responses`] or held by [`Response`].
 pub const MAX_RESPONSE: usize = 1 << 20;
 /// Input buffer capacity for [`Responses`], independent of its retained byte limit.
 pub const RESPONSE_WINDOW: usize = 4096;
-/// The most fields [`parse_fields`] reads and [`write_fields`] writes.
+/// The most fields [`parse_fields`] reads and [`Response::from_fields`] writes.
 pub const MAX_FIELDS: usize = 10_000;
 /// The longest key, in bytes, a line may have to be read as a field.
 pub const MAX_KEY: usize = 128;
 /// The longest host name, in bytes, a referral may name.
 pub const MAX_HOST: usize = 253;
-/// How deep [`write_fields`] indents the second and later lines of a
+/// How deep [`Response::from_fields`] indents the second and later lines of a
 /// value.
 pub const CONTINUATION_INDENT: &str = "        ";
 
@@ -196,38 +190,23 @@ impl std::error::Error for QueryError {}
 /// would read them back as something else.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EncodeError {
-    /// A key that is empty, longer than [`MAX_KEY`], holds a colon or a
-    /// control character, has space at either end, or starts with a
-    /// character that makes a line a comment or a continuation (`%`, `#`,
-    /// `>` or `+`).
-    Key,
-    /// A value with a control character other than a tab, a line with
-    /// space at either end, or an empty first line followed by more lines.
-    Value,
-    /// Blocks that do not start at 0 and go up by 0 or 1 from one field to
-    /// the next.
-    Block,
-    /// More than [`MAX_FIELDS`] fields, or more than [`MAX_RESPONSE`]
-    /// bytes.
+    /// A key, value, block order, or referral would change when read back.
+    /// Keys must be nonempty, at most [`MAX_KEY`] bytes, and have no colon,
+    /// control character, outer whitespace, or leading `%`, `#`, `>` or `+`.
+    /// Value lines must have no outer whitespace or controls other than tabs.
+    /// An empty first value line cannot precede continuation lines. Blocks
+    /// start at zero and advance by at most one. Referral hosts must follow
+    /// [`Referral::to_field`]'s rules, and ports must be nonzero.
+    Unwritable,
+    /// More than [`MAX_FIELDS`] fields, or more than [`MAX_RESPONSE`] bytes.
     TooLong,
-    /// A referral host that is empty, longer than [`MAX_HOST`], or neither
-    /// an IPv6 address in lowercase nor a name of lowercase ASCII letters,
-    /// digits, `.`, `-` and `_` that does not start with `-` and whose
-    /// labels are 1 to 63 bytes, with an optional `.` at the end.
-    Host,
-    /// A referral to port 0.
-    Port,
 }
 
 impl std::fmt::Display for EncodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            EncodeError::Key => f.write_str("a key a reader would not read back"),
-            EncodeError::Value => f.write_str("a value a reader would not read back"),
-            EncodeError::Block => f.write_str("blocks out of order"),
+            EncodeError::Unwritable => f.write_str("value cannot be written without changing it"),
             EncodeError::TooLong => f.write_str("more than one WHOIS response may hold"),
-            EncodeError::Host => f.write_str("a referral host a reader would not read back"),
-            EncodeError::Port => f.write_str("a referral to port 0"),
         }
     }
 }
@@ -306,7 +285,7 @@ impl Query {
 
     /// Reads a query line: the bytes before its line ending, with no CR
     /// or LF at the end.
-    pub fn parse_line(line: &[u8]) -> Result<Query, QueryError> {
+    fn parse_line(line: &[u8]) -> Result<Query, QueryError> {
         if line.len() > MAX_QUERY {
             return Err(QueryError::TooLong);
         }
@@ -317,14 +296,6 @@ impl Query {
     /// The query's text, as sent.
     pub fn as_str(&self) -> &str {
         &self.text
-    }
-
-    /// The bytes a client sends: the text, then CR LF.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.text.len() + 2);
-        out.extend_from_slice(self.text.as_bytes());
-        out.extend_from_slice(b"\r\n");
-        out
     }
 
     /// The flags at the start of the query: each word that starts with a
@@ -399,79 +370,6 @@ fn check_query(text: &str) -> Result<(), QueryError> {
     }
 }
 
-/// Splits the bytes a server reads into query lines. A line ends at LF,
-/// and a CR just before the LF is dropped, so clients that send a bare LF
-/// are read too. Most servers read one query and close, but some, such as
-/// the RIPE database with `-k`, read more, so the decoder goes on.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct QueryDecoder {
-    buf: Vec<u8>,
-    /// How many bytes at the start of `buf` are known to hold no LF, so
-    /// feeding a byte at a time does not search the same bytes again.
-    scanned: usize,
-    /// Dropping the rest of a line that was too long, up to its LF.
-    skipping: bool,
-}
-
-impl QueryDecoder {
-    /// A decoder holding no bytes.
-    pub fn new() -> QueryDecoder {
-        QueryDecoder::default()
-    }
-
-    /// Takes bytes read from the connection, from the start of `bytes`,
-    /// and returns how many it took. It takes them all unless that would
-    /// make it hold more than [`MAX_BUFFERED`] bytes. Then take queries
-    /// out with [`QueryDecoder::next_query`] and feed it the rest. Once it
-    /// is full, `next_query` always gives a query or an error, so a loop
-    /// of feeding and taking out always ends.
-    #[must_use = "bytes past the count returned were not taken"]
-    pub fn feed(&mut self, bytes: &[u8]) -> usize {
-        let mut taken = 0;
-        if self.skipping {
-            match bytes.iter().position(|&b| b == b'\n') {
-                Some(i) => {
-                    taken = i + 1;
-                    self.skipping = false;
-                }
-                None => return bytes.len(),
-            }
-        }
-        let rest = &bytes[taken..];
-        let n = rest.len().min(MAX_BUFFERED.saturating_sub(self.buf.len()));
-        self.buf.extend_from_slice(&rest[..n]);
-        taken + n
-    }
-
-    /// The next whole query line, if one has come. It returns `None` when
-    /// it needs more bytes. A line longer than [`MAX_QUERY`] gives
-    /// [`QueryError::TooLong`] once, and the decoder drops the rest of it.
-    pub fn next_query(&mut self) -> Option<Result<Query, QueryError>> {
-        let from = self.scanned.min(self.buf.len());
-        if let Some(i) = self.buf[from..].iter().position(|&b| b == b'\n').map(|i| from + i) {
-            let line = &self.buf[..i];
-            let line = line.strip_suffix(b"\r").unwrap_or(line);
-            let query = Query::parse_line(line);
-            self.buf.drain(..=i);
-            self.scanned = 0;
-            return Some(query);
-        }
-        self.scanned = self.buf.len();
-        if self.buf.len() >= MAX_BUFFERED {
-            self.buf.clear();
-            self.scanned = 0;
-            self.skipping = true;
-            return Some(Err(QueryError::TooLong));
-        }
-        None
-    }
-
-    /// How many bytes are held, waiting for the rest of a line.
-    pub fn buffered(&self) -> usize {
-        self.buf.len()
-    }
-}
-
 /// A server's answer: free text, at most [`MAX_RESPONSE`] bytes. Nothing
 /// in it marks its end. The server closes the connection after it.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
@@ -489,9 +387,80 @@ impl Response {
         Ok(Response { bytes: bytes.to_vec() })
     }
 
-    /// A response of `fields`, written by [`write_fields`].
+    /// Builds a response of `Key: value` lines ended by CRLF, with a blank
+    /// line between blocks. Continuations use [`CONTINUATION_INDENT`];
+    /// empty continuation lines use `+`. Refuses fields that would change
+    /// when read back, unordered blocks, and limits above [`MAX_FIELDS`]
+    /// or [`MAX_RESPONSE`]. Keys must be nonempty, at most [`MAX_KEY`]
+    /// bytes, without colons, controls, or outer whitespace. They must not
+    /// begin with `%`, `#`, `>`, or `+`. Value lines must have no outer
+    /// whitespace or controls other than tabs. An empty first value line
+    /// cannot precede continuation lines. Blocks start at zero and advance
+    /// by at most one.
     pub fn from_fields(fields: &[Field]) -> Result<Response, EncodeError> {
-        Ok(Response { bytes: write_fields(fields)?.into_bytes() })
+        if fields.len() > MAX_FIELDS {
+            return Err(EncodeError::TooLong);
+        }
+        let mut out = String::new();
+        let mut block = 0usize;
+        for (i, f) in fields.iter().enumerate() {
+            let next_block = block.checked_add(1).ok_or(EncodeError::Unwritable)?;
+            if (i == 0 && f.block != 0) || (f.block != block && f.block != next_block) {
+                return Err(EncodeError::Unwritable);
+            }
+            check_key(&f.key)?;
+            // Bound the work before splitting the value into lines.
+            if f.value.len() > MAX_RESPONSE {
+                return Err(EncodeError::TooLong);
+            }
+            let mut lines = f.value.split('\n');
+            let first = lines.next().unwrap_or("");
+            if first.is_empty() && f.value.contains('\n') {
+                return Err(EncodeError::Unwritable);
+            }
+            // The exact bytes this field adds: a blank line before a new
+            // block, the key line, and each further line.
+            let mut need = f.key.len() + 3;
+            if f.block != block {
+                need += 2;
+            }
+            if !first.is_empty() {
+                need += first.len() + 1;
+            }
+            for (i, line) in f.value.split('\n').enumerate() {
+                if trim(line) != line || line.chars().any(|c| c.is_control() && c != '\t') {
+                    return Err(EncodeError::Unwritable);
+                }
+                if i > 0 {
+                    let extra = if line.is_empty() { 3 } else { CONTINUATION_INDENT.len() + line.len() + 2 };
+                    need = need.checked_add(extra).ok_or(EncodeError::TooLong)?;
+                }
+            }
+            if out.len().saturating_add(need) > MAX_RESPONSE {
+                return Err(EncodeError::TooLong);
+            }
+            if f.block != block {
+                out.push_str("\r\n");
+                block = f.block;
+            }
+            out.push_str(&f.key);
+            out.push(':');
+            if !first.is_empty() {
+                out.push(' ');
+                out.push_str(first);
+            }
+            out.push_str("\r\n");
+            for line in lines {
+                if line.is_empty() {
+                    out.push('+');
+                } else {
+                    out.push_str(CONTINUATION_INDENT);
+                    out.push_str(line);
+                }
+                out.push_str("\r\n");
+            }
+        }
+        Ok(Response { bytes: out.into_bytes() })
     }
 
     /// The bytes a server sends before it closes the connection.
@@ -514,48 +483,6 @@ impl Response {
     /// [`Referral::from_field`].
     pub fn referral(&self) -> Option<Referral> {
         FieldReader::new(&self.text()).find_map(|f| Referral::from_field(&f))
-    }
-}
-
-/// Collects the bytes of a response until the server closes the
-/// connection. It keeps the first [`MAX_RESPONSE`] bytes and drops the
-/// rest.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ResponseDecoder {
-    buf: Vec<u8>,
-    truncated: bool,
-}
-
-impl ResponseDecoder {
-    /// A decoder holding no bytes.
-    pub fn new() -> ResponseDecoder {
-        ResponseDecoder::default()
-    }
-
-    /// Takes bytes read from the connection. All are taken, but only the
-    /// first [`MAX_RESPONSE`] in all are kept.
-    pub fn feed(&mut self, bytes: &[u8]) {
-        let n = bytes.len().min(MAX_RESPONSE.saturating_sub(self.buf.len()));
-        self.buf.extend_from_slice(&bytes[..n]);
-        if n < bytes.len() {
-            self.truncated = true;
-        }
-    }
-
-    /// Whether bytes were dropped because the response was longer than
-    /// [`MAX_RESPONSE`].
-    pub fn truncated(&self) -> bool {
-        self.truncated
-    }
-
-    /// How many bytes are kept so far.
-    pub fn buffered(&self) -> usize {
-        self.buf.len()
-    }
-
-    /// The response, once the server has closed the connection.
-    pub fn finish(self) -> Response {
-        Response { bytes: self.buf }
     }
 }
 
@@ -724,75 +651,6 @@ pub fn parse_fields(text: &str) -> Result<Vec<Field>, TooManyFields> {
     Ok(out)
 }
 
-/// Writes fields as `Key: value` lines ended by CR LF, with a blank line
-/// between blocks. Further lines of a value are indented by
-/// [`CONTINUATION_INDENT`], and an empty one is written as `+`.
-/// [`parse_fields`] reads the text back as the same fields.
-pub fn write_fields(fields: &[Field]) -> Result<String, EncodeError> {
-    if fields.len() > MAX_FIELDS {
-        return Err(EncodeError::TooLong);
-    }
-    let mut out = String::new();
-    let mut block = 0usize;
-    for (i, f) in fields.iter().enumerate() {
-        let next_block = block.checked_add(1).ok_or(EncodeError::Block)?;
-        if (i == 0 && f.block != 0) || (f.block != block && f.block != next_block) {
-            return Err(EncodeError::Block);
-        }
-        check_key(&f.key)?;
-        // Bound the work before splitting the value into lines.
-        if f.value.len() > MAX_RESPONSE {
-            return Err(EncodeError::TooLong);
-        }
-        let mut lines = f.value.split('\n');
-        let first = lines.next().unwrap_or("");
-        if first.is_empty() && f.value.contains('\n') {
-            return Err(EncodeError::Value);
-        }
-        // The exact bytes this field adds: a blank line before a new
-        // block, the key line, and each further line.
-        let mut need = f.key.len() + 3;
-        if f.block != block {
-            need += 2;
-        }
-        if !first.is_empty() {
-            need += first.len() + 1;
-        }
-        for (i, line) in f.value.split('\n').enumerate() {
-            if trim(line) != line || line.chars().any(|c| c.is_control() && c != '\t') {
-                return Err(EncodeError::Value);
-            }
-            if i > 0 {
-                need += if line.is_empty() { 3 } else { CONTINUATION_INDENT.len() + line.len() + 2 };
-            }
-        }
-        if out.len().saturating_add(need) > MAX_RESPONSE {
-            return Err(EncodeError::TooLong);
-        }
-        if f.block != block {
-            out.push_str("\r\n");
-            block = f.block;
-        }
-        out.push_str(&f.key);
-        out.push(':');
-        if !first.is_empty() {
-            out.push(' ');
-            out.push_str(first);
-        }
-        out.push_str("\r\n");
-        for line in lines {
-            if line.is_empty() {
-                out.push('+');
-            } else {
-                out.push_str(CONTINUATION_INDENT);
-                out.push_str(line);
-            }
-            out.push_str("\r\n");
-        }
-    }
-    Ok(out)
-}
-
 fn check_key(key: &str) -> Result<(), EncodeError> {
     let ok = !key.is_empty()
         && key.len() <= MAX_KEY
@@ -800,7 +658,7 @@ fn check_key(key: &str) -> Result<(), EncodeError> {
         && !key.contains(':')
         && !key.chars().any(char::is_control)
         && !key.starts_with(['%', '#', '>', '+']);
-    if ok { Ok(()) } else { Err(EncodeError::Key) }
+    if ok { Ok(()) } else { Err(EncodeError::Unwritable) }
 }
 
 /// Which field a referral came from.
@@ -898,10 +756,14 @@ impl Referral {
     /// port is not [`PORT`], after `whois://`
     /// for [`ReferralKind::ReferralServer`] as ARIN writes it.
     /// [`Referral::from_field`] reads it back as the same referral.
+    /// Refuses port zero, hosts above [`MAX_HOST`], and hosts that are not
+    /// canonical lowercase IPv6 addresses or ASCII names. Name labels
+    /// must have 1 to 63 letters, digits, hyphens, or underscores, with
+    /// no leading hyphen. A final dot is allowed.
     pub fn to_field(&self, block: usize) -> Result<Field, EncodeError> {
         check_host(&self.host)?;
         if self.port == 0 {
-            return Err(EncodeError::Port);
+            return Err(EncodeError::Unwritable);
         }
         let mut value = String::new();
         if self.kind == ReferralKind::ReferralServer {
@@ -937,12 +799,12 @@ fn parse_port(p: &str) -> Option<u16> {
 
 fn check_host(host: &str) -> Result<(), EncodeError> {
     if host.is_empty() || host.len() > MAX_HOST || host.bytes().any(|b| b.is_ascii_uppercase()) {
-        return Err(EncodeError::Host);
+        return Err(EncodeError::Unwritable);
     }
     if host.contains(':') {
         return match host.parse::<std::net::Ipv6Addr>() {
             Ok(_) => Ok(()),
-            Err(_) => Err(EncodeError::Host),
+            Err(_) => Err(EncodeError::Unwritable),
         };
     }
     // Labels of 1 to 63 bytes (RFC 1035, section 2.3.4), and a dot at the
@@ -951,7 +813,7 @@ fn check_host(host: &str) -> Result<(), EncodeError> {
     let ok = !host.starts_with('-')
         && name.split('.').all(|l| !l.is_empty() && l.len() <= 63)
         && host.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'-' | b'_'));
-    if ok { Ok(()) } else { Err(EncodeError::Host) }
+    if ok { Ok(()) } else { Err(EncodeError::Unwritable) }
 }
 
 /// Why an exact query wire value could not be read.
@@ -994,8 +856,9 @@ impl Wire for Query {
     type ParseError = QueryParseError;
     type WriteError = QueryError;
 
-    /// Reads exactly one query line, accepting CRLF or bare LF.
-    /// Incomplete input and trailing bytes are errors.
+    /// Reads one UTF-8 query with CRLF or bare LF. Refuses invalid UTF-8,
+    /// control characters other than tabs, more than [`MAX_QUERY`] content
+    /// bytes, incomplete input, and trailing bytes.
     fn parse(bytes: &[u8]) -> Result<Self, Self::ParseError> {
         let mut decoder = Queries::new();
         match decoder
@@ -1009,7 +872,8 @@ impl Wire for Query {
         }
     }
 
-    /// Appends a query with CRLF, leaving `out` unchanged on error.
+    /// Appends a query with CRLF. Refuses text over [`MAX_QUERY`] bytes
+    /// or control characters other than tabs. Leaves `out` unchanged on error.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), QueryError> {
         check_query(&self.text)?;
         out.extend_from_slice(self.text.as_bytes());
@@ -1022,8 +886,8 @@ impl Wire for Response {
     type ParseError = ResponseParseError;
     type WriteError = EncodeError;
 
-    /// Reads a complete response of at most [`MAX_RESPONSE`] bytes.
-    /// All byte values are accepted; there is no line terminator to strip.
+    /// Reads a complete response, refusing more than [`MAX_RESPONSE`]
+    /// bytes. All byte values are accepted; no line terminator is stripped.
     fn parse(bytes: &[u8]) -> Result<Self, ResponseParseError> {
         Self::new(bytes).map_err(|_| ResponseParseError::TooLong)
     }
@@ -1041,7 +905,7 @@ impl Wire for Response {
 
 /// Reads one query per item with [`super::codec::Lines`].
 ///
-/// CRLF and bare LF are accepted, as in [`QueryDecoder`]. Content is
+/// CRLF and bare LF are accepted. Content is
 /// bounded by [`MAX_QUERY`]. Bad and overlong lines are error items; an
 /// unfinished line at EOF is a terminal [`codec::LineError::Unterminated`].
 /// Persistent connections may send several query lines.
@@ -1106,8 +970,8 @@ pub struct CollectedResponse {
 /// Collects one response at EOF under a byte limit.
 ///
 /// Free text has no line framing or terminator requirement. Excess bytes
-/// are consumed without retaining them. The truncation flag matches
-/// [`ResponseDecoder::truncated`], including false at exactly the limit.
+/// are consumed without retaining them. The truncation flag is false
+/// at exactly the limit.
 /// Input capacity is [`RESPONSE_WINDOW`]; retained state is bounded by the byte limit.
 #[derive(Clone, Debug)]
 pub struct Responses {
@@ -1187,6 +1051,7 @@ impl Decode for Responses {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codec::{Stream, contract, test_support::{Lcg, decode_all, mutate}};
 
     /// An answer in the layout Verisign uses for .com, cut short.
     const VERISIGN: &str = concat!(
@@ -1261,18 +1126,18 @@ mod tests {
     fn query_line_from_rfc_3912() {
         // RFC 3912, section 2: a single line of text, ended by CR LF.
         let q = Query::new("example.com").unwrap();
-        assert_eq!(q.to_bytes(), b"example.com\r\n");
-        let mut d = QueryDecoder::new();
-        assert_eq!(d.feed(b"example.com\r\n"), 13);
-        assert_eq!(d.next_query(), Some(Ok(q)));
-        assert_eq!(d.next_query(), None);
+        assert_eq!(q.to_bytes().unwrap(), b"example.com\r\n");
+        let mut d = Stream::new(Queries::new());
+        assert_eq!(d.push(b"example.com\r\n"), 13);
+        assert_eq!(d.next(), Some(Ok(Ok(q))));
+        assert_eq!(d.next(), None);
         assert_eq!(d.buffered(), 0);
         // A bare LF is read too.
-        assert_eq!(d.feed(b"10.0.0.1\n"), 9);
-        assert_eq!(d.next_query().unwrap().unwrap().as_str(), "10.0.0.1");
+        assert_eq!(d.push(b"10.0.0.1\n"), 9);
+        assert_eq!(d.next().unwrap().unwrap().unwrap().as_str(), "10.0.0.1");
         // An empty line is a query, which servers answer with help.
-        assert_eq!(d.feed(b"\r\n"), 2);
-        assert_eq!(d.next_query().unwrap().unwrap().as_str(), "");
+        assert_eq!(d.push(b"\r\n"), 2);
+        assert_eq!(d.next().unwrap().unwrap().unwrap().as_str(), "");
     }
 
     #[test]
@@ -1345,9 +1210,9 @@ mod tests {
         assert_eq!(Query::new("a\nb"), Err(QueryError::Control('\n')));
         assert_eq!(Query::new("a\u{85}"), Err(QueryError::Control('\u{85}')));
         assert!(Query::new("a\tb").is_ok());
-        assert_eq!(Query::parse_line(b"\xffabc"), Err(QueryError::NotUtf8));
-        assert_eq!(Query::parse_line(&[b'a'; MAX_QUERY + 1]), Err(QueryError::TooLong));
-        assert!(Query::parse_line(&[b'a'; MAX_QUERY]).is_ok());
+        assert_eq!(Query::parse(b"\xffabc\r\n"), Err(QueryParseError::Query(QueryError::NotUtf8)));
+        assert_eq!(Query::parse(&[vec![b'a'; MAX_QUERY + 1], b"\r\n".to_vec()].concat()), Err(QueryParseError::Query(QueryError::TooLong)));
+        assert!(Query::parse(&[vec![b'a'; MAX_QUERY], b"\r\n".to_vec()].concat()).is_ok());
         assert_eq!(Query::new(&"a".repeat(MAX_QUERY + 1)), Err(QueryError::TooLong));
         assert_eq!(Query::build(&["x"; 2000], ""), Err(QueryError::TooLong));
         assert_eq!(Query::build(&[&"a".repeat(MAX_QUERY)], "b"), Err(QueryError::TooLong));
@@ -1358,31 +1223,22 @@ mod tests {
 
     #[test]
     fn decoder_skips_long_lines() {
-        let mut d = QueryDecoder::new();
         let mut bytes = vec![b'a'; 3000];
         bytes.extend_from_slice(b"\r\nok\r\n");
-        let mut got = Vec::new();
-        let mut rest = &bytes[..];
-        while !rest.is_empty() {
-            let n = d.feed(rest);
-            assert!(d.buffered() <= MAX_BUFFERED);
-            rest = &rest[n..];
-            while let Some(q) = d.next_query() {
-                got.push(q);
-            }
-        }
+        let got = decode_all(Queries::new, &bytes).0;
+        contract::check_decode_with_alloc_limit(Queries::new, &bytes, 2 * (MAX_QUERY + 2));
         assert_eq!(got, [Err(QueryError::TooLong), Ok(Query::new("ok").unwrap())]);
         // A line one byte too long, ended by a bare LF, is an error too.
-        let mut d = QueryDecoder::new();
+        let mut d = Stream::new(Queries::new());
         let mut line = vec![b'a'; MAX_QUERY + 1];
         line.push(b'\n');
-        assert_eq!(d.feed(&line), line.len());
-        assert_eq!(d.next_query(), Some(Err(QueryError::TooLong)));
+        assert_eq!(d.push(&line), line.len());
+        assert_eq!(d.next(), Some(Ok(Err(QueryError::TooLong))));
         // The longest line is read.
         let mut line = vec![b'a'; MAX_QUERY];
         line.extend_from_slice(b"\r\n");
-        assert_eq!(d.feed(&line), line.len());
-        assert_eq!(d.next_query().unwrap().unwrap().as_str().len(), MAX_QUERY);
+        assert_eq!(d.push(&line), line.len());
+        assert_eq!(d.next().unwrap().unwrap().unwrap().as_str().len(), MAX_QUERY);
     }
 
     #[test]
@@ -1472,11 +1328,11 @@ mod tests {
         let r = Referral { kind: ReferralKind::ReferralServer, host: "h".into(), port: 4343 };
         assert_eq!(r.to_field(0).unwrap().value, "whois://h:4343");
         let bad = |host: &str, port| Referral { kind: ReferralKind::Refer, host: host.into(), port }.to_field(0);
-        assert_eq!(bad("Upper.example", 43), Err(EncodeError::Host));
-        assert_eq!(bad("", 43), Err(EncodeError::Host));
-        assert_eq!(bad(".x", 43), Err(EncodeError::Host));
-        assert_eq!(bad("a:b", 43), Err(EncodeError::Host));
-        assert_eq!(bad("x", 0), Err(EncodeError::Port));
+        assert_eq!(bad("Upper.example", 43), Err(EncodeError::Unwritable));
+        assert_eq!(bad("", 43), Err(EncodeError::Unwritable));
+        assert_eq!(bad(".x", 43), Err(EncodeError::Unwritable));
+        assert_eq!(bad("a:b", 43), Err(EncodeError::Unwritable));
+        assert_eq!(bad("x", 0), Err(EncodeError::Unwritable));
     }
 
     #[test]
@@ -1517,23 +1373,36 @@ mod tests {
         assert_eq!(Response::new(text.as_bytes()).unwrap().fields(), Err(TooManyFields));
         assert!(!TooManyFields.to_string().is_empty());
         let fields = vec![Field::new(0, "k", "v"); MAX_FIELDS + 1];
-        assert_eq!(write_fields(&fields), Err(EncodeError::TooLong));
-        assert!(write_fields(&fields[..MAX_FIELDS]).is_ok());
+        assert_eq!(Response::from_fields(&fields), Err(EncodeError::TooLong));
+        assert!(Response::from_fields(&fields[..MAX_FIELDS]).is_ok());
     }
 
     #[test]
     fn writer_errors() {
-        let one = |k: &str, v: &str| write_fields(&[Field::new(0, k, v)]);
+        let one = |k: &str, v: &str| Response::from_fields(&[Field::new(0, k, v)]);
         for key in ["", " k", "k ", "a:b", "%k", "#k", ">k", "+k", "k\tx", "k\u{7f}"] {
-            assert_eq!(one(key, "v"), Err(EncodeError::Key), "{key:?}");
+            assert_eq!(one(key, "v"), Err(EncodeError::Unwritable), "{key:?}");
         }
-        assert_eq!(one(&"k".repeat(MAX_KEY + 1), "v"), Err(EncodeError::Key));
+        assert_eq!(one(&"k".repeat(MAX_KEY + 1), "v"), Err(EncodeError::Unwritable));
         for value in [" v", "v ", "v\r", "a\n b", "\nb", "a\u{1}"] {
-            assert_eq!(one("k", value), Err(EncodeError::Value), "{value:?}");
+            assert_eq!(one("k", value), Err(EncodeError::Unwritable), "{value:?}");
         }
-        assert_eq!(write_fields(&[Field::new(1, "k", "v")]), Err(EncodeError::Block));
-        assert_eq!(write_fields(&[Field::new(0, "k", "v"), Field::new(2, "k", "v")]), Err(EncodeError::Block));
-        assert_eq!(write_fields(&[Field::new(0, "k", "v"), Field::new(1, "k", "v"), Field::new(0, "k", "v")]), Err(EncodeError::Block));
+        assert_eq!(
+            Response::from_fields(&[Field::new(1, "k", "v")]),
+            Err(EncodeError::Unwritable)
+        );
+        assert_eq!(
+            Response::from_fields(&[Field::new(0, "k", "v"), Field::new(2, "k", "v")]),
+            Err(EncodeError::Unwritable)
+        );
+        assert_eq!(
+            Response::from_fields(&[
+                Field::new(0, "k", "v"),
+                Field::new(1, "k", "v"),
+                Field::new(0, "k", "v")
+            ]),
+            Err(EncodeError::Unwritable)
+        );
         let big = "v".repeat(MAX_RESPONSE);
         assert_eq!(one("k", &big), Err(EncodeError::TooLong));
         assert_eq!(Response::from_fields(&[Field::new(0, "k", &big)]), Err(EncodeError::TooLong));
@@ -1542,7 +1411,7 @@ mod tests {
         assert_eq!(one("k", &"a\n".repeat(MAX_RESPONSE)), Err(EncodeError::TooLong));
         assert_eq!(Response::new(&vec![0; MAX_RESPONSE + 1]), Err(EncodeError::TooLong));
         assert!(Response::new(&vec![0; MAX_RESPONSE]).is_ok());
-        for e in [EncodeError::Key, EncodeError::Value, EncodeError::Block, EncodeError::TooLong, EncodeError::Host, EncodeError::Port] {
+        for e in [EncodeError::Unwritable, EncodeError::TooLong] {
             assert!(!e.to_string().is_empty());
         }
     }
@@ -1557,43 +1426,45 @@ mod tests {
             Field::new(1, "tab", "a\tb"),
             Field::new(2, "trailing", "a\n"),
         ];
-        let text = write_fields(&fields).unwrap();
-        assert!(text.contains("descr: line one\r\n+\r\n        +plus\r\n"));
-        assert_eq!(parse_fields(&text).unwrap(), fields);
-        assert_eq!(write_fields(&[]).unwrap(), "");
+        let response = Response::from_fields(&fields).unwrap();
+        assert!(
+            response
+                .text()
+                .contains("descr: line one\r\n+\r\n        +plus\r\n")
+        );
+        assert_eq!(response.fields().unwrap(), fields);
+        assert_eq!(Response::from_fields(&[]).unwrap().as_bytes(), b"");
     }
 
     #[test]
-    fn response_decoder_keeps_the_first_bytes() {
-        let mut d = ResponseDecoder::new();
-        d.feed(&vec![b'x'; MAX_RESPONSE - 1]);
-        assert!(!d.truncated());
-        d.feed(b"yz");
-        assert!(d.truncated());
-        assert_eq!(d.buffered(), MAX_RESPONSE);
-        d.feed(b"more");
-        let r = d.finish();
+    fn response_collection_keeps_the_first_bytes() {
+        let bytes = [vec![b'x'; MAX_RESPONSE - 1], b"yzmore".to_vec()].concat();
+        let (items, failure) = decode_all(Responses::new, &bytes);
+        assert_eq!(failure, None);
+        assert_eq!(items.len(), 1);
+        assert!(items[0].truncated);
+        let r = &items[0].response;
         assert_eq!(r.as_bytes().len(), MAX_RESPONSE);
         assert_eq!(r.as_bytes().last(), Some(&b'y'));
-        // Latin-1 bytes read as U+FFFD.
+        contract::check_decode_with_alloc_limit(Responses::new, &bytes, 2 * RESPONSE_WINDOW);
         let r = Response::new(b"owner: M\xfcller\n").unwrap();
         assert_eq!(r.fields().unwrap()[0].value, "M\u{fffd}ller");
     }
 
     #[test]
     fn every_truncated_prefix() {
-        let q = Query::new("-B -T inetnum 193.0.0.1").unwrap().to_bytes();
+        let q = Query::new("-B -T inetnum 193.0.0.1").unwrap().to_bytes().unwrap();
         for n in 0..q.len() {
-            let mut d = QueryDecoder::new();
-            assert_eq!(d.feed(&q[..n]), n);
-            assert_eq!(d.next_query(), None, "{n}");
+            let mut d = Stream::new(Queries::new());
+            assert_eq!(d.push(&q[..n]), n);
+            assert_eq!(d.next(), None, "{n}");
         }
         for text in [VERISIGN, RIPE, IANA, ARIN] {
             let full = parse_fields(text).unwrap();
             for n in 0..=text.len() {
-                let mut d = ResponseDecoder::new();
-                d.feed(&text.as_bytes()[..n]);
-                let r = d.finish();
+                let (items, failure) = decode_all(Responses::new, &text.as_bytes()[..n]);
+                assert_eq!(failure, None);
+                let r = &items[0].response;
                 let fields = r.fields().unwrap();
                 assert!(fields.len() <= full.len());
                 // Every field but the last that was cut is read whole.
@@ -1605,177 +1476,89 @@ mod tests {
         }
     }
 
-    struct Lcg(u64);
-
-    impl Lcg {
-        fn next(&mut self) -> u64 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            self.0 >> 33
-        }
-        fn below(&mut self, n: usize) -> usize {
-            (self.next() % n as u64) as usize
-        }
-    }
-
-    /// Bytes drawn mostly from those that matter to the layout.
-    fn buffer(rng: &mut Lcg) -> Vec<u8> {
-        const ALPHABET: &[u8] = b"  \t\t\r\n\n\n::::++%#>-abcKwhois.:/0439\xff\xc3\xa9\x01";
-        // Now and then a buffer longer than one query line, so the
-        // decoder's long-line path runs.
-        let len = if rng.below(16) == 0 { MAX_QUERY - 8 + rng.below(2 * MAX_QUERY) } else { rng.below(300) };
-        (0..len)
-            .map(|_| if rng.below(20) == 0 { rng.next() as u8 } else { ALPHABET[rng.below(ALPHABET.len())] })
-            .collect()
-    }
-
-    fn split_queries(data: &[u8], bytewise: bool) -> Vec<Result<Query, QueryError>> {
-        let mut d = QueryDecoder::new();
-        let mut out = Vec::new();
-        let chunks: Vec<&[u8]> = if bytewise { data.chunks(1).collect() } else { vec![data] };
-        for chunk in chunks {
-            let mut rest = chunk;
-            while !rest.is_empty() {
-                let took = d.feed(rest);
-                assert!(d.buffered() <= MAX_BUFFERED);
-                rest = &rest[took..];
-                let mut progress = took > 0;
-                while let Some(q) = d.next_query() {
-                    out.push(q);
-                    progress = true;
-                }
-                assert!(progress);
-            }
-        }
-        out
-    }
-
     #[test]
-    fn lcg_fuzz() {
-        let mut rng = Lcg(0x5eed_3912);
+    fn random_queries_and_fields() {
+        let mut rng = Lcg::new(0x5eed_3912);
+        let seeds = [VERISIGN, RIPE, IANA, ARIN, "-B -T inetnum 193.0.0.1\r\n"];
         for _ in 0..4000 {
-            let data = buffer(&mut rng);
-            // Queries, all at once and a byte at a time.
-            let queries = split_queries(&data, false);
-            assert_eq!(split_queries(&data, true), queries);
-            for q in queries.iter().flatten() {
-                let bytes = q.to_bytes();
-                assert_eq!(Query::parse_line(&bytes[..bytes.len() - 2]).as_ref(), Ok(q));
-                let flags = q.flags();
-                let terms = q.terms();
-                assert!(flags.len() <= q.as_str().len());
-                assert!(terms.len() <= q.as_str().len());
+            let mut data = if rng.coin() { seeds[rng.index(seeds.len())].as_bytes().to_vec() } else { rng.bytes(300) };
+            if rng.index(16) == 0 {
+                data = vec![b'x'; MAX_QUERY + 1 + rng.index(MAX_QUERY)];
+                data.extend_from_slice(b"\r\nexample.com\r\n");
             }
-            // Queries built from random words: what build takes reads
-            // back as the same flags and terms.
+            mutate(&mut rng, &mut data);
+            contract::check_decode_with_alloc_limit(Queries::new, &data, 2 * (MAX_QUERY + 2));
+            contract::check_decode_with_alloc_limit(Responses::new, &data, 2 * RESPONSE_WINDOW);
+            contract::check_wire::<Query>(&data);
+            contract::check_wire::<Response>(&data);
+            for q in decode_all(Queries::new, &data).0.iter().flatten() {
+                contract::check_wire_value(q);
+                q.to_bytes().unwrap();
+                assert!(q.flags().len() <= q.as_str().len());
+                assert!(q.terms().len() <= q.as_str().len());
+            }
             let text = String::from_utf8_lossy(&data);
-            let mut parts: Vec<&str> = text.split(' ').collect();
+            let mut parts: Vec<_> = text.split(' ').collect();
             let terms = parts.pop().unwrap_or("");
-            if let Ok(q) = Query::build(&parts, terms) {
-                let words: Vec<&str> = q.flags().iter().flat_map(|f| std::iter::once(f.name).chain(f.argument)).collect();
+            if let Ok(query) = Query::build(&parts, terms) {
+                let words: Vec<_> = query.flags().iter().flat_map(|f| std::iter::once(f.name).chain(f.argument)).collect();
                 assert_eq!(words, parts);
-                assert_eq!(q.terms(), trim(terms));
-                assert_eq!(split_queries(&q.to_bytes(), false), [Ok(q)]);
+                assert_eq!(query.terms(), trim(terms));
+                contract::check_wire_value(&query);
             }
-            if let Ok(q) = Query::parse_line(&data) {
-                assert_eq!(split_queries(&q.to_bytes(), true), [Ok(q)]);
+            let response = &decode_all(Responses::new, &data).0[0].response;
+            let fields = response.fields().unwrap();
+            if let Ok(response) = Response::from_fields(&fields) {
+                assert_eq!(response.fields().unwrap(), fields);
+                contract::check_wire_value(&response);
             }
-            // Responses, all at once and a byte at a time.
-            let mut whole = ResponseDecoder::new();
-            whole.feed(&data);
-            let mut bytewise = ResponseDecoder::new();
-            for b in data.chunks(1) {
-                bytewise.feed(b);
-            }
-            let (whole, bytewise) = (whole.finish(), bytewise.finish());
-            assert_eq!(whole, bytewise);
-            let fields = whole.fields().unwrap();
-            // Fields read can be written back if the writer takes them,
-            // and read back the same.
-            if let Ok(text) = write_fields(&fields) {
-                assert_eq!(parse_fields(&text).unwrap(), fields);
-            }
-            for f in &fields {
-                if let Some(r) = Referral::from_field(f) {
-                    assert_eq!(Referral::from_field(&r.to_field(f.block).unwrap()), Some(r));
+            for field in &fields {
+                if let Some(referral) = Referral::from_field(field) {
+                    assert_eq!(Referral::from_field(&referral.to_field(field.block).unwrap()), Some(referral));
                 }
             }
-            assert_eq!(whole.referral(), find_referral(&fields));
-            // Fields built from random text: what the writer takes reads
-            // back the same.
-            let n = rng.below(5);
-            let mut built = Vec::new();
+            assert_eq!(response.referral(), find_referral(&fields));
+            let mut fields = Vec::new();
             let mut block = 0;
-            for i in 0..n {
-                if i > 0 && rng.below(3) == 0 {
-                    block += 1;
+            for i in 0..rng.index(6) {
+                if i > 0 {
+                    // A skipped block also exercises the ordering refusal.
+                    block += rng.index(3);
                 }
-                let key = String::from_utf8_lossy(&buffer(&mut rng)[..]).chars().take(12).collect::<String>();
-                let value = String::from_utf8_lossy(&buffer(&mut rng)).into_owned();
-                built.push(Field { block, key, value });
+                let key_bytes = rng.bytes(12);
+                let value_bytes = rng.bytes(80);
+                let key = if rng.coin() {
+                    String::from_utf8_lossy(&key_bytes).into_owned()
+                } else {
+                    // Valid keys let the value and continuation checks run.
+                    format!("key{i}")
+                };
+                let prefixes = [
+                    "", "+", "%", "\t", "\r", "\n", "\x01", "a\n", "a\n+", "a\n%",
+                ];
+                let value = format!(
+                    "{}{}",
+                    prefixes[rng.index(prefixes.len())],
+                    String::from_utf8_lossy(&value_bytes),
+                );
+                fields.push(Field { block, key, value });
             }
-            if let Ok(text) = write_fields(&built) {
-                assert_eq!(parse_fields(&text).unwrap(), built);
+            if let Ok(response) = Response::from_fields(&fields) {
+                assert_eq!(response.fields().unwrap(), fields);
+                contract::check_wire_value(&response);
             }
         }
-    }
-
-    /// What a [`QueryDecoder`] gives for `data`, worked out line by line: a
-    /// line whose bytes and LF fit in [`MAX_BUFFERED`] is read, and a
-    /// longer one, ended or not, is one [`QueryError::TooLong`].
-    fn expected_queries(data: &[u8]) -> Vec<Result<Query, QueryError>> {
-        let mut out = Vec::new();
-        let mut parts: Vec<&[u8]> = data.split(|&b| b == b'\n').collect();
-        let last = parts.pop().unwrap_or(&[]);
-        for line in parts {
-            if line.len() < MAX_BUFFERED {
-                out.push(Query::parse_line(line.strip_suffix(b"\r").unwrap_or(line)));
-            } else {
-                out.push(Err(QueryError::TooLong));
-            }
-        }
-        if last.len() >= MAX_BUFFERED {
-            out.push(Err(QueryError::TooLong));
-        }
-        out
     }
 
     #[test]
-    fn lcg_fuzz_long_query_lines() {
-        // Lines near and past the limit, fed in chunks of random size.
-        let mut rng = Lcg(0x1026);
-        for _ in 0..1500 {
-            let mut data = Vec::new();
-            for _ in 0..rng.below(4) {
-                let len = match rng.below(4) {
-                    0 => rng.below(20),
-                    1 => MAX_QUERY - 2 + rng.below(6),
-                    _ => rng.below(3 * MAX_QUERY),
-                };
-                data.extend((0..len).map(|_| b"ab -\t\r"[rng.below(6)]));
-                match rng.below(3) {
-                    0 => data.extend_from_slice(b"\r\n"),
-                    1 => data.push(b'\n'),
-                    _ => {}
-                }
+    fn long_query_lines() {
+        for length in [0, 1, MAX_QUERY - 1, MAX_QUERY, MAX_QUERY + 1, 3 * MAX_QUERY] {
+            for ending in [b"\r\n".as_slice(), b"\n"] {
+                let data = [vec![b'a'; length], ending.to_vec(), b"next\r\n".to_vec()].concat();
+                let expected = if length > MAX_QUERY { Err(QueryError::TooLong) } else { Query::new(&"a".repeat(length)) };
+                assert_eq!(decode_all(Queries::new, &data), (vec![expected, Query::new("next")], None));
+                contract::check_decode_with_alloc_limit(Queries::new, &data, 2 * (MAX_QUERY + 2));
             }
-            let want = expected_queries(&data);
-            assert_eq!(split_queries(&data, false), want);
-            let mut d = QueryDecoder::new();
-            let mut got = Vec::new();
-            let mut rest = &data[..];
-            while !rest.is_empty() {
-                let chunk = &rest[..rest.len().min(1 + rng.below(1500))];
-                let took = d.feed(chunk);
-                assert!(d.buffered() <= MAX_BUFFERED);
-                rest = &rest[took..];
-                let mut progress = took > 0;
-                while let Some(q) = d.next_query() {
-                    got.push(q);
-                    progress = true;
-                }
-                assert!(progress);
-            }
-            assert_eq!(got, want);
         }
     }
 
@@ -1843,7 +1626,7 @@ mod tests {
         let r = Referral { kind: ReferralKind::Refer, host: "2001:db8::1".into(), port: 4343 };
         assert_eq!(r.to_field(0).unwrap().value, "[2001:db8::1]:4343");
         let bad = Referral { kind: ReferralKind::Refer, host: "2001:DB8::1".into(), port: 43 };
-        assert_eq!(bad.to_field(0), Err(EncodeError::Host));
+        assert_eq!(bad.to_field(0), Err(EncodeError::Unwritable));
     }
 
     #[test]
@@ -1860,60 +1643,71 @@ mod tests {
         assert!(read(&longest).is_some());
         assert_eq!(read(&format!("{longest}e")), None);
         let bad = Referral { kind: ReferralKind::Refer, host: "a..b".into(), port: 43 };
-        assert_eq!(bad.to_field(0), Err(EncodeError::Host));
+        assert_eq!(bad.to_field(0), Err(EncodeError::Unwritable));
     }
 
     #[test]
     fn writer_takes_what_fits() {
         // "k: " and CR LF around a value make exactly MAX_RESPONSE bytes.
-        let text = write_fields(&[Field::new(0, "k", &"a".repeat(MAX_RESPONSE - 5))]).unwrap();
-        assert_eq!(text.len(), MAX_RESPONSE);
-        assert_eq!(write_fields(&[Field::new(0, "k", &"a".repeat(MAX_RESPONSE - 4))]), Err(EncodeError::TooLong));
+        let response =
+            Response::from_fields(&[Field::new(0, "k", &"a".repeat(MAX_RESPONSE - 5))]).unwrap();
+        assert_eq!(response.as_bytes().len(), MAX_RESPONSE);
+        assert_eq!(
+            Response::from_fields(&[Field::new(0, "k", &"a".repeat(MAX_RESPONSE - 4))]),
+            Err(EncodeError::TooLong)
+        );
         // Empty further lines are written as "+" and CR LF.
         let value = format!("a{}", "\n".repeat(100_000));
-        assert_eq!(write_fields(&[Field::new(0, "k", &value)]).unwrap().len(), 300_006);
+        assert_eq!(
+            Response::from_fields(&[Field::new(0, "k", &value)])
+                .unwrap()
+                .as_bytes()
+                .len(),
+            300_006
+        );
         // A blank line between blocks counts too.
         let fields = [Field::new(0, "k", ""), Field::new(1, "k", &"a".repeat(MAX_RESPONSE - 11))];
-        assert_eq!(write_fields(&fields).unwrap().len(), MAX_RESPONSE);
+        assert_eq!(
+            Response::from_fields(&fields).unwrap().as_bytes().len(),
+            MAX_RESPONSE
+        );
         let fields = [Field::new(0, "k", ""), Field::new(1, "k", &"a".repeat(MAX_RESPONSE - 10))];
-        assert_eq!(write_fields(&fields), Err(EncodeError::TooLong));
+        assert_eq!(Response::from_fields(&fields), Err(EncodeError::TooLong));
     }
 
     #[test]
-    fn decoder_is_clone() {
-        // A world may copy a decoder part way through a line.
-        let mut d = QueryDecoder::new();
-        assert_eq!(d.feed(b"exam"), 4);
-        assert_eq!(d.next_query(), None);
-        let mut e = d.clone();
-        assert_eq!(d, e);
-        assert_eq!(e.feed(b"ple.com\r\n"), 9);
-        assert_eq!(e.next_query().unwrap().unwrap().as_str(), "example.com");
-        assert_eq!(d.buffered(), 4);
-        let r = ResponseDecoder::new();
-        assert_eq!(r.clone(), r);
+    fn partial_query_waits_and_eof_refuses() {
+        let mut stream = Stream::new(Queries::new());
+        assert_eq!(stream.push(b"exam"), 4);
+        assert_eq!(stream.next(), None);
+        assert_eq!(stream.buffered(), 4);
+        assert_eq!(stream.push(b"ple.com\r\n"), 9);
+        assert_eq!(stream.next().unwrap().unwrap().unwrap().as_str(), "example.com");
+        assert_eq!(stream.buffered(), 0);
+        let (_, failure) = decode_all(Queries::new, b"exam");
+        assert_eq!(failure, Some(codec::Fail::Protocol(codec::LineError::Unterminated)));
     }
 
     #[test]
-    fn lcg_fuzz_clean_fields_round_trip() {
+    fn random_clean_fields_round_trip() {
         // Keys and values made to pass the writer, so the round trip runs
         // every time.
-        let mut rng = Lcg(43);
+        let mut rng = Lcg::new(43);
         const KEY: &[u8] = b"abcXYZ0 -_.";
         const VALUE: &[u8] = b"abc 12:+%#>/\t";
         for _ in 0..2000 {
-            let n = 1 + rng.below(6);
+            let n = 1 + rng.index(6);
             let mut fields = Vec::new();
             let mut block = 0;
             for i in 0..n {
-                if i > 0 && rng.below(4) == 0 {
+                if i > 0 && rng.index(4) == 0 {
                     block += 1;
                 }
-                let key: String = (0..1 + rng.below(10)).map(|_| KEY[rng.below(KEY.len())] as char).collect();
+                let key: String = (0..1 + rng.index(10)).map(|_| KEY[rng.index(KEY.len())] as char).collect();
                 let key = format!("k{}k", key);
-                let lines: Vec<String> = (0..1 + rng.below(3))
+                let lines: Vec<String> = (0..1 + rng.index(3))
                     .map(|_| {
-                        let s: String = (0..rng.below(12)).map(|_| VALUE[rng.below(VALUE.len())] as char).collect();
+                        let s: String = (0..rng.index(12)).map(|_| VALUE[rng.index(VALUE.len())] as char).collect();
                         trim(&s).to_string()
                     })
                     .collect();
@@ -1923,14 +1717,10 @@ mod tests {
                 }
                 fields.push(Field { block, key, value });
             }
-            let text = write_fields(&fields).unwrap();
-            assert_eq!(parse_fields(&text).unwrap(), fields);
             let resp = Response::from_fields(&fields).unwrap();
-            let mut d = ResponseDecoder::new();
-            for b in resp.as_bytes().chunks(1) {
-                d.feed(b);
-            }
-            assert_eq!(d.finish().fields().unwrap(), fields);
+            assert_eq!(resp.fields().unwrap(), fields);
+            contract::check_decode_with_alloc_limit(Responses::new, resp.as_bytes(), 2 * RESPONSE_WINDOW);
+            assert_eq!(decode_all(Responses::new, resp.as_bytes()).0[0].response.fields().unwrap(), fields);
         }
     }
 }

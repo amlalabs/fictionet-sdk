@@ -44,7 +44,7 @@ cargo +nightly fuzz list
 | `coap` | datagrams, TCP streams, and constructed values, checked with codec contracts | `stdlib::coap`: CoAP and block transfers |
 | `fastcgi` | arbitrary bytes and constructed values | `stdlib::fastcgi`: exact wire values, request and response state, and bounded codec contracts |
 | `bgp` | arbitrary bytes and constructed values | `stdlib::bgp`: exact frames, session context, UPDATE handling, and bounded codec contracts |
-| `ftp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::ftp`: FTP |
+| `ftp` | control streams, address tokens, and constructed commands and replies | `stdlib::ftp`: strict wire values and bounded codec contracts |
 | `geneve` | datagrams and constructed headers; bounded collection and wire contracts | `stdlib::geneve`: Geneve |
 | `git_protocol` | arbitrary bytes and typed values; wire, chunking, EOF, and allocation contracts | `stdlib::git_protocol`: The Git wire protocol |
 | `grpc` | Framed messages with input-selected limits, constructed payloads, header values, and zero-separated header blocks | `grpc`: chunking and EOF, message limits and transactional writes, compression flags, request and rejection round trips, trailers, timeouts, and paths |
@@ -58,7 +58,7 @@ cargo +nightly fuzz list
 | `gre` | GRE and PPTP packets; exact payload boundaries and wire contracts | `stdlib::gre`: GRE |
 | `igmp` | messages and checksum-corrected inputs; bounded collection and wire contracts | `stdlib::igmp`: IGMP |
 | `ipsec` | ESP, AH, NAT-T, and plaintext values; bounded collection and wire contracts | `stdlib::ipsec`: IPsec |
-| `memcache` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::memcache`: memcached |
+| `memcache` | text streams, binary packets, UDP datagrams, and constructed values | `stdlib::memcache`: strict wire values and bounded codec contracts |
 | `mime_multipart` | wire values and streams checked with bounded codec contracts | `stdlib::mime_multipart`: MIME multipart bodies |
 | `mongodb` | arbitrary bytes and typed values; wire, chunking, EOF, and allocation contracts | `stdlib::mongodb`: MongoDB |
 | `mqtt` | bytes and constructed values, checked with codec contracts | `stdlib::mqtt`: MQTT 3.1.1 |
@@ -106,6 +106,7 @@ cargo +nightly fuzz list
 | `xml` | wire values and streams checked with bounded codec contracts | `stdlib::xml`: XML 1.0 |
 | `zabbix` | arbitrary bytes and constructed values | `stdlib::zabbix`: exact headers, packets, JSON messages, and bounded codec contracts |
 | `wake_on_lan` | arbitrary payloads, bounded EOF decoding, exact packet writing, and password checks | `stdlib::wake_on_lan`: Wake-on-LAN |
+| `whois` | query streams, EOF responses, fields, and constructed values | `stdlib::whois`: strict wire values and bounded codec contracts |
 
 The proxy targets compile the `fictionet` binary's proxy modules from
 their source files (`src/proxy.rs` here), because a binary's modules

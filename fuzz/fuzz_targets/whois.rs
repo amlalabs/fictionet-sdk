@@ -4,59 +4,23 @@
 #![no_main]
 
 use arbitrary::{Result, Unstructured};
-use fictionet::stdlib::codec::contract::{
-    check_decode, check_decode_with_held_limit, check_wire, check_wire_value,
+use fictionet::stdlib::codec::{
+    Wire,
+    contract::{check_decode_with_alloc_limit, check_decode_with_held_limit, check_wire, check_wire_value},
+    test_support::decode_all,
 };
 use fictionet::stdlib::whois::{
-    Field, MAX_BUFFERED, MAX_RESPONSE, Queries, Query, QueryDecoder, QueryError, Referral,
-    ReferralKind, Response, ResponseDecoder, Responses, find_referral, parse_fields, write_fields,
+    Field, MAX_QUERY, MAX_RESPONSE, RESPONSE_WINDOW, Queries, Query, Referral,
+    ReferralKind, Response, Responses, find_referral, parse_fields,
 };
 use libfuzzer_sys::fuzz_target;
-
-/// Feeds `data` in chunks of `size` bytes, taking queries out after each
-/// feed, as a server does. Every query line, read or refused.
-fn split(data: &[u8], size: usize) -> Vec<std::result::Result<Query, QueryError>> {
-    let mut decoder = QueryDecoder::new();
-    let mut out = Vec::new();
-    for chunk in data.chunks(size.max(1)) {
-        let mut rest = chunk;
-        while !rest.is_empty() {
-            let took = decoder.feed(rest);
-            assert!(decoder.buffered() <= MAX_BUFFERED);
-            rest = &rest[took..];
-            let mut progress = took > 0;
-            while let Some(q) = decoder.next_query() {
-                out.push(q);
-                progress = true;
-            }
-            // A full decoder always gives a query or an error.
-            assert!(progress);
-        }
-    }
-    out
-}
-
-/// A response read all at once or a byte at a time.
-fn response(data: &[u8], bytewise: bool) -> (Response, bool) {
-    let mut decoder = ResponseDecoder::new();
-    if bytewise {
-        for b in data.chunks(1) {
-            decoder.feed(b);
-        }
-    } else {
-        decoder.feed(data);
-    }
-    assert!(decoder.buffered() <= MAX_RESPONSE);
-    let truncated = decoder.truncated();
-    (decoder.finish(), truncated)
-}
 
 /// Values a world builds: whatever a writer accepts reads back the same.
 fn built(data: &[u8]) -> Result<()> {
     let mut u = Unstructured::new(data);
     let text: String = u.arbitrary()?;
     if let Ok(q) = Query::new(&text) {
-        assert_eq!(split(&q.to_bytes(), usize::MAX), [Ok(q)]);
+        assert_eq!(decode_all(Queries::new, &q.to_bytes().unwrap()).0, [Ok(q)]);
     }
     let flags: Vec<&str> = u.arbitrary()?;
     let terms: &str = u.arbitrary()?;
@@ -66,7 +30,7 @@ fn built(data: &[u8]) -> Result<()> {
             q.flags().iter().flat_map(|f| std::iter::once(f.name).chain(f.argument)).collect();
         assert_eq!(words, flags);
         assert_eq!(q.terms(), terms.trim_matches([' ', '\t']));
-        assert_eq!(split(&q.to_bytes(), usize::MAX), [Ok(q)]);
+        assert_eq!(decode_all(Queries::new, &q.to_bytes().unwrap()).0, [Ok(q)]);
     }
     let n = u.int_in_range(0..=8usize)?;
     let mut fields = Vec::new();
@@ -77,11 +41,10 @@ fn built(data: &[u8]) -> Result<()> {
         }
         fields.push(Field { block, key: u.arbitrary()?, value: u.arbitrary()? });
     }
-    if let Ok(text) = write_fields(&fields) {
-        assert!(text.len() <= MAX_RESPONSE);
-        assert_eq!(parse_fields(&text).unwrap(), fields);
-        let resp = Response::from_fields(&fields).unwrap();
-        assert_eq!(resp.fields().unwrap(), fields);
+    if let Ok(response) = Response::from_fields(&fields) {
+        check_wire_value(&response);
+        assert!(response.as_bytes().len() <= MAX_RESPONSE);
+        assert_eq!(response.fields().unwrap(), fields);
     }
     let kind = *u.choose(&[
         ReferralKind::Refer,
@@ -104,52 +67,44 @@ fn built(data: &[u8]) -> Result<()> {
 }
 
 fuzz_target!(|data: &[u8]| {
-    check_decode(Queries::new, data);
+    check_decode_with_alloc_limit(Queries::new, data, 2 * (MAX_QUERY + 2));
+    check_decode_with_alloc_limit(Responses::new, data, 2 * RESPONSE_WINDOW);
     check_decode_with_held_limit(Responses::new, data, MAX_RESPONSE);
-    let limit = 17;
-    check_decode_with_held_limit(|| Responses::with_limit(limit), data, limit);
+    check_decode_with_alloc_limit(|| Responses::with_limit(17), data, 2 * RESPONSE_WINDOW);
+    check_decode_with_held_limit(|| Responses::with_limit(17), data, 17);
     check_wire::<Query>(data);
     check_wire::<Response>(data);
 
-    // Queries, split three ways: all at once, a byte at a time, and in
-    // chunks of a size the input picks. All give the same queries and the
-    // same errors.
-    let queries = split(data, usize::MAX);
-    assert_eq!(split(data, 1), queries);
-    let size = 1 + usize::from(data.first().copied().unwrap_or(0)) * 7;
-    assert_eq!(split(data, size), queries);
-    for q in queries.iter().flatten() {
-        check_wire_value(q);
-        // A query read can be written, and reads back the same.
-        let bytes = q.to_bytes();
-        assert_eq!(Query::parse_line(&bytes[..bytes.len() - 2]).as_ref(), Ok(q));
-        let _ = (q.flags(), q.terms());
+    for query in decode_all(Queries::new, data).0.iter().flatten() {
+        check_wire_value(query);
+        assert_eq!(Query::parse(&query.to_bytes().unwrap()).as_ref(), Ok(query));
+        let _ = (query.flags(), query.terms());
     }
 
-    // The response, read both ways, is the same.
-    let (resp, truncated) = response(data, false);
-    check_wire_value(&resp);
-    assert_eq!(response(data, true), (resp.clone(), truncated));
-    if let Ok(fields) = resp.fields() {
-        // Fields read can be written back if the writer takes them, and
-        // read back the same.
-        if let Ok(text) = write_fields(&fields) {
-            assert!(text.len() <= MAX_RESPONSE);
-            assert_eq!(parse_fields(&text).unwrap(), fields);
+    let (responses, failure) = decode_all(Responses::new, data);
+    assert_eq!(failure, None);
+    assert_eq!(responses.len(), 1);
+    let collected = &responses[0];
+    let response = &collected.response;
+    check_wire_value(response);
+    assert_eq!(response.as_bytes(), &data[..data.len().min(MAX_RESPONSE)]);
+    assert_eq!(collected.truncated, data.len() > MAX_RESPONSE);
+    if let Ok(fields) = response.fields() {
+        if let Ok(built) = Response::from_fields(&fields) {
+            check_wire_value(&built);
+            assert_eq!(built.fields().unwrap(), fields);
         }
-        for f in &fields {
-            if let Some(r) = Referral::from_field(f) {
-                assert_eq!(Referral::from_field(&r.to_field(f.block).unwrap()), Some(r));
+        for field in &fields {
+            if let Some(referral) = Referral::from_field(field) {
+                assert_eq!(Referral::from_field(&referral.to_field(field.block).unwrap()), Some(referral));
             }
         }
-        assert_eq!(resp.referral(), find_referral(&fields));
+        assert_eq!(response.referral(), find_referral(&fields));
     }
-    // Text read directly, with no decoder to cap it, gives the same
-    // fields when it fits in one response.
     if let Ok(text) = std::str::from_utf8(data)
-        && !truncated
+        && !collected.truncated
     {
-        assert_eq!(parse_fields(text), resp.fields());
+        assert_eq!(parse_fields(text), response.fields());
     }
     let _ = built(data);
 });
