@@ -1043,6 +1043,126 @@ fn test_support_reproducible_rng_and_chunks() {
     );
 }
 #[test]
+fn test_support_index_and_generators() {
+    let mut rng = test_support::Lcg::new(11);
+    assert_eq!(rng.index(0), 0);
+    let mut seen = [false; 5];
+    for _ in 0..200 {
+        let i = rng.index(5);
+        assert!(i < 5);
+        seen[i] = true;
+    }
+    assert_eq!(seen, [true; 5]);
+    let flips: Vec<bool> = (0..64).map(|_| rng.coin()).collect();
+    assert!(flips.contains(&true) && flips.contains(&false));
+    assert!(rng.bytes(0).is_empty());
+    assert!(rng.text(0).is_empty());
+    let mut lengths = Vec::new();
+    for _ in 0..200 {
+        let b = rng.bytes(9);
+        assert!(b.len() <= 9);
+        lengths.push(b.len());
+        let t = rng.text(9);
+        assert!(t.len() <= 9);
+        assert!(t.bytes().all(|c| (b' '..=b'~').contains(&c)));
+    }
+    assert!(lengths.contains(&0) && lengths.contains(&9));
+    let mut a = test_support::Lcg::new(5);
+    let mut b = test_support::Lcg::new(5);
+    assert_eq!(a.bytes(32), b.bytes(32));
+    assert_eq!(a.text(32), b.text(32));
+}
+#[test]
+fn test_support_mutate_is_bounded_and_reproducible() {
+    let mut rng = test_support::Lcg::new(3);
+    let mut empty = Vec::new();
+    test_support::mutate(&mut rng, &mut empty);
+    assert_eq!(empty.len(), 1);
+    let (mut shorter, mut same, mut one, mut more) = (false, false, false, false);
+    for _ in 0..2000 {
+        let mut data = rng.bytes(40);
+        let original = data.clone();
+        test_support::mutate(&mut rng, &mut data);
+        let (before, after) = (original.len(), data.len());
+        assert!(after <= before + test_support::MUTATE_GROWTH);
+        if after < before {
+            shorter = true;
+            assert_eq!(data[..], original[..after]);
+        } else if after == before {
+            same = true;
+            // Setting a byte or flipping a bit changes at most one byte.
+            let changed = data.iter().zip(&original).filter(|(x, y)| x != y).count();
+            assert!(changed <= 1);
+        } else if after == before + 1 {
+            one = true;
+        } else {
+            more = true;
+        }
+    }
+    assert!(shorter && same && one && more);
+    let (mut a, mut b) = (test_support::Lcg::new(9), test_support::Lcg::new(9));
+    let (mut x, mut y) = (b"abcdef".to_vec(), b"abcdef".to_vec());
+    for _ in 0..50 {
+        test_support::mutate(&mut a, &mut x);
+        test_support::mutate(&mut b, &mut y);
+    }
+    assert_eq!(x, y);
+    assert!(x.len() <= 6 + 50 * test_support::MUTATE_GROWTH);
+}
+#[test]
+fn test_support_mutate_duplicates_a_slice() {
+    // Growth beyond one byte only comes from copying an existing slice.
+    let mut rng = test_support::Lcg::new(1);
+    for _ in 0..500 {
+        let original = b"0123456789".to_vec();
+        let mut data = original.clone();
+        test_support::mutate(&mut rng, &mut data);
+        let n = data.len().saturating_sub(original.len());
+        if n > 1 {
+            let at = (0..=original.len())
+                .find(|&at| data[..at] == original[..at] && data[at + n..] == original[at..])
+                .expect("copy inserted at one position");
+            let copy = &data[at..at + n];
+            assert!(original.windows(n).any(|w| w == copy));
+        }
+    }
+}
+#[test]
+fn test_support_decode_all() {
+    let (items, failure) = test_support::decode_all(|| Frames, &[2, b'a', b'b', 0x80, 0]);
+    assert_eq!(items, vec![b"ab".to_vec(), Vec::new()]);
+    assert_eq!(failure, None);
+    let (items, failure) = test_support::decode_all(|| Frames, &[1, b'a', 3, b'b']);
+    assert_eq!(items, vec![b"a".to_vec()]);
+    assert_eq!(failure, Some(Fail::Truncated { unread: 2 }));
+    let (items, failure) = test_support::decode_all(|| Frames, &[0, 0x40, 0]);
+    assert_eq!(items, vec![Vec::new()]);
+    assert_eq!(failure, Some(Fail::Protocol(TestError)));
+    // Bytes after End are left undecoded.
+    let (items, failure) = test_support::decode_all(|| Frames, &[0, 0xff, 0x40]);
+    assert_eq!(items, vec![Vec::new()]);
+    assert_eq!(failure, None);
+    let (items, failure) = test_support::decode_all(|| Frames, b"");
+    assert!(items.is_empty());
+    assert_eq!(failure, None);
+}
+#[test]
+fn contract_alloc_limit_accepts_bounded_buffer() {
+    let data = [7, 1, 2, 3, 4, 5, 6, 7, 2, b'a', b'b', 0x80, 0];
+    contract::check_decode_with_alloc_limit(|| Frames, &data, 16);
+    let mut rng = test_support::Lcg::new(8);
+    for _ in 0..20 {
+        let mut bytes = data.to_vec();
+        test_support::mutate(&mut rng, &mut bytes);
+        contract::check_decode_with_alloc_limit(|| Frames, &bytes, 16);
+    }
+}
+#[test]
+#[should_panic(expected = "buffer allocation exceeds limit")]
+fn contract_alloc_limit_rejects_large_buffer() {
+    contract::check_decode_with_alloc_limit(|| Frames, &[7, 1, 2, 3, 4, 5, 6, 7], 4);
+}
+#[test]
 fn errors_support_borrowed_details_and_nested_display() {
     use alloc::string::ToString;
     #[derive(Debug, Clone)]
