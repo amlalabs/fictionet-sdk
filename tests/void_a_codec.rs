@@ -1,8 +1,8 @@
-//! Bounded frame streams, exact wire values, and compatibility behavior.
+//! Bounded frame streams, exact wire values, and protocol errors.
 
 use core::fmt::Debug;
 use fictionet::stdlib::codec::{
-    Decode, Fail, Stream, Wire, contract, finish, pump, test_support::chunks,
+    Decode, Fail, Stream, Wire, contract, finish, pump, test_support::{chunks, decode_all},
 };
 use fictionet::stdlib::{bgp, fastcgi, kafka, thrift, zabbix};
 
@@ -12,26 +12,19 @@ where
     D::Item: PartialEq + Debug,
     D::Error: Clone + PartialEq + Debug,
 {
-    contract::check_stack(&make, bytes);
-    for pattern in [&[][..], &[1][..], &[3, 1, 37][..], &[64][..]] {
-        let mut stream = Stream::new(make());
-        let capacity = make().capacity();
-        let mut items = Vec::new();
-        for part in chunks(bytes, pattern) {
-            assert_eq!(
-                pump(&mut stream, part, |item| items.push(item)),
-                Ok(part.len())
-            );
-            assert!(stream.buffered() <= capacity);
-            assert_eq!(stream.held(), 0);
-        }
-        finish(&mut stream, |item| items.push(item)).unwrap();
-        assert_eq!(items, expected);
-        assert_eq!(stream.offset(), bytes.len() as u64);
-        assert!(stream.is_done());
-        assert!(stream.failed().is_none());
-        assert!(stream.next().is_none());
+    contract::check_decode_with_alloc_limit(&make, bytes, 2 * make().capacity());
+    contract::check_decode_with_held_limit(&make, bytes, 0);
+    let (items, error) = decode_all(&make, bytes);
+    assert_eq!(error, None);
+    assert_eq!(items, expected);
+    let mut stream = Stream::new(make());
+    let mut items = Vec::new();
+    for chunk in chunks(bytes, &[1, 7, 2, 31]) {
+        assert_eq!(pump(&mut stream, chunk, |item| items.push(item)).unwrap(), chunk.len());
     }
+    finish(&mut stream, |item| items.push(item)).unwrap();
+    assert_eq!(items, expected);
+    assert_eq!(stream.offset(), bytes.len() as u64);
 }
 
 fn round_trip<D>(make: impl Fn() -> D, values: &[D::Item]) -> Vec<u8>
@@ -46,7 +39,7 @@ where
         let encoded = Wire::to_bytes(value).unwrap();
         contract::check_wire::<D::Item>(&encoded);
         assert_eq!(<D::Item as Wire>::parse(&encoded).unwrap(), *value);
-        // Wire is exact, while the inherent parsers retain prefix semantics.
+        // Exact parsing refuses partial and trailing input.
         for end in 0..encoded.len() {
             assert!(<D::Item as Wire>::parse(encoded.get(..end).unwrap()).is_err());
         }
@@ -81,7 +74,7 @@ where
     D::Item: PartialEq + Debug,
     D::Error: Clone + PartialEq + Debug,
 {
-    contract::check_decode(&make, header);
+    contract::check_decode_with_alloc_limit(&make, header, 2 * make().capacity());
     let capacity = make().capacity();
     let mut stream = Stream::new(make());
     assert_eq!(stream.push(header), header.len());
@@ -90,7 +83,7 @@ where
     assert!(stream.next().is_none());
     assert_eq!(stream.push(&[0; 3]), 3);
 
-    // Even a feed larger than the capacity holds only the named limit.
+    // Even an input larger than capacity holds only the named limit.
     let mut oversized = vec![0; capacity + 1];
     oversized
         .get_mut(..header.len())
@@ -180,20 +173,19 @@ fn thrift_chunked_round_trip() {
         thrift::Protocol::BinaryOld,
         thrift::Protocol::Compact,
     ] {
-        let payload = call.to_bytes(protocol).unwrap();
-        let size = payload.len();
+        let payload = thrift::EncodedMessage { message: call.clone(), protocol }.to_bytes().unwrap();
         let good = thrift::Frame(payload);
         let bytes = round_trip(
             thrift::Frames::new,
             &[good.clone(), thrift::Frame(vec![]), good],
         );
         stack(
-            || thrift::Frames::new().map(|frame| thrift::Message::parse(&frame.0)),
+            || thrift::Frames::new().map(|frame| thrift::EncodedMessage::parse(&frame.0)),
             &bytes,
             &[
-                Ok((call.clone(), protocol, size)),
+                Ok(thrift::EncodedMessage { message: call.clone(), protocol }),
                 Err(thrift::Error::Truncated),
-                Ok((call.clone(), protocol, size)),
+                Ok(thrift::EncodedMessage { message: call.clone(), protocol }),
             ],
         );
     }
@@ -326,7 +318,7 @@ fn zabbix_rejects_oversize_at_named_limit() {
             data_len: len,
             reserved: 0,
         }
-        .to_bytes();
+        .to_bytes().unwrap();
         rejects(
             zabbix::Frames::new,
             &header,
@@ -340,7 +332,7 @@ fn zabbix_rejects_oversize_at_named_limit() {
             data_len: 0,
             reserved: len,
         }
-        .to_bytes();
+        .to_bytes().unwrap();
         rejects(
             zabbix::Frames::new,
             &header,
@@ -360,7 +352,7 @@ fn refuses<M: Wire + PartialEq + Debug>(value: &M) {
 }
 
 #[test]
-fn strict_writers_are_transactional_and_old_writers_keep_their_meaning() {
+fn strict_writers_are_transactional() {
     refuses(&bgp::Frame {
         kind: 255,
         body: vec![0; bgp::MAX_BODY_LEN + 1],
@@ -372,15 +364,6 @@ fn strict_writers_are_transactional_and_old_writers_keep_their_meaning() {
         padding: 255,
     };
     refuses(&record);
-    assert_eq!(
-        fastcgi::Record::parse(&record.to_bytes())
-            .unwrap()
-            .unwrap()
-            .0
-            .content
-            .len(),
-        fastcgi::MAX_CONTENT
-    );
     refuses(&kafka::Frame(vec![0; kafka::MAX_FRAME + 1]));
     refuses(&thrift::Frame(vec![0; thrift::MAX_FRAME + 1]));
     let packet = zabbix::Packet {
@@ -393,12 +376,6 @@ fn strict_writers_are_transactional_and_old_writers_keep_their_meaning() {
         flags: zabbix::flags::PROTOCOL,
         ..packet.clone()
     });
-    let normalized = zabbix::Packet::parse(&packet.to_bytes())
-        .unwrap()
-        .unwrap()
-        .0;
-    assert_eq!(normalized.flags, zabbix::flags::KNOWN);
-    assert_eq!(normalized.reserved, zabbix::MAX_DATA as u64);
 }
 
 #[test]
@@ -445,7 +422,7 @@ fn configurable_limits_clamp_and_accept_empty_frames() {
     let packet = zabbix::Packet::new(vec![]);
     stack(
         || zabbix::Frames::with_limit(0),
-        &packet.to_bytes(),
+        &packet.to_bytes().unwrap(),
         &[packet],
     );
     let record = fastcgi::Record {
@@ -456,52 +433,7 @@ fn configurable_limits_clamp_and_accept_empty_frames() {
     };
     stack(
         || fastcgi::Frames::with_limit(0),
-        &record.to_bytes(),
+        &record.to_bytes().unwrap(),
         &[record],
     );
-}
-
-#[test]
-#[allow(deprecated)] // Check the original buffering and repeated errors.
-fn compatibility_decoders_keep_buffering_and_error_timing() {
-    let mut kafka = kafka::Decoder::with_limit(0);
-    kafka.feed(&[0; 40]);
-    assert_eq!(kafka.buffered(), 40);
-    for _ in 0..10 {
-        assert_eq!(kafka.next_frame(), Some(Ok(vec![])));
-    }
-    kafka.feed(&[0xff; 4]);
-    assert_eq!(kafka.buffered(), 0); // Kafka checks the first header in feed.
-    for _ in 0..2 {
-        assert_eq!(kafka.next_frame(), Some(Err(kafka::Error::FrameSize(-1))));
-    }
-    let mut thrift = thrift::Decoder::new();
-    thrift.feed(&[0xff; 4]);
-    assert_eq!(thrift.buffered(), 4); // Thrift checks it only when pulled.
-    for _ in 0..2 {
-        assert_eq!(
-            thrift.next_frame(),
-            Some(Err(thrift::FrameError::Length(-1)))
-        );
-    }
-    let mut zabbix = zabbix::Decoder::with_limit(0);
-    let empty = zabbix::Packet::new(vec![]).to_bytes();
-    zabbix.feed(&empty.repeat(3));
-    assert_eq!(zabbix.buffered(), 3 * empty.len());
-    let mut bgp = bgp::Decoder::new();
-    assert_eq!(bgp.feed(&vec![0; bgp::MAX_BUFFERED + 1]), bgp::MAX_BUFFERED);
-    for _ in 0..2 {
-        assert_eq!(
-            bgp.next_frame(),
-            Some(Err(bgp::Error::ConnectionNotSynchronized))
-        );
-    }
-    let mut fastcgi = fastcgi::Decoder::new();
-    fastcgi.feed(&vec![0; fastcgi::MAX_BUFFERED + 1]);
-    for _ in 0..2 {
-        assert_eq!(
-            fastcgi.next_record(),
-            Some(Err(fastcgi::RecordError::TooLong))
-        );
-    }
 }

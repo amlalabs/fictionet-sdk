@@ -6,11 +6,15 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use fictionet::stdlib::bgp::{
-    Attribute, Context, Decoder, EncodeError, Error, Frame, Frames, MAX_BODY_LEN, MAX_BUFFERED, Message, MpReach,
+    Attribute, Context, EncodeError, Frame, Frames, MAX_BODY_LEN, Message, MpReach,
     Nlri, Open, Origin, Prefix, Segment, SegmentKind, Update, afi, kind, safi,
 };
-use fictionet::stdlib::codec::{Decode, contract};
+use fictionet::stdlib::codec::{Decode, Wire, contract, test_support::decode_all};
 use libfuzzer_sys::fuzz_target;
+
+fn encode(message: &Message, context: &Context) -> Result<Vec<u8>, EncodeError> {
+    message.to_frame(context)?.to_bytes()
+}
 
 /// Every combination of the session settings.
 const CONTEXTS: [Context; 4] = [
@@ -19,29 +23,6 @@ const CONTEXTS: [Context; 4] = [
     Context { four_octet_as: false, enhanced_route_refresh: true },
     Context { four_octet_as: true, enhanced_route_refresh: true },
 ];
-
-/// Feeds all of `bytes`, taking frames out whenever the decoder is full,
-/// and returns every frame up to and with the first error.
-fn split(d: &mut Decoder, mut bytes: &[u8]) -> Vec<Result<Frame, Error>> {
-    let mut out = Vec::new();
-    loop {
-        let n = d.feed(bytes);
-        bytes = &bytes[n..];
-        assert!(d.buffered() <= MAX_BUFFERED);
-        while let Some(f) = d.next_frame() {
-            let stop = f.is_err();
-            out.push(f);
-            if stop {
-                return out;
-            }
-        }
-        if bytes.is_empty() {
-            return out;
-        }
-        // A full decoder always gives a frame or an error.
-        assert!(n > 0);
-    }
-}
 
 /// Whether an UPDATE mixes kinds of routes, which a reader takes from
 /// older speakers but a writer refuses (RFC 7606 section 5.1).
@@ -98,31 +79,21 @@ fn update_from(data: &[u8]) -> Update {
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode(|| Frames, data);
+    contract::check_decode_with_alloc_limit(|| Frames, data, 2 * Frames.capacity());
     contract::check_wire::<Frame>(data);
-    contract::check_decode(|| Frames.map(|frame| Message::decode(&frame, &Context::default())), data);
+    contract::check_wire::<Open>(data);
+    contract::check_decode_with_alloc_limit(|| Frames.map(|frame| Message::decode(&frame, &Context::default())), data, 2 * Frames.capacity());
     let built = Frame {
         kind: data.first().copied().unwrap_or(0),
         body: data.iter().take(MAX_BODY_LEN + 1).copied().collect(),
     };
     contract::check_wire_value(&built);
 
-    // The stream, split two ways: all at once, and a byte at a time, up to
-    // and with the first error.
-    let frames = split(&mut Decoder::new(), data);
-    let mut bytewise = Decoder::new();
-    let mut again = Vec::new();
-    for b in data {
-        again.extend(split(&mut bytewise, std::slice::from_ref(b)));
-        if again.last().is_some_and(Result::is_err) {
-            break;
-        }
-    }
-    assert_eq!(frames, again);
+    let frames = decode_all(|| Frames, data).0;
 
     // Any bytes as the body of each message type, too.
     let bodies = (1..=6).map(|kind| Frame { kind, body: data.to_vec() });
-    for f in frames.iter().flatten().cloned().chain(bodies) {
+    for f in frames.into_iter().chain(bodies) {
         for ctx in CONTEXTS {
             let strict = Message::decode(&f, &ctx);
             // RFC 7606 closes the connection only for errors the strict
@@ -139,7 +110,7 @@ fuzz_target!(|data: &[u8]| {
                     }
                     Err(e) => {
                         assert!(strict.is_err());
-                        assert!(Message::Notification(e.notification()).to_bytes(&ctx).is_ok());
+                        assert!(encode(&Message::Notification(e.notification()), &ctx).is_ok());
                     }
                 }
             }
@@ -148,18 +119,17 @@ fuzz_target!(|data: &[u8]| {
                 // routes, and reads back the same.
                 Ok(m) => {
                     if mixes(&m) {
-                        assert!(matches!(m.to_bytes(&ctx), Err(EncodeError::Invalid(_))));
+                        assert!(matches!(encode(&m, &ctx), Err(EncodeError::Unwritable)));
                         continue;
                     }
-                    let bytes = m.to_bytes(&ctx).unwrap();
-                    let (back, used) = Frame::parse(&bytes).unwrap().unwrap();
-                    assert_eq!(used, bytes.len());
+                    let bytes = encode(&m, &ctx).unwrap();
+                    let back = Frame::parse(&bytes).unwrap();
                     assert_eq!(Message::decode(&back, &ctx), Ok(m));
                 }
                 // An error's notification can always be sent.
                 Err(e) => {
                     let n = Message::Notification(e.notification());
-                    assert!(n.to_bytes(&ctx).is_ok());
+                    assert!(encode(&n, &ctx).is_ok());
                 }
             }
         }
@@ -170,8 +140,8 @@ fuzz_target!(|data: &[u8]| {
     let read = [Open::parse(data).map(Message::Open), Update::parse(data, &ctx).map(Message::Update)];
     for r in read {
         match r {
-            Ok(m) => assert!(mixes(&m) || m.to_bytes(&ctx).is_ok()),
-            Err(e) => assert!(Message::Notification(e.notification()).to_bytes(&ctx).is_ok()),
+            Ok(m) => assert!(mixes(&m) || encode(&m, &ctx).is_ok()),
+            Err(e) => assert!(encode(&Message::Notification(e.notification()), &ctx).is_ok()),
         }
     }
     // An UPDATE built from public fields: a frame the writer gives fits in

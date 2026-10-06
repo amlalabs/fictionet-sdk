@@ -1,120 +1,63 @@
-//! Thrift frames, messages and values in the binary and compact protocols,
-//! as a world playing a Thrift server reads them.
+//! Thrift frames, messages, and values in the binary and compact protocols.
 #![no_main]
-#![allow(deprecated)] // Also exercise the compatibility decoder.
 
-use fictionet::stdlib::codec::{Decode, contract};
+use fictionet::stdlib::codec::{Decode, Fail, Stream, Wire, contract, test_support::decode_all};
 use fictionet::stdlib::thrift::{
-    Decoder, Error, Frame, Frames, MAX_FRAME, Message, Messages, Protocol, StreamDecoder, Type, Value,
+    EncodedMessage, Error, Frame, Frames, MAX_FRAME, MAX_MESSAGE, Messages, ValueBody,
 };
 use libfuzzer_sys::fuzz_target;
 
-const TYPES: [Type; 12] = [
-    Type::Bool,
-    Type::Byte,
-    Type::I16,
-    Type::I32,
-    Type::I64,
-    Type::Double,
-    Type::Binary,
-    Type::Uuid,
-    Type::Struct,
-    Type::List,
-    Type::Set,
-    Type::Map,
-];
-
-/// A message read can be written, and reads back to the same bytes.
-fn rewrites(m: &Message, protocol: Protocol) {
-    let bytes = m.to_bytes(protocol).unwrap();
-    let (back, again, used) = Message::parse(&bytes).unwrap();
-    assert_eq!((again, used), (protocol, bytes.len()));
-    assert_eq!(back.to_bytes(protocol).unwrap(), bytes);
-}
-
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode(Messages::new, data);
-    contract::check_decode(Frames::new, data);
-    contract::check_decode(|| Frames::with_limit(usize::from(data.first().copied().unwrap_or(0))), data);
+    contract::check_decode_with_alloc_limit(Messages::new, data, 2 * Messages::new().capacity());
+    contract::check_decode_with_held_limit(Messages::new, data, Messages::new().held());
+    contract::check_decode_with_alloc_limit(Frames::new, data, 2 * Frames::new().capacity());
+    let limit = usize::from(data.first().copied().unwrap_or(0));
+    contract::check_decode_with_alloc_limit(|| Frames::with_limit(limit), data, 2 * Frames::with_limit(limit).capacity());
     contract::check_wire::<Frame>(data);
-    contract::check_decode(|| Frames::new().map(|frame| Message::parse(&frame.0)), data);
+    contract::check_wire::<EncodedMessage>(data);
+    contract::check_decode_with_alloc_limit(|| Frames::new().map(|frame| EncodedMessage::parse(&frame.0)), data, 2 * Frames::new().capacity());
     contract::check_wire_value(&Frame(data.iter().take(MAX_FRAME + 1).copied().collect()));
-
-    // The stream, split two ways: all at once, and a byte at a time.
-    let mut whole = Decoder::new();
-    whole.feed(data);
-    let mut frames = Vec::new();
-    while let Some(Ok(f)) = whole.next_frame() {
-        frames.push(f);
+    for frame in decode_all(Frames::new, data).0 {
+        contract::check_wire_value(&frame);
+        contract::check_wire::<EncodedMessage>(&frame.0);
     }
-    let mut bytewise = Decoder::new();
-    let mut again = Vec::new();
-    for b in data {
-        bytewise.feed(std::slice::from_ref(b));
-        while let Some(Ok(f)) = bytewise.next_frame() {
-            again.push(f);
+    let mut stream = Stream::new(Messages::new());
+    let mut pushed = 0;
+    let mut start = 0;
+    while !stream.is_done() {
+        pushed += stream.push(&data[pushed..]);
+        if pushed == data.len() {
+            stream.end();
+        }
+        while let Some(item) = stream.next() {
+            let Ok(value) = item else { break };
+            let end = usize::try_from(stream.offset()).unwrap();
+            assert_eq!(EncodedMessage::parse(&data[start..end]), Ok(value.clone()));
+            contract::check_wire_value(&value);
+            start = end;
         }
     }
-    assert_eq!(frames, again);
-    for f in &frames {
-        if let Ok((m, protocol, used)) = Message::parse(f) {
-            assert!(used <= f.len());
-            rewrites(&m, protocol);
-        }
-    }
-
-    // The stream without frames, read whole and a byte at a time, gives the
-    // messages that reading from the start again and again gives.
-    let mut want = Vec::new();
-    let mut rest = data;
-    let end = loop {
-        match Message::parse(rest) {
-            Ok((m, protocol, used)) => {
-                want.push((m, protocol));
-                rest = &rest[used..];
-            }
-            Err(e) => break e,
-        }
-    };
-    for whole in [true, false] {
-        let mut d = StreamDecoder::new();
-        let mut got = Vec::new();
-        let mut failed = None;
-        let pieces: Vec<&[u8]> = if whole { vec![data] } else { data.chunks(1).collect() };
-        'feed: for piece in pieces {
-            d.feed(piece);
-            while let Some(r) = d.next_message() {
-                match r {
-                    Ok(m) => got.push(m),
-                    Err(e) => {
-                        failed = Some(e);
-                        break 'feed;
-                    }
-                }
+    let rest = &data[start..];
+    match stream.failed() {
+        Some(Fail::Protocol(error)) => {
+            let expected = EncodedMessage::parse(rest).unwrap_err();
+            // An exact read checks the total length before the header. The
+            // stream can report a malformed prefix before reaching that limit.
+            if rest.len() <= MAX_MESSAGE && !matches!(expected, Error::Truncated | Error::Trailing) {
+                assert_eq!(*error, expected);
             }
         }
-        assert_eq!(got, want);
-        // A whole read can stop early on a count bigger than the bytes held,
-        // where the stream decoder already sees an error further on.
-        if end != Error::Truncated {
-            assert_eq!(failed, Some(end));
+        Some(Fail::Truncated { .. }) => {
+            assert_eq!(EncodedMessage::parse(rest), Err(Error::Truncated));
         }
+        Some(Fail::Stuck { .. }) => panic!("message decoder made no progress"),
+        None => assert!(rest.is_empty()),
     }
-
-    // Any bytes as a message on its own, and as a value of each type.
-    if let Ok((m, protocol, used)) = Message::parse(data) {
-        assert!(used <= data.len());
-        rewrites(&m, protocol);
+    macro_rules! values {
+        ($($code:literal),*) => { $(
+            contract::check_wire::<ValueBody<false, $code>>(data);
+            contract::check_wire::<ValueBody<true, $code>>(data);
+        )* };
     }
-    for protocol in [Protocol::Binary, Protocol::Compact] {
-        for ty in TYPES {
-            if let Ok((v, used)) = Value::parse(protocol, ty, data) {
-                assert!(used <= data.len());
-                let bytes = v.to_bytes(protocol).unwrap();
-                let (back, n) = Value::parse(protocol, ty, &bytes).unwrap();
-                assert_eq!(n, bytes.len());
-                assert_eq!(back.to_bytes(protocol).unwrap(), bytes);
-            }
-        }
-    }
+    values!(2, 3, 4, 6, 8, 10, 11, 12, 13, 14, 15, 16);
 });

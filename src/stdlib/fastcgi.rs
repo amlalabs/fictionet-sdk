@@ -12,9 +12,9 @@
 //! apart by their request ID. This module follows the FastCGI
 //! Specification 1.0.
 //!
-//! Nothing here reads a socket. A world that plays an application feeds
-//! the bytes it reads from a connection to [`Frames`] with
-//! [`super::codec::Stream`], gets [`Record`]s back, and hands each one
+//! Nothing here reads a socket. A world that plays an application passes
+//! bytes from a connection to [`Stream<Frames>`](super::codec::Stream),
+//! gets [`Record`]s back, and hands each one
 //! to a [`Server`], which puts the streams of each request back
 //! together and gives a [`Request`] once all of it has come. The world
 //! writes the bytes of the [`Response`] it chooses back to the
@@ -27,26 +27,23 @@
 //! bytes a decoder holds, the stream bytes held across all open requests,
 //! and the number of requests open at once.
 //!
-//! Use [`Frames`] with [`super::codec::Stream`] for bounded input, explicit
-//! EOF handling and errors reported once.
-//!
 //! ```
-//! use fictionet::stdlib::codec::{Stream, finish, pump};
-//! use fictionet::stdlib::fastcgi::{Frames, Request, Role, Server, ServerEvent};
+//! use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
+//! use fictionet::stdlib::fastcgi::{Frames, Pairs, Request, Role, Server, ServerEvent};
 //!
 //! // What a web server sends for GET /hello: two parameters and no body.
 //! let sent = Request {
 //!     id: 1,
 //!     role: Role::Responder,
 //!     keep_conn: false,
-//!     params: vec![
+//!     params: Pairs(vec![
 //!         (b"REQUEST_METHOD".to_vec(), b"GET".to_vec()),
 //!         (b"SCRIPT_NAME".to_vec(), b"/hello".to_vec()),
-//!     ],
+//!     ]),
 //!     stdin: Vec::new(),
 //!     data: Vec::new(),
 //! }
-//! .to_bytes();
+//! .to_bytes().unwrap();
 //!
 //! let mut stream = Stream::new(Frames::new());
 //! let mut server = Server::new();
@@ -56,7 +53,7 @@
 //!         Ok(Some(ServerEvent::Request(req))) => {
 //!             assert_eq!(req.param(b"SCRIPT_NAME"), Some(&b"/hello"[..]));
 //!             let page = b"Content-Type: text/plain\r\n\r\nhello".to_vec();
-//!             reply.extend(req.respond(page).to_bytes());
+//!             req.respond(page).write(&mut reply).unwrap();
 //!             // END_REQUEST has gone out, so the request ID is free again.
 //!             server.end(req.id);
 //!         }
@@ -106,10 +103,6 @@ pub const MAX_REQUESTS: usize = 32;
 /// requests it is putting together. It is room for two of the largest
 /// requests, so each limit on its own can be reached.
 pub const MAX_HELD: usize = 4 * MAX_STREAM;
-/// The most bytes a [`Decoder`] holds that have not been taken out as
-/// records. The largest request [`Request::to_bytes`] writes fits, so it
-/// can be fed in one go.
-pub const MAX_BUFFERED: usize = 4 * MAX_STREAM;
 
 /// How much content each record of a stream carries when this module
 /// writes one. A multiple of 8, so the records need no padding.
@@ -155,9 +148,6 @@ pub mod values {
 /// connection open after the request.
 pub const KEEP_CONN: u8 = 1;
 
-/// A name and a value, as raw bytes.
-pub type Pair = (Vec<u8>, Vec<u8>);
-
 /// One record: the header's fields and the content it carries. The
 /// header's version is always [`VERSION`] and its content length is the
 /// content's, so neither is kept. Padding bytes are ignored on reading and
@@ -181,16 +171,12 @@ pub struct Record {
 pub enum RecordError {
     /// The version byte was not 1.
     Version(u8),
-    /// A [`Decoder`] was fed more than [`MAX_BUFFERED`] bytes without
-    /// records being taken out.
-    TooLong,
 }
 
 impl core::fmt::Display for RecordError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             RecordError::Version(v) => write!(f, "FastCGI version {v}, not 1"),
-            RecordError::TooLong => write!(f, "more than {MAX_BUFFERED} bytes buffered"),
         }
     }
 }
@@ -199,9 +185,8 @@ impl core::error::Error for RecordError {}
 
 impl Record {
     /// A record carrying `content`, padded to a multiple of 8 bytes as the
-    /// specification recommends. Content past [`MAX_CONTENT`] is cut off.
+    /// specification recommends. Writing refuses content over [`MAX_CONTENT`].
     pub fn new(kind: u8, request_id: u16, content: &[u8]) -> Record {
-        let content = &content[..content.len().min(MAX_CONTENT)];
         let padding = ((8 - content.len() % 8) % 8) as u8;
         Record { kind, request_id, content: content.to_vec(), padding }
     }
@@ -209,7 +194,7 @@ impl Record {
     /// Reads the record at the start of `b`. It returns `Ok(None)` if `b`
     /// holds only part of one, and otherwise the record and how many bytes
     /// of `b` it took, padding included.
-    pub fn parse(b: &[u8]) -> Result<Option<(Record, usize)>, RecordError> {
+    fn parse_prefix(b: &[u8]) -> Result<Option<(Record, usize)>, RecordError> {
         // A bad version is known from the first byte.
         match b.first() {
             None => return Ok(None),
@@ -231,23 +216,6 @@ impl Record {
         Ok(Some((record, end)))
     }
 
-    /// The record's bytes: the header, the content and the padding.
-    /// Content longer than [`MAX_CONTENT`] is cut to that length, since no
-    /// record can hold more.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let content = &self.content[..self.content.len().min(MAX_CONTENT)];
-        let mut out = Vec::with_capacity(HEADER_LEN + content.len() + usize::from(self.padding));
-        out.push(VERSION);
-        out.push(self.kind);
-        out.extend_from_slice(&self.request_id.to_be_bytes());
-        out.extend_from_slice(&(content.len() as u16).to_be_bytes());
-        out.push(self.padding);
-        out.push(0);
-        out.extend_from_slice(content);
-        out.resize(out.len() + usize::from(self.padding), 0);
-        out
-    }
-
     /// Whether this is a management record: one with request ID 0.
     pub fn is_management(&self) -> bool {
         self.request_id == NULL_REQUEST_ID
@@ -255,7 +223,7 @@ impl Record {
 
     /// A BEGIN_REQUEST record for request `id`.
     pub fn begin_request(id: u16, body: BeginRequest) -> Record {
-        Record::new(kind::BEGIN_REQUEST, id, &body.to_bytes())
+        Record::new(kind::BEGIN_REQUEST, id, &body.to_bytes().unwrap_or_else(|never| match never {}))
     }
 
     /// An ABORT_REQUEST record for request `id`.
@@ -265,32 +233,31 @@ impl Record {
 
     /// An END_REQUEST record for request `id`.
     pub fn end_request(id: u16, body: EndRequest) -> Record {
-        Record::new(kind::END_REQUEST, id, &body.to_bytes())
+        Record::new(kind::END_REQUEST, id, &body.to_bytes().unwrap_or_else(|never| match never {}))
     }
 
     /// The UNKNOWN_TYPE management record that answers a management record
     /// of type `unknown`.
     pub fn unknown_type(unknown: u8) -> Record {
-        Record::new(kind::UNKNOWN_TYPE, NULL_REQUEST_ID, &[unknown, 0, 0, 0, 0, 0, 0, 0])
+        Record::new(kind::UNKNOWN_TYPE, NULL_REQUEST_ID, &UnknownType(unknown).to_bytes().unwrap_or_else(|never| match never {}))
     }
 
-    /// A GET_VALUES management record asking for `names`. Names that do
-    /// not fit in one record are left out.
-    pub fn get_values(names: &[&[u8]]) -> Record {
-        let (bytes, _) = encode_pairs_within(names.iter().map(|n| (*n, &[][..])), MAX_CONTENT);
-        Record::new(kind::GET_VALUES, NULL_REQUEST_ID, &bytes)
+    /// A GET_VALUES record asking for every name. Refuses excess pair
+    /// counts and names that cannot fit together in one record.
+    pub fn get_values(names: &[&[u8]]) -> Result<Record, WriteError> {
+        let (bytes, _) = encode_pairs_within(names.iter().map(|n| (*n, &[][..])), MAX_CONTENT)?;
+        Ok(Record::new(kind::GET_VALUES, NULL_REQUEST_ID, &bytes))
     }
 
-    /// A GET_VALUES_RESULT management record answering with `pairs`.
-    /// Pairs that do not fit in one record are left out.
-    pub fn get_values_result(pairs: &[Pair]) -> Record {
-        let (bytes, _) = encode_pairs_within(borrowed(pairs), MAX_CONTENT);
-        Record::new(kind::GET_VALUES_RESULT, NULL_REQUEST_ID, &bytes)
+    /// A GET_VALUES_RESULT record carrying every pair. Refuses excess
+    /// pair counts and pairs that cannot fit together in one record.
+    pub fn get_values_result(pairs: &Pairs) -> Result<Record, WriteError> {
+        let (bytes, _) = encode_pairs_within(borrowed(&pairs.0), MAX_CONTENT)?;
+        Ok(Record::new(kind::GET_VALUES_RESULT, NULL_REQUEST_ID, &bytes))
     }
 }
 
 /// Why an exact [`Wire`] parse did not read one complete FastCGI record.
-/// [`Record::parse`] keeps its prefix parsing behavior.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecordParseError {
     /// The record header is invalid.
@@ -320,41 +287,51 @@ impl core::error::Error for RecordParseError {
     }
 }
 
-/// Why a record cannot be written without losing content.
+/// Why a value cannot be written without changing it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RecordWriteError {
-    /// The content exceeds [`MAX_CONTENT`] bytes.
-    TooLong,
+pub enum WriteError {
+    /// The value cannot be written without changing it.
+    Unwritable,
 }
 
-impl core::fmt::Display for RecordWriteError {
+impl core::fmt::Display for WriteError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "record content exceeds {MAX_CONTENT} bytes")
+        f.write_str("value cannot be written without changing it")
     }
 }
 
-impl core::error::Error for RecordWriteError {}
+impl core::error::Error for WriteError {}
 
 impl Wire for Record {
     type ParseError = RecordParseError;
-    type WriteError = RecordWriteError;
+    type WriteError = WriteError;
 
-    /// Reads exactly one record. Incomplete input and trailing bytes are errors.
+    /// Reads exactly one record, including padding. Refuses a version other
+    /// than 1, incomplete input, and trailing bytes. Padding bytes may hold anything.
     fn parse(b: &[u8]) -> Result<Self, RecordParseError> {
-        match Self::parse(b).map_err(RecordParseError::Record)? {
+        match Self::parse_prefix(b).map_err(RecordParseError::Record)? {
             Some((record, used)) if used == b.len() => Ok(record),
             Some(_) => Err(RecordParseError::Trailing),
             None => Err(RecordParseError::Truncated),
         }
     }
 
-    /// Appends at most [`MAX_RECORD`] bytes. Leaves `out` unchanged on error.
-    /// Unlike [`Record::to_bytes`], this refuses content that would be clipped.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), RecordWriteError> {
+    /// Appends the header, content, and zero padding. Refuses content over
+    /// [`MAX_CONTENT`] or output length overflow without changing `out`.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
         if self.content.len() > MAX_CONTENT {
-            return Err(RecordWriteError::TooLong);
+            return Err(WriteError::Unwritable);
         }
-        out.extend_from_slice(&self.to_bytes());
+        let length = HEADER_LEN + self.content.len() + usize::from(self.padding);
+        let end = out.len().checked_add(length).ok_or(WriteError::Unwritable)?;
+        out.push(VERSION);
+        out.push(self.kind);
+        out.extend_from_slice(&self.request_id.to_be_bytes());
+        out.extend_from_slice(&(self.content.len() as u16).to_be_bytes());
+        out.push(self.padding);
+        out.push(0);
+        out.extend_from_slice(&self.content);
+        out.resize(end, 0);
         Ok(())
     }
 }
@@ -407,7 +384,7 @@ fn parse_record_limited(b: &[u8], limit: usize) -> Result<Option<(Record, usize)
             return Err(FrameError::TooLong { length, limit });
         }
     }
-    Record::parse(b).map_err(FrameError::Record)
+    Record::parse_prefix(b).map_err(FrameError::Record)
 }
 
 /// Reads FastCGI records without holding input bytes.
@@ -474,77 +451,6 @@ impl Decode for Frames {
             Some((record, used)) => Step::Item(record, used),
             None => Step::Need,
         })
-    }
-}
-
-/// Splits a FastCGI byte stream into records. Feed it the bytes a
-/// connection reads, in order, and take records out until it has none.
-/// It holds at most [`MAX_BUFFERED`] bytes that have not been taken out.
-///
-/// This compatibility decoder keeps its original feed limits and repeated
-/// errors. Use [`Frames`] with [`super::codec::Stream`] for EOF handling
-/// and errors reported once.
-#[derive(Clone, Debug, Default)]
-pub struct Decoder {
-    buf: Vec<u8>,
-    /// Where the bytes not yet taken out start. Bytes before it are
-    /// dropped in `feed` once they are half the buffer, so taking out many
-    /// small records costs time in proportion to their bytes.
-    start: usize,
-    failed: Option<RecordError>,
-}
-
-impl Decoder {
-    /// A decoder holding no bytes.
-    pub fn new() -> Decoder {
-        Decoder::default()
-    }
-
-    /// Adds bytes read from the connection. If they would make the decoder
-    /// hold more than [`MAX_BUFFERED`] bytes, the stream breaks with
-    /// [`RecordError::TooLong`], so take records out between feeds. After
-    /// a [`RecordError`] the stream cannot be read any further, and bytes
-    /// are dropped.
-    pub fn feed(&mut self, bytes: &[u8]) {
-        if self.failed.is_none() && self.buffered().saturating_add(bytes.len()) > MAX_BUFFERED {
-            self.failed = Some(RecordError::TooLong);
-            self.buf = Vec::new();
-            self.start = 0;
-        }
-        if self.failed.is_none() {
-            if self.start > 0 && self.start >= self.buf.len() / 2 {
-                self.buf.drain(..self.start);
-                self.start = 0;
-            }
-            self.buf.extend_from_slice(bytes);
-        }
-    }
-
-    /// The next whole record, if one has come. It returns `None` when it
-    /// needs more bytes, and keeps returning the same error once the
-    /// stream has broken.
-    pub fn next_record(&mut self) -> Option<Result<Record, RecordError>> {
-        if let Some(e) = self.failed {
-            return Some(Err(e));
-        }
-        match Record::parse(&self.buf[self.start..]) {
-            Ok(Some((record, used))) => {
-                self.start += used;
-                Some(Ok(record))
-            }
-            Ok(None) => None,
-            Err(e) => {
-                self.failed = Some(e);
-                self.buf = Vec::new();
-                self.start = 0;
-                Some(Err(e))
-            }
-        }
-    }
-
-    /// How many bytes are held, waiting for the rest of a record.
-    pub fn buffered(&self) -> usize {
-        self.buf.len() - self.start
     }
 }
 
@@ -617,20 +523,6 @@ pub struct BeginRequest {
 }
 
 impl BeginRequest {
-    /// Reads a BEGIN_REQUEST body. The reserved bytes may hold anything.
-    pub fn parse(content: &[u8]) -> Result<BeginRequest, BodyError> {
-        if content.len() != 8 {
-            return Err(BodyError);
-        }
-        Ok(BeginRequest { role: Role::from_code(be16(content, 0)), flags: content[2] })
-    }
-
-    /// The body's 8 bytes.
-    pub fn to_bytes(&self) -> [u8; 8] {
-        let [a, b] = self.role.code().to_be_bytes();
-        [a, b, self.flags, 0, 0, 0, 0, 0]
-    }
-
     /// Whether the web server asks to keep the connection open after this
     /// request.
     pub fn keep_conn(&self) -> bool {
@@ -698,30 +590,54 @@ pub struct EndRequest {
     pub protocol_status: ProtocolStatus,
 }
 
-impl EndRequest {
-    /// Reads an END_REQUEST body. The reserved bytes may hold anything.
-    pub fn parse(content: &[u8]) -> Result<EndRequest, BodyError> {
-        if content.len() != 8 {
-            return Err(BodyError);
+macro_rules! fixed_body {
+    ($ty:ty, $read:expr, $write:expr) => {
+        impl Wire for $ty {
+            type ParseError = BodyError;
+            type WriteError = core::convert::Infallible;
+
+            /// Reads an eight-byte body. Refuses any other length.
+            /// Reserved bytes may hold anything.
+            fn parse(content: &[u8]) -> Result<Self, BodyError> {
+                if content.len() != 8 { return Err(BodyError); }
+                Ok(($read)(content))
+            }
+
+            /// Appends eight bytes with zero reserved bytes. Refuses no values.
+            fn write(&self, out: &mut Vec<u8>) -> Result<(), Self::WriteError> {
+                out.extend_from_slice(&($write)(self));
+                Ok(())
+            }
         }
-        let app_status = u32::from_be_bytes([content[0], content[1], content[2], content[3]]);
-        Ok(EndRequest { app_status, protocol_status: ProtocolStatus::from_code(content[4]) })
-    }
-
-    /// The body's 8 bytes.
-    pub fn to_bytes(&self) -> [u8; 8] {
-        let [a, b, c, d] = self.app_status.to_be_bytes();
-        [a, b, c, d, self.protocol_status.code(), 0, 0, 0]
-    }
+    };
 }
 
-/// Reads the body of an UNKNOWN_TYPE record: the type that was not known.
-pub fn parse_unknown_type(content: &[u8]) -> Result<u8, BodyError> {
-    if content.len() != 8 {
-        return Err(BodyError);
-    }
-    Ok(content[0])
-}
+fixed_body!(BeginRequest,
+    |b: &[u8]| BeginRequest { role: Role::from_code(be16(b, 0)), flags: b[2] },
+    |v: &BeginRequest| {
+        let [a, b] = v.role.code().to_be_bytes();
+        [a, b, v.flags, 0, 0, 0, 0, 0]
+    });
+fixed_body!(EndRequest,
+    |b: &[u8]| EndRequest {
+        app_status: u32::from_be_bytes([b[0], b[1], b[2], b[3]]),
+        protocol_status: ProtocolStatus::from_code(b[4]),
+    },
+    |v: &EndRequest| {
+        let [a, b, c, d] = v.app_status.to_be_bytes();
+        [a, b, c, d, v.protocol_status.code(), 0, 0, 0]
+    });
+
+/// The eight-byte UNKNOWN_TYPE body, naming the unrecognized record type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnknownType(
+    /// The unrecognized record type.
+    pub u8,
+);
+
+fixed_body!(UnknownType,
+    |b: &[u8]| UnknownType(b[0]),
+    |v: &UnknownType| [v.0, 0, 0, 0, 0, 0, 0, 0]);
 
 /// Why bytes are not a list of name and value pairs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -730,11 +646,14 @@ pub enum PairError {
     Truncated,
     /// There are more than [`MAX_PAIRS`] pairs.
     TooMany,
+    /// The encoded pairs exceed [`MAX_PARAMS`] bytes.
+    TooLong,
 }
 
 impl core::fmt::Display for PairError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            PairError::TooLong => write!(f, "pairs exceed {MAX_PARAMS} bytes"),
             PairError::Truncated => f.write_str("name and value pair runs past the end"),
             PairError::TooMany => write!(f, "more than {MAX_PAIRS} name and value pairs"),
         }
@@ -743,52 +662,61 @@ impl core::fmt::Display for PairError {
 
 impl core::error::Error for PairError {}
 
-/// Reads name and value pairs. Each pair is the name's length, the
-/// value's length, the name and the value. A length below 128 takes one
-/// byte; a longer one takes four, with the top bit of the first set.
-pub fn parse_pairs(b: &[u8]) -> Result<Vec<Pair>, PairError> {
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < b.len() {
-        if out.len() >= MAX_PAIRS {
-            return Err(PairError::TooMany);
-        }
-        let (name_len, at) = read_len(b, i)?;
-        let (value_len, at) = read_len(b, at)?;
-        let name_end = at.checked_add(name_len).filter(|&e| e <= b.len()).ok_or(PairError::Truncated)?;
-        let value_end = name_end.checked_add(value_len).filter(|&e| e <= b.len()).ok_or(PairError::Truncated)?;
-        out.push((b[at..name_end].to_vec(), b[name_end..value_end].to_vec()));
-        i = value_end;
-    }
-    Ok(out)
-}
+/// A list of FastCGI name and value pairs, bounded by [`MAX_PARAMS`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Pairs(
+    /// The names and values, in order.
+    pub Vec<(Vec<u8>, Vec<u8>)>,
+);
 
-/// Writes name and value pairs, each length in one byte if it is below
-/// 128 and in four otherwise. Pairs past the first [`MAX_PAIRS`] are left
-/// out, and so is any pair with a name or value longer than
-/// [`MAX_PAIR_LEN`], so [`parse_pairs`] always reads the output.
-pub fn encode_pairs(pairs: &[Pair]) -> Vec<u8> {
-    encode_pairs_within(borrowed(pairs), usize::MAX).0
+impl Wire for Pairs {
+    type ParseError = PairError;
+    type WriteError = WriteError;
+
+    /// Reads name and value pairs. Each pair is the name's length, the
+    /// value's length, the name and the value. A length below 128 takes one
+    /// byte; a longer one takes four, with the top bit of the first set.
+    /// Refuses truncated pairs, excess pair counts, and input over [`MAX_PARAMS`].
+    fn parse(b: &[u8]) -> Result<Self, PairError> {
+        if b.len() > MAX_PARAMS { return Err(PairError::TooLong); }
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            if out.len() >= MAX_PAIRS {
+                return Err(PairError::TooMany);
+            }
+            let (name_len, at) = read_len(b, i)?;
+            let (value_len, at) = read_len(b, at)?;
+            let name_end = at.checked_add(name_len).filter(|&e| e <= b.len()).ok_or(PairError::Truncated)?;
+            let value_end = name_end.checked_add(value_len).filter(|&e| e <= b.len()).ok_or(PairError::Truncated)?;
+            out.push((b[at..name_end].to_vec(), b[name_end..value_end].to_vec()));
+            i = value_end;
+        }
+        Ok(Pairs(out))
+    }
+
+    /// Appends pairs with one-byte or four-byte lengths. Refuses excess
+    /// counts, lengths, or total size without changing `out`.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+        let (bytes, _) = encode_pairs_within(borrowed(&self.0), MAX_PARAMS)?;
+        out.extend_from_slice(&bytes);
+        Ok(())
+    }
 }
 
 /// The pairs as borrowed names and values.
-fn borrowed(pairs: &[Pair]) -> impl Iterator<Item = (&[u8], &[u8])> {
+fn borrowed(pairs: &[(Vec<u8>, Vec<u8>)]) -> impl Iterator<Item = (&[u8], &[u8])> {
     pairs.iter().map(|(n, v)| (n.as_slice(), v.as_slice()))
 }
 
-/// Like [`encode_pairs`], but also leaves out each pair that would take the
-/// output past `max` bytes. It returns the bytes and where each pair in
-/// them ends. Nothing is copied but the pairs written.
-fn encode_pairs_within<'a>(pairs: impl Iterator<Item = (&'a [u8], &'a [u8])>, max: usize) -> (Vec<u8>, Vec<usize>) {
+/// Encodes all pairs within `max` bytes, or refuses the value.
+/// Returns the bytes and the end of each pair for PARAMS record boundaries.
+fn encode_pairs_within<'a>(pairs: impl Iterator<Item = (&'a [u8], &'a [u8])>, max: usize) -> Result<(Vec<u8>, Vec<usize>), WriteError> {
     let mut out = Vec::new();
     let mut ends = Vec::new();
-    let mut count = 0;
-    for (name, value) in pairs {
-        if count >= MAX_PAIRS {
-            break;
-        }
-        if name.len() > MAX_PAIR_LEN || value.len() > MAX_PAIR_LEN {
-            continue;
+    for (count, (name, value)) in pairs.enumerate() {
+        if count >= MAX_PAIRS || name.len() > MAX_PAIR_LEN || value.len() > MAX_PAIR_LEN {
+            return Err(WriteError::Unwritable);
         }
         let size = len_size(name.len())
             .checked_add(len_size(value.len()))
@@ -797,16 +725,15 @@ fn encode_pairs_within<'a>(pairs: impl Iterator<Item = (&'a [u8], &'a [u8])>, ma
             .and_then(|s| s.checked_add(out.len()));
         match size {
             Some(total) if total <= max => {}
-            _ => continue,
+            _ => return Err(WriteError::Unwritable),
         }
         write_len(&mut out, name.len());
         write_len(&mut out, value.len());
         out.extend_from_slice(name);
         out.extend_from_slice(value);
         ends.push(out.len());
-        count += 1;
     }
-    (out, ends)
+    Ok((out, ends))
 }
 
 fn len_size(n: usize) -> usize {
@@ -835,18 +762,18 @@ fn read_len(b: &[u8], i: usize) -> Result<(usize, usize), PairError> {
 
 /// Appends the records of a stream: the data in records of at most
 /// [`MAX_CONTENT`] bytes, then the empty record that ends the stream.
-fn write_stream(out: &mut Vec<u8>, kind: u8, id: u16, data: &[u8]) {
+fn write_stream(out: &mut Vec<u8>, kind: u8, id: u16, data: &[u8]) -> Result<(), WriteError> {
     for chunk in data.chunks(CHUNK) {
-        out.extend(Record::new(kind, id, chunk).to_bytes());
+        Record::new(kind, id, chunk).write(out)?;
     }
-    out.extend(Record::new(kind, id, &[]).to_bytes());
+    Record::new(kind, id, &[]).write(out)
 }
 
 /// Appends the records of a PARAMS stream holding `bytes`, whose pairs end
 /// at `ends`. Each record ends at the end of a pair when one fits, since
 /// some applications, PHP-FPM among them, read the pairs of each PARAMS
 /// record on their own. A pair too long for one record spans records.
-fn write_params(out: &mut Vec<u8>, id: u16, bytes: &[u8], ends: &[usize]) {
+fn write_params(out: &mut Vec<u8>, id: u16, bytes: &[u8], ends: &[usize]) -> Result<(), WriteError> {
     let mut start = 0;
     while start < bytes.len() {
         let limit = start.saturating_add(CHUNK).min(bytes.len());
@@ -856,37 +783,117 @@ fn write_params(out: &mut Vec<u8>, id: u16, bytes: &[u8], ends: &[usize]) {
             Some(e) if e > start => e,
             _ => limit,
         };
-        out.extend(Record::new(kind::PARAMS, id, &bytes[start..cut]).to_bytes());
+        Record::new(kind::PARAMS, id, &bytes[start..cut]).write(out)?;
         start = cut;
     }
-    out.extend(Record::new(kind::PARAMS, id, &[]).to_bytes());
+    Record::new(kind::PARAMS, id, &[]).write(out)
 }
 
-/// The bytes of a whole stream of type `kind` for request `id`: the data
-/// in as many records as it needs, then the empty record that ends the
-/// stream. The data is cut to the limit a [`Server`] or [`Client`] takes
-/// for the stream: [`MAX_PARAMS`] bytes for PARAMS and [`MAX_STREAM`] for
-/// the others.
-pub fn stream_bytes(kind: u8, id: u16, data: &[u8]) -> Vec<u8> {
-    let limit = if kind == kind::PARAMS { MAX_PARAMS } else { MAX_STREAM };
-    let mut out = Vec::new();
-    write_stream(&mut out, kind, id, &data[..data.len().min(limit)]);
-    out
+/// A stream's data carried in records, ending with an empty record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordStream {
+    /// The record type, such as STDIN or PARAMS.
+    pub kind: u8,
+    /// The request ID.
+    pub request_id: u16,
+    /// The complete stream contents.
+    pub data: Vec<u8>,
+}
+
+impl Wire for RecordStream {
+    type ParseError = SequenceError;
+    type WriteError = WriteError;
+
+    /// Reads a terminated record stream. Refuses mixed types or IDs,
+    /// missing termination, trailing records, and excess stream lengths.
+    fn parse(bytes: &[u8]) -> Result<Self, SequenceError> {
+        let mut value: Option<Self> = None;
+        read_sequence(bytes, |record| {
+            let v = value.get_or_insert_with(|| Self {
+                kind: record.kind, request_id: record.request_id, data: Vec::new(),
+            });
+            if v.kind != record.kind { return Err(SequenceError::Unexpected); }
+            let limit = if v.kind == kind::PARAMS { MAX_PARAMS } else { MAX_STREAM };
+            if record.content.len() > limit.saturating_sub(v.data.len()) {
+                return Err(SequenceError::Stream(StreamError::TooLarge { id: v.request_id, kind: v.kind }));
+            }
+            v.data.extend_from_slice(&record.content);
+            Ok(if record.content.is_empty() { value.take() } else { None })
+        })
+    }
+
+    /// Appends records and an empty terminator. Refuses data over
+    /// [`MAX_PARAMS`] for PARAMS or [`MAX_STREAM`] otherwise, without changing `out`.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+        let limit = if self.kind == kind::PARAMS { MAX_PARAMS } else { MAX_STREAM };
+        if self.data.len() > limit { return Err(WriteError::Unwritable); }
+        let mut bytes = Vec::new();
+        write_stream(&mut bytes, self.kind, self.request_id, &self.data)?;
+        out.extend_from_slice(&bytes);
+        Ok(())
+    }
+}
+
+/// Why records do not form exactly one complete stream, request, or response.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SequenceError {
+    /// A record header is invalid.
+    Record(RecordError),
+    /// The request or response violates a protocol rule.
+    Stream(StreamError),
+    /// Input ends before completion.
+    Truncated,
+    /// Records have different IDs, an unexpected type, or follow completion.
+    Unexpected,
+}
+
+impl core::fmt::Display for SequenceError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Record(e) => e.fmt(f),
+            Self::Stream(e) => e.fmt(f),
+            Self::Truncated => f.write_str("input ends before completion"),
+            Self::Unexpected => f.write_str("unexpected record in sequence"),
+        }
+    }
+}
+
+impl core::error::Error for SequenceError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Record(e) => Some(e),
+            Self::Stream(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+fn read_sequence<T>(mut bytes: &[u8], mut receive: impl FnMut(&Record) -> Result<Option<T>, SequenceError>) -> Result<T, SequenceError> {
+    let mut id = None;
+    while !bytes.is_empty() {
+        let (record, used) = Record::parse_prefix(bytes).map_err(SequenceError::Record)?.ok_or(SequenceError::Truncated)?;
+        if id.is_some_and(|id| id != record.request_id) { return Err(SequenceError::Unexpected); }
+        id = Some(record.request_id);
+        bytes = &bytes[used..];
+        if let Some(value) = receive(&record)? {
+            return if bytes.is_empty() { Ok(value) } else { Err(SequenceError::Unexpected) };
+        }
+    }
+    Err(SequenceError::Truncated)
 }
 
 /// A whole request: the BEGIN_REQUEST body and every stream it carries,
 /// put back together.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Request {
-    /// The request ID. 0 belongs to management records, so
-    /// [`Request::to_bytes`] writes 0 as 1.
+    /// The nonzero request ID. 0 belongs to management records.
     pub id: u16,
     /// The role the application is to play.
     pub role: Role,
     /// Whether the web server asks to keep the connection open afterward.
     pub keep_conn: bool,
     /// The CGI parameters, in the order they came.
-    pub params: Vec<Pair>,
+    pub params: Pairs,
     /// The request body. An authorizer gets none.
     pub stdin: Vec<u8>,
     /// The file a filter works on. Other roles get none.
@@ -896,35 +903,7 @@ pub struct Request {
 impl Request {
     /// The value of the first parameter called `name`.
     pub fn param(&self, name: &[u8]) -> Option<&[u8]> {
-        self.params.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_slice())
-    }
-
-    /// The bytes a web server sends for this request: BEGIN_REQUEST, then
-    /// the PARAMS stream, then the STDIN stream unless the role is
-    /// [`Role::Authorizer`], then the DATA stream if the role is
-    /// [`Role::Filter`]. A role given as [`Role::Other`] with the number of
-    /// a named role is written as that role. Any other role is written with
-    /// a STDIN stream, and a [`Server`] refuses it with
-    /// [`StreamError::UnknownRole`]. Parameters that would take the PARAMS
-    /// stream past [`MAX_PARAMS`] bytes are left out, and STDIN and DATA
-    /// are cut to [`MAX_STREAM`] bytes, so a [`Server`] takes the whole of
-    /// what is written. Each PARAMS record holds whole pairs, unless a pair
-    /// is too long for one record.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let id = self.id.max(1);
-        // `Role::Other(3)` is the filter role too, and carries DATA.
-        let role = Role::from_code(self.role.code());
-        let begin = BeginRequest { role, flags: if self.keep_conn { KEEP_CONN } else { 0 } };
-        let mut out = Record::begin_request(id, begin).to_bytes();
-        let (params, ends) = encode_pairs_within(borrowed(&self.params), MAX_PARAMS);
-        write_params(&mut out, id, &params, &ends);
-        if role != Role::Authorizer {
-            write_stream(&mut out, kind::STDIN, id, &self.stdin[..self.stdin.len().min(MAX_STREAM)]);
-        }
-        if role == Role::Filter {
-            write_stream(&mut out, kind::DATA, id, &self.data[..self.data.len().min(MAX_STREAM)]);
-        }
-        out
+        self.params.0.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_slice())
     }
 
     /// A response to this request that writes `stdout` and ends with
@@ -944,7 +923,7 @@ impl Request {
 /// it ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Response {
-    /// The request ID. [`Response::to_bytes`] writes 0 as 1.
+    /// The nonzero request ID.
     pub id: u16,
     /// The output: CGI headers, a blank line, then the body.
     pub stdout: Vec<u8>,
@@ -956,21 +935,91 @@ pub struct Response {
     pub protocol_status: ProtocolStatus,
 }
 
-impl Response {
-    /// The bytes an application sends for this response: the STDOUT
-    /// stream, the STDERR stream if it holds anything, and END_REQUEST.
-    /// Each stream is cut to [`MAX_STREAM`] bytes, so a [`Client`] takes
-    /// the whole of what is written.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let id = self.id.max(1);
-        let mut out = Vec::new();
-        write_stream(&mut out, kind::STDOUT, id, &self.stdout[..self.stdout.len().min(MAX_STREAM)]);
-        if !self.stderr.is_empty() {
-            write_stream(&mut out, kind::STDERR, id, &self.stderr[..self.stderr.len().min(MAX_STREAM)]);
+impl Wire for Request {
+    type ParseError = SequenceError;
+    type WriteError = WriteError;
+
+    /// Reads BEGIN_REQUEST, PARAMS, STDIN, and DATA for one request.
+    /// Refuses malformed or out-of-order records, excess stream lengths,
+    /// unsupported roles, BEGIN_REQUEST flags other than KEEP_CONN, missing
+    /// completion, and trailing records.
+    fn parse(bytes: &[u8]) -> Result<Self, SequenceError> {
+        let mut server = Server::new();
+        let mut first = true;
+        read_sequence(bytes, |record| {
+            if record.request_id == 0 || (first && record.kind != kind::BEGIN_REQUEST)
+                || !matches!(record.kind, kind::BEGIN_REQUEST | kind::PARAMS | kind::STDIN | kind::DATA)
+            { return Err(SequenceError::Unexpected); }
+            first = false;
+            if record.kind == kind::BEGIN_REQUEST
+                && record.content.get(2).is_some_and(|flags| flags & !KEEP_CONN != 0)
+            { return Err(SequenceError::Unexpected); }
+            match server.receive(record).map_err(SequenceError::Stream)? {
+                Some(ServerEvent::Request(request)) => Ok(Some(request)),
+                None => Ok(None),
+                _ => Err(SequenceError::Unexpected),
+            }
+        })
+    }
+
+    /// Appends BEGIN_REQUEST, then PARAMS, then STDIN unless the role is
+    /// [`Role::Authorizer`], then DATA for [`Role::Filter`]. A numbered role
+    /// equal to a named role has the same encoding. Each PARAMS record holds
+    /// whole pairs unless a pair is too long for one record.
+    /// Refuses zero IDs, unsupported roles, unused stream data, and excess
+    /// lengths or pair counts without changing `out`.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+        let role = Role::from_code(self.role.code());
+        if self.id == 0 || matches!(role, Role::Other(_))
+            || (role == Role::Authorizer && !self.stdin.is_empty())
+            || (role != Role::Filter && !self.data.is_empty())
+            || self.stdin.len() > MAX_STREAM || self.data.len() > MAX_STREAM
+        { return Err(WriteError::Unwritable); }
+        let (params, ends) = encode_pairs_within(borrowed(&self.params.0), MAX_PARAMS)?;
+        let begin = BeginRequest { role, flags: if self.keep_conn { KEEP_CONN } else { 0 } };
+        let mut bytes = Record::begin_request(self.id, begin).to_bytes()?;
+        write_params(&mut bytes, self.id, &params, &ends)?;
+        if role != Role::Authorizer { write_stream(&mut bytes, kind::STDIN, self.id, &self.stdin)?; }
+        if role == Role::Filter { write_stream(&mut bytes, kind::DATA, self.id, &self.data)?; }
+        out.extend_from_slice(&bytes);
+        Ok(())
+    }
+}
+
+impl Wire for Response {
+    type ParseError = SequenceError;
+    type WriteError = WriteError;
+
+    /// Reads STDOUT, STDERR, and END_REQUEST for one response. Refuses
+    /// invalid records, excess stream lengths, zero or mixed IDs, missing
+    /// END_REQUEST, and trailing records.
+    fn parse(bytes: &[u8]) -> Result<Self, SequenceError> {
+        let mut client = Client::new();
+        read_sequence(bytes, |record| {
+            if record.request_id == 0 || !matches!(record.kind, kind::STDOUT | kind::STDERR | kind::END_REQUEST) {
+                return Err(SequenceError::Unexpected);
+            }
+            match client.receive(record).map_err(SequenceError::Stream)? {
+                Some(ClientEvent::Response(response)) => Ok(Some(response)),
+                None => Ok(None),
+                _ => Err(SequenceError::Unexpected),
+            }
+        })
+    }
+
+    /// Appends STDOUT, nonempty STDERR, and END_REQUEST. Refuses zero IDs
+    /// and streams over [`MAX_STREAM`] without changing `out`.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+        if self.id == 0 || self.stdout.len() > MAX_STREAM || self.stderr.len() > MAX_STREAM {
+            return Err(WriteError::Unwritable);
         }
+        let mut bytes = Vec::new();
+        write_stream(&mut bytes, kind::STDOUT, self.id, &self.stdout)?;
+        if !self.stderr.is_empty() { write_stream(&mut bytes, kind::STDERR, self.id, &self.stderr)?; }
         let end = EndRequest { app_status: self.app_status, protocol_status: self.protocol_status };
-        out.extend(Record::end_request(id, end).to_bytes());
-        out
+        Record::end_request(self.id, end).write(&mut bytes)?;
+        out.extend_from_slice(&bytes);
+        Ok(())
     }
 }
 
@@ -1189,7 +1238,7 @@ impl Server {
         if record.is_management() {
             return match record.kind {
                 // The values of a GET_VALUES record are empty.
-                kind::GET_VALUES => match parse_pairs(&record.content) {
+                kind::GET_VALUES => match Pairs::parse(&record.content).map(|pairs| pairs.0) {
                     Ok(pairs) if pairs.iter().all(|(_, v)| v.is_empty()) => {
                         Ok(Some(ServerEvent::GetValues(pairs.into_iter().map(|(n, _)| n).collect())))
                     }
@@ -1261,7 +1310,7 @@ impl Server {
                 }
                 let Some(req) = self.open.remove(&id) else { return Ok(None) };
                 self.answering.insert(id, req.keep_conn);
-                let params = parse_pairs(&req.params).map_err(|_| StreamError::Body { id, kind: kind::PARAMS })?;
+                let params = Pairs::parse(&req.params).map_err(|_| StreamError::Body { id, kind: kind::PARAMS })?;
                 Ok(Some(ServerEvent::Request(Request {
                     id,
                     role: req.role,
@@ -1308,7 +1357,7 @@ pub enum ClientEvent {
     /// A request has ended, with all its output.
     Response(Response),
     /// The application answered a GET_VALUES record with these pairs.
-    Values(Vec<Pair>),
+    Values(Pairs),
     /// The application did not know a management record of this type.
     UnknownType(u8),
 }
@@ -1359,12 +1408,12 @@ impl Client {
         let id = record.request_id;
         if record.is_management() {
             return match record.kind {
-                kind::GET_VALUES_RESULT => match parse_pairs(&record.content) {
+                kind::GET_VALUES_RESULT => match Pairs::parse(&record.content) {
                     Ok(pairs) => Ok(Some(ClientEvent::Values(pairs))),
                     Err(_) => Err(StreamError::Body { id, kind: record.kind }),
                 },
-                kind::UNKNOWN_TYPE => match parse_unknown_type(&record.content) {
-                    Ok(k) => Ok(Some(ClientEvent::UnknownType(k))),
+                kind::UNKNOWN_TYPE => match UnknownType::parse(&record.content) {
+                    Ok(k) => Ok(Some(ClientEvent::UnknownType(k.0))),
                     Err(_) => Err(StreamError::Body { id, kind: record.kind }),
                 },
                 _ => Ok(None),
@@ -1418,20 +1467,16 @@ fn be16(b: &[u8], i: usize) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stdlib::codec::{Stream, Fail, contract, pump, finish, test_support::{Lcg, mutate, decode_all}};
 
-    fn pair(n: &str, v: &str) -> Pair {
+    fn pair(n: &str, v: &str) -> (Vec<u8>, Vec<u8>) {
         (n.as_bytes().to_vec(), v.as_bytes().to_vec())
     }
 
     fn records(bytes: &[u8]) -> Vec<Record> {
-        let mut d = Decoder::new();
-        d.feed(bytes);
-        let mut out = Vec::new();
-        while let Some(r) = d.next_record() {
-            out.push(r.unwrap());
-        }
-        assert_eq!(d.buffered(), 0);
-        out
+        let (records, error) = decode_all(Frames::new, bytes);
+        assert_eq!(error, None);
+        records
     }
 
     fn serve(bytes: &[u8]) -> Vec<Result<Option<ServerEvent>, StreamError>> {
@@ -1446,27 +1491,27 @@ mod tests {
             id: 1,
             role: Role::Responder,
             keep_conn: false,
-            params: vec![pair("REQUEST_METHOD", "GET"), pair("SCRIPT_NAME", "/hello")],
+            params: Pairs(vec![pair("REQUEST_METHOD", "GET"), pair("SCRIPT_NAME", "/hello")]),
             stdin: Vec::new(),
             data: Vec::new(),
         }
-        .to_bytes();
-        let mut decoder = Decoder::new();
+        .to_bytes().unwrap();
+        let mut stream = Stream::new(Frames::new());
         let mut server = Server::new();
         let mut reply = Vec::new();
-        decoder.feed(&sent);
-        while let Some(record) = decoder.next_record() {
-            match server.receive(&record.unwrap()) {
+        pump(&mut stream, &sent, |record| {
+            match server.receive(&record) {
                 Ok(Some(ServerEvent::Request(req))) => {
                     assert_eq!(req.param(b"SCRIPT_NAME"), Some(&b"/hello"[..]));
                     let page = b"Content-Type: text/plain\r\n\r\nhello".to_vec();
-                    reply.extend(req.respond(page).to_bytes());
+                    reply.extend(req.respond(page).to_bytes().unwrap());
                     assert!(server.end(req.id));
                 }
                 Ok(_) => {}
                 Err(e) => panic!("{e}"),
             }
-        }
+        }).unwrap();
+        finish(&mut stream, |_| unreachable!()).unwrap();
         assert_eq!(reply[..8], [1, 6, 0, 1, 0, 33, 7, 0]);
     }
 
@@ -1474,22 +1519,22 @@ mod tests {
     // request with params and stdin, and its reply.
     #[test]
     fn spec_responder_example() {
-        let mut sent = Record::begin_request(1, BeginRequest { role: Role::Responder, flags: 0 }).to_bytes();
+        let mut sent = Record::begin_request(1, BeginRequest { role: Role::Responder, flags: 0 }).to_bytes().unwrap();
         // {FCGI_PARAMS, 1, "\013\002SERVER_PORT80\013\016SERVER_ADDR199.170.183.42 ... "}
         let mut params = vec![11, 2];
         params.extend_from_slice(b"SERVER_PORT80");
         params.extend_from_slice(&[11, 14]);
         params.extend_from_slice(b"SERVER_ADDR199.170.183.42");
-        sent.extend(Record::new(kind::PARAMS, 1, &params).to_bytes());
-        sent.extend(Record::new(kind::PARAMS, 1, &[]).to_bytes());
-        sent.extend(Record::new(kind::STDIN, 1, b"quantity=100&item=3047936").to_bytes());
-        sent.extend(Record::new(kind::STDIN, 1, &[]).to_bytes());
+        sent.extend(Record::new(kind::PARAMS, 1, &params).to_bytes().unwrap());
+        sent.extend(Record::new(kind::PARAMS, 1, &[]).to_bytes().unwrap());
+        sent.extend(Record::new(kind::STDIN, 1, b"quantity=100&item=3047936").to_bytes().unwrap());
+        sent.extend(Record::new(kind::STDIN, 1, &[]).to_bytes().unwrap());
         assert_eq!(sent[..16], [1, 1, 0, 1, 0, 8, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
         let events = serve(&sent);
         let Some(Ok(Some(ServerEvent::Request(req)))) = events.last() else { panic!("{events:?}") };
-        assert_eq!(req.params, [pair("SERVER_PORT", "80"), pair("SERVER_ADDR", "199.170.183.42")]);
+        assert_eq!(req.params.0, [pair("SERVER_PORT", "80"), pair("SERVER_ADDR", "199.170.183.42")]);
         assert_eq!(req.stdin, b"quantity=100&item=3047936");
-        assert_eq!(req.to_bytes(), sent);
+        assert_eq!(req.to_bytes().unwrap(), sent);
 
         let resp = Response {
             id: 1,
@@ -1498,10 +1543,10 @@ mod tests {
             app_status: 0,
             protocol_status: ProtocolStatus::RequestComplete,
         };
-        let bytes = resp.to_bytes();
+        let bytes = resp.to_bytes().unwrap();
         let rs = records(&bytes);
         assert_eq!(rs.len(), 3);
-        assert_eq!(rs[2].to_bytes(), [1, 3, 0, 1, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(rs[2].to_bytes().unwrap(), [1, 3, 0, 1, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         let mut c = Client::new();
         let got: Vec<_> = rs.iter().map(|r| c.receive(r).unwrap()).collect();
         assert_eq!(got[2], Some(ClientEvent::Response(resp)));
@@ -1514,13 +1559,13 @@ mod tests {
             id: 1,
             role: Role::Responder,
             keep_conn: true,
-            params: vec![pair("A", "1")],
+            params: Pairs(vec![pair("A", "1")]),
             stdin: b"one".to_vec(),
             data: vec![],
         };
         let b = Request { id: 2, stdin: b"two".to_vec(), ..a.clone() };
-        let ra = records(&a.to_bytes());
-        let rb = records(&b.to_bytes());
+        let ra = records(&a.to_bytes().unwrap());
+        let rb = records(&b.to_bytes().unwrap());
         let mut s = Server::new();
         let mut got = Vec::new();
         for (x, y) in ra.iter().zip(&rb) {
@@ -1539,7 +1584,7 @@ mod tests {
             protocol_status: ProtocolStatus::RequestComplete,
         };
         let mut c = Client::new();
-        let events: Vec<_> = records(&resp.to_bytes()).iter().map(|r| c.receive(r).unwrap()).collect();
+        let events: Vec<_> = records(&resp.to_bytes().unwrap()).iter().map(|r| c.receive(r).unwrap()).collect();
         assert_eq!(events.last().unwrap(), &Some(ClientEvent::Response(resp)));
         assert_eq!(c.open(), 0);
     }
@@ -1548,29 +1593,28 @@ mod tests {
     fn records_and_padding() {
         let r = Record::new(kind::STDOUT, 0x0102, b"hello");
         assert_eq!(r.padding, 3);
-        let bytes = r.to_bytes();
+        let bytes = r.to_bytes().unwrap();
         assert_eq!(bytes, [1, 6, 1, 2, 0, 5, 3, 0, b'h', b'e', b'l', b'l', b'o', 0, 0, 0]);
-        assert_eq!(Record::parse(&bytes), Ok(Some((r, 16))));
-        // Padding bytes may hold anything, and a record need not be aligned.
+        assert_eq!(Record::parse(&bytes), Ok(r));
         let odd = [1, 6, 0, 1, 0, 1, 2, 0, b'x', 0xaa, 0xbb, 1];
-        let (rec, used) = Record::parse(&odd).unwrap().unwrap();
-        assert_eq!(used, 11);
-        assert_eq!(rec, Record { kind: 6, request_id: 1, content: b"x".to_vec(), padding: 2 });
-        // Every prefix is incomplete.
+        assert_eq!(Record::parse(&odd), Err(RecordParseError::Trailing));
+        assert_eq!(Record::parse(&odd[..11]), Ok(Record { kind: 6, request_id: 1, content: b"x".to_vec(), padding: 2 }));
         for n in 0..16 {
-            assert_eq!(Record::parse(&bytes[..n]), Ok(None), "{n} bytes");
+            assert_eq!(Frames::new().decode(&bytes[..n], false), Ok(Step::Need), "{n} bytes");
+            assert_eq!(Record::parse(&bytes[..n]), Err(RecordParseError::Truncated));
         }
-        // A wrong version is known from the first byte.
-        assert_eq!(Record::parse(&[2]), Err(RecordError::Version(2)));
-        assert_eq!(Record::parse(&[0, 1, 0, 1, 0, 0, 0, 0]), Err(RecordError::Version(0)));
-        // The longest record.
-        let big = Record { kind: 5, request_id: 9, content: vec![7; MAX_CONTENT + 10], padding: 255 };
-        let bytes = big.to_bytes();
+        assert_eq!(Record::parse(&[2]), Err(RecordParseError::Record(RecordError::Version(2))));
+        assert_eq!(Record::parse(&[0, 1, 0, 1, 0, 0, 0, 0]), Err(RecordParseError::Record(RecordError::Version(0))));
+        let mut big = Record { kind: 5, request_id: 9, content: vec![7; MAX_CONTENT + 10], padding: 255 };
+        contract::check_wire_value(&big);
+        assert_eq!(big.to_bytes(), Err(WriteError::Unwritable));
+        big.content.truncate(MAX_CONTENT);
+        let bytes = big.to_bytes().unwrap();
         assert_eq!(bytes.len(), MAX_RECORD);
-        let (back, used) = Record::parse(&bytes).unwrap().unwrap();
-        assert_eq!(used, MAX_RECORD);
-        assert_eq!(back.content.len(), MAX_CONTENT);
-        assert_eq!(Record::new(5, 1, &vec![0; MAX_CONTENT + 1]).content.len(), MAX_CONTENT);
+        assert_eq!(Record::parse(&bytes), Ok(big));
+        let oversized = Record::new(5, 1, &vec![0; MAX_CONTENT + 1]);
+        assert_eq!(oversized.content.len(), MAX_CONTENT + 1);
+        assert_eq!(oversized.to_bytes(), Err(WriteError::Unwritable));
     }
 
     #[test]
@@ -1578,41 +1622,42 @@ mod tests {
         // Lengths below 128 take one byte, others four.
         let long = "v".repeat(200);
         let ps = vec![pair("SCRIPT_NAME", "/x"), pair("HTTP_COOKIE", &long), pair("", "")];
-        let bytes = encode_pairs(&ps);
+        let bytes = Pairs(ps.clone()).to_bytes().unwrap();
         assert_eq!(bytes[..2], [11, 2]);
         assert_eq!(bytes[15..20], [11, 0x80, 0, 0, 200]);
-        assert_eq!(parse_pairs(&bytes), Ok(ps));
+        assert_eq!(Pairs::parse(&bytes).map(|pairs| pairs.0), Ok(ps));
         // A four-byte length for a short value is read too.
-        assert_eq!(parse_pairs(&[0x80, 0, 0, 1, 0x80, 0, 0, 0, b'a']), Ok(vec![pair("a", "")]));
+        assert_eq!(Pairs::parse(&[0x80, 0, 0, 1, 0x80, 0, 0, 0, b'a']).map(|pairs| pairs.0), Ok(vec![pair("a", "")]));
         // Every truncated prefix of a pair fails.
-        let one = encode_pairs(&[pair("NAME", &long)]);
+        let one = Pairs(vec![pair("NAME", &long)]).to_bytes().unwrap();
         for n in 1..one.len() {
-            assert_eq!(parse_pairs(&one[..n]), Err(PairError::Truncated), "{n} bytes");
+            assert_eq!(Pairs::parse(&one[..n]).map(|pairs| pairs.0), Err(PairError::Truncated), "{n} bytes");
         }
         // A huge length is refused, not allocated.
-        assert_eq!(parse_pairs(&[0xff, 0xff, 0xff, 0xff, 0]), Err(PairError::Truncated));
+        assert_eq!(Pairs::parse(&[0xff, 0xff, 0xff, 0xff, 0]).map(|pairs| pairs.0), Err(PairError::Truncated));
         // Too many pairs.
         let many = vec![0u8; 2 * (MAX_PAIRS + 1)];
-        assert_eq!(parse_pairs(&many), Err(PairError::TooMany));
-        assert_eq!(parse_pairs(&many[..2 * MAX_PAIRS]).unwrap().len(), MAX_PAIRS);
-        let too_many: Vec<Pair> = (0..MAX_PAIRS + 5).map(|_| pair("", "")).collect();
-        assert_eq!(parse_pairs(&encode_pairs(&too_many)).unwrap().len(), MAX_PAIRS);
+        assert_eq!(Pairs::parse(&many).map(|pairs| pairs.0), Err(PairError::TooMany));
+        assert_eq!(Pairs::parse(&many[..2 * MAX_PAIRS]).map(|pairs| pairs.0).unwrap().len(), MAX_PAIRS);
+        let too_many: Vec<(Vec<u8>, Vec<u8>)> = (0..MAX_PAIRS + 5).map(|_| pair("", "")).collect();
+        contract::check_wire_value(&Pairs(too_many.clone()));
+        assert_eq!(Pairs(too_many).to_bytes(), Err(WriteError::Unwritable));
     }
 
     #[test]
     fn bodies() {
         let b = BeginRequest { role: Role::Filter, flags: KEEP_CONN };
-        assert_eq!(b.to_bytes(), [0, 3, 1, 0, 0, 0, 0, 0]);
-        assert_eq!(BeginRequest::parse(&b.to_bytes()), Ok(b));
+        assert_eq!(b.to_bytes().unwrap(), [0, 3, 1, 0, 0, 0, 0, 0]);
+        assert_eq!(BeginRequest::parse(&b.to_bytes().unwrap()), Ok(b));
         assert!(b.keep_conn());
         let e = EndRequest { app_status: 0x01020304, protocol_status: ProtocolStatus::Overloaded };
-        assert_eq!(e.to_bytes(), [1, 2, 3, 4, 2, 0, 0, 0]);
-        assert_eq!(EndRequest::parse(&e.to_bytes()), Ok(e));
-        assert_eq!(parse_unknown_type(&Record::unknown_type(42).content), Ok(42));
+        assert_eq!(e.to_bytes().unwrap(), [1, 2, 3, 4, 2, 0, 0, 0]);
+        assert_eq!(EndRequest::parse(&e.to_bytes().unwrap()), Ok(e));
+        assert_eq!(UnknownType::parse(&Record::unknown_type(42).content), Ok(UnknownType(42)));
         for n in 0..8 {
-            assert_eq!(BeginRequest::parse(&b.to_bytes()[..n]), Err(BodyError));
-            assert_eq!(EndRequest::parse(&e.to_bytes()[..n]), Err(BodyError));
-            assert_eq!(parse_unknown_type(&[0; 8][..n]), Err(BodyError));
+            assert_eq!(BeginRequest::parse(&b.to_bytes().unwrap()[..n]), Err(BodyError));
+            assert_eq!(EndRequest::parse(&e.to_bytes().unwrap()[..n]), Err(BodyError));
+            assert_eq!(UnknownType::parse(&[0; 8][..n]), Err(BodyError));
         }
         assert_eq!(BeginRequest::parse(&[0; 9]), Err(BodyError));
         for c in 0..=255u8 {
@@ -1625,13 +1670,13 @@ mod tests {
 
     #[test]
     fn management_records() {
-        let ask = Record::get_values(&[values::MAX_CONNS, values::MAX_REQS, values::MPXS_CONNS]);
+        let ask = Record::get_values(&[values::MAX_CONNS, values::MAX_REQS, values::MPXS_CONNS]).unwrap();
         let mut s = Server::new();
         let Ok(Some(ServerEvent::GetValues(names))) = s.receive(&ask) else { panic!() };
         assert_eq!(names, [values::MAX_CONNS, values::MAX_REQS, values::MPXS_CONNS]);
-        let answer = Record::get_values_result(&[(values::MAX_REQS.to_vec(), b"32".to_vec())]);
+        let answer = Record::get_values_result(&Pairs(vec![(values::MAX_REQS.to_vec(), b"32".to_vec())])).unwrap();
         let mut c = Client::new();
-        assert_eq!(c.receive(&answer), Ok(Some(ClientEvent::Values(vec![pair("FCGI_MAX_REQS", "32")]))));
+        assert_eq!(c.receive(&answer), Ok(Some(ClientEvent::Values(Pairs(vec![pair("FCGI_MAX_REQS", "32")])))));
         // An unknown management type, and the answer.
         let odd = Record::new(200, 0, &[]);
         assert_eq!(s.receive(&odd), Ok(Some(ServerEvent::UnknownType(200))));
@@ -1643,11 +1688,11 @@ mod tests {
         assert_eq!(c.receive(&bad), Err(StreamError::Body { id: 0, kind: kind::GET_VALUES_RESULT }));
         let bad = Record::new(kind::UNKNOWN_TYPE, 0, &[5]);
         assert_eq!(c.receive(&bad), Err(StreamError::Body { id: 0, kind: kind::UNKNOWN_TYPE }));
-        // A GET_VALUES_RESULT too big for one record keeps what fits.
-        let big: Vec<Pair> = (0..10).map(|i| (vec![b'a' + i], vec![0; 10_000])).collect();
-        let r = Record::get_values_result(&big);
-        assert!(r.content.len() <= MAX_CONTENT);
-        assert_eq!(parse_pairs(&r.content).unwrap().len(), 6);
+        // Every management pair must fit in one record.
+        let big: Vec<(Vec<u8>, Vec<u8>)> = (0..10).map(|i| (vec![b'a' + i], vec![0; 10_000])).collect();
+        assert_eq!(Record::get_values_result(&Pairs(big)), Err(WriteError::Unwritable));
+        assert_eq!(Record::get_values(&[&vec![0; MAX_CONTENT]]), Err(WriteError::Unwritable));
+
     }
 
     #[test]
@@ -1767,19 +1812,19 @@ mod tests {
             id: 7,
             role: Role::Authorizer,
             keep_conn: false,
-            params: vec![pair("REMOTE_USER", "ann")],
+            params: Pairs(vec![pair("REMOTE_USER", "ann")]),
             stdin: Vec::new(),
             data: Vec::new(),
         };
-        let events = serve(&base.to_bytes());
+        let events = serve(&base.to_bytes().unwrap());
         assert_eq!(events.last(), Some(&Ok(Some(ServerEvent::Request(base.clone())))));
         let filter = Request { role: Role::Filter, stdin: b"in".to_vec(), data: b"file".to_vec(), ..base };
-        let events = serve(&filter.to_bytes());
+        let events = serve(&filter.to_bytes().unwrap());
         assert_eq!(events.last(), Some(&Ok(Some(ServerEvent::Request(filter.clone())))));
-        // Id 0 is written as 1.
+        // Management IDs cannot name a request.
         let zero = Request { id: 0, ..filter };
-        let Some(Ok(Some(ServerEvent::Request(got)))) = serve(&zero.to_bytes()).pop() else { panic!() };
-        assert_eq!(got.id, 1);
+        contract::check_wire_value(&zero);
+        assert_eq!(zero.to_bytes(), Err(WriteError::Unwritable));
     }
 
     // The specification keeps a request ID active from BEGIN_REQUEST until
@@ -1790,13 +1835,13 @@ mod tests {
             id: 4,
             role: Role::Responder,
             keep_conn: true,
-            params: vec![pair("A", "1")],
+            params: Pairs(vec![pair("A", "1")]),
             stdin: b"body".to_vec(),
             data: Vec::new(),
         };
         let mut s = Server::new();
         let mut got = None;
-        for r in records(&req.to_bytes()) {
+        for r in records(&req.to_bytes().unwrap()) {
             if let Some(ServerEvent::Request(back)) = s.receive(&r).unwrap() {
                 got = Some(back);
             }
@@ -1826,7 +1871,7 @@ mod tests {
         // Requests being answered count toward the limit.
         for id in 1..=MAX_REQUESTS as u16 {
             let r = Request { id, ..req.clone() };
-            let Some(Ok(Some(ServerEvent::Request(_)))) = records(&r.to_bytes()).iter().map(|x| s.receive(x)).last()
+            let Some(Ok(Some(ServerEvent::Request(_)))) = records(&r.to_bytes().unwrap()).iter().map(|x| s.receive(x)).last()
             else {
                 panic!()
             };
@@ -1846,126 +1891,119 @@ mod tests {
             id: 2,
             role: Role::Other(3),
             keep_conn: false,
-            params: Vec::new(),
+            params: Pairs(Vec::new()),
             stdin: b"in".to_vec(),
             data: b"file".to_vec(),
         };
-        let Some(Ok(Some(ServerEvent::Request(got)))) = serve(&req.to_bytes()).pop() else { panic!() };
+        let Some(Ok(Some(ServerEvent::Request(got)))) = serve(&req.to_bytes().unwrap()).pop() else { panic!() };
         assert_eq!(got.role, Role::Filter);
         assert_eq!(got.data, b"file");
-        let auth = Request { role: Role::Other(2), ..req };
-        let Some(Ok(Some(ServerEvent::Request(got)))) = serve(&auth.to_bytes()).pop() else { panic!() };
+        let auth = Request { role: Role::Other(2), stdin: vec![], data: vec![], ..req };
+        let Some(Ok(Some(ServerEvent::Request(got)))) = serve(&auth.to_bytes().unwrap()).pop() else { panic!() };
         assert_eq!(got.role, Role::Authorizer);
         assert!(got.stdin.is_empty());
     }
 
     #[test]
-    fn writers_cap_what_they_write() {
-        // Long streams split over several records and come back whole, cut
-        // to their limits.
-        let req = Request {
+    fn request_refuses_unknown_begin_flags() {
+        for flags in [0, KEEP_CONN, 2, KEEP_CONN | 2, u8::MAX] {
+            let mut bytes = Vec::new();
+            Record::begin_request(1, BeginRequest { role: Role::Authorizer, flags }).write(&mut bytes).unwrap();
+            Record::new(kind::PARAMS, 1, &[]).write(&mut bytes).unwrap();
+            if flags & !KEEP_CONN == 0 {
+                assert_eq!(Request::parse(&bytes).unwrap().keep_conn, flags & KEEP_CONN != 0);
+            } else {
+                assert_eq!(Request::parse(&bytes), Err(SequenceError::Unexpected));
+            }
+        }
+    }
+
+    #[test]
+    fn writers_refuse_loss_and_preserve_long_streams() {
+        let mut req = Request {
             id: 3,
             role: Role::Responder,
             keep_conn: true,
-            params: (0..300).map(|i| (format!("P{i}").into_bytes(), vec![b'x'; 1000])).collect(),
+            params: Pairs((0..300).map(|i| (format!("P{i}").into_bytes(), vec![b'x'; 1000])).collect()),
             stdin: vec![9; MAX_STREAM + 100],
             data: Vec::new(),
         };
-        let Some(Ok(Some(ServerEvent::Request(got)))) = serve(&req.to_bytes()).pop() else { panic!() };
-        assert_eq!(got.stdin.len(), MAX_STREAM);
-        assert!(got.params.len() < 300 && got.params.len() > 200);
-        assert_eq!(got.params[..], req.params[..got.params.len()]);
-        let resp = Response {
-            id: 3,
-            stdout: vec![1; MAX_STREAM + 1],
-            stderr: vec![2; 70_000],
-            app_status: 1,
-            protocol_status: ProtocolStatus::RequestComplete,
-        };
-        let mut c = Client::new();
-        let mut last = None;
-        for r in records(&resp.to_bytes()) {
-            assert!(r.content.len() <= MAX_CONTENT);
-            last = c.receive(&r).unwrap();
+        contract::check_wire_value(&req);
+        assert_eq!(req.to_bytes(), Err(WriteError::Unwritable));
+        req.stdin.truncate(MAX_STREAM);
+        assert_eq!(req.to_bytes(), Err(WriteError::Unwritable));
+        req.params.0.truncate(200);
+        contract::check_wire_value(&req);
+        assert_eq!(Request::parse(&req.to_bytes().unwrap()), Ok(req.clone()));
+        for bad in [Request { id: 0, ..req.clone() }, Request { role: Role::Other(99), ..req.clone() },
+            Request { role: Role::Authorizer, ..req.clone() }, Request { data: vec![1], ..req }] {
+            contract::check_wire_value(&bad);
+            assert_eq!(bad.to_bytes(), Err(WriteError::Unwritable));
         }
-        let Some(ClientEvent::Response(back)) = last else { panic!() };
-        assert_eq!(back.stdout.len(), MAX_STREAM);
-        assert_eq!(back.stderr, resp.stderr);
-        assert_eq!(stream_bytes(kind::STDIN, 1, &[]), Record::new(kind::STDIN, 1, &[]).to_bytes());
+        let mut resp = Response { id: 3, stdout: vec![1; MAX_STREAM + 1], stderr: vec![2; 70_000],
+            app_status: 1, protocol_status: ProtocolStatus::RequestComplete };
+        contract::check_wire_value(&resp);
+        assert_eq!(resp.to_bytes(), Err(WriteError::Unwritable));
+        resp.stdout.truncate(MAX_STREAM);
+        contract::check_wire_value(&resp);
+        assert_eq!(Response::parse(&resp.to_bytes().unwrap()), Ok(resp.clone()));
+        resp.id = 0;
+        contract::check_wire_value(&resp);
+        assert_eq!(resp.to_bytes(), Err(WriteError::Unwritable));
+        let empty = RecordStream { kind: kind::STDIN, request_id: 1, data: vec![] };
+        assert_eq!(empty.to_bytes().unwrap(), Record::new(kind::STDIN, 1, &[]).to_bytes().unwrap());
     }
 
     #[test]
-    fn decoder_splits_a_stream() {
-        let a = Record::new(kind::STDIN, 1, b"abc").to_bytes();
-        let b = Record::new(kind::STDIN, 1, &[]).to_bytes();
-        let stream: Vec<u8> = a.iter().chain(&b).copied().collect();
-        let mut d = Decoder::new();
-        let mut got = Vec::new();
-        for byte in &stream {
-            d.feed(std::slice::from_ref(byte));
-            while let Some(r) = d.next_record() {
-                got.push(r.unwrap().content);
-            }
-        }
-        assert_eq!(got, [b"abc".to_vec(), vec![]]);
-        assert_eq!(d.buffered(), 0);
-        // A broken stream stays broken.
-        d.feed(&[3, 1, 0, 1, 0, 0, 0, 0]);
-        assert_eq!(d.next_record(), Some(Err(RecordError::Version(3))));
-        d.feed(&a);
-        assert_eq!(d.next_record(), Some(Err(RecordError::Version(3))));
-        assert_eq!(d.buffered(), 0);
+    fn stream_splits_records() {
+        let a = Record::new(kind::STDIN, 1, b"abc");
+        let b = Record::new(kind::STDIN, 1, &[]);
+        let mut bytes = a.to_bytes().unwrap();
+        b.write(&mut bytes).unwrap();
+        contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_RECORD);
+        assert_eq!(decode_all(Frames::new, &bytes), (vec![a, b], None));
+        let mut stream = Stream::new(Frames::new());
+        assert_eq!(stream.push(&[3, 1, 0, 1, 0, 0, 0, 0]), 8);
+        assert_eq!(stream.next(), Some(Err(Fail::Protocol(FrameError::Record(RecordError::Version(3))))));
+        assert_eq!(stream.push(&bytes), bytes.len());
+        assert!(stream.next().is_none());
+        assert_eq!(stream.buffered(), 8);
     }
 
     #[test]
-    fn decoder_takes_many_small_records_in_linear_time() {
-        let one = Record::new(kind::STDIN, 1, b"x").to_bytes();
-        let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * 200_000).collect();
-        let mut d = Decoder::new();
-        d.feed(&stream);
-        let mut n = 0;
-        while let Some(r) = d.next_record() {
-            r.unwrap();
-            n += 1;
-        }
-        assert_eq!(n, 200_000);
-        assert_eq!(d.buffered(), 0);
+    fn stream_reads_many_small_records_in_linear_time() {
+        let one = Record::new(kind::STDIN, 1, b"x").to_bytes().unwrap();
+        let mut stream = Stream::new(Frames::new());
+        let mut count = 0;
+        pump(&mut stream, &one.repeat(200_000), |_| count += 1).unwrap();
+        finish(&mut stream, |_| count += 1).unwrap();
+        assert_eq!(count, 200_000);
+        assert_eq!(stream.buffered(), 0);
     }
 
-    // The decoder holds at most MAX_BUFFERED bytes not taken out, and a
-    // whole request of the largest size still fits.
+    // A stream bounds input while complete requests may span many records.
     #[test]
-    fn decoder_bounds_what_it_holds() {
+    fn stream_bounds_input_and_accepts_large_requests() {
         let big = Request {
             id: 1,
             role: Role::Filter,
             keep_conn: false,
-            params: (0..300).map(|i| (format!("P{i}").into_bytes(), vec![b'x'; 1000])).collect(),
+            params: Pairs((0..200).map(|i| (format!("P{i}").into_bytes(), vec![b'x'; 1000])).collect()),
             stdin: vec![1; MAX_STREAM],
             data: vec![2; MAX_STREAM],
         };
-        let bytes = big.to_bytes();
-        assert!(bytes.len() <= MAX_BUFFERED);
+        let bytes = big.to_bytes().unwrap();
         let Some(Ok(Some(ServerEvent::Request(got)))) = serve(&bytes).pop() else { panic!() };
-        assert_eq!(got.data.len(), MAX_STREAM);
-
-        let mut d = Decoder::new();
-        d.feed(&vec![1; MAX_BUFFERED]);
-        assert_eq!(d.buffered(), MAX_BUFFERED);
-        d.feed(&[1]);
-        assert_eq!(d.next_record(), Some(Err(RecordError::TooLong)));
-        assert_eq!(d.buffered(), 0);
-        d.feed(&Record::abort_request(1).to_bytes());
-        assert_eq!(d.next_record(), Some(Err(RecordError::TooLong)));
-        assert!(!RecordError::TooLong.to_string().is_empty());
-        // Taking records out between feeds makes room.
-        let mut d = Decoder::new();
-        let one = Record::new(kind::STDIN, 1, &vec![0; MAX_CONTENT]).to_bytes();
-        for _ in 0..2 * MAX_BUFFERED / one.len() {
-            d.feed(&one);
-            assert!(d.next_record().unwrap().is_ok());
-            assert!(d.buffered() <= MAX_BUFFERED);
-        }
+        assert_eq!(got, big);
+        let mut stream = Stream::new(Frames::new());
+        assert_eq!(stream.push(&vec![1; MAX_RECORD + 1]), MAX_RECORD);
+        assert_eq!(stream.buffered(), MAX_RECORD);
+        let one = Record::new(kind::STDIN, 1, &vec![0; MAX_CONTENT]).to_bytes().unwrap();
+        let mut stream = Stream::new(Frames::new());
+        let mut count = 0;
+        pump(&mut stream, &one.repeat(20), |_| count += 1).unwrap();
+        finish(&mut stream, |_| count += 1).unwrap();
+        assert_eq!(count, 20);
     }
 
     // The stream bytes held across all open requests stay within MAX_HELD.
@@ -2024,71 +2062,39 @@ mod tests {
         assert!(c.held() < before);
     }
 
-    /// A small linear congruential generator, so the fuzz loop is the same
-    /// on every run.
-    struct Lcg(u64);
-
-    impl Lcg {
-        fn next(&mut self) -> u32 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (self.0 >> 33) as u32
-        }
-        fn below(&mut self, n: u32) -> u32 {
-            self.next() % n
-        }
-        fn bytes(&mut self, n: usize) -> Vec<u8> {
-            (0..n).map(|_| self.next() as u8).collect()
-        }
-        /// Up to `max - 1` random bytes.
-        fn some(&mut self, max: u32) -> Vec<u8> {
-            let n = self.below(max) as usize;
-            self.bytes(n)
-        }
-    }
-
     /// Everything the fuzz target checks, on one input.
     fn check(data: &[u8]) {
-        let mut whole = Decoder::new();
-        whole.feed(data);
-        let mut recs = Vec::new();
-        while let Some(Ok(r)) = whole.next_record() {
-            recs.push(r);
-        }
-        let mut bytewise = Decoder::new();
-        let mut again = Vec::new();
-        for b in data {
-            bytewise.feed(std::slice::from_ref(b));
-            while let Some(Ok(r)) = bytewise.next_record() {
-                again.push(r);
-            }
-        }
-        // A feed past MAX_BUFFERED breaks the decoder fed all at once.
-        if data.len() <= MAX_BUFFERED {
-            assert_eq!(recs, again);
-        } else {
-            assert!(recs.is_empty());
-        }
+        contract::check_decode_with_alloc_limit(Frames::new, data, 2 * MAX_RECORD);
+        contract::check_wire::<Record>(data);
+        contract::check_wire::<Pairs>(data);
+        contract::check_wire::<BeginRequest>(data);
+        contract::check_wire::<EndRequest>(data);
+        contract::check_wire::<UnknownType>(data);
+        contract::check_wire::<RecordStream>(data);
+        contract::check_wire::<Request>(data);
+        contract::check_wire::<Response>(data);
+        let recs = decode_all(Frames::new, data).0;
         let mut server = Server::new();
         let mut client = Client::new();
         for r in &recs {
-            let bytes = r.to_bytes();
-            assert_eq!(Record::parse(&bytes), Ok(Some((r.clone(), bytes.len()))));
+            let bytes = r.to_bytes().unwrap();
+            assert_eq!(Record::parse(&bytes), Ok(r.clone()));
             if let Ok(Some(ServerEvent::Request(req))) = server.receive(r) {
-                let Some(Ok(Some(ServerEvent::Request(back)))) = serve(&req.to_bytes()).pop() else { panic!() };
+                let Some(Ok(Some(ServerEvent::Request(back)))) = serve(&req.to_bytes().unwrap()).pop() else { panic!() };
                 assert_eq!(back, req);
             }
             if let Ok(Some(ClientEvent::Response(resp))) = client.receive(r) {
                 let mut c = Client::new();
                 let mut last = None;
-                for r in records(&resp.to_bytes()) {
+                for r in records(&resp.to_bytes().unwrap()) {
                     last = c.receive(&r).unwrap();
                 }
                 assert_eq!(last, Some(ClientEvent::Response(resp)));
             }
             assert!(server.open() <= MAX_REQUESTS && client.open() <= MAX_REQUESTS);
         }
-        if let Ok(pairs) = parse_pairs(data) {
-            assert_eq!(parse_pairs(&encode_pairs(&pairs)), Ok(pairs));
+        if let Ok(pairs) = Pairs::parse(data).map(|pairs| pairs.0) {
+            assert_eq!(Pairs::parse(&Pairs(pairs.clone()).to_bytes().unwrap()).map(|pairs| pairs.0), Ok(pairs));
         }
         let _ = BeginRequest::parse(data);
         let _ = EndRequest::parse(data);
@@ -2096,13 +2102,13 @@ mod tests {
 
     #[test]
     fn fuzz_random_bytes() {
-        let mut rng = Lcg(1);
+        let mut rng = Lcg::new(1);
         for _ in 0..5000 {
-            let len = rng.below(64) as usize;
+            let len = rng.index(64);
             let mut data = rng.bytes(len);
             // Mostly version 1, so records get read.
             if let Some(b) = data.first_mut()
-                && rng.below(8) != 0
+                && rng.index(8) != 0
             {
                 *b = 1;
             }
@@ -2112,66 +2118,57 @@ mod tests {
 
     #[test]
     fn fuzz_random_records() {
-        let mut rng = Lcg(2);
+        let mut rng = Lcg::new(2);
         for _ in 0..3000 {
             let mut data = Vec::new();
-            for _ in 0..rng.below(12) {
-                let id = rng.below(3) as u16;
-                let k = rng.below(13) as u8;
-                let content = match rng.below(4) {
+            for _ in 0..rng.index(12) {
+                let id = rng.index(3) as u16;
+                let k = rng.index(13) as u8;
+                let content = match rng.index(4) {
                     0 => Vec::new(),
-                    1 => BeginRequest { role: Role::from_code(rng.below(5) as u16), flags: rng.next() as u8 }
-                        .to_bytes()
+                    1 => BeginRequest { role: Role::from_code(rng.index(5) as u16), flags: rng.next() as u8 }
+                        .to_bytes().unwrap()
                         .to_vec(),
-                    2 => encode_pairs(&[(rng.some(4), rng.some(140))]),
+                    2 => Pairs(vec![(rng.bytes(4), rng.bytes(140))]).to_bytes().unwrap(),
                     _ => {
-                        let n = rng.below(20) as usize;
+                        let n = rng.index(20);
                         rng.bytes(n)
                     }
                 };
                 let mut r = Record::new(k, id, &content);
-                r.padding = rng.below(10) as u8;
-                data.extend(r.to_bytes());
+                r.padding = rng.index(10) as u8;
+                data.extend(r.to_bytes().unwrap());
             }
             check(&data);
+            let mut changed = data.clone();
+            mutate(&mut rng, &mut changed);
+            check(&changed);
             // And with bytes cut off the end.
-            let cut = rng.below(data.len() as u32 + 1) as usize;
+            let cut = rng.index(data.len() + 1);
             check(&data[..cut]);
         }
     }
 
     #[test]
     fn fuzz_requests_round_trip_in_pieces() {
-        let mut rng = Lcg(3);
+        let mut rng = Lcg::new(3);
         for _ in 0..2000 {
-            let role = [Role::Responder, Role::Authorizer, Role::Filter][rng.below(3) as usize];
-            let params = (0..rng.below(5)).map(|_| (rng.some(130), rng.some(200))).collect();
+            let role = [Role::Responder, Role::Authorizer, Role::Filter][rng.index(3)];
+            let params = (0..rng.index(5)).map(|_| (rng.bytes(130), rng.bytes(200))).collect();
             let req = Request {
-                id: 1 + rng.below(1000) as u16,
+                id: 1 + rng.index(1000) as u16,
                 role,
-                keep_conn: rng.below(2) == 1,
-                params,
-                stdin: if role == Role::Authorizer { Vec::new() } else { rng.some(50) },
-                data: if role == Role::Filter { rng.some(50) } else { Vec::new() },
+                keep_conn: rng.coin(),
+                params: Pairs(params),
+                stdin: if role == Role::Authorizer { Vec::new() } else { rng.bytes(50) },
+                data: if role == Role::Filter { rng.bytes(50) } else { Vec::new() },
             };
-            let bytes = req.to_bytes();
-            let mut d = Decoder::new();
-            let mut s = Server::new();
-            let mut got = None;
-            let mut i = 0;
-            while i < bytes.len() {
-                let n = (1 + rng.below(9) as usize).min(bytes.len() - i);
-                d.feed(&bytes[i..i + n]);
-                i += n;
-                while let Some(r) = d.next_record() {
-                    if let Some(ServerEvent::Request(back)) = s.receive(&r.unwrap()).unwrap() {
-                        got = Some(back);
-                    }
-                }
-            }
-            assert_eq!(got, Some(req));
+            let bytes = req.to_bytes().unwrap();
+            contract::check_wire_value(&req);
+            contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_RECORD);
+            assert_eq!(Request::parse(&bytes), Ok(req));
             // Every truncated prefix leaves the request unfinished.
-            let cut = rng.below(bytes.len() as u32) as usize;
+            let cut = rng.index(bytes.len());
             let mut s = Server::new();
             for r in records_prefix(&bytes[..cut]) {
                 assert!(!matches!(s.receive(&r), Ok(Some(ServerEvent::Request(_)))));
@@ -2209,45 +2206,42 @@ mod tests {
             id: 1,
             role: Role::Responder,
             keep_conn: false,
-            params: (0..66).map(|i| (format!("P{i:02}").into_bytes(), vec![b'x'; 1000])).collect(),
+            params: Pairs((0..66).map(|i| (format!("P{i:02}").into_bytes(), vec![b'x'; 1000])).collect()),
             stdin: Vec::new(),
             data: Vec::new(),
         };
-        let rs = records(&req.to_bytes());
+        let rs = records(&req.to_bytes().unwrap());
         let params: Vec<_> = rs.iter().filter(|r| r.kind == kind::PARAMS && !r.content.is_empty()).collect();
         assert_eq!(params.len(), 2);
         let mut n = 0;
         for r in params {
             assert!(r.content.len() <= MAX_CONTENT);
-            n += parse_pairs(&r.content).unwrap().len();
+            n += Pairs::parse(&r.content).map(|pairs| pairs.0).unwrap().len();
         }
         assert_eq!(n, 66);
-        let Some(Ok(Some(ServerEvent::Request(got)))) = serve(&req.to_bytes()).pop() else { panic!() };
+        let Some(Ok(Some(ServerEvent::Request(got)))) = serve(&req.to_bytes().unwrap()).pop() else { panic!() };
         assert_eq!(got, req);
         // A pair too long for one record still spans records and comes back.
-        let big = Request { params: vec![pair("A", "1"), (b"B".to_vec(), vec![7; 100_000]), pair("C", "3")], ..req };
-        let Some(Ok(Some(ServerEvent::Request(got)))) = serve(&big.to_bytes()).pop() else { panic!() };
+        let big = Request { params: Pairs(vec![pair("A", "1"), (b"B".to_vec(), vec![7; 100_000]), pair("C", "3")]), ..req };
+        let Some(Ok(Some(ServerEvent::Request(got)))) = serve(&big.to_bytes().unwrap()).pop() else { panic!() };
         assert_eq!(got, big);
     }
 
-    // stream_bytes cuts a stream to the limit a reader takes.
+    // A record stream preserves every byte or refuses the value.
     #[test]
-    fn stream_bytes_keeps_to_the_limit() {
-        let mut c = Client::new();
-        for r in records(&stream_bytes(kind::STDOUT, 1, &vec![1; MAX_STREAM + 1])) {
-            assert_eq!(c.receive(&r), Ok(None));
+    fn record_stream_refuses_excess_lengths() {
+        for (kind, limit) in [(kind::STDOUT, MAX_STREAM), (kind::PARAMS, MAX_PARAMS)] {
+            let mut value = RecordStream { kind, request_id: 1, data: vec![1; limit + 1] };
+            contract::check_wire_value(&value);
+            assert_eq!(value.to_bytes(), Err(WriteError::Unwritable));
+            value.data.truncate(limit);
+            contract::check_wire_value(&value);
+            assert_eq!(RecordStream::parse(&value.to_bytes().unwrap()), Ok(value));
         }
-        let end = EndRequest { app_status: 0, protocol_status: ProtocolStatus::RequestComplete };
-        let Ok(Some(ClientEvent::Response(r))) = c.receive(&Record::end_request(1, end)) else { panic!() };
-        assert_eq!(r.stdout.len(), MAX_STREAM);
-        let mut s = Server::new();
-        s.receive(&Record::begin_request(1, BeginRequest { role: Role::Authorizer, flags: 0 })).unwrap();
-        let mut last = Ok(None);
-        for r in records(&stream_bytes(kind::PARAMS, 1, &vec![0; MAX_PARAMS + 2])) {
-            last = s.receive(&r);
-        }
-        // The stream is cut to MAX_PARAMS, so it is not too large. Its
-        // 2-byte empty pairs are more than MAX_PAIRS.
+        let mut server = Server::new();
+        server.receive(&Record::begin_request(1, BeginRequest { role: Role::Authorizer, flags: 0 })).unwrap();
+        let pairs = RecordStream { kind: kind::PARAMS, request_id: 1, data: vec![0; MAX_PARAMS] };
+        let last = records(&pairs.to_bytes().unwrap()).iter().map(|r| server.receive(r)).last().unwrap();
         assert_eq!(last, Err(StreamError::Body { id: 1, kind: kind::PARAMS }));
     }
 
@@ -2255,11 +2249,11 @@ mod tests {
     #[test]
     fn numbered_roles_and_statuses_equal_named_ones() {
         let b = BeginRequest { role: Role::Other(1), flags: 0 };
-        assert_eq!(BeginRequest::parse(&b.to_bytes()), Ok(b));
+        assert_eq!(BeginRequest::parse(&b.to_bytes().unwrap()), Ok(b));
         assert_eq!(Role::Other(3), Role::Filter);
         assert_ne!(Role::Other(4), Role::Filter);
         let e = EndRequest { app_status: 0, protocol_status: ProtocolStatus::Other(0) };
-        assert_eq!(EndRequest::parse(&e.to_bytes()), Ok(e));
+        assert_eq!(EndRequest::parse(&e.to_bytes().unwrap()), Ok(e));
         assert_eq!(ProtocolStatus::Other(2), ProtocolStatus::Overloaded);
     }
 
@@ -2347,28 +2341,21 @@ mod tests {
         let mut s = Server::new();
         let bad = Record::new(kind::GET_VALUES, 0, &[1, 1, b'A', b'B']);
         assert_eq!(s.receive(&bad), Err(StreamError::Body { id: 0, kind: kind::GET_VALUES }));
-        // Names too long for one record are left out.
+        // Every name must fit; no name is dropped.
         let long = vec![b'n'; MAX_CONTENT];
-        let r = Record::get_values(&[b"A", &long, b"B"]);
+        assert_eq!(Record::get_values(&[b"A", &long, b"B"]), Err(WriteError::Unwritable));
+        let r = Record::get_values(&[b"A", b"B"]).unwrap();
         assert_eq!(s.receive(&r), Ok(Some(ServerEvent::GetValues(vec![b"A".to_vec(), b"B".to_vec()]))));
     }
 
-    // A feed past MAX_BUFFERED breaks a decoder fed all at once, but not
-    // one fed a byte at a time. The fuzz check allows for that.
     #[test]
-    fn fuzz_check_allows_an_oversized_feed() {
-        let mut data = Record::abort_request(1).to_bytes();
-        data.resize(MAX_BUFFERED + 1, 0);
+    fn stream_checks_an_input_larger_than_capacity() {
+        let mut data = Record::abort_request(1).to_bytes().unwrap();
+        data.resize(MAX_RECORD + 1, 0);
         check(&data);
     }
 
     fn records_prefix(bytes: &[u8]) -> Vec<Record> {
-        let mut d = Decoder::new();
-        d.feed(bytes);
-        let mut out = Vec::new();
-        while let Some(Ok(r)) = d.next_record() {
-            out.push(r);
-        }
-        out
+        decode_all(Frames::new, bytes).0
     }
 }

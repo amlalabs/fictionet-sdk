@@ -14,11 +14,11 @@
 //! UPDATE error handling), RFC 7607 (AS 0), RFC 7313 (enhanced route
 //! refresh errors) and RFC 9072 (long OPEN optional parameters).
 //!
-//! Nothing here reads a socket. A world that plays a router feeds the
-//! bytes it reads from a TCP connection to [`Frames`] with
-//! [`super::codec::Stream`], gets [`Frame`]s back, and reads each one
-//! with [`Message::decode`]. It writes the bytes of
-//! [`Message::to_bytes`] back to the connection. Which routes exist,
+//! Nothing here reads a socket. A world that plays a router passes the
+//! bytes it reads from a TCP connection to [`Stream<Frames>`](super::codec::Stream),
+//! gets [`Frame`]s back, and reads each one with [`Message::decode`].
+//! It builds a reply with [`Message::to_frame`] and writes its bytes
+//! back to the connection. Which routes exist,
 //! which peers are welcome and when timers fire is up to world code.
 //!
 //! How an UPDATE reads depends on the session: once both speakers have
@@ -35,11 +35,8 @@
 //! Writers check the same rules and return an [`EncodeError`] instead of
 //! bytes a reader would refuse.
 //!
-//! Use [`Frames`] with [`super::codec::Stream`] for bounded input, explicit
-//! EOF handling and errors reported once.
-//!
 //! ```
-//! use fictionet::stdlib::codec::{Stream, finish, pump};
+//! use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
 //! use core::net::Ipv4Addr;
 //! use fictionet::stdlib::bgp::{
 //!     afi, safi, Attribute, Capability, Context, Frames, Message, Open, Origin, Prefix, Segment, SegmentKind,
@@ -53,7 +50,7 @@
 //! }]);
 //! let mut stream = Stream::new(Frames);
 //! let mut frames = Vec::new();
-//! let bytes = Message::Open(theirs).to_bytes(&Context::default()).unwrap();
+//! let bytes = Message::Open(theirs).to_frame(&Context::default()).and_then(|frame| frame.to_bytes()).unwrap();
 //! pump(&mut stream, &bytes, |frame| frames.push(frame)).unwrap();
 //! let frame = frames.pop().unwrap();
 //! let Message::Open(open) = Message::decode(&frame, &Context::default()).unwrap() else {
@@ -66,7 +63,7 @@
 //! assert_eq!(ours.my_as, AS_TRANS);
 //! let ctx = Context::negotiated(&ours, &open);
 //! assert!(ctx.four_octet_as);
-//! let keepalive = Message::Keepalive.to_bytes(&ctx).unwrap();
+//! let keepalive = Message::Keepalive.to_frame(&ctx).and_then(|frame| frame.to_bytes()).unwrap();
 //! assert_eq!(keepalive[16..], [0, 19, 4]);
 //!
 //! // Announce 203.0.113.0/24 with the world's AS as the whole path.
@@ -79,7 +76,7 @@
 //!     ],
 //!     nlri: vec![Prefix::new(Ipv4Addr::new(203, 0, 113, 0).into(), 24).unwrap()],
 //! };
-//! let bytes = Message::Update(update.clone()).to_bytes(&ctx).unwrap();
+//! let bytes = Message::Update(update.clone()).to_frame(&ctx).and_then(|frame| frame.to_bytes()).unwrap();
 //! // No withdrawn routes, then 20 bytes of attributes.
 //! assert_eq!(bytes[19..23], [0, 0, 0, 20]);
 //! // The prefix comes last: its length in bits, then 3 bytes.
@@ -115,10 +112,6 @@ pub const MAX_BODY_LEN: usize = MAX_MESSAGE_LEN - HEADER_LEN;
 /// one byte. Longer parameters are written in the extended format of RFC
 /// 9072, with two-byte lengths.
 pub const MAX_PARAMETERS_LEN: usize = 255;
-/// The most bytes a [`Decoder`] holds that have not been taken out: one
-/// message of the longest length. A decoder this full always has a frame
-/// or an error to give.
-pub const MAX_BUFFERED: usize = MAX_MESSAGE_LEN;
 /// The most AS numbers one AS_PATH segment may hold: its count is one
 /// byte.
 pub const MAX_SEGMENT_ASNS: usize = 255;
@@ -393,7 +386,8 @@ pub enum Error {
 
 impl Error {
     /// The NOTIFICATION a speaker sends for this error, with the data RFC
-    /// 4271 asks for.
+    /// 4271 asks for. Preserves the stored data. Caller-built errors with
+    /// excess data produce a notification that writing refuses.
     pub fn notification(&self) -> Notification {
         use subcode::{header as h, open as o, update as u};
         let (code, subcode, data) = match self {
@@ -421,7 +415,7 @@ impl Error {
             Error::RouteRefreshLength(m) => (
                 code::ROUTE_REFRESH_MESSAGE,
                 subcode::route_refresh::INVALID_MESSAGE_LENGTH,
-                m[..m.len().min(MAX_BODY_LEN - 2)].to_vec(),
+                m.clone(),
             ),
         };
         Notification { code, subcode, data }
@@ -462,18 +456,13 @@ impl core::error::Error for Error {}
 /// checks, or it does not fit in [`MAX_MESSAGE_LEN`] bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EncodeError {
-    /// The message would be longer than [`MAX_MESSAGE_LEN`] bytes.
-    TooLong,
-    /// A field breaks a rule. The text says which.
-    Invalid(&'static str),
+    /// The value cannot be written without changing it.
+    Unwritable,
 }
 
 impl core::fmt::Display for EncodeError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            EncodeError::TooLong => write!(f, "message longer than {MAX_MESSAGE_LEN} bytes"),
-            EncodeError::Invalid(why) => f.write_str(why),
-        }
+        f.write_str("value cannot be written without changing it")
     }
 }
 
@@ -496,7 +485,7 @@ impl Frame {
     /// holds only part of one, and otherwise the frame and how many bytes
     /// of `b` it took. A marker byte that is not 0xFF is reported as soon
     /// as it arrives.
-    pub fn parse(b: &[u8]) -> Result<Option<(Frame, usize)>, Error> {
+    fn parse_prefix(b: &[u8]) -> Result<Option<(Frame, usize)>, Error> {
         if b.iter().take(MARKER_LEN).any(|&x| x != 0xff) {
             return Err(Error::ConnectionNotSynchronized);
         }
@@ -513,24 +502,9 @@ impl Frame {
         }
         Ok(Some((Frame { kind: b[MARKER_LEN + 2], body: b[HEADER_LEN..end].to_vec() }, end)))
     }
-
-    /// The frame's bytes: the header, then the body. A body longer than
-    /// [`MAX_BODY_LEN`] cannot be written.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, EncodeError> {
-        if self.body.len() > MAX_BODY_LEN {
-            return Err(EncodeError::TooLong);
-        }
-        let mut out = Vec::with_capacity(HEADER_LEN + self.body.len());
-        out.extend_from_slice(&[0xff; MARKER_LEN]);
-        out.extend_from_slice(&((HEADER_LEN + self.body.len()) as u16).to_be_bytes());
-        out.push(self.kind);
-        out.extend_from_slice(&self.body);
-        Ok(out)
-    }
 }
 
 /// Why an exact [`Wire`] parse did not read one complete BGP frame.
-/// [`Frame::parse`] keeps its prefix parsing behavior.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FrameParseError {
     /// The frame header is invalid.
@@ -564,18 +538,27 @@ impl Wire for Frame {
     type ParseError = FrameParseError;
     type WriteError = EncodeError;
 
-    /// Reads exactly one frame. Incomplete input and trailing bytes are errors.
+    /// Reads exactly one frame. Refuses a marker byte other than 0xFF,
+    /// a length outside [`HEADER_LEN`] through [`MAX_MESSAGE_LEN`],
+    /// incomplete input, and trailing bytes.
     fn parse(b: &[u8]) -> Result<Self, FrameParseError> {
-        match Self::parse(b).map_err(FrameParseError::Frame)? {
+        match Self::parse_prefix(b).map_err(FrameParseError::Frame)? {
             Some((frame, used)) if used == b.len() => Ok(frame),
             Some(_) => Err(FrameParseError::Trailing),
             None => Err(FrameParseError::Truncated),
         }
     }
 
-    /// Appends at most [`MAX_MESSAGE_LEN`] bytes. Leaves `out` unchanged on error.
+    /// Appends the header and body. Refuses a body longer than
+    /// [`MAX_BODY_LEN`] without changing `out`.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
-        out.extend_from_slice(&self.to_bytes()?);
+        if self.body.len() > MAX_BODY_LEN {
+            return Err(EncodeError::Unwritable);
+        }
+        out.extend_from_slice(&[0xff; MARKER_LEN]);
+        out.extend_from_slice(&((HEADER_LEN + self.body.len()) as u16).to_be_bytes());
+        out.push(self.kind);
+        out.extend_from_slice(&self.body);
         Ok(())
     }
 }
@@ -588,11 +571,11 @@ impl Wire for Frame {
 /// [`Message::decode`] with the session's [`Context`] to read their bodies.
 ///
 /// ```
-/// use fictionet::stdlib::codec::{Decode, Stream, finish, pump};
+/// use fictionet::stdlib::codec::{Decode, Stream, Wire, finish, pump};
 /// use fictionet::stdlib::bgp::{Context, Frames, Message};
 ///
 /// let context = Context::default();
-/// let bytes = Message::Keepalive.to_bytes(&context)?;
+/// let bytes = Message::Keepalive.to_frame(&context).and_then(|frame| frame.to_bytes())?;
 /// let mut stream = Stream::new(Frames.map(|frame| Message::decode(&frame, &context)));
 /// let mut messages = Vec::new();
 /// pump(&mut stream, &bytes, |message| messages.push(message))?;
@@ -613,81 +596,10 @@ impl Decode for Frames {
     }
 
     fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, Error> {
-        Ok(match Frame::parse(input)? {
+        Ok(match Frame::parse_prefix(input)? {
             Some((frame, used)) => Step::Item(frame, used),
             None => Step::Need,
         })
-    }
-}
-
-/// Splits a BGP byte stream into frames. Feed it the bytes a connection
-/// reads, in order, and take frames out until it has none. It holds at
-/// most [`MAX_BUFFERED`] bytes that have not been taken out.
-///
-/// This compatibility decoder keeps its original feed limits and repeated
-/// errors. Use [`Frames`] with [`super::codec::Stream`] for EOF handling
-/// and errors reported once.
-#[derive(Clone, Debug, Default)]
-pub struct Decoder {
-    buf: Vec<u8>,
-    /// Where the bytes not yet taken out start. Bytes before it are
-    /// dropped in `feed` once they are half the buffer, so taking out many
-    /// small frames costs time in proportion to their bytes, and the
-    /// buffer never grows past twice [`MAX_BUFFERED`].
-    start: usize,
-    failed: Option<Error>,
-}
-
-impl Decoder {
-    /// A decoder holding no bytes.
-    pub fn new() -> Decoder {
-        Decoder::default()
-    }
-
-    /// Adds bytes read from the connection, as many as fit in
-    /// [`MAX_BUFFERED`], and returns how many it took. Take frames out and
-    /// feed the rest again. After an [`Error`] the stream cannot be read
-    /// any further: it takes every byte and drops them.
-    #[must_use = "bytes past the returned count were not taken"]
-    pub fn feed(&mut self, bytes: &[u8]) -> usize {
-        if self.failed.is_some() {
-            return bytes.len();
-        }
-        if self.start > 0 && self.start >= self.buf.len() / 2 {
-            self.buf.drain(..self.start);
-            self.start = 0;
-        }
-        let n = bytes.len().min(MAX_BUFFERED.saturating_sub(self.buffered()));
-        self.buf.extend_from_slice(&bytes[..n]);
-        n
-    }
-
-    /// The next whole frame, if one has come. It returns `None` when it
-    /// needs more bytes, and keeps returning the same error once the
-    /// stream has broken. A full decoder always returns a frame or an
-    /// error.
-    pub fn next_frame(&mut self) -> Option<Result<Frame, Error>> {
-        if let Some(e) = &self.failed {
-            return Some(Err(e.clone()));
-        }
-        match Frame::parse(&self.buf[self.start..]) {
-            Ok(Some((frame, used))) => {
-                self.start += used;
-                Some(Ok(frame))
-            }
-            Ok(None) => None,
-            Err(e) => {
-                self.failed = Some(e.clone());
-                self.buf = Vec::new();
-                self.start = 0;
-                Some(Err(e))
-            }
-        }
-    }
-
-    /// How many bytes are held, waiting for the rest of a frame.
-    pub fn buffered(&self) -> usize {
-        self.buf.len() - self.start
     }
 }
 
@@ -726,8 +638,7 @@ impl Message {
             let mut whole = vec![0xff; MARKER_LEN];
             whole.extend_from_slice(&field.to_be_bytes());
             whole.push(frame.kind);
-            whole.extend_from_slice(&frame.body);
-            whole.truncate(MAX_BODY_LEN - 2);
+            whole.extend_from_slice(&frame.body[..frame.body.len().min(MAX_BODY_LEN - 2 - HEADER_LEN)]);
             return Err(Error::RouteRefreshLength(whole));
         }
         let (min, exact) = match frame.kind {
@@ -774,11 +685,6 @@ impl Message {
         };
         bound(&body)?;
         Ok(Frame { kind: self.kind(), body })
-    }
-
-    /// The message's bytes, header and all.
-    pub fn to_bytes(&self, ctx: &Context) -> Result<Vec<u8>, EncodeError> {
-        self.to_frame(ctx)?.to_bytes()
     }
 }
 
@@ -902,9 +808,74 @@ impl Open {
         self.four_octet_as().unwrap_or(u32::from(self.my_as))
     }
 
+    fn to_body(&self) -> Result<Vec<u8>, EncodeError> {
+        if self.my_as == 0 || self.capabilities().any(|c| *c == Capability::FourOctetAs(0)) {
+            return Err(EncodeError::Unwritable);
+        }
+        if self.hold_time == 1 || self.hold_time == 2 {
+            return Err(EncodeError::Unwritable);
+        }
+        if self.bgp_id.is_unspecified() {
+            return Err(EncodeError::Unwritable);
+        }
+        let mut params = Vec::new();
+        let mut size = 0;
+        for p in &self.parameters {
+            let (kind, value) = match p {
+                Parameter::Capabilities(caps) => (PARAMETER_CAPABILITIES, capabilities_bytes(caps)?),
+                Parameter::Other { kind, value } => {
+                    if *kind == PARAMETER_CAPABILITIES {
+                        return Err(EncodeError::Unwritable);
+                    }
+                    if *kind == PARAMETER_EXTENDED {
+                        return Err(EncodeError::Unwritable);
+                    }
+                    bound(value)?;
+                    (*kind, value.clone())
+                }
+            };
+            size += 3 + value.len();
+            if size > MAX_BODY_LEN {
+                return Err(EncodeError::Unwritable);
+            }
+            params.push((kind, value));
+        }
+        let mut out = vec![VERSION];
+        out.extend_from_slice(&self.my_as.to_be_bytes());
+        out.extend_from_slice(&self.hold_time.to_be_bytes());
+        out.extend_from_slice(&self.bgp_id.octets());
+        let short: usize = params.iter().map(|(_, v)| 2 + v.len()).sum();
+        if short <= MAX_PARAMETERS_LEN && params.iter().all(|(_, v)| v.len() <= 255) {
+            out.push(short as u8);
+            for (kind, value) in &params {
+                out.push(*kind);
+                out.push(value.len() as u8);
+                out.extend_from_slice(value);
+            }
+        } else {
+            // RFC 9072: the extended format, needed when the parameters do
+            // not fit in 255 bytes or one of them is longer than 255.
+            out.extend_from_slice(&[0xff, PARAMETER_EXTENDED]);
+            out.extend_from_slice(&(size as u16).to_be_bytes());
+            for (kind, value) in &params {
+                out.push(*kind);
+                out.extend_from_slice(&(value.len() as u16).to_be_bytes());
+                out.extend_from_slice(value);
+            }
+        }
+        bound(&out)?;
+        Ok(out)
+    }
+}
+
+impl Wire for Open {
+    type ParseError = Error;
+    type WriteError = EncodeError;
+
     /// Reads an OPEN's body, the bytes after the header. A body shorter
     /// than 10 bytes or longer than [`MAX_BODY_LEN`] is a bad length.
-    pub fn parse(b: &[u8]) -> Result<Open, Error> {
+    /// Refuses malformed fields, invalid AS numbers or timers, and excess lengths.
+    fn parse(b: &[u8]) -> Result<Open, Error> {
         if b.len() > MAX_BODY_LEN {
             return Err(Error::BadMessageLength(length_field(b)));
         }
@@ -956,63 +927,11 @@ impl Open {
         Ok(open)
     }
 
-    fn to_body(&self) -> Result<Vec<u8>, EncodeError> {
-        if self.my_as == 0 || self.capabilities().any(|c| *c == Capability::FourOctetAs(0)) {
-            return Err(EncodeError::Invalid("AS number is 0"));
-        }
-        if self.hold_time == 1 || self.hold_time == 2 {
-            return Err(EncodeError::Invalid("hold time is 1 or 2 seconds"));
-        }
-        if self.bgp_id.is_unspecified() {
-            return Err(EncodeError::Invalid("BGP identifier is 0"));
-        }
-        let mut params = Vec::new();
-        let mut size = 0;
-        for p in &self.parameters {
-            let (kind, value) = match p {
-                Parameter::Capabilities(caps) => (PARAMETER_CAPABILITIES, capabilities_bytes(caps)?),
-                Parameter::Other { kind, value } => {
-                    if *kind == PARAMETER_CAPABILITIES {
-                        return Err(EncodeError::Invalid("other parameter with the capabilities type"));
-                    }
-                    if *kind == PARAMETER_EXTENDED {
-                        return Err(EncodeError::Invalid("parameter type 255 marks the extended format"));
-                    }
-                    bound(value)?;
-                    (*kind, value.clone())
-                }
-            };
-            size += 3 + value.len();
-            if size > MAX_BODY_LEN {
-                return Err(EncodeError::TooLong);
-            }
-            params.push((kind, value));
-        }
-        let mut out = vec![VERSION];
-        out.extend_from_slice(&self.my_as.to_be_bytes());
-        out.extend_from_slice(&self.hold_time.to_be_bytes());
-        out.extend_from_slice(&self.bgp_id.octets());
-        let legacy: usize = params.iter().map(|(_, v)| 2 + v.len()).sum();
-        if legacy <= MAX_PARAMETERS_LEN && params.iter().all(|(_, v)| v.len() <= 255) {
-            out.push(legacy as u8);
-            for (kind, value) in &params {
-                out.push(*kind);
-                out.push(value.len() as u8);
-                out.extend_from_slice(value);
-            }
-        } else {
-            // RFC 9072: the extended format, needed when the parameters do
-            // not fit in 255 bytes or one of them is longer than 255.
-            out.extend_from_slice(&[0xff, PARAMETER_EXTENDED]);
-            out.extend_from_slice(&(size as u16).to_be_bytes());
-            for (kind, value) in &params {
-                out.push(*kind);
-                out.extend_from_slice(&(value.len() as u16).to_be_bytes());
-                out.extend_from_slice(value);
-            }
-        }
-        bound(&out)?;
-        Ok(out)
+    /// Appends an OPEN body. Refuses invalid fields, capabilities, or
+    /// lengths without changing `out`. Uses RFC 9072 for long parameters.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+        out.extend_from_slice(&self.to_body()?);
+        Ok(())
     }
 }
 
@@ -1050,7 +969,6 @@ fn parse_capabilities(mut r: &[u8]) -> Result<Vec<Capability>, Error> {
 }
 
 fn capabilities_bytes(caps: &[Capability]) -> Result<Vec<u8>, EncodeError> {
-    let too_long = EncodeError::Invalid("capability longer than 255 bytes");
     let mut out = Vec::new();
     for c in caps {
         let (code, value) = match c {
@@ -1062,13 +980,13 @@ fn capabilities_bytes(caps: &[Capability]) -> Result<Vec<u8>, EncodeError> {
             Capability::FourOctetAs(a) => (capability::FOUR_OCTET_AS, a.to_be_bytes().to_vec()),
             Capability::GracefulRestart(g) => {
                 if g.flags > 0x0f {
-                    return Err(EncodeError::Invalid("graceful restart flags above 15"));
+                    return Err(EncodeError::Unwritable);
                 }
                 if g.time > MAX_RESTART_TIME {
-                    return Err(EncodeError::Invalid("graceful restart time above 4095 seconds"));
+                    return Err(EncodeError::Unwritable);
                 }
                 if g.families.len() > (MAX_PARAMETERS_LEN - 2) / 4 {
-                    return Err(too_long);
+                    return Err(EncodeError::Unwritable);
                 }
                 let mut v = vec![(g.flags << 4) | (g.time >> 8) as u8, g.time as u8];
                 for f in &g.families {
@@ -1086,10 +1004,10 @@ fn capabilities_bytes(caps: &[Capability]) -> Result<Vec<u8>, EncodeError> {
                         | capability::GRACEFUL_RESTART
                         | capability::FOUR_OCTET_AS
                 ) {
-                    return Err(EncodeError::Invalid("other capability with a known code"));
+                    return Err(EncodeError::Unwritable);
                 }
                 if value.len() > MAX_PARAMETERS_LEN {
-                    return Err(too_long);
+                    return Err(EncodeError::Unwritable);
                 }
                 (*code, value.clone())
             }
@@ -1166,10 +1084,10 @@ fn write_prefixes(out: &mut Vec<u8>, prefixes: &[Prefix], v6: bool) -> Result<()
         let octets = match (p.addr, v6) {
             (IpAddr::V4(a), false) if p.length <= 32 => a.octets().to_vec(),
             (IpAddr::V6(a), true) if p.length <= 128 => a.octets().to_vec(),
-            _ => return Err(EncodeError::Invalid("prefix of the wrong family, or too long")),
+            _ => return Err(EncodeError::Unwritable),
         };
         if Prefix::new(p.addr, p.length) != Some(*p) {
-            return Err(EncodeError::Invalid("prefix with bits set past its length"));
+            return Err(EncodeError::Unwritable);
         }
         out.push(p.length);
         out.extend_from_slice(&octets[..usize::from(p.length).div_ceil(8)]);
@@ -1488,7 +1406,7 @@ impl Attribute {
             Attribute::AsPath(segments) => put_segments(&mut v, segments, ctx.four_octet_as)?,
             Attribute::NextHop(a) => {
                 if !host_address(*a) {
-                    return Err(EncodeError::Invalid("NEXT_HOP is not a host address"));
+                    return Err(EncodeError::Unwritable);
                 }
                 v.extend_from_slice(&a.octets())
             }
@@ -1496,7 +1414,7 @@ impl Attribute {
             Attribute::AtomicAggregate => {}
             Attribute::Aggregator { asn, address, partial: p } => {
                 if *asn == 0 {
-                    return Err(EncodeError::Invalid("AGGREGATOR with AS 0"));
+                    return Err(EncodeError::Unwritable);
                 }
                 put_asn(&mut v, *asn, ctx.four_octet_as)?;
                 v.extend_from_slice(&address.octets());
@@ -1504,7 +1422,7 @@ impl Attribute {
             }
             Attribute::Communities { values, partial: p } => {
                 if values.is_empty() {
-                    return Err(EncodeError::Invalid("COMMUNITIES with no communities"));
+                    return Err(EncodeError::Unwritable);
                 }
                 for n in values {
                     v.extend_from_slice(&n.to_be_bytes());
@@ -1514,10 +1432,10 @@ impl Attribute {
             }
             Attribute::MpReach(m) => {
                 if m.next_hop.len() > 255 {
-                    return Err(EncodeError::Invalid("MP_REACH_NLRI next hop longer than 255 bytes"));
+                    return Err(EncodeError::Unwritable);
                 }
                 if !next_hop_length(m.afi, m.safi, m.next_hop.len()) {
-                    return Err(EncodeError::Invalid("MP_REACH_NLRI next hop of the wrong length for its family"));
+                    return Err(EncodeError::Unwritable);
                 }
                 v.extend_from_slice(&m.afi.to_be_bytes());
                 v.push(m.safi);
@@ -1533,32 +1451,30 @@ impl Attribute {
             }
             Attribute::Unknown { flags, kind, value } => {
                 if known_flags(*kind).is_some() {
-                    return Err(EncodeError::Invalid("unknown attribute with a known type code"));
+                    return Err(EncodeError::Unwritable);
                 }
                 if flags & flag::OPTIONAL == 0 {
-                    return Err(EncodeError::Invalid("unknown attribute without the optional bit"));
+                    return Err(EncodeError::Unwritable);
                 }
                 if flags & !(flag::OPTIONAL | flag::TRANSITIVE | flag::PARTIAL) != 0 {
-                    return Err(EncodeError::Invalid(
-                        "unknown attribute flags other than optional, transitive, partial",
-                    ));
+                    return Err(EncodeError::Unwritable);
                 }
                 if flags & flag::PARTIAL != 0 && flags & flag::TRANSITIVE == 0 {
-                    return Err(EncodeError::Invalid("partial bit on a non-transitive attribute"));
+                    return Err(EncodeError::Unwritable);
                 }
                 if value.len() > MAX_BODY_LEN {
-                    return Err(EncodeError::TooLong);
+                    return Err(EncodeError::Unwritable);
                 }
                 let flags = *flags;
                 if *kind == attr::AS4_PATH || *kind == attr::AS4_AGGREGATOR {
                     if ctx.four_octet_as {
-                        return Err(EncodeError::Invalid("AS4_PATH or AS4_AGGREGATOR in a four-octet session"));
+                        return Err(EncodeError::Unwritable);
                     }
                     // A reader keeps the attribute as it is only if it is
                     // well formed.
                     match parse_as4(flags, *kind, value, &[], ctx) {
                         Ok(Some(Attribute::Unknown { value: read, .. })) if read == *value => {}
-                        _ => return Err(EncodeError::Invalid("malformed AS4_PATH or AS4_AGGREGATOR")),
+                        _ => return Err(EncodeError::Unwritable),
                     }
                 }
                 return put_attribute(out, flags, *kind, value);
@@ -1618,10 +1534,10 @@ fn next_hop_length(afi: u16, safi: u8, len: usize) -> bool {
 fn put_segments(v: &mut Vec<u8>, segments: &[Segment], four: bool) -> Result<(), EncodeError> {
     for s in segments {
         if s.asns.is_empty() || s.asns.len() > MAX_SEGMENT_ASNS {
-            return Err(EncodeError::Invalid("AS_PATH segment with no AS numbers or more than 255"));
+            return Err(EncodeError::Unwritable);
         }
         if s.asns.contains(&0) {
-            return Err(EncodeError::Invalid("AS_PATH with AS 0"));
+            return Err(EncodeError::Unwritable);
         }
         v.push(s.kind.code());
         v.push(s.asns.len() as u8);
@@ -1645,7 +1561,7 @@ fn put_asn(v: &mut Vec<u8>, asn: u32, four: bool) -> Result<(), EncodeError> {
     if four {
         v.extend_from_slice(&asn.to_be_bytes());
     } else {
-        let a = u16::try_from(asn).map_err(|_| EncodeError::Invalid("AS number needs four octets"))?;
+        let a = u16::try_from(asn).map_err(|_| EncodeError::Unwritable)?;
         v.extend_from_slice(&a.to_be_bytes());
     }
     Ok(())
@@ -1653,7 +1569,7 @@ fn put_asn(v: &mut Vec<u8>, asn: u32, four: bool) -> Result<(), EncodeError> {
 
 fn put_attribute(out: &mut Vec<u8>, flags: u8, kind: u8, value: &[u8]) -> Result<(), EncodeError> {
     if value.len() > MAX_BODY_LEN {
-        return Err(EncodeError::TooLong);
+        return Err(EncodeError::Unwritable);
     }
     if value.len() > 255 {
         out.push(flags | flag::EXTENDED_LENGTH);
@@ -1673,12 +1589,12 @@ fn write_nlri(v: &mut Vec<u8>, afi: u16, safi: u8, nlri: &Nlri) -> Result<(), En
         (Nlri::Prefixes(p), true) => write_prefixes(v, p, afi == afi::IPV6),
         (Nlri::Raw(r), false) => {
             if r.len() > MAX_BODY_LEN {
-                return Err(EncodeError::TooLong);
+                return Err(EncodeError::Unwritable);
             }
             v.extend_from_slice(r);
             bound(v)
         }
-        _ => Err(EncodeError::Invalid("NLRI form does not match the address family")),
+        _ => Err(EncodeError::Unwritable),
     }
 }
 
@@ -1779,12 +1695,10 @@ impl Update {
         let is_mp = |a: &Attribute| matches!(a, Attribute::MpReach(_) | Attribute::MpUnreach(_));
         let mp = self.attributes.iter().filter(|a| is_mp(a)).count();
         if usize::from(!self.withdrawn.is_empty()) + usize::from(!self.nlri.is_empty()) + mp > 1 {
-            return Err(EncodeError::Invalid(
-                "UPDATE with more than one of withdrawn routes, NLRI, MP_REACH_NLRI and MP_UNREACH_NLRI",
-            ));
+            return Err(EncodeError::Unwritable);
         }
         if mp == 1 && !self.attributes.first().is_some_and(is_mp) {
-            return Err(EncodeError::Invalid("MP_REACH_NLRI or MP_UNREACH_NLRI not the first attribute"));
+            return Err(EncodeError::Unwritable);
         }
         let mut out = vec![0, 0];
         write_prefixes(&mut out, &self.withdrawn, false)?;
@@ -1795,7 +1709,7 @@ impl Update {
         let mut seen = [false; 256];
         for a in &self.attributes {
             if core::mem::replace(&mut seen[usize::from(a.kind())], true) {
-                return Err(EncodeError::Invalid("attribute type appears twice"));
+                return Err(EncodeError::Unwritable);
             }
             a.write(&mut out, ctx)?;
         }
@@ -1803,7 +1717,7 @@ impl Update {
         out[at..at + 2].copy_from_slice(&alen.to_be_bytes());
         write_prefixes(&mut out, &self.nlri, false)?;
         if missing(&seen, !self.nlri.is_empty()).is_some() {
-            return Err(EncodeError::Invalid("routes without ORIGIN, AS_PATH or NEXT_HOP"));
+            return Err(EncodeError::Unwritable);
         }
         bound(&out)?;
         Ok(out)
@@ -1973,7 +1887,7 @@ impl Notification {
 
     fn to_body(&self) -> Result<Vec<u8>, EncodeError> {
         if self.data.len() > MAX_BODY_LEN - 2 {
-            return Err(EncodeError::TooLong);
+            return Err(EncodeError::Unwritable);
         }
         let mut out = vec![self.code, self.subcode];
         out.extend_from_slice(&self.data);
@@ -2030,7 +1944,7 @@ fn length_field(b: &[u8]) -> u16 {
 
 /// Fails once a body being written has passed what a message can hold.
 fn bound(out: &[u8]) -> Result<(), EncodeError> {
-    if out.len() > MAX_BODY_LEN { Err(EncodeError::TooLong) } else { Ok(()) }
+    if out.len() > MAX_BODY_LEN { Err(EncodeError::Unwritable) } else { Ok(()) }
 }
 
 fn take<'a>(r: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
@@ -2061,6 +1975,11 @@ fn be16(b: &[u8], i: usize) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stdlib::codec::{Stream, Fail, contract, pump, finish, test_support::{Lcg, mutate, decode_all}};
+
+    fn encode(message: &Message, context: &Context) -> Result<Vec<u8>, EncodeError> {
+        message.to_frame(context)?.to_bytes()
+    }
 
     const TWO: Context = Context { four_octet_as: false, enhanced_route_refresh: false };
     const FOUR: Context = Context { four_octet_as: true, enhanced_route_refresh: false };
@@ -2073,31 +1992,9 @@ mod tests {
     }
 
     fn decode(bytes: &[u8], ctx: &Context) -> Result<Message, Error> {
-        let (frame, used) = Frame::parse(bytes)?.expect("a whole frame");
+        let Step::Item(frame, used) = Frames.decode(bytes, true)? else { panic!("a whole frame") };
         assert_eq!(used, bytes.len());
         Message::decode(&frame, ctx)
-    }
-
-    /// Feeds all of `bytes`, taking frames out whenever the decoder is
-    /// full, and returns every frame and the first error.
-    fn split(d: &mut Decoder, mut bytes: &[u8]) -> Vec<Result<Frame, Error>> {
-        let mut out = Vec::new();
-        loop {
-            let n = d.feed(bytes);
-            bytes = &bytes[n..];
-            assert!(d.buffered() <= MAX_BUFFERED);
-            while let Some(f) = d.next_frame() {
-                let stop = f.is_err();
-                out.push(f);
-                if stop {
-                    return out;
-                }
-            }
-            if bytes.is_empty() {
-                return out;
-            }
-            assert!(n > 0, "a full decoder gave no frame");
-        }
     }
 
     fn update_body(body: &[u8], ctx: &Context) -> Result<Message, Error> {
@@ -2140,7 +2037,7 @@ mod tests {
         refresh.extend_from_slice(&[0, 2, 0, 1]);
         let mut note = header(23, 3);
         note.extend_from_slice(&[6, 2, 0xaa, 0xbb]);
-        let mp = Message::Update(Update {
+        let mp = encode(&Message::Update(Update {
             withdrawn: vec![],
             attributes: vec![
                 Attribute::MpReach(MpReach {
@@ -2162,22 +2059,20 @@ mod tests {
                 Attribute::Unknown { flags: 0xc0, kind: 32, value: vec![0; 300] },
             ],
             nlri: vec![],
-        })
-        .to_bytes(&FOUR)
+        }), &FOUR)
         .unwrap();
-        let unreach = Message::Update(Update {
+        let unreach = encode(&Message::Update(Update {
             attributes: vec![Attribute::MpUnreach(MpUnreach {
                 afi: 25,
                 safi: 65,
                 withdrawn: Nlri::Raw(vec![1, 2, 3]),
             })],
             ..Update::default()
-        })
-        .to_bytes(&FOUR)
+        }), &FOUR)
         .unwrap();
         // A two-octet session that carries the four-octet path and
         // aggregator beside AS_TRANS.
-        let as4 = Message::Update(Update {
+        let as4 = encode(&Message::Update(Update {
             withdrawn: vec![],
             attributes: vec![
                 Attribute::Origin(Origin::Igp),
@@ -2199,8 +2094,7 @@ mod tests {
                 },
             ],
             nlri: vec![v4(198, 51, 100, 0, 24)],
-        })
-        .to_bytes(&TWO)
+        }), &TWO)
         .unwrap();
         vec![
             (open_bytes(), TWO),
@@ -2217,7 +2111,7 @@ mod tests {
     #[test]
     fn keepalive_example() {
         // RFC 4271 section 4.4: a KEEPALIVE is the header alone, 19 bytes.
-        let b = Message::Keepalive.to_bytes(&TWO).unwrap();
+        let b = encode(&Message::Keepalive, &TWO).unwrap();
         let mut want = vec![0xff; 16];
         want.extend_from_slice(&[0, 19, 4]);
         assert_eq!(b, want);
@@ -2241,7 +2135,7 @@ mod tests {
             ]
         );
         assert_eq!(open.asn(), 65001);
-        assert_eq!(Message::Open(open.clone()).to_bytes(&TWO).unwrap(), b);
+        assert_eq!(encode(&Message::Open(open.clone()), &TWO).unwrap(), b);
         // Open::new builds the same message.
         let built = Open::new(
             65001,
@@ -2273,7 +2167,7 @@ mod tests {
                 Parameter::Capabilities(vec![]),
             ],
         };
-        let b = Message::Open(open.clone()).to_bytes(&TWO).unwrap();
+        let b = encode(&Message::Open(open.clone()), &TWO).unwrap();
         // The graceful restart value: flags 8 in the top bits, time 120.
         let at = b.windows(2).position(|w| w == [64, 6]).unwrap();
         assert_eq!(b[at + 2..at + 8], [0x80, 120, 0, 1, 1, 0x80]);
@@ -2302,11 +2196,11 @@ mod tests {
         assert_eq!(u.nlri, [v4(10, 0, 0, 0, 8)]);
         assert_eq!(u.attribute(attr::NEXT_HOP), Some(&Attribute::NextHop(Ipv4Addr::new(192, 0, 2, 1))));
         assert_eq!(u.attribute(attr::MED), None);
-        assert_eq!(Message::Update(u.clone()).to_bytes(&TWO).unwrap(), b);
+        assert_eq!(encode(&Message::Update(u.clone()), &TWO).unwrap(), b);
         // With four-octet AS numbers the AS_PATH reads differently: 1 AS
         // of 4 bytes needs 6 bytes of value, and 4 is too short.
         assert_eq!(decode(&b, &FOUR), Err(Error::MalformedAsPath));
-        let four = Message::Update(u).to_bytes(&FOUR).unwrap();
+        let four = encode(&Message::Update(u), &FOUR).unwrap();
         assert_eq!(four.len(), b.len() + 2);
         assert_eq!(four[19 + 4 + 4..19 + 4 + 4 + 9], [0x40, 2, 6, 2, 1, 0, 0, 0xfd, 0xe9]);
     }
@@ -2319,7 +2213,7 @@ mod tests {
         b.extend_from_slice(&[0, 0, 0, 0]);
         assert_eq!(decode(&b, &TWO), Ok(Message::Update(Update::default())));
         let u = Update { withdrawn: vec![v4(192, 168, 0, 0, 16), v4(0, 0, 0, 0, 0)], ..Update::default() };
-        let b = Message::Update(u.clone()).to_bytes(&TWO).unwrap();
+        let b = encode(&Message::Update(u.clone()), &TWO).unwrap();
         assert_eq!(b[19..], [0, 4, 16, 192, 168, 0, 0, 0]);
         assert_eq!(decode(&b, &TWO), Ok(Message::Update(u)));
     }
@@ -2355,12 +2249,12 @@ mod tests {
     #[test]
     fn notification_and_route_refresh_examples() {
         let n = Notification { code: code::CEASE, subcode: 2, data: b"bye".to_vec() };
-        let b = Message::Notification(n.clone()).to_bytes(&TWO).unwrap();
+        let b = encode(&Message::Notification(n.clone()), &TWO).unwrap();
         assert_eq!(b[16..], [0, 24, 3, 6, 2, b'b', b'y', b'e']);
         assert_eq!(decode(&b, &TWO), Ok(Message::Notification(n.clone())));
         assert_eq!(n.to_string(), "cease (code 6, subcode 2)");
         let r = RouteRefresh { afi: afi::IPV6, subtype: 0, safi: safi::UNICAST };
-        let b = Message::RouteRefresh(r).to_bytes(&TWO).unwrap();
+        let b = encode(&Message::RouteRefresh(r), &TWO).unwrap();
         assert_eq!(b[16..], [0, 23, 5, 0, 2, 0, 1]);
         assert_eq!(decode(&b, &TWO), Ok(Message::RouteRefresh(r)));
     }
@@ -2384,12 +2278,12 @@ mod tests {
 
     #[test]
     fn header_errors() {
-        assert_eq!(Frame::parse(&[0xff, 0xff, 0xfe]), Err(Error::ConnectionNotSynchronized));
+        assert_eq!(Frames.decode(&[0xff, 0xff, 0xfe], false), Err(Error::ConnectionNotSynchronized));
         let mut b = header(18, 4);
-        assert_eq!(Frame::parse(&b), Err(Error::BadMessageLength(18)));
+        assert_eq!(Frames.decode(&b, false), Err(Error::BadMessageLength(18)));
         b = header(4097, 4);
-        assert_eq!(Frame::parse(&b), Err(Error::BadMessageLength(4097)));
-        assert_eq!(Frame::parse(&header(4096, 4)), Ok(None));
+        assert_eq!(Frames.decode(&b, false), Err(Error::BadMessageLength(4097)));
+        assert_eq!(Frames.decode(&header(4096, 4), false), Ok(Step::Need));
         b = header(19, 9);
         assert_eq!(decode(&b, &TWO), Err(Error::BadMessageType(9)));
         b = header(19, 0);
@@ -2413,7 +2307,7 @@ mod tests {
         // A frame built by hand with a body too long for any message.
         let big = Frame { kind: kind::NOTIFICATION, body: vec![0; MAX_BODY_LEN + 1] };
         assert_eq!(Message::decode(&big, &TWO), Err(Error::BadMessageLength(4097)));
-        assert_eq!(big.to_bytes(), Err(EncodeError::TooLong));
+        assert_eq!(big.to_bytes(), Err(EncodeError::Unwritable));
         // Bodies passed straight to the readers, too short.
         assert_eq!(Open::parse(&[4, 0]), Err(Error::BadMessageLength(21)));
         assert_eq!(Update::parse(&[0], &TWO), Err(Error::MalformedAttributeList));
@@ -2566,7 +2460,7 @@ mod tests {
                 nlri: vec![v4(10, 0, 0, 0, 8)],
                 ..Update::default()
             };
-            assert!(matches!(Message::Update(u).to_bytes(&TWO), Err(EncodeError::Invalid(_))));
+            assert!(matches!(encode(&Message::Update(u), &TWO), Err(EncodeError::Unwritable)));
         }
         for good in [[1, 0, 0, 0], [10, 0, 0, 1], [126, 255, 255, 255], [128, 0, 0, 1], [223, 255, 255, 254]] {
             assert!(update_body(&body(good), &TWO).is_ok(), "{good:?}");
@@ -2583,7 +2477,7 @@ mod tests {
         b.extend(vec![0u8; 0xfffb]);
         let e = Update::parse(&b, &FOUR).unwrap_err();
         assert_eq!(e, Error::BadMessageLength(u16::MAX));
-        assert!(Message::Notification(e.notification()).to_bytes(&FOUR).is_ok());
+        assert!(encode(&Message::Notification(e.notification()), &FOUR).is_ok());
         // 4200 withdrawn /0 routes, one byte each: well formed, but too
         // many for one message.
         let mut withdrawn = vec![0x10, 0x68];
@@ -2600,7 +2494,7 @@ mod tests {
         assert_eq!(longest.len(), MAX_BODY_LEN);
         let u = Update::parse(&longest, &TWO).unwrap();
         assert_eq!(u.withdrawn.len(), MAX_BODY_LEN - 4);
-        assert!(Message::Update(u).to_bytes(&TWO).is_ok());
+        assert!(encode(&Message::Update(u), &TWO).is_ok());
     }
 
     #[test]
@@ -2666,9 +2560,35 @@ mod tests {
             let n = e.notification();
             assert_eq!((n.code, n.subcode), (c, s), "{e}");
             // Every notification can be sent.
-            let b = Message::Notification(n.clone()).to_bytes(&TWO).unwrap();
+            let b = encode(&Message::Notification(n.clone()), &TWO).unwrap();
             assert_eq!(decode(&b, &TWO), Ok(Message::Notification(n)));
             assert!(!e.to_string().is_empty());
+        }
+    }
+
+    #[test]
+    fn notifications_preserve_caller_supplied_data() {
+        for len in [MAX_BODY_LEN - 2, MAX_BODY_LEN - 1] {
+            let data = vec![7; len];
+            for error in [
+                Error::UnrecognizedWellKnownAttribute(data.clone()),
+                Error::AttributeFlags(data.clone()),
+                Error::AttributeLength(data.clone()),
+                Error::InvalidOrigin(data.clone()),
+                Error::InvalidNextHop(data.clone()),
+                Error::OptionalAttribute(data.clone()),
+                Error::RouteRefreshLength(data.clone()),
+            ] {
+                let notification = error.notification();
+                assert_eq!(notification.data, data);
+                let message = Message::Notification(notification);
+                if len == MAX_BODY_LEN - 2 {
+                    let bytes = encode(&message, &TWO).unwrap();
+                    assert_eq!(decode(&bytes, &TWO), Ok(message));
+                } else {
+                    assert_eq!(message.to_frame(&TWO), Err(EncodeError::Unwritable));
+                }
+            }
         }
     }
 
@@ -2676,8 +2596,8 @@ mod tests {
     fn writers_refuse_what_readers_refuse() {
         let id = Ipv4Addr::new(10, 0, 0, 1);
         let open = |p: Vec<Parameter>| Message::Open(Open { my_as: 1, hold_time: 90, bgp_id: id, parameters: p });
-        let bad = |m: Message, ctx: &Context| m.to_bytes(ctx).unwrap_err();
-        let invalid = |m: Message, ctx: &Context| matches!(bad(m, ctx), EncodeError::Invalid(_));
+        let bad = |m: Message, ctx: &Context| encode(&m, ctx).unwrap_err();
+        let invalid = |m: Message, ctx: &Context| matches!(bad(m, ctx), EncodeError::Unwritable);
         assert!(invalid(Message::Open(Open { hold_time: 2, ..Open::new(1, 0, id, vec![]) }), &TWO));
         assert!(invalid(Message::Open(Open::new(1, 0, Ipv4Addr::UNSPECIFIED, vec![])), &TWO));
         assert!(invalid(open(vec![Parameter::Other { kind: 2, value: vec![] }]), &TWO));
@@ -2686,13 +2606,13 @@ mod tests {
         assert!(invalid(Message::Open(Open::new(0, 0, id, vec![])), &TWO));
         assert_eq!(
             bad(open(vec![Parameter::Other { kind: 1, value: vec![0; MAX_BODY_LEN] }]), &TWO),
-            EncodeError::TooLong
+            EncodeError::Unwritable
         );
         let caps = |c: Vec<Capability>| open(vec![Parameter::Capabilities(c)]);
         assert!(invalid(caps(vec![Capability::Other { code: 65, value: vec![0; 4] }]), &TWO));
         assert!(invalid(caps(vec![Capability::Other { code: 9, value: vec![0; 256] }]), &TWO));
         // More than 255 bytes of capabilities take the extended format.
-        assert!(caps(vec![Capability::RouteRefresh; 128]).to_bytes(&TWO).is_ok());
+        assert!(encode(&caps(vec![Capability::RouteRefresh; 128]), &TWO).is_ok());
         let gr = |flags, time, n| {
             caps(vec![Capability::GracefulRestart(GracefulRestart {
                 flags,
@@ -2703,7 +2623,7 @@ mod tests {
         assert!(invalid(gr(16, 0, 0), &TWO));
         assert!(invalid(gr(0, 4096, 0), &TWO));
         assert!(invalid(gr(0, 0, 64), &TWO));
-        assert!(gr(15, 4095, 60).to_bytes(&TWO).is_ok());
+        assert!(encode(&gr(15, 4095, 60), &TWO).is_ok());
 
         let path = |asns: Vec<u32>| Attribute::AsPath(vec![Segment { kind: SegmentKind::Sequence, asns }]);
         let route = |attributes: Vec<Attribute>| {
@@ -2711,7 +2631,7 @@ mod tests {
         };
         let well_known =
             || vec![Attribute::Origin(Origin::Igp), path(vec![1]), Attribute::NextHop(Ipv4Addr::new(1, 2, 3, 4))];
-        assert!(route(well_known()).to_bytes(&TWO).is_ok());
+        assert!(encode(&route(well_known()), &TWO).is_ok());
         // Missing attributes, and one twice.
         assert!(invalid(route(well_known()[..2].to_vec()), &TWO));
         let mut twice = well_known();
@@ -2727,11 +2647,11 @@ mod tests {
         assert!(invalid(with(path(vec![])), &TWO));
         assert!(invalid(with(path(vec![1; 256])), &TWO));
         assert!(invalid(with(path(vec![70000])), &TWO));
-        assert!(with(path(vec![70000])).to_bytes(&FOUR).is_ok());
+        assert!(encode(&with(path(vec![70000])), &FOUR).is_ok());
         let mut agg = well_known();
         agg.push(Attribute::Aggregator { asn: 70000, address: id, partial: false });
         assert!(invalid(route(agg.clone()), &TWO));
-        assert!(route(agg).to_bytes(&FOUR).is_ok());
+        assert!(encode(&route(agg), &FOUR).is_ok());
         // Unknown attributes that would read as something else.
         let mut u = well_known();
         u.push(Attribute::Unknown { flags: 0xc0, kind: 8, value: vec![] });
@@ -2763,32 +2683,33 @@ mod tests {
         assert!(invalid(reach(vec![0; 16], 2, Nlri::Raw(vec![])), &TWO));
         assert!(invalid(reach(vec![0; 16], 9, Nlri::Prefixes(vec![])), &TWO));
         assert!(invalid(reach(vec![0; 4], 2, Nlri::Prefixes(vec![v4(1, 0, 0, 0, 8)])), &TWO));
-        assert!(reach(vec![0; 4], 9, Nlri::Raw(vec![1, 2, 3])).to_bytes(&TWO).is_ok());
+        assert!(encode(&reach(vec![0; 4], 9, Nlri::Raw(vec![1, 2, 3])), &TWO).is_ok());
         // Too much for one message.
         let mut many = well_known();
         many.push(Attribute::Communities { values: vec![1; 1100], partial: false });
-        assert_eq!(bad(route(many), &TWO), EncodeError::TooLong);
+        assert_eq!(bad(route(many), &TWO), EncodeError::Unwritable);
         let mut huge = well_known();
         huge.push(Attribute::Communities { values: vec![1; 10_000_000], partial: false });
-        assert_eq!(bad(route(huge), &TWO), EncodeError::TooLong);
+        assert_eq!(bad(route(huge), &TWO), EncodeError::Unwritable);
         let mut unknown = well_known();
         unknown.push(Attribute::Unknown { flags: 0x80, kind: 99, value: vec![0; 5000] });
-        assert_eq!(bad(route(unknown), &TWO), EncodeError::TooLong);
-        assert_eq!(bad(reach(vec![0; 4], 9, Nlri::Raw(vec![0; 5000])), &TWO), EncodeError::TooLong);
+        assert_eq!(bad(route(unknown), &TWO), EncodeError::Unwritable);
+        assert_eq!(bad(reach(vec![0; 4], 9, Nlri::Raw(vec![0; 5000])), &TWO), EncodeError::Unwritable);
         let note = Notification { code: 6, subcode: 0, data: vec![0; MAX_BODY_LEN - 1] };
-        assert_eq!(bad(Message::Notification(note), &TWO), EncodeError::TooLong);
+        assert_eq!(bad(Message::Notification(note), &TWO), EncodeError::Unwritable);
         let note = Notification { code: 6, subcode: 0, data: vec![0; MAX_BODY_LEN - 2] };
-        let b = Message::Notification(note).to_bytes(&TWO).unwrap();
+        let b = encode(&Message::Notification(note), &TWO).unwrap();
         assert_eq!(b.len(), MAX_MESSAGE_LEN);
         assert!(decode(&b, &TWO).is_ok());
-        assert!(!EncodeError::TooLong.to_string().is_empty());
+        assert!(!EncodeError::Unwritable.to_string().is_empty());
     }
 
     #[test]
     fn samples_round_trip() {
         for (b, ctx) in samples() {
             let m = decode(&b, &ctx).unwrap();
-            assert_eq!(m.to_bytes(&ctx).unwrap(), b, "{m:?}");
+            if let Message::Open(open) = &m { contract::check_wire_value(open); }
+            assert_eq!(encode(&m, &ctx).unwrap(), b, "{m:?}");
         }
     }
 
@@ -2796,11 +2717,11 @@ mod tests {
     fn every_truncated_prefix_waits_for_more() {
         for (b, ctx) in samples() {
             for n in 0..b.len() {
-                assert_eq!(Frame::parse(&b[..n]), Ok(None), "{n} of {} bytes", b.len());
+                assert_eq!(Frames.decode(&b[..n], false), Ok(Step::Need), "{n} of {} bytes", b.len());
             }
             // Bodies cut short never read as the whole message, and never
             // panic.
-            let (frame, _) = Frame::parse(&b).unwrap().unwrap();
+            let frame = Frame::parse(&b).unwrap();
             let whole = Message::decode(&frame, &ctx).unwrap();
             for n in 0..frame.body.len() {
                 let cut = Frame { kind: frame.kind, body: frame.body[..n].to_vec() };
@@ -2812,36 +2733,32 @@ mod tests {
     }
 
     #[test]
-    fn decoder_splits_a_stream() {
+    fn stream_splits_frames() {
         let all = samples();
-        let stream: Vec<u8> = all.iter().filter(|(_, c)| *c == TWO).flat_map(|(b, _)| b.clone()).collect();
-        let mut d = Decoder::new();
-        let mut kinds = Vec::new();
-        for byte in &stream {
-            for f in split(&mut d, std::slice::from_ref(byte)) {
-                kinds.push(f.unwrap().kind);
-            }
-        }
-        assert_eq!(kinds, [1, 2, 4, 5, 3, 2]);
-        assert_eq!(d.buffered(), 0);
-        // A broken stream stays broken, and takes every byte.
-        assert_eq!(d.feed(&[0xff, 0xff, 0]), 3);
-        assert_eq!(d.next_frame(), Some(Err(Error::ConnectionNotSynchronized)));
-        assert_eq!(d.feed(&stream), stream.len());
-        assert_eq!(d.next_frame(), Some(Err(Error::ConnectionNotSynchronized)));
-        assert_eq!(d.buffered(), 0);
+        let bytes: Vec<u8> = all.iter().filter(|(_, c)| *c == TWO).flat_map(|(b, _)| b.clone()).collect();
+        contract::check_decode_with_alloc_limit(|| Frames, &bytes, 2 * MAX_MESSAGE_LEN);
+        let (frames, error) = decode_all(|| Frames, &bytes);
+        assert_eq!(error, None);
+        assert_eq!(frames.iter().map(|f| f.kind).collect::<Vec<_>>(), [1, 2, 4, 5, 3, 2]);
+        let mut stream = Stream::new(Frames);
+        assert_eq!(stream.push(&[0xff, 0xff, 0]), 3);
+        assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::ConnectionNotSynchronized))));
+        assert_eq!(stream.push(&bytes), bytes.len());
+        assert!(stream.next().is_none());
+        assert_eq!(stream.buffered(), 3);
     }
 
     #[test]
-    fn decoder_takes_many_small_frames_in_linear_time() {
-        let one = Message::Keepalive.to_bytes(&TWO).unwrap();
-        let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * 200_000).collect();
+    fn stream_reads_many_small_frames_in_linear_time() {
+        let one = Message::Keepalive.to_frame(&TWO).unwrap().to_bytes().unwrap();
+        let bytes = one.repeat(200_000);
         let started = std::time::Instant::now();
-        let mut d = Decoder::new();
-        let frames = split(&mut d, &stream);
-        assert!(frames.iter().all(Result::is_ok));
-        assert_eq!(frames.len(), 200_000);
-        assert_eq!(d.buffered(), 0);
+        let mut stream = Stream::new(Frames);
+        let mut count = 0;
+        pump(&mut stream, &bytes, |_| count += 1).unwrap();
+        finish(&mut stream, |_| count += 1).unwrap();
+        assert_eq!(count, 200_000);
+        assert_eq!(stream.buffered(), 0);
         assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
     }
 
@@ -2872,74 +2789,59 @@ mod tests {
                     }
                     Err(e) => {
                         assert!(strict.is_err());
-                        assert!(Message::Notification(e.notification()).to_bytes(&ctx).is_ok());
+                        assert!(encode(&Message::Notification(e.notification()), &ctx).is_ok());
                     }
                 }
             }
             if let Ok(m) = Message::decode(frame, &ctx) {
                 if mixes(&m) {
-                    assert!(matches!(m.to_bytes(&ctx), Err(EncodeError::Invalid(_))));
+                    assert!(matches!(encode(&m, &ctx), Err(EncodeError::Unwritable)));
                     continue;
                 }
-                let bytes = m.to_bytes(&ctx).unwrap_or_else(|e| panic!("{m:?} cannot be written: {e}"));
+                let bytes = encode(&m, &ctx).unwrap_or_else(|e| panic!("{m:?} cannot be written: {e}"));
                 assert!(bytes.len() <= MAX_MESSAGE_LEN);
-                let (back, used) = Frame::parse(&bytes).unwrap().unwrap();
-                assert_eq!(used, bytes.len());
+                let back = Frame::parse(&bytes).unwrap();
                 assert_eq!(Message::decode(&back, &ctx), Ok(m));
             } else if let Err(e) = Message::decode(frame, &ctx) {
                 let n = e.notification();
-                assert!(Message::Notification(n).to_bytes(&ctx).is_ok());
+                assert!(encode(&Message::Notification(n), &ctx).is_ok());
             }
         }
     }
 
     #[test]
     fn lcg_fuzz() {
-        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
-        let mut next = move || {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (seed >> 33) as u32
-        };
+        let mut r = Lcg::new(0x2545_f491_4f6c_dd1d);
         let bases: Vec<Vec<u8>> = samples().into_iter().map(|(b, _)| b).collect();
         for round in 0..6000 {
-            let mut b = bases[next() as usize % bases.len()].clone();
+            let mut b = bases[r.index(bases.len())].clone();
             match round % 4 {
-                // Flip a few bytes after the marker.
+                // Mutate only the body, preserving the header and fixing its length.
                 0 | 1 => {
-                    for _ in 0..1 + next() % 4 {
-                        let i = HEADER_LEN + next() as usize % b.len().saturating_sub(HEADER_LEN).max(1);
-                        if i < b.len() {
-                            b[i] = next() as u8;
-                        }
-                    }
+                    let mut body = b.split_off(HEADER_LEN);
+                    mutate(&mut r, &mut body);
+                    b.extend_from_slice(&body);
+                    let length = u16::try_from(b.len()).unwrap();
+                    b[16..18].copy_from_slice(&length.to_be_bytes());
                 }
                 // Cut the body short or grow it, and fix the length field.
                 2 => {
-                    let n = HEADER_LEN + next() as usize % (b.len() + 8 - HEADER_LEN);
-                    b.resize(n, next() as u8);
+                    let n = HEADER_LEN + r.index(b.len() + 8 - HEADER_LEN);
+                    b.resize(n, r.next() as u8);
                     b[16..18].copy_from_slice(&(n as u16).to_be_bytes());
                 }
                 // Any bytes at all, behind a good marker half the time.
                 _ => {
-                    let n = next() as usize % 64;
-                    b = (0..n).map(|_| next() as u8).collect();
-                    if next() % 2 == 0 && b.len() >= MARKER_LEN {
+                    b = r.bytes(63);
+                    if r.coin() && b.len() >= MARKER_LEN {
                         b[..MARKER_LEN].fill(0xff);
                     }
                 }
             }
-            let frames = split(&mut Decoder::new(), &b);
-            let mut bytewise = Decoder::new();
-            let mut again = Vec::new();
-            for byte in &b {
-                again.extend(split(&mut bytewise, std::slice::from_ref(byte)));
-                if again.last().is_some_and(Result::is_err) {
-                    break;
-                }
-            }
-            assert_eq!(frames, again);
-            for f in frames.iter().flatten() {
-                check_frame(f);
+            contract::check_decode_with_alloc_limit(|| Frames, &b, 2 * MAX_MESSAGE_LEN);
+            contract::check_wire::<Frame>(&b);
+            for frame in decode_all(|| Frames, &b).0 {
+                check_frame(&frame);
             }
             // The body alone, as each message type.
             let body = b.get(HEADER_LEN..).unwrap_or(&[]).to_vec();
@@ -2953,25 +2855,21 @@ mod tests {
     fn lcg_fuzz_update_attributes() {
         // Random attribute lists behind good UPDATE lengths, so the
         // attribute readers see most of the inputs.
-        let mut seed: u64 = 7;
-        let mut next = move || {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (seed >> 33) as u32
-        };
+        let mut r = Lcg::new(7);
         let mut read = 0;
         for _ in 0..20_000 {
             let mut attrs = Vec::new();
-            for _ in 0..next() % 4 {
-                let kind = [1, 2, 3, 4, 5, 6, 7, 8, 14, 15, 99][next() as usize % 11];
-                let flags = match next() % 3 {
+            for _ in 0..r.index(4) {
+                let kind = [1, 2, 3, 4, 5, 6, 7, 8, 14, 15, 99][r.index(11)];
+                let flags = match r.index(3) {
                     0 => known_flags(kind).unwrap_or(0x80),
                     1 => known_flags(kind).unwrap_or(0xc0) | flag::EXTENDED_LENGTH,
-                    _ => next() as u8,
+                    _ => r.next() as u8,
                 };
-                let n = next() as usize % 12;
-                let mut v: Vec<u8> = (0..n).map(|_| next() as u8 % 6).collect();
+                let n = r.index(12);
+                let mut v: Vec<u8> = (0..n).map(|_| r.index(6) as u8).collect();
                 if kind == 14 || kind == 15 {
-                    v.splice(0..0, [0, 1 + next() as u8 % 2, 1, 0]);
+                    v.splice(0..0, [0, 1 + r.index(2) as u8, 1, 0]);
                 }
                 attrs.push(flags);
                 attrs.push(kind);
@@ -2985,7 +2883,7 @@ mod tests {
             let mut body = vec![0, 0];
             body.extend_from_slice(&(attrs.len() as u16).to_be_bytes());
             body.extend_from_slice(&attrs);
-            if next() % 2 == 0 {
+            if r.coin() {
                 body.extend_from_slice(&[8, 10]);
             }
             let frame = Frame { kind: kind::UPDATE, body };
@@ -3002,7 +2900,7 @@ mod tests {
         // 4074 withdrawn /0 routes: 4076 bytes of withdrawn routes, then
         // the attribute length makes the body 4078, too long.
         let u = Update { withdrawn: vec![v4(0, 0, 0, 0, 0); 4074], ..Update::default() };
-        assert_eq!(Message::Update(u).to_frame(&TWO), Err(EncodeError::TooLong));
+        assert_eq!(Message::Update(u).to_frame(&TWO), Err(EncodeError::Unwritable));
         let u = Update { withdrawn: vec![v4(0, 0, 0, 0, 0); 4073], ..Update::default() };
         let f = Message::Update(u).to_frame(&TWO).unwrap();
         assert_eq!(f.body.len(), MAX_BODY_LEN);
@@ -3029,7 +2927,7 @@ mod tests {
             attributes: vec![Attribute::Unknown { flags: 0xa0, kind: 99, value: vec![] }],
             ..Update::default()
         };
-        assert!(matches!(Message::Update(bad).to_bytes(&TWO), Err(EncodeError::Invalid(_))));
+        assert!(matches!(encode(&Message::Update(bad), &TWO), Err(EncodeError::Unwritable)));
     }
 
     #[test]
@@ -3042,7 +2940,7 @@ mod tests {
         assert_eq!(u.withdrawn, [v4(10, 128, 0, 0, 9)]);
         // A prefix with bits set past its length is not written.
         let u = Update { withdrawn: vec![v4(192, 0, 2, 9, 24)], ..Update::default() };
-        assert!(matches!(Message::Update(u).to_bytes(&TWO), Err(EncodeError::Invalid(_))));
+        assert!(matches!(encode(&Message::Update(u), &TWO), Err(EncodeError::Unwritable)));
     }
 
     #[test]
@@ -3080,7 +2978,7 @@ mod tests {
             ],
             ..Update::default()
         };
-        assert!(matches!(Message::Update(u).to_bytes(&TWO), Err(EncodeError::Invalid(_))));
+        assert!(matches!(encode(&Message::Update(u), &TWO), Err(EncodeError::Unwritable)));
     }
 
     #[test]
@@ -3096,7 +2994,7 @@ mod tests {
         let n = Error::BadPeerAs.notification();
         assert_eq!((n.code, n.subcode), (2, 2));
         let id = Ipv4Addr::new(10, 0, 0, 1);
-        assert!(matches!(Message::Open(Open::new(0, 90, id, vec![])).to_bytes(&TWO), Err(EncodeError::Invalid(_))));
+        assert!(matches!(encode(&Message::Open(Open::new(0, 90, id, vec![])), &TWO), Err(EncodeError::Unwritable)));
         // An AS_PATH or AGGREGATOR with AS 0 is malformed.
         assert_eq!(update_body(&[0, 0, 0, 7, 0x40, 2, 4, 2, 1, 0, 0], &TWO), Err(Error::MalformedAsPath));
         let raw = vec![0xc0, 7, 6, 0, 0, 10, 0, 0, 1];
@@ -3135,42 +3033,38 @@ mod tests {
             attributes: vec![Attribute::Origin(Origin::Igp), path.clone(), reach.clone()],
             ..Update::default()
         };
-        assert!(matches!(Message::Update(late).to_bytes(&TWO), Err(EncodeError::Invalid(_))));
+        assert!(matches!(encode(&Message::Update(late), &TWO), Err(EncodeError::Unwritable)));
         // Withdrawn routes with MP_REACH_NLRI are not written.
         let mixed = Update {
             withdrawn: vec![v4(10, 0, 0, 0, 8)],
             attributes: vec![reach.clone(), Attribute::Origin(Origin::Igp), path.clone()],
             ..Update::default()
         };
-        assert!(matches!(Message::Update(mixed).to_bytes(&TWO), Err(EncodeError::Invalid(_))));
+        assert!(matches!(encode(&Message::Update(mixed), &TWO), Err(EncodeError::Unwritable)));
         // A reader still takes the old layout, and puts MP_REACH_NLRI first.
         let mut body = vec![0, 0, 0, 31, 0x40, 1, 1, 0, 0x40, 2, 0, 0x80, 14, 21, 0, 2, 1, 16];
         body.extend_from_slice(&[0x20; 16]);
         body.push(0);
         let Message::Update(u) = update_body(&body, &TWO).unwrap() else { panic!() };
         assert_eq!(u.attributes[0].kind(), attr::MP_REACH_NLRI);
-        assert!(Message::Update(u).to_bytes(&TWO).is_ok());
+        assert!(encode(&Message::Update(u), &TWO).is_ok());
     }
 
     #[test]
-    fn review_decoder_holds_at_most_one_message() {
-        let mut d = Decoder::new();
-        // One large feed, even of bytes that will fail, is taken only in
-        // part.
-        assert_eq!(d.feed(&vec![0xff; 1 << 20]), MAX_BUFFERED);
-        assert_eq!(d.buffered(), MAX_BUFFERED);
-        assert_eq!(d.feed(&[0xff]), 0);
-        // A whole message of the longest length fits.
+    fn stream_holds_at_most_one_message() {
+        let mut stream = Stream::new(Frames);
+        assert_eq!(stream.push(&vec![0xff; 1 << 20]), MAX_MESSAGE_LEN);
+        assert_eq!(stream.buffered(), MAX_MESSAGE_LEN);
+        assert_eq!(stream.push(&[0xff]), 0);
         let note = Message::Notification(Notification { code: 6, subcode: 0, data: vec![0; MAX_BODY_LEN - 2] });
-        let b = note.to_bytes(&TWO).unwrap();
-        let mut d = Decoder::new();
-        assert_eq!(d.feed(&b), b.len());
-        assert!(d.next_frame().unwrap().is_ok());
-        // Many messages in one stream go through a full decoder.
-        let stream: Vec<u8> = b.iter().copied().cycle().take(b.len() * 50).collect();
-        let frames = split(&mut Decoder::new(), &stream);
-        assert_eq!(frames.len(), 50);
-        assert!(frames.iter().all(Result::is_ok));
+        let frame = note.to_frame(&TWO).unwrap();
+        let bytes = frame.to_bytes().unwrap();
+        let mut stream = Stream::new(Frames);
+        assert_eq!(stream.push(&bytes), bytes.len());
+        assert_eq!(stream.next(), Some(Ok(frame.clone())));
+        let (frames, error) = decode_all(|| Frames, &bytes.repeat(50));
+        assert_eq!(error, None);
+        assert_eq!(frames, vec![frame; 50]);
     }
 
     /// An UPDATE body announcing 10.0.0.0/8, with `extra` added to the
@@ -3313,7 +3207,7 @@ mod tests {
         let route = |a: Attribute, ctx: &Context| {
             let mut u = Update::parse(&route_with(&[]), &TWO).unwrap();
             u.attributes.push(a);
-            Message::Update(u).to_bytes(ctx)
+            encode(&Message::Update(u), ctx)
         };
         let unknown = |flags, kind, value: &[u8]| Attribute::Unknown { flags, kind, value: value.to_vec() };
         assert!(route(unknown(0xc0, 17, &path[3..]), &TWO).is_ok());
@@ -3343,7 +3237,7 @@ mod tests {
         // The longest such message still fits in a NOTIFICATION.
         let long = Frame { kind: kind::ROUTE_REFRESH, body: [&[0, 2, 2, 1][..], &[0; MAX_BODY_LEN - 4]].concat() };
         let e = Message::decode(&long, &ctx).unwrap_err();
-        assert!(Message::Notification(e.notification()).to_bytes(&ctx).is_ok());
+        assert!(encode(&Message::Notification(e.notification()), &ctx).is_ok());
         // The capability is negotiated when both sides send it.
         let id = Ipv4Addr::new(10, 0, 0, 1);
         let err =
@@ -3357,43 +3251,39 @@ mod tests {
     fn lcg_public_values_round_trip() {
         // Updates built from public fields, the way world code builds
         // them: whatever a writer takes reads back the same.
-        let mut seed: u64 = 99;
-        let mut next = move || {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (seed >> 33) as u32
-        };
+        let mut r = Lcg::new(99);
         let mut written = 0;
         for _ in 0..3000 {
-            let prefix = |next: &mut dyn FnMut() -> u32| {
-                let addr = Ipv4Addr::from(if next().is_multiple_of(2) { next() } else { next() & 0xffff_0000 });
-                let length = (next() % 34) as u8;
-                if next().is_multiple_of(3) {
+            let prefix = |r: &mut Lcg| {
+                let addr = Ipv4Addr::from(if r.coin() { r.next() as u32 } else { (r.next() as u32) & 0xffff_0000 });
+                let length = r.index(34) as u8;
+                if r.index(3) == 0 {
                     Prefix::new(addr.into(), length.min(32)).unwrap()
                 } else {
                     Prefix { addr: addr.into(), length }
                 }
             };
-            let count = [0, 1, 3, 4073, 4074, 5000][next() as usize % 6];
-            let withdrawn: Vec<Prefix> = (0..count).map(|_| prefix(&mut next)).collect();
+            let count = [0, 1, 3, 4073, 4074, 5000][r.index(6)];
+            let withdrawn: Vec<Prefix> = (0..count).map(|_| prefix(&mut r)).collect();
             let mut attributes = vec![];
-            if next() % 2 == 0 {
+            if r.coin() {
                 attributes.push(Attribute::Origin(Origin::Igp));
                 attributes
-                    .push(Attribute::AsPath(vec![Segment { kind: SegmentKind::Sequence, asns: vec![next() % 3] }]));
-                attributes.push(Attribute::NextHop(Ipv4Addr::from(next())));
+                    .push(Attribute::AsPath(vec![Segment { kind: SegmentKind::Sequence, asns: vec![r.index(3) as u32] }]));
+                attributes.push(Attribute::NextHop(Ipv4Addr::from(r.next() as u32)));
             }
-            if next() % 2 == 0 {
-                let values = (0..next() % 3).map(|_| next()).collect();
-                attributes.push(Attribute::Communities { values, partial: next() % 2 == 0 });
+            if r.coin() {
+                let values = (0..r.index(3)).map(|_| r.next() as u32).collect();
+                attributes.push(Attribute::Communities { values, partial: r.coin() });
             }
-            if next() % 4 == 0 {
+            if r.index(4) == 0 {
                 attributes.push(Attribute::Unknown {
-                    flags: next() as u8,
-                    kind: 17 + (next() % 3) as u8,
-                    value: vec![2, 1, 0, 0, 0, next() as u8 % 2],
+                    flags: r.next() as u8,
+                    kind: 17 + r.index(3) as u8,
+                    value: vec![2, 1, 0, 0, 0, r.index(2) as u8],
                 });
             }
-            let nlri = if next() % 2 == 0 { vec![prefix(&mut next)] } else { vec![] };
+            let nlri = if r.coin() { vec![prefix(&mut r)] } else { vec![] };
             let u = Update { withdrawn, attributes, nlri };
             for ctx in [TWO, FOUR] {
                 let m = Message::Update(u.clone());

@@ -1,75 +1,53 @@
-//! Kafka frames, requests and responses, as a world playing a broker reads
-//! them.
+//! Kafka frames, requests, and responses as a broker or client reads them.
 #![no_main]
-#![allow(deprecated)] // Also exercise the compatibility decoder.
 
-use fictionet::stdlib::codec::{Decode, contract};
-use fictionet::stdlib::kafka::{Decoder, Frame, Frames, MAX_FRAME, Reader, Request, Response, api_key};
+use fictionet::stdlib::codec::{Decode, Wire, contract, test_support::decode_all};
+use fictionet::stdlib::kafka::*;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode(Frames::new, data);
+    contract::check_decode_with_alloc_limit(Frames::new, data, 2 * Frames::new().capacity());
+    let limit = usize::from(data.first().copied().unwrap_or(0));
+    contract::check_decode_with_alloc_limit(|| Frames::with_limit(limit), data, 2 * Frames::with_limit(limit).capacity());
     contract::check_wire::<Frame>(data);
-    contract::check_decode(|| Frames::with_limit(usize::from(data.first().copied().unwrap_or(0))), data);
-    contract::check_decode(|| Frames::new().map(|frame| Request::parse(&frame.0)), data);
+    contract::check_wire::<Request>(data);
+    contract::check_wire::<RequestHeader>(data);
+    contract::check_wire::<ResponseHead<0>>(data);
+    contract::check_wire::<ResponseHead<1>>(data);
+    contract::check_decode_with_alloc_limit(|| Frames::new().map(|frame| Request::parse(&frame.0)), data, 2 * Frames::new().capacity());
     contract::check_wire_value(&Frame(data.iter().take(MAX_FRAME + 1).copied().collect()));
 
-    // The stream, split two ways: all at once, and a byte at a time.
-    let mut whole = Decoder::new();
-    whole.feed(data);
-    let mut frames = Vec::new();
-    while let Some(f) = whole.next_frame() {
-        match f {
-            Ok(f) => frames.push(f),
-            // A broken stream keeps nothing.
-            Err(_) => {
-                assert_eq!(whole.buffered(), 0);
-                break;
-            }
-        }
-    }
-    let mut bytewise = Decoder::new();
-    let mut again = Vec::new();
-    for b in data {
-        bytewise.feed(std::slice::from_ref(b));
-        while let Some(Ok(f)) = bytewise.next_frame() {
-            again.push(f);
-        }
-        // Nothing past one frame and its size is held.
-        assert!(bytewise.buffered() <= 4 + MAX_FRAME);
-    }
-    assert_eq!(frames, again);
-
-    // Each payload, and the bytes on their own, as a request and as a
-    // response to the APIs with full bodies.
-    let mut payloads: Vec<&[u8]> = frames.iter().map(Vec::as_slice).collect();
-    payloads.push(data);
-    for p in payloads {
-        // A request read can be written, and reads back the same.
-        if let Ok(req) = Request::parse(p) {
-            let bytes = req.to_bytes().unwrap();
-            assert_eq!(Request::parse(&bytes), Ok(req.clone()));
-            let framed = req.to_frame().unwrap();
-            let mut d = Decoder::new();
-            d.feed(&framed);
-            assert_eq!(d.next_frame(), Some(Ok(bytes)));
+    let frames = decode_all(Frames::new, data).0;
+    for payload in frames.iter().map(|frame| frame.0.as_slice()).chain(core::iter::once(data)) {
+        if let Ok(request) = Request::parse(payload) {
+            contract::check_wire_value(&request);
+            let frame = request.to_frame().unwrap();
+            assert_eq!(decode_all(Frames::new, &frame.to_bytes().unwrap()), (vec![frame], None));
         }
         for key in [api_key::API_VERSIONS, api_key::METADATA] {
             for version in 0..=13 {
-                // ApiVersions answers that read in version 0 are taken for
-                // any version, and must write back in the one asked for.
-                if let Ok(resp) = Response::parse(p, key, version) {
-                    let bytes = resp.to_bytes(key, version).unwrap();
-                    assert_eq!(Response::parse(&bytes, key, version), Ok(resp));
+                if let Ok(response) = Response::parse(payload, key, version) {
+                    let frame = response.to_frame(key, version).unwrap();
+                    contract::check_wire_value(&frame);
+                    assert_eq!(Response::parse(&frame.0, key, version), Ok(response));
                 }
             }
         }
-        // The primitive readers on their own.
-        let mut r = Reader::new(p);
-        let _ = r.tagged_fields();
-        let _ = r.varlong();
-        let _ = r.compact_nullable_string();
-        let _ = r.compact_array_len();
-        let _ = r.nullable_bytes();
+        contract::check_wire::<TaggedFields>(payload);
+        contract::check_wire::<Varlong>(payload);
+        contract::check_wire::<CompactNullableString>(payload);
+        contract::check_wire::<CompactArrayLength>(payload);
+        contract::check_wire::<NullableBytes>(payload);
     }
+    macro_rules! fields {
+        ($($ty:ty),*) => { $(contract::check_wire::<$ty>(data);)* };
+    }
+    fields!(Boolean, Int8, Uint8, Int16, Uint16, Int32, Uint32, Int64,
+        Float64, Uuid, UnsignedVarint, Varint, Varlong, String16,
+        NullableString, CompactString, CompactNullableString, BytesValue,
+        NullableBytes, CompactBytes, CompactNullableBytes, ArrayLength,
+        CompactArrayLength, TaggedFields);
+    contract::check_wire_value(&TaggedFields(vec![TaggedField {
+        tag: data.first().copied().map(u32::from).unwrap_or(0), data: data.to_vec(),
+    }]));
 });

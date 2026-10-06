@@ -3,29 +3,21 @@
 //! them.
 #![no_main]
 
-use fictionet::stdlib::codec::{Decode, contract};
+use fictionet::stdlib::codec::{Decode, Wire, contract, test_support::decode_all};
 use fictionet::stdlib::fastcgi::{
-    BeginRequest, Client, ClientEvent, Decoder, EndRequest, Frames, MAX_BUFFERED, MAX_CONTENT, MAX_HELD, MAX_REQUESTS,
-    Record, Server, ServerEvent, StreamError, encode_pairs, kind, parse_pairs, stream_bytes,
+    BeginRequest, Client, ClientEvent, EndRequest, Frames, MAX_CONTENT, MAX_HELD, MAX_REQUESTS,
+    Record, Pairs, Request, Response, RecordStream, UnknownType, Server, ServerEvent, StreamError, kind,
 };
 use libfuzzer_sys::fuzz_target;
 
-/// The records in `bytes`, up to the first error.
-fn records(bytes: &[u8]) -> Vec<Record> {
-    let mut d = Decoder::new();
-    d.feed(bytes);
-    let mut out = Vec::new();
-    while let Some(Ok(r)) = d.next_record() {
-        out.push(r);
-    }
-    out
-}
-
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode(Frames::new, data);
+    contract::check_decode_with_alloc_limit(Frames::new, data, 2 * Frames::new().capacity());
     contract::check_wire::<Record>(data);
-    contract::check_decode(|| Frames::with_limit(usize::from(data.first().copied().unwrap_or(0))), data);
-    contract::check_decode(|| Frames::new().map(|record| BeginRequest::parse(&record.content)), data);
+    let limit = usize::from(data.first().copied().unwrap_or(0));
+    contract::check_decode_with_alloc_limit(
+        || Frames::with_limit(limit), data, 2 * Frames::with_limit(limit).capacity(),
+    );
+    contract::check_decode_with_alloc_limit(|| Frames::new().map(|record| BeginRequest::parse(&record.content)), data, 2 * Frames::new().capacity());
     let built = Record {
         kind: data.first().copied().unwrap_or(0),
         request_id: 1,
@@ -34,34 +26,16 @@ fuzz_target!(|data: &[u8]| {
     };
     contract::check_wire_value(&built);
 
-    // The stream, split two ways: all at once, and a byte at a time.
-    let whole = records(data);
-    let mut bytewise = Decoder::new();
-    let mut again = Vec::new();
-    for b in data {
-        bytewise.feed(std::slice::from_ref(b));
-        assert!(bytewise.buffered() <= MAX_BUFFERED);
-        while let Some(Ok(r)) = bytewise.next_record() {
-            again.push(r);
-        }
-    }
-    // A feed past MAX_BUFFERED breaks the decoder fed all at once, while
-    // one drained a byte at a time reads the records before it.
-    if data.len() <= MAX_BUFFERED {
-        assert_eq!(whole, again);
-    } else {
-        assert!(whole.is_empty());
-    }
+    let whole = decode_all(Frames::new, data).0;
 
     let mut server = Server::new();
     let mut client = Client::new();
     let mut client_failed = std::collections::BTreeSet::new();
     for r in &whole {
         // A record read can be written, and reads back the same.
-        let bytes = r.to_bytes();
-        let (back, used) = Record::parse(&bytes).unwrap().unwrap();
+        let bytes = r.to_bytes().unwrap();
+        let back = Record::parse(&bytes).unwrap();
         assert_eq!(&back, r);
-        assert_eq!(used, bytes.len());
 
         // A request put together can be written, and is put together the
         // same again. Some requests are answered and ended, so their IDs
@@ -75,7 +49,7 @@ fuzz_target!(|data: &[u8]| {
         if let Ok(Some(ServerEvent::Request(req))) = event {
             let mut s = Server::new();
             let mut got = None;
-            for r in records(&req.to_bytes()) {
+            for r in decode_all(Frames::new, &req.to_bytes().unwrap()).0 {
                 if let Some(ServerEvent::Request(back)) = s.receive(&r).unwrap() {
                     got = Some(back);
                 }
@@ -101,7 +75,7 @@ fuzz_target!(|data: &[u8]| {
         if let Ok(Some(ClientEvent::Response(resp))) = got {
             let mut c = Client::new();
             let mut got = None;
-            for r in records(&resp.to_bytes()) {
+            for r in decode_all(Frames::new, &resp.to_bytes().unwrap()).0 {
                 got = c.receive(&r).unwrap();
             }
             assert_eq!(got, Some(ClientEvent::Response(resp)));
@@ -112,32 +86,32 @@ fuzz_target!(|data: &[u8]| {
         assert!(client.held() <= MAX_HELD);
     }
 
-    // Any bytes as pairs and as bodies on their own.
-    if let Ok(pairs) = parse_pairs(data) {
-        assert_eq!(parse_pairs(&encode_pairs(&pairs)), Ok(pairs));
-    }
-    if let Ok(b) = BeginRequest::parse(data) {
-        assert_eq!(BeginRequest::parse(&b.to_bytes()), Ok(b));
-    }
-    if let Ok(e) = EndRequest::parse(data) {
-        assert_eq!(EndRequest::parse(&e.to_bytes()), Ok(e));
-    }
+    contract::check_wire::<Pairs>(data);
+    contract::check_wire::<BeginRequest>(data);
+    contract::check_wire::<EndRequest>(data);
+    contract::check_wire::<UnknownType>(data);
+    contract::check_wire::<RecordStream>(data);
+    contract::check_wire::<Request>(data);
+    contract::check_wire::<Response>(data);
 
-    // Any bytes as a stream, written and read back whole.
-    let mut c = Client::new();
-    let mut got = Vec::new();
-    for r in records(&stream_bytes(kind::STDOUT, 1, data)) {
-        assert!(r.content.len() <= MAX_CONTENT);
-        assert_eq!(c.receive(&r), Ok(None));
-        got = r.content;
+    let stream = RecordStream { kind: kind::STDOUT, request_id: 1, data: data.to_vec() };
+    contract::check_wire_value(&stream);
+    if let Ok(bytes) = stream.to_bytes() {
+        let mut client = Client::new();
+        let mut got = Vec::new();
+        for r in decode_all(Frames::new, &bytes).0 {
+            assert!(r.content.len() <= MAX_CONTENT);
+            assert_eq!(client.receive(&r), Ok(None));
+            got = r.content;
+        }
+        assert!(got.is_empty());
     }
-    assert!(got.is_empty());
-    // Any bytes split into names for GET_VALUES, which a server reads back.
     let names: Vec<&[u8]> = data.split(|&b| b == b',').collect();
-    let ask = Record::get_values(&names);
-    assert!(ask.content.len() <= MAX_CONTENT);
-    match Server::new().receive(&ask) {
-        Ok(Some(ServerEvent::GetValues(back))) => assert!(back.len() <= names.len()),
-        other => panic!("{other:?}"),
+    if let Ok(ask) = Record::get_values(&names) {
+        assert!(ask.content.len() <= MAX_CONTENT);
+        match Server::new().receive(&ask) {
+            Ok(Some(ServerEvent::GetValues(back))) => assert_eq!(back, names),
+            other => panic!("{other:?}"),
+        }
     }
 });
