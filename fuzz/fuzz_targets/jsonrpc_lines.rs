@@ -4,7 +4,7 @@
 use fictionet::stdlib::codec::{Decode, Wire, contract, test_support::decode_all};
 use fictionet::stdlib::{
     json::Limits,
-    jsonrpc::{Message, Messages},
+    jsonrpc::{MAX_LINE, Message, Messages},
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -19,7 +19,7 @@ fuzz_target!(|input: &[u8]| {
             },
             rest,
         ),
-        _ => (4096, Limits::default(), input),
+        _ => (MAX_LINE, Limits::default(), input),
     };
     let make = || Messages::with_limits(max, limits);
     contract::check_decode_with_alloc_limit(make, data, 2 * make().capacity());
@@ -35,7 +35,12 @@ fuzz_target!(|input: &[u8]| {
                 message.write_line(&mut bytes).unwrap();
                 assert_eq!(decode_all(make, &bytes), (vec![Ok(message)], None));
             }
-            Err(error) => contract::check_wire_value(&Message::Response(error.response())),
+            Err(error) => {
+                let reply = Message::Response(error.response());
+                reply.to_bytes().expect("parse error response must fit");
+                reply.write_line(&mut Vec::new()).unwrap();
+                contract::check_wire_value(&reply);
+            }
         }
     }
     // Direct envelope edits must either round-trip or refuse transactionally.

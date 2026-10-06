@@ -1,12 +1,21 @@
 //! Complete JSON-RPC bodies, batch errors, bounded collection, and writes.
 #![no_main]
 
-use fictionet::stdlib::codec::{Collect, Decode, Wire, contract, test_support::decode_all};
+use fictionet::stdlib::codec::{
+    Collect, CollectError, Decode, Fail, Wire, contract, test_support::decode_all,
+};
 use fictionet::stdlib::{
-    json::{Limits, Value},
-    jsonrpc::{self, Batch, Body, Incoming, Message},
+    json::{self, Limits, Value},
+    jsonrpc::{self, Batch, Body, Incoming, Message, ParseError},
 };
 use libfuzzer_sys::fuzz_target;
+
+fn check_error(error: ParseError) {
+    let reply = Message::Response(error.response());
+    reply.to_bytes().expect("parse error response must fit");
+    reply.write_line(&mut Vec::new()).unwrap();
+    contract::check_wire_value(&reply);
+}
 
 fuzz_target!(|input: &[u8]| {
     let (limit, limits, data) = match input {
@@ -19,38 +28,62 @@ fuzz_target!(|input: &[u8]| {
             },
             rest,
         ),
-        _ => (4096, Limits::default(), input),
+        _ => (json::MAX_SIZE, Limits::default(), input),
     };
     let make = || Collect::<Body>::new(limit);
     contract::check_decode_with_alloc_limit(make, data, 2 * make().capacity());
     contract::check_wire::<Message>(data);
     contract::check_wire::<Batch>(data);
     contract::check_wire::<Body>(data);
-    let (bodies, _) = decode_all(make, data);
+    let (bodies, failure) = decode_all(make, data);
+    if let Some(Fail::Protocol(CollectError::Parse(error))) = failure {
+        check_error(error);
+    }
+    for error in [
+        Message::parse(data).err(),
+        Batch::parse(data).err(),
+        Body::parse(data).err(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        check_error(error);
+    }
     for body in bodies {
         contract::check_wire_value(&body);
         let bytes = body.to_bytes().unwrap();
         assert_eq!(decode_all(make, &bytes), (vec![body], None));
     }
-    if let Ok(body) = jsonrpc::parse_with(data, &limits) {
-        let bytes = body.to_bytes().unwrap();
-        assert_eq!(jsonrpc::parse_with(&bytes, &limits), Ok(body));
-    }
-    if let Ok(incoming) = jsonrpc::parse_incoming_with(data, &limits) {
-        let items = match incoming {
-            Incoming::Message(m) => vec![m],
-            Incoming::Batch(ms) => ms,
-        };
-        for item in items {
-            match item {
-                Ok(message) => contract::check_wire_value(&message),
-                Err(error) => contract::check_wire_value(&Message::Response(error.response())),
+    if let Ok(value) = json::parse_with(data, &limits) {
+        match Body::from_value(value) {
+            Ok(body) => {
+                let bytes = body.to_bytes().unwrap();
+                assert_eq!(
+                    Body::from_value(json::parse_with(&bytes, &limits).unwrap()),
+                    Ok(body)
+                );
             }
+            Err(error) => check_error(error),
         }
     }
-    if let Ok(Value::Array(values)) = Value::parse(data) {
+    match jsonrpc::parse_incoming_with(data, &limits) {
+        Ok(incoming) => {
+            let items = match incoming {
+                Incoming::Message(m) => vec![m],
+                Incoming::Batch(ms) => ms,
+            };
+            for item in items {
+                match item {
+                    Ok(message) => contract::check_wire_value(&message),
+                    Err(error) => check_error(error),
+                }
+            }
+        }
+        Err(error) => check_error(error),
+    }
+    if let Ok(Value::Array(values)) = &mut Value::parse(data) {
         let batch = Batch {
-            messages: values
+            messages: core::mem::take(values)
                 .into_iter()
                 .map(|value| Message::Response(jsonrpc::Response { value }))
                 .collect(),
