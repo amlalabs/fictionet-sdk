@@ -232,6 +232,7 @@ pub mod route;
 pub mod rtcp;
 pub mod rtp;
 pub mod rtsp;
+pub mod sbe;
 pub mod sdp;
 pub mod sftp;
 pub mod sip;

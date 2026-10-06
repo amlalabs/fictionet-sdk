@@ -55,6 +55,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "sbe"
+path = "fuzz_targets/sbe.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "relay"
 path = "fuzz_targets/relay.rs"
 test = false
