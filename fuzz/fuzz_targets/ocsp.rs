@@ -3,41 +3,13 @@
 //! bytes, as a world playing a client or responder writes them.
 #![no_main]
 
-use fictionet::stdlib::codec::contract;
+use fictionet::stdlib::codec::{Stream, Wire, contract, finish, pump};
 use fictionet::stdlib::ocsp::{
-    AlgorithmIdentifier, BasicResponse, CertId, CertStatus, CrlReason, Decoder, Extension, Frames, MAX_MESSAGE,
-    MAX_NONCE, OcspRequest, OcspResponse, Request, ResponderId, ResponseBytes, ResponseData, ResponseStatus,
-    SingleResponse, decode_get_path, find_nonce,
+    AlgorithmIdentifier, BasicResponse, CertId, CertStatus, CrlReason, Extension, Frames,
+    MAX_NONCE, OcspRequest, OcspResponse, Request, ResponderId, ResponseBytes, ResponseData,
+    ResponseStatus, SingleResponse, decode_get_path, encode_get_path, find_nonce,
 };
 use libfuzzer_sys::fuzz_target;
-
-/// Feeds `data` to `d` in pieces of at most `step` bytes, taking messages
-/// out as they come, and checks the decoder never holds more than a
-/// message.
-fn split(data: &[u8], step: usize) -> Vec<Vec<u8>> {
-    let mut d = Decoder::new();
-    let mut out = Vec::new();
-    let mut rest = data;
-    loop {
-        let n = d.feed(&rest[..rest.len().min(step)]);
-        rest = &rest[n..];
-        assert!(d.buffered() <= MAX_MESSAGE);
-        let mut broken = false;
-        while let Some(m) = d.next_message() {
-            match m {
-                Ok(m) => out.push(m),
-                Err(_) => {
-                    broken = true;
-                    break;
-                }
-            }
-        }
-        if broken || rest.is_empty() {
-            return out;
-        }
-        assert!(n > 0 || d.buffered() < MAX_MESSAGE, "the decoder stalled");
-    }
-}
 
 /// Takes the next `n` bytes, or what is left.
 fn take<'a>(data: &mut &'a [u8], n: usize) -> &'a [u8] {
@@ -63,7 +35,10 @@ fn written(mut data: &[u8]) {
     let hash = match byte(d) % 3 {
         0 => AlgorithmIdentifier::sha1(),
         1 => AlgorithmIdentifier::sha256(),
-        _ => AlgorithmIdentifier { algorithm: "1.2.3.4".parse().unwrap(), parameters: None },
+        _ => AlgorithmIdentifier {
+            algorithm: "1.2.3.4".parse().unwrap(),
+            parameters: None,
+        },
     };
     let n = usize::from(byte(d) % 40);
     let cert_id = CertId {
@@ -72,7 +47,12 @@ fn written(mut data: &[u8]) {
         issuer_key_hash: take(d, n).to_vec(),
         serial_number: some(d, 4),
     };
-    let requests = (0..byte(d) % 3).map(|_| Request { cert_id: cert_id.clone(), extensions: vec![] }).collect();
+    let requests = (0..byte(d) % 3)
+        .map(|_| Request {
+            cert_id: cert_id.clone(),
+            extensions: vec![],
+        })
+        .collect();
     let mut req = OcspRequest::new(requests);
     let name = some(d, 12);
     if !name.is_empty() {
@@ -88,17 +68,20 @@ fn written(mut data: &[u8]) {
         Err(_) => assert!(nonce.is_empty() || nonce.len() > MAX_NONCE),
     }
     contract::check_wire_value(&req);
-    if let Ok(der) = req.to_der() {
+    if let Ok(der) = req.to_bytes() {
         assert_eq!(OcspRequest::parse(&der).unwrap(), req);
         // Unsigned, the request is a SEQUENCE header and the TBSRequest.
-        let tbs = req.tbs_der().unwrap();
+        let tbs = OcspRequest::tbs_request(&der).unwrap();
         assert!(der.ends_with(&tbs) && der.len() - tbs.len() <= 4);
     }
 
     let status = match byte(d) % 3 {
         0 => CertStatus::Good,
         1 => CertStatus::Unknown,
-        c => CertStatus::Revoked { time: "20260101000000Z".to_string(), reason: CrlReason::from_code(i64::from(c)) },
+        c => CertStatus::Revoked {
+            time: "20260101000000Z".to_string(),
+            reason: CrlReason::from_code(i64::from(c)),
+        },
     };
     let data = ResponseData {
         version: 0,
@@ -123,12 +106,15 @@ fn written(mut data: &[u8]) {
     let bytes = match byte(d) % 3 {
         0 => None,
         1 => Some(ResponseBytes::Basic(basic)),
-        _ => Some(ResponseBytes::Other { response_type: "1.2.3.4".parse().unwrap(), response: d.to_vec() }),
+        _ => Some(ResponseBytes::Other {
+            response_type: "1.2.3.4".parse().unwrap(),
+            response: d.to_vec(),
+        }),
     };
     if let Some(status) = ResponseStatus::from_code(code) {
         let resp = OcspResponse { status, bytes };
         contract::check_wire_value(&resp);
-        if let Ok(der) = resp.to_der() {
+        if let Ok(der) = resp.to_bytes() {
             assert_eq!(OcspResponse::parse(&der).unwrap(), resp);
         }
     }
@@ -140,28 +126,30 @@ fuzz_target!(|data: &[u8]| {
     contract::check_wire::<OcspResponse>(data);
     contract::check_wire::<BasicResponse>(data);
 
-    // The body, split two ways: all at once, and a byte at a time.
-    let messages = split(data, usize::MAX);
-    assert_eq!(messages, split(data, 1));
+    let mut stream = Stream::new(Frames::new());
+    let mut messages = Vec::new();
+    let _ = pump(&mut stream, data, |m| messages.push(m));
+    let _ = finish(&mut stream, |m| messages.push(m));
+    contract::check_wire::<ResponseData>(data);
 
     // Any bytes as each message on its own. What reads can be written,
     // and reads back the same.
     for m in messages.iter().map(Vec::as_slice).chain([data]) {
         if let Ok(req) = OcspRequest::parse(m) {
-            let der = req.to_der().unwrap();
+            let der = req.to_bytes().unwrap();
             assert_eq!(OcspRequest::parse(&der).unwrap(), req);
-            let path = req.to_get_path().unwrap();
+            let path = encode_get_path(&req.to_bytes().unwrap()).unwrap();
             assert_eq!(OcspRequest::from_get_path(&path).unwrap(), req);
             if let Some(nonce) = req.nonce() {
                 assert!((1..=MAX_NONCE).contains(&nonce.len()));
             }
         }
         if let Ok(resp) = OcspResponse::parse(m) {
-            let der = resp.to_der().unwrap();
+            let der = resp.to_bytes().unwrap();
             assert_eq!(OcspResponse::parse(&der).unwrap(), resp);
         }
         if let Ok(basic) = BasicResponse::parse(m) {
-            let der = basic.to_der().unwrap();
+            let der = basic.to_bytes().unwrap();
             assert_eq!(BasicResponse::parse(&der).unwrap(), basic);
         }
     }

@@ -122,7 +122,7 @@ fn ldap_messages_round_trip() -> Result<(), Box<dyn core::error::Error>> {
         }),
         controls: Vec::new(),
     };
-    let bytes = <ldap::Message as Wire>::to_bytes(&request)?;
+    let bytes = request.to_bytes()?;
     let mut both = bytes.clone();
     request.write(&mut both)?;
     round_trip(
@@ -156,14 +156,14 @@ fn ocsp_requests_and_responses_round_trip() -> Result<(), Box<dyn core::error::E
         },
         extensions: vec![ocsp::Extension::nonce(b"nonce")?],
     }]);
-    let bytes = <ocsp::OcspRequest as Wire>::to_bytes(&request)?;
+    let bytes = request.to_bytes()?;
     round_trip(
         || ocsp::Frames::new().map(|b| <ocsp::OcspRequest as Wire>::parse(&b)),
         &bytes,
         &[Ok(request)],
     );
     let response = ocsp::OcspResponse::error(ocsp::ResponseStatus::TryLater);
-    let reply = <ocsp::OcspResponse as Wire>::to_bytes(&response)?;
+    let reply = response.to_bytes()?;
     let mut both = reply.clone();
     response.write(&mut both)?;
     round_trip(
@@ -189,9 +189,9 @@ fn spnego_tokens_round_trip() -> Result<(), Box<dyn core::error::Error>> {
     });
     let wrapper = spnego::InitialContextToken {
         mech: spnego::Mech::Spnego,
-        inner: <spnego::NegotiationToken as Wire>::to_bytes(&init)?,
+        inner: init.to_bytes()?,
     };
-    let mut bytes = <spnego::InitialContextToken as Wire>::to_bytes(&wrapper)?;
+    let mut bytes = wrapper.to_bytes()?;
     let first_len = bytes.len();
     let response = spnego::NegotiationToken::Resp(spnego::NegTokenResp {
         neg_state: Some(spnego::NegState::AcceptIncomplete),
@@ -247,15 +247,15 @@ fn x509_pem_blocks_round_trip() -> Result<(), Box<dyn core::error::Error>> {
         extensions: Vec::new(),
     };
     let certificate = x509::Certificate::assemble(
-        &tbs.to_der()?,
+        &tbs.to_bytes()?,
         algorithm,
         asn1::BitString::new(vec![8; 64], 0)?,
     )?;
     let block = x509::Pem {
         label: x509::PEM_CERTIFICATE.into(),
-        data: certificate.to_der()?,
+        data: certificate.to_bytes()?,
     };
-    let bytes = <x509::Pem as Wire>::to_bytes(&block)?;
+    let bytes = block.to_bytes()?;
     let mut both = bytes.clone();
     block.write(&mut both)?;
     round_trip(x509::PemBlocks::new, &both, &[block.clone(), block]);
@@ -284,7 +284,8 @@ fn x509_pem_trailing_text_at_eof() -> Result<(), Box<dyn core::error::Error>> {
         label: "TEST".into(),
         data: vec![1, 2, 3],
     }
-    .encode()?;
+    .to_bytes()?;
+    let text = String::from_utf8(text)?;
     for input in [
         format!("{text}# trailing comment"),
         format!("{}  ", text.trim_end_matches('\n')),
@@ -304,7 +305,8 @@ fn x509_pem_text_lines_have_their_own_limit() -> Result<(), Box<dyn core::error:
         label: "TEST".into(),
         data: vec![1, 2, 3],
     }
-    .encode()?;
+    .to_bytes()?;
+    let text = String::from_utf8(text)?;
     let limit = text.len() - 1;
     let comment = "#".repeat(128);
     let input = format!("{comment}\n{text}{comment}\n{text}{comment}");
@@ -400,14 +402,6 @@ fn frame_limits_refuse_lengths_before_bodies() {
 }
 
 #[test]
-#[deny(deprecated)]
-fn kerberos_legacy_feed_remains_available() {
-    let mut decoder = kerberos::Decoder::new();
-    decoder.feed(&[0, 0, 0, 1, 42]);
-    assert_eq!(decoder.next_message(), Some(Ok(vec![42])));
-}
-
-#[test]
 fn kerberos_tcp_messages_round_trip() -> Result<(), Box<dyn core::error::Error>> {
     let message = kerberos::Message::ApRep(kerberos::ApRep {
         enc_part: kerberos::EncryptedData {
@@ -416,9 +410,9 @@ fn kerberos_tcp_messages_round_trip() -> Result<(), Box<dyn core::error::Error>>
             cipher: vec![9; 133],
         },
     });
-    let der = <kerberos::Message as Wire>::to_bytes(&message)?;
+    let der = message.to_bytes()?;
     let frame = kerberos::Frame(der);
-    let bytes = <kerberos::Frame as Wire>::to_bytes(&frame)?;
+    let bytes = frame.to_bytes()?;
     let mut both = bytes.clone();
     frame.write(&mut both)?;
     round_trip(

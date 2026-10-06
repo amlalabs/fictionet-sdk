@@ -3,7 +3,7 @@
 #![no_main]
 
 use fictionet::stdlib::asn1::{
-    Class, Decoder, Element, Elements, Error, Frame, MAX_INPUT, Oid, Reader, Rules, StringKind, Tag, Writer,
+    Class, Element, Elements, Error, Frame, MAX_INPUT, Oid, Reader, Rules, StringKind, Tag, Writer,
     check_generalized_time, check_utc_time, element_len,
 };
 use fictionet::stdlib::codec::contract;
@@ -22,32 +22,6 @@ const KINDS: [StringKind; 11] = [
     StringKind::Universal,
     StringKind::Bmp,
 ];
-
-/// Every element the decoder gives, and the error that ended the stream.
-fn split(data: &[u8], rules: Rules, bytewise: bool) -> (Vec<Vec<u8>>, Option<Error>) {
-    let mut d = Decoder::new(rules);
-    let mut out = Vec::new();
-    let chunks: Vec<&[u8]> = if bytewise { data.chunks(1).collect() } else { vec![data] };
-    for mut chunk in chunks {
-        // Feed, take out, and feed the rest, as a world's read loop does.
-        loop {
-            let n = d.feed(chunk);
-            chunk = &chunk[n..];
-            assert!(d.buffered() <= MAX_INPUT);
-            while let Some(r) = d.next_element() {
-                match r {
-                    Ok(e) => out.push(e),
-                    Err(e) => return (out, Some(e)),
-                }
-            }
-            if chunk.is_empty() {
-                break;
-            }
-            assert!(n > 0, "a full decoder must give an element or an error");
-        }
-    }
-    (out, None)
-}
 
 /// Runs writer calls named by the bytes of `ops`, from the front, until
 /// they run out or say to stop. Closures get scripts of their own, some of
@@ -106,7 +80,14 @@ fn walk(e: Element<'_>) {
     }
     for kind in KINDS {
         if let Ok(s) = e.text(kind) {
-            assert_eq!(kind.encode(&s).ok().as_deref(), e.string_bytes(kind).ok().as_deref());
+            let mut writer = Writer::new();
+            writer.text(kind, &s);
+            let bytes = writer.finish().expect("decoded text re-encodes");
+            let mut reader = Reader::new(&bytes, Rules::Der);
+            assert_eq!(
+                reader.read().unwrap().string_bytes(kind).ok().as_deref(),
+                e.string_bytes(kind).ok().as_deref()
+            );
         }
     }
     let _ = (e.utc_time(), e.generalized_time(), e.set_reader().is_ok(), e.set_of_reader().is_ok());
@@ -191,17 +172,6 @@ fuzz_target!(|data: &[u8]| {
     contract::check_wire::<Frame>(data);
     contract::check_wire_value(&Frame(data.get(..MAX_INPUT + 1).unwrap_or(data).to_vec()));
 
-    // The stream, split two ways: all at once, and a byte at a time.
-    for rules in [Rules::Ber, Rules::Der] {
-        assert_eq!(split(data, rules, false), split(data, rules, true));
-    }
-    // Fed again and again without taking anything out, a decoder holds
-    // no more than MAX_INPUT bytes.
-    let mut d = Decoder::new(Rules::Ber);
-    for _ in 0..4 {
-        let _ = d.feed(data);
-        assert!(d.buffered() <= MAX_INPUT);
-    }
     // Whatever a script of writer calls does, the writer does not panic,
     // and what it finishes with reads under DER, element by element, with
     // every value checked.

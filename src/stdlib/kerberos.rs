@@ -12,10 +12,10 @@
 //! sections 5 and 7.2.
 //!
 //! Nothing here reads a socket or touches a key. A world that plays a KDC
-//! feeds the bytes it reads from a [`tcp`](crate::stdlib::tcp) connection
-//! to a [`Decoder`], or takes a UDP datagram as it is, and reads each
+//! pushes the bytes it reads from a [`tcp`](crate::stdlib::tcp) connection
+//! to a [`Stream<Frames>`](super::codec::Stream), or takes a UDP datagram as it is, and reads each
 //! message with [`Message::parse`]. It writes the reply with
-//! [`Message::to_der`], and over TCP, with [`Message::to_tcp`]. The parts
+//! [`Wire::write`], with a [`Frame`] around its DER for TCP. The parts
 //! that are encrypted (the ticket's secrets, the reply's session key, the
 //! authenticator) stay [`EncryptedData`]: an encryption type, a key
 //! version and opaque bytes. Which principals exist, which keys they have,
@@ -28,9 +28,10 @@
 //! [`Message::parse`] reads back.
 //!
 //! ```
+//! use fictionet::stdlib::codec::{Stream, Wire, pump, finish};
 //! use fictionet::stdlib::kerberos::{
-//!     error_code, msg_type, name_type, padata_type, Decoder, KdcReq, KdcReqBody, KerberosTime, KrbError, Message,
-//!     PaData, PrincipalName,
+//!     error_code, msg_type, name_type, padata_type, Frame, Frames, KdcReq, KdcReqBody, KerberosTime, KrbError, Message,
+//!     MethodData, PaData, PrincipalName,
 //! };
 //!
 //! // A client asks for a ticket-granting ticket for alice, without
@@ -52,17 +53,15 @@
 //!         additional_tickets: None,
 //!     },
 //! });
-//! let wire = request.to_tcp().unwrap();
+//! let wire = Frame(request.to_bytes().unwrap()).to_bytes().unwrap();
 //!
 //! // The KDC reads it from its TCP connection, a few bytes at a time.
-//! let mut decoder = Decoder::new();
+//! let mut decoder = Stream::new(Frames::new());
 //! let mut got = Vec::new();
 //! for chunk in wire.chunks(5) {
-//!     decoder.feed(chunk);
-//!     while let Some(m) = decoder.next_message() {
-//!         got.push(m.unwrap());
-//!     }
+//!     pump(&mut decoder, chunk, |m| got.push(m)).unwrap();
 //! }
+//! finish(&mut decoder, |m| got.push(m)).unwrap();
 //! assert_eq!(got.len(), 1);
 //! let Message::AsReq(req) = Message::parse(&got[0]).unwrap() else { panic!("not an AS-REQ") };
 //! assert_eq!(req.body.cname.as_ref().unwrap().to_string(), "alice");
@@ -81,11 +80,11 @@
 //!     e_text: None,
 //!     e_data: Some(
 //!         // METHOD-DATA: the pre-authentication types the KDC accepts.
-//!         KrbError::method_data(&[PaData { padata_type: padata_type::ENC_TIMESTAMP, value: Vec::new() }])
+//!         MethodData(vec![PaData { padata_type: padata_type::ENC_TIMESTAMP, value: Vec::new() }]).to_bytes()
 //!             .unwrap(),
 //!     ),
 //! });
-//! let der = reply.to_der().unwrap();
+//! let der = reply.to_bytes().unwrap();
 //! assert_eq!(der[0], 0x7e); // [APPLICATION 30]
 //! assert_eq!(Message::parse(&der).unwrap(), reply);
 //! assert_eq!(reply.msg_type(), msg_type::KRB_ERROR);
@@ -117,16 +116,22 @@ pub const MAX_TICKETS: usize = 16;
 /// The largest value of a Microseconds field.
 pub const MAX_MICROSECONDS: u32 = 999_999;
 
-/// The msg-type of each message this module reads, which is also its
-/// APPLICATION tag number.
+/// The msg-type of each message this module reads (RFC 4120 section 7.5.7).
+/// It is also the message's APPLICATION tag number.
 pub mod msg_type {
-    #![allow(missing_docs)]
+    /// KRB_AS_REQ (10): the client requests initial authentication.
     pub const AS_REQ: i64 = 10;
+    /// KRB_AS_REP (11): the authentication service answers an initial request.
     pub const AS_REP: i64 = 11;
+    /// KRB_TGS_REQ (12): the client requests a ticket using a ticket-granting ticket.
     pub const TGS_REQ: i64 = 12;
+    /// KRB_TGS_REP (13): the ticket-granting service answers a ticket request.
     pub const TGS_REP: i64 = 13;
+    /// KRB_AP_REQ (14): the client presents a ticket and authenticator to a service.
     pub const AP_REQ: i64 = 14;
+    /// KRB_AP_REP (15): the service answers a request for mutual authentication.
     pub const AP_REP: i64 = 15;
+    /// KRB_ERROR (30): a response reports an error.
     pub const KRB_ERROR: i64 = 30;
 }
 
@@ -135,102 +140,167 @@ pub const TICKET_TAG: u32 = 1;
 
 /// Principal name types (RFC 4120 section 6.2).
 pub mod name_type {
-    #![allow(missing_docs)]
+    /// KRB_NT_UNKNOWN (0): the principal's name type is not specified.
     pub const UNKNOWN: i32 = 0;
+    /// KRB_NT_PRINCIPAL (1): a principal name, such as a user's name.
     pub const PRINCIPAL: i32 = 1;
+    /// KRB_NT_SRV_INST (2): a service name followed by a unique instance.
     pub const SRV_INST: i32 = 2;
+    /// KRB_NT_SRV_HST (3): a service name followed by a host name.
     pub const SRV_HST: i32 = 3;
+    /// KRB_NT_SRV_XHST (4): a service name with the host in the remaining components.
     pub const SRV_XHST: i32 = 4;
+    /// KRB_NT_UID (5): a unique identifier names the principal.
     pub const UID: i32 = 5;
+    /// KRB_NT_X500_PRINCIPAL (6): an encoded X.509 distinguished name.
     pub const X500_PRINCIPAL: i32 = 6;
+    /// KRB_NT_SMTP_NAME (7): a principal name in SMTP email address form.
     pub const SMTP_NAME: i32 = 7;
+    /// KRB_NT_ENTERPRISE (10): an enterprise name that may map to a principal name.
     pub const ENTERPRISE: i32 = 10;
 }
 
 /// Pre-authentication data types (RFC 4120 section 7.5.2).
 pub mod padata_type {
-    #![allow(missing_docs)]
-    /// Carries the AP-REQ of a TGS-REQ.
+    /// PA-TGS-REQ (1): carries the AP-REQ that authenticates a ticket request.
     pub const TGS_REQ: i32 = 1;
-    /// An encrypted timestamp, the usual proof of the client's key.
+    /// PA-ENC-TIMESTAMP (2): an encrypted timestamp proves knowledge of the client's key.
     pub const ENC_TIMESTAMP: i32 = 2;
+    /// PA-PW-SALT (3): the salt used to derive the client's key from a password.
     pub const PW_SALT: i32 = 3;
+    /// PA-ETYPE-INFO (11): encryption types and salts offered for pre-authentication.
     pub const ETYPE_INFO: i32 = 11;
+    /// PA-ETYPE-INFO2 (19): encryption types, salts, and key derivation parameters.
     pub const ETYPE_INFO2: i32 = 19;
 }
 
 /// KDC option flags for [`KdcReqBody::kdc_options`]. Bit 0 of the BIT
-/// STRING is the most significant bit of the `u32`.
+/// STRING is the most significant bit of the `u32` (RFC 4120 section 5.4.1).
 pub mod kdc_options {
-    #![allow(missing_docs)]
+    /// FORWARDABLE (bit 1): requests a ticket that permits forwarding credentials.
     pub const FORWARDABLE: u32 = 1 << 30;
+    /// FORWARDED (bit 2): requests a ticket-granting ticket for a new network address.
     pub const FORWARDED: u32 = 1 << 29;
+    /// PROXIABLE (bit 3): requests a ticket that permits proxy tickets.
     pub const PROXIABLE: u32 = 1 << 28;
+    /// PROXY (bit 4): requests a proxy ticket for another network address.
     pub const PROXY: u32 = 1 << 27;
+    /// ALLOW-POSTDATE (bit 5): requests permission to issue postdated tickets.
     pub const ALLOW_POSTDATE: u32 = 1 << 26;
+    /// POSTDATED (bit 6): requests a ticket with a future start time.
     pub const POSTDATED: u32 = 1 << 25;
+    /// RENEWABLE (bit 8): requests a ticket that can be renewed.
     pub const RENEWABLE: u32 = 1 << 23;
+    /// OPT-HARDWARE-AUTH (bit 11): reserved for requesting hardware authentication.
     pub const OPT_HARDWARE_AUTH: u32 = 1 << 20;
+    /// DISABLE-TRANSITED-CHECK (bit 26): asks the KDC to skip transited-realm checks.
     pub const DISABLE_TRANSITED_CHECK: u32 = 1 << 5;
+    /// RENEWABLE-OK (bit 27): accepts a renewable ticket if the requested lifetime is too long.
     pub const RENEWABLE_OK: u32 = 1 << 4;
+    /// ENC-TKT-IN-SKEY (bit 28): encrypts the ticket with the additional ticket's session key.
     pub const ENC_TKT_IN_SKEY: u32 = 1 << 3;
+    /// RENEW (bit 30): requests renewal of the supplied renewable ticket.
     pub const RENEW: u32 = 1 << 1;
+    /// VALIDATE (bit 31): requests validation of a postdated ticket.
     pub const VALIDATE: u32 = 1;
 }
 
 /// AP option flags for [`ApReq::ap_options`]. Bit 0 of the BIT STRING is
 /// the most significant bit of the `u32`.
 pub mod ap_options {
-    #![allow(missing_docs)]
+    /// USE-SESSION-KEY (bit 1): the ticket uses the recipient's session key.
     pub const USE_SESSION_KEY: u32 = 1 << 30;
+    /// MUTUAL-REQUIRED (bit 2): requests an AP-REP to authenticate the service.
     pub const MUTUAL_REQUIRED: u32 = 1 << 29;
 }
 
 /// Error codes for [`KrbError::error_code`] (RFC 4120 section 7.5.9).
 pub mod error_code {
-    #![allow(missing_docs)]
+    /// KDC_ERR_NONE (0): the KDC reports no error.
     pub const KDC_ERR_NONE: i32 = 0;
+    /// KDC_ERR_NAME_EXP (1): the client's database entry has expired.
     pub const KDC_ERR_NAME_EXP: i32 = 1;
+    /// KDC_ERR_SERVICE_EXP (2): the service's database entry has expired.
     pub const KDC_ERR_SERVICE_EXP: i32 = 2;
+    /// KDC_ERR_BAD_PVNO (3): the KDC does not support the requested protocol version.
     pub const KDC_ERR_BAD_PVNO: i32 = 3;
+    /// KDC_ERR_C_PRINCIPAL_UNKNOWN (6): the client is not in the database.
     pub const KDC_ERR_C_PRINCIPAL_UNKNOWN: i32 = 6;
+    /// KDC_ERR_S_PRINCIPAL_UNKNOWN (7): the service is not in the database.
     pub const KDC_ERR_S_PRINCIPAL_UNKNOWN: i32 = 7;
+    /// KDC_ERR_PRINCIPAL_NOT_UNIQUE (8): the database has multiple entries for the principal.
     pub const KDC_ERR_PRINCIPAL_NOT_UNIQUE: i32 = 8;
+    /// KDC_ERR_NULL_KEY (9): the client or service has a null key.
     pub const KDC_ERR_NULL_KEY: i32 = 9;
+    /// KDC_ERR_CANNOT_POSTDATE (10): this ticket does not permit postdating.
     pub const KDC_ERR_CANNOT_POSTDATE: i32 = 10;
+    /// KDC_ERR_NEVER_VALID (11): the requested start time is after the end time.
     pub const KDC_ERR_NEVER_VALID: i32 = 11;
+    /// KDC_ERR_POLICY (12): KDC policy refuses the request.
     pub const KDC_ERR_POLICY: i32 = 12;
+    /// KDC_ERR_BADOPTION (13): the KDC cannot satisfy a requested option.
     pub const KDC_ERR_BADOPTION: i32 = 13;
+    /// KDC_ERR_ETYPE_NOSUPP (14): the KDC does not support the encryption type.
     pub const KDC_ERR_ETYPE_NOSUPP: i32 = 14;
+    /// KDC_ERR_SUMTYPE_NOSUPP (15): the KDC does not support the checksum type.
     pub const KDC_ERR_SUMTYPE_NOSUPP: i32 = 15;
+    /// KDC_ERR_PADATA_TYPE_NOSUPP (16): the KDC does not support the pre-authentication type.
     pub const KDC_ERR_PADATA_TYPE_NOSUPP: i32 = 16;
+    /// KDC_ERR_CLIENT_REVOKED (18): the client's credentials were revoked.
     pub const KDC_ERR_CLIENT_REVOKED: i32 = 18;
+    /// KDC_ERR_SERVICE_REVOKED (19): the service's credentials were revoked.
     pub const KDC_ERR_SERVICE_REVOKED: i32 = 19;
+    /// KDC_ERR_TGT_REVOKED (20): the ticket-granting ticket was revoked.
     pub const KDC_ERR_TGT_REVOKED: i32 = 20;
+    /// KDC_ERR_CLIENT_NOTYET (21): the client's credentials are not yet valid.
     pub const KDC_ERR_CLIENT_NOTYET: i32 = 21;
+    /// KDC_ERR_SERVICE_NOTYET (22): the service's credentials are not yet valid.
     pub const KDC_ERR_SERVICE_NOTYET: i32 = 22;
+    /// KDC_ERR_KEY_EXPIRED (23): the password has expired and must be changed.
     pub const KDC_ERR_KEY_EXPIRED: i32 = 23;
+    /// KDC_ERR_PREAUTH_FAILED (24): the pre-authentication data is invalid.
     pub const KDC_ERR_PREAUTH_FAILED: i32 = 24;
+    /// KDC_ERR_PREAUTH_REQUIRED (25): the KDC needs more pre-authentication data.
     pub const KDC_ERR_PREAUTH_REQUIRED: i32 = 25;
+    /// KDC_ERR_SERVER_NOMATCH (26): the requested service does not match the ticket.
     pub const KDC_ERR_SERVER_NOMATCH: i32 = 26;
+    /// KDC_ERR_MUST_USE_USER2USER (27): the service requires user-to-user authentication.
     pub const KDC_ERR_MUST_USE_USER2USER: i32 = 27;
+    /// KDC_ERR_SVC_UNAVAILABLE (29): the requested service is unavailable.
     pub const KDC_ERR_SVC_UNAVAILABLE: i32 = 29;
+    /// KRB_AP_ERR_BAD_INTEGRITY (31): decrypted data failed its integrity check.
     pub const KRB_AP_ERR_BAD_INTEGRITY: i32 = 31;
+    /// KRB_AP_ERR_TKT_EXPIRED (32): the ticket's validity period has ended.
     pub const KRB_AP_ERR_TKT_EXPIRED: i32 = 32;
+    /// KRB_AP_ERR_TKT_NYV (33): the ticket's validity period has not begun.
     pub const KRB_AP_ERR_TKT_NYV: i32 = 33;
+    /// KRB_AP_ERR_REPEAT (34): the authenticator repeats an earlier request.
     pub const KRB_AP_ERR_REPEAT: i32 = 34;
+    /// KRB_AP_ERR_NOT_US (35): the ticket names a different service.
     pub const KRB_AP_ERR_NOT_US: i32 = 35;
+    /// KRB_AP_ERR_BADMATCH (36): the ticket and authenticator name different clients.
     pub const KRB_AP_ERR_BADMATCH: i32 = 36;
+    /// KRB_AP_ERR_SKEW (37): the difference between clocks exceeds the allowed limit.
     pub const KRB_AP_ERR_SKEW: i32 = 37;
+    /// KRB_AP_ERR_BADADDR (38): the sender's address does not match the ticket.
     pub const KRB_AP_ERR_BADADDR: i32 = 38;
+    /// KRB_AP_ERR_BADVERSION (39): the protocol version is unsupported.
     pub const KRB_AP_ERR_BADVERSION: i32 = 39;
+    /// KRB_AP_ERR_MSG_TYPE (40): the message has an unexpected type.
     pub const KRB_AP_ERR_MSG_TYPE: i32 = 40;
+    /// KRB_AP_ERR_MODIFIED (41): the message stream was modified.
     pub const KRB_AP_ERR_MODIFIED: i32 = 41;
+    /// KRB_AP_ERR_BADKEYVER (44): the requested key version is unavailable.
     pub const KRB_AP_ERR_BADKEYVER: i32 = 44;
+    /// KRB_AP_ERR_NOKEY (45): no service key is available.
     pub const KRB_AP_ERR_NOKEY: i32 = 45;
+    /// KRB_AP_ERR_METHOD (48): an alternative authentication method is required.
     pub const KRB_AP_ERR_METHOD: i32 = 48;
+    /// KRB_ERR_RESPONSE_TOO_BIG (52): the reply needs TCP because it is too large for UDP.
     pub const KRB_ERR_RESPONSE_TOO_BIG: i32 = 52;
+    /// KRB_ERR_GENERIC (60): a generic error is described in the e-text field.
     pub const KRB_ERR_GENERIC: i32 = 60;
+    /// KRB_ERR_FIELD_TOOLONG (61): a field exceeds the implementation's length limit.
     pub const KRB_ERR_FIELD_TOOLONG: i32 = 61;
 }
 
@@ -238,6 +308,8 @@ pub mod error_code {
 /// written as one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
+    /// Encoding would change the value when parsed.
+    Unwritable,
     /// The ASN.1 is malformed, or not the structure RFC 4120 gives.
     Asn1(asn1::Error),
     /// The outer tag is not one of the messages this module reads. It
@@ -282,10 +354,13 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Error::Unwritable => f.write_str("value cannot be written without changing it"),
             Error::Asn1(e) => write!(f, "ASN.1: {e}"),
             Error::UnknownMessage(n) => write!(f, "not a Kerberos message (tag {n})"),
             Error::Version(v) => write!(f, "protocol version {v}, not 5"),
-            Error::MessageType { expected, found } => write!(f, "msg-type {found}, expected {expected}"),
+            Error::MessageType { expected, found } => {
+                write!(f, "msg-type {found}, expected {expected}")
+            }
             Error::Range => f.write_str("integer out of range"),
             Error::TooMany(what) => write!(f, "too many entries in {what}"),
             Error::Empty(what) => write!(f, "{what} is present but empty"),
@@ -377,7 +452,7 @@ impl PrincipalName {
         Ok(PrincipalName { name_type, components })
     }
 
-    fn write(&self, w: &mut Writer) {
+    fn write_fields(&self, w: &mut Writer) {
         w.sequence(|w| {
             w_int(w, 0, self.name_type.into());
             w.explicit(1, |w| {
@@ -450,7 +525,7 @@ impl HostAddress {
         Ok(a)
     }
 
-    fn write(&self, w: &mut Writer) {
+    fn write_fields(&self, w: &mut Writer) {
         w.sequence(|w| {
             w_int(w, 0, self.addr_type.into());
             w.explicit(1, |w| w.octet_string(&self.address));
@@ -479,7 +554,7 @@ impl PaData {
         Ok(PaData { padata_type, value })
     }
 
-    fn write(&self, w: &mut Writer) {
+    fn write_fields(&self, w: &mut Writer) {
         w.sequence(|w| {
             w_int(w, 1, self.padata_type.into());
             w.explicit(2, |w| w.octet_string(&self.value));
@@ -501,17 +576,12 @@ pub struct EncryptedData {
 }
 
 impl EncryptedData {
-    /// Reads an EncryptedData standing alone in `der`, as a PA-DATA value
-    /// holds one.
-    pub fn parse(der: &[u8]) -> Result<EncryptedData, Error> {
+    fn decode(der: &[u8]) -> Result<EncryptedData, Error> {
         whole(der, Rules::Der, EncryptedData::read)
     }
 
-    /// The DER of this EncryptedData on its own. One read near
-    /// [`MAX_MESSAGE`] with a negative kvno may be [`Error::TooLong`]
-    /// here, since a UInt32 kvno takes up to 4 more bytes.
-    pub fn to_der(&self) -> Result<Vec<u8>, Error> {
-        finish(|w| self.write(w))
+    fn encode(&self) -> Result<Vec<u8>, Error> {
+        finish(|w| self.write_fields(w))
     }
 
     fn read(r: &mut Reader<'_>) -> Result<EncryptedData, Error> {
@@ -523,7 +593,7 @@ impl EncryptedData {
         Ok(EncryptedData { etype, kvno, cipher })
     }
 
-    fn write(&self, w: &mut Writer) {
+    fn write_fields(&self, w: &mut Writer) {
         w.sequence(|w| {
             w_int(w, 0, self.etype.into());
             if let Some(k) = self.kvno {
@@ -548,18 +618,13 @@ pub struct Ticket {
 }
 
 impl Ticket {
-    /// Reads a Ticket standing alone in `der`, as a credential cache holds
-    /// one.
-    pub fn parse(der: &[u8]) -> Result<Ticket, Error> {
+    fn decode(der: &[u8]) -> Result<Ticket, Error> {
         whole(der, Rules::Der, Ticket::read)
     }
 
-    /// The DER of this Ticket on its own. As with
-    /// [`EncryptedData::to_der`], one read near [`MAX_MESSAGE`] may not
-    /// fit when written again.
-    pub fn to_der(&self) -> Result<Vec<u8>, Error> {
+    fn encode(&self) -> Result<Vec<u8>, Error> {
         self.check()?;
-        finish(|w| self.write(w))
+        finish(|w| self.write_fields(w))
     }
 
     fn check(&self) -> Result<(), Error> {
@@ -580,13 +645,13 @@ impl Ticket {
         Ok(Ticket { realm, sname, enc_part })
     }
 
-    fn write(&self, w: &mut Writer) {
+    fn write_fields(&self, w: &mut Writer) {
         w.constructed(Tag::application(TICKET_TAG), |w| {
             w.sequence(|w| {
                 w_int(w, 0, PVNO);
                 w_str(w, 1, &self.realm);
-                w.explicit(2, |w| self.sname.write(w));
-                w.explicit(3, |w| self.enc_part.write(w));
+                w.explicit(2, |w| self.sname.write_fields(w));
+                w.explicit(3, |w| self.enc_part.write_fields(w));
             })
         });
     }
@@ -625,20 +690,13 @@ pub struct KdcReqBody {
 }
 
 impl KdcReqBody {
-    /// Reads a KDC-REQ-BODY standing alone in `der`, such as the bytes a
-    /// checksum covers.
-    pub fn parse(der: &[u8]) -> Result<KdcReqBody, Error> {
+    fn decode(der: &[u8]) -> Result<KdcReqBody, Error> {
         whole(der, Rules::Der, KdcReqBody::read)
     }
 
-    /// The DER of the body on its own. A body read and written again may
-    /// not be the bytes it was read from: options shorter than 32 bits, a
-    /// nonce or kvno written as a negative number, an empty optional list,
-    /// or BER all come out differently. To check a checksum over a body
-    /// that was received, take its bytes with [`Message::kdc_req_body`].
-    pub fn to_der(&self) -> Result<Vec<u8>, Error> {
+    fn encode(&self) -> Result<Vec<u8>, Error> {
         self.check()?;
-        finish(|w| self.write(w))
+        finish(|w| self.write_fields(w))
     }
 
     fn check(&self) -> Result<(), Error> {
@@ -683,15 +741,15 @@ impl KdcReqBody {
         Ok(body)
     }
 
-    fn write(&self, w: &mut Writer) {
+    fn write_fields(&self, w: &mut Writer) {
         w.sequence(|w| {
             w_flags(w, 0, self.kdc_options);
             if let Some(n) = &self.cname {
-                w.explicit(1, |w| n.write(w));
+                w.explicit(1, |w| n.write_fields(w));
             }
             w_str(w, 2, &self.realm);
             if let Some(n) = &self.sname {
-                w.explicit(3, |w| n.write(w));
+                w.explicit(3, |w| n.write_fields(w));
             }
             if let Some(t) = &self.from {
                 w_time(w, 4, t);
@@ -709,13 +767,13 @@ impl KdcReqBody {
                 })
             });
             if let Some(a) = &self.addresses {
-                w.explicit(9, |w| w.sequence(|w| a.iter().for_each(|h| h.write(w))));
+                w.explicit(9, |w| w.sequence(|w| a.iter().for_each(|h| h.write_fields(w))));
             }
             if let Some(e) = &self.enc_authorization_data {
-                w.explicit(10, |w| e.write(w));
+                w.explicit(10, |w| e.write_fields(w));
             }
             if let Some(t) = &self.additional_tickets {
-                w.explicit(11, |w| w.sequence(|w| t.iter().for_each(|t| t.write(w))));
+                w.explicit(11, |w| w.sequence(|w| t.iter().for_each(|t| t.write_fields(w))));
             }
         });
     }
@@ -761,14 +819,14 @@ impl KdcReq {
         Ok(KdcReq { padata, body })
     }
 
-    fn write(&self, w: &mut Writer, msg_type: i64) {
+    fn write_fields(&self, w: &mut Writer, msg_type: i64) {
         w.sequence(|w| {
             w_int(w, 1, PVNO);
             w_int(w, 2, msg_type);
             if let Some(p) = &self.padata {
-                w.explicit(3, |w| w.sequence(|w| p.iter().for_each(|p| p.write(w))));
+                w.explicit(3, |w| w.sequence(|w| p.iter().for_each(|p| p.write_fields(w))));
             }
-            w.explicit(4, |w| self.body.write(w));
+            w.explicit(4, |w| self.body.write_fields(w));
         });
     }
 }
@@ -818,17 +876,17 @@ impl KdcRep {
         Ok(rep)
     }
 
-    fn write(&self, w: &mut Writer, msg_type: i64) {
+    fn write_fields(&self, w: &mut Writer, msg_type: i64) {
         w.sequence(|w| {
             w_int(w, 0, PVNO);
             w_int(w, 1, msg_type);
             if let Some(p) = &self.padata {
-                w.explicit(2, |w| w.sequence(|w| p.iter().for_each(|p| p.write(w))));
+                w.explicit(2, |w| w.sequence(|w| p.iter().for_each(|p| p.write_fields(w))));
             }
             w_str(w, 3, &self.crealm);
-            w.explicit(4, |w| self.cname.write(w));
-            w.explicit(5, |w| self.ticket.write(w));
-            w.explicit(6, |w| self.enc_part.write(w));
+            w.explicit(4, |w| self.cname.write_fields(w));
+            w.explicit(5, |w| self.ticket.write_fields(w));
+            w.explicit(6, |w| self.enc_part.write_fields(w));
         });
     }
 }
@@ -858,13 +916,13 @@ impl ApReq {
         Ok(req)
     }
 
-    fn write(&self, w: &mut Writer) {
+    fn write_fields(&self, w: &mut Writer) {
         w.sequence(|w| {
             w_int(w, 0, PVNO);
             w_int(w, 1, msg_type::AP_REQ);
             w_flags(w, 2, self.ap_options);
-            w.explicit(3, |w| self.ticket.write(w));
-            w.explicit(4, |w| self.authenticator.write(w));
+            w.explicit(3, |w| self.ticket.write_fields(w));
+            w.explicit(4, |w| self.authenticator.write_fields(w));
         });
     }
 }
@@ -887,11 +945,11 @@ impl ApRep {
         Ok(ApRep { enc_part })
     }
 
-    fn write(&self, w: &mut Writer) {
+    fn write_fields(&self, w: &mut Writer) {
         w.sequence(|w| {
             w_int(w, 0, PVNO);
             w_int(w, 1, msg_type::AP_REP);
-            w.explicit(2, |w| self.enc_part.write(w));
+            w.explicit(2, |w| self.enc_part.write_fields(w));
         });
     }
 }
@@ -920,23 +978,11 @@ pub struct KrbError {
     /// Text for a person to read.
     pub e_text: Option<String>,
     /// More data. With [`error_code::KDC_ERR_PREAUTH_REQUIRED`] it is a
-    /// METHOD-DATA, made with [`KrbError::method_data`] and read with
-    /// [`KrbError::read_method_data`].
+    /// [`MethodData`].
     pub e_data: Option<Vec<u8>>,
 }
 
 impl KrbError {
-    /// The DER of a METHOD-DATA (a SEQUENCE OF PA-DATA) for `e_data`.
-    pub fn method_data(padata: &[PaData]) -> Result<Vec<u8>, Error> {
-        limit(padata.len(), MAX_PADATA, "padata")?;
-        finish(|w| w.sequence(|w| padata.iter().for_each(|p| p.write(w))))
-    }
-
-    /// Reads `e_data` as a METHOD-DATA.
-    pub fn read_method_data(der: &[u8]) -> Result<Vec<PaData>, Error> {
-        whole(der, Rules::Der, |r| seq_of(r, MAX_PADATA, "padata", PaData::read))
-    }
-
     fn check(&self) -> Result<(), Error> {
         if self.cusec.is_some_and(|u| u > MAX_MICROSECONDS) || self.susec > MAX_MICROSECONDS {
             return Err(Error::Range);
@@ -972,7 +1018,7 @@ impl KrbError {
         Ok(e)
     }
 
-    fn write(&self, w: &mut Writer) {
+    fn write_fields(&self, w: &mut Writer) {
         w.sequence(|w| {
             w_int(w, 0, PVNO);
             w_int(w, 1, msg_type::KRB_ERROR);
@@ -989,10 +1035,10 @@ impl KrbError {
                 w_str(w, 7, r);
             }
             if let Some(n) = &self.cname {
-                w.explicit(8, |w| n.write(w));
+                w.explicit(8, |w| n.write_fields(w));
             }
             w_str(w, 9, &self.realm);
-            w.explicit(10, |w| self.sname.write(w));
+            w.explicit(10, |w| self.sname.write_fields(w));
             if let Some(t) = &self.e_text {
                 w_str(w, 11, t);
             }
@@ -1023,15 +1069,15 @@ pub enum Message {
 }
 
 impl Message {
-    /// Reads one message, which must fill `der`, under DER as RFC 4120
-    /// asks.
-    pub fn parse(der: &[u8]) -> Result<Message, Error> {
+    fn decode(der: &[u8]) -> Result<Message, Error> {
         Message::parse_with(der, Rules::Der)
     }
 
     /// Reads one message under `rules`. [`Rules::Ber`] also takes the
     /// indefinite lengths and split strings some older implementations
-    /// send.
+    /// send. This reader stays lenient: it does not check the DER output.
+    /// A value read near [`MAX_MESSAGE`] may grow past it when written.
+    /// [`Wire::parse`] checks that the DER output fits.
     pub fn parse_with(b: &[u8], rules: Rules) -> Result<Message, Error> {
         whole(b, rules, |r| {
             let tag = r.peek()?.tag();
@@ -1061,7 +1107,7 @@ impl Message {
     /// The KDC-REQ-BODY of the AS-REQ or TGS-REQ in `b`, exactly as the
     /// client sent it. A checksum over the body, such as the one in a
     /// TGS-REQ's authenticator (RFC 4120 section 5.2.7.1), covers these
-    /// bytes, which [`KdcReqBody::to_der`] does not always give back. The
+    /// bytes, which [`KdcReqBody::write`] does not always give back. The
     /// message is read as [`Message::parse_with`] reads it, and any of its
     /// errors is returned. Any other message is [`Error::UnknownMessage`]
     /// with its tag number.
@@ -1097,13 +1143,7 @@ impl Message {
         }
     }
 
-    /// The message's DER, as a UDP datagram carries it. A list over its
-    /// limit, a Microseconds field over [`MAX_MICROSECONDS`], or a message
-    /// longer than [`MAX_MESSAGE`] is an error, and nothing is written. A
-    /// message read near the limit may not fit when written again, since
-    /// DER can be a few bytes longer than the BER or the short flags it
-    /// was read from.
-    pub fn to_der(&self) -> Result<Vec<u8>, Error> {
+    fn encode(&self) -> Result<Vec<u8>, Error> {
         match self {
             Message::AsReq(m) | Message::TgsReq(m) => m.check()?,
             Message::AsRep(m) | Message::TgsRep(m) => m.check()?,
@@ -1115,32 +1155,14 @@ impl Message {
         let tag = Tag::application(u32::try_from(t).unwrap_or(u32::MAX));
         finish(|w| {
             w.constructed(tag, |w| match self {
-                Message::AsReq(m) | Message::TgsReq(m) => m.write(w, t),
-                Message::AsRep(m) | Message::TgsRep(m) => m.write(w, t),
-                Message::ApReq(m) => m.write(w),
-                Message::ApRep(m) => m.write(w),
-                Message::KrbError(m) => m.write(w),
+                Message::AsReq(m) | Message::TgsReq(m) => m.write_fields(w, t),
+                Message::AsRep(m) | Message::TgsRep(m) => m.write_fields(w, t),
+                Message::ApReq(m) => m.write_fields(w),
+                Message::ApRep(m) => m.write_fields(w),
+                Message::KrbError(m) => m.write_fields(w),
             })
         })
     }
-
-    /// The message as a TCP connection carries it: a 4-byte big-endian
-    /// length, then the DER.
-    pub fn to_tcp(&self) -> Result<Vec<u8>, Error> {
-        frame(&self.to_der()?)
-    }
-}
-
-/// Puts the 4-byte length in front of a message's bytes, for TCP.
-pub fn frame(message: &[u8]) -> Result<Vec<u8>, Error> {
-    if message.len() > MAX_MESSAGE {
-        return Err(Error::TooLong);
-    }
-    let len = u32::try_from(message.len()).map_err(|_| Error::TooLong)?;
-    let mut out = Vec::with_capacity(TCP_HEADER_LEN + message.len());
-    out.extend_from_slice(&len.to_be_bytes());
-    out.extend_from_slice(message);
-    Ok(out)
 }
 
 /// Why a TCP stream cannot be split into messages. Either way the stream
@@ -1168,40 +1190,29 @@ impl fmt::Display for FrameError {
 
 impl std::error::Error for FrameError {}
 
-/// A Kerberos message cannot be written without changing its value.
-///
-/// A field exceeds a named limit, is invalid, or would parse differently.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct EncodeError;
-
-impl core::fmt::Display for EncodeError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("Kerberos message cannot be represented without changing its value")
-    }
-}
-
-impl core::error::Error for EncodeError {}
-
 impl Wire for Message {
     type ParseError = Error;
-    type WriteError = EncodeError;
+    type WriteError = Error;
 
-    /// Reads exactly one DER message whose re-encoding fits [`MAX_MESSAGE`].
-    /// Short flags and signed integer forms can expand when written.
+    /// Reads one complete DER message, as RFC 4120 requires.
+    /// Refuses invalid tags, versions, fields, and lists, trailing bytes,
+    /// and input or DER output over [`MAX_MESSAGE`]. Short flags and signed
+    /// integer forms can expand when written.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        let message = Message::parse(bytes)?;
-        message.to_der()?;
-        Ok(message)
+        let value = Self::decode(bytes)?;
+        value.encode()?;
+        Ok(value)
     }
 
-    /// Appends DER bounded by [`MAX_MESSAGE`]. Leaves `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
-        let bytes = self.to_der().map_err(|_| EncodeError)?;
-        if Message::parse(&bytes).as_ref() != Ok(self) {
-            return Err(EncodeError);
-        }
-        out.extend_from_slice(&bytes);
-        Ok(())
+    /// Appends the message as DER, as a UDP datagram carries it. A list over its
+    /// limit, a Microseconds field over [`MAX_MICROSECONDS`], or a message
+    /// longer than [`MAX_MESSAGE`] is an error, and nothing is written. A
+    /// message read with [`Message::parse_with`] near the limit may grow
+    /// past it. DER can expand BER forms or short flags. [`Wire::parse`]
+    /// checks that the resulting encoding fits.
+    /// Refuses values that change when encoded. Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        asn1::write_checked(self, Self::encode, Self::decode, Error::Unwritable, out)
     }
 }
 
@@ -1242,6 +1253,8 @@ impl Wire for Frame {
     type ParseError = FrameParseError;
     type WriteError = FrameError;
 
+    /// Reads one TCP record. Refuses a reserved length bit, payloads over
+    /// [`MAX_MESSAGE`], incomplete records, and trailing bytes.
     fn parse(bytes: &[u8]) -> Result<Self, FrameParseError> {
         match Frames::new().decode(bytes, true).map_err(FrameParseError::Frame)? {
             Step::Item(data, n) if n == bytes.len() => Ok(Self(data)),
@@ -1250,6 +1263,8 @@ impl Wire for Frame {
         }
     }
 
+    /// Appends the four-byte length and payload. Refuses payloads over
+    /// [`MAX_MESSAGE`], leaving `out` unchanged.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), FrameError> {
         let length = u32::try_from(self.0.len()).map_err(|_| FrameError::TooLong(u32::MAX))?;
         if self.0.len() > MAX_MESSAGE {
@@ -1263,7 +1278,7 @@ impl Wire for Frame {
 
 /// Reads Kerberos TCP records without holding input bytes.
 ///
-/// Use with [`super::codec::Stream`] for a buffer limited to
+/// Use with [`Stream<Frames>`](super::codec::Stream) for a buffer limited to
 /// [`TCP_HEADER_LEN`] plus the configured message limit. The four-byte prefix
 /// suffices to refuse reserved bits and oversized messages. Map each
 /// payload through [`Message::parse`] to interpret it. Partial records
@@ -1283,9 +1298,7 @@ impl Frames {
     /// Sets the message limit, excluding the TCP header, clamped to
     /// [`MAX_MESSAGE`]. Zero accepts only empty records.
     pub fn with_limit(limit: usize) -> Self {
-        Self {
-            limit: limit.min(MAX_MESSAGE),
-        }
+        Self { limit: limit.min(MAX_MESSAGE) }
     }
 
     /// The maximum message size, excluding its TCP header.
@@ -1310,7 +1323,9 @@ impl Decode for Frames {
     }
 
     fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Vec<u8>>, FrameError> {
-        let Some(&[a, b, c, d]) = input.get(..TCP_HEADER_LEN) else { return Ok(Step::Need) };
+        let Some(&[a, b, c, d]) = input.get(..TCP_HEADER_LEN) else {
+            return Ok(Step::Need);
+        };
         let length = u32::from_be_bytes([a, b, c, d]);
         let n = frame_len(length)?;
         if n > self.limit {
@@ -1321,111 +1336,6 @@ impl Decode for Frames {
             Some(bytes) => Step::Item(bytes.to_vec(), total),
             None => Step::Need,
         })
-    }
-}
-
-/// Splits a Kerberos TCP byte stream into messages. Feed it the bytes a
-/// connection reads, in order, and take messages out until it has none.
-///
-/// Each length is checked as soon as its 4 bytes arrive. Once one is bad,
-/// the decoder keeps the whole messages before it, drops the bad length
-/// and everything after it, and drops whatever is fed later. So the most
-/// it holds is the whole messages not yet taken out, plus one unfinished
-/// message of at most [`MAX_MESSAGE`] bytes. A caller that takes messages
-/// out after each `feed` holds at most one message beyond what one `feed`
-/// added.
-///
-/// Errors repeat and there is no EOF handling.
-/// Use [`super::codec::Stream`] with [`Frames`] for EOF and one-time errors.
-#[derive(Clone, Debug, Default)]
-pub struct Decoder {
-    buf: Vec<u8>,
-    /// Where the bytes not yet taken out start. Bytes before it are
-    /// dropped in `feed` once they are half the buffer.
-    start: usize,
-    /// Where the next length not yet checked starts in `buf`. Every
-    /// length before it is good.
-    checked: usize,
-    /// A bad length found by `feed`, reported once the whole messages
-    /// before it have been taken out.
-    pending: Option<FrameError>,
-    failed: Option<FrameError>,
-}
-
-impl Decoder {
-    /// A decoder holding no bytes.
-    pub fn new() -> Decoder {
-        Decoder::default()
-    }
-
-    /// Adds bytes read from the connection. After a bad length the stream
-    /// cannot be read any further, and they are dropped.
-    pub fn feed(&mut self, bytes: &[u8]) {
-        if self.failed.is_some() || self.pending.is_some() {
-            return;
-        }
-        if self.start > 0 && self.start >= self.buf.len() / 2 {
-            self.buf.drain(..self.start);
-            self.checked = self.checked.saturating_sub(self.start);
-            self.start = 0;
-        }
-        self.buf.extend_from_slice(bytes);
-        // Check each length that is now whole. `checked` only moves
-        // forward, so a stream is scanned once however it is split.
-        while let Some(head) = self.buf.get(self.checked..self.checked.saturating_add(TCP_HEADER_LEN)) {
-            let mut len = [0; TCP_HEADER_LEN];
-            len.copy_from_slice(head);
-            match frame_len(u32::from_be_bytes(len)) {
-                Ok(n) => self.checked = self.checked.saturating_add(TCP_HEADER_LEN + n),
-                Err(e) => {
-                    self.buf.truncate(self.checked);
-                    self.pending = Some(e);
-                    break;
-                }
-            }
-        }
-    }
-
-    /// The next whole message's bytes, without the length, ready for
-    /// [`Message::parse`]. It returns `None` when it needs more bytes, and
-    /// keeps returning the same error once the stream has broken.
-    pub fn next_message(&mut self) -> Option<Result<Vec<u8>, FrameError>> {
-        if let Some(e) = self.failed {
-            return Some(Err(e));
-        }
-        let rest = self.buf.get(self.start..).unwrap_or_default();
-        let Some(head) = rest.get(..TCP_HEADER_LEN) else {
-            // Only whole messages are kept before a bad length, so once
-            // they are out, the stream has broken.
-            let e = self.pending.take()?;
-            self.failed = Some(e);
-            self.buf = Vec::new();
-            self.start = 0;
-            self.checked = 0;
-            return Some(Err(e));
-        };
-        let mut len = [0; TCP_HEADER_LEN];
-        len.copy_from_slice(head);
-        // `feed` has checked every length it has seen.
-        let n = frame_len(u32::from_be_bytes(len)).ok()?;
-        let body = rest.get(TCP_HEADER_LEN..TCP_HEADER_LEN + n)?.to_vec();
-        self.start += TCP_HEADER_LEN + n;
-        if self.start == self.buf.len() && self.pending.is_none() {
-            // All taken out: let go of a buffer grown past one message.
-            if self.buf.capacity() > MAX_MESSAGE + TCP_HEADER_LEN {
-                self.buf = Vec::new();
-            } else {
-                self.buf.clear();
-            }
-            self.start = 0;
-            self.checked = 0;
-        }
-        Some(Ok(body))
-    }
-
-    /// How many bytes are held, waiting for the rest of a message.
-    pub fn buffered(&self) -> usize {
-        self.buf.len().saturating_sub(self.start)
     }
 }
 
@@ -1601,8 +1511,115 @@ fn w_flags(w: &mut Writer, n: u32, f: u32) {
     w.explicit(n, |w| w.bit_string(&f.to_be_bytes(), 0));
 }
 
+impl Wire for EncryptedData {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads an EncryptedData standing alone in `bytes`, as a PA-DATA value
+    /// holds one.
+    /// Refuses malformed DER, trailing bytes, and input or DER output over
+    /// [`MAX_MESSAGE`]. Signed kvno values are read as UInt32.
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        let value = Self::decode(bytes)?;
+        value.encode()?;
+        Ok(value)
+    }
+
+    /// Appends this EncryptedData as DER. Refuses output over [`MAX_MESSAGE`].
+    /// Signed kvno input can expand when written as UInt32. The parser checks
+    /// that the resulting encoding still fits.
+    /// Refuses values that change when encoded. Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        asn1::write_checked(self, Self::encode, Self::decode, Error::Unwritable, out)
+    }
+}
+
+impl Wire for Ticket {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads a Ticket standing alone in `bytes`, as a credential cache holds
+    /// one.
+    /// Refuses malformed DER, invalid realms or names, wrong versions, trailing
+    /// bytes, and input or DER output over [`MAX_MESSAGE`].
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        let value = Self::decode(bytes)?;
+        value.encode()?;
+        Ok(value)
+    }
+
+    /// Appends this Ticket as DER. Refuses invalid realms or names and
+    /// output over [`MAX_MESSAGE`]. As with [`EncryptedData::write`], DER
+    /// may expand a signed kvno; the parser checks that the result fits.
+    /// Refuses values that change when encoded. Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        asn1::write_checked(self, Self::encode, Self::decode, Error::Unwritable, out)
+    }
+}
+
+impl Wire for KdcReqBody {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads a KDC-REQ-BODY standing alone in `bytes`, such as the bytes a
+    /// checksum covers.
+    /// Refuses malformed DER, invalid fields or lists, trailing bytes,
+    /// and input or DER output over [`MAX_MESSAGE`].
+    /// For a body that grows past the limit when written, read its message
+    /// with [`Message::parse_with`]. Use [`Message::kdc_req_body`] for the
+    /// original bytes that a checksum covers.
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        let value = Self::decode(bytes)?;
+        value.encode()?;
+        Ok(value)
+    }
+
+    /// Appends the body as DER. A body read and written again may
+    /// not be the bytes it was read from: options shorter than 32 bits, a
+    /// nonce or kvno written as a negative number, an empty optional list,
+    /// or BER all come out differently. To check a checksum over a body
+    /// that was received, take its bytes with [`Message::kdc_req_body`].
+    /// Refuses invalid fields or lists and output over [`MAX_MESSAGE`].
+    /// Refuses values that change when encoded. Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        asn1::write_checked(self, Self::encode, Self::decode, Error::Unwritable, out)
+    }
+}
+
+/// METHOD-DATA: a DER SEQUENCE OF PA-DATA, bounded by [`MAX_PADATA`].
+/// A KRB-ERROR with [`error_code::KDC_ERR_PREAUTH_REQUIRED`] carries it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct MethodData(
+    /// The pre-authentication methods, in wire order. An empty list is allowed.
+    pub Vec<PaData>,
+);
+
+impl Wire for MethodData {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads one DER METHOD-DATA. Refuses malformed fields, trailing bytes,
+    /// more than [`MAX_PADATA`] methods, and input over [`MAX_MESSAGE`].
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        whole(bytes, Rules::Der, |r| seq_of(r, MAX_PADATA, "padata", PaData::read)).map(Self)
+    }
+
+    /// Appends DER METHOD-DATA. Refuses more than [`MAX_PADATA`] methods
+    /// and output over [`MAX_MESSAGE`], leaving `out` unchanged.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        limit(self.0.len(), MAX_PADATA, "padata")?;
+        let bytes = finish(|w| w.sequence(|w| self.0.iter().for_each(|p| p.write_fields(w))))?;
+        out.extend_from_slice(&bytes);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::super::codec::{
+        Fail, Stream, contract, finish as finish_stream, pump,
+        test_support::{Lcg, chunks, decode_all, mutate},
+    };
     use super::*;
 
     fn time(s: &str) -> KerberosTime {
@@ -1625,7 +1642,7 @@ mod tests {
         KdcReq {
             padata: Some(vec![PaData {
                 padata_type: padata_type::ENC_TIMESTAMP,
-                value: enc(18, None, &[1, 2, 3]).to_der().unwrap(),
+                value: enc(18, None, &[1, 2, 3]).to_bytes().unwrap(),
             }]),
             body: KdcReqBody {
                 kdc_options: kdc_options::FORWARDABLE | kdc_options::RENEWABLE | kdc_options::RENEWABLE_OK,
@@ -1692,7 +1709,7 @@ mod tests {
     fn principal_name_by_hand() {
         let n = PrincipalName::new(name_type::SRV_INST, &["krbtgt", "A.B"]);
         let mut w = Writer::new();
-        n.write(&mut w);
+        n.write_fields(&mut w);
         let der = w.finish().unwrap();
         #[rustfmt::skip]
         let expected = [
@@ -1720,7 +1737,7 @@ mod tests {
         ];
         let m = Message::parse(&der).unwrap();
         assert_eq!(m, Message::ApRep(ApRep { enc_part: enc(18, None, &[]) }));
-        assert_eq!(m.to_der().unwrap(), der);
+        assert_eq!(m.to_bytes().unwrap(), der);
     }
 
     #[test]
@@ -1731,7 +1748,7 @@ mod tests {
         ];
         let e = EncryptedData::parse(&der).unwrap();
         assert_eq!(e, enc(23, Some(128), &[0xff]));
-        assert_eq!(e.to_der().unwrap(), der);
+        assert_eq!(e.to_bytes().unwrap(), der);
         // A kvno written as a signed -1 reads as 0xFFFFFFFF.
         let signed = [0x30, 0x0e, 0xa0, 0x03, 0x02, 0x01, 0x17, 0xa1, 0x03, 0x02, 0x01, 0xff, 0xa2, 0x02, 0x04, 0x00];
         assert_eq!(EncryptedData::parse(&signed).unwrap().kvno, Some(u32::MAX));
@@ -1740,7 +1757,7 @@ mod tests {
     #[test]
     fn flags_are_32_bits() {
         let m = Message::AsReq(as_req());
-        let der = m.to_der().unwrap();
+        let der = m.to_bytes().unwrap();
         // kdc-options [0] BIT STRING with no unused bits and 4 bytes.
         let want = [0xa0, 0x07, 0x03, 0x05, 0x00, 0x40, 0x80, 0x00, 0x10];
         assert!(der.windows(want.len()).any(|w| w == want));
@@ -1755,32 +1772,32 @@ mod tests {
     #[test]
     fn every_message_round_trips() {
         for m in all_messages() {
-            let der = m.to_der().unwrap();
+            let der = m.to_bytes().unwrap();
             assert_eq!(der[0], 0x60 | m.msg_type() as u8 & 0x1f, "{m:?}");
             assert_eq!(Message::parse(&der).unwrap(), m);
             assert_eq!(Message::parse_with(&der, Rules::Ber).unwrap(), m);
-            let tcp = m.to_tcp().unwrap();
+            let tcp = Frame(m.to_bytes().unwrap()).to_bytes().unwrap();
             assert_eq!(tcp[..4], (der.len() as u32).to_be_bytes());
         }
         let t = tgt();
-        assert_eq!(Ticket::parse(&t.to_der().unwrap()).unwrap(), t);
+        assert_eq!(Ticket::parse(&t.to_bytes().unwrap()).unwrap(), t);
         let body = as_req().body;
         let mut r = Reader::new(&[], Rules::Der);
         assert!(KdcReqBody::read(&mut r).is_err());
-        let der = body.to_der().unwrap();
+        let der = body.to_bytes().unwrap();
         assert_eq!(whole(&der, Rules::Der, KdcReqBody::read).unwrap(), body);
     }
 
     #[test]
     fn method_data() {
-        let p = vec![
+        let p = MethodData(vec![
             PaData { padata_type: padata_type::ENC_TIMESTAMP, value: vec![] },
             PaData { padata_type: padata_type::ETYPE_INFO2, value: vec![0x30, 0x00] },
-        ];
-        let der = KrbError::method_data(&p).unwrap();
-        assert_eq!(KrbError::read_method_data(&der).unwrap(), p);
-        let many = vec![p[0].clone(); MAX_PADATA + 1];
-        assert_eq!(KrbError::method_data(&many), Err(Error::TooMany("padata")));
+        ]);
+        let der = p.to_bytes().unwrap();
+        assert_eq!(MethodData::parse(&der).unwrap(), p);
+        let many = MethodData(vec![p.0[0].clone(); MAX_PADATA + 1]);
+        assert_eq!(many.to_bytes(), Err(Error::TooMany("padata")));
     }
 
     #[test]
@@ -1807,7 +1824,7 @@ mod tests {
 
     #[test]
     fn error_paths() {
-        let ap_rep = Message::ApRep(ApRep { enc_part: enc(18, None, &[]) }).to_der().unwrap();
+        let ap_rep = Message::ApRep(ApRep { enc_part: enc(18, None, &[]) }).to_bytes().unwrap();
         // Wrong version.
         let v4 = replace(&ap_rep, &[0xa0, 0x03, 0x02, 0x01, 0x05], &[0xa0, 0x03, 0x02, 0x01, 0x04]);
         assert_eq!(Message::parse(&v4), Err(Error::Version(4)));
@@ -1858,7 +1875,7 @@ mod tests {
         assert_eq!(whole(&prim, Rules::Der, PrincipalName::read), Err(Error::Asn1(asn1::Error::Primitive)));
         // A KerberosTime with a fraction.
         let e = krb_error();
-        let der = Message::KrbError(e).to_der().unwrap();
+        let der = Message::KrbError(e).to_bytes().unwrap();
         let frac = replace(&der, b"\x18\x0f20261005120000Z", b"\x18\x1120261005120000.5Z");
         assert!(Message::parse(&frac).is_err());
         let mut r = Reader::new(b"\x18\x1120261005120000.5Z", Rules::Der);
@@ -1879,39 +1896,39 @@ mod tests {
         n.components = vec!["a".into(); MAX_NAME_COMPONENTS];
         let mut e = krb_error();
         e.sname = n.clone();
-        assert!(Message::KrbError(e.clone()).to_der().is_ok());
+        assert!(Message::KrbError(e.clone()).to_bytes().is_ok());
         n.components.push("a".into());
         e.sname = n.clone();
-        assert_eq!(Message::KrbError(e.clone()).to_der(), Err(Error::TooMany("name-string")));
+        assert_eq!(Message::KrbError(e.clone()).to_bytes(), Err(Error::TooMany("name-string")));
         // The parser refuses the same list when it arrives.
         let mut w = Writer::new();
-        n.write(&mut w);
+        n.write_fields(&mut w);
         let der = w.finish().unwrap();
         assert_eq!(whole(&der, Rules::Der, PrincipalName::read), Err(Error::TooMany("name-string")));
 
         let mut r = as_req();
         r.body.etypes = vec![1; MAX_ETYPES + 1];
-        assert_eq!(Message::AsReq(r).to_der(), Err(Error::TooMany("etype")));
+        assert_eq!(Message::AsReq(r).to_bytes(), Err(Error::TooMany("etype")));
         let mut r = as_req();
         r.body.addresses = Some(vec![HostAddress { addr_type: 2, address: vec![10, 0, 0, 1] }; MAX_ADDRESSES + 1]);
-        assert_eq!(Message::AsReq(r).to_der(), Err(Error::TooMany("addresses")));
+        assert_eq!(Message::AsReq(r).to_bytes(), Err(Error::TooMany("addresses")));
         let mut r = as_req();
         r.body.additional_tickets = Some(vec![tgt(); MAX_TICKETS + 1]);
-        assert_eq!(Message::TgsReq(r).to_der(), Err(Error::TooMany("additional-tickets")));
+        assert_eq!(Message::TgsReq(r).to_bytes(), Err(Error::TooMany("additional-tickets")));
         let mut r = as_req();
         r.padata = Some(vec![PaData { padata_type: 2, value: vec![] }; MAX_PADATA + 1]);
-        assert_eq!(Message::AsReq(r).to_der(), Err(Error::TooMany("padata")));
+        assert_eq!(Message::AsReq(r).to_bytes(), Err(Error::TooMany("padata")));
         let mut e = krb_error();
         e.susec = MAX_MICROSECONDS + 1;
-        assert_eq!(Message::KrbError(e).to_der(), Err(Error::Range));
+        assert_eq!(Message::KrbError(e).to_bytes(), Err(Error::Range));
         let mut e = krb_error();
         e.cusec = Some(MAX_MICROSECONDS + 1);
-        assert_eq!(Message::KrbError(e).to_der(), Err(Error::Range));
+        assert_eq!(Message::KrbError(e).to_bytes(), Err(Error::Range));
         // A message over the size limit.
         let big = Message::ApRep(ApRep { enc_part: enc(18, None, &vec![0; MAX_MESSAGE]) });
-        assert_eq!(big.to_der(), Err(Error::TooLong));
-        assert_eq!(frame(&vec![0; MAX_MESSAGE + 1]), Err(Error::TooLong));
-        assert!(frame(&vec![0; MAX_MESSAGE]).is_ok());
+        assert_eq!(big.to_bytes(), Err(Error::TooLong));
+        assert_eq!(Frame(vec![0; MAX_MESSAGE + 1]).to_bytes(), Err(FrameError::TooLong(MAX_MESSAGE as u32 + 1)));
+        assert!(Frame(vec![0; MAX_MESSAGE]).to_bytes().is_ok());
     }
 
     #[test]
@@ -1920,22 +1937,22 @@ mod tests {
         // message longer than MAX_MESSAGE, and says so.
         let huge = vec![0; asn1::MAX_INPUT + 1];
         let big = Message::ApRep(ApRep { enc_part: enc(18, None, &huge) });
-        assert_eq!(big.to_der(), Err(Error::TooLong));
-        assert_eq!(enc(18, None, &huge).to_der(), Err(Error::TooLong));
+        assert_eq!(big.to_bytes(), Err(Error::TooLong));
+        assert_eq!(enc(18, None, &huge).to_bytes(), Err(Error::TooLong));
         let mut t = tgt();
         t.enc_part.cipher = huge.clone();
-        assert_eq!(t.to_der(), Err(Error::TooLong));
+        assert_eq!(t.to_bytes(), Err(Error::TooLong));
         let p = PaData { padata_type: 2, value: huge.clone() };
-        assert_eq!(KrbError::method_data(&[p]), Err(Error::TooLong));
+        assert_eq!(MethodData(vec![p]).to_bytes(), Err(Error::TooLong));
         let mut body = as_req().body;
         body.enc_authorization_data = Some(enc(18, None, &huge));
-        assert_eq!(body.to_der(), Err(Error::TooLong));
+        assert_eq!(body.to_bytes(), Err(Error::TooLong));
     }
 
     #[test]
     fn a_request_body_reads_on_its_own() {
         let body = as_req().body;
-        let der = body.to_der().unwrap();
+        let der = body.to_bytes().unwrap();
         assert_eq!(KdcReqBody::parse(&der), Ok(body));
         for n in 0..der.len() {
             assert!(KdcReqBody::parse(&der[..n]).is_err());
@@ -1953,19 +1970,19 @@ mod tests {
         // refuse them.
         let mut r = as_req();
         r.padata = Some(Vec::new());
-        assert_eq!(Message::AsReq(r.clone()).to_der(), Err(Error::Empty("padata")));
+        assert_eq!(Message::AsReq(r.clone()).to_bytes(), Err(Error::Empty("padata")));
 
         let mut r = as_req();
         r.body.additional_tickets = Some(Vec::new());
-        assert_eq!(Message::TgsReq(r.clone()).to_der(), Err(Error::Empty("additional-tickets")));
+        assert_eq!(Message::TgsReq(r.clone()).to_bytes(), Err(Error::Empty("additional-tickets")));
 
         let Message::AsRep(mut rep) = all_messages().swap_remove(1) else { panic!() };
         rep.padata = Some(Vec::new());
-        assert_eq!(Message::AsRep(rep.clone()).to_der(), Err(Error::Empty("padata")));
+        assert_eq!(Message::AsRep(rep.clone()).to_bytes(), Err(Error::Empty("padata")));
         // A reader takes them as absent; see empty_optional_lists_read_as_absent.
 
         // METHOD-DATA has no such note, so an empty one is fine.
-        assert_eq!(KrbError::read_method_data(&KrbError::method_data(&[]).unwrap()), Ok(Vec::new()));
+        assert_eq!(MethodData::parse(&MethodData::default().to_bytes().unwrap()), Ok(MethodData::default()));
     }
 
     #[test]
@@ -1973,26 +1990,26 @@ mod tests {
         // RFC 4120 section 5.2.2: realms shall not contain a NUL.
         let mut t = tgt();
         t.realm = "EXAMPLE\0COM".into();
-        assert_eq!(t.to_der(), Err(Error::Text));
+        assert_eq!(t.to_bytes(), Err(Error::Text));
         let mut w = Writer::new();
-        t.write(&mut w);
+        t.write_fields(&mut w);
         assert_eq!(Ticket::parse(&w.finish().unwrap()), Err(Error::Text));
 
         let mut e = krb_error();
         e.crealm = Some("A\0".into());
-        assert_eq!(Message::KrbError(e.clone()).to_der(), Err(Error::Text));
+        assert_eq!(Message::KrbError(e.clone()).to_bytes(), Err(Error::Text));
         let mut w = Writer::new();
-        w.constructed(Tag::application(30), |w| e.write(w));
+        w.constructed(Tag::application(30), |w| e.write_fields(w));
         assert_eq!(Message::parse(&w.finish().unwrap()), Err(Error::Text));
 
         let mut r = as_req();
         r.body.realm = "\0".into();
-        assert_eq!(Message::AsReq(r).to_der(), Err(Error::Text));
+        assert_eq!(Message::AsReq(r).to_bytes(), Err(Error::Text));
         // A NUL in a name component is not a realm, and is kept.
         let mut e = krb_error();
         e.sname = PrincipalName::new(name_type::PRINCIPAL, &["a\0b"]);
         let m = Message::KrbError(e);
-        assert_eq!(Message::parse(&m.to_der().unwrap()).unwrap(), m);
+        assert_eq!(Message::parse(&m.to_bytes().unwrap()).unwrap(), m);
     }
 
     #[test]
@@ -2011,25 +2028,72 @@ mod tests {
         let body = der.len() - 5;
         der[2..5].copy_from_slice(&[(body >> 16) as u8, (body >> 8) as u8, body as u8]);
         assert_eq!(der.len(), MAX_MESSAGE);
-        let e = EncryptedData::parse(&der).unwrap();
-        assert_eq!(e.kvno, Some(u32::MAX));
-        assert_eq!(e.to_der(), Err(Error::TooLong));
+        assert_eq!(EncryptedData::parse(&der), Err(Error::TooLong));
         assert_eq!(check_any(&der), 0);
+    }
+
+    #[test]
+    fn a_request_body_near_the_limit_can_grow_too_long() {
+        let mut request = as_req();
+        request.padata = None;
+        let mut tickets = vec![tgt(); MAX_TICKETS];
+        // Start above the DER length-width boundaries, then fill the exact
+        // remaining space in one step. This keeps the test linear in size.
+        tickets[0].enc_part.cipher.resize(MAX_MESSAGE / 2, 0xaa);
+        request.body.additional_tickets = Some(tickets);
+        let mut message = Message::TgsReq(request);
+        let room = MAX_MESSAGE
+            .checked_sub(message.to_bytes().unwrap().len())
+            .unwrap();
+        let Message::TgsReq(request) = &mut message else {
+            panic!()
+        };
+        let cipher = &mut request.body.additional_tickets.as_mut().unwrap()[0]
+            .enc_part
+            .cipher;
+        cipher.resize(cipher.len().checked_add(room).unwrap(), 0xaa);
+        let mut bytes = message.to_bytes().unwrap();
+        assert_eq!(bytes.len(), MAX_MESSAGE);
+
+        // Each kvno 2 becomes -1 without changing the input length. Reading
+        // it as UInt32 makes its next encoding four bytes longer.
+        let mut changed = 0;
+        for i in 0..bytes.len().saturating_sub(4) {
+            if bytes[i..].starts_with(&[0xa1, 0x03, 0x02, 0x01, 0x02]) {
+                bytes[i + 4] = 0xff;
+                changed += 1;
+            }
+        }
+        assert_eq!(changed, MAX_TICKETS);
+        let Message::TgsReq(parsed) = Message::parse_with(&bytes, Rules::Der).unwrap() else {
+            panic!("expected TGS-REQ");
+        };
+        let tickets = parsed.body.additional_tickets.as_ref().unwrap();
+        assert_eq!(tickets.len(), MAX_TICKETS);
+        assert!(
+            tickets
+                .iter()
+                .all(|ticket| ticket.enc_part.kvno == Some(u32::MAX))
+        );
+        let body = Message::kdc_req_body(&bytes, Rules::Der).unwrap();
+        assert!(body.len() <= MAX_MESSAGE);
+        assert_eq!(parsed.body.to_bytes(), Err(Error::TooLong));
+        assert_eq!(KdcReqBody::parse(body), Err(Error::TooLong));
     }
 
     #[test]
     fn every_truncated_prefix_fails() {
         for m in all_messages() {
-            let der = m.to_der().unwrap();
+            let der = m.to_bytes().unwrap();
             for n in 0..der.len() {
                 assert!(Message::parse(&der[..n]).is_err(), "{n} of {}", der.len());
                 assert!(Message::parse_with(&der[..n], Rules::Ber).is_err());
             }
-            let tcp = m.to_tcp().unwrap();
+            let tcp = Frame(m.to_bytes().unwrap()).to_bytes().unwrap();
             for n in 0..tcp.len() {
-                let mut d = Decoder::new();
-                d.feed(&tcp[..n]);
-                assert_eq!(d.next_message(), None);
+                let mut d = Stream::new(Frames::new());
+                assert_eq!(d.push(&tcp[..n]), n);
+                assert_eq!(d.next(), None);
                 assert_eq!(d.buffered(), n);
             }
         }
@@ -2051,100 +2115,91 @@ mod tests {
         ];
         assert_eq!(Message::parse(&ber), Err(Error::Asn1(asn1::Error::Indefinite)));
         let m = Message::parse_with(&ber, Rules::Ber).unwrap();
-        assert_eq!(Message::parse(&m.to_der().unwrap()).unwrap(), m);
+        assert_eq!(Message::parse(&m.to_bytes().unwrap()).unwrap(), m);
     }
 
     #[test]
     fn decoder_splits_a_stream() {
         let msgs = all_messages();
-        let stream: Vec<u8> = msgs.iter().flat_map(|m| m.to_tcp().unwrap()).collect();
-        let mut d = Decoder::new();
+        let stream: Vec<u8> = msgs.iter().flat_map(|m| Frame(m.to_bytes().unwrap()).to_bytes().unwrap()).collect();
+        let mut d = Stream::new(Frames::new());
         let mut got = Vec::new();
-        for b in &stream {
-            d.feed(std::slice::from_ref(b));
-            while let Some(m) = d.next_message() {
+        for b in chunks(&stream, &[1]) {
+            assert_eq!(d.push(b), (b).len());
+            while let Some(m) = d.next() {
                 got.push(Message::parse(&m.unwrap()).unwrap());
             }
         }
         assert_eq!(got, msgs);
         assert_eq!(d.buffered(), 0);
         // A zero-length record is passed on, and fails to parse.
-        d.feed(&[0, 0, 0, 0]);
-        assert_eq!(d.next_message(), Some(Ok(Vec::new())));
+        assert_eq!(d.push(&[0, 0, 0, 0]), 4);
+        assert_eq!(d.next(), Some(Ok(Vec::new())));
         // The reserved bit breaks the stream for good.
-        d.feed(&[0x80, 0, 0, 1, 0]);
-        assert_eq!(d.next_message(), Some(Err(FrameError::Reserved(0x8000_0001))));
-        d.feed(&stream);
-        assert_eq!(d.next_message(), Some(Err(FrameError::Reserved(0x8000_0001))));
-        assert_eq!(d.buffered(), 0);
+        assert_eq!(d.push(&[0x80, 0, 0, 1, 0]), 5);
+        assert_eq!(d.next(), Some(Err(Fail::Protocol(FrameError::Reserved(0x8000_0001)))));
+        assert_eq!(d.push(&stream), stream.len());
+        assert_eq!(d.next(), None);
+        assert_eq!(d.failed(), Some(&Fail::Protocol(FrameError::Reserved(0x8000_0001))));
         // So does a length over the limit, known before the body comes.
-        let mut d = Decoder::new();
+        let mut d = Stream::new(Frames::new());
         let over = (MAX_MESSAGE as u32 + 1).to_be_bytes();
-        d.feed(&over);
-        assert_eq!(d.next_message(), Some(Err(FrameError::TooLong(MAX_MESSAGE as u32 + 1))));
+        assert_eq!(d.push(&over), over.len());
+        assert_eq!(d.next(), Some(Err(Fail::Protocol(FrameError::TooLong(MAX_MESSAGE as u32 + 1)))));
         assert!(!FrameError::TooLong(1).to_string().is_empty());
     }
 
     #[test]
     fn decoder_takes_many_small_messages_in_linear_time() {
-        let one = Message::ApRep(ApRep { enc_part: enc(18, None, &[]) }).to_tcp().unwrap();
+        let one = Frame(Message::ApRep(ApRep { enc_part: enc(18, None, &[]) }).to_bytes().unwrap()).to_bytes().unwrap();
         let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * 100_000).collect();
-        let mut d = Decoder::new();
-        d.feed(&stream);
+        let mut d = Stream::new(Frames::new());
         let mut n = 0;
-        while let Some(m) = d.next_message() {
-            m.unwrap();
-            n += 1;
-        }
+        pump(&mut d, &stream, |_| n += 1).unwrap();
+        finish_stream(&mut d, |_| n += 1).unwrap();
         assert_eq!(n, 100_000);
         assert_eq!(d.buffered(), 0);
     }
 
     #[test]
-    fn decoder_drops_bytes_after_a_bad_header() {
-        // A bad length is caught as it is fed, so what follows it is not
-        // held even when the caller feeds without taking messages out.
-        let mut d = Decoder::new();
-        d.feed(&[0x80, 0, 0, 0]);
-        for _ in 0..16 {
-            d.feed(&[0; 64 * 1024]);
-        }
-        assert_eq!(d.buffered(), 0);
-        assert_eq!(d.next_message(), Some(Err(FrameError::Reserved(0x8000_0000))));
-        // Whole messages fed before the bad length still come out first,
-        // as they would had they been taken out one at a time.
-        let one = Message::ApRep(ApRep { enc_part: enc(18, None, &[]) }).to_tcp().unwrap();
-        let mut stream = one.clone();
-        stream.extend_from_slice(&one);
-        stream.extend_from_slice(&(MAX_MESSAGE as u32 + 1).to_be_bytes());
-        stream.extend_from_slice(&[0; 1000]);
-        let mut d = Decoder::new();
-        d.feed(&stream);
-        assert_eq!(d.buffered(), 2 * one.len());
-        assert_eq!(d.next_message(), Some(Ok(one[4..].to_vec())));
-        assert_eq!(d.next_message(), Some(Ok(one[4..].to_vec())));
-        assert_eq!(d.next_message(), Some(Err(FrameError::TooLong(MAX_MESSAGE as u32 + 1))));
-        d.feed(&one);
-        assert_eq!(d.buffered(), 0);
-        // A header split across feeds is checked once its last byte comes.
-        let mut d = Decoder::new();
-        d.feed(&[0x80, 0]);
-        d.feed(&[0, 5]);
-        d.feed(&[0; 100]);
-        assert_eq!(d.buffered(), 0);
-        assert_eq!(d.next_message(), Some(Err(FrameError::Reserved(0x8000_0005))));
+    fn stream_stops_after_a_bad_header() {
+        let one = Frame(Message::ApRep(ApRep { enc_part: enc(18, None, &[]) }).to_bytes().unwrap()).to_bytes().unwrap();
+        let mut bytes = one.repeat(2);
+        bytes.extend_from_slice(&(MAX_MESSAGE as u32 + 1).to_be_bytes());
+        bytes.extend_from_slice(&[0; 1000]);
+        contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * (TCP_HEADER_LEN + MAX_MESSAGE));
+        let mut stream = Stream::new(Frames::new());
+        let mut got = Vec::new();
+        assert_eq!(
+            pump(&mut stream, &bytes, |m| got.push(m)),
+            Err(Fail::Protocol(FrameError::TooLong(MAX_MESSAGE as u32 + 1)))
+        );
+        assert_eq!(got, [one[4..].to_vec(), one[4..].to_vec()]);
+        let held = stream.buffered();
+        assert_eq!(stream.push(&one), one.len());
+        assert_eq!(stream.buffered(), held);
+        assert_eq!(stream.next(), None);
+        let mut stream = Stream::new(Frames::new());
+        assert_eq!(stream.push(&[0x80, 0]), 2);
+        assert_eq!(stream.next(), None);
+        assert_eq!(stream.push(&[0, 5]), 2);
+        assert_eq!(stream.next(), Some(Err(Fail::Protocol(FrameError::Reserved(0x8000_0005)))));
     }
 
     #[test]
     fn a_drained_decoder_lets_go_of_a_large_buffer() {
-        let big = Message::ApRep(ApRep { enc_part: enc(18, None, &vec![0; MAX_MESSAGE - 100]) }).to_tcp().unwrap();
-        let mut d = Decoder::new();
-        d.feed(&big);
-        d.feed(&big);
-        assert!(d.next_message().unwrap().is_ok());
-        assert!(d.next_message().unwrap().is_ok());
+        let big =
+            Frame(Message::ApRep(ApRep { enc_part: enc(18, None, &vec![0; MAX_MESSAGE - 100]) }).to_bytes().unwrap())
+                .to_bytes()
+                .unwrap();
+        let mut d = Stream::new(Frames::new());
+        let mut count = 0;
+        pump(&mut d, &big, |_| count += 1).unwrap();
+        pump(&mut d, &big, |_| count += 1).unwrap();
+        finish_stream(&mut d, |_| count += 1).unwrap();
+        assert_eq!(count, 2);
         assert_eq!(d.buffered(), 0);
-        assert!(d.buf.capacity() <= MAX_MESSAGE + TCP_HEADER_LEN);
+        assert!(d.into_parts().0.allocated() <= MAX_MESSAGE + TCP_HEADER_LEN);
     }
 
     #[test]
@@ -2157,7 +2212,7 @@ mod tests {
         r.body.addresses = Some(Vec::new());
         r.body.additional_tickets = Some(Vec::new());
         let mut w = Writer::new();
-        w.constructed(Tag::application(12), |w| r.write(w, msg_type::TGS_REQ));
+        w.constructed(Tag::application(12), |w| r.write_fields(w, msg_type::TGS_REQ));
         let Message::TgsReq(got) = Message::parse(&w.finish().unwrap()).unwrap() else { panic!() };
         assert_eq!(got.padata, None);
         assert_eq!(got.body.addresses, None);
@@ -2166,15 +2221,15 @@ mod tests {
         let Message::AsRep(mut rep) = all_messages().swap_remove(1) else { panic!() };
         rep.padata = Some(Vec::new());
         let mut w = Writer::new();
-        w.constructed(Tag::application(11), |w| rep.write(w, msg_type::AS_REP));
+        w.constructed(Tag::application(11), |w| rep.write_fields(w, msg_type::AS_REP));
         let Message::AsRep(got) = Message::parse(&w.finish().unwrap()).unwrap() else { panic!() };
         assert_eq!(got.padata, None);
 
         // Writers leave them out instead: an empty list is an error.
         let mut r = as_req();
         r.body.addresses = Some(Vec::new());
-        assert_eq!(Message::AsReq(r.clone()).to_der(), Err(Error::Empty("addresses")));
-        assert_eq!(r.body.to_der(), Err(Error::Empty("addresses")));
+        assert_eq!(Message::AsReq(r.clone()).to_bytes(), Err(Error::Empty("addresses")));
+        assert_eq!(r.body.to_bytes(), Err(Error::Empty("addresses")));
     }
 
     #[test]
@@ -2184,19 +2239,19 @@ mod tests {
         // which DER writes back longer, so only the bytes as sent will do.
         let mut r = as_req();
         r.padata = Some(vec![PaData { padata_type: padata_type::TGS_REQ, value: vec![1, 2, 3] }]);
-        let der = Message::TgsReq(r).to_der().unwrap();
+        let der = Message::TgsReq(r).to_bytes().unwrap();
         let sent = replace(&der, &[0xa1, 0x03, 0x02, 0x01, 0x02], &[0xa1, 0x03, 0x02, 0x01, 0xff]);
         let Message::TgsReq(got) = Message::parse(&sent).unwrap() else { panic!() };
         assert_eq!(got.body.additional_tickets.as_ref().unwrap()[0].enc_part.kvno, Some(u32::MAX));
         let body = Message::kdc_req_body(&sent, Rules::Der).unwrap();
-        assert_ne!(body, got.body.to_der().unwrap());
+        assert_ne!(body, got.body.to_bytes().unwrap());
         assert_eq!(KdcReqBody::parse(body), Ok(got.body.clone()));
         assert!(sent.windows(body.len()).any(|w| w == body));
         assert_eq!(body[0], 0x30);
         // The same under BER, with the body's indefinite length kept.
         let ber = [0x6a, 0x80, 0x30, 0x80, 0xa1, 0x03, 0x02, 0x01, 0x05, 0xa2, 0x03, 0x02, 0x01, 0x0a, 0xa4, 0x80];
         let mut ber = ber.to_vec();
-        let plain = as_req().body.to_der().unwrap();
+        let plain = as_req().body.to_bytes().unwrap();
         let mut indef = vec![0x30, 0x80];
         // The body is long enough for a 2-byte length: 0x30 0x82 hi lo.
         assert_eq!(plain[1], 0x82);
@@ -2206,7 +2261,7 @@ mod tests {
         ber.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
         assert_eq!(Message::kdc_req_body(&ber, Rules::Ber), Ok(&indef[..]));
         // Other messages, and bytes that are not a message, have none.
-        let rep = all_messages().swap_remove(1).to_der().unwrap();
+        let rep = all_messages().swap_remove(1).to_bytes().unwrap();
         assert_eq!(Message::kdc_req_body(&rep, Rules::Der), Err(Error::UnknownMessage(11)));
         assert!(Message::kdc_req_body(&sent[..sent.len() - 1], Rules::Der).is_err());
     }
@@ -2239,7 +2294,7 @@ mod tests {
         ];
         for a in good {
             let m = Message::AsReq(with(a));
-            assert_eq!(Message::parse(&m.to_der().unwrap()), Ok(m));
+            assert_eq!(Message::parse(&m.to_bytes().unwrap()), Ok(m));
         }
         let bad = [
             HostAddress { addr_type: HostAddress::IPV4, address: vec![1] },
@@ -2252,11 +2307,11 @@ mod tests {
         ];
         for a in bad {
             let r = with(a.clone());
-            assert_eq!(Message::AsReq(r.clone()).to_der(), Err(Error::Address), "{a:?}");
-            assert_eq!(r.body.to_der(), Err(Error::Address));
+            assert_eq!(Message::AsReq(r.clone()).to_bytes(), Err(Error::Address), "{a:?}");
+            assert_eq!(r.body.to_bytes(), Err(Error::Address));
             // The reader refuses the same address when it arrives.
             let mut w = Writer::new();
-            w.constructed(Tag::application(10), |w| r.write(w, msg_type::AS_REQ));
+            w.constructed(Tag::application(10), |w| r.write_fields(w, msg_type::AS_REQ));
             assert_eq!(Message::parse(&w.finish().unwrap()), Err(Error::Address), "{a:?}");
         }
     }
@@ -2280,19 +2335,6 @@ mod tests {
         }
     }
 
-    /// A deterministic generator, so failures repeat.
-    struct Lcg(u64);
-
-    impl Lcg {
-        fn next(&mut self) -> u64 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            self.0 >> 33
-        }
-        fn below(&mut self, n: u64) -> u64 {
-            self.next() % n.max(1)
-        }
-    }
-
     /// Checks what can be read from `data` writes back, and returns how
     /// many messages it read.
     fn check_any(data: &[u8]) -> usize {
@@ -2301,89 +2343,48 @@ mod tests {
             if let Ok(m) = Message::parse_with(data, rules) {
                 read += 1;
                 // Written again, a message near the limit may grow past it.
-                match m.to_der() {
+                match m.to_bytes() {
                     Ok(der) => assert_eq!(Message::parse(&der).unwrap(), m),
                     Err(e) => assert_eq!(e, Error::TooLong),
                 }
             }
         }
-        if let Ok(t) = Ticket::parse(data) {
-            match t.to_der() {
-                Ok(der) => assert_eq!(Ticket::parse(&der).unwrap(), t),
-                Err(e) => assert_eq!(e, Error::TooLong),
-            }
-        }
-        if let Ok(e) = EncryptedData::parse(data) {
-            match e.to_der() {
-                Ok(der) => assert_eq!(EncryptedData::parse(&der).unwrap(), e),
-                Err(err) => assert_eq!(err, Error::TooLong),
-            }
-        }
-        if let Ok(b) = KdcReqBody::parse(data) {
-            // Short flags or a signed nonce may write a few bytes longer.
-            match b.to_der() {
-                Ok(der) => assert_eq!(KdcReqBody::parse(&der).unwrap(), b),
-                Err(e) => assert_eq!(e, Error::TooLong),
-            }
-        }
-        if let Ok(p) = KrbError::read_method_data(data) {
-            assert_eq!(KrbError::read_method_data(&KrbError::method_data(&p).unwrap()).unwrap(), p);
-        }
-        let mut whole_d = Decoder::new();
-        whole_d.feed(data);
-        let mut a = Vec::new();
-        while let Some(Ok(m)) = whole_d.next_message() {
-            a.push(m);
-        }
-        let mut byte_d = Decoder::new();
-        let mut b = Vec::new();
-        for x in data {
-            byte_d.feed(std::slice::from_ref(x));
-            while let Some(Ok(m)) = byte_d.next_message() {
-                b.push(m);
-            }
-        }
-        assert_eq!(a, b);
+        contract::check_wire::<Ticket>(data);
+        contract::check_wire::<EncryptedData>(data);
+        contract::check_wire::<KdcReqBody>(data);
+        contract::check_wire::<MethodData>(data);
+        contract::check_decode_with_alloc_limit(Frames::new, data, 2 * (TCP_HEADER_LEN + MAX_MESSAGE));
+        contract::check_wire::<Message>(data);
         read
     }
 
     #[test]
     fn fuzz_loop() {
-        let mut rng = Lcg(0x6b65_7262_6572_6f73);
-        let mut seeds: Vec<Vec<u8>> = all_messages().iter().map(|m| m.to_der().unwrap()).collect();
-        seeds.push(as_req().body.to_der().unwrap());
-        seeds.push(tgt().to_der().unwrap());
+        let mut rng = Lcg::new(0x6b65_7262_6572_6f73);
+        let mut seeds: Vec<Vec<u8>> = all_messages().iter().map(|m| m.to_bytes().unwrap()).collect();
+        seeds.push(as_req().body.to_bytes().unwrap());
+        seeds.push(tgt().to_bytes().unwrap());
         let mut read = 0;
         for i in 0..6000 {
             let data = if i % 3 == 0 {
                 // Random bytes, sometimes behind a plausible header.
-                let len = rng.below(200) as usize;
-                let mut d: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
+                let mut d = rng.bytes(199);
                 if i % 2 == 0 && d.len() >= 2 {
-                    d[0] = 0x60 | [10, 11, 12, 13, 14, 15, 30][rng.below(7) as usize];
+                    d[0] = 0x60 | [10, 11, 12, 13, 14, 15, 30][rng.index(7)];
                 }
                 d
             } else {
                 // A real message with a few bytes changed, cut or added.
-                let mut d = seeds[rng.below(seeds.len() as u64) as usize].clone();
-                for _ in 0..1 + rng.below(4) {
-                    let at = rng.below(d.len() as u64) as usize;
-                    match rng.below(3) {
-                        0 => d[at] = rng.next() as u8,
-                        1 => d.truncate(at.max(1)),
-                        _ => d.insert(at, rng.next() as u8),
-                    }
+                let mut d = seeds[rng.index(seeds.len())].clone();
+                for _ in 0..1 + rng.index(4) {
+                    mutate(&mut rng, &mut d);
                 }
                 d
             };
             read += check_any(&data);
-            if let Ok(f) = frame(&data) {
+            if let Ok(f) = Frame(data.clone()).to_bytes() {
                 check_any(&f);
-                let mut d = Decoder::new();
-                for x in &f {
-                    d.feed(std::slice::from_ref(x));
-                }
-                assert_eq!(d.next_message(), Some(Ok(data.clone())));
+                assert_eq!(decode_all(Frames::new, &f), (vec![data], None));
             }
         }
         // Some changed messages still read, so the round trip is tested.
@@ -2400,7 +2401,7 @@ mod tests {
         assert_eq!(stream.push(&bytes), bytes.len());
         assert_eq!(stream.push(&[0]), 0);
         assert_eq!(stream.next(), Some(Ok(frame.0)));
-        contract::check_decode(Frames::new, &[0, 0, 0, 0, 0x80, 0, 0, 0]);
+        contract::check_decode_with_alloc_limit(Frames::new, &[0, 0, 0, 0, 0x80, 0, 0, 0], 2 * (TCP_HEADER_LEN + MAX_MESSAGE));
         assert_eq!(stream.push(&[0x80, 0, 0, 0]), 4);
         assert_eq!(stream.next(), Some(Err(Fail::Protocol(FrameError::Reserved(0x8000_0000)))));
         assert_eq!(stream.next(), None);
@@ -2412,7 +2413,7 @@ mod tests {
         use super::super::codec::{Wire, contract};
         for message in all_messages() {
             contract::check_wire_value(&message);
-            contract::check_wire::<Message>(&message.to_der().unwrap());
+            contract::check_wire::<Message>(&message.to_bytes().unwrap());
         }
         let mut out = vec![42];
         let oversized = Frame(vec![0; MAX_MESSAGE + 1]);
@@ -2422,10 +2423,10 @@ mod tests {
         assert_eq!(<Frame as Wire>::parse(&[0, 0, 0, 1]), Err(FrameParseError::Truncated));
         let mut request = as_req();
         request.padata = Some(Vec::new());
-        // Optional empty lists are refused by both writers.
+        // Optional empty lists are refused without changing the destination.
         let message = Message::AsReq(request);
-        assert!(message.to_der().is_err());
-        assert_eq!(message.write(&mut out), Err(EncodeError));
+        assert!(message.to_bytes().is_err());
+        assert_eq!(message.write(&mut out), Err(Error::Empty("padata")));
         assert_eq!(out, [42]);
     }
 
@@ -2453,8 +2454,7 @@ mod tests {
         let overhead = build(payload_len).len() - payload_len;
         let bytes = build(MAX_MESSAGE - overhead);
         assert_eq!(bytes.len(), MAX_MESSAGE);
-        let message = Message::parse(&bytes).unwrap();
-        assert_eq!(message.to_der(), Err(Error::TooLong));
-        assert_eq!(<Message as Wire>::parse(&bytes), Err(Error::TooLong));
+        assert_eq!(Message::parse(&bytes), Err(Error::TooLong));
+        contract::check_wire::<Message>(&bytes);
     }
 }
