@@ -1,11 +1,10 @@
 use std::collections::HashMap;
-use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
-use std::task::{Context, Poll, Wake, Waker};
+use std::task::{Context, Poll, Waker};
 use std::time::Instant;
 
 use crate::attach::NameGuard;
@@ -82,9 +81,9 @@ impl std::error::Error for ParseWorldSocketError {}
 /// `listen` binds the socket and returns immediately. Accepting
 /// connections continues on a helper thread that Fictionet starts, so
 /// `listen` is not async and works the same under any executor, tokio or
-/// [`block_on`]. It fails if the socket cannot be made, for example when
-/// another live world is already listening at that path. A socket file left
-/// behind by a world that has exited is replaced.
+/// [`block_on`](crate::block_on). It fails if the socket cannot be made,
+/// for example when another live world is already listening at that path.
+/// A socket file left behind by a world that has exited is replaced.
 ///
 /// The socket speaks the [relay protocol](crate::proto).
 /// Dropping the returned [`Listening`] closes the socket, so no more
@@ -685,50 +684,5 @@ impl Drop for Listening {
 impl std::fmt::Debug for Listening {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Listening").field("path", &self.path).finish()
-    }
-}
-
-/// Runs `future` on the current thread, blocking until it finishes, and
-/// returns its output.
-///
-/// Use it for a world that needs no other executor. The thread sleeps while
-/// `future` waits, and wakes when the helper threads behind [`listen`] and
-/// the timers wake it. A world on tokio awaits [`run`](crate::run) inside
-/// the tokio runtime instead.
-///
-/// `block_on` is not a tokio runtime. Anything that needs one, such as
-/// everything behind the `tokio` feature or a tokio-based database client,
-/// fails under `block_on`. Such a world runs on tokio.
-///
-/// ```no_run
-/// # use fictionet::{Attachments, Cx, Result};
-/// # async fn world(_cx: Cx, _attachments: Attachments) -> Result { Ok(()) }
-/// fn main() -> fictionet::Result {
-///     let (attacher, attachments) = fictionet::attachments();
-///     let socket = fictionet::WorldSocket::UnixSocket("/run/fictionet/world.sock".into());
-///     let _listening = fictionet::listen(socket, attacher)?;
-///     fictionet::block_on(fictionet::run(|cx| world(cx, attachments)))
-/// }
-/// ```
-pub fn block_on<F: Future>(future: F) -> F::Output {
-    struct Unpark(std::thread::Thread);
-    impl Wake for Unpark {
-        fn wake(self: Arc<Self>) {
-            self.0.unpark();
-        }
-        fn wake_by_ref(self: &Arc<Self>) {
-            self.0.unpark();
-        }
-    }
-    let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
-    let mut task = Context::from_waker(&waker);
-    let mut future = std::pin::pin!(future);
-    loop {
-        if let Poll::Ready(output) = future.as_mut().poll(&mut task) {
-            return output;
-        }
-        // A wake that came during the poll leaves a token, so this returns
-        // immediately.
-        std::thread::park();
     }
 }

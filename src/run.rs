@@ -111,7 +111,7 @@ type BoxFuture = Pin<Box<dyn Future<Output = Result> + Send>>;
 /// The part of a run that wakers and every [`Cx`] share.
 pub(crate) struct RunShared {
     /// The moment the run started: [`Instant::ZERO`](crate::time::Instant::ZERO).
-    pub(crate) start: std::time::Instant,
+    pub(crate) start: crate::sys::Instant,
     queue: Mutex<Queue>,
     /// What the run records for observers.
     pub(crate) graph: Arc<Graph>,

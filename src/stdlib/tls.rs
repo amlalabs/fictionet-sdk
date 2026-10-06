@@ -178,19 +178,8 @@ impl SecureRandom for CxRandom {
     }
 }
 
-fn os_random(mut buf: &mut [u8]) -> Result<(), GetRandomFailed> {
-    while !buf.is_empty() {
-        // SAFETY: the pointer and length describe `buf`.
-        let n = unsafe { libc::getrandom(buf.as_mut_ptr().cast(), buf.len(), 0) };
-        if n < 0 {
-            if std::io::Error::last_os_error().kind() == ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(GetRandomFailed);
-        }
-        buf = &mut buf[n as usize..];
-    }
-    Ok(())
+fn os_random(buf: &mut [u8]) -> Result<(), GetRandomFailed> {
+    crate::sys::random_bytes(buf).map_err(|_| GetRandomFailed)
 }
 
 /// How much to read from the connection underneath in one read.

@@ -39,12 +39,29 @@ httparse = "1.10"
 hyper = { version = "1.11.1", default-features = false, features = ["http1", "http2", "server"] }
 hyper-rustls = { version = "0.27", optional = true, default-features = false, features = ["http1", "http2", "ring", "tls12", "webpki-roots"] }
 hyper-util = { version = "0.1", optional = true, default-features = false, features = ["client-legacy", "http1", "http2", "tokio"] }
-libc = "0.2.189"
 ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 smoltcp = { version = "0.14", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-tcp-reno", "async"] }
-tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "net", "time", "io-util", "sync"] }
+tokio = { version = "1", default-features = false, features = ["rt", "time", "io-util", "sync"] }
 tower-service = "0.3.3"
+
+# The host side: real sockets, threads, the relay, the listener and the CLI.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+libc = "0.2.189"
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net"] }
+
+# The browser (wasm32-unknown-unknown): random bytes and the clocks come
+# from JavaScript through wasm-bindgen, and timers from setTimeout. ring's
+# feature turns on getrandom 0.2's browser backend. getrandom 0.4 is the one
+# Fictionet and hickory-proto (through rand) use. rustls-pki-types reads the
+# time of day for certificates from web-time. ring's C code builds with a
+# clang that has the wasm32 target.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+ring = { version = "0.17", features = ["wasm32_unknown_unknown_js"] }
+rustls-pki-types = { version = "1", features = ["web"] }
+getrandom = { version = "0.4", features = ["wasm_js"] }
+wasm-bindgen = "0.2"
+web-time = "1"
 
 [dev-dependencies]
 fictionet-copy-modules = { path = "tests/copy_and_own" }
