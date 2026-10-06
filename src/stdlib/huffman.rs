@@ -6,7 +6,7 @@
 
 use fictionet::stdlib::codec::Wire;
 
-/// The largest decoded string, in bytes.
+/// The decoded string limit for [`decode`], [`encode`], and [`HuffmanString`].
 pub const MAX_STRING: usize = 64 << 10;
 /// The largest encoded string, in bytes, at thirty bits per symbol.
 pub const MAX_ENCODED: usize = MAX_STRING * 30 / 8;
@@ -157,8 +157,22 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<u8>, Error> {
     if bytes.len() > MAX_ENCODED {
         return Err(Error::TooLong);
     }
+    decode_limited(bytes, MAX_STRING)
+}
+
+/// Decodes a Huffman string with at most `limit` decoded octets.
+/// Refuses invalid codes, EOS, padding, and output above the limit.
+/// The caller bounds the encoded input. Allocation is bounded by the smaller
+/// of `limit` and the input length times eight fifths.
+///
+/// ```
+/// use fictionet::stdlib::huffman::decode_limited;
+/// assert_eq!(decode_limited(&[0x1f], 1)?, b"a");
+/// # Ok::<(), fictionet::stdlib::huffman::Error>(())
+/// ```
+pub fn decode_limited(bytes: &[u8], limit: usize) -> Result<Vec<u8>, Error> {
     let h = &HUFFMAN;
-    let mut out = Vec::with_capacity((bytes.len().saturating_mul(8) / 5).min(MAX_STRING));
+    let mut out = Vec::with_capacity((bytes.len().saturating_mul(8) / 5).min(limit));
     let (mut code, mut len) = (0u32, 0usize);
     for byte in bytes {
         for bit in (0..8).rev() {
@@ -172,7 +186,7 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<u8>, Error> {
                 if sym == 256 {
                     return Err(Error::InvalidCode);
                 }
-                if out.len() >= MAX_STRING {
+                if out.len() >= limit {
                     return Err(Error::TooLong);
                 }
                 out.push(sym as u8);
@@ -284,6 +298,18 @@ mod tests {
                 .len(),
             MAX_STRING
         );
+    }
+
+    #[test]
+    fn decoding_uses_the_callers_limit() {
+        let bytes = vec![0; 60_000];
+        assert_eq!(decode_limited(&bytes, 96_000).unwrap(), vec![b'0'; 96_000]);
+        assert_eq!(decode_limited(&bytes, 95_999), Err(Error::TooLong));
+        assert_eq!(decode(&bytes), Err(Error::TooLong));
+        assert_eq!(decode_limited(&[], 0).unwrap(), b"");
+        assert_eq!(decode_limited(&[0x1f], 0), Err(Error::TooLong));
+        assert_eq!(decode_limited(&[0xff], 1), Err(Error::InvalidCode));
+        assert_eq!(decode_limited(&[0x1f], usize::MAX).unwrap(), b"a");
     }
 
     #[test]

@@ -147,9 +147,19 @@ fn request_field_limit_rejects_oversized_fields() {
     // Keep literal strings uncompressed to exercise the review's 2.1 KB section.
     let mut section = vec![0, 0];
     for field in fields {
-        qpack::Integer::<3> { flags: 0x20, value: field.name.len() as u64 }.write(&mut section).unwrap();
+        fictionet::stdlib::prefix_int::Integer::<3> {
+            flags: 0x20,
+            value: field.name.len() as u64,
+        }
+        .write(&mut section)
+        .unwrap();
         section.extend_from_slice(&field.name);
-        qpack::Integer::<7> { flags: 0, value: field.value.len() as u64 }.write(&mut section).unwrap();
+        fictionet::stdlib::prefix_int::Integer::<7> {
+            flags: 0,
+            value: field.value.len() as u64,
+        }
+        .write(&mut section)
+        .unwrap();
         section.extend_from_slice(&field.value);
     }
     let frame = Frame::Headers(section);
@@ -876,7 +886,12 @@ fn qpack_blocked_retry_preserves_insert_count_across_wrapping() {
 #[test]
 fn qpack_instruction_failures_and_eof() {
     let mut over = vec![0xc0];
-    qpack::Integer::<7> { flags: 0, value: qpack::MAX_STRING as u64 + 1 }.write(&mut over).unwrap();
+    fictionet::stdlib::prefix_int::Integer::<7> {
+        flags: 0,
+        value: qpack::MAX_STRING as u64 + 1,
+    }
+    .write(&mut over)
+    .unwrap();
     let mut stream = Stream::new(qpack::EncoderInstructions::new());
     assert_eq!(stream.push(&over), over.len());
     assert_eq!(stream.next(), Some(Err(Fail::Protocol(qpack::Error::StringTooLong))));

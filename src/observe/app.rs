@@ -647,7 +647,7 @@ fn body_layer(d: &mut Decoded, total: u64, seen: &[u8]) {
 struct Http2 {
     /// The connection preface has been read (the client's direction).
     started: bool,
-    hpack: hpack::Decoder,
+    hpack: hpack::Table,
     /// A header block that goes on in CONTINUATION frames.
     block: Option<Pending>,
     /// Bytes of this direction were lost, so where frames start is not
@@ -657,7 +657,12 @@ struct Http2 {
 
 impl Default for Http2 {
     fn default() -> Self {
-        Self { started: false, hpack: hpack::Decoder::for_observation(), block: None, lost: false }
+        Self {
+            started: false,
+            hpack: hpack::Table::for_observation(),
+            block: None,
+            lost: false,
+        }
     }
 }
 
@@ -1536,6 +1541,33 @@ mod tests {
 
     const X_OLD: &str = "4001 7803 6f6c 64";
     const X_NEW: &str = "4001 7803 6e65 77";
+
+    #[test]
+    fn expanded_huffman_headers_keep_dynamic_references() {
+        use fictionet::stdlib::{codec::Wire, prefix_int::Integer};
+
+        let mut f = Feeder::h2();
+        f.send(true, &frame(1, 0x4, 1, &hex(X_OLD)), 1500);
+        let mut block = vec![0, 1, b'x'];
+        Integer::<7> {
+            flags: 0x80,
+            value: 60_000,
+        }
+        .write(&mut block)
+        .unwrap();
+        block.extend(vec![0; 60_000]);
+        let mut chunks = block.chunks(16_000).peekable();
+        let mut kind = 1;
+        while let Some(chunk) = chunks.next() {
+            let flags = if chunks.peek().is_none() { 0x4 } else { 0 };
+            let d = f.send(true, &frame(kind, flags, 3, chunk), 1500);
+            assert!(!d.tags.contains(&"malformed"));
+            kind = 9;
+        }
+        let d = f.send(true, &frame(1, 0x4, 5, &[0x88, 0xbe]), 1500);
+        assert!(!d.tags.contains(&"malformed"));
+        assert!(has(&d, "x", "old"));
+    }
 
     /// A header block whose padding does not fit is not decoded, and the
     /// table it may have changed is forgotten.

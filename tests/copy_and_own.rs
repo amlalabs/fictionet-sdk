@@ -123,6 +123,8 @@ macro_rules! protocols {
         pub mod portmap;
         #[path = "../src/stdlib/postgres.rs"]
         pub mod postgres;
+        #[path = "../src/stdlib/prefix_int.rs"]
+        pub mod prefix_int;
         #[path = "../src/stdlib/protobuf.rs"]
         pub mod protobuf;
         #[path = "../src/stdlib/proxy_protocol.rs"]

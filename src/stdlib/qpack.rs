@@ -52,7 +52,7 @@
 use std::collections::VecDeque;
 
 use fictionet::stdlib::codec::{Decode, Step, Wire};
-use fictionet::stdlib::huffman;
+use fictionet::stdlib::{huffman, prefix_int};
 
 /// The largest integer a reader accepts, 2^62 - 1, the largest QUIC stream
 /// ID. Larger values cannot be written.
@@ -321,35 +321,19 @@ impl<'a> Cursor<'a> {
         self.b.get(self.i).copied().ok_or(Stop::More)
     }
 
-    fn byte(&mut self) -> Result<u8, Stop> {
-        let b = self.peek()?;
-        self.i += 1;
-        Ok(b)
-    }
-
     /// An integer with a `prefix`-bit prefix, 1 to 8 bits.
     fn int(&mut self, prefix: u8) -> Result<u64, Stop> {
-        let mask = ((1u16 << prefix) - 1) as u8;
-        let mut v = u64::from(self.byte()? & mask);
-        if v < u64::from(mask) {
-            return Ok(v);
-        }
-        let mut shift = 0u32;
-        loop {
-            if shift > 56 {
-                return Err(Error::IntegerOverflow.into());
-            }
-            let b = self.byte()?;
-            v = v.checked_add(u64::from(b & 0x7f) << shift).ok_or(Error::IntegerOverflow)?;
-            shift += 7;
-            if b & 0x80 == 0 {
-                break;
-            }
-        }
-        if v > MAX_INTEGER {
+        let bytes = self.b.get(self.i..).ok_or(Stop::More)?;
+        let bounded = &bytes[..bytes.len().min(MAX_INTEGER_BYTES)];
+        let (value, used) = prefix_int::read(bounded, prefix).map_err(|error| match error {
+            prefix_int::Error::Truncated if bytes.len() < MAX_INTEGER_BYTES => Stop::More,
+            _ => Stop::Bad(Error::IntegerOverflow),
+        })?;
+        if value > MAX_INTEGER {
             return Err(Error::IntegerOverflow.into());
         }
-        Ok(v)
+        self.i = self.i.checked_add(used).ok_or(Error::IntegerOverflow)?;
+        Ok(value)
     }
 
     /// A string whose Huffman flag is the bit just above a `prefix`-bit
@@ -388,58 +372,8 @@ impl RawString<'_> {
     }
 }
 
-// All callers validate the prefix, flags, and value before writing.
-fn put_integer(out: &mut Vec<u8>, prefix: u8, flags: u8, v: u64) {
-    let max = (1u64 << prefix) - 1;
-    if v < max {
-        out.push(flags | v as u8);
-        return;
-    }
-    out.push(flags | max as u8);
-    let mut rest = v - max;
-    while rest >= 0x80 {
-        out.push((rest & 0x7f) as u8 | 0x80);
-        rest >>= 7;
-    }
-    out.push(rest as u8);
-}
-
-/// A prefixed integer and the flags above its `PREFIX` low bits.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Integer<const PREFIX: u8> {
-    /// Bits outside the integer prefix.
-    pub flags: u8,
-    /// The integer, at most [`MAX_INTEGER`].
-    pub value: u64,
-}
-
-impl<const PREFIX: u8> Wire for Integer<PREFIX> {
-    type ParseError = ParseError;
-    type WriteError = Error;
-
-    /// Reads one integer. Refuses invalid prefix widths, overflow, truncation, and trailing bytes.
-    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
-        if !(1..=8).contains(&PREFIX) {
-            return Err(ParseError::Instruction(Error::IntegerOverflow));
-        }
-        let mut c = Cursor { b: bytes, i: 0 };
-        let value = c.int(PREFIX).map_err(parse_stop)?;
-        let mask = ((1u16 << PREFIX) - 1) as u8;
-        exact(Ok((Self { flags: bytes[0] & !mask, value }, c.i)), bytes.len())
-    }
-
-    /// Writes one integer. Refuses invalid prefix widths, overlapping flags, and overflow.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        if !(1..=8).contains(&PREFIX) || self.value > MAX_INTEGER {
-            return Err(Error::Unwritable);
-        }
-        let mask = ((1u16 << PREFIX) - 1) as u8;
-        if self.flags & mask != 0 {
-            return Err(Error::Unwritable);
-        }
-        put_integer(out, PREFIX, self.flags, self.value);
-        Ok(())
-    }
+fn put_integer(out: &mut Vec<u8>, prefix: u8, flags: u8, value: u64) -> Result<(), Error> {
+    prefix_int::write(out, prefix, flags, value).map_err(|_| Error::Unwritable)
 }
 
 fn parse_stop(stop: Stop) -> ParseError {
@@ -462,10 +396,10 @@ fn exact<T>(result: Result<(T, usize), ParseError>, len: usize) -> Result<T, Par
 fn put_string(out: &mut Vec<u8>, prefix: u8, flags: u8, s: &[u8]) -> Result<(), Error> {
     let h = huffman::encoded_len(s).map_err(|_| Error::Unwritable)?;
     if h < s.len() {
-        put_integer(out, prefix, flags | (1 << prefix), h as u64);
+        put_integer(out, prefix, flags | (1 << prefix), h as u64)?;
         huffman::encode(s, out).map_err(|_| Error::Unwritable)?;
     } else {
-        put_integer(out, prefix, flags, s.len() as u64);
+        put_integer(out, prefix, flags, s.len() as u64)?;
         out.extend_from_slice(s);
     }
     Ok(())
@@ -941,8 +875,13 @@ impl Wire for EncodedPrefix {
         if self.encoded_insert_count > MAX_INTEGER || self.delta_base > MAX_INTEGER {
             return Err(Error::Unwritable);
         }
-        put_integer(out, 8, 0, self.encoded_insert_count);
-        put_integer(out, 7, if self.negative { 0x80 } else { 0 }, self.delta_base);
+        put_integer(out, 8, 0, self.encoded_insert_count)?;
+        put_integer(
+            out,
+            7,
+            if self.negative { 0x80 } else { 0 },
+            self.delta_base,
+        )?;
         Ok(())
     }
 }
@@ -1566,16 +1505,16 @@ impl Wire for EncoderInstruction {
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         check_encoder_instruction(self).map_err(|_| Error::Unwritable)?;
         match self {
-            EncoderInstruction::SetCapacity(c) => put_integer(out, 5, 0x20, *c),
+            EncoderInstruction::SetCapacity(c) => put_integer(out, 5, 0x20, *c)?,
             EncoderInstruction::InsertWithNameRef { static_table, index, value } => {
-                put_integer(out, 6, if *static_table { 0xc0 } else { 0x80 }, *index);
+                put_integer(out, 6, if *static_table { 0xc0 } else { 0x80 }, *index)?;
                 put_string(out, 7, 0, value)?;
             }
             EncoderInstruction::InsertWithLiteralName { name, value } => {
                 put_string(out, 5, 0x40, name)?;
                 put_string(out, 7, 0, value)?;
             }
-            EncoderInstruction::Duplicate(i) => put_integer(out, 5, 0, *i),
+            EncoderInstruction::Duplicate(i) => put_integer(out, 5, 0, *i)?,
         }
         Ok(())
     }
@@ -1610,9 +1549,9 @@ impl Wire for DecoderInstruction {
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         check_decoder_instruction(self).map_err(|_| Error::Unwritable)?;
         match self {
-            DecoderInstruction::SectionAck(s) => put_integer(out, 7, 0x80, *s),
-            DecoderInstruction::StreamCancel(s) => put_integer(out, 6, 0x40, *s),
-            DecoderInstruction::InsertCountIncrement(n) => put_integer(out, 6, 0, *n),
+            DecoderInstruction::SectionAck(s) => put_integer(out, 7, 0x80, *s)?,
+            DecoderInstruction::StreamCancel(s) => put_integer(out, 6, 0x40, *s)?,
+            DecoderInstruction::InsertCountIncrement(n) => put_integer(out, 6, 0, *n)?,
         }
         Ok(())
     }
@@ -1649,17 +1588,18 @@ impl Wire for Representation {
         }
         check_strings(name, value).map_err(|_| Error::Unwritable)?;
         match self {
-            Representation::Indexed { static_table, index } => {
-                put_integer(out, 6, if *static_table { 0xc0 } else { 0x80 }, *index)
-            }
-            Representation::IndexedPostBase(index) => put_integer(out, 4, 0x10, *index),
+            Representation::Indexed {
+                static_table,
+                index,
+            } => put_integer(out, 6, if *static_table { 0xc0 } else { 0x80 }, *index)?,
+            Representation::IndexedPostBase(index) => put_integer(out, 4, 0x10, *index)?,
             Representation::LiteralNameRef { never_index, static_table, index, value } => {
                 let flags = 0x40 | if *never_index { 0x20 } else { 0 } | if *static_table { 0x10 } else { 0 };
-                put_integer(out, 4, flags, *index);
+                put_integer(out, 4, flags, *index)?;
                 put_string(out, 7, 0, value)?;
             }
             Representation::LiteralPostBaseNameRef { never_index, index, value } => {
-                put_integer(out, 3, if *never_index { 0x08 } else { 0 }, *index);
+                put_integer(out, 3, if *never_index { 0x08 } else { 0 }, *index)?;
                 put_string(out, 7, 0, value)?;
             }
             Representation::LiteralName { never_index, name, value } => {
@@ -1871,6 +1811,7 @@ mod tests {
         test_support::{decode_all, Lcg, mutate},
     };
     use super::*;
+    use fictionet::stdlib::prefix_int::Integer;
 
     fn apply(table: &mut Table, bytes: &[u8]) -> Result<(), Error> {
         let (items, error) = decode_all(EncoderInstructions::new, bytes);
@@ -1906,7 +1847,10 @@ mod tests {
         assert_eq!(Integer::<8> { flags: 0, value: 42 }.to_bytes().unwrap(), [0x2a]);
         assert_eq!(Integer::<5>::parse(&[0xea]), Ok(Integer { flags: 0xe0, value: 10 }));
         for n in 0..3 {
-            assert_eq!(Integer::<5>::parse(&[0x1f, 0x9a, 0x0a][..n]), Err(ParseError::Truncated));
+            assert_eq!(
+                Integer::<5>::parse(&[0x1f, 0x9a, 0x0a][..n]),
+                Err(prefix_int::Error::Truncated)
+            );
         }
     }
 
@@ -1918,10 +1862,17 @@ mod tests {
             {
                 let unit = Integer::<P> { flags: 0, value };
                 contract::check_wire_value(&unit);
+                let bytes = unit.to_bytes().unwrap();
+                let mut c = Cursor { b: &bytes, i: 0 };
                 if value > MAX_INTEGER {
-                    assert_eq!(unit.to_bytes(), Err(Error::Unwritable));
+                    assert!(matches!(c.int(P), Err(Stop::Bad(Error::IntegerOverflow))));
+                    assert_eq!(
+                        DecoderInstruction::SectionAck(value).to_bytes(),
+                        Err(Error::Unwritable)
+                    );
                 } else {
-                    assert!(unit.to_bytes().unwrap().len() <= MAX_INTEGER_BYTES);
+                    assert!(bytes.len() <= MAX_INTEGER_BYTES);
+                    assert_eq!(c.int(P).ok(), Some(value));
                 }
             }
         }
@@ -1933,17 +1884,22 @@ mod tests {
         check::<6>();
         check::<7>();
         check::<8>();
-        assert_eq!(Integer::<0> { flags: 0, value: 0 }.to_bytes(), Err(Error::Unwritable));
-        assert_eq!(Integer::<9>::parse(&[0]), Err(ParseError::Instruction(Error::IntegerOverflow)));
+        assert_eq!(
+            Integer::<0> { flags: 0, value: 0 }.to_bytes(),
+            Err(prefix_int::Error::Prefix)
+        );
+        assert_eq!(Integer::<9>::parse(&[0]), Err(prefix_int::Error::Prefix));
         assert_eq!(Integer::<8>::parse(&hex("ff 80feffffffffffff3f")), Ok(Integer { flags: 0, value: MAX_INTEGER }));
         // MAX_INTEGER + 1 with an eight-bit prefix.
         for bytes in [vec![0xff; 30], hex("ff 81feffffffffffff3f")] {
-            assert_eq!(Integer::<8>::parse(&bytes), Err(ParseError::Instruction(Error::IntegerOverflow)));
+            let mut c = Cursor { b: &bytes, i: 0 };
+            assert!(matches!(c.int(8), Err(Stop::Bad(Error::IntegerOverflow))));
         }
-        assert_eq!(
-            Integer::<5>::parse(&[0x1f, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0]),
-            Err(ParseError::Instruction(Error::IntegerOverflow))
-        );
+        let bytes = [
+            0x1f, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0,
+        ];
+        let mut c = Cursor { b: &bytes, i: 0 };
+        assert!(matches!(c.int(5), Err(Stop::Bad(Error::IntegerOverflow))));
     }
 
     #[test]
@@ -2516,8 +2472,23 @@ mod tests {
 
     #[test]
     fn integer_flags_never_spill_into_the_value() {
-        assert_eq!(Integer::<5> { flags: 0xff, value: 3 }.to_bytes(), Err(Error::Unwritable));
-        assert_eq!(Integer::<5> { flags: 0xe0, value: 3 }.to_bytes().unwrap(), [0xe3]);
+        assert_eq!(
+            Integer::<5> {
+                flags: 0xff,
+                value: 3
+            }
+            .to_bytes(),
+            Err(prefix_int::Error::Flags)
+        );
+        assert_eq!(
+            Integer::<5> {
+                flags: 0xe0,
+                value: 3
+            }
+            .to_bytes()
+            .unwrap(),
+            [0xe3]
+        );
     }
 
     #[test]
@@ -2606,6 +2577,4 @@ mod tests {
         }
         assert!(encoder.table().is_empty());
     }
-
-
 }

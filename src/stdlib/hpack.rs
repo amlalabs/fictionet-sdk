@@ -1,24 +1,26 @@
 //! HPACK header compression for HTTP/2 (RFC 7541).
 //!
-//! Keep one [`Decoder`] and [`Encoder`] per direction. Pass complete header
-//! blocks to [`Decoder::decode_block`]; HTTP/2 framing supplies their boundaries.
-//! [`Decoder::set_settings_limit`] applies an acknowledged header table setting.
-//! [`Decoder::for_observation`] handles captures with missing settings or blocks.
-//! Call [`Decoder::forget`] after a gap to avoid reading stale table entries.
+//! Keep one [`Table`] and [`Encoder`] per direction. Pass complete header
+//! blocks to [`Table::decode_block`]; HTTP/2 framing supplies their boundaries.
+//! [`Table::set_settings_limit`] applies an acknowledged header table setting.
+//! [`Table::for_observation`] handles captures with missing settings or blocks.
+//! Call [`Table::forget`] after a gap to avoid reading stale table entries.
 //! Names and values stay as octets. Text conversion belongs to the caller.
+//! A server using this module must advertise SETTINGS_HEADER_TABLE_SIZE
+//! at most [`MAX_TABLE`].
 //!
 //! ```
-//! use fictionet::stdlib::hpack::{Decoder, Encoder, Field, MAX_DECODED};
+//! use fictionet::stdlib::hpack::{Table, Encoder, Field, MAX_DECODED};
 //! let mut encoder = Encoder::new(4096);
 //! let fields = [Field::new(":method", "GET"), Field::new("x-color", "blue")];
 //! let mut bytes = Vec::new();
 //! encoder.encode_block(&fields, &mut bytes)?;
-//! let block = Decoder::new(4096).decode_block(&bytes, MAX_DECODED)?;
+//! let block = Table::new(4096).decode_block(&bytes, MAX_DECODED)?;
 //! assert_eq!(block.headers[1].value.as_deref(), Some(b"blue".as_slice()));
 //! # Ok::<(), fictionet::stdlib::hpack::Error>(())
 //! ```
 
-use fictionet::stdlib::{codec::Wire, huffman};
+use fictionet::stdlib::{codec::Wire, huffman, prefix_int};
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -28,7 +30,7 @@ pub const MAX_HEADERS: usize = 256;
 pub const MAX_DECODED: usize = 64 << 10;
 /// The largest encoded block accepted by the decoder.
 pub const MAX_BLOCK: usize = 256 << 10;
-/// The largest encoded or decoded string literal.
+/// The largest encoded or decoded string literal in strict mode.
 pub const MAX_STRING: usize = huffman::MAX_STRING;
 /// The most entry bytes retained in a dynamic table, including overhead.
 pub const MAX_TABLE: usize = 64 << 10;
@@ -44,7 +46,8 @@ pub enum Error {
     Trailing,
     /// An integer exceeds `u64` or its prefix width is invalid.
     IntegerOverflow,
-    /// A string exceeds [`MAX_STRING`] before or after decoding.
+    /// A string exceeds its encoded or decoded limit. Strict mode uses
+    /// [`MAX_STRING`]; observation uses `MAX_BLOCK * 8 / 5`.
     StringTooLong,
     /// A Huffman string has invalid codes, EOS, or padding.
     Huffman,
@@ -52,13 +55,15 @@ pub enum Error {
     Index,
     /// A size update exceeds the acknowledged settings limit.
     TableSize,
-    /// Size updates must precede fields, with at most two in nondecreasing order.
+    /// Strict mode requires size updates before fields. It also permits at most
+    /// two updates in nondecreasing order. The count and order checks are
+    /// stricter than RFC 7541 requires of decoders. Observation skips these checks.
     SizeUpdateOrder,
     /// A settings reduction requires a size update at the next block's start.
     MissingSizeUpdate,
     /// The encoded block exceeds [`MAX_BLOCK`].
     BlockTooLong,
-    /// A standalone field refers to a table or is not a literal.
+    /// A standalone field reads or changes table state, or is not a literal.
     ContextRequired,
     /// The value cannot be written exactly within its limits.
     Unwritable,
@@ -148,48 +153,6 @@ pub const STATIC_TABLE: [(&str, &str); 61] = [
     ("www-authenticate", ""),
 ];
 
-/// An integer with a prefix width from one to eight bits.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Integer<const PREFIX: u8> {
-    /// Bits above the integer prefix.
-    pub flags: u8,
-    /// The unsigned integer.
-    pub value: u64,
-}
-impl<const PREFIX: u8> Wire for Integer<PREFIX> {
-    type ParseError = Error;
-    type WriteError = Error;
-
-    /// Reads one integer. Refuses invalid widths, overflow, truncation, and trailing bytes.
-    fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        let mut c = Cursor { bytes, at: 0 };
-        let first = c.peek()?;
-        let value = c.integer(PREFIX)?;
-        c.end()?;
-        Ok(Self {
-            flags: first & !mask(PREFIX)?,
-            value,
-        })
-    }
-
-    /// Appends one integer. Refuses invalid widths or flags inside the prefix.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        let mask = mask(PREFIX).map_err(|_| Error::Unwritable)?;
-        if self.flags & mask != 0 {
-            return Err(Error::Unwritable);
-        }
-        put_integer(out, PREFIX, self.flags, self.value);
-        Ok(())
-    }
-}
-
-fn mask(prefix: u8) -> Result<u8, Error> {
-    if !(1..=8).contains(&prefix) {
-        return Err(Error::IntegerOverflow);
-    }
-    Ok(((1u16 << prefix) - 1) as u8)
-}
-
 struct Cursor<'a> {
     bytes: &'a [u8],
     at: usize,
@@ -211,37 +174,25 @@ impl Cursor<'_> {
         }
     }
     fn integer(&mut self, prefix: u8) -> Result<u64, Error> {
-        let mask = u64::from(mask(prefix)?);
-        let mut value = u64::from(self.byte()?) & mask;
-        if value < mask {
-            return Ok(value);
-        }
-        for shift in (0..=63).step_by(7) {
-            let b = self.byte()?;
-            let low = u64::from(b & 0x7f);
-            if low > (u64::MAX >> shift) {
-                return Err(Error::IntegerOverflow);
-            }
-            value = value
-                .checked_add(low << shift)
-                .ok_or(Error::IntegerOverflow)?;
-            if b & 0x80 == 0 {
-                return Ok(value);
-            }
-        }
-        Err(Error::IntegerOverflow)
+        let bytes = self.bytes.get(self.at..).ok_or(Error::Truncated)?;
+        let (value, used) = prefix_int::read(bytes, prefix).map_err(|error| match error {
+            prefix_int::Error::Truncated => Error::Truncated,
+            _ => Error::IntegerOverflow,
+        })?;
+        self.at = self.at.checked_add(used).ok_or(Error::IntegerOverflow)?;
+        Ok(value)
     }
-    fn string(&mut self) -> Result<Vec<u8>, Error> {
+    fn string(&mut self, limit: usize) -> Result<Vec<u8>, Error> {
         let coded = self.peek()? & 0x80 != 0;
         let len = usize::try_from(self.integer(7)?).map_err(|_| Error::StringTooLong)?;
-        if len > MAX_STRING {
+        if len > limit {
             return Err(Error::StringTooLong);
         }
         let end = self.at.checked_add(len).ok_or(Error::StringTooLong)?;
         let bytes = self.bytes.get(self.at..end).ok_or(Error::Truncated)?;
         self.at = end;
         if coded {
-            huffman::decode(bytes).map_err(|e| match e {
+            huffman::decode_limited(bytes, limit).map_err(|e| match e {
                 huffman::Error::TooLong => Error::StringTooLong,
                 _ => Error::Huffman,
             })
@@ -251,28 +202,16 @@ impl Cursor<'_> {
     }
 }
 
-// Internal callers use constant valid prefixes and nonoverlapping flags.
-fn put_integer(out: &mut Vec<u8>, prefix: u8, flags: u8, value: u64) {
-    let max = (1u64 << prefix) - 1;
-    if value < max {
-        out.push(flags | value as u8);
-        return;
-    }
-    out.push(flags | max as u8);
-    let mut rest = value - max;
-    while rest >= 128 {
-        out.push((rest & 127) as u8 | 128);
-        rest >>= 7;
-    }
-    out.push(rest as u8);
+fn put_integer(out: &mut Vec<u8>, prefix: u8, flags: u8, value: u64) -> Result<(), Error> {
+    prefix_int::write(out, prefix, flags, value).map_err(|_| Error::Unwritable)
 }
 fn put_string(out: &mut Vec<u8>, bytes: &[u8], coded: bool) -> Result<(), Error> {
     let len = huffman::encoded_len(bytes).map_err(|_| Error::Unwritable)?;
     if coded && len < bytes.len() {
-        put_integer(out, 7, 0x80, len as u64);
+        put_integer(out, 7, 0x80, len as u64)?;
         huffman::encode(bytes, out).map_err(|_| Error::Unwritable)?;
     } else {
-        put_integer(out, 7, 0, bytes.len() as u64);
+        put_integer(out, 7, 0, bytes.len() as u64)?;
         out.extend_from_slice(bytes);
     }
     Ok(())
@@ -291,7 +230,7 @@ impl Wire for StringLiteral {
     /// Reads one string. Refuses truncation, trailing bytes, overflow, bad Huffman, and limits.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         let mut c = Cursor { bytes, at: 0 };
-        let value = c.string()?;
+        let value = c.string(MAX_STRING)?;
         c.end()?;
         Ok(Self(value))
     }
@@ -326,16 +265,17 @@ impl Wire for Field {
     type ParseError = Error;
     type WriteError = Error;
 
-    /// Reads one literal with a new name. Refuses table references, nonliterals,
+    /// Reads one literal with a new name. Refuses incremental indexing,
+    /// table references, nonliterals,
     /// truncation, trailing bytes, bad Huffman, integer overflow, and string limits.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         let mut c = Cursor { bytes, at: 0 };
         let first = c.byte()?;
-        if !matches!(first, 0 | 0x10 | 0x40) {
+        if !matches!(first, 0 | 0x10) {
             return Err(Error::ContextRequired);
         }
-        let name = c.string()?;
-        let value = c.string()?;
+        let name = c.string(MAX_STRING)?;
+        let value = c.string(MAX_STRING)?;
         c.end()?;
         Ok(Self {
             name,
@@ -408,7 +348,7 @@ impl Block {
 
 /// Reads complete blocks while retaining one direction's bounded dynamic table.
 #[derive(Clone, Debug)]
-pub struct Decoder {
+pub struct Table {
     table: VecDeque<(Arc<[u8]>, Vec<u8>)>,
     size: usize,
     max: Option<usize>,
@@ -416,7 +356,7 @@ pub struct Decoder {
     settings: Option<usize>,
     required_min: Option<usize>,
 }
-impl Default for Decoder {
+impl Default for Table {
     fn default() -> Self {
         Self::new(4096)
     }
@@ -427,23 +367,26 @@ enum Entry<'a> {
     Dynamic(&'a Arc<[u8]>, &'a [u8]),
     Unknown,
 }
-impl Decoder {
+impl Table {
     /// Starts with the agreed settings limit, capped at [`MAX_TABLE`].
-    /// The initial table maximum is the lesser of this limit and 4096.
+    /// The table starts at 4096. A limit below 4096 requires a size update
+    /// at or below that limit at the start of the first block.
     pub fn new(settings_limit: usize) -> Self {
         let settings_limit = settings_limit.min(MAX_TABLE);
         Self {
             table: VecDeque::new(),
             size: 0,
-            max: Some(settings_limit.min(4096)),
+            max: Some(4096),
             unsure: false,
             settings: Some(settings_limit),
-            required_min: None,
+            required_min: (settings_limit < 4096).then_some(settings_limit),
         }
     }
     /// Starts a capture decoder without a known settings bound. Tables larger
     /// than [`MAX_TABLE`] retain their newest entries and mark older ones unknown.
-    /// Block syntax and string limits are still checked.
+    /// Strings may expand to `MAX_BLOCK * 8 / 5` decoded octets.
+    /// Size updates may follow fields, repeat, or decrease.
+    /// Block syntax and the derived string limit are still checked.
     pub fn for_observation() -> Self {
         Self {
             settings: None,
@@ -545,7 +488,7 @@ impl Decoder {
         }
     }
     fn insert(&mut self, name: Arc<[u8]>, value: Vec<u8>) {
-        // Each string is bounded by MAX_STRING and the old size by MAX_TABLE.
+        // Each string is bounded by MAX_BLOCK * 8 / 5 and the old size by MAX_TABLE.
         self.size += name.len() + value.len() + ENTRY_OVERHEAD;
         self.table.push_front((name, value));
         self.evict();
@@ -557,6 +500,11 @@ impl Decoder {
         let mut out = Block::default();
         let mut used = 0;
         let mut c = Cursor { bytes, at: 0 };
+        let string_limit = if self.settings.is_none() {
+            MAX_BLOCK * 8 / 5
+        } else {
+            MAX_STRING
+        };
         let mut fields_started = false;
         let mut updates = 0;
         let mut previous = 0;
@@ -564,7 +512,9 @@ impl Decoder {
             let first = c.peek()?;
             if first & 0xe0 == 0x20 {
                 let size = usize::try_from(c.integer(5)?).map_err(|_| Error::TableSize)?;
-                if fields_started || updates == 2 || (updates == 1 && size < previous) {
+                if self.settings.is_some()
+                    && (fields_started || updates == 2 || (updates == 1 && size < previous))
+                {
                     return Err(Error::SizeUpdateOrder);
                 }
                 if self.settings.is_some_and(|limit| size > limit) {
@@ -595,14 +545,14 @@ impl Decoder {
                 let never_index = !indexing && first & 0x10 != 0;
                 let index = c.integer(if indexing { 6 } else { 4 })?;
                 let name: Option<Arc<[u8]>> = match index {
-                    0 => Some(c.string()?.into()),
+                    0 => Some(c.string(string_limit)?.into()),
                     n => match self.get(n)? {
                         Entry::Known(name, _) => Some(name.into()),
                         Entry::Dynamic(name, _) => Some(name.clone()),
                         Entry::Unknown => None,
                     },
                 };
-                let value = c.string()?;
+                let value = c.string(string_limit)?;
                 out.keep(limit, &mut used, name.as_deref(), Some(&value), never_index);
                 match (indexing, name) {
                     (true, Some(name)) => self.insert(name, value),
@@ -622,7 +572,7 @@ impl Decoder {
 /// Never-indexed fields always remain literals. Huffman is used when shorter.
 #[derive(Clone, Debug)]
 pub struct Encoder {
-    table: Decoder,
+    table: Table,
     pending_min: Option<usize>,
     huffman: bool,
 }
@@ -633,13 +583,16 @@ impl Default for Encoder {
 }
 impl Encoder {
     /// Starts with an agreed settings limit, capped at [`MAX_TABLE`].
-    /// The initial maximum is the lesser of that limit and 4096.
+    /// The table starts at 4096. A lower limit queues a size update
+    /// at the start of the first block.
     pub fn new(settings_limit: usize) -> Self {
-        Self {
-            table: Decoder::new(settings_limit),
+        let mut encoder = Self {
+            table: Table::default(),
             pending_min: None,
             huffman: true,
-        }
+        };
+        encoder.set_settings_limit(settings_limit);
+        encoder
     }
     /// Enables Huffman coding when it is shorter. Disabling it emits raw literals.
     pub fn set_huffman(&mut self, enabled: bool) {
@@ -692,14 +645,13 @@ impl Encoder {
                 return Err(Error::Unwritable);
             }
         }
-        let mut next = self.clone();
+        // Length checks and fixed prefixes cover all fallible writes below.
+        let pending_min = self.pending_min;
         let start = out.len();
-        match next.write_block(fields, out) {
-            Ok(()) => {
-                *self = next;
-                Ok(())
-            }
+        match self.write_block(fields, out) {
+            Ok(()) => Ok(()),
             Err(_) => {
+                self.pending_min = pending_min;
                 out.truncate(start);
                 Err(Error::Unwritable)
             }
@@ -707,10 +659,10 @@ impl Encoder {
     }
     fn write_block(&mut self, fields: &[Field], out: &mut Vec<u8>) -> Result<(), Error> {
         if let Some(min) = self.pending_min.take() {
-            put_integer(out, 5, 0x20, min as u64);
+            put_integer(out, 5, 0x20, min as u64)?;
             let capacity = self.table.max.unwrap_or(0);
             if capacity != min {
-                put_integer(out, 5, 0x20, capacity as u64);
+                put_integer(out, 5, 0x20, capacity as u64)?;
             }
         }
         for field in fields {
@@ -737,7 +689,7 @@ impl Encoder {
                 }
             }
             if let Some(index) = exact.filter(|_| !field.never_index) {
-                put_integer(out, 7, 0x80, index as u64);
+                put_integer(out, 7, 0x80, index as u64)?;
                 continue;
             }
             let (prefix, flags) = if field.never_index {
@@ -745,7 +697,7 @@ impl Encoder {
             } else {
                 (6, 0x40)
             };
-            put_integer(out, prefix, flags, name_index as u64);
+            put_integer(out, prefix, flags, name_index as u64)?;
             if name_index == 0 {
                 put_string(out, &field.name, self.huffman)?;
             }
@@ -762,6 +714,7 @@ impl Encoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fictionet::stdlib::prefix_int::Integer;
 
     fn hex(s: &str) -> Vec<u8> {
         let s: String = s.split_whitespace().collect();
@@ -792,7 +745,7 @@ mod tests {
     /// dynamic table.
     #[test]
     fn rfc_7541_requests_with_huffman() {
-        let mut d = Decoder::for_observation();
+        let mut d = Table::for_observation();
         let h = d.decode_all(&hex("8286 8441 8cf1 e3c2 e5f2 3a6b a0ab 90f4 ff"));
         assert_eq!(
             pairs(&h),
@@ -816,9 +769,9 @@ mod tests {
     /// RFC 7541 C.6.1: a response, Huffman coded, in a 256-byte table.
     #[test]
     fn rfc_7541_response() {
-        let mut d = Decoder {
+        let mut d = Table {
             max: Some(256),
-            ..Decoder::for_observation()
+            ..Table::for_observation()
         };
         let h = d
             .decode_all(&hex(
@@ -837,9 +790,16 @@ mod tests {
 
     #[test]
     fn broken_blocks_forget_the_table() {
-        let mut d = Decoder::for_observation();
-        assert!(d.decode_block(&[0xff], MAX_DECODED).is_err());
-        assert!(d.decode_block(&[0x41, 0x85, 0xff], MAX_DECODED).is_err());
+        for bytes in [vec![0xff], vec![0x41, 0x85, 0xff]] {
+            let mut d = Table::for_observation();
+            d.decode_all(&hex("400178036f6c64"));
+            assert_eq!(d.table_len(), 1);
+            assert!(d.decode_block(&bytes, MAX_DECODED).is_err());
+            assert!(d.is_unsure());
+            assert_eq!(d.table_len(), 0);
+            assert_eq!(d.table_size(), 0);
+            assert_eq!(d.table_capacity(), None);
+        }
         assert!(huffman::decode(&[0xff, 0xff, 0xff, 0xff]).is_err());
     }
 
@@ -849,7 +809,7 @@ mod tests {
     fn a_block_keeps_only_what_the_limit_allows() {
         let mut block = vec![0x40, 0x01, b'x', 0x7f, 0xa1, 0x1e];
         block.extend(std::iter::repeat_n(b'v', 4000));
-        let mut d = Decoder::for_observation();
+        let mut d = Table::for_observation();
         assert_eq!(d.decode_all(&block).len(), 1);
         let b = d.decode_block(&vec![0xbe; 10_000], MAX_DECODED).unwrap();
         assert_eq!(b.headers.len(), MAX_DECODED / 4001);
@@ -862,7 +822,7 @@ mod tests {
     /// 256 headers is seen by the next block.
     #[test]
     fn headers_past_the_limit_still_update_the_table() {
-        let mut d = Decoder::for_observation();
+        let mut d = Table::for_observation();
         d.decode_all(&hex("4001 7803 6f6c 64")); // x: old
         let mut block = vec![0x82; 256];
         block.extend(hex("4001 7803 6e65 77")); // x: new
@@ -876,7 +836,7 @@ mod tests {
     /// takes one byte of the table.
     #[test]
     fn table_sizes_count_octets() {
-        let mut d = Decoder::for_observation();
+        let mut d = Table::for_observation();
         // Table size 35, then x: 0xff, which takes 1 + 1 + 32 = 34 bytes.
         d.decode_all(&hex("3f04 4001 7801 ff"));
         let h = d.decode_all(&[0xbe]);
@@ -888,7 +848,7 @@ mod tests {
     /// added later are known, older ones show as unknown, not stale.
     #[test]
     fn a_forgotten_table_shows_unknown_not_stale() {
-        let mut d = Decoder::for_observation();
+        let mut d = Table::for_observation();
         d.decode_all(&hex("4001 7803 6f6c 64")); // x: old
         d.forget();
         d.decode_all(&hex("4001 7903 6e65 77")); // y: new
@@ -911,7 +871,7 @@ mod tests {
             (None, Some(b"a".as_slice()))
         );
         // Once known entries fill the table, nothing older can be left.
-        let mut d = Decoder::for_observation();
+        let mut d = Table::for_observation();
         d.forget();
         d.decode_all(&hex("3f3b 4001 7801 61")); // size 90, then x: a (34)
         assert!(d.unsure, "an entry of 32 bytes or more may be left");
@@ -927,7 +887,7 @@ mod tests {
     /// are unknown, not missing.
     #[test]
     fn a_table_past_what_is_kept_is_unsure() {
-        let mut d = Decoder::for_observation();
+        let mut d = Table::for_observation();
         // Size update to 1 MiB: 0x3f, then 1,048,576 - 31 as an integer.
         let mut block = vec![0x3f];
         let mut v = (1usize << 20) - 31;
@@ -953,7 +913,7 @@ mod tests {
     /// it, entries are kept until a size update says what the maximum is.
     #[test]
     fn a_forgotten_table_forgets_its_maximum() {
-        let mut d = Decoder::for_observation();
+        let mut d = Table::for_observation();
         d.decode_all(&hex("20")); // size 0
         d.forget(); // the block not decoded set it to 4,096
         d.decode_all(&hex("4001 7803 6e65 77")); // x: new
@@ -966,7 +926,7 @@ mod tests {
     /// such literals costs no more than its own bytes.
     #[test]
     fn literals_share_long_names() {
-        let mut d = Decoder::for_observation();
+        let mut d = Table::for_observation();
         // Size 65,536, then an entry with a 4,000-byte name.
         let mut block = vec![0x3f, 0xe1, 0xff, 0x03, 0x40, 0x7f, 0xa1, 0x1e];
         block.extend(std::iter::repeat_n(b'n', 4000));
@@ -979,13 +939,14 @@ mod tests {
         assert!(d.table.iter().all(|(n, _)| Arc::ptr_eq(n, &d.table[0].0)));
     }
 
-    impl Decoder {
+    impl Table {
         fn decode_all(&mut self, b: &[u8]) -> Vec<Header> {
             let block = self.decode_block(b, MAX_DECODED).unwrap();
             assert_eq!(block.more, 0);
             block.headers
         }
     }
+
     #[test]
     fn rfc_c2_representations() {
         for (bytes, expected, size, never) in [
@@ -1009,7 +970,7 @@ mod tests {
             ),
             ("82", (":method", "GET"), 0, false),
         ] {
-            let mut d = Decoder::default();
+            let mut d = Table::default();
             let b = d.decode_block(&hex(bytes), MAX_DECODED).unwrap();
             assert_eq!(pairs(&b.headers), [expected]);
             assert_eq!(b.headers[0].never_index, never);
@@ -1052,7 +1013,7 @@ mod tests {
             ],
         ];
         for (huffman, examples) in [(false, raw), (true, coded)] {
-            let mut d = Decoder::default();
+            let mut d = Table::default();
             let mut encoder = Encoder::default();
             encoder.set_huffman(huffman);
             for ((example, fields), size) in examples.iter().zip(&expected).zip([57, 110, 164]) {
@@ -1106,9 +1067,10 @@ mod tests {
             ],
         ];
         for (huffman, examples) in [(false, raw), (true, coded)] {
-            let mut d = Decoder::new(256);
+            let mut d = Table::new(256);
+            d.decode_block(&update(256), 0).unwrap();
             let mut encoder = Encoder::new(256);
-            let mut back = Decoder::new(256);
+            let mut back = Table::new(256);
             encoder.set_huffman(huffman);
             for ((example, fields), size) in examples.iter().zip(&expected).zip([222, 222, 215]) {
                 let block = d.decode_block(&hex(example), MAX_DECODED).unwrap();
@@ -1128,35 +1090,8 @@ mod tests {
     }
 
     #[test]
-    fn integers_edges_overflow_and_strict_writers() {
+    fn strict_literal_writers() {
         use fictionet::stdlib::codec::contract;
-        assert_eq!(Integer::<5>::parse(&hex("0a")).unwrap().value, 10);
-        assert_eq!(Integer::<5>::parse(&hex("1f9a0a")).unwrap().value, 1337);
-        assert_eq!(Integer::<8>::parse(&hex("2a")).unwrap().value, 42);
-        for value in [0, 30, 31, 32, 127, 255, 256, u32::MAX as u64, u64::MAX] {
-            contract::check_wire_value(&Integer::<1> { flags: 0xfe, value });
-            contract::check_wire_value(&Integer::<5> { flags: 0xa0, value });
-            contract::check_wire_value(&Integer::<8> { flags: 0, value });
-        }
-        assert_eq!(Integer::<5>::parse(&[31]), Err(Error::Truncated));
-        assert_eq!(Integer::<5>::parse(&[0, 0]), Err(Error::Trailing));
-        assert_eq!(
-            Integer::<5>::parse(&[0xff; 12]),
-            Err(Error::IntegerOverflow)
-        );
-        assert_eq!(
-            Integer::<5>::parse(&hex("1fffffffffffffffffff01")),
-            Err(Error::IntegerOverflow)
-        );
-        assert_eq!(
-            Integer::<5>::parse(&hex("1f80808080808080808002")),
-            Err(Error::IntegerOverflow)
-        );
-        // Nonminimal encodings are permitted, within the fixed integer byte bound.
-        assert_eq!(Integer::<5>::parse(&hex("1f8000")).unwrap().value, 31);
-        contract::check_wire_value(&Integer::<0> { flags: 0, value: 0 });
-        contract::check_wire_value(&Integer::<9> { flags: 0, value: 0 });
-        contract::check_wire_value(&Integer::<8> { flags: 1, value: 0 });
         contract::check_wire_value(&StringLiteral(vec![0; MAX_STRING + 1]));
         contract::check_wire_value(&Field::new(vec![0; MAX_STRING + 1], b""));
         contract::check_wire_value(&Field::new(b"", vec![0; MAX_STRING + 1]));
@@ -1173,16 +1108,31 @@ mod tests {
 
     #[test]
     fn size_updates_and_settings_reductions() {
-        for block in [vec![0x82, 0x20], vec![0x20, 0x20, 0x20], vec![0x21, 0x20]] {
+        for (block, capacity) in [
+            (vec![0x82, 0x20], 0),
+            (vec![0x20, 0x20, 0x20], 0),
+            (vec![0x21, 0x20], 0),
+            (hex("3f453082"), 16),
+            (hex("203fe11f2082"), 0),
+        ] {
             assert_eq!(
-                Decoder::default().decode_block(&block, 0),
+                Table::default().decode_block(&block, 0),
                 Err(Error::SizeUpdateOrder)
             );
+            let mut observed = Table::for_observation();
+            let decoded = observed.decode_block(&block, MAX_DECODED).unwrap();
+            assert_eq!(observed.table_capacity(), Some(capacity));
+            assert!(!observed.is_unsure());
+            if block.contains(&0x82) {
+                assert_eq!(pairs(&decoded.headers), [(":method", "GET")]);
+            } else {
+                assert!(decoded.headers.is_empty());
+            }
         }
-        let mut d = Decoder::default();
+        let mut d = Table::default();
         assert_eq!(d.decode_block(&update(4097), 0), Err(Error::TableSize));
         assert!(d.is_unsure());
-        let mut d = Decoder::default();
+        let mut d = Table::default();
         d.set_settings_limit(128);
         d.set_settings_limit(512);
         assert_eq!(
@@ -1196,13 +1146,13 @@ mod tests {
         assert_eq!(d.table_capacity(), Some(512));
         assert_eq!(d.settings_limit(), Some(512));
         for bytes in [vec![], vec![0x82]] {
-            let mut d = Decoder::default();
+            let mut d = Table::default();
             d.set_settings_limit(0);
             assert_eq!(d.decode_block(&bytes, 0), Err(Error::MissingSizeUpdate));
         }
-        let mut d = Decoder::new(MAX_TABLE);
+        let mut d = Table::new(MAX_TABLE);
         assert!(d.decode_block(&update(MAX_TABLE), 0).is_ok());
-        assert_eq!(Decoder::new(usize::MAX).settings_limit(), Some(MAX_TABLE));
+        assert_eq!(Table::new(usize::MAX).settings_limit(), Some(MAX_TABLE));
         assert_eq!(
             d.decode_block(&update(MAX_TABLE + 1), 0),
             Err(Error::TableSize)
@@ -1211,7 +1161,8 @@ mod tests {
 
     #[test]
     fn zero_capacity_and_oversized_entry_clear_the_table() {
-        let mut d = Decoder::new(64);
+        let mut d = Table::new(64);
+        d.decode_block(&update(64), 0).unwrap();
         d.decode_all(&hex("4001780161"));
         assert_eq!(d.table_size(), 34);
         let mut block = vec![0x40, 1, b'y', 40];
@@ -1227,9 +1178,67 @@ mod tests {
     }
 
     #[test]
+    fn observation_accepts_huffman_expansion_and_keeps_the_table() {
+        let mut d = Table::for_observation();
+        d.decode_all(&hex("400178036f6c64")); // x: old
+        let mut bytes = vec![0x00, 0x01, b'x'];
+        Integer::<7> {
+            flags: 0x80,
+            value: 60_000,
+        }
+        .write(&mut bytes)
+        .unwrap();
+        bytes.extend(vec![0; 60_000]);
+        assert!(bytes.len() < 64 << 10);
+        let block = d.decode_block(&bytes, MAX_DECODED).unwrap();
+        assert_eq!((block.headers.len(), block.more), (0, 1));
+        assert!(!d.is_unsure());
+        assert_eq!(d.table_len(), 1);
+        assert_eq!(d.table_capacity(), Some(4096));
+        assert_eq!(pairs(&d.decode_all(&[0xbe])), [("x", "old")]);
+        assert_eq!(
+            Table::default().decode_block(&bytes, MAX_DECODED),
+            Err(Error::StringTooLong)
+        );
+    }
+
+    #[test]
+    fn encoder_new_reduction_matches_acknowledged_settings() {
+        let mut d = Table::default();
+        d.set_settings_limit(100);
+        let mut encoder = Encoder::new(100);
+        let mut bytes = Vec::new();
+        encoder
+            .encode_block(&[Field::new("x-a", "b")], &mut bytes)
+            .unwrap();
+        assert!((0x20..=0x3f).contains(&bytes[0]));
+        assert_eq!(pairs(&d.decode_all(&bytes)), [("x-a", "b")]);
+        assert_eq!(encoder.table_size(), d.table_size());
+    }
+
+    #[test]
+    fn constructors_require_the_initial_reduction() {
+        let mut d = Table::new(256);
+        assert_eq!(d.table_capacity(), Some(4096));
+        assert_eq!(
+            d.decode_block(&[0x82], MAX_DECODED),
+            Err(Error::MissingSizeUpdate)
+        );
+        let mut d = Table::new(256);
+        let mut encoder = Encoder::new(256);
+        let mut bytes = Vec::new();
+        encoder
+            .encode_block(&[Field::new("x-a", "b")], &mut bytes)
+            .unwrap();
+        assert!((0x20..=0x3f).contains(&bytes[0]));
+        assert_eq!(pairs(&d.decode_all(&bytes)), [("x-a", "b")]);
+        assert_eq!(encoder.table_size(), d.table_size());
+    }
+
+    #[test]
     fn encoder_settings_updates_and_failure_are_transactional() {
         let mut encoder = Encoder::default();
-        let mut d = Decoder::default();
+        let mut d = Table::default();
         let fields = [Field::new("x-color", "red")];
         let mut bytes = Vec::new();
         encoder.encode_block(&fields, &mut bytes).unwrap();
@@ -1265,6 +1274,11 @@ mod tests {
     fn string_and_block_limits_and_octets() {
         let field = Field::new([0, 0xff], [0xff, 0, 0x80]);
         assert_eq!(Field::parse(&field.to_bytes().unwrap()).unwrap(), field);
+        assert_eq!(Field::parse(&[0x40]), Err(Error::ContextRequired));
+        assert_eq!(
+            Field::parse(&hex("4001780161")),
+            Err(Error::ContextRequired)
+        );
         for coded in [
             vec![0x81, 0xff],
             vec![0x81, 0x18],
@@ -1288,10 +1302,10 @@ mod tests {
         expanded.extend(vec![0; MAX_STRING * 5 / 8 + 5]);
         assert_eq!(StringLiteral::parse(&expanded), Err(Error::StringTooLong));
         assert_eq!(
-            Decoder::default().decode_block(&vec![0x82; MAX_BLOCK + 1], 0),
+            Table::default().decode_block(&vec![0x82; MAX_BLOCK + 1], 0),
             Err(Error::BlockTooLong)
         );
-        let block = Decoder::default()
+        let block = Table::default()
             .decode_block(&vec![0x82; MAX_BLOCK], 0)
             .unwrap();
         assert_eq!(block.more, MAX_BLOCK);

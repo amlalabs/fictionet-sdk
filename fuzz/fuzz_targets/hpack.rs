@@ -2,7 +2,8 @@
 #![no_main]
 use fictionet::stdlib::{
     codec::{Collect, contract},
-    hpack::{self, Decoder, Encoder, Field, Integer, StringLiteral},
+    hpack::{self, Encoder, Field, StringLiteral, Table},
+    prefix_int::Integer,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -15,11 +16,7 @@ fuzz_target!(|input: &[u8]| {
     contract::check_wire::<Field>(bytes);
     let short = &bytes[..bytes.len().min(512)];
     contract::check_decode(|| Collect::<Field>::new(hpack::MAX_BLOCK), short);
-    for mut decoder in [
-        Decoder::default(),
-        Decoder::new(0),
-        Decoder::for_observation(),
-    ] {
+    for mut decoder in [Table::default(), Table::new(0), Table::for_observation()] {
         let _ = decoder.decode_block(bytes, hpack::MAX_DECODED);
         assert!(decoder.table_size() <= hpack::MAX_TABLE);
         for (i, piece) in short.chunks(32).enumerate() {
@@ -46,7 +43,7 @@ fuzz_target!(|input: &[u8]| {
     contract::check_wire_value(&StringLiteral(value.to_vec()));
     contract::check_wire_value(&Field::new(b"x-fuzz", value));
     let mut encoder = Encoder::default();
-    let mut decoder = Decoder::default();
+    let mut decoder = Table::default();
     for (i, piece) in short.chunks(64).enumerate() {
         let size = usize::from(piece[0]);
         encoder.set_settings_limit(size);

@@ -4,8 +4,9 @@ use fictionet::stdlib::{
         Collect, Wire, contract,
         test_support::{self, Lcg},
     },
-    hpack::{self, Decoder, Encoder, Field, Integer, StringLiteral},
+    hpack::{self, Encoder, Field, StringLiteral, Table},
     huffman::{self, HuffmanString},
+    prefix_int::Integer,
 };
 
 #[test]
@@ -36,7 +37,7 @@ fn wire_contracts_and_collection_at_eof() {
 fn settings_table_eviction_and_round_trips_through_public_api() {
     let mut rng = Lcg::new(0xcafe7541);
     let mut encoder = Encoder::new(512);
-    let mut decoder = Decoder::new(512);
+    let mut decoder = Table::new(512);
     for i in 0..128 {
         if i % 16 == 0 {
             let size = rng.index(513);
@@ -77,10 +78,21 @@ fn copied_modules_use_the_same_public_contracts() {
     let bytes = field.to_bytes().unwrap();
     contract::check_decode(|| Collect::<copied::Field>::new(hpack::MAX_BLOCK), &bytes);
     contract::check_wire_value(&shared::HuffmanString(vec![0, 255]));
+    let integer = fictionet_copy_modules::prefix_int::Integer::<5> {
+        flags: 0x20,
+        value: u64::MAX,
+    };
+    contract::check_wire_value(&integer);
+    assert_eq!(
+        Integer::<5>::parse(&integer.to_bytes().unwrap())
+            .unwrap()
+            .value,
+        u64::MAX
+    );
     let mut encoder = copied::Encoder::default();
     let mut bytes = Vec::new();
     encoder.encode_block(&[field], &mut bytes).unwrap();
-    let result = copied::Decoder::default()
+    let result = copied::Table::default()
         .decode_block(&bytes, copied::MAX_DECODED)
         .unwrap();
     assert_eq!(

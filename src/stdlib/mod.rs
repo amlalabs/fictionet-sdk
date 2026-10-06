@@ -36,7 +36,7 @@
 //! and the generic codec tools. Named sibling modules stay SDK dependencies.
 //! See the `custom_protocol` example for a copied Modbus module.
 //!
-//! Use [`hpack::Decoder`] and [`hpack::Encoder`] for complete HTTP/2 header
+//! Use [`hpack::Table`] and [`hpack::Encoder`] for complete HTTP/2 header
 //! blocks. Each direction has its own dynamic table. [`huffman`] supplies
 //! the RFC 7541 string code shared by [`hpack`] and [`qpack`].
 //!
@@ -195,6 +195,8 @@ pub mod pim;
 pub mod pop3;
 pub mod portmap;
 pub mod postgres;
+/// RFC 7541 prefix integers shared by HPACK and QPACK.
+pub mod prefix_int;
 pub mod protobuf;
 pub mod proxy_protocol;
 pub mod qpack;
