@@ -2,28 +2,17 @@
 
 use fictionet::stdlib::codec::{
     AssembleError, Decode, Fail, Step, Stream, Wire, contract, finish, pump,
-    test_support::{Lcg, chunks},
+    test_support::{Lcg, chunks, decode_all},
 };
 use fictionet::stdlib::{telnet as tn, websocket as ws};
 
-fn read<D>(decoder: D, bytes: &[u8], pattern: &[usize]) -> (Vec<D::Item>, Option<Fail<D::Error>>)
+fn bounded<D: Decode>(make: impl Fn() -> D, bytes: &[u8])
 where
-    D: Decode,
-    D::Error: Clone,
+    D::Item: PartialEq + core::fmt::Debug,
+    D::Error: Clone + PartialEq + core::fmt::Debug,
 {
-    let mut stream = Stream::new(decoder);
-    let mut items = Vec::new();
-    for part in chunks(bytes, pattern) {
-        match pump(&mut stream, part, |item| items.push(item)) {
-            Ok(_) if stream.is_done() => break,
-            Ok(n) => assert_eq!(n, part.len()),
-            Err(error) => return (items, Some(error)),
-        }
-    }
-    let failure = finish(&mut stream, |item| items.push(item)).err();
-    assert!(stream.is_done());
-    assert!(stream.next().is_none());
-    (items, failure)
+    let limit = make().capacity().checked_mul(2).unwrap();
+    contract::check_decode_with_alloc_limit(make, bytes, limit);
 }
 
 fn telnet_units() -> Vec<tn::Event> {
@@ -49,8 +38,8 @@ fn telnet_default_delivers_login_without_waiting_for_more_input() {
         assert_eq!(stream.buffered(), 0);
         assert_eq!(stream.decoder().data_limit(), 1);
     }
-    contract::check_decode(tn::Events::new, b"root\r\n");
-    contract::check_decode(tn::Events::default, b"root\r\n");
+    bounded(tn::Events::new, b"root\r\n");
+    bounded(tn::Events::default, b"root\r\n");
 }
 
 #[test]
@@ -62,14 +51,12 @@ fn telnet_chunked_wire_round_trip() {
         contract::check_wire_value(event);
         contract::check_wire::<tn::Event>(&Wire::to_bytes(event).unwrap());
     }
-    contract::check_decode(tn::Events::new, &bytes);
+    bounded(tn::Events::new, &bytes);
     contract::check_decode_with_held_limit(tn::Events::new, &bytes, 0);
-    for pattern in [&[][..], &[1], &[3, 1, 2, 19]] {
-        assert_eq!(
-            read(tn::Events::with_data_limit(tn::MAX_DATA), &bytes, pattern),
-            (events.clone(), None)
-        );
-    }
+    assert_eq!(
+        decode_all(|| tn::Events::with_data_limit(tn::MAX_DATA), &bytes),
+        (events.clone(), None)
+    );
     let typed = [
         tn::Subnegotiation::TerminalTypeSend,
         tn::Subnegotiation::TerminalTypeIs("VT100".into()),
@@ -142,12 +129,16 @@ fn telnet_binary_changes_between_items_in_one_buffer() {
     let mut bytes = Vec::new();
     let mut binary = false;
     for event in &events {
-        event.write_with(&mut bytes, binary).unwrap();
+        if binary {
+            tn::BinaryEvent(event.clone()).write(&mut bytes).unwrap();
+        } else {
+            event.write(&mut bytes).unwrap();
+        }
         if let tn::Event::Negotiation { verb, .. } = event {
             binary = *verb == tn::Verb::Will;
         }
     }
-    contract::check_stack(Negotiated::new, &bytes);
+    bounded(Negotiated::new, &bytes);
     for pattern in [&[][..], &[1], &[2, 1, 13]] {
         // Here the world changes the decoder through Stream::decoder.
         let mut stream = Stream::new(tn::Events::with_data_limit(tn::MAX_DATA));
@@ -167,9 +158,9 @@ fn telnet_binary_changes_between_items_in_one_buffer() {
     }
     // A bare NVT CR still owns a NUL separated from it by a negotiation.
     let bytes = b"\r\xff\xfb\0\0X";
-    contract::check_stack(Negotiated::new, bytes);
+    bounded(Negotiated::new, bytes);
     assert_eq!(
-        read(Negotiated::new(), bytes, &[1]).0,
+        decode_all(Negotiated::new, bytes).0,
         vec![
             tn::Event::Data(vec![13]),
             tn::Event::Negotiation { verb: tn::Verb::Will, option: 0 },
@@ -193,15 +184,15 @@ fn telnet_data_runs_are_bounded_and_chunk_invariant() {
     let event = tn::Event::Data(vec![tn::IAC; tn::MAX_DATA]);
     let mut bytes = Wire::to_bytes(&event).unwrap();
     bytes.extend_from_slice(b"xyz");
-    contract::check_decode(tn::Events::new, &bytes);
-    contract::check_decode(|| tn::Events::with_data_limit(tn::MAX_DATA), &bytes);
+    bounded(tn::Events::new, &bytes);
+    bounded(|| tn::Events::with_data_limit(tn::MAX_DATA), &bytes);
     assert_eq!(
-        read(tn::Events::with_data_limit(tn::MAX_DATA), &bytes, &[1]).0,
+        decode_all(|| tn::Events::with_data_limit(tn::MAX_DATA), &bytes).0,
         [event, tn::Event::Data(b"xyz".to_vec())]
     );
-    contract::check_decode(|| tn::Events::with_data_limit(1), b"\r\0\xff\xffx");
+    bounded(|| tn::Events::with_data_limit(1), b"\r\0\xff\xffx");
     assert_eq!(
-        read(tn::Events::with_data_limit(1), b"\r\0\xff\xffx", &[1]).0,
+        decode_all(|| tn::Events::with_data_limit(1), b"\r\0\xff\xffx").0,
         [tn::Event::Data(vec![13]), tn::Event::Data(vec![255]), tn::Event::Data(vec![b'x'])]
     );
     assert_eq!(tn::Events::with_data_limit(0).data_limit(), 1);
@@ -225,19 +216,14 @@ fn telnet_recovers_from_bad_units_and_discards_oversized_subnegotiations() {
         tn::Event::Command(tn::Command::Nop),
     ];
     contract::check_decode_with_held_limit(tn::Events::new, &bytes, 0);
-    for pattern in [&[][..], &[1], &[7, 1, 19]] {
-        assert_eq!(
-            read(tn::Events::new(), &bytes, pattern),
-            (want.clone(), None)
-        );
-    }
-    // Overflow followed by another command reports interruption, as before.
+    assert_eq!(decode_all(tn::Events::new, &bytes), (want.clone(), None));
+    // Overflow followed by another command reports interruption.
     let mut interrupted = vec![255, 250, 42];
     interrupted.extend(vec![1; tn::MAX_SUBNEGOTIATION + 1]);
     interrupted.extend_from_slice(&[255, 251, 0]);
-    contract::check_decode(tn::Events::new, &interrupted);
+    bounded(tn::Events::new, &interrupted);
     assert_eq!(
-        read(tn::Events::new(), &interrupted, &[1]).0,
+        decode_all(tn::Events::new, &interrupted).0,
         [
             tn::Event::Error(tn::DecodeError::SubnegotiationInterrupted { option: 42 }),
             tn::Event::Negotiation { verb: tn::Verb::Will, option: 0 },
@@ -248,9 +234,9 @@ fn telnet_recovers_from_bad_units_and_discards_oversized_subnegotiations() {
 #[test]
 fn telnet_eof_reports_partial_units_once() {
     for bytes in [&[255][..], &[255, 251], &[255, 250], &[255, 250, 42, 1, 255]] {
-        contract::check_decode(tn::Events::new, bytes);
+        bounded(tn::Events::new, bytes);
         assert_eq!(
-            read(tn::Events::new(), bytes, &[1]),
+            decode_all(tn::Events::new, bytes),
             (
                 vec![],
                 Some(Fail::Truncated {
@@ -260,7 +246,7 @@ fn telnet_eof_reports_partial_units_once() {
         );
     }
     assert_eq!(
-        read(tn::Events::new(), b"ok\xff", &[1]),
+        decode_all(tn::Events::new, b"ok\xff"),
         (
             vec![tn::Event::Data(vec![b'o']), tn::Event::Data(vec![b'k'])],
             Some(Fail::Truncated { unread: 1 }),
@@ -271,9 +257,9 @@ fn telnet_eof_reports_partial_units_once() {
     for suffix in [&[][..], &[255]] {
         let mut input = bytes.clone();
         input.extend_from_slice(suffix);
-        contract::check_decode(tn::Events::new, &input);
+        bounded(tn::Events::new, &input);
         assert_eq!(
-            read(tn::Events::new(), &input, &[1]).1,
+            decode_all(tn::Events::new, &input).1,
             Some(Fail::Protocol(tn::DecodeError::Truncated))
         );
     }
@@ -322,11 +308,20 @@ fn telnet_wire_is_exact_strict_and_transactional() {
     let data = tn::Event::Data((0..=255).collect());
     for binary in [false, true] {
         let mut out = vec![];
-        data.write_with(&mut out, binary).unwrap();
-        assert_eq!(tn::Event::parse_with(&out, binary), Ok(data.clone()));
+        if binary {
+            tn::BinaryEvent(data.clone()).write(&mut out).unwrap();
+        } else {
+            data.write(&mut out).unwrap();
+        }
+        let parsed = if binary {
+            tn::BinaryEvent::parse(&out).map(|event| event.0)
+        } else {
+            tn::Event::parse(&out)
+        };
+        assert_eq!(parsed, Ok(data.clone()));
         let mut decoder = tn::Events::with_data_limit(tn::MAX_DATA);
         decoder.set_binary(binary);
-        assert_eq!(read(decoder, &out, &[1]).0, core::slice::from_ref(&data));
+        assert_eq!(decode_all(|| decoder, &out).0, core::slice::from_ref(&data));
     }
 }
 
@@ -357,24 +352,22 @@ fn websocket_masked_fragmented_text_with_interleaved_controls() {
             contract::check_wire_value(frame);
             contract::check_wire::<ws::Frame>(&Wire::to_bytes(frame).unwrap());
         }
-        contract::check_decode(|| ws::Frames::new(role), &bytes);
-        contract::check_stack(|| ws::Messages::new(role), &bytes);
+        bounded(|| ws::Frames::new(role), &bytes);
+        bounded(|| ws::Messages::new(role), &bytes);
         contract::check_decode_with_held_limit(|| ws::Messages::with_limit(role, 256), &bytes, 256);
-        for pattern in [&[][..], &[1], &[1, 3, 2, 64]] {
-            assert_eq!(read(ws::Frames::new(role), &bytes, pattern), (frames.clone(), None));
-            assert_eq!(
-                read(ws::Messages::new(role), &bytes, pattern),
-                (
-                    vec![
-                        ws::Message::Ping(b"?".to_vec()),
-                        ws::Message::Text("Heéllo".into()),
-                        ws::Message::Binary(vec![3; 130]),
-                        ws::Message::Pong(b"!".to_vec()),
-                    ],
-                    None
-                )
-            );
-        }
+        assert_eq!(decode_all(|| ws::Frames::new(role), &bytes), (frames.clone(), None));
+        assert_eq!(
+            decode_all(|| ws::Messages::new(role), &bytes),
+            (
+                vec![
+                    ws::Message::Ping(b"?".to_vec()),
+                    ws::Message::Text("Heéllo".into()),
+                    ws::Message::Binary(vec![3; 130]),
+                    ws::Message::Pong(b"!".to_vec()),
+                ],
+                None
+            )
+        );
     }
 }
 
@@ -387,26 +380,21 @@ fn websocket_message_limit_has_one_error_and_close_code() {
     ]);
     for bytes in [single, fragmented] {
         let make = || ws::Messages::with_limit(ws::Role::Client, 125);
-        contract::check_stack(make, &bytes);
-        for pattern in [&[][..], &[1], &[3, 17, 2]] {
-            let (items, failure) = read(make(), &bytes, pattern);
-            assert!(items.is_empty());
-            assert_eq!(
-                failure,
-                Some(Fail::Protocol(AssembleError::Inner(ws::Error::TooBig)))
-            );
-            let Some(Fail::Protocol(AssembleError::Inner(error))) = failure else {
-                panic!()
-            };
-            assert_eq!(error.close_code(), ws::close_code::MESSAGE_TOO_BIG);
-        }
+        bounded(make, &bytes);
+        let (items, failure) = decode_all(make, &bytes);
+        assert!(items.is_empty());
+        assert_eq!(failure, Some(Fail::Protocol(AssembleError::Inner(ws::Error::TooBig))));
+        let Some(Fail::Protocol(AssembleError::Inner(error))) = failure else {
+            panic!()
+        };
+        assert_eq!(error.close_code(), ws::close_code::MESSAGE_TOO_BIG);
     }
     let mut header = vec![0x82, 127];
     header.extend_from_slice(&u64::try_from(ws::MAX_PAYLOAD + 1).unwrap().to_be_bytes());
     let make = || ws::Messages::new(ws::Role::Client);
-    contract::check_stack(make, &header);
+    bounded(make, &header);
     assert_eq!(
-        read(make(), &header, &[1]),
+        decode_all(make, &header),
         (
             vec![],
             Some(Fail::Protocol(AssembleError::Inner(ws::Error::TooBig)))
@@ -421,10 +409,19 @@ fn websocket_wire_refuses_invalid_close_payloads_transactionally() {
         for mask in [None, Some([1, 2, 3, 4])] {
             let frame = frame(true, ws::Opcode::Close, payload, mask);
             let mut out = vec![7, 8];
-            assert_eq!(frame.write(&mut out), Err(ws::Error::Close(error)));
+            assert_eq!(frame.write(&mut out), Err(ws::WriteError::Unwritable));
             assert_eq!(out, [7, 8]);
             contract::check_wire_value(&frame);
-            let bytes = frame.to_bytes();
+            // A malformed fixture must bypass the strict writer.
+            let mut bytes = vec![0x88, payload.len() as u8 | if mask.is_some() { 0x80 } else { 0 }];
+            if let Some(key) = mask {
+                bytes.extend_from_slice(&key);
+            }
+            let start = bytes.len();
+            bytes.extend_from_slice(payload);
+            if let Some(key) = mask {
+                ws::apply_mask(&mut bytes[start..], key, 0);
+            }
             assert_eq!(
                 <ws::Frame as Wire>::parse(&bytes),
                 Err(ws::FrameParseError::Close(error))
@@ -441,13 +438,17 @@ fn websocket_wire_refuses_invalid_close_payloads_transactionally() {
             contract::check_wire_value(&frame);
             let bytes = Wire::to_bytes(&frame).unwrap();
             assert_eq!(
-                read(ws::Frames::new(role), &bytes, &[1]),
+                decode_all(|| ws::Frames::new(role), &bytes),
                 (vec![frame], None)
             );
             assert_eq!(
-                read(ws::Messages::new(role), &bytes, &[1]),
+                decode_all(|| ws::Messages::new(role), &bytes),
                 (
-                    vec![ws::Message::Close(ws::Close::parse(payload).unwrap())],
+                    vec![ws::Message::Close(if payload.is_empty() {
+                        None
+                    } else {
+                        Some(ws::Close::parse(payload).unwrap())
+                    })],
                     None
                 )
             );
@@ -465,7 +466,7 @@ fn websocket_refuses_frame_and_assembly_limits_from_headers() {
     assert_eq!(stream.next(), Some(Err(Fail::Protocol(ws::Error::TooBig))));
     assert_eq!(stream.next(), None);
     assert_eq!(stream.unread(), header);
-    contract::check_decode(|| ws::Frames::with_limit(ws::Role::Server, 3), &bytes);
+    bounded(|| ws::Frames::with_limit(ws::Role::Server, 3), &bytes);
 
     let first = frame_bytes(&[frame(false, ws::Opcode::Text, b"abc", None)]);
     let last = frame_bytes(&[frame(true, ws::Opcode::Continuation, b"def", None)]);
@@ -481,9 +482,9 @@ fn websocket_refuses_frame_and_assembly_limits_from_headers() {
     );
     assert_eq!(stream.next(), None);
     let bytes = [first, last].concat();
-    contract::check_stack(make, &bytes);
+    bounded(make, &bytes);
     assert_eq!(
-        read(make(), &bytes, &[1]).1,
+        decode_all(make, &bytes).1,
         Some(Fail::Protocol(AssembleError::Inner(ws::Error::TooBig)))
     );
     assert_eq!(
@@ -503,8 +504,8 @@ fn websocket_close_preserves_trailing_bytes_for_parts_and_swap() {
     let tail = b"after\r\0close";
     let mut bytes = close_bytes.clone();
     bytes.extend_from_slice(tail);
-    contract::check_decode(|| ws::Frames::new(ws::Role::Client), &bytes);
-    contract::check_stack(|| ws::Messages::new(ws::Role::Client), &bytes);
+    bounded(|| ws::Frames::new(ws::Role::Client), &bytes);
+    bounded(|| ws::Messages::new(ws::Role::Client), &bytes);
     for eof in [false, true] {
         let mut stream = Stream::new(ws::Frames::new(ws::Role::Client));
         assert_eq!(stream.push(&bytes), bytes.len());
@@ -544,7 +545,7 @@ fn websocket_close_interrupts_assembly_and_pump_accounts_for_unaccepted_tail() {
     let (buffer, _) = stream.into_parts();
     let tail = [buffer.unread(), bytes.get(accepted..).unwrap()].concat();
     assert_eq!(tail, bytes.get(end..).unwrap());
-    contract::check_stack(|| ws::Messages::with_limit(ws::Role::Client, 16), &bytes);
+    bounded(|| ws::Messages::with_limit(ws::Role::Client, 16), &bytes);
 }
 
 #[test]
@@ -565,13 +566,11 @@ fn websocket_framing_errors_end_the_stream_once() {
     ];
     for (mut bytes, error) in cases {
         bytes.extend_from_slice(&[0x82, 0]); // No item may follow the error.
-        contract::check_stack(|| ws::Messages::new(ws::Role::Client), &bytes);
-        for pattern in [&[][..], &[1]] {
-            assert_eq!(
-                read(ws::Messages::new(ws::Role::Client), &bytes, pattern),
-                (vec![], Some(Fail::Protocol(AssembleError::Inner(error))))
-            );
-        }
+        bounded(|| ws::Messages::new(ws::Role::Client), &bytes);
+        assert_eq!(
+            decode_all(|| ws::Messages::new(ws::Role::Client), &bytes),
+            (vec![], Some(Fail::Protocol(AssembleError::Inner(error))))
+        );
     }
     let mut stream = Stream::new(ws::Frames::new(ws::Role::Server));
     assert_eq!(stream.push(&[0x82, 0]), 2);
@@ -587,16 +586,16 @@ fn websocket_framing_errors_end_the_stream_once() {
 fn websocket_eof_distinguishes_frames_from_incomplete_messages() {
     for input in [&[0x82][..], &[0x82, 2, 1], &[0x82, 126, 0]] {
         assert_eq!(
-            read(ws::Messages::new(ws::Role::Client), input, &[1]).1,
+            decode_all(|| ws::Messages::new(ws::Role::Client), input).1,
             Some(Fail::Truncated { unread: input.len() })
         );
-        contract::check_stack(|| ws::Messages::new(ws::Role::Client), input);
+        bounded(|| ws::Messages::new(ws::Role::Client), input);
     }
     for payload in [&[][..], b"partial"] {
         let bytes = frame_bytes(&[frame(false, ws::Opcode::Binary, payload, None)]);
-        contract::check_stack(|| ws::Messages::new(ws::Role::Client), &bytes);
+        bounded(|| ws::Messages::new(ws::Role::Client), &bytes);
         assert_eq!(
-            read(ws::Messages::new(ws::Role::Client), &bytes, &[1]).1,
+            decode_all(|| ws::Messages::new(ws::Role::Client), &bytes).1,
             Some(Fail::Protocol(AssembleError::Incomplete { held: payload.len() }))
         );
     }
@@ -606,9 +605,9 @@ fn websocket_eof_distinguishes_frames_from_incomplete_messages() {
         frame(true, ws::Opcode::Ping, &[42; 125], None),
         frame(true, ws::Opcode::Continuation, &[], None),
     ]);
-    contract::check_stack(|| ws::Messages::with_limit(ws::Role::Client, 0), &bytes);
+    bounded(|| ws::Messages::with_limit(ws::Role::Client, 0), &bytes);
     assert_eq!(
-        read(ws::Messages::with_limit(ws::Role::Client, 0), &bytes, &[1]),
+        decode_all(|| ws::Messages::with_limit(ws::Role::Client, 0), &bytes),
         (vec![ws::Message::Ping(vec![42; 125]), ws::Message::Binary(vec![])], None)
     );
 }
@@ -636,15 +635,14 @@ fn websocket_wire_refuses_loss_and_requires_exact_input() {
 fn interactive_contracts_on_generated_inputs() {
     let mut rng = Lcg::new(0x1a7e_6ac7);
     for round in 0..160 {
-        let length = rng.below(96);
-        let bytes: Vec<_> = (0..length).map(|_| rng.next() as u8).collect();
-        contract::check_decode(tn::Events::new, &bytes);
-        contract::check_decode(|| tn::Events::with_data_limit(7), &bytes);
+        let bytes = rng.bytes(96);
+        bounded(tn::Events::new, &bytes);
+        bounded(|| tn::Events::with_data_limit(7), &bytes);
         contract::check_wire::<tn::Event>(&bytes);
         contract::check_wire::<tn::Subnegotiation>(&bytes);
         contract::check_wire::<ws::Frame>(&bytes);
         let role = if round % 2 == 0 { ws::Role::Server } else { ws::Role::Client };
-        contract::check_decode(|| ws::Frames::with_limit(role, 64), &bytes);
-        contract::check_stack(|| ws::Messages::with_limit(role, 64), &bytes);
+        bounded(|| ws::Frames::with_limit(role, 64), &bytes);
+        bounded(|| ws::Messages::with_limit(role, 64), &bytes);
     }
 }

@@ -86,13 +86,13 @@ cargo +nightly fuzz list
 | `stun` | TCP streams, UDP datagrams, standalone attributes, and constructed messages | `stun`: chunking and EOF, exact raw frame spans, strict attribute writes, canonical padding and fingerprints, Binding replies, and transaction IDs |
 | `syslog` | bytes and constructed values, checked with codec contracts | `stdlib::syslog`: Syslog |
 | `tds` | arbitrary bytes and typed values; wire, chunking, EOF, and allocation contracts | `stdlib::tds`: SQL Server TDS |
-| `telnet` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::telnet`: Telnet |
+| `telnet` | events, binary mode changes, strict writers, and bounded codec contracts | `stdlib::telnet`: Telnet |
 | `tftp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::tftp`: TFTP |
 | `tpkt` | TCP bytes with limits selected from the input, plus constructed headers, packets, and COTP messages | `tpkt` and `cotp::over_tpkt`: chunking and EOF, exact headers and packets, size limits, TPDU round trips, and segmented message assembly |
 | `thrift` | arbitrary bytes and constructed values | `stdlib::thrift`: framed and unframed messages, typed values, and bounded codec contracts |
 | `urlencoded_form` | wire values and streams checked with bounded codec contracts | `stdlib::urlencoded_form`: application/x-www-form-urlencoded |
 | `vxlan` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::vxlan`: VXLAN and VXLAN-GPE |
-| `websocket` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::websocket`: WebSocket (RFC 6455) |
+| `websocket` | frames, messages, close payloads, handshake fields, and bounded codec contracts | `stdlib::websocket`: WebSocket (RFC 6455) |
 | `x509` | DER certificates, CRLs, extensions, and PEM bundles; checks signed-byte preservation, text framing, limits, and constructed writes | `stdlib::x509`: X.509 certificates and CRLs |
 | `xml` | wire values and streams checked with bounded codec contracts | `stdlib::xml`: XML 1.0 |
 | `zabbix` | arbitrary bytes and constructed values | `stdlib::zabbix`: exact headers, packets, JSON messages, and bounded codec contracts |
