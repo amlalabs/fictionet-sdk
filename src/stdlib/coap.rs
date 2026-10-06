@@ -2102,17 +2102,23 @@ mod tests {
     #[test]
     fn bad_option_takes_linear_time() {
         // Many elective options, then many repeatable critical ones.
-        let mut o = Options::new();
-        for i in 0..60_000u16 {
-            o.add(2 + 2 * (i % 2000) + 2000, Vec::new());
-        }
-        for _ in 0..60_000 {
-            o.add(option::URI_PATH, b"p".to_vec());
-        }
-        let m = Message { options: o, ..Message::new(Type::Confirmable, Code::GET, 1) };
-        let started = std::time::Instant::now();
-        assert_eq!(m.bad_option(), None);
-        assert!(started.elapsed().as_secs() < 2, "took {:?}", started.elapsed());
+        let message = |n: usize| {
+            let mut o = Options::new();
+            for i in 0..n {
+                o.add(2 + 2 * (i % 2000) as u16 + 2000, Vec::new());
+            }
+            for _ in 0..n {
+                o.add(option::URI_PATH, b"p".to_vec());
+            }
+            Message { options: o, ..Message::new(Type::Confirmable, Code::GET, 1) }
+        };
+        // Only bad_option is timed, after the first call at each size
+        // builds the message. The larger size is 60,000 of each kind.
+        let mut messages = std::collections::HashMap::new();
+        fictionet::stdlib::codec::test_support::assert_linear("CoAP bad_option", 15_000, |n| {
+            let m = messages.entry(n).or_insert_with(|| message(n));
+            assert_eq!(m.bad_option(), None);
+        });
     }
 
     #[test]

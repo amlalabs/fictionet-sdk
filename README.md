@@ -236,7 +236,8 @@ Start at the crate root, which explains the main ideas, then read in this order:
 
 ```console
 $ cargo build --all-targets --features tokio
-$ cargo test --features tokio
+$ cargo nextest run --workspace --features tokio
+$ cargo test --doc --workspace --features tokio
 $ cargo clippy --all-targets --features tokio
 ```
 

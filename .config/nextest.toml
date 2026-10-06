@@ -1,0 +1,35 @@
+# cargo-nextest runs each test in its own process, all binaries at once.
+# `cargo nextest run` does not run doctests; `cargo test --doc` does.
+# See CONTRIBUTING.md.
+
+# Tests that run whole worlds on real time and real sockets. They pass when
+# the machine is oversubscribed, but each holds threads and descriptors for
+# seconds, so a few at a time is enough.
+[test-groups]
+worlds = { max-threads = 8 }
+# Tests that flood a world as fast as they can, or use up descriptors on
+# purpose: one at a time.
+heavy = { max-threads = 1 }
+
+[profile.default]
+# One test per CPU.
+test-threads = "num-cpus"
+# A flaky test fails the run; it is not retried into a pass.
+retries = 0
+# Flag a test after 15 seconds, and stop it after 8 periods (2 minutes).
+# The slowest tests wait on 10-second protocol timeouts.
+slow-timeout = { period = "15s", terminate-after = 8 }
+fail-fast = false
+
+[[profile.default.overrides]]
+filter = "binary(flood) | binary(stress) | binary(fd_limit)"
+test-group = "heavy"
+
+[[profile.default.overrides]]
+filter = """
+binary(web) | binary(listen) | binary(recipes) | binary(tcpudp) | binary(core)
+| binary(e2e) | binary(attach_bin) | binary(tap_bin) | binary(proxy) | binary(tls)
+| binary(observe) | binary(observe_bin) | binary(observe_tls) | binary(tun_linux)
+| test(=stdlib::tcp::tests::quiet_connections_give_their_buffer_pages_back)
+"""
+test-group = "worlds"

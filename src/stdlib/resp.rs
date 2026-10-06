@@ -2651,7 +2651,7 @@ mod tests {
     fn fuzz_loop() {
         let mut r = Lcg::new(0x5eed);
         let small = Limits { max_bulk_len: 6, max_elements: 3, max_depth: 2, max_line_len: 6, max_frame_len: 30 };
-        let rounds = std::env::var("RESP_FUZZ_ROUNDS").ok().and_then(|n| n.parse().ok()).unwrap_or(5000);
+        let rounds = codec::test_support::rounds(1250);
         for _ in 0..rounds {
             let mut b = Vec::new();
             for _ in 0..1 + r.index(3) {
@@ -2804,40 +2804,40 @@ mod tests {
     /// decoder does not read its first elements again after every push.
     #[test]
     fn decoder_is_linear_in_one_big_value() {
-        const N: usize = 200_000;
-        let start = std::time::Instant::now();
-        // An array of nulls, a map inside an attribute, and a streamed
-        // string of one-byte chunks.
-        let mut values = Vec::new();
-        values.extend_from_slice(format!("*{N}\r\n").as_bytes());
-        values.extend(std::iter::repeat_n(&b"_\r\n"[..], N).flatten());
-        values.extend_from_slice(format!("|1\r\n+a\r\n%{N}\r\n").as_bytes());
-        values.extend(std::iter::repeat_n(&b":1\r\n#t\r\n"[..], N).flatten());
-        values.extend_from_slice(b"+v\r\n*?\r\n~?\r\n%?\r\n");
-        values.extend(std::iter::repeat_n(&b"$?\r\n;1\r\nx\r\n;0\r\n"[..], 8).flatten());
-        values.extend_from_slice(b".\r\n.\r\n.\r\n$?\r\n");
-        values.extend(std::iter::repeat_n(&b";1\r\nx\r\n"[..], N).flatten());
-        values.extend_from_slice(b";0\r\n");
-        check_values(&values, Limits::DEFAULT);
-        let (got, error) = decode_all(Values::new, &values);
-        assert_eq!(error, None);
-        assert_eq!(got.len(), 4);
-        assert_eq!(got[0], Value::Array(vec![Value::Null; N]));
-        let Value::Attribute { attributes, value } = &got[1] else { panic!() };
-        assert!(matches!(&attributes[..], [(_, Value::Map(e))] if e.len() == N));
-        assert_eq!(**value, s("v"));
-        let streamed = Value::Array(vec![Value::Set(vec![Value::Map(vec![(bulk("x"), bulk("x")); 4])])]);
-        assert_eq!(got[2], streamed);
-        assert_eq!(got[3], Value::Bulk(vec![b'x'; N]));
-        // Commands, likewise.
-        let mut c = format!("*{N}\r\n").into_bytes();
-        c.extend(std::iter::repeat_n(&b"$1\r\nx\r\n"[..], N).flatten());
-        check_commands(&c, Limits::DEFAULT);
-        let (commands, error) = decode_all(Commands::new, &c);
-        assert_eq!(error, None);
-        assert_eq!(commands.len(), 1);
-        assert_eq!(commands[0].args.len(), N);
-        assert!(start.elapsed() < std::time::Duration::from_secs(20), "{:?}", start.elapsed());
+        let run = |n: usize| {
+            // An array of nulls, a map inside an attribute, and a streamed
+            // string of one-byte chunks.
+            let mut values = Vec::new();
+            values.extend_from_slice(format!("*{n}\r\n").as_bytes());
+            values.extend(std::iter::repeat_n(&b"_\r\n"[..], n).flatten());
+            values.extend_from_slice(format!("|1\r\n+a\r\n%{n}\r\n").as_bytes());
+            values.extend(std::iter::repeat_n(&b":1\r\n#t\r\n"[..], n).flatten());
+            values.extend_from_slice(b"+v\r\n*?\r\n~?\r\n%?\r\n");
+            values.extend(std::iter::repeat_n(&b"$?\r\n;1\r\nx\r\n;0\r\n"[..], 8).flatten());
+            values.extend_from_slice(b".\r\n.\r\n.\r\n$?\r\n");
+            values.extend(std::iter::repeat_n(&b";1\r\nx\r\n"[..], n).flatten());
+            values.extend_from_slice(b";0\r\n");
+            check_values(&values, Limits::DEFAULT);
+            let (got, error) = decode_all(Values::new, &values);
+            assert_eq!(error, None);
+            assert_eq!(got.len(), 4);
+            assert_eq!(got[0], Value::Array(vec![Value::Null; n]));
+            let Value::Attribute { attributes, value } = &got[1] else { panic!() };
+            assert!(matches!(&attributes[..], [(_, Value::Map(e))] if e.len() == n));
+            assert_eq!(**value, s("v"));
+            let streamed = Value::Array(vec![Value::Set(vec![Value::Map(vec![(bulk("x"), bulk("x")); 4])])]);
+            assert_eq!(got[2], streamed);
+            assert_eq!(got[3], Value::Bulk(vec![b'x'; n]));
+            // Commands, likewise.
+            let mut c = format!("*{n}\r\n").into_bytes();
+            c.extend(std::iter::repeat_n(&b"$1\r\nx\r\n"[..], n).flatten());
+            check_commands(&c, Limits::DEFAULT);
+            let (commands, error) = decode_all(Commands::new, &c);
+            assert_eq!(error, None);
+            assert_eq!(commands.len(), 1);
+            assert_eq!(commands[0].args.len(), n);
+        };
+        codec::test_support::assert_linear("RESP big values", 12_500, run);
     }
 
     /// Feeds a stream one byte at a time, draining it after each byte, until

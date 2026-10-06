@@ -96,6 +96,15 @@ fn until(client: &mut Client, mut want: impl FnMut(&Value) -> bool) -> Vec<Value
     panic!("never got the value; saw {:?}", seen.iter().map(text).collect::<Vec<_>>());
 }
 
+/// The number of the first edge in `json` that ends at a sandbox: an
+/// object `{"id":"e<n>",...,"b":"s<m>",...}`.
+fn sandbox_edge_in(json: &str) -> Option<u64> {
+    json.match_indices(r#"{"id":"e"#).find_map(|(at, _)| {
+        let edge = &json[at..at + json[at..].find('}')?];
+        edge.contains(r#""b":"s"#).then(|| edge[8..].chars().take_while(char::is_ascii_digit).collect::<String>().parse().ok())?
+    })
+}
+
 /// The number after `"key":` in `json`.
 fn number_after(json: &str, key: &str) -> u64 {
     let at = json.find(&format!("\"{key}\":")).unwrap_or_else(|| panic!("no {key} in {json}")) + key.len() + 3;
@@ -113,6 +122,14 @@ fn an_observer_sees_the_graph_its_changes_events_and_packets() {
     let world = client.call(r#"{"op":"world"}"#).unwrap();
     assert!(world.end && !world.binary);
     assert!(text(&world).starts_with(r#"{"observe":1,"#), "{}", text(&world));
+    // The observer finds the run once the world first asks for a sandbox;
+    // before that, a watch starts with "waiting". Wait for it, so the watch
+    // below starts with the snapshot even on a busy machine.
+    let start = Instant::now();
+    while !text(&client.call(r#"{"op":"world"}"#).unwrap()).contains(r#""running":true"#) {
+        assert!(start.elapsed() < Duration::from_secs(10), "the world never started running");
+        std::thread::sleep(Duration::from_millis(10));
+    }
 
     // Follow the graph, then attach a sandbox: it shows up as a node with
     // an edge, its counters rise, and the echo task's events arrive.
@@ -125,9 +142,10 @@ fn an_observer_sees_the_graph_its_changes_events_and_packets() {
         let t = text(v);
         assert_eq!(v.id, watch);
         assert!(!v.end);
-        if t.starts_with(r#"{"event":"edge""#) && t.contains(r#""b":"s"#) {
-            let at = t.find(r#""id":"e"#).unwrap() + 7;
-            sandbox_edge = Some(t[at..].chars().take_while(char::is_ascii_digit).collect::<String>().parse::<u64>().unwrap());
+        // The sandbox may attach before the snapshot is taken, so its edge
+        // arrives either in the snapshot or as an edge event.
+        if t.starts_with(r#"{"event":"edge""#) || t.starts_with(r#"{"event":"snapshot""#) {
+            sandbox_edge = sandbox_edge.or_else(|| sandbox_edge_in(&t));
         }
         counters += t.starts_with(r#"{"event":"counters""#) as u32;
         if t.starts_with(r#"{"event":"note""#) && t.contains(r#""kind":"event","#) && t.contains(r#""name":"echo","data":{"len":28}"#) {
