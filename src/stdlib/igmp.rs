@@ -13,17 +13,20 @@
 //!
 //! Nothing here reads a socket. A world that plays a host or a router
 //! hands each IGMP payload (the bytes after the IPv4 header) to
-//! [`Message::parse`], looks at the [`Message`], and sends the bytes
+//! [`Message::receive`], looks at the [`Message`], and sends the bytes
 //! [`Message::to_bytes`] returns in an IPv4 packet with protocol
 //! [`PROTOCOL`], a TTL of 1 and the Router Alert option, to the address
-//! [`Message::destination`] gives. A [`Decoder`] reads a message that comes
-//! in pieces and reports a bad type as soon as the first byte shows it.
+//! [`Message::destination`] gives. For pieces of one payload, use
+//! [`Stream<Frames>`](super::codec::Stream), with `Frames = Collect<Message>`
+//! and [`MAX_MESSAGE`] as the collection limit. Call `end` at the IPv4 boundary.
+//! This collection uses the strict [`Message::parse`] reader.
 //! Which groups a host has joined, and what a router does with a report,
 //! is up to world code.
 //!
 //! Every reader checks lengths and the checksum, because the agent can send
-//! any bytes it likes. Bytes past the end of a message are covered by the
-//! checksum and otherwise ignored, as both RFCs ask. Reserved fields and
+//! any bytes it likes. Bytes past the message and its declared auxiliary
+//! data are included in the checksum and ignored by [`Message::receive`].
+//! [`Message::parse`] refuses them. Reserved fields and
 //! the unused field of version 1 reports are ignored when read and written
 //! as zero. So is the group field of a version 1 query, which RFC 1112
 //! says is zero when sent and ignored when read. Auxiliary data in a
@@ -43,6 +46,7 @@
 //! that has joined some groups from every source.
 //!
 //! ```
+//! use fictionet::stdlib::codec::Wire;
 //! use std::net::Ipv4Addr;
 //! use fictionet::stdlib::igmp::{ALL_SYSTEMS, GroupRecord, Message, QueryV3, RecordType};
 //!
@@ -96,14 +100,8 @@
 //! assert_eq!(reports.len(), 1);
 //! assert_eq!(reports[0].to_bytes().unwrap(), [0x22, 0, 0xea, 0xf9, 0, 0, 0, 1, 2, 0, 0, 0, 239, 1, 2, 3]);
 //! ```
-//!
-//! [`Message`] implements [`Wire`](super::codec::Wire) for exact parsing
-//! and transactional writing. Its trait parser refuses trailing bytes;
-//! [`Message::parse`] keeps ignoring them. Declared auxiliary data is part
-//! of the message and is still ignored. For chunks of one message, use
-//! `Stream::new(Collect::<Message>::new(MAX_MESSAGE))` and end the stream
-//! at the message boundary. [`Decoder`] keeps its early type check,
-//! constructor, and repeated feed errors.
+
+use super::codec::Wire;
 
 use std::net::Ipv4Addr;
 
@@ -293,6 +291,11 @@ pub struct GroupRecord {
 pub enum IgmpError {
     /// The bytes end before the message does.
     Truncated,
+    /// Bytes follow the message and its declared auxiliary data.
+    Trailing {
+        /// Number of bytes after the message.
+        remaining: usize,
+    },
     /// The message is longer than [`MAX_MESSAGE`].
     TooLong,
     /// The checksum over the message is wrong.
@@ -310,14 +313,15 @@ pub enum IgmpError {
     /// A version 3 general query listed this many sources. A general query
     /// lists none.
     GeneralQuerySources(usize),
-    /// A group record to be written had [`RecordType::Other`] with a code
-    /// from 1 to 6, which would read back as a different record type.
-    RecordType(u8),
+    /// A value cannot be written without changing it. This includes an
+    /// inexact response code or [`RecordType::Other`] with a known code.
+    Unwritable,
 }
 
 impl std::fmt::Display for IgmpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            IgmpError::Trailing { remaining } => write!(f, "{remaining} bytes after the IGMP message"),
             IgmpError::Truncated => write!(f, "the message is cut short"),
             IgmpError::TooLong => write!(f, "the message is longer than {MAX_MESSAGE} bytes"),
             IgmpError::Checksum => write!(f, "the checksum is wrong"),
@@ -326,7 +330,7 @@ impl std::fmt::Display for IgmpError {
             IgmpError::Qrv(q) => write!(f, "QRV {q}, above {MAX_QRV}"),
             IgmpError::Address(a) => write!(f, "address {a} cannot be used in that field"),
             IgmpError::GeneralQuerySources(n) => write!(f, "a general query that lists {n} sources"),
-            IgmpError::RecordType(c) => write!(f, "record type Other({c}), a code that has its own type"),
+            IgmpError::Unwritable => f.write_str("value cannot be written without changing it"),
         }
     }
 }
@@ -347,23 +351,39 @@ pub fn decode_code(code: u8) -> u32 {
     }
 }
 
-/// The code for `value`, for a maximum response code or QQIC. Values below
-/// 128 are exact. Larger values round down to the nearest value a code can
-/// hold, and values above [`MAX_CODE_VALUE`] become the largest code.
-pub fn encode_code(value: u32) -> u8 {
-    if value < 128 {
-        return value as u8;
-    }
-    if value >= MAX_CODE_VALUE {
-        return 0xff;
-    }
-    for exp in 0..8u32 {
-        let m = value >> (exp + 3);
-        if (16..32).contains(&m) {
-            return 0x80 | ((exp as u8) << 4) | ((m - 16) as u8);
+/// A maximum response code or QQIC, stored as its decoded numeric value.
+/// Values below 128 are exact. Larger values must fit the exponent and
+/// mantissa described by [`decode_code`]. Serialization never rounds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Code(
+    /// Decoded response time or query interval, at most [`MAX_CODE_VALUE`].
+    pub u32,
+);
+
+impl Wire for Code {
+    type ParseError = IgmpError;
+    type WriteError = IgmpError;
+
+    /// Reads one response code or QQIC. Refuses an empty slice or trailing bytes.
+    fn parse(bytes: &[u8]) -> Result<Self, IgmpError> {
+        match bytes {
+            [code] => Ok(Self(decode_code(*code))),
+            [] => Err(IgmpError::Truncated),
+            _ => Err(IgmpError::Trailing { remaining: bytes.len() - 1 }),
         }
     }
-    0xff
+
+    /// Appends one code. Refuses values that need rounding or exceed
+    /// [`MAX_CODE_VALUE`]. Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), IgmpError> {
+        let code = if self.0 < 128 {
+            self.0 as u8
+        } else {
+            (128..=255u8).find(|&code| decode_code(code) == self.0).ok_or(IgmpError::Unwritable)?
+        };
+        out.push(code);
+        Ok(())
+    }
 }
 
 /// The Internet checksum of `b`: the ones' complement of the ones'
@@ -440,73 +460,6 @@ fn check_query_v3(group: Ipv4Addr, sources: usize) -> Result<(), IgmpError> {
 }
 
 impl Message {
-    /// Reads the message in `b`, the whole IGMP payload of one IPv4
-    /// packet. The checksum must be right. Bytes past the end of the
-    /// message are ignored.
-    pub fn parse(b: &[u8]) -> Result<Message, IgmpError> {
-        let &t = b.first().ok_or(IgmpError::Truncated)?;
-        if !known_type(t) {
-            return Err(IgmpError::UnknownType(t));
-        }
-        if b.len() > MAX_MESSAGE {
-            return Err(IgmpError::TooLong);
-        }
-        if b.len() < HEADER_LEN {
-            return Err(IgmpError::Truncated);
-        }
-        if checksum(b) != 0 {
-            return Err(IgmpError::Checksum);
-        }
-        let group = addr(b, 4).ok_or(IgmpError::Truncated)?;
-        match t {
-            kind::MEMBERSHIP_QUERY => match b.len() {
-                // A version 1 query's group field is ignored when read.
-                HEADER_LEN if b[1] == 0 => Ok(Message::Query { max_resp_time: 0, group: Ipv4Addr::UNSPECIFIED }),
-                HEADER_LEN => {
-                    check_group(group, true)?;
-                    Ok(Message::Query { max_resp_time: b[1], group })
-                }
-                n if n < V3_QUERY_LEN => Err(IgmpError::QueryLength(n)),
-                _ => {
-                    let n = usize::from(be16(b, 10).ok_or(IgmpError::Truncated)?);
-                    check_query_v3(group, n)?;
-                    let (sources, _) = addrs(b, V3_QUERY_LEN, n)?;
-                    Ok(Message::QueryV3(QueryV3 {
-                        max_resp_code: b[1],
-                        group,
-                        suppress: b[8] & 0x08 != 0,
-                        qrv: b[8] & 0x07,
-                        qqic: b[9],
-                        sources,
-                    }))
-                }
-            },
-            kind::V1_REPORT => check_group(group, false).map(|()| Message::ReportV1 { group }),
-            kind::V2_REPORT => check_group(group, false).map(|()| Message::ReportV2 { group }),
-            kind::LEAVE_GROUP => check_group(group, false).map(|()| Message::Leave { group }),
-            _ => {
-                let m = usize::from(be16(b, 6).ok_or(IgmpError::Truncated)?);
-                // Each record takes at least 8 bytes, so the bytes bound
-                // what is allocated, whatever the count says.
-                let mut records = Vec::with_capacity(m.min((b.len() - HEADER_LEN) / RECORD_HEADER_LEN));
-                let mut at = HEADER_LEN;
-                for _ in 0..m {
-                    let head = b.get(at..at + RECORD_HEADER_LEN).ok_or(IgmpError::Truncated)?;
-                    let aux_len = usize::from(head[1]) * 4;
-                    let n = usize::from(u16::from_be_bytes([head[2], head[3]]));
-                    let group = Ipv4Addr::new(head[4], head[5], head[6], head[7]);
-                    check_group(group, false)?;
-                    let (sources, end) = addrs(b, at + RECORD_HEADER_LEN, n)?;
-                    // The auxiliary data must be there, but is skipped.
-                    let aux_end = end.checked_add(aux_len).filter(|&e| e <= b.len()).ok_or(IgmpError::Truncated)?;
-                    records.push(GroupRecord { kind: RecordType::from_code(head[0]), group, sources });
-                    at = aux_end;
-                }
-                Ok(Message::ReportV3 { records })
-            }
-        }
-    }
-
     /// The message's type byte.
     pub fn kind(&self) -> u8 {
         match self {
@@ -576,8 +529,8 @@ impl Message {
             Message::ReportV3 { records } => {
                 let mut n = Some(HEADER_LEN);
                 for r in records {
-                    if let RecordType::Other(c @ 1..=6) = r.kind {
-                        return Err(IgmpError::RecordType(c));
+                    if let RecordType::Other(1..=6) = r.kind {
+                        return Err(IgmpError::Unwritable);
                     }
                     check_group(r.group, false)?;
                     check_sources(&r.sources)?;
@@ -594,15 +547,110 @@ impl Message {
         n.filter(|&n| n <= MAX_MESSAGE).ok_or(IgmpError::TooLong)
     }
 
+    /// Reads a complete IPv4 IGMP payload as a receiver does. Checks the
+    /// checksum over all of `b`, then ignores bytes after the message and
+    /// its declared auxiliary data (RFC 2236 2.5, RFC 3376 4.1.10 and 4.2.11).
+    /// Refuses invalid lengths, types, checksums, addresses, and payloads
+    /// above [`MAX_MESSAGE`], as [`Message::parse`] does.
+    pub fn receive(b: &[u8]) -> Result<Message, IgmpError> {
+        Self::read(b, false)
+    }
+
+    /// Reads the message, optionally requiring it to fill the payload.
+    fn read(b: &[u8], exact: bool) -> Result<Message, IgmpError> {
+        let &t = b.first().ok_or(IgmpError::Truncated)?;
+        if !known_type(t) {
+            return Err(IgmpError::UnknownType(t));
+        }
+        if b.len() > MAX_MESSAGE {
+            return Err(IgmpError::TooLong);
+        }
+        if b.len() < HEADER_LEN {
+            return Err(IgmpError::Truncated);
+        }
+        if checksum(b) != 0 {
+            return Err(IgmpError::Checksum);
+        }
+        let group = addr(b, 4).ok_or(IgmpError::Truncated)?;
+        let mut used = HEADER_LEN;
+        let message = match t {
+            kind::MEMBERSHIP_QUERY => match b.len() {
+                // A version 1 query's group field is ignored when read.
+                HEADER_LEN if b[1] == 0 => Ok(Message::Query { max_resp_time: 0, group: Ipv4Addr::UNSPECIFIED }),
+                HEADER_LEN => {
+                    check_group(group, true)?;
+                    Ok(Message::Query { max_resp_time: b[1], group })
+                }
+                n if n < V3_QUERY_LEN => Err(IgmpError::QueryLength(n)),
+                _ => {
+                    let n = usize::from(be16(b, 10).ok_or(IgmpError::Truncated)?);
+                    check_query_v3(group, n)?;
+                    let (sources, end) = addrs(b, V3_QUERY_LEN, n)?;
+                    used = end;
+                    Ok(Message::QueryV3(QueryV3 {
+                        max_resp_code: b[1],
+                        group,
+                        suppress: b[8] & 0x08 != 0,
+                        qrv: b[8] & 0x07,
+                        qqic: b[9],
+                        sources,
+                    }))
+                }
+            },
+            kind::V1_REPORT => check_group(group, false).map(|()| Message::ReportV1 { group }),
+            kind::V2_REPORT => check_group(group, false).map(|()| Message::ReportV2 { group }),
+            kind::LEAVE_GROUP => check_group(group, false).map(|()| Message::Leave { group }),
+            _ => {
+                let m = usize::from(be16(b, 6).ok_or(IgmpError::Truncated)?);
+                // Each record takes at least 8 bytes, so the bytes bound
+                // what is allocated, whatever the count says.
+                let mut records = Vec::with_capacity(m.min((b.len() - HEADER_LEN) / RECORD_HEADER_LEN));
+                let mut at = HEADER_LEN;
+                for _ in 0..m {
+                    let head = b.get(at..at + RECORD_HEADER_LEN).ok_or(IgmpError::Truncated)?;
+                    let aux_len = usize::from(head[1]) * 4;
+                    let n = usize::from(u16::from_be_bytes([head[2], head[3]]));
+                    let group = Ipv4Addr::new(head[4], head[5], head[6], head[7]);
+                    check_group(group, false)?;
+                    let (sources, end) = addrs(b, at + RECORD_HEADER_LEN, n)?;
+                    // The auxiliary data must be there, but is skipped.
+                    let aux_end = end.checked_add(aux_len).filter(|&e| e <= b.len()).ok_or(IgmpError::Truncated)?;
+                    records.push(GroupRecord { kind: RecordType::from_code(head[0]), group, sources });
+                    at = aux_end;
+                }
+                used = at;
+                Ok(Message::ReportV3 { records })
+            }
+        }?;
+        if exact && used != b.len() {
+            return Err(IgmpError::Trailing { remaining: b.len() - used });
+        }
+        Ok(message)
+    }
+}
+
+impl Wire for Message {
+    type ParseError = IgmpError;
+    type WriteError = IgmpError;
+
+    /// Reads one complete IPv4 IGMP payload. Refuses invalid lengths,
+    /// types, checksums, addresses, and trailing bytes. Reserved fields and
+    /// version 1 query groups are ignored. Declared auxiliary data is skipped.
+    fn parse(b: &[u8]) -> Result<Self, IgmpError> {
+        Self::read(b, true)
+    }
+
     /// The message's bytes, with the checksum filled in. It fails if the
     /// message would be longer than [`MAX_MESSAGE`], a QRV is above
     /// [`MAX_QRV`], an address is wrong for its field (see the module
     /// docs), a version 3 general query lists sources, or a record type is
     /// [`RecordType::Other`] with a code from 1 to 6. Auxiliary data is
     /// never written. Nothing is allocated before those checks pass.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, IgmpError> {
+    /// Leaves the destination unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), IgmpError> {
         let len = self.encoded_len()?;
-        let mut out = Vec::with_capacity(len);
+        let start = out.len();
+        out.reserve(len);
         out.push(self.kind());
         let (code, group) = match self {
             Message::Query { max_resp_time, group } => (*max_resp_time, *group),
@@ -637,132 +685,31 @@ impl Message {
             }
             _ => out.extend_from_slice(&group.octets()),
         }
-        let c = checksum(&out);
-        out[2..4].copy_from_slice(&c.to_be_bytes());
-        Ok(out)
-    }
-}
-
-/// Why an exact [`Wire`](super::codec::Wire) parse refused a message.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ParseError {
-    /// The message's fields, length, or checksum are invalid.
-    Message(IgmpError),
-    /// Bytes follow the message and its declared auxiliary data.
-    Trailing {
-        /// Number of bytes after the message.
-        remaining: usize,
-    },
-}
-
-impl core::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Message(e) => e.fmt(f),
-            Self::Trailing { remaining } => write!(f, "{remaining} bytes after the IGMP message"),
-        }
-    }
-}
-
-impl core::error::Error for ParseError {}
-
-impl super::codec::Wire for Message {
-    type ParseError = ParseError;
-    type WriteError = IgmpError;
-
-    /// Reads exactly one message, including any declared auxiliary data.
-    /// Reserved fields and auxiliary data follow [`Message::parse`].
-    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
-        let message = Message::parse(bytes).map_err(ParseError::Message)?;
-        let short = ParseError::Message(IgmpError::Truncated);
-        let used = match &message {
-            Message::QueryV3(q) => V3_QUERY_LEN.saturating_add(q.sources.len().saturating_mul(4)),
-            Message::ReportV3 { records } => {
-                let mut at = HEADER_LEN;
-                for record in records {
-                    let aux_at = at.checked_add(1).ok_or(short)?;
-                    let aux = usize::from(*bytes.get(aux_at).ok_or(short)?).saturating_mul(4);
-                    at = at.checked_add(RECORD_HEADER_LEN)
-                        .and_then(|n| n.checked_add(record.sources.len().checked_mul(4)?))
-                        .and_then(|n| n.checked_add(aux)).ok_or(short)?;
-                }
-                at
-            }
-            _ => HEADER_LEN,
-        };
-        if used != bytes.len() {
-            return Err(ParseError::Trailing { remaining: bytes.len().saturating_sub(used) });
-        }
-        Ok(message)
-    }
-
-    /// Appends at most [`MAX_MESSAGE`] bytes. Leaves `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), IgmpError> {
-        out.extend_from_slice(&self.to_bytes()?);
+        let c = checksum(&out[start..]);
+        out[start + 2..start + 4].copy_from_slice(&c.to_be_bytes());
         Ok(())
-    }
-}
-
-/// Reads one message that comes in pieces. Feed it the bytes in order,
-/// then call [`Decoder::finish`]. It fails as soon as the first byte shows
-/// an unknown type, or the bytes run past [`MAX_MESSAGE`]. It holds at
-/// most [`MAX_MESSAGE`] plus one bytes.
-#[derive(Clone, Debug, Default)]
-pub struct Decoder {
-    buf: Vec<u8>,
-    failed: Option<IgmpError>,
-}
-
-impl Decoder {
-    /// A decoder holding no bytes.
-    pub fn new() -> Decoder {
-        Decoder::default()
-    }
-
-    /// Adds the next bytes of the message. It returns the error once the
-    /// bytes show one, and the same error on every later call; bytes fed
-    /// after that are dropped.
-    pub fn feed(&mut self, bytes: &[u8]) -> Result<(), IgmpError> {
-        if let Some(e) = self.failed {
-            return Err(e);
-        }
-        // One byte past the limit is enough to know the message is too long.
-        let room = (MAX_MESSAGE + 1).saturating_sub(self.buf.len());
-        self.buf.extend_from_slice(&bytes[..bytes.len().min(room)]);
-        if let Some(&t) = self.buf.first()
-            && !known_type(t) {
-                return Err(self.fail(IgmpError::UnknownType(t)));
-            }
-        if self.buf.len() > MAX_MESSAGE {
-            return Err(self.fail(IgmpError::TooLong));
-        }
-        Ok(())
-    }
-
-    fn fail(&mut self, e: IgmpError) -> IgmpError {
-        self.failed = Some(e);
-        self.buf = Vec::new();
-        e
-    }
-
-    /// How many bytes are held.
-    pub fn buffered(&self) -> usize {
-        self.buf.len()
-    }
-
-    /// The message, when no more bytes will come. It gives the same result
-    /// as [`Message::parse`] on all the bytes fed.
-    pub fn finish(self) -> Result<Message, IgmpError> {
-        match self.failed {
-            Some(e) => Err(e),
-            None => Message::parse(&self.buf),
-        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stdlib::codec::{Collect, CollectError, Fail, contract, test_support::{Lcg, decode_all, mutate}};
+
+    fn collect(b: &[u8]) -> Result<Message, IgmpError> {
+        let make = || Collect::<Message>::new(MAX_MESSAGE);
+        contract::check_decode_with_alloc_limit(make, b, 2 * (MAX_MESSAGE + 1));
+        contract::check_wire::<Message>(b);
+        let parsed = Message::parse(b);
+        let (items, failure) = decode_all(make, b);
+        if b.len() <= MAX_MESSAGE {
+            assert_eq!(failure, parsed.clone().err().map(|e| Fail::Protocol(CollectError::Parse(e))));
+            assert_eq!(items, parsed.clone().ok().into_iter().collect::<Vec<_>>());
+        } else {
+            assert_eq!(failure, Some(Fail::Protocol(CollectError::TooLong { limit: MAX_MESSAGE })));
+        }
+        parsed
+    }
 
     fn ip(a: u8, b: u8, c: u8, d: u8) -> Ipv4Addr {
         Ipv4Addr::new(a, b, c, d)
@@ -779,38 +726,12 @@ mod tests {
         b
     }
 
-    fn decode_bytewise(b: &[u8]) -> Result<Message, IgmpError> {
-        let mut d = Decoder::new();
-        for x in b {
-            if d.feed(std::slice::from_ref(x)).is_err() {
-                break;
-            }
-        }
-        d.finish()
-    }
-
-    fn decode_whole(b: &[u8]) -> Result<Message, IgmpError> {
-        let mut d = Decoder::new();
-        let _ = d.feed(b);
-        d.finish()
-    }
-
-    fn decode_chunked(b: &[u8], size: usize) -> Result<Message, IgmpError> {
-        let mut d = Decoder::new();
-        for chunk in b.chunks(size) {
-            if d.feed(chunk).is_err() {
-                break;
-            }
-        }
-        d.finish()
-    }
-
     fn round_trip(m: &Message) -> Vec<u8> {
         let b = m.to_bytes().unwrap();
         assert_eq!(b.len(), m.encoded_len().unwrap());
         assert_eq!(checksum(&b), 0);
         assert_eq!(Message::parse(&b).as_ref(), Ok(m));
-        assert_eq!(decode_bytewise(&b).as_ref(), Ok(m));
+        assert_eq!(collect(&b).as_ref(), Ok(m));
         b
     }
 
@@ -963,34 +884,59 @@ mod tests {
         assert_eq!(decode_code(0x90), 16 << 4);
         assert_eq!(decode_code(0xff), MAX_CODE_VALUE);
         for c in 0..=255u8 {
-            assert_eq!(encode_code(decode_code(c)), c);
+            assert_eq!(Code(decode_code(c)).to_bytes(), Ok(vec![c]));
+            contract::check_wire::<Code>(&[c]);
         }
-        for v in [0u32, 1, 127, 128, 129, 255, 256, 1000, 31_743, 31_744, 40_000, u32::MAX] {
-            let d = decode_code(encode_code(v));
-            assert!(d <= v);
-            if v < 128 {
-                assert_eq!(d, v);
-            }
+        for v in [129, 255, 1000, 31_743, 40_000, u32::MAX] {
+            assert_eq!(Code(v).to_bytes(), Err(IgmpError::Unwritable));
+            contract::check_wire_value(&Code(v));
         }
-        assert_eq!(encode_code(u32::MAX), 0xff);
-        assert_eq!(encode_code(1000), 0xaf);
+        assert_eq!(Code(992).to_bytes(), Ok(vec![0xaf]));
+        assert_eq!(Code::parse(&[0xaf]), Ok(Code(992)));
+        assert_eq!(Code::parse(&[]), Err(IgmpError::Truncated));
+        assert_eq!(Code::parse(&[0xaf, 0]), Err(IgmpError::Trailing { remaining: 1 }));
         assert_eq!(decode_code(0xaf), 31 << 5);
     }
 
     #[test]
     fn trailing_bytes_are_ignored() {
-        let mut b = Message::ReportV2 { group: ip(239, 9, 9, 9) }.to_bytes().unwrap();
-        b.extend_from_slice(&[1, 2, 3, 4, 5]);
-        let b = fix(b);
-        assert_eq!(Message::parse(&b), Ok(Message::ReportV2 { group: ip(239, 9, 9, 9) }));
-        let q = QueryV3 { max_resp_code: 1, group: ip(0, 0, 0, 0), suppress: false, qrv: 1, qqic: 1, sources: vec![] };
-        let mut b = Message::QueryV3(q.clone()).to_bytes().unwrap();
-        b.extend_from_slice(&[9; 3]);
-        assert_eq!(Message::parse(&fix(b)), Ok(Message::QueryV3(q)));
-        // The extra bytes are in the checksum.
-        let mut b = Message::Leave { group: ip(239, 1, 1, 1) }.to_bytes().unwrap();
-        b.push(1);
-        assert_eq!(Message::parse(&b), Err(IgmpError::Checksum));
+        let messages = [
+            Message::ReportV2 { group: ip(239, 9, 9, 9) },
+            Message::Leave { group: ip(239, 1, 1, 1) },
+            Message::QueryV3(QueryV3 {
+                max_resp_code: 1, group: Ipv4Addr::UNSPECIFIED, suppress: false,
+                qrv: 1, qqic: 1, sources: vec![],
+            }),
+            Message::QueryV3(QueryV3 {
+                max_resp_code: 1, group: ip(239, 1, 1, 1), suppress: false,
+                qrv: 1, qqic: 1, sources: vec![ip(192, 0, 2, 1)],
+            }),
+            Message::ReportV3 { records: vec![GroupRecord {
+                kind: RecordType::ModeIsInclude, group: ip(239, 1, 1, 1),
+                sources: vec![ip(192, 0, 2, 1)],
+            }] },
+        ];
+        for m in messages {
+            let mut b = m.to_bytes().unwrap();
+            assert_eq!(Message::receive(&b).as_ref(), Ok(&m));
+            // A report's declared auxiliary data is skipped before trailing bytes.
+            if matches!(m, Message::ReportV3 { .. }) {
+                b[9] = 1;
+                b.extend_from_slice(&[6, 7, 8, 9]);
+                b = fix(b);
+                assert_eq!(Message::parse(&b).as_ref(), Ok(&m));
+                assert_eq!(Message::receive(&b).as_ref(), Ok(&m));
+                assert_eq!(Message::receive(&fix(b[..b.len() - 1].to_vec())), Err(IgmpError::Truncated));
+            }
+            b.extend_from_slice(&[1, 2, 3, 4, 5]);
+            // Trailing bytes still participate in the checksum.
+            assert_eq!(Message::receive(&b), Err(IgmpError::Checksum));
+            assert_eq!(Message::parse(&b), Err(IgmpError::Checksum));
+            let b = fix(b);
+            assert_eq!(Message::receive(&b), Ok(m));
+            assert_eq!(collect(&b), Err(IgmpError::Trailing { remaining: 5 }));
+            check_bytes(&b);
+        }
     }
 
     #[test]
@@ -1046,8 +992,8 @@ mod tests {
         for c in 1..=6u8 {
             let r = GroupRecord { kind: RecordType::Other(c), group: ip(239, 0, 0, 1), sources: vec![] };
             let m = Message::ReportV3 { records: vec![r] };
-            assert_eq!(m.to_bytes(), Err(IgmpError::RecordType(c)));
-            assert_eq!(m.encoded_len(), Err(IgmpError::RecordType(c)));
+            assert_eq!(m.to_bytes(), Err(IgmpError::Unwritable));
+            assert_eq!(m.encoded_len(), Err(IgmpError::Unwritable));
         }
     }
 
@@ -1070,8 +1016,8 @@ mod tests {
         // A large chunk of unknown type fails on its type, as parse does.
         let big = vec![0x99; MAX_MESSAGE * 2];
         assert_eq!(Message::parse(&big), Err(IgmpError::UnknownType(0x99)));
-        assert_eq!(decode_whole(&big), Err(IgmpError::UnknownType(0x99)));
-        assert_eq!(decode_whole(&vec![0x11; MAX_MESSAGE * 2]), Err(IgmpError::TooLong));
+        assert_eq!(collect(&big), Err(IgmpError::UnknownType(0x99)));
+        assert_eq!(collect(&vec![0x11; MAX_MESSAGE * 2]), Err(IgmpError::TooLong));
     }
 
     #[test]
@@ -1093,7 +1039,7 @@ mod tests {
             IgmpError::Qrv(9),
             IgmpError::Address(ip(10, 0, 0, 1)),
             IgmpError::GeneralQuerySources(1),
-            IgmpError::RecordType(1),
+            IgmpError::Unwritable,
         ];
         for e in all {
             assert!(!e.to_string().is_empty());
@@ -1233,7 +1179,7 @@ mod tests {
             for n in 0..b.len() {
                 let p = &b[..n];
                 assert!(Message::parse(p).is_err(), "{m:?} prefix {n}");
-                assert_eq!(decode_bytewise(p), Message::parse(p));
+                assert_eq!(collect(p), Message::parse(p));
                 // With the checksum fixed, a prefix still fails, unless it
                 // happens to be a whole shorter message (a v3 query cut to
                 // 8 bytes reads as a v2 query).
@@ -1246,69 +1192,56 @@ mod tests {
     }
 
     #[test]
-    fn decoder_matches_parse() {
+    fn collection_matches_parse() {
         for m in samples() {
-            let b = m.to_bytes().unwrap();
-            assert_eq!(decode_whole(&b), Ok(m.clone()));
-            for size in 1..6 {
-                assert_eq!(decode_chunked(&b, size), Ok(m.clone()));
-            }
+            assert_eq!(collect(&m.to_bytes().unwrap()), Ok(m));
         }
-        // An unknown type fails at the first byte, and stays failed.
-        let mut d = Decoder::new();
-        assert_eq!(d.feed(&[0x99]), Err(IgmpError::UnknownType(0x99)));
-        assert_eq!(d.feed(&[0x11]), Err(IgmpError::UnknownType(0x99)));
-        assert_eq!(d.buffered(), 0);
-        assert_eq!(d.finish(), Err(IgmpError::UnknownType(0x99)));
-        // Too many bytes fail, and the decoder holds no more than allowed.
-        let mut d = Decoder::new();
-        assert_eq!(d.feed(&vec![0x22; MAX_MESSAGE]), Ok(()));
-        assert_eq!(d.buffered(), MAX_MESSAGE);
-        assert_eq!(d.feed(&[0; 100]), Err(IgmpError::TooLong));
-        assert_eq!(d.finish(), Err(IgmpError::TooLong));
-        assert_eq!(Decoder::new().finish(), Err(IgmpError::Truncated));
+        assert_eq!(collect(&[0x99]), Err(IgmpError::UnknownType(0x99)));
+        assert_eq!(collect(&vec![0x22; MAX_MESSAGE + 100]), Err(IgmpError::TooLong));
+        assert_eq!(collect(&[]), Err(IgmpError::Truncated));
     }
 
-    /// A deterministic pseudo-random generator for the fuzz loops.
-    struct Lcg(u64);
+    trait Samples {
+        fn addr(&mut self) -> Ipv4Addr;
+        fn group(&mut self) -> Ipv4Addr;
+        fn query_group(&mut self) -> Ipv4Addr;
+        fn source(&mut self) -> Ipv4Addr;
+        fn sources(&mut self, n: usize) -> Vec<Ipv4Addr>;
+        fn addrs(&mut self, n: usize) -> Vec<Ipv4Addr>;
+    }
 
-    impl Lcg {
-        fn next(&mut self) -> u32 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (self.0 >> 32) as u32
-        }
-        fn below(&mut self, n: usize) -> usize {
-            self.next() as usize % n.max(1)
-        }
+    impl Samples for Lcg {
         /// Any address at all.
         fn addr(&mut self) -> Ipv4Addr {
-            Ipv4Addr::from(self.next())
+            let mut bytes = [0; 4];
+            self.fill(&mut bytes);
+            Ipv4Addr::from(bytes)
         }
         /// A multicast address, 224.0.0.0 to 239.255.255.255.
         fn group(&mut self) -> Ipv4Addr {
-            Ipv4Addr::from(0xe000_0000 | (self.next() & 0x0fff_ffff))
+            Ipv4Addr::from(0xe000_0000 | ((self.next() as u32) & 0x0fff_ffff))
         }
         /// A group for a query: multicast, or now and then 0.0.0.0.
         fn query_group(&mut self) -> Ipv4Addr {
-            if self.below(3) == 0 { Ipv4Addr::UNSPECIFIED } else { self.group() }
+            if self.index(3) == 0 { Ipv4Addr::UNSPECIFIED } else { self.group() }
         }
         /// A unicast address: first octet 1 to 223.
         fn source(&mut self) -> Ipv4Addr {
-            let first = 1 + self.below(223) as u32;
-            Ipv4Addr::from((first << 24) | (self.next() & 0x00ff_ffff))
+            let first = 1 + self.index(223) as u32;
+            Ipv4Addr::from((first << 24) | ((self.next() as u32) & 0x00ff_ffff))
         }
         fn sources(&mut self, n: usize) -> Vec<Ipv4Addr> {
-            (0..self.below(n)).map(|_| self.source()).collect()
+            (0..self.index(n)).map(|_| self.source()).collect()
         }
         /// Any addresses, valid or not.
         fn addrs(&mut self, n: usize) -> Vec<Ipv4Addr> {
-            (0..self.below(n)).map(|_| self.addr()).collect()
+            (0..self.index(n)).map(|_| self.addr()).collect()
         }
     }
 
     /// A random message the writer accepts.
     fn random_message(rng: &mut Lcg) -> Message {
-        match rng.below(6) {
+        match rng.index(6) {
             0 => match rng.next() as u8 {
                 0 => Message::Query { max_resp_time: 0, group: Ipv4Addr::UNSPECIFIED },
                 t => Message::Query { max_resp_time: t, group: rng.query_group() },
@@ -1322,19 +1255,19 @@ mod tests {
                 Message::QueryV3(QueryV3 {
                     max_resp_code: rng.next() as u8,
                     group,
-                    suppress: rng.below(2) == 0,
-                    qrv: rng.below(8) as u8,
+                    suppress: !rng.coin(),
+                    qrv: rng.index(8) as u8,
                     qqic: rng.next() as u8,
                     sources,
                 })
             }
             _ => {
-                let n = rng.below(5);
+                let n = rng.index(5);
                 let records = (0..n)
                     .map(|_| GroupRecord {
-                        kind: match rng.below(9) as u8 {
+                        kind: match rng.index(9) as u8 {
                             c @ 1..=6 => RecordType::from_code(c),
-                            _ => RecordType::Other([0, 7, 200, 255][rng.below(4)]),
+                            _ => RecordType::Other([0, 7, 200, 255][rng.index(4)]),
                         },
                         group: rng.group(),
                         sources: rng.sources(5),
@@ -1348,25 +1281,25 @@ mod tests {
     /// A random message, valid or not: any addresses, QRV and record
     /// codes.
     fn random_any_message(rng: &mut Lcg) -> Message {
-        match rng.below(6) {
+        match rng.index(6) {
             0 => Message::Query { max_resp_time: rng.next() as u8 % 3, group: rng.addr() },
             1 => Message::ReportV1 { group: rng.addr() },
             2 => Message::ReportV2 { group: rng.addr() },
             3 => Message::Leave { group: rng.addr() },
             4 => Message::QueryV3(QueryV3 {
                 max_resp_code: rng.next() as u8,
-                group: if rng.below(2) == 0 { Ipv4Addr::UNSPECIFIED } else { rng.addr() },
-                suppress: rng.below(2) == 0,
-                qrv: rng.below(10) as u8,
+                group: if !rng.coin() { Ipv4Addr::UNSPECIFIED } else { rng.addr() },
+                suppress: !rng.coin(),
+                qrv: rng.index(10) as u8,
                 qqic: rng.next() as u8,
                 sources: rng.addrs(3),
             }),
             _ => {
-                let n = rng.below(3);
+                let n = rng.index(3);
                 let records = (0..n)
                     .map(|_| GroupRecord {
-                        kind: RecordType::Other(rng.below(9) as u8),
-                        group: if rng.below(2) == 0 { rng.group() } else { rng.addr() },
+                        kind: RecordType::Other(rng.index(9) as u8),
+                        group: if !rng.coin() { rng.group() } else { rng.addr() },
                         sources: rng.addrs(3),
                     })
                     .collect();
@@ -1416,21 +1349,22 @@ mod tests {
     fn check_bytes(data: &[u8]) {
         let parsed = Message::parse(data);
         if let Ok(m) = &parsed {
+            assert_eq!(Message::receive(data).as_ref(), Ok(m));
+        }
+        if let Ok(m) = Message::receive(data) {
             // A message read follows the RFCs, can be written, and reads
             // back the same.
-            assert!(conforms(m), "{m:?}");
+            assert!(conforms(&m), "{m:?}");
             let out = m.to_bytes().unwrap();
             assert!(out.len() <= data.len());
-            assert_eq!(Message::parse(&out).as_ref(), Ok(m));
+            assert_eq!(Message::parse(&out), Ok(m));
         }
-        assert_eq!(decode_whole(data), parsed);
-        assert_eq!(decode_bytewise(data), parsed);
-        assert_eq!(decode_chunked(data, data.len() % 7 + 2), parsed);
+        assert_eq!(collect(data), parsed);
     }
 
     #[test]
     fn fuzz_loop() {
-        let mut rng = Lcg(0x1906_2236_3376);
+        let mut rng = Lcg::new(0x1906_2236_3376);
         for _ in 0..4000 {
             // Any message: the writer accepts exactly the ones that follow
             // the RFCs.
@@ -1450,24 +1384,17 @@ mod tests {
             // Flip some bytes, cut or extend, and fix the checksum most of
             // the time so the parser looks past it.
             let mut mutated = b.clone();
-            for _ in 0..rng.below(4) {
-                let i = rng.below(mutated.len());
-                mutated[i] = rng.next() as u8;
+            for _ in 0..1 + rng.index(4) {
+                mutate(&mut rng, &mut mutated);
             }
-            match rng.below(4) {
-                0 => mutated.truncate(rng.below(mutated.len() + 1)),
-                1 => mutated.extend((0..rng.below(12)).map(|_| rng.next() as u8)),
-                _ => {}
-            }
-            if rng.below(4) != 0 {
+            if rng.index(4) != 0 {
                 mutated = fix(mutated);
             }
             check_bytes(&mutated);
             // Plain random bytes, with a known type and a right checksum.
-            let n = rng.below(40);
-            let mut raw: Vec<u8> = (0..n).map(|_| rng.next() as u8).collect();
+            let mut raw = rng.bytes(80);
             if let Some(t) = raw.first_mut() {
-                *t = [0x11, 0x12, 0x16, 0x17, 0x22, rng.next() as u8][rng.below(6)];
+                *t = [0x11, 0x12, 0x16, 0x17, 0x22, rng.next() as u8][rng.index(6)];
             }
             check_bytes(&fix(raw));
         }

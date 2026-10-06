@@ -4,8 +4,8 @@
 
 use std::net::Ipv4Addr;
 
-use fictionet::stdlib::igmp::{Decoder, Message, RecordType, checksum};
-use fictionet::stdlib::{codec::{Collect, contract}, igmp};
+use fictionet::stdlib::igmp::{Message, RecordType, checksum};
+use fictionet::stdlib::{codec::{Wire, Collect, contract}, igmp};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -23,8 +23,12 @@ fuzz_target!(|data: &[u8]| {
 });
 
 fn check(data: &[u8]) {
-    contract::check_decode(|| Collect::<igmp::Message>::new(igmp::MAX_MESSAGE), data);
+    contract::check_decode_with_alloc_limit(|| Collect::<igmp::Message>::new(igmp::MAX_MESSAGE), data, 2 * (igmp::MAX_MESSAGE + 1));
     contract::check_wire::<igmp::Message>(data);
+    contract::check_wire::<igmp::Code>(data);
+    if let Some((value, _)) = data.split_first_chunk::<4>() {
+        contract::check_wire_value(&igmp::Code(u32::from_be_bytes(*value)));
+    }
 
     let query = Message::QueryV3(igmp::QueryV3 {
         max_resp_code: 100,
@@ -37,25 +41,18 @@ fn check(data: &[u8]) {
     contract::check_wire_value(&query);
     let parsed = Message::parse(data);
 
-    // The message, fed two ways: all at once, and a byte at a time.
-    let mut whole = Decoder::new();
-    let _ = whole.feed(data);
-    assert_eq!(whole.finish(), parsed);
-    let mut bytewise = Decoder::new();
-    for b in data {
-        let _ = bytewise.feed(std::slice::from_ref(b));
-    }
-    assert_eq!(bytewise.finish(), parsed);
-
     if let Ok(m) = &parsed {
+        assert_eq!(Message::receive(data).as_ref(), Ok(m));
+    }
+    if let Ok(m) = Message::receive(data) {
         // A message read follows the RFCs, checked apart from the module's
         // own rules, can be written, and reads back the same.
-        assert!(conforms(m), "{m:?}");
+        assert!(conforms(&m), "{m:?}");
         let bytes = m.to_bytes().unwrap();
         assert_eq!(m.encoded_len(), Ok(bytes.len()));
         assert!(bytes.len() <= data.len());
         assert_eq!(checksum(&bytes), 0);
-        assert_eq!(Message::parse(&bytes).as_ref(), Ok(m));
+        assert_eq!(Message::parse(&bytes), Ok(m));
     }
 }
 

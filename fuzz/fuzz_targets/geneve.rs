@@ -2,8 +2,8 @@
 //! headers built from any field values, as a world writes them.
 #![no_main]
 
-use fictionet::stdlib::geneve::{Decoder, GeneveOption, Header, Packet};
-use fictionet::stdlib::{codec::{Collect, contract}, geneve};
+use fictionet::stdlib::geneve::{GeneveOption, Header, Packet};
+use fictionet::stdlib::{codec::{Wire, Collect, contract}, geneve};
 use libfuzzer_sys::fuzz_target;
 
 /// A packet built from any field values, valid or not. Each option takes
@@ -35,20 +35,11 @@ fn packet_from(data: &[u8]) -> Option<Packet> {
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode(|| Collect::<geneve::Packet>::new(geneve::MAX_DATAGRAM), data);
+    contract::check_decode_with_alloc_limit(|| Collect::<geneve::Packet>::new(geneve::MAX_DATAGRAM), data, 2 * (geneve::MAX_DATAGRAM + 1));
     contract::check_wire::<geneve::Packet>(data);
+    contract::check_wire::<Header>(data);
 
     let parsed = Packet::parse(data);
-
-    // The datagram, fed two ways: all at once, and a byte at a time.
-    let mut whole = Decoder::new();
-    let _ = whole.feed(data);
-    assert_eq!(whole.finish(), parsed);
-    let mut bytewise = Decoder::new();
-    for b in data {
-        let _ = bytewise.feed(std::slice::from_ref(b));
-    }
-    assert_eq!(bytewise.finish(), parsed);
 
     if let Ok(p) = &parsed {
         // A packet read can be written, and reads back the same.
@@ -72,6 +63,7 @@ fuzz_target!(|data: &[u8]| {
     // same, or refuses and leaves the buffer alone.
     if let Some(p) = packet_from(data) {
         contract::check_wire_value(&p);
+        contract::check_wire_value(&p.header);
         let mut out = vec![0xee];
         match p.write(&mut out) {
             Ok(()) => assert_eq!(Packet::parse(&out[1..]).as_ref(), Ok(&p)),

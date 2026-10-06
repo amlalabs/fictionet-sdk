@@ -45,7 +45,7 @@ cargo +nightly fuzz list
 | `fastcgi` | arbitrary bytes and constructed values | `stdlib::fastcgi`: exact wire values, request and response state, and bounded codec contracts |
 | `bgp` | arbitrary bytes and constructed values | `stdlib::bgp`: exact frames, session context, UPDATE handling, and bounded codec contracts |
 | `ftp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::ftp`: FTP |
-| `geneve` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::geneve`: Geneve |
+| `geneve` | datagrams and constructed headers; bounded collection and wire contracts | `stdlib::geneve`: Geneve |
 | `git_protocol` | arbitrary bytes and typed values; wire, chunking, EOF, and allocation contracts | `stdlib::git_protocol`: The Git wire protocol |
 | `grpc` | Framed messages with input-selected limits, constructed payloads, header values, and zero-separated header blocks | `grpc`: chunking and EOF, message limits and transactional writes, compression flags, request and rejection round trips, trailers, timeouts, and paths |
 | `imap` | commands, responses, literals, raw lines, and refusal decisions | `stdlib::imap`: strict wire values and bounded codec contracts |
@@ -55,6 +55,9 @@ cargo +nightly fuzz list
 | `kerberos` | DER/BER messages, TCP records, and METHOD-DATA; checks record bounds, request-body slices, round trips, and write refusal | `stdlib::kerberos`: Kerberos V5 |
 | `ldap` | BER messages, CLDAP datagrams, filters, and DN text; checks stream limits, text round trips, and constructed search writes | `stdlib::ldap`: LDAP |
 | `ipp` | heads, documents, and attribute values | `stdlib::ipp`: `Head`, `Header`, `Message`, and bounded-allocation codec contracts |
+| `gre` | GRE and PPTP packets; exact payload boundaries and wire contracts | `stdlib::gre`: GRE |
+| `igmp` | messages and checksum-corrected inputs; bounded collection and wire contracts | `stdlib::igmp`: IGMP |
+| `ipsec` | ESP, AH, NAT-T, and plaintext values; bounded collection and wire contracts | `stdlib::ipsec`: IPsec |
 | `memcache` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::memcache`: memcached |
 | `mime_multipart` | wire values and streams checked with bounded codec contracts | `stdlib::mime_multipart`: MIME multipart bodies |
 | `mongodb` | arbitrary bytes and typed values; wire, chunking, EOF, and allocation contracts | `stdlib::mongodb`: MongoDB |
@@ -93,6 +96,10 @@ cargo +nightly fuzz list
 | `tpkt` | TCP bytes with limits selected from the input, plus constructed headers, packets, and COTP messages | `tpkt` and `cotp::over_tpkt`: chunking and EOF, exact headers and packets, size limits, TPDU round trips, and segmented message assembly |
 | `thrift` | arbitrary bytes and constructed values | `stdlib::thrift`: framed and unframed messages, typed values, and bounded codec contracts |
 | `urlencoded_form` | wire values and streams checked with bounded codec contracts | `stdlib::urlencoded_form`: application/x-www-form-urlencoded |
+| `ospf` | packets and LSAs; contextual parsing and bounded payload contracts | `stdlib::ospf`: OSPFv2 and OSPFv3 |
+| `pim` | messages and checksum-corrected inputs; contextual parsing and bounded payload contracts | `stdlib::pim`: PIMv2 |
+| `rip` | RIP and RIPng routes and authentication; bounded collection and wire contracts | `stdlib::rip`: RIP |
+| `vrrp` | advertisements, checksum oracles, and constructed values; bounded payload contracts | `stdlib::vrrp`: VRRP |
 | `vxlan` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::vxlan`: VXLAN and VXLAN-GPE |
 | `websocket` | frames, messages, close payloads, handshake fields, and bounded codec contracts | `stdlib::websocket`: WebSocket (RFC 6455) |
 | `x509` | DER certificates, CRLs, extensions, and PEM bundles; checks signed-byte preservation, text framing, limits, and constructed writes | `stdlib::x509`: X.509 certificates and CRLs |

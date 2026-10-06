@@ -14,8 +14,9 @@
 //! each datagram it reads from a [`udp`](crate::stdlib::udp) socket to
 //! [`Packet::parse`], looks at the [`Header`], and does what it likes with
 //! the inner payload. To send, it builds a [`Packet`] and writes the bytes
-//! [`Packet::to_bytes`] returns. A [`Decoder`] reads a datagram that comes
-//! in pieces and reports a bad header as soon as the bytes show it.
+//! [`Wire::to_bytes`] returns. For pieces of one datagram, use
+//! [`Stream<Frames>`](super::codec::Stream), with `Frames = Collect<Packet>`
+//! and a collection limit of [`MAX_DATAGRAM`]. Call `end` at the datagram boundary.
 //!
 //! Every reader checks lengths, because the agent can send any bytes it
 //! likes. A header whose version is not 0, whose options run past the
@@ -25,6 +26,7 @@
 //! always read back.
 //!
 //! ```
+//! use fictionet::stdlib::codec::Wire;
 //! use fictionet::stdlib::geneve::{protocol, GeneveOption, Header, Packet};
 //!
 //! let packet = Packet {
@@ -47,12 +49,8 @@
 //! assert_eq!(back, packet);
 //! assert_eq!(back.header.option(0x0105, 1).unwrap().data, [0, 0, 0, 7]);
 //! ```
-//!
-//! [`Packet`] implements [`Wire`](super::codec::Wire) for exact parsing and
-//! transactional writing. For chunks of one datagram, use
-//! `Stream::new(Collect::<Packet>::new(MAX_DATAGRAM))` and end the stream
-//! at the datagram boundary. [`Decoder`] keeps its early header checks,
-//! header access, constructor, and repeated feed errors.
+
+use super::codec::Wire;
 
 /// The UDP port Geneve endpoints listen on.
 pub const PORT: u16 = 6081;
@@ -155,6 +153,11 @@ pub struct Header {
 pub enum GeneveError {
     /// The bytes end before the header and its options do.
     Truncated,
+    /// Bytes follow a standalone header.
+    Trailing {
+        /// Number of bytes after the Geneve header.
+        remaining: usize,
+    },
     /// The version was not 0. A receiver drops such packets.
     Version(u8),
     /// The option whose header starts at this offset says it is longer
@@ -180,6 +183,9 @@ pub enum GeneveError {
 impl std::fmt::Display for GeneveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            GeneveError::Trailing { remaining } => {
+                write!(f, "{remaining} bytes after the Geneve header")
+            }
             GeneveError::Truncated => f.write_str("bytes end inside the Geneve header"),
             GeneveError::Version(v) => write!(f, "Geneve version {v}, not 0"),
             GeneveError::OptionOverrun(at) => {
@@ -332,10 +338,76 @@ impl Header {
         }
         Ok(())
     }
+}
 
-    /// Appends the header's bytes to `out`, after [`Header::check`]. On an
-    /// error, `out` is left as it was.
-    pub fn write(&self, out: &mut Vec<u8>) -> Result<(), GeneveError> {
+/// One Geneve datagram: the header and the inner packet it carries.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Packet {
+    /// The header and its options.
+    pub header: Header,
+    /// The inner packet, whose kind the header's protocol type names.
+    pub payload: Vec<u8>,
+}
+
+impl Packet {
+    /// A packet that answers this one with `payload`, on the same virtual
+    /// network, with the same protocol type, the same O bit and no
+    /// options. Some peers want options echoed back: AWS Gateway Load
+    /// Balancer, for one, drops returned traffic that lacks its flow
+    /// cookie. To keep every option, build the reply from a copy of the
+    /// header, `Packet { header: self.header.clone(), payload }`, which
+    /// writes whenever this packet does.
+    pub fn reply(&self, payload: Vec<u8>) -> Packet {
+        let header =
+            Header { control: self.header.control, protocol: self.header.protocol, vni: self.header.vni, options: Vec::new() };
+        Packet { header, payload }
+    }
+}
+
+impl Wire for Packet {
+    type ParseError = GeneveError;
+    type WriteError = GeneveError;
+
+    /// Reads a whole datagram and copies the payload after the header.
+    /// Refuses an invalid header or a datagram above [`MAX_DATAGRAM`].
+    fn parse(b: &[u8]) -> Result<Self, GeneveError> {
+        let (header, payload) = Header::split(b)?;
+        Ok(Packet { header, payload: payload.to_vec() })
+    }
+
+    /// Appends a datagram after [`Header::check`]. Refuses a datagram above
+    /// [`MAX_DATAGRAM`]. Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), GeneveError> {
+        self.header.check()?;
+        let total = self.header.len().saturating_add(self.payload.len());
+        if total > MAX_DATAGRAM {
+            return Err(GeneveError::TooLong);
+        }
+        out.reserve(total);
+        self.header.write(out)?;
+        out.extend_from_slice(&self.payload);
+        Ok(())
+    }
+}
+
+impl Wire for Header {
+    type ParseError = GeneveError;
+    type WriteError = GeneveError;
+
+    /// Reads a standalone header. Refuses truncation, invalid options,
+    /// an unsupported version, and bytes after the header.
+    fn parse(b: &[u8]) -> Result<Self, GeneveError> {
+        let (header, used) = Self::parse_prefix(b)?.ok_or(GeneveError::Truncated)?;
+        if used != b.len() {
+            return Err(GeneveError::Trailing { remaining: b.len() - used });
+        }
+        Ok(header)
+    }
+
+    /// Appends the header after [`Header::check`]. Refuses a VNI, option
+    /// type, option length, or total option size that cannot fit its field.
+    /// Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), GeneveError> {
         self.check()?;
         // check() bounds the options to 252 bytes, so this is at most 63.
         let words = (self.options_len() / 4) as u8;
@@ -354,159 +426,27 @@ impl Header {
         }
         Ok(())
     }
-
-    /// The header's bytes, after [`Header::check`].
-    pub fn to_bytes(&self) -> Result<Vec<u8>, GeneveError> {
-        let mut out = Vec::new();
-        self.write(&mut out)?;
-        Ok(out)
-    }
-}
-
-/// One Geneve datagram: the header and the inner packet it carries.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub struct Packet {
-    /// The header and its options.
-    pub header: Header,
-    /// The inner packet, whose kind the header's protocol type names.
-    pub payload: Vec<u8>,
-}
-
-impl Packet {
-    /// Reads a whole datagram. The payload is every byte after the header.
-    pub fn parse(b: &[u8]) -> Result<Packet, GeneveError> {
-        let (header, payload) = Header::split(b)?;
-        Ok(Packet { header, payload: payload.to_vec() })
-    }
-
-    /// The datagram's bytes. It fails if the header fails
-    /// [`Header::check`], or with [`GeneveError::TooLong`] if the whole
-    /// would be longer than [`MAX_DATAGRAM`].
-    pub fn to_bytes(&self) -> Result<Vec<u8>, GeneveError> {
-        let mut out = Vec::new();
-        self.write(&mut out)?;
-        Ok(out)
-    }
-
-    /// Appends the datagram's bytes to `out`, with the same checks as
-    /// [`Packet::to_bytes`]. On an error, `out` is left as it was.
-    pub fn write(&self, out: &mut Vec<u8>) -> Result<(), GeneveError> {
-        self.header.check()?;
-        let total = self.header.len().saturating_add(self.payload.len());
-        if total > MAX_DATAGRAM {
-            return Err(GeneveError::TooLong);
-        }
-        out.reserve(total);
-        self.header.write(out)?;
-        out.extend_from_slice(&self.payload);
-        Ok(())
-    }
-
-    /// A packet that answers this one with `payload`, on the same virtual
-    /// network, with the same protocol type, the same O bit and no
-    /// options. Some peers want options echoed back: AWS Gateway Load
-    /// Balancer, for one, drops returned traffic that lacks its flow
-    /// cookie. To keep every option, build the reply from a copy of the
-    /// header, `Packet { header: self.header.clone(), payload }`, which
-    /// writes whenever this packet does.
-    pub fn reply(&self, payload: Vec<u8>) -> Packet {
-        let header =
-            Header { control: self.header.control, protocol: self.header.protocol, vni: self.header.vni, options: Vec::new() };
-        Packet { header, payload }
-    }
-}
-
-impl super::codec::Wire for Packet {
-    type ParseError = GeneveError;
-    type WriteError = GeneveError;
-
-    /// Reads exactly one datagram of at most [`MAX_DATAGRAM`] bytes.
-    fn parse(bytes: &[u8]) -> Result<Self, GeneveError> {
-        Packet::parse(bytes)
-    }
-
-    /// Appends one datagram. Leaves `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), GeneveError> {
-        Packet::write(self, out)
-    }
-}
-
-/// Reads one datagram that comes in pieces. Feed it the bytes in order,
-/// then call [`Decoder::finish`]. It reads the header as soon as its bytes
-/// have come, and fails as soon as the bytes show a bad one. It holds at
-/// most [`MAX_DATAGRAM`] plus one bytes.
-#[derive(Clone, Debug, Default)]
-pub struct Decoder {
-    buf: Vec<u8>,
-    header: Option<(Header, usize)>,
-    failed: Option<GeneveError>,
-}
-
-impl Decoder {
-    /// A decoder holding no bytes.
-    pub fn new() -> Decoder {
-        Decoder::default()
-    }
-
-    /// Adds the next bytes of the datagram. It returns the error once the
-    /// bytes show one, and the same error on every later call; bytes fed
-    /// after that are dropped.
-    pub fn feed(&mut self, bytes: &[u8]) -> Result<(), GeneveError> {
-        if let Some(e) = self.failed {
-            return Err(e);
-        }
-        // One byte past the limit is enough to know the datagram is too long.
-        let room = (MAX_DATAGRAM + 1).saturating_sub(self.buf.len());
-        self.buf.extend_from_slice(&bytes[..bytes.len().min(room)]);
-        if self.header.is_none() {
-            match Header::parse_prefix(&self.buf) {
-                Ok(Some(h)) => self.header = Some(h),
-                Ok(None) => {}
-                Err(e) => return Err(self.fail(e)),
-            }
-        }
-        if self.buf.len() > MAX_DATAGRAM {
-            return Err(self.fail(GeneveError::TooLong));
-        }
-        Ok(())
-    }
-
-    fn fail(&mut self, e: GeneveError) -> GeneveError {
-        self.failed = Some(e);
-        self.buf = Vec::new();
-        self.header = None;
-        e
-    }
-
-    /// The header, once all its bytes have come and passed every check.
-    pub fn header(&self) -> Option<&Header> {
-        self.header.as_ref().map(|(h, _)| h)
-    }
-
-    /// How many bytes are held.
-    pub fn buffered(&self) -> usize {
-        self.buf.len()
-    }
-
-    /// The datagram, when no more bytes will come. It gives the same
-    /// result as [`Packet::parse`] on all the bytes fed.
-    pub fn finish(mut self) -> Result<Packet, GeneveError> {
-        if let Some(e) = self.failed {
-            return Err(e);
-        }
-        match self.header.take() {
-            None => Err(GeneveError::Truncated),
-            Some((header, used)) => {
-                let payload = self.buf.split_off(used.min(self.buf.len()));
-                Ok(Packet { header, payload })
-            }
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stdlib::codec::{Collect, CollectError, Fail, contract, test_support::{Lcg, decode_all, mutate}};
+
+    fn collect(b: &[u8]) -> Result<Packet, GeneveError> {
+        let make = || Collect::<Packet>::new(MAX_DATAGRAM);
+        contract::check_decode_with_alloc_limit(make, b, 2 * (MAX_DATAGRAM + 1));
+        contract::check_wire::<Packet>(b);
+        let parsed = Packet::parse(b);
+        let (items, failure) = decode_all(make, b);
+        if b.len() <= MAX_DATAGRAM {
+            assert_eq!(failure, parsed.clone().err().map(|e| Fail::Protocol(CollectError::Parse(e))));
+            assert_eq!(items, parsed.clone().ok().into_iter().collect::<Vec<_>>());
+        } else {
+            assert_eq!(failure, Some(Fail::Protocol(CollectError::TooLong { limit: MAX_DATAGRAM })));
+        }
+        parsed
+    }
 
     fn opt(class: u16, kind: u8, critical: bool, data: &[u8]) -> GeneveOption {
         GeneveOption { class, kind, critical, data: data.to_vec() }
@@ -514,33 +454,6 @@ mod tests {
 
     fn header(options: Vec<GeneveOption>) -> Header {
         Header { control: false, protocol: protocol::TRANSPARENT_ETHERNET_BRIDGING, vni: 0x123456, options }
-    }
-
-    fn decode_whole(b: &[u8]) -> Result<Packet, GeneveError> {
-        let mut d = Decoder::new();
-        let fed = d.feed(b);
-        let out = d.finish();
-        if let Err(e) = fed {
-            assert_eq!(out, Err(e));
-        }
-        out
-    }
-
-    fn decode_bytewise(b: &[u8]) -> Result<Packet, GeneveError> {
-        let mut d = Decoder::new();
-        let mut first = None;
-        for byte in b {
-            if let Err(e) = d.feed(std::slice::from_ref(byte)) {
-                // The error sticks.
-                assert_eq!(*first.get_or_insert(e), e);
-            }
-            assert!(d.buffered() <= MAX_DATAGRAM + 1);
-        }
-        let out = d.finish();
-        if let Some(e) = first {
-            assert_eq!(out, Err(e));
-        }
-        out
     }
 
     // The layouts of RFC 8926, sections 3.4 and 3.5.
@@ -602,7 +515,7 @@ mod tests {
         assert_eq!(b.len(), MAX_DATAGRAM);
         assert_eq!(b[0], 63);
         assert_eq!(Packet::parse(&b).unwrap(), p);
-        assert_eq!(decode_whole(&b).unwrap(), p);
+        assert_eq!(collect(&b).unwrap(), p);
     }
 
     #[test]
@@ -677,12 +590,11 @@ mod tests {
         // Even when a later option overruns, the earlier error stands.
         let b = [0x02, 0x00, 0, 0, 0, 0, 0, 0, 0, 1, 0x81, 0, 0, 1, 0x01, 1];
         assert_eq!(Packet::parse(&b), Err(GeneveError::CriticalBit(false)));
-        assert_eq!(decode_bytewise(&b), Err(GeneveError::CriticalBit(false)));
+        assert_eq!(collect(&b), Err(GeneveError::CriticalBit(false)));
     }
 
     /// Every prefix of `b` reads as incomplete or as the error the whole
-    /// gives, and the error first shows at the same prefix for the
-    /// decoder.
+    /// gives.
     fn check_prefixes(b: &[u8]) {
         let whole = Header::parse_prefix(b);
         for n in 0..=b.len() {
@@ -696,12 +608,12 @@ mod tests {
 
     #[test]
     fn prefixes_agree_with_the_whole() {
-        let mut rng = Lcg(0xc0de);
+        let mut rng = Lcg::new(0xc0de);
         for _ in 0..3_000 {
             let mut b = random_packet(&mut rng).to_bytes().unwrap();
             if !b.is_empty() {
-                let at = rng.below(b.len().min(40));
-                b[at] ^= 1 << rng.below(8);
+                let at = rng.index(b.len().min(40));
+                b[at] ^= 1 << rng.index(8);
                 b[0] &= 0x3f;
             }
             check_prefixes(&b);
@@ -713,16 +625,9 @@ mod tests {
         let mut b = vec![0, 0, 0x65, 0x58, 0, 0, 0, 0];
         b.resize(MAX_DATAGRAM + 1, 0);
         assert_eq!(Packet::parse(&b), Err(GeneveError::TooLong));
-        assert_eq!(decode_whole(&b), Err(GeneveError::TooLong));
-        assert_eq!(decode_bytewise(&b), Err(GeneveError::TooLong));
+        assert_eq!(collect(&b), Err(GeneveError::TooLong));
         b.pop();
         assert!(Packet::parse(&b).is_ok());
-        let mut d = Decoder::new();
-        assert_eq!(d.feed(&b), Ok(()));
-        assert_eq!(d.feed(&[1, 2, 3]), Err(GeneveError::TooLong));
-        assert_eq!(d.feed(&[]), Err(GeneveError::TooLong));
-        assert_eq!(d.buffered(), 0);
-        assert_eq!(d.finish(), Err(GeneveError::TooLong));
     }
 
     #[test]
@@ -737,32 +642,25 @@ mod tests {
             assert_eq!(Header::parse_prefix(&b[..n]), Ok(None), "prefix {n}");
             assert_eq!(Packet::parse(&b[..n]), Err(GeneveError::Truncated), "prefix {n}");
             assert_eq!(Header::split(&b[..n]), Err(GeneveError::Truncated));
-            assert_eq!(decode_whole(&b[..n]), Err(GeneveError::Truncated));
-            assert_eq!(decode_bytewise(&b[..n]), Err(GeneveError::Truncated));
+            assert_eq!(collect(&b[..n]), Err(GeneveError::Truncated));
         }
         // From the end of the header on, the rest is payload.
         for n in header_len..=b.len() {
             let q = Packet::parse(&b[..n]).unwrap();
             assert_eq!(q.header, p.header);
             assert_eq!(q.payload, &b[header_len..n]);
-            assert_eq!(decode_bytewise(&b[..n]), Ok(q));
+            assert_eq!(collect(&b[..n]), Ok(q));
         }
     }
 
     #[test]
-    fn decoder_shows_the_header_early() {
+    fn header_prefix_and_stream_boundary() {
         let p = Packet { header: header(vec![opt(9, 9, false, &[1; 4])]), payload: vec![3; 100] };
         let b = p.to_bytes().unwrap();
-        let mut d = Decoder::new();
-        d.feed(&b[..p.header.len() - 1]).unwrap();
-        assert!(d.header().is_none());
-        d.feed(&b[p.header.len() - 1..p.header.len()]).unwrap();
-        assert_eq!(d.header(), Some(&p.header));
-        d.feed(&b[p.header.len()..]).unwrap();
-        assert_eq!(d.buffered(), b.len());
-        assert_eq!(d.finish(), Ok(p));
-        // A decoder fed nothing.
-        assert_eq!(Decoder::new().finish(), Err(GeneveError::Truncated));
+        assert_eq!(Header::parse_prefix(&b[..p.header.len() - 1]), Ok(None));
+        assert_eq!(Header::parse_prefix(&b[..p.header.len()]), Ok(Some((p.header.clone(), p.header.len()))));
+        assert_eq!(collect(&b), Ok(p));
+        assert_eq!(collect(&[]), Err(GeneveError::Truncated));
     }
 
     // Error paths when writing.
@@ -825,23 +723,23 @@ mod tests {
         // Headers built from any field values, valid or not: the writer
         // either writes bytes that read back the same, or refuses and
         // leaves the buffer alone.
-        let mut rng = Lcg(0xabcd);
+        let mut rng = Lcg::new(0xabcd);
         for _ in 0..5_000 {
             let mut options = Vec::new();
-            for _ in 0..rng.below(70) {
-                let n = if rng.below(4) == 0 { rng.below(140) } else { rng.below(8) * 4 };
+            for _ in 0..rng.index(70) {
+                let n = if rng.index(4) == 0 { rng.index(140) } else { rng.index(8) * 4 };
                 let data = rng.bytes(n);
                 options.push(GeneveOption {
                     class: rng.next() as u16,
                     kind: rng.next() as u8,
-                    critical: rng.below(2) == 0,
+                    critical: !rng.coin(),
                     data,
                 });
             }
-            let vni = if rng.below(4) == 0 { rng.next() } else { rng.next() & MAX_VNI };
-            let n = rng.below(64);
+            let vni = if rng.index(4) == 0 { rng.next() as u32 } else { (rng.next() as u32) & MAX_VNI };
+            let n = rng.index(64);
             let p = Packet {
-                header: Header { control: rng.below(2) == 0, protocol: rng.next() as u16, vni, options },
+                header: Header { control: !rng.coin(), protocol: rng.next() as u16, vni, options },
                 payload: rng.bytes(n),
             };
             let mut out = vec![0xee];
@@ -882,22 +780,17 @@ mod tests {
     }
 
     #[test]
-    fn huge_feed_is_bounded() {
-        // A single feed far past the limit keeps at most one extra byte
-        // before it fails, and drops it then.
+    fn huge_push_is_bounded() {
         let mut b = vec![0, 0, 0x65, 0x58, 0, 0, 0, 0];
         b.resize(3 * MAX_DATAGRAM, 0);
-        let mut d = Decoder::new();
-        assert_eq!(d.feed(&b), Err(GeneveError::TooLong));
-        assert_eq!(d.buffered(), 0);
-        // A clone carries the state with it.
-        assert_eq!(d.clone().finish(), Err(GeneveError::TooLong));
+        assert_eq!(collect(&b), Err(GeneveError::TooLong));
     }
 
     #[test]
     fn errors_display() {
         let all = [
             GeneveError::Truncated,
+            GeneveError::Trailing { remaining: 1 },
             GeneveError::Version(1),
             GeneveError::OptionOverrun(8),
             GeneveError::CriticalBit(true),
@@ -913,44 +806,29 @@ mod tests {
         }
     }
 
-    /// A deterministic pseudo-random generator for the fuzz loops.
-    struct Lcg(u64);
-
-    impl Lcg {
-        fn next(&mut self) -> u32 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (self.0 >> 33) as u32
-        }
-        fn below(&mut self, n: usize) -> usize {
-            self.next() as usize % n.max(1)
-        }
-        fn bytes(&mut self, n: usize) -> Vec<u8> {
-            (0..n).map(|_| self.next() as u8).collect()
-        }
-    }
-
     /// A random packet the writer accepts.
     fn random_packet(rng: &mut Lcg) -> Packet {
         let mut options = Vec::new();
         let mut room = MAX_OPTIONS_LEN;
-        for _ in 0..rng.below(6) {
-            let words = rng.below(32).min((room - OPTION_HEADER_LEN) / 4);
-            let data = rng.bytes(words * 4);
+        for _ in 0..rng.index(6) {
+            let words = rng.index(32).min((room - OPTION_HEADER_LEN) / 4);
+            let mut data = rng.bytes(words * 4);
+            data.truncate(data.len() / 4 * 4);
             room -= OPTION_HEADER_LEN + data.len();
             let class = rng.next() as u16;
-            let kind = rng.below(128) as u8;
-            let critical = rng.below(4) == 0;
+            let kind = rng.index(128) as u8;
+            let critical = rng.index(4) == 0;
             options.push(GeneveOption { class, kind, critical, data });
             if room < OPTION_HEADER_LEN {
                 break;
             }
         }
-        let n = rng.below(64);
+        let n = rng.index(64);
         Packet {
             header: Header {
-                control: rng.below(2) == 0,
+                control: !rng.coin(),
                 protocol: rng.next() as u16,
-                vni: rng.next() & MAX_VNI,
+                vni: (rng.next() as u32) & MAX_VNI,
                 options,
             },
             payload: rng.bytes(n),
@@ -966,58 +844,37 @@ mod tests {
             assert_eq!(Packet::parse(&out).as_ref(), Ok(p));
             assert_eq!(Header::split(data).unwrap().1, &p.payload[..]);
         }
-        assert_eq!(decode_whole(data), parsed);
-        assert_eq!(decode_bytewise(data), parsed);
-        assert_eq!(decode_chunked(data, data.len() % 7 + 2), parsed);
-    }
-
-    fn decode_chunked(b: &[u8], size: usize) -> Result<Packet, GeneveError> {
-        let mut d = Decoder::new();
-        for chunk in b.chunks(size) {
-            if d.feed(chunk).is_err() {
-                break;
-            }
-        }
-        d.finish()
+        assert_eq!(collect(data), parsed);
     }
 
     #[test]
     fn fuzz_round_trips() {
-        let mut rng = Lcg(0x6081);
+        let mut rng = Lcg::new(0x6081);
         for _ in 0..5_000 {
             let p = random_packet(&mut rng);
             let b = p.to_bytes().unwrap();
             assert_eq!(b.len(), p.header.len() + p.payload.len());
             assert_eq!(Packet::parse(&b), Ok(p.clone()));
-            assert_eq!(decode_bytewise(&b), Ok(p));
+            assert_eq!(collect(&b), Ok(p));
         }
     }
 
     #[test]
     fn fuzz_parsers() {
-        let mut rng = Lcg(0x5eed);
+        let mut rng = Lcg::new(0x5eed);
         let mut seeds: Vec<Vec<u8>> = Vec::new();
         for _ in 0..20 {
             seeds.push(random_packet(&mut rng).to_bytes().unwrap());
         }
         for i in 0..20_000 {
             let mut data = if i % 4 == 0 {
-                let n = rng.below(80);
+                let n = rng.index(80);
                 rng.bytes(n)
             } else {
-                seeds[rng.below(seeds.len())].clone()
+                seeds[rng.index(seeds.len())].clone()
             };
-            for _ in 0..rng.below(4) {
-                if data.is_empty() {
-                    break;
-                }
-                let at = rng.below(data.len());
-                match rng.below(4) {
-                    0 => data[at] = rng.next() as u8,
-                    1 => data[at] ^= 1 << rng.below(8),
-                    2 => data.truncate(at),
-                    _ => data.insert(at, rng.next() as u8),
-                }
+            for _ in 0..1 + rng.index(4) {
+                mutate(&mut rng, &mut data);
             }
             // Keep the version 0 most of the time, so mutations reach the
             // options.

@@ -2,12 +2,12 @@
 //! them.
 #![no_main]
 
-use fictionet::stdlib::gre::{Decoder, Header, Packet};
-use fictionet::stdlib::{codec::{Collect, contract}, gre};
+use fictionet::stdlib::gre::{Header, Packet};
+use fictionet::stdlib::{codec::{Wire, Collect, contract}, gre};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode(|| Collect::<gre::Packet>::new(gre::MAX_PACKET), data);
+    contract::check_decode_with_alloc_limit(|| Collect::<gre::Packet>::new(gre::MAX_PACKET), data, 2 * (gre::MAX_PACKET + 1));
     contract::check_wire::<gre::Packet>(data);
 
     let payload = data.iter().take(gre::MAX_PACKET + 1).copied().collect();
@@ -22,16 +22,6 @@ fuzz_target!(|data: &[u8]| {
     contract::check_wire_value(&packet);
 
     let parsed = Packet::parse(data);
-
-    // The packet, fed two ways: all at once, and a byte at a time.
-    let mut whole = Decoder::new();
-    let _ = whole.feed(data);
-    assert_eq!(whole.finish(), parsed);
-    let mut bytewise = Decoder::new();
-    for b in data {
-        let _ = bytewise.feed(std::slice::from_ref(b));
-    }
-    assert_eq!(bytewise.finish(), parsed);
 
     if let Ok(p) = &parsed {
         // A packet read can be written, and reads back the same.

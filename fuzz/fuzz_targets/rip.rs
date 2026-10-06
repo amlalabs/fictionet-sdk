@@ -2,16 +2,15 @@
 #![no_main]
 
 use fictionet::stdlib::rip::{
-    Decoder, Entries, MAX_DATAGRAM, MAX_PREFIX_LEN, Message, NgDecoder, NgEntries, NgEntry, NgMessage, Received,
-    RipError,
+    Entries, MAX_PREFIX_LEN, Message, NgEntries, NgEntry, NgMessage, Received,
 };
-use fictionet::stdlib::{codec::{Collect, contract}, rip};
+use fictionet::stdlib::{codec::{Wire, Collect, Stream, contract}, rip};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode(|| Collect::<rip::Message>::new(rip::MAX_MESSAGE), data);
+    contract::check_decode_with_alloc_limit(|| Collect::<rip::Message>::new(rip::MAX_MESSAGE), data, 2 * (rip::MAX_MESSAGE + 1));
     contract::check_wire::<rip::Message>(data);
-    contract::check_decode(|| Collect::<rip::NgMessage>::new(rip::MAX_NG_MESSAGE), data);
+    contract::check_decode_with_alloc_limit(|| Collect::<rip::NgMessage>::new(rip::MAX_NG_MESSAGE), data, 2 * (rip::MAX_NG_MESSAGE + 1));
     contract::check_wire::<rip::NgMessage>(data);
 
     let message = Message {
@@ -24,34 +23,20 @@ fuzz_target!(|data: &[u8]| {
         entries: Entries::WholeTable,
     };
     contract::check_wire_value(&message);
-    // As a RIP message, fed two ways: all at once, and a byte at a time.
     let parsed = Message::parse(data);
-    let mut whole = Decoder::new();
-    let _ = whole.feed(data);
-    if parsed.is_ok() {
-        // The decoder keeps the bytes as received, for checking a digest.
-        assert_eq!(whole.bytes(), data);
-    }
-    assert_eq!(whole.finish(), parsed);
-    let mut bytewise = Decoder::new();
-    for b in data {
-        let _ = bytewise.feed(std::slice::from_ref(b));
-    }
-    assert_eq!(bytewise.finish(), parsed);
     if let Ok(m) = &parsed {
-        // A message read can be written, and reads back the same, unless it
-        // is longer than a writer sends.
-        match m.to_bytes() {
-            Ok(bytes) => {
-                assert!(data.len() <= MAX_DATAGRAM);
-                assert_eq!(bytes.len(), data.len());
-                assert_eq!(Message::parse(&bytes).as_ref(), Ok(m));
-            }
-            Err(e) => {
-                assert_eq!(e, RipError::TooManyEntries);
-                assert!(data.len() > MAX_DATAGRAM);
-            }
-        }
+        assert_eq!(m.fits_datagram(), data.len() <= rip::MAX_DATAGRAM);
+        let mut stream = Stream::new(Collect::<Message>::new(rip::MAX_MESSAGE));
+        assert_eq!(stream.push(data), data.len());
+        stream.end();
+        assert_eq!(stream.with_next(|message, raw, span| {
+            assert_eq!(raw, data);
+            assert_eq!(span, 0..data.len() as u64);
+            message
+        }), Some(Ok(m.clone())));
+        let bytes = m.to_bytes().unwrap();
+        assert_eq!(bytes.len(), data.len());
+        assert_eq!(Message::parse(&bytes).as_ref(), Ok(m));
         // Reading as a router does agrees on every message parse takes.
         assert_eq!(Message::receive(data), Ok(Received { message: m.clone(), skipped: vec![] }));
     }
@@ -68,14 +53,6 @@ fuzz_target!(|data: &[u8]| {
 
     // The same bytes as a RIPng message.
     let parsed = NgMessage::parse(data);
-    let mut whole = NgDecoder::new();
-    let _ = whole.feed(data);
-    assert_eq!(whole.finish(), parsed);
-    let mut bytewise = NgDecoder::new();
-    for b in data {
-        let _ = bytewise.feed(std::slice::from_ref(b));
-    }
-    assert_eq!(bytewise.finish(), parsed);
     if let Ok(m) = &parsed {
         let bytes = m.to_bytes().unwrap();
         assert_eq!(bytes.len(), data.len());
