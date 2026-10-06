@@ -47,6 +47,10 @@ fuzz_target!(|data: &[u8]| {
     let code = ReplyCode::new(100 + u16::from(data.first().copied().unwrap_or(0)) % 500);
     if let Some(code) = code {
         check_wire_value(&Reply { code, lines: lines.clone() });
+        if let Ok(reply) = Reply::from_lines(code, lines.clone()) {
+            check_wire_value(&reply);
+            assert_eq!(Reply::parse(&reply.to_bytes().unwrap()).as_ref(), Ok(&reply));
+        }
         let features: Vec<Feature> = lines.iter().map(|line| {
             let (name, params) = line.split_once(' ').map_or((line.as_str(), None), |(n, p)| (n, Some(p.into())));
             Feature { name: name.into(), params }

@@ -2537,6 +2537,29 @@ mod tests {
             for request in [Request::Allo(text.clone()), Request::Rest(text.clone()), Request::Opts(text.clone())] {
                 contract::check_wire_value(&request);
             }
+            let lines: Vec<String> = text
+                .split('\n')
+                .map(|line| match rng.index(8) {
+                    0 => format!("{}{}", rng.index(1000), line),
+                    1 => format!("123{}", "x".repeat(MAX_CONTENT - 4 + rng.index(3))),
+                    _ => line.to_string(),
+                })
+                .collect();
+            if let Some(code) = ReplyCode::new(100 + rng.index(500) as u16)
+                && let Ok(reply) = Reply::from_lines(code, lines.clone())
+            {
+                contract::check_wire_value(&reply);
+                assert_eq!(Reply::parse(&reply.to_bytes().unwrap()).as_ref(), Ok(&reply));
+                for (i, (line, padded)) in lines.iter().zip(&reply.lines).enumerate() {
+                    let middle = i != 0 && i + 1 != lines.len();
+                    let numeric = line.as_bytes().get(..3).is_some_and(|start| start.iter().all(u8::is_ascii_digit));
+                    if middle && numeric {
+                        assert_eq!(padded.strip_prefix(' '), Some(line.as_str()));
+                    } else {
+                        assert_eq!(padded, line);
+                    }
+                }
+            }
         }
     }
 }
