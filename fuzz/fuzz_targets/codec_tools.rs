@@ -4,7 +4,8 @@ use core::time::Duration;
 use fictionet::stdlib::{
     codec::{
         ByteFault, Carry, Decode, Direction, Ending, Faults, Interceptor, ItemFault, Lines, Pipe,
-        Recorder, Rewrite, Rule, Stream, Trigger, Wire, test_support,
+        PumpError, Recorder, Rewrite, Rule, Stream, StreamEvent, Trigger, Wire, test_support,
+        write_bounded,
     },
     json, modbus,
 };
@@ -15,57 +16,73 @@ where
     D::Item: Clone,
     D::Error: Clone,
 {
-    let mut stream = Stream::new(make());
-    let proxy = Interceptor::new(32768);
-    let mut recorder = Recorder::new(8, 512);
-    let mut output = Vec::new();
-    let mut recorded = Stream::new(make());
-    let mut failed = false;
-    for chunk in input.chunks(1).chain(core::iter::once(&[][..])) {
-        if chunk.is_empty() {
-            stream.end();
-            recorded.end();
-        }
-        if !failed {
-            let before = stream.offset() as usize;
-            let result = proxy.intercept_with(
-                &mut stream,
-                chunk,
-                &mut output,
-                |_, _, _| Rewrite::Forward,
-                modbus::Frame::write,
-            );
-            let consumed = if result.is_err() {
-                failed = true;
-                before // This call rolled back output, including any skips.
-            } else {
-                stream.offset() as usize
-            };
-            assert_eq!(output, input[..consumed]);
-        }
-        if !recorded.is_done() {
-            assert_eq!(recorded.push(chunk), chunk.len());
-        }
-        while let Some(result) =
-            recorder.with_next(Direction::ClientToServer, &mut recorded, |_, raw, range| {
-                assert_eq!(raw, &input[range.start as usize..range.end as usize]);
-            })
-        {
-            if result.is_err() {
-                break;
+    // Both policies must preserve every consumed byte in the recording pass.
+    for empty_plan in [false, true] {
+        let mut stream = Stream::new(make());
+        let proxy = Interceptor::new(32768);
+        let mut faults = Faults::new(0, 32768, 8);
+        let mut recorder = Recorder::new(8, 512);
+        let mut output = Vec::new();
+        for chunk in input.chunks(1).chain(core::iter::once(&[][..])) {
+            if chunk.is_empty() {
+                stream.end();
+            } else if !stream.is_done() {
+                assert_eq!(stream.push(chunk), chunk.len());
             }
+            loop {
+                let observe = |event: StreamEvent<'_, D::Item, D::Error>| {
+                    match &event {
+                        StreamEvent::Item { bytes, range, .. }
+                        | StreamEvent::Skipped { bytes, range }
+                        | StreamEvent::Failed { bytes, range, .. } => {
+                            assert_eq!(*bytes, &input[range.start as usize..range.end as usize]);
+                        }
+                        _ => {}
+                    }
+                    recorder.observe_tagged(7, Direction::ClientToServer, event);
+                };
+                let result = if empty_plan {
+                    faults
+                        .next_with_observed(
+                            &mut stream,
+                            &mut output,
+                            &[],
+                            write_bounded::<modbus::Frame>,
+                            observe,
+                        )
+                        .map(|result| result.is_err())
+                } else {
+                    proxy
+                        .next_with_observed(
+                            &mut stream,
+                            &mut output,
+                            |_, _, _| Rewrite::Forward,
+                            write_bounded::<modbus::Frame>,
+                            observe,
+                        )
+                        .map(|result| result.is_err())
+                };
+                assert_eq!(output, input[..stream.offset() as usize]);
+                match result {
+                    Some(false) => {}
+                    Some(true) => {
+                        assert!(stream.failed().is_some());
+                        break;
+                    }
+                    None => break,
+                }
+            }
+            assert!(recorder.len() <= 8);
+            assert!(recorder.retained_bytes() <= 512);
+            assert_eq!(
+                recorder.iter().map(|e| e.bytes.len()).sum::<usize>(),
+                recorder.retained_bytes()
+            );
         }
-        assert!(recorder.len() <= 8);
-        assert!(recorder.retained_bytes() <= 512);
-        assert_eq!(
-            recorder.iter().map(|e| e.bytes.len()).sum::<usize>(),
-            recorder.retained_bytes()
-        );
-    }
-    if !failed {
+        faults.flush(&mut output).unwrap();
         assert_eq!(output, input[..stream.offset() as usize]);
+        assert!(stream.is_done());
     }
-    assert!(stream.is_done());
 }
 
 fn faults<D: Decode>(
@@ -199,21 +216,29 @@ where
                 let taken = stream.push(rest);
                 rest = &rest[taken..];
                 let before = stream.offset();
-                while let Some(result) =
-                    recorder.with_next(Direction::ServerToClient, &mut stream, |_, raw, _| {
-                        let start = output.len();
-                        match faults.item(&item_plan, raw, &mut output) {
-                            Ok(Some(marker)) => markers.push((marker.at, marker.duration)),
-                            Ok(None) => {}
-                            Err(_) => assert_eq!(output.len(), start),
+                loop {
+                    let start = output.len();
+                    let offset = stream.offset();
+                    let result = faults.next_with_observed(
+                        &mut stream,
+                        &mut output,
+                        &item_plan,
+                        write_bounded,
+                        recorder.observer(3, Direction::ServerToClient),
+                    );
+                    assert!(output.len() <= 65536);
+                    assert!(faults.held_count() <= 8);
+                    assert!(faults.held_bytes() <= 65536);
+                    match result {
+                        Some(Ok(Some(marker))) => markers.push((marker.at, marker.duration)),
+                        Some(Ok(None)) => {}
+                        Some(Err(PumpError::Handler(_))) => {
+                            assert_eq!(output.len(), start);
+                            if stream.offset() == offset {
+                                break;
+                            }
                         }
-                        assert!(output.len() <= 65536);
-                        assert!(faults.held_count() <= 8);
-                        assert!(faults.held_bytes() <= 65536);
-                    })
-                {
-                    if result.is_err() {
-                        break;
+                        Some(Err(PumpError::Decode(_))) | None => break,
                     }
                 }
                 assert!(recorder.len() <= 8);
@@ -221,7 +246,9 @@ where
                 if rest.is_empty() || stream.is_done() {
                     break;
                 }
-                assert!(taken != 0 || stream.offset() > before);
+                if taken == 0 && stream.offset() == before {
+                    break;
+                }
             }
         }
     }

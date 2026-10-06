@@ -1,8 +1,11 @@
 extern crate alloc;
 
-use alloc::{collections::VecDeque, vec::Vec};
-use core::{convert::Infallible, error::Error, fmt, ops::Range, time::Duration};
-use fictionet::stdlib::codec::{Interceptor, Lcg, Rewrite, RewriteError, Wire};
+use alloc::{collections::BinaryHeap, vec::Vec};
+use core::{cmp::Ordering, convert::Infallible, error::Error, fmt, ops::Range, time::Duration};
+use fictionet::stdlib::codec::{
+    Buffer, Decode, Interceptor, Lcg, PumpError, Rewrite, RewriteError, SkipPolicy, Stream,
+    StreamEvent, Wire, append_bounded, write_bounded,
+};
 
 /// When a rule applies. Call numbers start at one in each fault domain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -135,10 +138,22 @@ impl<E> From<RewriteError<E>> for FaultError<E> {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Held {
+    due: u128,
+    seq: u64,
     bytes: Vec<u8>,
-    remaining: u64,
+}
+impl Ord for Held {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Reverse order makes the earliest due call and sequence the root.
+        (other.due, other.seq).cmp(&(self.due, self.seq))
+    }
+}
+impl PartialOrd for Held {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 /// Deterministic byte and item fault plans with an explicit seed.
@@ -153,23 +168,31 @@ struct Held {
 /// in world code, with an aggregate bound on any per-key Faults instances.
 ///
 /// Byte rules apply to each supplied chunk before [`Stream::push`](fictionet::stdlib::codec::Stream::push).
-/// Chunk boundaries are part of that input. Item rules run once per item,
+/// Chunk boundaries are part of that input. Use [`next_with_observed`](Self::next_with_observed)
+/// with [`Recorder::observer`](fictionet::stdlib::codec::Recorder::observer) to
+/// record and fault in one pass through the Interceptor. Skips are forwarded
+/// even when an item is held. Item rules run once per item,
 /// independent of push sizes. Apply them to outer frames when holding a
 /// Pipe's inner item would retain no raw bytes. Use caller-owned framing
 /// for inner replacements. Honor returned delay offsets when sending output.
 ///
 /// ```
-/// use fictionet::stdlib::{codec::{Faults, ItemFault, Rule, Trigger}, modbus};
+/// use fictionet::stdlib::{codec::{Direction, Faults, ItemFault, Recorder, Rule, Stream, Trigger, write_bounded}, json};
 /// let mut faults = Faults::new(7, 1024, 8);
-/// let plan = [Rule { when: Trigger::At(1), fault: ItemFault::<modbus::Frame>::Hold { window: 1 } }];
-/// let first = [0, 1, 0, 0, 0, 2, 1, 3];
-/// let second = [0, 2, 0, 0, 0, 2, 1, 3];
+/// let mut log = Recorder::new(16, 1024);
+/// let mut stream = Stream::new(json::Values::new());
+/// let plan = [Rule { when: Trigger::At(1), fault: ItemFault::<json::Value>::Hold { window: 1 } }];
+/// let input = b"1 2\n";
+/// assert_eq!(stream.push(input), input.len());
+/// stream.end();
 /// let mut output = Vec::new();
-/// faults.item(&plan, &first, &mut output)?;
-/// assert!(output.is_empty());
-/// faults.item(&plan, &second, &mut output)?;
-/// assert_eq!(output, [second, first].concat());
+/// while let Some(result) = faults.next_with_observed(&mut stream, &mut output, &plan,
+///     write_bounded, log.observer(0, Direction::ClientToServer)) {
+///     result?;
+/// }
 /// faults.flush(&mut output)?;
+/// assert_eq!(output, b" 21\n"); // skipped separators survive the deliberate reorder
+/// assert_eq!(log.retained_bytes(), input.len());
 /// # Ok::<(), Box<dyn core::error::Error>>(())
 /// ```
 #[derive(Clone, Debug)]
@@ -178,7 +201,8 @@ pub struct Faults {
     byte_at: Option<u64>,
     item_at: Option<u64>,
     output: Interceptor,
-    held: VecDeque<Held>,
+    held: BinaryHeap<Held>,
+    completed: u128,
     held_bytes: usize,
     max_held: usize,
 }
@@ -193,7 +217,8 @@ impl Faults {
             byte_at: Some(1),
             item_at: Some(1),
             output: Interceptor::new(max_output),
-            held: VecDeque::new(),
+            held: BinaryHeap::new(),
+            completed: 0,
             held_bytes: 0,
             max_held: max_held.min((isize::MAX as usize) / core::mem::size_of::<Held>()),
         }
@@ -277,21 +302,99 @@ impl Faults {
         result
     }
 
+    /// Sets the shared Interceptor's skip policy. Forward is the default.
+    /// Drop is for caller-owned framing of inner items, such as a Pipe.
+    pub fn with_skips(mut self, skips: SkipPolicy) -> Self {
+        self.output = self.output.with_skips(skips);
+        self
+    }
+
+    /// Drives one item through the Interceptor with the supplied plan.
+    /// Skips are forwarded by default, including on Hold. No item means no
+    /// plan call, though skips may be appended. See [`next_with_observed`](Self::next_with_observed)
+    /// for transaction and observer behavior.
+    #[allow(clippy::type_complexity)]
+    pub fn next<D: Decode>(
+        &mut self,
+        stream: &mut Stream<D>,
+        out: &mut Vec<u8>,
+        plan: &[Rule<ItemFault<D::Item>>],
+    ) -> Option<
+        Result<Option<FaultDelay>, PumpError<D::Error, FaultError<<D::Item as Wire>::WriteError>>>,
+    >
+    where
+        D::Error: Clone,
+        D::Item: Wire,
+    {
+        self.next_with_observed(stream, out, plan, write_bounded, |_| {})
+    }
+
+    /// Drives one item with caller-owned replacement framing. The writer
+    /// receives the remaining output budget as in [`Interceptor::apply_with`].
+    #[allow(clippy::type_complexity)]
+    pub fn next_with<D: Decode, T, E>(
+        &mut self,
+        stream: &mut Stream<D>,
+        out: &mut Vec<u8>,
+        plan: &[Rule<ItemFault<T>>],
+        write: impl FnMut(&T, &mut Buffer) -> Result<(), RewriteError<E>>,
+    ) -> Option<Result<Option<FaultDelay>, PumpError<D::Error, FaultError<E>>>>
+    where
+        D::Error: Clone,
+    {
+        self.next_with_observed(stream, out, plan, write, |_| {})
+    }
+
+    /// Drives, faults, and observes one pass using the Interceptor's skip
+    /// handling, output bound, and per-item transaction. Observations contain
+    /// original bytes before any fault. Pass a [`Recorder::observer`](fictionet::stdlib::codec::Recorder::observer)
+    /// to retain them by stream key and direction.
+    ///
+    /// A handler failure rolls back this call's output, including its skips.
+    /// A decode failure keeps consumed skips and is returned once. Reserving
+    /// room for skips can fail before decoding, leaving input untouched.
+    /// Hold commits only if the whole item action succeeds. Delay offsets
+    /// include any forwarded skips. EOF does not flush holds automatically;
+    /// call [`flush`](Self::flush) after honoring the last delay marker.
+    #[allow(clippy::type_complexity)]
+    pub fn next_with_observed<D: Decode, T, E>(
+        &mut self,
+        stream: &mut Stream<D>,
+        out: &mut Vec<u8>,
+        plan: &[Rule<ItemFault<T>>],
+        write: impl FnMut(&T, &mut Buffer) -> Result<(), RewriteError<E>>,
+        observe: impl FnMut(StreamEvent<'_, D::Item, D::Error>),
+    ) -> Option<Result<Option<FaultDelay>, PumpError<D::Error, FaultError<E>>>>
+    where
+        D::Error: Clone,
+    {
+        let output = self.output;
+        output.with_next_observed::<D, _, _, E>(
+            stream,
+            out,
+            |_, raw, _, out| self.item_with(plan, raw, out, write),
+            observe,
+        )
+    }
+
     /// Applies one item's plan using its replacement type's Wire writer.
     /// No match forwards raw bytes. The plan is borrowed without cloning.
-    /// See [`item_with`](Self::item_with) for queue and error behavior.
+    /// This operates on one supplied item, without stream skips. For a stream,
+    /// use [`next`](Self::next). See [`item_with`](Self::item_with) for errors.
     pub fn item<T: Wire>(
         &mut self,
         plan: &[Rule<ItemFault<T>>],
         raw: &[u8],
         out: &mut Vec<u8>,
     ) -> Result<Option<FaultDelay>, FaultError<T::WriteError>> {
-        self.item_with(plan, raw, out, T::write)
+        self.item_with(plan, raw, out, write_bounded)
     }
 
     /// Applies a plan with caller-owned replacement framing, then releases
-    /// due held items in insertion order. Items with longer windows do not
+    /// due held items by (due call, insertion order). Longer windows do not
     /// block later entries. Writers follow [`Interceptor::apply_with`].
+    /// Holds use absolute successful call numbers in a heap. Each call
+    /// examines only the earliest entry and any entries it releases.
     /// The queue is bounded by count and total raw bytes. A new hold must
     /// fit before due entries are released. An error restores output and
     /// leaves the queue and its windows unchanged. Counters and random
@@ -301,7 +404,7 @@ impl Faults {
         plan: &[Rule<ItemFault<T>>],
         raw: &[u8],
         out: &mut Vec<u8>,
-        mut write: impl FnMut(&T, &mut Vec<u8>) -> Result<(), E>,
+        mut write: impl FnMut(&T, &mut Buffer) -> Result<(), RewriteError<E>>,
     ) -> Result<Option<FaultDelay>, FaultError<E>> {
         let call = self.item_at;
         self.item_at = call.and_then(|n| n.checked_add(1));
@@ -311,6 +414,10 @@ impl Faults {
             .map(|rule| &rule.fault);
         let start = out.len();
         let mut pending = None;
+        let mut released = Vec::new();
+        // Plans stop selecting holds after u64::MAX attempts. u128 keeps
+        // every such due call representable, including u64::MAX windows.
+        let completed = self.completed.saturating_add(1);
         let result = (|| {
             let mut marker = None;
             match fault {
@@ -321,8 +428,11 @@ impl Faults {
                         });
                     }
                     let mut bytes = Vec::new();
-                    Interceptor::new(self.output.limit().saturating_sub(self.held_bytes))
-                        .append(raw, 1, &mut bytes)?;
+                    let limit = self.output.limit();
+                    if raw.len() > limit.saturating_sub(self.held_bytes) {
+                        return Err(RewriteError::TooLong { limit }.into());
+                    }
+                    append_bounded(raw, 1, &mut bytes, limit)?;
                     if self.held.len() == self.held.capacity() {
                         let target = self
                             .held
@@ -336,7 +446,8 @@ impl Faults {
                     }
                     pending = Some(Held {
                         bytes,
-                        remaining: *window,
+                        due: completed.saturating_add(u128::from(*window)),
+                        seq: call.unwrap_or(u64::MAX),
                     });
                 }
                 Some(ItemFault::Action { delay, rewrite }) => {
@@ -350,54 +461,68 @@ impl Faults {
             }
             // Check the output bound even for a hold with no released bytes.
             self.output.append(&[], 1, out)?;
-            for entry in &self.held {
-                if entry.remaining == 1 {
+            while self.held.peek().is_some_and(|entry| entry.due <= completed) {
+                if released.len() == released.capacity() {
+                    // Keep this small reservation local. Recorder owns a deque;
+                    // this temporary vector and the held heap have separate bounds.
+                    let target = released
+                        .capacity()
+                        .saturating_mul(2)
+                        .max(1)
+                        .min(self.max_held);
+                    released
+                        .try_reserve_exact(target.saturating_sub(released.len()))
+                        .map_err(|_| RewriteError::Allocation)?;
+                }
+                if let Some(entry) = self.held.peek() {
                     self.output.append(&entry.bytes, 1, out)?;
+                }
+                if let Some(entry) = self.held.pop() {
+                    released.push(entry);
                 }
             }
             Ok(marker)
         })();
         if result.is_err() {
             out.truncate(start);
+            // Pop preserves heap capacity, so restoring these cannot allocate.
+            for entry in released {
+                self.held.push(entry);
+            }
             return result;
         }
-        self.held.retain_mut(|entry| {
-            entry.remaining = entry.remaining.saturating_sub(1);
-            if entry.remaining == 0 {
-                self.held_bytes = self.held_bytes.saturating_sub(entry.bytes.len());
-                false
-            } else {
-                true
-            }
-        });
+        self.completed = completed;
+        for entry in released {
+            self.held_bytes = self.held_bytes.saturating_sub(entry.bytes.len());
+        }
         if let Some(entry) = pending {
             // The reservation and append above checked both bounds.
             self.held_bytes = self.held_bytes.saturating_add(entry.bytes.len());
-            self.held.push_back(entry);
+            self.held.push(entry);
         }
         result
     }
 
-    /// Releases all held raw bytes in insertion order at end of stream.
-    /// This adds no delay or plan call. An error leaves output and queue
-    /// unchanged, so the caller can drain output and retry. Empty flushes
-    /// also check the destination limit.
+    /// Releases all held raw bytes in due order, breaking ties by insertion.
+    /// This adds no delay or plan call. Reserves for all held bytes first.
+    /// An error leaves output and queue unchanged, so the caller can drain
+    /// output and retry. Empty flushes also check the destination limit.
     pub fn flush(&mut self, out: &mut Vec<u8>) -> Result<(), RewriteError<Infallible>> {
-        let start = out.len();
-        let result = (|| {
-            self.output.append(&[], 1, out)?;
-            for entry in &self.held {
-                self.output.append(&entry.bytes, 1, out)?;
-            }
-            Ok(())
-        })();
-        if result.is_err() {
-            out.truncate(start);
-        } else {
-            self.held.clear();
-            self.held_bytes = 0;
+        let limit = self.output.limit();
+        let size = out
+            .len()
+            .checked_add(self.held_bytes)
+            .filter(|size| *size <= limit)
+            .ok_or(RewriteError::TooLong { limit })?;
+        if size > out.capacity() {
+            out.try_reserve_exact(size.saturating_sub(out.len()))
+                .map_err(|_| RewriteError::Allocation)?;
         }
-        result
+        while let Some(entry) = self.held.pop() {
+            out.extend_from_slice(&entry.bytes);
+        }
+        self.held_bytes = 0;
+        Ok(())
     }
 
     fn matches(&mut self, trigger: Trigger, call: Option<u64>) -> bool {
@@ -429,6 +554,63 @@ mod tests {
             when: Trigger::Always,
             fault,
         }]
+    }
+
+    #[test]
+    fn many_distant_holds_do_not_walk_the_queue_per_call() {
+        let count = 40_000;
+        let mut faults = Faults::new(0, 0, count);
+        let plan = rule(ItemFault::<modbus::Frame>::Hold { window: u64::MAX });
+        let mut out = Vec::new();
+        for _ in 0..count {
+            faults.item(&plan, b"", &mut out).unwrap();
+        }
+        assert_eq!(faults.held_count(), count);
+        assert_eq!(faults.held_bytes(), 0);
+        assert_eq!(faults.held.peek().unwrap().due, u128::from(u64::MAX) + 1);
+        faults.flush(&mut out).unwrap();
+        assert_eq!(faults.held_count(), 0);
+    }
+
+    #[test]
+    fn due_entries_restore_after_partial_release_failure() {
+        let mut faults = Faults::new(0, 3, 4);
+        let mut out = Vec::new();
+        faults
+            .item(
+                &rule(ItemFault::<modbus::Frame>::Hold { window: 2 }),
+                b"a",
+                &mut out,
+            )
+            .unwrap();
+        faults
+            .item(
+                &rule(ItemFault::<modbus::Frame>::Hold { window: 1 }),
+                b"bb",
+                &mut out,
+            )
+            .unwrap();
+        assert!(faults.item::<modbus::Frame>(&[], b"c", &mut out).is_err());
+        assert_eq!(faults.held_count(), 2);
+        assert_eq!(faults.held_bytes(), 3);
+        assert!(out.is_empty());
+        faults.item::<modbus::Frame>(&[], b"", &mut out).unwrap();
+        assert_eq!(out, b"abb");
+        assert_eq!(faults.held_count(), 0);
+    }
+
+    #[test]
+    fn held_byte_error_reports_configured_limit() {
+        let mut faults = Faults::new(0, 4, 4);
+        let plan = rule(ItemFault::<modbus::Frame>::Hold { window: 2 });
+        let mut out = Vec::new();
+        faults.item(&plan, b"abc", &mut out).unwrap();
+        assert_eq!(
+            faults.item(&plan, b"de", &mut out),
+            Err(FaultError::Rewrite(RewriteError::TooLong { limit: 4 }))
+        );
+        assert_eq!(faults.held_bytes(), 3);
+        assert!(out.is_empty());
     }
 
     #[test]

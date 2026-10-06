@@ -1,9 +1,9 @@
 use core::{convert::Infallible, time::Duration};
 use fictionet::stdlib::{
     codec::{
-        ByteFault, Carry, Decode, Demux, Direction, Ending, Fail, Faults, Interceptor, ItemFault,
-        Layered, Lines, RecordKind, Recorder, Rewrite, Rule, Stream, Trigger, Wire, contract,
-        test_support,
+        Buffer, ByteFault, Carry, Decode, Demux, Direction, Ending, Fail, Faults, Interceptor,
+        ItemFault, Layered, Lines, RecordKind, Recorder, Rewrite, RewriteError, Rule, Stream,
+        Trigger, Wire, contract, test_support, write_bounded,
     },
     json, modbus,
 };
@@ -68,19 +68,28 @@ fn modbus_two_direction_proxy_records_input_and_faults_output() {
     let mut markers = Vec::new();
     for chunk in test_support::chunks(&input, &[1]) {
         assert_eq!(client.push(chunk), chunk.len());
-        while let Some(r) = log.with_next(Direction::ClientToServer, &mut client, |_, raw, _| {
-            let marker = faults.item(&rules, raw, &mut sent)?;
-            if let Some(marker) = marker {
+        while let Some(r) = faults.next_with_observed(
+            &mut client,
+            &mut sent,
+            &rules,
+            write_bounded,
+            log.observer(0, Direction::ClientToServer),
+        ) {
+            if let Some(marker) = r.unwrap() {
                 markers.push((marker.at, marker.duration));
             }
-            Ok::<_, fictionet::stdlib::codec::FaultError<modbus::EncodeError>>(())
-        }) {
-            r.unwrap().unwrap();
         }
     }
     client.end();
     assert!(
-        log.with_next(Direction::ClientToServer, &mut client, |_, _, _| ())
+        faults
+            .next_with_observed(
+                &mut client,
+                &mut sent,
+                &rules,
+                write_bounded,
+                log.observer(0, Direction::ClientToServer),
+            )
             .is_none()
     );
     let (forwarded, failure) = test_support::decode_all(|| modbus::Frames, &sent);
@@ -97,12 +106,15 @@ fn modbus_two_direction_proxy_records_input_and_faults_output() {
     .unwrap();
     let mut received = Vec::new();
     assert_eq!(server.push(&reply), reply.len());
-    log.with_next(Direction::ServerToClient, &mut server, |_, raw, _| {
-        downstream.apply(raw, Rewrite::<modbus::Frame>::Forward, &mut received)
-    })
-    .unwrap()
-    .unwrap()
-    .unwrap();
+    downstream
+        .next_observed(
+            &mut server,
+            &mut received,
+            |_, _, _| Rewrite::Forward,
+            log.observer(0, Direction::ServerToClient),
+        )
+        .unwrap()
+        .unwrap();
     assert_eq!(received, reply);
     let entries: Vec<_> = log.iter().collect();
     assert_eq!(entries.len(), 6);
@@ -121,9 +133,14 @@ fn json_lines() -> impl Decode<Item = Result<json::Value, String>, Error = Infal
     })
 }
 
-fn write_line(value: &json::Value, out: &mut Vec<u8>) -> Result<(), json::Error> {
-    value.write(out)?;
-    out.push(b'\n');
+fn write_line(value: &json::Value, out: &mut Buffer) -> Result<(), RewriteError<json::Error>> {
+    write_bounded(value, out)?;
+    if out.room() == 0 {
+        return Err(RewriteError::TooLong { limit: out.limit() });
+    }
+    if out.push(b"\n") != 1 {
+        return Err(RewriteError::Allocation);
+    }
     Ok(())
 }
 
@@ -161,40 +178,38 @@ fn json_line_calls_are_logged_dropped_duplicated_and_results_rewritten() {
     let mut call_count = 0;
     for byte in &input {
         assert_eq!(streams[0].push(&[*byte]), 1);
-        while let Some(r) = log.with_next(
-            Direction::ClientToServer,
-            &mut streams[0],
-            |item, raw, _| {
-                let value = item.unwrap();
-                if value.get("method").and_then(json::Value::as_str) == Some("tools/call") {
+        while let Some(r) =
+            faults.next_with_observed(&mut streams[0], &mut sent, &plan, write_line, |event| {
+                if let fictionet::stdlib::codec::StreamEvent::Item {
+                    item: Ok(value), ..
+                } = &event
+                    && value.get("method").and_then(json::Value::as_str) == Some("tools/call")
+                {
                     call_count += 1;
                 }
-                faults.item_with(&plan, raw, &mut sent, write_line)
-            },
-        ) {
-            r.unwrap().unwrap();
+                log.observe(Direction::ClientToServer, event);
+            })
+        {
+            r.unwrap();
         }
     }
     assert_eq!(sent, call.repeat(2)); // CRLF and spacing survive duplication.
     assert_eq!(call_count, 1);
     let mut received = Vec::new();
     assert_eq!(streams[1].push(result), result.len());
-    log.with_next(
-        Direction::ServerToClient,
-        &mut streams[1],
-        |item, raw, _| {
-            assert!(item.unwrap().get("result").is_some());
-            proxies[1].apply_with(
-                raw,
-                &Rewrite::Replace(vec![replacement.clone()]),
-                &mut received,
-                write_line,
-            )
-        },
-    )
-    .unwrap()
-    .unwrap()
-    .unwrap();
+    proxies[1]
+        .next_with_observed(
+            &mut streams[1],
+            &mut received,
+            |item, _, _| {
+                assert!(item.as_ref().unwrap().get("result").is_some());
+                Rewrite::Replace(vec![replacement.clone()])
+            },
+            write_line,
+            log.observer(0, Direction::ServerToClient),
+        )
+        .unwrap()
+        .unwrap();
     assert_eq!(
         test_support::decode_all(json_lines, &received).0,
         [Ok(replacement)]
@@ -283,8 +298,7 @@ fn pipe_inner_items_require_explicit_outer_framing() {
     contract::check_stack(make, &bytes);
     let mut stream = Stream::new(make());
     let mut log = Recorder::new(8, 256);
-    let proxy = Interceptor::new(256);
-    let mut faults = Faults::new(1, 256, 8);
+    let mut faults = Faults::new(1, 256, 8).with_skips(fictionet::stdlib::codec::SkipPolicy::Drop);
     let plan = [Rule {
         when: Trigger::Always,
         fault: ItemFault::Action {
@@ -294,32 +308,39 @@ fn pipe_inner_items_require_explicit_outer_framing() {
     }];
     let mut out = Vec::new();
     assert_eq!(stream.push(&bytes), bytes.len());
-    log.with_next(
-        Direction::ClientToServer,
-        &mut stream,
-        |item, raw, range| {
-            assert_eq!(item, Layered::Inner(Ok(b"ab".to_vec())));
-            assert!(raw.is_empty());
-            assert_eq!(range, bytes.len() as u64..bytes.len() as u64);
-            proxy
-                .apply::<modbus::Frame>(raw, Rewrite::Forward, &mut out)
-                .unwrap();
-            assert!(out.is_empty());
-            faults.item_with(&plan, raw, &mut out, |line, target| {
+    faults
+        .next_with_observed(
+            &mut stream,
+            &mut out,
+            &plan,
+            |line, target| {
                 let mut pdu = line.clone();
                 pdu.push(b'\n');
-                modbus::Frame {
-                    transaction: 7,
-                    unit: 1,
-                    pdu,
+                write_bounded(
+                    &modbus::Frame {
+                        transaction: 7,
+                        unit: 1,
+                        pdu,
+                    },
+                    target,
+                )
+            },
+            |event| {
+                if let fictionet::stdlib::codec::StreamEvent::Item {
+                    item,
+                    bytes: raw,
+                    range,
+                } = &event
+                {
+                    assert_eq!(*item, &Layered::Inner(Ok(b"ab".to_vec())));
+                    assert!(raw.is_empty());
+                    assert_eq!(*range, bytes.len() as u64..bytes.len() as u64);
                 }
-                .write(target)
-            })
-        },
-    )
-    .unwrap()
-    .unwrap()
-    .unwrap();
+                log.observe(Direction::ClientToServer, event);
+            },
+        )
+        .unwrap()
+        .unwrap();
     assert_eq!(
         test_support::decode_all(make, &out).0,
         [Layered::Inner(Ok(b"xy".to_vec()))]
@@ -349,13 +370,14 @@ fn demux_stream_access_composes_with_all_tools_and_shared_budget() {
                 rewrite: Rewrite::Repeat(2),
             },
         }];
-        while let Some(r) = log.with_next_tagged(
-            u64::from(key),
-            Direction::ClientToServer,
+        while let Some(r) = faults.next_with_observed(
             demux.get_mut(&key).unwrap(),
-            |_, raw, _| faults.item(&plan, raw, &mut out[usize::from(key)]),
+            &mut out[usize::from(key)],
+            &plan,
+            write_bounded,
+            log.observer(u64::from(key), Direction::ClientToServer),
         ) {
-            r.unwrap().unwrap();
+            r.unwrap();
         }
         assert_eq!(out[usize::from(key)], input.repeat(2));
         assert!(demux.total() <= 1024);
@@ -396,15 +418,14 @@ fn seeded_item_plans_are_repeatable_across_input_chunking() {
             while !chunk.is_empty() {
                 let n = stream.push(chunk);
                 chunk = &chunk[n..];
-                while let Some(r) = stream.with_next(|_, raw, _| faults.item(&plan, raw, &mut out))
-                {
-                    r.unwrap().unwrap();
+                while let Some(r) = faults.next(&mut stream, &mut out, &plan) {
+                    r.unwrap();
                 }
             }
         }
         stream.end();
-        while let Some(r) = stream.with_next(|_, raw, _| faults.item(&plan, raw, &mut out)) {
-            r.unwrap().unwrap();
+        while let Some(r) = faults.next(&mut stream, &mut out, &plan) {
+            r.unwrap();
         }
         out
     };
@@ -423,16 +444,29 @@ fn recorded_end_leaves_handoff_bytes_and_is_not_repeated() {
     let mut out = Vec::new();
     let proxy = Interceptor::new(512);
     assert_eq!(stream.push(&bytes), bytes.len());
-    log.with_next(Direction::ClientToServer, &mut stream, |item, raw, _| {
-        assert!(item.is_ok());
-        proxy.apply::<proxy_protocol::Header>(raw, Rewrite::Forward, &mut out)
-    })
-    .unwrap()
-    .unwrap()
-    .unwrap();
+    proxy
+        .next_with_observed(
+            &mut stream,
+            &mut out,
+            |item, _, _| {
+                assert!(item.is_ok());
+                Rewrite::Forward
+            },
+            write_bounded::<modbus::Frame>,
+            log.observer(0, Direction::ClientToServer),
+        )
+        .unwrap()
+        .unwrap();
     for _ in 0..2 {
         assert!(
-            log.with_next(Direction::ClientToServer, &mut stream, |_, _, _| ())
+            proxy
+                .next_with_observed(
+                    &mut stream,
+                    &mut out,
+                    |_, _, _| Rewrite::Forward,
+                    write_bounded::<modbus::Frame>,
+                    log.observer(0, Direction::ClientToServer)
+                )
                 .is_none()
         );
     }
@@ -500,7 +534,7 @@ where
                     chunk,
                     &mut out,
                     |_, _, _| Rewrite::Forward,
-                    modbus::Frame::write
+                    write_bounded::<modbus::Frame>
                 )
                 .unwrap(),
             chunk.len()
@@ -513,7 +547,7 @@ where
             &[],
             &mut out,
             |_, _, _| Rewrite::Forward,
-            modbus::Frame::write,
+            write_bounded::<modbus::Frame>,
         )
         .unwrap();
     assert_eq!(out, input);
@@ -645,7 +679,7 @@ fn skip_output_is_transactional_on_limits_writes_and_decode_failure() {
         &mut stream,
         &mut out,
         |_, _, _| Rewrite::Replace(vec![()]),
-        |_, _| Err("refused"),
+        |_, _| Err(RewriteError::Write("refused")),
     );
     assert_eq!(
         result,
@@ -664,7 +698,12 @@ fn skip_output_is_transactional_on_limits_writes_and_decode_failure() {
             .unwrap()
             .is_err()
     );
-    assert_eq!(out, [42]);
+    assert_eq!(out, b"* \n");
+    assert_eq!(
+        [out[1..].to_vec(), stream.unread().to_vec()].concat(),
+        b" \n!"
+    );
+    out.truncate(1);
 
     let mut stream = Stream::new(json::Values::new());
     let proxy = Interceptor::new(64).with_skips(SkipPolicy::Drop);
@@ -708,30 +747,36 @@ fn forward_composes_with_collect_and_assemble() {
 }
 
 #[test]
-fn intercept_helper_rolls_back_a_batch_and_keeps_handoff_bytes() {
+fn intercept_helper_keeps_prior_items_and_handoff_bytes() {
     let proxy = Interceptor::new(128);
     let mut stream = Stream::new(modbus::Frames);
     let input = frame(1).to_bytes().unwrap().repeat(2);
     let mut calls = 0;
     let mut out = vec![42];
-    assert!(
-        proxy
-            .intercept(&mut stream, &input, &mut out, |_, _, _| {
-                calls += 1;
-                if calls == 1 {
-                    Rewrite::Forward
-                } else {
-                    Rewrite::Replace(vec![modbus::Frame {
-                        pdu: vec![],
-                        ..frame(2)
-                    }])
-                }
-            })
-            .is_err()
-    );
-    assert_eq!(out, [42]);
+    let error = proxy
+        .intercept(&mut stream, &input, &mut out, |_, _, _| {
+            calls += 1;
+            if calls == 1 {
+                Rewrite::Forward
+            } else {
+                Rewrite::Replace(vec![modbus::Frame {
+                    pdu: vec![],
+                    ..frame(2)
+                }])
+            }
+        })
+        .unwrap_err();
+    assert_eq!(error.0, input.len());
+    assert!(matches!(
+        error.1,
+        fictionet::stdlib::codec::InterceptError::Rewrite(
+            fictionet::stdlib::codec::RewriteError::Write(modbus::EncodeError::EmptyPdu)
+        )
+    ));
+    assert_eq!(&out[1..], &input[..12]);
     assert_eq!(stream.offset(), input.len() as u64);
 
+    out.truncate(1);
     let header = b"PROXY UNKNOWN\r\n";
     let input = [header.as_slice(), b"rest"].concat();
     let mut stream = Stream::new(fictionet::stdlib::proxy_protocol::Headers::new());
@@ -741,7 +786,7 @@ fn intercept_helper_rolls_back_a_batch_and_keeps_handoff_bytes() {
             &input,
             &mut out,
             |_, _, _| Rewrite::Forward,
-            modbus::Frame::write,
+            write_bounded::<modbus::Frame>,
         )
         .unwrap();
     assert_eq!(taken, input.len());
@@ -770,4 +815,238 @@ fn intercept_after_eof_does_not_accept_new_input() {
         0
     );
     assert_eq!(out, b"1");
+}
+
+#[test]
+fn intercept_keeps_good_frame_before_decode_failure() {
+    let first = frame(1).to_bytes().unwrap();
+    let input = [first.as_slice(), &[0, 2, 0, 1, 0, 2]].concat();
+    let mut stream = Stream::new(modbus::Frames);
+    let mut out = Vec::new();
+    let (accepted, error) = Interceptor::new(128)
+        .intercept(&mut stream, &input, &mut out, |_, _, _| Rewrite::Forward)
+        .unwrap_err();
+    assert_eq!(accepted, input.len());
+    assert!(matches!(
+        error,
+        fictionet::stdlib::codec::InterceptError::Decode(Fail::Protocol(
+            modbus::FrameError::Protocol(1)
+        ))
+    ));
+    assert_eq!(out, first);
+    assert_eq!(stream.unread(), &input[first.len()..]);
+}
+
+#[test]
+fn skip_limit_does_not_consume_the_next_item() {
+    let mut stream = Stream::new(json::Values::new());
+    let input = b"    1 ";
+    assert_eq!(stream.push(input), input.len());
+    let mut calls = 0;
+    let mut out = Vec::new();
+    assert!(
+        Interceptor::new(2)
+            .next(&mut stream, &mut out, |_, _, _| {
+                calls += 1;
+                Rewrite::Forward
+            })
+            .unwrap()
+            .is_err()
+    );
+    assert_eq!(calls, 0);
+    assert_eq!(stream.offset(), 0);
+    assert_eq!(stream.unread(), input);
+    Interceptor::new(16)
+        .next(&mut stream, &mut out, |value, _, _| {
+            assert_eq!(*value, json::Value::parse(b"1").unwrap());
+            calls += 1;
+            Rewrite::Forward
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(calls, 1);
+}
+
+fn assert_recorded_empty_plan<D: Decode>(decoder: D, input: &[u8])
+where
+    D::Item: Clone,
+    D::Error: Clone,
+{
+    let mut stream = Stream::new(decoder);
+    let mut faults = Faults::new(1, 4096, 16);
+    let mut log = Recorder::new(128, 4096);
+    let mut out = Vec::new();
+    for chunk in test_support::chunks(input, &[1]).chain(core::iter::once(&[][..])) {
+        if chunk.is_empty() {
+            stream.end();
+        } else {
+            assert_eq!(stream.push(chunk), chunk.len());
+        }
+        while let Some(result) = faults.next_with_observed(
+            &mut stream,
+            &mut out,
+            &[],
+            write_bounded::<modbus::Frame>,
+            log.observer(0, Direction::ClientToServer),
+        ) {
+            result.unwrap();
+        }
+    }
+    assert_eq!(out, input);
+    assert_eq!(
+        log.iter()
+            .flat_map(|r| r.bytes.iter().copied())
+            .collect::<Vec<_>>(),
+        input
+    );
+    assert!(log.iter().any(|r| matches!(r.kind, RecordKind::Skipped)));
+    assert!(log.iter().any(|r| matches!(r.kind, RecordKind::Item(_))));
+}
+
+#[test]
+fn empty_plan_records_and_forwards_json_scalars() {
+    assert_recorded_empty_plan(json::Values::new(), b"1 2\n");
+}
+
+#[test]
+fn empty_plan_records_and_forwards_json_objects() {
+    assert_recorded_empty_plan(json::Values::new(), b"{\"a\":1}\n  {\"b\":2}\n");
+}
+
+#[test]
+fn empty_plan_records_and_forwards_refused_lines() {
+    assert_recorded_empty_plan(Lines::new(4, Ending::LfOrCrlf), b"abcdefgh\nok\n");
+}
+
+#[test]
+fn skip_reservation_failure_leaves_decode_failure_for_retry() {
+    use fictionet::stdlib::codec::{InterceptError, RewriteError};
+    let input = b" \n!";
+    let mut stream = Stream::new(json::Values::new());
+    assert_eq!(stream.push(input), input.len());
+    let mut out = Vec::new();
+    assert!(matches!(
+        Interceptor::new(1).next(&mut stream, &mut out, |_, _, _| Rewrite::Forward),
+        Some(Err(InterceptError::Rewrite(RewriteError::TooLong {
+            limit: 1
+        })))
+    ));
+    assert_eq!(stream.offset(), 0);
+    assert!(stream.failed().is_none());
+    assert!(matches!(
+        Interceptor::new(16).next(&mut stream, &mut out, |_, _, _| Rewrite::Forward),
+        Some(Err(InterceptError::Decode(_)))
+    ));
+    assert!(stream.failed().is_some());
+    assert_eq!(out, b" \n");
+    assert_eq!([out.clone(), stream.unread().to_vec()].concat(), input);
+    assert!(
+        Interceptor::new(16)
+            .next(&mut stream, &mut out, |_, _, _| Rewrite::Forward)
+            .is_none()
+    );
+}
+
+#[test]
+fn holds_and_delays_share_recording_and_forwarded_skips() {
+    let input = b" 1 2\n";
+    let mut stream = Stream::new(json::Values::new());
+    assert_eq!(stream.push(input), input.len());
+    stream.end();
+    let duration = Duration::from_millis(5);
+    let plan = [
+        Rule {
+            when: Trigger::At(1),
+            fault: ItemFault::<json::Value>::Hold { window: 1 },
+        },
+        Rule {
+            when: Trigger::At(2),
+            fault: ItemFault::Action {
+                delay: Some(duration),
+                rewrite: Rewrite::Forward,
+            },
+        },
+    ];
+    let mut faults = Faults::new(1, 128, 4);
+    let mut log = Recorder::new(16, 128);
+    let mut out = Vec::new();
+    let mut markers = Vec::new();
+    while let Some(result) = faults.next_with_observed(
+        &mut stream,
+        &mut out,
+        &plan,
+        write_bounded,
+        log.observer(9, Direction::ServerToClient),
+    ) {
+        if let Some(marker) = result.unwrap() {
+            markers.push(marker);
+        }
+    }
+    faults.flush(&mut out).unwrap();
+    assert_eq!(out, b"  21\n");
+    assert_eq!(
+        markers,
+        [fictionet::stdlib::codec::FaultDelay { at: 2, duration }]
+    );
+    assert_eq!(
+        log.iter()
+            .flat_map(|r| r.bytes.iter().copied())
+            .collect::<Vec<_>>(),
+        input
+    );
+    assert!(
+        log.iter()
+            .all(|r| r.tag == 9 && r.direction == Direction::ServerToClient)
+    );
+    assert_eq!(
+        log.iter()
+            .filter(|r| matches!(r.kind, RecordKind::Item(_)))
+            .count(),
+        2
+    );
+    assert_eq!(
+        log.iter()
+            .filter(|r| matches!(r.kind, RecordKind::Skipped))
+            .count(),
+        3
+    );
+}
+
+#[test]
+fn empty_plan_records_and_forwards_pipe_payloads() {
+    let pipe = fictionet::stdlib::codec::Pipe::new(
+        modbus::Frames,
+        Lines::new(4, Ending::LfOrCrlf),
+        |frame: modbus::Frame| Carry::Bytes(frame.pdu),
+    );
+    let input = modbus::Frame {
+        pdu: b"abcdefgh\nok\n".to_vec(),
+        ..frame(1)
+    }
+    .to_bytes()
+    .unwrap();
+    assert_recorded_empty_plan(pipe, &input);
+}
+
+#[test]
+fn intercept_reports_accepted_prefix_before_unaccepted_suffix() {
+    let first = frame(1).to_bytes().unwrap();
+    let mut input = [first.as_slice(), &[0, 2, 0, 1, 0, 2]].concat();
+    input.resize(1024, 0);
+    let mut stream = Stream::new(modbus::Frames);
+    let mut out = Vec::new();
+    let (accepted, error) = Interceptor::new(4096)
+        .intercept(&mut stream, &input, &mut out, |_, _, _| Rewrite::Forward)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        fictionet::stdlib::codec::InterceptError::Decode(_)
+    ));
+    assert!(accepted < input.len());
+    assert_eq!(accepted, modbus::Frames.capacity());
+    assert_eq!(out, first);
+    assert_eq!(
+        [out.as_slice(), stream.unread(), &input[accepted..]].concat(),
+        input
+    );
 }

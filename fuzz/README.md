@@ -18,7 +18,7 @@ cargo +nightly fuzz list
 
 | Target | What it feeds | Code it reaches |
 |---|---|---|
-| `codec_tools` | arbitrary Modbus/TCP, JSON, and line streams, byte edits, and seeded item plans | `codec`: consumed-input forwarding, transactional replacement, tagged recorder bounds, truncated skip and failure events, and repeatable fault output |
+| `codec_tools` | arbitrary Modbus/TCP, JSON, and line streams, byte edits, and seeded item plans | `codec`: one-pass recording with Forward and empty fault plans equals consumed input for JSON, Lines, Modbus, and Pipe; transactional replacement, recorder bounds, skip and failure events, and repeatable fault output |
 | `codec_tools` / Hold | every 11th item held for two later items, then EOF flush | held count and byte limits, release order, transactional flush |
 | `codec_tools` / Split | every 17th byte call split at offset 2 with a delay | two pushes with a delay marker at their boundary |
 | `codec_tools` / range Drop | every 19th byte call removes bytes 1..4 | clamped range edits and retained prefix/suffix |

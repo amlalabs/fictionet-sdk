@@ -18,7 +18,7 @@ pub enum Direction {
 pub enum RecordKind<T, E> {
     /// An owned copy of a decoded item.
     Item(T),
-    /// Bytes consumed without an item, including zero-byte transitions.
+    /// Nonempty bytes consumed without an item. Zero-byte skips are omitted.
     Skipped,
     /// Clean completion. The entry has an empty byte range.
     Ended,
@@ -58,18 +58,23 @@ pub struct Record<T, E> {
 /// or errors. Those keep their decoder's named limits; the entry limit
 /// bounds how many such values are held. Allocator overhead is separate.
 /// Use one recorder for all Demux keys and directions under one budget.
-/// Assign each stream a numeric tag with [`with_next_tagged`](Self::with_next_tagged).
+/// Assign each stream a numeric tag with [`observer`](Self::observer).
 /// Untagged calls use zero. The recorder does not infer stream identity.
 ///
 /// ```
-/// use fictionet::stdlib::{codec::{Direction, Recorder, Stream}, modbus};
+/// use fictionet::stdlib::{codec::{Direction, Interceptor, Recorder, Rewrite, Stream}, modbus};
 /// let mut stream = Stream::new(modbus::Frames);
 /// let mut log = Recorder::new(16, 1024);
+/// let proxy = Interceptor::new(1024);
 /// let input = [0, 1, 0, 0, 0, 2, 1, 3];
+/// let mut out = Vec::new();
 /// assert_eq!(stream.push(&input), input.len());
-/// log.with_next(Direction::ClientToServer, &mut stream, |_, _, _| ()).unwrap()?;
 /// stream.end();
-/// assert!(log.with_next(Direction::ClientToServer, &mut stream, |_, _, _| ()).is_none());
+/// while let Some(result) = proxy.next_observed(&mut stream, &mut out,
+///     |_, _, _| Rewrite::Forward, log.observer(7, Direction::ClientToServer)) {
+///     result?;
+/// }
+/// assert_eq!(out, input);
 /// assert_eq!(log.len(), 2); // item, then end
 /// assert_eq!(log.iter().next().unwrap().bytes, input);
 /// # Ok::<(), Box<dyn core::error::Error>>(())
@@ -147,13 +152,17 @@ impl<T: Clone, E: Clone> Recorder<T, E> {
     }
 
     /// Copies an observation with a caller-assigned stream key. Count and
-    /// byte limits are shared across all tags and directions.
+    /// byte limits are shared across all tags and directions. Empty skips
+    /// are ignored without eviction or incrementing the dropped count.
     pub fn observe_tagged(
         &mut self,
         tag: u64,
         direction: Direction,
         event: StreamEvent<'_, T, E>,
     ) -> bool {
+        if matches!(event, StreamEvent::Skipped { bytes: [], .. }) {
+            return false;
+        }
         let (bytes, range) = match &event {
             StreamEvent::Item { bytes, range, .. }
             | StreamEvent::Skipped { bytes, range }
@@ -166,6 +175,8 @@ impl<T: Clone, E: Clone> Recorder<T, E> {
         }
         let keep = bytes.len().min(self.max_bytes);
         let mut owned = Vec::new();
+        // Keep deque growth local for copy-and-own. Faults uses a heap
+        // and a temporary vector with their own reservation bounds.
         let target = self
             .entries
             .capacity()
@@ -210,10 +221,26 @@ impl<T: Clone, E: Clone> Recorder<T, E> {
         true
     }
 
+    /// Returns an observer for a keyed stream direction. Pass it to
+    /// [`Interceptor::next_observed`](fictionet::stdlib::codec::Interceptor::next_observed)
+    /// or [`Faults::next_with_observed`](fictionet::stdlib::codec::Faults::next_with_observed)
+    /// to record and rewrite in one pass, including skipped bytes.
+    pub fn observer(
+        &mut self,
+        tag: u64,
+        direction: Direction,
+    ) -> impl FnMut(StreamEvent<'_, T, E>) + '_ {
+        move |event| {
+            self.observe_tagged(tag, direction, event);
+        }
+    }
+
     /// Drives one item while recording every skip and terminal event along
     /// the way. The callback receives the owned item and its borrowed bytes
-    /// after recording. Apply an interceptor there to record and rewrite in
-    /// one pass. Waiting for input allocates and copies nothing.
+    /// after recording. For recording with rewrites or faults, pass
+    /// [`observer`](Self::observer) to `Interceptor::next_with_observed` or
+    /// `Faults::next_with_observed`. Those forward skips in the same pass.
+    /// Waiting for input allocates and copies nothing.
     pub fn with_next<D: Decode<Item = T, Error = E>, R>(
         &mut self,
         direction: Direction,
@@ -246,6 +273,30 @@ mod tests {
         codec::{Ending, Lines},
         json, modbus,
     };
+
+    #[test]
+    fn empty_skips_do_not_evict_real_entries() {
+        let mut log = Recorder::<(), core::convert::Infallible>::new(1, 4);
+        assert!(log.observe(
+            Direction::ClientToServer,
+            StreamEvent::Skipped {
+                bytes: b"data",
+                range: 0..4
+            }
+        ));
+        for _ in 0..1000 {
+            assert!(!log.observe(
+                Direction::ClientToServer,
+                StreamEvent::Skipped {
+                    bytes: b"",
+                    range: 4..4
+                }
+            ));
+        }
+        assert_eq!(log.len(), 1);
+        assert_eq!(log.dropped(), 0);
+        assert_eq!(log.iter().next().unwrap().bytes, b"data");
+    }
 
     #[test]
     fn bounds_drop_oldest_and_truncate_oversized_incoming() {

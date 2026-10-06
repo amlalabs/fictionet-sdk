@@ -103,7 +103,9 @@ pub use combinators::{
 };
 pub use demux::Demux;
 pub use faults::{ByteFault, FaultDelay, FaultError, Faults, ItemFault, Rule, Trigger};
-pub use interceptor::{InterceptError, Interceptor, Rewrite, RewriteError, SkipPolicy};
+pub use interceptor::{
+    InterceptError, Interceptor, Rewrite, RewriteError, SkipPolicy, append_bounded, write_bounded,
+};
 pub use lcg::Lcg;
 pub use pipe::{Carry, DEFAULT_SPANS, Layered, Pipe, PipeError, Span, Spans};
 pub use recorder::{Direction, Record, RecordKind, Recorder};
