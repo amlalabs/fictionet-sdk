@@ -578,8 +578,32 @@ impl fmt::Display for Malformed {
 }
 impl std::error::Error for Malformed {}
 
-// Envelope errors are outer errors. Field failures are per-unit items.
-fn parse_frame(input: &[u8]) -> Result<Result<Message, Malformed>, Error> {
+// The tag before the first `=` in the next 11 bytes, if it reads as one.
+fn leading_tag(rest: &[u8]) -> Option<u32> {
+    let eq = rest.iter().take(11).position(|b| *b == b'=')?;
+    decimal(rest.get(..eq)?).ok()
+}
+fn checksum(bytes: &[u8]) -> u8 {
+    bytes.iter().fold(0u8, |sum, b| sum.wrapping_add(*b))
+}
+
+/// Where a whole candidate's fields and trailer lie, found in O(1) after the
+/// bounded prefix.
+#[derive(Clone, Copy)]
+struct Envelope {
+    /// Offset of the first field after BodyLength.
+    start: usize,
+    /// Offset of the `10=` trailer.
+    checksum_at: usize,
+    /// The CheckSum value the trailer declares.
+    checksum: u32,
+}
+
+// Cheap envelope checks only: the bounded prefix, the exact length, the
+// trailer's shape and position, and MsgType in the first body field. None of
+// them reads more than MAX_PREFIX_SIZE + 18 bytes, so Frames runs them on
+// every candidate before any work that grows with BodyLength.
+fn envelope(input: &[u8]) -> Result<Envelope, Error> {
     if input.len() > MAX_MESSAGE_SIZE {
         return Err(Error::Limit);
     }
@@ -600,13 +624,33 @@ fn parse_frame(input: &[u8]) -> Result<Result<Message, Malformed>, Error> {
         }
         _ => return Err(Error::Checksum),
     };
-    let content = input.get(..checksum_at).ok_or(Error::BodyLength)?;
-    if content.last() != Some(&SOH) {
+    if checksum_at.checked_sub(1).and_then(|i| input.get(i)) != Some(&SOH) {
         return Err(Error::BodyLength);
     }
-    if content.iter().fold(0u8, |sum, b| sum.wrapping_add(*b)) as u32 != checksum {
+    if leading_tag(input.get(start..checksum_at).unwrap_or_default()) != Some(35) {
+        return Err(Error::Header);
+    }
+    Ok(Envelope {
+        start,
+        checksum_at,
+        checksum,
+    })
+}
+
+// Envelope errors are outer errors. Field failures are per-unit items.
+fn parse_frame(input: &[u8]) -> Result<Result<Message, Malformed>, Error> {
+    let envelope = envelope(input)?;
+    let content = input.get(..envelope.checksum_at).ok_or(Error::BodyLength)?;
+    if u32::from(checksum(content)) != envelope.checksum {
         return Err(Error::Checksum);
     }
+    fields(content, envelope.start)
+}
+
+// Reads the fields of a candidate whose envelope and checksum were checked.
+// Work and allocation are linear in `content`.
+fn fields(content: &[u8], start: usize) -> Result<Result<Message, Malformed>, Error> {
+    let checksum_at = content.len();
     let mut pos = 0;
     let (_, begin) = next_field(content, &mut pos, None)?;
     let mut message = Message {
@@ -622,11 +666,7 @@ fn parse_frame(input: &[u8]) -> Result<Result<Message, Malformed>, Error> {
         let raw = pending.take();
         let first = at == start;
         let rest = content.get(at..).ok_or(Error::Incomplete)?;
-        let tag_hint = rest
-            .iter()
-            .take(11)
-            .position(|b| *b == b'=')
-            .and_then(|eq| decimal(&rest[..eq]).ok());
+        let tag_hint = leading_tag(rest);
         if first && tag_hint != Some(35) {
             return Err(Error::Header);
         }
@@ -747,9 +787,26 @@ impl Wire for Message {
     }
 }
 
+/// Bytes of failed-candidate checksum work [`Frames`] may owe before it stops
+/// trying overlapping candidates. Each candidate that fails its CheckSum adds
+/// its length to a debt, and every byte consumed pays one byte back. While the
+/// debt is above this bound, a candidate that fails its CheckSum is skipped
+/// whole, by its BodyLength, instead of rescanned from just past its start.
+/// Total checksum and parse work is then at most twice the bytes consumed plus
+/// this bound plus [`MAX_MESSAGE_SIZE`], for any input and any chunking.
+pub const MAX_RESYNC_DEBT: usize = 4 * MAX_MESSAGE_SIZE;
+
 /// Splits a TCP byte stream using BodyLength. No input bytes are retained.
 /// At most [`MAX_PREFIX_SIZE`] header bytes are rescanned per call. The body
-/// is parsed only when complete, so one-byte delivery takes linear time.
+/// is checked only when complete, and cheap envelope checks (the prefix, the
+/// trailer's shape and position, MsgType first) run before any work that grows
+/// with BodyLength. Total work is linear in the input for any chunking, also
+/// when garbled candidates overlap: see [`MAX_RESYNC_DEBT`].
+///
+/// A wrong BodyLength is found only when its whole span has arrived. A header
+/// that claims up to [`MAX_MESSAGE_SIZE`] bytes holds back the messages after
+/// it until that many bytes arrive or the input ends. Pair the stream with the
+/// session's TestRequest timer, which ends a silent link.
 /// Use [`Self::default`] to start with a zero garbled-message count.
 ///
 /// ```
@@ -767,6 +824,8 @@ pub struct Frames {
     unsupported_versions: u64,
     resync: bool,
     scanned: usize,
+    debt: usize,
+    examined: u64,
 }
 impl Frames {
     /// Number of rejected envelope candidates or runs of noise. A resync scan
@@ -783,33 +842,99 @@ impl Frames {
     pub fn unsupported_versions(&self) -> u64 {
         self.unsupported_versions
     }
+    /// Candidate bytes checksummed so far, valid or not, saturating at
+    /// `u64::MAX`. Field parsing reads at most these bytes again. For observe
+    /// layers and work bounds: see [`MAX_RESYNC_DEBT`].
+    pub fn examined(&self) -> u64 {
+        self.examined
+    }
+    // Skips to the next `8=FIX` after offset zero, keeping four bytes when a
+    // whole marker has not arrived, including across buffer compaction. The
+    // cursor is relative to the unread start, so a scan is linear across
+    // calls. Returns Need, with no state changed, only when there is nothing
+    // to skip yet.
     fn recover(&mut self, input: &[u8], eof: bool) -> Step<Result<Message, Malformed>> {
-        if !self.resync {
-            self.garbled = self.garbled.saturating_add(1);
-            self.resync = true;
-            self.scanned = 1;
-        }
-        // The cursor is relative to the unread start. Keep four bytes when a
-        // full marker has not arrived, including across buffer compaction.
-        while let Some(window) = input.get(self.scanned..).and_then(|b| b.get(..5)) {
+        let mut scanned = if self.resync { self.scanned } else { 1 };
+        let mut found = false;
+        while let Some(window) = input.get(scanned..).and_then(|b| b.get(..5)) {
             if window == b"8=FIX" {
-                let used = self.scanned;
-                self.resync = false;
-                self.scanned = 0;
-                return Step::Skip(used);
+                found = true;
+                break;
             }
-            self.scanned += 1;
+            scanned += 1;
         }
-        let used = if eof {
+        let used = if found {
+            scanned
+        } else if eof {
             input.len()
         } else {
             input.len().saturating_sub(4)
         };
-        self.scanned = self.scanned.saturating_sub(used);
         if used == 0 {
-            Step::Need
+            return Step::Need;
+        }
+        if !self.resync {
+            self.garbled = self.garbled.saturating_add(1);
+        }
+        self.resync = !found;
+        self.scanned = if found {
+            0
         } else {
-            Step::Skip(used)
+            scanned.saturating_sub(used)
+        };
+        Step::Skip(used)
+    }
+    fn step(&mut self, input: &[u8], eof: bool) -> Step<Result<Message, Malformed>> {
+        // A marker kept back by a partial skip may now start the input.
+        if self.resync && self.scanned == 0 && input.starts_with(b"8=FIX") {
+            self.resync = false;
+        }
+        if self.resync {
+            return self.recover(input, eof);
+        }
+        let total = match prefix(input) {
+            Ok(Some((_, total))) => total,
+            Ok(None) => return Step::Need,
+            Err(error) => {
+                let step = self.recover(input, eof);
+                if error == Error::Version && !matches!(step, Step::Need) {
+                    self.unsupported_versions = self.unsupported_versions.saturating_add(1);
+                }
+                return step;
+            }
+        };
+        let Some(bytes) = input.get(..total) else {
+            // Stops at the first later marker, and recover then skips to it,
+            // so this scan never covers the same bytes twice.
+            if eof && input.windows(5).skip(1).any(|b| b == b"8=FIX") {
+                return self.recover(input, eof);
+            }
+            return Step::Need;
+        };
+        let Ok(envelope) = envelope(bytes) else {
+            return self.recover(input, eof);
+        };
+        let content = bytes.get(..envelope.checksum_at).unwrap_or_default();
+        self.examined = self
+            .examined
+            .saturating_add(u64::try_from(total).unwrap_or(u64::MAX));
+        if u32::from(checksum(content)) != envelope.checksum {
+            self.debt = self.debt.saturating_add(total);
+            if self.debt <= MAX_RESYNC_DEBT {
+                return self.recover(input, eof);
+            }
+            self.garbled = self.garbled.saturating_add(1);
+            return Step::Skip(total);
+        }
+        match fields(content, envelope.start) {
+            Ok(item) => Step::Item(item, total),
+            // The trailer sits where BodyLength says and the CheckSum covers
+            // exactly that span, so the length is confirmed. Skip the frame
+            // rather than rescan inside it.
+            Err(_) => {
+                self.garbled = self.garbled.saturating_add(1);
+                Step::Skip(total)
+            }
         }
     }
 }
@@ -822,37 +947,21 @@ impl Decode for Frames {
         MAX_MESSAGE_SIZE
     }
     /// Returns a checked message or a [`Malformed`] field-failure item.
-    /// On an envelope fault, skips to the next
-    /// `8=FIX` after offset zero, retaining four bytes for a split marker.
-    /// Includes bad lengths, misplaced tags, unsupported versions, and noise
-    /// (FIX 4.4 Vol 2 cases 2.d, 2.m, 2.t, 3.b; Session Layer 4.5.2).
-    /// Never uses a failed candidate's BodyLength as the skip distance.
+    /// On an envelope fault, skips to the next `8=FIX` after offset zero,
+    /// retaining four bytes for a split marker. Includes bad lengths,
+    /// misplaced tags, unsupported versions, and noise (FIX 4.4 Vol 2 cases
+    /// 2.d, 2.m, 2.t, 3.b; Session Layer 4.5.2). A failed candidate's
+    /// BodyLength is used as the skip distance only when its trailer and
+    /// CheckSum both verify, or past [`MAX_RESYNC_DEBT`].
     /// At EOF, searches incomplete candidates for a later frame. Otherwise
     /// partial input returns `Need`; the driver reports any final truncation.
+    /// Never returns `Err`.
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Self::Item>, Error> {
-        if self.resync {
-            return Ok(self.recover(input, eof));
+        let step = self.step(input, eof);
+        if let Step::Item(_, n) | Step::Skip(n) = &step {
+            self.debt = self.debt.saturating_sub(*n);
         }
-        let total = match prefix(input) {
-            Ok(Some((_, total))) => total,
-            Ok(None) => return Ok(Step::Need),
-            Err(error) => {
-                if error == Error::Version {
-                    self.unsupported_versions = self.unsupported_versions.saturating_add(1);
-                }
-                return Ok(self.recover(input, eof));
-            }
-        };
-        let Some(bytes) = input.get(..total) else {
-            if eof && input.windows(5).skip(1).any(|b| b == b"8=FIX") {
-                return Ok(self.recover(input, eof));
-            }
-            return Ok(Step::Need);
-        };
-        Ok(match parse_frame(bytes) {
-            Ok(message) => Step::Item(message, total),
-            Err(_) => self.recover(input, eof),
-        })
+        Ok(step)
     }
 }
 
@@ -1506,29 +1615,29 @@ impl Session {
             match s.state {
                 SessionState::Closed => return Ok(()),
                 SessionState::AwaitingLogon | SessionState::LogonSent => {
-                    if now_ms - s.state_since >= s.config.logon_timeout_ms {
+                    if now_ms.saturating_sub(s.state_since) >= s.config.logon_timeout_ms {
                         s.close(CloseReason::LogonTimeout, actions)?;
                     }
                     return Ok(());
                 }
                 SessionState::LogoutSent | SessionState::LogoutReceived => {
-                    if now_ms - s.state_since >= s.config.logout_timeout_ms {
+                    if now_ms.saturating_sub(s.state_since) >= s.config.logout_timeout_ms {
                         s.close(CloseReason::LogoutTimeout, actions)?;
                     }
                     return Ok(());
                 }
                 SessionState::Established => {}
             }
-            if s.pending_logout
-                .is_some_and(|(_, since)| now_ms - since >= s.config.logout_timeout_ms)
-            {
+            if s.pending_logout.is_some_and(|(_, since)| {
+                now_ms.saturating_sub(since) >= s.config.logout_timeout_ms
+            }) {
                 s.acknowledge_logout(now_ms, sending_time, actions)?;
                 return Ok(());
             }
             let interval = u64::from(s.heartbeat) * 1000;
-            let timeout = interval + s.config.transmission_grace_ms;
+            let timeout = interval.saturating_add(s.config.transmission_grace_ms);
             if let Some((_, sent)) = &s.test {
-                if now_ms - *sent >= timeout {
+                if now_ms.saturating_sub(*sent) >= timeout {
                     s.fatal(
                         CloseReason::TestRequestTimeout,
                         b"TestRequest timeout",
@@ -1538,13 +1647,13 @@ impl Session {
                     )?;
                     return Ok(());
                 }
-            } else if interval != 0 && now_ms - s.last_received >= timeout {
+            } else if interval != 0 && now_ms.saturating_sub(s.last_received) >= timeout {
                 s.test_serial = s.test_serial.checked_add(1).ok_or(Error::Limit)?;
                 let id = s.test_serial.to_string();
                 s.emit(b"1", &[(112, id.as_bytes())], now_ms, sending_time, actions)?;
                 s.test = Some((id, now_ms));
             }
-            if interval != 0 && now_ms - s.last_sent >= interval {
+            if interval != 0 && now_ms.saturating_sub(s.last_sent) >= interval {
                 s.emit(b"0", &[], now_ms, sending_time, actions)?;
             }
             Ok(())
@@ -3382,6 +3491,160 @@ mod tests {
             frames.decode(&wire, false),
             Ok(Step::Item(_, MAX_MESSAGE_SIZE))
         ));
+    }
+
+    // Pumps `bytes` in 64 KiB chunks and finishes. Returns the decoder, the
+    // item count, and the work bound MAX_RESYNC_DEBT documents.
+    fn pump_bounded(bytes: &[u8]) -> (Frames, usize, u64) {
+        let mut stream = Stream::new(Frames::default());
+        let mut count = 0;
+        for chunk in bytes.chunks(64 * 1024) {
+            let mut rest = chunk;
+            while !rest.is_empty() {
+                let n = stream.push(rest);
+                rest = &rest[n..];
+                while let Some(item) = stream.next() {
+                    assert!(item.is_ok());
+                    count += 1;
+                }
+            }
+        }
+        // A final incomplete candidate is reported as truncation.
+        if let Err(failure) = fictionet::stdlib::codec::finish(&mut stream, |_| count += 1) {
+            assert!(matches!(
+                failure,
+                fictionet::stdlib::codec::Fail::Truncated { .. }
+            ));
+        }
+        let bound = 2 * bytes.len() as u64 + (MAX_RESYNC_DEBT + MAX_MESSAGE_SIZE) as u64;
+        (*stream.decoder(), count, bound)
+    }
+
+    #[test]
+    fn periodic_overlapping_candidates_take_linear_work() {
+        // The reviewed input: every 26 bytes a candidate whose BodyLength, a
+        // multiple of 26, lands its trailer on a later `10=000`. Its first
+        // body field is not MsgType, so the cheap checks refuse it unread.
+        let period = b"8=FIX.4.4\x019=988000\x0110=000\x01";
+        assert_eq!(period.len(), 26);
+        let (frames, count, _) = pump_bounded(&period.repeat(76_000));
+        assert_eq!((count, frames.examined()), (0, 0));
+        // With MsgType first, every candidate passes the cheap checks and
+        // fails only its CheckSum, after a fold of about 1 MB.
+        let period = b"8=FIX.4.4\x019=988006\x0135=0\x0110=000\x01";
+        assert_eq!(period.len(), 31);
+        assert_eq!((19 + 988_006 + 7) % 31, 0);
+        let bytes = period.repeat(64_000);
+        let (frames, count, bound) = pump_bounded(&bytes);
+        assert_eq!(count, 0);
+        assert!(frames.garbled() > 0);
+        assert!(frames.examined() > 0);
+        assert!(
+            frames.examined() <= bound,
+            "{} > {bound}",
+            frames.examined()
+        );
+    }
+
+    #[test]
+    fn overlapping_headers_over_a_shared_region_take_linear_work() {
+        // K headers whose raw data jumps to one region of valid fields. The
+        // region ends in a late envelope fault, and each candidate ends at its
+        // own trailer with a valid CheckSum.
+        fn build(k: usize, fields: usize) -> Vec<u8> {
+            let header = |body: usize, data: usize| {
+                format!("8=FIX.4.4\x019={body:07}\x0135=0\x0195={data:07}\x0196=").into_bytes()
+            };
+            let width = header(0, 0).len();
+            let mut region = vec![SOH];
+            for _ in 0..fields {
+                region.extend_from_slice(b"1=");
+                region.extend_from_slice(&[b'a'; 100]);
+                region.push(SOH);
+            }
+            region.extend_from_slice(b"9=1\x01");
+            let headers = k * width;
+            let mut bytes = vec![0; headers];
+            bytes.extend_from_slice(&region);
+            // Candidate i starts at i * width and ends at trailer i.
+            let mut ends = Vec::new();
+            for i in 0..k {
+                let at = bytes.len();
+                ends.push(at);
+                bytes.extend_from_slice(b"10=000\x01");
+                let start = i * width;
+                let prefix_len = "8=FIX.4.4\x019=0000000\x01".len();
+                let body = at - (start + prefix_len);
+                let data = headers - (start + width);
+                bytes[start..start + width].copy_from_slice(&header(body, data));
+            }
+            // Earlier trailers fall inside later candidates, so fill them in order.
+            for (i, at) in ends.iter().enumerate() {
+                let sum = checksum(&bytes[i * width..*at]);
+                bytes[at + 3..at + 6].copy_from_slice(format!("{sum:03}").as_bytes());
+            }
+            bytes
+        }
+        let small = build(20, 40);
+        // Candidate 0 passes its CheckSum and fails only at the late `9=1`.
+        assert_eq!(
+            Message::parse(&small[..small.len() - 19 * 7]),
+            Err(Error::Header)
+        );
+        check_decode_with_alloc_limit(Frames::default, &small, 2 * MAX_MESSAGE_SIZE);
+        let bytes = build(2000, 4000);
+        assert!(bytes.len() <= MAX_MESSAGE_SIZE);
+        let (frames, count, bound) = pump_bounded(&bytes);
+        assert_eq!(count, 0);
+        assert!(
+            frames.examined() <= bound,
+            "{} > {bound}",
+            frames.examined()
+        );
+        assert!(frames.garbled() <= 2);
+    }
+
+    #[test]
+    fn candidates_sharing_one_trailer_take_linear_work() {
+        // Many headers point at one trailer. Almost all fail their CheckSum.
+        let k = 20_000;
+        let header = |body: usize| format!("8=FIX.4.4\x019={body:07}\x0135=0\x01").into_bytes();
+        let width = header(0).len();
+        let filler = b"58=x\x01";
+        let trailer_at = k * width + filler.len();
+        let prefix_len = "8=FIX.4.4\x019=0000000\x01".len();
+        let mut bytes = Vec::new();
+        for i in 0..k {
+            bytes.extend_from_slice(&header(trailer_at - (i * width + prefix_len)));
+        }
+        bytes.extend_from_slice(filler);
+        bytes.extend_from_slice(b"10=000\x01");
+        assert!(bytes.len() <= MAX_MESSAGE_SIZE);
+        let (frames, _, bound) = pump_bounded(&bytes);
+        assert!(
+            frames.examined() <= bound,
+            "{} > {bound}",
+            frames.examined()
+        );
+    }
+
+    #[test]
+    fn need_leaves_resync_state_unchanged_and_skips_are_never_empty() {
+        let mut frames = Frames::default();
+        assert_eq!(frames.decode(b"8=X\x01", false), Ok(Step::Need));
+        assert_eq!((frames.garbled(), frames.unsupported_versions()), (0, 0));
+        assert!(!frames.resync);
+        assert_eq!(frames.decode(b"8=X\x01y", false), Ok(Step::Skip(1)));
+        assert_eq!((frames.garbled(), frames.unsupported_versions()), (1, 1));
+        // A marker kept back by a partial skip is read in place, not skipped by 0.
+        let good = b"8=FIX.4.4\x019=5\x0135=0\x0110=163\x01";
+        let mut frames = Frames::default();
+        assert_eq!(frames.decode(b"x\x01xxx8=FI", false), Ok(Step::Skip(5)));
+        assert!(matches!(
+            frames.decode(good, false),
+            Ok(Step::Item(Ok(_), n)) if n == good.len()
+        ));
+        assert_eq!(frames.garbled(), 1);
     }
 
     #[test]
