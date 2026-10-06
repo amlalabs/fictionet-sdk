@@ -78,8 +78,14 @@ const MAX_HEADER_BLOCK: usize = 64 << 10;
 /// One direction's bytes not decoded yet.
 #[derive(Default)]
 struct Dir {
-    buf: Vec<u8>,
-    /// The stream offset of `buf[0]`.
+    /// Bytes received; those before `head` are already decoded.
+    raw: Vec<u8>,
+    /// Where the bytes not decoded yet start in `raw`. Consuming a frame
+    /// only moves this, so a chunk of many small frames costs time in
+    /// proportion to its size; the decoded bytes are dropped once, when
+    /// the next chunk arrives.
+    head: usize,
+    /// The stream offset of the first byte not decoded yet.
     start: u64,
     /// Bytes still to come of a message too long to hold, which are
     /// dropped as they arrive.
@@ -88,26 +94,39 @@ struct Dir {
 }
 
 impl Dir {
+    /// The bytes not decoded yet.
+    fn buf(&self) -> &[u8] {
+        &self.raw[self.head..]
+    }
+
     fn push(&mut self, bytes: &[u8], place: &Place) {
-        if self.buf.is_empty() {
+        if self.head > 0 {
+            self.raw.drain(..self.head);
+            self.head = 0;
+        }
+        if self.raw.is_empty() {
             self.start = place.stream_start;
         }
-        self.buf.extend_from_slice(bytes);
-        let n = self.skip.min(self.buf.len() as u64);
+        self.raw.extend_from_slice(bytes);
+        let n = self.skip.min(self.buf().len() as u64);
         self.consume(n as usize);
         self.skip -= n;
     }
 
     fn consume(&mut self, n: usize) {
-        let n = n.min(self.buf.len());
-        self.buf.drain(..n);
+        let n = n.min(self.buf().len());
+        self.head += n;
         self.start = self.start.saturating_add(n as u64);
+        if self.head == self.raw.len() {
+            self.raw.clear();
+            self.head = 0;
+        }
     }
 
     /// Consumes a message of `len` bytes at the start of `buf`, of which
     /// only some may have come: the rest is skipped when it comes.
     fn consume_message(&mut self, len: usize) {
-        let n = len.min(self.buf.len());
+        let n = len.min(self.buf().len());
         self.consume(n);
         self.skip = (len - n) as u64;
     }
@@ -115,7 +134,8 @@ impl Dir {
     /// Bytes of this direction were lost, so the message buffered cannot
     /// be finished, and where the next one starts is not known.
     fn lose(&mut self) {
-        self.buf.clear();
+        self.raw.clear();
+        self.head = 0;
         self.skip = 0;
         self.http2.lose();
     }
@@ -123,7 +143,7 @@ impl Dir {
     /// Drops what is buffered if it outgrew [`MAX_BUFFER`]: a message
     /// whose end could not be found.
     fn limit(&mut self) {
-        if self.buf.len() > MAX_BUFFER {
+        if self.buf().len() > MAX_BUFFER {
             self.lose();
         }
     }
@@ -235,7 +255,7 @@ impl Protocol for H2Session {
     }
     fn waiting(&self, reverse: bool) -> bool {
         let dir = &self.dirs[usize::from(reverse)];
-        !dir.buf.is_empty() || dir.skip > 0
+        !dir.buf().is_empty() || dir.skip > 0
     }
     fn lost(&mut self, reverse: bool) { self.dirs[usize::from(reverse)].lose(); }
 }
@@ -314,16 +334,16 @@ fn h2_error(code: u32) -> String {
 
 fn http2(dir: &mut Dir, place: Place, d: &mut Decoded) {
     if dir.http2.lost {
-        let n = dir.buf.len();
+        let n = dir.buf().len();
         dir.consume(n);
         return;
     }
     // The client's direction starts with the preface, which may come in
     // pieces: wait for all of it.
-    if !dir.http2.started && dir.buf.len() < HTTP2_PREFACE.len() && HTTP2_PREFACE.starts_with(&dir.buf) {
+    if !dir.http2.started && dir.buf().len() < HTTP2_PREFACE.len() && HTTP2_PREFACE.starts_with(dir.buf()) {
         return;
     }
-    if !dir.http2.started && dir.buf.starts_with(HTTP2_PREFACE) {
+    if !dir.http2.started && dir.buf().starts_with(HTTP2_PREFACE) {
         let (buf, base) = place.locate(d, dir.start, HTTP2_PREFACE, "HTTP/2 preface");
         let mut l = Layer::new("HyperText Transfer Protocol 2", buf, (base, base + HTTP2_PREFACE.len()));
         l.summary = "Connection preface".into();
@@ -332,15 +352,15 @@ fn http2(dir: &mut Dir, place: Place, d: &mut Decoded) {
         dir.consume(HTTP2_PREFACE.len());
     }
     dir.http2.started = true;
-    while dir.buf.len() >= 9 {
-        let len = (usize::from(dir.buf[0]) << 16) | usize::from(be16(&dir.buf, 1));
+    while dir.buf().len() >= 9 {
+        let len = (usize::from(dir.buf()[0]) << 16) | usize::from(be16(dir.buf(), 1));
         // A frame too long to hold is shown by its header, and the rest of
         // it is skipped as it comes.
-        let whole = dir.buf.len() >= 9 + len;
+        let whole = dir.buf().len() >= 9 + len;
         if !whole && 9 + len <= MAX_BUFFER {
             return;
         }
-        let frame = dir.buf[..if whole { 9 + len } else { 9 }].to_vec();
+        let frame = dir.buf()[..if whole { 9 + len } else { 9 }].to_vec();
         let (kind, flags, stream) = (frame[3], frame[4], be32(&frame, 5) & 0x7fff_ffff);
         let (buf, base) = place.locate(d, dir.start, &frame, "Reassembled HTTP/2 frame");
         let payload = whole.then(|| &frame[9..]);
@@ -828,4 +848,25 @@ mod tests {
         assert_ne!(d.proto, "Modbus/TCP");
     }
 
+
+    /// A large chunk of tiny HTTP/2 frames takes time in proportion to its
+    /// size. Consuming each frame used to move the rest of the buffer, so a
+    /// chunk of n frames took n^2 work.
+    #[test]
+    fn many_tiny_http2_frames_in_one_chunk_take_linear_time() {
+        let one = frame(0xff, 0, 1, &[]);
+        let time = |n: usize| {
+            let bytes = one.repeat(n);
+            let mut f = Feeder::h2();
+            let started = std::time::Instant::now();
+            let d = f.send(false, &bytes, bytes.len());
+            assert!(d.layers.len() + d.cut > 0);
+            started.elapsed()
+        };
+        let small = time(20_000);
+        let large = time(160_000);
+        // Eight times the frames: linear work takes about eight times as
+        // long; quadratic work, about 64 times.
+        assert!(large < small * 24 + std::time::Duration::from_millis(50), "{small:?} for 20,000 frames, {large:?} for 160,000");
+    }
 }

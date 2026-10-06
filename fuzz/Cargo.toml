@@ -844,3 +844,10 @@ path = "fuzz_targets/serve_http1.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "observe_http2"
+path = "fuzz_targets/observe_http2.rs"
+test = false
+doc = false
+bench = false
