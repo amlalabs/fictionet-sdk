@@ -79,7 +79,7 @@
 //! ```
 
 use fictionet::stdlib::codec::{Decode, Step, Wire};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::str::FromStr;
 
@@ -120,8 +120,8 @@ pub enum Error {
     /// Bytes of another message type than the one asked for, or an
     /// [`Unknown`] message written with a type this module defines.
     Type(u8),
-    /// An alphanumeric field has a byte outside printable ASCII, or text
-    /// longer than the field.
+    /// Text for an alphanumeric field is longer than the field or not
+    /// printable ASCII.
     Field,
     /// A side indicator other than "B" or "S".
     Side(u8),
@@ -277,9 +277,13 @@ impl Field for ShortPrice {
     }
 }
 
-/// A fixed-width alphanumeric field: `N` bytes of printable ASCII, left
-/// justified and padded on the right with spaces ("Data Types"). Padding
-/// is part of the value, so fields round-trip byte for byte.
+/// A fixed-width alphanumeric field, left justified and padded on the
+/// right with spaces ("Data Types"). Bytes are kept exactly as read, so
+/// fields round-trip byte for byte. Parsing accepts any byte: Cboe's
+/// Reserved bytes can sit inside a field of this type (the options layout
+/// of [`TradingStatus`] keeps two in `symbol`), and a feed may fill them
+/// with NUL. [`right_padded`](Self::right_padded) builds only printable
+/// ASCII.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Alpha<const N: usize>([u8; N]);
 impl<const N: usize> Alpha<N> {
@@ -287,17 +291,14 @@ impl<const N: usize> Alpha<N> {
     pub fn blank() -> Self {
         Self([b' '; N])
     }
-    /// The field's exact bytes. Refuses a byte outside 0x20..=0x7e.
-    pub fn new(bytes: [u8; N]) -> Result<Self, Error> {
-        if bytes.iter().all(|b| (0x20..=0x7e).contains(b)) {
-            Ok(Self(bytes))
-        } else {
-            Err(Error::Field)
-        }
+    /// The field's exact bytes.
+    pub fn new(bytes: [u8; N]) -> Self {
+        Self(bytes)
     }
-    /// `text` padded on the right with spaces.
+    /// `text` padded on the right with spaces. Refuses text longer than
+    /// the field or with a byte outside printable ASCII (0x20..=0x7e).
     pub fn right_padded(text: &str) -> Result<Self, Error> {
-        if text.len() > N {
+        if text.len() > N || !text.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
             return Err(Error::Field);
         }
         let mut bytes = [b' '; N];
@@ -305,16 +306,22 @@ impl<const N: usize> Alpha<N> {
             .get_mut(..text.len())
             .ok_or(Error::Field)?
             .copy_from_slice(text.as_bytes());
-        Self::new(bytes)
+        Ok(Self(bytes))
     }
     /// The field's bytes, padding included.
     pub fn as_bytes(&self) -> &[u8; N] {
         &self.0
     }
-    /// The text without trailing spaces.
+    /// The text: the bytes up to the first one outside printable ASCII
+    /// (NUL fill, reserved bytes), without trailing spaces.
     pub fn trimmed(&self) -> &str {
-        // Every byte is printable ASCII, so this is valid UTF-8.
-        std::str::from_utf8(&self.0)
+        let end = self
+            .0
+            .iter()
+            .position(|b| !(0x20..=0x7e).contains(b))
+            .unwrap_or(N);
+        // Every byte before `end` is printable ASCII, so this is UTF-8.
+        std::str::from_utf8(self.0.get(..end).unwrap_or_default())
             .unwrap_or_default()
             .trim_end_matches(' ')
     }
@@ -326,13 +333,13 @@ impl<const N: usize> Alpha<N> {
 }
 impl<const N: usize> fmt::Debug for Alpha<N> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}", std::str::from_utf8(&self.0).unwrap_or_default())
+        write!(f, "\"{}\"", self.0.escape_ascii())
     }
 }
 impl<const N: usize> Field for Alpha<N> {
     const LEN: usize = N;
     fn get(b: &[u8]) -> Result<Self, Error> {
-        Self::new(array(b)?)
+        array(b).map(Self)
     }
     fn put(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.0);
@@ -1682,6 +1689,8 @@ impl SymbolBook {
 pub struct Book {
     config: BookConfig,
     orders: HashMap<u64, Order>,
+    /// Order Ids per unit, so Unit Clear costs the orders it removes.
+    by_unit: HashMap<u8, HashSet<u64>>,
     symbols: HashMap<Symbol, SymbolBook>,
     levels: usize,
 }
@@ -1697,6 +1706,7 @@ impl Book {
         Ok(Self {
             config,
             orders: HashMap::new(),
+            by_unit: HashMap::new(),
             symbols: HashMap::new(),
             levels: 0,
         })
@@ -1800,12 +1810,7 @@ impl Book {
                 self.modify(m.order_id, old, old.price, 0)
             }
             Message::UnitClear(_) => {
-                let ids: Vec<u64> = self
-                    .orders
-                    .iter()
-                    .filter(|(_, o)| o.unit == unit)
-                    .map(|(id, _)| *id)
-                    .collect();
+                let ids = self.by_unit.remove(&unit).unwrap_or_default();
                 for id in &ids {
                     if let Some(order) = self.orders.get(id).copied() {
                         self.remove(*id, order);
@@ -1881,6 +1886,7 @@ impl Book {
             });
         level.quantity = level.quantity.saturating_add(u64::from(order.quantity));
         level.orders = level.orders.saturating_add(1);
+        self.by_unit.entry(order.unit).or_default().insert(order_id);
         self.orders.insert(order_id, order);
     }
     fn remove(&mut self, order_id: u64, order: Order) {
@@ -1896,6 +1902,12 @@ impl Book {
             }
             if book.bids.is_empty() && book.asks.is_empty() {
                 self.symbols.remove(&order.symbol);
+            }
+        }
+        if let Some(ids) = self.by_unit.get_mut(&order.unit) {
+            ids.remove(&order_id);
+            if ids.is_empty() {
+                self.by_unit.remove(&order.unit);
             }
         }
         self.orders.remove(&order_id);
@@ -2734,9 +2746,34 @@ mod tests {
             "1A 22 {OFFSET} {ORDER_ID} 58 20 4E 5A 56 5A 5A 54 20 0A 28 01"
         ));
         assert_eq!(Message::parse(&add), Err(Error::Side(b'X')));
+        // A byte outside printable ASCII in an alphanumeric field reads
+        // and writes back as it is.
         add[14] = b'S';
         add[17] = 0x7f;
-        assert_eq!(Message::parse(&add), Err(Error::Field));
+        let Message::AddOrderShort(m) = Message::parse(&add).unwrap() else {
+            panic!()
+        };
+        assert_eq!(m.symbol.trimmed(), "");
+        assert_eq!(Message::from(m).to_bytes().unwrap(), add);
+        assert_eq!(Symbol6::right_padded("A\u{7f}"), Err(Error::Field));
+    }
+
+    // "Trading Status (Options)": the two Reserved bytes after the six-byte
+    // symbol share the equities Symbol field. A feed that fills them, and
+    // the other reserved bytes, with NUL must still read, and write back
+    // the same bytes.
+    #[test]
+    fn options_trading_status_with_nul_reserved_bytes() {
+        let mut b = hex(&format!("12 31 {OFFSET}"));
+        b.extend_from_slice(b"998877");
+        b.extend_from_slice(&[0, 0, b'T', 0, b'H', 0]);
+        let Message::TradingStatus(t) = Message::parse(&b).unwrap() else {
+            panic!()
+        };
+        assert_eq!(t.symbol.trimmed(), "998877");
+        assert_eq!((t.trading_status, t.reserved1), (b'T', b'H'));
+        assert_eq!(Message::from(t).to_bytes().unwrap(), b);
+        check_wire::<Message>(&b);
     }
 
     #[test]
@@ -3090,6 +3127,10 @@ mod tests {
         assert_eq!(book.order_count(), 1);
         assert_eq!(book.level_count(), 1);
         assert_eq!(book.best_bid(z), None);
+        // Unit Clear finds the unit's orders through the per-unit index,
+        // not by scanning every order; the index follows every removal.
+        assert_eq!(book.by_unit.len(), 1);
+        assert_eq!(book.by_unit[&2].len(), 1);
         // Trades leave the book alone.
         assert_eq!(book.apply(2, &samples()[15]), Ok(Applied::Ignored));
     }
@@ -3286,6 +3327,11 @@ mod tests {
             assert_eq!(book.order_count(), model.len());
             for (id, o) in &model {
                 assert_eq!(book.order(*id), Some(o));
+            }
+            let indexed: usize = book.by_unit.values().map(HashSet::len).sum();
+            assert_eq!(indexed, model.len());
+            for (u, ids) in &book.by_unit {
+                assert!(ids.iter().all(|id| model[id].unit == *u));
             }
             let mut levels = 0;
             for s in symbols {

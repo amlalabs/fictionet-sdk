@@ -97,7 +97,7 @@
 //! ```
 
 use fictionet::stdlib::codec::{Decode, Step, Wire};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::marker::PhantomData;
 use std::str::FromStr;
@@ -2153,11 +2153,14 @@ impl Client {
         message: &Outbound,
         now_ms: u64,
     ) -> Result<Vec<Action<Inbound>>, Error> {
-        let mut s = self.clone();
-        s.clock.advance(now_ms)?;
-        let actions = s.receive_inner(message)?;
-        *self = s;
-        Ok(actions)
+        // Both refusals come before any change, so nothing is staged: a
+        // copy of the client (its configuration and unit map) per message
+        // would cost more than the message.
+        if self.state == ClientState::Closed {
+            return Err(Error::State);
+        }
+        self.clock.advance(now_ms)?;
+        Ok(self.receive_inner(message))
     }
     /// [`receive`](Self::receive) for a [`Frames`] item. A message that did
     /// not parse closes the session with [`CloseReason::Protocol`].
@@ -2177,19 +2180,16 @@ impl Client {
             }
         }
     }
-    fn receive_inner(&mut self, message: &Outbound) -> Result<Vec<Action<Inbound>>, Error> {
+    fn receive_inner(&mut self, message: &Outbound) -> Vec<Action<Inbound>> {
         use ClientState as S;
-        if self.state == S::Closed {
-            return Err(Error::State);
-        }
         self.clock.received = self.clock.now;
         let in_session = matches!(self.state, S::Replaying | S::LoggedIn | S::LoggingOut);
-        Ok(match (self.state, message) {
+        match (self.state, message) {
             (S::LoginSent, Outbound::LoginResponse(r))
                 if r.status == codes::login_status::ACCEPTED =>
             {
                 let Some(next) = r.last_received_sequence.checked_add(1) else {
-                    return Ok(self.close(CloseReason::Protocol));
+                    return self.close(CloseReason::Protocol);
                 };
                 self.next = next;
                 self.state = S::Replaying;
@@ -2222,18 +2222,18 @@ impl Client {
             }
             (_, m) if in_session && !m.is_session() => {
                 if !m.is_sequenced() {
-                    return Ok(vec![Action::Event(Event::Unsequenced)]);
+                    return vec![Action::Event(Event::Unsequenced)];
                 }
                 let Header { unit, sequence } = *m.header();
                 if unit == 0 || sequence == 0 {
-                    return Ok(self.close(CloseReason::Protocol));
+                    return self.close(CloseReason::Protocol);
                 }
                 let last = self.last.get(&unit).copied().unwrap_or(0);
                 if sequence <= last {
-                    return Ok(vec![Action::Event(Event::Duplicate(UnitSequence {
+                    return vec![Action::Event(Event::Duplicate(UnitSequence {
                         unit,
                         sequence,
-                    }))]);
+                    }))];
                 }
                 self.last.insert(unit, sequence);
                 let expected = last.saturating_add(1);
@@ -2248,7 +2248,7 @@ impl Client {
                 })]
             }
             _ => self.close(CloseReason::Protocol),
-        })
+        }
     }
     /// Numbers an application message (New Order, Cancel Order, Modify
     /// Order, Purge Orders) and returns it to write. Only once logged in
@@ -2933,7 +2933,9 @@ pub struct Exchange {
     config: ExchangeConfig,
     returns: BTreeMap<u8, Vec<u8>>,
     orders: HashMap<ClOrdId, Order>,
-    executions: VecDeque<Execution>,
+    /// Remembered executions by ExecID. ExecIDs only grow, so the first
+    /// entry is the oldest.
+    executions: BTreeMap<u64, Execution>,
     next_order_id: u64,
     next_exec_id: u64,
 }
@@ -2957,7 +2959,7 @@ impl Exchange {
             config,
             returns,
             orders: HashMap::new(),
-            executions: VecDeque::new(),
+            executions: BTreeMap::new(),
             next_order_id: config.first_order_id,
             next_exec_id: config.first_exec_id,
         })
@@ -3263,9 +3265,9 @@ impl Exchange {
             self.orders.insert(cl_ord_id, after);
         }
         if self.executions.len() >= self.config.max_executions {
-            self.executions.pop_front();
+            self.executions.pop_first();
         }
-        self.executions.push_back(execution);
+        self.executions.insert(exec_id, execution);
         Ok(reply.into())
     }
     /// Cancels a live order for the exchange's own `reason`, and returns
@@ -3332,14 +3334,9 @@ impl Exchange {
         corrected: Price,
         now: u64,
     ) -> Result<Outbound, ExchangeError> {
-        let i = self
-            .executions
-            .iter()
-            .position(|e| e.exec_id == exec_id)
-            .ok_or(ExchangeError::UnknownExecution(exec_id))?;
         let e = self
             .executions
-            .remove(i)
+            .remove(&exec_id)
             .ok_or(ExchangeError::UnknownExecution(exec_id))?;
         let order = self.orders.get(&e.cl_ord_id);
         Ok(TradeCancelOrCorrect {
@@ -4844,6 +4841,39 @@ mod tests {
         let out = x.receive(&cancel, 8);
         assert!(matches!(reply(&out), Outbound::CancelRejected(r) if r.reason == b'O'));
         assert_eq!(x.orders().count(), 0);
+    }
+
+    // Busts find the execution by ExecID in the bounded store (not by a
+    // scan), the oldest is forgotten first, and each bust removes it.
+    #[test]
+    fn exchange_busts_by_exec_id_within_the_limit() {
+        let returns = config().returns.into_iter().collect();
+        let config = ExchangeConfig {
+            max_executions: 2,
+            first_exec_id: 10,
+            ..ExchangeConfig::default()
+        };
+        let mut x = Exchange::new(config, returns).unwrap();
+        x.receive(&good("A1", 300), 1);
+        x.accept(text("A1"), 1, 1).unwrap();
+        for _ in 0..3 {
+            x.execute(text("A1"), 1, Price(1), b'A', 2).unwrap();
+        }
+        assert_eq!(x.executions.len(), 2);
+        assert_eq!(
+            x.bust(10, Price(0), 3),
+            Err(ExchangeError::UnknownExecution(10))
+        );
+        let Outbound::TradeCancelOrCorrect(t) = x.bust(12, Price(0), 3).unwrap() else {
+            panic!()
+        };
+        assert_eq!(t.exec_ref_id, 12);
+        assert_eq!(
+            x.bust(12, Price(0), 3),
+            Err(ExchangeError::UnknownExecution(12))
+        );
+        assert!(x.bust(11, Price(0), 3).is_ok());
+        assert!(x.executions.is_empty());
     }
 
     #[test]
