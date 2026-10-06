@@ -1,135 +1,117 @@
-//! RTSP messages, interleaved frames and the header values in them, as a
-//! world playing a camera reads them.
+//! RTSP messages, interleaved frames, and header values through codec contracts.
 #![no_main]
 
-use fictionet::stdlib::codec::{Wire, contract};
-use fictionet::stdlib::rtsp::Frames;
-use fictionet::stdlib::rtsp::{Decoder, Error, Item, Message, Range, Session, Transport};
+use fictionet::stdlib::codec::{Wire, contract, test_support::decode_all};
+use fictionet::stdlib::rtsp::{
+    Error, Frames, Interleaved, Item, MAX_BODY, MAX_HEAD, MAX_INTERLEAVED, MAX_MESSAGE, Message, Range, Session, Transport,
+    Transports, Version,
+};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode(Frames::new, data);
+    contract::check_decode_with_alloc_limit(Frames::new, data, 2 * MAX_MESSAGE);
     contract::check_decode_with_held_limit(Frames::new, data, 0);
     contract::check_wire::<Message>(data);
     contract::check_wire::<Item>(data);
-    contract::check_wire::<fictionet::stdlib::rtsp::Interleaved>(data);
-    let frame = fictionet::stdlib::rtsp::Interleaved {
+    contract::check_wire::<Interleaved>(data);
+    contract::check_wire::<Session>(data);
+    contract::check_wire::<Range>(data);
+    contract::check_wire::<Transport>(data);
+    contract::check_wire::<Transports>(data);
+
+    let frame = Interleaved {
         channel: data.first().copied().unwrap_or(0),
-        data: data.get(..fictionet::stdlib::rtsp::MAX_INTERLEAVED + 1).unwrap_or(data).to_vec(),
+        data: data.get(..MAX_INTERLEAVED + 1).unwrap_or(data).to_vec(),
     };
     contract::check_wire_value(&frame);
-    let mut message = Message::response(fictionet::stdlib::rtsp::Version::Rtsp20, 200, "OK");
-    message.body = data.get(..fictionet::stdlib::rtsp::MAX_BODY + 1).unwrap_or(data).to_vec();
+    let mut message = Message::response(Version::Rtsp20, 200, "OK");
+    message.body = data.get(..MAX_BODY + 1).unwrap_or(data).to_vec();
     message.push_header("Content-Length", &message.body.len().to_string());
     contract::check_wire_value(&message);
-    if let Ok(bytes) = Wire::to_bytes(&message) {
+    if let Ok(bytes) = message.to_bytes() {
         contract::check_wire::<Message>(&bytes);
-        contract::check_decode(Frames::new, &bytes);
+        contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_MESSAGE);
     }
     message.push_header("X", " leading");
     contract::check_wire_value(&message);
 
-    // The stream, split two ways: all at once, and a byte at a time.
-    let mut whole = Decoder::new();
-    whole.feed(data);
-    let first = drain(&mut whole);
-    let mut bytewise = Decoder::new();
-    let mut again = Vec::new();
-    for b in data {
-        bytewise.feed(std::slice::from_ref(b));
-        again.extend(drain(&mut bytewise));
-        if again.last().is_some_and(Result::is_err) {
-            break;
-        }
-    }
-    assert_eq!(first, again);
-
-    // The stateless reader, drained on its own, gives the same items, so
-    // neither side can drop a whole item the other reads.
-    let mut stateless = Vec::new();
-    let mut rest = data;
-    loop {
-        match Item::parse(rest) {
-            Ok(Some((item, used))) => {
-                assert!(used > 0 && used <= rest.len());
-                stateless.push(Ok(item));
-                rest = &rest[used..];
-            }
-            Ok(None) => break,
-            Err(e) => {
-                stateless.push(Err(e));
-                break;
-            }
-        }
-    }
-    assert_eq!(first, stateless);
-
-    for item in first.iter().flatten() {
+    let (items, _) = decode_all(Frames::new, data);
+    for item in items.iter().flatten() {
         round_trip(item);
     }
-    // The bytes as one header value.
-    if let Ok(s) = std::str::from_utf8(data) {
-        if let Ok(t) = Transport::parse_list(s) {
-            assert_eq!(Transport::parse_list(&Transport::list_to_value(&t).unwrap()).unwrap(), t);
+    if data.len() <= MAX_HEAD + 1
+        && let Ok(text) = core::str::from_utf8(data)
+    {
+        // Accessors call the text readers without first invoking the writers.
+        let mut message = Message::request(Version::Rtsp20, "SETUP", "rtsp://h/s");
+        for name in ["Session", "Range", "Transport"] {
+            message.push_header(name, text);
         }
-        if let Ok(t) = Transport::parse(s) {
-            assert_eq!(Transport::parse(&t.to_value().unwrap()).unwrap(), t);
-        }
-        if let Ok(r) = Range::parse(s) {
-            assert_eq!(Range::parse(&r.to_value().unwrap()).unwrap(), r);
-        }
-        if let Ok(x) = Session::parse(s) {
-            assert_eq!(Session::parse(&x.to_value().unwrap()).unwrap(), x);
-        }
+        text_value(message.session());
+        text_value(message.range());
+        text_value(message.transports().map(|values| Transports { values }));
     }
+    writers(data);
 });
 
-/// The items a decoder has, up to and including the first error.
-fn drain(d: &mut Decoder) -> Vec<Result<Item, Error>> {
-    let mut out = Vec::new();
-    while let Some(r) = d.next_item() {
-        let stop = r.is_err();
-        out.push(r);
-        if stop {
-            break;
-        }
-    }
-    out
-}
-
-/// An item read can be written, unless a message was near a size limit,
-/// and reads back the same. So do the header values in a message.
 fn round_trip(item: &Item) {
     contract::check_wire_value(item);
-    let bytes = match item.to_bytes() {
-        Ok(b) => b,
-        Err(e) => {
-            assert!(matches!(e, Error::TooLong | Error::TooMany), "{e:?}");
-            return;
-        }
-    };
-    let (back, used) = Item::parse(&bytes).unwrap().unwrap();
-    assert_eq!(used, bytes.len());
-    let (Item::Message(m), Item::Message(back)) = (item, &back) else {
-        assert_eq!(&back, item);
+    if let Item::Interleaved(frame) = item {
+        frame.to_bytes().unwrap();
         return;
+    }
+    if let Err(error) = item.to_bytes() {
+        assert!(matches!(error, Error::TooLong | Error::TooMany), "{error:?} for {item:?}");
+        return;
+    }
+    if let Item::Message(message) = item {
+        if let Ok(value) = message.session() {
+            contract::check_wire_value(&value);
+            value.to_bytes().unwrap();
+        }
+        if let Ok(value) = message.range() {
+            contract::check_wire_value(&value);
+            value.to_bytes().unwrap();
+        }
+        if let Ok(values) = message.transports()
+            && !values.is_empty()
+        {
+            let value = Transports { values };
+            contract::check_wire_value(&value);
+            value.to_bytes().unwrap();
+        }
+        if message.method().is_some() {
+            let reply = message.reply(100, "Continue");
+            contract::check_wire_value(&reply);
+            assert!(matches!(reply.to_bytes(), Ok(_) | Err(Error::TooLong | Error::TooMany)));
+        }
+    }
+}
+
+fn text_value<T: Wire<ParseError = Error, WriteError = Error> + PartialEq + core::fmt::Debug>(value: Result<T, Error>) {
+    if let Ok(value) = value {
+        contract::check_wire_value(&value);
+        assert!(matches!(value.to_bytes(), Ok(_) | Err(Error::TooLong)), "{value:?}");
+    }
+}
+
+// Exercise message fields that parsed input has already normalized.
+fn writers(data: &[u8]) {
+    let bounded = data.get(..MAX_HEAD + 1).unwrap_or(data);
+    let parts: Vec<String> =
+        bounded.split(|&b| b == 0xff).take(12).map(|p| String::from_utf8_lossy(p).into_owned()).collect();
+    let part = |i: usize| parts.get(i).cloned().unwrap_or_default();
+    let version = if data.first().is_some_and(|b| b & 1 == 1) { Version::Rtsp10 } else { Version::Rtsp20 };
+    let mut message = if data.first().is_some_and(|b| b & 2 == 2) {
+        Message::request(version, &part(0), &part(1))
+    } else {
+        Message::response(version, u16::from(data.first().copied().unwrap_or(0)) * 3, &part(1))
     };
-    assert_eq!(back.start, m.start);
-    assert_eq!(back.body, m.body);
-    let others = |m: &Message| {
-        m.headers.iter().filter(|h| !h.name.eq_ignore_ascii_case("Content-Length")).cloned().collect::<Vec<_>>()
-    };
-    assert_eq!(others(back), others(m));
-    assert_eq!(back.cseq(), m.cseq());
-    if let Ok(s) = m.session() {
-        assert_eq!(Session::parse(&s.to_value().unwrap()).unwrap(), s);
+    for i in (2..parts.len()).step_by(2) {
+        message.push_header(&part(i), &part(i + 1));
     }
-    if let Ok(r) = m.range() {
-        assert_eq!(Range::parse(&r.to_value().unwrap()).unwrap(), r);
-    }
-    if let Ok(t) = m.transports()
-        && !t.is_empty()
-    {
-        assert_eq!(Transport::parse_list(&Transport::list_to_value(&t).unwrap()).unwrap(), t);
-    }
+    message.body = parts.last().map(|p| p.as_bytes().to_vec()).unwrap_or_default();
+    contract::check_wire_value(&message);
+    message.set_header("Content-Length", &message.body.len().to_string());
+    contract::check_wire_value(&message);
 }

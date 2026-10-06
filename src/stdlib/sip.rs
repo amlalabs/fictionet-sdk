@@ -9,12 +9,12 @@
 //! over UDP or TCP, usually on port 5060. This module follows RFC 3261.
 //!
 //! Nothing here reads a socket. A world that plays a phone or a proxy reads
-//! each UDP datagram with [`Message::parse`]. Over TCP, it feeds the bytes
-//! it reads to a [`Decoder`], which splits the stream into messages by
+//! a UDP message with [`Message::read_datagram`]. Over TCP, it pushes bytes
+//! into [`Stream<Frames>`](super::codec::Stream), which splits messages by
 //! their Content-Length. Either way, it reads the headers it needs with
 //! [`Message::vias`], [`Message::from`], [`Message::cseq`] and the others,
 //! builds its answer (often with [`Message::reply`]), and sends the bytes
-//! [`Message::to_bytes`] gives. Bodies stay as bytes. Which users exist,
+//! [`Wire::write`] produces. Bodies stay as bytes. Which users exist,
 //! and whether a call is answered, is up to world code.
 //!
 //! Every reader checks lengths and characters, because the agent can send
@@ -23,31 +23,25 @@
 //! Writers check what they write and return an error instead of bytes that
 //! would not read back.
 //!
-//! New stacks use [`Frames`] with [`super::codec::Stream`]. [`Message`] implements
-//! [`Wire`] for exact stream parsing and strict, transactional writing.
-//! Wire writing preserves every field; the inherent `to_bytes` still
-//! rewrites Content-Length and trims values. The old [`Decoder`] stays
-//! separate to preserve its feed, buffering, and repeating-error behavior.
-//!
 //! SIP accepts only CRLF and writers always emit CRLF. Empty CRLF
 //! keep-alive lines are skipped between messages. Lines exclude their
 //! endings and are bounded by [`MAX_LINE`]. The whole head, including
 //! endings, is bounded by [`MAX_HEAD`]; the header count by [`MAX_HEADERS`];
 //! bodies by [`MAX_BODY`]. Stream messages, including bodiless responses,
 //! require Content-Length (or compact `l`). No status overrides it.
-//! The inherent datagram parser still accepts absent Content-Length and
-//! drops trailing datagram bytes when a length is present. [`Wire`] uses
-//! stream framing and refuses missing lengths and trailing bytes.
+//! [`Message::parse`] requires a length and refuses trailing bytes.
+//! [`Message::read_datagram`] uses the rest of the datagram as the body
+//! when no length is present, and discards bytes after a declared body.
 //!
 //! A malformed start line or unrelated header with a trusted message
 //! boundary is an error item. An over-limit line, head, or body, or an
 //! untrusted Content-Length is a stream error. Bare LF also ends the
 //! stream because it cannot establish a SIP message boundary. Header-count
-//! errors are items. The driver reports truncated input at EOF. Body
-//! framing follows the headers as before; no mode methods or expectation
-//! queues are needed. Bodies remain bytes; SDP belongs to [`super::sdp`].
+//! errors are items. The driver reports truncated input at EOF.
+//! Bodies remain bytes; SDP belongs to [`super::sdp`].
 //!
 //! ```
+//! use fictionet::stdlib::codec::Wire;
 //! use fictionet::stdlib::sip::{Message, Uri};
 //!
 //! let datagram = b"OPTIONS sip:carol@chicago.com SIP/2.0\r\n\
@@ -60,9 +54,9 @@
 //!     Contact: <sip:alice@pc33.atlanta.com>\r\n\
 //!     Accept: application/sdp\r\n\
 //!     Content-Length: 0\r\n\r\n";
-//! let request = Message::parse(datagram).unwrap();
+//! let request = Message::read_datagram(datagram).unwrap();
 //! assert_eq!(request.method(), Some("OPTIONS"));
-//! let uri = Uri::parse(request.request_uri().unwrap()).unwrap();
+//! let uri = Uri::parse(request.request_uri().unwrap().as_bytes()).unwrap();
 //! assert_eq!(uri.user.as_deref(), Some("carol"));
 //! assert_eq!(request.from().unwrap().tag(), Some("1928301774"));
 //! assert_eq!(request.cseq().unwrap().seq, 63104);
@@ -70,6 +64,7 @@
 //! // Carol's phone answers. The reply copies Via, From, To, Call-ID and CSeq.
 //! let mut reply = request.reply(200, "OK");
 //! reply.push_header("Allow", "INVITE, ACK, CANCEL, OPTIONS, BYE");
+//! reply.push_header("Content-Length", "0");
 //! let bytes = reply.to_bytes().unwrap();
 //! assert!(bytes.starts_with(
 //!     b"SIP/2.0 200 OK\r\nVia: SIP/2.0/UDP pc33.atlanta.com;branch=z9hG4bKhjhs8ass877\r\n"
@@ -78,7 +73,9 @@
 //! assert_eq!(Message::parse(&bytes).unwrap().status(), Some(200));
 //! ```
 
-use super::codec::{Decode, Ending, LineError, Lines, Step, Wire};
+extern crate self as fictionet;
+
+use fictionet::stdlib::codec::{Decode, Ending, LineError, Lines, Step, Wire};
 
 /// The port SIP servers listen on, for UDP and TCP.
 pub const PORT: u16 = 5060;
@@ -106,20 +103,33 @@ pub const MAX_PARAMS: usize = 64;
 
 /// Request methods from RFC 3261 and the RFCs that extend it.
 pub mod method {
-    #![allow(missing_docs)]
+    /// The `INVITE` request method.
     pub const INVITE: &str = "INVITE";
+    /// The `ACK` request method.
     pub const ACK: &str = "ACK";
+    /// The `BYE` request method.
     pub const BYE: &str = "BYE";
+    /// The `CANCEL` request method.
     pub const CANCEL: &str = "CANCEL";
+    /// The `OPTIONS` request method.
     pub const OPTIONS: &str = "OPTIONS";
+    /// The `REGISTER` request method.
     pub const REGISTER: &str = "REGISTER";
+    /// The `PRACK` request method.
     pub const PRACK: &str = "PRACK";
+    /// The `SUBSCRIBE` request method.
     pub const SUBSCRIBE: &str = "SUBSCRIBE";
+    /// The `NOTIFY` request method.
     pub const NOTIFY: &str = "NOTIFY";
+    /// The `PUBLISH` request method.
     pub const PUBLISH: &str = "PUBLISH";
+    /// The `INFO` request method.
     pub const INFO: &str = "INFO";
+    /// The `REFER` request method.
     pub const REFER: &str = "REFER";
+    /// The `MESSAGE` request method.
     pub const MESSAGE: &str = "MESSAGE";
+    /// The `UPDATE` request method.
     pub const UPDATE: &str = "UPDATE";
 }
 
@@ -178,9 +188,12 @@ pub fn same_name(a: &str, b: &str) -> bool {
 /// written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
-    /// A datagram ended before the blank line after the headers, or before
-    /// the body its Content-Length promised.
-    Truncated,
+    /// Input ended before a complete wire unit arrived.
+    Incomplete,
+    /// Bytes remain after the wire unit.
+    Trailing,
+    /// Writing would change a field or the body's framing.
+    Unwritable,
     /// The head or the body is longer than [`MAX_HEAD`] or [`MAX_BODY`],
     /// or a header value to read or write is longer than [`MAX_HEAD`].
     TooLong,
@@ -189,7 +202,7 @@ pub enum Error {
     TooMany,
     /// A CR or LF in the head that is not part of a CRLF pair.
     LineEnding,
-    /// The head is not UTF-8.
+    /// The message head or header value is not UTF-8.
     Utf8,
     /// The request line or status line is malformed.
     StartLine,
@@ -203,8 +216,9 @@ pub enum Error {
     HeaderValue,
     /// A Content-Length is not a number, or there are two.
     ContentLength,
-    /// A message on a stream has no Content-Length, so where it ends is not
-    /// known. RFC 3261 section 18.3 requires one over TCP.
+    /// A message has no Content-Length or compact `l`. Exact messages
+    /// and streams require a length. RFC 3261 section 18.3 requires one
+    /// over TCP.
     MissingContentLength,
     /// A header a read needs is absent. It names the header.
     Missing(&'static str),
@@ -218,17 +232,19 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::Truncated => f.write_str("message ends early"),
-            Error::TooLong => write!(f, "head over {MAX_HEAD} bytes or body over {MAX_BODY} bytes"),
+            Error::Incomplete => f.write_str("incomplete wire unit"),
+            Error::Trailing => f.write_str("bytes after wire unit"),
+            Error::Unwritable => f.write_str("value cannot be written without changing it"),
+            Error::TooLong => write!(f, "head or header value over {MAX_HEAD} bytes or body over {MAX_BODY} bytes"),
             Error::TooMany => write!(f, "over {MAX_HEADERS} headers or {MAX_VALUES} values"),
             Error::LineEnding => f.write_str("CR or LF outside a CRLF pair"),
-            Error::Utf8 => f.write_str("head is not UTF-8"),
+            Error::Utf8 => f.write_str("head or header value is not UTF-8"),
             Error::StartLine => f.write_str("malformed request or status line"),
             Error::Version => f.write_str("version is not SIP/2.0"),
             Error::HeaderLine => f.write_str("malformed header line"),
             Error::HeaderValue => f.write_str("control character in a header value"),
             Error::ContentLength => f.write_str("bad Content-Length"),
-            Error::MissingContentLength => f.write_str("no Content-Length on a stream"),
+            Error::MissingContentLength => f.write_str("no Content-Length"),
             Error::Missing(name) => write!(f, "no {name} header"),
             Error::Malformed(name) => write!(f, "malformed {name}"),
             Error::Uri => f.write_str("malformed SIP URI"),
@@ -257,12 +273,21 @@ impl Header {
 
 /// The first line of a message: a request line or a status line.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(missing_docs)] // each variant's doc names its fields
 pub enum StartLine {
     /// A request: the `method` and the Request-URI, `uri`, as written.
-    Request { method: String, uri: String },
+    Request {
+        /// The request method.
+        method: String,
+        /// The request URI as written.
+        uri: String,
+    },
     /// A response: the status `code`, 100 to 699, and the `reason` phrase.
-    Status { code: u16, reason: String },
+    Status {
+        /// The status code.
+        code: u16,
+        /// The reason phrase.
+        reason: String,
+    },
 }
 
 /// One SIP message: a start line, header fields in order, and a body.
@@ -291,135 +316,28 @@ impl Message {
         Message { start: StartLine::Status { code, reason: reason.to_string() }, headers: Vec::new(), body: Vec::new() }
     }
 
-    /// Reads the message in one UDP datagram. With a Content-Length, the
-    /// body is that many bytes and any bytes after it are dropped, as RFC
-    /// 3261 section 18.3 says. Without one, the body is the rest of the
-    /// datagram.
-    pub fn parse(datagram: &[u8]) -> Result<Message, Error> {
-        let end = match find_head_end(datagram, 0) {
-            Some(end) => end,
-            None if datagram.len() >= MAX_HEAD => return Err(Error::TooLong),
-            None => return Err(Error::Truncated),
-        };
-        let (mut message, length) = parse_head(&datagram[..end])?;
-        let rest = &datagram[end..];
+    /// Reads one UDP datagram with CRLF lines, per RFC 3261 section 18.3.
+    /// With Content-Length or compact `l`, the body is that many bytes;
+    /// bytes after it are discarded. Without a length, the body is the
+    /// rest of the datagram. Refuses malformed heads, duplicate lengths,
+    /// incomplete heads or declared bodies, and heads, lines, bodies, or
+    /// header counts over their named limits.
+    ///
+    /// This reader preserves the headers. To write a message received
+    /// without Content-Length, set that header to the body length first.
+    pub fn read_datagram(datagram: &[u8]) -> Result<Message, Error> {
+        let mut lines = Lines::new(MAX_LINE, Ending::Crlf);
+        let mut scanned = 0;
+        let end = scan_head(&mut lines, &mut scanned, datagram)?.ok_or(Error::Incomplete)?;
+        let (mut message, length) = parse_head(datagram.get(..end).ok_or(Error::Incomplete)?)?;
+        let rest = datagram.get(end..).ok_or(Error::Incomplete)?;
         let body = match length {
-            Some(n) => rest.get(..n).ok_or(Error::Truncated)?,
+            Some(length) => rest.get(..length).ok_or(Error::Incomplete)?,
             None if rest.len() > MAX_BODY => return Err(Error::TooLong),
             None => rest,
         };
         message.body = body.to_vec();
         Ok(message)
-    }
-
-    /// Reads the message at the start of `b`, a TCP byte stream. CRLFs
-    /// before it are skipped, since clients send them to keep connections
-    /// open. It returns `Ok(None)` if `b` holds only part of a message, and
-    /// otherwise the message and how many bytes of `b` it took. A message
-    /// here must have a Content-Length.
-    pub fn parse_stream(b: &[u8]) -> Result<Option<(Message, usize)>, Error> {
-        let mut skip = 0;
-        while b.get(skip..skip + 2) == Some(b"\r\n") {
-            skip += 2;
-        }
-        let avail = &b[skip..];
-        let end = match find_head_end(avail, 0) {
-            Some(end) => end,
-            None if avail.len() >= MAX_HEAD => return Err(Error::TooLong),
-            None => return Ok(None),
-        };
-        let (mut message, length) = parse_head(&avail[..end])?;
-        let n = length.ok_or(Error::MissingContentLength)?;
-        let Some(body) = avail.get(end..end + n) else { return Ok(None) };
-        message.body = body.to_vec();
-        Ok(Some((message, skip + end + n)))
-    }
-
-    /// The message's bytes. Content-Length headers in [`Message::headers`]
-    /// are left out, and one that gives the body's real length is written
-    /// last. Header values are written trimmed. A method that is not a
-    /// token, a Request-URI with spaces or no scheme, a status outside 100
-    /// to 699, a bad header name, a control character, or a head or body
-    /// over its limit is an error.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
-        if self.body.len() > MAX_BODY {
-            return Err(Error::TooLong);
-        }
-        // Every part is checked, and the head's length counted, before any
-        // of it is copied, so an oversized message costs no allocation.
-        let mut head = match &self.start {
-            StartLine::Request { method, uri } => {
-                let n = method.len().saturating_add(uri.len()).saturating_add(VERSION.len() + 4);
-                if n > MAX_HEAD {
-                    return Err(Error::TooLong);
-                }
-                if !is_token(method) || !valid_uri_text(uri) {
-                    return Err(Error::StartLine);
-                }
-                n
-            }
-            StartLine::Status { code, reason } => {
-                let n = reason.len().saturating_add(VERSION.len() + 7);
-                if n > MAX_HEAD {
-                    return Err(Error::TooLong);
-                }
-                if !(100..=699).contains(code) || !valid_value(reason) {
-                    return Err(Error::StartLine);
-                }
-                n
-            }
-        };
-        let mut count = 0usize;
-        for h in &self.headers {
-            if same_name(&h.name, "Content-Length") {
-                continue;
-            }
-            let value = trim_ws(&h.value);
-            head = head.saturating_add(h.name.len()).saturating_add(value.len()).saturating_add(4);
-            if head > MAX_HEAD {
-                return Err(Error::TooLong);
-            }
-            if !is_token(&h.name) {
-                return Err(Error::HeaderLine);
-            }
-            if !valid_field(value) {
-                return Err(Error::HeaderValue);
-            }
-            count += 1;
-            if count >= MAX_HEADERS {
-                return Err(Error::TooMany);
-            }
-        }
-        let length = format!("Content-Length: {}\r\n\r\n", self.body.len());
-        head = head.saturating_add(length.len());
-        if head > MAX_HEAD {
-            return Err(Error::TooLong);
-        }
-        let mut out = Vec::with_capacity(head + self.body.len());
-        match &self.start {
-            StartLine::Request { method, uri } => {
-                out.extend_from_slice(method.as_bytes());
-                out.push(b' ');
-                out.extend_from_slice(uri.as_bytes());
-                out.push(b' ');
-                out.extend_from_slice(VERSION.as_bytes());
-            }
-            StartLine::Status { code, reason } => {
-                out.extend_from_slice(VERSION.as_bytes());
-                out.extend_from_slice(format!(" {code} ").as_bytes());
-                out.extend_from_slice(reason.as_bytes());
-            }
-        }
-        out.extend_from_slice(b"\r\n");
-        for h in self.headers.iter().filter(|h| !same_name(&h.name, "Content-Length")) {
-            out.extend_from_slice(h.name.as_bytes());
-            out.extend_from_slice(b": ");
-            out.extend_from_slice(trim_ws(&h.value).as_bytes());
-            out.extend_from_slice(b"\r\n");
-        }
-        out.extend_from_slice(length.as_bytes());
-        out.extend_from_slice(&self.body);
-        Ok(out)
     }
 
     /// The method, for a request.
@@ -484,6 +402,15 @@ impl Message {
         self.headers.push(Header::new(name, value));
     }
 
+    /// Adds a header from a wire value. Refuses a failed value write or
+    /// invalid UTF-8, and leaves the headers unchanged on error.
+    /// The message writer checks the header name, text, and size limits.
+    pub fn push_value(&mut self, name: &str, value: &impl Wire<WriteError = Error>) -> Result<(), Error> {
+        let value = String::from_utf8(value.to_bytes()?).map_err(|_| Error::Utf8)?;
+        self.headers.push(Header { name: name.to_string(), value });
+        Ok(())
+    }
+
     /// Sets the header named `name` to `value`: the first one is changed
     /// and any others are removed. With none, it is added at the end.
     pub fn set_header(&mut self, name: &str, value: &str) {
@@ -518,17 +445,17 @@ impl Message {
         for h in self.headers_named("Via") {
             split_list(&h.value, &mut parts, "Via")?;
         }
-        parts.into_iter().map(Via::parse).collect()
+        parts.into_iter().map(Via::read_value).collect()
     }
 
     /// The From header: who sent the request.
     pub fn from(&self) -> Result<NameAddr, Error> {
-        NameAddr::parse(self.single("From")?).map_err(|_| Error::Malformed("From"))
+        NameAddr::read_value(self.single("From")?).map_err(|_| Error::Malformed("From"))
     }
 
     /// The To header: whom the request is for.
     pub fn to(&self) -> Result<NameAddr, Error> {
-        NameAddr::parse(self.single("To")?).map_err(|_| Error::Malformed("To"))
+        NameAddr::read_value(self.single("To")?).map_err(|_| Error::Malformed("To"))
     }
 
     /// The Call-ID, the same in every message of a call: a word, or two
@@ -547,7 +474,7 @@ impl Message {
 
     /// The CSeq: a sequence number and the request's method.
     pub fn cseq(&self) -> Result<CSeq, Error> {
-        CSeq::parse(self.single("CSeq")?)
+        CSeq::read_value(self.single("CSeq")?)
     }
 
     /// The Contact headers' addresses, or [`Contacts::All`] for `*`. With
@@ -600,35 +527,9 @@ impl Message {
     }
 }
 
-/// Why an exact wire parse or a strict write failed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WireError {
-    /// The message violates a protocol rule or a named limit.
-    Protocol(Error),
-    /// Input ended before the complete unit arrived.
-    Incomplete,
-    /// Bytes remain after the unit.
-    Trailing,
-    /// Encoding would change a field or the body's framing.
-    Unrepresentable,
-}
-
-impl core::fmt::Display for WireError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Protocol(e) => e.fmt(f),
-            Self::Incomplete => f.write_str("incomplete wire unit"),
-            Self::Trailing => f.write_str("bytes after wire unit"),
-            Self::Unrepresentable => f.write_str("value cannot be preserved on the wire"),
-        }
-    }
-}
-
-impl core::error::Error for WireError {}
-
 /// Reads complete SIP units with bounded line and body framing.
 ///
-/// Use with [`super::codec::Stream`]. Items are `Result<Message, Error>`.
+/// Use with [`Stream<Frames>`](super::codec::Stream). Items are `Result<Message, Error>`.
 /// A bad start line or header is an error item once a trusted body length
 /// and the complete unit are available. Invalid lengths and byte limits
 /// end the stream. Bare LF is a stream error: only CRLF ends SIP lines,
@@ -640,8 +541,7 @@ impl core::error::Error for WireError {}
 /// of times. The driver retains the whole unit, so
 /// [`super::codec::Stream::with_next`] includes its head and body.
 /// Capacity is [`MAX_MESSAGE`]; no input bytes are held in decoder state.
-/// Body framing follows Content-Length automatically, as in [`Decoder`].
-/// There are no caller-selected modes or response expectation queues.
+/// Body framing follows Content-Length automatically, from the headers.
 /// Each call yields at most one unit and returns control to the caller.
 ///
 /// ```
@@ -654,7 +554,7 @@ impl core::error::Error for WireError {}
 /// assert_eq!(stream.next(), Some(Ok(Ok(message))));
 /// stream.end();
 /// assert_eq!(stream.next(), None);
-/// # Ok::<(), fictionet::stdlib::sip::WireError>(())
+/// # Ok::<(), fictionet::stdlib::sip::Error>(())
 /// ```
 pub struct Frames {
     lines: Lines,
@@ -701,33 +601,10 @@ impl Decode for Frames {
                 return Ok(Step::Skip(skip));
             }
         }
-        while self.body.is_none() {
-            let room = MAX_HEAD.saturating_sub(self.scanned);
-            let rest = input.get(self.scanned..).unwrap_or_default();
-            let window = rest.get(..rest.len().min(room)).unwrap_or_default();
-            // Leave partial lines unread at EOF. Stream reports truncation.
-            let step = match self.lines.decode(window, false) {
-                Ok(step) => step,
-                Err(never) => match never {},
-            };
-            match step {
-                Step::Item(line, used) => {
-                    match line {
-                        Err(LineError::TooLong { .. }) => return Err(Error::TooLong),
-                        Err(LineError::BareLf) => return Err(Error::LineEnding),
-                        Err(LineError::Unterminated) => return Ok(Step::Need),
-                        Ok(_) => {}
-                    }
-                    self.scanned = self.scanned.checked_add(used).ok_or(Error::TooLong)?;
-                    let raw = window.get(..used).unwrap_or_default();
-                    if raw == b"\r\n" {
-                        let head = input.get(..self.scanned).ok_or(Error::TooLong)?;
-                        self.body = Some((self.scanned, frame_body_length(head)?));
-                    }
-                }
-                _ if window.len() >= room => return Err(Error::TooLong),
-                _ => return Ok(Step::Need),
-            }
+        if self.body.is_none() {
+            let Some(end) = scan_head(&mut self.lines, &mut self.scanned, input)? else { return Ok(Step::Need) };
+            let head = input.get(..end).ok_or(Error::TooLong)?;
+            self.body = Some((end, frame_body_length(head)?));
         }
         let Some((head, length)) = self.body else { return Ok(Step::Need) };
         let used = head.checked_add(length).ok_or(Error::TooLong)?;
@@ -739,6 +616,38 @@ impl Decode for Frames {
         self.scanned = 0;
         self.body = None;
         Ok(Step::Item(message, used))
+    }
+}
+
+// Both transports scan bounded CRLF lines before parsing the head.
+fn scan_head(lines: &mut Lines, scanned: &mut usize, input: &[u8]) -> Result<Option<usize>, Error> {
+    loop {
+        let room = MAX_HEAD.saturating_sub(*scanned);
+        let rest = input.get(*scanned..).unwrap_or_default();
+        let window = rest.get(..rest.len().min(room)).unwrap_or_default();
+        // Leave partial lines unread. The caller handles truncation.
+        let step = match lines.decode(window, false) {
+            Ok(step) => step,
+            Err(never) => match never {},
+        };
+        match step {
+            Step::Item(line, used) => {
+                match line {
+                    Err(LineError::TooLong { .. }) => return Err(Error::TooLong),
+                    Err(LineError::BareLf) => return Err(Error::LineEnding),
+                    Err(LineError::Unterminated) => return Ok(None),
+                    Ok(_) => {}
+                }
+                *scanned = scanned.checked_add(used).ok_or(Error::TooLong)?;
+                let raw = window.get(..used).unwrap_or_default();
+                // One initial CRLF alone is not a complete head.
+                if raw == b"\r\n" && *scanned > 2 {
+                    return Ok(Some(*scanned));
+                }
+            }
+            _ if window.len() >= room => return Err(Error::TooLong),
+            _ => return Ok(None),
+        }
     }
 }
 
@@ -805,37 +714,40 @@ fn frame_length_value(length: &mut Option<usize>, bytes: &[u8]) -> Result<(), Er
     Ok(())
 }
 
-fn read_wire(bytes: &[u8]) -> Result<Message, WireError> {
+fn read_wire(bytes: &[u8]) -> Result<Message, Error> {
     if bytes.len() > MAX_MESSAGE {
-        return Err(WireError::Protocol(Error::TooLong));
+        return Err(Error::TooLong);
     }
     let mut frames = Frames::new();
     let mut rest = bytes;
     loop {
-        match frames.decode(rest, true).map_err(WireError::Protocol)? {
+        match frames.decode(rest, true)? {
             Step::Item(item, used) => {
-                let item = item.map_err(WireError::Protocol)?;
+                let item = item?;
                 if used != rest.len() {
-                    return Err(WireError::Trailing);
+                    return Err(Error::Trailing);
                 }
                 return Ok(item);
             }
-            Step::Skip(used) => rest = rest.get(used..).ok_or(WireError::Incomplete)?,
-            _ => return Err(WireError::Incomplete),
+            Step::Skip(used) => rest = rest.get(used..).ok_or(Error::Incomplete)?,
+            _ => return Err(Error::Incomplete),
         }
     }
 }
 
 impl Wire for Message {
-    type ParseError = WireError;
-    type WriteError = WireError;
+    type ParseError = Error;
+    type WriteError = Error;
 
-    /// Reads exactly one stream message whose CRLF encoding fits the limits.
-    /// Leading keep-alive lines are accepted. Trailing bytes are refused.
-    /// Use the inherent parser for its original framing and size policy.
-    fn parse(bytes: &[u8]) -> Result<Self, WireError> {
+    /// Reads one complete SIP message with CRLF lines. Leading CRLF
+    /// keep-alives are skipped. Content-Length or compact `l` is required
+    /// and selects the body, even for status 1xx, 204, and 304.
+    /// Refuses missing or duplicate lengths, malformed or incomplete input,
+    /// trailing bytes, and heads or bodies over their named limits.
+    /// The canonical CRLF head must also fit [`MAX_HEAD`] and [`MAX_LINE`].
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         let message = read_wire(bytes)?;
-        encode_message(&message)?;
+        message_size(&message)?;
         Ok(message)
     }
 
@@ -843,20 +755,46 @@ impl Wire for Message {
     /// unchanged on error. Content-Length fields are preserved, including
     /// spelling, position, and digits. Set them to match the body before
     /// writing. Values that need trimming or header injection are refused.
-    /// A body length mismatch is [`WireError::Unrepresentable`].
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WireError> {
-        out.extend_from_slice(&encode_message(self)?);
+    /// A body length mismatch is [`Error::Unwritable`]. Refuses invalid
+    /// methods, URIs, status codes outside 100 to 699, bad header names
+    /// or controls, and heads, lines, bodies, or header counts over their
+    /// named limits. Missing and duplicate Content-Length are refused.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        let total = message_size(self)?;
+        out.try_reserve(total).map_err(|_| Error::TooLong)?;
+        match &self.start {
+            StartLine::Request { method, uri } => {
+                out.extend_from_slice(method.as_bytes());
+                out.push(b' ');
+                out.extend_from_slice(uri.as_bytes());
+                out.push(b' ');
+                out.extend_from_slice(VERSION.as_bytes());
+            }
+            StartLine::Status { code, reason } => {
+                out.extend_from_slice(VERSION.as_bytes());
+                out.extend_from_slice(format!(" {code} {reason}").as_bytes());
+            }
+        }
+        out.extend_from_slice(b"\r\n");
+        for header in &self.headers {
+            out.extend_from_slice(header.name.as_bytes());
+            out.extend_from_slice(b": ");
+            out.extend_from_slice(header.value.as_bytes());
+            out.extend_from_slice(b"\r\n");
+        }
+        out.extend_from_slice(b"\r\n");
+        out.extend_from_slice(&self.body);
         Ok(())
     }
 }
 
-fn encode_message(message: &Message) -> Result<Vec<u8>, WireError> {
-    let too_long = WireError::Protocol(Error::TooLong);
+fn message_size(message: &Message) -> Result<usize, Error> {
+    let too_long = Error::TooLong;
     if message.body.len() > MAX_BODY {
         return Err(too_long);
     }
     if message.headers.len() > MAX_HEADERS {
-        return Err(WireError::Protocol(Error::TooMany));
+        return Err(Error::TooMany);
     }
     // Count before formatting or copying caller-owned strings.
     let start = match &message.start {
@@ -868,7 +806,7 @@ fn encode_message(message: &Message) -> Result<Vec<u8>, WireError> {
             .ok_or(too_long)?,
         StartLine::Status { code, reason } => {
             if !(100..=699).contains(code) {
-                return Err(WireError::Protocol(Error::StartLine));
+                return Err(Error::StartLine);
             }
             reason.len().checked_add(VERSION.len()).and_then(|n| n.checked_add(5)).ok_or(too_long)?
         }
@@ -891,35 +829,29 @@ fn encode_message(message: &Message) -> Result<Vec<u8>, WireError> {
         return Err(too_long);
     }
     let total = head.checked_add(message.body.len()).ok_or(too_long)?;
-    let mut out = Vec::with_capacity(total);
     match &message.start {
-        StartLine::Request { method, uri } => {
-            out.extend_from_slice(method.as_bytes());
-            out.push(b' ');
-            out.extend_from_slice(uri.as_bytes());
-            out.push(b' ');
-            out.extend_from_slice(VERSION.as_bytes());
+        StartLine::Request { method, uri } if !is_token(method) || !valid_uri_text(uri) => {
+            return Err(Error::StartLine);
         }
-        StartLine::Status { code, reason } => {
-            out.extend_from_slice(VERSION.as_bytes());
-            out.extend_from_slice(format!(" {code} {reason}").as_bytes());
-        }
+        StartLine::Status { reason, .. } if !valid_value(reason) => return Err(Error::StartLine),
+        _ => {}
     }
-    out.extend_from_slice(b"\r\n");
     for header in &message.headers {
-        out.extend_from_slice(header.name.as_bytes());
-        out.extend_from_slice(b": ");
-        out.extend_from_slice(header.value.as_bytes());
-        out.extend_from_slice(b"\r\n");
+        if !is_token(&header.name) {
+            return Err(Error::HeaderLine);
+        }
+        if !valid_field(&header.value) {
+            return Err(Error::HeaderValue);
+        }
+        if trim_ws(&header.value) != header.value {
+            return Err(Error::Unwritable);
+        }
     }
-    out.extend_from_slice(b"\r\n");
-    out.extend_from_slice(&message.body);
-    // Check the same framing and value rules as the receiver, before append.
-    match read_wire(&out) {
-        Ok(ref parsed) if parsed == message => Ok(out),
-        Err(error @ WireError::Protocol(_)) => Err(error),
-        _ => Err(WireError::Unrepresentable),
+    let length = message.content_length()?.ok_or(Error::MissingContentLength)?;
+    if length != message.body.len() {
+        return Err(Error::Unwritable);
     }
+    Ok(total)
 }
 
 fn trim_frame_ws(mut bytes: &[u8]) -> &[u8] {
@@ -930,111 +862,6 @@ fn trim_frame_ws(mut bytes: &[u8]) -> &[u8] {
         bytes = rest;
     }
     bytes
-}
-
-/// Splits a SIP byte stream, such as a TCP connection, into messages by
-/// their Content-Length. Feed it the bytes a connection reads, in order,
-/// and take messages out until it has none.
-#[derive(Debug, Default)]
-pub struct Decoder {
-    buf: Vec<u8>,
-    /// Where the bytes not yet taken out start. Bytes before it are
-    /// dropped in `feed` once they are half the buffer.
-    start: usize,
-    /// How many bytes after `start` have been searched for the end of the
-    /// head, so each byte is searched about once.
-    scanned: usize,
-    /// A head already read, its length, and the body length it gives.
-    pending: Option<(Message, usize, usize)>,
-    failed: Option<Error>,
-}
-
-impl Decoder {
-    /// A decoder holding no bytes.
-    pub fn new() -> Decoder {
-        Decoder::default()
-    }
-
-    /// Takes bytes read from the connection, from the start of `bytes`,
-    /// and returns how many it took. It takes them all unless that would
-    /// make it hold more than [`MAX_MESSAGE`] bytes. Then take messages
-    /// out with [`Decoder::next_message`] and feed it the rest. Once it is
-    /// full, `next_message` always gives a message or an error, or drops
-    /// keep-alive CRLFs, so a loop of feeding and taking out always ends.
-    /// After an error the stream cannot be read any further, and every
-    /// byte is taken and dropped.
-    #[must_use = "bytes past the count returned were not taken"]
-    pub fn feed(&mut self, bytes: &[u8]) -> usize {
-        if self.failed.is_some() {
-            return bytes.len();
-        }
-        if self.start > 0 && self.start >= self.buf.len() / 2 {
-            self.buf.drain(..self.start);
-            self.start = 0;
-        }
-        let n = bytes.len().min(MAX_MESSAGE.saturating_sub(self.buffered()));
-        self.buf.extend_from_slice(&bytes[..n]);
-        n
-    }
-
-    /// The next whole message, if one has come. It returns `None` when it
-    /// needs more bytes, and keeps returning the same error once the
-    /// stream has broken. It gives the same messages and errors as
-    /// [`Message::parse_stream`], however the bytes are split. A decoder
-    /// holds at most [`MAX_MESSAGE`] bytes beyond what has been taken out.
-    pub fn next_message(&mut self) -> Option<Result<Message, Error>> {
-        if let Some(e) = self.failed {
-            return Some(Err(e));
-        }
-        if self.pending.is_none() {
-            while self.buf.get(self.start..self.start + 2) == Some(b"\r\n") {
-                self.start += 2;
-                self.scanned = 0;
-            }
-            let avail = &self.buf[self.start..];
-            let found = find_head_end(avail, self.scanned.saturating_sub(3));
-            let result = match found {
-                None if avail.len() >= MAX_HEAD => Err(Error::TooLong),
-                None => {
-                    self.scanned = avail.len();
-                    return None;
-                }
-                Some(end) => match parse_head(&avail[..end]) {
-                    Ok((message, Some(n))) => Ok((message, end, n)),
-                    Ok((_, None)) => Err(Error::MissingContentLength),
-                    Err(e) => Err(e),
-                },
-            };
-            match result {
-                Ok(p) => self.pending = Some(p),
-                Err(e) => return Some(Err(self.fail(e))),
-            }
-        }
-        let (end, n) = match &self.pending {
-            Some((_, end, n)) => (*end, *n),
-            None => return None,
-        };
-        let body = self.buf.get(self.start + end..self.start + end + n)?.to_vec();
-        let (mut message, _, _) = self.pending.take()?;
-        message.body = body;
-        self.start += end + n;
-        self.scanned = 0;
-        Some(Ok(message))
-    }
-
-    /// How many bytes are held, waiting for the rest of a message.
-    pub fn buffered(&self) -> usize {
-        self.buf.len() - self.start
-    }
-
-    fn fail(&mut self, e: Error) -> Error {
-        self.failed = Some(e);
-        self.buf = Vec::new();
-        self.start = 0;
-        self.scanned = 0;
-        self.pending = None;
-        e
-    }
 }
 
 /// A SIP URI's scheme.
@@ -1105,11 +932,7 @@ impl Uri {
         }
     }
 
-    /// Reads a SIP or SIPS URI. The scheme may be in any case. Other
-    /// schemes, such as `tel:`, are [`Error::Uri`], and so is a parameter
-    /// name that appears twice (RFC 3261 section 19.1.1). Text over
-    /// [`MAX_HEAD`] bytes is [`Error::TooLong`].
-    pub fn parse(s: &str) -> Result<Uri, Error> {
+    fn read_value(s: &str) -> Result<Uri, Error> {
         if s.len() > MAX_HEAD {
             return Err(Error::TooLong);
         }
@@ -1177,11 +1000,7 @@ impl Uri {
         Ok(Uri { scheme, user, password, host, port, params, headers })
     }
 
-    /// The URI as text. A part with a character its place does not allow,
-    /// an empty user, a password with no user, a parameter name given
-    /// twice, or more than [`MAX_PARAMS`] parameters or headers is
-    /// [`Error::Uri`]. Text over [`MAX_HEAD`] bytes is [`Error::TooLong`].
-    pub fn to_value(&self) -> Result<String, Error> {
+    fn format_value(&self) -> Result<String, Error> {
         if self.params.len() > MAX_PARAMS || self.headers.len() > MAX_PARAMS {
             return Err(Error::Uri);
         }
@@ -1277,13 +1096,7 @@ impl NameAddr {
         NameAddr { display: None, uri: uri.to_string(), params: Vec::new() }
     }
 
-    /// Reads a name-addr (`Name <uri>;params`) or an addr-spec
-    /// (`uri;params`). In the second form, everything after the first `;`
-    /// is a header parameter, as RFC 3261 section 20 says. A parameter
-    /// name given twice, or a `tag` that is not a token, is
-    /// [`Error::Malformed`]. Text over [`MAX_HEAD`] bytes is
-    /// [`Error::TooLong`].
-    pub fn parse(s: &str) -> Result<NameAddr, Error> {
+    fn read_value(s: &str) -> Result<NameAddr, Error> {
         if s.len() > MAX_HEAD {
             return Err(Error::TooLong);
         }
@@ -1329,13 +1142,7 @@ impl NameAddr {
         Some(NameAddr { display, uri: uri.to_string(), params })
     }
 
-    /// The address as a header value: the display name quoted, the URI in
-    /// angle brackets, then the parameters. In the display name, quotes,
-    /// backslashes and control characters other than tab are escaped with
-    /// a backslash. A CR or LF in the display name, a URI that does not
-    /// follow its grammar, or a bad parameter is [`Error::Malformed`].
-    /// Text over [`MAX_HEAD`] bytes is [`Error::TooLong`].
-    pub fn to_value(&self) -> Result<String, Error> {
+    fn format_value(&self) -> Result<String, Error> {
         let bad = Error::Malformed("address");
         if !fits([self.raw_len()]) {
             return Err(Error::TooLong);
@@ -1376,7 +1183,7 @@ impl NameAddr {
 
     /// The URI read as a SIP or SIPS URI.
     pub fn sip_uri(&self) -> Result<Uri, Error> {
-        Uri::parse(&self.uri)
+        Uri::read_value(&self.uri)
     }
 
     /// The first parameter named `name`, in any case.
@@ -1405,7 +1212,7 @@ impl Contacts {
         if parts.contains(&"*") {
             return if parts.len() == 1 { Ok(Contacts::All) } else { Err(bad) };
         }
-        let read = |p: &&str| match NameAddr::parse(p) {
+        let read = |p: &&str| match NameAddr::read_value(p) {
             Ok(a) if contact_params_ok(&a) => Ok(a),
             Err(Error::TooLong) => Err(Error::TooLong),
             _ => Err(bad),
@@ -1413,10 +1220,7 @@ impl Contacts {
         parts.iter().map(read).collect::<Result<_, _>>().map(Contacts::List)
     }
 
-    /// Reads a Contact header's value: `*` or at least one address, with
-    /// no empty items. A value over [`MAX_HEAD`] bytes is
-    /// [`Error::TooLong`].
-    pub fn parse(s: &str) -> Result<Contacts, Error> {
+    fn read_value(s: &str) -> Result<Contacts, Error> {
         if s.len() > MAX_HEAD {
             return Err(Error::TooLong);
         }
@@ -1425,13 +1229,7 @@ impl Contacts {
         Contacts::from_values(&parts)
     }
 
-    /// The value as a Contact header's value, the addresses separated by
-    /// commas. An empty list is [`Error::Malformed`], since it would not
-    /// read back; leave the header out instead. So is a bad address, or a
-    /// `q` or `expires` that does not follow its grammar. More than
-    /// [`MAX_VALUES`] addresses is [`Error::TooMany`], and text over
-    /// [`MAX_HEAD`] bytes is [`Error::TooLong`].
-    pub fn to_value(&self) -> Result<String, Error> {
+    fn format_value(&self) -> Result<String, Error> {
         let bad = Error::Malformed("Contact");
         match self {
             Contacts::All => Ok("*".to_string()),
@@ -1450,7 +1248,7 @@ impl Contacts {
                     if !contact_params_ok(a) {
                         return Err(bad);
                     }
-                    let v = a.to_value().map_err(|e| if e == Error::TooLong { e } else { bad })?;
+                    let v = a.format_value().map_err(|e| if e == Error::TooLong { e } else { bad })?;
                     if !out.is_empty() {
                         out.push_str(", ");
                     }
@@ -1485,12 +1283,7 @@ impl Via {
         Via { transport: transport.to_string(), host: host.to_string(), port: None, params: Vec::new() }
     }
 
-    /// Reads one Via value. Spaces around the slashes and around the colon
-    /// before the port are allowed, as RFC 3261 allows them. A parameter
-    /// name given twice, or a `branch`, `ttl`, `maddr`, `received` or
-    /// `rport` that does not follow its grammar, is [`Error::Malformed`].
-    /// Text over [`MAX_HEAD`] bytes is [`Error::TooLong`].
-    pub fn parse(s: &str) -> Result<Via, Error> {
+    fn read_value(s: &str) -> Result<Via, Error> {
         if s.len() > MAX_HEAD {
             return Err(Error::TooLong);
         }
@@ -1554,10 +1347,7 @@ impl Via {
         Some(Via { transport: words[2].to_string(), host: host.to_string(), port, params })
     }
 
-    /// The value as text. A transport that is not a token, a bad host or
-    /// a bad parameter is [`Error::Malformed`]. Text over [`MAX_HEAD`]
-    /// bytes is [`Error::TooLong`].
-    pub fn to_value(&self) -> Result<String, Error> {
+    fn format_value(&self) -> Result<String, Error> {
         let bad = Error::Malformed("Via");
         let params = self.params.iter().map(|p| p.name.len().saturating_add(p.value.as_deref().map_or(0, str::len)));
         if !fits([self.transport.len(), self.host.len()].into_iter().chain(params)) {
@@ -1593,16 +1383,15 @@ impl Via {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CSeq {
     /// The sequence number. RFC 3261 section 8.1.1.5 says senders keep it
-    /// below 2^31, so [`CSeq::to_value`] does; any 32-bit number reads.
+    /// below 2^31. [`Wire`] enforces this for parsing and writing.
+    /// [`Message::cseq`] can inspect any 32-bit received number.
     pub seq: u32,
     /// The request's method.
     pub method: String,
 }
 
 impl CSeq {
-    /// Reads a CSeq value. Text over [`MAX_HEAD`] bytes is
-    /// [`Error::TooLong`].
-    pub fn parse(s: &str) -> Result<CSeq, Error> {
+    fn read_value(s: &str) -> Result<CSeq, Error> {
         if s.len() > MAX_HEAD {
             return Err(Error::TooLong);
         }
@@ -1617,10 +1406,7 @@ impl CSeq {
         Ok(CSeq { seq: seq.ok_or(bad)?, method: method.to_string() })
     }
 
-    /// The value as text. A method that is not a token, or a sequence
-    /// number of 2^31 or more, is [`Error::Malformed`]. Text over
-    /// [`MAX_HEAD`] bytes is [`Error::TooLong`].
-    pub fn to_value(&self) -> Result<String, Error> {
+    fn format_value(&self) -> Result<String, Error> {
         if self.method.len() > MAX_HEAD {
             return Err(Error::TooLong);
         }
@@ -1635,25 +1421,11 @@ impl CSeq {
     }
 }
 
-/// Where the head ends: the index just past the first CRLF CRLF that ends
-/// within the first [`MAX_HEAD`] bytes, searching from `from`.
-fn find_head_end(b: &[u8], from: usize) -> Option<usize> {
-    let b = &b[..b.len().min(MAX_HEAD)];
-    let mut i = from;
-    while i + 4 <= b.len() {
-        if &b[i..i + 4] == b"\r\n\r\n" {
-            return Some(i + 4);
-        }
-        i += 1;
-    }
-    None
-}
-
 /// Reads a head that ends with CRLF CRLF: the message with no body, and
 /// its Content-Length.
 fn parse_head(head: &[u8]) -> Result<(Message, Option<usize>), Error> {
     let text = std::str::from_utf8(head).map_err(|_| Error::Utf8)?;
-    let text = text.strip_suffix("\r\n\r\n").ok_or(Error::Truncated)?;
+    let text = text.strip_suffix("\r\n\r\n").ok_or(Error::Incomplete)?;
     let mut lines = text.split("\r\n");
     let first = lines.next().unwrap_or("");
     if first.contains(['\r', '\n']) {
@@ -1749,7 +1521,7 @@ fn parse_content_length(v: &str) -> Result<usize, Error> {
     }
     let mut n = 0usize;
     for d in v.bytes() {
-        n = n * 10 + usize::from(d - b'0');
+        n = n.checked_mul(10).and_then(|n| n.checked_add(usize::from(d - b'0'))).ok_or(Error::TooLong)?;
         if n > MAX_BODY {
             return Err(Error::TooLong);
         }
@@ -2092,7 +1864,7 @@ fn valid_uri_text(s: &str) -> bool {
     let Some(colon) = b.iter().position(|&c| c == b':') else { return false };
     let scheme = &s[..colon];
     if scheme.eq_ignore_ascii_case("sip") || scheme.eq_ignore_ascii_case("sips") {
-        return Uri::parse(s).is_ok();
+        return Uri::read_value(s).is_ok();
     }
     colon >= 1
         && b[0].is_ascii_alphabetic()
@@ -2254,9 +2026,126 @@ fn token_end(b: &[u8], mut i: usize) -> usize {
     i
 }
 
+// Header values share UTF-8, size, round-trip, and transactional checks.
+macro_rules! wire_value {
+    ($ty:ty, $(#[$parse:meta])* parse, $(#[$write:meta])* write) => {
+        impl Wire for $ty {
+            type ParseError = Error;
+            type WriteError = Error;
+
+            $(#[$parse])*
+            /// Refuses input over [`MAX_HEAD`], invalid UTF-8, and values
+            /// whose canonical form exceeds that limit or changes a field.
+            fn parse(bytes: &[u8]) -> Result<Self, Error> {
+                if bytes.len() > MAX_HEAD {
+                    return Err(Error::TooLong);
+                }
+                let text = core::str::from_utf8(bytes).map_err(|_| Error::Utf8)?;
+                let value = Self::read_value(text)?;
+                value.write(&mut Vec::new())?;
+                Ok(value)
+            }
+
+            $(#[$write])*
+            /// Refuses values that would read back differently. Leaves `out`
+            /// unchanged on error. Output is bounded by [`MAX_HEAD`].
+            fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+                let text = self.format_value()?;
+                if text.len() > MAX_HEAD {
+                    return Err(Error::TooLong);
+                }
+                if Self::read_value(&text)? != *self {
+                    return Err(Error::Unwritable);
+                }
+                out.extend_from_slice(text.as_bytes());
+                Ok(())
+            }
+        }
+    };
+}
+
+wire_value!(
+    Uri,
+    /// Reads a SIP or SIPS URI. The scheme may be in any case. Other
+    /// schemes, such as `tel:`, are [`Error::Uri`], and so is a parameter
+    /// name that appears twice (RFC 3261 section 19.1.1). Text over
+    /// [`MAX_HEAD`] bytes is [`Error::TooLong`].
+    parse,
+    /// The URI as text. A part with a character its place does not allow,
+    /// an empty user, a password with no user, a parameter name given
+    /// twice, or more than [`MAX_PARAMS`] parameters or headers is
+    /// [`Error::Uri`]. Text over [`MAX_HEAD`] bytes is [`Error::TooLong`].
+    write
+);
+
+wire_value!(
+    NameAddr,
+    /// Reads a name-addr (`Name <uri>;params`) or an addr-spec
+    /// (`uri;params`). In the second form, everything after the first `;`
+    /// is a header parameter, as RFC 3261 section 20 says. A parameter
+    /// name given twice, or a `tag` that is not a token, is
+    /// [`Error::Malformed`]. Text over [`MAX_HEAD`] bytes is
+    /// [`Error::TooLong`].
+    parse,
+    /// The address as a header value: the display name quoted, the URI in
+    /// angle brackets, then the parameters. In the display name, quotes,
+    /// backslashes and control characters other than tab are escaped with
+    /// a backslash. A CR or LF in the display name, a URI that does not
+    /// follow its grammar, or a bad parameter is [`Error::Malformed`].
+    /// Text over [`MAX_HEAD`] bytes is [`Error::TooLong`].
+    write
+);
+
+wire_value!(
+    Contacts,
+    /// Reads a Contact header's value: `*` or at least one address, with
+    /// no empty items. A value over [`MAX_HEAD`] bytes is
+    /// [`Error::TooLong`].
+    parse,
+    /// The value as a Contact header's value, the addresses separated by
+    /// commas. An empty list is [`Error::Malformed`], since it would not
+    /// read back; leave the header out instead. So is a bad address, or a
+    /// `q` or `expires` that does not follow its grammar. More than
+    /// [`MAX_VALUES`] addresses is [`Error::TooMany`], and text over
+    /// [`MAX_HEAD`] bytes is [`Error::TooLong`].
+    write
+);
+
+wire_value!(
+    Via,
+    /// Reads one Via value. Spaces around the slashes and around the colon
+    /// before the port are allowed, as RFC 3261 allows them. A parameter
+    /// name given twice, or a `branch`, `ttl`, `maddr`, `received` or
+    /// `rport` that does not follow its grammar, is [`Error::Malformed`].
+    /// Text over [`MAX_HEAD`] bytes is [`Error::TooLong`].
+    parse,
+    /// The value as text. A transport that is not a token, a bad host or
+    /// a bad parameter is [`Error::Malformed`]. Text over [`MAX_HEAD`]
+    /// bytes is [`Error::TooLong`].
+    write
+);
+
+wire_value!(
+    CSeq,
+    /// Reads a CSeq value. Refuses sequence numbers of 2^31 or more;
+    /// [`Message::cseq`] can inspect any 32-bit received number.
+    /// Text over [`MAX_HEAD`] bytes is [`Error::TooLong`].
+    parse,
+    /// The value as text. A method that is not a token, or a sequence
+    /// number of 2^31 or more, is [`Error::Malformed`]. Text over
+    /// [`MAX_HEAD`] bytes is [`Error::TooLong`].
+    write
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fictionet::stdlib::codec::test_support::{Lcg, decode_all, mutate};
+    use fictionet::stdlib::codec::{Fail, Stream, contract};
+
+    fn wire_text<T: Wire<WriteError = Error>>(value: &T) -> Result<String, Error> {
+        String::from_utf8(value.to_bytes()?).map_err(|_| Error::Utf8)
+    }
 
     /// The INVITE from RFC 3261 section 4, with a short SDP body.
     fn invite() -> Vec<u8> {
@@ -2424,10 +2313,11 @@ mod tests {
             "sip:[2001:db8::10]:5070;lr",
             "sip:biloxi.com:5060;maddr=239.255.255.1;ttl=15",
         ] {
-            let uri = Uri::parse(text).unwrap();
-            assert_eq!(uri.to_value().unwrap(), text);
+            let uri = Uri::parse(text.as_bytes()).unwrap();
+            assert_eq!(wire_text(&uri).unwrap(), text);
         }
-        let u = Uri::parse("SIP:alice:secretword@atlanta.com:5061;transport=tcp;lr?h=1&i=").unwrap();
+        let u =
+            Uri::parse("SIP:alice:secretword@atlanta.com:5061;transport=tcp;lr?h=1&i=".as_bytes()).unwrap();
         assert_eq!(u.scheme, Scheme::Sip);
         assert_eq!(u.user.as_deref(), Some("alice"));
         assert_eq!(u.password.as_deref(), Some("secretword"));
@@ -2435,7 +2325,7 @@ mod tests {
         assert_eq!(u.param("TRANSPORT").unwrap().value.as_deref(), Some("tcp"));
         assert_eq!(u.param("lr").unwrap().value, None);
         assert_eq!(u.headers, [("h".to_string(), "1".to_string()), ("i".to_string(), String::new())]);
-        let u = Uri::parse("sip:alice;day=tuesday@atlanta.com").unwrap();
+        let u = Uri::parse("sip:alice;day=tuesday@atlanta.com".as_bytes()).unwrap();
         assert_eq!(u.user.as_deref(), Some("alice;day=tuesday"));
         assert!(u.params.is_empty());
     }
@@ -2466,42 +2356,42 @@ mod tests {
             "sip:[1.2.3.4]",
             "sip:a:p@ss@host",
         ] {
-            assert_eq!(Uri::parse(text), Err(Error::Uri), "{text:?}");
+            assert_eq!(Uri::parse(text.as_bytes()), Err(Error::Uri), "{text:?}");
         }
         let params = |n: usize| (0..n).map(|i| format!(";p{i}")).collect::<String>();
-        assert_eq!(Uri::parse(&format!("sip:h{}", params(MAX_PARAMS + 1))), Err(Error::Uri));
-        assert!(Uri::parse(&format!("sip:h{}", params(MAX_PARAMS))).is_ok());
+        assert_eq!(Uri::parse(format!("sip:h{}", params(MAX_PARAMS + 1)).as_bytes()), Err(Error::Uri));
+        assert!(Uri::parse(format!("sip:h{}", params(MAX_PARAMS)).as_bytes()).is_ok());
         // Writers refuse what would not read back.
         let mut u = Uri::new(Scheme::Sip, "atlanta.com");
         u.password = Some("x".into());
-        assert_eq!(u.to_value(), Err(Error::Uri));
+        assert_eq!(wire_text(&u), Err(Error::Uri));
         u.user = Some(String::new());
-        assert_eq!(u.to_value(), Err(Error::Uri));
+        assert_eq!(wire_text(&u), Err(Error::Uri));
         u.user = Some("al ice".into());
-        assert_eq!(u.to_value(), Err(Error::Uri));
+        assert_eq!(wire_text(&u), Err(Error::Uri));
         u.user = Some("alice".into());
-        assert_eq!(u.to_value().unwrap(), "sip:alice:x@atlanta.com");
+        assert_eq!(wire_text(&u).unwrap(), "sip:alice:x@atlanta.com");
         u.params.push(Param::new("a", Some("")));
-        assert_eq!(u.to_value(), Err(Error::Uri));
+        assert_eq!(wire_text(&u), Err(Error::Uri));
         u.params = vec![];
         u.headers.push((String::new(), "x".into()));
-        assert_eq!(u.to_value(), Err(Error::Uri));
-        assert_eq!(Uri::new(Scheme::Sips, "::1").to_value(), Err(Error::Uri));
-        assert_eq!(Uri::new(Scheme::Sips, "[::1]").to_value().unwrap(), "sips:[::1]");
+        assert_eq!(wire_text(&u), Err(Error::Uri));
+        assert_eq!(wire_text(&Uri::new(Scheme::Sips, "::1")), Err(Error::Uri));
+        assert_eq!(wire_text(&Uri::new(Scheme::Sips, "[::1]")).unwrap(), "sips:[::1]");
     }
 
     #[test]
     fn name_addrs() {
-        let a = NameAddr::parse("The Operator <sip:operator@cs.columbia.edu>;tag=287447").unwrap();
+        let a = NameAddr::parse("The Operator <sip:operator@cs.columbia.edu>;tag=287447".as_bytes()).unwrap();
         assert_eq!(a.display.as_deref(), Some("The Operator"));
         assert_eq!(a.tag(), Some("287447"));
-        assert_eq!(a.to_value().unwrap(), "\"The Operator\" <sip:operator@cs.columbia.edu>;tag=287447");
-        let b = NameAddr::parse("  <sip:x@y>  ").unwrap();
+        assert_eq!(wire_text(&a).unwrap(), "\"The Operator\" <sip:operator@cs.columbia.edu>;tag=287447");
+        let b = NameAddr::parse("  <sip:x@y>  ".as_bytes()).unwrap();
         assert_eq!(b, NameAddr::new("sip:x@y"));
-        let c = NameAddr::parse("\"\" <sip:x@y>;foo=\"a \\\"b\\\"\"").unwrap();
+        let c = NameAddr::parse("\"\" <sip:x@y>;foo=\"a \\\"b\\\"\"".as_bytes()).unwrap();
         assert_eq!(c.display, None);
         assert_eq!(c.param("foo").unwrap().unquoted().as_deref(), Some("a \"b\""));
-        assert_eq!(NameAddr::parse(&c.to_value().unwrap()).unwrap(), c);
+        assert_eq!(NameAddr::parse(wire_text(&c).unwrap().as_bytes()).unwrap(), c);
         for bad in [
             "",
             "<sip:x@y",
@@ -2521,47 +2411,52 @@ mod tests {
             "\"a\\\r\" <sip:x@y>",
             "\u{1} <sip:x@y>",
         ] {
-            assert_eq!(NameAddr::parse(bad), Err(Error::Malformed("address")), "{bad:?}");
+            assert_eq!(NameAddr::parse(bad.as_bytes()), Err(Error::Malformed("address")), "{bad:?}");
         }
         let mut d = NameAddr::new("sip:x@y");
         d.display = Some("a\nb".into());
-        assert!(d.to_value().is_err());
+        assert!(wire_text(&d).is_err());
         d.display = Some("\\ and \"".into());
-        assert_eq!(NameAddr::parse(&d.to_value().unwrap()).unwrap(), d);
+        assert_eq!(NameAddr::parse(wire_text(&d).unwrap().as_bytes()).unwrap(), d);
         d.params.push(Param::new("x y", None));
-        assert!(d.to_value().is_err());
+        assert!(wire_text(&d).is_err());
         d.params = vec![Param::new("q", Some("\"unclosed"))];
-        assert!(d.to_value().is_err());
-        assert!(NameAddr::new("no scheme").to_value().is_err());
+        assert!(wire_text(&d).is_err());
+        assert!(wire_text(&NameAddr::new("no scheme")).is_err());
     }
 
     #[test]
     fn contacts() {
-        assert_eq!(Contacts::parse("*"), Ok(Contacts::All));
-        assert_eq!(Contacts::All.to_value().unwrap(), "*");
-        assert_eq!(Contacts::parse("*, <sip:a@b>"), Err(Error::Malformed("Contact")));
+        assert_eq!(Contacts::parse("*".as_bytes()), Ok(Contacts::All));
+        assert_eq!(wire_text(&Contacts::All).unwrap(), "*");
+        assert_eq!(Contacts::parse("*, <sip:a@b>".as_bytes()), Err(Error::Malformed("Contact")));
         // RFC 3261 section 25.1: a Contact holds `*` or at least one address.
-        assert_eq!(Contacts::parse(""), Err(Error::Malformed("Contact")));
-        assert_eq!(Contacts::parse(" , "), Err(Error::Malformed("Contact")));
-        assert_eq!(Contacts::List(vec![]).to_value(), Err(Error::Malformed("Contact")));
+        assert_eq!(Contacts::parse("".as_bytes()), Err(Error::Malformed("Contact")));
+        assert_eq!(Contacts::parse(" , ".as_bytes()), Err(Error::Malformed("Contact")));
+        assert_eq!(wire_text(&Contacts::List(vec![])), Err(Error::Malformed("Contact")));
         let m = Message::parse(b"OPTIONS sip:a@b SIP/2.0\r\nm: <sip:a@b>\r\nContact:\r\nl: 0\r\n\r\n").unwrap();
         assert_eq!(m.contacts(), Err(Error::Malformed("Contact")));
-        assert_eq!(Contacts::parse("<sip:a@b>, junk junk"), Err(Error::Malformed("Contact")));
-        assert_eq!(Contacts::parse("<sip:a@b"), Err(Error::Malformed("Contact")));
-        let list = Contacts::parse("<sip:a@b>;expires=60, \"C\" <sip:c@d>").unwrap();
-        assert_eq!(Contacts::parse(&list.to_value().unwrap()).unwrap(), list);
+        assert_eq!(Contacts::parse("<sip:a@b>, junk junk".as_bytes()), Err(Error::Malformed("Contact")));
+        assert_eq!(Contacts::parse("<sip:a@b".as_bytes()), Err(Error::Malformed("Contact")));
+        let list = Contacts::parse("<sip:a@b>;expires=60, \"C\" <sip:c@d>".as_bytes()).unwrap();
+        assert_eq!(Contacts::parse(wire_text(&list).unwrap().as_bytes()).unwrap(), list);
         let many = vec!["<sip:a@b>"; MAX_VALUES + 1].join(",");
-        assert_eq!(Contacts::parse(&many), Err(Error::TooMany));
+        assert_eq!(Contacts::parse(many.as_bytes()), Err(Error::TooMany));
         let long = Contacts::List(vec![NameAddr::new("sip:a@b"); MAX_VALUES + 1]);
-        assert_eq!(long.to_value(), Err(Error::TooMany));
+        assert_eq!(wire_text(&long), Err(Error::TooMany));
         let m = Message::parse(b"OPTIONS sip:a@b SIP/2.0\r\nl: 0\r\n\r\n").unwrap();
         assert_eq!(m.contacts(), Ok(Contacts::List(vec![])));
     }
 
     #[test]
     fn vias_and_cseqs() {
-        let v = Via::parse("SIP/2.0/UDP 192.0.2.1:5060 ;received=192.0.2.207;branch=z9hG4bK77asjd").unwrap();
-        assert_eq!(v.to_value().unwrap(), "SIP/2.0/UDP 192.0.2.1:5060;received=192.0.2.207;branch=z9hG4bK77asjd");
+        let v =
+            Via::parse("SIP/2.0/UDP 192.0.2.1:5060 ;received=192.0.2.207;branch=z9hG4bK77asjd".as_bytes())
+                .unwrap();
+        assert_eq!(
+            wire_text(&v).unwrap(),
+            "SIP/2.0/UDP 192.0.2.1:5060;received=192.0.2.207;branch=z9hG4bK77asjd"
+        );
         assert_eq!(v.branch(), Some("z9hG4bK77asjd"));
         for bad in [
             "",
@@ -2579,24 +2474,54 @@ mod tests {
             "SIP/2.0/UDP _bad",
             "SIP/2.0/UDP host;branch=\u{1}",
         ] {
-            assert_eq!(Via::parse(bad), Err(Error::Malformed("Via")), "{bad:?}");
+            assert_eq!(Via::parse(bad.as_bytes()), Err(Error::Malformed("Via")), "{bad:?}");
         }
         let mut w = Via { transport: "U P".into(), host: "h".into(), port: None, params: vec![] };
-        assert!(w.to_value().is_err());
+        assert!(wire_text(&w).is_err());
         w.transport = "UDP".into();
         w.host = "a b".into();
-        assert!(w.to_value().is_err());
+        assert!(wire_text(&w).is_err());
         w.host = "h".into();
         w.params.push(Param::new("received", Some("[::1]")));
-        assert_eq!(Via::parse(&w.to_value().unwrap()).unwrap(), w);
+        assert_eq!(Via::parse(wire_text(&w).unwrap().as_bytes()).unwrap(), w);
 
-        assert_eq!(CSeq::parse("4711 INVITE").unwrap(), CSeq { seq: 4711, method: "INVITE".into() });
-        assert_eq!(CSeq::parse(" 4294967295\t ACK ").unwrap().seq, u32::MAX);
+        assert_eq!(
+            CSeq::parse("4711 INVITE".as_bytes()).unwrap(),
+            CSeq { seq: 4711, method: "INVITE".into() }
+        );
+        assert_eq!(CSeq::parse(b" 4294967295\t ACK "), Err(Error::Malformed("CSeq")));
         for bad in ["", "INVITE", "1", "1 ", "x INVITE", "4294967296 INVITE", "1 IN VITE", "-1 ACK", "1 A@B"] {
-            assert_eq!(CSeq::parse(bad), Err(Error::Malformed("CSeq")), "{bad:?}");
+            assert_eq!(CSeq::parse(bad.as_bytes()), Err(Error::Malformed("CSeq")), "{bad:?}");
         }
-        assert!(CSeq { seq: 1, method: "A B".into() }.to_value().is_err());
-        assert_eq!(CSeq { seq: 7, method: "BYE".into() }.to_value().unwrap(), "7 BYE");
+        assert!(wire_text(&CSeq { seq: 1, method: "A B".into() }).is_err());
+        assert_eq!(wire_text(&CSeq { seq: 7, method: "BYE".into() }).unwrap(), "7 BYE");
+    }
+
+    #[test]
+    fn cseq_reader_accepts_lws_and_checks_overflow() {
+        let mut message = Message::request("ACK", "sip:a@b");
+        // The received number may use all 32 bits. The writer limit is lower.
+        message.push_header("CSeq", " 4294967295\t ACK ");
+        assert_eq!(message.cseq(), Ok(CSeq { seq: u32::MAX, method: "ACK".into() }));
+        message.set_header("CSeq", "4294967296 INVITE");
+        assert_eq!(message.cseq(), Err(Error::Malformed("CSeq")));
+    }
+
+    #[test]
+    fn header_values_append_only_after_a_valid_write() {
+        let mut message = Message::request("INVITE", "sip:a@b");
+        let cseq = CSeq { seq: 1, method: "INVITE".into() };
+        message.push_value("CSeq", &cseq).unwrap();
+        assert_eq!(message.cseq(), Ok(cseq));
+        let before = message.clone();
+        let invalid = CSeq { seq: 1 << 31, method: "INVITE".into() };
+        assert_eq!(message.push_value("CSeq", &invalid), Err(Error::Malformed("CSeq")));
+        assert_eq!(message, before);
+        let mut binary = Message::response(200, "OK");
+        binary.body = vec![0xff];
+        binary.push_header("Content-Length", "1");
+        assert_eq!(message.push_value("X", &binary), Err(Error::Utf8));
+        assert_eq!(message, before);
     }
 
     #[test]
@@ -2604,16 +2529,16 @@ mod tests {
         // RFC 3261 section 25.1: via-received = "received" EQUAL
         // (IPv4address / IPv6address). The example is from RFC 5118 section 4.5.
         let text = "SIP/2.0/UDP [2001:db8::9:1];received=2001:db8::9:255;branch=z9hG4bKas3-111";
-        let v = Via::parse(text).unwrap();
+        let v = Via::parse(text.as_bytes()).unwrap();
         assert_eq!(v.param("received").unwrap().value.as_deref(), Some("2001:db8::9:255"));
-        assert_eq!(v.to_value().unwrap(), text);
+        assert_eq!(wire_text(&v).unwrap(), text);
         // Only in a Via, and only for received.
-        assert!(Via::parse("SIP/2.0/UDP h;maddr=2001:db8::1").is_err());
-        assert!(Via::parse("SIP/2.0/UDP h;received=2001:zz::1").is_err());
-        assert!(NameAddr::parse("<sip:a@b>;received=2001:db8::1").is_err());
+        assert!(Via::parse("SIP/2.0/UDP h;maddr=2001:db8::1".as_bytes()).is_err());
+        assert!(Via::parse("SIP/2.0/UDP h;received=2001:zz::1".as_bytes()).is_err());
+        assert!(NameAddr::parse("<sip:a@b>;received=2001:db8::1".as_bytes()).is_err());
         let mut a = NameAddr::new("sip:a@b");
         a.params.push(Param::new("received", Some("2001:db8::1")));
-        assert!(a.to_value().is_err());
+        assert!(wire_text(&a).is_err());
     }
 
     #[test]
@@ -2635,12 +2560,12 @@ mod tests {
     fn version_error_needs_a_well_formed_version() {
         // A malformed line is a 400, not a 505.
         let e = |b: &[u8]| Message::parse(b).unwrap_err();
-        assert_eq!(e(b"OPTIONS sip:a@b SIP/2.0 \r\n\r\n"), Error::StartLine);
-        assert_eq!(e(b"OPTIONS sip:a@b SIP/2\r\n\r\n"), Error::StartLine);
-        assert_eq!(e(b"SIP/2.0x 200 OK\r\n\r\n"), Error::StartLine);
-        assert_eq!(e(b"SIP/ 200 OK\r\n\r\n"), Error::StartLine);
-        assert_eq!(e(b"OPTIONS sip:a@b sip/3.10\r\n\r\n"), Error::Version);
-        assert_eq!(e(b"SIP/1.0 200 OK\r\n\r\n"), Error::Version);
+        assert_eq!(e(b"OPTIONS sip:a@b SIP/2.0 \r\nl: 0\r\n\r\n"), Error::StartLine);
+        assert_eq!(e(b"OPTIONS sip:a@b SIP/2\r\nl: 0\r\n\r\n"), Error::StartLine);
+        assert_eq!(e(b"SIP/2.0x 200 OK\r\nl: 0\r\n\r\n"), Error::StartLine);
+        assert_eq!(e(b"SIP/ 200 OK\r\nl: 0\r\n\r\n"), Error::StartLine);
+        assert_eq!(e(b"OPTIONS sip:a@b sip/3.10\r\nl: 0\r\n\r\n"), Error::Version);
+        assert_eq!(e(b"SIP/1.0 200 OK\r\nl: 0\r\n\r\n"), Error::Version);
     }
 
     #[test]
@@ -2657,8 +2582,8 @@ mod tests {
             "1:2:3:4:5:6:192.0.2.1",
             "FEDC:BA98:7654:3210:FEDC:BA98:7654:3210",
         ] {
-            assert!(Uri::parse(&format!("sip:[{good}]")).is_ok(), "{good:?}");
-            assert!(Via::parse(&format!("SIP/2.0/UDP h;received={good}")).is_ok(), "{good:?}");
+            assert!(Uri::parse(format!("sip:[{good}]").as_bytes()).is_ok(), "{good:?}");
+            assert!(Via::parse(format!("SIP/2.0/UDP h;received={good}").as_bytes()).is_ok(), "{good:?}");
         }
         for bad in [
             "",
@@ -2679,13 +2604,13 @@ mod tests {
             "1.2.3.4:5060",
             "1:2:3:4:5:6:7:1.2.3.4",
         ] {
-            assert_eq!(Uri::parse(&format!("sip:[{bad}]")), Err(Error::Uri), "{bad:?}");
-            assert!(Via::parse(&format!("SIP/2.0/UDP [{bad}]")).is_err(), "{bad:?}");
-            assert!(Via::parse(&format!("SIP/2.0/UDP h;received={bad}")).is_err(), "{bad:?}");
-            assert!(Uri::new(Scheme::Sip, &format!("[{bad}]")).to_value().is_err(), "{bad:?}");
+            assert_eq!(Uri::parse(format!("sip:[{bad}]").as_bytes()), Err(Error::Uri), "{bad:?}");
+            assert!(Via::parse(format!("SIP/2.0/UDP [{bad}]").as_bytes()).is_err(), "{bad:?}");
+            assert!(Via::parse(format!("SIP/2.0/UDP h;received={bad}").as_bytes()).is_err(), "{bad:?}");
+            assert!(wire_text(&Uri::new(Scheme::Sip, &format!("[{bad}]"))).is_err(), "{bad:?}");
             let mut v = Via::new("UDP", "h");
             v.params.push(Param::new("received", Some(bad)));
-            assert!(v.to_value().is_err(), "{bad:?}");
+            assert!(wire_text(&v).is_err(), "{bad:?}");
         }
     }
 
@@ -2693,12 +2618,12 @@ mod tests {
     fn version_error_needs_an_otherwise_good_line() {
         // A server answers Version with 505, so it must not hide a 400.
         let e = |b: &[u8]| Message::parse(b).unwrap_err();
-        assert_eq!(e(b"OPT@ONS sip:a@b SIP/3.0\r\n\r\n"), Error::StartLine);
-        assert_eq!(e(b"OPTIONS nocolon SIP/3.0\r\n\r\n"), Error::StartLine);
-        assert_eq!(e(b"SIP/3.0 2x0 OK\r\n\r\n"), Error::StartLine);
-        assert_eq!(e(b"SIP/3.0\r\n\r\n"), Error::StartLine);
-        assert_eq!(e(b"SIP/3.0 200 OK\r\n\r\n"), Error::Version);
-        assert_eq!(e(b"OPTIONS sip:a@b SIP/3.0\r\n\r\n"), Error::Version);
+        assert_eq!(e(b"OPT@ONS sip:a@b SIP/3.0\r\nl: 0\r\n\r\n"), Error::StartLine);
+        assert_eq!(e(b"OPTIONS nocolon SIP/3.0\r\nl: 0\r\n\r\n"), Error::StartLine);
+        assert_eq!(e(b"SIP/3.0 2x0 OK\r\nl: 0\r\n\r\n"), Error::StartLine);
+        assert_eq!(e(b"SIP/3.0\r\nl: 0\r\n\r\n"), Error::StartLine);
+        assert_eq!(e(b"SIP/3.0 200 OK\r\nl: 0\r\n\r\n"), Error::Version);
+        assert_eq!(e(b"OPTIONS sip:a@b SIP/3.0\r\nl: 0\r\n\r\n"), Error::Version);
     }
 
     #[test]
@@ -2709,8 +2634,8 @@ mod tests {
         let mut v = Via::new("TCP", "[2001:db8::1]");
         v.port = Some(5060);
         v.params.push(Param::new("branch", Some("z9hG4bK1")));
-        assert_eq!(v.to_value().unwrap(), "SIP/2.0/TCP [2001:db8::1]:5060;branch=z9hG4bK1");
-        assert_eq!(Via::parse(&v.to_value().unwrap()).unwrap(), v);
+        assert_eq!(wire_text(&v).unwrap(), "SIP/2.0/TCP [2001:db8::1]:5060;branch=z9hG4bK1");
+        assert_eq!(Via::parse(wire_text(&v).unwrap().as_bytes()).unwrap(), v);
     }
 
     #[test]
@@ -2737,26 +2662,62 @@ mod tests {
     }
 
     #[test]
+    fn datagram_framing() {
+        // RFC 3261 section 18.3: bytes past a declared body are dropped.
+        let bytes = b"OPTIONS sip:a@b SIP/2.0\r\nContent-Length: 01\r\n\r\nab";
+        let message = Message::read_datagram(bytes).unwrap();
+        assert_eq!(message.body, b"a");
+        assert_eq!(message.header("Content-Length"), Some("01"));
+        round_trip(&message);
+        // Without Content-Length, every body prefix is a complete datagram.
+        let head = b"OPTIONS sip:a@b SIP/2.0\r\nX: a\r\n b\r\n\r\n";
+        let body = b"\0\xff\r\nSIP/2.0";
+        let bytes = [head.as_slice(), body].concat();
+        for n in 0..=body.len() {
+            let mut message = Message::read_datagram(&bytes[..head.len() + n]).unwrap();
+            assert_eq!(message.body, body[..n]);
+            assert_eq!(message.header("X"), Some("a b"));
+            assert_eq!(message.content_length(), Ok(None));
+            message.push_header("Content-Length", &n.to_string());
+            round_trip(&message);
+        }
+        assert_eq!(
+            Message::read_datagram(b"OPTIONS sip:a@b SIP/2.0\r\nl: 3\r\n\r\nab"),
+            Err(Error::Incomplete)
+        );
+        assert_eq!(
+            Message::read_datagram(b"OPTIONS sip:a@b SIP/2.0\r\nl: 0\r\nContent-Length: 0\r\n\r\n"),
+            Err(Error::ContentLength)
+        );
+        assert_eq!(Message::read_datagram(b"OPTIONS sip:a@b SIP/2.0\n\n"), Err(Error::LineEnding));
+    }
+
+    #[test]
     fn message_errors() {
         let e = |b: &[u8]| Message::parse(b).unwrap_err();
-        assert_eq!(e(b""), Error::Truncated);
-        assert_eq!(e(b"OPTIONS sip:a@b SIP/2.0\r\n"), Error::Truncated);
-        assert_eq!(e(b"OPTIONS sip:a@b SIP/2.0\r\nl: 5\r\n\r\nabc"), Error::Truncated);
+        assert_eq!(e(b""), Error::Incomplete);
+        assert_eq!(e(b"OPTIONS sip:a@b SIP/2.0\r\n"), Error::Incomplete);
+        assert_eq!(e(b"OPTIONS sip:a@b SIP/2.0\r\nl: 5\r\n\r\nabc"), Error::Incomplete);
         assert_eq!(e(&vec![b'a'; MAX_HEAD]), Error::TooLong);
         assert_eq!(e(b"OPTIONS sip:a@b SIP/2.0\r\nl: 1048577\r\n\r\n"), Error::TooLong);
-        let mut big = b"OPTIONS sip:a@b SIP/2.0\r\n\r\n".to_vec();
+        let mut big = format!("OPTIONS sip:a@b SIP/2.0\r\nl: {}\r\n\r\n", MAX_BODY + 1).into_bytes();
         big.resize(big.len() + MAX_BODY + 1, 0);
         assert_eq!(e(&big), Error::TooLong);
-        let many = format!("OPTIONS sip:a@b SIP/2.0\r\n{}\r\n", "X: 1\r\n".repeat(MAX_HEADERS + 1));
+        let many = format!("OPTIONS sip:a@b SIP/2.0\r\nl: 0\r\n{}\r\n", "X: 1\r\n".repeat(MAX_HEADERS));
         assert_eq!(e(many.as_bytes()), Error::TooMany);
-        let enough = format!("OPTIONS sip:a@b SIP/2.0\r\n{}\r\n", "X: 1\r\n".repeat(MAX_HEADERS));
+        let enough = format!("OPTIONS sip:a@b SIP/2.0\r\nl: 0\r\n{}\r\n", "X: 1\r\n".repeat(MAX_HEADERS - 1));
         assert!(Message::parse(enough.as_bytes()).is_ok());
-        assert_eq!(e(b"OPTIONS sip:a@b SIP/2.0\nX: 1\r\n\r\n"), Error::LineEnding);
-        assert_eq!(e(b"OPTIONS sip:a@b SIP/2.0\r\nX: 1\r2\r\n\r\n"), Error::LineEnding);
-        assert_eq!(e(b"OPTIONS sip:a@b SIP/2.0\r\n\r\r\n\r\n"), Error::LineEnding);
-        assert_eq!(e(b"OPTIONS sip:a@b SIP/2.0\r\nX: \xff\r\n\r\n"), Error::Utf8);
+        assert_eq!(e(b"OPTIONS sip:a@b SIP/2.0\nX: 1\r\nl: 0\r\n\r\n"), Error::LineEnding);
+        assert_eq!(e(b"OPTIONS sip:a@b SIP/2.0\r\nX: 1\r2\r\nl: 0\r\n\r\n"), Error::LineEnding);
+        assert_eq!(e(b"OPTIONS sip:a@b SIP/2.0\r\n\r\r\nl: 0\r\n\r\n"), Error::LineEnding);
+        assert_eq!(e(b"OPTIONS sip:a@b SIP/2.0\r\nX: \xff\r\nl: 0\r\n\r\n"), Error::Utf8);
+        // The stream skips an empty keep-alive line, then needs a start line.
+        assert_eq!(e(b"\r\nl: 0\r\n\r\n"), Error::MissingContentLength);
+        assert_eq!(e(b"\r\nX: 1\r\nl: 0\r\n\r\n"), Error::StartLine);
+        assert_eq!(Message::read_datagram(b"\r\nl: 0\r\n\r\n"), Err(Error::StartLine));
+        assert_eq!(Message::read_datagram(b"\r\nX: 1\r\n\r\n"), Err(Error::StartLine));
         for line in [
-            "",
+            " ",
             "OPTIONS",
             "OPTIONS sip:a@b",
             "OPTIONS  sip:a@b SIP/2.0",
@@ -2775,24 +2736,26 @@ mod tests {
             let msg = format!("{line}\r\nl: 0\r\n\r\n");
             assert_eq!(e(msg.as_bytes()), Error::StartLine, "{line:?}");
         }
-        assert_eq!(e(b"SIP/3.0 200 OK\r\n\r\n"), Error::Version);
-        assert_eq!(e(b"OPTIONS sip:a@b SIP/1.0\r\n\r\n"), Error::Version);
-        assert_eq!(e(b"OPTIONS sip:a@b SIP/2.0\r\n folded\r\n\r\n"), Error::HeaderLine);
-        assert_eq!(e(b"OPTIONS sip:a@b SIP/2.0\r\nNo colon\r\n\r\n"), Error::HeaderLine);
-        assert_eq!(e(b"OPTIONS sip:a@b SIP/2.0\r\nBad Name: 1\r\n\r\n"), Error::HeaderLine);
-        assert_eq!(e(b"OPTIONS sip:a@b SIP/2.0\r\n: 1\r\n\r\n"), Error::HeaderLine);
-        assert_eq!(e(b"OPTIONS sip:a@b SIP/2.0\r\nX: a\x00b\r\n\r\n"), Error::HeaderValue);
+        assert_eq!(e(b"SIP/3.0 200 OK\r\nl: 0\r\n\r\n"), Error::Version);
+        assert_eq!(e(b"OPTIONS sip:a@b SIP/1.0\r\nl: 0\r\n\r\n"), Error::Version);
+        assert_eq!(e(b"OPTIONS sip:a@b SIP/2.0\r\n folded\r\nl: 0\r\n\r\n"), Error::HeaderLine);
+        assert_eq!(e(b"OPTIONS sip:a@b SIP/2.0\r\nNo colon\r\nl: 0\r\n\r\n"), Error::HeaderLine);
+        assert_eq!(e(b"OPTIONS sip:a@b SIP/2.0\r\nBad Name: 1\r\nl: 0\r\n\r\n"), Error::HeaderLine);
+        assert_eq!(e(b"OPTIONS sip:a@b SIP/2.0\r\n: 1\r\nl: 0\r\n\r\n"), Error::HeaderLine);
+        assert_eq!(e(b"OPTIONS sip:a@b SIP/2.0\r\nX: a\x00b\r\nl: 0\r\n\r\n"), Error::HeaderValue);
         assert_eq!(e(b"OPTIONS sip:a@b SIP/2.0\r\nl: x\r\n\r\n"), Error::ContentLength);
         assert_eq!(e(b"OPTIONS sip:a@b SIP/2.0\r\nl: \r\n\r\n"), Error::ContentLength);
         assert_eq!(e(b"OPTIONS sip:a@b SIP/2.0\r\nl: 1\r\nContent-Length: 2\r\n\r\nab"), Error::ContentLength);
-        // Bytes past the body are dropped.
-        let m = Message::parse(b"OPTIONS sip:a@b SIP/2.0\r\nContent-Length: 01\r\n\r\nab").unwrap();
-        assert_eq!(m.body, b"a");
+        // Exact stream messages refuse bytes past the body.
+        assert_eq!(
+            Message::parse(b"OPTIONS sip:a@b SIP/2.0\r\nContent-Length: 01\r\n\r\nab"),
+            Err(Error::Trailing)
+        );
         // Lenient bits: status line with no reason, spaces before the colon.
-        let m = Message::parse(b"sip/2.0 404\r\nX-A \t: v\r\n\r\n").unwrap();
+        let m = Message::parse(b"sip/2.0 404\r\nX-A \t: v\r\nl: 0\r\n\r\n").unwrap();
         assert_eq!(m.start, StartLine::Status { code: 404, reason: String::new() });
         assert_eq!(m.header("x-a"), Some("v"));
-        assert_eq!(Message::parse_stream(b"OPTIONS sip:a@b SIP/2.0\r\n\r\n"), Err(Error::MissingContentLength));
+        assert_eq!(Message::parse(b"OPTIONS sip:a@b SIP/2.0\r\n\r\n"), Err(Error::MissingContentLength));
     }
 
     #[test]
@@ -2806,15 +2769,19 @@ mod tests {
         assert_eq!(w(&Message::response(700, "x")), Error::StartLine);
         assert_eq!(w(&Message::response(200, "O\r\nK")), Error::StartLine);
         let mut m = Message::response(200, "OK");
+        m.push_header("Content-Length", "0");
         m.push_header("Bad:Name", "x");
         assert_eq!(w(&m), Error::HeaderLine);
         let mut m = Message::response(200, "OK");
+        m.push_header("Content-Length", "0");
         m.push_header("X", "a\r\nInjected: 1");
         assert_eq!(w(&m), Error::HeaderValue);
         let mut m = Message::response(200, "OK");
+        m.push_header("Content-Length", "0");
         m.body = vec![0; MAX_BODY + 1];
         assert_eq!(w(&m), Error::TooLong);
         let mut m = Message::response(200, "OK");
+        m.push_header("Content-Length", "0");
         for _ in 0..MAX_HEADERS {
             m.push_header("X", "1");
         }
@@ -2822,16 +2789,19 @@ mod tests {
         m.headers.pop();
         assert!(Message::parse(&m.to_bytes().unwrap()).is_ok());
         let mut m = Message::response(200, "OK");
+        m.push_header("Content-Length", "0");
         m.push_header("X", &"a".repeat(MAX_HEAD));
         assert_eq!(w(&m), Error::TooLong);
-        // Content-Length is always the body's length, written last.
+        // The writer refuses a length mismatch and preserves corrected fields.
         let mut m = Message::request("MESSAGE", "sip:a@b");
         m.push_header("l", "99");
         m.push_header("Content-Type", "text/plain");
         m.body = b"hi".to_vec();
+        assert_eq!(m.to_bytes(), Err(Error::Unwritable));
+        m.set_header("l", "2");
         assert_eq!(
             m.to_bytes().unwrap(),
-            b"MESSAGE sip:a@b SIP/2.0\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nhi"
+            b"MESSAGE sip:a@b SIP/2.0\r\nl: 2\r\nContent-Type: text/plain\r\n\r\nhi"
         );
     }
 
@@ -2862,9 +2832,10 @@ mod tests {
     #[test]
     fn reply_copies_the_right_headers() {
         let m = Message::parse(&invite()).unwrap();
-        let r = m.reply(180, "Ringing");
+        let mut r = m.reply(180, "Ringing");
         let names: Vec<_> = r.headers.iter().map(|h| h.name.as_str()).collect();
         assert_eq!(names, ["Via", "To", "From", "Call-ID", "CSeq"]);
+        r.push_header("Content-Length", "0");
         let back = Message::parse(&r.to_bytes().unwrap()).unwrap();
         assert_eq!(back.status(), Some(180));
         assert_eq!(back.cseq(), m.cseq());
@@ -2872,82 +2843,54 @@ mod tests {
 
     #[test]
     fn stream_framing() {
-        let mut stream = b"\r\n\r\n".to_vec();
-        stream.extend(invite());
-        stream.extend(b"\r\n");
-        stream.extend(ok());
-        let (first, used) = Message::parse_stream(&stream).unwrap().unwrap();
-        assert_eq!(first, Message::parse(&invite()).unwrap());
-        let (second, used2) = Message::parse_stream(&stream[used..]).unwrap().unwrap();
-        assert_eq!(second.status(), Some(200));
-        assert_eq!(used + used2, stream.len());
-        // One byte at a time.
-        let mut d = Decoder::new();
-        let mut got = Vec::new();
-        for byte in &stream {
-            assert_eq!(d.feed(std::slice::from_ref(byte)), 1);
-            while let Some(m) = d.next_message() {
-                got.push(m.unwrap());
-            }
-        }
-        assert_eq!(got, [first.clone(), second]);
-        assert_eq!(d.buffered(), 0);
-        // A broken stream stays broken.
-        assert_eq!(d.feed(b"OPTIONS sip:a@b SIP/2.0\r\n\r\n"), 27);
-        assert_eq!(d.next_message(), Some(Err(Error::MissingContentLength)));
-        assert_eq!(d.feed(&invite()), invite().len());
-        assert_eq!(d.next_message(), Some(Err(Error::MissingContentLength)));
-        assert_eq!(d.buffered(), 0);
-        // A head that never ends.
-        let mut d = Decoder::new();
-        assert_eq!(d.feed(b"OPTIONS sip:a@b SIP/2.0\r\n"), 25);
-        for _ in 0..MAX_HEAD {
-            if let Some(r) = d.next_message() {
-                assert_eq!(r, Err(Error::TooLong));
-                break;
-            }
-            assert_eq!(d.feed(b"X"), 1);
-        }
-        assert_eq!(d.next_message(), Some(Err(Error::TooLong)));
-        assert_eq!(Message::parse_stream(&vec![b'X'; MAX_HEAD]), Err(Error::TooLong));
-        assert_eq!(Message::parse_stream(&vec![b'X'; MAX_HEAD - 1]), Ok(None));
-        // A body too long to wait for.
-        let mut d = Decoder::new();
-        let _ = d.feed(b"INFO sip:a@b SIP/2.0\r\nl: 9999999\r\n\r\n");
-        assert_eq!(d.next_message(), Some(Err(Error::TooLong)));
+        let bytes = [b"\r\n\r\n".as_slice(), &invite(), b"\r\n", &ok()].concat();
+        contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_MESSAGE);
+        assert_eq!(
+            decode_all(Frames::new, &bytes),
+            (vec![Ok(Message::parse(&invite()).unwrap()), Ok(Message::parse(&ok()).unwrap())], None)
+        );
+        let mut stream = Stream::new(Frames::new());
+        let missing = b"OPTIONS sip:a@b SIP/2.0\r\n\r\n";
+        assert_eq!(stream.push(missing), missing.len());
+        assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::MissingContentLength))));
+        assert_eq!(stream.push(&invite()), invite().len());
+        assert_eq!(stream.next(), None);
+        assert_eq!(stream.failed(), Some(&Fail::Protocol(Error::MissingContentLength)));
+        assert_eq!(stream.unread(), missing);
+        let bytes = vec![b'X'; MAX_HEAD];
+        contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_MESSAGE);
+        assert_eq!(decode_all(Frames::new, &bytes).1, Some(Fail::Protocol(Error::TooLong)));
+        assert_eq!(Frames::new().decode(&bytes[..MAX_HEAD - 1], false), Ok(Step::Need));
+        assert_eq!(
+            decode_all(Frames::new, b"INFO sip:a@b SIP/2.0\r\nl: 9999999\r\n\r\n").1,
+            Some(Fail::Protocol(Error::TooLong))
+        );
     }
 
     #[test]
-    fn decoder_takes_many_small_messages_in_linear_time() {
+    fn stream_takes_many_small_messages_in_linear_time() {
         let one = b"\r\nOPTIONS sip:a@b SIP/2.0\r\nl: 1\r\n\r\nx";
-        let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * 50_000).collect();
+        let bytes = one.repeat(50_000);
         let started = std::time::Instant::now();
-        let mut d = Decoder::new();
-        let got = feed_all(&mut d, &stream);
-        assert!(got.iter().all(Result::is_ok));
-        assert_eq!(got.len(), 50_000);
-        assert_eq!(d.buffered(), 0);
+        let (items, failure) = decode_all(Frames::new, &bytes);
+        assert_eq!(failure, None);
+        assert_eq!(items.len(), 50_000);
+        assert!(items.iter().all(Result::is_ok));
         assert!(started.elapsed().as_secs() < 10, "took {:?}", started.elapsed());
     }
 
     #[test]
     fn every_truncated_prefix() {
         for whole in [invite(), ok(), compact()] {
+            contract::check_decode_with_alloc_limit(Frames::new, &whole, 2 * MAX_MESSAGE);
             for n in 0..whole.len() {
                 let part = &whole[..n];
-                assert_eq!(Message::parse_stream(part), Ok(None), "{n} bytes");
-                let mut d = Decoder::new();
-                assert_eq!(d.feed(part), part.len());
-                assert_eq!(d.next_message(), None, "{n} bytes");
-                // As a datagram, a prefix is cut short, or (inside the
-                // body, with no Content-Length) a shorter message.
-                match Message::parse(part) {
-                    Err(Error::Truncated) => {}
-                    other => panic!("{n} bytes: {other:?}"),
-                }
+                assert_eq!(Frames::new().decode(part, false), Ok(Step::Need), "{n} bytes");
+                assert_eq!(Message::parse(part), Err(Error::Incomplete), "{n} bytes");
+                assert_eq!(Message::read_datagram(part), Err(Error::Incomplete), "{n} bytes");
             }
-            assert!(Message::parse_stream(&whole).unwrap().is_some());
             assert!(Message::parse(&whole).is_ok());
+            assert_eq!(Message::read_datagram(&whole), Message::parse(&whole));
         }
         // Prefixes of values never panic and never read as the whole.
         for text in [
@@ -2958,170 +2901,113 @@ mod tests {
         ] {
             for n in 0..text.len() {
                 let p = &text[..n];
-                let _ = (NameAddr::parse(p), Via::parse(p), Uri::parse(p), CSeq::parse(p), Contacts::parse(p));
+                let _ = (
+                    NameAddr::parse(p.as_bytes()),
+                    Via::parse(p.as_bytes()),
+                    Uri::parse(p.as_bytes()),
+                    CSeq::parse(p.as_bytes()),
+                    Contacts::parse(p.as_bytes()),
+                );
             }
         }
     }
 
-    /// A small deterministic generator, so the fuzz loop is the same on
-    /// every run.
-    struct Lcg(u64);
-
-    impl Lcg {
-        fn next(&mut self) -> u32 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (self.0 >> 33) as u32
-        }
-        fn below(&mut self, n: usize) -> usize {
-            self.next() as usize % n.max(1)
-        }
-        fn pick<'a, T>(&mut self, from: &'a [T]) -> &'a T {
-            &from[self.below(from.len())]
-        }
-        fn text(&mut self, alphabet: &[u8], max: usize) -> String {
-            let n = self.below(max + 1);
-            (0..n).map(|_| char::from(*self.pick(alphabet))).collect()
-        }
-    }
-
-    const ALPHABET: &[u8] = b"aZ09-._!~*'()%:;@,<>\"\\/?&=+$[] \t\r\n\x00\x07SIP/2.0lv";
-
-    /// Everything that must hold for any bytes. It returns how many
-    /// messages the bytes held, so the loop can tell it reached them.
     fn check(data: &[u8]) -> usize {
-        let mut whole = Decoder::new();
-        assert_eq!(whole.feed(data), data.len());
-        let mut a = Vec::new();
-        while let Some(r) = whole.next_message() {
-            let stop = r.is_err();
-            a.push(r);
-            if stop {
-                break;
+        contract::check_decode_with_alloc_limit(Frames::new, data, 2 * MAX_MESSAGE);
+        contract::check_decode_with_held_limit(Frames::new, data, 0);
+        contract::check_wire::<Message>(data);
+        let (items, _) = decode_all(Frames::new, data);
+        for message in items.iter().flatten() {
+            round_trip(message);
+        }
+        let datagram = Message::read_datagram(data);
+        let datagrams = usize::from(datagram.is_ok());
+        if let Ok(mut message) = datagram {
+            if message.content_length().unwrap().is_none() {
+                message.push_header("Content-Length", &message.body.len().to_string());
             }
+            round_trip(&message);
         }
-        let mut bytewise = Decoder::new();
-        let mut b = Vec::new();
-        'outer: for byte in data {
-            assert_eq!(bytewise.feed(std::slice::from_ref(byte)), 1);
-            while let Some(r) = bytewise.next_message() {
-                let stop = r.is_err();
-                b.push(r);
-                if stop {
-                    break 'outer;
-                }
-            }
-        }
-        assert_eq!(a, b);
-        // The stateless reader agrees with the decoder.
-        let mut rest = data;
-        for r in &a {
-            match (Message::parse_stream(rest), r) {
-                (Ok(Some((m, used))), Ok(n)) => {
-                    assert_eq!(&m, n);
-                    rest = &rest[used..];
-                }
-                (Err(e), Err(f)) => assert_eq!(&e, f),
-                (x, y) => panic!("{x:?} vs {y:?}"),
-            }
-        }
-        for m in a.iter().flatten() {
-            round_trip(m);
-        }
-        if let Ok(m) = Message::parse(data) {
-            round_trip(&m);
-        }
-        if let Ok(s) = std::str::from_utf8(data) {
-            values_round_trip(s);
-        }
-        a.iter().flatten().count() + usize::from(Message::parse(data).is_ok())
+        values_round_trip(data);
+        items.iter().flatten().count() + datagrams
     }
 
-    /// A message read writes, unless it was near a limit, and reads back
-    /// the same.
-    fn round_trip(m: &Message) {
-        let bytes = match m.to_bytes() {
-            Ok(b) => b,
-            Err(e) => {
-                assert!(matches!(e, Error::TooLong | Error::TooMany), "{e:?} for {m:?}");
-                return;
-            }
-        };
-        let (back, used) = Message::parse_stream(&bytes).unwrap().unwrap();
-        assert_eq!(used, bytes.len());
-        assert_eq!(Message::parse(&bytes).unwrap(), back);
-        assert_eq!(back.start, m.start);
-        assert_eq!(back.body, m.body);
-        let others = |m: &Message| -> Vec<Header> {
-            m.headers.iter().filter(|h| !same_name(&h.name, "Content-Length")).cloned().collect()
-        };
-        assert_eq!(others(&back), others(m));
-        assert_eq!(back.vias(), m.vias());
-        assert_eq!(back.contacts(), m.contacts());
-        assert_eq!(back.call_id(), m.call_id());
-        if let Ok(vias) = m.vias() {
-            for v in vias {
-                assert_eq!(Via::parse(&v.to_value().unwrap()).unwrap(), v);
+    fn round_trip(message: &Message) {
+        contract::check_wire_value(message);
+        if let Err(error) = message.to_bytes() {
+            assert!(matches!(error, Error::TooLong | Error::TooMany), "{error:?} for {message:?}");
+            return;
+        }
+        if let Ok(vias) = message.vias() {
+            for value in vias {
+                contract::check_wire_value(&value);
+                value.to_bytes().unwrap();
             }
         }
         for read in [Message::from, Message::to] {
-            if let Ok(a) = read(m) {
-                assert_eq!(NameAddr::parse(&a.to_value().unwrap()).unwrap(), a);
+            if let Ok(value) = read(message) {
+                contract::check_wire_value(&value);
+                value.to_bytes().unwrap();
             }
         }
-        if let Ok(c) = m.cseq() {
-            cseq_round_trip(&c);
+        if let Ok(value) = message.cseq() {
+            cseq_round_trip(&value);
         }
-        if let Ok(c) = m.contacts()
-            && let Ok(v) = c.to_value()
+        if let Ok(value) = message.contacts() {
+            contract::check_wire_value(&value);
+            if let Err(error) = value.to_bytes() {
+                assert_eq!(value, Contacts::List(vec![]), "{error:?}");
+            }
+        }
+        if let Some(uri) = message.request_uri()
+            && let Ok(value) = Uri::read_value(uri)
         {
-            assert_eq!(Contacts::parse(&v).unwrap(), c);
-        }
-        if let Some(Ok(u)) = m.request_uri().map(Uri::parse) {
-            assert_eq!(Uri::parse(&u.to_value().unwrap()).unwrap(), u);
-            for p in &u.params {
-                assert!(u.param(&p.name).is_some());
+            contract::check_wire_value(&value);
+            value.to_bytes().unwrap();
+            for param in &value.params {
+                assert!(value.param(&param.name).is_some());
             }
         }
-        // A reply to anything read writes, but for size.
-        if m.method().is_some() {
-            match m.reply(100, "Trying").to_bytes() {
-                Ok(b) => assert!(Message::parse(&b).is_ok()),
-                Err(e) => assert!(matches!(e, Error::TooLong | Error::TooMany), "{e:?}"),
-            }
+        if message.method().is_some() {
+            let mut reply = message.reply(100, "Trying");
+            reply.set_header("Content-Length", "0");
+            contract::check_wire_value(&reply);
+            assert!(matches!(reply.to_bytes(), Ok(_) | Err(Error::TooLong | Error::TooMany)));
         }
     }
 
-    /// A CSeq read writes and reads back, unless its number is one a
-    /// sender may not use.
-    fn cseq_round_trip(c: &CSeq) {
-        match c.to_value() {
-            Ok(v) => assert_eq!(&CSeq::parse(&v).unwrap(), c),
-            Err(e) => assert!(c.seq >= 1 << 31, "{e:?}"),
+    fn cseq_round_trip(value: &CSeq) {
+        contract::check_wire_value(value);
+        if let Err(error) = value.to_bytes() {
+            assert!(value.seq >= 1 << 31, "{error:?} for {value:?}");
         }
     }
 
-    fn values_round_trip(s: &str) {
-        let fine = |e: Error| assert_eq!(e, Error::TooLong);
-        if let Ok(u) = Uri::parse(s) {
-            u.to_value().map_or_else(fine, |v| assert_eq!(Uri::parse(&v).unwrap(), u));
+    fn values_round_trip(bytes: &[u8]) {
+        macro_rules! check {
+            ($($ty:ty),+) => {$(
+                contract::check_wire::<$ty>(bytes);
+                // Read text directly so a writer failure cannot hide as a parse refusal.
+                if let Ok(text) = core::str::from_utf8(bytes)
+                    && let Ok(value) = <$ty>::read_value(text)
+                {
+                    contract::check_wire_value(&value);
+                    assert!(matches!(value.to_bytes(), Ok(_) | Err(Error::TooLong)), "{value:?}");
+                }
+            )+};
         }
-        if let Ok(a) = NameAddr::parse(s) {
-            a.to_value().map_or_else(fine, |v| assert_eq!(NameAddr::parse(&v).unwrap(), a));
-        }
-        if let Ok(v) = Via::parse(s) {
-            v.to_value().map_or_else(fine, |t| assert_eq!(Via::parse(&t).unwrap(), v));
-        }
-        if let Ok(c) = CSeq::parse(s) {
-            cseq_round_trip(&c);
-        }
-        if let Ok(c) = Contacts::parse(s) {
-            c.to_value().map_or_else(fine, |v| assert_eq!(Contacts::parse(&v).unwrap(), c));
+        check!(Uri, NameAddr, Via, Contacts);
+        contract::check_wire::<CSeq>(bytes);
+        if let Ok(text) = core::str::from_utf8(bytes)
+            && let Ok(value) = CSeq::read_value(text)
+        {
+            cseq_round_trip(&value);
         }
     }
 
     #[test]
     fn fuzz_loop() {
-        let mut rng = Lcg(0x5eed_5160);
+        let mut rng = Lcg::new(0x5eed_5160);
         let seeds = [invite(), ok(), compact()];
         let mut stream = Vec::new();
         for s in &seeds {
@@ -3139,198 +3025,164 @@ mod tests {
         for round in 0..6000 {
             let base: &[u8] = match round % 3 {
                 0 => &stream,
-                1 => rng.pick(&seeds).as_slice(),
-                _ => rng.pick::<&[u8]>(&values),
+                1 => seeds[rng.index(seeds.len())].as_slice(),
+                _ => values[rng.index(values.len())],
             };
             let mut data = base.to_vec();
-            for _ in 0..1 + rng.below(6) {
-                if data.is_empty() {
-                    break;
-                }
-                let i = rng.below(data.len());
-                match rng.below(5) {
-                    0 => data[i] = *rng.pick(ALPHABET),
-                    1 => data[i] = rng.next() as u8,
-                    2 => data.truncate(i),
-                    3 => {
-                        data.remove(i);
-                    }
-                    _ => data.insert(i, *rng.pick(ALPHABET)),
-                }
+            for _ in 0..1 + rng.index(6) {
+                mutate(&mut rng, &mut data);
             }
             read += check(&data);
         }
-        assert!(read > 3000, "only {read} messages read");
-        // Pure noise too.
-        for _ in 0..2000 {
-            let n = rng.below(200);
-            let data: Vec<u8> = (0..n).map(|_| *rng.pick(ALPHABET)).collect();
-            let _ = check(&data);
+        // This seed reads 2800 messages; allow a small margin.
+        assert!(read > 2750, "only {read} messages read");
+        // Mix arbitrary bytes into text as well as checking byte noise.
+        for _ in 0..3000 {
+            let mut text = rng.text(200).into_bytes();
+            let at = rng.index(text.len().saturating_add(1));
+            text.splice(at..at, rng.bytes(4));
+            let _ = check(&text);
+            let _ = check(&rng.bytes(200));
         }
     }
 
     #[test]
     fn writers_only_write_what_reads_back() {
-        let mut rng = Lcg(42);
+        let mut rng = Lcg::new(42);
+        let text = |rng: &mut Lcg, max| {
+            let mut value = rng.text(max);
+            if rng.index(8) == 0 {
+                value.push_str(&String::from_utf8_lossy(&rng.bytes(3)));
+            }
+            value
+        };
         let words = ["", "alice", "a b", "x%20", "%zz", "sip", "[::1]", "::1", "host.com", "a;b", "q\"", "UDP"];
         let mut written = 0;
         for _ in 0..20_000 {
-            let mut u = Uri::new(*rng.pick(&[Scheme::Sip, Scheme::Sips]), rng.pick::<&str>(&words));
-            if rng.below(2) == 0 {
-                u.user = Some(rng.text(ALPHABET, 6));
+            let mut u =
+                Uri::new(if rng.coin() { Scheme::Sip } else { Scheme::Sips }, words[rng.index(words.len())]);
+            if rng.coin() {
+                u.user = Some(text(&mut rng, 6));
             }
-            if rng.below(3) == 0 {
-                u.password = Some(rng.text(ALPHABET, 4));
+            if rng.index(3) == 0 {
+                u.password = Some(text(&mut rng, 4));
             }
-            if rng.below(2) == 0 {
+            if rng.coin() {
                 u.port = Some(rng.next() as u16);
             }
-            for _ in 0..rng.below(3) {
-                let value = if rng.below(2) == 0 { None } else { Some(rng.text(ALPHABET, 4)) };
-                u.params.push(Param { name: rng.text(ALPHABET, 4), value });
+            for _ in 0..rng.index(3) {
+                let value = if rng.coin() { None } else { Some(text(&mut rng, 4)) };
+                u.params.push(Param { name: text(&mut rng, 4), value });
             }
-            for _ in 0..rng.below(2) {
-                u.headers.push((rng.text(ALPHABET, 3), rng.text(ALPHABET, 3)));
+            for _ in 0..rng.index(2) {
+                u.headers.push((text(&mut rng, 3), text(&mut rng, 3)));
             }
-            if let Ok(text) = u.to_value() {
-                assert_eq!(Uri::parse(&text).unwrap(), u, "{text}");
+            contract::check_wire_value(&u);
+            if let Ok(text) = wire_text(&u) {
+                assert_eq!(Uri::parse(text.as_bytes()).unwrap(), u, "{text}");
                 written += 1;
             }
 
             let mut params = Vec::new();
-            for _ in 0..rng.below(3) {
-                let value = match rng.below(3) {
+            for _ in 0..rng.index(3) {
+                let value = match rng.index(3) {
                     0 => None,
-                    1 => Some(rng.text(ALPHABET, 5)),
-                    _ => Some(format!("\"{}\"", rng.text(ALPHABET, 5))),
+                    1 => Some(text(&mut rng, 5)),
+                    _ => Some(format!("\"{}\"", text(&mut rng, 5))),
                 };
-                params.push(Param { name: rng.text(ALPHABET, 4), value });
+                params.push(Param { name: text(&mut rng, 4), value });
             }
-            let display = if rng.below(2) == 0 { None } else { Some(rng.text(ALPHABET, 8)) };
-            let a = NameAddr { display, uri: rng.text(ALPHABET, 10), params: params.clone() };
-            if let Ok(text) = a.to_value() {
-                let mut want = a.clone();
-                want.display = want.display.filter(|d| !d.is_empty());
-                assert_eq!(NameAddr::parse(&text).unwrap(), want, "{text}");
+            let display = if rng.coin() { None } else { Some(text(&mut rng, 8)) };
+            let a = NameAddr { display, uri: text(&mut rng, 10), params: params.clone() };
+            contract::check_wire_value(&a);
+            if let Ok(text) = wire_text(&a) {
+                assert_eq!(NameAddr::parse(text.as_bytes()).unwrap(), a, "{text}");
                 written += 1;
             }
-            let port = if rng.below(2) == 0 { None } else { Some(rng.next() as u16) };
-            let v = Via { transport: rng.pick(&words).to_string(), host: rng.pick(&words).to_string(), port, params };
-            if let Ok(text) = v.to_value() {
-                assert_eq!(Via::parse(&text).unwrap(), v, "{text}");
+            let port = if rng.coin() { None } else { Some(rng.next() as u16) };
+            let v = Via {
+                transport: words[rng.index(words.len())].to_string(),
+                host: words[rng.index(words.len())].to_string(),
+                port,
+                params,
+            };
+            contract::check_wire_value(&v);
+            if let Ok(text) = wire_text(&v) {
+                assert_eq!(Via::parse(text.as_bytes()).unwrap(), v, "{text}");
                 written += 1;
             }
-            let c = CSeq { seq: rng.next(), method: rng.text(ALPHABET, 5) };
-            if let Ok(text) = c.to_value() {
-                assert_eq!(CSeq::parse(&text).unwrap(), c);
+            let c = CSeq { seq: rng.next() as u32, method: text(&mut rng, 5) };
+            contract::check_wire_value(&c);
+            if let Ok(text) = wire_text(&c) {
+                assert_eq!(CSeq::parse(text.as_bytes()).unwrap(), c);
             }
 
-            let mut m = if rng.below(2) == 0 {
-                Message::request(&rng.text(ALPHABET, 5), &rng.text(ALPHABET, 8))
+            let mut m = if rng.coin() {
+                Message::request(&text(&mut rng, 5), &text(&mut rng, 8))
             } else {
-                Message::response(rng.below(800) as u16, &rng.text(ALPHABET, 6))
+                Message::response(rng.index(800) as u16, &text(&mut rng, 6))
             };
-            for _ in 0..rng.below(4) {
-                let name = rng.pick(&["Via", "l", "X", "Bad Name", "f"]).to_string();
-                m.push_header(&name, &rng.text(ALPHABET, 8));
+            for _ in 0..rng.index(4) {
+                let name = ["Via", "l", "X", "Bad Name", "f"][rng.index(5)].to_string();
+                m.push_header(&name, &text(&mut rng, 8));
             }
-            m.body = rng.text(ALPHABET, 6).into_bytes();
+            m.body = text(&mut rng, 6).into_bytes();
+            m.set_header("Content-Length", &m.body.len().to_string());
+            contract::check_wire_value(&m);
             if let Ok(bytes) = m.to_bytes() {
-                let back = Message::parse(&bytes).unwrap();
-                let (stream, used) = Message::parse_stream(&bytes).unwrap().unwrap();
-                assert_eq!(used, bytes.len());
-                assert_eq!(stream, back);
-                assert_eq!(back.start, m.start);
-                assert_eq!(back.body, m.body);
-                let kept: Vec<_> = m
-                    .headers
-                    .iter()
-                    .filter(|h| !same_name(&h.name, "l"))
-                    .map(|h| Header::new(&h.name, trim_ws(&h.value)))
-                    .collect();
-                assert_eq!(back.headers[..back.headers.len() - 1], kept[..]);
+                assert_eq!(Message::parse(&bytes).unwrap(), m);
                 written += 1;
             }
         }
         assert!(written > 5000, "only {written} writes succeeded");
     }
 
-    /// Feeds `bytes` to `d` and takes messages out until every byte is
-    /// taken, as a caller does.
-    fn feed_all(d: &mut Decoder, mut bytes: &[u8]) -> Vec<Result<Message, Error>> {
-        let mut out = Vec::new();
-        loop {
-            let n = d.feed(bytes);
-            bytes = &bytes[n..];
-            assert!(d.buffered() <= MAX_MESSAGE);
-            let mut got = false;
-            while let Some(r) = d.next_message() {
-                got = true;
-                let stop = r.is_err();
-                out.push(r);
-                if stop {
-                    return out;
-                }
-            }
-            if bytes.is_empty() {
-                return out;
-            }
-            assert!(n > 0 || got, "no progress");
-        }
-    }
-
     #[test]
-    fn decoder_holds_at_most_one_message() {
-        // Fed without being drained, it takes no more than one message.
-        let mut d = Decoder::new();
-        let chunk = vec![b'\r'; 4096];
-        let mut taken = 0;
-        for _ in 0..1000 {
-            taken += d.feed(&chunk);
-        }
-        assert!(taken <= MAX_MESSAGE, "took {taken}");
-        assert!(d.buffered() <= MAX_MESSAGE);
-        // A full decoder always gives a message or an error.
-        assert_eq!(d.next_message(), Some(Err(Error::TooLong)));
-        // Many messages in one slice come out in turn.
+    fn stream_holds_at_most_one_message() {
+        let mut stream = Stream::new(Frames::new());
+        let bytes = vec![b'\r'; MAX_MESSAGE + 1];
+        assert_eq!(stream.push(&bytes), MAX_MESSAGE);
+        assert_eq!(stream.push(b"extra"), 0);
+        assert_eq!(stream.buffered(), MAX_MESSAGE);
+        assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::TooLong))));
+        assert_eq!(stream.next(), None);
+        assert_eq!(stream.push(&bytes), bytes.len());
         let one = b"OPTIONS sip:a@b SIP/2.0\r\nl: 4\r\n\r\nbody";
-        let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * 40_000).collect();
-        let mut d = Decoder::new();
-        let got = feed_all(&mut d, &stream);
-        assert_eq!(got.len(), 40_000);
-        assert!(got.iter().all(Result::is_ok));
-        // Keep-alive CRLFs past the limit are taken too.
-        let mut d = Decoder::new();
+        let (items, failure) = decode_all(Frames::new, &one.repeat(40_000));
+        assert_eq!(failure, None);
+        assert_eq!(items.len(), 40_000);
+        assert!(items.iter().all(Result::is_ok));
         let mut crlfs = b"\r\n".repeat(MAX_MESSAGE);
         crlfs.extend(one);
-        assert_eq!(feed_all(&mut d, &crlfs).len(), 1);
-        // After an error, everything is taken and dropped.
-        let mut d = Decoder::new();
-        assert_eq!(feed_all(&mut d, b"junk\r\n\r\n"), [Err(Error::StartLine)]);
-        assert_eq!(d.feed(&stream), stream.len());
-        assert_eq!(d.buffered(), 0);
+        let (items, failure) = decode_all(Frames::new, &crlfs);
+        assert_eq!(failure, None);
+        assert_eq!(items, [Ok(Message::parse(one).unwrap())]);
+        contract::check_decode_with_alloc_limit(Frames::new, &crlfs, 2 * MAX_MESSAGE);
     }
 
     #[test]
     fn value_readers_and_writers_are_bounded() {
         let long = "a".repeat(MAX_HEAD);
-        assert_eq!(Uri::parse(&format!("sip:{long}@h")), Err(Error::TooLong));
-        assert_eq!(NameAddr::parse(&format!("<sip:{long}@h>")), Err(Error::TooLong));
-        assert_eq!(NameAddr::parse(&format!("{}<sip:a@h>", "x ".repeat(MAX_HEAD))), Err(Error::TooLong));
-        assert_eq!(Via::parse(&format!("SIP/2.0/UDP {long}")), Err(Error::TooLong));
-        assert_eq!(CSeq::parse(&format!("1 {long}")), Err(Error::TooLong));
-        assert_eq!(Contacts::parse(&format!("<sip:{long}@h>")), Err(Error::TooLong));
+        assert_eq!(Uri::parse(format!("sip:{long}@h").as_bytes()), Err(Error::TooLong));
+        assert_eq!(NameAddr::parse(format!("<sip:{long}@h>").as_bytes()), Err(Error::TooLong));
+        assert_eq!(
+            NameAddr::parse(format!("{}<sip:a@h>", "x ".repeat(MAX_HEAD)).as_bytes()),
+            Err(Error::TooLong)
+        );
+        assert_eq!(Via::parse(format!("SIP/2.0/UDP {long}").as_bytes()), Err(Error::TooLong));
+        assert_eq!(CSeq::parse(format!("1 {long}").as_bytes()), Err(Error::TooLong));
+        assert_eq!(Contacts::parse(format!("<sip:{long}@h>").as_bytes()), Err(Error::TooLong));
         // Writers refuse what readers would.
         let mut u = Uri::new(Scheme::Sip, "h");
         u.user = Some(long.clone());
-        assert_eq!(u.to_value(), Err(Error::TooLong));
+        assert_eq!(wire_text(&u), Err(Error::TooLong));
         let a = NameAddr { display: Some(long.clone()), uri: "sip:a@h".into(), params: vec![] };
-        assert_eq!(a.to_value(), Err(Error::TooLong));
-        assert_eq!(Contacts::List(vec![a]).to_value(), Err(Error::TooLong));
-        assert_eq!(Via::new("UDP", &long).to_value(), Err(Error::TooLong));
-        assert_eq!(CSeq { seq: 1, method: long.clone() }.to_value(), Err(Error::TooLong));
+        assert_eq!(wire_text(&a), Err(Error::TooLong));
+        assert_eq!(wire_text(&Contacts::List(vec![a])), Err(Error::TooLong));
+        assert_eq!(wire_text(&Via::new("UDP", &long)), Err(Error::TooLong));
+        assert_eq!(wire_text(&CSeq { seq: 1, method: long.clone() }), Err(Error::TooLong));
         // Display-name words are joined without a list of them.
-        let a = NameAddr::parse("  Mr.   Watson\t <sip:w@h>").unwrap();
+        let a = NameAddr::parse("  Mr.   Watson\t <sip:w@h>".as_bytes()).unwrap();
         assert_eq!(a.display.as_deref(), Some("Mr. Watson"));
     }
 
@@ -3347,6 +3199,7 @@ mod tests {
         let mut m = Message::response(200, "OK");
         let fixed = "SIP/2.0 200 OK\r\nX: \r\nContent-Length: 0\r\n\r\n".len();
         m.push_header("X", &"a".repeat(MAX_HEAD - fixed));
+        m.push_header("Content-Length", "0");
         let bytes = m.to_bytes().unwrap();
         assert_eq!(bytes.len(), MAX_HEAD);
         assert!(Message::parse(&bytes).is_ok());
@@ -3360,84 +3213,95 @@ mod tests {
         assert_eq!(Message::request("OPTIONS", "sip:%GG@h").to_bytes(), Err(Error::StartLine));
         assert_eq!(Message::parse(b"OPTIONS sip:%GG@h SIP/2.0\r\nl: 0\r\n\r\n"), Err(Error::StartLine));
         assert_eq!(Message::request("OPTIONS", "tel:12{3}").to_bytes(), Err(Error::StartLine));
-        assert!(Message::request("OPTIONS", "tel:+1-201-555-0123").to_bytes().is_ok());
-        assert!(NameAddr::new("sip:").to_value().is_err());
-        assert!(NameAddr::parse("<sip:>").is_err());
-        assert!(NameAddr::parse("<mailto:a@b>").is_ok());
+        let mut message = Message::request("OPTIONS", "tel:+1-201-555-0123");
+        message.push_header("Content-Length", "0");
+        assert!(message.to_bytes().is_ok());
+        assert!(wire_text(&NameAddr::new("sip:")).is_err());
+        assert!(NameAddr::parse("<sip:>".as_bytes()).is_err());
+        assert!(NameAddr::parse("<mailto:a@b>".as_bytes()).is_ok());
         for bad in ["sip:.", "sip:-bad.example", "sip:bad-.example", "sip:a..b", "sip:1.2.3", "sip:example.123"] {
-            assert_eq!(Uri::parse(bad), Err(Error::Uri), "{bad:?}");
+            assert_eq!(Uri::parse(bad.as_bytes()), Err(Error::Uri), "{bad:?}");
         }
         for good in ["sip:example.com.", "sip:a-b.c", "sip:x1.y2z", "sip:192.0.2.1", "sip:h"] {
-            assert!(Uri::parse(good).is_ok(), "{good:?}");
+            assert!(Uri::parse(good.as_bytes()).is_ok(), "{good:?}");
         }
-        assert!(Via::parse("SIP/2.0/UDP -bad").is_err());
-        assert!(Via::new("UDP", "-bad").to_value().is_err());
+        assert!(Via::parse("SIP/2.0/UDP -bad".as_bytes()).is_err());
+        assert!(wire_text(&Via::new("UDP", "-bad")).is_err());
     }
 
     #[test]
     fn recognized_parameters_follow_their_grammar() {
         // RFC 3261 section 25.1: tag-param, via-received, via-branch,
         // via-ttl, via-maddr, c-p-q and c-p-expires.
-        assert!(NameAddr::parse("<sip:a@b>;tag=\"two words\"").is_err());
-        assert!(NameAddr::parse("<sip:a@b>;tag").is_err());
-        assert!(NameAddr::parse("<sip:a@b>;tag=a.b-c!").is_ok());
-        assert!(Via::parse("SIP/2.0/UDP h;received=garbage").is_err());
-        assert!(Via::parse("SIP/2.0/UDP h;branch=\"a b\"").is_err());
-        assert!(Via::parse("SIP/2.0/UDP h;branch").is_err());
-        assert!(Via::parse("SIP/2.0/UDP h;ttl=256").is_err());
-        assert!(Via::parse("SIP/2.0/UDP h;ttl=1000").is_err());
-        assert!(Via::parse("SIP/2.0/UDP h;maddr=-x").is_err());
-        assert!(Via::parse("SIP/2.0/UDP h;rport=x").is_err());
-        assert!(Via::parse("SIP/2.0/UDP h;rport;received=1.2.3.4;ttl=255;maddr=m.example;branch=z9hG4bK.x").is_ok());
-        assert!(Via::parse("SIP/2.0/UDP h;rport=5060").is_ok());
+        assert!(NameAddr::parse("<sip:a@b>;tag=\"two words\"".as_bytes()).is_err());
+        assert!(NameAddr::parse("<sip:a@b>;tag".as_bytes()).is_err());
+        assert!(NameAddr::parse("<sip:a@b>;tag=a.b-c!".as_bytes()).is_ok());
+        assert!(Via::parse("SIP/2.0/UDP h;received=garbage".as_bytes()).is_err());
+        assert!(Via::parse("SIP/2.0/UDP h;branch=\"a b\"".as_bytes()).is_err());
+        assert!(Via::parse("SIP/2.0/UDP h;branch".as_bytes()).is_err());
+        assert!(Via::parse("SIP/2.0/UDP h;ttl=256".as_bytes()).is_err());
+        assert!(Via::parse("SIP/2.0/UDP h;ttl=1000".as_bytes()).is_err());
+        assert!(Via::parse("SIP/2.0/UDP h;maddr=-x".as_bytes()).is_err());
+        assert!(Via::parse("SIP/2.0/UDP h;rport=x".as_bytes()).is_err());
+        assert!(
+            Via::parse(
+                "SIP/2.0/UDP h;rport;received=1.2.3.4;ttl=255;maddr=m.example;branch=z9hG4bK.x".as_bytes()
+            )
+            .is_ok()
+        );
+        assert!(Via::parse("SIP/2.0/UDP h;rport=5060".as_bytes()).is_ok());
         for bad in ["q=2.0", "q=1.5", "q=0.1234", "q=x", "q", "expires=tomorrow", "expires=-1", "expires"] {
-            assert_eq!(Contacts::parse(&format!("<sip:a@b>;{bad}")), Err(Error::Malformed("Contact")), "{bad:?}");
+            assert_eq!(
+                Contacts::parse(format!("<sip:a@b>;{bad}").as_bytes()),
+                Err(Error::Malformed("Contact")),
+                "{bad:?}"
+            );
         }
         for good in ["q=0", "q=0.", "q=0.7", "q=0.123", "q=1", "q=1.000", "expires=3600", "expires=0"] {
-            assert!(Contacts::parse(&format!("<sip:a@b>;{good}")).is_ok(), "{good:?}");
+            assert!(Contacts::parse(format!("<sip:a@b>;{good}").as_bytes()).is_ok(), "{good:?}");
         }
         // Other headers' generic parameters keep the generic grammar.
-        assert!(NameAddr::parse("<sip:a@b>;q=2.0").is_ok());
+        assert!(NameAddr::parse("<sip:a@b>;q=2.0".as_bytes()).is_ok());
         // Writers refuse the same.
         let mut a = NameAddr::new("sip:a@b");
         a.params.push(Param::new("tag", Some("\"x y\"")));
-        assert!(a.to_value().is_err());
+        assert!(wire_text(&a).is_err());
         let mut c = NameAddr::new("sip:a@b");
         c.params.push(Param::new("q", Some("2.0")));
-        assert_eq!(Contacts::List(vec![c]).to_value(), Err(Error::Malformed("Contact")));
+        assert_eq!(wire_text(&Contacts::List(vec![c])), Err(Error::Malformed("Contact")));
         let mut v = Via::new("UDP", "h");
         v.params.push(Param::new("received", Some("garbage")));
-        assert!(v.to_value().is_err());
+        assert!(wire_text(&v).is_err());
     }
 
     #[test]
     fn duplicate_parameters_are_refused() {
         // RFC 3261 sections 7.3.1 and 19.1.1.
-        assert_eq!(Uri::parse("sip:h;transport=tcp;TRANSPORT=udp"), Err(Error::Uri));
-        assert_eq!(Uri::parse("sip:h;lr;%6C%72"), Err(Error::Uri));
-        assert!(Uri::parse("sip:h;lr;lr2").is_ok());
-        assert!(NameAddr::parse("<sip:a@b>;tag=one;TAG=two").is_err());
-        assert!(Via::parse("SIP/2.0/UDP h;branch=z9hG4bK1;branch=z9hG4bK2").is_err());
+        assert_eq!(Uri::parse("sip:h;transport=tcp;TRANSPORT=udp".as_bytes()), Err(Error::Uri));
+        assert_eq!(Uri::parse("sip:h;lr;%6C%72".as_bytes()), Err(Error::Uri));
+        assert!(Uri::parse("sip:h;lr;lr2".as_bytes()).is_ok());
+        assert!(NameAddr::parse("<sip:a@b>;tag=one;TAG=two".as_bytes()).is_err());
+        assert!(Via::parse("SIP/2.0/UDP h;branch=z9hG4bK1;branch=z9hG4bK2".as_bytes()).is_err());
         let mut u = Uri::new(Scheme::Sip, "h");
         u.params = vec![Param::new("lr", None), Param::new("LR", None)];
-        assert_eq!(u.to_value(), Err(Error::Uri));
+        assert_eq!(wire_text(&u), Err(Error::Uri));
         let mut a = NameAddr::new("sip:a@b");
         a.params = vec![Param::new("x", None), Param::new("X", Some("1"))];
-        assert!(a.to_value().is_err());
+        assert!(wire_text(&a).is_err());
         let mut v = Via::new("UDP", "h");
         v.params = vec![Param::new("rport", None), Param::new("rport", None)];
-        assert!(v.to_value().is_err());
+        assert!(wire_text(&v).is_err());
     }
 
     #[test]
     fn uri_param_lookup_reads_escapes() {
         // RFC 3261 section 19.1.4; the URI is from RFC 4475 section 3.1.1.3.
-        let u = Uri::parse("sip:proxy.example;%6C%72").unwrap();
+        let u = Uri::parse("sip:proxy.example;%6C%72".as_bytes()).unwrap();
         assert_eq!(u.param("lr").map(|p| p.name.as_str()), Some("%6C%72"));
         assert_eq!(u.param("LR").map(|p| p.name.as_str()), Some("%6C%72"));
-        assert_eq!(u.to_value().unwrap(), "sip:proxy.example;%6C%72");
+        assert_eq!(wire_text(&u).unwrap(), "sip:proxy.example;%6C%72");
         // An escaped reserved character is not the character itself.
-        let u = Uri::parse("sip:h;a%2Fb").unwrap();
+        let u = Uri::parse("sip:h;a%2Fb".as_bytes()).unwrap();
         assert!(u.param("a/b").is_none());
         assert!(u.param("a%2fb").is_some());
     }
@@ -3452,38 +3316,44 @@ mod tests {
         .unwrap();
         let to = m.to().unwrap();
         assert_eq!(to.display.as_deref(), Some("BEL:\u{7} NUL:\u{0} DEL:\u{7f}"));
-        assert_eq!(NameAddr::parse(&to.to_value().unwrap()).unwrap(), to);
+        assert_eq!(NameAddr::parse(wire_text(&to).unwrap().as_bytes()).unwrap(), to);
         assert_eq!(Message::parse(&m.to_bytes().unwrap()).unwrap().to().unwrap(), to);
         // Bare ones are still refused, in quotes or out.
         assert_eq!(
             Message::parse(b"OPTIONS sip:a@b SIP/2.0\r\nTo: \"a\x07\" <sip:a@b>\r\nl: 0\r\n\r\n"),
             Err(Error::HeaderValue)
         );
-        assert!(NameAddr::parse("\"a\u{7}\" <sip:a@b>").is_err());
-        assert!(NameAddr::parse("<sip:a@b>;x=\"\\\u{0}\"").is_ok());
+        assert!(NameAddr::parse("\"a\u{7}\" <sip:a@b>".as_bytes()).is_err());
+        assert!(NameAddr::parse("<sip:a@b>;x=\"\\\u{0}\"".as_bytes()).is_ok());
         // Writers escape them, and refuse CR and LF.
         let mut a = NameAddr::new("sip:a@b");
         a.display = Some("a\u{0}b".into());
-        assert_eq!(a.to_value().unwrap(), "\"a\\\u{0}b\" <sip:a@b>");
+        assert_eq!(wire_text(&a).unwrap(), "\"a\\\u{0}b\" <sip:a@b>");
         a.display = Some("a\rb".into());
-        assert!(a.to_value().is_err());
+        assert!(wire_text(&a).is_err());
     }
 
     #[test]
     fn cseq_writer_keeps_below_2_pow_31() {
         // RFC 3261 section 8.1.1.5.
-        assert_eq!(CSeq { seq: (1 << 31) - 1, method: "INVITE".into() }.to_value().unwrap(), "2147483647 INVITE");
-        assert_eq!(CSeq { seq: 1 << 31, method: "INVITE".into() }.to_value(), Err(Error::Malformed("CSeq")));
-        assert_eq!(CSeq::parse("2147483648 INVITE").unwrap().seq, 1 << 31);
+        assert_eq!(
+            wire_text(&CSeq { seq: (1 << 31) - 1, method: "INVITE".into() }).unwrap(),
+            "2147483647 INVITE"
+        );
+        assert_eq!(wire_text(&CSeq { seq: 1 << 31, method: "INVITE".into() }), Err(Error::Malformed("CSeq")));
+        assert_eq!(CSeq::parse(b"2147483648 INVITE"), Err(Error::Malformed("CSeq")));
+        let mut message = Message::request("INVITE", "sip:a@b");
+        message.push_header("CSeq", "2147483648 INVITE");
+        assert_eq!(message.cseq().unwrap().seq, 1 << 31);
     }
 
     #[test]
     fn empty_list_elements_are_refused() {
         // RFC 3261 section 25.1: Contact and Via lists have no empty items.
-        assert_eq!(Contacts::parse(",*,"), Err(Error::Malformed("Contact")));
-        assert_eq!(Contacts::parse("<sip:a@b>,,"), Err(Error::Malformed("Contact")));
+        assert_eq!(Contacts::parse(",*,".as_bytes()), Err(Error::Malformed("Contact")));
+        assert_eq!(Contacts::parse("<sip:a@b>,,".as_bytes()), Err(Error::Malformed("Contact")));
         assert_eq!(
-            Contacts::parse("<sip:a@b>, <sip:c@d>"),
+            Contacts::parse("<sip:a@b>, <sip:c@d>".as_bytes()),
             Ok(Contacts::List(vec![NameAddr::new("sip:a@b"), NameAddr::new("sip:c@d")]))
         );
         let m = Message::parse(b"OPTIONS sip:a@b SIP/2.0\r\nm: ,*\r\nVia:\r\nl: 0\r\n\r\n").unwrap();

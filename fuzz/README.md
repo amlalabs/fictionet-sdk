@@ -74,10 +74,10 @@ cargo +nightly fuzz list
 | `resp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::resp`: RESP, the Redis protocol |
 | `rfb` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::rfb`: RFB, the remote framebuffer protocol behind VNC |
 | `rtp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::rtp`: RTP and RTCP |
-| `rtsp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::rtsp`: RTSP |
+| `rtsp` | message streams, interleaved frames, header values, and constructed messages | `stdlib::rtsp`: strict wire values and bounded codec contracts |
 | `sdp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::sdp`: SDP |
 | `sftp` | arbitrary bytes and typed values; wire, chunking, EOF, and allocation contracts | `stdlib::sftp`: SFTP version 3 |
-| `sip` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::sip`: SIP |
+| `sip` | message streams, UDP datagrams, header values, and constructed values | `stdlib::sip`: strict wire values and bounded codec contracts |
 | `snmp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::snmp`: SNMP v1 and v2c |
 | `socks` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::socks`: SOCKS4, SOCKS4a and SOCKS5 |
 | `spnego` | Bare and GSS-wrapped tokens plus constructed wrappers; checks framing, mechanism rules, round trips, and write refusal | `stdlib::spnego`: SPNEGO |
