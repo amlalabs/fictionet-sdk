@@ -44,9 +44,7 @@
 //! untrusted Content-Length is a stream error. An RTSP 2.0 head with bare
 //! LF also ends the stream because its CRLF boundary cannot be trusted.
 //! Header-count errors are items. The driver reports truncated input at
-//! EOF. Body framing follows the headers as before; no mode methods or
-//! expectation queues are needed. Bodies remain bytes; SDP belongs to
-//! [`super::sdp`].
+//! EOF. Bodies remain bytes; SDP belongs to [`super::sdp`].
 //!
 //! ```
 //! use fictionet::stdlib::codec::{Stream, Wire};
@@ -540,7 +538,6 @@ pub enum Item {
 /// [`super::codec::Stream::with_next`] includes its head and body.
 /// Capacity is [`MAX_MESSAGE`]; no input bytes are held in decoder state.
 /// Body framing follows Content-Length automatically, from the headers.
-/// There are no caller-selected modes or response expectation queues.
 /// Each call yields at most one unit and returns control to the caller.
 ///
 /// ```
@@ -591,7 +588,7 @@ impl Decode for Frames {
 
     fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Self::Item>, Error> {
         if self.scanned == 0 && self.body.is_none() {
-            let skip = skip_crlfs(input);
+            let skip = skip_crlfs(input)?;
             if skip != 0 {
                 self.lines = Lines::new(MAX_LINE, Ending::LfOrCrlf);
                 return Ok(Step::Skip(skip));
@@ -1902,14 +1899,15 @@ fn valid_session_id(s: &str) -> bool {
 }
 
 /// How many bytes of CRLF pairs and bare LFs start `b`.
-fn skip_crlfs(b: &[u8]) -> usize {
-    let mut skip = 0;
+fn skip_crlfs(b: &[u8]) -> Result<usize, Error> {
+    let mut skip = 0usize;
     loop {
-        match b.get(skip..).unwrap_or_default() {
-            [b'\r', b'\n', ..] => skip += 2,
-            [b'\n', ..] => skip += 1,
-            _ => return skip,
-        }
+        let n = match b.get(skip..).unwrap_or_default() {
+            [b'\r', b'\n', ..] => 2,
+            [b'\n', ..] => 1,
+            _ => return Ok(skip),
+        };
+        skip = skip.checked_add(n).ok_or(Error::TooLong)?;
     }
 }
 
@@ -2686,11 +2684,23 @@ mod tests {
     #[test]
     fn value_review_fixes() {
         let bad = Error::Malformed("Range");
+        let mut m = Message::request(Version::Rtsp20, "PLAY", "rtsp://h/a");
         // RFC 7826 section 4.4.1: frames below the rate, minutes and
         // seconds below 60.
         for v in ["smpte-25=00:00:00:25-", "smpte=00:00:00:30-", "smpte=00:60:00-", "smpte=00:00:60-"] {
+            m.set_header("Range", v);
+            assert_eq!(m.range(), Err(bad), "{v}");
             assert_eq!(Range::parse(v.as_bytes()), Err(bad), "{v}");
         }
+        m.set_header("Range", "smpte-25=00:59:59:24-");
+        assert_eq!(m.range(), Ok(Range {
+            span: Span::Smpte {
+                rate: SmpteRate::Smpte25,
+                start: Some(Smpte { hours: 0, minutes: 59, seconds: 59, frames: Some(24), subframes: None }),
+                end: None,
+            },
+            time: None,
+        }));
         assert!(Range::parse("smpte-25=00:00:00:24-".as_bytes()).is_ok());
         let s = Smpte { hours: 0, minutes: 0, seconds: 0, frames: Some(25), subframes: None };
         let r = Range { span: Span::Smpte { rate: SmpteRate::Smpte25, start: Some(s), end: None }, time: None };
@@ -2698,22 +2708,34 @@ mod tests {
         // RFC 7826 section 4.4.3: a real UTC date and time, and at most 9
         // fraction digits.
         for v in ["clock=20230230T000000Z-", "clock=20230101T250000Z-", "clock=20231301T000000Z-", "clock=20230229T000000Z-"] {
+            m.set_header("Range", v);
+            assert_eq!(m.range(), Err(bad), "{v}");
             assert_eq!(Range::parse(v.as_bytes()), Err(bad), "{v}");
         }
         assert!(Range::parse("clock=20240229T235960.123456789Z-".as_bytes()).is_ok());
         assert_eq!(Range::parse("clock=20240229T000000.1234567890Z-".as_bytes()), Err(bad));
         // RFC 7826 section 20.2.3: 1*19DIGIT seconds.
+        m.set_header("Range", "npt=10000000000000000000-");
+        assert_eq!(m.range(), Err(bad));
+        m.set_header("Range", "npt=9999999999999999999-");
+        assert_eq!(m.range(), Ok(Range {
+            span: Span::Npt { start: Some(Npt::Time { seconds: 9_999_999_999_999_999_999, nanos: 0 }), end: None },
+            time: None,
+        }));
         assert_eq!(Range::parse("npt=10000000000000000000-".as_bytes()), Err(bad));
         assert!(Range::parse("npt=9999999999999999999-".as_bytes()).is_ok());
         let r = Range { span: Span::Npt { start: Some(Npt::Time { seconds: u64::MAX, nanos: 0 }), end: None }, time: None };
         assert_eq!(wire_text(&r), Err(bad));
         let s = Session { id: "a".into(), timeout: Some(u64::MAX) };
         assert!(wire_text(&s).is_err());
+        m.set_header("Session", "a;timeout=10000000000000000000");
+        assert_eq!(m.session(), Err(Error::Malformed("Session")));
+        m.set_header("Session", "a;timeout=9999999999999999999");
+        assert_eq!(m.session(), Ok(Session { id: "a".into(), timeout: Some(9_999_999_999_999_999_999) }));
         assert!(Session::parse("a;timeout=10000000000000000000".as_bytes()).is_err());
         assert!(Session::parse("a;timeout=9999999999999999999".as_bytes()).is_ok());
         // RFC 7826 has no time parameter on Range.
-        let mut m = Message::request(Version::Rtsp20, "PLAY", "rtsp://h/a");
-        m.push_header("Range", "npt=0-;time=19970123T153600Z");
+        m.set_header("Range", "npt=0-;time=19970123T153600Z");
         assert_eq!(m.range(), Err(bad));
         m.start = StartLine::Request { method: "PLAY".into(), uri: "rtsp://h/a".into(), version: Version::Rtsp10 };
         assert!(m.range().is_ok());
@@ -2754,6 +2776,7 @@ mod tests {
     fn interleaved_frames() {
         let frame = Interleaved { channel: 0, data: vec![0x80, 0x60, 0, 1] };
         let bytes = frame.to_bytes().unwrap();
+        // RFC 2326 section 10.12.
         assert_eq!(bytes, [b'$', 0, 0, 4, 0x80, 0x60, 0, 1]);
         assert_eq!(Interleaved::parse(&bytes), Ok(frame));
         for n in 0..bytes.len() {
@@ -3067,9 +3090,12 @@ mod tests {
             read += check(&data);
         }
         assert!(read > 3000, "only {read} items read");
-        // Printable text and arbitrary bytes reach separate grammar paths.
+        // Mix arbitrary bytes into text as well as checking byte noise.
         for _ in 0..3000 {
-            let _ = check(rng.text(200).as_bytes());
+            let mut text = rng.text(200).into_bytes();
+            let at = rng.index(text.len().saturating_add(1));
+            text.splice(at..at, rng.bytes(4));
+            let _ = check(&text);
             let _ = check(&rng.bytes(200));
         }
     }
@@ -3081,7 +3107,13 @@ mod tests {
         let words = ["", "a", "PLAY", "a b", "x;y", "q\"", ":1", "AQ==", "\"z\"", "\"", "TCP", "unicast", "é"];
         let mut written = 0;
         for _ in 0..20_000 {
-            let w = |rng: &mut Lcg| words[rng.index(words.len())].to_string();
+            let w = |rng: &mut Lcg| {
+                let mut value = words[rng.index(words.len())].to_string();
+                if rng.index(16) == 0 {
+                    value.push_str(&String::from_utf8_lossy(&rng.bytes(3)));
+                }
+                value
+            };
             let mut params = Vec::new();
             for _ in 0..rng.index(4) {
                 let n = rng.next() as u32;

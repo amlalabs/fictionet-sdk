@@ -37,9 +37,8 @@
 //! boundary is an error item. An over-limit line, head, or body, or an
 //! untrusted Content-Length is a stream error. Bare LF also ends the
 //! stream because it cannot establish a SIP message boundary. Header-count
-//! errors are items. The driver reports truncated input at EOF. Body
-//! framing follows the headers as before; no mode methods or expectation
-//! queues are needed. Bodies remain bytes; SDP belongs to [`super::sdp`].
+//! errors are items. The driver reports truncated input at EOF.
+//! Bodies remain bytes; SDP belongs to [`super::sdp`].
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
@@ -403,6 +402,15 @@ impl Message {
         self.headers.push(Header::new(name, value));
     }
 
+    /// Adds a header from a wire value. Refuses a failed value write or
+    /// invalid UTF-8, and leaves the headers unchanged on error.
+    /// The message writer checks the header name, text, and size limits.
+    pub fn push_value(&mut self, name: &str, value: &impl Wire<WriteError = Error>) -> Result<(), Error> {
+        let value = String::from_utf8(value.to_bytes()?).map_err(|_| Error::Utf8)?;
+        self.headers.push(Header { name: name.to_string(), value });
+        Ok(())
+    }
+
     /// Sets the header named `name` to `value`: the first one is changed
     /// and any others are removed. With none, it is added at the end.
     pub fn set_header(&mut self, name: &str, value: &str) {
@@ -534,7 +542,6 @@ impl Message {
 /// [`super::codec::Stream::with_next`] includes its head and body.
 /// Capacity is [`MAX_MESSAGE`]; no input bytes are held in decoder state.
 /// Body framing follows Content-Length automatically, from the headers.
-/// There are no caller-selected modes or response expectation queues.
 /// Each call yields at most one unit and returns control to the caller.
 ///
 /// ```
@@ -2491,6 +2498,33 @@ mod tests {
     }
 
     #[test]
+    fn cseq_reader_accepts_lws_and_checks_overflow() {
+        let mut message = Message::request("ACK", "sip:a@b");
+        // The received number may use all 32 bits. The writer limit is lower.
+        message.push_header("CSeq", " 4294967295\t ACK ");
+        assert_eq!(message.cseq(), Ok(CSeq { seq: u32::MAX, method: "ACK".into() }));
+        message.set_header("CSeq", "4294967296 INVITE");
+        assert_eq!(message.cseq(), Err(Error::Malformed("CSeq")));
+    }
+
+    #[test]
+    fn header_values_append_only_after_a_valid_write() {
+        let mut message = Message::request("INVITE", "sip:a@b");
+        let cseq = CSeq { seq: 1, method: "INVITE".into() };
+        message.push_value("CSeq", &cseq).unwrap();
+        assert_eq!(message.cseq(), Ok(cseq));
+        let before = message.clone();
+        let invalid = CSeq { seq: 1 << 31, method: "INVITE".into() };
+        assert_eq!(message.push_value("CSeq", &invalid), Err(Error::Malformed("CSeq")));
+        assert_eq!(message, before);
+        let mut binary = Message::response(200, "OK");
+        binary.body = vec![0xff];
+        binary.push_header("Content-Length", "1");
+        assert_eq!(message.push_value("X", &binary), Err(Error::Utf8));
+        assert_eq!(message, before);
+    }
+
+    #[test]
     fn via_received_holds_a_bare_ipv6_address() {
         // RFC 3261 section 25.1: via-received = "received" EQUAL
         // (IPv4address / IPv6address). The example is from RFC 5118 section 4.5.
@@ -3000,10 +3034,14 @@ mod tests {
             }
             read += check(&data);
         }
-        assert!(read > 2000, "only {read} messages read");
-        // Printable text and arbitrary bytes reach separate grammar paths.
+        // This seed reads 2800 messages; allow a small margin.
+        assert!(read > 2750, "only {read} messages read");
+        // Mix arbitrary bytes into text as well as checking byte noise.
         for _ in 0..3000 {
-            let _ = check(rng.text(200).as_bytes());
+            let mut text = rng.text(200).into_bytes();
+            let at = rng.index(text.len().saturating_add(1));
+            text.splice(at..at, rng.bytes(4));
+            let _ = check(&text);
             let _ = check(&rng.bytes(200));
         }
     }
@@ -3011,26 +3049,33 @@ mod tests {
     #[test]
     fn writers_only_write_what_reads_back() {
         let mut rng = Lcg::new(42);
+        let text = |rng: &mut Lcg, max| {
+            let mut value = rng.text(max);
+            if rng.index(8) == 0 {
+                value.push_str(&String::from_utf8_lossy(&rng.bytes(3)));
+            }
+            value
+        };
         let words = ["", "alice", "a b", "x%20", "%zz", "sip", "[::1]", "::1", "host.com", "a;b", "q\"", "UDP"];
         let mut written = 0;
         for _ in 0..20_000 {
             let mut u =
                 Uri::new(if rng.coin() { Scheme::Sip } else { Scheme::Sips }, words[rng.index(words.len())]);
             if rng.coin() {
-                u.user = Some(rng.text(6));
+                u.user = Some(text(&mut rng, 6));
             }
             if rng.index(3) == 0 {
-                u.password = Some(rng.text(4));
+                u.password = Some(text(&mut rng, 4));
             }
             if rng.coin() {
                 u.port = Some(rng.next() as u16);
             }
             for _ in 0..rng.index(3) {
-                let value = if rng.coin() { None } else { Some(rng.text(4)) };
-                u.params.push(Param { name: rng.text(4), value });
+                let value = if rng.coin() { None } else { Some(text(&mut rng, 4)) };
+                u.params.push(Param { name: text(&mut rng, 4), value });
             }
             for _ in 0..rng.index(2) {
-                u.headers.push((rng.text(3), rng.text(3)));
+                u.headers.push((text(&mut rng, 3), text(&mut rng, 3)));
             }
             contract::check_wire_value(&u);
             if let Ok(text) = wire_text(&u) {
@@ -3042,13 +3087,13 @@ mod tests {
             for _ in 0..rng.index(3) {
                 let value = match rng.index(3) {
                     0 => None,
-                    1 => Some(rng.text(5)),
-                    _ => Some(format!("\"{}\"", rng.text(5))),
+                    1 => Some(text(&mut rng, 5)),
+                    _ => Some(format!("\"{}\"", text(&mut rng, 5))),
                 };
-                params.push(Param { name: rng.text(4), value });
+                params.push(Param { name: text(&mut rng, 4), value });
             }
-            let display = if rng.coin() { None } else { Some(rng.text(8)) };
-            let a = NameAddr { display, uri: rng.text(10), params: params.clone() };
+            let display = if rng.coin() { None } else { Some(text(&mut rng, 8)) };
+            let a = NameAddr { display, uri: text(&mut rng, 10), params: params.clone() };
             contract::check_wire_value(&a);
             if let Ok(text) = wire_text(&a) {
                 assert_eq!(NameAddr::parse(text.as_bytes()).unwrap(), a, "{text}");
@@ -3066,22 +3111,22 @@ mod tests {
                 assert_eq!(Via::parse(text.as_bytes()).unwrap(), v, "{text}");
                 written += 1;
             }
-            let c = CSeq { seq: rng.next() as u32, method: rng.text(5) };
+            let c = CSeq { seq: rng.next() as u32, method: text(&mut rng, 5) };
             contract::check_wire_value(&c);
             if let Ok(text) = wire_text(&c) {
                 assert_eq!(CSeq::parse(text.as_bytes()).unwrap(), c);
             }
 
             let mut m = if rng.coin() {
-                Message::request(&rng.text(5), &rng.text(8))
+                Message::request(&text(&mut rng, 5), &text(&mut rng, 8))
             } else {
-                Message::response(rng.index(800) as u16, &rng.text(6))
+                Message::response(rng.index(800) as u16, &text(&mut rng, 6))
             };
             for _ in 0..rng.index(4) {
                 let name = ["Via", "l", "X", "Bad Name", "f"][rng.index(5)].to_string();
-                m.push_header(&name, &rng.text(8));
+                m.push_header(&name, &text(&mut rng, 8));
             }
-            m.body = rng.text(6).into_bytes();
+            m.body = text(&mut rng, 6).into_bytes();
             m.set_header("Content-Length", &m.body.len().to_string());
             contract::check_wire_value(&m);
             if let Ok(bytes) = m.to_bytes() {

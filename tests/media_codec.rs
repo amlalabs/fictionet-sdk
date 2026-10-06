@@ -19,7 +19,7 @@ fn rtsp_body() -> rtsp::Message {
 
 fn sip_body() -> sip::Message {
     let mut message = sip::Message::request("INVITE", "sip:alice@example.com");
-    message.push_header("CSeq", "1 INVITE");
+    message.push_value("CSeq", &sip::CSeq { seq: 1, method: "INVITE".into() }).unwrap();
     message.push_header("c", "application/sdp");
     message.body = Wire::to_bytes(&<sdp::SessionDescription as Wire>::parse(SDP).unwrap()).unwrap();
     message.push_header("l", &message.body.len().to_string());
@@ -27,7 +27,7 @@ fn sip_body() -> sip::Message {
 }
 
 #[test]
-fn rtsp_chunked_round_trip_with_interleaved_media_and_recovery() {
+fn rtsp_stream_round_trip_with_interleaved_media_and_recovery() {
     let body = rtsp_body();
     let mut response = rtsp::Message::response(rtsp::Version::Rtsp10, 204, "No Content");
     // This version and status ignore even an invalid Content-Length.
@@ -64,7 +64,7 @@ fn rtsp_chunked_round_trip_with_interleaved_media_and_recovery() {
 }
 
 #[test]
-fn sip_chunked_round_trip_with_recovery_and_bodiless_response() {
+fn sip_stream_round_trip_with_recovery_and_bodiless_response() {
     let body = sip_body();
     let mut response = sip::Message::response(100, "Trying");
     response.push_header("Content-Length", "0");
