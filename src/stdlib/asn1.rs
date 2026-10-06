@@ -3,7 +3,7 @@
 //!
 //! Complete wire values use [`Wire::parse`] and [`Wire::write`].
 //! Writing appends to the destination only after validation succeeds.
-//! `Stream<Elements>` frames BER or DER elements.
+//! [`Stream<Elements>`](super::codec::Stream) frames BER or DER [`Elements`].
 //!
 //! ASN.1 describes data structures, and its encoding rules turn them into
 //! bytes. The Basic Encoding Rules (BER) allow several encodings of one
@@ -15,8 +15,8 @@
 //! specification, and the character sets and time formats of ITU-T X.680.
 //!
 //! Nothing here reads a socket. A world that plays an LDAP server feeds the
-//! bytes it reads from a connection to a [`super::codec::Stream`], gets one message's
-//! bytes at a time, and walks each one with a [`Reader`]. A world that
+//! bytes it reads from a connection to a [`Stream<Elements>`](super::codec::Stream),
+//! gets one message's bytes at a time, and walks each one with a [`Reader`]. A world that
 //! checks a certificate reads it with [`Rules::Der`], so any encoding DER
 //! does not allow is refused. Replies are built with a [`Writer`], which
 //! always writes DER. DER is also valid BER, so a reader under either rules
@@ -244,50 +244,51 @@ pub struct Tag {
     /// The tag number.
     pub number: u32,
 }
+// Universal tag assignments from ITU-T X.680.
 impl Tag {
-    /// Boolean.
+    /// BOOLEAN (UNIVERSAL 1): a true or false value.
     pub const BOOLEAN: Tag = Tag::universal(1);
-    /// Integer.
+    /// INTEGER (UNIVERSAL 2): a signed whole number.
     pub const INTEGER: Tag = Tag::universal(2);
-    /// Bit string.
+    /// BIT STRING (UNIVERSAL 3): an ordered sequence of bits.
     pub const BIT_STRING: Tag = Tag::universal(3);
-    /// Octet string.
+    /// OCTET STRING (UNIVERSAL 4): an ordered sequence of bytes.
     pub const OCTET_STRING: Tag = Tag::universal(4);
-    /// Null.
+    /// NULL (UNIVERSAL 5): a value with no contents.
     pub const NULL: Tag = Tag::universal(5);
-    /// Oid.
+    /// OBJECT IDENTIFIER (UNIVERSAL 6): a path of numeric arcs naming an object.
     pub const OID: Tag = Tag::universal(6);
-    /// Enumerated.
+    /// ENUMERATED (UNIVERSAL 10): a value from a named set of alternatives.
     pub const ENUMERATED: Tag = Tag::universal(10);
-    /// Utf8 string.
+    /// UTF8String (UNIVERSAL 12): text encoded as UTF-8.
     pub const UTF8_STRING: Tag = Tag::universal(12);
-    /// Sequence.
+    /// SEQUENCE or SEQUENCE OF (UNIVERSAL 16): an ordered collection of values.
     pub const SEQUENCE: Tag = Tag::universal(16).as_constructed();
-    /// Set.
+    /// SET or SET OF (UNIVERSAL 17): an unordered collection of values.
     pub const SET: Tag = Tag::universal(17).as_constructed();
-    /// Numeric string.
+    /// NumericString (UNIVERSAL 18): digits and spaces.
     pub const NUMERIC_STRING: Tag = Tag::universal(18);
-    /// Printable string.
+    /// PrintableString (UNIVERSAL 19): letters, digits, spaces, and selected punctuation.
     pub const PRINTABLE_STRING: Tag = Tag::universal(19);
-    /// Teletex string.
+    /// TeletexString (UNIVERSAL 20): text from the Teletex character repertoire.
     pub const TELETEX_STRING: Tag = Tag::universal(20);
-    /// Videotex string.
+    /// VideotexString (UNIVERSAL 21): text from the Videotex character repertoire.
     pub const VIDEOTEX_STRING: Tag = Tag::universal(21);
-    /// Ia5 string.
+    /// IA5String (UNIVERSAL 22): text from the seven-bit IA5 character repertoire.
     pub const IA5_STRING: Tag = Tag::universal(22);
-    /// Utc time.
+    /// UTCTime (UNIVERSAL 23): a date and time with a two-digit year.
     pub const UTC_TIME: Tag = Tag::universal(23);
-    /// Generalized time.
+    /// GeneralizedTime (UNIVERSAL 24): a date and time with a four-digit year.
     pub const GENERALIZED_TIME: Tag = Tag::universal(24);
-    /// Graphic string.
+    /// GraphicString (UNIVERSAL 25): graphic characters from registered character sets.
     pub const GRAPHIC_STRING: Tag = Tag::universal(25);
-    /// Visible string.
+    /// VisibleString (UNIVERSAL 26): printing ASCII characters, including space.
     pub const VISIBLE_STRING: Tag = Tag::universal(26);
-    /// General string.
+    /// GeneralString (UNIVERSAL 27): graphic and control characters from registered sets.
     pub const GENERAL_STRING: Tag = Tag::universal(27);
-    /// Universal string.
+    /// UniversalString (UNIVERSAL 28): text from the ISO/IEC 10646 character repertoire.
     pub const UNIVERSAL_STRING: Tag = Tag::universal(28);
-    /// Bmp string.
+    /// BMPString (UNIVERSAL 30): text from the Unicode Basic Multilingual Plane.
     pub const BMP_STRING: Tag = Tag::universal(30);
 }
 
@@ -330,7 +331,7 @@ impl Tag {
 
     /// Appends the identifier octets to `out`: one byte for numbers below
     /// 31, and otherwise 0x1F-style long form in as few bytes as it takes.
-    pub(crate) fn encode(self, out: &mut Vec<u8>) {
+    pub fn encode(self, out: &mut Vec<u8>) {
         let first = self.class.bits() | if self.constructed { 0x20 } else { 0 };
         if self.number < 31 {
             out.push(first | self.number as u8);
@@ -1547,10 +1548,11 @@ impl StringKind {
         })
     }
 
-    /// Encodes `s` as the type's bytes, if every character is allowed.
+    /// Encodes `s` as contents octets, without a tag or length, if every
+    /// character is allowed.
     /// An encoding of more than [`MAX_INPUT`] bytes is [`Error::TooLong`],
     /// so whatever [`StringKind::decode`] gives, this takes back.
-    fn encode(self, s: &str) -> Result<Vec<u8>, Error> {
+    pub fn encode(self, s: &str) -> Result<Vec<u8>, Error> {
         if !self.is_decoded() {
             return Err(Error::Charset);
         }
@@ -2270,6 +2272,14 @@ mod tests {
             let _ = e.string_bytes(kind);
             if let Ok(s) = e.text(kind) {
                 assert_eq!(kind.encode(&s).ok().as_deref(), e.string_bytes(kind).ok().as_deref());
+                let mut writer = Writer::new();
+                writer.text(kind, &s);
+                let bytes = writer.finish().expect("decoded text re-encodes");
+                let mut reader = Reader::new(&bytes, Rules::Der);
+                assert_eq!(
+                    reader.read().unwrap().string_bytes(kind).ok().as_deref(),
+                    e.string_bytes(kind).ok().as_deref()
+                );
             }
         }
         let _ = (e.utc_time(), e.generalized_time(), e.set_reader().is_ok(), e.set_of_reader().is_ok());

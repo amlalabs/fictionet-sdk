@@ -12,6 +12,8 @@
 //! server answers with NegTokenResp messages until the exchange is done.
 //! The first token travels inside the GSS-API initial context token
 //! wrapper, which names the mechanism (SPNEGO) by its object identifier.
+//! Only negTokenInit goes in this wrapper. Wrapped negTokenResp values
+//! are refused on both read and write (RFC 4178 section 4.1).
 //! Windows servers also send a NegTokenInit2 first, with hints, in the SMB
 //! negotiate response. This module follows RFC 4178, the wrapper of
 //! RFC 2743 section 3.1, and NegTokenInit2 from Microsoft's \[MS-SPNG\]
@@ -269,8 +271,8 @@ fn push_length(out: &mut Vec<u8>, n: usize) {
 
 /// The GSS-API initial context token of RFC 2743 section 3.1: a
 /// mechanism's object identifier, then that mechanism's own token. For
-/// SPNEGO the inner token is a [`NegotiationToken`]; for Kerberos it is a
-/// two-byte token ID and an AP-REQ.
+/// SPNEGO the inner token is a [`NegotiationToken::Init`]; for Kerberos it
+/// is a two-byte token ID and an AP-REQ.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InitialContextToken {
     /// The mechanism the token is for.
@@ -319,6 +321,9 @@ impl InitialContextToken {
         out.extend_from_slice(&self.inner);
         if out.len() > MAX_TOKEN {
             return Err(Error::TooLong);
+        }
+        if self.mech == Mech::Spnego && self.inner.first() == Some(&RESP_TAG) {
+            return Err(Error::WrappedResp);
         }
         Ok(out)
     }
@@ -391,9 +396,8 @@ impl std::ops::BitOr for ContextFlags {
 pub struct NegHints {
     /// hintName: a GeneralString, as bytes.
     pub hint_name: Option<Vec<u8>>,
-    /// hintAddress, as bytes. \[MS-SPNG\] says a sender must leave it
-    /// out, so a reader reads one an agent sends but a writer refuses it
-    /// with [`Error::HintAddress`].
+    /// hintAddress, as bytes. \[MS-SPNG\] says a sender must leave it out.
+    /// Received and written hint addresses are refused with [`Error::HintAddress`].
     pub hint_address: Option<Vec<u8>>,
 }
 
@@ -779,7 +783,8 @@ impl Wire for InitialContextToken {
     type ParseError = Error;
     type WriteError = Error;
 
-    /// Reads exactly one wrapper, bounded by [`MAX_TOKEN`].
+    /// Reads exactly one wrapper, bounded by [`MAX_TOKEN`]. A SPNEGO
+    /// wrapper containing negTokenResp is [`Error::WrappedResp`].
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         let token = Self::read_der(bytes)?;
         // BER can expand when written as DER. The Wire domain includes
@@ -788,7 +793,8 @@ impl Wire for InitialContextToken {
         Ok(token)
     }
 
-    /// Appends DER bounded by [`MAX_TOKEN`]. Leaves `out` unchanged on error.
+    /// Appends DER bounded by [`MAX_TOKEN`]. Refuses a SPNEGO wrapper
+    /// containing negTokenResp. Leaves `out` unchanged on error.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         let bytes = self.encode_der()?;
         if Self::read_der(&bytes).as_ref() != Ok(self) {
@@ -1132,15 +1138,49 @@ mod tests {
     fn wrapped_resp_is_rejected() {
         // RFC 4178 4.1: tokens after the first are never wrapped, and a
         // negTokenResp is never a first token.
-        let w = InitialContextToken { mech: Mech::Spnego, inner: ACCEPT_COMPLETED.to_vec() }.to_bytes().unwrap();
-        assert_eq!(NegotiationToken::parse(&w), Err(Error::WrappedResp));
-        let r = NegotiationToken::parse(&ACCEPT_COMPLETED).unwrap();
-        assert_eq!(
-            NegotiationToken::parse(
-                &InitialContextToken { mech: Mech::Spnego, inner: r.to_bytes().unwrap() }.to_bytes().unwrap()
-            ),
-            Err(Error::WrappedResp)
-        );
+        for inner in [
+            ACCEPT_COMPLETED.as_slice(),
+            &[
+                0xa1, 0x80, 0x30, 0x80, 0xa0, 0x03, 0x0a, 0x01, 0x00, 0, 0, 0, 0,
+            ],
+        ] {
+            assert!(matches!(
+                NegotiationToken::parse(inner),
+                Ok(NegotiationToken::Resp(_))
+            ));
+            let wrapper = InitialContextToken {
+                mech: Mech::Spnego,
+                inner: inner.to_vec(),
+            };
+            let mut out = vec![42];
+            assert_eq!(wrapper.write(&mut out), Err(Error::WrappedResp));
+            assert_eq!(out, [42]);
+            contract::check_wire_value(&wrapper);
+
+            // Received wrappers still need the same check.
+            let mut bytes = vec![
+                0x60,
+                (8 + inner.len()) as u8,
+                0x06,
+                0x06,
+                0x2b,
+                0x06,
+                0x01,
+                0x05,
+                0x05,
+                0x02,
+            ];
+            bytes.extend_from_slice(inner);
+            assert_eq!(InitialContextToken::parse(&bytes), Err(Error::WrappedResp));
+            assert_eq!(NegotiationToken::parse(&bytes), Err(Error::WrappedResp));
+            contract::check_wire::<InitialContextToken>(&bytes);
+
+            // Other mechanisms retain their own inner-token syntax.
+            contract::check_wire_value(&InitialContextToken {
+                mech: Mech::Ntlm,
+                inner: inner.to_vec(),
+            });
+        }
     }
 
     #[test]
@@ -1638,7 +1678,7 @@ mod tests {
             }
             check(&r);
 
-            // A stream of tokens, all at once and a byte at a time.
+            // A stream of tokens, with chunking checked by the contract.
             let mut stream = Vec::new();
             for _ in 0..(rng.below(4) as usize) {
                 stream.extend_from_slice(&rng.token().to_bytes().unwrap());

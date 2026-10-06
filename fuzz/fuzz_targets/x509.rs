@@ -7,8 +7,8 @@ use fictionet::stdlib::codec::{Stream, Wire, contract, finish, pump};
 use fictionet::stdlib::x509::{
     AuthorityInfoAccess, AuthorityKeyIdentifier, BasicConstraints, Certificate, Crl,
     CrlDistributionPoints, CrlNumber, CrlReason, ExtendedKeyUsage, ExtensionValue, GeneralName,
-    IssuerAltName, KeyUsage, MAX_PEM_DATA, Name, Pem, PemBlocks, RevokedCertificate,
-    SubjectAltName, SubjectKeyIdentifier, TbsCertList, TbsCertificate, Value,
+    IssuerAltName, KeyUsage, MAX_PEM_DATA, MAX_PEM_FRAME, Name, Pem, PemBlocks, RevokedCertificate,
+    SubjectAltName, SubjectKeyIdentifier, TbsCertList, TbsCertificate, Value, pem_decode,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -151,6 +151,20 @@ fn der(data: &[u8]) {
 }
 
 fuzz_target!(|data: &[u8]| {
+    if data.len() <= MAX_PEM_FRAME
+        && let Ok(list) = pem_decode(data)
+    {
+        let mut stream = Stream::new(PemBlocks::new());
+        let mut blocks = Vec::new();
+        pump(&mut stream, data, |block| blocks.push(block)).unwrap();
+        finish(&mut stream, |block| blocks.push(block)).unwrap();
+        assert_eq!(list, blocks);
+        for block in &list {
+            if let Ok(text) = block.to_bytes() {
+                assert_eq!(pem_decode(&text).unwrap(), std::slice::from_ref(block));
+            }
+        }
+    }
     contract::check_decode(PemBlocks::new, data);
     contract::check_decode(|| PemBlocks::with_limit(128), data);
     contract::check_wire::<Pem>(data);

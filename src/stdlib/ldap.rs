@@ -254,83 +254,83 @@ pub struct ResultCode(
     pub u32,
 );
 impl ResultCode {
-    /// Success.
+    /// success (0): the operation completed successfully.
     pub const SUCCESS: ResultCode = ResultCode(0);
-    /// Operations error.
+    /// operationsError (1): the operation is out of sequence with other operations.
     pub const OPERATIONS_ERROR: ResultCode = ResultCode(1);
-    /// Protocol error.
+    /// protocolError (2): the request violates the protocol or asks for an unsupported operation.
     pub const PROTOCOL_ERROR: ResultCode = ResultCode(2);
-    /// Time limit exceeded.
+    /// timeLimitExceeded (3): the operation exceeded the client's time limit.
     pub const TIME_LIMIT_EXCEEDED: ResultCode = ResultCode(3);
-    /// Size limit exceeded.
+    /// sizeLimitExceeded (4): the operation exceeded the client's result size limit.
     pub const SIZE_LIMIT_EXCEEDED: ResultCode = ResultCode(4);
-    /// Compare false.
+    /// compareFalse (5): the comparison completed with a false or undefined assertion.
     pub const COMPARE_FALSE: ResultCode = ResultCode(5);
-    /// Compare true.
+    /// compareTrue (6): the comparison completed with a true assertion.
     pub const COMPARE_TRUE: ResultCode = ResultCode(6);
-    /// Auth method not supported.
+    /// authMethodNotSupported (7): the server does not support the authentication method.
     pub const AUTH_METHOD_NOT_SUPPORTED: ResultCode = ResultCode(7);
-    /// Stronger auth required.
+    /// strongerAuthRequired (8): the operation requires stronger authentication.
     pub const STRONGER_AUTH_REQUIRED: ResultCode = ResultCode(8);
-    /// Referral.
+    /// referral (10): the client must follow a referral to complete the operation.
     pub const REFERRAL: ResultCode = ResultCode(10);
-    /// Admin limit exceeded.
+    /// adminLimitExceeded (11): the operation exceeded a limit set by the administrator.
     pub const ADMIN_LIMIT_EXCEEDED: ResultCode = ResultCode(11);
-    /// Unavailable critical extension.
+    /// unavailableCriticalExtension (12): the server cannot perform a critical control.
     pub const UNAVAILABLE_CRITICAL_EXTENSION: ResultCode = ResultCode(12);
-    /// Confidentiality required.
+    /// confidentialityRequired (13): the operation needs protection against disclosure.
     pub const CONFIDENTIALITY_REQUIRED: ResultCode = ResultCode(13);
-    /// Sasl bind in progress.
+    /// saslBindInProgress (14): the SASL bind needs another exchange.
     pub const SASL_BIND_IN_PROGRESS: ResultCode = ResultCode(14);
-    /// No such attribute.
+    /// noSuchAttribute (16): the named entry lacks the requested attribute or value.
     pub const NO_SUCH_ATTRIBUTE: ResultCode = ResultCode(16);
-    /// Undefined attribute type.
+    /// undefinedAttributeType (17): the server does not recognize the attribute type.
     pub const UNDEFINED_ATTRIBUTE_TYPE: ResultCode = ResultCode(17);
-    /// Inappropriate matching.
+    /// inappropriateMatching (18): the matching rule does not apply to the attribute.
     pub const INAPPROPRIATE_MATCHING: ResultCode = ResultCode(18);
-    /// Constraint violation.
+    /// constraintViolation (19): an attribute value violates a data model constraint.
     pub const CONSTRAINT_VIOLATION: ResultCode = ResultCode(19);
-    /// Attribute or value exists.
+    /// attributeOrValueExists (20): the attribute or value being added already exists.
     pub const ATTRIBUTE_OR_VALUE_EXISTS: ResultCode = ResultCode(20);
-    /// Invalid attribute syntax.
+    /// invalidAttributeSyntax (21): a value does not follow its attribute's syntax.
     pub const INVALID_ATTRIBUTE_SYNTAX: ResultCode = ResultCode(21);
-    /// No such object.
+    /// noSuchObject (32): the named object is absent from the directory.
     pub const NO_SUCH_OBJECT: ResultCode = ResultCode(32);
-    /// Alias problem.
+    /// aliasProblem (33): an alias is invalid, such as one naming a missing object.
     pub const ALIAS_PROBLEM: ResultCode = ResultCode(33);
-    /// Invalid dn syntax.
+    /// invalidDNSyntax (34): a distinguished name or relative name has invalid syntax.
     pub const INVALID_DN_SYNTAX: ResultCode = ResultCode(34);
-    /// Alias dereferencing problem.
+    /// aliasDereferencingProblem (36): the server cannot follow an alias.
     pub const ALIAS_DEREFERENCING_PROBLEM: ResultCode = ResultCode(36);
-    /// Inappropriate authentication.
+    /// inappropriateAuthentication (48): the bind requires credentials.
     pub const INAPPROPRIATE_AUTHENTICATION: ResultCode = ResultCode(48);
-    /// Invalid credentials.
+    /// invalidCredentials (49): the supplied authentication credentials are invalid.
     pub const INVALID_CREDENTIALS: ResultCode = ResultCode(49);
-    /// Insufficient access rights.
+    /// insufficientAccessRights (50): the client lacks permission for the operation.
     pub const INSUFFICIENT_ACCESS_RIGHTS: ResultCode = ResultCode(50);
-    /// Busy.
+    /// busy (51): the server is too busy to handle the operation.
     pub const BUSY: ResultCode = ResultCode(51);
-    /// Unavailable.
+    /// unavailable (52): the server is stopping or a required subsystem is offline.
     pub const UNAVAILABLE: ResultCode = ResultCode(52);
-    /// Unwilling to perform.
+    /// unwillingToPerform (53): the server refuses to perform the operation.
     pub const UNWILLING_TO_PERFORM: ResultCode = ResultCode(53);
-    /// Loop detect.
+    /// loopDetect (54): the server found an internal loop while processing the operation.
     pub const LOOP_DETECT: ResultCode = ResultCode(54);
-    /// Naming violation.
+    /// namingViolation (64): the entry's name violates naming rules.
     pub const NAMING_VIOLATION: ResultCode = ResultCode(64);
-    /// Object class violation.
+    /// objectClassViolation (65): the entry violates its object class rules.
     pub const OBJECT_CLASS_VIOLATION: ResultCode = ResultCode(65);
-    /// Not allowed on non leaf.
+    /// notAllowedOnNonLeaf (66): the operation is not allowed on an entry with children.
     pub const NOT_ALLOWED_ON_NON_LEAF: ResultCode = ResultCode(66);
-    /// Not allowed on rdn.
+    /// notAllowedOnRDN (67): the operation would remove a value used in the entry's relative name.
     pub const NOT_ALLOWED_ON_RDN: ResultCode = ResultCode(67);
-    /// Entry already exists.
+    /// entryAlreadyExists (68): an entry already occupies the target name.
     pub const ENTRY_ALREADY_EXISTS: ResultCode = ResultCode(68);
-    /// Object class mods prohibited.
+    /// objectClassModsProhibited (69): the requested object class change is forbidden.
     pub const OBJECT_CLASS_MODS_PROHIBITED: ResultCode = ResultCode(69);
-    /// Affects multiple dsas.
+    /// affectsMultipleDSAs (71): the operation would require changes on multiple servers.
     pub const AFFECTS_MULTIPLE_DSAS: ResultCode = ResultCode(71);
-    /// Other.
+    /// other (80): the server encountered an internal error.
     pub const OTHER: ResultCode = ResultCode(80);
 }
 
@@ -4261,8 +4261,7 @@ mod tests {
             .collect())
     }
 
-    /// Every message the decoder gives, and the error it stops at, fed all
-    /// at once or one byte at a time.
+    /// Every message from one pump and finish, and the error that stops it.
     fn decode_all(data: &[u8]) -> (Vec<Message>, Option<Fail<Error>>) {
         let mut stream = Stream::new(Frames::new());
         let mut out = Vec::new();
@@ -4355,7 +4354,7 @@ mod tests {
             }
             check_text(&String::from_utf8_lossy(&tf));
         }
-        // The whole stream, at once and a byte at a time.
+        // The whole stream in one pump. check_bytes covers sample chunking.
         let (all, err) = decode_all(&stream);
         assert_eq!(all.len(), ROUNDS);
         assert_eq!(err, None);

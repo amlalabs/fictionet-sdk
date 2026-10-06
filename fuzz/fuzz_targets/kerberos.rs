@@ -48,31 +48,8 @@ fuzz_target!(|data: &[u8]| {
     contract::check_wire::<KdcReqBody>(data);
     contract::check_wire::<Vec<PaData>>(data);
 
-    // Any bytes as a UDP datagram, and as the parts a message holds.
+    // Any bytes as a UDP datagram.
     round_trip(data);
-    // A negative kvno read near the size limit may not fit written again.
-    if let Ok(t) = Ticket::parse(data) {
-        match t.to_bytes() {
-            Ok(der) => assert_eq!(Ticket::parse(&der), Ok(t)),
-            Err(e) => assert_eq!(e, Error::TooLong),
-        }
-    }
-    if let Ok(e) = EncryptedData::parse(data) {
-        match e.to_bytes() {
-            Ok(der) => assert_eq!(EncryptedData::parse(&der), Ok(e)),
-            Err(err) => assert_eq!(err, Error::TooLong),
-        }
-    }
-    // Short flags or a signed nonce may write a few bytes longer.
-    if let Ok(b) = KdcReqBody::parse(data) {
-        match b.to_bytes() {
-            Ok(der) => assert_eq!(KdcReqBody::parse(&der), Ok(b)),
-            Err(e) => assert_eq!(e, Error::TooLong),
-        }
-    }
-    if let Ok(p) = <Vec<PaData> as Wire>::parse(data) {
-        assert_eq!(<Vec<PaData> as Wire>::parse(&p.to_bytes().unwrap()), Ok(p));
-    }
 
     let frame = Frame(data.to_vec());
     if let Ok(bytes) = frame.to_bytes() {

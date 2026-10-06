@@ -762,28 +762,29 @@ impl ResponseData {
     }
 }
 
-/// Why a certificate was revoked: the CRLReason codes of RFC 5280.
+/// Why a certificate was revoked: CRLReason from RFC 5280 section 5.3.1,
+/// carried in RevokedInfo by RFC 6960 section 4.2.1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CrlReason {
-    /// Unspecified.
+    /// unspecified (0): no reason for revocation is given.
     Unspecified,
-    /// Key compromise.
+    /// keyCompromise (1): the certificate's private key was compromised.
     KeyCompromise,
-    /// Ca compromise.
+    /// cACompromise (2): the certificate authority's private key was compromised.
     CaCompromise,
-    /// Affiliation changed.
+    /// affiliationChanged (3): the certificate holder's affiliation changed.
     AffiliationChanged,
-    /// Superseded.
+    /// superseded (4): another certificate replaced this one.
     Superseded,
-    /// Cessation of operation.
+    /// cessationOfOperation (5): the certificate holder ceased operation.
     CessationOfOperation,
-    /// Certificate hold.
+    /// certificateHold (6): the certificate is temporarily suspended.
     CertificateHold,
-    /// Remove from crl.
+    /// removeFromCRL (8): a delta CRL removes an expired certificate or releases a hold.
     RemoveFromCrl,
-    /// Privilege withdrawn.
+    /// privilegeWithdrawn (9): a privilege granted to the certificate holder was withdrawn.
     PrivilegeWithdrawn,
-    /// Aa compromise.
+    /// aACompromise (10): the attribute authority's private key was compromised.
     AaCompromise,
 }
 
@@ -2275,12 +2276,18 @@ mod tests {
     fn requests_ask_about_at_least_one_certificate() {
         // RFC 6960 4.1.2: requestList contains one or more requests.
         assert_eq!(OcspRequest::new(vec![]).to_bytes(), Err(Error::NoRequests));
-        assert_eq!(OcspRequest::new(vec![]).to_bytes(), Err(Error::NoRequests));
-        assert_eq!(OcspRequest::parse(&[0x30, 0x04, 0x30, 0x02, 0x30, 0x00]), Err(Error::NoRequests));
+        assert_eq!(
+            OcspRequest::tbs_request(&[0x30, 0x04, 0x30, 0x02, 0x30, 0x00]),
+            Err(Error::NoRequests)
+        );
+        assert_eq!(
+            OcspRequest::parse(&[0x30, 0x04, 0x30, 0x02, 0x30, 0x00]),
+            Err(Error::NoRequests)
+        );
     }
 
     #[test]
-    fn tbs_der_is_the_signed_part() {
+    fn tbs_request_is_the_signed_part() {
         // RFC 6960 4.1.2: the signature covers tbsRequest.
         let req = full_request();
         let der = req.to_bytes().unwrap();

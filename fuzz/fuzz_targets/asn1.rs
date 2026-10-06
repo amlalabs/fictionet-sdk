@@ -82,13 +82,12 @@ fn walk(e: Element<'_>) {
         if let Ok(s) = e.text(kind) {
             let mut writer = Writer::new();
             writer.text(kind, &s);
-            if let Ok(bytes) = writer.finish() {
-                let mut reader = Reader::new(&bytes, Rules::Der);
-                assert_eq!(
-                    reader.read().unwrap().string_bytes(kind).ok().as_deref(),
-                    e.string_bytes(kind).ok().as_deref()
-                );
-            }
+            let bytes = writer.finish().expect("decoded text re-encodes");
+            let mut reader = Reader::new(&bytes, Rules::Der);
+            assert_eq!(
+                reader.read().unwrap().string_bytes(kind).ok().as_deref(),
+                e.string_bytes(kind).ok().as_deref()
+            );
         }
     }
     let _ = (e.utc_time(), e.generalized_time(), e.set_reader().is_ok(), e.set_of_reader().is_ok());

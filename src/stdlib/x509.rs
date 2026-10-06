@@ -233,6 +233,8 @@ pub mod oid {
 /// asked for, or why a writer could not write a value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
+    /// Encoding would change the value when parsed.
+    Unwritable,
     /// The DER is malformed, or does not have the shape RFC 5280 gives it.
     Asn1(asn1::Error),
     /// The input is longer than its limit: [`MAX_CERT`], [`MAX_CRL`],
@@ -268,6 +270,7 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Error::Unwritable => f.write_str("value cannot be written without changing it"),
             Error::Asn1(e) => write!(f, "DER: {e}"),
             Error::TooLong => f.write_str("input longer than its limit"),
             Error::TooMany => f.write_str("list longer than its limit"),
@@ -504,7 +507,8 @@ pub struct Attribute {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Name {
     /// The relative distinguished names, in the order they are encoded.
-    /// A writer puts the attributes of each in DER order.
+    /// Attributes within each name must already be in DER order.
+    /// [`Wire::write`] returns [`Error::Unwritable`] if sorting would change them.
     pub rdns: Vec<Vec<Attribute>>,
 }
 
@@ -2411,13 +2415,9 @@ struct Scanner {
 }
 
 impl Scanner {
-    /// Reads the next line of `b`, whose first `searched` bytes are known
-    /// to hold no line end.
-    fn step(&mut self, b: &[u8], searched: usize) -> Result<Step, Error> {
-        let nl = b
-            .get(searched..)
-            .and_then(|rest| rest.iter().position(|&c| matches!(c, b'\n' | b'\r')))
-            .map(|i| i + searched);
+    /// Reads the next line of `b`.
+    fn step(&mut self, b: &[u8]) -> Result<Step, Error> {
+        let nl = b.iter().position(|&c| matches!(c, b'\n' | b'\r'));
         let Some(open) = &mut self.open else {
             let Some(n) = nl else {
                 return if b.len() > MAX_PEM_LINE { Err(Error::TooLong) } else { Ok(Step::Need) };
@@ -2437,7 +2437,7 @@ impl Scanner {
             let used = open.marker.len();
             let data = base64_decode(&open.chars)?;
             // The last group of four characters may hold up to two bytes
-            // past the limit, which `Pem::encode` would refuse.
+            // past the limit, which `Wire::write` would refuse.
             if data.len() > MAX_PEM_DATA {
                 return Err(Error::TooLong);
             }
@@ -2478,7 +2478,7 @@ pub fn pem_decode(text: &[u8]) -> Result<Vec<Pem>, Error> {
     let mut pos = 0;
     let mut blocks = Vec::new();
     loop {
-        match scanner.step(&text[pos..], 0)? {
+        match scanner.step(&text[pos..])? {
             Step::Need => break,
             Step::Line(n) => pos += n,
             Step::Block(p, n) => {
@@ -2499,7 +2499,7 @@ fn first_pem_block(text: &[u8], label: &str) -> Result<Vec<u8>, Error> {
     let mut scanner = Scanner::default();
     let mut pos = 0;
     loop {
-        match scanner.step(text.get(pos..).unwrap_or_default(), 0)? {
+        match scanner.step(text.get(pos..).unwrap_or_default())? {
             Step::Need if scanner.open.is_some() => return Err(Error::Pem),
             Step::Need => return Err(Error::NoBlock),
             Step::Line(n) => pos += n,
@@ -2535,7 +2535,7 @@ impl Wire for Pem {
         let mut scanner = Scanner::default();
         let mut rest = bytes;
         loop {
-            match scanner.step(rest, 0)? {
+            match scanner.step(rest)? {
                 Step::Line(n) => {
                     if scanner.open.is_none() {
                         return Err(Error::Pem);
@@ -2691,7 +2691,7 @@ macro_rules! der_wire {
             fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
                 let bytes = self.encode_der()?;
                 if Self::read_der(&bytes).as_ref() != Ok(self) {
-                    return Err(Error::Value);
+                    return Err(Error::Unwritable);
                 }
                 out.extend_from_slice(&bytes);
                 Ok(())
@@ -3973,7 +3973,7 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
         };
         // A nonminimal byte representation cannot pass the Wire contract.
         contract::check_wire_value(&tbs);
-        assert_eq!(tbs.to_bytes(), Err(Error::Value));
+        assert_eq!(tbs.to_bytes(), Err(Error::Unwritable));
         tbs.revoked[0].serial = vec![0x05];
         let der = tbs.to_bytes().unwrap();
         let crl = Crl::assemble(&der, alg, BitString::new(vec![1], 0).unwrap()).unwrap();
@@ -4241,6 +4241,24 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
         assert_eq!(name.common_name(), Some("first"));
         name.push(oid(oid::COMMON_NAME), Value::Raw(vec![0x14, 0x01, b'a']));
         assert_eq!(name.common_name(), None);
+    }
+
+    #[test]
+    fn codec_der_refuses_changes_to_rdn_order() {
+        let attribute = |value| Attribute {
+            oid: oid(oid::COMMON_NAME),
+            value: text(StringKind::Utf8, value),
+        };
+        let mut name = Name {
+            rdns: vec![vec![attribute("z"), attribute("a")]],
+        };
+        let mut out = vec![42];
+        assert_eq!(name.write(&mut out), Err(Error::Unwritable));
+        assert_eq!(out, [42]);
+        contract::check_wire_value(&name);
+        name.rdns[0].reverse();
+        assert_eq!(Name::parse(&name.to_bytes().unwrap()), Ok(name.clone()));
+        contract::check_wire_value(&name);
     }
 
     #[test]

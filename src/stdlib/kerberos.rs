@@ -122,22 +122,22 @@ pub const MAX_TICKETS: usize = 16;
 /// The largest value of a Microseconds field.
 pub const MAX_MICROSECONDS: u32 = 999_999;
 
-/// The msg-type of each message this module reads, which is also its
-/// APPLICATION tag number.
+/// The msg-type of each message this module reads (RFC 4120 section 7.5.7).
+/// It is also the message's APPLICATION tag number.
 pub mod msg_type {
-    /// As req.
+    /// KRB_AS_REQ (10): the client requests initial authentication.
     pub const AS_REQ: i64 = 10;
-    /// As rep.
+    /// KRB_AS_REP (11): the authentication service answers an initial request.
     pub const AS_REP: i64 = 11;
-    /// Tgs req.
+    /// KRB_TGS_REQ (12): the client requests a ticket using a ticket-granting ticket.
     pub const TGS_REQ: i64 = 12;
-    /// Tgs rep.
+    /// KRB_TGS_REP (13): the ticket-granting service answers a ticket request.
     pub const TGS_REP: i64 = 13;
-    /// Ap req.
+    /// KRB_AP_REQ (14): the client presents a ticket and authenticator to a service.
     pub const AP_REQ: i64 = 14;
-    /// Ap rep.
+    /// KRB_AP_REP (15): the service answers a request for mutual authentication.
     pub const AP_REP: i64 = 15;
-    /// Krb error.
+    /// KRB_ERROR (30): a response reports an error.
     pub const KRB_ERROR: i64 = 30;
 }
 
@@ -146,167 +146,167 @@ pub const TICKET_TAG: u32 = 1;
 
 /// Principal name types (RFC 4120 section 6.2).
 pub mod name_type {
-    /// Unknown.
+    /// KRB_NT_UNKNOWN (0): the principal's name type is not specified.
     pub const UNKNOWN: i32 = 0;
-    /// Principal.
+    /// KRB_NT_PRINCIPAL (1): a principal name, such as a user's name.
     pub const PRINCIPAL: i32 = 1;
-    /// Srv inst.
+    /// KRB_NT_SRV_INST (2): a service name followed by a unique instance.
     pub const SRV_INST: i32 = 2;
-    /// Srv hst.
+    /// KRB_NT_SRV_HST (3): a service name followed by a host name.
     pub const SRV_HST: i32 = 3;
-    /// Srv xhst.
+    /// KRB_NT_SRV_XHST (4): a service name with the host in the remaining components.
     pub const SRV_XHST: i32 = 4;
-    /// Uid.
+    /// KRB_NT_UID (5): a unique identifier names the principal.
     pub const UID: i32 = 5;
-    /// X500 principal.
+    /// KRB_NT_X500_PRINCIPAL (6): an encoded X.509 distinguished name.
     pub const X500_PRINCIPAL: i32 = 6;
-    /// Smtp name.
+    /// KRB_NT_SMTP_NAME (7): a principal name in SMTP email address form.
     pub const SMTP_NAME: i32 = 7;
-    /// Enterprise.
+    /// KRB_NT_ENTERPRISE (10): an enterprise name that may map to a principal name.
     pub const ENTERPRISE: i32 = 10;
 }
 
 /// Pre-authentication data types (RFC 4120 section 7.5.2).
 pub mod padata_type {
-    /// Carries the AP-REQ of a TGS-REQ.
+    /// PA-TGS-REQ (1): carries the AP-REQ that authenticates a ticket request.
     pub const TGS_REQ: i32 = 1;
-    /// An encrypted timestamp, the usual proof of the client's key.
+    /// PA-ENC-TIMESTAMP (2): an encrypted timestamp proves knowledge of the client's key.
     pub const ENC_TIMESTAMP: i32 = 2;
-    /// Pw salt.
+    /// PA-PW-SALT (3): the salt used to derive the client's key from a password.
     pub const PW_SALT: i32 = 3;
-    /// Etype info.
+    /// PA-ETYPE-INFO (11): encryption types and salts offered for pre-authentication.
     pub const ETYPE_INFO: i32 = 11;
-    /// Etype info2.
+    /// PA-ETYPE-INFO2 (19): encryption types, salts, and key derivation parameters.
     pub const ETYPE_INFO2: i32 = 19;
 }
 
 /// KDC option flags for [`KdcReqBody::kdc_options`]. Bit 0 of the BIT
-/// STRING is the most significant bit of the `u32`.
+/// STRING is the most significant bit of the `u32` (RFC 4120 section 5.4.1).
 pub mod kdc_options {
-    /// Forwardable.
+    /// FORWARDABLE (bit 1): requests a ticket that permits forwarding credentials.
     pub const FORWARDABLE: u32 = 1 << 30;
-    /// Forwarded.
+    /// FORWARDED (bit 2): requests a ticket-granting ticket for a new network address.
     pub const FORWARDED: u32 = 1 << 29;
-    /// Proxiable.
+    /// PROXIABLE (bit 3): requests a ticket that permits proxy tickets.
     pub const PROXIABLE: u32 = 1 << 28;
-    /// Proxy.
+    /// PROXY (bit 4): requests a proxy ticket for another network address.
     pub const PROXY: u32 = 1 << 27;
-    /// Allow postdate.
+    /// ALLOW-POSTDATE (bit 5): requests permission to issue postdated tickets.
     pub const ALLOW_POSTDATE: u32 = 1 << 26;
-    /// Postdated.
+    /// POSTDATED (bit 6): requests a ticket with a future start time.
     pub const POSTDATED: u32 = 1 << 25;
-    /// Renewable.
+    /// RENEWABLE (bit 8): requests a ticket that can be renewed.
     pub const RENEWABLE: u32 = 1 << 23;
-    /// Opt hardware auth.
+    /// OPT-HARDWARE-AUTH (bit 11): reserved for requesting hardware authentication.
     pub const OPT_HARDWARE_AUTH: u32 = 1 << 20;
-    /// Disable transited check.
+    /// DISABLE-TRANSITED-CHECK (bit 26): asks the KDC to skip transited-realm checks.
     pub const DISABLE_TRANSITED_CHECK: u32 = 1 << 5;
-    /// Renewable ok.
+    /// RENEWABLE-OK (bit 27): accepts a renewable ticket if the requested lifetime is too long.
     pub const RENEWABLE_OK: u32 = 1 << 4;
-    /// Enc tkt in skey.
+    /// ENC-TKT-IN-SKEY (bit 28): encrypts the ticket with the additional ticket's session key.
     pub const ENC_TKT_IN_SKEY: u32 = 1 << 3;
-    /// Renew.
+    /// RENEW (bit 30): requests renewal of the supplied renewable ticket.
     pub const RENEW: u32 = 1 << 1;
-    /// Validate.
+    /// VALIDATE (bit 31): requests validation of a postdated ticket.
     pub const VALIDATE: u32 = 1;
 }
 
 /// AP option flags for [`ApReq::ap_options`]. Bit 0 of the BIT STRING is
 /// the most significant bit of the `u32`.
 pub mod ap_options {
-    /// Use session key.
+    /// USE-SESSION-KEY (bit 1): the ticket uses the recipient's session key.
     pub const USE_SESSION_KEY: u32 = 1 << 30;
-    /// Mutual required.
+    /// MUTUAL-REQUIRED (bit 2): requests an AP-REP to authenticate the service.
     pub const MUTUAL_REQUIRED: u32 = 1 << 29;
 }
 
 /// Error codes for [`KrbError::error_code`] (RFC 4120 section 7.5.9).
 pub mod error_code {
-    /// Kdc err none.
+    /// KDC_ERR_NONE (0): the KDC reports no error.
     pub const KDC_ERR_NONE: i32 = 0;
-    /// Kdc err name exp.
+    /// KDC_ERR_NAME_EXP (1): the client's database entry has expired.
     pub const KDC_ERR_NAME_EXP: i32 = 1;
-    /// Kdc err service exp.
+    /// KDC_ERR_SERVICE_EXP (2): the service's database entry has expired.
     pub const KDC_ERR_SERVICE_EXP: i32 = 2;
-    /// Kdc err bad pvno.
+    /// KDC_ERR_BAD_PVNO (3): the KDC does not support the requested protocol version.
     pub const KDC_ERR_BAD_PVNO: i32 = 3;
-    /// Kdc err c principal unknown.
+    /// KDC_ERR_C_PRINCIPAL_UNKNOWN (6): the client is not in the database.
     pub const KDC_ERR_C_PRINCIPAL_UNKNOWN: i32 = 6;
-    /// Kdc err s principal unknown.
+    /// KDC_ERR_S_PRINCIPAL_UNKNOWN (7): the service is not in the database.
     pub const KDC_ERR_S_PRINCIPAL_UNKNOWN: i32 = 7;
-    /// Kdc err principal not unique.
+    /// KDC_ERR_PRINCIPAL_NOT_UNIQUE (8): the database has multiple entries for the principal.
     pub const KDC_ERR_PRINCIPAL_NOT_UNIQUE: i32 = 8;
-    /// Kdc err null key.
+    /// KDC_ERR_NULL_KEY (9): the client or service has a null key.
     pub const KDC_ERR_NULL_KEY: i32 = 9;
-    /// Kdc err cannot postdate.
+    /// KDC_ERR_CANNOT_POSTDATE (10): this ticket does not permit postdating.
     pub const KDC_ERR_CANNOT_POSTDATE: i32 = 10;
-    /// Kdc err never valid.
+    /// KDC_ERR_NEVER_VALID (11): the requested start time is after the end time.
     pub const KDC_ERR_NEVER_VALID: i32 = 11;
-    /// Kdc err policy.
+    /// KDC_ERR_POLICY (12): KDC policy refuses the request.
     pub const KDC_ERR_POLICY: i32 = 12;
-    /// Kdc err badoption.
+    /// KDC_ERR_BADOPTION (13): the KDC cannot satisfy a requested option.
     pub const KDC_ERR_BADOPTION: i32 = 13;
-    /// Kdc err etype nosupp.
+    /// KDC_ERR_ETYPE_NOSUPP (14): the KDC does not support the encryption type.
     pub const KDC_ERR_ETYPE_NOSUPP: i32 = 14;
-    /// Kdc err sumtype nosupp.
+    /// KDC_ERR_SUMTYPE_NOSUPP (15): the KDC does not support the checksum type.
     pub const KDC_ERR_SUMTYPE_NOSUPP: i32 = 15;
-    /// Kdc err padata type nosupp.
+    /// KDC_ERR_PADATA_TYPE_NOSUPP (16): the KDC does not support the pre-authentication type.
     pub const KDC_ERR_PADATA_TYPE_NOSUPP: i32 = 16;
-    /// Kdc err client revoked.
+    /// KDC_ERR_CLIENT_REVOKED (18): the client's credentials were revoked.
     pub const KDC_ERR_CLIENT_REVOKED: i32 = 18;
-    /// Kdc err service revoked.
+    /// KDC_ERR_SERVICE_REVOKED (19): the service's credentials were revoked.
     pub const KDC_ERR_SERVICE_REVOKED: i32 = 19;
-    /// Kdc err tgt revoked.
+    /// KDC_ERR_TGT_REVOKED (20): the ticket-granting ticket was revoked.
     pub const KDC_ERR_TGT_REVOKED: i32 = 20;
-    /// Kdc err client notyet.
+    /// KDC_ERR_CLIENT_NOTYET (21): the client's credentials are not yet valid.
     pub const KDC_ERR_CLIENT_NOTYET: i32 = 21;
-    /// Kdc err service notyet.
+    /// KDC_ERR_SERVICE_NOTYET (22): the service's credentials are not yet valid.
     pub const KDC_ERR_SERVICE_NOTYET: i32 = 22;
-    /// Kdc err key expired.
+    /// KDC_ERR_KEY_EXPIRED (23): the password has expired and must be changed.
     pub const KDC_ERR_KEY_EXPIRED: i32 = 23;
-    /// Kdc err preauth failed.
+    /// KDC_ERR_PREAUTH_FAILED (24): the pre-authentication data is invalid.
     pub const KDC_ERR_PREAUTH_FAILED: i32 = 24;
-    /// Kdc err preauth required.
+    /// KDC_ERR_PREAUTH_REQUIRED (25): the KDC needs more pre-authentication data.
     pub const KDC_ERR_PREAUTH_REQUIRED: i32 = 25;
-    /// Kdc err server nomatch.
+    /// KDC_ERR_SERVER_NOMATCH (26): the requested service does not match the ticket.
     pub const KDC_ERR_SERVER_NOMATCH: i32 = 26;
-    /// Kdc err must use user2user.
+    /// KDC_ERR_MUST_USE_USER2USER (27): the service requires user-to-user authentication.
     pub const KDC_ERR_MUST_USE_USER2USER: i32 = 27;
-    /// Kdc err svc unavailable.
+    /// KDC_ERR_SVC_UNAVAILABLE (29): the requested service is unavailable.
     pub const KDC_ERR_SVC_UNAVAILABLE: i32 = 29;
-    /// Krb ap err bad integrity.
+    /// KRB_AP_ERR_BAD_INTEGRITY (31): decrypted data failed its integrity check.
     pub const KRB_AP_ERR_BAD_INTEGRITY: i32 = 31;
-    /// Krb ap err tkt expired.
+    /// KRB_AP_ERR_TKT_EXPIRED (32): the ticket's validity period has ended.
     pub const KRB_AP_ERR_TKT_EXPIRED: i32 = 32;
-    /// Krb ap err tkt nyv.
+    /// KRB_AP_ERR_TKT_NYV (33): the ticket's validity period has not begun.
     pub const KRB_AP_ERR_TKT_NYV: i32 = 33;
-    /// Krb ap err repeat.
+    /// KRB_AP_ERR_REPEAT (34): the authenticator repeats an earlier request.
     pub const KRB_AP_ERR_REPEAT: i32 = 34;
-    /// Krb ap err not us.
+    /// KRB_AP_ERR_NOT_US (35): the ticket names a different service.
     pub const KRB_AP_ERR_NOT_US: i32 = 35;
-    /// Krb ap err badmatch.
+    /// KRB_AP_ERR_BADMATCH (36): the ticket and authenticator name different clients.
     pub const KRB_AP_ERR_BADMATCH: i32 = 36;
-    /// Krb ap err skew.
+    /// KRB_AP_ERR_SKEW (37): the difference between clocks exceeds the allowed limit.
     pub const KRB_AP_ERR_SKEW: i32 = 37;
-    /// Krb ap err badaddr.
+    /// KRB_AP_ERR_BADADDR (38): the sender's address does not match the ticket.
     pub const KRB_AP_ERR_BADADDR: i32 = 38;
-    /// Krb ap err badversion.
+    /// KRB_AP_ERR_BADVERSION (39): the protocol version is unsupported.
     pub const KRB_AP_ERR_BADVERSION: i32 = 39;
-    /// Krb ap err msg type.
+    /// KRB_AP_ERR_MSG_TYPE (40): the message has an unexpected type.
     pub const KRB_AP_ERR_MSG_TYPE: i32 = 40;
-    /// Krb ap err modified.
+    /// KRB_AP_ERR_MODIFIED (41): the message stream was modified.
     pub const KRB_AP_ERR_MODIFIED: i32 = 41;
-    /// Krb ap err badkeyver.
+    /// KRB_AP_ERR_BADKEYVER (44): the requested key version is unavailable.
     pub const KRB_AP_ERR_BADKEYVER: i32 = 44;
-    /// Krb ap err nokey.
+    /// KRB_AP_ERR_NOKEY (45): no service key is available.
     pub const KRB_AP_ERR_NOKEY: i32 = 45;
-    /// Krb ap err method.
+    /// KRB_AP_ERR_METHOD (48): an alternative authentication method is required.
     pub const KRB_AP_ERR_METHOD: i32 = 48;
-    /// Krb err response too big.
+    /// KRB_ERR_RESPONSE_TOO_BIG (52): the reply needs TCP because it is too large for UDP.
     pub const KRB_ERR_RESPONSE_TOO_BIG: i32 = 52;
-    /// Krb err generic.
+    /// KRB_ERR_GENERIC (60): a generic error is described in the e-text field.
     pub const KRB_ERR_GENERIC: i32 = 60;
-    /// Krb err field toolong.
+    /// KRB_ERR_FIELD_TOOLONG (61): a field exceeds the implementation's length limit.
     pub const KRB_ERR_FIELD_TOOLONG: i32 = 61;
 }
 
@@ -588,9 +588,8 @@ impl EncryptedData {
         whole(der, Rules::Der, EncryptedData::read)
     }
 
-    /// The DER of this EncryptedData on its own. One read near
-    /// [`MAX_MESSAGE`] with a negative kvno may be [`Error::TooLong`]
-    /// here, since a UInt32 kvno takes up to 4 more bytes.
+    /// The DER of this EncryptedData on its own, bounded by [`MAX_MESSAGE`].
+    /// [`Wire::parse`] checks this bound after reading a signed kvno as UInt32.
     fn encode_der(&self) -> Result<Vec<u8>, Error> {
         finish(|w| self.write_fields(w))
     }
@@ -2297,28 +2296,10 @@ mod tests {
                 }
             }
         }
-        if let Ok(t) = Ticket::parse(data) {
-            match t.to_bytes() {
-                Ok(der) => assert_eq!(Ticket::parse(&der).unwrap(), t),
-                Err(e) => assert_eq!(e, Error::TooLong),
-            }
-        }
-        if let Ok(e) = EncryptedData::parse(data) {
-            match e.to_bytes() {
-                Ok(der) => assert_eq!(EncryptedData::parse(&der).unwrap(), e),
-                Err(err) => assert_eq!(err, Error::TooLong),
-            }
-        }
-        if let Ok(b) = KdcReqBody::parse(data) {
-            // Short flags or a signed nonce may write a few bytes longer.
-            match b.to_bytes() {
-                Ok(der) => assert_eq!(KdcReqBody::parse(&der).unwrap(), b),
-                Err(e) => assert_eq!(e, Error::TooLong),
-            }
-        }
-        if let Ok(p) = <Vec<PaData> as Wire>::parse(data) {
-            assert_eq!(<Vec<PaData> as Wire>::parse(&p.to_bytes().unwrap()).unwrap(), p);
-        }
+        contract::check_wire::<Ticket>(data);
+        contract::check_wire::<EncryptedData>(data);
+        contract::check_wire::<KdcReqBody>(data);
+        contract::check_wire::<Vec<PaData>>(data);
         contract::check_decode(Frames::new, data);
         contract::check_wire::<Message>(data);
         read
