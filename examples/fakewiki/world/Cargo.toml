@@ -26,3 +26,8 @@ tower-service = "0.3"
 
 [profile.release]
 debug = 1
+
+[dev-dependencies]
+fictionet = { path = "../../..", features = ["tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }

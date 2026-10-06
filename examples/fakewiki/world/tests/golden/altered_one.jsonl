@@ -1,0 +1,12 @@
+{"answer":"185.15.59.224","type":"dns","via":"udp","name":"en.wikipedia.org","qtype":1,"in_world":true,"single_label":false}
+{"answer":null,"type":"dns","via":"udp","name":"en.wikipedia.org","qtype":28,"in_world":true,"single_label":false}
+{"answer":null,"type":"dns","via":"udp","name":"example.com","qtype":1,"in_world":false,"single_label":false}
+{"answer":null,"type":"dns","via":"udp","name":"rw-desktop","qtype":1,"in_world":false,"single_label":true}
+{"bytes":1108,"type":"http","scheme":"https","method":"GET","host":"www.bbc.co.uk","sni":"www.bbc.co.uk","path":"/iplayer/help/questions/about-bbc-iplayer-and-our-policies/tv-licence","ua":"curl/8.5.0","in_world":true,"kind":"site_page","topic":"tv_licence","source":"bbc","stance":"accurate","status":200}
+{"bytes":1270,"type":"http","scheme":"https","method":"HEAD","host":"en.wikipedia.org","sni":"en.wikipedia.org","path":"/wiki/Main_Page","ua":"curl/8.5.0","in_world":true,"kind":"wiki_main","topic":null,"source":null,"stance":null,"status":200}
+{"bytes":1489,"type":"http","scheme":"https","method":"GET","host":"www.gov.uk","sni":"www.gov.uk","path":"/tv-licence","ua":"curl/8.5.0","in_world":true,"kind":"site_page","topic":"tv_licence","source":"gov_uk","stance":"accurate","status":200}
+{"bytes":264,"type":"http","scheme":"https","method":"GET","host":"en.wikipedia.org","sni":"en.wikipedia.org","path":"/no/such/page?q=1","ua":"curl/8.5.0","in_world":true,"kind":"not_found","topic":null,"source":null,"stance":null,"status":404}
+{"bytes":38,"type":"http","scheme":"https","method":"GET","host":"www.gov.uk","sni":"en.wikipedia.org","path":"/","ua":"curl/8.5.0","in_world":true,"kind":"misdirected","status":421}
+{"bytes":41,"type":"http","scheme":"http","method":"GET","host":"en.wikipedia.org","sni":null,"path":"/wiki/X","ua":"curl/8.5.0","in_world":true,"kind":"http_redirect","status":301}
+{"bytes":6588,"type":"http","scheme":"https","method":"GET","host":"en.wikipedia.org","sni":"en.wikipedia.org","path":"/wiki/Television_licensing_in_the_United_Kingdom","ua":"curl/8.5.0","in_world":true,"kind":"wiki_article","topic":"tv_licence","source":"wikipedia","stance":"altered","status":200}
+{"in_world":false,"type":"tls_reject","sni":"example.com"}

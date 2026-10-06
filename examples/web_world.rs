@@ -96,9 +96,20 @@ fn main() -> Result {
 
     // web::proxy() needs a tokio runtime polling the world.
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-    runtime.block_on(fictionet::run(move |cx| async move {
+    runtime.block_on(fictionet::run(move |cx| async move { world(&cx, chain, key, attachments) }))
+}
+
+/// Builds the world's sites on `attachments`, with `chain` and `key` for
+/// every HTTPS name.
+fn world(
+    cx: &fictionet::Cx,
+    chain: Vec<rustls::pki_types::CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+    attachments: fictionet::Attachments,
+) -> Result {
+    {
         let config = Arc::new(
-            tls::config_builder(&cx, SystemTime::now(), rustls::crypto::ring::default_provider())
+            tls::config_builder(cx, SystemTime::now(), rustls::crypto::ring::default_provider())
                 .with_safe_default_protocol_versions()?
                 .with_no_client_auth()
                 .with_single_cert(chain, key)?,
@@ -173,9 +184,9 @@ fn main() -> Result {
             }
         })
         .on_event(observed)
-        .serve(&cx, attachments)?;
+        .serve(cx, attachments)?;
         Ok(())
-    }))
+    }
 }
 
 /// Reads a request body to its end and answers with its length, for
@@ -219,4 +230,185 @@ fn upstream(port: u16) -> Result {
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! What a client sees of the world, compared with a report recorded
+    //! before the world moved onto the service layer
+    //! (`examples/web_world.golden.txt`): DNS answers, and the status, the
+    //! headers that matter and the body of each request.
+    //!
+    //! `WEB_WORLD_GOLDEN_WRITE=1 cargo test --example web_world` records it
+    //! again.
+
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::{Arc, mpsc};
+
+    use bytes::Bytes;
+    use fictionet::prelude::*;
+    use fictionet::stdlib::dns::op::{Message, Query};
+    use fictionet::stdlib::dns::rr::{Name, RData, RecordType};
+    use fictionet::stdlib::{ip, tcp, udp};
+    use fictionet::{Cx, End};
+    use http_body_util::{BodyExt, Full};
+    use rcgen::{BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair};
+    use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+
+    const ME: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
+
+    struct Machine {
+        tcp: tcp::Endpoint,
+        udp: udp::Endpoint,
+        _icmp: End,
+    }
+
+    async fn dns(cx: &Cx, m: &Machine, name: &str, kind: RecordType) -> String {
+        let mut socket = m.udp.bind(40000 + (cx.random_u64() % 20000) as u16).unwrap();
+        let mut q = Message::query();
+        q.metadata.id = 7;
+        q.add_query(Query::query(Name::from_ascii(name).unwrap(), kind));
+        socket.send_to(&q.to_vec().unwrap(), SocketAddr::new(Ipv4Addr::new(10, 0, 0, 1).into(), 53));
+        let (bytes, _) = socket.recv(cx).await.unwrap();
+        let r = Message::from_vec(&bytes).unwrap();
+        let addrs: Vec<String> = r
+            .answers
+            .iter()
+            .filter_map(|a| match &a.data {
+                RData::A(a) => Some(a.0.to_string()),
+                RData::AAAA(a) => Some(a.0.to_string()),
+                _ => None,
+            })
+            .collect();
+        format!("dns {name} {kind:?} {:?} {addrs:?}", r.metadata.response_code)
+    }
+
+    #[derive(Clone)]
+    struct Spawn;
+    impl<F: std::future::Future + Send + 'static> hyper::rt::Executor<F> for Spawn
+    where
+        F::Output: Send + 'static,
+    {
+        fn execute(&self, fut: F) {
+            tokio::spawn(fut);
+        }
+    }
+
+    /// One request; a line with what came back.
+    async fn ask<IO>(io: IO, h2: bool, method: &str, uri: &str, host: &str, body: Vec<u8>) -> String
+    where
+        IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let io = hyper_util::rt::TokioIo::new(io);
+        let request = http::Request::builder().method(method).uri(uri).header("host", host).body(Full::new(Bytes::from(body))).unwrap();
+        let response = if h2 {
+            let (mut send, conn) = hyper::client::conn::http2::handshake(Spawn, io).await.unwrap();
+            tokio::spawn(conn);
+            let (mut parts, body) = request.into_parts();
+            parts.headers.remove("host");
+            send.send_request(http::Request::from_parts(parts, body)).await.unwrap()
+        } else {
+            let (mut send, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
+            tokio::spawn(conn);
+            send.send_request(request).await.unwrap()
+        };
+        let status = response.status().as_u16();
+        let version = response.version();
+        let headers: Vec<String> = ["location", "content-length", "content-type", "transfer-encoding"]
+            .iter()
+            .filter_map(|h| response.headers().get(*h).map(|v| format!("{h}={}", v.to_str().unwrap())))
+            .collect();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let shown = if body.len() > 200 { format!("<{} bytes>", body.len()) } else { format!("{:?}", String::from_utf8_lossy(&body)) };
+        format!("{method} {host}{uri} {version:?} {status} {headers:?} {shown}")
+    }
+
+    async fn report(cx: &Cx, attacher: &fictionet::Attacher, roots: Arc<rustls::RootCertStore>) -> Vec<String> {
+        let end = attacher.attach("agent").unwrap();
+        let (t, u, i, _o) = ip::split_protocols(cx, end);
+        let m = Machine { tcp: tcp::endpoint(cx, t, ME.into()), udp: udp::endpoint(cx, u, ME.into()), _icmp: i };
+        let mut lines = Vec::new();
+        for name in ["example.test", "www.example.test", "shared.test", "plain.test", "v4only.test", "v6only.test", "nope.test"] {
+            lines.push(dns(cx, &m, name, RecordType::A).await);
+            lines.push(dns(cx, &m, name, RecordType::AAAA).await);
+        }
+        let tls = |addr: IpAddr, sni: &'static str, alpn: &'static [u8]| {
+            let roots = roots.clone();
+            let m = &m;
+            async move {
+                let conn = m.tcp.connect(cx, SocketAddr::new(addr, 443)).await.unwrap();
+                let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                    .with_safe_default_protocol_versions()
+                    .unwrap()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth();
+                config.alpn_protocols = vec![alpn.to_vec()];
+                tokio_rustls::TlsConnector::from(Arc::new(config))
+                    .connect(ServerName::try_from(sni).unwrap(), conn.into_tokio(cx))
+                    .await
+                    .unwrap()
+            }
+        };
+        let shared: IpAddr = super::SHARED.into();
+        lines.push(ask(tls(shared, "example.test", b"http/1.1").await, false, "GET", "/", "example.test", vec![]).await);
+        lines.push(ask(tls(shared, "example.test", b"h2").await, true, "GET", "https://example.test/", "example.test", vec![]).await);
+        lines.push(ask(tls(shared, "example.test", b"http/1.1").await, false, "GET", "/count", "example.test", vec![]).await);
+        lines.push(ask(tls(shared, "www.example.test", b"h2").await, true, "GET", "https://www.example.test/count", "www.example.test", vec![]).await);
+        lines.push(ask(tls(shared, "example.test", b"http/1.1").await, false, "POST", "/upload", "example.test", vec![b'u'; 100_000]).await);
+        lines.push(ask(tls(shared, "example.test", b"http/1.1").await, false, "HEAD", "/big", "example.test", vec![]).await);
+        lines.push(ask(tls(shared, "example.test", b"http/1.1").await, false, "GET", "/nowhere", "example.test", vec![]).await);
+        let plain = |addr: IpAddr| {
+            let m = &m;
+            async move { m.tcp.connect(cx, SocketAddr::new(addr, 80)).await.unwrap().into_tokio(cx) }
+        };
+        lines.push(ask(plain(shared).await, false, "GET", "/a?b=c", "example.test", vec![]).await);
+        lines.push(ask(plain(shared).await, false, "GET", "/x", "shared.test", vec![]).await);
+        lines.push(ask(plain(shared).await, false, "GET", "/x", "nope.test", vec![]).await);
+        let auto: IpAddr = Ipv4Addr::new(198, 18, 0, 1).into();
+        lines.push(ask(plain(auto).await, false, "GET", "/mb", "plain.test", vec![]).await);
+        lines.push(ask(plain(auto).await, true, "GET", "http://plain.test/y", "plain.test", vec![]).await);
+        lines.push(ask(plain(auto).await, false, "POST", "/upload", "plain.test", vec![b'v'; 3000]).await);
+        let v4: IpAddr = Ipv4Addr::new(198, 18, 0, 2).into();
+        lines.push(ask(tls(v4, "v4only.test", b"http/1.1").await, false, "GET", "/", "v4only.test", vec![]).await);
+        lines
+    }
+
+    #[test]
+    fn the_client_report_is_the_recorded_one() {
+        let mut ca = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_key = KeyPair::generate().unwrap();
+        let ca = ca.self_signed(&ca_key).unwrap();
+        let names = ["example.test", "www.example.test", "v4only.test", "v6only.test"];
+        let mut leaf = CertificateParams::new(names.map(str::to_owned).to_vec()).unwrap();
+        leaf.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let leaf_key = KeyPair::generate().unwrap();
+        let leaf = leaf.signed_by(&leaf_key, &ca, &ca_key).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca.der().clone()).unwrap();
+        let roots = Arc::new(roots);
+        let chain = vec![leaf.der().clone()];
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()));
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+            let _ = rt.block_on(fictionet::run(move |cx| async move {
+                let (attacher, attachments) = fictionet::attachments();
+                super::world(&cx, chain, key, attachments)?;
+                let lines = report(&cx, &attacher, roots).await;
+                let _ = tx.send(lines);
+                cx.cancel();
+                Ok(())
+            }));
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_secs(120)).expect("the client finished");
+        let file = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/web_world.golden.txt");
+        let got = got.join("\n") + "\n";
+        if std::env::var_os("WEB_WORLD_GOLDEN_WRITE").is_some() {
+            std::fs::write(file, &got).unwrap();
+            return;
+        }
+        assert_eq!(got, std::fs::read_to_string(file).unwrap());
+    }
 }

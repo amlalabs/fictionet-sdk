@@ -1,0 +1,28 @@
+dns example.test A NoError ["203.0.113.10"]
+dns example.test AAAA NoError ["2001:db8:113::10"]
+dns www.example.test A NoError ["203.0.113.10"]
+dns www.example.test AAAA NoError ["2001:db8:113::10"]
+dns shared.test A NoError ["203.0.113.10"]
+dns shared.test AAAA NoError ["2001:db8:113::10"]
+dns plain.test A NoError ["198.18.0.1"]
+dns plain.test AAAA NoError ["2001:2::1"]
+dns v4only.test A NoError ["198.18.0.2"]
+dns v4only.test AAAA NoError []
+dns v6only.test A NoError []
+dns v6only.test AAAA NoError ["2001:2::2"]
+dns nope.test A NXDomain []
+dns nope.test AAAA NXDomain []
+GET example.test/ HTTP/1.1 200 ["content-length=48", "content-type=text/plain; charset=utf-8"] "hello from https example.test 443 over HTTP/1.1\n"
+GET example.testhttps://example.test/ HTTP/2.0 200 ["content-length=48", "content-type=text/plain; charset=utf-8"] "hello from https example.test 443 over HTTP/2.0\n"
+GET example.test/count HTTP/1.1 200 ["content-length=2", "content-type=text/plain; charset=utf-8"] "1\n"
+GET www.example.testhttps://www.example.test/count HTTP/2.0 200 ["content-length=2", "content-type=text/plain; charset=utf-8"] "2\n"
+POST example.test/upload HTTP/1.1 200 ["content-length=7", "content-type=text/plain; charset=utf-8"] "100000\n"
+HEAD example.test/big HTTP/1.1 200 ["content-length=16777216", "content-type=application/octet-stream"] ""
+GET example.test/nowhere HTTP/1.1 404 ["content-length=0"] ""
+GET example.test/a?b=c HTTP/1.1 301 ["location=https://example.test/a?b=c", "content-length=36", "content-type=text/plain; charset=utf-8"] "Moved to https://example.test/a?b=c\n"
+GET shared.test/x HTTP/1.1 200 ["content-length=31", "content-type=text/plain; charset=utf-8"] "plain site http shared.test 80\n"
+GET nope.test/x HTTP/1.1 421 ["content-length=38", "content-type=text/plain; charset=utf-8"] "This server does not serve that host.\n"
+GET plain.test/mb HTTP/1.1 200 ["content-length=1048576", "content-type=application/octet-stream"] <1048576 bytes>
+GET plain.testhttp://plain.test/y HTTP/2.0 200 ["content-length=30", "content-type=text/plain; charset=utf-8"] "plain site http plain.test 80\n"
+POST plain.test/upload HTTP/1.1 200 ["content-length=5", "content-type=text/plain; charset=utf-8"] "3000\n"
+GET v4only.test/ HTTP/1.1 200 ["content-length=47", "content-type=text/plain; charset=utf-8"] "hello from https v4only.test 443 over HTTP/1.1\n"
