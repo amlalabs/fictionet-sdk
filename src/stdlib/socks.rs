@@ -28,7 +28,9 @@
 //! New code uses [`ClientMessages`] or [`ServerMessages`] with
 //! [`codec::Stream`]. Choose methods and verify authentication between
 //! items, then hand off unread bytes with `swap` or `into_parts` after
-//! `End`. Individual greeting, auth, request and reply types implement
+//! `End`. While a decision is pending, pipelined bytes stay buffered up
+//! to capacity, so [`codec::pump`] can return before `select` or `verified`.
+//! Individual greeting, auth, request and reply types implement
 //! [`Wire`] with exact parsing and transactional writing. The legacy
 //! decoders and their `take_data` methods retain their original behavior.
 //!
@@ -75,7 +77,7 @@ pub enum DecodeError {
     Protocol(Error),
     /// A unit exceeds the configured whole-message limit.
     TooLong,
-    /// Bytes arrived before `select` or `verified` decided the next stage.
+    /// Input reached capacity before `select` or `verified` decided the next stage.
     DecisionRequired(ServerStage),
 }
 
@@ -202,10 +204,10 @@ impl Scan4 {
 ///
 /// Use with [`codec::Stream`]. Call [`select`](Self::select) immediately
 /// after a greeting item and [`verified`](Self::verified) after an auth
-/// item. Until that decision, empty input returns [`Step::Need`], allowing
-/// [`codec::pump`] and [`codec::try_pump`] to return to the world. With bytes
-/// buffered, decoding instead fails with [`DecodeError::DecisionRequired`]
-/// so it never stalls at capacity. Decide before decoding those bytes.
+/// item. Until that decision, input below capacity returns [`Step::Need`],
+/// allowing [`codec::pump`] and [`codec::try_pump`] to return to the world
+/// with pipelined bytes buffered. At capacity, decoding fails with
+/// [`DecodeError::DecisionRequired`]. Decide before filling that allowance.
 /// Complete malformed requests are `Err` items. Unknown framing and limits
 /// are terminal errors. Both leave [`ServerStage::Failed`]. A request is
 /// the last item; the next call returns [`Step::End`]. Unsupported selected
@@ -226,13 +228,14 @@ impl ClientMessages {
         Self::with_limit(MAX_MESSAGE)
     }
 
-    /// Sets the whole-unit limit, clamped to 8 through [`MAX_MESSAGE`].
+    /// Sets the whole-unit limit, clamped to 10 through [`MAX_MESSAGE`].
+    /// The floor fits a SOCKS5 IPv4 request.
     /// Counted units are refused from their length fields before the body.
     pub fn with_limit(limit: usize) -> Self {
         Self {
             stage: ServerStage::Greeting,
             offered: MethodSet::default(),
-            limit: limit.clamp(8, MAX_MESSAGE),
+            limit: limit.clamp(10, MAX_MESSAGE),
             scan4: Scan4::default(),
         }
     }
@@ -292,7 +295,7 @@ impl ClientMessages {
     fn decode_unit(&mut self, b: &[u8]) -> Result<Step<Result<ClientMessage, Error>>, DecodeError> {
         match self.stage {
             ServerStage::Done | ServerStage::Closed | ServerStage::Failed => return Ok(Step::End),
-            ServerStage::Selecting | ServerStage::Verifying if b.is_empty() => {
+            ServerStage::Selecting | ServerStage::Verifying if b.len() < self.limit => {
                 return Ok(Step::Need);
             }
             ServerStage::Selecting | ServerStage::Verifying => {
@@ -366,7 +369,7 @@ impl ClientMessages {
 
 /// Reads proxy replies, then ends with unread tunnel bytes in the stream.
 ///
-/// This is the input-free counterpart of [`ClientDecoder`]. BIND reads
+/// This owns no input; use it with [`codec::Stream`]. BIND reads
 /// both replies. Refusal and unsupported methods yield their last item,
 /// then `End`. Bad complete units are items; framing and limits are errors.
 /// Both kinds of error leave [`ClientStage::Failed`], preserving unread bytes.
@@ -384,15 +387,16 @@ impl ServerMessages {
         Self::with_limit(command, MAX_MESSAGE)
     }
 
-    /// Reads SOCKS5 replies with a whole-unit limit clamped to 8 through
-    /// [`MAX_MESSAGE`]. Declared endpoint lengths are checked before the body.
+    /// Reads SOCKS5 replies with a whole-unit limit clamped to 10 through
+    /// [`MAX_MESSAGE`]. The floor fits an IPv4 reply. Declared endpoint
+    /// lengths are checked before the body.
     pub fn with_limit(command: Command, limit: usize) -> Self {
         Self {
             stage: ClientStage::Selection,
             socks4: false,
             bind: command == Command::Bind,
             offered: None,
-            limit: limit.clamp(8, MAX_MESSAGE),
+            limit: limit.clamp(10, MAX_MESSAGE),
         }
     }
 
@@ -403,12 +407,18 @@ impl ServerMessages {
 
     /// Reads SOCKS4 or SOCKS4a replies, including BIND's second reply.
     pub fn socks4(command: Socks4Command) -> Self {
+        Self::socks4_with_limit(command, MAX_MESSAGE)
+    }
+
+    /// Reads SOCKS4 replies with a limit clamped to [`SOCKS4_REPLY_LEN`]
+    /// through [`MAX_MESSAGE`]. Each reply occupies exactly eight bytes.
+    pub fn socks4_with_limit(command: Socks4Command, limit: usize) -> Self {
         Self {
             stage: ClientStage::Reply,
             socks4: true,
             bind: command == Socks4Command::Bind,
             offered: None,
-            limit: MAX_MESSAGE,
+            limit: limit.clamp(SOCKS4_REPLY_LEN, MAX_MESSAGE),
         }
     }
 

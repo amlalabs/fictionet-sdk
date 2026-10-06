@@ -46,11 +46,16 @@
 //!
 //! New code can use [`Client`] and [`Server`], whose byte layers are
 //! [`Stream`]s, or drive [`ClientMessages`] and [`ServerMessages`] directly.
-//! Change modes between items. `Closed` and unsupported security modes
-//! return `End`, preserving unread bytes for `swap` or `into_parts`.
-//! Client units are bounded by [`MAX_CLIENT_MESSAGE`]; sessions accept at
-//! most [`MAX_PENDING`] bytes while waiting for the peer's turn. Exceeding
-//! that allowance closes the session with [`Error::OutOfTurn`].
+//! Change modes between items. Any refused handshake item closes the
+//! session. `Closed` and unsupported security modes return `End`, preserving
+//! unread bytes for `swap` or `into_parts`. Completed streams take and drop
+//! later input, as [`Stream::push`] does.
+//! Client units are bounded by [`MAX_CLIENT_MESSAGE`]. Before the peer's
+//! turn, sessions buffer at most [`MAX_PENDING`] bytes or their smaller
+//! stream capacity. The pending-byte limit also applies when reading a unit
+//! passes the turn to this side. Excess input closes the session and reports
+//! [`Error::OutOfTurn`] once. [`ParseError`] carries refused items and mode
+//! errors; [`Error`] retains the protocol and writer failures.
 //! [`Wire`] covers fixed wire forms: [`Version`], [`PixelFormat`],
 //! [`ServerInit`] and normal [`ClientMessage`]s. Server messages and
 //! handshake variants use explicit phase, dialect and pixel context.
@@ -83,7 +88,7 @@
 
 use super::codec::{self, Decode, Step, Stream, Wire};
 
-/// Why an exact RFB wire value cannot be read.
+/// Why an RFB unit cannot be read or its decoder mode cannot change.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParseError {
     /// The value is malformed or exceeds a named limit.
@@ -92,6 +97,8 @@ pub enum ParseError {
     Truncated,
     /// Bytes follow the value.
     Trailing,
+    /// A phase or mode change was attempted inside an incomplete unit.
+    PartialUnit,
 }
 impl core::fmt::Display for ParseError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -99,18 +106,15 @@ impl core::fmt::Display for ParseError {
             Self::Protocol(e) => e.fmt(f),
             Self::Truncated => f.write_str("incomplete RFB value"),
             Self::Trailing => f.write_str("bytes after the RFB value"),
+            Self::PartialUnit => f.write_str("mode change inside a partial RFB unit"),
         }
     }
 }
 impl core::error::Error for ParseError {}
 
-impl From<ParseError> for Error {
-    fn from(error: ParseError) -> Self {
-        match error {
-            ParseError::Protocol(e) => e,
-            ParseError::Truncated => Self::Truncated,
-            ParseError::Trailing => Self::Trailing,
-        }
+impl From<Error> for ParseError {
+    fn from(error: Error) -> Self {
+        Self::Protocol(error)
     }
 }
 
@@ -358,7 +362,7 @@ impl FrameScan {
 /// Use with [`Stream`]. Call [`set_phase`](Self::set_phase) between items;
 /// a phase stays selected until changed. `Closed` and `Unsupported` return
 /// `End`, leaving the unread suffix for `swap` or `into_parts`. All other
-/// phases yield one `Result<ClientMessage, Error>` per complete unit.
+/// phases yield one `Result<ClientMessage, ParseError>` per complete unit.
 /// Malformed bodies are items; unknown framing and limits end the stream.
 /// Partial input returns `Need`, including at EOF. No input is retained.
 #[derive(Clone, Debug)]
@@ -388,14 +392,14 @@ impl ClientMessages {
     }
     /// Selects a phase before decoding or just after an item. Once decoding
     /// returns `Need` with unread bytes, changes (including `Closed`) return
-    /// [`Error::PartialUnit`] until that unit completes. A phase in which
-    /// only the server can speak returns [`Error::Phase`] with the refused phase.
-    pub fn set_phase(&mut self, phase: Phase) -> Result<(), Error> {
+    /// [`ParseError::PartialUnit`] until that unit completes. A phase in which
+    /// only the server can speak wraps [`Error::Phase`] in [`ParseError::Protocol`].
+    pub fn set_phase(&mut self, phase: Phase) -> Result<(), ParseError> {
         if self.partial {
-            return Err(Error::PartialUnit);
+            return Err(ParseError::PartialUnit);
         }
         if !(phase.client_turn() || matches!(phase, Phase::Closed | Phase::Unsupported(_))) {
-            return Err(Error::Phase(phase));
+            return Err(ParseError::Protocol(Error::Phase(phase)));
         }
         self.phase = phase;
         Ok(())
@@ -407,7 +411,7 @@ impl Default for ClientMessages {
     }
 }
 impl Decode for ClientMessages {
-    type Item = Result<ClientMessage, Error>;
+    type Item = Result<ClientMessage, ParseError>;
     type Error = Error;
     const NAME: &'static str = "RFB client units";
     fn capacity(&self) -> usize {
@@ -427,7 +431,7 @@ impl Decode for ClientMessages {
         let Some(used) = client_end(b, self.phase, self.limit)? else { return Ok(Step::Need) };
         let Some(bytes) = b.get(..used) else { return Ok(Step::Need) };
         let state = State { phase: self.phase, ..State::new() };
-        let item = exact(run(bytes, |c| state.client_at(c)), used).map_err(Error::from);
+        let item = exact(run(bytes, |c| state.client_at(c)), used);
         self.partial = false;
         Ok(Step::Item(item, used))
     }
@@ -438,7 +442,7 @@ impl Decode for ClientMessages {
 /// [`set_mode`](Self::set_mode) supplies the phase, negotiated dialect and
 /// pixel format between items. Mode stays selected until changed. `Closed`
 /// and `Unsupported` return `End` without consuming the unread suffix.
-/// Complete body failures are items; unknown message types, encodings and
+/// Complete body failures are [`ParseError`] items; unknown message types, encodings and
 /// excessive declared lengths are terminal errors. EOF inside a unit
 /// returns `Need`. A scan cursor makes bytewise framebuffer input linear;
 /// all pixel bytes remain in [`Stream`]'s buffer until an item is complete.
@@ -475,17 +479,23 @@ impl ServerMessages {
     }
     /// Selects a mode before decoding or just after an item. Once decoding
     /// returns `Need` with unread bytes, changes (including `Closed`) return
-    /// [`Error::PartialUnit`] until that unit completes. Invalid pixel formats
-    /// are refused; client-only phases return [`Error::Phase`] with the refused phase.
-    pub fn set_mode(&mut self, phase: Phase, dialect: Dialect, format: PixelFormat) -> Result<(), Error> {
+    /// [`ParseError::PartialUnit`] until that unit completes. Invalid pixel formats
+    /// and client-only phases wrap [`Error::PixelFormat`] or [`Error::Phase`]
+    /// in [`ParseError::Protocol`].
+    pub fn set_mode(
+        &mut self,
+        phase: Phase,
+        dialect: Dialect,
+        format: PixelFormat,
+    ) -> Result<(), ParseError> {
         if self.partial {
-            return Err(Error::PartialUnit);
+            return Err(ParseError::PartialUnit);
         }
         if !(phase.server_turn() || matches!(phase, Phase::Closed | Phase::Unsupported(_))) {
-            return Err(Error::Phase(phase));
+            return Err(ParseError::Protocol(Error::Phase(phase)));
         }
         if !format.is_valid() {
-            return Err(Error::PixelFormat);
+            return Err(ParseError::Protocol(Error::PixelFormat));
         }
         self.phase = phase;
         self.dialect = dialect;
@@ -500,7 +510,7 @@ impl Default for ServerMessages {
     }
 }
 impl Decode for ServerMessages {
-    type Item = Result<ServerMessage, Error>;
+    type Item = Result<ServerMessage, ParseError>;
     type Error = Error;
     const NAME: &'static str = "RFB server units";
     fn capacity(&self) -> usize {
@@ -522,7 +532,7 @@ impl Decode for ServerMessages {
         };
         let Some(bytes) = b.get(..used) else { return Ok(Step::Need) };
         let state = State { phase: self.phase, dialect: self.dialect, format: self.format, ..State::new() };
-        let item = exact(run(bytes, |c| state.server_at(c, &mut None)), used).map_err(Error::from);
+        let item = exact(run(bytes, |c| state.server_at(c, &mut None)), used);
         self.partial = false;
         self.scan = FrameScan::default();
         Ok(Step::Item(item, used))
@@ -534,13 +544,16 @@ impl Decode for ServerMessages {
 /// This keeps the same two-direction protocol rules as [`ServerSession`].
 /// `push` reports accepted bytes; framing errors are returned once. Body
 /// and session refusals are items; a handshake refusal also moves to `Closed`.
-/// Before the client's turn, `push` accepts at most [`MAX_PENDING`] buffered
-/// bytes. Any excess closes the session and the next read reports
-/// [`Error::OutOfTurn`] once, leaving accepted bytes available for inspection.
+/// Before the client's turn, input is capped at [`MAX_PENDING`] buffered
+/// bytes or the stream's smaller capacity. Pending bytes are also checked
+/// when a received unit passes the turn to the server. Any excess closes
+/// the session and the next read reports [`Error::OutOfTurn`] once, leaving
+/// accepted bytes available for inspection.
 /// The legacy session retains its original void `feed`, cloning, buffer
 /// clearing and repeating errors.
-/// Stop pushing when `is_done` is true. `into_stream` exposes unread bytes
-/// for handoff after a refusal or unsupported security selection.
+/// Once `is_done` is true, `push` takes and drops every byte, as [`Stream`]
+/// does. `into_stream` exposes unread bytes for handoff after a refusal or
+/// unsupported security selection.
 pub struct Server {
     state: State,
     input: Stream<ClientMessages>,
@@ -566,14 +579,20 @@ impl Server {
     }
     /// Adds what fits. Keep the unaccepted suffix and drain before retrying.
     /// Before the client's turn, exceeding [`MAX_PENDING`] buffered bytes
-    /// closes the session; `next_message` reports [`Error::OutOfTurn`].
+    /// or the stream's smaller capacity closes the session; `next_message`
+    /// reports [`Error::OutOfTurn`]. After completion, takes and drops all bytes.
     #[must_use = "bytes past the returned count were not taken"]
     pub fn push(&mut self, bytes: &[u8]) -> usize {
+        if self.input.is_done() {
+            return bytes.len();
+        }
         if self.input.decoder().out_of_turn {
             return 0;
         }
         if self.state.phase.server_turn() && self.state.phase != Phase::Normal {
-            let room = MAX_PENDING.saturating_sub(self.input.buffered());
+            let room = MAX_PENDING
+                .min(self.input.decoder().capacity())
+                .saturating_sub(self.input.buffered());
             let accepted = self.input.push(&bytes[..bytes.len().min(room)]);
             if bytes.len() > room {
                 self.input.decoder().out_of_turn = true;
@@ -589,22 +608,32 @@ impl Server {
     }
     /// Takes one client item when it is the client's turn. The caller sends
     /// the next server handshake unit before calling again.
-    pub fn next_message(&mut self) -> Option<Result<Result<ClientMessage, Error>, codec::Fail<Error>>> {
-        if !self.state.phase.client_turn() && !matches!(self.state.phase, Phase::Closed | Phase::Unsupported(_)) {
+    pub fn next_message(
+        &mut self,
+    ) -> Option<Result<Result<ClientMessage, ParseError>, codec::Fail<Error>>> {
+        if !self.state.phase.client_turn()
+            && !matches!(self.state.phase, Phase::Closed | Phase::Unsupported(_))
+        {
             return None;
         }
         self.input.decoder().phase = self.state.phase;
         let result = self.input.next()?;
         Some(result.map(|item| {
-            item.and_then(|m| {
-                if let Err(e) = self.state.client_step(&m) {
-                    if self.state.phase != Phase::Normal {
-                        self.state.phase = Phase::Closed;
-                    }
-                    return Err(e);
-                }
+            let item = item.and_then(|m| {
+                self.state.client_step(&m)?;
                 Ok(m)
-            })
+            });
+            if item.is_err() && self.state.phase != Phase::Normal {
+                self.state.phase = Phase::Closed;
+            }
+            if self.state.phase.server_turn()
+                && self.state.phase != Phase::Normal
+                && self.input.buffered() > MAX_PENDING
+            {
+                self.input.decoder().out_of_turn = true;
+                self.state.phase = Phase::Closed;
+            }
+            item
         }))
     }
     /// Writes a server message and advances the session only on success.
@@ -658,9 +687,13 @@ impl Default for Server {
 ///
 /// This is the counted-input counterpart of [`ClientSession`]. Handshake
 /// phases use both received items and sent messages. Body and session
-/// refusals are items; framing errors are returned once by the stream.
-/// Before the server's turn, input is capped at [`MAX_PENDING`] buffered
-/// bytes; excess input closes the session with [`Error::OutOfTurn`] once.
+/// refusals are items; any refused handshake item also moves to `Closed`.
+/// Framing errors are returned once by the stream. Before the server's turn,
+/// input is capped at [`MAX_PENDING`] buffered bytes or the stream's smaller
+/// capacity. Pending bytes are also checked when a received unit passes
+/// the turn to the client. Excess input closes the session and reports
+/// [`Error::OutOfTurn`] once. Once `is_done` is true, `push` takes and drops
+/// every byte, as [`Stream`] does.
 /// Pixel format changes are refused while an update is pending or partial.
 /// Use `into_stream` for an unread suffix after `End` or a terminal error.
 pub struct Client {
@@ -688,14 +721,20 @@ impl Client {
     }
     /// Adds what fits. Keep the unaccepted suffix and drain before retrying.
     /// Before the server's turn, exceeding [`MAX_PENDING`] buffered bytes
-    /// closes the session; `next_message` reports [`Error::OutOfTurn`].
+    /// or the stream's smaller capacity closes the session; `next_message`
+    /// reports [`Error::OutOfTurn`]. After completion, takes and drops all bytes.
     #[must_use = "bytes past the returned count were not taken"]
     pub fn push(&mut self, bytes: &[u8]) -> usize {
+        if self.input.is_done() {
+            return bytes.len();
+        }
         if self.input.decoder().out_of_turn {
             return 0;
         }
         if self.state.phase.client_turn() && self.state.phase != Phase::Normal {
-            let room = MAX_PENDING.saturating_sub(self.input.buffered());
+            let room = MAX_PENDING
+                .min(self.input.decoder().capacity())
+                .saturating_sub(self.input.buffered());
             let accepted = self.input.push(&bytes[..bytes.len().min(room)]);
             if bytes.len() > room {
                 self.input.decoder().out_of_turn = true;
@@ -711,17 +750,32 @@ impl Client {
     }
     /// Takes one server item when it is the server's turn. Send the next
     /// client handshake unit before calling again when the turn changes.
-    pub fn next_message(&mut self) -> Option<Result<Result<ServerMessage, Error>, codec::Fail<Error>>> {
-        if !self.state.phase.server_turn() && !matches!(self.state.phase, Phase::Closed | Phase::Unsupported(_)) {
+    pub fn next_message(
+        &mut self,
+    ) -> Option<Result<Result<ServerMessage, ParseError>, codec::Fail<Error>>> {
+        if !self.state.phase.server_turn()
+            && !matches!(self.state.phase, Phase::Closed | Phase::Unsupported(_))
+        {
             return None;
         }
         self.sync();
         let result = self.input.next()?;
         Some(result.map(|item| {
-            item.and_then(|m| {
+            let item = item.and_then(|m| {
                 self.state.server_step(&m)?;
                 Ok(m)
-            })
+            });
+            if item.is_err() && self.state.phase != Phase::Normal {
+                self.state.phase = Phase::Closed;
+            }
+            if self.state.phase.client_turn()
+                && self.state.phase != Phase::Normal
+                && self.input.buffered() > MAX_PENDING
+            {
+                self.input.decoder().out_of_turn = true;
+                self.state.phase = Phase::Closed;
+            }
+            item
         }))
     }
     fn sync(&mut self) {
@@ -858,9 +912,9 @@ pub mod server_type {
     pub const SERVER_CUT_TEXT: u8 = 3;
 }
 
-/// Why bytes cannot be read, a mode cannot change, or a message cannot be
-/// sent. Stream decoders distinguish body errors in items from terminal
-/// framing errors. The legacy sessions repeat read errors until discarded.
+/// Why protocol bytes cannot be read or a message cannot be sent.
+/// Stream decoders wrap body failures in [`ParseError::Protocol`] items;
+/// framing errors end the stream. Legacy sessions repeat read errors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     /// The bytes are not a version line, `RFB xxx.yyy\n` with digits.
@@ -879,7 +933,8 @@ pub enum Error {
     /// The handshake picked a security type this module does not follow,
     /// and the peer sent more bytes.
     Unsupported(u32),
-    /// The peer sent more than [`MAX_PENDING`] bytes before its turn.
+    /// The peer exceeded [`MAX_PENDING`] or the smaller stream capacity
+    /// before its turn.
     OutOfTurn,
     /// A pixel format RFC 6143 does not allow: bits per pixel other than
     /// 8, 16 or 32, a depth past bits per pixel, or, for true color, a
@@ -902,12 +957,6 @@ pub enum Error {
     Outstanding,
     /// A message sent in a phase where it does not belong.
     Phase(Phase),
-    /// A phase or mode change was attempted inside an incomplete unit.
-    PartialUnit,
-    /// A framed unit ends before the message parser can finish it.
-    Truncated,
-    /// A framed unit has bytes after the parsed message.
-    Trailing,
     /// A message that cannot be written as it is: an empty list of
     /// security types, a security type of 0, a security offer in the wrong
     /// dialect, a failure reason in a dialect before 3.8, a version part
@@ -932,9 +981,6 @@ impl std::fmt::Display for Error {
             Error::NotRequested => f.write_str("server message the client did not ask for"),
             Error::Outstanding => f.write_str("pixel format changed while an update is outstanding"),
             Error::Phase(p) => write!(f, "message does not belong in phase {p:?}"),
-            Error::PartialUnit => f.write_str("mode change inside a partial RFB unit"),
-            Error::Truncated => f.write_str("incomplete RFB message"),
-            Error::Trailing => f.write_str("bytes after the RFB message"),
             Error::Unwritable => f.write_str("message cannot be written as it is"),
         }
     }
@@ -944,7 +990,8 @@ impl std::error::Error for Error {}
 
 /// A protocol version, as in `RFB 003.008\n`. Each part has three digits
 /// on the wire, so a message that carries a part past 999 cannot be
-/// written.
+/// written. With [`Wire`] in scope, `v.to_bytes()` on `&Version` uses the
+/// trait method; `Version::to_bytes(*v)` selects the inherent array writer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Version {
     /// The major version, 3 for every version in use.

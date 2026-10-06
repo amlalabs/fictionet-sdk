@@ -29,7 +29,9 @@
 //! New code uses [`Headers`] with [`codec::Stream`]. The decoder returns
 //! one header result and then `End`. `swap` or `into_parts` preserves the
 //! unread suffix. [`Wire`] adds exact parsing and strict writing for
-//! [`Header`]. The legacy `Decoder` and `Step` keep their old behavior.
+//! [`Header`], with [`HeaderParseError`] for parsing and [`EncodeError`]
+//! for writing. [`HeaderError`] covers terminal framing errors. The legacy
+//! `Decoder`, `Step`, prefix parser and writer keep their old behavior.
 //!
 //! ```
 //! use fictionet::stdlib::proxy_protocol::{Addresses, Command, Decoder, Header, Step, Tlv, Transport, V2};
@@ -68,13 +70,30 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use super::codec::{self, Decode, Wire};
 
-/// Why a header cannot be framed or read as an exact wire value.
+/// Why the next PROXY header cannot be framed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HeaderError {
     /// A signature or fixed header is invalid, or a v1 line exceeds [`V1_MAX_LEN`].
     Protocol(Error),
     /// The declared header exceeds the configured whole-header limit.
     TooLong,
+}
+
+impl core::fmt::Display for HeaderError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Protocol(e) => e.fmt(f),
+            Self::TooLong => f.write_str("PROXY header exceeds its limit"),
+        }
+    }
+}
+impl core::error::Error for HeaderError {}
+
+/// Why an exact [`Wire`] parse cannot read one PROXY header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeaderParseError {
+    /// The header is malformed.
+    Protocol(Error),
     /// The input ends inside a header.
     Truncated,
     /// Bytes follow the header.
@@ -83,47 +102,63 @@ pub enum HeaderError {
     Unrepresentable,
 }
 
-impl core::fmt::Display for HeaderError {
+impl core::fmt::Display for HeaderParseError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Protocol(e) => e.fmt(f),
-            Self::TooLong => f.write_str("PROXY header exceeds its limit"),
             Self::Truncated => f.write_str("incomplete PROXY header"),
             Self::Trailing => f.write_str("bytes after the PROXY header"),
             Self::Unrepresentable => f.write_str("PROXY header cannot be written unchanged"),
         }
     }
 }
-impl core::error::Error for HeaderError {}
+impl core::error::Error for HeaderParseError {}
+
+/// Why a strict writer cannot preserve a PROXY header's value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EncodeError {
+    /// Encoding would clip a field, normalize a variant or change a checksum.
+    Unrepresentable,
+}
+impl core::fmt::Display for EncodeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Unrepresentable => f.write_str("PROXY header cannot be written unchanged"),
+        }
+    }
+}
+impl core::error::Error for EncodeError {}
 
 impl Wire for Header {
-    type ParseError = HeaderError;
-    type WriteError = HeaderError;
+    type ParseError = HeaderParseError;
+    type WriteError = EncodeError;
 
     /// Reads exactly one header. Refuses values whose canonical encoding
     /// changes their checksum. The inherent prefix parser is unchanged.
-    fn parse(bytes: &[u8]) -> Result<Self, HeaderError> {
-        let (header, used) = Header::parse(bytes).map_err(HeaderError::Protocol)?.ok_or(HeaderError::Truncated)?;
+    fn parse(bytes: &[u8]) -> Result<Self, HeaderParseError> {
+        let (header, used) = Header::parse(bytes)
+            .map_err(HeaderParseError::Protocol)?
+            .ok_or(HeaderParseError::Truncated)?;
         if used != bytes.len() {
-            return Err(HeaderError::Trailing);
+            return Err(HeaderParseError::Trailing);
         }
-        strict_header(&header)?;
+        strict_header(&header).map_err(|_| HeaderParseError::Unrepresentable)?;
         Ok(header)
     }
 
     /// Appends at most [`MAX_HEADER_LEN`] bytes. Refuses clipping, variant
     /// normalization and checksum changes without changing `out`.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), HeaderError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
         out.extend_from_slice(&strict_header(self)?);
         Ok(())
     }
 }
 
-fn strict_header(header: &Header) -> Result<Vec<u8>, HeaderError> {
+fn strict_header(header: &Header) -> Result<Vec<u8>, EncodeError> {
     let bytes = header.to_bytes();
     match Header::parse(&bytes) {
         Ok(Some((ref back, used))) if back == header && used == bytes.len() => Ok(bytes),
-        _ => Err(HeaderError::Unrepresentable),
+        _ => Err(EncodeError::Unrepresentable),
     }
 }
 
@@ -138,8 +173,9 @@ fn strict_header(header: &Header) -> Result<Vec<u8>, HeaderError> {
 /// no consumption. Use [`codec::Stream::swap`] or
 /// [`codec::Stream::into_parts`] to give every unread byte to the plain
 /// protocol. After a header item, only its bytes have been consumed.
-/// Stop feeding at completion and give any unaccepted input to the next
-/// decoder too. Partial headers return `Need`, including at EOF.
+/// After `End`, [`codec::Stream::push`] takes and drops further input.
+/// Give any unaccepted input to the next decoder along with the unread
+/// suffix. Partial headers return `Need`, including at EOF.
 #[derive(Clone, Debug)]
 pub struct Headers {
     limit: usize,
