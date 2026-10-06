@@ -44,7 +44,7 @@ cargo +nightly fuzz list
 | `fastcgi` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::fastcgi`: FastCGI |
 | `ftp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::ftp`: FTP |
 | `geneve` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::geneve`: Geneve |
-| `git_protocol` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::git_protocol`: The Git wire protocol |
+| `git_protocol` | arbitrary bytes and typed values; wire, chunking, EOF, and allocation contracts | `stdlib::git_protocol`: The Git wire protocol |
 | `grpc` | Framed messages with input-selected limits, constructed payloads, header values, and zero-separated header blocks | `grpc`: chunking and EOF, message limits and transactional writes, compression flags, request and rejection round trips, trailers, timeouts, and paths |
 | `imap` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::imap`: IMAP |
 | `imf` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::imf`: Internet Message Format headers |
@@ -54,9 +54,9 @@ cargo +nightly fuzz list
 | `ldap` | BER messages, CLDAP datagrams, filters, and DN text; checks stream limits, text round trips, and constructed search writes | `stdlib::ldap`: LDAP |
 | `memcache` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::memcache`: memcached |
 | `mime_multipart` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::mime_multipart`: MIME multipart bodies |
-| `mongodb` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::mongodb`: MongoDB |
+| `mongodb` | arbitrary bytes and typed values; wire, chunking, EOF, and allocation contracts | `stdlib::mongodb`: MongoDB |
 | `mqtt` | bytes and constructed values, checked with codec contracts | `stdlib::mqtt`: MQTT 3.1.1 |
-| `mysql` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::mysql`: MySQL |
+| `mysql` | arbitrary bytes and typed values; wire, chunking, EOF, and allocation contracts | `stdlib::mysql`: MySQL |
 | `nbns` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::nbns`: NetBIOS Name Service |
 | `nfs` | Procedure-selected NFS and MOUNT arguments and results, RPC streams, and constructed handles and names | `nfs`: argument and result round trips, handle and name limits, failure replies, RPC framing and EOF, and envelope writes |
 | `ntp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::ntp`: NTP |
@@ -74,7 +74,7 @@ cargo +nightly fuzz list
 | `rtp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::rtp`: RTP and RTCP |
 | `rtsp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::rtsp`: RTSP |
 | `sdp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::sdp`: SDP |
-| `sftp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::sftp`: SFTP version 3 |
+| `sftp` | arbitrary bytes and typed values; wire, chunking, EOF, and allocation contracts | `stdlib::sftp`: SFTP version 3 |
 | `sip` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::sip`: SIP |
 | `snmp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::snmp`: SNMP v1 and v2c |
 | `socks` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::socks`: SOCKS4, SOCKS4a and SOCKS5 |
@@ -82,6 +82,7 @@ cargo +nightly fuzz list
 | `ssh` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::ssh`: The SSH transport layer before encryption |
 | `stun` | TCP streams, UDP datagrams, standalone attributes, and constructed messages | `stun`: chunking and EOF, exact raw frame spans, strict attribute writes, canonical padding and fingerprints, Binding replies, and transaction IDs |
 | `syslog` | bytes and constructed values, checked with codec contracts | `stdlib::syslog`: Syslog |
+| `tds` | arbitrary bytes and typed values; wire, chunking, EOF, and allocation contracts | `stdlib::tds`: SQL Server TDS |
 | `telnet` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::telnet`: Telnet |
 | `tftp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::tftp`: TFTP |
 | `tpkt` | TCP bytes with limits selected from the input, plus constructed headers, packets, and COTP messages | `tpkt` and `cotp::over_tpkt`: chunking and EOF, exact headers and packets, size limits, TPDU round trips, and segmented message assembly |

@@ -1,48 +1,11 @@
-//! TDS packets, PRELOGIN, LOGIN7, SQL batches and response tokens, as a
-//! world playing SQL Server reads them, and values world code builds, as
-//! the writers write them.
+//! TDS packet, message, login, batch, and token contracts.
 #![no_main]
 
-use fictionet::stdlib::codec::{Wire, contract};
-use fictionet::stdlib::tds::{
-    Column, Decoder, Error, Frames, Login7, MAX_LOGIN_NAME, MAX_PACKET, Message, Packet, Prelogin,
-    PreloginOption, SqlBatch, StreamHeader, Token, TokenReader, TokenWriter, TypeInfo, Value,
-    data_type,
-};
+use fictionet::stdlib::codec::{Wire, contract, test_support::decode_all};
+use fictionet::stdlib::tds::*;
 use libfuzzer_sys::fuzz_target;
 
 const LIMIT: usize = 1 << 16;
-
-/// Every message in `data`, fed in pieces of `piece` bytes (all at once
-/// for 0). A decoder takes what fits and holds no more than its bound.
-fn run(data: &[u8], piece: usize) -> Vec<Result<Message, fictionet::stdlib::tds::FrameError>> {
-    let mut d = Decoder::with_limit(LIMIT);
-    let mut got = Vec::new();
-    let mut chunks: Box<dyn Iterator<Item = &[u8]>> = if piece == 0 {
-        Box::new(std::iter::once(data))
-    } else {
-        Box::new(data.chunks(piece))
-    };
-    'feed: while let Some(mut rest) = chunks.next() {
-        while !rest.is_empty() {
-            let took = d.feed(rest);
-            rest = &rest[took..];
-            assert!(d.buffered() <= 2 * LIMIT + MAX_PACKET);
-            let mut any = false;
-            while let Some(m) = d.next_message() {
-                any = true;
-                let stop = m.is_err();
-                got.push(m);
-                if stop {
-                    break 'feed;
-                }
-            }
-            // A decoder that took nothing always has a message to give.
-            assert!(took > 0 || any);
-        }
-    }
-    got
-}
 
 /// A value of the kind `ty` holds, made from `b`.
 fn value_for(ty: u8, b: &[u8]) -> Value {
@@ -70,151 +33,89 @@ fn value_for(ty: u8, b: &[u8]) -> Value {
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode(Frames::new, data);
-    contract::check_decode(|| Frames::with_limit(64), data);
+    contract::check_decode_with_alloc_limit(Frames::new, data, 2 * MAX_PACKET);
+    contract::check_decode_with_alloc_limit(|| Frames::with_limit(64), data, 128);
+    contract::check_decode_with_alloc_limit(|| Messages::with_limit(LIMIT), data, 2 * MAX_PACKET);
     contract::check_wire::<Packet>(data);
-    let packet = Packet {
-        packet_type: data.first().copied().unwrap_or(0),
-        status: data.get(1).copied().unwrap_or(0),
-        spid: u16::from(data.get(2).copied().unwrap_or(0)),
-        id: data.get(3).copied().unwrap_or(0),
-        window: data.get(4).copied().unwrap_or(0),
-        data: data.get(..MAX_PACKET).unwrap_or(data).to_vec(),
-    };
-    contract::check_wire_value(&packet);
-    if let Ok(bytes) = Wire::to_bytes(&packet) {
-        contract::check_wire::<Packet>(&bytes);
-        contract::check_decode(Frames::new, &bytes);
-    }
-
-    // The stream, split three ways: all at once, a byte at a time, and in
-    // pieces. A message read can be written, and reads back the same.
-    let messages = run(data, 0);
-    assert_eq!(messages, run(data, 1));
-    assert_eq!(messages, run(data, 7));
-    for m in messages.into_iter().flatten() {
-        let mut d = Decoder::new();
-        let bytes = m.to_packets(4096).unwrap();
-        assert_eq!(d.feed(&bytes), bytes.len());
-        assert_eq!(d.next_message(), Some(Ok(m)));
-    }
-
-    // Any bytes as a single packet.
-    if let Ok(Some((p, used))) = Packet::parse(data) {
-        assert_eq!(Packet::parse(&p.to_bytes()), Ok(Some((p, used))));
-    }
-
-    // Any bytes as each kind of message data. What is read, written,
-    // reads back the same.
-    if let Ok(p) = Prelogin::parse(data) {
-        assert_eq!(Prelogin::parse(&p.to_bytes()), Ok(p));
-    }
-    if let Ok(l) = Login7::parse(data) {
-        assert_eq!(Login7::parse(&l.to_bytes().unwrap()), Ok(l));
+    contract::check_wire::<Message>(data);
+    contract::check_wire::<Prelogin>(data);
+    contract::check_wire::<Login7>(data);
+    contract::check_wire::<Version>(data);
+    contract::check_wire::<TokenStream>(data);
+    contract::check_wire_value(&Packet {
+        packet_type: data.first().copied().unwrap_or(0), status: data.get(1).copied().unwrap_or(0),
+        spid: u16::from(data.get(2).copied().unwrap_or(0)), id: data.get(3).copied().unwrap_or(0),
+        window: data.get(4).copied().unwrap_or(0), data: data.to_vec(),
+    });
+    for message in decode_all(|| Messages::with_limit(LIMIT), data).0 {
+        assert!(message.to_bytes().is_ok(), "{message:?}");
+        contract::check_wire_value(&message);
     }
     for all_headers in [true, false] {
-        if let Ok(s) = SqlBatch::parse(data, all_headers) {
-            assert_eq!(SqlBatch::parse(&s.to_bytes(), all_headers), Ok(s));
+        if let Ok(batch) = SqlBatch::parse(data, all_headers) {
+            assert_eq!(SqlBatch::parse(&batch.message().unwrap().data, all_headers), Ok(batch));
         }
     }
     let tokens: Vec<Token> = TokenReader::new(data).map_while(Result::ok).collect();
-    let mut w = TokenWriter::new();
-    for t in &tokens {
-        w.push(t).unwrap();
-    }
-    let back: Vec<Token> = TokenReader::new(w.bytes())
-        .collect::<Result<_, _>>()
-        .unwrap();
-    assert_eq!(back, tokens);
-    // Columns read can start another reader, as for a response split
-    // over messages.
-    let columns = tokens.iter().rev().find_map(|t| match t {
-        Token::ColMetadata(Some(c)) => Some(c.clone()),
-        _ => None,
-    });
-    if let Some(columns) = columns {
-        let reader = TokenReader::with_columns(data, columns).unwrap();
-        for t in reader.take(64) {
-            if t.is_err() {
-                break;
-            }
+    let stream = TokenStream(tokens.clone());
+    assert!(stream.to_bytes().is_ok(), "{stream:?}");
+    contract::check_wire_value(&stream);
+    if let Some(columns) = tokens.iter().rev().find_map(|t| match t {
+        Token::ColMetadata(Some(c)) => Some(c.clone()), _ => None,
+    }) {
+        for token in TokenReader::with_columns(data, columns).unwrap().take(64) {
+            if token.is_err() { break; }
         }
     }
-
-    // Values world code builds, from the same bytes. The writers either
-    // refuse them or write what reads back the same.
     let (head, rest) = data.split_at(data.len().min(8));
     let text = String::from_utf8_lossy(rest);
-    let mut p = Prelogin::default();
-    for (i, chunk) in rest.chunks(9).take(40).enumerate() {
-        let token = head.get(i % head.len().max(1)).copied().unwrap_or(0) % 10;
-        p.options.push(PreloginOption {
-            token,
+    let valid = head.first().is_none_or(|b| b & 3 != 0);
+    let mut prelogin = Prelogin::new(Version::default(), encryption::OFF);
+    for (i, chunk) in rest.chunks(9).take(if valid { MAX_PRELOGIN_OPTIONS - 2 } else { 40 }).enumerate() {
+        prelogin.options.push(PreloginOption {
+            token: if valid { 9 + i as u8 } else { head[i % head.len()] % 10 },
             data: chunk.to_vec(),
         });
     }
-    let read = Prelogin::parse(&p.to_bytes()).unwrap();
-    assert!(read.options.iter().all(Prelogin::option_valid));
-
-    let mut l = Login7::new();
-    l.option_flags3 = head.first().copied().unwrap_or(0);
-    l.user_name = text.chars().take(200).collect();
-    l.password = text.chars().rev().take(200).collect();
-    l.change_password = text.chars().skip(3).take(5).collect();
-    match l.to_bytes() {
-        Ok(b) => {
-            let mut want = l.clone();
-            want.option_flags3 &= !0x10;
-            assert_eq!(Login7::parse(&b), Ok(want));
-        }
-        Err(e) => {
-            assert_eq!(e, Error::Unwritable);
-            let units = |s: &str| s.encode_utf16().count();
-            assert!(
-                units(&l.user_name) > MAX_LOGIN_NAME
-                    || units(&l.password) > MAX_LOGIN_NAME
-                    || (l.option_flags3 & 1 == 0 && !l.change_password.is_empty())
-            );
-        }
+    if valid {
+        assert!(prelogin.to_bytes().is_ok(), "{prelogin:?}");
     }
-
-    let batch = SqlBatch {
-        headers: Some(
-            rest.chunks(13)
-                .take(20)
-                .map(|c| StreamHeader {
-                    kind: u16::from(c[0] % 4),
-                    data: c[1..].to_vec(),
-                })
-                .collect(),
-        ),
-        text: text.into_owned(),
+    contract::check_wire_value(&prelogin);
+    let login = Login7 {
+        option_flags3: head.first().copied().unwrap_or(0) & !option_flags3::EXTENSION,
+        user_name: text.chars().take(200).collect(), password: text.chars().rev().take(200).collect(),
+        change_password: text.chars().skip(3).take(5).collect(), ..Login7::new()
     };
-    let read = SqlBatch::parse(&batch.to_bytes(), true).unwrap();
-    assert!(read.headers.unwrap().iter().all(StreamHeader::is_valid));
-
+    if let Err(error) = login.to_bytes() {
+        assert_eq!(error, Error::Unwritable);
+        let units = |s: &str| s.encode_utf16().count();
+        assert!(units(&login.user_name) > MAX_LOGIN_NAME
+            || units(&login.password) > MAX_LOGIN_NAME
+            || (login.option_flags3 & option_flags3::CHANGE_PASSWORD == 0 && !login.change_password.is_empty()));
+    }
+    contract::check_wire_value(&login);
+    let mut batch = SqlBatch::new(&text);
+    batch.headers.as_mut().unwrap().extend(rest.chunks(13).take(if valid { MAX_HEADERS - 1 } else { 20 }).enumerate().map(|(i, c)| StreamHeader {
+        kind: if valid { 0x100 + i as u16 } else { u16::from(c[0] % 4) }, data: c[1..].to_vec(),
+    }));
+    let message = batch.message();
+    if valid && rest.len() <= MAX_MESSAGE / 4 {
+        assert!(message.is_ok(), "{batch:?}");
+    }
+    if let Ok(message) = message {
+        assert_eq!(SqlBatch::parse(&message.data, true), Ok(batch));
+        assert!(message.to_bytes().is_ok(), "{message:?}");
+        contract::check_wire_value(&message);
+    }
     let kinds = [
         TypeInfo::nullable(data_type::INTN, 4),
         TypeInfo::decimal(head.first().map_or(1, |p| p % 38 + 1), 0),
         TypeInfo::scaled(data_type::TIMEN, head.get(1).map_or(0, |s| s % 8)),
         TypeInfo::scaled(data_type::DATETIMEOFFSETN, head.get(2).map_or(0, |s| s % 8)),
         TypeInfo::string(data_type::NVARCHAR, 40),
-        TypeInfo {
-            max_len: 8016,
-            ..TypeInfo::binary(data_type::SSVARIANT, 0)
-        },
+        TypeInfo { max_len: 8016, ..TypeInfo::binary(data_type::SSVARIANT, 0) },
     ];
-    let mut w = TokenWriter::new();
-    let cols: Vec<Column> = kinds.iter().map(|t| Column::new("c", t.clone())).collect();
-    w.push(&Token::ColMetadata(Some(cols))).unwrap();
-    let row: Vec<Value> = kinds.iter().map(|t| value_for(t.ty, rest)).collect();
-    let pushed = w.push(&Token::Row(row.clone()));
-    let back: Vec<Token> = TokenReader::new(w.bytes())
-        .collect::<Result<_, _>>()
-        .unwrap();
-    if pushed.is_ok() {
-        assert_eq!(back.last(), Some(&Token::Row(row)));
-    } else {
-        assert_eq!(back.len(), 1);
-    }
+    let columns = kinds.iter().map(|t| Column::new("c", t.clone())).collect();
+    let row = kinds.iter().map(|t| value_for(t.ty, rest)).collect();
+    contract::check_wire_value(&TokenStream(vec![Token::ColMetadata(Some(columns)), Token::Row(row)]));
 });
