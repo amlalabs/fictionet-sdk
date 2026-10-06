@@ -1119,7 +1119,12 @@ fn raw_lines_are_bounded_and_last_for_one_item() {
             );
             assert_eq!(items.len(), 2);
         }
-        let wire = [answer.clone(), b"\r\n+OK done\r\n".to_vec()].concat();
+        // A server's raw line is a challenge: `+` alone, or `+ ` and data.
+        let challenge = match size {
+            0 => b"+".to_vec(),
+            _ => [b"+ ".as_slice(), &answer[2..]].concat(),
+        };
+        let wire = [challenge.clone(), b"\r\n+OK done\r\n".to_vec()].concat();
         contract::check_decode_with_held_limit(replies, &wire, pop3::MAX_REPLY_HELD);
         for pattern in [&[][..], &[1], &[511, 2, 4096]] {
             let items = read(replies(), &wire, pattern);
@@ -1127,7 +1132,7 @@ fn raw_lines_are_bounded_and_last_for_one_item() {
                 assert_eq!(
                     items,
                     vec![
-                        Ok(Ok(pop3::Output::Line(answer.clone()))),
+                        Ok(Ok(pop3::Output::Line(challenge.clone()))),
                         Ok(Ok(pop3::Output::Reply(pop3::Reply::ok("done")))),
                     ]
                 );
@@ -1158,6 +1163,20 @@ fn raw_lines_are_bounded_and_last_for_one_item() {
             }
         ))))
     );
+    // A raw line that is not a challenge is a status line, held to the
+    // status limit even though a challenge may be longer.
+    for line in [vec![b'X'; 600], [b"+OK ".as_slice(), &[b'x'; 600]].concat()] {
+        let wire = [line, b"\r\n+OK done\r\n".to_vec()].concat();
+        contract::check_decode_with_held_limit(replies, &wire, pop3::MAX_REPLY_HELD);
+        assert_eq!(
+            read(replies(), &wire, &[1]),
+            vec![Err(Fail::Protocol(pop3::DecodeError::Line(
+                codec::LineError::TooLong {
+                    max: pop3::MAX_REPLY_LINE - 2
+                }
+            )))]
+        );
+    }
 
     let commands = || {
         let mut decoder = imap::Commands::new();
@@ -1347,5 +1366,74 @@ fn smtp_data_line_overflow_has_one_fatal_shape() {
                 ))))
             );
         }
+    }
+}
+
+type Pop3ReplyItems =
+    Vec<Result<Result<pop3::Output, pop3::ReplyItemError>, Fail<pop3::DecodeError>>>;
+
+/// Reads `bytes` as a client that reads the greeting, then sends `AUTH`
+/// with one raw line selected and `LIST` behind it. Gives the items and the
+/// number of expectations queued after each.
+fn pop3_auth_then_list(bytes: &[u8], pattern: &[usize]) -> (Pop3ReplyItems, Vec<usize>) {
+    let mut replies = pop3::Replies::new();
+    replies.expect(false).unwrap();
+    let mut greeted = false;
+    let mut seen = Vec::new();
+    let items = read_with(replies, bytes, pattern, |decoder, _| {
+        if !greeted {
+            greeted = true;
+            decoder.expect(false).unwrap();
+            decoder.expect_line().unwrap();
+            decoder.expect(true).unwrap();
+        }
+        seen.push(decoder.expected());
+    });
+    (items, seen)
+}
+
+#[test]
+fn pop3_auth_rejected_at_once_keeps_the_reply_queue() {
+    // RFC 5034, section 4: the server may answer AUTH with -ERR and no
+    // challenge. The raw line selected for a challenge reads it as the
+    // final reply, and LIST keeps its own expectation.
+    let bytes = b"+OK ready\r\n-ERR unsupported\r\n+OK 1 messages\r\n1 120\r\n.\r\n";
+    let list = pop3::Reply::ok("1 messages").with_body(b"1 120\r\n".to_vec());
+    for pattern in [&[][..], &[1], &[11, 5, 2]] {
+        let (items, seen) = pop3_auth_then_list(bytes, pattern);
+        assert_eq!(
+            items,
+            vec![
+                Ok(Ok(pop3::Output::Reply(pop3::Reply::ok("ready")))),
+                Ok(Ok(pop3::Output::Reply(pop3::Reply::err("unsupported")))),
+                Ok(Ok(pop3::Output::Reply(list.clone()))),
+            ]
+        );
+        assert_eq!(seen, [2, 1, 0]);
+    }
+}
+
+#[test]
+fn pop3_auth_after_a_challenge_keeps_the_reply_queue() {
+    let challenge = b"+ PDE4OTYuNjk3MTcwOTUyQHBvc3RvZmZpY2U+";
+    let bytes = [
+        b"+OK ready\r\n".as_slice(),
+        challenge,
+        b"\r\n+OK maildrop locked\r\n+OK 1 messages\r\n1 120\r\n.\r\n",
+    ]
+    .concat();
+    let list = pop3::Reply::ok("1 messages").with_body(b"1 120\r\n".to_vec());
+    for pattern in [&[][..], &[1], &[11, 5, 2]] {
+        let (items, seen) = pop3_auth_then_list(&bytes, pattern);
+        assert_eq!(
+            items,
+            vec![
+                Ok(Ok(pop3::Output::Reply(pop3::Reply::ok("ready")))),
+                Ok(Ok(pop3::Output::Line(challenge.to_vec()))),
+                Ok(Ok(pop3::Output::Reply(pop3::Reply::ok("maildrop locked")))),
+                Ok(Ok(pop3::Output::Reply(list.clone()))),
+            ]
+        );
+        assert_eq!(seen, [2, 2, 1, 0]);
     }
 }

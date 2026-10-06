@@ -26,12 +26,20 @@ fuzz_target!(|data: &[u8]| {
         data,
         0,
     );
+    // AUTH with one raw line selected, then LIST. Only a challenge comes
+    // back raw; any other line is AUTH's final reply.
     contract::check_decode_with_held_limit(
         || {
             let mut replies = Replies::new();
             replies.expect(false).unwrap();
             replies.expect_line().unwrap();
-            replies
+            replies.expect(true).unwrap();
+            replies.map(|item: Result<Output, ReplyItemError>| {
+                if let Ok(Output::Line(line)) = &item {
+                    assert!(line == b"+" || line.starts_with(b"+ "));
+                }
+                item
+            })
         },
         data,
         MAX_REPLY_HELD,

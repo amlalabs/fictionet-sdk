@@ -47,9 +47,12 @@
 //! During an `AUTH` exchange (RFC 5034) the lines between the command and
 //! the final `+OK` or `-ERR` are neither commands nor replies. Read them
 //! with [`Commands::expect_line`] and [`Replies::expect_line`], called
-//! between items. Each selects one raw line, without consuming a reply
-//! expectation. Legacy callers use [`CommandDecoder::next_line`] and
-//! [`ReplyDecoder::next_line`].
+//! between items. Each selects one raw line. A client cannot know whether
+//! the server's next line is a challenge or the final reply, so
+//! [`Replies`] gives a raw line only for a challenge (`+` alone, or `+ `
+//! and data) and leaves AUTH's expectation queued. Any other line is read
+//! as the final reply and takes that expectation. Legacy callers use
+//! [`CommandDecoder::next_line`] and [`ReplyDecoder::next_line`].
 //!
 //! ```
 //! use fictionet::stdlib::pop3::{
@@ -1590,7 +1593,7 @@ pub enum Input {
 pub enum Output {
     /// A complete reply, including its body when expected.
     Reply(Reply),
-    /// A raw line without CRLF, selected by [`Replies::expect_line`].
+    /// An AUTH challenge without CRLF, selected by [`Replies::expect_line`].
     Line(Vec<u8>),
 }
 
@@ -1702,11 +1705,17 @@ impl Decode for Commands {
 /// for the greeting. A `-ERR` consumes an expectation without reading a body.
 /// An empty queue never implies a reply mode. Queue changes happen between
 /// items. The active response keeps the expectation consumed at its status.
-/// For an AUTH challenge, call [`expect_line`](Self::expect_line) between
-/// items. It reads one raw line without consuming an expectation, then
-/// returns to status mode. The queued expectation remains for AUTH's final
-/// `+OK` or `-ERR`. Raw lines use [`MAX_AUTH_LINE`] excluding CRLF; input
-/// capacity is always `MAX_AUTH_LINE + 2`.
+/// During AUTH, call [`expect_line`](Self::expect_line) between items,
+/// before each line that may be a challenge. The next line is read in one of
+/// two ways, then the decoder returns to status mode. A challenge (`+`
+/// alone, or `+ ` and data, RFC 5034 section 4) is [`Output::Line`] and
+/// consumes no expectation; the queued one remains for AUTH's final reply.
+/// Any other line is that final `+OK` or `-ERR`, read as a status line: it
+/// consumes the expectation and gives [`Output::Reply`], or the error item
+/// or stream error a bad status line gives. A server may refuse AUTH with
+/// no challenge at all, so the client cannot know which comes. Challenges
+/// use [`MAX_AUTH_LINE`] excluding CRLF; a status line still uses
+/// [`MAX_REPLY_LINE`]. Input capacity is always `MAX_AUTH_LINE + 2`.
 ///
 /// CRLF is required. Status lines use RFC 1939's [`MAX_REPLY_LINE`]. Body
 /// lines use the local [`MAX_DATA_LINE`], including stuffing and CRLF;
@@ -1715,7 +1724,7 @@ impl Decode for Commands {
 /// A malformed status line is an error item for a single-line expectation,
 /// and ends the stream for a multiline expectation. A bad body line rejects
 /// its whole reply at the terminator with [`ReplyItemError::BadBodyLine`].
-/// This covers bare LF and embedded CR. A bare LF in a raw AUTH challenge
+/// This covers bare LF and embedded CR. A bare LF after an AUTH challenge
 /// yields [`ReplyItemError::Reply`] wrapping [`ReplyError::BadStatus`] and
 /// leaves the queued expectation for the final reply. Line overflow,
 /// unterminated lines, and incomplete bodies end the stream. Retained state
@@ -1772,8 +1781,10 @@ impl Replies {
     }
 
     /// Selects one raw AUTH challenge line without consuming a reply expectation.
-    /// Call between items, before reading the challenge. Refuses an active body,
-    /// a partial line, or an already selected raw line without changing state.
+    /// Call between items, before a line that may be a challenge. If the line
+    /// is AUTH's final `+OK` or `-ERR` instead, it is read as a reply and
+    /// consumes the expectation. Refuses an active body, a partial line, or
+    /// an already selected raw line without changing state.
     pub fn expect_line(&mut self) -> Result<(), DecodeError> {
         if self.pending.is_some() || self.partial || self.raw_line {
             return Err(DecodeError::State);
@@ -1829,11 +1840,25 @@ impl Decode for Replies {
         self.partial = false;
         if core::mem::take(&mut self.raw_line) {
             self.lines = codec::Lines::new(MAX_REPLY_LINE - 2, codec::Ending::Crlf);
-            return Ok(codec::Step::Item(
-                line.map(Output::Line)
-                    .map_err(|_| ReplyItemError::Reply(ReplyError::BadStatus)),
-                used,
-            ));
+            // The line as sent, without its LF or CRLF. A challenge is `+`
+            // alone or `+ ` and data (RFC 5034, section 4). Anything else is
+            // the final status line and takes AUTH's expectation.
+            let sent = input.get(..used).unwrap_or_default();
+            let sent = sent.strip_suffix(b"\n").unwrap_or(sent);
+            let sent = sent.strip_suffix(b"\r").unwrap_or(sent);
+            if sent == b"+" || sent.starts_with(b"+ ") {
+                return Ok(codec::Step::Item(
+                    line.map(Output::Line)
+                        .map_err(|_| ReplyItemError::Reply(ReplyError::BadStatus)),
+                    used,
+                ));
+            }
+            // A status line is held to its own limit, as in status mode.
+            if sent.len() > MAX_REPLY_LINE - 2 {
+                return Err(DecodeError::Line(codec::LineError::TooLong {
+                    max: MAX_REPLY_LINE - 2,
+                }));
+            }
         }
         if self.pending.is_none() {
             let multi = self
