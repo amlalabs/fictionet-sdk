@@ -746,3 +746,17 @@ path = "fuzz_targets/rdp.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "soupbintcp"
+path = "fuzz_targets/soupbintcp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "moldudp64"
+path = "fuzz_targets/moldudp64.rs"
+test = false
+doc = false
+bench = false

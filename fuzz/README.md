@@ -115,6 +115,8 @@ cargo +nightly fuzz list
 | `ntlmssp` | wire units, constructed values, protocol helpers and shared codec contracts | `stdlib::ntlmssp`: NTLMSSP tokens and fields |
 | `pcp` | wire units, constructed values, protocol helpers and shared codec contracts | `stdlib::pcp`: PCP and NAT-PMP |
 | `wireguard` | wire units, constructed values, protocol helpers and shared codec contracts | `stdlib::wireguard`: WireGuard messages and replay windows |
+| `soupbintcp` | TCP bytes framed at the default and a small limit, and the frames fed to logged-in and fresh sessions | `stdlib::soupbintcp`: packets, framing, client and server sessions |
+| `moldudp64` | datagrams, message blocks, and forged headers fed to a receiver whose requests a bounded store answers | `stdlib::moldudp64`: packets, blocks, gap recovery, re-request answers |
 
 The proxy targets compile the `fictionet` binary's proxy modules from
 their source files (`src/proxy.rs` here), because a binary's modules
