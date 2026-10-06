@@ -17,9 +17,13 @@
 //! [`Schema::decode`] reads one exact message. [`Frames`] reads a sequence
 //! of header-prefixed messages (section 3.1). It caches a schema walk rather
 //! than reparsing an incomplete tree. Larger fixed blocks are skipped
-//! (section 5.3). Unknown templates, enum values, set bits, and extra group
-//! or data counts are refused. Load the newer schema for those extensions.
+//! (section 5.3). Unknown templates and enum values are refused. Undeclared
+//! set bits are refused under section 2.12's rule to clear unassigned bits.
+//! Mismatched `numGroups` and `numVarDataFields` counts are refused, unlike
+//! section 5's "Number of repeating groups and variable data" extension
+//! mechanism. Load the newer schema for those extensions.
 //! Without counts, the sender must keep the known group and data layout.
+//! Float ranges default to finite values and exclude infinities (section 2.6).
 //!
 //! [`MessageWire`] supplies the static schema context required by [`Wire`].
 //! A runtime caller can use [`Schema::write`] directly. Both writers validate
@@ -48,11 +52,15 @@ pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 /// Maximum elements in a primitive array or entries in one group.
 pub const MAX_ARRAY_LENGTH: usize = 65_536;
 /// Maximum values, named members, and group entries visited in one message.
+/// Also bounds the block work of one message, including empty groups.
 pub const MAX_VALUES: usize = 65_536;
 /// Maximum total byte and name storage in one decoded value tree.
 pub const MAX_VALUE_BYTES: usize = 4 * 1024 * 1024;
 /// Maximum compiled type and block definitions, including inline types.
 pub const MAX_SCHEMA_NODES: usize = MAX_XML_ELEMENTS + 16;
+/// Maximum version and length entries read while compiling the minimum
+/// block lengths of every acting version.
+pub const MAX_LAYOUT_ENTRIES: usize = 1 << 18;
 
 /// A schema, wire, or value validation failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -735,6 +743,42 @@ impl Simple {
     fn is_null(&self, v: Scalar) -> bool {
         v == self.null || (nan(v) && nan(self.null))
     }
+    /// Moves a default bound past an explicit null that sits on it, so
+    /// `nullValue="127"` on an int8 leaves -127..=126 (section 2.5 lets a
+    /// schema override the default null). Explicit bounds are kept as given.
+    fn exclude_null(&mut self, explicit_min: bool, explicit_max: bool) {
+        let step = |v: Scalar, up: bool| match v {
+            Scalar::Char(n) => if up {
+                n.checked_add(1)
+            } else {
+                n.checked_sub(1)
+            }
+            .map(Scalar::Char),
+            Scalar::Int(n) => if up {
+                n.checked_add(1)
+            } else {
+                n.checked_sub(1)
+            }
+            .map(Scalar::Int),
+            Scalar::Uint(n) => if up {
+                n.checked_add(1)
+            } else {
+                n.checked_sub(1)
+            }
+            .map(Scalar::Uint),
+            _ => None,
+        };
+        if !explicit_max && self.null == self.max {
+            if let Some(v) = step(self.null, false) {
+                self.max = v;
+            }
+        } else if !explicit_min
+            && self.null == self.min
+            && let Some(v) = step(self.null, true)
+        {
+            self.min = v;
+        }
+    }
     fn decode(&self, v: Scalar, presence: Presence) -> Result<Value, Error> {
         if self.is_null(v) {
             if presence == Presence::Optional {
@@ -776,6 +820,26 @@ struct TypeDef {
     since: u64,
     depth: usize,
     work: usize,
+    /// Minimum encoded length by acting version: `(since, end)` pairs with
+    /// both parts increasing. See [`Block::minimum`].
+    ends: Vec<(u64, usize)>,
+}
+impl TypeDef {
+    fn presence(&self) -> Presence {
+        match &self.kind {
+            Kind::Simple(s) | Kind::Enum(s, _) => s.presence,
+            _ => Presence::Required,
+        }
+    }
+    fn member_presence(&self, optional: &mut bool) -> Presence {
+        let presence = self.presence();
+        if *optional && presence != Presence::Constant {
+            *optional = false;
+            Presence::Optional
+        } else {
+            presence
+        }
+    }
 }
 #[derive(Clone, Debug)]
 struct Field {
@@ -802,6 +866,7 @@ struct Block {
     length: usize,
     tail: usize,
     work: usize,
+    minimums: Vec<(u64, usize)>,
 }
 #[derive(Clone, Debug)]
 struct Template {
@@ -848,6 +913,7 @@ struct Compiler<'a> {
     types: Vec<TypeDef>,
     blocks: Vec<Block>,
     version: u64,
+    layout_work: usize,
 }
 impl Compiler<'_> {
     fn ty(&self, id: usize) -> Result<&TypeDef, Error> {
@@ -879,6 +945,7 @@ impl Compiler<'_> {
             since: 0,
             depth: 1,
             work: 1,
+            ends: vec![(0, p.size())],
         })?;
         self.primitives.insert(name.to_owned(), id);
         Ok(id)
@@ -897,7 +964,7 @@ impl Compiler<'_> {
             .get(node_id)
             .ok_or(Error::Schema("XML reference"))?;
         n.symbol()?;
-        let since = n.since(self.version)?;
+        let mut since = n.since(self.version)?;
         let t = match n.tag.as_str() {
             "type" => {
                 if !n.children.is_empty() {
@@ -911,9 +978,14 @@ impl Compiler<'_> {
                 s.length = usize::try_from(n.number("length", 1)?)
                     .map_err(|_| Error::Limit("MAX_ARRAY_LENGTH"))?;
                 s.array = n.attr("length").is_some();
+                let value_ref = n.attr("valueRef");
+                if value_ref.is_some() && s.presence != Presence::Constant {
+                    return Err(Error::Schema("valueRef requires constant"));
+                }
                 if s.presence == Presence::Constant
                     && p == Primitive::Char
                     && n.attr("length").is_none()
+                    && value_ref.is_none()
                 {
                     s.length = n.text.len();
                     s.array = s.length != 1;
@@ -933,6 +1005,7 @@ impl Compiler<'_> {
                 }
                 if let Some(v) = n.attr("nullValue") {
                     s.null = p.literal(v)?;
+                    s.exclude_null(n.attr("minValue").is_some(), s.explicit_max);
                 }
                 if !scalar_le(s.min, s.max) {
                     return Err(Error::Schema("inverted value range"));
@@ -943,10 +1016,35 @@ impl Compiler<'_> {
                 if s.presence == Presence::Optional && s.valid(s.null) {
                     return Err(Error::Schema("null overlaps value range"));
                 }
-                if s.presence == Presence::Constant {
+                if let Some(reference) = value_ref {
+                    // Section 2's "Timestamp with constant time unit" names an
+                    // enum value; the constant takes that value's encoding.
+                    if !n.text.trim().is_empty() {
+                        return Err(Error::Schema("valueRef with constant text"));
+                    }
+                    if s.length != 1 {
+                        return Err(Error::Schema("constant requires scalar or char array"));
+                    }
+                    let (_, choice) = self.value_ref(reference, depth)?;
+                    if !s.valid(choice.value) || s.is_null(choice.value) {
+                        return Err(Error::Schema("constant outside range"));
+                    }
+                    since = since.max(choice.since);
+                    s.constant = Some(match choice.value {
+                        Scalar::Char(c) if s.array => Value::Bytes(vec![c]),
+                        v => Value::Scalar(v),
+                    });
+                } else if s.presence == Presence::Constant {
                     let v = if p == Primitive::Char && s.array {
                         if n.text.len() != s.length || s.length == 0 {
                             return Err(Error::Schema("constant array length"));
+                        }
+                        if !n
+                            .text
+                            .bytes()
+                            .all(|b| (0x20..=0x7e).contains(&b) && s.valid(Scalar::Char(b)))
+                        {
+                            return Err(Error::Schema("constant outside range"));
                         }
                         Value::Bytes(n.text.as_bytes().to_vec())
                     } else {
@@ -990,6 +1088,7 @@ impl Compiler<'_> {
                     since,
                     depth: 1,
                     work,
+                    ends: vec![(since, length.unwrap_or(0))],
                 }
             }
             "enum" | "set" => {
@@ -1070,17 +1169,18 @@ impl Compiler<'_> {
                 if choices.is_empty() {
                     return Err(Error::Schema("empty enum/set"));
                 }
-                let length = Some(s.primitive.size());
+                let length = s.primitive.size();
                 TypeDef {
                     kind: if is_set {
                         Kind::Set(s.primitive, choices)
                     } else {
                         Kind::Enum(s, choices)
                     },
-                    length,
+                    length: Some(length),
                     since,
                     depth: 1,
                     work: 1,
+                    ends: vec![(since, length)],
                 }
             }
             "composite" => {
@@ -1115,10 +1215,12 @@ impl Compiler<'_> {
                     };
                     let t = self.ty(ty)?;
                     let member_since = c.since(self.version)?.max(t.since).max(since);
-                    if member_since < last_since {
-                        return Err(Error::Schema("sinceVersion order"));
+                    if t.presence() != Presence::Constant {
+                        if member_since < last_since {
+                            return Err(Error::Schema("sinceVersion order"));
+                        }
+                        last_since = member_since;
                     }
-                    last_since = member_since;
                     let offset = size(c.number("offset", end as u64)?)?;
                     if offset < end {
                         return Err(Error::Schema("overlapping composite members"));
@@ -1141,12 +1243,17 @@ impl Compiler<'_> {
                     return Err(Error::Schema("empty composite"));
                 }
                 nesting(tree_depth)?;
+                let mut ends = vec![(since, 0)];
+                for m in &members {
+                    self.extend_ends(m.ty, m.offset, m.since, &mut ends)?;
+                }
                 TypeDef {
                     kind: Kind::Composite(members),
                     length: if variable { None } else { Some(end) },
                     since,
                     depth: tree_depth,
                     work,
+                    ends: minimums(ends),
                 }
             }
             _ => return Err(Error::Schema("unknown encoding element")),
@@ -1155,6 +1262,30 @@ impl Compiler<'_> {
         self.active.remove(&node_id);
         self.resolved.insert(node_id, id);
         Ok(id)
+    }
+
+    /// Resolves a `valueRef` of the form `Enum.value` (section 4) to the
+    /// enum's id and the named valid value.
+    fn value_ref(&mut self, reference: &str, depth: usize) -> Result<(usize, Choice), Error> {
+        let (enum_name, choice_name) =
+            reference.split_once('.').ok_or(Error::Schema("valueRef"))?;
+        let id = self.named(enum_name, depth + 1)?;
+        let t = self.ty(id)?;
+        let Kind::Enum(_, choices) = &t.kind else {
+            return Err(Error::Schema("valueRef requires enum"));
+        };
+        let choice = choices
+            .iter()
+            .find(|c| c.name == choice_name)
+            .ok_or(Error::Schema("unknown valueRef"))?;
+        Ok((
+            id,
+            Choice {
+                name: choice.name.clone(),
+                value: choice.value,
+                since: choice.since.max(t.since),
+            },
+        ))
     }
 
     fn layout(&mut self, name: &str, header: bool) -> Result<Layout, Error> {
@@ -1262,10 +1393,7 @@ impl Compiler<'_> {
                     let t = self.ty(ty)?;
                     nesting(depth + t.depth)?;
                     since = since.max(t.since);
-                    let base_presence = match &t.kind {
-                        Kind::Simple(s) | Kind::Enum(s, _) => s.presence,
-                        _ => Presence::Required,
-                    };
+                    let base_presence = t.presence();
                     let presence = c.presence()?.unwrap_or(base_presence);
                     let explicit = match &t.kind {
                         Kind::Simple(s) | Kind::Enum(s, _) => s.explicit_presence,
@@ -1274,27 +1402,39 @@ impl Compiler<'_> {
                     if explicit && presence != base_presence {
                         return Err(Error::Schema("presence mismatch"));
                     }
-                    if matches!(t.kind, Kind::Composite(_) | Kind::Set(..))
-                        && presence != Presence::Required
+                    if (matches!(t.kind, Kind::Set(..)) && presence != Presence::Required)
+                        || (matches!(t.kind, Kind::Composite(_)) && presence == Presence::Constant)
                     {
                         return Err(Error::Schema("composite/set field presence"));
                     }
+                    if presence == Presence::Optional {
+                        self.optional(ty, 1)?;
+                    }
                     let constant = if presence == Presence::Constant {
                         if let Some(reference) = c.attr("valueRef") {
-                            let (enum_name, choice_name) =
-                                reference.split_once('.').ok_or(Error::Schema("valueRef"))?;
-                            if enum_name != c.required("type")? {
-                                return Err(Error::Schema("valueRef type mismatch"));
-                            }
-                            let Kind::Enum(_, choices) = &t.kind else {
-                                return Err(Error::Schema("valueRef requires enum"));
-                            };
-                            let choice = choices
-                                .iter()
-                                .find(|v| v.name == choice_name)
-                                .ok_or(Error::Schema("unknown valueRef"))?;
+                            // Section 4 only requires that valueRef name a
+                            // valid value. On an enum field it must be that
+                            // enum's; on a scalar field it must fit the type.
+                            let (enum_id, choice) = self.value_ref(reference, 1)?;
                             since = since.max(choice.since);
-                            Some(Value::Enum(choice.name.clone()))
+                            match &self.ty(ty)?.kind {
+                                Kind::Enum(..) => {
+                                    if enum_id != ty {
+                                        return Err(Error::Schema("valueRef type mismatch"));
+                                    }
+                                    Some(Value::Enum(choice.name))
+                                }
+                                Kind::Simple(s) if s.constant.is_none() && s.length == 1 => {
+                                    if !s.valid(choice.value) || s.is_null(choice.value) {
+                                        return Err(Error::Schema("constant outside range"));
+                                    }
+                                    Some(match choice.value {
+                                        Scalar::Char(v) if s.array => Value::Bytes(vec![v]),
+                                        v => Value::Scalar(v),
+                                    })
+                                }
+                                _ => return Err(Error::Schema("valueRef field type")),
+                            }
                         } else {
                             // Primitive constants stay in the type arena. A
                             // large string reused by many fields is stored once.
@@ -1306,6 +1446,7 @@ impl Compiler<'_> {
                         }
                         None
                     };
+                    let t = self.ty(ty)?;
                     if presence == Presence::Constant
                         && constant.is_none()
                         && !matches!(&t.kind, Kind::Simple(s) if s.constant.is_some())
@@ -1385,13 +1526,15 @@ impl Compiler<'_> {
                 }
                 _ => return Err(Error::Schema("unknown member")),
             };
-            let last = last_since
-                .get_mut(category)
-                .ok_or(Error::Schema("member category"))?;
-            if since < *last {
-                return Err(Error::Schema("sinceVersion order"));
+            if !matches!(&kind, MemberKind::Field(f) if f.presence == Presence::Constant) {
+                let last = last_since
+                    .get_mut(category)
+                    .ok_or(Error::Schema("member category"))?;
+                if since < *last {
+                    return Err(Error::Schema("sinceVersion order"));
+                }
+                *last = since;
             }
-            *last = since;
             members.push(Member { name, since, kind });
         }
         let length = size(n.number("blockLength", end as u64)?)?;
@@ -1412,15 +1555,84 @@ impl Compiler<'_> {
                 .filter(|n| *n <= MAX_VALUES)
                 .ok_or(Error::Limit("MAX_VALUES"))?;
         }
+        // Minimum lengths for every acting version, computed once here so
+        // that readers never walk composite trees per group entry.
+        let mut ends = Vec::new();
+        for m in &members {
+            if let MemberKind::Field(f) = &m.kind
+                && f.presence != Presence::Constant
+            {
+                self.extend_ends(f.ty, f.offset, m.since, &mut ends)?;
+            }
+        }
+        let minimums = minimums(ends);
         let id = self.blocks.len();
         self.blocks.push(Block {
             members,
             length,
             tail,
             work,
+            minimums,
         });
         Ok(id)
     }
+
+    fn optional(&self, id: usize, depth: usize) -> Result<(), Error> {
+        nesting(depth)?;
+        match &self.ty(id)?.kind {
+            Kind::Simple(s) if s.valid(s.null) => Err(Error::Schema("null overlaps value range")),
+            Kind::Enum(s, choices) if choices.iter().any(|c| s.is_null(c.value)) => {
+                Err(Error::Schema("enum value equals null"))
+            }
+            Kind::Composite(members) => {
+                for m in members {
+                    if self.ty(m.ty)?.presence() != Presence::Constant {
+                        return self.optional(m.ty, depth + 1);
+                    }
+                }
+                Err(Error::Schema("composite has no null member"))
+            }
+            Kind::Set(..) => Err(Error::Schema("set has no null encoding")),
+            _ => Ok(()),
+        }
+    }
+
+    /// Appends the minimum-length table of type `id`, placed at `offset`
+    /// and available from `since`. Charges every entry read.
+    fn extend_ends(
+        &mut self,
+        id: usize,
+        offset: usize,
+        since: u64,
+        out: &mut Vec<(u64, usize)>,
+    ) -> Result<(), Error> {
+        let n = self.ty(id)?.ends.len();
+        self.layout_work = self
+            .layout_work
+            .checked_add(n)
+            .filter(|n| *n <= MAX_LAYOUT_ENTRIES)
+            .ok_or(Error::Limit("MAX_LAYOUT_ENTRIES"))?;
+        for &(s, e) in &self.ty(id)?.ends {
+            out.push((s.max(since), add(offset, e)?));
+        }
+        Ok(())
+    }
+}
+
+/// Sorts `(since, end)` pairs into a table where the minimum length at
+/// version `v` is the end of the last pair with `since <= v`, or 0.
+fn minimums(mut ends: Vec<(u64, usize)>) -> Vec<(u64, usize)> {
+    ends.sort_unstable();
+    let mut table: Vec<(u64, usize)> = Vec::new();
+    for (since, end) in ends {
+        match table.last_mut() {
+            Some(last) if end <= last.1 => {}
+            Some(last) if last.0 == since => last.1 = end,
+            None if end == 0 => {}
+            _ => table.push((since, end)),
+        }
+    }
+    table
 }
 
 impl Schema {
@@ -1452,6 +1664,7 @@ impl Schema {
             types: Vec::new(),
             blocks: Vec::new(),
             version,
+            layout_work: 0,
         };
         for child in &root.children {
             let n = nodes.get(*child).ok_or(Error::Schema("XML reference"))?;
@@ -1567,7 +1780,7 @@ impl Schema {
         if version >= self.version {
             Ok(b.length)
         } else {
-            self.minimum(b, version)
+            Ok(b.minimum(version))
         }
     }
     fn ty(&self, id: usize) -> Result<&TypeDef, Error> {
@@ -1582,36 +1795,31 @@ impl Schema {
             .filter(|t| t.since <= version)
             .ok_or(Error::Header)
     }
-    fn type_length(&self, id: usize, version: u64, depth: usize) -> Result<usize, Error> {
-        nesting(depth)?;
-        let t = self.ty(id)?;
-        if t.since > version {
-            return Ok(0);
-        }
-        if let Kind::Composite(members) = &t.kind {
-            let mut end = 0;
-            for m in members.iter().filter(|m| m.since <= version) {
-                end = end.max(add(m.offset, self.type_length(m.ty, version, depth + 1)?)?);
-            }
-            Ok(end)
-        } else {
-            t.length.ok_or(Error::Schema("variable field"))
-        }
-    }
-    fn minimum(&self, block: &Block, version: u64) -> Result<usize, Error> {
-        let mut end = 0;
-        for m in block.members.iter().filter(|m| m.since <= version) {
-            if let MemberKind::Field(f) = &m.kind
-                && f.presence != Presence::Constant
-            {
-                end = end.max(add(f.offset, self.type_length(f.ty, version, 1)?)?);
-            }
-        }
-        Ok(end)
-    }
 }
 
 impl Block {
+    /// The shortest block that holds every field of the acting version,
+    /// from the table built at schema compile time. O(log n).
+    fn minimum(&self, version: u64) -> usize {
+        let n = self
+            .minimums
+            .partition_point(|(since, _)| *since <= version);
+        n.checked_sub(1)
+            .and_then(|i| self.minimums.get(i))
+            .map_or(0, |(_, end)| *end)
+    }
+
+    /// Adds the work of `count` entries to `work`, plus one visit of this
+    /// definition, so an empty group still costs its member walk.
+    fn charge(&self, work: &mut usize, count: usize) -> Result<(), Error> {
+        *work = count
+            .checked_mul(self.work)
+            .and_then(|n| n.checked_add(self.members.len() + 1))
+            .and_then(|n| work.checked_add(n))
+            .filter(|n| *n <= MAX_VALUES)
+            .ok_or(Error::Limit("MAX_VALUES"))?;
+        Ok(())
+    }
     fn counts(&self, version: u64) -> (u64, u64) {
         let mut groups = 0;
         let mut data = 0;
@@ -1743,6 +1951,7 @@ impl Layout {
 struct Budget {
     nodes: usize,
     bytes: usize,
+    work: usize,
 }
 impl Budget {
     fn nodes(&mut self, n: usize) -> Result<(), Error> {
@@ -1857,15 +2066,13 @@ impl Reader<'_, '_> {
             }
             Kind::Composite(members) => {
                 let mut values = Vec::new();
+                let mut optional = presence == Presence::Optional;
                 for m in members {
                     self.budget.name(&m.name)?;
+                    let presence = self.schema.ty(m.ty)?.member_presence(&mut optional);
                     let v = if m.since > self.version {
                         Value::Absent
                     } else {
-                        let presence = match &self.schema.ty(m.ty)?.kind {
-                            Kind::Simple(s) | Kind::Enum(s, _) => s.presence,
-                            _ => Presence::Required,
-                        };
                         self.value(m.ty, add(at, m.offset)?, end, presence, depth + 1)?
                     };
                     values.push(NamedValue {
@@ -1888,7 +2095,7 @@ impl Reader<'_, '_> {
         nesting(depth)?;
         self.budget.nodes(1)?;
         let block = self.schema.block(id)?;
-        if length < self.schema.minimum(block, self.version)? {
+        if length < block.minimum(self.version) {
             return Err(Error::BlockLength);
         }
         let start = *pos;
@@ -1924,14 +2131,16 @@ impl Reader<'_, '_> {
                     } => {
                         let values = dimensions.read(self.input, *pos, self.schema.order)?;
                         let [block_length, count, _, _, _, _] = values;
-                        dimensions.counts(values, self.schema.block(*id)?, self.version)?;
                         let count = group_count(count)?;
+                        let definition = self.schema.block(*id)?;
+                        definition.charge(&mut self.budget.work, count)?;
+                        dimensions.counts(values, definition, self.version)?;
                         // Charge entries before allocating, including zero-byte entries.
                         self.budget.nodes(count)?;
                         *pos = add(*pos, dimensions.length)?;
                         let mut entries = Vec::with_capacity(count);
                         let length = size(block_length)?;
-                        if length < self.schema.minimum(self.schema.block(*id)?, self.version)? {
+                        if length < definition.minimum(self.version) {
                             return Err(Error::BlockLength);
                         }
                         for _ in 0..count {
@@ -2114,20 +2323,18 @@ impl Writer<'_> {
                 if values.len() != members.len() {
                     return Err(Error::Tree);
                 }
+                let mut optional = presence == Presence::Optional;
                 for (m, v) in members.iter().zip(values) {
                     self.budget.name(&v.name)?;
                     if m.name != v.name {
                         return Err(Error::Tree);
                     }
+                    let presence = self.schema.ty(m.ty)?.member_presence(&mut optional);
                     if m.since > self.version {
                         if v.value != Value::Absent {
                             return Err(Error::Tree);
                         }
                     } else {
-                        let presence = match &self.schema.ty(m.ty)?.kind {
-                            Kind::Simple(s) | Kind::Enum(s, _) => s.presence,
-                            _ => Presence::Required,
-                        };
                         self.value(m.ty, &v.value, add(at, m.offset)?, end, presence, depth + 1)?;
                     }
                 }
@@ -2148,7 +2355,7 @@ impl Writer<'_> {
         if fields.len() != block.members.len() {
             return Err(Error::Tree);
         }
-        if length < self.schema.minimum(block, self.version)? {
+        if length < block.minimum(self.version) {
             return Err(Error::BlockLength);
         }
         let start = extend_zero(&mut self.out, length)?;
@@ -2204,19 +2411,17 @@ impl Writer<'_> {
                         return Err(Error::Tree);
                     };
                     let count = group_count(group.entries.len() as u64)?;
+                    let definition = self.schema.block(*block)?;
+                    definition.charge(&mut self.budget.work, count)?;
                     self.budget.nodes(count)?;
-                    let (groups, data) = self.schema.block(*block)?.counts(self.version);
+                    let (groups, data) = definition.counts(self.version);
                     dimensions.write(
                         [group.block_length, count as u64, 0, 0, groups, data],
                         self.schema.order,
                         &mut self.out,
                     )?;
                     let length = size(group.block_length)?;
-                    if length
-                        < self
-                            .schema
-                            .minimum(self.schema.block(*block)?, self.version)?
-                    {
+                    if length < definition.minimum(self.version) {
                         return Err(Error::BlockLength);
                     }
                     for entry in &group.entries {
@@ -2261,6 +2466,7 @@ impl Schema {
             out: Vec::new(),
             budget: Budget::default(),
         };
+        self.block(template.block)?.charge(&mut w.budget.work, 1)?;
         self.header.write(
             [
                 h.block_length,
@@ -2293,6 +2499,7 @@ impl Schema {
             version: header.version,
             budget: Budget::default(),
         };
+        self.block(block)?.charge(&mut reader.budget.work, 1)?;
         let mut pos = self.header.length;
         let fields = reader.block(block, &mut pos, size(header.block_length)?, 1)?;
         if pos != input.len() {
@@ -2384,9 +2591,13 @@ struct ScanFrame {
 /// Unknown templates and malformed messages end the stream. Partial input
 /// returns [`Step::Need`], including at EOF. [`codec::Stream`](fictionet::stdlib::codec::Stream)
 /// reports truncation. Use [`Decode::map`] to interpret complete messages.
+/// A combinator that makes decoders on demand, such as
+/// [`codec::Demux`](fictionet::stdlib::codec::Demux), needs a
+/// `&'static Schema`, for example one kept in a `OnceLock`.
 #[derive(Clone, Debug)]
 pub struct Frames<'s> {
     schema: &'s Schema,
+    limit: usize,
     header: Option<Header>,
     root: usize,
     stack: [Option<ScanFrame>; MAX_NESTING],
@@ -2397,8 +2608,16 @@ pub struct Frames<'s> {
 impl<'s> Frames<'s> {
     /// Creates a decoder with a [`MAX_MESSAGE_BYTES`] input bound.
     pub fn new(schema: &'s Schema) -> Self {
+        Self::with_limit(schema, MAX_MESSAGE_BYTES)
+    }
+    /// Creates a decoder that refuses any message longer than `limit`
+    /// bytes, header included, from the first length that shows it. Limits
+    /// above [`MAX_MESSAGE_BYTES`] are clamped; limits below the header
+    /// length are raised to it.
+    pub fn with_limit(schema: &'s Schema, limit: usize) -> Self {
         Self {
             schema,
+            limit: limit.clamp(schema.header.length, MAX_MESSAGE_BYTES),
             header: None,
             root: 0,
             stack: [None; MAX_NESTING],
@@ -2407,14 +2626,21 @@ impl<'s> Frames<'s> {
             work: 0,
         }
     }
+    /// The largest message this decoder accepts, header included.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+    /// `a + b`, refused when it passes this decoder's message limit.
+    fn end(&self, a: usize, b: usize) -> Result<usize, Error> {
+        let n = add(a, b)?;
+        if n > self.limit {
+            return Err(Error::Limit("Frames::limit"));
+        }
+        Ok(n)
+    }
     fn push(&mut self, block: usize, left: usize, length: usize) -> Result<(), Error> {
         let definition = self.schema.block(block)?;
-        let work = left
-            .checked_mul(definition.work)
-            .and_then(|n| n.checked_add(self.work))
-            .filter(|n| *n <= MAX_VALUES)
-            .ok_or(Error::Limit("MAX_VALUES"))?;
-        self.work = work;
+        definition.charge(&mut self.work, left)?;
         if left == 0 {
             return Ok(());
         }
@@ -2451,12 +2677,12 @@ impl<'s> Frames<'s> {
             let b = self.schema.block(t.block)?;
             self.schema.header.counts(values, b, version)?;
             let length = size(block_length)?;
-            if length < self.schema.minimum(b, version)? {
+            if length < b.minimum(version) {
                 return Err(Error::BlockLength);
             }
             self.root = t.block;
             self.pos = self.schema.header.length;
-            add(self.pos, length)?;
+            self.end(self.pos, length)?;
             self.push(t.block, 1, length)?;
             self.header = Some(Header {
                 block_length,
@@ -2476,7 +2702,7 @@ impl<'s> Frames<'s> {
                 .ok_or(Error::Layout)?;
             let block = self.schema.block(frame.block)?;
             if !frame.fixed {
-                let end = add(self.pos, frame.length)?;
+                let end = self.end(self.pos, frame.length)?;
                 if end > input.len() {
                     return Ok(None);
                 }
@@ -2504,11 +2730,11 @@ impl<'s> Frames<'s> {
             match &m.kind {
                 MemberKind::Field(_) => return Err(Error::Layout),
                 MemberKind::Data { length, prefix } => {
-                    if add(self.pos, *prefix)? > input.len() {
+                    if self.end(self.pos, *prefix)? > input.len() {
                         return Ok(None);
                     }
                     let n = read_length(length, self.schema.order, input, self.pos)?;
-                    let end = add(add(self.pos, *prefix)?, n)?;
+                    let end = self.end(add(self.pos, *prefix)?, n)?;
                     if end > input.len() {
                         return Ok(None);
                     }
@@ -2517,22 +2743,22 @@ impl<'s> Frames<'s> {
                     self.update(frame)?;
                 }
                 MemberKind::Group { block, dimensions } => {
-                    if add(self.pos, dimensions.length)? > input.len() {
+                    if self.end(self.pos, dimensions.length)? > input.len() {
                         return Ok(None);
                     }
                     let values = dimensions.read(input, self.pos, self.schema.order)?;
                     let [length, count, _, _, _, _] = values;
                     let definition = self.schema.block(*block)?;
-                    dimensions.counts(values, definition, header.version)?;
                     let length = size(length)?;
                     let count = group_count(count)?;
-                    if length < self.schema.minimum(definition, header.version)? {
+                    dimensions.counts(values, definition, header.version)?;
+                    if length < definition.minimum(header.version) {
                         return Err(Error::BlockLength);
                     }
                     let fixed = length
                         .checked_mul(count)
                         .ok_or(Error::Limit("MAX_MESSAGE_BYTES"))?;
-                    add(add(self.pos, dimensions.length)?, fixed)?;
+                    self.end(add(self.pos, dimensions.length)?, fixed)?;
                     self.pos = add(self.pos, dimensions.length)?;
                     frame.member += 1;
                     self.update(frame)?;
@@ -2547,22 +2773,19 @@ impl Decode for Frames<'_> {
     type Item = Message;
     type Error = Error;
     const NAME: &'static str = "SBE 1.0";
-    /// The maximum unread message size. Oversized lengths fail immediately.
+    /// The message limit. Oversized lengths fail as soon as they are read.
     fn capacity(&self) -> usize {
-        MAX_MESSAGE_BYTES
-    }
-    /// Returns the fixed scanner storage size. The schema is borrowed and
-    /// owned by the caller; it is not counted as retained decoder storage.
-    fn held(&self) -> usize {
-        core::mem::size_of::<Self>()
+        self.limit
     }
     /// Reads one message. Refuses unknown headers/layouts, invalid values,
     /// short fixed blocks, and all named limits. Incomplete messages return
     /// `Need`, including at EOF. No input bytes are retained.
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Message>, Error> {
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Message>, Error> {
         let Some(used) = self.scan(input)? else {
-            if input.len() >= MAX_MESSAGE_BYTES {
-                return Err(Error::Limit("MAX_MESSAGE_BYTES"));
+            // Every position the scan needs is checked against the limit,
+            // so this is only a guard for rule 5 (progress at capacity).
+            if !eof && input.len() >= self.limit {
+                return Err(Error::Limit("Frames::limit"));
             }
             return Ok(Step::Need);
         };
@@ -2570,7 +2793,7 @@ impl Decode for Frames<'_> {
         let message =
             self.schema
                 .read_message(bytes, self.header.ok_or(Error::Header)?, self.root)?;
-        *self = Self::new(self.schema);
+        *self = Self::with_limit(self.schema, self.limit);
         Ok(Step::Item(message, used))
     }
 }
@@ -2578,7 +2801,7 @@ impl Decode for Frames<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Stream, contract, test_support};
+    use fictionet::stdlib::codec::{Fail, Stream, contract, test_support};
     use std::sync::OnceLock;
 
     // A small rewrite of the public Real Logic car example, with nested refs,
@@ -2682,6 +2905,509 @@ mod tests {
         let mut bytes = vec![block as u8, (block >> 8) as u8, 1, 0, 7, 0, 2, 0];
         bytes.extend_from_slice(body);
         bytes
+    }
+
+    // Authored from SBE 1.0 sections 2.3, 2.5, and 4. These are small
+    // market-data-style encodings, not an exchange's production schema.
+    const NULL_TYPES: &str = r#"
+        <type name="Int32NULL" primitiveType="int32" presence="optional" nullValue="2147483647"/>
+        <type name="Int8NULL" primitiveType="int8" presence="optional" nullValue="127"/>
+        <composite name="PRICENULL9">
+          <type name="mantissa" primitiveType="int64" presence="optional" nullValue="9223372036854775807"/>
+          <type name="exponent" primitiveType="int8" presence="constant">-9</type>
+        </composite>"#;
+    struct MarketNulls;
+    impl SchemaSource for MarketNulls {
+        fn schema() -> Result<&'static Schema, Error> {
+            static S: OnceLock<Result<Schema, Error>> = OnceLock::new();
+            S.get_or_init(|| {
+                Schema::parse(&schema_xml(
+                    NULL_TYPES,
+                    r#"
+                <field name="quantity" id="1" type="Int32NULL"/>
+                <field name="flag" id="2" type="Int8NULL"/>
+                <field name="price" id="3" type="PRICENULL9"/>"#,
+                ))
+            })
+            .as_ref()
+            .map_err(|e| *e)
+        }
+    }
+
+    #[test]
+    fn explicit_null_at_default_boundary() {
+        let s = MarketNulls::schema().unwrap();
+        let bytes = packet(
+            13,
+            &[
+                0xff, 0xff, 0xff, 0x7f, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f,
+            ],
+        );
+        let mut wire = MessageWire::<MarketNulls>::parse(&bytes).unwrap();
+        assert_eq!(
+            wire.message.fields,
+            vec![
+                named("quantity", Value::Null),
+                named("flag", Value::Null),
+                named(
+                    "price",
+                    Value::Composite(vec![
+                        named("mantissa", Value::Null),
+                        named("exponent", int(-9)),
+                    ])
+                ),
+            ]
+        );
+        assert_eq!(wire.to_bytes().unwrap(), bytes);
+        contract::check_wire::<MessageWire<MarketNulls>>(&bytes);
+        contract::check_decode_with_alloc_limit(|| Frames::new(s), &bytes, 2 * MAX_MESSAGE_BYTES);
+        wire.message.fields[0].value = int(i64::from(i32::MAX));
+        let mut out = vec![1, 2, 3];
+        assert_eq!(wire.write(&mut out), Err(Error::Value));
+        assert_eq!(out, [1, 2, 3]);
+        contract::check_wire_value(&wire);
+    }
+
+    #[test]
+    fn constant_fields_do_not_order_versions() {
+        let types =
+            r#"<enum name="E" encodingType="uint8"><validValue name="A">1</validValue></enum>"#;
+        let s = Schema::parse(&schema_xml(
+            types,
+            r#"
+            <field name="new" id="1" type="E" presence="constant" valueRef="E.A" sinceVersion="2"/>
+            <field name="old" id="2" type="E" presence="constant" valueRef="E.A"/>
+            <field name="value" id="3" type="uint8"/>"#,
+        ))
+        .unwrap();
+        for version in [0, 2, 3] {
+            let mut bytes = packet(1, &[42]);
+            bytes[6] = version;
+            let m = s.decode(&bytes).unwrap();
+            assert_eq!(
+                m.fields[0].value,
+                if version < 2 {
+                    Value::Absent
+                } else {
+                    Value::Enum("A".into())
+                }
+            );
+            let mut out = Vec::new();
+            s.write(&m, &mut out).unwrap();
+            assert_eq!(out, bytes);
+            contract::check_decode_with_alloc_limit(
+                || Frames::new(&s),
+                &bytes,
+                2 * MAX_MESSAGE_BYTES,
+            );
+        }
+    }
+
+    #[test]
+    fn constant_composite_members_do_not_order_versions() {
+        let types = r#"<composite name="C">
+            <type name="new" primitiveType="int8" presence="constant" sinceVersion="2">2</type>
+            <type name="old" primitiveType="int8" presence="constant">1</type>
+            <type name="value" primitiveType="uint8"/>
+        </composite>"#;
+        let s = Schema::parse(&schema_xml(types, r#"<field name="c" id="1" type="C"/>"#)).unwrap();
+        for version in [0, 2, 3] {
+            let mut bytes = packet(1, &[42]);
+            bytes[6] = version;
+            let m = s.decode(&bytes).unwrap();
+            assert_eq!(
+                m.fields[0].value,
+                Value::Composite(vec![
+                    named("new", if version < 2 { Value::Absent } else { int(2) }),
+                    named("old", int(1)),
+                    named("value", uint(42)),
+                ])
+            );
+            let mut out = Vec::new();
+            s.write(&m, &mut out).unwrap();
+            assert_eq!(out, bytes);
+            contract::check_decode_with_alloc_limit(
+                || Frames::new(&s),
+                &bytes,
+                2 * MAX_MESSAGE_BYTES,
+            );
+        }
+    }
+
+    /// Both composite shapes from the work-amplification reports: a 31-way
+    /// tree three levels deep, and a binary tree thirteen levels deep.
+    fn deep_composites() -> [(String, u16); 2] {
+        let mut wide = String::new();
+        for (name, child) in [("C2", "uint8"), ("C1", "C2"), ("C0", "C1")] {
+            wide.push_str(&format!(r#"<composite name="{name}">"#));
+            for n in 0..31 {
+                wide.push_str(&format!(r#"<ref name="v{n}" type="{child}"/>"#));
+            }
+            wide.push_str("</composite>");
+        }
+        let mut binary = String::from(
+            r#"<composite name="B0"><type name="a" primitiveType="uint8"/></composite>"#,
+        );
+        for k in 1..=13 {
+            binary.push_str(&format!(
+                r#"<composite name="B{k}"><ref name="x" type="B{0}"/><ref name="y" type="B{0}"/></composite>"#,
+                k - 1
+            ));
+        }
+        binary = binary.replace(r#"name="B13""#, r#"name="C0""#);
+        [(wide, 29791), (binary, 8192)]
+    }
+
+    /// An outer group of `count` entries, each holding one empty inner
+    /// group whose entries would be `block_length` bytes long.
+    fn empty_groups(count: u16, block_length: u16) -> Vec<u8> {
+        let mut bytes = packet(0, &[0, 0]);
+        bytes.extend_from_slice(&count.to_le_bytes());
+        for _ in 0..count {
+            bytes.extend_from_slice(&block_length.to_le_bytes());
+            bytes.extend_from_slice(&[0, 0]);
+        }
+        bytes
+    }
+
+    #[test]
+    fn empty_groups_cost_linear_work() {
+        let group_size = r#"<composite name="groupSizeEncoding"><type name="blockLength" primitiveType="uint16"/><type name="numInGroup" primitiveType="uint16"/></composite>"#;
+        for (types, block_length) in deep_composites() {
+            let s = Schema::parse(&schema_xml(
+                &format!("{group_size}{types}"),
+                r#"<group name="outer" id="1">
+                <group name="inner" id="2"><field name="value" id="3" type="C0"/></group>
+                </group>"#,
+            ))
+            .unwrap();
+            // Minimum lengths are a table lookup, so a group costs its member
+            // walk whatever its composites hold, and work stays below two
+            // units per input byte.
+            let bytes = empty_groups(10_000, block_length);
+            let mut frames = Frames::new(&s);
+            assert_eq!(frames.scan(&bytes), Ok(Some(bytes.len())));
+            assert!(frames.work <= 2 * bytes.len(), "{}", frames.work);
+            let m = s.decode(&bytes).unwrap();
+            let mut out = vec![0xaa];
+            s.write(&m, &mut out).unwrap();
+            assert_eq!(out[1..], bytes);
+            // The 80 KB message from the report is refused by the work
+            // limit, not decoded in quadratic time.
+            let bytes = empty_groups(20_000, block_length);
+            assert_eq!(s.decode(&bytes), Err(Error::Limit("MAX_VALUES")));
+            let mut stream = Stream::new(Frames::new(&s));
+            for b in &bytes {
+                assert_eq!(stream.push(core::slice::from_ref(b)), 1);
+                if let Some(r) = stream.next() {
+                    assert_eq!(r, Err(Fail::Protocol(Error::Limit("MAX_VALUES"))));
+                    break;
+                }
+            }
+            let short = empty_groups(1, block_length - 1);
+            assert_eq!(s.decode(&short), Err(Error::BlockLength));
+        }
+    }
+
+    #[test]
+    fn optional_composite_uses_first_nonconstant_member() {
+        let types = r#"<composite name="Price">
+            <type name="exponent" primitiveType="int8" presence="constant">-9</type>
+            <type name="mantissa" primitiveType="int64"/>
+            <type name="flag" primitiveType="uint8"/>
+        </composite><composite name="Quote"><ref name="price" type="Price"/></composite>"#;
+        for ty in ["Price", "Quote"] {
+            let s = Schema::parse(&schema_xml(
+                types,
+                &format!(
+                    r#"
+                <field name="optional" id="1" type="{ty}" presence="optional"/>
+                <field name="required" id="2" type="{ty}"/>"#
+                ),
+            ))
+            .unwrap();
+            let bytes = packet(
+                18,
+                &[0, 0, 0, 0, 0, 0, 0, 0x80, 1, 42, 0, 0, 0, 0, 0, 0, 0, 2],
+            );
+            let m = s.decode(&bytes).unwrap();
+            let mut price = Value::Composite(vec![
+                named("exponent", int(-9)),
+                named("mantissa", Value::Null),
+                named("flag", uint(1)),
+            ]);
+            if ty == "Quote" {
+                price = Value::Composite(vec![named("price", price)]);
+            }
+            assert_eq!(m.fields[0].value, price);
+            let mut out = Vec::new();
+            s.write(&m, &mut out).unwrap();
+            assert_eq!(out, bytes);
+            contract::check_decode_with_alloc_limit(
+                || Frames::new(&s),
+                &bytes,
+                2 * MAX_MESSAGE_BYTES,
+            );
+            let mut bad = bytes.clone();
+            bad[16] = 255; // A later member remains required.
+            assert_eq!(s.decode(&bad), Err(Error::Value));
+            bad = bytes;
+            bad[17..25].copy_from_slice(&i64::MIN.to_le_bytes());
+            assert_eq!(s.decode(&bad), Err(Error::Value));
+        }
+    }
+
+    #[test]
+    fn optional_field_overrides_refuse_null_overlap() {
+        for (types, reason) in [
+            (
+                r#"<enum name="E" encodingType="uint8"><validValue name="a">1</validValue><validValue name="z">255</validValue></enum>"#,
+                "enum value equals null",
+            ),
+            (
+                r#"<type name="E" primitiveType="uint8" maxValue="255"/>"#,
+                "null overlaps value range",
+            ),
+        ] {
+            for (types, ty) in [
+                (types.to_owned(), "E"),
+                (
+                    format!(
+                        r#"{types}<composite name="C"><ref name="value" type="E"/></composite>"#
+                    ),
+                    "C",
+                ),
+            ] {
+                let xml = schema_xml(
+                    &types,
+                    &format!(r#"<field name="value" id="1" type="{ty}" presence="optional"/>"#),
+                );
+                assert!(matches!(Schema::parse(&xml), Err(Error::Schema(r)) if r == reason));
+            }
+        }
+    }
+
+    #[test]
+    fn constant_char_arrays_require_printable_ascii() {
+        for (text, valid) in [
+            (" ~", true),
+            ("é", false),
+            ("a&#x7f;", false),
+            ("a&#9;", false),
+        ] {
+            let types = format!(
+                r#"<type name="Text" primitiveType="char" presence="constant">{text}</type>"#
+            );
+            let result = Schema::parse(&schema_xml(
+                &types,
+                r#"<field name="text" id="1" type="Text"/>"#,
+            ));
+            assert_eq!(result.is_ok(), valid, "{text}");
+        }
+    }
+
+    // Section 2, "Timestamp with constant time unit": the unit is a
+    // constant taken from an enum by valueRef. The composite comes before
+    // the enum to check forward references.
+    const TIMESTAMP_TYPES: &str = r#"
+        <composite name="UTCTimestampNanos">
+          <type name="time" primitiveType="uint64"/>
+          <type name="unit" primitiveType="uint8" presence="constant" valueRef="TimeUnit.nanosecond"/>
+        </composite>
+        <enum name="TimeUnit" encodingType="uint8">
+          <validValue name="second">0</validValue>
+          <validValue name="millisecond">3</validValue>
+          <validValue name="microsecond">6</validValue>
+          <validValue name="nanosecond">9</validValue>
+        </enum>
+        <enum name="EntryType" encodingType="char">
+          <validValue name="bid">0</validValue>
+          <validValue name="reset">J</validValue>
+        </enum>
+        <type name="ResetType" primitiveType="char" length="1" presence="constant" valueRef="EntryType.reset"/>"#;
+
+    #[test]
+    fn constant_types_take_value_ref() {
+        let s = Schema::parse(&schema_xml(
+            TIMESTAMP_TYPES,
+            r#"<field name="sent" id="1" type="UTCTimestampNanos"/>
+            <field name="unit" id="2" type="uint8" presence="constant" valueRef="TimeUnit.second"/>
+            <field name="entry" id="3" type="ResetType"/>
+            <field name="kind" id="4" type="EntryType" presence="constant" valueRef="EntryType.bid"/>"#,
+        ))
+        .unwrap();
+        // 1_000_000_001 ns after the epoch, little-endian.
+        let bytes = packet(8, &[0x01, 0xca, 0x9a, 0x3b, 0, 0, 0, 0]);
+        let m = s.decode(&bytes).unwrap();
+        assert_eq!(
+            m.fields,
+            vec![
+                named(
+                    "sent",
+                    Value::Composite(vec![
+                        named("time", uint(1_000_000_001)),
+                        named("unit", uint(9))
+                    ])
+                ),
+                named("unit", uint(0)),
+                named("entry", Value::Bytes(b"J".to_vec())),
+                named("kind", Value::Enum("bid".into())),
+            ]
+        );
+        let mut out = Vec::new();
+        s.write(&m, &mut out).unwrap();
+        assert_eq!(out, bytes);
+        contract::check_decode(|| Frames::new(&s), &bytes);
+        let mut bad = m.clone();
+        bad.fields[0].value =
+            Value::Composite(vec![named("time", uint(1)), named("unit", uint(3))]);
+        let mut out = vec![1];
+        assert_eq!(s.write(&bad, &mut out), Err(Error::Value));
+        assert_eq!(out, [1]);
+
+        for (types, field, reason) in [
+            (
+                r#"<type name="T" primitiveType="uint8" presence="constant" valueRef="TimeUnit.second">0</type>"#,
+                r#"<field name="t" id="1" type="T"/>"#,
+                "valueRef with constant text",
+            ),
+            (
+                r#"<type name="T" primitiveType="uint8" valueRef="TimeUnit.second"/>"#,
+                r#"<field name="t" id="1" type="T"/>"#,
+                "valueRef requires constant",
+            ),
+            (
+                r#"<type name="T" primitiveType="uint8" presence="constant" valueRef="EntryType.reset"/>"#,
+                r#"<field name="t" id="1" type="T"/>"#,
+                "constant outside range",
+            ),
+            (
+                r#"<type name="T" primitiveType="uint8" presence="constant" valueRef="TimeUnit.hour"/>"#,
+                r#"<field name="t" id="1" type="T"/>"#,
+                "unknown valueRef",
+            ),
+            (
+                "",
+                r#"<field name="t" id="1" type="EntryType" presence="constant" valueRef="TimeUnit.second"/>"#,
+                "valueRef type mismatch",
+            ),
+            (
+                "",
+                r#"<field name="t" id="1" type="int8" presence="constant" valueRef="TimeUnit.second"/>"#,
+                "constant outside range",
+            ),
+        ] {
+            let xml = schema_xml(&format!("{TIMESTAMP_TYPES}{types}"), field);
+            assert_eq!(
+                Schema::parse(&xml).err(),
+                Some(Error::Schema(reason)),
+                "{types}{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn frames_with_limit() {
+        let types = r#"<composite name="Var"><type name="length" primitiveType="uint32"/><type name="varData" primitiveType="uint8" length="0"/></composite>"#;
+        let s = Schema::parse(&schema_xml(
+            types,
+            r#"<data name="first" id="1" type="Var"/><data name="second" id="2" type="Var"/>"#,
+        ))
+        .unwrap();
+        assert_eq!(Frames::with_limit(&s, 0).limit(), s.header_length());
+        assert_eq!(
+            Frames::with_limit(&s, usize::MAX).limit(),
+            MAX_MESSAGE_BYTES
+        );
+        let mut small = packet(0, &[3, 0, 0, 0]);
+        small.extend_from_slice(b"abc");
+        small.extend_from_slice(&[0; 4]);
+        let frames = Frames::with_limit(&s, small.len());
+        assert_eq!(frames.capacity(), small.len());
+        contract::check_decode(|| Frames::with_limit(&s, small.len()), &small);
+        // Truncated below the limit: Need at EOF, so the driver reports it.
+        let cut = &small[..small.len() - 1];
+        assert_eq!(Frames::with_limit(&s, 64).decode(cut, true), Ok(Step::Need));
+        // A length past the limit is refused as soon as it is read.
+        let long = packet(0, &[100, 0, 0, 0]);
+        assert_eq!(
+            Frames::with_limit(&s, 64).decode(&long, false),
+            Err(Error::Limit("Frames::limit"))
+        );
+        // At the default limit, a length past it is refused the same way.
+        let huge = packet(0, &((MAX_MESSAGE_BYTES - 11) as u32).to_le_bytes());
+        assert_eq!(
+            Frames::new(&s).decode(&huge, true),
+            Err(Error::Limit("MAX_MESSAGE_BYTES"))
+        );
+    }
+
+    #[test]
+    fn scanner_holds_no_input() {
+        let mut frames = Frames::new(Car::schema().unwrap());
+        assert_eq!(frames.held(), 0);
+        assert_eq!(frames.decode(&CAR_BYTES[..20], false), Ok(Step::Need));
+        assert_eq!(frames.held(), 0);
+    }
+
+    #[test]
+    fn null_boundaries_and_explicit_ranges() {
+        for (primitive, null, adjacent) in [
+            ("int8", "-127", int(-126)),
+            ("uint8", "0", uint(1)),
+            ("uint8", "254", uint(253)),
+        ] {
+            let types = format!(
+                r#"<type name="T" primitiveType="{primitive}" presence="optional" nullValue="{null}"/>"#
+            );
+            let s = Schema::parse(&schema_xml(
+                &types,
+                r#"<field name="value" id="1" type="T"/>"#,
+            ))
+            .unwrap();
+            let byte = null.parse::<i16>().unwrap() as u8;
+            assert_eq!(
+                s.decode(&packet(1, &[byte])).unwrap().fields[0].value,
+                Value::Null
+            );
+            let mut m = s.decode(&packet(1, &[byte])).unwrap();
+            m.fields[0].value = adjacent;
+            let mut out = Vec::new();
+            s.write(&m, &mut out).unwrap();
+            assert_eq!(s.decode(&out), Ok(m));
+        }
+        for attrs in [
+            r#"nullValue="1""#,
+            r#"nullValue="127" maxValue="127""#,
+            r#"nullValue="-127" minValue="-127""#,
+            r#"nullValue="5" minValue="0" maxValue="10""#,
+        ] {
+            let types =
+                format!(r#"<type name="T" primitiveType="int8" presence="optional" {attrs}/>"#);
+            assert!(matches!(
+                Schema::parse(&schema_xml(&types, "")),
+                Err(Error::Schema("null overlaps value range"))
+            ));
+        }
+        // An explicit bound on the other end keeps the null out of range.
+        for attrs in [
+            r#"nullValue="127" minValue="0" maxValue="126""#,
+            r#"nullValue="127" minValue="0""#,
+            r#"nullValue="-127" maxValue="5""#,
+        ] {
+            let types =
+                format!(r#"<type name="T" primitiveType="int8" presence="optional" {attrs}/>"#);
+            let s = Schema::parse(&schema_xml(
+                &types,
+                r#"<field name="value" id="1" type="T"/>"#,
+            ))
+            .unwrap();
+            let null = if attrs.contains("-127") { 0x81 } else { 0x7f };
+            assert_eq!(
+                s.decode(&packet(1, &[null])).unwrap().fields[0].value,
+                Value::Null
+            );
+        }
     }
 
     #[test]
