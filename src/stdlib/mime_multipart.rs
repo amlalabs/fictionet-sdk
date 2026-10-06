@@ -15,6 +15,8 @@
 //! pieces goes to [`Stream<Parts>`](super::codec::Stream), which returns
 //! complete [`Part`] values within a fixed size limit. What the fields mean,
 //! and where uploaded files go, is up to world code.
+//! Write raw HTTP bodies with [`Body`] and choose the multipart subtype in
+//! the HTTP header. [`Entity`] writes complete `multipart/mixed` MIME entities.
 //!
 //! Every reader checks lengths and counts, because the agent can send any
 //! bytes it likes. The limits are the `MAX_` constants below. A writer
@@ -651,7 +653,7 @@ fn part_header_end(input: &[u8], scanned: usize) -> Result<Option<usize>, Error>
 /// A partial header returns [`Step::Need`]. An unclosed body returns
 /// [`Error::Truncated`]. Other syntax and limit errors also end the stream.
 /// Capacity is [`MAX_PART`] plus [`MAX_BOUNDARY_LINE`] plus one overflow byte.
-/// Use [`codec::Stream`](super::codec::Stream) to hold the bounded input.
+/// Drive it with [`Stream<Parts>`](super::codec::Stream).
 /// An empty stream ends cleanly with no items, unlike [`Multipart::parse`],
 /// while a preamble-only body is an error.
 ///
@@ -1034,8 +1036,80 @@ impl Multipart {
     }
 }
 
-/// A complete multipart MIME entity with a `Content-Type` header.
-/// Raw HTTP body bytes are read with [`Multipart::parse`] or [`Parts`].
+/// A multipart body with a boundary and no outer MIME header.
+/// Use it for HTTP bodies with any multipart subtype. Parsing takes the
+/// boundary from the first delimiter line, so a preamble cannot be written.
+/// A first line ending in `--` is a closing delimiter. Nonempty bodies
+/// therefore cannot use a boundary ending in `--`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Body {
+    /// The boundary, without its leading dashes.
+    pub boundary: String,
+    /// The parts and epilogue. The preamble must be empty to write.
+    pub multipart: Multipart,
+}
+
+impl Wire for Body {
+    type ParseError = Error;
+    type WriteError = WriteError;
+
+    /// Reads a complete body starting with its delimiter line. Refuses a
+    /// preamble, invalid or colliding boundaries, malformed parts, missing
+    /// closure, excessive counts, parts over [`MAX_PART`], and raw or
+    /// canonical bodies over [`MAX_ENTITY`]. A first closing delimiter
+    /// represents an empty body followed by its epilogue.
+    fn parse(input: &[u8]) -> Result<Self, Error> {
+        if input.len() > MAX_ENTITY {
+            return Err(Error::EntityTooLong);
+        }
+        let prefix = &input[..input.len().min(MAX_BOUNDARY_LINE)];
+        let end = find(prefix, b"\r\n").unwrap_or(prefix.len());
+        let line = core::str::from_utf8(&prefix[..end]).map_err(|_| Error::Boundary)?;
+        let delimiter = line
+            .strip_prefix("--")
+            .ok_or(Error::Boundary)?
+            .trim_end_matches([' ', '\t']);
+        let boundary = delimiter.strip_suffix("--").unwrap_or(delimiter);
+        let multipart = Multipart::parse(input, boundary)?;
+        let body = Self {
+            boundary: boundary.into(),
+            multipart,
+        };
+        body.to_bytes().map_err(parse_error)?;
+        Ok(body)
+    }
+
+    /// Appends only the multipart body. Refuses nonempty preambles and
+    /// nonempty bodies whose boundary ends in `--` as [`WriteError::Unwritable`].
+    /// Also refuses invalid or colliding boundaries, invalid headers,
+    /// excessive counts, parts over [`MAX_PART`], and output over
+    /// [`MAX_ENTITY`]. On error, `out` is unchanged.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+        if !self.multipart.preamble.is_empty()
+            || (!self.multipart.parts.is_empty() && self.boundary.ends_with("--"))
+        {
+            return Err(WriteError::Unwritable);
+        }
+        out.extend_from_slice(&self.multipart.render(&self.boundary)?);
+        Ok(())
+    }
+}
+
+fn parse_error(error: WriteError) -> Error {
+    match error {
+        WriteError::Boundary | WriteError::BoundaryInData => Error::Boundary,
+        WriteError::TooManyParts => Error::TooManyParts,
+        WriteError::TooManyHeaders => Error::TooManyHeaders,
+        WriteError::HeaderTooLong => Error::HeaderTooLong,
+        WriteError::HeaderName | WriteError::HeaderValue | WriteError::Unwritable => Error::Header,
+        WriteError::TooLong => Error::TooLong,
+        WriteError::EntityTooLong => Error::EntityTooLong,
+    }
+}
+
+/// A complete `multipart/mixed` MIME entity with a `Content-Type` header.
+/// Other subtypes use [`Body`] with an outer header supplied by the caller.
+/// Read bodies with a known boundary using [`Multipart::parse`] or [`Parts`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entity {
     /// The boundary, without its leading dashes.
@@ -1071,15 +1145,7 @@ impl Wire for Entity {
         let multipart = Multipart::parse(input.get(end..).unwrap_or_default(), &boundary)?;
         let entity = Self { boundary, multipart };
         // Canonical header spacing must also fit the entity cap.
-        entity.to_bytes().map_err(|error| match error {
-            WriteError::Boundary | WriteError::BoundaryInData => Error::Boundary,
-            WriteError::TooManyParts => Error::TooManyParts,
-            WriteError::TooManyHeaders => Error::TooManyHeaders,
-            WriteError::HeaderTooLong => Error::HeaderTooLong,
-            WriteError::HeaderName | WriteError::HeaderValue | WriteError::Unwritable => Error::Header,
-            WriteError::TooLong => Error::TooLong,
-            WriteError::EntityTooLong => Error::EntityTooLong,
-        })?;
+        entity.to_bytes().map_err(parse_error)?;
         Ok(entity)
     }
 

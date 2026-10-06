@@ -9,7 +9,74 @@ where
     D::Error: Clone + Debug + PartialEq,
 {
     let allocation = 2 * make().capacity();
-    contract::check_decode_with_alloc_limit(make, input, allocation);
+    contract::check_decode_with_alloc_limit(&make, input, allocation);
+    for cut in 0..=input.len().min(256) {
+        contract::check_decode_with_alloc_limit(&make, &input[..cut], allocation);
+    }
+}
+
+#[test]
+fn multipart_body_for_http_form_data() {
+    let body = mime::Body {
+        boundary: "upload".into(),
+        multipart: mime::Multipart {
+            parts: vec![mime::Part::field("name", "Alice").unwrap()],
+            ..mime::Multipart::default()
+        },
+    };
+    let bytes = body.to_bytes().unwrap();
+    assert_eq!(
+        bytes,
+        b"--upload\r\nContent-Disposition: form-data; name=name\r\n\r\nAlice\r\n--upload--\r\n"
+    );
+    let header = mime::content_type("form-data", &body.boundary).unwrap();
+    let header = String::from_utf8(header.to_bytes().unwrap()).unwrap();
+    assert_eq!(
+        mime::Multipart::parse(&bytes, &mime::boundary(&header).unwrap()),
+        Ok(body.multipart.clone())
+    );
+    assert_eq!(mime::Body::parse(&bytes), Ok(body.clone()));
+    contract::check_wire_value(&body);
+}
+
+#[test]
+fn multipart_body_boundaries_and_refusals() {
+    for input in [
+        b"--b--".as_slice(),
+        b"--b-- \t\r\nepilogue",
+        b"--b \t\r\n\r\npart\r\n--b--\r\nepilogue",
+        b"--b----\r\nepilogue",
+    ] {
+        let body = mime::Body::parse(input).unwrap();
+        assert!(body.multipart.preamble.is_empty());
+        contract::check_wire_value(&body);
+        contract::check_wire::<mime::Body>(input);
+    }
+    for input in [b"preamble\r\n--b--".as_slice(), b"--b\r\n\r\npart"] {
+        assert!(mime::Body::parse(input).is_err());
+        contract::check_wire::<mime::Body>(input);
+    }
+    let mut body = mime::Body {
+        boundary: "b".into(),
+        multipart: mime::Multipart {
+            preamble: b"preamble".to_vec(),
+            ..mime::Multipart::default()
+        },
+    };
+    let mut out = b"keep".to_vec();
+    assert_eq!(body.write(&mut out), Err(mime::WriteError::Unwritable));
+    assert_eq!(out, b"keep");
+    body.multipart.preamble.clear();
+    body.multipart.parts.push(mime::Part::default());
+    body.boundary = "b--".into();
+    assert_eq!(body.write(&mut out), Err(mime::WriteError::Unwritable));
+    assert_eq!(out, b"keep");
+    contract::check_wire_value(&body);
+    body.boundary = "b".into();
+    body.multipart.parts[0].body = b"--b".to_vec();
+    assert_eq!(body.write(&mut out), Err(mime::WriteError::BoundaryInData));
+    assert_eq!(out, b"keep");
+    contract::check_wire_value(&body);
 }
 
 #[test]
@@ -106,7 +173,7 @@ fn json_depth_errors() {
         (b"{{".to_vec(), json::Limits { depth: 1, ..json::Limits::default() }),
     ] {
         let expected = json::parse_with(&input, &limits).unwrap_err();
-            assert_eq!(
+        assert_eq!(
             decode_all(|| json::Values::with_limits(limits), &input).1,
             Some(Fail::Protocol(expected))
         );

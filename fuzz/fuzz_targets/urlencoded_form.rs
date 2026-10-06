@@ -1,10 +1,10 @@
 //! Form bodies, query strings, and percent-encoded URL components.
 #![no_main]
 
-use fictionet::stdlib::codec::{Wire, contract, test_support::decode_all};
+use fictionet::stdlib::codec::{Fail, Wire, contract, test_support::decode_all};
 use fictionet::stdlib::urlencoded_form::{
-    decode_component, percent_decode, query_of, EncodeSet, Field, Fields, Form,
-    FormError, PercentEncoded, MAX_INPUT, MAX_PAIRS,
+    EncodeSet, Field, FieldError, Fields, Form, FormError, MAX_INPUT, MAX_PAIRS, PercentEncoded,
+    decode_component, percent_decode, query_of,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -24,9 +24,18 @@ fuzz_target!(|data: &[u8]| {
     }
     let form = Form { pairs: fields.into_iter().map(|field| field.0).collect() };
     contract::check_wire_value(&form);
-    if let Ok(whole) = Form::parse(data) {
-        assert_eq!(error, None);
-        assert_eq!(whole, form);
+    match Form::parse(data) {
+        Ok(whole) => {
+            assert_eq!(error, None);
+            assert_eq!(whole, form);
+        }
+        Err(FormError::TooManyPairs) if data.len() <= MAX_INPUT => {
+            assert_eq!(
+                error,
+                Some(Fail::Protocol(FieldError::Form(FormError::TooManyPairs)))
+            );
+        }
+        Err(_) => {}
     }
     if error.is_none() {
         match form.to_bytes() {

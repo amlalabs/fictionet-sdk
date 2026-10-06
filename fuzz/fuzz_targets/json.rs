@@ -19,11 +19,9 @@ fuzz_target!(|input: &[u8]| {
     let (values, error) = decode_all(make, data);
     for value in &values {
         contract::check_wire_value(value);
-        // Canonical escaping can exceed a tight input-size cap.
-        if value.validate(&limits).is_ok() {
-            let bytes = value.to_bytes().unwrap();
-            assert_eq!(json::parse_with(&bytes, &limits).as_ref(), Ok(value));
-        }
+        assert!(value.validate(&limits).is_ok());
+        let bytes = value.to_bytes().unwrap();
+        assert_eq!(json::parse_with(&bytes, &limits).as_ref(), Ok(value));
     }
     if let Ok(value) = json::parse_with(data, &limits) {
         contract::check_wire_value(&value);

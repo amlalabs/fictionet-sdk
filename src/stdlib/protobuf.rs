@@ -136,7 +136,9 @@ impl core::fmt::Display for Error {
             Error::TooManyFields => write!(f, "protobuf: more than {MAX_FIELDS} fields"),
             Error::TooDeep => write!(f, "protobuf: groups nest deeper than {MAX_DEPTH}"),
             Error::Utf8 => write!(f, "protobuf: a string is not UTF-8"),
-            Error::Trailing { remaining } => write!(f, "trailing bytes after the value: {remaining}"),
+            Error::Trailing { remaining } => {
+                write!(f, "protobuf: trailing bytes after the value: {remaining}")
+            }
         }
     }
 }
@@ -1297,6 +1299,7 @@ mod tests {
 
     #[test]
     fn stream_takes_many_small_frames() {
+        let started = std::time::Instant::now();
         let mut stream = Stream::new(Frames::new());
         let mut count = 0;
         pump(&mut stream, &vec![0; MAX_MESSAGE], |frame| {
@@ -1306,6 +1309,7 @@ mod tests {
         finish(&mut stream, |_| panic!("no pending frame")).unwrap();
         assert_eq!(count, MAX_MESSAGE);
         assert_eq!(stream.buffered(), 0);
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
     }
 
     // Counts fields as MAX_FIELDS does: group members included.
@@ -1402,15 +1406,20 @@ mod tests {
         assert_eq!(w.message(1), Err(Error::TooDeep));
     }
 
+    fn wide(r: &mut Lcg) -> u64 {
+        let bits = r.next() | (r.next() << 31) | ((r.next() & 3) << 62);
+        bits >> r.index(64)
+    }
+
     fn random(r: &mut Lcg, depth: usize) -> Message {
         let mut m = Message::new();
         for _ in 0..r.index(6) {
             let number = [1, 2, 15, 16, 2047, 2048, MAX_FIELD_NUMBER][r.index(7)];
             let value = match r.index(if depth >= 3 { 4 } else { 5 }) {
-                0 => Value::Varint(r.next()),
-                1 => Value::Fixed64(r.next()),
+                0 => Value::Varint(wide(r)),
+                1 => Value::Fixed64(wide(r)),
                 2 => Value::Bytes(r.bytes(10)),
-                3 => Value::Fixed32(r.next() as u32),
+                3 => Value::Fixed32(wide(r) as u32),
                 _ => Value::Group(random(r, depth + 1)),
             };
             m.push(number, value);

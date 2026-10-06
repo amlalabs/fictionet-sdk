@@ -1053,6 +1053,13 @@ impl Decode for Values {
         if eof && self.scan == Scan::Scalar {
             return self.value(input, self.pos, true);
         }
+        if eof
+            && matches!(self.scan, Scan::Container { .. } | Scan::Str { .. })
+            && let Err(error) = parse_with(input, &self.limits)
+            && error.kind != ErrorKind::UnexpectedEnd
+        {
+            return Err(self.error(error.kind, error.offset));
+        }
         Ok(Step::Need)
     }
 }
@@ -1097,8 +1104,12 @@ mod tests {
         (e.kind, e.offset)
     }
 
+    fn written_text(value: &Value) -> String {
+        String::from_utf8(value.to_bytes().unwrap()).unwrap()
+    }
+
     fn round_trip(v: &Value) {
-        let text = v.to_bytes().map(|bytes| String::from_utf8(bytes).unwrap()).unwrap();
+        let text = written_text(v);
         assert_eq!(&Value::parse(text.as_bytes()).unwrap(), v, "{text}");
     }
 
@@ -1185,7 +1196,7 @@ mod tests {
         for good in ["0", "-0", "1", "-1", "10", "1.5", "0.25", "-0.0", "1e5", "1E5", "1e+5", "1e-5", "2.5E-03", "123456789012345678901234567890"] {
             let v = Value::parse(good.as_bytes()).unwrap();
             assert_eq!(v.as_number().unwrap().text(), good);
-            assert_eq!(v.to_bytes().map(|bytes| String::from_utf8(bytes).unwrap()).unwrap(), good);
+            assert_eq!(written_text(&v), good);
             assert!(Number::from_text(good).is_some());
         }
         for bad in ["-", "01", "-01", "00", "1.", ".5", "+1", "1e", "1e+", "1.e5", "0x10", "Infinity", "NaN", "-Infinity", " 1", "1 ", "1.5.5", ""] {
@@ -1227,7 +1238,7 @@ mod tests {
         // U+0000 is allowed as an escape.
         assert_eq!(Value::parse(br#""\u0000""#).unwrap(), s("\0"));
         // The writer escapes only what it must.
-        let w = s("q\"b\\/\n\u{1}\u{7f}é😀").to_bytes().map(|bytes| String::from_utf8(bytes).unwrap()).unwrap();
+        let w = written_text(&s("q\"b\\/\n\u{1}\u{7f}é😀"));
         assert_eq!(w, "\"q\\\"b\\\\/\\n\\u0001\u{7f}é😀\"");
         round_trip(&s("q\"b\\/\n\u{1}\u{1f}\u{7f}é😀\u{2028}"));
         for c in 0..0x20u32 {
@@ -1243,7 +1254,7 @@ mod tests {
         assert_eq!(members[2], ("a".to_string(), n("3")));
         assert_eq!(v.get("a"), Some(&n("1")));
         assert_eq!(v.get("c"), None);
-        assert_eq!(v.to_bytes().map(|bytes| String::from_utf8(bytes).unwrap()).unwrap(), r#"{"a":1,"b":2,"a":3}"#);
+        assert_eq!(written_text(&v), r#"{"a":1,"b":2,"a":3}"#);
     }
 
     #[test]
@@ -1318,16 +1329,19 @@ mod tests {
         for _ in 0..MAX_DEPTH + 1 {
             deep = Value::Array(vec![deep]);
         }
-        assert_eq!(deep.to_bytes().map(|bytes| String::from_utf8(bytes).unwrap()).unwrap_err().kind, ErrorKind::TooDeep);
+        assert_eq!(deep.to_bytes().unwrap_err().kind, ErrorKind::TooDeep);
         let Value::Array(mut inner) = deep else { panic!() };
         round_trip(&inner.pop().unwrap());
         let big = Value::String("x".repeat(MAX_SIZE));
-        assert_eq!(big.to_bytes().map(|bytes| String::from_utf8(bytes).unwrap()).unwrap_err().kind, ErrorKind::TooLarge);
-        assert!(Value::String("x".repeat(MAX_SIZE - 2)).to_bytes().map(|bytes| String::from_utf8(bytes).unwrap()).is_ok());
+        assert_eq!(big.to_bytes().unwrap_err().kind, ErrorKind::TooLarge);
+        assert!(Value::String("x".repeat(MAX_SIZE - 2)).to_bytes().is_ok());
         let escapes = Value::String("\u{1}".repeat(MAX_SIZE / 6 + 1));
-        assert_eq!(escapes.to_bytes().map(|bytes| String::from_utf8(bytes).unwrap()).unwrap_err().kind, ErrorKind::TooLarge);
+        assert_eq!(escapes.to_bytes().unwrap_err().kind, ErrorKind::TooLarge);
         let many = Value::Array(vec![Value::Null; MAX_ELEMENTS]);
-        assert_eq!(many.to_bytes().map(|bytes| String::from_utf8(bytes).unwrap()).unwrap_err().kind, ErrorKind::TooManyElements);
+        assert_eq!(
+            many.to_bytes().unwrap_err().kind,
+            ErrorKind::TooManyElements
+        );
         let ok = Value::Array(vec![Value::Null; MAX_ELEMENTS - 1]);
         round_trip(&ok);
         let tight = Limits { depth: 1, size: 10, elements: 3 };
@@ -1348,11 +1362,14 @@ mod tests {
             ("n".into(), Value::from("again")),
         ]);
         round_trip(&v);
-        let text = v.to_bytes().map(|bytes| String::from_utf8(bytes).unwrap()).unwrap();
-        assert_eq!(Value::parse(text.as_bytes()).unwrap().to_bytes().map(|bytes| String::from_utf8(bytes).unwrap()).unwrap(), text);
+        let text = written_text(&v);
+        assert_eq!(written_text(&Value::parse(text.as_bytes()).unwrap()), text);
         // Whitespace anywhere it may go.
         let spaced = b" { \"a\" : [ 1 , { } , [ ] ] , \"b\" : null } ";
-        assert_eq!(Value::parse(spaced).unwrap().to_bytes().map(|bytes| String::from_utf8(bytes).unwrap()).unwrap(), r#"{"a":[1,{},[]],"b":null}"#);
+        assert_eq!(
+            written_text(&Value::parse(spaced).unwrap()),
+            r#"{"a":[1,{},[]],"b":null}"#
+        );
     }
 
     #[test]
@@ -1368,7 +1385,9 @@ mod tests {
         for doc in docs {
             check(doc);
             for cut in 0..doc.len() {
-                assert_eq!(Value::parse(&doc[..cut]).unwrap_err().kind, ErrorKind::UnexpectedEnd);
+                let error = Value::parse(&doc[..cut]).unwrap_err();
+                assert_eq!(error.kind, ErrorKind::UnexpectedEnd);
+                assert!(error.offset <= cut);
                 let (items, error) = decode_all(Values::new, &doc[..cut]);
                 assert!(items.is_empty());
                 assert_eq!(error.is_none(), doc[..cut].iter().all(|c| is_ws(*c)));
@@ -1405,7 +1424,26 @@ mod tests {
         }
         assert_eq!(decode_all(Values::new, b"{\"a\":1}\n42"),
             (vec![Value::parse(b"{\"a\":1}").unwrap(), n("42")], None));
-        for input in [b"{\"a\":".as_slice(), b"[1] [2,", b" \"abc", b"tru", b"1e", b"[x"] {
+        assert_eq!(
+            decode_all(Values::new, b"[x"),
+            (
+                vec![],
+                Some(Fail::Protocol(Error::at(
+                    ErrorKind::UnexpectedByte(b'x'),
+                    1
+                )))
+            )
+        );
+        for input in [b"[x".as_slice(), b"{x", b"\"\\q", b"\"a\n"] {
+            check(input);
+            let error = Value::parse(input).unwrap_err();
+            assert_ne!(error.kind, ErrorKind::UnexpectedEnd);
+            assert_eq!(
+                decode_all(Values::new, input),
+                (vec![], Some(Fail::Protocol(error)))
+            );
+        }
+        for input in [b"{\"a\":".as_slice(), b"[1] [2,", b" \"abc", b"tru", b"1e"] {
             check(input);
             assert!(matches!(decode_all(Values::new, input).1, Some(Fail::Truncated { .. })));
         }
@@ -1478,7 +1516,10 @@ mod tests {
         assert_eq!(Value::from(3), n("3"));
         assert_eq!(Value::from(-3), n("-3"));
         assert_eq!(Value::from(7u32), n("7"));
-        assert_eq!(Value::from(vec![Value::from(1), Value::Null]).to_bytes().map(|bytes| String::from_utf8(bytes).unwrap()).unwrap(), "[1,null]");
+        assert_eq!(
+            written_text(&Value::from(vec![Value::from(1), Value::Null])),
+            "[1,null]"
+        );
         assert_eq!(Value::default(), Value::Null);
         let v = Value::parse(b"[12, 1.5, -1, \"x\"]").unwrap();
         let items = v.as_array().unwrap();
@@ -1520,6 +1561,7 @@ mod tests {
 
     #[test]
     fn stream_reads_large_batch() {
+        let started = std::time::Instant::now();
         let bytes = "0\n".repeat(MAX_SIZE);
         let mut stream = Stream::new(Values::new());
         let mut count = 0;
@@ -1531,6 +1573,7 @@ mod tests {
         assert_eq!(count, MAX_SIZE);
         assert_eq!(stream.buffered(), 0);
         assert!(stream.into_parts().0.allocated() <= 2 * (MAX_SIZE + 1));
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
     }
 
     const PIECES: [&str; 32] = [
@@ -1553,11 +1596,20 @@ mod tests {
             0 => Value::Null,
             1 => Value::Bool(r.coin()),
             2 => match r.index(3) {
-                0 => Value::from(r.next() as i64),
-                1 => Value::from(Number::from_f64(f64::from_bits(r.next() << 32 | r.next())).unwrap_or(Number::from_i64(0))),
+                0 => Value::from(r.next() as i64 - (1 << 31)),
+                1 => Value::from(
+                    Number::from_f64(f64::from_bits(
+                        r.next() | (r.next() << 31) | ((r.next() & 3) << 62),
+                    ))
+                    .unwrap_or(Number::from_i64(0)),
+                ),
                 _ => Value::from(Number::from_text(&format!("{}.{}e-{}", r.next(), r.next(), r.index(400))).unwrap()),
             },
-            3 => Value::String(r.text(8)),
+            3 => Value::String(
+                (0..r.index(8))
+                    .filter_map(|_| char::from_u32(r.next() as u32 % 0x11000))
+                    .collect(),
+            ),
             4 => Value::Array((0..r.index(5)).map(|_| random_value(r, depth + 1)).collect()),
             _ => Value::Object((0..r.index(5)).map(|_| (PIECES[r.index(PIECES.len())].to_string(), random_value(r, depth + 1))).collect()),
         }
@@ -1566,17 +1618,29 @@ mod tests {
     #[test]
     fn generated_and_mutated_values() {
         let mut rng = Lcg::new(0x5eed_1234);
-        for _ in 0..1000 {
-            let data = random_input(&mut rng);
-            check(&data);
-            contract::check_wire::<Value>(&data);
+        let mut parsed = 0;
+        for _ in 0..20_000 {
+            parsed += usize::from(check_parsed(&random_input(&mut rng)));
+        }
+        assert!(parsed > 100, "only {parsed} parsed inputs");
+        for _ in 0..5_000 {
             let value = random_value(&mut rng, 0);
             contract::check_wire_value(&value);
             let mut bytes = value.to_bytes().unwrap();
             assert_eq!(decode_all(Values::new, &bytes), (vec![value], None));
             mutate(&mut rng, &mut bytes);
-            check(&bytes);
-            contract::check_wire::<Value>(&bytes);
+            check_parsed(&bytes);
+        }
+    }
+
+    fn check_parsed(data: &[u8]) -> bool {
+        check(data);
+        contract::check_wire::<Value>(data);
+        if let Ok(value) = Value::parse(data) {
+            assert_eq!(decode_all(Values::new, data), (vec![value], None));
+            true
+        } else {
+            false
         }
     }
 }

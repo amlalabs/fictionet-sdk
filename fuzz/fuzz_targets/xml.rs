@@ -34,7 +34,7 @@ fuzz_target!(|data: &[u8]| {
         if written {
             let out = w.build().unwrap();
             let bytes = out.to_bytes().unwrap();
-            assert_eq!(&decode_all(Events::new, &bytes).0, events);
+            assert_eq!(decode_all(Events::new, &bytes), (events.clone(), None));
         }
     }
 

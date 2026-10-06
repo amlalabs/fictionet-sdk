@@ -381,8 +381,8 @@ impl Wire for Document {
 /// text. Partial markup returns [`codec::Step::Need`]; an open element
 /// returns [`ErrorKind::UnexpectedEnd`]. Syntax and limit errors are terminal.
 /// Capacity is [`MAX_DOCUMENT`] plus one byte to detect overflow.
-/// Use [`codec::Stream`] for bounded buffering and one-time errors.
-/// An empty stream ends cleanly with no items, unlike [`parse`], while
+/// Drive it with [`Stream<Events>`](super::codec::Stream).
+/// An empty stream ends cleanly with no items, unlike [`Document::parse`], while
 /// whitespace-only input is an error.
 ///
 /// ```
@@ -1824,7 +1824,7 @@ impl Doc {
 }
 
 /// Builds a document, checking each piece as it goes. A method that
-/// returns an error writes nothing, and the writer can go on. What
+/// returns an error adds nothing, and the builder can go on. What
 /// [`Builder::build`] returns, [`Events`] reads without error, and gives
 /// back the events added, with four exceptions. Whitespace outside the
 /// root element gives no event. Text written in more than one call, with
@@ -1832,7 +1832,7 @@ impl Doc {
 /// comments, CDATA and processing instructions read back as newlines. And
 /// whitespace at the start of processing instruction data is dropped.
 ///
-/// A writer keeps room for the end tags of the elements open, so each one
+/// The builder keeps room for the end tags of the elements open, so each one
 /// can always be closed within [`MAX_DOCUMENT`]. It sizes each piece
 /// before it builds it, so a long string given to it costs no more memory
 /// than the room left.
@@ -2166,6 +2166,11 @@ mod tests {
     use super::*;
     use fictionet::stdlib::codec::{Fail, Stream, contract, pump};
     use fictionet::stdlib::codec::test_support::{Lcg, decode_all, mutate};
+
+    fn built_text(builder: Builder) -> Result<String, ErrorKind> {
+        let document = builder.build()?;
+        Ok(String::from_utf8(document.to_bytes().unwrap()).unwrap())
+    }
 
     fn read_events(input: &[u8]) -> Result<Vec<Event>, Error> {
         Document::parse(input)?.events()
@@ -2502,7 +2507,7 @@ mod tests {
         w.text("\r\n").unwrap();
         w.empty("a", &[]).unwrap();
         w.text(" \r\t").unwrap();
-        let out = w.build().map(|document| String::from_utf8(document.to_bytes().unwrap()).unwrap()).unwrap();
+        let out = built_text(w).unwrap();
         assert_eq!(out, "\r\n<a/> \r\t");
         assert_eq!(read_events(out.as_bytes()).unwrap().len(), 2);
     }
@@ -2526,7 +2531,7 @@ mod tests {
         w.empty("p:d", &[]).unwrap();
         w.empty("e", &[]).unwrap();
         w.end().unwrap();
-        let events = read_events(w.build().map(|document| String::from_utf8(document.to_bytes().unwrap()).unwrap()).unwrap().as_bytes()).unwrap();
+        let events = read_events(built_text(w).unwrap().as_bytes()).unwrap();
         let Event::Start(d) = &events[1] else { panic!() };
         assert_eq!(d.name.namespace.as_deref(), Some("u1"));
         let Event::Start(e) = &events[3] else { panic!() };
@@ -2547,6 +2552,7 @@ mod tests {
 
     #[test]
     fn shared_namespaces() {
+        let started = std::time::Instant::now();
         // A long URI, declared once, is shared by every name in it rather
         // than copied, so a short element does not cost the URI's length.
         let uri = "u".repeat(64 << 10);
@@ -2572,6 +2578,8 @@ mod tests {
                 assert!(Arc::ptr_eq(&p, a.name.namespace.as_ref().unwrap()));
             }
         }
+        assert_eq!(decode_all(Events::new, doc.as_bytes()), (events, None));
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
     }
 
     #[test]
@@ -2625,7 +2633,7 @@ mod tests {
         for e in &events {
             w.event(e).unwrap();
         }
-        let out = w.build().map(|document| String::from_utf8(document.to_bytes().unwrap()).unwrap()).unwrap();
+        let out = built_text(w).unwrap();
         assert_eq!(read_events(out.as_bytes()).unwrap(), events);
     }
 
@@ -2658,11 +2666,11 @@ mod tests {
         w.pi("go", "now").unwrap();
         assert_eq!(w.depth(), 1);
         let unfinished = w.clone();
-        assert_eq!(unfinished.build().map(|document| String::from_utf8(document.to_bytes().unwrap()).unwrap()), Err(ErrorKind::UnexpectedEnd));
+        assert_eq!(unfinished.build(), Err(ErrorKind::UnexpectedEnd));
         w.end().unwrap();
         assert_eq!(w.start("again", &[]), Err(ErrorKind::OutsideRoot));
         w.text("\n").unwrap();
-        let out = w.build().map(|document| String::from_utf8(document.to_bytes().unwrap()).unwrap()).unwrap();
+        let out = built_text(w).unwrap();
         assert_eq!(
             out,
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?><!DOCTYPE r><!-- hi --><r xmlns:p=\"urn:p\" a=\"&lt;&quot;&amp;'&#9;&#10;&#13;&gt;\"><p:e/>]]&gt; &amp; &lt;&#13;<![CDATA[<raw>]]><?go now?></r>\n"
@@ -2678,7 +2686,7 @@ mod tests {
         assert_eq!(w.text(&big), Err(ErrorKind::TooLarge));
         w.text(&big[..MAX_DOCUMENT - 7]).unwrap();
         w.end().unwrap();
-        let out = w.build().map(|document| String::from_utf8(document.to_bytes().unwrap()).unwrap()).unwrap();
+        let out = built_text(w).unwrap();
         assert_eq!(out.len(), MAX_DOCUMENT);
         assert!(read_events(out.as_bytes()).is_ok());
     }
@@ -2767,7 +2775,7 @@ mod tests {
                 for e in &events {
                     w.event(e).unwrap();
                 }
-                let out = w.build().map(|document| String::from_utf8(document.to_bytes().unwrap()).unwrap()).unwrap();
+                let out = built_text(w).unwrap();
                 assert_eq!(read_events(out.as_bytes()).unwrap(), events, "{out:?}");
             }
             // Whatever a writer accepts, a parser reads.
@@ -2786,7 +2794,7 @@ mod tests {
             }
             let _ = w.text(&s);
             let _ = w.text(&s.replace(|c: char| !c.is_ascii_whitespace(), "\r"));
-            if let Ok(out) = w.build().map(|document| String::from_utf8(document.to_bytes().unwrap()).unwrap()) {
+            if let Ok(out) = built_text(w) {
                 assert!(read_events(out.as_bytes()).is_ok(), "{out:?}");
             }
         }
@@ -2841,7 +2849,7 @@ mod tests {
         assert_eq!(w.start(&long, &[]), Err(ErrorKind::NameTooLong));
         assert_eq!(w.start("x", &[(&long, "")]), Err(ErrorKind::NameTooLong));
         w.end().unwrap();
-        assert!(read_events(w.build().map(|document| String::from_utf8(document.to_bytes().unwrap()).unwrap()).unwrap().as_bytes()).is_ok());
+        assert!(read_events(built_text(w).unwrap().as_bytes()).is_ok());
     }
 
     #[test]
@@ -2930,7 +2938,10 @@ mod tests {
         for e in &events {
             w.event(e).unwrap();
         }
-        assert_eq!(read_events(w.build().map(|document| String::from_utf8(document.to_bytes().unwrap()).unwrap()).unwrap().as_bytes()).unwrap(), events);
+        assert_eq!(
+            read_events(built_text(w).unwrap().as_bytes()).unwrap(),
+            events
+        );
     }
 
     #[test]
@@ -2991,7 +3002,7 @@ mod tests {
         assert_eq!(w.depth(), 1);
         assert_eq!(w.event(&Event::End(name("r"))), Err(ErrorKind::BadNamespace));
         w.event(&Event::End(r)).unwrap();
-        let out = w.build().map(|document| String::from_utf8(document.to_bytes().unwrap()).unwrap()).unwrap();
+        let out = built_text(w).unwrap();
         assert_eq!(out, "<r xmlns=\"urn:r\"></r>");
         // A failed start leaves nothing behind: the document can still have
         // its root.
@@ -2999,7 +3010,7 @@ mod tests {
         assert_eq!(w.event(&start), Err(ErrorKind::BadNamespace));
         w.start("r", &[]).unwrap();
         w.end().unwrap();
-        assert!(w.build().map(|document| String::from_utf8(document.to_bytes().unwrap()).unwrap()).is_ok());
+        assert!(w.build().is_ok());
     }
 
     #[test]
@@ -3015,7 +3026,7 @@ mod tests {
         assert_eq!(w.empty("t", &[]), Err(ErrorKind::TooLarge));
         w.end().unwrap();
         w.end().unwrap();
-        let out = w.build().map(|document| String::from_utf8(document.to_bytes().unwrap()).unwrap()).unwrap();
+        let out = built_text(w).unwrap();
         assert_eq!(out.len(), MAX_DOCUMENT);
         assert!(read_events(out.as_bytes()).is_ok());
         // The fuzz target's case: spaces escape to nothing longer, and the
@@ -3031,6 +3042,6 @@ mod tests {
         while w.depth() > 0 {
             w.end().unwrap();
         }
-        assert!(read_events(w.build().map(|document| String::from_utf8(document.to_bytes().unwrap()).unwrap()).unwrap().as_bytes()).is_ok());
+        assert!(read_events(built_text(w).unwrap().as_bytes()).is_ok());
     }
 }

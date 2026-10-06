@@ -23,9 +23,9 @@
 //!
 //! The parser accepts any bytes, as browsers do: a stray `%` stays as it
 //! is, and bytes that are not UTF-8 become U+FFFD. The only errors are
-//! the size limits [`MAX_INPUT`] and [`MAX_PAIRS`], because the agent can
-//! send as much as it likes. [`Form`] checks the same limits, so it
-//! never writes a form the parser would refuse.
+//! the size limits [`MAX_INPUT`] and [`MAX_PAIRS`]. [`Form::parse`] also
+//! refuses input whose canonical encoding exceeds [`MAX_INPUT`].
+//! [`Fields`] accepts expanding forms within the input and pair limits.
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
@@ -69,6 +69,8 @@ pub enum FormError {
     TooLong,
     /// The form holds more than [`MAX_PAIRS`] pairs.
     TooManyPairs,
+    /// An encoded component contains bytes outside ASCII.
+    NonAscii,
     /// The value cannot be written without changing it.
     Unwritable,
 }
@@ -79,6 +81,7 @@ impl core::fmt::Display for FormError {
             FormError::TooLong => write!(f, "form is longer than {MAX_INPUT} bytes"),
             FormError::Unwritable => f.write_str("value cannot be written without changing it"),
             FormError::TooManyPairs => write!(f, "form has more than {MAX_PAIRS} pairs"),
+            FormError::NonAscii => f.write_str("encoded component contains non-ASCII bytes"),
         }
     }
 }
@@ -281,29 +284,32 @@ fn encode_into(bytes: &[u8], set: EncodeSet, space_as_plus: bool, out: &mut Stri
     }
 }
 
-fn serialize<N: AsRef<str>, V: AsRef<str>>(pairs: &[(N, V)]) -> Result<String, FormError> {
+fn canonical_len<N: AsRef<str>, V: AsRef<str>>(pairs: &[(N, V)]) -> Result<usize, FormError> {
     if pairs.len() > MAX_PAIRS {
         return Err(FormError::TooManyPairs);
     }
-    // Each string is read once, so the bytes measured are the bytes written
-    // even if an `AsRef` gives a different string on each call.
-    let pairs: Vec<(&[u8], &[u8])> = pairs.iter().map(|(n, v)| (n.as_ref().as_bytes(), v.as_ref().as_bytes())).collect();
     let mut len = 0usize;
-    for (i, &(n, v)) in pairs.iter().enumerate() {
+    for (i, (n, v)) in pairs.iter().enumerate() {
+        let (n, v) = (n.as_ref().as_bytes(), v.as_ref().as_bytes());
         let piece = encoded_len(n, EncodeSet::Form, true).saturating_add(encoded_len(v, EncodeSet::Form, true)).saturating_add(1);
         len = len.saturating_add(piece).saturating_add(usize::from(i > 0));
         if len > MAX_INPUT {
             return Err(FormError::TooLong);
         }
     }
+    Ok(len)
+}
+
+fn serialize(pairs: &[(String, String)]) -> Result<String, FormError> {
+    let len = canonical_len(pairs)?;
     let mut out = String::with_capacity(len);
-    for (i, &(n, v)) in pairs.iter().enumerate() {
+    for (i, (n, v)) in pairs.iter().enumerate() {
         if i > 0 {
             out.push('&');
         }
-        encode_into(n, EncodeSet::Form, true, &mut out);
+        encode_into(n.as_bytes(), EncodeSet::Form, true, &mut out);
         out.push('=');
-        encode_into(v, EncodeSet::Form, true, &mut out);
+        encode_into(v.as_bytes(), EncodeSet::Form, true, &mut out);
     }
     Ok(out)
 }
@@ -323,19 +329,18 @@ impl Form {
         if pairs.len() > MAX_PAIRS {
             return Err(FormError::TooManyPairs);
         }
-        let mut result = Self::default();
-        let mut len = 0usize;
-        for (i, (name, value)) in pairs.iter().enumerate() {
-            let (name, value) = (name.as_ref(), value.as_ref());
-            len = len.saturating_add(encoded_len(name.as_bytes(), EncodeSet::Form, true))
-                .saturating_add(encoded_len(value.as_bytes(), EncodeSet::Form, true))
-                .saturating_add(1).saturating_add(usize::from(i > 0));
-            if len > MAX_INPUT {
-                return Err(FormError::TooLong);
-            }
-            result.pairs.push((name.into(), value.into()));
-        }
-        Ok(result)
+        // Borrow each string once so a changing AsRef cannot bypass the cap.
+        let pairs: Vec<(&str, &str)> = pairs
+            .iter()
+            .map(|(n, v)| (n.as_ref(), v.as_ref()))
+            .collect();
+        canonical_len(&pairs)?;
+        Ok(Self {
+            pairs: pairs
+                .into_iter()
+                .map(|(n, v)| (n.into(), v.into()))
+                .collect(),
+        })
     }
 }
 
@@ -352,7 +357,7 @@ impl Wire for Form {
     /// Use [`Fields`] to accept expanding input within its input cap.
     fn parse(input: &[u8]) -> Result<Self, FormError> {
         let pairs = parse(input)?;
-        serialize(&pairs)?;
+        canonical_len(&pairs)?;
         Ok(Self { pairs })
     }
 
@@ -395,10 +400,11 @@ impl Wire for PercentEncoded {
             return Err(FormError::TooLong);
         }
         if !input.is_ascii() {
-            return Err(FormError::Unwritable);
+            return Err(FormError::NonAscii);
         }
-        let text = core::str::from_utf8(input).map_err(|_| FormError::Unwritable)?;
-        Ok(Self { text: text.into() })
+        Ok(Self {
+            text: input.iter().copied().map(char::from).collect(),
+        })
     }
 
     /// Appends encoded text unchanged. Refuses non-ASCII text and values
@@ -443,7 +449,8 @@ pub fn query_of(target: &[u8]) -> &[u8] {
 ///
 /// The wire form contains exactly one nonempty field, without `&`.
 /// Parsing also checks that its canonical encoding fits [`MAX_INPUT`].
-/// [`parse`] and [`Fields`] accept fields whose canonical encoding is larger.
+/// [`Fields`] accepts fields whose canonical encoding is larger.
+/// [`Form::parse`] refuses them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Field(
     /// The decoded name and value.
@@ -490,7 +497,7 @@ impl Wire for Field {
             return Err(FieldError::Trailing);
         }
         let pair = split_pair(input);
-        serialize(core::slice::from_ref(&pair)).map_err(FieldError::Form)?;
+        canonical_len(core::slice::from_ref(&pair)).map_err(FieldError::Form)?;
         Ok(Self(pair))
     }
 
@@ -506,11 +513,11 @@ impl Wire for Field {
 ///
 /// Empty pieces are skipped. EOF completes the last nonempty field.
 /// Stray percent signs stay literal. Invalid UTF-8 becomes U+FFFD.
-/// Limits apply to the entire input form, as in [`parse`]. Writing a field
+/// Limits apply to the entire input form, as in [`Form::parse`]. Writing a field
 /// also checks that its canonical encoding fits [`MAX_INPUT`].
 /// Capacity is [`MAX_INPUT`] plus one byte to detect overflow.
 /// Only [`FieldError::Form`] occurs from the stream, and ends it.
-/// Use [`codec::Stream`](super::codec::Stream) to drive this decoder.
+/// Drive it with [`Stream<Fields>`](super::codec::Stream).
 ///
 /// ```
 /// use fictionet::stdlib::{codec::{Stream, finish, pump}, urlencoded_form::{Field, Fields}};
@@ -620,34 +627,48 @@ mod tests {
         list.iter().map(|(n, v)| (n.to_string(), v.to_string())).collect()
     }
 
+    fn assert_pairs(input: &[u8], expected: Vec<(String, String)>) {
+        assert_eq!(
+            Form::parse(input).map(|form| form.pairs),
+            Ok(expected.clone())
+        );
+        assert_eq!(decoded(input), Ok(expected));
+    }
+
     // Examples from the WHATWG URL Standard and from what browsers do.
 
     #[test]
     fn parser_examples() {
-        assert_eq!(decoded(b"a=b&c=d").unwrap(), pairs(&[("a", "b"), ("c", "d")]));
-        assert_eq!(decoded(b"").unwrap(), pairs(&[]));
-        assert_eq!(decoded(b"&&&").unwrap(), pairs(&[]));
-        assert_eq!(decoded(b"a").unwrap(), pairs(&[("a", "")]));
-        assert_eq!(decoded(b"=").unwrap(), pairs(&[("", "")]));
-        assert_eq!(decoded(b"=b").unwrap(), pairs(&[("", "b")]));
-        assert_eq!(decoded(b"a=b=c").unwrap(), pairs(&[("a", "b=c")]));
-        assert_eq!(decoded(b"a=1&a=2").unwrap(), pairs(&[("a", "1"), ("a", "2")]));
-        assert_eq!(decoded(b"a+b=c+d").unwrap(), pairs(&[("a b", "c d")]));
+        assert_pairs(b"a=b&c=d", pairs(&[("a", "b"), ("c", "d")]));
+        assert_pairs(b"", pairs(&[]));
+        assert_pairs(b"&&&", pairs(&[]));
+        assert_pairs(b"a", pairs(&[("a", "")]));
+        assert_pairs(b"=", pairs(&[("", "")]));
+        assert_pairs(b"=b", pairs(&[("", "b")]));
+        assert_pairs(b"a=b=c", pairs(&[("a", "b=c")]));
+        assert_pairs(b"a=1&a=2", pairs(&[("a", "1"), ("a", "2")]));
+        assert_pairs(b"a+b=c+d", pairs(&[("a b", "c d")]));
         // A plus written as %2B stays a plus.
-        assert_eq!(decoded(b"q=1%2B1").unwrap(), pairs(&[("q", "1+1")]));
+        assert_pairs(b"q=1%2B1", pairs(&[("q", "1+1")]));
         // Stray percent signs stay as they are.
-        assert_eq!(decoded(b"%zz=%4&x=%").unwrap(), pairs(&[("%zz", "%4"), ("x", "%")]));
-        assert_eq!(decoded(b"%61=%41%42").unwrap(), pairs(&[("a", "AB")]));
+        assert_pairs(b"%zz=%4&x=%", pairs(&[("%zz", "%4"), ("x", "%")]));
+        assert_pairs(b"%61=%41%42", pairs(&[("a", "AB")]));
         // %26 and %3D are data, not separators.
-        assert_eq!(decoded(b"k%3D=v%26w").unwrap(), pairs(&[("k=", "v&w")]));
+        assert_pairs(b"k%3D=v%26w", pairs(&[("k=", "v&w")]));
         // UTF-8, in either hex case.
-        assert_eq!(decoded(b"x=%e2%80%bd").unwrap(), pairs(&[("x", "\u{203d}")]));
+        assert_pairs(b"x=%e2%80%bd", pairs(&[("x", "\u{203d}")]));
         // Bytes that are not UTF-8 become U+FFFD.
-        assert_eq!(decoded(b"x=%FF&y=\xc3").unwrap(), pairs(&[("x", "\u{fffd}"), ("y", "\u{fffd}")]));
+        assert_pairs(
+            b"x=%FF&y=\xc3",
+            pairs(&[("x", "\u{fffd}"), ("y", "\u{fffd}")]),
+        );
         // A byte order mark is kept.
-        assert_eq!(decoded(b"%EF%BB%BFa=1").unwrap(), pairs(&[("\u{feff}a", "1")]));
+        assert_pairs(b"%EF%BB%BFa=1", pairs(&[("\u{feff}a", "1")]));
         // Raw bytes outside ASCII are read as UTF-8 too.
-        assert_eq!(decoded("caf\u{e9}=\u{2603}".as_bytes()).unwrap(), pairs(&[("caf\u{e9}", "\u{2603}")]));
+        assert_pairs(
+            "caf\u{e9}=\u{2603}".as_bytes(),
+            pairs(&[("caf\u{e9}", "\u{2603}")]),
+        );
     }
 
     #[test]
@@ -769,12 +790,15 @@ mod tests {
     fn too_long() {
         let big = vec![b'a'; MAX_INPUT + 1];
         assert_eq!(decoded(&big), Err(FormError::TooLong));
-        assert_eq!(decoded(&big), Err(FormError::TooLong));
+        assert_eq!(
+            Form::parse(&big).map(|form| form.pairs),
+            Err(FormError::TooLong)
+        );
         assert_eq!(percent_decode(&big), Err(FormError::TooLong));
         assert_eq!(encoded(&big, EncodeSet::Form, true), Err(FormError::TooLong));
-        // Exactly the limit is fine.
+        // The stream accepts the input limit. The whole form needs room for '='.
         assert_eq!(decoded(&big[..MAX_INPUT]).unwrap().len(), 1);
-        assert_eq!(decoded(&big[..MAX_INPUT]).unwrap().len(), 1);
+        assert_eq!(Form::parse(&big[..MAX_INPUT]), Err(FormError::TooLong));
         // The serializer refuses what the parser would refuse. Each byte
         // outside ASCII grows to 3.
         let wide = "\u{e9}".repeat(MAX_INPUT / 6 + 1);
@@ -782,7 +806,10 @@ mod tests {
         let fits = "a".repeat(MAX_INPUT - 2);
         let s = serialized(&[("x", fits.as_str())]).unwrap();
         assert_eq!(s.len(), MAX_INPUT);
-        assert!(decoded(s.as_bytes()).is_ok());
+        assert_eq!(
+            Form::parse(s.as_bytes()).map(|form| form.pairs),
+            decoded(s.as_bytes())
+        );
         assert_eq!(serialized(&[("x", "a".repeat(MAX_INPUT - 1).as_str())]), Err(FormError::TooLong));
         // Writing can grow a form. Bytes that are not UTF-8 each become
         // U+FFFD, nine bytes once encoded, so a form the parser reads may
@@ -791,6 +818,7 @@ mod tests {
         let read = decoded(&bad).unwrap();
         assert_eq!(read[0].0.chars().count(), bad.len());
         assert_eq!(serialized(&read), Err(FormError::TooLong));
+        assert_eq!(Form::parse(&bad), Err(FormError::TooLong));
         let mut stream = Stream::new(Fields::new());
         let error = Fail::Protocol(FieldError::Form(FormError::TooLong));
         assert_eq!(pump(&mut stream, &big, |_| panic!("no field")), Err(error.clone()));
@@ -867,14 +895,18 @@ mod tests {
     fn too_many_pairs() {
         let at = b"a&".repeat(MAX_PAIRS);
         assert_eq!(decoded(&at).unwrap().len(), MAX_PAIRS);
-        assert_eq!(decoded(&at).unwrap().len(), MAX_PAIRS);
+        assert_eq!(Form::parse(&at).map(|form| form.pairs), decoded(&at));
         let over = b"a&".repeat(MAX_PAIRS + 1);
         assert_eq!(decoded(&over), Err(FormError::TooManyPairs));
-        assert_eq!(decoded(&over), Err(FormError::TooManyPairs));
+        assert_eq!(Form::parse(&over), Err(FormError::TooManyPairs));
         // Empty pieces do not count.
         let mut sparse = b"&".repeat(MAX_PAIRS * 3);
         sparse.extend_from_slice(b"a=1");
         assert_eq!(decoded(&sparse).unwrap().len(), 1);
+        assert_eq!(
+            Form::parse(&sparse).map(|form| form.pairs),
+            decoded(&sparse)
+        );
         let many = vec![("a", "b"); MAX_PAIRS + 1];
         assert_eq!(serialized(&many), Err(FormError::TooManyPairs));
         assert!(decoded(serialized(&many[..MAX_PAIRS]).unwrap().as_bytes()).is_ok());
@@ -905,7 +937,7 @@ mod tests {
         for n in 0..=full.len() {
             let prefix = &full[..n];
             let got = decoded(prefix).unwrap();
-            assert_eq!(decoded(prefix).unwrap(), got, "{n} bytes");
+            assert_eq!(Form::parse(prefix).unwrap().pairs, got, "{n} bytes");
             check(prefix);
             assert!(got.len() <= whole.len());
             assert_eq!(decoded(serialized(&got).unwrap().as_bytes()).unwrap(), got);
@@ -921,6 +953,9 @@ mod tests {
         contract::check_wire::<Form>(&bytes);
         contract::check_wire_value(&PercentEncoded { text: "é".into() });
         assert_eq!(PercentEncoded { text: "é".into() }.to_bytes(), Err(FormError::Unwritable));
+        for input in ["é".as_bytes(), &[0xff]] {
+            assert_eq!(PercentEncoded::parse(input), Err(FormError::NonAscii));
+        }
         assert_eq!(PercentEncoded::parse(b"%+%zz").unwrap().to_bytes().unwrap(), b"%+%zz");
         contract::check_wire::<PercentEncoded>(b"%+%zz");
     }
@@ -936,7 +971,7 @@ mod tests {
                 .collect();
             let got = decoded(&buf).unwrap();
             check(&buf);
-            assert_eq!(decoded(&buf).unwrap(), got, "round {round}");
+            assert_eq!(Form::parse(&buf).unwrap().pairs, got, "round {round}");
             contract::check_wire::<Form>(&buf);
             contract::check_wire::<Field>(&buf);
             // What is read can be written, and reads back the same.

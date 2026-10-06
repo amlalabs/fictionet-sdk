@@ -1,9 +1,10 @@
 //! Multipart body framing, MIME entities, parts, and parameterized headers.
 #![no_main]
 
-use fictionet::stdlib::codec::{Decode, contract, test_support::decode_all};
+use fictionet::stdlib::codec::{Decode, Fail, contract, test_support::decode_all};
 use fictionet::stdlib::mime_multipart::{
-    Entity, Headers, Multipart, ParamValue, Part, Parts, boundary, valid_boundary,
+    Body, Entity, Error, Headers, MAX_ENTITY, Multipart, ParamValue, Part, Parts, boundary,
+    valid_boundary,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -22,6 +23,7 @@ fuzz_target!(|input: &[u8]| {
     contract::check_decode_with_alloc_limit(make, data, 2 * make().capacity());
     contract::check_wire::<Part>(data);
     contract::check_wire::<Entity>(data);
+    contract::check_wire::<Body>(data);
     contract::check_wire::<ParamValue>(data);
     let (parts, error) = decode_all(make, data);
     for part in &parts {
@@ -29,12 +31,26 @@ fuzz_target!(|input: &[u8]| {
         let _ = (part.name(), part.filename(), part.headers.content_type(), part.headers.get_one("x"));
         let _ = part.headers.get_all("content-type").count();
     }
-    if let Ok(multipart) = Multipart::parse(data, &bnd) {
-        assert_eq!(error, None);
-        assert_eq!(parts, multipart.parts);
-        if let Ok(entity) = multipart.with_free_boundary(&bnd) {
-            contract::check_wire_value(&entity);
+    match Multipart::parse(data, &bnd) {
+        Ok(multipart) => {
+            assert_eq!(error, None);
+            assert_eq!(parts, multipart.parts);
+            if let Ok(entity) = multipart.with_free_boundary(&bnd) {
+                contract::check_wire_value(&entity);
+                contract::check_wire_value(&Body {
+                    boundary: entity.boundary,
+                    multipart: entity.multipart,
+                });
+            }
         }
+        // Parts has no aggregate body cap.
+        Err(Error::EntityTooLong) if data.len() > MAX_ENTITY => {}
+        Err(expected) if !data.is_empty() => match error {
+            Some(Fail::Protocol(error)) => assert_eq!(error, expected),
+            Some(Fail::Truncated { .. }) => assert_eq!(expected, Error::Truncated),
+            other => panic!("{other:?}"),
+        },
+        Err(_) => assert!(data.is_empty()),
     }
     let text = String::from_utf8_lossy(data);
     if let Some((name, value)) = text.split_once(':') {
