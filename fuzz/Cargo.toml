@@ -802,3 +802,10 @@ path = "fuzz_targets/observe_tls.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "http2"
+path = "fuzz_targets/http2.rs"
+test = false
+doc = false
+bench = false

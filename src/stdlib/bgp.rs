@@ -1975,7 +1975,7 @@ fn be16(b: &[u8], i: usize) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Stream, Fail, contract, pump, finish, test_support::{Lcg, mutate, decode_all}};
+    use fictionet::stdlib::codec::{Stream, Fail, contract, pump, finish, Lcg, test_support::{mutate, decode_all}};
 
     fn encode(message: &Message, context: &Context) -> Result<Vec<u8>, EncodeError> {
         message.to_frame(context)?.to_bytes()

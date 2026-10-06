@@ -187,7 +187,7 @@ fn buffer_compaction_is_amortized_at_full_capacity() {
 }
 #[test]
 fn buffer_random_operations_match_a_queue() {
-    let mut rng = test_support::Lcg::new(72);
+    let mut rng = fictionet::stdlib::codec::Lcg::new(72);
     let mut b = Buffer::new(31);
     let mut expected = alloc::collections::VecDeque::new();
     let mut consumed = 0;
@@ -828,7 +828,7 @@ fn harness_accepts_correct_decoders_on_valid_and_invalid_inputs() {
         contract::check_decode(|| Pairs, data);
         contract::check_decode_with_held_limit(|| Collect::<Blob>::new(8), data, 1);
     }
-    let mut rng = test_support::Lcg::new(42);
+    let mut rng = fictionet::stdlib::codec::Lcg::new(42);
     for _ in 0..100 {
         let mut bytes = [0; 32];
         rng.fill(&mut bytes);
@@ -1018,7 +1018,7 @@ fn wire_harness_accepts_valid_and_refused_values() {
 }
 #[test]
 fn test_support_reproducible_rng_and_chunks() {
-    let mut rng = test_support::Lcg::new(0);
+    let mut rng = fictionet::stdlib::codec::Lcg::new(0);
     assert_eq!(rng.next(), 1442695040888963407 >> 33);
     assert_eq!(rng.below(0), 0);
     let data = b"abcdefghi";
@@ -1031,8 +1031,8 @@ fn test_support_reproducible_rng_and_chunks() {
         vec![&data[..]]
     );
     assert!(test_support::chunks(b"", &[1]).next().is_none());
-    let mut a = test_support::Lcg::new(7);
-    let mut b = test_support::Lcg::new(7);
+    let mut a = fictionet::stdlib::codec::Lcg::new(7);
+    let mut b = fictionet::stdlib::codec::Lcg::new(7);
     assert_eq!(
         test_support::random_chunks(data, &mut a, 3).collect::<Vec<_>>(),
         test_support::random_chunks(data, &mut b, 3).collect::<Vec<_>>()
@@ -1044,7 +1044,7 @@ fn test_support_reproducible_rng_and_chunks() {
 }
 #[test]
 fn test_support_index_and_generators() {
-    let mut rng = test_support::Lcg::new(11);
+    let mut rng = fictionet::stdlib::codec::Lcg::new(11);
     assert_eq!(rng.index(0), 0);
     let mut seen = [false; 5];
     for _ in 0..200 {
@@ -1067,14 +1067,14 @@ fn test_support_index_and_generators() {
         assert!(t.bytes().all(|c| (b' '..=b'~').contains(&c)));
     }
     assert!(lengths.contains(&0) && lengths.contains(&9));
-    let mut a = test_support::Lcg::new(5);
-    let mut b = test_support::Lcg::new(5);
+    let mut a = fictionet::stdlib::codec::Lcg::new(5);
+    let mut b = fictionet::stdlib::codec::Lcg::new(5);
     assert_eq!(a.bytes(32), b.bytes(32));
     assert_eq!(a.text(32), b.text(32));
 }
 #[test]
 fn test_support_mutate_is_bounded_and_reproducible() {
-    let mut rng = test_support::Lcg::new(3);
+    let mut rng = fictionet::stdlib::codec::Lcg::new(3);
     let mut empty = Vec::new();
     test_support::mutate(&mut rng, &mut empty);
     assert_eq!(empty.len(), 1);
@@ -1100,7 +1100,7 @@ fn test_support_mutate_is_bounded_and_reproducible() {
         }
     }
     assert!(shorter && same && one && more);
-    let (mut a, mut b) = (test_support::Lcg::new(9), test_support::Lcg::new(9));
+    let (mut a, mut b) = (fictionet::stdlib::codec::Lcg::new(9), fictionet::stdlib::codec::Lcg::new(9));
     let (mut x, mut y) = (b"abcdef".to_vec(), b"abcdef".to_vec());
     for _ in 0..50 {
         test_support::mutate(&mut a, &mut x);
@@ -1112,7 +1112,7 @@ fn test_support_mutate_is_bounded_and_reproducible() {
 #[test]
 fn test_support_mutate_duplicates_a_slice() {
     // Growth beyond one byte only comes from copying an existing slice.
-    let mut rng = test_support::Lcg::new(1);
+    let mut rng = fictionet::stdlib::codec::Lcg::new(1);
     for _ in 0..500 {
         let original = b"0123456789".to_vec();
         let mut data = original.clone();
@@ -1150,7 +1150,7 @@ fn test_support_decode_all() {
 fn contract_alloc_limit_accepts_bounded_buffer() {
     let data = [7, 1, 2, 3, 4, 5, 6, 7, 2, b'a', b'b', 0x80, 0];
     contract::check_decode_with_alloc_limit(|| Frames, &data, 16);
-    let mut rng = test_support::Lcg::new(8);
+    let mut rng = fictionet::stdlib::codec::Lcg::new(8);
     for _ in 0..20 {
         let mut bytes = data.to_vec();
         test_support::mutate(&mut rng, &mut bytes);
@@ -1240,7 +1240,7 @@ fn eof_allows_persistent_tables_in_held_state() {
 
 #[test]
 fn pipe_random_payload_partitions_preserve_inner_stream() {
-    let mut rng = test_support::Lcg::new(93);
+    let mut rng = fictionet::stdlib::codec::Lcg::new(93);
     for _ in 0..32 {
         let mut input = Vec::new();
         for _ in 0..16 {
@@ -1416,9 +1416,10 @@ fn regression_pipe_end_with_unpushed_payload() {
 
 #[test]
 fn regression_demux_visits_only_ready_streams() {
+    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
     struct Counted {
-        calls: Rc<Cell<usize>>,
-        held_calls: Rc<Cell<usize>>,
+        calls: Arc<AtomicUsize>,
+        held_calls: Arc<AtomicUsize>,
     }
     impl Decode for Counted {
         type Item = u8;
@@ -1428,16 +1429,16 @@ fn regression_demux_visits_only_ready_streams() {
             2
         }
         fn held(&self) -> usize {
-            self.held_calls.set(self.held_calls.get() + 1);
+            self.held_calls.fetch_add(1, Ordering::Relaxed);
             0
         }
         fn decode(&mut self, b: &[u8], eof: bool) -> Result<Step<u8>, Infallible> {
-            self.calls.set(self.calls.get() + 1);
+            self.calls.fetch_add(1, Ordering::Relaxed);
             Bytes.decode(b, eof)
         }
     }
-    let calls = Rc::new(Cell::new(0));
-    let held_calls = Rc::new(Cell::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let held_calls = Arc::new(AtomicUsize::new(0));
     let counters = (calls.clone(), held_calls.clone());
     let mut d = Demux::new(4096, 8192, move |_: &usize| Counted {
         calls: counters.0.clone(),
@@ -1447,19 +1448,19 @@ fn regression_demux_visits_only_ready_streams() {
         assert_eq!(d.push(&key, b""), 0);
     }
     assert!(d.next().is_none());
-    calls.set(0);
-    held_calls.set(0);
+    calls.store(0, Ordering::Relaxed);
+    held_calls.store(0, Ordering::Relaxed);
     for key in (0..4096).cycle().take(8192) {
         assert_eq!(d.push(&key, b"a"), 1);
         assert_eq!(d.next(), Some((key, Ok(b'a'))));
         assert!(d.next().is_none());
         assert_eq!(d.total(), 0);
     }
-    assert!(calls.get() <= 8192 * 2, "{} decode calls", calls.get());
+    assert!(calls.load(Ordering::Relaxed) <= 8192 * 2, "{} decode calls", calls.load(Ordering::Relaxed));
     assert!(
-        held_calls.get() <= 8192 * 12,
+        held_calls.load(Ordering::Relaxed) <= 8192 * 12,
         "{} held calls",
-        held_calls.get()
+        held_calls.load(Ordering::Relaxed)
     );
 }
 

@@ -1808,7 +1808,7 @@ impl BlockedSections {
 mod tests {
     use fictionet::stdlib::codec::{
         contract,
-        test_support::{decode_all, Lcg, mutate},
+        Lcg, test_support::{decode_all, mutate},
     };
     use super::*;
     use fictionet::stdlib::prefix_int::Integer;

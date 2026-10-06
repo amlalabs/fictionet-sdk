@@ -212,7 +212,9 @@
 //!
 //! Each copy is decoded the way Wireshark decodes it. Packets on a link are
 //! IPv4 or IPv6 with no Ethernet header. The decoder reads IP, TCP, UDP and
-//! ICMP, then DNS, DHCP, HTTP/1.1, and HTTP/2 with its headers. TCP
+//! ICMP, then DNS, DHCP, HTTP/1.1, and HTTP/2 with its headers. HTTP/2 uses
+//! [`Capture`](crate::stdlib::http2::Capture) through the public registry.
+//! Recognized gRPC calls add message layers from DATA under a shared budget. TCP
 //! connections are followed in order, so a message spread over several
 //! packets is shown whole on the packet that completes it. An HTTP/2 header
 //! that names a table entry the decoder could not follow, for example

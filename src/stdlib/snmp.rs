@@ -1604,7 +1604,7 @@ mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
         Stream, Fail, pump, contract,
-        test_support::{Lcg, mutate, decode_all},
+        Lcg, test_support::{mutate, decode_all},
     };
 
     fn oid(s: &str) -> Oid {

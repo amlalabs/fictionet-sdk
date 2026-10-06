@@ -1259,7 +1259,7 @@ fn crc32c_update(mut crc: u32, data: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codec::{Stream, contract, test_support::{chunks, decode_all, Lcg, mutate}};
+    use codec::{Stream, contract, Lcg, test_support::{chunks, decode_all, mutate}};
     use HeaderParseError::Protocol as Protocol;
 
     fn tcp4() -> Header {

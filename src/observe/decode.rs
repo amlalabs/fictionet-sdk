@@ -201,7 +201,7 @@ impl Decoded {
     }
 
     /// Bytes the detail still has room for.
-    pub(crate) fn room(&self) -> usize {
+    pub fn room(&self) -> usize {
         if self.cut > 0 { 0 } else { MAX_DETAIL - self.used }
     }
 

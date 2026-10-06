@@ -59,6 +59,8 @@ macro_rules! protocols {
         pub mod hpack;
         #[path = "../src/stdlib/huffman.rs"]
         pub mod huffman;
+        #[path = "../src/stdlib/http2.rs"]
+        pub mod http2;
         #[path = "../src/stdlib/http3.rs"]
         pub mod http3;
         #[path = "../src/stdlib/iec104.rs"]

@@ -168,10 +168,13 @@ the codec tools. The file's `fictionet::stdlib::...` imports need no change.
 [`custom_protocol`](examples/custom_protocol) shows this with a Modbus register.
 Run it with `cargo run --example custom_protocol`; it needs no network or root.
 
-For header compression outside the web server, use the public
-[`stdlib::hpack`](src/stdlib/hpack.rs) block encoder and decoder for HTTP/2,
-or [`stdlib::qpack`](src/stdlib/qpack.rs) for HTTP/3. Both use
-[`stdlib::huffman`](src/stdlib/huffman.rs).
+For HTTP/2 outside the web server, use the public
+[`stdlib::http2`](src/stdlib/http2.rs) frame and connection codecs for HTTP/2,
+with the [`stdlib::hpack`](src/stdlib/hpack.rs) block encoder and decoder,
+or [`stdlib::qpack`](src/stdlib/qpack.rs) for HTTP/3 header compression. Both use
+[`stdlib::huffman`](src/stdlib/huffman.rs). HTTP/2 capture presentation uses the
+public observe adapter. gRPC messages use `stdlib::grpc::Messages` through
+`codec::Demux`, with one DATA budget across streams.
 
 To show your decoder in observe, implement `observe::Present` and register it
 with `observe::Registry`. Built-ins use the same registry. Match by port or

@@ -36,6 +36,9 @@
 //! and the generic codec tools. Named sibling modules stay SDK dependencies.
 //! See the `custom_protocol` example for a copied Modbus module.
 //!
+//! Use [`http2::Connection`] for directional HTTP/2 state and [`http2::Capture`]
+//! with the public observe registry. DATA payloads feed [`grpc::Messages`]
+//! through [`codec::Demux`] under one byte budget across streams.
 //! Use [`hpack::Table`] and [`hpack::Encoder`] for complete HTTP/2 header
 //! blocks. Each direction has its own dynamic table. [`huffman`] supplies
 //! the RFC 7541 string code shared by [`hpack`] and [`qpack`].
@@ -157,6 +160,8 @@ pub mod git_protocol;
 pub mod gre;
 pub mod grpc;
 pub mod hpack;
+/// HTTP/2 frames, directional state, and capture presentation (RFC 9113).
+pub mod http2;
 pub mod http3;
 pub mod huffman;
 pub mod icmp;

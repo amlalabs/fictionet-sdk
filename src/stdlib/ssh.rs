@@ -1560,7 +1560,7 @@ mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
         contract, Stream, Fail, pump,
-        test_support::{decode_all, chunks, Lcg, mutate},
+        Lcg, test_support::{decode_all, chunks, mutate},
     };
     fn names(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()

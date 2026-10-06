@@ -2,7 +2,7 @@
 use fictionet::stdlib::{
     codec::{
         Collect, Wire, contract,
-        test_support::{self, Lcg},
+        Lcg, test_support,
     },
     hpack::{self, Encoder, Field, StringLiteral, Table},
     huffman::{self, HuffmanString},

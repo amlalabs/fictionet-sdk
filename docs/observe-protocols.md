@@ -47,7 +47,7 @@ logic used by TCP streams. Call `data`, `lost`, and `waiting` for ordered
 bytes, gaps, and partial-message status. `with_alpn` supplies a negotiated
 ALPN to matchers before bytes arrive. Undecided prefixes are not waiting.
 
-TLS, Modbus, and HTTP/2 sessions use `Registry::register_protocol` when
+TLS and Modbus sessions use `Registry::register_protocol` when
 shared state requires the `Protocol` interface. The session factory receives
 the active registry. TLS clones it for plaintext selection with the outer
 ports. ALPN hints select `http2` for `h2` or `http1` for `http/1.1` only when
@@ -56,7 +56,7 @@ across split plaintext prefixes. Eight unmatched bytes permanently reject
 plaintext selection in both directions, as in the outer conversation.
 Selection is not retried at each record. User replacements apply inside TLS
 too. HTTP/1 capture parsing remains in observe until a stdlib HTTP/1 module
-is available. Framing for DNS, DHCP, Modbus, HTTP/1, and TLS uses `Stream`
+is available. Framing for DNS, DHCP, Modbus, HTTP/1, HTTP/2, and TLS uses `Stream`
 and `Present`.
 
 These files can be copied into another crate and edited:
@@ -74,3 +74,19 @@ These files can be copied into another crate and edited:
 tags. `Decoded::level` and `Decoded::cap_info` expose the summary
 policy. The adapter and registry require cloneable decoder errors so `Stream`
 can retain a terminal error while reporting it once.
+
+HTTP/2 uses `stdlib::http2::Capture` through `register_with_buffer`, with
+`http2::CAPTURE_READ_AHEAD`. Copy `src/stdlib/http2.rs` to customize both
+framing and presentation. The file uses only public SDK APIs. Strict
+`Frames` and `Connection` check RFC 9113 framing and directional state.
+`Connection::peer_settings` and `peer_window_update` apply control frames
+from the other direction. `lost` clears state and stops decoding because
+a TCP gap does not identify the next frame boundary.
+
+Capture policy keeps complete frames already present in bounded read-ahead.
+An incomplete oversized frame becomes a header-only item, followed by `Skip`
+for its payload. Header blocks share the stdlib HPACK decoder. Recognized
+gRPC calls use `grpc::Messages` through `codec::Demux`, with an 8 MiB aggregate
+DATA budget across both directions created by `http2::Capture::pair`. Message layers point at payload bytes when one
+contiguous range is available; otherwise they use a reassembly buffer.
+Copy `src/stdlib/grpc.rs` to customize message decoding and its `Present` impl.

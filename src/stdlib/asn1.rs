@@ -2198,7 +2198,7 @@ fn sorted(contents: &[u8], order: Order) -> Result<Vec<u8>, Error> {
 mod tests {
     use fictionet::stdlib::codec::{
         Fail, Stream, contract,
-        test_support::{Lcg, chunks, mutate},
+        Lcg, test_support::{chunks, mutate},
     };
     use super::*;
 

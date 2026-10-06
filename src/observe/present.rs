@@ -65,6 +65,10 @@ pub trait Present: Decode {
         packet.info = format!("{}: {error}", Self::NAME);
     }
 
+    /// Supplies the packet's remaining display budget before decoding the
+    /// next item. Changes affect presentation limits only, not wire validity.
+    fn prepare(&mut self, _packet: &Decoded) {}
+
     /// Whether a header-only item still has payload bytes to skip.
     /// This preserves the packet's partial-message annotation while skipping.
     fn pending(&self) -> bool {
@@ -332,15 +336,17 @@ where
         loop {
             let n = self.stream.push(bytes);
             bytes = bytes.get(n..).unwrap_or_default();
-            while let Some(result) = self.stream.with_next(|item, raw, range| {
-                present(
-                    item,
-                    raw,
-                    range.start.saturating_add(origin),
-                    &self.place,
-                    packet,
-                );
-            }) {
+            loop {
+                self.stream.decoder().prepare(packet);
+                let Some(result) = self.stream.with_next(|item, raw, range| {
+                    present(
+                        item,
+                        raw,
+                        range.start.saturating_add(origin),
+                        &self.place,
+                        packet,
+                    );
+                }) else { break };
                 if let Err(error) = result {
                     D::error(&error, packet);
                 }
@@ -375,15 +381,17 @@ where
             return;
         }
         self.stream.end();
-        while let Some(result) = self.stream.with_next(|item, raw, range| {
-            D::present(
-                &item,
-                raw,
-                range.start.saturating_add(self.origin.unwrap_or(0)),
-                &self.place,
-                packet,
-            );
-        }) {
+        loop {
+            self.stream.decoder().prepare(packet);
+            let Some(result) = self.stream.with_next(|item, raw, range| {
+                D::present(
+                    &item,
+                    raw,
+                    range.start.saturating_add(self.origin.unwrap_or(0)),
+                    &self.place,
+                    packet,
+                );
+            }) else { break };
             if let Err(error) = result {
                 D::error(&error, packet);
             }

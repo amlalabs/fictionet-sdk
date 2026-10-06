@@ -121,7 +121,10 @@
 //! To customize a protocol, copy its file from `src/stdlib/` into your crate
 //! and edit it. Keep its `fictionet::stdlib::...` imports, then use its
 //! [`Decode`](stdlib::codec::Decode) and [`Wire`](stdlib::codec::Wire)
-//! implementations with [`Stream`](stdlib::codec::Stream). The
+//! implementations with [`Stream`](stdlib::codec::Stream).
+//! [`stdlib::http2`] provides frames, directional connection state, and capture
+//! presentation. HTTP/2 DATA feeds [`stdlib::grpc::Messages`] through a shared
+//! [`Demux`](stdlib::codec::Demux) budget. The
 //! `custom_protocol` example runs this workflow without network or root.
 //! Implement [`observe::Present`] to show its items and byte ranges, then
 //! add it to [`observe::Registry`]. Use [`observe::Dissector::with_registry`]

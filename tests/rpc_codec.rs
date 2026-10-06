@@ -3,7 +3,7 @@
 use core::fmt::Debug;
 use fictionet::stdlib::codec::{
     Decode, Fail, Step, Stream, Wire, contract, finish,
-    test_support::{Lcg, mutate, decode_all},
+    Lcg, test_support::{mutate, decode_all},
 };
 use fictionet::stdlib::{dcerpc, diameter, nbss, radius, smb2};
 

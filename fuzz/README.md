@@ -81,6 +81,7 @@ cargo +nightly fuzz list
 | `protobuf` | wire values and streams checked with bounded codec contracts | `stdlib::protobuf`: Protocol Buffers |
 | `proxy_protocol` | exact wire values, header handoff and bounded codec contracts | `stdlib::proxy_protocol`: The PROXY protocol |
 | `hpack` | wire contracts, complete blocks, settings limits, table recovery, and encode/decode round trips | `stdlib::hpack`: HTTP/2 header compression |
+| `http2` | Frame and preface contracts, every Wire frame type, capture framing, and directional connection EOF and gap handling | `stdlib::http2` |
 | `huffman` | wire contracts, EOS and padding refusal, byte round trips | `stdlib::huffman`: the RFC 7541 code shared by HPACK and QPACK |
 | `qpack` | wire values, bounded instruction contracts, tables, blocked sections, and acknowledgments | `stdlib::qpack`: QPACK, the header compression of HTTP/3 |
 | `quic` | datagram and payload wire contracts, every short-header ID length, and reassembly | `stdlib::quic`: QUIC |
