@@ -11,6 +11,14 @@
 #[cfg(not(test))]
 macro_rules! protocols {
     () => {
+        #[path = "../src/stdlib/codec/interceptor.rs"]
+        pub mod interceptor;
+        #[path = "../src/stdlib/codec/recorder.rs"]
+        pub mod recorder;
+        #[path = "../src/stdlib/codec/faults.rs"]
+        pub mod faults;
+        #[path = "../src/stdlib/codec/lcg.rs"]
+        pub mod lcg;
         #[path = "../src/stdlib/amqp.rs"]
         pub mod amqp;
         #[path = "../src/stdlib/asn1.rs"]

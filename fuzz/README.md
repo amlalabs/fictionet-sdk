@@ -18,6 +18,7 @@ cargo +nightly fuzz list
 
 | Target | What it feeds | Code it reaches |
 |---|---|---|
+| `codec_tools` | arbitrary Modbus/TCP and line streams, byte edits, and seeded item plans | `codec`: exact forwarding, transactional replacement, recorder bounds, skip and failure events, and repeatable fault output |
 | `relay` | relay messages | `relay::decode` |
 | `packets` | whole packets | `ip::split_protocols`'s sorting, `icmp::echo_reply`, `dhcp::Message::parse` |
 | `ip_reassembly` | IPv4 and IPv6 fragments, with timing | fragment reassembly in `ip::split_protocols` |

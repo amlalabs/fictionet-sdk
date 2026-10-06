@@ -22,7 +22,8 @@
 //! This module uses only `core` and `alloc`. The planned async `serve`
 //! adapter lives in stdlib next to [`tcp`](super::tcp), outside this module.
 //! No function here performs I/O, reads a clock, or uses global state.
-//! Interception, recording, fault injection, and length prefixes are planned.
+//! [`Interceptor`], [`Recorder`], and [`Faults`] operate on any decoder's
+//! items and original bytes. Length prefixes are planned.
 //!
 //! ```
 //! use fictionet::stdlib::codec::{Decode, Step, Stream, pump, finish};
@@ -87,7 +88,15 @@ mod buffer;
 mod combinators;
 pub mod contract;
 mod demux;
+/// Seeded byte and item fault plans with delay markers.
+pub mod faults;
+/// Exact-byte forwarding and caller-directed replacement.
+pub mod interceptor;
+/// Small deterministic generator shared by tools and tests.
+pub mod lcg;
 mod pipe;
+/// Bounded transcripts of driver events in both directions.
+pub mod recorder;
 mod stream;
 pub mod test_support;
 
@@ -97,8 +106,12 @@ pub use combinators::{
     Map,
 };
 pub use demux::Demux;
+pub use faults::{ByteFault, FaultAction, Faults, ItemFault, Rule, Trigger};
+pub use interceptor::{InterceptError, Interceptor, Rewrite, RewriteError};
+pub use lcg::Lcg;
 pub use pipe::{Carry, DEFAULT_SPANS, Layered, Pipe, PipeError, Span, Spans};
-pub use stream::{Fail, PumpError, Stream, finish, pump, try_pump};
+pub use recorder::{Direction, Record, RecordKind, Recorder};
+pub use stream::{Fail, PumpError, Stream, StreamEvent, finish, pump, try_pump};
 
 /// The result of one call to [`Decode::decode`].
 #[derive(Clone, Debug, PartialEq, Eq)]

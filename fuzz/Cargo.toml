@@ -34,6 +34,13 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
 debug = 1
 
 [[bin]]
+name = "codec_tools"
+path = "fuzz_targets/codec_tools.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "relay"
 path = "fuzz_targets/relay.rs"
 test = false
