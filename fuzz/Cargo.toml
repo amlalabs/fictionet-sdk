@@ -746,3 +746,17 @@ path = "fuzz_targets/rdp.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "jsonrpc_lines"
+path = "fuzz_targets/jsonrpc_lines.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "jsonrpc_body"
+path = "fuzz_targets/jsonrpc_body.rs"
+test = false
+doc = false
+bench = false

@@ -36,6 +36,11 @@
 //! and the generic codec tools. Named sibling modules stay SDK dependencies.
 //! See the `custom_protocol` example for a copied Modbus module.
 //!
+//! [`jsonrpc`] reads JSON-RPC 2.0 requests, notifications, responses, and
+//! batches over ordered [`json::Value`] trees. Use [`jsonrpc::Messages`] for
+//! stdio lines and [`codec::Collect<jsonrpc::Body>`] for an HTTP body. Reply
+//! helpers keep request ids exact, and writers check edited envelopes.
+//!
 //! # Three kinds of functions
 //!
 //! Every function in the stdlib is one of three kinds. The kind tells you
@@ -163,6 +168,7 @@ pub mod ip;
 pub mod ipp;
 pub mod ipsec;
 pub mod json;
+pub mod jsonrpc;
 pub mod kafka;
 pub mod kerberos;
 pub mod l2tp;
