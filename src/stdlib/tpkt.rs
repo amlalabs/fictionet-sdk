@@ -10,9 +10,9 @@
 //! ISO transport over TCP on IPv6 and for transport classes other than 0.
 //!
 //! Nothing here reads a socket. A world pushes bytes from a
-//! TCP connection into a [`Stream<Packets>`](super::codec::Stream), takes each
+//! TCP connection into a [`Stream<Packets>`](fictionet::stdlib::codec::Stream), takes each
 //! [`Packet`] out, and reads its payload. Most payloads are COTP TPDUs;
-//! [`super::cotp::over_tpkt`] provides conversions and a message writer.
+//! [`fictionet::stdlib::cotp::over_tpkt`] provides conversions and a message writer.
 //! A world may set a size limit lower than the 65535 bytes the header allows, as
 //! real stacks often do.
 //!
@@ -39,7 +39,7 @@
 //! assert_eq!(Packet::parse(&[3, 0, 0, 7, 1, 2, 3]), Ok(Some((packet, 7))));
 //! ```
 
-use super::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire};
 
 /// The TCP port ISO transport servers listen on.
 pub const PORT: u16 = 102;
@@ -319,7 +319,7 @@ impl Wire for Packet {
 
 /// Splits a TPKT byte stream into packets.
 ///
-/// Use with [`super::codec::Stream`] for bounded input buffering. A partial
+/// Use with [`fictionet::stdlib::codec::Stream`] for bounded input buffering. A partial
 /// packet returns [`Step::Need`], including at EOF. The stream reports
 /// truncation at EOF and reports framing errors once. No input is retained.
 #[derive(Clone, Copy, Debug)]
@@ -377,7 +377,7 @@ impl Decode for Packets {
 
 #[cfg(test)]
 mod codec_tests {
-    use super::super::codec::{Fail, Stream, contract};
+    use fictionet::stdlib::codec::{Fail, Stream, contract};
     use super::*;
 
     #[test]
@@ -466,7 +466,7 @@ mod codec_tests {
         let packet = Packet::new(vec![0x5a; MAX_PAYLOAD]);
         let bytes = packet.to_bytes().unwrap();
         let mut stream = Stream::new(Packets::new());
-        for (i, byte) in super::super::codec::test_support::chunks(&bytes, &[1]).enumerate() {
+        for (i, byte) in fictionet::stdlib::codec::test_support::chunks(&bytes, &[1]).enumerate() {
             assert_eq!(stream.push(byte), 1);
             assert!(stream.buffered() <= MAX_PACKET);
             let result = stream.next();
@@ -485,8 +485,8 @@ mod codec_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stdlib::codec::test_support::Lcg;
-    use crate::stdlib::codec::{Fail, Stream, contract, test_support};
+    use fictionet::stdlib::codec::test_support::Lcg;
+    use fictionet::stdlib::codec::{Fail, Stream, contract, test_support};
 
     // RFC 1006 section 6: version 3, reserved, then the length of the
     // whole packet, header included. The smallest TPDU, a class 0 data

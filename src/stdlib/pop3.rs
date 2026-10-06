@@ -13,8 +13,8 @@
 //! response codes).
 //!
 //! Run a server's connection bytes through
-//! [`Stream<Commands>`](super::codec::Stream), interpret each [`Request`],
-//! and write a [`Reply`]. Clients use [`Stream<Replies>`](super::codec::Stream)
+//! [`Stream<Commands>`](fictionet::stdlib::codec::Stream), interpret each [`Request`],
+//! and write a [`Reply`]. Clients use [`Stream<Replies>`](fictionet::stdlib::codec::Stream)
 //! and queue whether each reply has a body with [`Replies::expect`]. CRLF is
 //! required. Bad or overlong commands are error items. Overlong command
 //! remainders are skipped through LF, including at EOF. Short partial lines
@@ -46,7 +46,7 @@
 extern crate alloc;
 
 use self::alloc::{collections::VecDeque, string::String, vec::Vec};
-use super::codec::{self, Decode, Wire};
+use fictionet::stdlib::codec::{self, Decode, Wire};
 use std::num::NonZeroU32;
 
 /// The TCP port POP3 servers listen on.

@@ -12,8 +12,8 @@
 //! are little-endian.
 //!
 //! Nothing here reads a socket. A world that plays a device pushes the
-//! bytes it reads from a [`tcp`](super::tcp) connection to a
-//! [`Stream<Frames>`](super::codec::Stream), gets [`Packet`]s back,
+//! bytes it reads from a [`tcp`](fictionet::stdlib::tcp) connection to a
+//! [`Stream<Frames>`](fictionet::stdlib::codec::Stream), gets [`Packet`]s back,
 //! checks each one with [`Packet::check`], reads its command, and for the
 //! data commands reads the [`SendData`] envelope, its [`Cpf`] items and
 //! the [`MessageRequest`] inside. It writes replies with the same types,
@@ -70,7 +70,7 @@
 //! assert_eq!(request.path[0], PathSegment::Class(1));
 //! ```
 
-use super::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire};
 use core::convert::Infallible;
 
 /// The TCP port EtherNet/IP devices listen on.
@@ -307,7 +307,7 @@ impl Wire for Packet {
 ///
 /// Framing accepts every command, option word, and 16-bit data length.
 /// Use [`Packet::check`] to decide whether to act on each packet.
-/// [`Stream::new`](super::codec::Stream::new) holds at most [`FRAMES_CAPACITY`]
+/// [`Stream::new`](fictionet::stdlib::codec::Stream::new) holds at most [`FRAMES_CAPACITY`]
 /// bytes (65559), including room for lengths above [`MAX_DATA`].
 /// Partial packets return [`Step::Need`], including at EOF, when the stream
 /// reports truncation.
@@ -1700,7 +1700,7 @@ impl Wire for ForwardCloseResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::codec::{
+    use fictionet::stdlib::codec::{
         Stream, contract, pump,
         test_support::{self, Lcg, decode_all},
     };

@@ -9,16 +9,16 @@
 //! Command lines use the base 512-byte limit; extension-specific increases
 //! and BDAT binary chunk framing are not implemented.
 //!
-//! Run connection bytes through [`Stream<Server>`](super::codec::Stream).
+//! Run connection bytes through [`Stream<Server>`](fictionet::stdlib::codec::Stream).
 //! After accepting DATA and sending a 354 reply, call [`Server::start_data`].
 //! The next item is the complete unstuffed message. Its terminating dot
-//! returns the reader to commands. Use [`Stream<Replies>`](super::codec::Stream)
+//! returns the reader to commands. Use [`Stream<Replies>`](fictionet::stdlib::codec::Stream)
 //! on the client. Bad commands are error items; overlong lines are skipped.
 //! Partial lines at EOF, DATA overflow, and malformed multiline replies end
 //! the stream. Call [`Server::handoff`] after accepting STARTTLS, then take
 //! the unread TLS bytes from the stream. Session state, authentication, TLS,
 //! and storage belong to the caller. Read headers separately with
-//! [`imf`](crate::stdlib::imf).
+//! [`imf`](fictionet::stdlib::imf).
 //!
 //! ```
 //! use fictionet::stdlib::{codec::{Stream, Wire}, smtp::{Server, Input, Request, Reply}};
@@ -38,7 +38,7 @@
 extern crate alloc;
 
 use self::alloc::{string::String, vec::Vec};
-use super::codec::{self, Decode, Wire};
+use fictionet::stdlib::codec::{self, Decode, Wire};
 
 /// SMTP relay port.
 pub const PORT: u16 = 25;

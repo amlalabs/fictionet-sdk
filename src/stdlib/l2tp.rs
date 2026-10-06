@@ -82,7 +82,6 @@
 //! assert_eq!(back.message(), Ok(reply));
 //! ```
 
-extern crate self as fictionet;
 use fictionet::stdlib::codec::Wire;
 
 /// The UDP port L2TP peers listen on.

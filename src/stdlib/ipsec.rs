@@ -22,7 +22,7 @@
 //! [`Plaintext::parse`] reads the trailer: the padding, the pad length and
 //! the next header. To send, it builds the same values and writes their
 //! bytes through [`Wire::write`]. For pieces of one packet, use
-//! [`Stream<Frames>`](super::codec::Stream), with `Frames = Collect<EspPacket>`,
+//! [`Stream<Collect<EspPacket>>`](fictionet::stdlib::codec::Stream),
 //! `Collect<AhPacket>`, or `Collect<Datagram>`. Set the limit to [`MAX_PACKET`]
 //! for IP payloads or [`MAX_DATAGRAM`] for UDP. Call `end` at that boundary.
 //!
@@ -67,7 +67,7 @@
 //! assert_eq!(Datagram::parse(&[0, 0, 0, 0, 1]), Ok(Datagram::Ike(vec![1])));
 //! ```
 
-use super::codec::Wire;
+use fictionet::stdlib::codec::Wire;
 
 /// The IP protocol number that marks an ESP packet.
 pub const ESP_PROTOCOL: u8 = 50;
@@ -658,7 +658,7 @@ impl Wire for AhHeader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stdlib::codec::{Collect, CollectError, Fail, contract, test_support::{Lcg, decode_all, mutate}};
+    use fictionet::stdlib::codec::{Collect, CollectError, Fail, contract, test_support::{Lcg, decode_all, mutate}};
 
     fn check<M>(limit: usize, b: &[u8]) -> Result<M, IpsecError>
     where M: Wire<ParseError = IpsecError, WriteError = IpsecError> + Clone + std::fmt::Debug + PartialEq {

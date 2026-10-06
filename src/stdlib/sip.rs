@@ -10,7 +10,7 @@
 //!
 //! Nothing here reads a socket. A world that plays a phone or a proxy reads
 //! a UDP message with [`Message::read_datagram`]. Over TCP, it pushes bytes
-//! into [`Stream<Frames>`](super::codec::Stream), which splits messages by
+//! into [`Stream<Frames>`](fictionet::stdlib::codec::Stream), which splits messages by
 //! their Content-Length. Either way, it reads the headers it needs with
 //! [`Message::vias`], [`Message::from`], [`Message::cseq`] and the others,
 //! builds its answer (often with [`Message::reply`]), and sends the bytes
@@ -38,7 +38,7 @@
 //! untrusted Content-Length is a stream error. Bare LF also ends the
 //! stream because it cannot establish a SIP message boundary. Header-count
 //! errors are items. The driver reports truncated input at EOF.
-//! Bodies remain bytes; SDP belongs to [`super::sdp`].
+//! Bodies remain bytes; SDP belongs to [`fictionet::stdlib::sdp`].
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
@@ -72,8 +72,6 @@
 //! assert!(bytes.ends_with(b"Allow: INVITE, ACK, CANCEL, OPTIONS, BYE\r\nContent-Length: 0\r\n\r\n"));
 //! assert_eq!(Message::parse(&bytes).unwrap().status(), Some(200));
 //! ```
-
-extern crate self as fictionet;
 
 use fictionet::stdlib::codec::{Decode, Ending, LineError, Lines, Step, Wire};
 
@@ -529,7 +527,7 @@ impl Message {
 
 /// Reads complete SIP units with bounded line and body framing.
 ///
-/// Use with [`Stream<Frames>`](super::codec::Stream). Items are `Result<Message, Error>`.
+/// Use with [`Stream<Frames>`](fictionet::stdlib::codec::Stream). Items are `Result<Message, Error>`.
 /// A bad start line or header is an error item once a trusted body length
 /// and the complete unit are available. Invalid lengths and byte limits
 /// end the stream. Bare LF is a stream error: only CRLF ends SIP lines,
@@ -539,7 +537,7 @@ impl Message {
 ///
 /// [`Lines`] scans incrementally; each head byte is scanned a fixed number
 /// of times. The driver retains the whole unit, so
-/// [`super::codec::Stream::with_next`] includes its head and body.
+/// [`fictionet::stdlib::codec::Stream::with_next`] includes its head and body.
 /// Capacity is [`MAX_MESSAGE`]; no input bytes are held in decoder state.
 /// Body framing follows Content-Length automatically, from the headers.
 /// Each call yields at most one unit and returns control to the caller.

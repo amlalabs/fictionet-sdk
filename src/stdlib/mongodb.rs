@@ -12,8 +12,8 @@
 //! reference and the BSON 1.1 specification at bsonspec.org.
 //!
 //! A world that plays a database server passes bytes from a
-//! [`tcp`](crate::stdlib::tcp) connection to
-//! [`Stream<Frames>`](super::codec::Stream), reads each message's command document,
+//! [`tcp`](fictionet::stdlib::tcp) connection to
+//! [`Stream<Frames>`](fictionet::stdlib::codec::Stream), reads each message's command document,
 //! and writes the reply's bytes back to the connection. Which databases
 //! and collections exist, and what they hold, is up to world code.
 //!
@@ -71,7 +71,7 @@
 //! assert_eq!(m.body.get("ok"), Some(&Bson::Double(1.0)));
 //! ```
 
-use super::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire};
 
 /// The TCP port MongoDB servers listen on.
 pub const PORT: u16 = 27017;
@@ -1361,7 +1361,7 @@ impl Wire for Message {
 
 /// Reads MongoDB messages without holding input bytes.
 ///
-/// Use with [`codec::Stream`](super::codec::Stream) for a buffer bounded
+/// Use with [`codec::Stream`](fictionet::stdlib::codec::Stream) for a buffer bounded
 /// by [`limit`](Self::limit), including the header. Oversized messages
 /// are refused from the first four bytes. Partial messages return
 /// [`Step::Need`], including at EOF, so the stream reports truncation.
@@ -1627,7 +1627,7 @@ fn parse_reply(data: &[u8]) -> Result<Reply, MessageError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stdlib::codec::{Stream, Fail, contract, test_support::{Lcg, mutate, decode_all}};
+    use fictionet::stdlib::codec::{Stream, Fail, contract, test_support::{Lcg, mutate, decode_all}};
 
     fn s(v: &str) -> Bson {
         Bson::String(v.to_owned())

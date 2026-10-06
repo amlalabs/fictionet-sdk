@@ -21,7 +21,7 @@
 //! password, and wakes the host when that returns true. A world that plays
 //! a tool or a router reads exact packets with [`MagicPacket::parse`],
 //! searches payloads with [`MagicPacket::find`], or uses
-//! [`Stream<Packets>`](super::codec::Stream) for a payload ending at EOF,
+//! [`Stream<Packets>`](fictionet::stdlib::codec::Stream) for a payload ending at EOF,
 //! and writes packets with [`MagicPacket::write`].
 //!
 //! Every reader checks lengths, because the agent can send any bytes it
@@ -59,7 +59,7 @@
 
 extern crate alloc;
 
-use super::codec::{self, Decode, Wire};
+use fictionet::stdlib::codec::{self, Decode, Wire};
 use alloc::vec::Vec;
 
 /// The UDP port senders use most often, the discard port.

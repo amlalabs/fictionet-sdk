@@ -12,8 +12,8 @@
 //! text) and RFC 4514 (DNs as text).
 //!
 //! Nothing here reads a socket. A world that plays a directory server pushes
-//! the bytes it reads from a [`tcp`](crate::stdlib::tcp) connection to a
-//! [`Stream<Frames>`](super::codec::Stream), gets [`Message`]s back, matches on each one's [`Op`], and
+//! the bytes it reads from a [`tcp`](fictionet::stdlib::tcp) connection to a
+//! [`Stream<Frames>`](fictionet::stdlib::codec::Stream), gets [`Message`]s back, matches on each one's [`Op`], and
 //! writes the reply's bytes with [`Message::write`]. A CLDAP server reads
 //! each datagram with [`Message::parse`], and a client reads a reply that
 //! may hold several messages with [`Message::parse_datagram`]. Which entries
@@ -26,7 +26,7 @@
 //! constructed strings, so they are refused. Unknown fields at the end of a
 //! SEQUENCE are skipped, as RFC 4511 section 4 asks. RFC 4511 says a server that
 //! cannot read a message sends a notice of disconnection and closes the
-//! connection, so a [`Stream<Frames>`](super::codec::Stream) stops at the first [`Error`]. The writers
+//! connection, so a [`Stream<Frames>`](fictionet::stdlib::codec::Stream) stops at the first [`Error`]. The writers
 //! check what they are given and return an error instead of bytes a reader
 //! would refuse.
 //!
@@ -60,8 +60,8 @@
 //! assert_eq!(dn.to_text().unwrap(), "uid=jdoe,dc=example,dc=com");
 //! ```
 
-use super::asn1::{self, Class, Element, Length, Reader, Rules, Tag};
-use super::codec::{Decode, Step, Wire};
+use fictionet::stdlib::asn1::{self, Class, Element, Length, Reader, Rules, Tag};
+use fictionet::stdlib::codec::{Decode, Step, Wire};
 use std::fmt;
 
 /// The port LDAP servers listen on, over TCP, and CLDAP over UDP.
@@ -2459,8 +2459,8 @@ impl Wire for Message {
 
 /// Reads LDAP messages without holding input bytes.
 ///
-/// Use with [`Stream<Frames>`](super::codec::Stream) for bounded input. Partial messages
-/// return [`super::codec::Step::Need`], including at EOF. The stream reports
+/// Use with [`Stream<Frames>`](fictionet::stdlib::codec::Stream) for bounded input. Partial messages
+/// return [`fictionet::stdlib::codec::Step::Need`], including at EOF. The stream reports
 /// truncation at EOF and errors once. A malformed message ends the stream.
 /// This includes a well-framed message that [`Message::parse`] rejects:
 /// [RFC 4511 section 4.1.1](https://www.rfc-editor.org/rfc/rfc4511.html#section-4.1.1)
@@ -2553,7 +2553,7 @@ fn declared_total(b: &[u8]) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::super::codec::{
+    use fictionet::stdlib::codec::{
         Fail, Stream, contract,
         test_support::{Lcg, chunks, decode_all, mutate},
     };
@@ -4334,7 +4334,7 @@ mod tests {
 
     #[test]
     fn codec_frames_obey_small_limits_and_report_once() {
-        use super::super::codec::{Decode, Fail, Stream, contract};
+        use fictionet::stdlib::codec::{Decode, Fail, Stream, contract};
         let bytes = Message {
             id: 1,
             op: Op::UnbindRequest,
@@ -4359,7 +4359,7 @@ mod tests {
 
     #[test]
     fn codec_message_writer_rolls_back() {
-        use super::super::codec::{Wire, contract};
+        use fictionet::stdlib::codec::{Wire, contract};
         let mut message = Message {
             id: 1,
             op: Op::UnbindRequest,

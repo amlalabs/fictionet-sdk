@@ -13,7 +13,7 @@
 //! writes both versions.
 //!
 //! Nothing here reads a socket. A world that plays a camera pushes the
-//! bytes it reads into [`Stream<Frames>`](super::codec::Stream), which splits the
+//! bytes it reads into [`Stream<Frames>`](fictionet::stdlib::codec::Stream), which splits the
 //! stream into [`Item`]s: messages, by their Content-Length, and
 //! interleaved frames, by their length. It reads the headers it needs with
 //! [`Message::cseq`], [`Message::session`], [`Message::transports`] and
@@ -44,7 +44,7 @@
 //! untrusted Content-Length is a stream error. An RTSP 2.0 head with bare
 //! LF also ends the stream because its CRLF boundary cannot be trusted.
 //! Header-count errors are items. The driver reports truncated input at
-//! EOF. Bodies remain bytes; SDP belongs to [`super::sdp`].
+//! EOF. Bodies remain bytes; SDP belongs to [`fictionet::stdlib::sdp`].
 //!
 //! ```
 //! use fictionet::stdlib::codec::{Stream, Wire};
@@ -79,8 +79,6 @@
 //! assert_eq!(stream.next(), Some(Ok(Ok(Item::Interleaved(frame)))));
 //! assert_eq!(stream.next(), None);
 //! ```
-
-extern crate self as fictionet;
 
 use fictionet::stdlib::codec::{Decode, Ending, LineError, Lines, Step, Wire};
 
@@ -525,7 +523,7 @@ pub enum Item {
 
 /// Reads complete RTSP units with bounded line and body framing.
 ///
-/// Use with [`Stream<Frames>`](super::codec::Stream). Items are `Result<Item, Error>`.
+/// Use with [`Stream<Frames>`](fictionet::stdlib::codec::Stream). Items are `Result<Item, Error>`.
 /// A bad start line or header is an error item once a trusted body length
 /// and the complete unit are available. Invalid lengths and byte limits
 /// end the stream. Once the head is complete, bare LF in RTSP 2.0 ends the
@@ -535,7 +533,7 @@ pub enum Item {
 ///
 /// [`Lines`] scans incrementally; each head byte is scanned a fixed number
 /// of times. The driver retains the whole unit, so
-/// [`super::codec::Stream::with_next`] includes its head and body.
+/// [`fictionet::stdlib::codec::Stream::with_next`] includes its head and body.
 /// Capacity is [`MAX_MESSAGE`]; no input bytes are held in decoder state.
 /// Body framing follows Content-Length automatically, from the headers.
 /// Each call yields at most one unit and returns control to the caller.

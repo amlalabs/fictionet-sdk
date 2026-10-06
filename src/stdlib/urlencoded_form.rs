@@ -10,7 +10,7 @@
 //! what browsers do, byte for byte:
 //!
 //! - [`Form::parse`] reads a whole form that fits the canonical output cap.
-//! - [`Stream<Fields>`](super::codec::Stream) reads a body that arrives in
+//! - [`Stream<Fields>`](fictionet::stdlib::codec::Stream) reads a body that arrives in
 //!   pieces, and hands out each field as soon as its `&` arrives.
 //! - [`Form`] writes complete forms through [`Wire::write`].
 //! - [`PercentEncoded`] and [`percent_decode`] encode and decode one
@@ -47,7 +47,6 @@
 //! ```
 
 extern crate alloc;
-extern crate self as fictionet;
 
 use alloc::{string::String, vec::Vec};
 use fictionet::stdlib::codec::{Decode, Step, Wire};
@@ -517,7 +516,7 @@ impl Wire for Field {
 /// also checks that its canonical encoding fits [`MAX_INPUT`].
 /// Capacity is [`MAX_INPUT`] plus one byte to detect overflow.
 /// Only [`FieldError::Form`] occurs from the stream, and ends it.
-/// Drive it with [`Stream<Fields>`](super::codec::Stream).
+/// Drive it with [`Stream<Fields>`](fictionet::stdlib::codec::Stream).
 ///
 /// ```
 /// use fictionet::stdlib::{codec::{Stream, finish, pump}, urlencoded_form::{Field, Fields}};

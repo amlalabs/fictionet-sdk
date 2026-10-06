@@ -15,12 +15,12 @@
 //!
 //! An RTP packet is an [`RtpPacket`]. It may list contributing sources,
 //! carry padding, and carry a [`HeaderExtension`] in either RFC 8285 form.
-//! RTCP datagrams use [`super::rtcp::Datagram`]; compound packets use
-//! [`super::rtcp::Compound`].
+//! RTCP datagrams use [`fictionet::stdlib::rtcp::Datagram`]; compound packets use
+//! [`fictionet::stdlib::rtcp::Compound`].
 //!
 //! Nothing here reads a socket. A world reads each UDP datagram with
 //! [`Packet::parse`], which tells RTP from RTCP using RFC 5761. Over TCP,
-//! [`Stream<rtcp::Frames>`](super::codec::Stream) splits RFC 4571 envelopes.
+//! [`Stream<rtcp::Frames>`](fictionet::stdlib::codec::Stream) splits RFC 4571 envelopes.
 //! [`rtcp::Frame`] supplies the length prefix when sending. Media contents and
 //! report policy belong to world code. SRTP and SRTCP are not handled here.
 //!
@@ -58,7 +58,7 @@ pub const TWO_BYTE_PROFILE: u16 = 0x1000;
 // ---------------------------------------------------------------------------
 // RTP
 
-use super::{codec::Wire, rtcp};
+use fictionet::stdlib::{codec::Wire, rtcp};
 
 /// One RTP packet: the header's fields, the extension and the payload.
 /// The version is always 2, and the padding, extension and CSRC count bits
@@ -520,7 +520,7 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::codec::{
+    use fictionet::stdlib::codec::{
         contract,
         test_support::{Lcg, mutate, decode_all},
     };

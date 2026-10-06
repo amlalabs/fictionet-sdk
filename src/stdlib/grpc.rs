@@ -13,7 +13,7 @@
 //! Nothing here reads a socket or speaks HTTP/2. A world that plays a gRPC
 //! server takes a stream's headers from its HTTP/2 code and checks them
 //! with [`Request::parse`]. It pushes the stream's DATA bytes into a
-//! [`Stream<Messages>`](super::codec::Stream) and gets [`Message`]s back. Each message body stays as
+//! [`Stream<Messages>`](fictionet::stdlib::codec::Stream) and gets [`Message`]s back. Each message body stays as
 //! bytes: reading it (as protobuf, JSON or anything else) is up to world
 //! code. So is the answer. The world writes [`response_headers`], each
 //! reply with [`Message::to_bytes`], and ends with [`Status::to_trailers`].
@@ -62,7 +62,7 @@
 use std::fmt;
 use std::time::Duration;
 
-use super::codec::{self, Step, Wire};
+use fictionet::stdlib::codec::{self, Step, Wire};
 
 /// The TCP port gRPC servers most often listen on without TLS. With TLS
 /// they usually use 443.
@@ -1661,8 +1661,8 @@ fn trim(mut b: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stdlib::codec::test_support::Lcg;
-    use crate::stdlib::codec::{Decode, Fail, Stream, contract, finish, pump, test_support};
+    use fictionet::stdlib::codec::test_support::Lcg;
+    use fictionet::stdlib::codec::{Decode, Fail, Stream, contract, finish, pump, test_support};
 
     #[test]
     fn messages_limits_and_header_refusals() {

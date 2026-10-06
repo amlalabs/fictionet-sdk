@@ -11,7 +11,7 @@
 //! (Plus Errata 01).
 //!
 //! Nothing here reads a socket. A world that plays a broker pushes the bytes
-//! it reads from a TCP connection to a [`Stream<Frames>`](super::codec::Stream), gets [`Packet`]s back,
+//! it reads from a TCP connection to a [`Stream<Frames>`](fictionet::stdlib::codec::Stream), gets [`Packet`]s back,
 //! and writes the bytes of its replies, from [`Packet::to_bytes`], back to
 //! the connection. Which clients may connect, which topics exist, and who
 //! receives what is up to world code. [`topic_matches`] says whether a
@@ -54,7 +54,7 @@
 //! assert!(!topic_matches("#", "$SYS/broker/uptime"));
 //! ```
 
-use super::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire};
 
 /// The TCP port MQTT brokers listen on, without TLS.
 pub const PORT: u16 = 1883;
@@ -73,7 +73,7 @@ pub const MAX_REMAINING_LENGTH_BYTES: usize = 4;
 /// The longest packet: the first byte, four length bytes, and the largest
 /// remaining length.
 pub const MAX_PACKET: usize = 1 + MAX_REMAINING_LENGTH_BYTES + MAX_REMAINING_LENGTH;
-/// The longest packet a [`Stream<Frames>`](super::codec::Stream) takes unless told otherwise: 1 MiB.
+/// The longest packet a [`Stream<Frames>`](fictionet::stdlib::codec::Stream) takes unless told otherwise: 1 MiB.
 pub const DEFAULT_MAX_PACKET: usize = 1 << 20;
 /// The longest UTF-8 string or binary field, in bytes: its length is a
 /// 16-bit number.
@@ -1023,7 +1023,7 @@ impl Wire for Packet {
 
     /// Appends a packet. Refuses invalid topics, flags, identifiers, strings,
     /// and size limits. Leaves `out` unchanged on error.
-    /// A [`Stream<Frames>`](super::codec::Stream) with a smaller limit may
+    /// A [`Stream<Frames>`](fictionet::stdlib::codec::Stream) with a smaller limit may
     /// still refuse a large packet. The size is checked before anything is allocated.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         let (flags, body) = self.measure().map_err(|_| Error::Unwritable)?;
@@ -1038,7 +1038,7 @@ impl Wire for Packet {
 
 /// Reads MQTT packets without retaining input bytes.
 ///
-/// Use with [`super::codec::Stream`] for bounded input and one-time errors.
+/// Use with [`fictionet::stdlib::codec::Stream`] for bounded input and one-time errors.
 /// Header and body errors end the stream.
 /// Partial packets return [`Step::Need`], including at EOF. The driver
 /// reports truncation.
@@ -1103,7 +1103,7 @@ impl Decode for Frames {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stdlib::codec::{
+    use fictionet::stdlib::codec::{
         Fail, Stream, contract, pump,
         test_support::{Lcg, decode_all, mutate},
     };

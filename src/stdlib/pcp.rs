@@ -77,7 +77,6 @@
 //! assert_eq!(Response::parse(&error.to_bytes().unwrap()).unwrap().result, ResultCode::AddressMismatch);
 //! ```
 
-extern crate self as fictionet;
 use fictionet::stdlib::codec::Wire;
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};

@@ -11,10 +11,10 @@
 //! and its SOCKS4a extension, which lets the client send a domain name.
 //!
 //! A world that plays a proxy pushes client bytes into
-//! [`Stream<ClientMessages>`](super::codec::Stream). It answers each
+//! [`Stream<ClientMessages>`](fictionet::stdlib::codec::Stream). It answers each
 //! [`ClientMessage`] and chooses the next stage with [`ClientMessages::select`]
 //! or [`ClientMessages::verified`]. A client uses
-//! [`Stream<ServerMessages>`](super::codec::Stream). After the last handshake
+//! [`Stream<ServerMessages>`](fictionet::stdlib::codec::Stream). After the last handshake
 //! item, `swap` or `into_parts` hands unread bytes to the tunnel protocol.
 //! While a decision is pending, input stays buffered up to the unit limit.
 //! Choose the next stage before filling that allowance. Each reader checks
@@ -55,7 +55,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use super::codec::{self, Step, Wire};
+use fictionet::stdlib::codec::{self, Step, Wire};
 
 /// Why a SOCKS stream cannot find its next unit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

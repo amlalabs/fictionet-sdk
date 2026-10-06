@@ -19,9 +19,9 @@
 //! the last scalar wins, embedded messages merge, and repeated numbers may
 //! come packed or one by one.
 //!
-//! Nothing here reads a socket. Use [`Stream<Frames>`](super::codec::Stream)
+//! Nothing here reads a socket. Use [`Stream<Frames>`](fictionet::stdlib::codec::Stream)
 //! for varint-delimited messages. For gRPC, use
-//! [`grpc::Messages`](super::grpc::Messages) and parse each uncompressed
+//! [`grpc::Messages`](fictionet::stdlib::grpc::Messages) and parse each uncompressed
 //! payload as a [`Message`]. Write replies with [`Wire::write`].
 //! Messages are capped at [`MAX_MESSAGE`] bytes and [`MAX_FIELDS`] fields.
 //! Groups and embedded messages nest at most [`MAX_DEPTH`] deep.
@@ -53,7 +53,6 @@
 //! ```
 
 extern crate alloc;
-extern crate self as fictionet;
 
 use alloc::vec::Vec;
 use fictionet::stdlib::codec::{Decode, Step, Wire};
@@ -779,7 +778,7 @@ fn write_fields(m: &Message, depth: usize, out: &mut Vec<u8>, count: &mut usize)
 }
 
 /// One varint-delimited message, still as bytes.
-/// For gRPC framing use [`grpc::Message`](super::grpc::Message).
+/// For gRPC framing use [`grpc::Message`](fictionet::stdlib::grpc::Message).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Frame {
     /// The message bytes, bounded by [`MAX_MESSAGE`] on read and write.
@@ -858,7 +857,7 @@ impl Wire for Message {
 /// Malformed lengths and bodies over [`MAX_MESSAGE`] end the stream.
 /// Incomplete frames return [`Step::Need`], including at EOF.
 /// Map items through [`Message::parse`] to handle payload errors per item.
-/// Drive this decoder with [`Stream<Frames>`](super::codec::Stream).
+/// Drive this decoder with [`Stream<Frames>`](fictionet::stdlib::codec::Stream).
 ///
 /// ```
 /// use fictionet::stdlib::{codec::{Stream, finish, pump}, protobuf::{Frame, Frames}};

@@ -11,11 +11,11 @@
 //! 8926.
 //!
 //! Nothing here reads a socket. A world that plays a tunnel endpoint hands
-//! each datagram it reads from a [`udp`](crate::stdlib::udp) socket to
+//! each datagram it reads from a [`udp`](fictionet::stdlib::udp) socket to
 //! [`Packet::parse`], looks at the [`Header`], and does what it likes with
 //! the inner payload. To send, it builds a [`Packet`] and writes the bytes
 //! [`Wire::to_bytes`] returns. For pieces of one datagram, use
-//! [`Stream<Frames>`](super::codec::Stream), with `Frames = Collect<Packet>`
+//! [`Stream<Collect<Packet>>`](fictionet::stdlib::codec::Stream)
 //! and a collection limit of [`MAX_DATAGRAM`]. Call `end` at the datagram boundary.
 //!
 //! Every reader checks lengths, because the agent can send any bytes it
@@ -50,7 +50,7 @@
 //! assert_eq!(back.header.option(0x0105, 1).unwrap().data, [0, 0, 0, 7]);
 //! ```
 
-use super::codec::Wire;
+use fictionet::stdlib::codec::Wire;
 
 /// The UDP port Geneve endpoints listen on.
 pub const PORT: u16 = 6081;
@@ -431,7 +431,7 @@ impl Wire for Header {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stdlib::codec::{Collect, CollectError, Fail, contract, test_support::{Lcg, decode_all, mutate}};
+    use fictionet::stdlib::codec::{Collect, CollectError, Fail, contract, test_support::{Lcg, decode_all, mutate}};
 
     fn collect(b: &[u8]) -> Result<Packet, GeneveError> {
         let make = || Collect::<Packet>::new(MAX_DATAGRAM);

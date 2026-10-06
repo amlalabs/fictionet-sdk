@@ -21,13 +21,13 @@
 //! Over UDP, usually to port 514, each datagram holds one message. Over TCP
 //! (RFC 6587) messages are framed one of two ways: octet counting, where a
 //! decimal length and a space come before each message, or non-transparent
-//! framing, where a newline ends each one. A [`Stream<Frames>`](super::codec::Stream) splits a stream
+//! framing, where a newline ends each one. A [`Stream<Frames>`](fictionet::stdlib::codec::Stream) splits a stream
 //! framed either way, and tells them apart frame by frame, as RFC 6587
 //! suggests receivers do.
 //!
 //! Nothing here reads a socket. A world that plays a log collector pushes
 //! the bytes it reads from a TCP connection to a
-//! [`Stream<Frames>`](super::codec::Stream), gets [`Frame`]s back, and reads each one with
+//! [`Stream<Frames>`](fictionet::stdlib::codec::Stream), gets [`Frame`]s back, and reads each one with
 //! [`Entry::parse`]. Every reader checks lengths and characters, because
 //! the agent can send any bytes it likes, and no message may be longer
 //! than [`MAX_MESSAGE_LEN`]. The stream returns the bounded prefix of an
@@ -77,7 +77,7 @@
 
 use std::borrow::Cow;
 
-use super::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire};
 
 /// The UDP port syslog collectors listen on (RFC 5426). Plain TCP syslog
 /// has no assigned port and most collectors use 514 for it too.
@@ -89,7 +89,7 @@ pub const TLS_PORT: u16 = 6514;
 /// more. This allows the long messages real senders produce while keeping
 /// a decoder's buffer bounded.
 pub const MAX_MESSAGE_LEN: usize = 65_536;
-/// The most bytes a [`Stream<Frames>`](super::codec::Stream) holds beyond those taken out: one message
+/// The most bytes a [`Stream<Frames>`](fictionet::stdlib::codec::Stream) holds beyond those taken out: one message
 /// of [`MAX_MESSAGE_LEN`] bytes and the longest octet count before it, 20
 /// digits and a space. It also holds a message ended by CR LF.
 pub const MAX_BUFFERED: usize = MAX_MESSAGE_LEN + 21;
@@ -1126,7 +1126,7 @@ impl core::error::Error for DecodeError {}
 
 /// Reads syslog TCP frames without retaining input bytes.
 ///
-/// Use with [`super::codec::Stream`] for at most [`MAX_BUFFERED`] unread
+/// Use with [`fictionet::stdlib::codec::Stream`] for at most [`MAX_BUFFERED`] unread
 /// bytes. Empty lines are skipped. Oversized messages yield a prefix of
 /// [`MAX_MESSAGE_LEN`] bytes with [`Frame::truncated`] set, then skip the
 /// remaining bytes. A scan cursor keeps bytewise line input linear.
@@ -1630,7 +1630,7 @@ fn days_in_month(year: u16, month: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stdlib::codec::{
+    use fictionet::stdlib::codec::{
         Fail, Stream, contract, pump,
         test_support::{Lcg, decode_all, mutate},
     };

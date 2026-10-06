@@ -80,8 +80,8 @@
 //! assert_eq!(basic.data.responses[0].cert_id.serial_number, [0x12, 0x34]);
 //! ```
 
-use super::asn1::{self, Class, Element, Header, Length, Oid, Reader, Rules, Tag, Writer};
-use super::codec::{Decode, Step, Wire};
+use fictionet::stdlib::asn1::{self, Class, Element, Header, Length, Oid, Reader, Rules, Tag, Writer};
+use fictionet::stdlib::codec::{Decode, Step, Wire};
 
 /// The TCP port OCSP responders usually listen on, since OCSP runs over
 /// plain HTTP.
@@ -1002,11 +1002,11 @@ impl Wire for BasicResponse {
 
 /// Reads whole DER messages without holding input bytes.
 ///
-/// Use with [`Stream<Frames>`](super::codec::Stream) for a buffer bounded by the configured
+/// Use with [`Stream<Frames>`](fictionet::stdlib::codec::Stream) for a buffer bounded by the configured
 /// message limit, with at least 16 bytes to read or refuse any ASN.1 header.
 /// Only headers are checked. Map each item through [`OcspRequest::parse`]
 /// or [`OcspResponse::parse`] to interpret it. Partial messages return
-/// [`super::codec::Step::Need`], including at EOF, so the stream reports
+/// [`fictionet::stdlib::codec::Step::Need`], including at EOF, so the stream reports
 /// truncation. Framing errors are reported once.
 #[derive(Clone, Copy, Debug)]
 pub struct Frames {
@@ -1505,7 +1505,7 @@ impl Wire for ResponseData {
 
 #[cfg(test)]
 mod tests {
-    use super::super::codec::{
+    use fictionet::stdlib::codec::{
         Fail, Stream, contract,
         test_support::{Lcg, chunks, mutate},
     };
@@ -2439,7 +2439,7 @@ mod tests {
 
     #[test]
     fn codec_frames_bound_headers_and_report_once() {
-        use super::super::codec::{Decode, Fail, Stream, contract};
+        use fictionet::stdlib::codec::{Decode, Fail, Stream, contract};
         assert_eq!(Frames::new().capacity(), MAX_MESSAGE);
         let mut stream = Stream::new(Frames::new());
         let bytes = [0x30, 0x83, 1, 0, 0];
@@ -2452,7 +2452,7 @@ mod tests {
 
     #[test]
     fn codec_writers_are_exact_and_transactional() {
-        use super::super::codec::{Wire, contract};
+        use fictionet::stdlib::codec::{Wire, contract};
         let response = OcspResponse::error(ResponseStatus::TryLater);
         contract::check_wire_value(&response);
         let mut bytes = <OcspResponse as Wire>::to_bytes(&response).unwrap();

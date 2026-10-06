@@ -1,6 +1,6 @@
 //! RDP connection messages from MS-RDPBCGR, with no I/O.
 //!
-//! [`Stream<Frames>`](super::codec::Stream) separates TPKT slow-path
+//! [`Stream<Frames>`](fictionet::stdlib::codec::Stream) separates TPKT slow-path
 //! packets from fast-path packets.
 //! [`Connection`] reads X.224 connection requests and confirms, including
 //! cookies, routing tokens and security negotiation. [`McsConnect`] reads
@@ -45,7 +45,7 @@
 //! assert_eq!(request.to_packet().unwrap().to_bytes().unwrap(), bytes);
 //! ```
 
-use super::{
+use fictionet::stdlib::{
     codec::{Decode, Step, Wire},
     cotp, tpkt,
 };
@@ -492,7 +492,7 @@ impl Wire for Frame {
 
 /// Reads RDP slow-path and fast-path frames without holding input bytes.
 ///
-/// Use with [`Stream<Frames>`](super::codec::Stream) for a buffer limited to
+/// Use with [`Stream<Frames>`](fictionet::stdlib::codec::Stream) for a buffer limited to
 /// [`MAX_FRAME`]. Partial frames return [`Step::Need`], including at EOF.
 /// The stream reports truncation at EOF and framing errors once.
 /// Slow-path framing uses the shared [`tpkt`] parser.
@@ -2468,7 +2468,7 @@ impl Wire for ActivePdu {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::codec::{
+    use fictionet::stdlib::codec::{
         Fail, Stream, contract, pump,
         test_support::{self, Lcg, decode_all},
     };

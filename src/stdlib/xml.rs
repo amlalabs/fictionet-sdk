@@ -7,7 +7,7 @@
 //! and Namespaces in XML 1.0, Third Edition.
 //!
 //! Nothing here reads a socket. A world passes body bytes to
-//! [`Stream<Events>`](super::codec::Stream) and takes [`Event`]s
+//! [`Stream<Events>`](fictionet::stdlib::codec::Stream) and takes [`Event`]s
 //! out: the declaration, start and end tags with their attributes, text,
 //! CDATA sections, comments and processing instructions. Names come back
 //! with their namespaces resolved. A [`Builder`] builds a document from the
@@ -72,7 +72,6 @@
 //! ```
 
 extern crate alloc;
-extern crate self as fictionet;
 
 use alloc::{
     format,
@@ -381,7 +380,7 @@ impl Wire for Document {
 /// text. Partial markup returns [`codec::Step::Need`]; an open element
 /// returns [`ErrorKind::UnexpectedEnd`]. Syntax and limit errors are terminal.
 /// Capacity is [`MAX_DOCUMENT`] plus one byte to detect overflow.
-/// Drive it with [`Stream<Events>`](super::codec::Stream).
+/// Drive it with [`Stream<Events>`](fictionet::stdlib::codec::Stream).
 /// An empty stream ends cleanly with no items, unlike [`Document::parse`], while
 /// whitespace-only input is an error.
 ///

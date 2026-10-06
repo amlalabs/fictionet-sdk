@@ -10,7 +10,7 @@
 //!
 //! Nothing here reads a socket. A world that plays a SIP phone takes the
 //! body of an INVITE, reads it with [`SessionDescription::parse`] (or a
-//! [`Stream<Descriptions>`](super::codec::Stream), with a body ending at EOF),
+//! [`Stream<Descriptions>`](fictionet::stdlib::codec::Stream), with a body ending at EOF),
 //! picks the streams and codecs it will take, and writes its answer with
 //! [`SessionDescription::write`].
 //! Which codecs a world accepts, and what it does with the media, is up
@@ -66,7 +66,7 @@
 
 extern crate alloc;
 
-use super::codec::{self, Decode, Wire};
+use fictionet::stdlib::codec::{self, Decode, Wire};
 use alloc::{
     string::{String, ToString},
     vec,

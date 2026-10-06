@@ -15,7 +15,7 @@
 //!
 //! Nothing here reads a socket. A world that plays a database server
 //! reads connection bytes through
-//! [`Stream<FrontendMessages>`](super::codec::Stream) and takes [`Frontend`]
+//! [`Stream<FrontendMessages>`](fictionet::stdlib::codec::Stream) and takes [`Frontend`]
 //! messages out. It answers with [`Backend`] messages, written by [`Wire::write`].
 //! Which users exist, which passwords they have, and what a query returns
 //! are up to world code. A world that plays a client does the reverse,
@@ -73,7 +73,7 @@
 //! assert_eq!(bytes[bytes.len() - 6..], *b"Z\0\0\0\x05I");
 //! ```
 
-use super::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire};
 
 /// The TCP port PostgreSQL servers listen on.
 pub const PORT: u16 = 5432;
@@ -558,13 +558,13 @@ pub enum Frontend {
     Startup(Startup),
     /// SSLRequest: asks to switch to TLS. The server answers with one
     /// byte, [`ACCEPT_SSL`] or [`REFUSE_ENCRYPTION`]. A server that
-    /// accepts calls [`super::codec::Stream::into_parts`], then
+    /// accepts calls [`fictionet::stdlib::codec::Stream::into_parts`], then
     /// [`FrontendMessages::start_encryption`] on the returned decoder.
     /// The decoder refuses a second SSLRequest on one connection.
     SslRequest,
     /// GSSENCRequest: asks to switch to GSSAPI encryption. The server
     /// answers with one byte, [`ACCEPT_GSSENC`] or [`REFUSE_ENCRYPTION`],
-    /// then calls [`super::codec::Stream::into_parts`] if it accepts and
+    /// then calls [`fictionet::stdlib::codec::Stream::into_parts`] if it accepts and
     /// [`FrontendMessages::start_encryption`] on the returned decoder.
     /// The decoder refuses a second GSSENCRequest on one connection.
     GssEncRequest,
@@ -963,7 +963,7 @@ pub enum Error {
     /// The connection opened with a TLS record, not a startup-phase
     /// message: the client asked for direct TLS (`sslnegotiation=direct`).
     /// A server that supports it starts TLS with the bytes
-    /// [`super::codec::Stream::into_parts`] retains, then calls
+    /// [`fictionet::stdlib::codec::Stream::into_parts`] retains, then calls
     /// [`FrontendMessages::start_encryption`] on the returned decoder.
     /// A new stream uses that decoder for decrypted bytes. As in
     /// PostgreSQL, only the first byte of a connection is read this way.
@@ -1627,12 +1627,12 @@ impl Wire for Backend {
 /// [`Error::Malformed`] for a complete typed body, preserving its tag.
 /// Invalid framing, malformed startup-phase bodies, unsupported protocols,
 /// repeated encryption requests, and over-limit lengths end the stream.
-/// Partial messages return [`Step::Need`], so [`super::codec::Stream`]
+/// Partial messages return [`Step::Need`], so [`fictionet::stdlib::codec::Stream`]
 /// reports truncation at EOF.
 ///
 /// A StartupMessage selects typed messages after its item. SSLRequest and
 /// GSSENCRequest each yield an item followed by [`Step::End`]. Call
-/// [`super::codec::Stream::into_parts`] and give its unread bytes to TLS or GSS,
+/// [`fictionet::stdlib::codec::Stream::into_parts`] and give its unread bytes to TLS or GSS,
 /// then call [`start_encryption`](Self::start_encryption) on the returned
 /// decoder and use a new stream for decrypted bytes. A direct ClientHello
 /// returns [`Error::DirectTls`] without consuming any bytes; the same
@@ -1640,8 +1640,8 @@ impl Wire for Backend {
 ///
 /// To answer `N`, call [`refuse_encryption`](Self::refuse_encryption)
 /// between the request item and the next poll. If End was already polled,
-/// clone the decoder, refuse on that clone, and use [`super::codec::Stream::swap`].
-/// [`super::codec::pump`] polls End after the item, so its users take this swap route.
+/// clone the decoder, refuse on that clone, and use [`fictionet::stdlib::codec::Stream::swap`].
+/// [`fictionet::stdlib::codec::pump`] polls End after the item, so its users take this swap route.
 /// Keep any unaccepted part of a pushed slice for the next transport.
 ///
 /// ```
@@ -1735,7 +1735,7 @@ impl FrontendMessages {
     }
 
     /// Prepares this decoder for decrypted startup bytes after handoff.
-    /// Call on the decoder returned by [`super::codec::Stream::into_parts`].
+    /// Call on the decoder returned by [`fictionet::stdlib::codec::Stream::into_parts`].
     /// After a negotiated upgrade, further SSL and GSS requests are refused.
     /// Inside direct TLS, encryption requests may still be refused with `N`.
     pub fn start_encryption(&mut self) {
@@ -1861,7 +1861,7 @@ pub enum BackendEvent {
 /// Call [`expect_encryption`](Self::expect_encryption) before the response
 /// to an SSLRequest or GSSENCRequest. An `S` or `G` item is followed by
 /// [`Step::End`]; unread bytes go to the next transport through
-/// [`super::codec::Stream::into_parts`]. Use a new decoder for decrypted messages.
+/// [`fictionet::stdlib::codec::Stream::into_parts`]. Use a new decoder for decrypted messages.
 /// An `N` item resumes typed messages. World code may request another
 /// negotiation response between items if it sends another request.
 /// This mode accepts only `S`, `G` and `N`: an `E` ErrorResponse from an
@@ -2421,7 +2421,7 @@ fn show_tag(t: u8) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::codec::{
+    use fictionet::stdlib::codec::{
         Fail, Stream, contract,
         test_support::{Lcg, decode_all, mutate},
     };

@@ -24,7 +24,7 @@
 //! [`Message::answer`], adds the addresses and prefixes it hands out, and
 //! sends [`Message::to_bytes`] back. Which addresses exist and who gets them
 //! is up to world code. For DHCPv6 over TCP, as leasequery uses, a
-//! [`Stream<Frames>`](super::codec::Stream) splits the stream into messages.
+//! [`Stream<Frames>`](fictionet::stdlib::codec::Stream) splits the stream into messages.
 //!
 //! Every reader checks lengths and ranges, because the agent can send any
 //! bytes it likes. Options nest at most [`MAX_DEPTH`] deep; deeper ones are
@@ -72,7 +72,7 @@
 use core::convert::Infallible;
 use std::net::Ipv6Addr;
 
-use super::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire};
 
 /// The UDP port DHCPv6 clients listen on.
 pub const CLIENT_PORT: u16 = 546;
@@ -89,10 +89,10 @@ pub const ALL_DHCP_SERVERS: Ipv6Addr = Ipv6Addr::new(0xff05, 0, 0, 0, 0, 0, 1, 3
 /// it.
 pub const MAX_MESSAGE: usize = 65_527;
 /// The longest message over TCP, where a 2-byte length comes before each
-/// message (RFC 5460, section 5.1). [`Stream<Frames>`](super::codec::Stream) reads messages this long,
+/// message (RFC 5460, section 5.1). [`Stream<Frames>`](fictionet::stdlib::codec::Stream) reads messages this long,
 /// and [`Frame`] writes them.
 pub const MAX_TCP_MESSAGE: usize = 65_535;
-/// The most bytes a [`Stream<Frames>`](super::codec::Stream) holds that have not been taken out: one
+/// The most bytes a [`Stream<Frames>`](fictionet::stdlib::codec::Stream) holds that have not been taken out: one
 /// whole message over TCP and its length.
 pub const MAX_BUFFERED: usize = 2 + MAX_TCP_MESSAGE;
 /// The length of a client or server message's header: the type and the
@@ -923,11 +923,11 @@ impl Wire for Frame {
 
 /// Reads DHCPv6 TCP messages without retaining input bytes.
 ///
-/// Use with [`Stream<Frames>`](super::codec::Stream) for at most [`MAX_BUFFERED`] unread bytes. Each
+/// Use with [`Stream<Frames>`](fictionet::stdlib::codec::Stream) for at most [`MAX_BUFFERED`] unread bytes. Each
 /// two-byte length delimits one item. Malformed messages are error items,
 /// so the next message can still be read. Framing has no protocol errors.
 /// Partial prefixes and bodies return [`Step::Need`], including at EOF;
-/// the driver reports [`Fail::Truncated`](super::codec::Fail::Truncated). UDP uses [`Wire`] on [`Message`].
+/// the driver reports [`Fail::Truncated`](fictionet::stdlib::codec::Fail::Truncated). UDP uses [`Wire`] on [`Message`].
 ///
 /// ```
 /// use fictionet::stdlib::{dhcpv6::{Frame, Frames, Message, msg}, codec::{Stream, Wire}};
@@ -1393,7 +1393,7 @@ fn addr(b: &[u8], i: usize) -> Ipv6Addr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stdlib::codec::{
+    use fictionet::stdlib::codec::{
         Stream, contract, pump,
         test_support::{Lcg, decode_all, mutate},
     };

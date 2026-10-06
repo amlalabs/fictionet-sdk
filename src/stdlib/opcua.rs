@@ -11,7 +11,7 @@
 //! CloseSecureChannel services with security policy None.
 //!
 //! Nothing here reads a socket. A world pushes connection bytes to a
-//! [`Stream<Messages>`](super::codec::Stream) and gets [`Message`]s back.
+//! [`Stream<Messages>`](fictionet::stdlib::codec::Stream) and gets [`Message`]s back.
 //! It answers a [`Hello`] with an [`Acknowledge`], gives the decoder the
 //! negotiated [`Limits`], reads each [`SecureMessage`]'s body as a [`Service`],
 //! and splits replies with [`Message::chunks`]. Each chunk is written with
@@ -120,7 +120,7 @@
 //! assert_eq!(&bytes[8..12], &7u32.to_le_bytes());
 //! ```
 
-use super::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire};
 
 /// The TCP port OPC UA servers listen on.
 pub const PORT: u16 = 4840;
@@ -2208,7 +2208,7 @@ impl Wire for Chunk {
 /// Capacity is the larger of [`Limits::chunk_limit`] and
 /// [`MAX_HANDSHAKE_SIZE`]. Oversized chunks fail from their header.
 /// Partial chunks return [`Step::Need`], including at EOF, when
-/// [`Stream`](super::codec::Stream) reports truncation.
+/// [`Stream`](fictionet::stdlib::codec::Stream) reports truncation.
 /// Message bodies, chunk counts, and sequence numbers are not checked here.
 /// Use [`Messages`] for message assembly and connection checks.
 #[derive(Clone, Copy, Debug, Default)]
@@ -2719,14 +2719,14 @@ fn follows(prev: u32, got: u32) -> bool {
 
 /// Reads OPC UA messages and assembles MSG chunks under negotiated limits.
 ///
-/// Use with [`Stream<Messages>`](super::codec::Stream). Each secure chunk must follow
+/// Use with [`Stream<Messages>`](fictionet::stdlib::codec::Stream). Each secure chunk must follow
 /// the previous sequence number, including across message boundaries.
 /// Input stays in the stream. Only an unfinished message body is held here.
 /// EOF during an assembly returns [`ChunkError::Incomplete`], including when
 /// its body is empty. [`Decode::held`] counts body bytes, so zero held bytes
 /// does not imply a complete message. Use [`Messages::is_between_messages`]
 /// to check for an unfinished assembly. Set receive limits between messages
-/// through [`Stream::decoder`](super::codec::Stream::decoder).
+/// through [`Stream::decoder`](fictionet::stdlib::codec::Stream::decoder).
 #[derive(Debug, Default)]
 pub struct Messages {
     limits: Limits,
@@ -3646,7 +3646,7 @@ impl Wire for Service {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::codec::{
+    use fictionet::stdlib::codec::{
         Fail, Stream, contract, pump,
         test_support::{self, Lcg, decode_all},
     };

@@ -277,7 +277,7 @@ impl<E: fmt::Display, H: fmt::Display> fmt::Display for PumpError<E, H> {
 impl<E: Error, H: Error> Error for PumpError<E, H> {}
 
 /// Feeds bytes and returns the number accepted from this slice.
-/// Stops at EOF or completion. After `End`, swap decoders and feed
+/// Stops at EOF or completion. After `End`, swap decoders and push
 /// `bytes[taken..]` to the new stream. Buffered unread bytes survive the swap.
 /// On error, use `offset() + buffered()` before and after to count acceptance.
 pub fn pump<D: Decode>(

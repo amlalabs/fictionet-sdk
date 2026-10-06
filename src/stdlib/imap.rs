@@ -18,9 +18,9 @@
 //! wait. A binary literal, `~{n}`, may also hold NUL bytes.
 //!
 //! Run a server's connection bytes through
-//! [`Stream<Commands>`](super::codec::Stream). Each item is a [`Command`],
+//! [`Stream<Commands>`](fictionet::stdlib::codec::Stream). Each item is a [`Command`],
 //! a literal continuation, or a syntax error. Send a [`Response`] for each
-//! command. Clients read [`Stream<Responses>`](super::codec::Stream).
+//! command. Clients read [`Stream<Responses>`](fictionet::stdlib::codec::Stream).
 //! Mailboxes, messages, and command execution belong to world code.
 //!
 //! Readers require CRLF and bound lines, literals, messages, and nesting.
@@ -51,7 +51,7 @@
 extern crate alloc;
 
 use self::alloc::{string::String, sync::Arc, vec::Vec};
-use super::codec::{self, Decode, Wire};
+use fictionet::stdlib::codec::{self, Decode, Wire};
 
 /// The TCP port IMAP servers listen on.
 pub const PORT: u16 = 143;

@@ -14,17 +14,17 @@
 //! addresses.
 //!
 //! Nothing here reads a socket, and nothing here frames a message. The
-//! [`onc_rpc`](crate::stdlib::onc_rpc) module reads and writes calls,
+//! [`onc_rpc`](fictionet::stdlib::onc_rpc) module reads and writes calls,
 //! replies and TCP records. A world that plays a portmapper reads each
 //! [`Call`] there, reads its [`Request`] here with
 //! [`Request::from_call`], works out the answer, and writes it with
 //! [`PmapResult::to_bytes`] or [`RpcbResult::to_bytes`] as the results of
 //! a successful reply. What is registered, and what a forwarded call does,
 //! is up to world code. A portmapper sends no reply at all when CALLIT
-//! fails; [`silent_on_failure`](crate::stdlib::onc_rpc::silent_on_failure)
+//! fails; [`silent_on_failure`](fictionet::stdlib::onc_rpc::silent_on_failure)
 //! says which calls those are.
 //!
-//! Over TCP, map [`onc_rpc::messages`](super::onc_rpc::messages) with a
+//! Over TCP, map [`onc_rpc::messages`](fictionet::stdlib::onc_rpc::messages) with a
 //! closure. [`Request::read`] also accepts version, procedure, and arguments
 //! directly when the caller has already checked the RPC header.
 //!
@@ -117,11 +117,11 @@
 
 use std::net::{IpAddr, SocketAddr};
 
-use super::onc_rpc::{
+use fictionet::stdlib::onc_rpc::{
     Accept, Body, Call, MAX_RPCB_STRING, Message, PMAP_PROGRAM, PMAP_VERSION, RPC_VERSION,
     RPCB_VERSION_HIGH, RPCB_VERSION_LOW, Reader, Reject, Reply, Writer, XdrError,
 };
-pub use super::onc_rpc::{IPPROTO_TCP, IPPROTO_UDP, Mapping, PORT, Rpcb};
+pub use fictionet::stdlib::onc_rpc::{IPPROTO_TCP, IPPROTO_UDP, Mapping, PORT, Rpcb};
 
 /// The longest string this module reads or writes: a network ID, a
 /// universal address, an owner, a protocol family or a protocol name.
@@ -656,7 +656,7 @@ impl PmapResult {
         }
     }
 
-    /// The results' bytes, for [`Reply::success`](crate::stdlib::onc_rpc::Reply::success).
+    /// The results' bytes, for [`Reply::success`](fictionet::stdlib::onc_rpc::Reply::success).
     pub fn to_bytes(&self) -> Result<Vec<u8>, EncodeError> {
         let mut w = Writer::new();
         match self {
@@ -875,7 +875,7 @@ impl RpcbResult {
         }
     }
 
-    /// The results' bytes, for [`Reply::success`](crate::stdlib::onc_rpc::Reply::success).
+    /// The results' bytes, for [`Reply::success`](fictionet::stdlib::onc_rpc::Reply::success).
     pub fn to_bytes(&self) -> Result<Vec<u8>, EncodeError> {
         let mut w = Writer::new();
         match self {
@@ -921,7 +921,7 @@ pub enum Request {
 impl Request {
     /// Reads the request a call makes. When the call is not one, the
     /// error's [`ParseError::status`] is what a portmapper replies with,
-    /// unless [`silent_on_failure`](crate::stdlib::onc_rpc::silent_on_failure)
+    /// unless [`silent_on_failure`](fictionet::stdlib::onc_rpc::silent_on_failure)
     /// says it sends no reply. A call whose RPC version is not 2 is
     /// [`ParseError::RpcVersion`], whose reply is
     /// [`ParseError::reply`]. The credentials are not checked.
@@ -1092,10 +1092,10 @@ fn write_list<T>(
 
 #[cfg(test)]
 mod tests {
-    use super::super::onc_rpc::{MAX_RECORD, Record, records};
+    use fictionet::stdlib::onc_rpc::{MAX_RECORD, Record, records};
     use super::*;
-    use crate::stdlib::codec::test_support::Lcg;
-    use crate::stdlib::codec::{Assembled, Stream, Wire, contract, finish, pump, test_support};
+    use fictionet::stdlib::codec::test_support::Lcg;
+    use fictionet::stdlib::codec::{Assembled, Stream, Wire, contract, finish, pump, test_support};
 
     fn rpcb(rng: &mut Lcg) -> Rpcb {
         Rpcb {
@@ -1666,7 +1666,7 @@ mod tests {
             assert_eq!(e, ParseError::RpcVersion(v));
             assert_eq!(
                 e.reply(),
-                Reply::Denied(super::super::onc_rpc::Reject::RpcMismatch { low: 2, high: 2 })
+                Reply::Denied(fictionet::stdlib::onc_rpc::Reject::RpcMismatch { low: 2, high: 2 })
             );
             assert!(!e.to_string().is_empty());
             // Before the program is checked.
@@ -1820,7 +1820,7 @@ mod tests {
     /// limit, crosses TCP in fragments and a byte at a time.
     #[test]
     fn largest_getstat_reply_over_tcp() {
-        use super::super::onc_rpc::encode_fragments;
+        use fictionet::stdlib::onc_rpc::encode_fragments;
         let netid = "z".repeat(MAX_STRING);
         let s = RpcbStat {
             info: [i32::MAX; STAT_PROCEDURES],
@@ -1894,7 +1894,7 @@ mod tests {
     /// when they fail. INDIRECT and the rest are not.
     #[test]
     fn silent_calls() {
-        use super::super::onc_rpc::silent_on_failure;
+        use fictionet::stdlib::onc_rpc::silent_on_failure;
         let c = CallArgs::default();
         let silent = [
             Request::Pmap(PmapRequest::CallIt(c.clone())),
@@ -2142,7 +2142,7 @@ mod tests {
             contract::check_decode_with_alloc_limit(
                 || records(MAX_RECORD),
                 &stream,
-                2 * (MAX_RECORD + super::super::onc_rpc::RECORD_MARK_LEN),
+                2 * (MAX_RECORD + fictionet::stdlib::onc_rpc::RECORD_MARK_LEN),
             );
             {
                 let (items, failure) = test_support::decode_all(|| records(MAX_RECORD), &stream);

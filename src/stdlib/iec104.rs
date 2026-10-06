@@ -2,7 +2,7 @@
 //!
 //! IEC 104 carries telecontrol messages over TCP, usually on port 2404.
 //! [`Frame`] reads the I (information), S (acknowledgment) and U (link
-//! control) formats. [`Stream<Frames>`](super::codec::Stream) splits a byte
+//! control) formats. [`Stream<Frames>`](fictionet::stdlib::codec::Stream) splits a byte
 //! stream into those frames.
 //! Sequence numbers are checked for their 15-bit range; tracking which
 //! numbers have been sent or acknowledged belongs to world code.
@@ -30,7 +30,7 @@
 //! assert_eq!(Frame::parse(&bytes).unwrap(), Some((frame, bytes.len())));
 //! ```
 
-use super::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire};
 
 /// The TCP port IEC 104 servers normally listen on.
 pub const PORT: u16 = 2404;
@@ -278,7 +278,7 @@ impl Wire for Frame {
 
 /// Reads IEC 104 frames without holding input bytes.
 ///
-/// Use with [`Stream<Frames>`](super::codec::Stream) for a buffer limited to
+/// Use with [`Stream<Frames>`](fictionet::stdlib::codec::Stream) for a buffer limited to
 /// [`MAX_FRAME`]. Partial frames return [`Step::Need`], including at EOF.
 /// The stream reports truncation at EOF and framing errors once.
 #[derive(Clone, Copy, Debug, Default)]
@@ -516,7 +516,7 @@ impl Wire for Asdu {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::codec::{Fail, Stream, contract, test_support::decode_all};
+    use fictionet::stdlib::codec::{Fail, Stream, contract, test_support::decode_all};
 
     const INTERROGATION: &[u8] = &[0x68, 14, 0, 0, 0, 0, 100, 1, 6, 0, 1, 0, 0, 0, 0, 20];
 

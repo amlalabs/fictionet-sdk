@@ -11,7 +11,7 @@
 //! and error.
 //!
 //! Nothing here reads a socket. A world that plays a server pushes bytes
-//! from a TCP connection into a [`Stream<Tpdus>`](super::codec::Stream) and
+//! from a TCP connection into a [`Stream<Tpdus>`](fictionet::stdlib::codec::Stream) and
 //! gets each packet's TPDU back. Data TPDUs carry a message in segments;
 //! [`messages`] puts them back together, and [`segment`] cuts a message
 //! into them. Which TSAPs exist, what TPDU size to accept, and what the
@@ -74,7 +74,7 @@
 //! assert_eq!(messages.push(&data), Ok(Some(b"hi".to_vec())));
 //! ```
 
-use super::{
+use fictionet::stdlib::{
     codec::{Assemble, Decode, Fragment, Map, Wire},
     tpkt,
 };
@@ -838,7 +838,7 @@ pub type Tpdus = Map<tpkt::Packets, fn(tpkt::Packet) -> Result<Tpdu, TpduError>>
 /// Creates a TPDU decoder with a TPKT packet limit, including its header.
 /// Clamps `packet_limit` to [`tpkt::MIN_PACKET`] through [`tpkt::MAX_PACKET`].
 /// TPDU errors do not retain the refused bytes. To build an error reply
-/// with [`ErrorTpdu::rejecting`], use [`super::codec::Stream::with_next`]:
+/// with [`ErrorTpdu::rejecting`], use [`fictionet::stdlib::codec::Stream::with_next`]:
 /// its raw bytes are the TPKT packet, whose TPDU starts at [`tpkt::HEADER_LEN`].
 pub fn tpdus(packet_limit: usize) -> Tpdus {
     tpkt::Packets::with_limit(packet_limit).map(|packet| Tpdu::parse(&packet.payload))
@@ -846,12 +846,12 @@ pub fn tpdus(packet_limit: usize) -> Tpdus {
 
 /// Data TPDUs joined into messages by [`Assemble`].
 ///
-/// Items are [`super::codec::Assembled`]. Control TPDUs and TPDU parse
+/// Items are [`fictionet::stdlib::codec::Assembled`]. Control TPDUs and TPDU parse
 /// errors pass through as `Whole(Result<Tpdu, TpduError>)` items without
 /// clearing a pending message.
 /// DT payloads join in order until EOT. TPDU numbers are not checked.
-/// EOF before EOT reports [`super::codec::AssembleError::Incomplete`], even
-/// for an empty fragment. A torn TPKT reports [`super::codec::Fail::Truncated`].
+/// EOF before EOT reports [`fictionet::stdlib::codec::AssembleError::Incomplete`], even
+/// for an empty fragment. A torn TPKT reports [`fictionet::stdlib::codec::Fail::Truncated`].
 /// Framing errors and message overflow end the stream.
 pub type Messages =
     Assemble<Tpdus, fn(Result<Tpdu, TpduError>) -> Fragment<Result<Tpdu, TpduError>>>;
@@ -863,7 +863,7 @@ pub type Messages =
 /// Zero permits empty messages. The decoder holds at most `message_limit`
 /// bytes outside its driver's input buffer.
 /// For `Whole(Err(_))`, obtain refused TPDU bytes through
-/// [`super::codec::Stream::with_next`] as described on [`tpdus`].
+/// [`fictionet::stdlib::codec::Stream::with_next`] as described on [`tpdus`].
 pub fn messages(packet_limit: usize, message_limit: usize) -> Messages {
     Assemble::new(
         tpdus(packet_limit),
@@ -1064,7 +1064,7 @@ pub fn segment(message: &[u8], tpdu_size: usize) -> Vec<Data> {
 
 #[cfg(test)]
 mod codec_tests {
-    use super::super::codec::{
+    use fictionet::stdlib::codec::{
         AssembleError, Assembled, Fail, Stream, contract, finish, pump, test_support,
     };
     use super::*;
@@ -1456,8 +1456,8 @@ mod codec_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stdlib::codec::test_support::Lcg;
-    use crate::stdlib::codec::{Fail, Stream, contract, pump, test_support};
+    use fictionet::stdlib::codec::test_support::Lcg;
+    use fictionet::stdlib::codec::{Fail, Stream, contract, pump, test_support};
     use tpkt::{MAX_PACKET, MAX_PAYLOAD, Packet, Packets};
 
     // An RDP connection request (MS-RDPBCGR 4.1.1) starts with a TPKT

@@ -30,6 +30,12 @@
 //! [`Attachments::map`](crate::Attachments::map). The
 //! [recipes](crate::recipes) show both ways, with commands to run.
 //!
+//! To customize a protocol, copy its module file into your crate and edit it.
+//! Its `fictionet::stdlib::...` imports need no change. Plug the copy's
+//! [`codec::Decode`] and [`codec::Wire`] implementations into [`codec::Stream`]
+//! and the generic codec tools. Named sibling modules stay SDK dependencies.
+//! See the `custom_protocol` example for a copied Modbus module.
+//!
 //! # Three kinds of functions
 //!
 //! Every function in the stdlib is one of three kinds. The kind tells you

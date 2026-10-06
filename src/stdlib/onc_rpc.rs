@@ -1,5 +1,5 @@
 //! ONC RPC and XDR: reading and writing calls, replies, and TCP records
-//! with no I/O. [`portmap`](super::portmap) handles portmap procedures.
+//! with no I/O. [`portmap`](fictionet::stdlib::portmap) handles portmap procedures.
 //!
 //! ONC RPC (Open Network Computing Remote Procedure Call, first Sun RPC)
 //! is how NFS, NIS and the network lock manager talk. A client calls a
@@ -14,7 +14,7 @@
 //! for XDR, RFC 5531 for ONC RPC and record marking, and RFC 1833 for
 //! portmap and rpcbind.
 //!
-//! For TCP, [`Stream<Fragments>`](super::codec::Stream) reads record
+//! For TCP, [`Stream<Fragments>`](fictionet::stdlib::codec::Stream) reads record
 //! fragments; [`records`] joins them and [`messages`] reads each RPC header.
 //! UDP datagrams contain one [`Message`]. [`Reader`] and [`Writer`] handle
 //! XDR arguments and results.
@@ -64,7 +64,7 @@
 //! );
 //! ```
 
-use super::codec::{self, Assemble, AssembleError, Assembled, Decode, Step, Wire};
+use fictionet::stdlib::codec::{self, Assemble, AssembleError, Assembled, Decode, Step, Wire};
 use core::convert::Infallible;
 
 /// The port the portmapper and rpcbind listen on, over TCP and UDP.
@@ -1438,7 +1438,7 @@ pub struct Rpcb {
     /// The network ID, such as "tcp", "udp", "tcp6" or "udp6".
     pub netid: String,
     /// The universal address, such as "10.0.0.5.8.1" for port 2049. See
-    /// [`portmap::format_uaddr`](super::portmap::format_uaddr).
+    /// [`portmap::format_uaddr`](fictionet::stdlib::portmap::format_uaddr).
     pub addr: String,
     /// Who registered it, usually a user ID as a string.
     pub owner: String,
@@ -1486,9 +1486,9 @@ pub fn silent_on_failure(call: &Call) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stdlib::codec::test_support::Lcg;
-    use crate::stdlib::codec::{Fail, Stream, contract, finish, pump, test_support};
-    use crate::stdlib::portmap::{
+    use fictionet::stdlib::codec::test_support::Lcg;
+    use fictionet::stdlib::codec::{Fail, Stream, contract, finish, pump, test_support};
+    use fictionet::stdlib::portmap::{
         self, ParseError, PmapRequest, PmapResult, Request, RpcbRequest, RpcbResult,
     };
     use std::net::SocketAddr;

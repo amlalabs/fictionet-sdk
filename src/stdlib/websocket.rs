@@ -15,8 +15,8 @@
 //! parses the request line and header fields itself, hands the fields to
 //! [`check_request`], and writes back the fields from
 //! [`Upgrade::response_headers`]. It pushes connection bytes to
-//! [`Stream<Frames>`](super::codec::Stream) for frames or
-//! [`Stream<Messages>`](super::codec::Stream) for whole [`Message`]s.
+//! [`Stream<Frames>`](fictionet::stdlib::codec::Stream) for frames or
+//! [`Stream<Messages>`](fictionet::stdlib::codec::Stream) for whole [`Message`]s.
 //! Replies become frames through [`Message::to_frame`] or
 //! [`Message::to_frames`]. Answering pings and deciding when to close
 //! belong to world code.
@@ -59,7 +59,7 @@
 //! assert_eq!(Wire::to_bytes(&frame).unwrap(), [0x81, 0x05, b'H', b'e', b'l', b'l', b'o']);
 //! ```
 
-use super::codec::{self, Step, Wire};
+use fictionet::stdlib::codec::{self, Step, Wire};
 
 /// The fixed string a server appends to the client's key before hashing it
 /// into `Sec-WebSocket-Accept`.
@@ -1545,7 +1545,7 @@ fn base64_value(c: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::codec::{
+    use fictionet::stdlib::codec::{
         AssembleError, Decode, Fail, Stream, contract,
         test_support::{Lcg, decode_all, mutate},
     };

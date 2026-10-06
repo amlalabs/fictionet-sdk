@@ -15,7 +15,7 @@
 //! [`Packet::parse`], looks at the [`Header`], and does what it likes with
 //! the inner payload. To send, it builds a [`Packet`] and writes the bytes
 //! [`Wire::to_bytes`] returns. For pieces of one packet, use
-//! [`Stream<Frames>`](super::codec::Stream), with `Frames = Collect<Packet>`
+//! [`Stream<Collect<Packet>>`](fictionet::stdlib::codec::Stream)
 //! and a collection limit of [`MAX_PACKET`]. Call `end` at the packet boundary.
 //!
 //! Every reader checks lengths, because the agent can send any bytes it
@@ -48,7 +48,7 @@
 //! assert_eq!(back.header.key(), Some(7));
 //! ```
 
-use super::codec::Wire;
+use fictionet::stdlib::codec::Wire;
 
 /// The IP protocol number that marks a GRE packet.
 pub const IP_PROTOCOL: u8 = 47;
@@ -494,7 +494,7 @@ impl Wire for Packet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stdlib::codec::{Collect, CollectError, Fail, contract, test_support::{Lcg, decode_all, mutate}};
+    use fictionet::stdlib::codec::{Collect, CollectError, Fail, contract, test_support::{Lcg, decode_all, mutate}};
 
     fn collect(b: &[u8]) -> Result<Packet, GreError> {
         let make = || Collect::<Packet>::new(MAX_PACKET);

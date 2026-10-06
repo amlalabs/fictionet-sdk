@@ -7,7 +7,7 @@
 //! every CRC and removes them from its data; its writer puts them back.
 //! The framing follows IEEE 1815 (DNP3).
 //!
-//! Push connection bytes to a [`Stream<Frames>`](super::codec::Stream),
+//! Push connection bytes to a [`Stream<Frames>`](fictionet::stdlib::codec::Stream),
 //! then read each data frame's [`Segment`]. A [`Reassembler`] joins transport
 //! segments into application fragments. Use one reassembler per source,
 //! destination and direction. Link acknowledgments, duplicate suppression
@@ -33,7 +33,7 @@
 //! assert_eq!(decoder.next().unwrap().unwrap(), frame);
 //! ```
 
-use super::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire};
 
 /// The usual TCP and UDP port.
 pub const PORT: u16 = 20000;
@@ -234,7 +234,7 @@ impl Wire for Frame {
 
 /// Reads DNP3 frames without holding input bytes.
 ///
-/// Use with [`Stream<Frames>`](super::codec::Stream) for a buffer limited to
+/// Use with [`Stream<Frames>`](fictionet::stdlib::codec::Stream) for a buffer limited to
 /// [`MAX_FRAME`]. Partial frames return [`Step::Need`], including at EOF.
 /// The stream reports truncation at EOF and framing errors once.
 #[derive(Clone, Copy, Debug, Default)]
@@ -501,7 +501,7 @@ impl Wire for Fragment {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::codec::{Fail, Stream, contract, test_support::decode_all};
+    use fictionet::stdlib::codec::{Fail, Stream, contract, test_support::decode_all};
 
     // Reset link states: master 1024 to outstation 1, no user data.
     const RESET: &[u8] = &[5, 0x64, 5, 0xc0, 1, 0, 0, 4, 0xe9, 0x21];

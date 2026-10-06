@@ -13,7 +13,7 @@
 //! extensions to the connection and basic classes.
 //!
 //! Nothing here reads a socket. A world that plays a broker pushes the bytes
-//! it reads from a TCP connection to a [`Stream<Frames>`](super::codec::Stream), gets [`Frame`]s back,
+//! it reads from a TCP connection to a [`Stream<Frames>`](fictionet::stdlib::codec::Stream), gets [`Frame`]s back,
 //! reads each method frame's [`Method`], and writes the reply's bytes back
 //! to the connection. Which exchanges and queues exist, and where a message
 //! goes, is up to world code.
@@ -73,7 +73,7 @@
 //! assert!(decoder.next().is_none());
 //! ```
 
-use super::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire};
 
 /// The TCP port AMQP brokers listen on.
 pub const PORT: u16 = 5672;
@@ -87,7 +87,7 @@ pub const FRAME_END: u8 = 0xce;
 pub const FRAME_OVERHEAD: u32 = 8;
 /// The frame size every peer must accept, whatever was negotiated.
 pub const FRAME_MIN_SIZE: u32 = 4096;
-/// The frame size a [`Stream<Frames>`](super::codec::Stream) accepts until told otherwise. RabbitMQ
+/// The frame size a [`Stream<Frames>`](fictionet::stdlib::codec::Stream) accepts until told otherwise. RabbitMQ
 /// offers it in `connection.tune`.
 pub const DEFAULT_FRAME_MAX: u32 = 131_072;
 /// The largest frame this module reads or writes, whatever was negotiated.
@@ -413,7 +413,7 @@ impl Wire for Frame {
 
 /// Reads AMQP frames without retaining input bytes.
 ///
-/// Use with [`super::codec::Stream`] for bounded input and one-time errors.
+/// Use with [`fictionet::stdlib::codec::Stream`] for bounded input and one-time errors.
 /// Partial frames return [`Step::Need`], including at EOF. Frame faults
 /// end the stream. Parse method and content payloads separately to receive
 /// their [`DecodeError`] values as items with [`Decode::map`].
@@ -2091,7 +2091,7 @@ impl Writer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stdlib::codec::{
+    use fictionet::stdlib::codec::{
         Fail, Stream, contract, pump,
         test_support::{Lcg, decode_all, mutate},
     };

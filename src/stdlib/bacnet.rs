@@ -27,7 +27,7 @@
 //! are read and written in full by [`WhoIs`] and [`IAm`]. Every other
 //! service body is kept as raw bytes. World code walks its fields with
 //! [`ContextValue::read`], [`Tags`] and [`Primitives`]. Repeated application
-//! values can use [`Stream<Primitives>`](super::codec::Stream).
+//! values can use [`Stream<Primitives>`](fictionet::stdlib::codec::Stream).
 //!
 //! Nothing here reads a socket. A world that plays a BACnet device reads
 //! each datagram from its UDP socket, passes it to [`Bvlc::parse`], reads
@@ -76,7 +76,6 @@
 //! );
 //! ```
 
-extern crate self as fictionet;
 use fictionet::stdlib::codec::{Decode, Step, Wire};
 
 use std::net::{Ipv4Addr, SocketAddrV4};

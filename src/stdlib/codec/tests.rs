@@ -430,7 +430,7 @@ fn map_forwards_every_step_error_capacity_and_held() {
     let mut mapped = Map::new(Fault::Drain(3, true), |_: ()| 1);
     assert_eq!((mapped.capacity(), mapped.held()), (4, 3));
     *mapped.inner() = Fault::End;
-    let (_, _) = mapped.into_parts();
+    assert_eq!(mapped.decode(&[], false), Ok(Step::End));
 }
 #[test]
 fn collect_empty_full_limit_parse_error_and_single_item() {

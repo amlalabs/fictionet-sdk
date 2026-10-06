@@ -25,7 +25,7 @@
 //! neither checks the HMAC nor decrypts.
 //!
 //! Nothing here reads a socket. A world that plays an OpenVPN server pushes
-//! TCP bytes through [`Stream<Frames>`](super::codec::Stream), or takes each
+//! TCP bytes through [`Stream<Frames>`](fictionet::stdlib::codec::Stream), or takes each
 //! UDP datagram whole, reads it with [`Packet::parse_with`], and writes
 //! the reply's bytes back. What the TLS session says, and what the tunnel
 //! carries, is up to world code.
@@ -76,7 +76,7 @@
 //! assert_eq!(Packet::parse_with(&wire[2..], Wrapping::None), Ok(reply));
 //! ```
 
-use super::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire};
 
 /// The port OpenVPN servers listen on, over UDP and over TCP.
 pub const PORT: u16 = 1194;
@@ -858,7 +858,7 @@ impl Frame {
 ///
 /// Capacity is the payload limit plus [`LENGTH_PREFIX_LEN`]. An oversized
 /// packet is refused from its prefix. Partial envelopes return [`Step::Need`],
-/// including at EOF, so [`super::codec::Stream`] reports truncation.
+/// including at EOF, so [`fictionet::stdlib::codec::Stream`] reports truncation.
 /// Map each frame through [`Packet::parse_with`] with the connection's wrapping
 /// to receive packet errors as items while framing continues.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -921,7 +921,7 @@ impl Decode for Frames {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::codec::{
+    use fictionet::stdlib::codec::{
         contract, Stream, Fail,
         test_support::{decode_all, Lcg, mutate},
     };

@@ -21,9 +21,9 @@
 //! `Registrar WHOIS Server:`, and ARIN's `ReferralServer:`.
 //!
 //! A world that plays a WHOIS server pushes query lines into
-//! [`Stream<Queries>`](super::codec::Stream), writes a [`Response`], and
+//! [`Stream<Queries>`](fictionet::stdlib::codec::Stream), writes a [`Response`], and
 //! closes the connection. Query lines accept CRLF and bare LF. A client
-//! collects replies with [`Stream<Responses>`](super::codec::Stream) and
+//! collects replies with [`Stream<Responses>`](fictionet::stdlib::codec::Stream) and
 //! calls `end` at connection close. The resulting [`CollectedResponse`]
 //! preserves the truncation flag. Names, owners, and referrals belong to
 //! world code.
@@ -76,7 +76,7 @@
 //! assert_eq!(referral.port, 43);
 //! ```
 
-use super::codec::{self, Decode, Step, Wire};
+use fictionet::stdlib::codec::{self, Decode, Step, Wire};
 use std::borrow::Cow;
 
 /// The TCP port WHOIS servers listen on.
@@ -903,7 +903,7 @@ impl Wire for Response {
     }
 }
 
-/// Reads one query per item with [`super::codec::Lines`].
+/// Reads one query per item with [`fictionet::stdlib::codec::Lines`].
 ///
 /// CRLF and bare LF are accepted. Content is
 /// bounded by [`MAX_QUERY`]. Bad and overlong lines are error items; an

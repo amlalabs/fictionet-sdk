@@ -22,7 +22,7 @@
 //! mechanism tokens (a Kerberos AP-REQ, an NTLM message) are kept as bytes.
 //! What they mean, and whether to accept them, is up to world code. HTTP,
 //! SMB and LDAP each give a token's length, so most worlds never need the
-//! [`Stream<Frames>`](super::codec::Stream), which splits tokens sent back to back.
+//! [`Stream<Frames>`](fictionet::stdlib::codec::Stream), which splits tokens sent back to back.
 //!
 //! Every reader checks lengths and nesting, because the agent can send any
 //! bytes it likes. Tokens are read as BER and written as DER. A token is at
@@ -60,8 +60,8 @@
 //! assert_eq!(NegotiationToken::parse(&bytes).unwrap(), reply);
 //! ```
 
-use super::asn1::{self, Class, Element, Header, Length, Oid, Reader, Rules, StringKind, Tag, Writer};
-use super::codec::{Decode, Step, Wire};
+use fictionet::stdlib::asn1::{self, Class, Element, Header, Length, Oid, Reader, Rules, StringKind, Tag, Writer};
+use fictionet::stdlib::codec::{Decode, Step, Wire};
 use std::fmt;
 
 /// The longest token, wrapper included, a reader accepts and a writer
@@ -94,7 +94,7 @@ pub enum Error {
     /// The first element is not a GSS-API wrapper, a negTokenInit or a
     /// negTokenResp.
     NotToken,
-    /// A GSS-API wrapper, or a token given to the [`Stream<Frames>`](super::codec::Stream), has an
+    /// A GSS-API wrapper, or a token given to the [`Stream<Frames>`](fictionet::stdlib::codec::Stream), has an
     /// indefinite length. RFC 2743 requires a definite one.
     Indefinite,
     /// A GSS-API wrapper names a mechanism other than SPNEGO.
@@ -826,11 +826,11 @@ impl Wire for NegotiationToken {
 
 /// Reads complete tokens without holding input bytes.
 ///
-/// Use with [`Stream<Frames>`](super::codec::Stream) for a buffer bounded by the configured
+/// Use with [`Stream<Frames>`](fictionet::stdlib::codec::Stream) for a buffer bounded by the configured
 /// token limit, with at least [`asn1::HEADER_ROOM`] bytes to read or refuse any ASN.1 header.
 /// Only outer headers are checked. Map items through [`NegotiationToken::parse`]
 /// or [`InitialContextToken::parse`] to interpret them. Partial tokens return
-/// [`super::codec::Step::Need`], including at EOF. The stream reports
+/// [`fictionet::stdlib::codec::Step::Need`], including at EOF. The stream reports
 /// truncation at EOF and framing errors once.
 #[derive(Clone, Copy, Debug)]
 pub struct Frames {
@@ -881,7 +881,7 @@ impl Decode for Frames {
 
 #[cfg(test)]
 mod tests {
-    use super::super::codec::{
+    use fictionet::stdlib::codec::{
         Fail, Stream, contract,
         test_support::{Lcg, chunks, decode_all, mutate},
     };
@@ -1657,7 +1657,7 @@ mod tests {
 
     #[test]
     fn codec_frames_bound_headers_and_report_once() {
-        use super::super::codec::{Decode, Fail, Stream, contract};
+        use fictionet::stdlib::codec::{Decode, Fail, Stream, contract};
         assert_eq!(Frames::new().capacity(), MAX_TOKEN);
         let mut stream = Stream::new(Frames::new());
         let bytes = [GSS_TAG, 0x83, 1, 0, 0];
@@ -1670,7 +1670,7 @@ mod tests {
 
     #[test]
     fn codec_wire_domain_excludes_hint_addresses() {
-        use super::super::codec::{Wire, contract};
+        use fictionet::stdlib::codec::{Wire, contract};
         // A received hint address is outside the Wire domain.
         let bytes = [0xa0, 10, 0x30, 8, 0xa3, 6, 0x30, 4, 0xa1, 2, 4, 0];
         let token = NegotiationToken::Init(NegTokenInit {

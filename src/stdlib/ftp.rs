@@ -12,9 +12,9 @@
 //! (`SIZE`, `MDTM`, `REST`, `MLST` and `MLSD`).
 //!
 //! A world that plays an FTP server pushes control bytes into
-//! [`Stream<Commands>`](super::codec::Stream), reads each [`Request`], and
+//! [`Stream<Commands>`](fictionet::stdlib::codec::Stream), reads each [`Request`], and
 //! writes a [`Reply`] back. A client reads replies with
-//! [`Stream<Replies>`](super::codec::Stream). Both accept CRLF and bare LF.
+//! [`Stream<Replies>`](fictionet::stdlib::codec::Stream). Both accept CRLF and bare LF.
 //! Which files exist, who may log in, and what commands do belong to world code.
 //!
 //! Every reader checks lengths, because the agent can send any bytes it
@@ -71,7 +71,7 @@
 //! assert_eq!(features[1].params.as_deref(), Some("size*;modify*;"));
 //! ```
 
-use super::codec::{self, Decode, Step, Wire};
+use fictionet::stdlib::codec::{self, Decode, Step, Wire};
 use std::borrow::Cow;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
 use std::num::NonZeroU8;
@@ -1488,7 +1488,7 @@ impl ControlLines {
     }
 }
 
-/// Reads control commands through [`super::codec::Lines`].
+/// Reads control commands through [`fictionet::stdlib::codec::Lines`].
 ///
 /// CRLF and bare LF are accepted. RFC 2640's CR NUL escaping stays in
 /// this module. Lines are bounded by [`MAX_LINE`], including CRLF.
@@ -1536,7 +1536,7 @@ impl Decode for Commands {
     }
 }
 
-/// Reads and assembles control replies through [`super::codec::Lines`].
+/// Reads and assembles control replies through [`fictionet::stdlib::codec::Lines`].
 ///
 /// CRLF and bare LF are accepted under [`MAX_LINE`]. Assemblies retain
 /// at most [`MAX_REPLY_LINES`] lines and [`MAX_REPLY_BYTES`] text bytes.

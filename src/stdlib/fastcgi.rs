@@ -13,7 +13,7 @@
 //! Specification 1.0.
 //!
 //! Nothing here reads a socket. A world that plays an application passes
-//! bytes from a connection to [`Stream<Frames>`](super::codec::Stream),
+//! bytes from a connection to [`Stream<Frames>`](fictionet::stdlib::codec::Stream),
 //! gets [`Record`]s back, and hands each one
 //! to a [`Server`], which puts the streams of each request back
 //! together and gives a [`Request`] once all of it has come. The world
@@ -69,7 +69,7 @@
 
 extern crate alloc;
 
-use super::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire};
 use alloc::{collections::BTreeMap, vec::Vec};
 
 /// The TCP port FastCGI applications such as PHP-FPM listen on by
@@ -389,7 +389,7 @@ fn parse_record_limited(b: &[u8], limit: usize) -> Result<Option<(Record, usize)
 
 /// Reads FastCGI records without holding input bytes.
 ///
-/// Use with [`super::codec::Stream`] for input bounded by [`Self::limit`].
+/// Use with [`fictionet::stdlib::codec::Stream`] for input bounded by [`Self::limit`].
 /// Partial records return [`Step::Need`], including at EOF. The stream reports
 /// truncation at EOF and framing errors once. Body parsing stays separate.
 ///
@@ -1467,7 +1467,7 @@ fn be16(b: &[u8], i: usize) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stdlib::codec::{Stream, Fail, contract, pump, finish, test_support::{Lcg, mutate, decode_all}};
+    use fictionet::stdlib::codec::{Stream, Fail, contract, pump, finish, test_support::{Lcg, mutate, decode_all}};
 
     fn pair(n: &str, v: &str) -> (Vec<u8>, Vec<u8>) {
         (n.as_bytes().to_vec(), v.as_bytes().to_vec())

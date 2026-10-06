@@ -2,8 +2,8 @@
 //!
 //! A [`Decode`] reads a slice and returns a [`Step`]. It owns state, but
 //! never keeps unread input. [`Stream`] owns that input in one [`Buffer`].
-//! [`pump`] feeds chunks and reports the accepted count. [`finish`] marks EOF.
-//! After `End`, use [`Stream::swap`] and feed the unaccepted slice to it.
+//! [`pump`] accepts chunks and reports the accepted count. [`finish`] marks EOF.
+//! After `End`, use [`Stream::swap`] and push the unaccepted slice to it.
 //! Buffered unread bytes are kept for the new decoder. Direct [`Stream::push`]
 //! takes and drops new bytes after EOF or completion.
 //! Errors are returned once and kept by [`Stream::failed`]. Driving a stream
@@ -14,6 +14,10 @@
 //! [`Pipe`] feeds selected outer payloads into an inner decoder. [`Lines`]
 //! and [`Collect`] cover lines and values that end at EOF. [`Spans`] records
 //! bounded provenance; [`Demux`] shares a budget across keyed streams.
+//!
+//! To customize a protocol, copy its module file into your crate and edit it.
+//! Keep its `fictionet::stdlib::...` imports. Its [`Decode`] and [`Wire`]
+//! implementations work with the same [`Stream`] and combinators.
 //!
 //! This module uses only `core` and `alloc`. The planned async `serve`
 //! adapter lives in stdlib next to [`tcp`](super::tcp), outside this module.

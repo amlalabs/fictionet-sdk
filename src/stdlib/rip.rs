@@ -24,7 +24,7 @@
 //! [`NG_PORT`] to [`NgMessage::parse`], looks at the routes, and sends the
 //! bytes [`Wire::to_bytes`] returns. Check [`Message::fits_datagram`] before
 //! sending a RIP message. For pieces of one payload, use
-//! [`Stream<Frames>`](super::codec::Stream), with `Frames = Collect<Message>`
+//! [`Stream<Collect<Message>>`](fictionet::stdlib::codec::Stream)
 //! and a limit of [`MAX_MESSAGE`], or `Collect<NgMessage>` with
 //! [`MAX_NG_MESSAGE`]. Call `end` at the UDP boundary. Which routes exist,
 //! what their metrics are, and whether a password or a digest is right
@@ -82,7 +82,7 @@
 //! assert_eq!(Message::parse(&bytes), Ok(reply));
 //! ```
 
-use super::codec::Wire;
+use fictionet::stdlib::codec::Wire;
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -238,7 +238,7 @@ pub struct Crypto {
     /// The authentication data from the trailer, at most
     /// [`MAX_AUTH_DATA`] bytes. The digest covers the message as received,
     /// so check it against the payload from
-    /// [`Stream::with_next`](super::codec::Stream::with_next), not against
+    /// [`Stream::with_next`](fictionet::stdlib::codec::Stream::with_next), not against
     /// [`Message::to_bytes`], which writes ignored fields as zero.
     pub data: Vec<u8>,
 }
@@ -905,7 +905,7 @@ impl Wire for NgMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stdlib::codec::{Collect, CollectError, Fail, Stream, contract, test_support::{Lcg, decode_all, mutate}};
+    use fictionet::stdlib::codec::{Collect, CollectError, Fail, Stream, contract, test_support::{Lcg, decode_all, mutate}};
 
     fn collect(b: &[u8]) -> Result<Message, RipError> {
         let make = || Collect::<Message>::new(MAX_MESSAGE);

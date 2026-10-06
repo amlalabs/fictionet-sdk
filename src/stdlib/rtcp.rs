@@ -25,7 +25,7 @@
 //! Nothing here reads a socket. A world that plays a media server takes
 //! each UDP datagram it receives, tells RTP from RTCP and from STUN or DTLS
 //! with [`classify`], reads the RTCP with [`Compound::parse`], and sends the
-//! bytes of what it answers. Over TCP, [`Stream<Frames>`](super::codec::Stream)
+//! bytes of what it answers. Over TCP, [`Stream<Frames>`](fictionet::stdlib::codec::Stream)
 //! splits the stream into datagrams. [`Frame`] supplies the length prefix
 //! when writing. Report contents and responses to NACK or PLI belong to
 //! world code. SRTCP encryption is not handled here.
@@ -187,7 +187,7 @@ pub mod xr {
     pub const VOIP_METRICS: u8 = 7;
 }
 
-use super::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire};
 
 /// One RTCP packet: what it carries, and how many bytes of padding follow.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1465,7 +1465,7 @@ pub fn classify(b: &[u8]) -> Demux {
 /// [`Wire`] includes the prefix. Payloads are opaque and bounded by
 /// [`MAX_FRAME`]. An empty payload is a null frame. For RTCP, map nonempty
 /// payloads through [`Datagram::parse`] or [`Compound::parse`]. For RTP, use
-/// [`super::rtp::RtpPacket::parse`]. A payload parse error leaves framing intact.
+/// [`fictionet::stdlib::rtp::RtpPacket::parse`]. A payload parse error leaves framing intact.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Frame(
     /// Datagram bytes, or an empty vector for a null frame.
@@ -1562,7 +1562,7 @@ impl Wire for Frame {
 /// Each item is one opaque datagram, including empty null frames. Capacity
 /// is two bytes plus the payload limit. A length over that limit is refused
 /// from the prefix. Partial frames return [`Step::Need`], including at EOF,
-/// so [`super::codec::Stream`] reports truncation. RTCP body errors belong
+/// so [`fictionet::stdlib::codec::Stream`] reports truncation. RTCP body errors belong
 /// in a mapping through [`Datagram::parse`], where they do not end framing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Frames {
@@ -1855,7 +1855,7 @@ fn be32(b: &[u8], i: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::codec::{
+    use fictionet::stdlib::codec::{
         Fail, contract,
         test_support::{Lcg, mutate, decode_all},
     };

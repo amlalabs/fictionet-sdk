@@ -91,8 +91,8 @@
 //! assert_eq!(san.0, [GeneralName::Dns("www.example.com".into())]);
 //! ```
 
-use super::asn1::{self, BitString, Class, Element, Oid, Reader, Rules, StringKind, Tag, Writer};
-use super::codec::{Decode, Step as DecodeStep, Wire};
+use fictionet::stdlib::asn1::{self, BitString, Class, Element, Oid, Reader, Rules, StringKind, Tag, Writer};
+use fictionet::stdlib::codec::{Decode, Step as DecodeStep, Wire};
 use std::fmt;
 use std::fmt::Write as _;
 
@@ -2589,12 +2589,12 @@ impl Wire for Pem {
 
 /// Reads PEM blocks without holding input bytes.
 ///
-/// Use with [`Stream<PemBlocks>`](super::codec::Stream). The buffer holds at most the larger of
+/// Use with [`Stream<PemBlocks>`](fictionet::stdlib::codec::Stream). The buffer holds at most the larger of
 /// the configured whole-block limit and [`MAX_PEM_LINE`], plus one byte to
 /// refuse oversized input. Blocks are bounded by [`MAX_PEM_FRAME`], including
 /// whitespace. [`pem_decode`] applies per-line and decoded-data bounds.
 /// Text lines outside blocks are skipped, including the final line at EOF,
-/// and obey only [`MAX_PEM_LINE`]. Partial blocks return [`super::codec::Step::Need`],
+/// and obey only [`MAX_PEM_LINE`]. Partial blocks return [`fictionet::stdlib::codec::Step::Need`],
 /// including at EOF, so the stream reports truncation. An end marker completes
 /// an item without consuming its optional line ending. Framing errors are
 /// reported once. Scan positions are relative to the unread start.
@@ -3030,7 +3030,7 @@ impl Wire for Crl {
 
 #[cfg(test)]
 mod tests {
-    use super::super::codec::{
+    use fictionet::stdlib::codec::{
         Fail, Stream, contract, finish as finish_stream, pump,
         test_support::{Lcg, chunks, decode_all, mutate},
     };
@@ -4565,7 +4565,7 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
 
     #[test]
     fn codec_pem_wire_is_exact_and_transactional() {
-        use super::super::codec::{Wire, contract};
+        use fictionet::stdlib::codec::{Wire, contract};
         let block = Pem { label: "TEST".into(), data: vec![1, 2, 3, 4] };
         contract::check_wire_value(&block);
         let bytes = <Pem as Wire>::to_bytes(&block).unwrap();
@@ -4586,7 +4586,7 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
 
     #[test]
     fn codec_pem_scans_without_retaining_partial_bytes() {
-        use super::super::codec::{Decode, Fail, Stream, contract, finish, pump};
+        use fictionet::stdlib::codec::{Decode, Fail, Stream, contract, finish, pump};
         let text = b"-----BEGIN TEST-----\r\nAQID\r\n-----END TEST-----\r\n";
         contract::check_decode_with_alloc_limit(PemBlocks::new, text, 2 * PemBlocks::new().capacity());
         for limit in 0..=text.len() {
@@ -4622,7 +4622,7 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
         assert_eq!(stream.next(), None);
         let mut decoder = PemBlocks::new();
         for n in 1..=partial.len() {
-            assert!(matches!(decoder.decode(&partial[..n], false).unwrap(), super::super::codec::Step::Need));
+            assert!(matches!(decoder.decode(&partial[..n], false).unwrap(), fictionet::stdlib::codec::Step::Need));
             assert_eq!(decoder.searched, n);
         }
     }

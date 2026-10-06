@@ -17,7 +17,7 @@
 //! extended vendor-specific attributes. Its dictionary holds every
 //! standard attribute from 1 to 101, and it reads the data types of RFC
 //! 6572 and RFC 8044. RFC 6613 and RFC 6614 carry the same packets
-//! over TCP and TLS. [`Stream<Frames>`](super::codec::Stream) reads those streams.
+//! over TCP and TLS. [`Stream<Frames>`](fictionet::stdlib::codec::Stream) reads those streams.
 //!
 //! Nothing here reads a socket, and nothing here does cryptography. A
 //! world that plays a RADIUS server gives each datagram's bytes to
@@ -67,7 +67,7 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use crate::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire};
 
 /// The UDP port RADIUS servers take Access-Requests on.
 pub const AUTH_PORT: u16 = 1812;
@@ -646,7 +646,7 @@ impl Wire for Packet {
 
 /// Reads RADIUS over TCP or TLS packets without retaining input.
 ///
-/// Use with [`super::codec::Stream`] for a buffer bounded by [`limit`](Self::limit).
+/// Use with [`fictionet::stdlib::codec::Stream`] for a buffer bounded by [`limit`](Self::limit).
 /// The first four bytes suffice to refuse an invalid or excessive length. Partial packets
 /// return [`Step::Need`], including at EOF, so the driver reports truncation.
 /// An invalid length or malformed attributes ends the stream.
@@ -1800,7 +1800,7 @@ pub fn enum_name(kind: u8, value: u32) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stdlib::codec::{Stream, Fail, contract, test_support::{Lcg, mutate, decode_all}};
+    use fictionet::stdlib::codec::{Stream, Fail, contract, test_support::{Lcg, mutate, decode_all}};
 
     fn hex(s: &str) -> Vec<u8> {
         s.split_whitespace().map(|h| u8::from_str_radix(h, 16).unwrap()).collect()

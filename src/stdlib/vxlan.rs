@@ -62,7 +62,6 @@
 //! assert_eq!(GpePacket::parse(&bytes), Ok(gpe));
 //! ```
 
-extern crate self as fictionet;
 use fictionet::stdlib::codec::Wire;
 
 /// The UDP port VXLAN endpoints listen on (RFC 7348).

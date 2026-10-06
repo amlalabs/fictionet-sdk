@@ -13,7 +13,7 @@
 //!
 //! Nothing here reads a socket or parses HTTP. A world that plays a
 //! printer takes the body of each POST, reads its attributes with
-//! [`Stream<Head>`](super::codec::Stream) (or parses the whole [`Message`]),
+//! [`Stream<Head>`](fictionet::stdlib::codec::Stream) (or parses the whole [`Message`]),
 //! and writes the bytes of its reply as the HTTP response body. Which
 //! operations the printer supports, which attributes it has, and what it
 //! does with a document are up to world code.
@@ -53,7 +53,7 @@
 
 use std::collections::BTreeSet;
 
-use super::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire};
 
 /// The TCP port IPP printers listen on.
 pub const PORT: u16 = 631;
@@ -797,7 +797,7 @@ fn standard_operation_group() -> Group {
 
 /// The largest document [`Message`] reads or writes: 64 MiB. This is a
 /// world policy, not a wire length field. After [`Head`], streaming worlds
-/// choose their own document budget with [`super::codec::Collect`].
+/// choose their own document budget with [`fictionet::stdlib::codec::Collect`].
 pub const MAX_DOCUMENT: usize = 64 * 1024 * 1024;
 
 /// An IPP message through its end-of-attributes tag, without document data.
@@ -1114,8 +1114,8 @@ impl core::error::Error for HeadError {}
 
 /// Reads one IPP head item, then returns [`Step::End`] unconditionally.
 ///
-/// All document bytes remain unread for [`super::codec::Stream::swap`]
-/// into a [`super::codec::Collect`] with [`MAX_DOCUMENT`] or a world's
+/// All document bytes remain unread for [`fictionet::stdlib::codec::Stream::swap`]
+/// into a [`fictionet::stdlib::codec::Collect`] with [`MAX_DOCUMENT`] or a world's
 /// smaller named limit. The enclosing HTTP body supplies EOF.
 ///
 /// Capacity is the head limit, including the fixed header and end tag.
@@ -1127,7 +1127,7 @@ impl core::error::Error for HeadError {}
 ///
 /// After a framing failure or truncation, no head bytes have been consumed.
 /// Once eight bytes have arrived, bytes `4..8` of
-/// [`super::codec::Stream::unread`] hold the request ID in big-endian order.
+/// [`fictionet::stdlib::codec::Stream::unread`] hold the request ID in big-endian order.
 /// Echo that ID in a [`status::CLIENT_ERROR_BAD_REQUEST`] response, as
 /// RFC 8011 section 4.1.2 requires. For a complete head, use the request ID
 /// in the [`Header`] or [`HeadError`] item instead.
@@ -1534,7 +1534,7 @@ fn read_members(records: &mut Records<'_>, depth: usize) -> Result<Vec<Attribute
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::codec::{
+    use fictionet::stdlib::codec::{
         Fail, Stream, contract,
         test_support::{Lcg, decode_all, mutate},
     };
@@ -1742,7 +1742,7 @@ mod tests {
 
     #[test]
     fn strict_head_covers_all_values_and_bounds_collection_depth() {
-        use crate::stdlib::codec::contract;
+        use fictionet::stdlib::codec::contract;
         let mut message = Message::request(operation::PRINT_JOB, 3);
         message.add(
             tag::JOB_ATTRIBUTES,

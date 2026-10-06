@@ -10,7 +10,7 @@
 //! body of a request, calls [`Value::parse`], looks at the [`Value`] it gets,
 //! and writes its answer with [`Wire::write`]. For a stream that carries
 //! one JSON text after another, such as JSON-RPC over a TCP connection,
-//! [`Stream<Values>`](super::codec::Stream) takes the bytes as they come
+//! [`Stream<Values>`](fictionet::stdlib::codec::Stream) takes the bytes as they come
 //! and hands back each value once it is whole.
 //!
 //! The agent can send any bytes it likes, so the parser checks
@@ -44,7 +44,6 @@
 //! ```
 
 extern crate alloc;
-extern crate self as fictionet;
 
 use alloc::{
     format,
@@ -864,7 +863,7 @@ impl Wire for Value {
 /// values return [`Step::Need`], including at EOF. Syntax and limit errors
 /// end the stream. Error offsets count from the start of the stream.
 /// Capacity is the clamped size limit plus one delimiter or overflow byte.
-/// Drive it with [`Stream<Values>`](super::codec::Stream).
+/// Drive it with [`Stream<Values>`](fictionet::stdlib::codec::Stream).
 /// Values need no separating whitespace. This does not frame JSON Lines;
 /// use a line decoder and parse each line for that format.
 ///

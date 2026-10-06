@@ -9,7 +9,7 @@
 //! OpenSSH and almost every other implementation speak.
 //!
 //! A world that plays a file server passes bytes from the SSH channel
-//! to [`Stream<Frames>`](super::codec::Stream), gets
+//! to [`Stream<Frames>`](fictionet::stdlib::codec::Stream), gets
 //! [`Packet`]s back, reads each one's [`Request`], and writes the bytes of
 //! a [`Response`] back to the channel. Which files exist, what they hold
 //! and who may touch them is up to world code.
@@ -65,7 +65,7 @@
 //! );
 //! ```
 
-use super::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire};
 
 /// The SSH subsystem name a client asks for to start SFTP.
 pub const SUBSYSTEM: &str = "sftp";
@@ -314,7 +314,7 @@ impl Wire for Packet {
 
 /// Reads SFTP packets without holding input bytes.
 ///
-/// Use with [`codec::Stream`](super::codec::Stream) for a buffer bounded
+/// Use with [`codec::Stream`](fictionet::stdlib::codec::Stream) for a buffer bounded
 /// by [`LENGTH_LEN`] plus [`limit`](Self::limit). Oversized packets are
 /// refused from the length field. Partial packets return [`Step::Need`],
 /// including at EOF, so the stream reports truncation. Packet bodies
@@ -1184,7 +1184,7 @@ impl Wire for Attrs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stdlib::codec::{Stream, Fail, contract, test_support::{Lcg, mutate, decode_all}};
+    use fictionet::stdlib::codec::{Stream, Fail, contract, test_support::{Lcg, mutate, decode_all}};
 
     fn s(v: &[u8]) -> Vec<u8> {
         v.to_vec()

@@ -7,7 +7,7 @@
 //! use the RFC 8941 grammar, including values and parameters we ignore.
 //!
 //! [`Connection`] routes ordered stream bytes under a shared input budget.
-//! For a single stream, use [`Stream<Frames>`](super::codec::Stream),
+//! For a single stream, use [`Stream<Frames>`](fictionet::stdlib::codec::Stream),
 //! [`ControlFrames`], or [`StreamHeaders`]. [`RequestState`] validates decoded
 //! request and push frames. QPACK tables and blocked sections belong to the
 //! caller, who applies instructions and sends acknowledgment values between
@@ -40,7 +40,7 @@
 //! # Ok::<(), fictionet::stdlib::http3::Error>(())
 //! ```
 
-use super::{
+use fictionet::stdlib::{
     codec::{self, Decode, Step, Wire},
     qpack, quic,
 };
@@ -2070,7 +2070,7 @@ impl Decode for StreamItems {
 
 /// Ordered QUIC stream input under one aggregate connection budget.
 ///
-/// This is an input owner, separate from the I/O [`super::Connection`] trait.
+/// This is an input owner, separate from the I/O [`fictionet::stdlib::Connection`] trait.
 /// Each stream has its own decoder inside [`codec::Demux`]. The constructor
 /// bounds both stream count and the sum of unread and decoder-held bytes.
 /// Buffers allocate as input arrives. Metadata and allocator overhead are
@@ -2223,7 +2223,7 @@ impl Connection {
 
 #[cfg(test)]
 mod tests {
-    use super::super::codec::{
+    use fictionet::stdlib::codec::{
         contract, Fail, Stream,
         test_support::{decode_all, Lcg, mutate},
     };

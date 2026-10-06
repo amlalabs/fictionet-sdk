@@ -28,7 +28,7 @@
 //! Write that frame with [`Wire::write`] in an IP packet with protocol
 //! [`PROTOCOL`]. Hello, Join/Prune, Assert and Bootstrap messages go to
 //! [`ALL_PIM_ROUTERS_V4`] or [`ALL_PIM_ROUTERS_V6`] with a TTL of 1. A
-//! [`Stream<Frames>`](super::codec::Stream), with `Frames = Collect<Datagram>`,
+//! [`Stream<Collect<Datagram>>`](fictionet::stdlib::codec::Stream)
 //! collects pieces with [`MAX_MESSAGE`] as its limit. Map each payload through
 //! [`Message::parse`] and call `end` at the IP packet boundary. Which routers are
 //! neighbors, what trees exist and who wins an assert are up to world code.
@@ -78,7 +78,7 @@
 //! assert_eq!(hello.frame(&ends).and_then(|frame| frame.to_bytes()).unwrap(), bytes);
 //! ```
 
-use super::codec::Wire;
+use fictionet::stdlib::codec::Wire;
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -1478,10 +1478,10 @@ impl Wire for Datagram {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stdlib::codec::{Wire, Collect, CollectError, Fail, contract, test_support::{Lcg, decode_all, mutate}};
+    use fictionet::stdlib::codec::{Wire, Collect, CollectError, Fail, contract, test_support::{Lcg, decode_all, mutate}};
 
     fn collect(b: &[u8], e: &Endpoints) -> Result<Message, PimError> {
-        use crate::stdlib::codec::Decode;
+        use fictionet::stdlib::codec::Decode;
         let make = || Collect::<Datagram>::new(MAX_MESSAGE).map(|d| Message::parse(&d.0, e));
         contract::check_decode_with_alloc_limit(make, b, 2 * (MAX_MESSAGE + 1));
         contract::check_wire::<Datagram>(b);
