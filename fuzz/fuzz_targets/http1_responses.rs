@@ -22,6 +22,11 @@ fuzz_target!(|data: &[u8]| {
             decoder
         };
         contract::check_decode_with_held_limit(make, data, MAX_PENDING_REQUESTS);
+        if let Ok(response) = Response::parse_for(data, method) {
+            let mut out = Vec::new();
+            response.write_for(method, &mut out).unwrap();
+            assert_eq!(Response::parse_for(&out, method), Ok(response));
+        }
     }
     contract::check_decode_with_alloc_limit(|| Responses::new(limits), data, 4096);
     contract::check_decode(|| Collect::<Response>::new(4096), data);
@@ -31,7 +36,9 @@ fuzz_target!(|data: &[u8]| {
     let response = Response {
         head: ResponseHead {
             version: Version::Http11,
-            status: data.first().map_or(200, |b| u16::from(*b) * 3),
+            status: data
+                .first()
+                .map_or(200, |b| u16::from(*b).saturating_mul(3)),
             reason: bounded.to_vec(),
             headers: vec![Header {
                 name: "Content-Length".into(),

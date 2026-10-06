@@ -65,7 +65,7 @@ cargo +nightly fuzz list
 | `mysql` | arbitrary bytes and typed values; wire, chunking, EOF, and allocation contracts | `stdlib::mysql`: MySQL |
 | `http3` | bounded frame and stream contracts, field validation, connection routing, and QPACK pause/resume | `stdlib::http3`: HTTP/3 |
 | `http1_requests` | request stream and Collect contracts, head limits, chunk framing, and transactional constructed writers | `stdlib::http1`: Requests, Request, RequestHead, Chunk |
-| `http1_responses` | response stream and Collect contracts, queued HEAD/CONNECT methods, body framing, and transactional writers | `stdlib::http1`: Responses, Response, ResponseHead |
+| `http1_responses` | response stream and Collect contracts, queued HEAD/CONNECT methods, method-aware parse/write symmetry, body framing, and transactional writers | `stdlib::http1`: Responses, Response, ResponseHead |
 | `nbns` | wire units, constructed values, protocol helpers and shared codec contracts | `stdlib::nbns`: NetBIOS Name Service |
 | `nfs` | Procedure-selected NFS and MOUNT arguments and results, RPC streams, and constructed handles and names | `nfs`: argument and result round trips, handle and name limits, failure replies, RPC framing and EOF, and envelope writes |
 | `ntp` | wire units, constructed values, protocol helpers and shared codec contracts | `stdlib::ntp`: NTP |

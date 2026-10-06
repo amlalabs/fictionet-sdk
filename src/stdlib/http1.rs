@@ -1,4 +1,13 @@
-use fictionet::stdlib::codec::{Buffer, Decode, Ending, LineError, Lines, Step, Wire};
+//! HTTP/1 request and response heads and bodies, with RFC 9112 framing.
+//!
+//! Content-Length, chunked bodies, connection close, Expect: 100-continue,
+//! and CONNECT handoff use the shared codec drivers. Non-empty trailers and
+//! chunk extensions are refused. Requests ignore Upgrade offers and continue
+//! as HTTP; 101 responses are outside this module's scope.
+
+use fictionet::stdlib::codec::{
+    Buffer, Decode, Ending, Fail, LineError, Lines, PumpError, Step, Stream, Wire, finish, try_pump,
+};
 use std::collections::VecDeque;
 use std::fmt;
 
@@ -9,6 +18,8 @@ pub const MAX_BODY: usize = 8 << 20;
 pub const MAX_CHUNK_LINE: usize = 128;
 /// The most request methods waiting for responses: 128.
 pub const MAX_PENDING_REQUESTS: usize = 128;
+/// The most empty CRLF lines ignored before each request line: eight.
+pub const MAX_EMPTY_LINES: usize = 8;
 
 /// Head and streaming buffer limits. Line lengths exclude CRLF.
 ///
@@ -16,6 +27,11 @@ pub const MAX_PENDING_REQUESTS: usize = 128;
 /// 64 KiB for the complete head, and 8 KiB per body event. The head limit
 /// includes every CRLF and the final empty line. Decoders clamp byte limits
 /// to [`Buffer::MAX_LIMIT`] and raise a zero body block size to one.
+/// Limits count received bytes. Writers emit fields as `name:value`, with
+/// no added space, and omit the space before an empty reason phrase. The
+/// written head is never longer than the received head. Wire uses default
+/// limits; a decoder configured with larger limits can accept larger heads.
+/// Ignored empty lines before a request do not count toward its head limit.
 /// Body events have fixed boundaries, independent of input chunking. A
 /// block is emitted when full, at a wire chunk boundary, or at body end.
 /// Choose a smaller `body_chunk` for low latency on close-delimited streams.
@@ -70,7 +86,8 @@ pub enum Error {
     HeadTooLong,
     /// A line does not end in CRLF.
     LineEnding,
-    /// A message or chunk ends early.
+    /// A Wire value ends early, or EOF leaves unfinished body framing with
+    /// no unread bytes. Partial buffered units use the driver's Truncated.
     Incomplete,
     /// Extra bytes follow a complete value passed to `Wire::parse`.
     Trailing,
@@ -98,7 +115,7 @@ pub enum Error {
     Http10TransferEncoding,
     /// A writer found forbidden framing fields on 1xx, 204, or CONNECT 2xx.
     ForbiddenFraming,
-    /// Protocol upgrades are outside this module's scope.
+    /// A 101 response would switch protocols, outside this module's scope.
     Upgrade,
     /// The chunk-size line exceeds [`MAX_CHUNK_LINE`].
     ChunkLineTooLong,
@@ -116,7 +133,7 @@ pub enum Error {
     BodyLength,
     /// The response method queue is full.
     TooManyRequests,
-    /// A mode change was attempted outside the required message boundary.
+    /// The framing state or buffer accounting is inconsistent.
     State,
 }
 
@@ -153,7 +170,7 @@ impl fmt::Display for Error {
             Self::BodyTooLong => "owned HTTP body exceeds limit",
             Self::BodyLength => "HTTP body does not match its framing",
             Self::TooManyRequests => "HTTP response method queue is full",
-            Self::State => "HTTP mode change requires a message boundary",
+            Self::State => "inconsistent HTTP framing state",
         })
     }
 }
@@ -194,7 +211,8 @@ pub struct Header {
 ///
 /// `Wire` reads and writes exactly a head, using default limits. No body is
 /// required to write a head; [`Request`] validates the complete body length.
-/// HTTP/1.1 requires one Host field. Obsolete folding and Upgrade are refused.
+/// HTTP/1.1 requires one Host field, which may be empty. Obsolete folding
+/// is refused. Upgrade offers are accepted without switching protocols.
 ///
 /// ```
 /// use fictionet::stdlib::{codec::Wire, http1::RequestHead};
@@ -216,9 +234,10 @@ pub struct RequestHead {
 }
 
 impl RequestHead {
-    /// Whether any Expect field contains the `100-continue` expectation.
+    /// Whether an HTTP/1.1 Expect field contains `100-continue`.
+    /// HTTP/1.0 expectations are ignored (RFC 9110 section 10.1.1).
     pub fn expects_continue(&self) -> bool {
-        has_option(&self.headers, "expect", b"100-continue")
+        self.version == Version::Http11 && has_option(&self.headers, "expect", b"100-continue")
     }
     /// Whether the head permits another HTTP message after this one.
     /// CONNECT still requires the connection owner to handle the response.
@@ -232,6 +251,9 @@ impl RequestHead {
 /// `Wire` reads and writes exactly the head with default limits. A head can
 /// be sent before a streamed body. Use [`ResponseHead::continue_100`] to
 /// accept a request body after `Expect: 100-continue`.
+/// [`Responses`] accepts Content-Length on 204 and 1xx responses other than 101,
+/// including `Content-Length: 0`, and reads no body. The writer and Wire
+/// parser refuse those fields because RFC 9110 forbids sending them.
 ///
 /// ```
 /// use fictionet::stdlib::{codec::Wire, http1::ResponseHead};
@@ -300,9 +322,15 @@ pub enum Event<H> {
 /// Capacity is the larger of the head limit, body block size, and 130 bytes.
 /// No input bytes are held outside the driver's buffer. Head scanning is
 /// linear even when fed one byte at a time. After Connection: close, Done
-/// is followed by End. For CONNECT, stop after Done until the response is
-/// known; call [`accept_connect`](Self::accept_connect) for a 2xx response,
-/// then use `Stream::into_parts` to hand off unread tunnel bytes.
+/// is followed by End. Every CONNECT request also ends HTTP after Done.
+/// To accept it, send a 2xx response and use [`Stream::into_parts`] for the
+/// unread tunnel bytes. To reject it and keep reading HTTP, use
+/// `stream.swap(Requests::new(limits))`, or close the connection.
+/// Upgrade offers are treated as ordinary HTTP requests. Up to
+/// [`MAX_EMPTY_LINES`] empty CRLF lines are ignored before each request line.
+/// A partial buffered head or body returns Need at EOF for the driver's
+/// Truncated error. EOF between body parts with no unread bytes reports
+/// [`Error::Incomplete`]; Need on an empty buffer would mean a clean end.
 ///
 /// ```
 /// use fictionet::stdlib::{codec::Stream, http1::{Event, Limits, Requests}};
@@ -314,7 +342,7 @@ pub enum Event<H> {
 /// ```
 pub struct Requests {
     core: Reader,
-    connect: bool,
+    empty_lines: usize,
 }
 
 impl Requests {
@@ -322,18 +350,8 @@ impl Requests {
     pub fn new(limits: Limits) -> Self {
         Self {
             core: Reader::new(limits),
-            connect: false,
+            empty_lines: 0,
         }
-    }
-    /// Ends HTTP after a CONNECT request received a successful response.
-    /// Call immediately after that request's Done event, before decoding
-    /// another head. For a rejected CONNECT, continue decoding normally.
-    pub fn accept_connect(&mut self) -> Result<(), Error> {
-        if !self.connect || !matches!(self.core.state, State::Boundary) {
-            return Err(Error::State);
-        }
-        self.core.state = State::End;
-        Ok(())
     }
 }
 
@@ -354,14 +372,28 @@ impl Decode for Requests {
         if let Some(step) = self.core.body(input, eof)? {
             return Ok(step);
         }
-        let Some(n) = self.core.head(input, eof)? else {
+        if self.core.scanned == 0 {
+            if input == b"\r" {
+                return Ok(Step::Need);
+            }
+            if input.starts_with(b"\r\n") {
+                if self.empty_lines >= MAX_EMPTY_LINES {
+                    return Err(Error::StartLine);
+                }
+                self.empty_lines = self.empty_lines.saturating_add(1);
+                self.core.lines = Lines::new(self.core.limits.start_line, Ending::Crlf);
+                return Ok(Step::Skip(2));
+            }
+        }
+        let Some(n) = self.core.head(input)? else {
             return Ok(Step::Need);
         };
         let head = request_head(&input[..n])?;
         let info = fields(&head.headers, head.version)?;
         let framing = request_framing(info)?;
-        self.connect = head.method == "CONNECT";
-        self.core.begin(framing, info.close);
+        self.empty_lines = 0;
+        self.core
+            .begin(framing, info.close || head.method == "CONNECT");
         Ok(Step::Item(Event::Head(head), n))
     }
 }
@@ -375,7 +407,8 @@ impl Decode for Requests {
 /// bytes of held state. Queue before feeding the corresponding response.
 /// HEAD, 1xx, 204, and 304 have no body. A successful CONNECT ends HTTP after
 /// Done, leaving tunnel bytes in `Stream::into_parts`. A response without a
-/// length or final chunked coding ends at EOF. Status 101 is refused.
+/// length or final chunked coding ends at EOF. Status 101 is refused because
+/// protocol switching through Upgrade is outside this module's scope.
 /// Valid length fields on bodyless responses do not create a body. Conflicting
 /// lengths and Transfer-Encoding with Content-Length are always refused.
 /// Writers additionally refuse framing fields forbidden by HTTP semantics.
@@ -436,7 +469,7 @@ impl Decode for Responses {
         if let Some(step) = self.core.body(input, eof)? {
             return Ok(step);
         }
-        let Some(n) = self.core.head(input, eof)? else {
+        let Some(n) = self.core.head(input)? else {
             return Ok(Step::Need);
         };
         let head = response_head(&input[..n])?;
@@ -506,10 +539,12 @@ impl Response {
     /// Parses exactly one response with the given request method. Tunnel
     /// bytes after a CONNECT head are trailing bytes here; use Responses
     /// and Stream for handoff. Informational responses are separate values.
+    /// Applies the same field and framing validation as [`Self::write_for`].
     pub fn parse_for(bytes: &[u8], method: &str) -> Result<Self, Error> {
         let mut decoder = Responses::default();
         decoder.expect_method(method)?;
         let (head, body) = whole(decoder, bytes)?;
+        validate_response_for(&head, Method::parse(method)?)?;
         Ok(Self { head, body })
     }
     /// Appends a response using the given request method. Validates the
@@ -517,15 +552,7 @@ impl Response {
     /// A successful CONNECT writer refuses Content-Length and Transfer-Encoding.
     pub fn write_for(&self, method: &str, out: &mut Vec<u8>) -> Result<(), Error> {
         let method = Method::parse(method)?;
-        validate_response(&self.head)?;
-        let info = fields(&self.head.headers, self.head.version)?;
-        let framing = response_framing(&self.head, info, method)?;
-        if method == Method::Connect
-            && (200..300).contains(&self.head.status)
-            && (info.length.is_some() || info.transfer)
-        {
-            return Err(Error::ForbiddenFraming);
-        }
+        let framing = validate_response_for(&self.head, method)?;
         validate_body(&self.body, framing)?;
         emit_response(&self.head, out);
         emit_body(&self.body, framing, out);
@@ -616,9 +643,9 @@ impl Reader {
         self.limits
             .head
             .max(self.limits.body_chunk)
-            .max(MAX_CHUNK_LINE + 2)
+            .max(MAX_CHUNK_LINE.saturating_add(2))
     }
-    fn head(&mut self, input: &[u8], eof: bool) -> Result<Option<usize>, Error> {
+    fn head(&mut self, input: &[u8]) -> Result<Option<usize>, Error> {
         loop {
             let rest = input.get(self.scanned..).ok_or(Error::State)?;
             let room = self.limits.head.saturating_sub(self.scanned);
@@ -653,9 +680,6 @@ impl Reader {
                     }
                     if window.len() == room {
                         return Err(Error::HeadTooLong);
-                    }
-                    if eof {
-                        return Err(Error::Incomplete);
                     }
                     return Ok(None);
                 }
@@ -699,12 +723,9 @@ impl Reader {
                     .unwrap_or(usize::MAX)
                     .min(self.limits.body_chunk);
                 if input.len() < n {
-                    if eof {
-                        return Err(Error::Incomplete);
-                    }
                     Step::Need
                 } else {
-                    let remaining = left - n as u64;
+                    let remaining = left.saturating_sub(u64::try_from(n).unwrap_or(u64::MAX));
                     self.state = match self.state {
                         State::Length(_) if remaining == 0 => State::Done,
                         State::Length(_) => State::Length(remaining),
@@ -725,55 +746,68 @@ impl Reader {
                     Step::Need
                 }
             }
-            State::Size => {
-                let step = match self.lines.decode(input, false) {
-                    Ok(s) => s,
-                    Err(e) => match e {},
-                };
-                match step {
-                    Step::Item(line, n) => {
-                        let line = line.map_err(|e| match e {
-                            LineError::TooLong { .. } => Error::ChunkLineTooLong,
-                            _ => Error::LineEnding,
-                        })?;
-                        let size = chunk_size(&line)?;
-                        self.state = if size == 0 {
-                            State::Trailers
-                        } else {
-                            State::Data(size)
-                        };
+            State::Size | State::DataEnd | State::Trailers => {
+                match chunk_framing(&mut self.lines, self.state, input)? {
+                    Some((state, n)) => {
+                        self.state = state;
                         Step::Skip(n)
                     }
-                    _ if eof => return Err(Error::Incomplete),
-                    _ => Step::Need,
-                }
-            }
-            State::DataEnd | State::Trailers => {
-                let trailer = matches!(self.state, State::Trailers);
-                let error = if trailer {
-                    Error::Trailers
-                } else {
-                    Error::ChunkEnding
-                };
-                if input.first().is_some_and(|b| *b != b'\r') {
-                    return Err(error);
-                }
-                if input.len() < 2 {
-                    if eof {
-                        return Err(Error::Incomplete);
-                    }
-                    Step::Need
-                } else {
-                    if input[1] != b'\n' {
-                        return Err(error);
-                    }
-                    self.state = if trailer { State::Done } else { State::Size };
-                    Step::Skip(2)
+                    None => Step::Need,
                 }
             }
         };
+        // Stream treats Need at empty EOF as a clean end. An unfinished
+        // body with no buffered partial unit must still report a failure.
+        if matches!(step, Step::Need) && eof && input.is_empty() {
+            return Err(Error::Incomplete);
+        }
         Ok(Some(step))
     }
+}
+
+fn chunk_framing(
+    lines: &mut Lines,
+    state: State,
+    input: &[u8],
+) -> Result<Option<(State, usize)>, Error> {
+    if matches!(state, State::Size) {
+        let step = match lines.decode(input, false) {
+            Ok(s) => s,
+            Err(e) => match e {},
+        };
+        let Step::Item(line, n) = step else {
+            return Ok(None);
+        };
+        let line = line.map_err(|e| match e {
+            LineError::TooLong { .. } => Error::ChunkLineTooLong,
+            _ => Error::LineEnding,
+        })?;
+        let size = chunk_size(&line)?;
+        return Ok(Some((
+            if size == 0 {
+                State::Trailers
+            } else {
+                State::Data(size)
+            },
+            n,
+        )));
+    }
+    let trailer = matches!(state, State::Trailers);
+    let error = if trailer {
+        Error::Trailers
+    } else {
+        Error::ChunkEnding
+    };
+    if input.first().is_some_and(|b| *b != b'\r') {
+        return Err(error);
+    }
+    let Some(second) = input.get(1) else {
+        return Ok(None);
+    };
+    if *second != b'\n' {
+        return Err(error);
+    }
+    Ok(Some((if trailer { State::Done } else { State::Size }, 2)))
 }
 
 fn token(b: &[u8]) -> bool {
@@ -789,7 +823,7 @@ fn trim(mut b: &[u8]) -> &[u8] {
         b = &b[1..];
     }
     while b.last().is_some_and(|b| matches!(b, b' ' | b'\t')) {
-        b = &b[..b.len() - 1];
+        b = &b[..b.len().saturating_sub(1)];
     }
     b
 }
@@ -870,6 +904,9 @@ fn fields(headers: &[Header], version: Version) -> Result<Fields, Error> {
             }
             for value in h.value.split(|b| *b == b',') {
                 let value = trim(value);
+                if value.is_empty() {
+                    continue;
+                }
                 if result.chunked {
                     return Err(Error::ChunkedNotLast);
                 }
@@ -882,18 +919,19 @@ fn fields(headers: &[Header], version: Version) -> Result<Fields, Error> {
         } else if h.name.eq_ignore_ascii_case("connection") {
             for value in h.value.split(|b| *b == b',') {
                 let value = trim(value);
+                if value.is_empty() {
+                    continue;
+                }
                 if !token(value) {
                     return Err(Error::Header);
-                }
-                if value.eq_ignore_ascii_case(b"upgrade") {
-                    return Err(Error::Upgrade);
                 }
                 result.close |= value.eq_ignore_ascii_case(b"close");
                 keep |= value.eq_ignore_ascii_case(b"keep-alive");
             }
-        } else if h.name.eq_ignore_ascii_case("upgrade") {
-            return Err(Error::Upgrade);
         }
+    }
+    if named(headers, "transfer-encoding").next().is_some() && !result.transfer {
+        return Err(Error::TransferEncoding);
     }
     result.close |= version == Version::Http10 && !keep;
     Ok(result)
@@ -949,7 +987,7 @@ fn split_head(b: &[u8]) -> Result<(&[u8], Vec<Header>), Error> {
         if !token(name) {
             return Err(Error::Header);
         }
-        let value = trim(&line[colon + 1..]);
+        let value = trim(&line[colon.saturating_add(1)..]);
         if !value.iter().copied().all(field_byte) {
             return Err(Error::Header);
         }
@@ -977,7 +1015,7 @@ fn valid_authority(value: &[u8], require_port: bool) -> bool {
         if ip.parse::<std::net::Ipv6Addr>().is_err() {
             return false;
         }
-        (&value[..=end], &value[end + 1..])
+        (&value[..=end], &value[end.saturating_add(1)..])
     } else {
         let at = value.iter().position(|b| *b == b':').unwrap_or(value.len());
         let host = &value[..at];
@@ -994,7 +1032,8 @@ fn valid_authority(value: &[u8], require_port: bool) -> bool {
             !require_port
         } else {
             port.first() == Some(&b':')
-                && number(&port[1..], 10, Error::Host).is_ok_and(|n| n <= 65535)
+                && ((!require_port && port.len() == 1)
+                    || number(&port[1..], 10, Error::Host).is_ok_and(|n| n <= 65535))
         }
 }
 fn validate_target(method: &str, target: &str) -> Result<(), Error> {
@@ -1023,7 +1062,11 @@ fn validate_host(head: &RequestHead) -> Result<(), Error> {
     let mut hosts = named(&head.headers, "host");
     match hosts.next() {
         None if head.version == Version::Http10 => Ok(()),
-        Some(host) if valid_authority(host, false) && hosts.next().is_none() => Ok(()),
+        Some(host)
+            if (host.is_empty() || valid_authority(host, false)) && hosts.next().is_none() =>
+        {
+            Ok(())
+        }
         _ => Err(Error::Host),
     }
 }
@@ -1056,7 +1099,7 @@ fn response_head(b: &[u8]) -> Result<ResponseHead, Error> {
         return Err(Error::StartLine);
     }
     let status = number(status, 10, Error::StartLine)? as u16;
-    let reason = parts.next().ok_or(Error::StartLine)?;
+    let reason = parts.next().unwrap_or_default();
     if !(100..=599).contains(&status) || !reason.iter().copied().all(field_byte) {
         return Err(Error::StartLine);
     }
@@ -1083,7 +1126,7 @@ fn head_size(start: usize, headers: &[Header]) -> Result<(), Error> {
         let line = h
             .name
             .len()
-            .checked_add(2)
+            .checked_add(1)
             .and_then(|n| n.checked_add(h.value.len()))
             .ok_or(Error::HeaderLineTooLong)?;
         if line > limits.header_line {
@@ -1123,15 +1166,26 @@ fn validate_response(head: &ResponseHead) -> Result<(), Error> {
     head_size(
         head.reason
             .len()
-            .checked_add(13)
+            .checked_add(if head.reason.is_empty() { 12 } else { 13 })
             .ok_or(Error::StartLineTooLong)?,
         &head.headers,
     )
 }
+fn validate_response_for(head: &ResponseHead, method: Method) -> Result<Framing, Error> {
+    validate_response(head)?;
+    let info = fields(&head.headers, head.version)?;
+    if method == Method::Connect
+        && (200..300).contains(&head.status)
+        && (info.length.is_some() || info.transfer)
+    {
+        return Err(Error::ForbiddenFraming);
+    }
+    response_framing(head, info, method)
+}
 fn emit_headers(headers: &[Header], out: &mut Vec<u8>) {
     for h in headers {
         out.extend_from_slice(h.name.as_bytes());
-        out.extend_from_slice(b": ");
+        out.push(b':');
         out.extend_from_slice(&h.value);
         out.extend_from_slice(b"\r\n");
     }
@@ -1150,8 +1204,10 @@ fn emit_response(head: &ResponseHead, out: &mut Vec<u8>) {
     out.extend_from_slice(head.version.as_str().as_bytes());
     out.push(b' ');
     out.extend_from_slice(head.status.to_string().as_bytes());
-    out.push(b' ');
-    out.extend_from_slice(&head.reason);
+    if !head.reason.is_empty() {
+        out.push(b' ');
+        out.extend_from_slice(&head.reason);
+    }
     out.extend_from_slice(b"\r\n");
     emit_headers(&head.headers, out);
 }
@@ -1182,44 +1238,73 @@ fn emit_body(body: &[u8], framing: Framing, out: &mut Vec<u8>) {
 }
 fn exact_head(b: &[u8]) -> Result<(), Error> {
     let mut reader = Reader::new(Limits::default());
-    let n = reader.head(b, true)?.ok_or(Error::Incomplete)?;
+    let n = reader.head(b)?.ok_or(Error::Incomplete)?;
     if n != b.len() {
         return Err(Error::Trailing);
     }
     Ok(())
 }
 fn whole<H, D: Decode<Item = Event<H>, Error = Error>>(
-    mut decoder: D,
-    mut b: &[u8],
+    decoder: D,
+    b: &[u8],
 ) -> Result<(H, Vec<u8>), Error> {
+    let mut stream = Stream::new(decoder);
     let mut head = None;
     let mut body = Vec::new();
-    loop {
-        match decoder.decode(b, true)? {
-            Step::Item(Event::Head(h), n) => {
-                head = Some(h);
-                b = &b[n..];
-            }
-            Step::Item(Event::Body(data), n) => {
+    let mut done = false;
+    // A handler refusal stops at the first Done. None marks completion;
+    // Some(error) marks a refused value or an oversized owned body.
+    let mut collect = |event| -> Result<(), Option<Error>> {
+        match event {
+            Event::Head(h) => head = Some(h),
+            Event::Body(data) => {
                 if body
                     .len()
                     .checked_add(data.len())
                     .is_none_or(|n| n > MAX_BODY)
                 {
-                    return Err(Error::BodyTooLong);
+                    return Err(Some(Error::BodyTooLong));
                 }
                 body.extend_from_slice(&data);
-                b = &b[n..];
             }
-            Step::Item(Event::Done, n) => {
-                if b.len() != n {
-                    return Err(Error::Trailing);
-                }
-                return Ok((head.ok_or(Error::Incomplete)?, body));
+            Event::Done => {
+                done = true;
+                return Err(None);
             }
-            Step::Skip(n) => b = &b[n..],
-            Step::Need | Step::End => return Err(Error::Incomplete),
         }
+        Ok(())
+    };
+    match try_pump(&mut stream, b, &mut collect) {
+        Err(PumpError::Decode(error)) => return Err(wire_failure(error)),
+        Err(PumpError::Handler(Some(error))) => return Err(error),
+        Err(PumpError::Handler(None)) => {}
+        Ok(_) => {
+            let mut result = Ok(());
+            let ended = finish(&mut stream, |event| {
+                if result.is_ok() {
+                    result = collect(event);
+                }
+            });
+            if let Err(Some(error)) = result {
+                return Err(error);
+            }
+            ended.map_err(wire_failure)?;
+        }
+    }
+    if !done {
+        return Err(Error::Incomplete);
+    }
+    if stream.offset() != u64::try_from(b.len()).map_err(|_| Error::Trailing)? {
+        return Err(Error::Trailing);
+    }
+    Ok((head.ok_or(Error::Incomplete)?, body))
+}
+
+fn wire_failure(failure: Fail<Error>) -> Error {
+    match failure {
+        Fail::Protocol(error) => error,
+        Fail::Truncated { .. } => Error::Incomplete,
+        Fail::Stuck { .. } => Error::State,
     }
 }
 
@@ -1283,9 +1368,7 @@ impl Wire for Response {
     /// Parses exactly one ordinary response with default limits. Uses EOF
     /// for a close-delimited body. Use parse_for for HEAD and CONNECT.
     fn parse(b: &[u8]) -> Result<Self, Error> {
-        let response = Self::parse_for(b, "GET")?;
-        validate_response(&response.head)?;
-        Ok(response)
+        Self::parse_for(b, "GET")
     }
     /// Validates an ordinary response and its full body before writing.
     /// Use write_for for HEAD and CONNECT. Close-delimited output needs EOF.
@@ -1300,35 +1383,20 @@ impl Wire for Chunk {
     /// a zero chunk. Extra bytes, extensions, and trailers are refused.
     fn parse(b: &[u8]) -> Result<Self, Error> {
         let mut lines = Lines::new(MAX_CHUNK_LINE, Ending::Crlf);
-        let step = match lines.decode(b, true) {
-            Ok(s) => s,
-            Err(e) => match e {},
+        let (state, used) = chunk_framing(&mut lines, State::Size, b)?.ok_or(Error::Incomplete)?;
+        let (size, ending) = match state {
+            State::Data(size) => (size, State::DataEnd),
+            State::Trailers => (0, State::Trailers),
+            _ => return Err(Error::State),
         };
-        let Step::Item(line, used) = step else {
-            return Err(Error::Incomplete);
-        };
-        let line = line.map_err(|e| match e {
-            LineError::TooLong { .. } => Error::ChunkLineTooLong,
-            LineError::Unterminated => Error::Incomplete,
-            LineError::BareLf => Error::LineEnding,
-        })?;
-        let n = usize::try_from(chunk_size(&line)?).map_err(|_| Error::BodyTooLong)?;
+        let n = usize::try_from(size).map_err(|_| Error::BodyTooLong)?;
         if n > MAX_BODY {
             return Err(Error::BodyTooLong);
         }
         let end = used.checked_add(n).ok_or(Error::BodyTooLong)?;
         let tail = b.get(end..).ok_or(Error::Incomplete)?;
-        if tail.len() < 2 {
-            return Err(Error::Incomplete);
-        }
-        if !tail.starts_with(b"\r\n") {
-            return Err(if n == 0 {
-                Error::Trailers
-            } else {
-                Error::ChunkEnding
-            });
-        }
-        if tail.len() != 2 {
+        let (_, used_tail) = chunk_framing(&mut lines, ending, tail)?.ok_or(Error::Incomplete)?;
+        if tail.len() != used_tail {
             return Err(Error::Trailing);
         }
         Ok(Self(b[used..end].to_vec()))
@@ -1347,8 +1415,8 @@ impl Wire for Chunk {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
-        Assemble, Assembled, Carry, Collect, CollectError, Demux, Fail, Fragment, Layered, Pipe,
-        Stream, contract, finish, pump, test_support,
+        Assemble, Assembled, Carry, Collect, CollectError, Demux, Fragment, Layered, Pipe,
+        contract, pump, test_support,
     };
 
     const GET: &[u8] = b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n";
@@ -1462,7 +1530,7 @@ mod tests {
             ),
             (
                 Limits {
-                    head: bytes.len() - 1,
+                    head: bytes.len().saturating_sub(1),
                     ..exact
                 },
                 Error::HeadTooLong,
@@ -1502,7 +1570,7 @@ mod tests {
                 ..exact
             },
             Limits {
-                head: response.len() - 1,
+                head: response.len().saturating_sub(1),
                 ..exact
             },
         ] {
@@ -1557,11 +1625,11 @@ mod tests {
             ..small()
         };
         let mut stream = Stream::new(Requests::new(limits));
-        let mut total = 0;
+        let mut total = 0usize;
         pump(&mut stream, &bytes, |e| {
             if let Event::Body(b) = e {
                 assert!(b.len() <= 97);
-                total += b.len();
+                total = total.saturating_add(b.len());
             }
         })
         .unwrap();
@@ -1646,6 +1714,225 @@ mod tests {
     }
 
     #[test]
+    fn list_elements_and_upgrade_offers_allow_http_pipelines() {
+        for fields in [
+            "Connection:\r\n",
+            "Connection: keep-alive, \r\n",
+            "Connection: , ,keep-alive,,\r\n",
+            "Upgrade: h2c\r\n",
+            "Connection: upgrade\r\n",
+            "Connection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\nHTTP2-Settings: AAMAAABk\r\n",
+        ] {
+            let request = request_with(fields, b"");
+            let bytes = [&request, GET].concat();
+            let (events, failure) = test_support::decode_all(Requests::default, &bytes);
+            assert_eq!(failure, None, "{fields}");
+            assert_eq!(events.len(), 4, "{fields}");
+            contract::check_decode(Requests::default, &bytes);
+            contract::check_wire::<Request>(&request);
+        }
+        for fields in [
+            "Transfer-Encoding: , chunked\r\n",
+            "Transfer-Encoding: chunked,\r\n",
+            "Transfer-Encoding: ,gzip,, chunked, ,\r\n",
+            "Transfer-Encoding: ,\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: ,\r\n",
+        ] {
+            let request = request_with(fields, b"1\r\na\r\n0\r\n\r\n");
+            let response = response_with(fields, b"1\r\na\r\n0\r\n\r\n");
+            assert_eq!(Request::parse(&request).unwrap().body, b"a");
+            assert_eq!(Response::parse(&response).unwrap().body, b"a");
+            contract::check_decode(Requests::default, &request);
+            contract::check_decode(Responses::default, &response);
+            contract::check_wire::<Request>(&request);
+            contract::check_wire::<Response>(&response);
+        }
+        request_error(
+            &request_with("Content-Length: ,0\r\n", b""),
+            Error::ContentLength,
+        );
+        request_error(
+            &request_with("Transfer-Encoding: , ,\r\n", b""),
+            Error::TransferEncoding,
+        );
+    }
+
+    #[test]
+    fn empty_lines_before_requests_are_bounded_and_reset_per_message() {
+        for bytes in [
+            b"\r\n".to_vec(),
+            [b"\r\n".as_slice(), GET].concat(),
+            [POST, b"\r\n", GET, b"\r\n"].concat(),
+            [b"\r\n".repeat(MAX_EMPTY_LINES), GET.to_vec()].concat(),
+            [
+                b"\r\n".repeat(MAX_EMPTY_LINES),
+                GET.to_vec(),
+                b"\r\n".repeat(MAX_EMPTY_LINES),
+                GET.to_vec(),
+            ]
+            .concat(),
+        ] {
+            let (events, failure) = test_support::decode_all(Requests::default, &bytes);
+            assert_eq!(failure, None);
+            let expected = bytes
+                .windows(GET.len())
+                .filter(|w| *w == GET)
+                .count()
+                .saturating_add(usize::from(bytes.starts_with(POST)));
+            assert_eq!(
+                events.iter().filter(|e| matches!(e, Event::Done)).count(),
+                expected
+            );
+            contract::check_decode(Requests::default, &bytes);
+        }
+        request_error(
+            &b"\r\n".repeat(MAX_EMPTY_LINES.saturating_add(1)),
+            Error::StartLine,
+        );
+        let (_, failure) = test_support::decode_all(Requests::default, b"\r\n\r");
+        assert_eq!(failure, Some(Fail::Truncated { unread: 1 }));
+        for head in [0, 1, 2] {
+            let make = || {
+                Requests::new(Limits {
+                    head,
+                    start_line: 0,
+                    ..small()
+                })
+            };
+            assert_eq!(test_support::decode_all(make, b"\r\n").1, None);
+            contract::check_decode(make, b"\r\n");
+        }
+    }
+
+    #[test]
+    fn empty_host_and_port_are_valid_but_connect_requires_a_port() {
+        for host in ["", "a:", "[::1]:"] {
+            let bytes = format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n");
+            let head = RequestHead::parse(bytes.as_bytes()).unwrap();
+            assert_eq!(head.headers[0].value, host.as_bytes());
+            contract::check_wire::<RequestHead>(bytes.as_bytes());
+            contract::check_decode(Requests::default, bytes.as_bytes());
+        }
+        for authority in ["a", "a:", "[::1]:"] {
+            let bytes = format!("CONNECT {authority} HTTP/1.1\r\nHost: a\r\n\r\n");
+            request_error(bytes.as_bytes(), Error::StartLine);
+        }
+        request_error(b"GET / HTTP/1.1\r\nHost:\r\nHost:\r\n\r\n", Error::Host);
+    }
+
+    #[test]
+    fn missing_reason_phrase_and_method_aware_validation() {
+        let bytes = b"HTTP/1.1 200\r\nContent-Length:0\r\n\r\n";
+        let response = Response::parse(bytes).unwrap();
+        assert!(response.head.reason.is_empty());
+        assert_eq!(response.to_bytes().unwrap(), bytes);
+        contract::check_wire::<Response>(bytes);
+        contract::check_wire::<ResponseHead>(bytes);
+        contract::check_decode(Responses::default, bytes);
+        for (method, bytes) in [
+            (
+                "HEAD",
+                b"HTTP/1.1 200 OK\r\nContent-Length:20\r\n\r\n".as_slice(),
+            ),
+            ("CONNECT", b"HTTP/1.1 200\r\n\r\n"),
+            (
+                "CONNECT",
+                b"HTTP/1.1 403 Denied\r\nContent-Length:2\r\n\r\nno",
+            ),
+            ("GET", b"HTTP/1.1 100 Continue\r\n\r\n"),
+        ] {
+            let response = Response::parse_for(bytes, method).unwrap();
+            let mut out = Vec::new();
+            response.write_for(method, &mut out).unwrap();
+            assert_eq!(Response::parse_for(&out, method), Ok(response));
+        }
+        for (method, status) in [("GET", 100), ("HEAD", 103), ("GET", 204), ("CONNECT", 200)] {
+            for field in ["Content-Length:0", "Transfer-Encoding:chunked"] {
+                let bytes = format!("HTTP/1.1 {status} Fine\r\n{field}\r\n\r\n");
+                let make = || {
+                    let mut decoder = Responses::default();
+                    decoder.expect_method(method).unwrap();
+                    decoder
+                };
+                let (events, failure) = test_support::decode_all(make, bytes.as_bytes());
+                assert_eq!(failure, None);
+                let Event::Head(head) = &events[0] else {
+                    panic!("head")
+                };
+                let response = Response {
+                    head: head.clone(),
+                    body: Vec::new(),
+                };
+                assert_eq!(
+                    Response::parse_for(bytes.as_bytes(), method),
+                    Err(Error::ForbiddenFraming)
+                );
+                let mut out = b"prefix".to_vec();
+                assert_eq!(
+                    response.write_for(method, &mut out),
+                    Err(Error::ForbiddenFraming)
+                );
+                assert_eq!(out, b"prefix");
+            }
+        }
+    }
+
+    #[test]
+    fn received_head_limits_allow_writing_and_rewriting() {
+        for (request, prefix) in [
+            (true, b"GET / HTTP/1.1\r\nHost:a\r\n".as_slice()),
+            (false, b"HTTP/1.1 200\r\nContent-Length:0\r\n"),
+        ] {
+            let mut line_boundary = prefix.to_vec();
+            line_boundary.extend_from_slice(b"X:");
+            line_boundary.extend_from_slice(&vec![b'a'; 8190]);
+            line_boundary.extend_from_slice(b"\r\n\r\n");
+            let mut head_boundary = prefix.to_vec();
+            while head_boundary.len().saturating_add(2) < Limits::default().head {
+                let line = Limits::default()
+                    .head
+                    .saturating_sub(head_boundary.len())
+                    .saturating_sub(2)
+                    .min(8194);
+                head_boundary.extend_from_slice(b"X:");
+                head_boundary.extend_from_slice(&vec![b'a'; line.saturating_sub(4)]);
+                head_boundary.extend_from_slice(b"\r\n");
+            }
+            head_boundary.extend_from_slice(b"\r\n");
+            assert_eq!(head_boundary.len(), Limits::default().head);
+            for bytes in [line_boundary, head_boundary] {
+                if request {
+                    let (events, failure) = test_support::decode_all(Requests::default, &bytes);
+                    assert_eq!(failure, None);
+                    let Event::Head(mut head) = events[0].clone() else {
+                        panic!("head")
+                    };
+                    assert_eq!(head.to_bytes().unwrap(), bytes);
+                    head.headers[1].value[0] = b'b';
+                    contract::check_wire_value(&head);
+                    contract::check_wire::<Request>(&bytes);
+                    let (values, failure) =
+                        test_support::decode_all(|| Collect::<Request>::new(bytes.len()), &bytes);
+                    assert_eq!(failure, None);
+                    assert_eq!(values.len(), 1);
+                } else {
+                    let (events, failure) = test_support::decode_all(Responses::default, &bytes);
+                    assert_eq!(failure, None);
+                    let Event::Head(mut head) = events[0].clone() else {
+                        panic!("head")
+                    };
+                    assert_eq!(head.to_bytes().unwrap(), bytes);
+                    head.headers[1].value[0] = b'b';
+                    contract::check_wire_value(&head);
+                    contract::check_wire::<Response>(&bytes);
+                }
+            }
+        }
+        let bytes = request_with(&format!("X:{}\r\n", "a".repeat(8191)), b"");
+        request_error(&bytes, Error::HeaderLineTooLong);
+        assert_eq!(RequestHead::parse(&bytes), Err(Error::HeaderLineTooLong));
+    }
+
+    #[test]
     fn malformed_chunks_extensions_trailers_and_truncation() {
         for (body, error) in [
             (b"1;x=y\r\na\r\n0\r\n\r\n".as_slice(), Error::ChunkExtension),
@@ -1666,9 +1953,9 @@ mod tests {
                 &response_with("Transfer-Encoding: chunked\r\n", body),
                 error,
             );
-            assert!(Chunk::parse(body).is_err());
+            assert_eq!(Chunk::parse(body), Err(error));
         }
-        let too_long = vec![b'0'; MAX_CHUNK_LINE + 2];
+        let too_long = vec![b'0'; MAX_CHUNK_LINE.saturating_add(2)];
         request_error(
             &request_with("Transfer-Encoding: chunked\r\n", &too_long),
             Error::ChunkLineTooLong,
@@ -1676,27 +1963,53 @@ mod tests {
         let mut exact = vec![b'0'; MAX_CHUNK_LINE];
         exact.extend_from_slice(b"\r\n\r\n");
         assert_eq!(Chunk::parse(&exact), Ok(Chunk(Vec::new())));
-        for body in [
-            b"".as_slice(),
-            b"1",
-            b"1\r\n",
-            b"2\r\nx",
-            b"1\r\nx",
-            b"1\r\nx\r",
-            b"0\r\n",
-            b"0\r\n\r",
-        ] {
+        for body in [b"".as_slice(), b"1\r\n", b"1\r\nx", b"0\r\n"] {
             request_error(
                 &request_with("Transfer-Encoding: chunked\r\n", body),
                 Error::Incomplete,
             );
         }
-        request_error(
-            &request_with("Content-Length: 3\r\n", b"ab"),
-            Error::Incomplete,
+        for body in [b"1".as_slice(), b"2\r\nx", b"1\r\nx\r", b"0\r\n\r"] {
+            let request = request_with("Transfer-Encoding: chunked\r\n", body);
+            let response = response_with("Transfer-Encoding: chunked\r\n", body);
+            assert_eq!(
+                test_support::decode_all(Requests::default, &request).1,
+                Some(Fail::Truncated { unread: 1 })
+            );
+            assert_eq!(
+                test_support::decode_all(Responses::default, &response).1,
+                Some(Fail::Truncated { unread: 1 })
+            );
+            contract::check_decode(Requests::default, &request);
+            contract::check_decode(Responses::default, &response);
+            assert_eq!(Chunk::parse(body), Err(Error::Incomplete));
+        }
+        let request = request_with("Content-Length: 3\r\n", b"ab");
+        let response = response_with("Content-Length: 3\r\n", b"ab");
+        assert_eq!(
+            test_support::decode_all(Requests::default, &request).1,
+            Some(Fail::Truncated { unread: 2 })
         );
-        request_error(b"GET / HTTP/1.1\r\nHost: x\r\n", Error::Incomplete);
-        response_error(b"HTTP/1.1 200 OK\r\n", Error::Incomplete);
+        assert_eq!(
+            test_support::decode_all(Responses::default, &response).1,
+            Some(Fail::Truncated { unread: 2 })
+        );
+        let request = b"GET / HTTP/1.1\r\nHost: x\r\n";
+        let response = b"HTTP/1.1 200 OK\r\n";
+        assert_eq!(
+            test_support::decode_all(Requests::default, request).1,
+            Some(Fail::Truncated {
+                unread: request.len()
+            })
+        );
+        assert_eq!(
+            test_support::decode_all(Responses::default, response).1,
+            Some(Fail::Truncated {
+                unread: response.len()
+            })
+        );
+        contract::check_decode(Requests::default, request);
+        contract::check_decode(Responses::default, response);
     }
 
     #[test]
@@ -1820,10 +2133,12 @@ mod tests {
         let bytes = request_with("Expect: 100-Continue\r\nContent-Length: 5\r\n", b"");
         let mut stream = Stream::new(Requests::default());
         assert_eq!(stream.push(&bytes), bytes.len());
-        let Some(Ok(Event::Head(head))) = stream.next() else {
+        let Some(Ok(Event::Head(mut head))) = stream.next() else {
             panic!("head")
         };
         assert!(head.expects_continue());
+        head.version = Version::Http10;
+        assert!(!head.expects_continue());
         assert_eq!(
             ResponseHead::continue_100().to_bytes().unwrap(),
             b"HTTP/1.1 100 Continue\r\n\r\n"
@@ -1835,15 +2150,80 @@ mod tests {
     }
 
     #[test]
+    fn connect_pump_ends_after_done() {
+        let bytes = b"CONNECT example.test:443 HTTP/1.1\r\nHost: example.test:443\r\n\r\n";
+        let mut stream = Stream::new(Requests::default());
+        let mut events = Vec::new();
+        assert_eq!(
+            pump(&mut stream, bytes, |e| events.push(e)),
+            Ok(bytes.len())
+        );
+        assert!(matches!(events.as_slice(), [Event::Head(_), Event::Done]));
+        assert!(stream.is_done());
+        assert_eq!(stream.failed(), None);
+        assert_eq!(stream.next(), None);
+        contract::check_decode(Requests::default, bytes);
+    }
+
+    #[test]
+    fn connect_drivers_preserve_tunnel_bytes() {
+        let head = b"CONNECT example.test:443 HTTP/1.1\r\nHost: example.test:443\r\n\r\n";
+        for tunnel in [
+            b"\x16\x03\x01\x00\x05hello".as_slice(),
+            b"SSH-2.0-OpenSSH_9.6\r\n",
+        ] {
+            let bytes = [head.as_slice(), tunnel].concat();
+            for fallible in [false, true] {
+                let mut stream = Stream::new(Requests::default());
+                let mut events = Vec::new();
+                let taken = if fallible {
+                    try_pump(&mut stream, &bytes, |e| {
+                        events.push(e);
+                        Ok::<(), Error>(())
+                    })
+                    .unwrap()
+                } else {
+                    pump(&mut stream, &bytes, |e| events.push(e)).unwrap()
+                };
+                assert_eq!(taken, bytes.len());
+                assert!(matches!(events.as_slice(), [Event::Head(_), Event::Done]));
+                assert_eq!(stream.failed(), None);
+                assert!(stream.is_done());
+                assert_eq!(stream.into_parts().0.unread(), tunnel);
+            }
+            contract::check_decode(Requests::default, &bytes);
+        }
+    }
+
+    #[test]
+    fn connect_rejection_swaps_back_to_http() {
+        let head = b"CONNECT example.test:443 HTTP/1.1\r\nHost: example.test:443\r\n\r\n";
+        let bytes = [head.as_slice(), GET].concat();
+        let limits = Limits::default();
+        let mut stream = Stream::new(Requests::new(limits));
+        let mut events = Vec::new();
+        assert_eq!(
+            pump(&mut stream, &bytes, |e| events.push(e)),
+            Ok(bytes.len())
+        );
+        assert!(matches!(events.as_slice(), [Event::Head(_), Event::Done]));
+        assert!(stream.is_done());
+        assert_eq!(stream.unread(), GET);
+        let mut stream = stream.swap(Requests::new(limits));
+        events.clear();
+        finish(&mut stream, |e| events.push(e)).unwrap();
+        assert_eq!(events, test_support::decode_all(Requests::default, GET).0);
+        assert!(stream.unread().is_empty());
+        assert_eq!(stream.failed(), None);
+    }
+
+    #[test]
     fn connect_handoff_in_both_directions() {
         let request = b"CONNECT example.test:443 HTTP/1.1\r\nHost: example.test:443\r\n\r\ntunnel";
         let mut stream = Stream::new(Requests::default());
-        assert_eq!(stream.decoder().accept_connect(), Err(Error::State));
         assert_eq!(stream.push(request), request.len());
         assert!(matches!(stream.next(), Some(Ok(Event::Head(_)))));
-        assert_eq!(stream.decoder().accept_connect(), Err(Error::State));
         assert_eq!(stream.next(), Some(Ok(Event::Done)));
-        stream.decoder().accept_connect().unwrap();
         assert_eq!(stream.next(), None);
         assert!(stream.is_done());
         assert_eq!(stream.into_parts().0.unread(), b"tunnel");
@@ -1876,7 +2256,7 @@ mod tests {
             test_support::decode_all(make, b"HTTP/1.1 403 Denied\r\nContent-Length: 2\r\n\r\nno");
         assert_eq!(error, None);
         assert_eq!(events[1], Event::Body(b"no".to_vec()));
-        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 99\r\n\r\n";
+        let head = b"HTTP/1.1 200 OK\r\nContent-Length:99\r\n\r\n";
         let value = Response::parse_for(head, "HEAD").unwrap();
         let mut out = Vec::new();
         value.write_for("HEAD", &mut out).unwrap();
@@ -1915,7 +2295,6 @@ mod tests {
             Error::StartLine,
         );
         request_error(b"CONNECT / HTTP/1.1\r\nHost: x\r\n\r\n", Error::StartLine);
-        request_error(&request_with("Upgrade: websocket\r\n", b""), Error::Upgrade);
         response_error(b"HTTP/1.1 101 Switching Protocols\r\n\r\n", Error::Upgrade);
         request_error(
             b"POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n",
@@ -1978,9 +2357,12 @@ mod tests {
         });
         refused(&value, Error::TransferEncodingAndContentLength);
         value = base.clone();
-        value.body = vec![0; MAX_BODY + 1];
+        value.body = vec![0; MAX_BODY.saturating_add(1)];
         refused(&value, Error::BodyTooLong);
-        refused(&Chunk(vec![0; MAX_BODY + 1]), Error::BodyTooLong);
+        refused(
+            &Chunk(vec![0; MAX_BODY.saturating_add(1)]),
+            Error::BodyTooLong,
+        );
         value = base.clone();
         value.head.target = format!("/{}", "a".repeat(8192));
         refused(&value, Error::StartLineTooLong);
@@ -2039,9 +2421,13 @@ mod tests {
         assert_eq!(error, None);
         assert_eq!(items, vec![Request::parse(POST).unwrap()]);
         assert_eq!(
-            test_support::decode_all(|| Collect::<Request>::new(POST.len() - 1), POST).1,
+            test_support::decode_all(
+                || Collect::<Request>::new(POST.len().saturating_sub(1)),
+                POST
+            )
+            .1,
             Some(Fail::Protocol(CollectError::TooLong {
-                limit: POST.len() - 1
+                limit: POST.len().saturating_sub(1)
             }))
         );
         let assemble = || {
@@ -2078,10 +2464,10 @@ mod tests {
         let mut demux = Demux::new(2, 1 << 20, |_: &u8| Requests::default());
         assert_eq!(demux.push(&1, GET), GET.len());
         assert_eq!(demux.push(&2, POST), POST.len());
-        let mut count = 0;
+        let mut count = 0usize;
         while let Some((_, event)) = demux.next() {
             assert!(event.is_ok());
-            count += 1;
+            count = count.saturating_add(1);
         }
         assert_eq!(count, 5);
     }

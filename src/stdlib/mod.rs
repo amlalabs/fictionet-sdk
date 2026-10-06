@@ -152,7 +152,6 @@ pub mod geneve;
 pub mod git_protocol;
 pub mod gre;
 pub mod grpc;
-/// HTTP/1 heads, streaming bodies, and strict wire messages.
 pub mod http1;
 pub mod http3;
 pub mod icmp;
