@@ -3,11 +3,12 @@
 #![no_main]
 
 use fictionet::stdlib::nfs::{
-    DirOp, FileHandle, MAX_FH, MAX_NAME, MountRequest, MountResponse, NfsError, Request, Response, procedure,
+    DirOp, FileHandle, MAX_FH, MAX_NAME, MountRequest, MountResponse, NfsError, Request, Response,
+    procedure,
 };
-use fictionet::stdlib::onc_rpc::{Body, Decoder, Message};
+use fictionet::stdlib::onc_rpc::{Body, Message};
 use fictionet::stdlib::{
-    codec::{Decode, contract},
+    codec::{Assembled, Decode, Wire, contract, test_support::decode_all},
     onc_rpc,
 };
 use libfuzzer_sys::fuzz_target;
@@ -17,22 +18,22 @@ use libfuzzer_sys::fuzz_target;
 /// count the data they carry.
 fn check(p: u32, bytes: &[u8]) {
     if let Ok(req) = Request::read(p, bytes) {
-        assert_eq!(req.to_args(), bytes);
+        assert_eq!(req.to_args().unwrap(), bytes);
         if let Request::Write { count, data, .. } = &req {
             assert_eq!(*count as usize, data.len());
         }
     }
     if let Ok(resp) = Response::parse(p, bytes) {
-        assert_eq!(resp.to_results(), bytes);
+        assert_eq!(resp.to_results().unwrap(), bytes);
         if let Response::Read(Ok(ok)) = &resp {
             assert_eq!(ok.count as usize, ok.data.len());
         }
     }
     if let Ok(req) = MountRequest::read(p, bytes) {
-        assert_eq!(req.to_args(), bytes);
+        assert_eq!(req.to_args().unwrap(), bytes);
     }
     if let Ok(resp) = MountResponse::parse(p, bytes) {
-        assert_eq!(resp.to_results(), bytes);
+        assert_eq!(resp.to_results().unwrap(), bytes);
     }
 }
 
@@ -43,20 +44,22 @@ fuzz_target!(|data: &[u8]| {
         check(u32::from(p % 24), rest);
     }
 
-    // A handle and a name made from the bytes, of any length and any
-    // bytes, write back as themselves or, past their limits, as nothing:
-    // never as another handle or name.
-    let split = data.first().map_or(0, |&n| usize::from(n) % (MAX_FH + 8)).min(data.len());
+    // Handles and names must fit their protocol limits.
+    let split = data
+        .first()
+        .map_or(0, |&n| usize::from(n) % (MAX_FH + 8))
+        .min(data.len());
     let (handle, name) = data.split_at(split);
-    let op = DirOp { dir: FileHandle(handle.to_vec()), name: name.to_vec() };
-    let Ok(Request::Remove(back)) = Request::read(procedure::REMOVE, &Request::Remove(op.clone()).to_args()) else {
-        panic!("a REMOVE that does not read back")
-    };
-    assert!(back.dir == op.dir || (back.dir.0.is_empty() && op.dir.0.len() > MAX_FH));
-    assert!(back.name == op.name || (back.name.is_empty() && op.name.len() > MAX_NAME));
+    let request = Request::Remove(DirOp {
+        dir: FileHandle(handle.to_vec()),
+        name: name.to_vec(),
+    });
+    match request.to_args() {
+        Ok(bytes) => assert_eq!(Request::read(procedure::REMOVE, &bytes), Ok(request)),
+        Err(_) => assert!(handle.len() > MAX_FH || name.len() > MAX_NAME),
+    }
 
-    // The bytes as a TCP stream of calls, split two ways: all at once,
-    // and a byte at a time.
+    // The bytes as a TCP stream of calls, across the contract partitions.
     let limit = 1 << 16;
     contract::check_decode(|| onc_rpc::Fragments::with_limit(limit), data);
     contract::check_decode(|| onc_rpc::records(limit), data);
@@ -74,38 +77,44 @@ fuzz_target!(|data: &[u8]| {
     // NFS arguments need a procedure; Wire belongs to the RPC envelope.
     contract::check_wire::<Message>(data);
     contract::check_wire::<onc_rpc::Record>(data);
-    let mut whole = Decoder::with_limit(limit);
-    whole.feed(data);
-    let mut records = Vec::new();
-    while let Some(Ok(r)) = whole.next_record() {
-        records.push(r);
-    }
-    let mut bytewise = Decoder::with_limit(limit);
-    let mut again = Vec::new();
-    for b in data {
-        bytewise.feed(std::slice::from_ref(b));
-        while let Some(Ok(r)) = bytewise.next_record() {
-            again.push(r);
-        }
-    }
-    assert_eq!(records, again);
+    let (records, _) = decode_all(|| onc_rpc::records(limit), data);
 
     // Each record, and the bytes on their own as a UDP datagram.
-    for bytes in records.iter().map(Vec::as_slice).chain([data]) {
+    for bytes in records
+        .iter()
+        .map(|record| match record {
+            Assembled::Message(bytes) => bytes.as_slice(),
+            Assembled::Whole(never) => match *never {},
+        })
+        .chain([data])
+    {
         contract::check_wire::<Message>(bytes);
-        let Ok(Message { xid, body: Body::Call(call) }) = Message::parse(bytes) else { continue };
+        let Ok(Message {
+            xid,
+            body: Body::Call(call),
+        }) = <Message as Wire>::parse(bytes)
+        else {
+            continue;
+        };
         // A request read makes the same call again.
         if let Ok(req) = Request::parse(&call) {
-            assert_eq!(req.to_args(), call.args);
-            let Body::Call(c) = req.call(xid).body else { unreachable!() };
+            assert_eq!(req.to_args().unwrap(), call.args);
+            let Body::Call(c) = req.call(xid).unwrap().body else {
+                unreachable!()
+            };
             assert_eq!(Request::parse(&c), Ok(req.clone()));
             // A failure for it reads back.
             let failed = Response::failed(&req, NfsError::Io);
-            assert_eq!(Response::parse(req.procedure(), &failed.to_results()), Ok(failed));
+            assert_eq!(
+                Response::parse(req.procedure(), &failed.to_results().unwrap()),
+                Ok(failed)
+            );
         }
         if let Ok(req) = MountRequest::parse(&call) {
-            assert_eq!(req.to_args(), call.args);
-            let Body::Call(c) = req.call(xid).body else { unreachable!() };
+            assert_eq!(req.to_args().unwrap(), call.args);
+            let Body::Call(c) = req.call(xid).unwrap().body else {
+                unreachable!()
+            };
             assert_eq!(MountRequest::parse(&c), Ok(req));
         }
     }

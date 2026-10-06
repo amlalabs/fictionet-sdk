@@ -8,6 +8,38 @@ use onc_rpc::{Accept, Body, Message, Reply};
 
 const RECORD_LIMIT: usize = 4096;
 
+#[test]
+fn authentication_composes_with_xdr_and_refuses_changed_values() {
+    for auth in [
+        onc_rpc::Auth::None,
+        onc_rpc::Auth::Other {
+            flavor: 9,
+            body: vec![1, 2, 3],
+        },
+    ] {
+        let mut writer = onc_rpc::Writer::new();
+        writer.uint(42);
+        auth.write(&mut writer);
+        writer.uint(7);
+        let bytes = writer.finish().unwrap();
+        let mut reader = onc_rpc::Reader::new(&bytes);
+        assert_eq!(reader.uint(), Ok(42));
+        assert_eq!(onc_rpc::Auth::read(&mut reader), Ok(auth));
+        assert_eq!(reader.uint(), Ok(7));
+        assert_eq!(reader.finish(), Ok(()));
+    }
+    let mut writer = onc_rpc::Writer::new();
+    writer.uint(42);
+    let prefix = writer.as_bytes().to_vec();
+    onc_rpc::Auth::Other {
+        flavor: onc_rpc::flavor::NONE,
+        body: Vec::new(),
+    }
+    .write(&mut writer);
+    assert_eq!(writer.as_bytes(), prefix);
+    assert_eq!(writer.finish(), Err(onc_rpc::XdrError::Unwritable));
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum Request {
     Nfs(nfs::Request),
@@ -41,8 +73,10 @@ fn request_stream() -> impl Decode<
 
 #[test]
 fn tcp_requests_and_replies() -> Result<(), Box<dyn core::error::Error>> {
-    let lookup =
-        nfs::Request::Lookup(nfs::DirOp { dir: nfs::FileHandle(vec![1, 2, 3]), name: b"notes.txt".to_vec() });
+    let lookup = nfs::Request::Lookup(nfs::DirOp {
+        dir: nfs::FileHandle(vec![1, 2, 3]),
+        name: b"notes.txt".to_vec(),
+    });
     let pmap = portmap::Request::Pmap(portmap::PmapRequest::GetPort(portmap::Mapping {
         program: nfs::NFS_PROGRAM,
         version: nfs::NFS_VERSION,
@@ -59,13 +93,13 @@ fn tcp_requests_and_replies() -> Result<(), Box<dyn core::error::Error>> {
             owner: String::new(),
         }),
     };
-    let calls = [lookup.call(101), pmap.call(102)?, rpcb.call(103)?];
+    let calls = [lookup.call(101)?, pmap.call(102)?, rpcb.call(103)?];
     let mut tcp = Vec::new();
     for (call, fragment_len) in calls.iter().zip([1, 7, 13]) {
         let payload = <Message as Wire>::to_bytes(call)?;
         // Empty nonfinal fragments are legal even before nonempty data.
         tcp.extend_from_slice(&0u32.to_be_bytes());
-        tcp.extend(onc_rpc::encode_fragments(&payload, fragment_len));
+        tcp.extend(onc_rpc::encode_fragments(&payload, fragment_len)?);
     }
     contract::check_decode(request_stream, &tcp);
     contract::check_decode_with_held_limit(|| onc_rpc::records(RECORD_LIMIT), &tcp, RECORD_LIMIT);
@@ -98,10 +132,17 @@ fn tcp_requests_and_replies() -> Result<(), Box<dyn core::error::Error>> {
         }
         finish(&mut stream, |r| requests.push(r))?;
         let requests = requests.into_iter().collect::<Result<Vec<_>, _>>()?;
-        assert_eq!(requests.iter().map(|(m, _)| m).collect::<Vec<_>>(), calls.iter().collect::<Vec<_>>());
+        assert_eq!(
+            requests.iter().map(|(m, _)| m).collect::<Vec<_>>(),
+            calls.iter().collect::<Vec<_>>()
+        );
         assert_eq!(
             requests.iter().map(|(_, r)| r).collect::<Vec<_>>(),
-            [&Request::Nfs(lookup.clone()), &Request::Portmap(pmap.clone()), &Request::Portmap(rpcb.clone())]
+            [
+                &Request::Nfs(lookup.clone()),
+                &Request::Portmap(pmap.clone()),
+                &Request::Portmap(rpcb.clone())
+            ]
         );
 
         let lookup_result = nfs::Response::Lookup(Ok(nfs::LookupOk {
@@ -112,7 +153,7 @@ fn tcp_requests_and_replies() -> Result<(), Box<dyn core::error::Error>> {
         let mut replies = Vec::new();
         for (message, request) in requests {
             let reply = match request {
-                Request::Nfs(_) => lookup_result.reply(),
+                Request::Nfs(_) => lookup_result.reply()?,
                 Request::Portmap(portmap::Request::Pmap(_)) => {
                     Reply::success(portmap::PmapResult::Port(u32::from(nfs::PORT)).to_bytes()?)
                 }
@@ -136,15 +177,24 @@ fn tcp_requests_and_replies() -> Result<(), Box<dyn core::error::Error>> {
         assert_eq!(parsed_replies.len(), calls.len());
         for reply in parsed_replies {
             let Message { xid, body } = reply?;
-            let Body::Reply(Reply::Accepted { status: Accept::Success(results), .. }) = body else {
+            let Body::Reply(Reply::Accepted {
+                status: Accept::Success(results),
+                ..
+            }) = body
+            else {
                 panic!("expected a successful RPC reply");
             };
             // A client's outstanding calls supply the response procedure.
             let call = calls.iter().find(|call| call.xid == xid).unwrap();
-            let Body::Call(call) = &call.body else { panic!("expected a call") };
+            let Body::Call(call) = &call.body else {
+                panic!("expected a call")
+            };
             match call.program {
                 nfs::NFS_PROGRAM => {
-                    assert_eq!(nfs::Response::parse(call.procedure, &results), Ok(lookup_result.clone()))
+                    assert_eq!(
+                        nfs::Response::parse(call.procedure, &results),
+                        Ok(lookup_result.clone())
+                    )
                 }
                 _ if call.version == 2 => assert_eq!(
                     portmap::PmapResult::parse(call.procedure, &results),
@@ -162,16 +212,27 @@ fn tcp_requests_and_replies() -> Result<(), Box<dyn core::error::Error>> {
 
 #[test]
 fn bad_rpc_record_does_not_hide_the_next_request() -> Result<(), Box<dyn core::error::Error>> {
-    let good = nfs::Request::Null.call(7);
-    let mut tcp = onc_rpc::encode_record(&[0, 1, 2]);
-    tcp.extend(onc_rpc::encode_fragments(&<Message as Wire>::to_bytes(&good)?, 1));
+    let good = nfs::Request::Null.call(7)?;
+    let mut tcp = onc_rpc::Record(vec![0, 1, 2]).to_bytes()?;
+    tcp.extend(onc_rpc::encode_fragments(
+        &<Message as Wire>::to_bytes(&good)?,
+        1,
+    )?);
     let mut stream = Stream::new(request_stream());
     let mut items = Vec::new();
     for byte in &tcp {
-        pump(&mut stream, core::slice::from_ref(byte), |item| items.push(item))?;
+        pump(&mut stream, core::slice::from_ref(byte), |item| {
+            items.push(item)
+        })?;
     }
     finish(&mut stream, |item| items.push(item))?;
-    assert_eq!(items, [Err(onc_rpc::XdrError::Short), Ok((good, Request::Nfs(nfs::Request::Null)))]);
+    assert_eq!(
+        items,
+        [
+            Err(onc_rpc::XdrError::Short),
+            Ok((good, Request::Nfs(nfs::Request::Null)))
+        ]
+    );
     assert!(stream.failed().is_none());
 
     // The assembler itself accepts an empty record; RPC parsing refuses it.

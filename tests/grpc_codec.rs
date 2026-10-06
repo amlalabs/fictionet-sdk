@@ -1,7 +1,7 @@
 use fictionet::stdlib::codec::{
-    Carry, Decode, Demux, Fail, Layered, Pipe, PipeError, Step, Stream, contract, finish, pump,
+    Carry, Decode, Demux, Fail, Layered, Pipe, PipeError, Step, Wire, contract, test_support,
 };
-use fictionet::stdlib::grpc::{FrameError, HEADER_LEN, Message, Messages};
+use fictionet::stdlib::grpc::{Code, FrameError, HEADER_LEN, Message, Messages, fail_status};
 use std::collections::BTreeMap;
 
 const MESSAGE_LIMIT: usize = 8;
@@ -13,6 +13,16 @@ const H2_HEADER_LEN: usize = 9;
 type Key = (u8, u32);
 type Calls = Demux<Key, Messages>;
 type Results = BTreeMap<Key, Vec<Result<Message, Fail<FrameError>>>>;
+
+#[test]
+fn partial_message_prefix_ends_the_call_with_internal() {
+    for prefix in 1..HEADER_LEN {
+        let (_, failure) = test_support::decode_all(Messages::new, &vec![0; prefix]);
+        let failure = failure.unwrap();
+        assert_eq!(failure, Fail::Truncated { unread: prefix });
+        assert_eq!(fail_status(&failure).code, Code::Internal);
+    }
+}
 
 // Payloads already extracted by HTTP/2, as in design section 5.3.
 // No padding is included. Each direction has its own stream ID space.
@@ -102,7 +112,7 @@ fn route(chunk_size: usize) {
     let mut saw_backpressure = false;
     for frame in frames() {
         assert!(frame.payload.len() <= MAX_DATA);
-        for chunk in frame.payload.chunks(chunk_size) {
+        for chunk in fictionet::stdlib::codec::test_support::chunks(frame.payload, &[chunk_size]) {
             let mut rest = chunk;
             while !rest.is_empty() {
                 let n = calls.push(&frame.key, rest);
@@ -120,7 +130,7 @@ fn route(chunk_size: usize) {
                 stream.failed(),
                 Some(&Fail::Protocol(FrameError::TooLarge {
                     length: 9,
-                    limit: MESSAGE_LIMIT,
+                    limit: MESSAGE_LIMIT
                 }))
             );
             assert_eq!(stream.buffered(), HEADER_LEN);
@@ -180,18 +190,16 @@ fn route(chunk_size: usize) {
 
     for (key, items) in &results {
         for message in items.iter().flatten() {
-            // The existing writer round-trips through the new decoder bytewise.
+            // The writer round-trips through the decoder bytewise.
             let bytes = message.to_bytes().unwrap();
-            let mut stream = Stream::new(Messages::with_limit(MESSAGE_LIMIT));
-            let mut decoded = Vec::new();
-            for byte in &bytes {
-                assert_eq!(
-                    pump(&mut stream, core::slice::from_ref(byte), |m| decoded
-                        .push(m)),
-                    Ok(1)
-                );
-            }
-            finish(&mut stream, |m| decoded.push(m)).unwrap();
+            contract::check_decode_with_alloc_limit(
+                || Messages::with_limit(MESSAGE_LIMIT),
+                &bytes,
+                2 * (HEADER_LEN + MESSAGE_LIMIT),
+            );
+            let (decoded, failure) =
+                test_support::decode_all(|| Messages::with_limit(MESSAGE_LIMIT), &bytes);
+            assert_eq!(failure, None);
             assert_eq!(decoded, std::slice::from_ref(message));
         }
         assert!(calls.remove(key).is_some());
@@ -325,37 +333,15 @@ fn pipe_carries_http2_data_across_frames_and_checks_inner_eof() {
     ];
     for (bytes, expected, failure) in cases {
         contract::check_stack(make, &bytes);
-        for chunk_size in [MAX_DATA, 1] {
-            let mut stream = Stream::new(make());
-            let mut items = Vec::new();
-            let mut failed = None;
-            for chunk in bytes.chunks(chunk_size) {
-                match pump(&mut stream, chunk, |item| items.push(item)) {
-                    Ok(n) => assert_eq!(n, chunk.len()),
-                    Err(e) => {
-                        failed = Some(e);
-                        break;
-                    }
-                }
-            }
-            if failed.is_none() {
-                failed = finish(&mut stream, |item| items.push(item)).err();
-            }
-            assert_eq!(
-                items,
-                expected
-                    .iter()
-                    .cloned()
-                    .map(Layered::Inner)
-                    .collect::<Vec<_>>()
-            );
-            assert_eq!(
-                failed,
-                failure.clone().map(|e| Fail::Protocol(PipeError::Inner(e)))
-            );
-            assert_eq!(stream.failed(), failed.as_ref());
-            assert!(stream.is_done());
-            assert_eq!(stream.next(), None);
-        }
+        let (items, failed) = test_support::decode_all(make, &bytes);
+        assert_eq!(
+            items,
+            expected
+                .iter()
+                .cloned()
+                .map(Layered::Inner)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(failed, failure.map(|e| Fail::Protocol(PipeError::Inner(e))));
     }
 }

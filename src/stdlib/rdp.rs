@@ -31,6 +31,7 @@
 //! 2.2.8 and 4.1](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/).
 //!
 //! ```
+//! use fictionet::stdlib::codec::Wire;
 //! use fictionet::stdlib::rdp::{Connection, Decoder, Frame, Negotiation, Protocols};
 //!
 //! // MS-RDPBCGR connection request: TLS and CredSSP are supported.
@@ -622,14 +623,15 @@ pub fn read_data(packet: &tpkt::Packet) -> Result<Vec<u8>, Error> {
 }
 
 /// Wraps at most [`MAX_PDU`] bytes in an unsegmented COTP Data TPDU and TPKT.
-/// Checks size first because the sibling COTP writer can truncate large data.
+/// Both COTP and TPKT writers enforce their size limits.
 pub fn write_data(data: &[u8]) -> Result<tpkt::Packet, Error> {
     bound(data.len(), MAX_PDU, "RDP data")?;
-    Ok(cotp::over_tpkt::from_tpdu(&cotp::Tpdu::Data(cotp::Data {
+    cotp::over_tpkt::from_tpdu(&cotp::Tpdu::Data(cotp::Data {
         eot: true,
         number: 0,
         data: data.to_vec(),
-    })))
+    }))
+    .map_err(|_| Error::Limit("RDP data"))
 }
 
 /// Requested protocol bits, or one selected protocol. Unknown bits survive.
@@ -891,14 +893,14 @@ impl Connection {
         let c = cotp::Connect {
             dst_ref: self.destination,
             src_ref: self.source,
-            variable: cotp::Variable::Raw(w.b),
+            variable: cotp::Variable::parse(&w.b),
             ..cotp::Connect::default()
         };
         let t = match self.kind {
             ConnectionKind::Request => cotp::Tpdu::ConnectionRequest(c),
             ConnectionKind::Confirm => cotp::Tpdu::ConnectionConfirm(c),
         };
-        Ok(cotp::over_tpkt::from_tpdu(&t))
+        cotp::over_tpkt::from_tpdu(&t).map_err(|_| Error::Invalid("RDP connection TPDU"))
     }
 }
 

@@ -4,37 +4,9 @@
 
 use arbitrary::{Result, Unstructured};
 use fictionet::stdlib::codec::contract::{check_decode, check_wire, check_wire_value};
-use fictionet::stdlib::modbus::{
-    Decoder, Exception, Frame, FrameError, Frames, MAX_BUFFERED, MAX_PDU, Request, Response, function,
-};
+use fictionet::stdlib::codec::{Wire, test_support::decode_all};
+use fictionet::stdlib::modbus::{Exception, Frame, Frames, MAX_PDU, Request, Response, function};
 use libfuzzer_sys::fuzz_target;
-
-/// Feeds `data` in chunks, taking frames out after each feed, as a world
-/// does. Every frame, then the error that broke the stream, if one did.
-fn split(data: &[u8], bytewise: bool) -> (Vec<Frame>, Option<FrameError>) {
-    let mut decoder = Decoder::new();
-    let mut frames = Vec::new();
-    let chunks: Vec<&[u8]> = if bytewise { data.chunks(1).collect() } else { vec![data] };
-    for chunk in chunks {
-        let mut rest = chunk;
-        while !rest.is_empty() {
-            let took = decoder.feed(rest);
-            assert!(decoder.buffered() <= MAX_BUFFERED);
-            rest = &rest[took..];
-            let mut progress = took > 0;
-            while let Some(r) = decoder.next_frame() {
-                match r {
-                    Ok(f) => frames.push(f),
-                    Err(e) => return (frames, Some(e)),
-                }
-                progress = true;
-            }
-            // A full decoder always gives a frame or an error.
-            assert!(progress);
-        }
-    }
-    (frames, None)
-}
 
 /// A PDU read as a request and as a response. Whatever reads is written
 /// back, and reads back the same.
@@ -62,9 +34,18 @@ fn request(u: &mut Unstructured) -> Result<Request> {
         3 => Request::ReadInputRegisters { address, quantity: n as u16 },
         4 => Request::WriteSingleCoil { address, value: u.arbitrary()? },
         5 => Request::WriteSingleRegister { address, value: u.arbitrary()? },
-        6 => Request::WriteMultipleCoils { address, values: (0..n).map(|_| u.arbitrary()).collect::<Result<_>>()? },
-        7 => Request::WriteMultipleRegisters { address, values: (0..n).map(|_| u.arbitrary()).collect::<Result<_>>()? },
-        _ => Request::Other { function: u.arbitrary()?, data: (0..n).map(|_| u.arbitrary()).collect::<Result<_>>()? },
+        6 => Request::WriteMultipleCoils {
+            address,
+            values: (0..n).map(|_| u.arbitrary()).collect::<Result<_>>()?,
+        },
+        7 => Request::WriteMultipleRegisters {
+            address,
+            values: (0..n).map(|_| u.arbitrary()).collect::<Result<_>>()?,
+        },
+        _ => Request::Other {
+            function: u.arbitrary()?,
+            data: (0..n).map(|_| u.arbitrary()).collect::<Result<_>>()?,
+        },
     })
 }
 
@@ -111,7 +92,7 @@ fn built(data: &[u8]) -> Result<()> {
     let frame = Frame { transaction: u.arbitrary()?, unit: u.arbitrary()?, pdu: u.bytes(n)?.to_vec() };
     check_wire_value(&frame);
     if let Ok(bytes) = frame.to_bytes() {
-        assert_eq!(Frame::parse(&bytes), Ok(Some((frame, bytes.len()))));
+        assert_eq!(<Frame as Wire>::parse(&bytes), Ok(frame));
     }
     Ok(())
 }
@@ -120,19 +101,10 @@ fuzz_target!(|data: &[u8]| {
     check_decode(|| Frames, data);
     check_wire::<Frame>(data);
 
-    // The stream, split two ways: all at once, and a byte at a time. Both
-    // give the same frames and the same error.
-    let (frames, err) = split(data, false);
-    assert_eq!(split(data, true), (frames.clone(), err));
-
-    for f in &frames {
-        // A frame read can be written, and reads back the same.
-        let bytes = f.to_bytes().unwrap();
-        check_wire::<Frame>(&bytes);
-        let (back, used) = Frame::parse(&bytes).unwrap().unwrap();
-        assert_eq!(&back, f);
-        assert_eq!(used, bytes.len());
-        pdu(&f.pdu);
+    let (frames, _) = decode_all(|| Frames, data);
+    for frame in frames {
+        check_wire_value(&frame);
+        pdu(&frame.pdu);
     }
     // Any bytes as a PDU on their own, including ones longer than a frame
     // holds.

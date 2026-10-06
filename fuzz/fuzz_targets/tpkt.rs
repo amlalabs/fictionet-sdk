@@ -1,49 +1,17 @@
 //! TPKT packets, as a world on port 102 or 3389 reads them, and packets a
 //! world builds, as it writes them.
 #![no_main]
-#![allow(deprecated)] // Also exercise the legacy decoder and COTP conversions.
 
 use arbitrary::{Result, Unstructured};
 use fictionet::stdlib::codec::contract::{check_decode, check_wire, check_wire_value};
-use fictionet::stdlib::cotp::{Connect, Data, Parameter, Reassembler, Tpdu, Variable};
+use fictionet::stdlib::codec::{Assembled, Wire, test_support::decode_all};
+use fictionet::stdlib::cotp::{Connect, Data, Parameter, Tpdu, Variable};
+use fictionet::stdlib::cotp::{messages, over_tpkt};
 use fictionet::stdlib::tpkt::{
-    Decoder, EncodeError, HEADER_LEN, Header, MAX_BUFFERED, MAX_PACKET, MAX_PAYLOAD,
-    MIN_PACKET, MIN_PAYLOAD, Packet, Packets, TpktError, write_message,
+    EncodeError, HEADER_LEN, Header, MAX_PACKET, MAX_PAYLOAD, MIN_PACKET, MIN_PAYLOAD, Packet,
+    Packets,
 };
 use libfuzzer_sys::fuzz_target;
-
-/// Feeds `data` in chunks to a decoder with `limit`, taking packets out
-/// after each feed, as a world does. Every packet, then the error that
-/// broke the stream, if one did.
-fn split(data: &[u8], limit: usize, bytewise: bool) -> (Vec<Packet>, Option<TpktError>) {
-    let mut decoder = Decoder::with_limit(limit);
-    let mut packets = Vec::new();
-    let chunks: Vec<&[u8]> = if bytewise {
-        data.chunks(1).collect()
-    } else {
-        vec![data]
-    };
-    for chunk in chunks {
-        let mut rest = chunk;
-        while !rest.is_empty() {
-            let took = decoder.feed(rest);
-            assert!(decoder.buffered() <= decoder.limit());
-            assert!(decoder.buffered() <= MAX_BUFFERED);
-            rest = &rest[took..];
-            let mut progress = took > 0;
-            while let Some(r) = decoder.next_packet() {
-                match r {
-                    Ok(p) => packets.push(p),
-                    Err(e) => return (packets, Some(e)),
-                }
-                progress = true;
-            }
-            // A full decoder always gives a packet or an error.
-            assert!(progress);
-        }
-    }
-    (packets, None)
-}
 
 /// Values a world builds: whatever a writer accepts reads back the same.
 fn built(data: &[u8]) -> Result<()> {
@@ -54,7 +22,7 @@ fn built(data: &[u8]) -> Result<()> {
         length: u.arbitrary()?,
     };
     match header.to_bytes() {
-        Ok(bytes) => assert_eq!(Header::parse(&bytes, MAX_PACKET), Ok(Some(header))),
+        Ok(bytes) => assert_eq!(<Header as Wire>::parse(&bytes), Ok(header)),
         Err(e) => {
             assert!(usize::from(header.length) < MIN_PACKET);
             assert_eq!(e, EncodeError::TooShort(header.payload_len()));
@@ -67,7 +35,7 @@ fn built(data: &[u8]) -> Result<()> {
     };
     check_wire_value(&packet);
     match packet.to_bytes() {
-        Ok(bytes) => assert_eq!(Packet::parse(&bytes), Ok(Some((packet, bytes.len())))),
+        Ok(bytes) => assert_eq!(<Packet as Wire>::parse(&bytes), Ok(packet)),
         Err(e) => assert_eq!(e, EncodeError::TooShort(n)),
     }
     // A data TPDU a world builds, up to and past what one packet holds: the
@@ -83,14 +51,17 @@ fn built(data: &[u8]) -> Result<()> {
     });
     check_wire_value(&data);
     let fits = n <= MAX_PAYLOAD - 3 && number < 0x80;
-    match Packet::try_from_tpdu(&data) {
+    match over_tpkt::from_tpdu(&data) {
         Ok(p) => {
             assert!(fits);
-            assert_eq!(p.tpdu(), Ok(data));
+            assert_eq!(over_tpkt::tpdu(&p), Ok(data));
         }
         Err(e) => {
             assert!(!fits);
-            assert_eq!(e, EncodeError::Unrepresentable);
+            assert_eq!(
+                e,
+                over_tpkt::EncodeError::Tpdu(fictionet::stdlib::cotp::EncodeError::Unwritable)
+            );
         }
     }
     // A connection request a world builds, with any fields, parameters,
@@ -122,67 +93,48 @@ fn built(data: &[u8]) -> Result<()> {
     };
     let t = Tpdu::ConnectionRequest(connect.clone());
     check_wire_value(&t);
-    if let Ok(p) = Packet::try_from_tpdu(&t) {
+    if let Ok(p) = over_tpkt::from_tpdu(&t) {
         assert!(connect.credit < 16 && connect.class < 16 && connect.options < 16);
         if let Variable::Raw(b) = &connect.variable {
             connect.variable = Variable::parse(b);
         }
-        assert_eq!(p.tpdu(), Ok(Tpdu::ConnectionRequest(connect)));
+        assert_eq!(over_tpkt::tpdu(&p), Ok(Tpdu::ConnectionRequest(connect)));
         assert!(p.to_bytes().is_ok());
     }
     // A message cut into data TPDUs reads back whole.
     let tpdu_size = u.int_in_range(0..=MAX_PACKET)?;
     let n = u.int_in_range(0..=4000usize)?;
     let message = u.bytes(n)?;
-    let bytes = write_message(message, tpdu_size).unwrap();
-    let (packets, err) = split(&bytes, MAX_PACKET, false);
-    assert_eq!(err, None);
-    let mut reassembler = Reassembler::new();
-    let mut whole = None;
-    for p in &packets {
-        let Ok(Tpdu::Data(d)) = p.tpdu() else {
-            panic!("not a data TPDU")
-        };
-        if let Some(m) = reassembler.push(&d).unwrap() {
-            assert!(whole.is_none());
-            whole = Some(m);
-        }
-    }
-    assert_eq!(whole.as_deref(), Some(message));
+    let bytes = over_tpkt::write_message(message, tpdu_size).unwrap();
+    let (got, failure) = decode_all(|| messages(MAX_PACKET, 4000), &bytes);
+    assert_eq!(failure, None);
+    assert_eq!(got, [Assembled::Message(message.to_vec())]);
     Ok(())
 }
 
 fuzz_target!(|data: &[u8]| {
     check_wire::<Packet>(data);
+    check_wire::<Header>(data);
     // The size limit comes from the first two bytes.
     let limit = match data {
         [a, b, ..] => usize::from(u16::from_be_bytes([*a, *b])),
         _ => MAX_PACKET,
     };
-    // The stream, split two ways: all at once, and a byte at a time. Both
-    // give the same packets and the same error.
     for limit in [MAX_PACKET, limit] {
         check_decode(|| Packets::with_limit(limit), data);
-        let (packets, err) = split(data, limit, false);
-        assert_eq!(split(data, limit, true), (packets.clone(), err));
-        for p in &packets {
-            assert!(p.payload.len() >= MIN_PAYLOAD && p.payload.len() <= MAX_PAYLOAD);
-            assert!(p.payload.len() + HEADER_LEN <= limit.max(HEADER_LEN + MIN_PAYLOAD));
-            // A packet read can be written, and reads back the same.
-            let bytes = p.to_bytes().unwrap();
-            check_wire::<Packet>(&bytes);
-            check_wire::<Tpdu>(&p.payload);
-            assert_eq!(Packet::parse(&bytes), Ok(Some((p.clone(), bytes.len()))));
-            // A TPDU read is written back whole, into a packet that reads
-            // back as the same TPDU.
-            if let Ok(t) = p.tpdu() {
-                let back = Packet::try_from_tpdu(&t).unwrap();
-                assert!(back.to_bytes().is_ok());
-                assert_eq!(back.tpdu(), Ok(t.clone()));
-                assert_eq!(Packet::from_tpdu(&t), back);
+        let (packets, _) = decode_all(|| Packets::with_limit(limit), data);
+        for packet in packets {
+            assert!(packet.payload.len() + HEADER_LEN <= Packets::with_limit(limit).limit());
+            assert!((MIN_PAYLOAD..=MAX_PAYLOAD).contains(&packet.payload.len()));
+            check_wire_value(&packet);
+            check_wire::<Tpdu>(&packet.payload);
+            if let Ok(tpdu) = over_tpkt::tpdu(&packet) {
+                assert_eq!(
+                    over_tpkt::tpdu(&over_tpkt::from_tpdu(&tpdu).unwrap()),
+                    Ok(tpdu)
+                );
             }
         }
     }
-    let _ = Packet::parse(data);
     let _ = built(data);
 });
