@@ -251,10 +251,18 @@ dependencies = [
 name = "fictionet-copy-modules"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "fictionet",
+ "h2",
  "hickory-proto",
+ "http",
+ "http-body",
+ "http-body-util",
  "httparse",
+ "hyper",
  "ring",
+ "rustls",
+ "tower-service",
 ]
 
 [[package]]

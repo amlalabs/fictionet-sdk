@@ -66,6 +66,8 @@ macro_rules! protocols {
         pub mod grpc;
         #[path = "../../src/stdlib/hpack.rs"]
         pub mod hpack;
+        #[path = "../../src/stdlib/httpd.rs"]
+        pub mod httpd;
         #[path = "../../src/stdlib/huffman.rs"]
         pub mod huffman;
         #[path = "../../src/stdlib/http1.rs"]
@@ -88,6 +90,8 @@ macro_rules! protocols {
         pub mod ipp;
         #[path = "../../src/stdlib/ipsec.rs"]
         pub mod ipsec;
+        #[path = "../../src/stdlib/journal.rs"]
+        pub mod journal;
         #[path = "../../src/stdlib/json.rs"]
         pub mod json;
         #[path = "../../src/stdlib/json_schema.rs"]
@@ -122,6 +126,8 @@ macro_rules! protocols {
         pub mod nbns;
         #[path = "../../src/stdlib/nbss.rs"]
         pub mod nbss;
+        #[path = "../../src/stdlib/net.rs"]
+        pub mod net;
         #[path = "../../src/stdlib/nfs.rs"]
         pub mod nfs;
         #[path = "../../src/stdlib/ntlmssp.rs"]
@@ -176,8 +182,12 @@ macro_rules! protocols {
         pub mod rtsp;
         #[path = "../../src/stdlib/sbe.rs"]
         pub mod sbe;
+        #[path = "../../src/stdlib/scenario.rs"]
+        pub mod scenario;
         #[path = "../../src/stdlib/sdp.rs"]
         pub mod sdp;
+        #[path = "../../src/stdlib/serve.rs"]
+        pub mod serve;
         #[path = "../../src/stdlib/sftp.rs"]
         pub mod sftp;
         #[path = "../../src/stdlib/sip.rs"]

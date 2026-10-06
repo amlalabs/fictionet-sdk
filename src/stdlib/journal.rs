@@ -256,7 +256,6 @@ impl Sandbox {
 /// Where an event came from: the connection and the sandbox behind it.
 /// Every field is optional, since some events belong to no connection.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-#[non_exhaustive]
 pub struct ConnInfo {
     /// The connection's number, from whoever accepted it. [`Net`]
     /// numbers its connections from 1, on every port.
