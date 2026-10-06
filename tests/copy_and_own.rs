@@ -143,6 +143,8 @@ macro_rules! protocols {
         pub mod rtp;
         #[path = "../src/stdlib/rtsp.rs"]
         pub mod rtsp;
+        #[path = "../src/stdlib/sbe.rs"]
+        pub mod sbe;
         #[path = "../src/stdlib/sdp.rs"]
         pub mod sdp;
         #[path = "../src/stdlib/sftp.rs"]
