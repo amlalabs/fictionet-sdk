@@ -2,10 +2,33 @@
 //! world playing a camera reads them.
 #![no_main]
 
+use fictionet::stdlib::codec::{Wire, contract};
+use fictionet::stdlib::rtsp::Frames;
 use fictionet::stdlib::rtsp::{Decoder, Error, Item, Message, Range, Session, Transport};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode(Frames::new, data);
+    contract::check_decode_with_held_limit(Frames::new, data, 0);
+    contract::check_wire::<Message>(data);
+    contract::check_wire::<Item>(data);
+    contract::check_wire::<fictionet::stdlib::rtsp::Interleaved>(data);
+    let frame = fictionet::stdlib::rtsp::Interleaved {
+        channel: data.first().copied().unwrap_or(0),
+        data: data.get(..fictionet::stdlib::rtsp::MAX_INTERLEAVED + 1).unwrap_or(data).to_vec(),
+    };
+    contract::check_wire_value(&frame);
+    let mut message = Message::response(fictionet::stdlib::rtsp::Version::Rtsp20, 200, "OK");
+    message.body = data.get(..fictionet::stdlib::rtsp::MAX_BODY + 1).unwrap_or(data).to_vec();
+    message.push_header("Content-Length", &message.body.len().to_string());
+    contract::check_wire_value(&message);
+    if let Ok(bytes) = Wire::to_bytes(&message) {
+        contract::check_wire::<Message>(&bytes);
+        contract::check_decode(Frames::new, &bytes);
+    }
+    message.push_header("X", " leading");
+    contract::check_wire_value(&message);
+
     // The stream, split two ways: all at once, and a byte at a time.
     let mut whole = Decoder::new();
     whole.feed(data);
@@ -77,6 +100,7 @@ fn drain(d: &mut Decoder) -> Vec<Result<Item, Error>> {
 /// An item read can be written, unless a message was near a size limit,
 /// and reads back the same. So do the header values in a message.
 fn round_trip(item: &Item) {
+    contract::check_wire_value(item);
     let bytes = match item.to_bytes() {
         Ok(b) => b,
         Err(e) => {

@@ -27,6 +27,33 @@
 //! would. Writers check what they write and return an error instead of
 //! bytes that would not read back.
 //!
+//! New stacks use [`Frames`] with [`super::codec::Stream`]. [`Message`] implements
+//! [`Wire`] for exact stream parsing and strict, transactional writing.
+//! Wire writing preserves every field; the inherent `to_bytes` still
+//! rewrites Content-Length and trims values. The old [`Decoder`] stays
+//! separate to preserve its feed, buffering, and repeating-error behavior.
+//!
+//! RTSP 1.0 accepts CRLF and bare LF. RTSP 2.0 requires CRLF. Empty CRLF
+//! and LF keep-alive lines are skipped between units in either version.
+//! Writers always emit CRLF. Lines exclude their endings and are bounded
+//! by [`MAX_LINE`]. The whole head, including endings, is bounded by
+//! [`MAX_HEAD`]; the header count by [`MAX_HEADERS`]; bodies by [`MAX_BODY`].
+//! Interleaved `$` frames are separate [`Item`]s, with [`MAX_INTERLEAVED`]
+//! payload bytes and a four-byte header.
+//!
+//! Content-Length selects exactly that many body bytes. Without it, there
+//! is no body. RTSP 1.0 status 1xx, 204, and 304 ignore Content-Length and
+//! have no body. RTSP 2.0 has no status-based body exception.
+//!
+//! A malformed start line or unrelated header with a trusted message
+//! boundary is an error item. An over-limit line, head, or body, or an
+//! untrusted Content-Length is a stream error. An RTSP 2.0 head with bare
+//! LF also ends the stream because its CRLF boundary cannot be trusted.
+//! Header-count errors are items. The driver reports truncated input at
+//! EOF. Body framing follows the headers as before; no mode methods or
+//! expectation queues are needed. Bodies remain bytes; SDP belongs to
+//! [`super::sdp`].
+//!
 //! ```
 //! use fictionet::stdlib::rtsp::{Decoder, Interleaved, Item, TransportParam};
 //!
@@ -59,6 +86,8 @@
 //! assert_eq!(decoder.next_item(), None);
 //! ```
 
+use super::codec::{Decode, Ending, LineError, Lines, Step, Wire};
+
 /// The TCP port RTSP servers listen on.
 pub const PORT: u16 = 554;
 /// The TCP port RTSP servers listen on for TLS (`rtsps`), from RFC 7826.
@@ -66,6 +95,8 @@ pub const TLS_PORT: u16 = 322;
 /// The longest head a message may have: the start line, the header lines
 /// and the blank line after them.
 pub const MAX_HEAD: usize = 65_536;
+/// The most content bytes in one codec start or header line, excluding CRLF.
+pub const MAX_LINE: usize = MAX_HEAD - 2;
 /// The longest body a message may carry.
 pub const MAX_BODY: usize = 1_048_576;
 /// The longest message: the longest head and the longest body.
@@ -581,6 +612,399 @@ impl Item {
         match self {
             Item::Message(m) => m.to_bytes(),
             Item::Interleaved(f) => f.to_bytes(),
+        }
+    }
+}
+
+/// Why an exact wire parse or a strict write failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WireError {
+    /// The message violates a protocol rule or a named limit.
+    Protocol(Error),
+    /// Input ended before the complete unit arrived.
+    Incomplete,
+    /// Bytes remain after the unit.
+    Trailing,
+    /// Encoding would change a field or the body's framing.
+    Unrepresentable,
+}
+
+impl core::fmt::Display for WireError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Protocol(e) => e.fmt(f),
+            Self::Incomplete => f.write_str("incomplete wire unit"),
+            Self::Trailing => f.write_str("bytes after wire unit"),
+            Self::Unrepresentable => f.write_str("value cannot be preserved on the wire"),
+        }
+    }
+}
+
+impl core::error::Error for WireError {}
+
+/// Reads complete RTSP units with bounded line and body framing.
+///
+/// Use with [`super::codec::Stream`]. Items are `Result<Item, Error>`.
+/// A bad start line or header is an error item once a trusted body length
+/// and the complete unit are available. Invalid lengths and byte limits
+/// end the stream. Once the head is complete, bare LF in RTSP 2.0 ends the
+/// stream because only CRLF can establish its message boundary. RTSP 1.0
+/// accepts bare LF. Partial units return [`Step::Need`], including at EOF.
+/// The driver reports truncation and returns stream errors once.
+///
+/// [`Lines`] scans incrementally; each head byte is scanned a fixed number
+/// of times. The driver retains the whole unit, so
+/// [`super::codec::Stream::with_next`] includes its head and body.
+/// Capacity is [`MAX_MESSAGE`]; no input bytes are held in decoder state.
+/// Body framing follows Content-Length automatically, as in [`Decoder`].
+/// There are no caller-selected modes or response expectation queues.
+/// Each call yields at most one unit and returns control to the caller.
+///
+/// ```
+/// use fictionet::stdlib::{codec::{Stream, Wire}, rtsp::{Frames, Message}};
+///
+/// let bytes = b"RTSP/2.0 200 OK\r\nContent-Length: 0\r\n\r\n";
+/// let message = <Message as Wire>::parse(bytes)?;
+/// let mut stream = Stream::new(Frames::new());
+/// assert_eq!(stream.push(bytes), bytes.len());
+/// assert_eq!(stream.next(), Some(Ok(Ok(fictionet::stdlib::rtsp::Item::Message(message)))));
+/// stream.end();
+/// assert_eq!(stream.next(), None);
+/// # Ok::<(), fictionet::stdlib::rtsp::WireError>(())
+/// ```
+pub struct Frames {
+    lines: Lines,
+    scanned: usize,
+    body: Option<(usize, usize)>,
+}
+
+impl core::fmt::Debug for Frames {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Frames").field("scanned", &self.scanned).field("body", &self.body).finish_non_exhaustive()
+    }
+}
+
+impl Default for Frames {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Frames {
+    /// Creates a decoder using [`MAX_LINE`], [`MAX_HEAD`], and [`MAX_BODY`].
+    pub fn new() -> Self {
+        Self { lines: Lines::new(MAX_LINE, Ending::LfOrCrlf), scanned: 0, body: None }
+    }
+}
+
+impl Decode for Frames {
+    type Item = Result<Item, Error>;
+    type Error = Error;
+    const NAME: &'static str = "RTSP";
+
+    fn capacity(&self) -> usize {
+        MAX_MESSAGE
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Self::Item>, Error> {
+        if self.scanned == 0 && self.body.is_none() {
+            let skip = skip_crlfs(input);
+            if skip != 0 {
+                self.lines = Lines::new(MAX_LINE, Ending::LfOrCrlf);
+                return Ok(Step::Skip(skip));
+            }
+            if input.first() == Some(&INTERLEAVED_MARKER) {
+                return Ok(match Interleaved::parse(input)? {
+                    Some((frame, used)) => Step::Item(Ok(Item::Interleaved(frame)), used),
+                    None => Step::Need,
+                });
+            }
+        }
+        while self.body.is_none() {
+            let room = MAX_HEAD.saturating_sub(self.scanned);
+            let rest = input.get(self.scanned..).unwrap_or_default();
+            let window = rest.get(..rest.len().min(room)).unwrap_or_default();
+            // Leave partial lines unread at EOF. Stream reports truncation.
+            let step = match self.lines.decode(window, false) {
+                Ok(step) => step,
+                Err(never) => match never {},
+            };
+            match step {
+                Step::Item(line, used) => {
+                    match line {
+                        Err(LineError::TooLong { .. }) => return Err(Error::TooLong),
+                        Err(_) => return Ok(Step::Need),
+                        Ok(_) => {}
+                    }
+                    self.scanned = self.scanned.checked_add(used).ok_or(Error::TooLong)?;
+                    let raw = window.get(..used).unwrap_or_default();
+                    if raw == b"\r\n" || raw == b"\n" {
+                        let head = input.get(..self.scanned).ok_or(Error::TooLong)?;
+                        self.body = Some((self.scanned, frame_body_length(head)?));
+                    }
+                }
+                _ if window.len() >= room => return Err(Error::TooLong),
+                _ => return Ok(Step::Need),
+            }
+        }
+        let Some((head, length)) = self.body else { return Ok(Step::Need) };
+        let used = head.checked_add(length).ok_or(Error::TooLong)?;
+        let Some(body) = input.get(head..used) else { return Ok(Step::Need) };
+        let message = parse_head(input.get(..head).ok_or(Error::TooLong)?).map(|(mut message, _)| {
+            message.body = body.to_vec();
+            message
+        });
+        self.scanned = 0;
+        self.body = None;
+        Ok(Step::Item(message.map(Item::Message), used))
+    }
+}
+
+// Find the length independently of message syntax. This lets a malformed
+// start line or unrelated header be returned as an item at a known boundary.
+// Only offsets and lengths survive Need; header strings are never cached.
+fn frame_body_length(head: &[u8]) -> Result<usize, Error> {
+    let mut lines = head.split(|&b| b == b'\n').map(|line| line.strip_suffix(b"\r").unwrap_or(line));
+    let first = lines.next().unwrap_or_default();
+    if let Ok(text) = core::str::from_utf8(first)
+        && let Ok(start) = parse_start_line(text)
+    {
+        let version = match &start {
+            StartLine::Request { version, .. } | StartLine::Status { version, .. } => *version,
+        };
+        if version == Version::Rtsp20 && head.windows(2).any(|pair| pair[1] == b'\n' && pair[0] != b'\r') {
+            return Err(Error::LineEnding);
+        }
+        if let StartLine::Status { code, .. } = start
+            && bodyless(version, code)
+        {
+            return Ok(0);
+        }
+    }
+    let mut length = None;
+    let mut active = false;
+    let mut value: Option<&[u8]> = None;
+    for line in lines {
+        let trimmed = trim_frame_ws(line);
+        if line.first().is_some_and(|b| *b == b' ' || *b == b'\t') {
+            if active && !trimmed.is_empty() {
+                // Unfolding two nonempty pieces inserts a space. A decimal
+                // Content-Length cannot contain that space.
+                if value.is_some() {
+                    return Err(Error::ContentLength);
+                }
+                value = Some(trimmed);
+            }
+            continue;
+        }
+        if active {
+            frame_length_value(&mut length, value.unwrap_or_default())?;
+        }
+        value = None;
+        let colon = line.iter().position(|&b| b == b':');
+        let name = colon.and_then(|n| line.get(..n)).unwrap_or(line);
+        let name = trim_frame_ws(name);
+        active = name.eq_ignore_ascii_case(b"Content-Length");
+        if !active {
+            // A recognizable length name with a missing colon or an invalid
+            // suffix must not be mistaken for an unrelated bad header.
+            let token = name.split(|b| !is_token_byte(*b)).next().unwrap_or_default();
+            if token.eq_ignore_ascii_case(b"Content-Length") {
+                return Err(Error::ContentLength);
+            }
+        }
+        if active {
+            let at = colon.ok_or(Error::ContentLength)?.checked_add(1).ok_or(Error::TooLong)?;
+            let bytes = line.get(at..).ok_or(Error::ContentLength)?;
+            let bytes = trim_frame_ws(bytes);
+            if !bytes.is_empty() {
+                value = Some(bytes);
+            }
+        }
+    }
+    if active {
+        frame_length_value(&mut length, value.unwrap_or_default())?;
+    }
+    Ok(length.unwrap_or(0))
+}
+
+fn frame_length_value(length: &mut Option<usize>, bytes: &[u8]) -> Result<(), Error> {
+    let value = core::str::from_utf8(bytes).map_err(|_| Error::ContentLength)?;
+    let n = parse_content_length(value)?;
+    if length.is_some_and(|old| old != n) {
+        return Err(Error::ContentLength);
+    }
+    *length = Some(n);
+    Ok(())
+}
+
+fn read_wire(bytes: &[u8]) -> Result<Item, WireError> {
+    if bytes.len() > MAX_MESSAGE {
+        return Err(WireError::Protocol(Error::TooLong));
+    }
+    let mut frames = Frames::new();
+    let mut rest = bytes;
+    loop {
+        match frames.decode(rest, true).map_err(WireError::Protocol)? {
+            Step::Item(item, used) => {
+                let item = item.map_err(WireError::Protocol)?;
+                if used != rest.len() {
+                    return Err(WireError::Trailing);
+                }
+                return Ok(item);
+            }
+            Step::Skip(used) => rest = rest.get(used..).ok_or(WireError::Incomplete)?,
+            _ => return Err(WireError::Incomplete),
+        }
+    }
+}
+
+impl Wire for Message {
+    type ParseError = WireError;
+    type WriteError = WireError;
+
+    /// Reads exactly one stream message whose CRLF encoding fits the limits.
+    /// Leading keep-alive lines are accepted. Trailing bytes are refused.
+    /// Use the inherent parser for its original framing and size policy.
+    fn parse(bytes: &[u8]) -> Result<Self, WireError> {
+        let Item::Message(message) = read_wire(bytes)? else {
+            return Err(WireError::Protocol(Error::StartLine));
+        };
+        encode_message(&message)?;
+        Ok(message)
+    }
+
+    /// Appends a CRLF message without changing any field. Leaves `out`
+    /// unchanged on error. Content-Length fields are preserved, including
+    /// spelling, position, and digits. Set them to match the body before
+    /// writing. Values that need trimming or header injection are refused.
+    /// A body length mismatch is [`WireError::Unrepresentable`].
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), WireError> {
+        out.extend_from_slice(&encode_message(self)?);
+        Ok(())
+    }
+}
+
+fn encode_message(message: &Message) -> Result<Vec<u8>, WireError> {
+    let too_long = WireError::Protocol(Error::TooLong);
+    if message.body.len() > MAX_BODY {
+        return Err(too_long);
+    }
+    if message.headers.len() > MAX_HEADERS {
+        return Err(WireError::Protocol(Error::TooMany));
+    }
+    // Count before formatting or copying caller-owned strings.
+    let start = match &message.start {
+        StartLine::Request { method, uri, version } => method
+            .len()
+            .checked_add(uri.len())
+            .and_then(|n| n.checked_add(version.as_str().len()))
+            .and_then(|n| n.checked_add(2))
+            .ok_or(too_long)?,
+        StartLine::Status { version, code, reason } => {
+            if !(100..=599).contains(code) {
+                return Err(WireError::Protocol(Error::StartLine));
+            }
+            reason.len().checked_add(version.as_str().len()).and_then(|n| n.checked_add(5)).ok_or(too_long)?
+        }
+    };
+    if start > MAX_LINE {
+        return Err(too_long);
+    }
+    let mut head = start.checked_add(4).ok_or(too_long)?;
+    for header in &message.headers {
+        let line = header.name.len().checked_add(header.value.len()).and_then(|n| n.checked_add(2)).ok_or(too_long)?;
+        if line > MAX_LINE {
+            return Err(too_long);
+        }
+        head = head.checked_add(line).and_then(|n| n.checked_add(2)).ok_or(too_long)?;
+        if head > MAX_HEAD {
+            return Err(too_long);
+        }
+    }
+    if head > MAX_HEAD {
+        return Err(too_long);
+    }
+    let total = head.checked_add(message.body.len()).ok_or(too_long)?;
+    let mut out = Vec::with_capacity(total);
+    match &message.start {
+        StartLine::Request { method, uri, version } => {
+            out.extend_from_slice(method.as_bytes());
+            out.push(b' ');
+            out.extend_from_slice(uri.as_bytes());
+            out.push(b' ');
+            out.extend_from_slice(version.as_str().as_bytes());
+        }
+        StartLine::Status { version, code, reason } => {
+            out.extend_from_slice(version.as_str().as_bytes());
+            out.extend_from_slice(format!(" {code} {reason}").as_bytes());
+        }
+    }
+    out.extend_from_slice(b"\r\n");
+    for header in &message.headers {
+        out.extend_from_slice(header.name.as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(header.value.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(&message.body);
+    // Check the same framing and value rules as the receiver, before append.
+    match read_wire(&out) {
+        Ok(Item::Message(ref parsed)) if parsed == message => Ok(out),
+        Err(error @ WireError::Protocol(_)) => Err(error),
+        _ => Err(WireError::Unrepresentable),
+    }
+}
+
+fn trim_frame_ws(mut bytes: &[u8]) -> &[u8] {
+    while let Some((b' ' | b'\t', rest)) = bytes.split_first() {
+        bytes = rest;
+    }
+    while let Some((b' ' | b'\t', rest)) = bytes.split_last() {
+        bytes = rest;
+    }
+    bytes
+}
+
+impl Wire for Interleaved {
+    type ParseError = WireError;
+    type WriteError = WireError;
+
+    /// Reads exactly one interleaved frame with at most [`MAX_INTERLEAVED`] bytes.
+    fn parse(bytes: &[u8]) -> Result<Self, WireError> {
+        match Self::parse(bytes).map_err(WireError::Protocol)? {
+            Some((frame, used)) if used == bytes.len() => Ok(frame),
+            Some(_) => Err(WireError::Trailing),
+            None => Err(WireError::Incomplete),
+        }
+    }
+
+    /// Appends a frame without changing `out` on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), WireError> {
+        out.extend_from_slice(&self.to_bytes().map_err(WireError::Protocol)?);
+        Ok(())
+    }
+}
+
+impl Wire for Item {
+    type ParseError = WireError;
+    type WriteError = WireError;
+
+    /// Reads exactly one message or interleaved frame.
+    fn parse(bytes: &[u8]) -> Result<Self, WireError> {
+        let item = read_wire(bytes)?;
+        if let Item::Message(message) = &item {
+            encode_message(message)?;
+        }
+        Ok(item)
+    }
+
+    /// Appends a strict encoding. Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), WireError> {
+        match self {
+            Self::Message(message) => Wire::write(message, out),
+            Self::Interleaved(frame) => Wire::write(frame, out),
         }
     }
 }

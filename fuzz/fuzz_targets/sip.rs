@@ -2,12 +2,26 @@
 //! world playing a phone or a proxy reads them, and as it writes them.
 #![no_main]
 
+use fictionet::stdlib::codec::{Wire, contract};
+use fictionet::stdlib::sip::Frames;
 use fictionet::stdlib::sip::{
     CSeq, Contacts, Decoder, Error, MAX_HEAD, MAX_MESSAGE, Message, NameAddr, Param, Scheme, Uri, Via, same_name,
 };
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode(Frames::new, data);
+    contract::check_decode_with_held_limit(Frames::new, data, 0);
+    contract::check_wire::<Message>(data);
+    let mut message = Message::response(200, "OK");
+    message.body = data.get(..fictionet::stdlib::sip::MAX_BODY + 1).unwrap_or(data).to_vec();
+    message.push_header("l", &message.body.len().to_string());
+    contract::check_wire_value(&message);
+    if let Ok(bytes) = Wire::to_bytes(&message) {
+        contract::check_wire::<Message>(&bytes);
+        contract::check_decode(Frames::new, &bytes);
+    }
+
     // The stream, split two ways: all at once, and a byte at a time.
     let mut whole = Decoder::new();
     let first = feed_all(&mut whole, data);
@@ -78,6 +92,7 @@ fn drain(d: &mut Decoder) -> Vec<Result<Message, Error>> {
 /// A message read can be written, unless it was near a size limit, and
 /// reads back the same. So do the header values in it, and a reply to it.
 fn round_trip(m: &Message) {
+    contract::check_wire_value(m);
     let bytes = match m.to_bytes() {
         Ok(b) => b,
         Err(e) => {
@@ -207,6 +222,7 @@ fn writers(data: &[u8]) {
         m.push_header(&part(i), &part(i + 1));
     }
     m.body = parts.last().map(|p| p.as_bytes().to_vec()).unwrap_or_default();
+    contract::check_wire_value(&m);
     if let Ok(bytes) = m.to_bytes() {
         let back = Message::parse(&bytes).unwrap();
         assert_eq!(Message::parse_stream(&bytes).unwrap().unwrap(), (back.clone(), bytes.len()));
