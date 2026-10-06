@@ -2,71 +2,38 @@
 //! reads them.
 #![no_main]
 
-use fictionet::stdlib::codec::contract;
+use fictionet::stdlib::codec::{Decode, Fail, Wire, contract, test_support::decode_all};
 use fictionet::stdlib::nbss::{
-    Decoder, EncodeError, Error, Frames, HEADER_LEN, MAX_LABEL, MAX_LENGTH, MAX_NAME_LEN, NAME_LEN, Name, NegativeCode,
+    Error, Frames, HEADER_LEN, MAX_LABEL, MAX_LENGTH, MAX_NAME_LEN, NAME_LEN, Name, NegativeCode,
     Packet, decode_first_level,
 };
 use libfuzzer_sys::fuzz_target;
 
-/// Feeds `data` to `d` in pieces of `step` bytes, taking packets out after
-/// each, and returns the packets and the error that ended the stream, if
-/// any. The decoder never holds more than it says it may.
-fn read(d: &mut Decoder, data: &[u8], step: usize) -> (Vec<Packet>, Option<Error>) {
-    let mut packets = Vec::new();
-    for piece in data.chunks(step.max(1)) {
-        let mut rest = piece;
-        loop {
-            rest = &rest[d.feed(rest)..];
-            assert!(d.buffered() <= d.max_buffered());
-            let mut took = false;
-            while let Some(p) = d.next_packet() {
-                match p {
-                    Ok(p) => packets.push(p),
-                    Err(e) => return (packets, Some(e)),
-                }
-                took = true;
-            }
-            if rest.is_empty() {
-                break;
-            }
-            // A full decoder always gives a packet or an error.
-            assert!(took);
-        }
-    }
-    (packets, None)
-}
-
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode(Frames::new, data);
+    contract::check_decode_with_alloc_limit(Frames::new, data, 2 * Frames::new().capacity());
     contract::check_wire::<Packet>(data);
-    contract::check_decode(|| Frames::with_limit(0), data);
-    contract::check_decode(|| Frames::with_limit(64), data);
+    contract::check_decode_with_alloc_limit(|| Frames::with_limit(0), data, 2 * Frames::with_limit(0).capacity());
+    contract::check_decode_with_alloc_limit(|| Frames::with_limit(64), data, 2 * Frames::with_limit(64).capacity());
 
-    // The stream, split three ways: all at once, a byte at a time, and in
-    // pieces whose size the first byte picks.
-    let (packets, end) = read(&mut Decoder::new(), data, data.len());
-    assert_eq!(read(&mut Decoder::new(), data, 1), (packets.clone(), end));
-    let step = usize::from(data.first().copied().unwrap_or(1)) + 1;
-    assert_eq!(read(&mut Decoder::new(), data, step), (packets.clone(), end));
+    let (packets, _) = decode_all(Frames::new, data);
 
     // A small limit reads the same packets, up to the first one too long,
     // and stops there with Error::TooLong.
-    let (limited, small_end) = read(&mut Decoder::with_limit(64), data, data.len());
+    let (limited, small_end) = decode_all(|| Frames::with_limit(64), data);
     let fit = packets.iter().take_while(|p| p.to_bytes().unwrap().len() - HEADER_LEN <= 64).count();
     assert_eq!(&limited[..], &packets[..fit]);
     if fit < packets.len() {
-        assert!(matches!(small_end, Some(Error::TooLong(n)) if n > 64));
+        assert!(matches!(small_end, Some(Fail::Protocol(Error::TooLong(n))) if n > 64));
     }
 
     for p in &packets {
         // A packet read can be written, and reads back the same.
         let bytes = p.to_bytes().unwrap();
-        assert_eq!(Packet::parse(&bytes), Ok(Some((p.clone(), bytes.len()))));
+        assert_eq!(Packet::parse(&bytes), Ok(p.clone()));
     }
-    // Any bytes as a name on their own.
-    if let Some((name, used)) = Name::parse(data) {
-        assert_eq!(name.to_bytes().unwrap(), data[..used]);
+    contract::check_wire::<Name>(data);
+    if let Ok(name) = Name::parse(data) {
+        assert_eq!(name.to_bytes().unwrap(), data);
     }
     let _ = decode_first_level(data);
 
@@ -84,20 +51,20 @@ fuzz_target!(|data: &[u8]| {
         match req.to_bytes() {
             Ok(bytes) => {
                 assert!(fits);
-                assert_eq!(Packet::parse(&bytes), Ok(Some((req, bytes.len()))));
+                assert_eq!(Packet::parse(&bytes), Ok(req));
             }
             Err(e) => {
                 assert!(!fits);
-                assert_eq!(e, EncodeError::Name);
+                assert_eq!(e, Error::Unwritable);
             }
         }
         let code = NegativeCode::Other(first);
         let neg = Packet::Negative(code);
         contract::check_wire_value(&neg);
         match neg.to_bytes() {
-            Ok(bytes) => assert_eq!(Packet::parse(&bytes), Ok(Some((neg, bytes.len())))),
+            Ok(bytes) => assert_eq!(Packet::parse(&bytes), Ok(neg)),
             Err(e) => {
-                assert_eq!(e, EncodeError::Code(first));
+                assert_eq!(e, Error::Unwritable);
                 assert_ne!(NegativeCode::from_code(first), code);
             }
         }
@@ -105,7 +72,7 @@ fuzz_target!(|data: &[u8]| {
         if first == 0xff {
             let long = Packet::Message(vec![0; MAX_LENGTH + 1]);
             contract::check_wire_value(&long);
-            assert_eq!(long.to_bytes(), Err(EncodeError::TooLong(MAX_LENGTH + 1)));
+            assert_eq!(long.to_bytes(), Err(Error::Unwritable));
         }
     }
 });

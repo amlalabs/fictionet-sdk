@@ -5,39 +5,12 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use fictionet::stdlib::codec::contract;
+use fictionet::stdlib::codec::{Decode, Wire, contract};
 use fictionet::stdlib::radius::{
-    Attribute, Code, DataType, Decoder, Evs, Extended, Frames, MAX_BUFFERED, MAX_PACKET, MAX_VALUE, Packet,
-    PacketError, RESERVED_EXTENDED_TYPES, TooLong, Value, Vsa,
+    Attribute, Code, DataType, Evs, Extended, Frames, MAX_PACKET, MAX_VALUE, Packet,
+    Error, RESERVED_EXTENDED_TYPES, Value, Vsa,
 };
 use libfuzzer_sys::fuzz_target;
-
-/// Feeds `data` in chunks, taking packets out after each feed, as a world
-/// does. Every packet, then the error that broke the stream, if one did.
-fn split(data: &[u8], bytewise: bool) -> (Vec<Packet>, Option<PacketError>) {
-    let mut decoder = Decoder::new();
-    let mut packets = Vec::new();
-    let chunks: Vec<&[u8]> = if bytewise { data.chunks(1).collect() } else { vec![data] };
-    for chunk in chunks {
-        let mut rest = chunk;
-        while !rest.is_empty() {
-            let took = decoder.feed(rest);
-            assert!(decoder.buffered() <= MAX_BUFFERED);
-            rest = &rest[took..];
-            let mut progress = took > 0;
-            while let Some(r) = decoder.next_packet() {
-                match r {
-                    Ok(p) => packets.push(p),
-                    Err(e) => return (packets, Some(e)),
-                }
-                progress = true;
-            }
-            // A full decoder always gives a packet or an error.
-            assert!(progress);
-        }
-    }
-    (packets, None)
-}
 
 /// Takes bytes off the front of the fuzzer's input.
 struct Input<'a>(&'a [u8]);
@@ -112,7 +85,7 @@ fn construct(data: &[u8]) -> Option<()> {
             // A value through the typed constructor.
             0 => {
                 let v = input.value(0)?;
-                if let Some(bytes) = v.to_bytes() {
+                if let Some(bytes) = v.to_attribute(kind).map(|a| a.value) {
                     assert!(bytes.len() <= MAX_VALUE);
                     assert!(Value::decode(v.data_type(), &bytes).is_ok());
                 }
@@ -137,7 +110,10 @@ fn construct(data: &[u8]) -> Option<()> {
                 let before = p.clone();
                 match p.push_extended(&e) {
                     Ok(()) => assert!(e.ext_type < RESERVED_EXTENDED_TYPES),
-                    Err(TooLong) => assert_eq!(p, before),
+                    Err(error) => {
+                        assert_eq!(error, Error::Unwritable);
+                        assert_eq!(p, before);
+                    }
                 }
             }
             // Raw bytes through push.
@@ -156,7 +132,8 @@ fn construct(data: &[u8]) -> Option<()> {
             assert_eq!(bytes.len(), p.encoded_len());
             assert_eq!(Packet::parse(&bytes).as_ref(), Ok(&p));
         }
-        Err(TooLong) => {
+        Err(error) => {
+            assert_eq!(error, Error::Unwritable);
             assert!(p.encoded_len() > MAX_PACKET || p.attributes.iter().any(|a| a.value.len() > MAX_VALUE))
         }
     }
@@ -164,21 +141,28 @@ fn construct(data: &[u8]) -> Option<()> {
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode(Frames::new, data);
-    contract::check_decode(|| Frames::with_limit(0), data);
-    contract::check_decode(|| Frames::with_limit(64), data);
+    contract::check_decode_with_alloc_limit(Frames::new, data, 2 * Frames::new().capacity());
+    contract::check_decode_with_alloc_limit(|| Frames::with_limit(0), data, 2 * Frames::with_limit(0).capacity());
+    contract::check_decode_with_alloc_limit(|| Frames::with_limit(64), data, 2 * Frames::with_limit(64).capacity());
     contract::check_wire::<Packet>(data);
 
     // The bytes as one datagram.
-    if let Ok(p) = Packet::parse(data) {
+    if let Ok(p) = Packet::parse_datagram(data) {
         // A packet read can be written, and reads back the same.
         let bytes = p.to_bytes().expect("a packet read can be written");
         assert_eq!(Packet::parse(&bytes).as_ref(), Ok(&p));
+        let mut padded = bytes.clone();
+        padded.extend_from_slice(&[9, 9, 9]);
+        assert_eq!(Packet::parse_datagram(&padded).as_ref(), Ok(&p));
+        assert_eq!(
+            Packet::parse(&padded),
+            Err(Error::Trailing { remaining: 3 })
+        );
         for a in &p.attributes {
             // A value read as its type writes back to bytes that read the same.
             if let Ok(v) = a.decode() {
                 let t = a.info().map_or(DataType::String, |i| i.data_type);
-                let written = v.to_bytes().expect("a value read can be written");
+                let written = v.to_attribute(a.kind).map(|a| a.value).expect("a value read can be written");
                 assert_eq!(Value::decode(t, &written), Ok(v.clone()));
                 // A value read can be put in an attribute again, with the
                 // same bytes it came in or bytes that read the same.
@@ -192,7 +176,7 @@ fuzz_target!(|data: &[u8]| {
             }
             for t in [DataType::Tlv, DataType::Ipv6Prefix, DataType::Ipv4Prefix, DataType::Evs] {
                 if let Ok(v) = Value::decode(t, &a.value) {
-                    assert_eq!(Value::decode(t, &v.to_bytes().expect("a value read can be written")), Ok(v));
+                    assert_eq!(Value::decode(t, &v.to_attribute(a.kind).map(|a| a.value).expect("a value read can be written")), Ok(v));
                 }
             }
         }
@@ -212,7 +196,7 @@ fuzz_target!(|data: &[u8]| {
     // The bytes as instructions for building packets and values.
     let _ = construct(data);
 
-    // The bytes as a RADIUS over TCP stream, split two ways: all at once,
-    // and a byte at a time.
-    assert_eq!(split(data, false), split(data, true));
+    contract::check_wire::<Attribute>(data);
+    contract::check_wire::<Vsa>(data);
+    contract::check_wire::<Evs>(data);
 });

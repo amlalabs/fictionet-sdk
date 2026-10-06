@@ -14,30 +14,27 @@
 //! module follows The Open Group's DCE 1.1 RPC specification (C706),
 //! chapter 12, and Microsoft's extensions in MS-RPCE, section 2.2.2.
 //!
-//! Nothing here reads a socket. A world that plays an RPC server feeds the
-//! bytes it reads from a connection or a pipe to a [`Decoder`], gets
+//! A world that plays an RPC server pushes bytes from a connection or pipe
+//! into a [`Stream<Frames>`](super::codec::Stream), gets
 //! [`Pdu`]s back, and writes the bytes of its answers. A large call comes
 //! in several fragments, which a [`Reassembler`] joins, and
 //! [`Pdu::fragments`] splits an answer the same way. Which interfaces
 //! exist, and what each operation does, is up to world code. Stub data,
 //! the NDR-encoded arguments and results, stays as bytes.
 //!
-//! New stream readers use [`Frames`] with [`super::codec::Stream`] for
-//! bounded buffering and EOF handling. [`Pdu`] implements [`Wire`] for
-//! exact parsing of writable PDUs and transactional writing. Its inherent
-//! `parse` still reads one prefix, and [`Decoder`] keeps its original behavior.
-//!
 //! Every reader checks lengths, because the agent can send any bytes it
 //! likes. A header that cannot be read breaks the stream, since the next
 //! PDU cannot be found. A body that cannot be read is an [`Error`] for
 //! that PDU alone, and the stream goes on. Writers return an
-//! [`EncodeError`] rather than write bytes a reader would refuse or read
+//! [`Error`] rather than write bytes a reader would refuse or read
 //! back as something else.
 //!
 //! ```
 //! use fictionet::stdlib::dcerpc::{
-//!     Bind, BindAck, Body, Context, ContextResult, Decoder, EPMAPPER, NDR, Pdu, reason,
+//!     Bind, BindAck, Body, Context, ContextResult, Frames, EPMAPPER, NDR, Pdu, reason,
 //! };
+//!
+//! use fictionet::stdlib::codec::{Stream, Wire};
 //!
 //! /// An endpoint mapper that accepts NDR for its own interface only.
 //! fn answer(pdu: &Pdu) -> Option<Pdu> {
@@ -79,12 +76,12 @@
 //! assert_eq!(bytes.len(), 72);
 //! assert_eq!(bytes[..4], [5, 0, 11, 3]);
 //!
-//! let mut decoder = Decoder::new();
+//! let mut decoder = Stream::new(Frames::new());
 //! // The bind arrives in two pieces.
-//! assert_eq!(decoder.feed(&bytes[..30]), 30);
-//! assert!(decoder.next_pdu().is_none());
-//! assert_eq!(decoder.feed(&bytes[30..]), 42);
-//! let pdu = decoder.next_pdu().unwrap().unwrap();
+//! assert_eq!(decoder.push(&bytes[..30]), 30);
+//! assert!(decoder.next().is_none());
+//! assert_eq!(decoder.push(&bytes[30..]), 42);
+//! let pdu = decoder.next().unwrap().unwrap().unwrap();
 //! assert_eq!(pdu, bind);
 //!
 //! let reply = answer(&pdu).unwrap().to_bytes().unwrap();
@@ -94,7 +91,7 @@
 //! assert_eq!(reply.len(), 16 + 8 + 2 + 4 + 2 + 4 + 24);
 //! ```
 
-use super::codec::{Decode, Step, Wire};
+use crate::stdlib::codec::{Decode, Step, Wire};
 
 /// The TCP port of the endpoint mapper.
 pub const PORT: u16 = 135;
@@ -107,9 +104,6 @@ pub const HEADER_LEN: usize = 16;
 pub const SEC_TRAILER_LEN: usize = 8;
 /// The longest fragment: the fragment length is 16 bits.
 pub const MAX_FRAG: usize = 65535;
-/// The most bytes a [`Decoder`] holds that have not been taken out: one
-/// longest fragment.
-pub const MAX_BUFFERED: usize = MAX_FRAG;
 /// The most stub data a [`Reassembler`] joins for one call.
 pub const MAX_STUB: usize = 4 << 20;
 /// The most fragments [`Pdu::fragments`] makes of one PDU. The peer picks
@@ -451,7 +445,7 @@ impl Default for DataRep {
 /// An authentication verifier: the trailer at the end of a PDU and the
 /// security provider's token. The padding before it and the reserved
 /// byte are not kept; the writer works the padding out, as zeros.
-/// [`Decoder::next_frame`] gives a PDU's bytes as they came, padding
+/// [`Stream::with_next`](super::codec::Stream::with_next) gives a PDU's bytes as they came, padding
 /// included, for a world that checks or decrypts a verifier. To sign one
 /// it writes, a world writes the PDU with a token of the right length,
 /// then fills the token in over the last bytes (and, for privacy,
@@ -545,20 +539,52 @@ pub struct BindNak {
 
 /// What a PDU carries, by packet type.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(missing_docs)] // each variant's doc names its fields
 pub enum Body {
     /// Type 0: a call of operation `opnum` on context `context_id`, with
     /// an object UUID if the [`flags::OBJECT_UUID`] flag is set.
     /// `alloc_hint` is the stub size the sender expects in all, or 0.
-    Request { alloc_hint: u32, context_id: u16, opnum: u16, object: Option<Uuid>, stub: Vec<u8> },
+    Request {
+        /// Expected total stub size, or zero.
+        alloc_hint: u32,
+        /// Presentation context ID.
+        context_id: u16,
+        /// Operation number within the interface.
+        opnum: u16,
+        /// Optional object UUID.
+        object: Option<Uuid>,
+        /// Opaque stub data.
+        stub: Vec<u8>,
+    },
     /// Type 2: a call's results.
-    Response { alloc_hint: u32, context_id: u16, cancel_count: u8, stub: Vec<u8> },
+    Response {
+        /// Expected total stub size, or zero.
+        alloc_hint: u32,
+        /// Presentation context ID.
+        context_id: u16,
+        /// Number of pending cancels.
+        cancel_count: u8,
+        /// Opaque stub data.
+        stub: Vec<u8>,
+    },
     /// Type 3: a call failed with `status`, one of [`status`].
     /// `fault_flags` holds bits of [`fault_flags`]: with
     /// [`fault_flags::EXTENDED_ERROR`] set the stub data is extended error
     /// information (MS-RPCE 2.2.2.8), and otherwise it is C706's fault
     /// stub data, which MS-RPCE peers ignore.
-    Fault { alloc_hint: u32, context_id: u16, cancel_count: u8, fault_flags: u8, status: u32, stub: Vec<u8> },
+    Fault {
+        /// Expected total stub size, or zero.
+        alloc_hint: u32,
+        /// Presentation context ID.
+        context_id: u16,
+        /// Number of pending cancels.
+        cancel_count: u8,
+        /// Bits from [`fault_flags`].
+        fault_flags: u8,
+        /// Fault status code.
+        status: u32,
+        /// Opaque stub data.
+        stub: Vec<u8>,
+    },
     /// Type 11.
     Bind(Bind),
     /// Type 12.
@@ -664,9 +690,7 @@ pub struct Pdu {
     pub auth: Option<Auth>,
 }
 
-/// Why bytes are not a PDU this module reads. The first three break the
-/// stream, since the end of the PDU cannot be found; see
-/// [`Error::breaks_stream`].
+/// Why a PDU or fragment could not be read or written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     /// The version was not 5.0 or 5.1.
@@ -695,18 +719,31 @@ pub enum Error {
     /// A bind_ack's secondary address does not end with its terminating
     /// zero (C706 12.6.3.1).
     Address,
-}
-
-impl Error {
-    /// Whether the stream cannot be read past this error.
-    pub fn breaks_stream(self) -> bool {
-        matches!(self, Error::Version { .. } | Error::IntegerRep(_) | Error::FragLength(_))
-    }
+    /// The declared fragment exceeds the configured limit.
+    TooLong {
+        /// Declared fragment length.
+        length: usize,
+        /// Largest accepted fragment.
+        limit: usize,
+    },
+    /// The input ends before a complete fragment.
+    Incomplete,
+    /// Bytes follow the complete fragment.
+    Trailing {
+        /// Number of trailing bytes.
+        remaining: usize,
+    },
+    /// The value cannot be written without changing it.
+    Unwritable,
 }
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Error::TooLong { length, limit } => write!(f, "DCE/RPC fragment of {length} bytes exceeds {limit}"),
+            Error::Incomplete => f.write_str("incomplete DCE/RPC fragment"),
+            Error::Trailing { remaining } => write!(f, "{remaining} bytes after DCE/RPC fragment"),
+            Error::Unwritable => f.write_str("DCE/RPC value cannot be written without changing it"),
             Error::Version { major, minor } => write!(f, "DCE/RPC version {major}.{minor}, not 5.0 or 5.1"),
             Error::IntegerRep(r) => write!(f, "integer representation {r}, not 0 or 1"),
             Error::FragLength(n) => write!(f, "fragment length {n}, shorter than the header"),
@@ -720,53 +757,6 @@ impl std::fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
-
-/// Why a writer refused a value.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EncodeError {
-    /// A minor version other than 0 or 1.
-    Version(u8),
-    /// A data representation whose integer format is not 0 or 1.
-    IntegerRep(u8),
-    /// A request whose [`flags::OBJECT_UUID`] flag disagrees with its
-    /// object UUID.
-    ObjectFlag,
-    /// An auth verifier with an empty value, which reads as none.
-    EmptyAuth,
-    /// More than 255 contexts, transfer syntaxes, results or versions.
-    Count,
-    /// A PDU longer than [`MAX_FRAG`], or a field longer than its length
-    /// can say.
-    TooLong,
-    /// Fragments too small for the request or response header.
-    FragSize,
-    /// Splitting a PDU that has an auth verifier, which each fragment
-    /// needs its own of.
-    FragmentAuth,
-    /// An auth3 with no auth verifier, or a bind_nak or shutdown with one.
-    Auth,
-    /// A nonempty secondary address without its terminating zero.
-    Address,
-}
-
-impl std::fmt::Display for EncodeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            EncodeError::Version(m) => write!(f, "minor version {m}, not 0 or 1"),
-            EncodeError::IntegerRep(r) => write!(f, "integer representation {r}, not 0 or 1"),
-            EncodeError::ObjectFlag => f.write_str("the object UUID flag disagrees with the object UUID"),
-            EncodeError::EmptyAuth => f.write_str("an auth verifier needs a value"),
-            EncodeError::Count => f.write_str("more than 255 items in a list"),
-            EncodeError::TooLong => f.write_str("longer than one fragment may be"),
-            EncodeError::FragSize => f.write_str("fragments too small for the header or too many"),
-            EncodeError::FragmentAuth => f.write_str("a PDU with an auth verifier cannot be split"),
-            EncodeError::Auth => f.write_str("this packet type cannot have, or must have, an auth verifier"),
-            EncodeError::Address => f.write_str("the secondary address does not end with a zero byte"),
-        }
-    }
-}
-
-impl std::error::Error for EncodeError {}
 
 impl Pdu {
     /// A whole PDU (first and last fragment) with little-endian integers,
@@ -808,31 +798,115 @@ impl Pdu {
         Ok(Some(usize::from(n)))
     }
 
-    /// Reads the PDU at the start of `b`. It returns `Ok(None)` if `b`
-    /// holds only part of one, and otherwise the PDU and how many bytes of
-    /// `b` it took.
-    pub fn parse(b: &[u8]) -> Result<Option<(Pdu, usize)>, Error> {
-        let Some(n) = Pdu::frame_length(b)? else { return Ok(None) };
-        if b.len() < n {
-            return Ok(None);
+    /// Splits a request or response into fragments of at most `max_frag`
+    /// bytes each, such as the `max_recv_frag` the peer bound with. The
+    /// first has [`flags::FIRST_FRAG`], the last [`flags::LAST_FRAG`],
+    /// and each keeps the PDU's other flags and fields, except that a
+    /// nonzero `alloc_hint` counts down by the stub data already sent, as
+    /// MS-RPCE 2.2.2.6 asks. Any other PDU comes back whole if it writes
+    /// in at most `max_frag` bytes, and is [`Error::Unwritable`] if
+    /// it is longer. A PDU with an auth verifier is an error, since each
+    /// fragment's verifier is the security provider's to make, and so is
+    /// a split into more than [`MAX_FRAGMENTS`] fragments. Every other
+    /// error [`Pdu::to_bytes`] gives is checked before anything is copied.
+    pub fn fragments(&self, max_frag: u16) -> Result<Vec<Pdu>, Error> {
+        if self.auth.is_some() {
+            return Err(Error::Unwritable);
         }
-        Ok(Some((parse_fragment(&b[..n])?, n)))
+        let header = match &self.body {
+            Body::Request { object: Some(_), .. } => HEADER_LEN + 24,
+            Body::Request { .. } | Body::Response { .. } => HEADER_LEN + 8,
+            _ => {
+                // The writer stops at MAX_FRAG bytes, so this copies at
+                // most one fragment's worth.
+                if self.to_bytes()?.len() > usize::from(max_frag) {
+                    return Err(Error::Unwritable);
+                }
+                return Ok(vec![self.clone()]);
+            }
+        };
+        // The body without its stub, cloned once per fragment, so the
+        // stub is copied once in all rather than once per fragment.
+        let template = self.body.clone_without_stub();
+        // The header the fragments share, written once to check it.
+        Pdu { auth: None, body: template.clone(), ..*self }.to_bytes()?;
+        let room = usize::from(max_frag).checked_sub(header).filter(|&r| r > 0).ok_or(Error::Unwritable)?;
+        let stub = self.body.stub().unwrap_or(&[]);
+        let n = stub.len().div_ceil(room).max(1);
+        if n > MAX_FRAGMENTS {
+            return Err(Error::Unwritable);
+        }
+        let base = self.flags & !(flags::FIRST_FRAG | flags::LAST_FRAG);
+        let pieces: Vec<&[u8]> = if stub.is_empty() { vec![&[]] } else { stub.chunks(room).collect() };
+        let last = n - 1;
+        let mut out = Vec::with_capacity(n);
+        for (i, piece) in pieces.into_iter().enumerate() {
+            let mut f = base;
+            if i == 0 {
+                f |= flags::FIRST_FRAG;
+            }
+            if i == last {
+                f |= flags::LAST_FRAG;
+            }
+            let mut body = template.clone();
+            let sent = u32::try_from(i * room).unwrap_or(u32::MAX);
+            if let Body::Request { alloc_hint, .. } | Body::Response { alloc_hint, .. } = &mut body
+                && *alloc_hint != 0
+            {
+                *alloc_hint = alloc_hint.saturating_sub(sent);
+            }
+            if let Some(s) = body.stub_mut() {
+                *s = piece.to_vec();
+            }
+            out.push(Pdu {
+                version_minor: self.version_minor,
+                flags: f,
+                drep: self.drep,
+                call_id: self.call_id,
+                body,
+                auth: None,
+            });
+        }
+        Ok(out)
+    }
+}
+
+impl Wire for Pdu {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads exactly one PDU. Refuses invalid headers or bodies, incomplete
+    /// fragments, trailing bytes, and values whose canonical padding or
+    /// reserved fields would exceed [`MAX_FRAG`]. [`Frames`] accepts those
+    /// last values for forwarding through the driver's original bytes.
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        let used = Self::frame_length(bytes)?.ok_or(Error::Incomplete)?;
+        let fragment = bytes.get(..used).ok_or(Error::Incomplete)?;
+        if used != bytes.len() {
+            return Err(Error::Trailing { remaining: bytes.len() - used });
+        }
+        let pdu = parse_fragment(fragment)?;
+        pdu.write(&mut Vec::new())?;
+        Ok(pdu)
     }
 
-    /// The PDU's bytes. A value [`Pdu::parse`] would refuse or read back
-    /// as something else is an error; see [`EncodeError`].
-    pub fn to_bytes(&self) -> Result<Vec<u8>, EncodeError> {
+    /// Appends one PDU. Refuses invalid versions or integer representations,
+    /// mismatched object flags, invalid authentication, unterminated secondary
+    /// addresses, counts over 255, and fragments over [`MAX_FRAG`].
+    /// Authenticated stubs receive 16-byte padding; other bodies receive
+    /// 4-byte padding. Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         if self.version_minor > 1 {
-            return Err(EncodeError::Version(self.version_minor));
+            return Err(Error::Unwritable);
         }
-        let le = self.drep.little_endian().ok_or(EncodeError::IntegerRep(self.drep.0[0] >> 4))?;
+        let le = self.drep.little_endian().ok_or(Error::Unwritable)?;
         if let Body::Request { object, .. } = &self.body
             && object.is_some() != (self.flags & flags::OBJECT_UUID != 0)
         {
-            return Err(EncodeError::ObjectFlag);
+            return Err(Error::Unwritable);
         }
         match (&self.body, &self.auth) {
-            (Body::Auth3, None) | (Body::BindNak(_) | Body::Shutdown, Some(_)) => return Err(EncodeError::Auth),
+            (Body::Auth3, None) | (Body::BindNak(_) | Body::Shutdown, Some(_)) => return Err(Error::Unwritable),
             _ => {}
         }
         let mut w = W { out: Vec::with_capacity(64), le };
@@ -889,9 +963,9 @@ impl Pdu {
                 w.u16(a.max_recv_frag);
                 w.u32(a.assoc_group);
                 if a.secondary_address.last().is_some_and(|&b| b != 0) {
-                    return Err(EncodeError::Address);
+                    return Err(Error::Unwritable);
                 }
-                let n = u16::try_from(a.secondary_address.len()).map_err(|_| EncodeError::TooLong)?;
+                let n = u16::try_from(a.secondary_address.len()).map_err(|_| Error::Unwritable)?;
                 w.u16(n);
                 w.bytes(&a.secondary_address)?;
                 w.align(4);
@@ -915,9 +989,9 @@ impl Pdu {
         let mut auth_len = 0u16;
         if let Some(a) = &self.auth {
             if a.value.is_empty() {
-                return Err(EncodeError::EmptyAuth);
+                return Err(Error::Unwritable);
             }
-            auth_len = u16::try_from(a.value.len()).map_err(|_| EncodeError::TooLong)?;
+            auth_len = u16::try_from(a.value.len()).map_err(|_| Error::Unwritable)?;
             // Padding before the trailer: the stub data of a call to a
             // multiple of 16 bytes, anything else to 4 from the PDU's start.
             let before = w.out.len();
@@ -933,7 +1007,7 @@ impl Pdu {
             w.u32(a.context_id);
             w.bytes(&a.value)?;
         }
-        let frag = u16::try_from(w.out.len()).map_err(|_| EncodeError::TooLong)?;
+        let frag = u16::try_from(w.out.len()).map_err(|_| Error::Unwritable)?;
         let (f, l) = if le {
             (frag.to_le_bytes(), auth_len.to_le_bytes())
         } else {
@@ -941,173 +1015,7 @@ impl Pdu {
         };
         w.out[8..10].copy_from_slice(&f);
         w.out[10..12].copy_from_slice(&l);
-        Ok(w.out)
-    }
-
-    /// Splits a request or response into fragments of at most `max_frag`
-    /// bytes each, such as the `max_recv_frag` the peer bound with. The
-    /// first has [`flags::FIRST_FRAG`], the last [`flags::LAST_FRAG`],
-    /// and each keeps the PDU's other flags and fields, except that a
-    /// nonzero `alloc_hint` counts down by the stub data already sent, as
-    /// MS-RPCE 2.2.2.6 asks. Any other PDU comes back whole if it writes
-    /// in at most `max_frag` bytes, and is [`EncodeError::FragSize`] if
-    /// it is longer. A PDU with an auth verifier is an error, since each
-    /// fragment's verifier is the security provider's to make, and so is
-    /// a split into more than [`MAX_FRAGMENTS`] fragments. Every other
-    /// error [`Pdu::to_bytes`] gives is checked before anything is copied.
-    pub fn fragments(&self, max_frag: u16) -> Result<Vec<Pdu>, EncodeError> {
-        if self.auth.is_some() {
-            return Err(EncodeError::FragmentAuth);
-        }
-        let header = match &self.body {
-            Body::Request { object: Some(_), .. } => HEADER_LEN + 24,
-            Body::Request { .. } | Body::Response { .. } => HEADER_LEN + 8,
-            _ => {
-                // The writer stops at MAX_FRAG bytes, so this copies at
-                // most one fragment's worth.
-                if self.to_bytes()?.len() > usize::from(max_frag) {
-                    return Err(EncodeError::FragSize);
-                }
-                return Ok(vec![self.clone()]);
-            }
-        };
-        // The body without its stub, cloned once per fragment, so the
-        // stub is copied once in all rather than once per fragment.
-        let template = self.body.clone_without_stub();
-        // The header the fragments share, written once to check it.
-        Pdu { auth: None, body: template.clone(), ..*self }.to_bytes()?;
-        let room = usize::from(max_frag).checked_sub(header).filter(|&r| r > 0).ok_or(EncodeError::FragSize)?;
-        let stub = self.body.stub().unwrap_or(&[]);
-        let n = stub.len().div_ceil(room).max(1);
-        if n > MAX_FRAGMENTS {
-            return Err(EncodeError::FragSize);
-        }
-        let base = self.flags & !(flags::FIRST_FRAG | flags::LAST_FRAG);
-        let pieces: Vec<&[u8]> = if stub.is_empty() { vec![&[]] } else { stub.chunks(room).collect() };
-        let last = n - 1;
-        let mut out = Vec::with_capacity(n);
-        for (i, piece) in pieces.into_iter().enumerate() {
-            let mut f = base;
-            if i == 0 {
-                f |= flags::FIRST_FRAG;
-            }
-            if i == last {
-                f |= flags::LAST_FRAG;
-            }
-            let mut body = template.clone();
-            let sent = u32::try_from(i * room).unwrap_or(u32::MAX);
-            if let Body::Request { alloc_hint, .. } | Body::Response { alloc_hint, .. } = &mut body
-                && *alloc_hint != 0
-            {
-                *alloc_hint = alloc_hint.saturating_sub(sent);
-            }
-            if let Some(s) = body.stub_mut() {
-                *s = piece.to_vec();
-            }
-            out.push(Pdu {
-                version_minor: self.version_minor,
-                flags: f,
-                drep: self.drep,
-                call_id: self.call_id,
-                body,
-                auth: None,
-            });
-        }
-        Ok(out)
-    }
-}
-
-/// Why a fragment stream cannot continue.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FrameError {
-    /// A version, integer representation, or fragment length broke framing.
-    Header(Error),
-    /// The declared fragment length exceeded the configured limit.
-    TooLong {
-        /// Declared length, including the common header.
-        length: usize,
-        /// Largest accepted fragment.
-        limit: usize,
-    },
-}
-
-impl core::fmt::Display for FrameError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Header(e) => e.fmt(f),
-            Self::TooLong { length, limit } => write!(f, "DCE/RPC fragment of {length} bytes exceeds {limit}"),
-        }
-    }
-}
-
-impl core::error::Error for FrameError {
-    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
-        match self {
-            Self::Header(error) => Some(error),
-            Self::TooLong { .. } => None,
-        }
-    }
-}
-
-/// Why an exact [`Wire`] parse did not contain one writable PDU.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ParseError {
-    /// The PDU header or body was invalid.
-    Pdu(Error),
-    /// The input ended before a complete fragment.
-    Incomplete,
-    /// Bytes followed the complete fragment.
-    Trailing {
-        /// Number of bytes after the fragment.
-        remaining: usize,
-    },
-    /// The writer's padding or reserved fields would exceed [`MAX_FRAG`].
-    Unrepresentable(EncodeError),
-}
-
-impl core::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Pdu(e) => e.fmt(f),
-            Self::Incomplete => f.write_str("incomplete DCE/RPC fragment"),
-            Self::Trailing { remaining } => write!(f, "{remaining} bytes after DCE/RPC fragment"),
-            Self::Unrepresentable(e) => write!(f, "DCE/RPC PDU cannot be re-encoded: {e}"),
-        }
-    }
-}
-
-impl core::error::Error for ParseError {
-    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
-        match self {
-            Self::Pdu(error) => Some(error),
-            Self::Unrepresentable(error) => Some(error),
-            Self::Incomplete | Self::Trailing { .. } => None,
-        }
-    }
-}
-
-impl Wire for Pdu {
-    type ParseError = ParseError;
-    type WriteError = EncodeError;
-
-    /// Reads exactly one PDU whose re-encoding fits [`MAX_FRAG`].
-    ///
-    /// The writer adds padding and reserved fields some peers omit. A PDU
-    /// that would then exceed the fragment limit is refused. [`Pdu::parse`]
-    /// and [`Frames`] retain their broader receive behavior.
-    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
-        let (pdu, used) = Pdu::parse(bytes).map_err(ParseError::Pdu)?.ok_or(ParseError::Incomplete)?;
-        if used != bytes.len() {
-            return Err(ParseError::Trailing { remaining: bytes.len().saturating_sub(used) });
-        }
-        Pdu::to_bytes(&pdu).map_err(ParseError::Unrepresentable)?;
-        Ok(pdu)
-    }
-
-    /// Appends one PDU with at most [`MAX_FRAG`] bytes of temporary storage.
-    /// Leaves `out` unchanged on error. Padding follows [`Pdu::to_bytes`].
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
-        out.extend_from_slice(&self.to_bytes()?);
+        out.extend_from_slice(&w.out);
         Ok(())
     }
 }
@@ -1115,7 +1023,7 @@ impl Wire for Pdu {
 /// Reads DCE/RPC fragments without retaining input.
 ///
 /// Items are `Result<Pdu, Error>`: body errors are recoverable items.
-/// Only [`FrameError`] ends the stream, for invalid headers or fragments above
+/// Only a framing error ends the stream, for invalid headers or fragments above
 /// [`limit`](Self::limit). Lengths are checked as soon as their first ten
 /// header bytes arrive, before any body is needed.
 /// Partial fragments return [`Step::Need`], including at EOF, so
@@ -1123,8 +1031,6 @@ impl Wire for Pdu {
 /// the original fragment bytes for authentication, including discarded padding.
 /// Proxies should forward those bytes: a received PDU can fit the limit while
 /// canonical padding or reserved fields would make [`Wire::write`] refuse it.
-/// The legacy [`Decoder`] remains separate to preserve borrowed frames,
-/// repeated framing errors, and buffer clearing on failure.
 ///
 /// ```
 /// use fictionet::stdlib::{codec::{Stream, Wire}, dcerpc::{Body, Frames, Pdu}};
@@ -1133,7 +1039,7 @@ impl Wire for Pdu {
 /// let mut stream = Stream::new(Frames::new());
 /// assert_eq!(stream.push(&bytes), bytes.len());
 /// assert_eq!(stream.next(), Some(Ok(Ok(pdu))));
-/// # Ok::<(), fictionet::stdlib::dcerpc::EncodeError>(())
+/// # Ok::<(), fictionet::stdlib::dcerpc::Error>(())
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Frames {
@@ -1165,17 +1071,17 @@ impl Default for Frames {
 
 impl Decode for Frames {
     type Item = Result<Pdu, Error>;
-    type Error = FrameError;
+    type Error = Error;
     const NAME: &'static str = "DCE/RPC";
 
     fn capacity(&self) -> usize {
         self.limit
     }
 
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Self::Item>, FrameError> {
-        let Some(used) = Pdu::frame_length(input).map_err(FrameError::Header)? else { return Ok(Step::Need) };
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Self::Item>, Error> {
+        let Some(used) = Pdu::frame_length(input)? else { return Ok(Step::Need) };
         if used > self.limit {
-            return Err(FrameError::TooLong { length: used, limit: self.limit });
+            return Err(Error::TooLong { length: used, limit: self.limit });
         }
         let Some(bytes) = input.get(..used) else { return Ok(Step::Need) };
         Ok(Step::Item(parse_fragment(bytes), used))
@@ -1183,8 +1089,8 @@ impl Decode for Frames {
 }
 
 /// How many items a list holds, as its 8-bit count.
-fn count(n: usize) -> Result<u8, EncodeError> {
-    u8::try_from(n).map_err(|_| EncodeError::Count)
+fn count(n: usize) -> Result<u8, Error> {
+    u8::try_from(n).map_err(|_| Error::Unwritable)
 }
 
 /// Reads one whole fragment, whose length the header has been checked to
@@ -1389,16 +1295,16 @@ impl W {
 
     /// Appends bytes, refusing once the PDU is past what one fragment
     /// holds, so a huge value is never copied whole.
-    fn bytes(&mut self, b: &[u8]) -> Result<(), EncodeError> {
+    fn bytes(&mut self, b: &[u8]) -> Result<(), Error> {
         if self.out.len().saturating_add(b.len()) > MAX_FRAG {
-            return Err(EncodeError::TooLong);
+            return Err(Error::Unwritable);
         }
         self.out.extend_from_slice(b);
         Ok(())
     }
 
-    fn check(&self) -> Result<(), EncodeError> {
-        if self.out.len() > MAX_FRAG { Err(EncodeError::TooLong) } else { Ok(()) }
+    fn check(&self) -> Result<(), Error> {
+        if self.out.len() > MAX_FRAG { Err(Error::Unwritable) } else { Ok(()) }
     }
 
     /// Pads with zeros to a multiple of `n` from the PDU's start.
@@ -1421,86 +1327,6 @@ fn rd16(le: bool, b: &[u8], i: usize) -> u16 {
 fn rd32(le: bool, b: &[u8], i: usize) -> u32 {
     let v = [b[i], b[i + 1], b[i + 2], b[i + 3]];
     if le { u32::from_le_bytes(v) } else { u32::from_be_bytes(v) }
-}
-
-/// Splits a DCE/RPC byte stream into PDUs. Feed it the bytes a connection
-/// or pipe reads, in order, and take PDUs out until it has none.
-#[derive(Debug, Default)]
-pub struct Decoder {
-    buf: Vec<u8>,
-    /// Where the bytes not yet taken out start. Bytes before it are
-    /// dropped in `feed` once they are half the buffer.
-    start: usize,
-    failed: Option<Error>,
-}
-
-impl Decoder {
-    /// A decoder holding no bytes.
-    pub fn new() -> Decoder {
-        Decoder::default()
-    }
-
-    /// Takes bytes read from the connection, from the start of `bytes`,
-    /// and returns how many it took. It takes them all unless that would
-    /// make it hold more than [`MAX_BUFFERED`] bytes. Then take PDUs out
-    /// with [`Decoder::next_pdu`] and feed it the rest. Once it is full,
-    /// `next_pdu` always gives a PDU or an error, so a loop of feeding and
-    /// taking out always ends. After an error that breaks the stream,
-    /// every byte is taken and dropped.
-    #[must_use = "bytes past the count returned were not taken"]
-    pub fn feed(&mut self, bytes: &[u8]) -> usize {
-        if self.failed.is_some() {
-            return bytes.len();
-        }
-        if self.start > 0 && self.start >= self.buf.len() / 2 {
-            self.buf.drain(..self.start);
-            self.start = 0;
-        }
-        let n = bytes.len().min(MAX_BUFFERED.saturating_sub(self.buffered()));
-        self.buf.extend_from_slice(&bytes[..n]);
-        n
-    }
-
-    /// The next whole PDU, if one has come. It returns `None` when it
-    /// needs more bytes. A PDU whose body cannot be read gives its error
-    /// once, and the stream goes on after it. An error that breaks the
-    /// stream ([`Error::breaks_stream`]) comes back on every call.
-    pub fn next_pdu(&mut self) -> Option<Result<Pdu, Error>> {
-        self.next_frame().map(|(r, _)| r)
-    }
-
-    /// Like [`Decoder::next_pdu`], with the PDU's bytes as they came. A
-    /// world that checks or decrypts auth verifiers needs them: the
-    /// security provider covers the header, the stub data and the padding
-    /// before the trailer, and at [`auth_level::PKT_PRIVACY`] that padding
-    /// is ciphertext, which a [`Pdu`] does not keep. After an error that
-    /// breaks the stream the bytes are empty.
-    pub fn next_frame(&mut self) -> Option<(Result<Pdu, Error>, &[u8])> {
-        if let Some(e) = self.failed {
-            return Some((Err(e), &[]));
-        }
-        let b = &self.buf[self.start..];
-        match Pdu::frame_length(b) {
-            Ok(Some(n)) if b.len() >= n => {
-                let r = parse_fragment(&b[..n]);
-                let at = self.start;
-                self.start += n;
-                Some((r, &self.buf[at..at + n]))
-            }
-            Ok(_) => None,
-            Err(e) => {
-                self.failed = Some(e);
-                self.buf = Vec::new();
-                self.start = 0;
-                Some((Err(e), &[]))
-            }
-        }
-    }
-
-    /// How many bytes are held, waiting for the rest of a PDU.
-    pub fn buffered(&self) -> usize {
-        self.buf.len() - self.start
-    }
 }
 
 /// Why a [`Reassembler`] dropped a call.
@@ -1540,7 +1366,7 @@ impl std::fmt::Display for ReassemblyError {
 impl std::error::Error for ReassemblyError {}
 
 /// Joins the fragments of requests and responses into whole calls. Push
-/// each PDU a [`Decoder`] gives; a whole call comes back once its last
+/// each PDU a stream gives; a whole call comes back once its last
 /// fragment has come. Other PDUs come back as they are. A fault or
 /// orphaned PDU for the call being joined drops it.
 ///
@@ -1648,6 +1474,7 @@ impl Reassembler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stdlib::codec::{Stream, Fail, contract, test_support::{Lcg, mutate, decode_all}};
 
     /// An endpoint mapper bind as Windows sends it: one context, the
     /// endpoint mapper over NDR.
@@ -1677,7 +1504,7 @@ mod tests {
 
     fn round_trip(p: &Pdu) -> Vec<u8> {
         let bytes = p.to_bytes().unwrap();
-        assert_eq!(Pdu::parse(&bytes), Ok(Some((p.clone(), bytes.len()))), "{p:?}");
+        assert_eq!(Pdu::parse(&bytes), Ok(p.clone()), "{p:?}");
         bytes
     }
 
@@ -1738,18 +1565,17 @@ mod tests {
 
     #[test]
     fn windows_bind_example() {
-        let (pdu, used) = Pdu::parse(&BIND).unwrap().unwrap();
-        assert_eq!(used, 72);
+        let pdu = Pdu::parse(&BIND).unwrap();
         assert_eq!(pdu, bind());
         assert_eq!(bind().to_bytes().unwrap(), BIND);
         // Every prefix is part of a PDU.
         for n in 0..BIND.len() {
-            assert_eq!(Pdu::parse(&BIND[..n]), Ok(None), "{n} bytes");
+            assert_eq!(Pdu::parse(&BIND[..n]), Err(Error::Incomplete), "{n} bytes");
         }
         // Bytes past the fragment are left.
         let mut more = BIND.to_vec();
         more.extend_from_slice(&[5, 0]);
-        assert_eq!(Pdu::parse(&more).unwrap().unwrap().1, 72);
+        assert_eq!(Pdu::parse(&more), Err(Error::Trailing { remaining: more.len() - 72 }));
     }
 
     #[test]
@@ -1803,7 +1629,7 @@ mod tests {
             p.version_minor = 1;
             let bytes = round_trip(&p);
             for n in 0..bytes.len() {
-                assert_eq!(Pdu::parse(&bytes[..n]), Ok(None));
+                assert_eq!(Pdu::parse(&bytes[..n]), Err(Error::Incomplete));
             }
             if matches!(p.body, Body::BindNak(_) | Body::Shutdown) {
                 continue;
@@ -1816,7 +1642,7 @@ mod tests {
             });
             let bytes = round_trip(&p);
             for n in 0..bytes.len() {
-                assert_eq!(Pdu::parse(&bytes[..n]), Ok(None));
+                assert_eq!(Pdu::parse(&bytes[..n]), Err(Error::Incomplete));
             }
         }
     }
@@ -1839,7 +1665,7 @@ mod tests {
         assert_eq!(b[48..52], [0, 1, 0, 3]);
         let mut be = b.clone();
         be[48..52].copy_from_slice(&[0, 0, 0, 2]);
-        let Body::Bind(got) = Pdu::parse(&be).unwrap().unwrap().0.body else { panic!() };
+        let Body::Bind(got) = Pdu::parse(&be).unwrap().body else { panic!() };
         assert_eq!((got.contexts[0].abstract_syntax.major, got.contexts[0].abstract_syntax.minor), (2, 0));
     }
 
@@ -1899,7 +1725,7 @@ mod tests {
         // A fault without the reserved word still reads.
         let mut short = b[..28].to_vec();
         short[8] = 28;
-        assert_eq!(Pdu::parse(&short).unwrap().unwrap().0, fault);
+        assert_eq!(Pdu::parse(&short).unwrap(), fault);
     }
 
     #[test]
@@ -1933,12 +1759,11 @@ mod tests {
     fn header_errors_break_the_stream() {
         assert_eq!(Pdu::parse(&[4, 0]), Err(Error::Version { major: 4, minor: 0 }));
         assert_eq!(Pdu::parse(&[5, 2]), Err(Error::Version { major: 5, minor: 2 }));
-        assert_eq!(Pdu::parse(&[5]), Ok(None));
+        assert_eq!(Pdu::parse(&[5]), Err(Error::Incomplete));
         assert_eq!(Pdu::parse(&[5, 0, 0, 3, 0x20]), Err(Error::IntegerRep(2)));
         assert_eq!(Pdu::parse(&[5, 0, 0, 3, 0x10, 0, 0, 0, 15, 0]), Err(Error::FragLength(15)));
         assert_eq!(Pdu::parse(&[5, 0, 0, 3, 0x00, 0, 0, 0, 0, 15]), Err(Error::FragLength(15)));
         for e in [Error::Version { major: 4, minor: 0 }, Error::IntegerRep(2), Error::FragLength(0)] {
-            assert!(e.breaks_stream());
             assert!(!e.to_string().is_empty());
         }
     }
@@ -1956,7 +1781,7 @@ mod tests {
         }
         // An auth length the fragment cannot hold.
         assert_eq!(Pdu::parse(&header(18, 24, 1)), Err(Error::AuthLength(1)));
-        assert_eq!(Pdu::parse(&header(18, 25, 1)).unwrap().unwrap().0.auth.unwrap().value, [0]);
+        assert_eq!(Pdu::parse(&header(18, 25, 1)).unwrap().auth.unwrap().value, [0]);
         // Padding that runs into the header.
         let mut b = header(18, 25, 1);
         b[18] = 1;
@@ -1990,11 +1815,10 @@ mod tests {
         assert_eq!(Pdu::parse(&b), Err(Error::Truncated));
         // A bind_nak that stops after its reason.
         assert_eq!(
-            Pdu::parse(&header(13, 18, 0)).unwrap().unwrap().0.body,
+            Pdu::parse(&header(13, 18, 0)).unwrap().body,
             Body::BindNak(BindNak { reason: 0, versions: vec![] })
         );
         for e in [Error::Type(1), Error::AuthLength(1), Error::AuthPad(1), Error::Truncated, Error::Address] {
-            assert!(!e.breaks_stream());
             assert!(!e.to_string().is_empty());
         }
     }
@@ -2003,35 +1827,35 @@ mod tests {
     fn writers_refuse_what_would_not_read_back() {
         let mut p = request(vec![]);
         p.version_minor = 2;
-        assert_eq!(p.to_bytes(), Err(EncodeError::Version(2)));
+        assert_eq!(p.to_bytes(), Err(Error::Unwritable));
         let mut p = request(vec![]);
         p.drep = DataRep([0x20, 0, 0, 0]);
-        assert_eq!(p.to_bytes(), Err(EncodeError::IntegerRep(2)));
+        assert_eq!(p.to_bytes(), Err(Error::Unwritable));
         let mut p = request(vec![]);
         p.flags |= flags::OBJECT_UUID;
-        assert_eq!(p.to_bytes(), Err(EncodeError::ObjectFlag));
+        assert_eq!(p.to_bytes(), Err(Error::Unwritable));
         let mut p = request(vec![]);
         p.auth = Some(Auth { kind: 9, level: 6, context_id: 0, value: vec![] });
-        assert_eq!(p.to_bytes(), Err(EncodeError::EmptyAuth));
+        assert_eq!(p.to_bytes(), Err(Error::Unwritable));
         let mut p = request(vec![]);
         p.auth = Some(Auth { kind: 9, level: 6, context_id: 0, value: vec![0; 65536] });
-        assert_eq!(p.to_bytes(), Err(EncodeError::TooLong));
-        assert_eq!(request(vec![0; MAX_FRAG]).to_bytes(), Err(EncodeError::TooLong));
+        assert_eq!(p.to_bytes(), Err(Error::Unwritable));
+        assert_eq!(request(vec![0; MAX_FRAG]).to_bytes(), Err(Error::Unwritable));
         // The longest request fits exactly.
         round_trip(&request(vec![0; MAX_FRAG - 24]));
-        assert_eq!(request(vec![0; MAX_FRAG - 23]).to_bytes(), Err(EncodeError::TooLong));
+        assert_eq!(request(vec![0; MAX_FRAG - 23]).to_bytes(), Err(Error::Unwritable));
         let mut b = match bind().body {
             Body::Bind(b) => b,
             _ => unreachable!(),
         };
         b.contexts[0].transfer_syntaxes = vec![NDR; 256];
-        assert_eq!(Pdu::new(1, Body::Bind(b.clone())).to_bytes(), Err(EncodeError::Count));
+        assert_eq!(Pdu::new(1, Body::Bind(b.clone())).to_bytes(), Err(Error::Unwritable));
         b.contexts = vec![Context { id: 0, abstract_syntax: NDR, transfer_syntaxes: vec![] }; 256];
-        assert_eq!(Pdu::new(1, Body::Bind(b.clone())).to_bytes(), Err(EncodeError::Count));
+        assert_eq!(Pdu::new(1, Body::Bind(b.clone())).to_bytes(), Err(Error::Unwritable));
         b.contexts = vec![Context { id: 0, abstract_syntax: NDR, transfer_syntaxes: vec![NDR; 255] }; 255];
-        assert_eq!(Pdu::new(1, Body::Bind(b)).to_bytes(), Err(EncodeError::TooLong));
+        assert_eq!(Pdu::new(1, Body::Bind(b)).to_bytes(), Err(Error::Unwritable));
         let nak = BindNak { reason: 0, versions: vec![(5, 0); 256] };
-        assert_eq!(Pdu::new(1, Body::BindNak(nak)).to_bytes(), Err(EncodeError::Count));
+        assert_eq!(Pdu::new(1, Body::BindNak(nak)).to_bytes(), Err(Error::Unwritable));
         let ack = BindAck {
             max_xmit_frag: 0,
             max_recv_frag: 0,
@@ -2039,23 +1863,10 @@ mod tests {
             secondary_address: vec![0; 70000],
             results: vec![],
         };
-        assert_eq!(Pdu::new(1, Body::BindAck(ack.clone())).to_bytes(), Err(EncodeError::TooLong));
+        assert_eq!(Pdu::new(1, Body::BindAck(ack.clone())).to_bytes(), Err(Error::Unwritable));
         let ack = BindAck { secondary_address: vec![], results: vec![ContextResult::accept(NDR); 256], ..ack };
-        assert_eq!(Pdu::new(1, Body::BindAck(ack)).to_bytes(), Err(EncodeError::Count));
-        for e in [
-            EncodeError::Version(2),
-            EncodeError::IntegerRep(2),
-            EncodeError::ObjectFlag,
-            EncodeError::EmptyAuth,
-            EncodeError::Count,
-            EncodeError::TooLong,
-            EncodeError::FragSize,
-            EncodeError::FragmentAuth,
-            EncodeError::Auth,
-            EncodeError::Address,
-        ] {
-            assert!(!e.to_string().is_empty());
-        }
+        assert_eq!(Pdu::new(1, Body::BindAck(ack)).to_bytes(), Err(Error::Unwritable));
+        assert!(!Error::Unwritable.to_string().is_empty());
     }
 
     #[test]
@@ -2083,10 +1894,10 @@ mod tests {
         assert_eq!(request(vec![]).fragments(25).unwrap(), [request(vec![])]);
         assert_eq!(bind().fragments(72).unwrap(), [bind()]);
         // Too small for the header, and a PDU with a verifier.
-        assert_eq!(request(vec![1]).fragments(24), Err(EncodeError::FragSize));
+        assert_eq!(request(vec![1]).fragments(24), Err(Error::Unwritable));
         let mut p = request(vec![1]);
         p.auth = Some(Auth { kind: 9, level: 6, context_id: 0, value: vec![1] });
-        assert_eq!(p.fragments(1000), Err(EncodeError::FragmentAuth));
+        assert_eq!(p.fragments(1000), Err(Error::Unwritable));
         // Responses with an object-less header split too.
         let resp = Pdu::new(4, Body::Response { alloc_hint: 9, context_id: 1, cancel_count: 0, stub: vec![5; 9] });
         let parts = resp.fragments(28).unwrap();
@@ -2104,10 +1915,10 @@ mod tests {
         // A peer that binds with a tiny max_recv_frag must not make a
         // world build millions of fragments, or copy the stub once per
         // fragment.
-        assert_eq!(request(vec![0; MAX_STUB]).fragments(25), Err(EncodeError::FragSize));
+        assert_eq!(request(vec![0; MAX_STUB]).fragments(25), Err(Error::Unwritable));
         let n = MAX_FRAGMENTS;
         assert_eq!(request(vec![0; n]).fragments(25).map(|v| v.len()), Ok(n));
-        assert_eq!(request(vec![0; n + 1]).fragments(25), Err(EncodeError::FragSize));
+        assert_eq!(request(vec![0; n + 1]).fragments(25), Err(Error::Unwritable));
         let started = std::time::Instant::now();
         let parts = request(vec![1; 60_000]).fragments(25).unwrap();
         assert_eq!(parts.len(), 60_000);
@@ -2183,7 +1994,7 @@ mod tests {
             secondary_address: vec![0; 1 << 20],
             results: vec![],
         };
-        assert_eq!(Pdu::new(1, Body::BindAck(ack)).fragments(4096), Err(EncodeError::TooLong));
+        assert_eq!(Pdu::new(1, Body::BindAck(ack)).fragments(4096), Err(Error::Unwritable));
         let fault = Body::Fault {
             alloc_hint: 0,
             context_id: 0,
@@ -2192,17 +2003,17 @@ mod tests {
             status: 0,
             stub: vec![0; 1 << 20],
         };
-        assert_eq!(Pdu::new(1, fault).fragments(4096), Err(EncodeError::TooLong));
+        assert_eq!(Pdu::new(1, fault).fragments(4096), Err(Error::Unwritable));
         // A PDU that writes but is longer than the fragments asked for.
-        assert_eq!(bind().fragments(71), Err(EncodeError::FragSize));
+        assert_eq!(bind().fragments(71), Err(Error::Unwritable));
         assert_eq!(bind().fragments(72).unwrap(), [bind()]);
         // A request the writer would refuse is refused before it is split.
         let mut p = request(vec![1; 300]);
         p.flags |= flags::OBJECT_UUID;
-        assert_eq!(p.fragments(100), Err(EncodeError::ObjectFlag));
+        assert_eq!(p.fragments(100), Err(Error::Unwritable));
         let mut p = request(vec![1; 300]);
         p.version_minor = 2;
-        assert_eq!(p.fragments(100), Err(EncodeError::Version(2)));
+        assert_eq!(p.fragments(100), Err(Error::Unwritable));
     }
 
     #[test]
@@ -2282,7 +2093,7 @@ mod tests {
     #[test]
     fn auth_rules_by_packet_type() {
         // MS-RPCE 2.2.2.10: an auth3 has a verifier and 4 bytes of pad.
-        assert_eq!(Pdu::new(1, Body::Auth3).to_bytes(), Err(EncodeError::Auth));
+        assert_eq!(Pdu::new(1, Body::Auth3).to_bytes(), Err(Error::Unwritable));
         let bare = [5, 0, 16, 3, 0x10, 0, 0, 0, 16, 0, 0, 0, 1, 0, 0, 0];
         assert_eq!(Pdu::parse(&bare), Err(Error::AuthLength(0)));
         // A trailer straight after the header, with no pad.
@@ -2296,7 +2107,7 @@ mod tests {
             let mut p = Pdu::new(1, body);
             let plain = p.to_bytes().unwrap();
             p.auth = Some(auth(0));
-            assert_eq!(p.to_bytes(), Err(EncodeError::Auth));
+            assert_eq!(p.to_bytes(), Err(Error::Unwritable));
             let mut b = plain.clone();
             b.resize(b.len().next_multiple_of(4), 0);
             b.extend_from_slice(&[0x0a, 5, (b.len() - plain.len()) as u8, 0, 0, 0, 0, 0]);
@@ -2324,7 +2135,7 @@ mod tests {
         b.extend_from_slice(&[7; 16]);
         b[8] = b.len() as u8;
         b[10] = 16;
-        let p = Pdu::parse(&b).unwrap().unwrap().0;
+        let p = Pdu::parse(&b).unwrap();
         assert_eq!(p.body.stub(), Some(&[9][..]));
     }
 
@@ -2343,7 +2154,7 @@ mod tests {
                 }),
             )
         };
-        assert_eq!(ack(b"135").to_bytes(), Err(EncodeError::Address));
+        assert_eq!(ack(b"135").to_bytes(), Err(Error::Unwritable));
         round_trip(&ack(b"135\0"));
         round_trip(&ack(b""));
         let mut b = ack(b"135\0").to_bytes().unwrap();
@@ -2371,7 +2182,7 @@ mod tests {
     }
 
     #[test]
-    fn decoder_gives_each_frame_as_it_came() {
+    fn stream_gives_each_frame_as_it_came() {
         // A privacy-protected request: 3 bytes of stub and 13 bytes of
         // padding that are ciphertext too, so not zeros.
         let mut b = request(vec![1, 2, 3]).to_bytes().unwrap();
@@ -2382,51 +2193,24 @@ mod tests {
         b[10] = 16;
         let mut stream = b.clone();
         stream.extend(BIND);
-        let mut d = Decoder::new();
-        assert_eq!(d.feed(&stream), stream.len());
-        let (p, frame) = d.next_frame().unwrap();
+        let mut d = Stream::new(Frames::new());
+        assert_eq!(d.push(&stream), stream.len());
+        let (p, frame) = d.with_next(|p, raw, _| (p, raw.to_vec())).unwrap().unwrap();
         assert_eq!(frame, &b[..]);
         let p = p.unwrap();
         assert_eq!(p.body.stub(), Some(&[1, 2, 3][..]));
         assert_eq!(p.auth.unwrap().context_id, 1);
-        let (p, frame) = d.next_frame().unwrap();
-        assert_eq!((p, frame), (Ok(bind()), &BIND[..]));
-        assert!(d.next_frame().is_none());
+        let (p, frame) = d.with_next(|p, raw, _| (p, raw.to_vec())).unwrap().unwrap();
+        assert_eq!((p, frame), (Ok(bind()), BIND.to_vec()));
+        assert!(d.next().is_none());
         // A body that cannot be read still gives its bytes.
         let bad = [5, 0, 9, 3, 0x10, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0];
-        assert_eq!(d.feed(&bad), 16);
-        assert_eq!(d.next_frame(), Some((Err(Error::Type(9)), &bad[..])));
-    }
-
-    /// Feeds `data` in chunks of `chunk` bytes, taking PDUs out after each
-    /// feed. Every result, ending with the error that broke the stream, if
-    /// one did.
-    fn split(data: &[u8], chunk: usize) -> Vec<Result<Pdu, Error>> {
-        let mut d = Decoder::new();
-        let mut out = Vec::new();
-        for piece in data.chunks(chunk) {
-            let mut rest = piece;
-            while !rest.is_empty() {
-                let took = d.feed(rest);
-                assert!(d.buffered() <= MAX_BUFFERED);
-                rest = &rest[took..];
-                let mut progress = took > 0;
-                while let Some(r) = d.next_pdu() {
-                    let fatal = matches!(r, Err(e) if e.breaks_stream());
-                    out.push(r);
-                    if fatal {
-                        return out;
-                    }
-                    progress = true;
-                }
-                assert!(progress, "a full decoder gave nothing");
-            }
-        }
-        out
+        assert_eq!(d.push(&bad), 16);
+        assert_eq!(d.with_next(|p, raw, _| (p, raw.to_vec())), Some(Ok((Err(Error::Type(9)), bad.to_vec()))));
     }
 
     #[test]
-    fn decoder_splits_a_stream() {
+    fn stream_splits_a_stream() {
         let mut stream = Vec::new();
         for p in all_bodies() {
             stream.extend(p.to_bytes().unwrap());
@@ -2434,95 +2218,41 @@ mod tests {
         // A PDU with a bad body, then a good one: the stream goes on.
         stream.extend_from_slice(&[5, 0, 9, 3, 0x10, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0]);
         stream.extend(BIND);
-        let whole = split(&stream, stream.len());
+        contract::check_decode_with_alloc_limit(Frames::new, &stream, 2 * MAX_FRAG);
+        let (whole, error) = decode_all(Frames::new, &stream);
+        assert_eq!(error, None);
         assert_eq!(whole.len(), all_bodies().len() + 2);
         assert_eq!(whole[whole.len() - 2], Err(Error::Type(9)));
         assert_eq!(whole[whole.len() - 1], Ok(bind()));
-        for chunk in [1, 2, 7, 16, 100] {
-            assert_eq!(split(&stream, chunk), whole);
-        }
-        // A broken header stays broken, and later bytes are dropped.
-        let mut d = Decoder::new();
-        assert_eq!(d.feed(&[6, 0, 0, 0]), 4);
-        assert_eq!(d.next_pdu(), Some(Err(Error::Version { major: 6, minor: 0 })));
-        assert_eq!(d.feed(&BIND), 72);
-        assert_eq!(d.next_pdu(), Some(Err(Error::Version { major: 6, minor: 0 })));
-        assert_eq!(d.buffered(), 0);
+        assert_eq!(decode_all(Frames::new, &[6, 0, 0, 0]).1,
+            Some(Fail::Protocol(Error::Version { major: 6, minor: 0 })));
     }
 
     #[test]
-    fn decoder_holds_at_most_max_buffered() {
+    fn stream_holds_at_most_max_buffered() {
         let p = request(vec![3; MAX_FRAG - 24]);
         let one = p.to_bytes().unwrap();
         let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * 3).collect();
-        let mut d = Decoder::new();
-        assert_eq!(d.feed(&stream), MAX_BUFFERED);
-        assert_eq!(d.feed(&stream[MAX_BUFFERED..]), 0);
-        assert_eq!(d.next_pdu(), Some(Ok(p.clone())));
-        assert_eq!(d.feed(&stream[MAX_BUFFERED..]), MAX_FRAG);
-        let got = split(&stream, 5000);
+        let mut d = Stream::new(Frames::new());
+        assert_eq!(d.push(&stream), MAX_FRAG);
+        assert_eq!(d.push(&stream[MAX_FRAG..]), 0);
+        assert_eq!(d.next(), Some(Ok(Ok(p.clone()))));
+        assert_eq!(d.push(&stream[MAX_FRAG..]), MAX_FRAG);
+        let (got, error) = decode_all(Frames::new, &stream);
+        assert_eq!(error, None);
         assert_eq!(got.len(), 3);
         assert!(got.iter().all(|r| r.as_ref() == Ok(&p)));
     }
 
     #[test]
-    fn decoder_takes_many_small_pdus_in_linear_time() {
-        let one = Pdu::new(1, Body::Shutdown).to_bytes().unwrap();
-        let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * 200_000).collect();
+    fn stream_takes_many_small_pdus_in_linear_time() {
+        let bytes = Pdu::new(1, Body::Shutdown).to_bytes().unwrap().repeat(200_000);
         let started = std::time::Instant::now();
-        let mut d = Decoder::new();
-        let mut rest = &stream[..];
-        let mut n = 0;
-        while !rest.is_empty() {
-            rest = &rest[d.feed(rest)..];
-            while let Some(p) = d.next_pdu() {
-                p.unwrap();
-                n += 1;
-            }
-        }
-        assert_eq!(n, 200_000);
+        let (pdus, error) = decode_all(Frames::new, &bytes);
+        assert_eq!(pdus.len(), 200_000);
+        assert!(pdus.iter().all(Result::is_ok));
+        assert_eq!(error, None);
         assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
-    }
-
-    /// A small deterministic generator, so the fuzz loop needs no crates.
-    struct Lcg(u64);
-
-    impl Lcg {
-        fn next(&mut self) -> u8 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (self.0 >> 33) as u8
-        }
-    }
-
-    /// Random bytes, often a real PDU or two with a few bytes changed, so
-    /// the loop reaches the bodies.
-    fn buffer(rng: &mut Lcg, samples: &[Vec<u8>]) -> Vec<u8> {
-        let len = usize::from(rng.next()) % 120;
-        let mut b: Vec<u8> = (0..len).map(|_| rng.next()).collect();
-        if rng.next().is_multiple_of(2) && b.len() >= 16 {
-            b[0] = 5;
-            b[1] = rng.next() % 2;
-            b[2] = rng.next() % 20;
-            b[4] = 0x10 * (rng.next() % 2);
-            if b[4] == 0 {
-                b[8..10].copy_from_slice(&(len as u16).to_be_bytes());
-            } else {
-                b[8..10].copy_from_slice(&(len as u16).to_le_bytes());
-            }
-            b[10] = if rng.next().is_multiple_of(2) { 0 } else { rng.next() % 32 };
-            b[11] = 0;
-        }
-        if rng.next().is_multiple_of(2) {
-            b = samples[usize::from(rng.next()) % samples.len()].clone();
-            if rng.next().is_multiple_of(2) {
-                b.extend_from_slice(&samples[usize::from(rng.next()) % samples.len()]);
-            }
-            for _ in 0..usize::from(rng.next() % 4) {
-                let i = usize::from(rng.next()) % b.len();
-                b[i] = rng.next();
-            }
-        }
-        b
     }
 
     #[test]
@@ -2538,21 +2268,71 @@ mod tests {
             p.drep = DataRep::BIG_ENDIAN;
             samples.push(p.to_bytes().unwrap());
         }
-        let mut rng = Lcg(0xdce);
-        for _ in 0..20_000 {
-            let data = buffer(&mut rng, &samples);
-            let whole = split(&data, data.len().max(1));
-            assert_eq!(split(&data, 1), whole);
+        let mut rng = Lcg::new(0xdce);
+        for _ in 0..60_000 {
+            let mut data = if rng.coin() {
+                let mut bytes = samples[rng.index(samples.len())].clone();
+                if rng.coin() {
+                    bytes.extend_from_slice(&samples[rng.index(samples.len())]);
+                }
+                bytes
+            } else {
+                let mut bytes = rng.bytes(120);
+                if bytes.len() >= HEADER_LEN && rng.coin() {
+                    bytes[0] = VERSION;
+                    bytes[1] = rng.index(2) as u8;
+                    bytes[2] = rng.index(20) as u8;
+                    let le = rng.coin();
+                    bytes[4] = if le { 0x10 } else { 0 };
+                    let length = bytes.len() as u16;
+                    let auth = if rng.coin() { 0 } else { rng.index(32) as u16 };
+                    bytes[8..10].copy_from_slice(&if le {
+                        length.to_le_bytes()
+                    } else {
+                        length.to_be_bytes()
+                    });
+                    bytes[10..12].copy_from_slice(&if le {
+                        auth.to_le_bytes()
+                    } else {
+                        auth.to_be_bytes()
+                    });
+                }
+                bytes
+            };
+            mutate(&mut rng, &mut data);
+            contract::check_decode_with_alloc_limit(Frames::new, &data, 2 * MAX_FRAG);
+            contract::check_wire::<Pdu>(&data);
+            let (whole, _) = decode_all(Frames::new, &data);
             let mut r = Reassembler::new(64);
             for p in whole.into_iter().flatten() {
                 // Whatever reads writes back and reads the same, unless the
                 // writer's padding or reserved fields make it too long.
                 match p.to_bytes() {
-                    Ok(bytes) => assert_eq!(Pdu::parse(&bytes), Ok(Some((p.clone(), bytes.len())))),
-                    Err(e) => assert_eq!(e, EncodeError::TooLong),
+                    Ok(bytes) => assert_eq!(Pdu::parse(&bytes), Ok(p.clone())),
+                    Err(e) => {
+                        assert_eq!(e, Error::Unwritable);
+                        let mut bare = p.clone();
+                        let auth = bare
+                            .auth
+                            .take()
+                            .expect("only auth padding can exceed the limit");
+                        let reserved = if matches!(bare.body, Body::Auth3) {
+                            bare.body = Body::Shutdown;
+                            4
+                        } else {
+                            0
+                        };
+                        let length = bare.to_bytes().unwrap().len() + reserved;
+                        let (alignment, padded) = p
+                            .body
+                            .stub()
+                            .map_or((4, length), |stub| (AUTH_PAD_ALIGN, stub.len()));
+                        let padding = (alignment - padded % alignment) % alignment;
+                        assert!(length + padding + SEC_TRAILER_LEN + auth.value.len() > MAX_FRAG);
+                    }
                 }
                 if p.auth.is_none()
-                    && let Ok(parts) = p.fragments(40 + u16::from(rng.next()))
+                    && let Ok(parts) = p.fragments(40 + rng.index(256) as u16)
                 {
                     let mut joined = Reassembler::default();
                     let mut got = None;

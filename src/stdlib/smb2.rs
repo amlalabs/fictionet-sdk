@@ -13,18 +13,12 @@
 //! and a 24-bit length. This module follows Microsoft's MS-SMB2
 //! specification, sections 2.1 and 2.2.
 //!
-//! Nothing here reads a socket. A world that plays a file server feeds the
-//! bytes it reads from a TCP connection to a [`Decoder`], gets the payload of
+//! A world that plays a file server pushes connection bytes into a
+//! [`Stream<Frames>`](super::codec::Stream), gets the payload of
 //! each transport frame back, reads it as a [`Packet`], reads each
 //! [`Message`]'s [`Request`], and writes the bytes of its replies back to
 //! the connection. Which dialects, users, shares and files exist, and what
 //! each request does to them, is up to world code.
-//!
-//! New stream readers use [`Frames`] with [`super::codec::Stream`] for
-//! bounded buffering and EOF handling, mapping each payload through
-//! [`Packet::parse`]. [`Frame`] implements [`Wire`] for exact transport-frame
-//! parsing and transactional writing. [`Decoder`] keeps its original behavior,
-//! and [`parse_frame`] remains a prefix parser.
 //!
 //! Signing and encryption are not done here. A message's signature is kept
 //! as 16 bytes, and encrypted and compressed messages are read as their
@@ -34,12 +28,13 @@
 //!
 //! Every reader checks lengths and offsets, because the agent can send any
 //! bytes it likes. Bytes that break the specification are an [`Error`].
-//! Writers return an [`EncodeError`] rather than write bytes a reader would
+//! Writers return an [`Error`] rather than write bytes a reader would
 //! refuse or read back as something else.
 //!
 //! ```
+//! use fictionet::stdlib::codec::{Stream, Wire};
 //! use fictionet::stdlib::smb2::{
-//!     Decoder, Header, Message, NegotiateRequest, NegotiateResponse, Packet, Request, Response,
+//!     Frames, Frame, Header, Message, NegotiateRequest, NegotiateResponse, Packet, Request, Response,
 //!     command, dialect, status,
 //! };
 //!
@@ -49,15 +44,15 @@
 //!     ..NegotiateRequest::default()
 //! });
 //! let hello = Message::from_request(Header::new(command::NEGOTIATE, 0), &negotiate).unwrap();
-//! let bytes = Packet::Smb2(vec![hello]).to_frame().unwrap();
+//! let bytes = Frame::from_packet(&Packet::Smb2(vec![hello])).unwrap().to_bytes().unwrap();
 //!
 //! // The world reads it, in two pieces.
-//! let mut decoder = Decoder::new();
-//! assert_eq!(decoder.feed(&bytes[..10]), 10);
-//! assert_eq!(decoder.next_frame(), None);
-//! assert_eq!(decoder.feed(&bytes[10..]), bytes.len() - 10);
-//! let payload = decoder.next_frame().unwrap().unwrap();
-//! let Packet::Smb2(messages) = Packet::parse(&payload).unwrap() else { panic!() };
+//! let mut decoder = Stream::new(Frames::new());
+//! assert_eq!(decoder.push(&bytes[..10]), 10);
+//! assert_eq!(decoder.next(), None);
+//! assert_eq!(decoder.push(&bytes[10..]), bytes.len() - 10);
+//! let payload = decoder.next().unwrap().unwrap();
+//! let Packet::Smb2(messages) = Packet::parse(&payload.payload).unwrap() else { panic!() };
 //! let Ok(Request::Negotiate(offer)) = messages[0].request() else { panic!() };
 //!
 //! // It picks the highest dialect it speaks, up to SMB 3.0.2.
@@ -69,12 +64,12 @@
 //!     ..NegotiateResponse::default()
 //! });
 //! let reply = Message::reply_to(&messages[0].header, status::SUCCESS, &answer).unwrap();
-//! let out = Packet::Smb2(vec![reply]).to_frame().unwrap();
+//! let out = Frame::from_packet(&Packet::Smb2(vec![reply])).unwrap().to_bytes().unwrap();
 //! // A 129-byte message: the 64-byte header and a 65-byte body.
 //! assert_eq!(out[..8], [0, 0, 0, 129, 0xfe, b'S', b'M', b'B']);
 //! ```
 
-use super::codec::{Decode, Step, Wire};
+use crate::stdlib::codec::{Decode, Step, Wire};
 
 /// The TCP port SMB servers listen on for direct TCP.
 pub const PORT: u16 = 445;
@@ -84,9 +79,8 @@ pub const FRAME_HEADER_LEN: usize = 4;
 /// one READ or WRITE usually moves, and 64 KiB for headers and bodies. The
 /// transport's own limit is 16 MiB; frames past this one are refused.
 pub const MAX_MESSAGE: usize = 8 * 1024 * 1024 + 64 * 1024;
-/// The most bytes a [`Decoder`] holds that have not been taken out: one
-/// longest frame.
-pub const MAX_BUFFERED: usize = FRAME_HEADER_LEN + MAX_MESSAGE;
+/// The largest direct TCP frame, including its transport header.
+pub const MAX_FRAME: usize = FRAME_HEADER_LEN + MAX_MESSAGE;
 /// The length of an SMB2 header.
 pub const HEADER_LEN: usize = 64;
 /// The length of an SMB2 transform header, before the encrypted message.
@@ -118,26 +112,45 @@ pub mod protocol {
 
 /// Command codes.
 pub mod command {
-    #![allow(missing_docs)]
+    /// The NEGOTIATE command code.
     pub const NEGOTIATE: u16 = 0x0000;
+    /// The SESSION-SETUP command code.
     pub const SESSION_SETUP: u16 = 0x0001;
+    /// The LOGOFF command code.
     pub const LOGOFF: u16 = 0x0002;
+    /// The TREE-CONNECT command code.
     pub const TREE_CONNECT: u16 = 0x0003;
+    /// The TREE-DISCONNECT command code.
     pub const TREE_DISCONNECT: u16 = 0x0004;
+    /// The CREATE command code.
     pub const CREATE: u16 = 0x0005;
+    /// The CLOSE command code.
     pub const CLOSE: u16 = 0x0006;
+    /// The FLUSH command code.
     pub const FLUSH: u16 = 0x0007;
+    /// The READ command code.
     pub const READ: u16 = 0x0008;
+    /// The WRITE command code.
     pub const WRITE: u16 = 0x0009;
+    /// The LOCK command code.
     pub const LOCK: u16 = 0x000a;
+    /// The IOCTL command code.
     pub const IOCTL: u16 = 0x000b;
+    /// The CANCEL command code.
     pub const CANCEL: u16 = 0x000c;
+    /// The ECHO command code.
     pub const ECHO: u16 = 0x000d;
+    /// The QUERY-DIRECTORY command code.
     pub const QUERY_DIRECTORY: u16 = 0x000e;
+    /// The CHANGE-NOTIFY command code.
     pub const CHANGE_NOTIFY: u16 = 0x000f;
+    /// The QUERY-INFO command code.
     pub const QUERY_INFO: u16 = 0x0010;
+    /// The SET-INFO command code.
     pub const SET_INFO: u16 = 0x0011;
+    /// The OPLOCK-BREAK command code.
     pub const OPLOCK_BREAK: u16 = 0x0012;
+    /// The SERVER-TO-CLIENT-NOTIFICATION command code.
     pub const SERVER_TO_CLIENT_NOTIFICATION: u16 = 0x0013;
 }
 
@@ -162,11 +175,15 @@ pub mod flags {
 
 /// Dialect revisions.
 pub mod dialect {
-    #![allow(missing_docs)]
+    /// The SMB-2-0-2 dialect revision.
     pub const SMB_2_0_2: u16 = 0x0202;
+    /// The SMB-2-1 dialect revision.
     pub const SMB_2_1: u16 = 0x0210;
+    /// The SMB-3-0 dialect revision.
     pub const SMB_3_0: u16 = 0x0300;
+    /// The SMB-3-0-2 dialect revision.
     pub const SMB_3_0_2: u16 = 0x0302;
+    /// The SMB-3-1-1 dialect revision.
     pub const SMB_3_1_1: u16 = 0x0311;
     /// Sent in reply to an SMB1 NEGOTIATE: the client should negotiate
     /// again with SMB2.
@@ -175,63 +192,101 @@ pub mod dialect {
 
 /// Status codes worlds often answer with. Any other `u32` is allowed.
 pub mod status {
-    #![allow(missing_docs)]
+    /// The SUCCESS status code.
     pub const SUCCESS: u32 = 0x0000_0000;
+    /// The PENDING status code.
     pub const PENDING: u32 = 0x0000_0103;
+    /// The NOTIFY-ENUM-DIR status code.
     pub const NOTIFY_ENUM_DIR: u32 = 0x0000_010c;
+    /// The BUFFER-OVERFLOW status code.
     pub const BUFFER_OVERFLOW: u32 = 0x8000_0005;
+    /// The NO-MORE-FILES status code.
     pub const NO_MORE_FILES: u32 = 0x8000_0006;
+    /// The STOPPED-ON-SYMLINK status code.
     pub const STOPPED_ON_SYMLINK: u32 = 0x8000_002d;
+    /// The NOT-IMPLEMENTED status code.
     pub const NOT_IMPLEMENTED: u32 = 0xc000_0002;
+    /// The INVALID-HANDLE status code.
     pub const INVALID_HANDLE: u32 = 0xc000_0008;
+    /// The INVALID-PARAMETER status code.
     pub const INVALID_PARAMETER: u32 = 0xc000_000d;
+    /// The NO-SUCH-FILE status code.
     pub const NO_SUCH_FILE: u32 = 0xc000_000f;
+    /// The END-OF-FILE status code.
     pub const END_OF_FILE: u32 = 0xc000_0011;
+    /// The MORE-PROCESSING-REQUIRED status code.
     pub const MORE_PROCESSING_REQUIRED: u32 = 0xc000_0016;
+    /// The ACCESS-DENIED status code.
     pub const ACCESS_DENIED: u32 = 0xc000_0022;
+    /// The OBJECT-NAME-INVALID status code.
     pub const OBJECT_NAME_INVALID: u32 = 0xc000_0033;
+    /// The OBJECT-NAME-NOT-FOUND status code.
     pub const OBJECT_NAME_NOT_FOUND: u32 = 0xc000_0034;
+    /// The OBJECT-NAME-COLLISION status code.
     pub const OBJECT_NAME_COLLISION: u32 = 0xc000_0035;
+    /// The OBJECT-PATH-NOT-FOUND status code.
     pub const OBJECT_PATH_NOT_FOUND: u32 = 0xc000_003a;
+    /// The SHARING-VIOLATION status code.
     pub const SHARING_VIOLATION: u32 = 0xc000_0043;
+    /// The LOGON-FAILURE status code.
     pub const LOGON_FAILURE: u32 = 0xc000_006d;
+    /// The NOT-SUPPORTED status code.
     pub const NOT_SUPPORTED: u32 = 0xc000_00bb;
+    /// The NETWORK-NAME-DELETED status code.
     pub const NETWORK_NAME_DELETED: u32 = 0xc000_00c9;
+    /// The BAD-NETWORK-NAME status code.
     pub const BAD_NETWORK_NAME: u32 = 0xc000_00cc;
+    /// The CANCELLED status code.
     pub const CANCELLED: u32 = 0xc000_0120;
+    /// The FILE-CLOSED status code.
     pub const FILE_CLOSED: u32 = 0xc000_0128;
+    /// The USER-SESSION-DELETED status code.
     pub const USER_SESSION_DELETED: u32 = 0xc000_0203;
 }
 
 /// Global capabilities, in NEGOTIATE.
 pub mod capability {
-    #![allow(missing_docs)]
+    /// The DFS capability bit.
     pub const DFS: u32 = 0x01;
+    /// The LEASING capability bit.
     pub const LEASING: u32 = 0x02;
+    /// The LARGE-MTU capability bit.
     pub const LARGE_MTU: u32 = 0x04;
+    /// The MULTI-CHANNEL capability bit.
     pub const MULTI_CHANNEL: u32 = 0x08;
+    /// The PERSISTENT-HANDLES capability bit.
     pub const PERSISTENT_HANDLES: u32 = 0x10;
+    /// The DIRECTORY-LEASING capability bit.
     pub const DIRECTORY_LEASING: u32 = 0x20;
+    /// The ENCRYPTION capability bit.
     pub const ENCRYPTION: u32 = 0x40;
+    /// The NOTIFICATIONS capability bit.
     pub const NOTIFICATIONS: u32 = 0x80;
 }
 
 /// Security mode bits, in NEGOTIATE and SESSION_SETUP.
 pub mod security_mode {
-    #![allow(missing_docs)]
+    /// The SIGNING-ENABLED security mode bit.
     pub const SIGNING_ENABLED: u16 = 0x01;
+    /// The SIGNING-REQUIRED security mode bit.
     pub const SIGNING_REQUIRED: u16 = 0x02;
 }
 
 /// Negotiate context types, SMB 3.1.1 only.
 pub mod negotiate_context {
-    #![allow(missing_docs)]
+    /// The PREAUTH-INTEGRITY-CAPABILITIES negotiate context type.
     pub const PREAUTH_INTEGRITY_CAPABILITIES: u16 = 0x0001;
+    /// The ENCRYPTION-CAPABILITIES negotiate context type.
     pub const ENCRYPTION_CAPABILITIES: u16 = 0x0002;
+    /// The COMPRESSION-CAPABILITIES negotiate context type.
     pub const COMPRESSION_CAPABILITIES: u16 = 0x0003;
+    /// The NETNAME-NEGOTIATE-CONTEXT-ID negotiate context type.
     pub const NETNAME_NEGOTIATE_CONTEXT_ID: u16 = 0x0005;
+    /// The TRANSPORT-CAPABILITIES negotiate context type.
     pub const TRANSPORT_CAPABILITIES: u16 = 0x0006;
+    /// The RDMA-TRANSFORM-CAPABILITIES negotiate context type.
     pub const RDMA_TRANSFORM_CAPABILITIES: u16 = 0x0007;
+    /// The SIGNING-CAPABILITIES negotiate context type.
     pub const SIGNING_CAPABILITIES: u16 = 0x0008;
     /// The one preauthentication hash, SHA-512.
     pub const SHA_512: u16 = 0x0001;
@@ -239,48 +294,39 @@ pub mod negotiate_context {
 
 /// Create context names, as they travel.
 pub mod create_context {
-    #![allow(missing_docs)]
+    /// The EA-BUFFER create context name.
     pub const EA_BUFFER: &[u8] = b"ExtA";
+    /// The SD-BUFFER create context name.
     pub const SD_BUFFER: &[u8] = b"SecD";
+    /// The DURABLE-HANDLE-REQUEST create context name.
     pub const DURABLE_HANDLE_REQUEST: &[u8] = b"DHnQ";
+    /// The DURABLE-HANDLE-RECONNECT create context name.
     pub const DURABLE_HANDLE_RECONNECT: &[u8] = b"DHnC";
+    /// The ALLOCATION-SIZE create context name.
     pub const ALLOCATION_SIZE: &[u8] = b"AlSi";
+    /// The QUERY-MAXIMAL-ACCESS create context name.
     pub const QUERY_MAXIMAL_ACCESS: &[u8] = b"MxAc";
+    /// The TIMEWARP-TOKEN create context name.
     pub const TIMEWARP_TOKEN: &[u8] = b"TWrp";
+    /// The QUERY-ON-DISK-ID create context name.
     pub const QUERY_ON_DISK_ID: &[u8] = b"QFid";
+    /// The REQUEST-LEASE create context name.
     pub const REQUEST_LEASE: &[u8] = b"RqLs";
+    /// The DURABLE-HANDLE-REQUEST-V2 create context name.
     pub const DURABLE_HANDLE_REQUEST_V2: &[u8] = b"DH2Q";
+    /// The DURABLE-HANDLE-RECONNECT-V2 create context name.
     pub const DURABLE_HANDLE_RECONNECT_V2: &[u8] = b"DH2C";
 }
 
 /// Share types, in a TREE_CONNECT response.
 pub mod share_type {
-    #![allow(missing_docs)]
+    /// The DISK share type.
     pub const DISK: u8 = 0x01;
+    /// The PIPE share type.
     pub const PIPE: u8 = 0x02;
+    /// The PRINT share type.
     pub const PRINT: u8 = 0x03;
 }
-
-/// Why bytes are not an SMB direct TCP frame. Either way, the connection
-/// holds no more frames a reader can find, and a real server closes it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FrameError {
-    /// The first byte was not 0.
-    Type(u8),
-    /// The length was more than [`MAX_MESSAGE`].
-    Length(usize),
-}
-
-impl std::fmt::Display for FrameError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            FrameError::Type(t) => write!(f, "frame type {t:#04x}, not 0"),
-            FrameError::Length(n) => write!(f, "frame length {n}, more than {MAX_MESSAGE}"),
-        }
-    }
-}
-
-impl std::error::Error for FrameError {}
 
 /// Why bytes are not an SMB2 message, chain or body.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -296,7 +342,7 @@ pub enum Error {
     /// A body's StructureSize was not the one its command has.
     StructureSize(u16),
     /// A NextCommand that is below 64, not a multiple of 8, or past the
-    /// end of the payload.
+    /// end of the payload. A standalone [`Message`] requires zero.
     NextCommand(u32),
     /// A compound chain of more than [`MAX_CHAIN`] messages.
     TooMany,
@@ -339,11 +385,34 @@ pub enum Error {
     /// context, or more than one encryption, compression, RDMA transform,
     /// signing or transport context.
     NegotiateContexts,
+    /// The direct TCP frame type was not zero.
+    FrameType(u8),
+    /// The direct TCP payload length exceeds its configured limit.
+    Length {
+        /// Declared payload length.
+        length: usize,
+        /// Largest accepted payload.
+        limit: usize,
+    },
+    /// The input ends before a complete transport frame.
+    Incomplete,
+    /// Bytes follow a complete transport frame.
+    Trailing {
+        /// Number of trailing bytes.
+        remaining: usize,
+    },
+    /// The value cannot be written without changing it.
+    Unwritable,
 }
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Error::FrameType(kind) => write!(f, "SMB direct TCP frame type {kind}, not zero"),
+            Error::Length { length, limit } => write!(f, "frame length {length}, more than {limit}"),
+            Error::Incomplete => f.write_str("incomplete SMB direct TCP frame"),
+            Error::Trailing { remaining } => write!(f, "{remaining} bytes after SMB direct TCP frame"),
+            Error::Unwritable => f.write_str("SMB value cannot be written without changing it"),
             Error::Truncated => f.write_str("the bytes end inside a fixed part"),
             Error::Protocol(p) => write!(f, "protocol ID {p:02x?} is not SMB2"),
             Error::TooLong => write!(f, "a payload longer than {MAX_MESSAGE} bytes"),
@@ -369,227 +438,63 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// Why a writer refused a value: its bytes would break the specification,
-/// or a reader would read them back as something else.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EncodeError {
-    /// A buffer or list too long for its length field, or a message longer
-    /// than [`MAX_MESSAGE`].
-    TooLong,
-    /// A body that does not go with the command: a typed request or
-    /// response given another command, or an `Other` value given a command
-    /// this module reads as a typed one.
-    Command(u16),
-    /// A response body that does not go with the status: an error body
-    /// where the status says a typed one is read, or the other way round.
-    Status(u32),
-    /// A header whose ASYNC_COMMAND flag does not match its [`Target`].
-    AsyncFlag,
-    /// An empty compound chain, or a chained compression header with no
-    /// payloads.
-    Empty,
-    /// Negotiate contexts without SMB 3.1.1, or a client start time with
-    /// it. Also an SMB 3.1.1 NEGOTIATE response whose contexts a client
-    /// must refuse (see [`Error::NegotiateContexts`]).
-    Dialect,
-    /// A compression header whose flags break the rules: an unchained
-    /// header with algorithm NONE, or chained payloads whose first flags
-    /// are not exactly [`COMPRESSION_FLAG_CHAINED`] or whose later flags
-    /// are not 0. Also a chained payload of LZNT1, LZ77, LZ77+Huffman or
-    /// LZ4 with fewer than the 4 bytes of its OriginalPayloadSize.
-    Chained,
-    /// SMB1 bytes that do not start with the SMB1 protocol ID.
-    Protocol,
-    /// A LOCK request with no locks.
-    NoLocks,
-    /// A NEGOTIATE request with no dialects.
-    NoDialects,
-    /// An unchained compression offset past the end of its data.
-    Offset,
-    /// A transform header whose flags are not 0x0001, or with no
-    /// encrypted message after it.
-    Transform,
-    /// READ or WRITE channel information with channel 0, NONE, which
-    /// carries none.
-    Channel,
-    /// Error data that does not hold the error contexts its count claims,
-    /// each 8-byte aligned.
-    ErrorContexts,
-    /// An IOCTL request with output bytes: its OutputCount must be 0.
-    IoctlOutput,
-}
-
-impl std::fmt::Display for EncodeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            EncodeError::TooLong => f.write_str("too long for its length field or for one message"),
-            EncodeError::Command(c) => write!(f, "this body does not go with command {c:#06x}"),
-            EncodeError::Status(s) => write!(f, "this response body does not go with status {s:#010x}"),
-            EncodeError::AsyncFlag => f.write_str("the ASYNC_COMMAND flag does not match the header's target"),
-            EncodeError::Empty => f.write_str("an empty chain"),
-            EncodeError::Dialect => f.write_str("negotiate contexts and the dialects disagree"),
-            EncodeError::Chained => f.write_str("the compression header's flags or algorithm break the rules"),
-            EncodeError::Protocol => f.write_str("SMB1 bytes must start with the SMB1 protocol ID"),
-            EncodeError::NoLocks => f.write_str("a LOCK request needs at least one lock"),
-            EncodeError::NoDialects => f.write_str("a NEGOTIATE request needs at least one dialect"),
-            EncodeError::Offset => f.write_str("an offset past the end of the data"),
-            EncodeError::Transform => f.write_str("a transform header needs flags 0x0001 and an encrypted message"),
-            EncodeError::Channel => f.write_str("channel information needs a channel other than NONE"),
-            EncodeError::ErrorContexts => f.write_str("the error data does not hold the error contexts counted"),
-            EncodeError::IoctlOutput => f.write_str("an IOCTL request carries no output bytes"),
-        }
-    }
-}
-
-impl std::error::Error for EncodeError {}
-
 // ---------------------------------------------------------------------
 // Framing
-
-/// Reads the direct TCP frame at the start of `b`. It returns `Ok(None)` if
-/// `b` holds only part of one, and otherwise the frame's payload and how
-/// many bytes of `b` it took.
-pub fn parse_frame(b: &[u8]) -> Result<Option<(&[u8], usize)>, FrameError> {
-    let Some(&first) = b.first() else { return Ok(None) };
-    if first != 0 {
-        return Err(FrameError::Type(first));
-    }
-    if b.len() < FRAME_HEADER_LEN {
-        return Ok(None);
-    }
-    let length = (usize::from(b[1]) << 16) | (usize::from(b[2]) << 8) | usize::from(b[3]);
-    if length > MAX_MESSAGE {
-        return Err(FrameError::Length(length));
-    }
-    let end = FRAME_HEADER_LEN + length;
-    match b.get(FRAME_HEADER_LEN..end) {
-        Some(payload) => Ok(Some((payload, end))),
-        None => Ok(None),
-    }
-}
-
-/// The direct TCP frame that carries `payload`. A payload longer than
-/// [`MAX_MESSAGE`] is an error.
-pub fn frame(payload: &[u8]) -> Result<Vec<u8>, EncodeError> {
-    if payload.len() > MAX_MESSAGE {
-        return Err(EncodeError::TooLong);
-    }
-    let n = payload.len() as u32;
-    let mut out = Vec::with_capacity(FRAME_HEADER_LEN + payload.len());
-    out.push(0);
-    out.extend_from_slice(&n.to_be_bytes()[1..]);
-    out.extend_from_slice(payload);
-    Ok(out)
-}
 
 /// One direct TCP frame with an uninterpreted payload.
 ///
 /// [`Wire`] includes the four-byte transport header. Interpret the payload
 /// with [`Packet::parse`]. A payload error does not prevent finding the next
-/// frame. Empty payloads are allowed, as in [`parse_frame`].
+/// frame. Empty payloads are allowed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Frame {
     /// Payload bytes, limited to [`MAX_MESSAGE`] on read and write.
     pub payload: Vec<u8>,
 }
 
-/// Why an exact [`Wire`] parse did not contain one complete TCP frame.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FrameParseError {
-    /// The transport header was invalid.
-    Frame(FrameError),
-    /// The input ended before a complete frame.
-    Incomplete,
-    /// Bytes followed the complete frame.
-    Trailing {
-        /// Number of bytes after the frame.
-        remaining: usize,
-    },
-}
-
-impl core::fmt::Display for FrameParseError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Frame(e) => e.fmt(f),
-            Self::Incomplete => f.write_str("incomplete SMB direct TCP frame"),
-            Self::Trailing { remaining } => write!(f, "{remaining} bytes after SMB direct TCP frame"),
-        }
-    }
-}
-
-impl core::error::Error for FrameParseError {
-    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
-        match self {
-            Self::Frame(error) => Some(error),
-            Self::Incomplete | Self::Trailing { .. } => None,
-        }
+impl Frame {
+    /// A direct TCP frame containing the complete serialized packet.
+    /// Refuses packets that cannot be written without changing them.
+    pub fn from_packet(packet: &Packet) -> Result<Self, Error> {
+        Ok(Self { payload: packet.to_bytes()? })
     }
 }
 
 impl Wire for Frame {
-    type ParseError = FrameParseError;
-    type WriteError = EncodeError;
+    type ParseError = Error;
+    type WriteError = Error;
 
-    /// Reads exactly one transport frame of at most [`MAX_BUFFERED`] bytes.
-    fn parse(bytes: &[u8]) -> Result<Self, FrameParseError> {
-        match parse_frame(bytes).map_err(FrameParseError::Frame)? {
-            Some((payload, used)) if used == bytes.len() => Ok(Self { payload: payload.to_vec() }),
-            Some((_, used)) => Err(FrameParseError::Trailing { remaining: bytes.len().saturating_sub(used) }),
-            None => Err(FrameParseError::Incomplete),
+    /// Reads one direct TCP frame. Refuses nonzero types, excessive lengths,
+    /// incomplete frames, and trailing bytes.
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        match Frames::new().decode(bytes, false)? {
+            Step::Item(frame, used) if used == bytes.len() => Ok(frame),
+            Step::Item(_, used) => Err(Error::Trailing { remaining: bytes.len() - used }),
+            _ => Err(Error::Incomplete),
         }
     }
 
-    /// Appends the transport header and payload. Leaves `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
-        out.extend_from_slice(&frame(&self.payload)?);
+    /// Appends a transport header and payload. Refuses payloads over
+    /// [`MAX_MESSAGE`]. Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        if self.payload.len() > MAX_MESSAGE {
+            return Err(Error::Unwritable);
+        }
+        out.push(0);
+        out.extend_from_slice(&(self.payload.len() as u32).to_be_bytes()[1..]);
+        out.extend_from_slice(&self.payload);
         Ok(())
-    }
-}
-
-/// Why a [`Frames`] stream cannot continue.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StreamError {
-    /// The transport header was invalid.
-    Frame(FrameError),
-    /// The payload length exceeded the configured limit.
-    TooLong {
-        /// The payload length from the transport header.
-        length: usize,
-        /// The largest accepted payload, excluding its transport header.
-        limit: usize,
-    },
-}
-
-impl core::fmt::Display for StreamError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Frame(e) => e.fmt(f),
-            Self::TooLong { length, limit } => write!(f, "frame length {length}, more than {limit}"),
-        }
-    }
-}
-
-impl core::error::Error for StreamError {
-    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
-        match self {
-            Self::Frame(error) => Some(error),
-            Self::TooLong { .. } => None,
-        }
     }
 }
 
 /// Reads direct TCP frames without retaining input.
 ///
 /// Use with [`super::codec::Stream`] for a buffer bounded by the four-byte
-/// header plus [`limit`](Self::limit), at most [`MAX_BUFFERED`]. The header
+/// header plus [`limit`](Self::limit), at most [`MAX_FRAME`]. The header
 /// suffices to refuse a payload above the configured limit.
 /// Partial frames return [`Step::Need`], including at EOF, so the driver
-/// reports truncation. A [`StreamError`] ends the stream and is reported once:
-/// [`StreamError::Frame`] for a bad frame type, [`StreamError::TooLong`] for a
-/// payload above the limit.
+/// reports truncation. An invalid type or excessive length ends the stream.
 /// Map items through [`Packet::parse`] to receive payload errors as items.
-/// The legacy [`Decoder`] remains separate to preserve repeated errors and
-/// buffer clearing on failure.
 ///
 /// ```
 /// use fictionet::stdlib::{codec::{Decode, Stream, Wire}, smb2::{Frame, Frames, Packet}};
@@ -597,7 +502,7 @@ impl core::error::Error for StreamError {
 /// let mut stream = Stream::new(Frames::new().map(|f| Packet::parse(&f.payload)));
 /// assert_eq!(stream.push(&bytes), bytes.len());
 /// assert!(matches!(stream.next(), Some(Ok(Ok(Packet::Smb1(_))))));
-/// # Ok::<(), fictionet::stdlib::smb2::EncodeError>(())
+/// # Ok::<(), fictionet::stdlib::smb2::Error>(())
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Frames {
@@ -631,97 +536,28 @@ impl Default for Frames {
 
 impl Decode for Frames {
     type Item = Frame;
-    type Error = StreamError;
+    type Error = Error;
     const NAME: &'static str = "SMB direct TCP";
 
     fn capacity(&self) -> usize {
         FRAME_HEADER_LEN.saturating_add(self.limit)
     }
 
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, StreamError> {
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, Error> {
         let Some(&first) = input.first() else { return Ok(Step::Need) };
         if first != 0 {
-            return Err(StreamError::Frame(FrameError::Type(first)));
+            return Err(Error::FrameType(first));
         }
         let Some(&[_, a, b, c]) = input.get(..FRAME_HEADER_LEN) else { return Ok(Step::Need) };
         let length = (usize::from(a) << 16) | (usize::from(b) << 8) | usize::from(c);
         if length > self.limit {
-            return Err(StreamError::TooLong { length, limit: self.limit });
+            return Err(Error::Length { length, limit: self.limit });
         }
         let end = FRAME_HEADER_LEN + length;
         Ok(match input.get(FRAME_HEADER_LEN..end) {
             Some(payload) => Step::Item(Frame { payload: payload.to_vec() }, end),
             None => Step::Need,
         })
-    }
-}
-
-/// Splits an SMB direct TCP byte stream into frame payloads. Feed it the
-/// bytes a connection reads, in order, and take payloads out until it has
-/// none.
-#[derive(Debug, Default)]
-pub struct Decoder {
-    buf: Vec<u8>,
-    /// Where the bytes not yet taken out start. Bytes before it are
-    /// dropped in `feed` once they are half the buffer.
-    start: usize,
-    failed: Option<FrameError>,
-}
-
-impl Decoder {
-    /// A decoder holding no bytes.
-    pub fn new() -> Decoder {
-        Decoder::default()
-    }
-
-    /// Takes bytes read from the connection, from the start of `bytes`,
-    /// and returns how many it took. It takes them all unless that would
-    /// make it hold more than [`MAX_BUFFERED`] bytes. Then take payloads
-    /// out with [`Decoder::next_frame`] and feed it the rest. Once it is
-    /// full, `next_frame` always gives a payload or an error, so a loop of
-    /// feeding and taking out always ends. After a [`FrameError`] the
-    /// stream cannot be read any further, and every byte is taken and
-    /// dropped.
-    #[must_use = "bytes past the count returned were not taken"]
-    pub fn feed(&mut self, bytes: &[u8]) -> usize {
-        if self.failed.is_some() {
-            return bytes.len();
-        }
-        if self.start > 0 && self.start >= self.buf.len() / 2 {
-            self.buf.drain(..self.start);
-            self.start = 0;
-        }
-        let n = bytes.len().min(MAX_BUFFERED.saturating_sub(self.buffered()));
-        self.buf.extend_from_slice(&bytes[..n]);
-        n
-    }
-
-    /// The payload of the next whole frame, if one has come. It returns
-    /// `None` when it needs more bytes, and keeps returning the same error
-    /// once the stream has broken.
-    pub fn next_frame(&mut self) -> Option<Result<Vec<u8>, FrameError>> {
-        if let Some(e) = self.failed {
-            return Some(Err(e));
-        }
-        match parse_frame(&self.buf[self.start..]) {
-            Ok(Some((payload, used))) => {
-                let payload = payload.to_vec();
-                self.start += used;
-                Some(Ok(payload))
-            }
-            Ok(None) => None,
-            Err(e) => {
-                self.failed = Some(e);
-                self.buf = Vec::new();
-                self.start = 0;
-                Some(Err(e))
-            }
-        }
-    }
-
-    /// How many bytes are held, waiting for the rest of a frame.
-    pub fn buffered(&self) -> usize {
-        self.buf.len() - self.start
     }
 }
 
@@ -741,16 +577,20 @@ pub enum Packet {
     Smb1(Vec<u8>),
 }
 
-impl Packet {
+impl Wire for Packet {
+    type ParseError = Error;
+    type WriteError = Error;
+
     /// Reads a frame's payload, by its protocol ID. A payload longer than
-    /// [`MAX_MESSAGE`] is refused.
-    pub fn parse(b: &[u8]) -> Result<Packet, Error> {
+    /// [`MAX_MESSAGE`], invalid protocol IDs, malformed headers, and invalid
+    /// compound offsets are refused.
+    fn parse(b: &[u8]) -> Result<Packet, Error> {
         if b.len() > MAX_MESSAGE {
             return Err(Error::TooLong);
         }
         let id: [u8; 4] = arr(b, 0)?;
         match id {
-            protocol::SMB2 => Ok(Packet::Smb2(parse_chain(b)?)),
+            protocol::SMB2 => Ok(Packet::Smb2(read_chain(b)?)),
             protocol::TRANSFORM => Ok(Packet::Transform(Transform::parse(b)?)),
             protocol::COMPRESSION => Ok(Packet::Compressed(Compressed::parse(b)?)),
             protocol::SMB1 => Ok(Packet::Smb1(b.to_vec())),
@@ -758,29 +598,52 @@ impl Packet {
         }
     }
 
-    /// The payload's bytes.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, EncodeError> {
+    /// Appends a payload. Refuses invalid variants, oversized payloads,
+    /// inconsistent flags, and compound bodies without alignment padding.
+    /// Leaves the destination unchanged on error.
+    fn write(&self, destination: &mut Vec<u8>) -> Result<(), Error> {
         let out = match self {
-            Packet::Smb2(messages) => write_chain(messages)?,
+            Packet::Smb2(messages) => write_messages(messages)?,
             Packet::Transform(t) => t.to_bytes()?,
             Packet::Compressed(c) => c.to_bytes()?,
             Packet::Smb1(b) => {
                 if !b.starts_with(&protocol::SMB1) {
-                    return Err(EncodeError::Protocol);
+                    return Err(Error::Unwritable);
                 }
                 too_long(b.len())?;
                 b.clone()
             }
         };
         if out.len() > MAX_MESSAGE {
-            return Err(EncodeError::TooLong);
+            return Err(Error::Unwritable);
         }
-        Ok(out)
+        destination.extend_from_slice(&out);
+        Ok(())
     }
+}
 
-    /// The payload's bytes in a direct TCP frame, ready for the connection.
-    pub fn to_frame(&self) -> Result<Vec<u8>, EncodeError> {
-        frame(&self.to_bytes()?)
+impl Packet {
+    /// Builds a compound packet, padding each body before the last to an
+    /// eight-byte boundary. Refuses empty or excessive chains, invalid
+    /// headers, and packets over [`MAX_MESSAGE`]. The padding becomes part
+    /// of each message's body before the packet is written.
+    pub fn compound(mut messages: Vec<Message>) -> Result<Self, Error> {
+        if messages.is_empty() || messages.len() > MAX_CHAIN {
+            return Err(Error::Unwritable);
+        }
+        let last = messages.len() - 1;
+        let mut total = 0usize;
+        for (i, message) in messages.iter().enumerate() {
+            let size = HEADER_LEN.checked_add(message.body.len()).ok_or(Error::Unwritable)?;
+            let size = if i == last { size } else { size.checked_next_multiple_of(8).ok_or(Error::Unwritable)? };
+            total = total.checked_add(size).filter(|n| *n <= MAX_MESSAGE).ok_or(Error::Unwritable)?;
+            message.header.encode(0)?;
+        }
+        for message in &mut messages[..last] {
+            let size = message.body.len().checked_next_multiple_of(8).ok_or(Error::Unwritable)?;
+            message.body.resize(size, 0);
+        }
+        Ok(Self::Smb2(messages))
     }
 }
 
@@ -804,11 +667,14 @@ pub struct Transform {
     pub data: Vec<u8>,
 }
 
-impl Transform {
+impl Wire for Transform {
+    type ParseError = Error;
+    type WriteError = Error;
+
     /// Reads a transform header and what follows it. Following MS-SMB2
     /// section 3.3.5.2.1.1, flags other than 0x0001 are an error, and so is
     /// a header with no message after it ([`Error::Truncated`]).
-    pub fn parse(b: &[u8]) -> Result<Transform, Error> {
+    fn parse(b: &[u8]) -> Result<Transform, Error> {
         if arr::<4>(b, 0)? != protocol::TRANSFORM {
             return Err(Error::Protocol(arr(b, 0)?));
         }
@@ -833,10 +699,11 @@ impl Transform {
     }
 
     /// The header's bytes, then the data. Flags other than 0x0001, empty
-    /// data, or a payload longer than [`MAX_MESSAGE`] are an error.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, EncodeError> {
+    /// data, or a payload longer than [`MAX_MESSAGE`] are refused.
+    /// Leaves the destination unchanged on error.
+    fn write(&self, destination: &mut Vec<u8>) -> Result<(), Error> {
         if self.flags != 1 || self.data.is_empty() {
-            return Err(EncodeError::Transform);
+            return Err(Error::Unwritable);
         }
         too_long(TRANSFORM_HEADER_LEN.saturating_add(self.data.len()))?;
         let mut out = Vec::with_capacity(TRANSFORM_HEADER_LEN + self.data.len());
@@ -848,7 +715,8 @@ impl Transform {
         out.extend_from_slice(&self.flags.to_le_bytes());
         out.extend_from_slice(&self.session_id.to_le_bytes());
         out.extend_from_slice(&self.data);
-        Ok(out)
+        destination.extend_from_slice(&out);
+        Ok(())
     }
 }
 
@@ -906,9 +774,13 @@ impl ChainedPayload {
     }
 }
 
-impl Compressed {
-    /// Reads a compression transform header and what follows it.
-    pub fn parse(b: &[u8]) -> Result<Compressed, Error> {
+impl Wire for Compressed {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads a compression header and payload. Refuses oversized input,
+    /// invalid flags or algorithms, invalid offsets, and truncated payloads.
+    fn parse(b: &[u8]) -> Result<Compressed, Error> {
         if arr::<4>(b, 0)? != protocol::COMPRESSION {
             return Err(Error::Protocol(arr(b, 0)?));
         }
@@ -957,17 +829,19 @@ impl Compressed {
         Ok(Compressed::Chained { original_size, payloads })
     }
 
-    /// The header's bytes, then the data.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, EncodeError> {
+    /// Appends the compression header and data. Refuses invalid flags or
+    /// algorithms, empty chains, short compressed payloads, invalid offsets,
+    /// and payloads over [`MAX_MESSAGE`]. Leaves the destination unchanged on error.
+    fn write(&self, destination: &mut Vec<u8>) -> Result<(), Error> {
         let mut out = Vec::new();
         out.extend_from_slice(&protocol::COMPRESSION);
         match self {
             Compressed::Unchained { original_size, algorithm, offset, data } => {
                 if *algorithm == 0 {
-                    return Err(EncodeError::Chained);
+                    return Err(Error::Unwritable);
                 }
                 if *offset as usize > data.len() {
-                    return Err(EncodeError::Offset);
+                    return Err(Error::Unwritable);
                 }
                 too_long(COMPRESSION_HEADER_LEN.saturating_add(data.len()))?;
                 out.extend_from_slice(&original_size.to_le_bytes());
@@ -977,12 +851,12 @@ impl Compressed {
                 out.extend_from_slice(data);
             }
             Compressed::Chained { original_size, payloads } => {
-                let Some(first) = payloads.first() else { return Err(EncodeError::Empty) };
+                let Some(first) = payloads.first() else { return Err(Error::Unwritable) };
                 if first.flags != COMPRESSION_FLAG_CHAINED
                     || payloads[1..].iter().any(|p| p.flags != 0)
                     || payloads.iter().any(|p| p.data.len() < p.min_len())
                 {
-                    return Err(EncodeError::Chained);
+                    return Err(Error::Unwritable);
                 }
                 out.extend_from_slice(&original_size.to_le_bytes());
                 for p in payloads {
@@ -994,7 +868,8 @@ impl Compressed {
                 }
             }
         }
-        Ok(out)
+        destination.extend_from_slice(&out);
+        Ok(())
     }
 }
 
@@ -1082,7 +957,7 @@ impl Header {
     }
 
     /// Reads a header from the start of `b`, and its NextCommand.
-    pub fn parse(b: &[u8]) -> Result<(Header, u32), Error> {
+    fn read(b: &[u8]) -> Result<(Header, u32), Error> {
         let id: [u8; 4] = arr(b, 0)?;
         if id != protocol::SMB2 {
             return Err(Error::Protocol(id));
@@ -1115,7 +990,7 @@ impl Header {
     }
 
     /// The header's 64 bytes, with `next_command` as its NextCommand.
-    pub fn to_bytes(&self, next_command: u32) -> Result<[u8; HEADER_LEN], EncodeError> {
+    fn encode(&self, next_command: u32) -> Result<[u8; HEADER_LEN], Error> {
         let is_async = self.flags & flags::ASYNC_COMMAND != 0;
         let mut out = [0u8; HEADER_LEN];
         match (self.target, is_async) {
@@ -1124,7 +999,7 @@ impl Header {
                 out[32..36].copy_from_slice(&process_id.to_le_bytes());
                 out[36..40].copy_from_slice(&tree_id.to_le_bytes());
             }
-            _ => return Err(EncodeError::AsyncFlag),
+            _ => return Err(Error::Unwritable),
         }
         out[0..4].copy_from_slice(&protocol::SMB2);
         out[4..6].copy_from_slice(&(HEADER_LEN as u16).to_le_bytes());
@@ -1153,6 +1028,31 @@ pub struct Message {
     pub body: Vec<u8>,
 }
 
+impl Wire for Message {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads one standalone message. Refuses invalid protocol or header
+    /// sizes, nonzero NextCommand, and messages over [`MAX_MESSAGE`].
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        if bytes.len() > MAX_MESSAGE {
+            return Err(Error::TooLong);
+        }
+        let (header, next) = Header::read(bytes)?;
+        if next != 0 {
+            return Err(Error::NextCommand(next));
+        }
+        Ok(Self { header, body: bytes[HEADER_LEN..].to_vec() })
+    }
+
+    /// Appends one message with NextCommand zero. Refuses inconsistent async
+    /// flags and messages over [`MAX_MESSAGE`]. Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        out.extend_from_slice(&write_messages(std::slice::from_ref(self))?);
+        Ok(())
+    }
+}
+
 impl Message {
     /// Reads the message's body as the request its header's command names.
     pub fn request(&self) -> Result<Request, Error> {
@@ -1166,24 +1066,34 @@ impl Message {
     }
 
     /// A request message: `header` with the body of `request`. The header's
-    /// command must be the request's.
-    pub fn from_request(header: Header, request: &Request) -> Result<Message, EncodeError> {
+    /// command must be the request's. Buffers follow the fixed body fields.
+    /// A WRITE puts data first unless that would push the channel info's
+    /// 16-bit offset past 65535; then channel info comes first.
+    /// Refuses invalid body fields, buffers too long for their length
+    /// fields, `Other` with a known command, or a complete message over
+    /// [`MAX_MESSAGE`].
+    pub fn from_request(header: Header, request: &Request) -> Result<Message, Error> {
         if header.command != request.command() {
-            return Err(EncodeError::Command(header.command));
+            return Err(Error::Unwritable);
         }
-        Ok(Message { header, body: request.to_body()? })
+        let body = request.encode_body()?;
+        too_long(HEADER_LEN.saturating_add(body.len()))?;
+        Ok(Message { header, body })
     }
 
     /// The message that answers the request with header `request` with
-    /// `response`, under `status`. See [`Header::reply`].
-    pub fn reply_to(request: &Header, status: u32, response: &Response) -> Result<Message, EncodeError> {
+    /// `response`, under `status`. See [`Header::reply`]. Refuses invalid
+    /// body fields, mismatched commands or statuses, and complete messages
+    /// over [`MAX_MESSAGE`].
+    /// Refuses any body [`Response::parse`] would read as another kind:
+    /// a typed response for another command, `Other` for a known command,
+    /// or an error body where the status calls for a typed body or the
+    /// other way around.
+    pub fn reply_to(request: &Header, status: u32, response: &Response) -> Result<Message, Error> {
         let header = request.reply(status);
-        Ok(Message { body: response.to_body(header.command, status)?, header })
-    }
-
-    /// The message's bytes, alone: its NextCommand is 0.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, EncodeError> {
-        write_chain(std::slice::from_ref(self))
+        let body = response.encode_body(header.command, status)?;
+        too_long(HEADER_LEN.saturating_add(body.len()))?;
+        Ok(Message { body, header })
     }
 }
 
@@ -1191,7 +1101,7 @@ impl Message {
 /// by NextCommand. Each NextCommand must be a multiple of 8, at least 64,
 /// and inside the payload. A payload longer than [`MAX_MESSAGE`] is
 /// refused.
-pub fn parse_chain(b: &[u8]) -> Result<Vec<Message>, Error> {
+fn read_chain(b: &[u8]) -> Result<Vec<Message>, Error> {
     if b.len() > MAX_MESSAGE {
         return Err(Error::TooLong);
     }
@@ -1201,7 +1111,7 @@ pub fn parse_chain(b: &[u8]) -> Result<Vec<Message>, Error> {
         if out.len() == MAX_CHAIN {
             return Err(Error::TooMany);
         }
-        let (header, next) = Header::parse(rest)?;
+        let (header, next) = Header::read(rest)?;
         if next == 0 {
             out.push(Message { header, body: rest[HEADER_LEN..].to_vec() });
             return Ok(out);
@@ -1215,27 +1125,25 @@ pub fn parse_chain(b: &[u8]) -> Result<Vec<Message>, Error> {
     }
 }
 
-/// Writes one message or a compound chain. Each message but the last is
-/// padded with zeros to a multiple of 8 bytes, and its NextCommand points
-/// past the padding. A message read from a chain already ends on a multiple
-/// of 8, so it gets no padding and reads back the same.
-pub fn write_chain(messages: &[Message]) -> Result<Vec<u8>, EncodeError> {
+/// Writes a checked chain whose intermediate bodies already include padding.
+fn write_messages(messages: &[Message]) -> Result<Vec<u8>, Error> {
     if messages.is_empty() {
-        return Err(EncodeError::Empty);
+        return Err(Error::Unwritable);
     }
     if messages.len() > MAX_CHAIN {
-        return Err(EncodeError::TooLong);
+        return Err(Error::Unwritable);
     }
     let mut out = Vec::new();
     for (i, m) in messages.iter().enumerate() {
         let last = i + 1 == messages.len();
-        let len = HEADER_LEN.checked_add(m.body.len()).ok_or(EncodeError::TooLong)?;
-        let padded = if last { len } else { len.checked_next_multiple_of(8).ok_or(EncodeError::TooLong)? };
-        too_long(out.len().saturating_add(padded))?;
-        let next = if last { 0 } else { padded as u32 };
-        out.extend_from_slice(&m.header.to_bytes(next)?);
+        let len = HEADER_LEN.checked_add(m.body.len()).ok_or(Error::Unwritable)?;
+        if !last && !len.is_multiple_of(8) {
+            return Err(Error::Unwritable);
+        }
+        too_long(out.len().saturating_add(len))?;
+        let next = if last { 0 } else { len as u32 };
+        out.extend_from_slice(&m.header.encode(next)?);
         out.extend_from_slice(&m.body);
-        out.resize(out.len() + (padded - len), 0);
     }
     Ok(out)
 }
@@ -1330,7 +1238,7 @@ impl NegotiateContext {
     /// A preauthentication integrity context: hash algorithm IDs (see
     /// [`negotiate_context::SHA_512`]) and a salt. Lists too long for the
     /// context's 16-bit counts and length are an error.
-    pub fn preauth_integrity(hashes: &[u16], salt: &[u8]) -> Result<NegotiateContext, EncodeError> {
+    pub fn preauth_integrity(hashes: &[u16], salt: &[u8]) -> Result<NegotiateContext, Error> {
         let mut data = Vec::new();
         put16(&mut data, fit16(hashes.len())?);
         put16(&mut data, fit16(salt.len())?);
@@ -1360,7 +1268,7 @@ impl NegotiateContext {
     /// A context that is a 16-bit count and a list of 16-bit IDs, as the
     /// encryption and signing capabilities are. A list too long for the
     /// context's 16-bit length is an error.
-    pub fn algorithms(kind: u16, ids: &[u16]) -> Result<NegotiateContext, EncodeError> {
+    pub fn algorithms(kind: u16, ids: &[u16]) -> Result<NegotiateContext, Error> {
         let mut data = Vec::new();
         put16(&mut data, fit16(ids.len())?);
         for id in ids {
@@ -1689,6 +1597,17 @@ pub enum Request {
 }
 
 impl Request {
+    /// Builds a request message with this command and `message_id`.
+    /// Refuses bodies that exceed field or message limits or would read
+    /// back changed.
+    /// Buffers follow the fixed body fields. A WRITE puts data first unless
+    /// that would push the channel info's 16-bit offset past 65535; then
+    /// channel info comes first. Refuses `Other` with a known command and
+    /// buffers too long for their length fields.
+    pub fn message(&self, message_id: u64) -> Result<Message, Error> {
+        Message::from_request(Header::new(self.command(), message_id), self)
+    }
+
     /// The command code this request is sent with.
     pub fn command(&self) -> u16 {
         match self {
@@ -1952,20 +1871,17 @@ impl Request {
         })
     }
 
-    /// The request's body bytes, with buffers right after the fixed part.
-    /// A WRITE puts its data first, unless that would push the channel
-    /// info's 16-bit offset past 65535. An `Other` request with a command this module reads as a typed one
-    /// is an error, as is a buffer too long for its length field.
-    pub fn to_body(&self) -> Result<Vec<u8>, EncodeError> {
+    /// Builds the body for [`Request::message`], applying its writer rules.
+    fn encode_body(&self) -> Result<Vec<u8>, Error> {
         let mut w = Vec::new();
         match self {
             Request::Negotiate(r) => {
                 if r.dialects.is_empty() {
-                    return Err(EncodeError::NoDialects);
+                    return Err(Error::Unwritable);
                 }
                 let has_311 = r.dialects.contains(&dialect::SMB_3_1_1);
                 if (!has_311 && !r.contexts.is_empty()) || (has_311 && r.client_start_time != 0) {
-                    return Err(EncodeError::Dialect);
+                    return Err(Error::Unwritable);
                 }
                 put16(&mut w, 36);
                 put16(&mut w, fit16(r.dialects.len())?);
@@ -2053,7 +1969,7 @@ impl Request {
                 put32(&mut w, r.remaining_bytes);
                 let info = !r.channel_info.is_empty();
                 if info && r.channel == 0 {
-                    return Err(EncodeError::Channel);
+                    return Err(Error::Unwritable);
                 }
                 put16(&mut w, if info { 112 } else { 0 });
                 put16(&mut w, fit16(r.channel_info.len())?);
@@ -2061,7 +1977,7 @@ impl Request {
             }
             Request::Write(r) => {
                 if r.channel == 0 && !r.channel_info.is_empty() {
-                    return Err(EncodeError::Channel);
+                    return Err(Error::Unwritable);
                 }
                 // Both offsets are 16 bits. The data goes first unless that
                 // pushes the channel info's offset past 65535.
@@ -2093,7 +2009,7 @@ impl Request {
             }
             Request::Lock(r) => {
                 if r.locks.is_empty() {
-                    return Err(EncodeError::NoLocks);
+                    return Err(Error::Unwritable);
                 }
                 put16(&mut w, 48);
                 put16(&mut w, fit16(r.locks.len())?);
@@ -2108,7 +2024,7 @@ impl Request {
             }
             Request::Ioctl(r) => {
                 if !r.output.is_empty() {
-                    return Err(EncodeError::IoctlOutput);
+                    return Err(Error::Unwritable);
                 }
                 put16(&mut w, 57);
                 put16(&mut w, 0);
@@ -2170,7 +2086,7 @@ impl Request {
             }
             Request::Other { command, body } => {
                 if known(*command) {
-                    return Err(EncodeError::Command(*command));
+                    return Err(Error::Unwritable);
                 }
                 too_long(body.len())?;
                 return Ok(body.clone());
@@ -2356,6 +2272,17 @@ pub enum Response {
 }
 
 impl Response {
+    /// Builds an answer to `request` under `status`.
+    /// Refuses mismatched commands or statuses, invalid body fields, and
+    /// values that exceed field or message limits.
+    /// Refuses any body [`Response::parse`] would read as another kind:
+    /// a typed response for another command, `Other` for a known command,
+    /// or an error body where the status calls for a typed body or the
+    /// other way around.
+    pub fn message(&self, request: &Header, status: u32) -> Result<Message, Error> {
+        Message::reply_to(request, status, self)
+    }
+
     /// Reads the body of a response to `command` sent with `status`.
     ///
     /// Whether the body is an [`ErrorResponse`] depends on both, following
@@ -2529,34 +2456,30 @@ impl Response {
         })
     }
 
-    /// The response's body bytes, for a response to `command` with
-    /// `status`. It is an error if [`Response::parse`] would read the bytes
-    /// back as another kind of body: a typed response for another command,
-    /// an `Other` one for a command this module reads, or an error body
-    /// where the status calls for a typed one, or the other way round.
-    pub fn to_body(&self, command: u16, status: u32) -> Result<Vec<u8>, EncodeError> {
+    /// Builds the body for [`Response::message`], applying its writer rules.
+    fn encode_body(&self, command: u16, status: u32) -> Result<Vec<u8>, Error> {
         match self.command() {
-            Some(c) if c != command => return Err(EncodeError::Command(command)),
+            Some(c) if c != command => return Err(Error::Unwritable),
             None if matches!(self, Response::Other { .. }) && own_size(command).is_some() => {
-                return Err(EncodeError::Command(command));
+                return Err(Error::Unwritable);
             }
             _ => {}
         }
-        let w = self.write()?;
+        let w = self.encode_fields()?;
         let is_error = matches!(self, Response::Error(_));
         if error_body(command, status, le16(&w, 0).ok()) != is_error {
-            return Err(EncodeError::Status(status));
+            return Err(Error::Unwritable);
         }
         Ok(w)
     }
 
-    fn write(&self) -> Result<Vec<u8>, EncodeError> {
+    fn encode_fields(&self) -> Result<Vec<u8>, Error> {
         let mut w = Vec::new();
         match self {
             Response::Negotiate(r) => {
                 let is_311 = r.dialect == dialect::SMB_3_1_1;
                 if (!is_311 && !r.contexts.is_empty()) || (is_311 && !response_contexts_ok(&r.contexts)) {
-                    return Err(EncodeError::Dialect);
+                    return Err(Error::Unwritable);
                 }
                 put16(&mut w, 65);
                 put16(&mut w, r.security_mode);
@@ -2663,7 +2586,7 @@ impl Response {
             Response::SetInfo => put16(&mut w, 2),
             Response::Error(e) => {
                 if !error_contexts_fit(e.context_count, &e.data) {
-                    return Err(EncodeError::ErrorContexts);
+                    return Err(Error::Unwritable);
                 }
                 put16(&mut w, 9);
                 w.push(e.context_count);
@@ -2836,7 +2759,7 @@ fn string(b: &[u8]) -> Result<Vec<u16>, Error> {
 
 /// Code units as UTF-16LE bytes for a 16-bit length field, checked
 /// before any bytes are made.
-fn string16(units: &[u16]) -> Result<Vec<u8>, EncodeError> {
+fn string16(units: &[u16]) -> Result<Vec<u8>, Error> {
     fit16(units.len().saturating_mul(2))?;
     Ok(unstring(units))
 }
@@ -2875,7 +2798,7 @@ fn negotiate_contexts(b: &[u8], offset: u32, count: u16, before: (u32, u32)) -> 
     Ok(out)
 }
 
-fn write_negotiate_contexts(w: &mut Vec<u8>, contexts: &[NegotiateContext]) -> Result<(), EncodeError> {
+fn write_negotiate_contexts(w: &mut Vec<u8>, contexts: &[NegotiateContext]) -> Result<(), Error> {
     for (i, c) in contexts.iter().enumerate() {
         if i > 0 {
             pad8(w);
@@ -2955,7 +2878,7 @@ fn create_contexts(region: &[u8]) -> Result<Vec<CreateContext>, Error> {
 
 /// Writes create contexts after the bytes already in `w`, 8-byte aligned,
 /// and puts their offset and length at `field` in the fixed part.
-fn write_create_contexts(w: &mut Vec<u8>, contexts: &[CreateContext], field: usize) -> Result<(), EncodeError> {
+fn write_create_contexts(w: &mut Vec<u8>, contexts: &[CreateContext], field: usize) -> Result<(), Error> {
     if contexts.is_empty() {
         return Ok(());
     }
@@ -2963,7 +2886,7 @@ fn write_create_contexts(w: &mut Vec<u8>, contexts: &[CreateContext], field: usi
     let start = w.len();
     for (i, c) in contexts.iter().enumerate() {
         let here = w.len();
-        let name_end = 16usize.checked_add(c.name.len()).ok_or(EncodeError::TooLong)?;
+        let name_end = 16usize.checked_add(c.name.len()).ok_or(Error::Unwritable)?;
         let data_at = if c.data.is_empty() { 0 } else { name_end.next_multiple_of(8) };
         let size = if c.data.is_empty() { name_end } else { data_at.saturating_add(c.data.len()) };
         too_long(here.saturating_add(size))?;
@@ -3013,17 +2936,17 @@ fn pad8(w: &mut Vec<u8>) {
     w.resize(w.len().next_multiple_of(8), 0);
 }
 
-fn too_long(n: usize) -> Result<(), EncodeError> {
-    if n > MAX_MESSAGE { Err(EncodeError::TooLong) } else { Ok(()) }
+fn too_long(n: usize) -> Result<(), Error> {
+    if n > MAX_MESSAGE { Err(Error::Unwritable) } else { Ok(()) }
 }
 
-fn fit16(n: usize) -> Result<u16, EncodeError> {
-    u16::try_from(n).map_err(|_| EncodeError::TooLong)
+fn fit16(n: usize) -> Result<u16, Error> {
+    u16::try_from(n).map_err(|_| Error::Unwritable)
 }
 
-fn fit32(n: usize) -> Result<u32, EncodeError> {
+fn fit32(n: usize) -> Result<u32, Error> {
     too_long(n)?;
-    u32::try_from(n).map_err(|_| EncodeError::TooLong)
+    u32::try_from(n).map_err(|_| Error::Unwritable)
 }
 
 fn put16(w: &mut Vec<u8>, v: u16) {
@@ -3058,6 +2981,7 @@ fn le64(b: &[u8], at: usize) -> Result<u64, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stdlib::codec::{Stream, Fail, contract, test_support::{Lcg, mutate, decode_all}};
 
     // The byte layouts below are built field by field from MS-SMB2,
     // section 2.2, not with this module's writers.
@@ -3107,13 +3031,13 @@ mod tests {
             ..NegotiateRequest::default()
         });
         let hello = Message::from_request(Header::new(command::NEGOTIATE, 0), &negotiate).unwrap();
-        let bytes = Packet::Smb2(vec![hello]).to_frame().unwrap();
-        let mut decoder = Decoder::new();
-        assert_eq!(decoder.feed(&bytes[..10]), 10);
-        assert_eq!(decoder.next_frame(), None);
-        assert_eq!(decoder.feed(&bytes[10..]), bytes.len() - 10);
-        let payload = decoder.next_frame().unwrap().unwrap();
-        let Packet::Smb2(messages) = Packet::parse(&payload).unwrap() else { panic!() };
+        let bytes = Packet::Smb2(vec![hello]).to_bytes().and_then(|payload| Frame { payload }.to_bytes()).unwrap();
+        let mut decoder = Stream::new(Frames::new());
+        assert_eq!(decoder.push(&bytes[..10]), 10);
+        assert_eq!(decoder.next(), None);
+        assert_eq!(decoder.push(&bytes[10..]), bytes.len() - 10);
+        let payload = decoder.next().unwrap().unwrap();
+        let Packet::Smb2(messages) = Packet::parse(&payload.payload).unwrap() else { panic!() };
         let Ok(Request::Negotiate(offer)) = messages[0].request() else { panic!() };
         let chosen = offer.dialects.iter().copied().filter(|&d| d <= dialect::SMB_3_0_2).max().unwrap();
         assert_eq!(chosen, dialect::SMB_3_0_2);
@@ -3123,7 +3047,7 @@ mod tests {
             ..NegotiateResponse::default()
         });
         let reply = Message::reply_to(&messages[0].header, status::SUCCESS, &answer).unwrap();
-        let out = Packet::Smb2(vec![reply]).to_frame().unwrap();
+        let out = Packet::Smb2(vec![reply]).to_bytes().and_then(|payload| Frame { payload }.to_bytes()).unwrap();
         assert_eq!(out[..8], [0, 0, 0, 129, 0xfe, b'S', b'M', b'B']);
         // The reply's header: the response flag, the same message ID.
         let Packet::Smb2(back) = Packet::parse(&out[4..]).unwrap() else { panic!() };
@@ -3134,30 +3058,29 @@ mod tests {
     #[test]
     fn sync_and_async_headers() {
         let b = header_bytes(command::READ, 0, flags::SIGNED, 0, 7, 0x0001_0001, 0x4000_0000_0001);
-        let (h, next) = Header::parse(&b).unwrap();
-        assert_eq!(next, 0);
+        let h = Message::parse(&b).unwrap().header;
         assert_eq!(h.command, command::READ);
         assert_eq!(h.credit_charge, 1);
         assert_eq!(h.credits, 31);
         assert_eq!(h.message_id, 7);
         assert_eq!(h.target, Target::Sync { process_id: 0xfeff, tree_id: 0x0001_0001 });
         assert_eq!(h.session_id, 0x4000_0000_0001);
-        assert_eq!(h.to_bytes(0).unwrap()[..], b[..]);
+        assert_eq!(Message { header: h, body: vec![] }.to_bytes().unwrap()[..], b[..]);
         // The async form: bytes 32..40 are the async ID.
         let mut a = b.clone();
         a[16..20].copy_from_slice(&(flags::ASYNC_COMMAND | flags::SERVER_TO_REDIR).to_le_bytes());
         a[8..12].copy_from_slice(&status::PENDING.to_le_bytes());
-        let (h, _) = Header::parse(&a).unwrap();
+        let h = Message::parse(&a).unwrap().header;
         assert_eq!(h.target, Target::Async { async_id: 0x0001_0001_0000_feff });
         assert!(h.is_response());
-        assert_eq!(h.to_bytes(0).unwrap()[..], a[..]);
+        assert_eq!(Message { header: h, body: vec![] }.to_bytes().unwrap()[..], a[..]);
         // The flag and the target must agree.
         let mut wrong = h;
         wrong.target = Target::default();
-        assert_eq!(wrong.to_bytes(0), Err(EncodeError::AsyncFlag));
+        assert_eq!(Message { header: wrong, body: vec![] }.to_bytes(), Err(Error::Unwritable));
         let mut wrong = Header::new(command::ECHO, 1);
         wrong.target = Target::Async { async_id: 1 };
-        assert_eq!(wrong.to_bytes(0), Err(EncodeError::AsyncFlag));
+        assert_eq!(Message { header: wrong, body: vec![] }.to_bytes(), Err(Error::Unwritable));
     }
 
     #[test]
@@ -3202,12 +3125,12 @@ mod tests {
         assert_eq!(n.contexts[1].kind, negotiate_context::ENCRYPTION_CAPABILITIES);
         assert_eq!(n.contexts[1].algorithm_list(), Some(vec![2]));
         // The writer lays it out the same way.
-        assert_eq!(req.to_body().unwrap(), body);
+        assert_eq!(req.message(0).map(|m| m.body).unwrap(), body);
         assert_eq!(NegotiateContext::preauth_integrity(&[1], &[1, 2, 3, 4]).unwrap(), n.contexts[0]);
         assert_eq!(NegotiateContext::algorithms(2, &[2]).unwrap(), n.contexts[1]);
         assert_eq!(n.contexts[1].preauth_integrity_parts(), None);
-        assert_eq!(NegotiateContext::algorithms(2, &[0; 40000]), Err(EncodeError::TooLong));
-        assert_eq!(NegotiateContext::preauth_integrity(&[], &[0; 70000]), Err(EncodeError::TooLong));
+        assert_eq!(NegotiateContext::algorithms(2, &[0; 40000]), Err(Error::Unwritable));
+        assert_eq!(NegotiateContext::preauth_integrity(&[], &[0; 70000]), Err(Error::Unwritable));
         assert_eq!(NegotiateContext { kind: 2, data: vec![5, 0] }.algorithm_list(), None);
     }
 
@@ -3221,15 +3144,15 @@ mod tests {
         let Request::Negotiate(n) = &req else { panic!() };
         assert_eq!(n.client_start_time, 0x1234);
         assert!(n.contexts.is_empty());
-        assert_eq!(req.to_body().unwrap(), body);
+        assert_eq!(req.message(0).map(|m| m.body).unwrap(), body);
         // Contexts need 3.1.1, and 3.1.1 leaves no room for a start time.
         let bad = NegotiateRequest { dialects: vec![0x202], contexts: vec![NegotiateContext::default()], ..n.clone() };
-        assert_eq!(Request::Negotiate(bad).to_body(), Err(EncodeError::Dialect));
+        assert_eq!(Request::Negotiate(bad).message(0).map(|m| m.body), Err(Error::Unwritable));
         let bad = NegotiateRequest { dialects: vec![0x311], ..n.clone() };
-        assert_eq!(Request::Negotiate(bad).to_body(), Err(EncodeError::Dialect));
+        assert_eq!(Request::Negotiate(bad).message(0).map(|m| m.body), Err(Error::Unwritable));
         let bad =
             NegotiateResponse { dialect: 0x302, contexts: vec![NegotiateContext::default()], ..Default::default() };
-        assert_eq!(Response::Negotiate(bad).to_body(0, 0), Err(EncodeError::Dialect));
+        assert_eq!(Response::Negotiate(bad).message(&Header::new(0, 0), 0).map(|m| m.body), Err(Error::Unwritable));
     }
 
     #[test]
@@ -3249,7 +3172,7 @@ mod tests {
         assert_eq!(n.system_time, 132);
         assert_eq!(n.security_buffer, [0x60, 0x48, 0x06]);
         assert_eq!(n.contexts[0].preauth_integrity_parts(), Some((vec![1], vec![9; 32])));
-        assert_eq!(resp.to_body(0, 0).unwrap(), body);
+        assert_eq!(resp.message(&Header::new(0, 0), 0).map(|m| m.body).unwrap(), body);
     }
 
     #[test]
@@ -3264,22 +3187,22 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(req, Request::SessionSetup(want));
-        assert_eq!(req.to_body().unwrap(), body);
+        assert_eq!(req.message(0).map(|m| m.body).unwrap(), body);
         // The challenge goes back with MORE_PROCESSING_REQUIRED and a
         // SESSION_SETUP body, not an error body.
         let mut body = le(&[9, 0, 72, 2], &[2, 2, 2, 2]);
         body.extend_from_slice(&[0xa1, 0x00]);
         let resp = Response::parse(command::SESSION_SETUP, status::MORE_PROCESSING_REQUIRED, &body).unwrap();
         assert_eq!(resp, Response::SessionSetup { session_flags: 0, security_buffer: vec![0xa1, 0] });
-        assert_eq!(resp.to_body(command::SESSION_SETUP, status::MORE_PROCESSING_REQUIRED).unwrap(), body);
+        assert_eq!(resp.message(&Header::new(command::SESSION_SETUP, 0), status::MORE_PROCESSING_REQUIRED).map(|m| m.body).unwrap(), body);
         // The same bytes with LOGON_FAILURE are an error body.
         assert!(matches!(
             Response::parse(command::SESSION_SETUP, status::LOGON_FAILURE, &body),
             Ok(Response::Error(_)) | Err(_)
         ));
         assert_eq!(
-            resp.to_body(command::SESSION_SETUP, status::LOGON_FAILURE),
-            Err(EncodeError::Status(status::LOGON_FAILURE))
+            resp.message(&Header::new(command::SESSION_SETUP, 0), status::LOGON_FAILURE).map(|m| m.body),
+            Err(Error::Unwritable)
         );
     }
 
@@ -3291,7 +3214,7 @@ mod tests {
         let req = Request::parse(command::TREE_CONNECT, &body).unwrap();
         let Request::TreeConnect(t) = &req else { panic!() };
         assert_eq!(utf16_lossy(&t.path), "\\\\fs1\\IPC$");
-        assert_eq!(req.to_body().unwrap(), body);
+        assert_eq!(req.message(0).map(|m| m.body).unwrap(), body);
         let body = le(&[16, 2, 0, 0x30, 0, 0x1f01ff], &[2, 1, 1, 4, 4, 4]);
         let resp = Response::parse(command::TREE_CONNECT, 0, &body).unwrap();
         assert_eq!(
@@ -3303,10 +3226,10 @@ mod tests {
                 maximal_access: 0x1f01ff
             })
         );
-        assert_eq!(resp.to_body(command::TREE_CONNECT, 0).unwrap(), body);
+        assert_eq!(resp.message(&Header::new(command::TREE_CONNECT, 0), 0).map(|m| m.body).unwrap(), body);
         // A bad share is an error body with one zero byte of data.
         let err = Response::Error(ErrorResponse::default());
-        let bytes = err.to_body(command::TREE_CONNECT, status::BAD_NETWORK_NAME).unwrap();
+        let bytes = err.message(&Header::new(command::TREE_CONNECT, 0), status::BAD_NETWORK_NAME).map(|m| m.body).unwrap();
         assert_eq!(bytes, [9, 0, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(Response::parse(command::TREE_CONNECT, status::BAD_NETWORK_NAME, &bytes), Ok(err));
     }
@@ -3350,7 +3273,7 @@ mod tests {
         body[52..56].copy_from_slice(&len.to_le_bytes());
         let req = Request::parse(command::CREATE, &body).unwrap();
         assert_eq!(req, Request::Create(create_request()));
-        assert_eq!(req.to_body().unwrap(), body);
+        assert_eq!(req.message(0).map(|m| m.body).unwrap(), body);
 
         let resp = Response::Create(CreateResponse {
             oplock_level: 0,
@@ -3368,7 +3291,7 @@ mod tests {
             file_id: FileId { persistent: 5, volatile: 6 },
             contexts: vec![CreateContext { name: b"MxAc".to_vec(), data: vec![0, 0, 0, 0, 0xff, 1, 0x1f, 0] }],
         });
-        let bytes = resp.to_body(command::CREATE, 0).unwrap();
+        let bytes = resp.message(&Header::new(command::CREATE, 0), 0).map(|m| m.body).unwrap();
         assert_eq!(le16(&bytes, 0), Ok(89));
         assert_eq!(le32(&bytes, 56), Ok(0x20)); // FileAttributes
         assert_eq!(le64(&bytes, 64), Ok(5)); // FileId
@@ -3376,7 +3299,7 @@ mod tests {
         assert_eq!(Response::parse(command::CREATE, 0, &bytes), Ok(resp));
         // Without contexts: the fixed part and one zero byte.
         let plain = Response::Create(CreateResponse::default());
-        assert_eq!(plain.to_body(command::CREATE, 0).unwrap().len(), 89);
+        assert_eq!(plain.message(&Header::new(command::CREATE, 0), 0).map(|m| m.body).unwrap().len(), 89);
     }
 
     #[test]
@@ -3384,15 +3307,15 @@ mod tests {
         let fid = FileId { persistent: 1, volatile: 2 };
         let mut body = le(&[24, 1, 0, 1, 2], &[2, 2, 4, 8, 8]);
         assert_eq!(Request::parse(command::CLOSE, &body), Ok(Request::Close { flags: 1, file_id: fid }));
-        assert_eq!(Request::Close { flags: 1, file_id: fid }.to_body().unwrap(), body);
+        assert_eq!(Request::Close { flags: 1, file_id: fid }.message(0).map(|m| m.body).unwrap(), body);
         body[2] = 0;
         assert_eq!(Request::parse(command::FLUSH, &body), Ok(Request::Flush { file_id: fid }));
-        assert_eq!(Request::Flush { file_id: fid }.to_body().unwrap(), body);
+        assert_eq!(Request::Flush { file_id: fid }.message(0).map(|m| m.body).unwrap(), body);
         let info = FileInfo { end_of_file: 9, file_attributes: 0x80, ..Default::default() };
         let mut close = le(&[60, 1, 0, 0, 0, 0, 0, 0, 9, 0x80], &[2, 2, 4, 8, 8, 8, 8, 8, 8, 4]);
         let resp = Response::parse(command::CLOSE, 0, &close).unwrap();
         assert_eq!(resp, Response::Close { flags: 1, info });
-        assert_eq!(resp.to_body(command::CLOSE, 0).unwrap(), close);
+        assert_eq!(resp.message(&Header::new(command::CLOSE, 0), 0).map(|m| m.body).unwrap(), close);
         close.pop();
         assert_eq!(Response::parse(command::CLOSE, 0, &close), Err(Error::Truncated));
         let four = [4, 0, 0, 0];
@@ -3403,16 +3326,16 @@ mod tests {
             (command::CANCEL, Request::Cancel, None),
         ] {
             assert_eq!(Request::parse(c, &four), Ok(req.clone()));
-            assert_eq!(req.to_body().unwrap(), four);
+            assert_eq!(req.message(0).map(|m| m.body).unwrap(), four);
             if let Some(r) = resp {
                 assert_eq!(Response::parse(c, 0, &four), Ok(r.clone()));
-                assert_eq!(r.to_body(c, 0).unwrap(), four);
+                assert_eq!(r.message(&Header::new(c, 0), 0).map(|m| m.body).unwrap(), four);
             }
         }
         assert_eq!(Response::parse(command::FLUSH, 0, &four), Ok(Response::Flush));
         assert_eq!(Response::parse(command::LOCK, 0, &four), Ok(Response::Lock));
         assert_eq!(Response::parse(command::SET_INFO, 0, &[2, 0]), Ok(Response::SetInfo));
-        assert_eq!(Response::SetInfo.to_body(command::SET_INFO, 0).unwrap(), [2, 0]);
+        assert_eq!(Response::SetInfo.message(&Header::new(command::SET_INFO, 0), 0).map(|m| m.body).unwrap(), [2, 0]);
         // CANCEL has no response body of its own.
         assert_eq!(Response::parse(command::CANCEL, 0, &four), Ok(Response::Other { body: four.to_vec() }));
     }
@@ -3431,12 +3354,12 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(req, Request::Read(want));
-        assert_eq!(req.to_body().unwrap(), body);
+        assert_eq!(req.message(0).map(|m| m.body).unwrap(), body);
         let mut body = le(&[17, 80, 0, 5, 0, 0], &[2, 1, 1, 4, 4, 4]);
         body.extend_from_slice(b"hello");
         let resp = Response::parse(command::READ, 0, &body).unwrap();
         assert_eq!(resp, Response::Read { data: b"hello".to_vec(), data_remaining: 0, flags: 0 });
-        assert_eq!(resp.to_body(command::READ, 0).unwrap(), body);
+        assert_eq!(resp.message(&Header::new(command::READ, 0), 0).map(|m| m.body).unwrap(), body);
         // BUFFER_OVERFLOW on a pipe read still carries a READ body.
         assert_eq!(Response::parse(command::READ, status::BUFFER_OVERFLOW, &body), Ok(resp));
 
@@ -3451,15 +3374,15 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(req, Request::Write(want.clone()));
-        assert_eq!(req.to_body().unwrap(), body);
+        assert_eq!(req.message(0).map(|m| m.body).unwrap(), body);
         let with_info = Request::Write(WriteRequest { channel: 1, channel_info: vec![1, 2, 3, 4], ..want });
-        assert_eq!(Request::parse(command::WRITE, &with_info.to_body().unwrap()), Ok(with_info));
+        assert_eq!(Request::parse(command::WRITE, &with_info.message(0).map(|m| m.body).unwrap()), Ok(with_info));
         let body = le(&[17, 0, 3, 0, 0, 0], &[2, 2, 4, 4, 2, 2]);
         let resp = Response::parse(command::WRITE, 0, &body).unwrap();
         assert_eq!(resp, Response::Write { count: 3, remaining: 0 });
         let mut padded = body.clone();
         padded.push(0);
-        assert_eq!(resp.to_body(command::WRITE, 0).unwrap(), padded);
+        assert_eq!(resp.message(&Header::new(command::WRITE, 0), 0).map(|m| m.body).unwrap(), padded);
         // A write past the end of the message is refused.
         let mut short = le(&[49, 112, 30], &[2, 2, 4]);
         short.resize(49, 0);
@@ -3474,7 +3397,7 @@ mod tests {
         let req = Request::parse(command::LOCK, &body).unwrap();
         let Request::Lock(l) = &req else { panic!() };
         assert_eq!(l.locks, [Lock { offset: 0, length: 10, flags: 2 }, Lock { offset: 100, length: 1, flags: 0x11 }]);
-        assert_eq!(req.to_body().unwrap(), body);
+        assert_eq!(req.message(0).map(|m| m.body).unwrap(), body);
         // A lock without its 4 reserved bytes is cut short.
         assert_eq!(Request::parse(command::LOCK, &body[..body.len() - 1]), Err(Error::Truncated));
         // A count past the locks there are.
@@ -3482,7 +3405,7 @@ mod tests {
         assert_eq!(Request::parse(command::LOCK, &body), Err(Error::Truncated));
         body[2] = 0;
         assert_eq!(Request::parse(command::LOCK, &body), Err(Error::NoLocks));
-        assert_eq!(Request::Lock(LockRequest::default()).to_body(), Err(EncodeError::NoLocks));
+        assert_eq!(Request::Lock(LockRequest::default()).message(0).map(|m| m.body), Err(Error::Unwritable));
     }
 
     #[test]
@@ -3498,13 +3421,13 @@ mod tests {
         assert_eq!(i.file_id, FileId::RELATED);
         assert_eq!(i.input, [1, 2, 3, 4]);
         assert_eq!(i.max_output_response, 24);
-        assert_eq!(req.to_body().unwrap(), body);
+        assert_eq!(req.message(0).map(|m| m.body).unwrap(), body);
         let resp = Response::Ioctl(IoctlResponse { ctl_code: 0x0014_0204, output: vec![5; 24], ..Default::default() });
-        let bytes = resp.to_body(command::IOCTL, 0).unwrap();
+        let bytes = resp.message(&Header::new(command::IOCTL, 0), 0).map(|m| m.body).unwrap();
         assert_eq!(le32(&bytes, 32), Ok(112));
         assert_eq!(Response::parse(command::IOCTL, 0, &bytes), Ok(resp.clone()));
         // An IOCTL body may come with a failing status, as copychunk does.
-        let b = resp.to_body(command::IOCTL, status::INVALID_PARAMETER).unwrap();
+        let b = resp.message(&Header::new(command::IOCTL, 0), status::INVALID_PARAMETER).map(|m| m.body).unwrap();
         assert_eq!(Response::parse(command::IOCTL, status::INVALID_PARAMETER, &b), Ok(resp));
     }
 
@@ -3516,29 +3439,29 @@ mod tests {
         let req = Request::parse(command::QUERY_DIRECTORY, &body).unwrap();
         let Request::QueryDirectory(q) = &req else { panic!() };
         assert_eq!((q.file_information_class, q.flags, q.pattern.clone()), (0x25, 1, utf16("*")));
-        assert_eq!(req.to_body().unwrap(), body);
+        assert_eq!(req.message(0).map(|m| m.body).unwrap(), body);
         let body = le(&[32, 1, 4096, 1, 2, 0x17, 0], &[2, 2, 4, 8, 8, 4, 4]);
         let req = Request::parse(command::CHANGE_NOTIFY, &body).unwrap();
         let Request::ChangeNotify(c) = &req else { panic!() };
         assert_eq!((c.flags, c.output_buffer_length, c.completion_filter), (1, 4096, 0x17));
-        assert_eq!(req.to_body().unwrap(), body);
+        assert_eq!(req.message(0).map(|m| m.body).unwrap(), body);
         let mut body = le(&[41, 1, 5, 1024, 104, 0, 0, 0, 0, 1, 2], &[2, 1, 1, 4, 2, 2, 4, 4, 4, 8, 8]);
         body.push(0);
         let req = Request::parse(command::QUERY_INFO, &body).unwrap();
         let Request::QueryInfo(q) = &req else { panic!() };
         assert_eq!((q.info_type, q.file_info_class, q.output_buffer_length), (1, 5, 1024));
-        assert_eq!(req.to_body().unwrap(), body);
+        assert_eq!(req.message(0).map(|m| m.body).unwrap(), body);
         let mut body = le(&[33, 1, 20, 8, 96, 0, 0, 1, 2], &[2, 1, 1, 4, 2, 2, 4, 8, 8]);
         body.extend_from_slice(&1234u64.to_le_bytes());
         let req = Request::parse(command::SET_INFO, &body).unwrap();
         let Request::SetInfo(s) = &req else { panic!() };
         assert_eq!((s.info_type, s.file_info_class, s.data.clone()), (1, 20, 1234u64.to_le_bytes().to_vec()));
-        assert_eq!(req.to_body().unwrap(), body);
+        assert_eq!(req.message(0).map(|m| m.body).unwrap(), body);
         for c in [command::QUERY_DIRECTORY, command::CHANGE_NOTIFY, command::QUERY_INFO] {
             let mut body = le(&[9, 72, 3], &[2, 2, 4]);
             body.extend_from_slice(&[1, 2, 3]);
             let resp = Response::parse(c, 0, &body).unwrap();
-            assert_eq!(resp.to_body(c, 0).unwrap(), body);
+            assert_eq!(resp.message(&Header::new(c, 0), 0).map(|m| m.body).unwrap(), body);
             assert_eq!(resp.command(), Some(c));
         }
         // NO_MORE_FILES ends a listing with an error body.
@@ -3546,7 +3469,7 @@ mod tests {
         assert_eq!(end, Ok(Response::Error(ErrorResponse::default())));
         // QUERY_INFO with BUFFER_OVERFLOW carries what fit.
         let body =
-            Response::QueryInfo { data: vec![1; 8] }.to_body(command::QUERY_INFO, status::BUFFER_OVERFLOW).unwrap();
+            Response::QueryInfo { data: vec![1; 8] }.message(&Header::new(command::QUERY_INFO, 0), status::BUFFER_OVERFLOW).map(|m| m.body).unwrap();
         assert_eq!(
             Response::parse(command::QUERY_INFO, status::BUFFER_OVERFLOW, &body),
             Ok(Response::QueryInfo { data: vec![1; 8] })
@@ -3559,14 +3482,14 @@ mod tests {
         body.extend_from_slice(&[0x10, 0, 0, 0]);
         let resp = Response::parse(command::READ, status::END_OF_FILE, &body).unwrap();
         assert_eq!(resp, Response::Error(ErrorResponse { context_count: 0, data: vec![0x10, 0, 0, 0] }));
-        assert_eq!(resp.to_body(command::READ, status::END_OF_FILE).unwrap(), body);
+        assert_eq!(resp.message(&Header::new(command::READ, 0), status::END_OF_FILE).map(|m| m.body).unwrap(), body);
         assert_eq!(resp.command(), None);
         // An interim response.
         let pending = Response::Error(ErrorResponse::default());
-        let b = pending.to_body(command::CHANGE_NOTIFY, status::PENDING).unwrap();
+        let b = pending.message(&Header::new(command::CHANGE_NOTIFY, 0), status::PENDING).map(|m| m.body).unwrap();
         assert_eq!(Response::parse(command::CHANGE_NOTIFY, status::PENDING, &b), Ok(pending.clone()));
         // An error body never goes with success.
-        assert_eq!(pending.to_body(command::READ, 0), Err(EncodeError::Status(0)));
+        assert_eq!(pending.message(&Header::new(command::READ, 0), 0).map(|m| m.body), Err(Error::Unwritable));
         // A ByteCount past the end.
         body[4] = 9;
         assert_eq!(Response::parse(command::READ, status::END_OF_FILE, &body), Err(Error::Buffer));
@@ -3586,18 +3509,18 @@ mod tests {
         let body = vec![24, 0, 1, 0, 0, 0, 0, 0];
         let req = Request::parse(command::OPLOCK_BREAK, &body).unwrap();
         assert_eq!(req, Request::Other { command: command::OPLOCK_BREAK, body: body.clone() });
-        assert_eq!(req.to_body().unwrap(), body);
-        assert_eq!(Request::Other { command: command::READ, body: vec![] }.to_body(), Err(EncodeError::Command(8)));
-        assert_eq!(Response::Other { body: vec![4, 0] }.to_body(command::ECHO, 0), Err(EncodeError::Command(13)));
-        assert_eq!(Response::Echo.to_body(command::LOGOFF, 0), Err(EncodeError::Command(2)));
+        assert_eq!(req.message(0).map(|m| m.body).unwrap(), body);
+        assert_eq!(Request::Other { command: command::READ, body: vec![] }.message(0).map(|m| m.body), Err(Error::Unwritable));
+        assert_eq!(Response::Other { body: vec![4, 0] }.message(&Header::new(command::ECHO, 0), 0).map(|m| m.body), Err(Error::Unwritable));
+        assert_eq!(Response::Echo.message(&Header::new(command::LOGOFF, 0), 0).map(|m| m.body), Err(Error::Unwritable));
         assert_eq!(
             Message::from_request(Header::new(command::ECHO, 1), &Request::Logoff),
-            Err(EncodeError::Command(command::ECHO))
+            Err(Error::Unwritable)
         );
         // An Other body with status 0 and an odd StructureSize is kept as is.
         let odd = Response::Other { body: vec![9, 0] };
-        assert_eq!(odd.to_body(0x99, 0), Ok(vec![9, 0]));
-        assert_eq!(odd.to_body(0x99, 1), Err(EncodeError::Status(1)));
+        assert_eq!(odd.message(&Header::new(0x99, 0), 0).map(|m| m.body), Ok(vec![9, 0]));
+        assert_eq!(odd.message(&Header::new(0x99, 0), 1).map(|m| m.body), Err(Error::Unwritable));
     }
 
     /// CREATE, READ and CLOSE in one compound chain, related.
@@ -3618,8 +3541,8 @@ mod tests {
     #[test]
     fn compound_chains() {
         let messages = chain();
-        let bytes = write_chain(&messages).unwrap();
-        let back = parse_chain(&bytes).unwrap();
+        let bytes = Packet::compound(messages.clone()).and_then(|packet| packet.to_bytes()).unwrap();
+        let Packet::Smb2(back) = Packet::parse(&bytes).unwrap() else { panic!() };
         assert_eq!(back.len(), 3);
         // The READ body (49 bytes) was padded to 56 to keep the CLOSE aligned.
         let first = le32(&bytes, 20).unwrap() as usize;
@@ -3631,28 +3554,28 @@ mod tests {
         assert_eq!(back[1].request(), messages[1].request());
         assert_eq!(back[2], messages[2]);
         // Read back, the chain writes the same bytes.
-        assert_eq!(write_chain(&back).unwrap(), bytes);
+        assert_eq!(Packet::compound(back.clone()).and_then(|packet| packet.to_bytes()).unwrap(), bytes);
         // Bad NextCommand values.
         for next in [8u32, 63, 65, 100, bytes.len() as u32 + 8] {
             let mut b = bytes.clone();
             b[20..24].copy_from_slice(&next.to_le_bytes());
-            assert_eq!(parse_chain(&b), Err(Error::NextCommand(next)), "{next}");
+            assert_eq!(Packet::parse(&b), Err(Error::NextCommand(next)), "{next}");
         }
-        assert_eq!(write_chain(&[]), Err(EncodeError::Empty));
+        assert_eq!(Packet::compound(vec![]).and_then(|packet| packet.to_bytes()), Err(Error::Unwritable));
         // The longest chain reads; one more is refused.
         let echo = Message::from_request(Header::new(command::ECHO, 0), &Request::Echo).unwrap();
         let many = vec![echo; MAX_CHAIN];
-        let b = write_chain(&many).unwrap();
-        assert_eq!(parse_chain(&b).unwrap().len(), MAX_CHAIN);
+        let b = Packet::compound(many.clone()).and_then(|packet| packet.to_bytes()).unwrap();
+        assert_eq!(match Packet::parse(&b).unwrap() { Packet::Smb2(m) => m.len(), _ => panic!() }, MAX_CHAIN);
         let mut more = b.clone();
         let last = more.len() - 68;
         more[last + 20..last + 24].copy_from_slice(&72u32.to_le_bytes());
         more.resize(more.len() + 4, 0);
         more.extend_from_slice(&b[..68]);
-        assert_eq!(parse_chain(&more), Err(Error::TooMany));
+        assert_eq!(Packet::parse(&more), Err(Error::TooMany));
         let mut too_many = many;
         too_many.push(too_many[0].clone());
-        assert_eq!(write_chain(&too_many), Err(EncodeError::TooLong));
+        assert_eq!(Packet::compound(too_many.clone()).and_then(|packet| packet.to_bytes()), Err(Error::Unwritable));
     }
 
     #[test]
@@ -3680,9 +3603,9 @@ mod tests {
         assert_eq!(b[..16], [0xfc, b'S', b'M', b'B', 0x90, 1, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0]);
         assert_eq!(Packet::parse(&b), Ok(Packet::Compressed(c)));
         let bad = Compressed::Unchained { original_size: 0, algorithm: 0, offset: 0, data: vec![] };
-        assert_eq!(bad.to_bytes(), Err(EncodeError::Chained));
+        assert_eq!(bad.to_bytes(), Err(Error::Unwritable));
         let bad = Compressed::Unchained { original_size: 0, algorithm: 1, offset: 1, data: vec![] };
-        assert_eq!(bad.to_bytes(), Err(EncodeError::Offset));
+        assert_eq!(bad.to_bytes(), Err(Error::Unwritable));
         let mut b =
             Compressed::Unchained { original_size: 0, algorithm: 1, offset: 0, data: vec![] }.to_bytes().unwrap();
         b[12] = 1;
@@ -3701,9 +3624,9 @@ mod tests {
         assert_eq!(Compressed::parse(&b[..b.len() - 1]), Err(Error::Buffer));
         assert_eq!(Compressed::parse(&b[..b.len() - 13]), Err(Error::Truncated));
         let empty = Compressed::Chained { original_size: 0, payloads: vec![] };
-        assert_eq!(empty.to_bytes(), Err(EncodeError::Empty));
+        assert_eq!(empty.to_bytes(), Err(Error::Unwritable));
         let unflagged = Compressed::Chained { original_size: 0, payloads: vec![ChainedPayload::default()] };
-        assert_eq!(unflagged.to_bytes(), Err(EncodeError::Chained));
+        assert_eq!(unflagged.to_bytes(), Err(Error::Unwritable));
     }
 
     #[test]
@@ -3711,7 +3634,7 @@ mod tests {
         let smb1 = [0xff, b'S', b'M', b'B', 0x72];
         assert_eq!(Packet::parse(&smb1), Ok(Packet::Smb1(smb1.to_vec())));
         assert_eq!(Packet::Smb1(smb1.to_vec()).to_bytes().unwrap(), smb1);
-        assert_eq!(Packet::Smb1(vec![1, 2, 3]).to_bytes(), Err(EncodeError::Protocol));
+        assert_eq!(Packet::Smb1(vec![1, 2, 3]).to_bytes(), Err(Error::Unwritable));
         assert_eq!(Packet::parse(b"GET /"), Err(Error::Protocol(*b"GET ")));
         assert_eq!(Packet::parse(&[0xfe, b'S']), Err(Error::Truncated));
         assert_eq!(Packet::parse(&vec![0xff; MAX_MESSAGE + 1]), Err(Error::TooLong));
@@ -3720,9 +3643,9 @@ mod tests {
         assert_eq!(Packet::parse(&h), Err(Error::HeaderSize(65)));
         assert_eq!(Packet::parse(&h[..63]), Err(Error::Truncated));
         let big = Packet::Smb1([&smb1[..4], &vec![0; MAX_MESSAGE][..]].concat());
-        assert_eq!(big.to_bytes(), Err(EncodeError::TooLong));
+        assert_eq!(big.to_bytes(), Err(Error::Unwritable));
         let big = Message { header: Header::new(0x99, 0), body: vec![0; MAX_MESSAGE] };
-        assert_eq!(big.to_bytes(), Err(EncodeError::TooLong));
+        assert_eq!(big.to_bytes(), Err(Error::Unwritable));
     }
 
     #[test]
@@ -3742,20 +3665,20 @@ mod tests {
         b[6] = 1;
         assert_eq!(Request::parse(command::TREE_CONNECT, &b), Err(Error::OddString));
         // Create contexts that run off their region, or link backwards.
-        let mut body = Request::Create(create_request()).to_body().unwrap();
+        let mut body = Request::Create(create_request()).message(0).map(|m| m.body).unwrap();
         let ctx = le32(&body, 48).unwrap() as usize - 64;
         body[ctx] = 8; // Next below 16
         assert_eq!(Request::parse(command::CREATE, &body), Err(Error::Buffer));
         body[ctx] = 0xf0;
         assert_eq!(Request::parse(command::CREATE, &body), Err(Error::Buffer));
-        let mut body = Request::Create(create_request()).to_body().unwrap();
+        let mut body = Request::Create(create_request()).message(0).map(|m| m.body).unwrap();
         body[ctx + 6] = 30; // name past its context
         assert_eq!(Request::parse(command::CREATE, &body), Err(Error::Buffer));
         let n = body.len();
         body[52..56].copy_from_slice(&((n - ctx) as u32 - 4).to_le_bytes());
         assert_eq!(Request::parse(command::CREATE, &body), Err(Error::Buffer));
         // A context region of a few bytes.
-        let mut body = Request::Create(create_request()).to_body().unwrap();
+        let mut body = Request::Create(create_request()).message(0).map(|m| m.body).unwrap();
         body[52..56].copy_from_slice(&8u32.to_le_bytes());
         assert_eq!(Request::parse(command::CREATE, &body), Err(Error::Buffer));
         // Negotiate contexts past the end.
@@ -3764,7 +3687,7 @@ mod tests {
             contexts: vec![NegotiateContext { kind: 1, data: vec![1; 6] }],
             ..Default::default()
         });
-        let mut body = req.to_body().unwrap();
+        let mut body = req.message(0).map(|m| m.body).unwrap();
         body[32] = 2;
         assert_eq!(Request::parse(command::NEGOTIATE, &body), Err(Error::Buffer));
         body[32] = 1;
@@ -3772,101 +3695,74 @@ mod tests {
         assert_eq!(Request::parse(command::NEGOTIATE, &body), Err(Error::Buffer));
         // Dialects past the end.
         let mut body =
-            Request::Negotiate(NegotiateRequest { dialects: vec![0x202], ..Default::default() }).to_body().unwrap();
+            Request::Negotiate(NegotiateRequest { dialects: vec![0x202], ..Default::default() }).message(0).map(|m| m.body).unwrap();
         body[2] = 2;
         assert_eq!(Request::parse(command::NEGOTIATE, &body), Err(Error::Truncated));
         // Writers refuse what will not fit a field.
         let long = Request::SessionSetup(SessionSetupRequest { security_buffer: vec![0; 70000], ..Default::default() });
-        assert_eq!(long.to_body(), Err(EncodeError::TooLong));
+        assert_eq!(long.message(0).map(|m| m.body), Err(Error::Unwritable));
         let long = Request::TreeConnect(TreeConnectRequest { flags: 0, path: vec![0x41; 40000] });
-        assert_eq!(long.to_body(), Err(EncodeError::TooLong));
+        assert_eq!(long.message(0).map(|m| m.body), Err(Error::Unwritable));
         let long = Request::Write(WriteRequest {
             data: vec![0; 70000],
             channel: 1,
             channel_info: vec![1; 65500],
             ..Default::default()
         });
-        assert_eq!(long.to_body(), Err(EncodeError::TooLong));
+        assert_eq!(long.message(0).map(|m| m.body), Err(Error::Unwritable));
         let long = Response::Read { data: vec![0; MAX_MESSAGE + 1], data_remaining: 0, flags: 0 };
-        assert_eq!(long.to_body(command::READ, 0), Err(EncodeError::TooLong));
+        assert_eq!(long.message(&Header::new(command::READ, 0), 0).map(|m| m.body), Err(Error::Unwritable));
     }
 
     #[test]
     fn frames_and_errors() {
-        let payload = [0xfe, b'S', b'M', b'B'];
-        let f = frame(&payload).unwrap();
-        assert_eq!(f, [0, 0, 0, 4, 0xfe, b'S', b'M', b'B']);
-        for n in 0..f.len() {
-            assert_eq!(parse_frame(&f[..n]), Ok(None), "{n}");
-        }
-        assert_eq!(parse_frame(&f), Ok(Some((&payload[..], 8))));
-        assert_eq!(parse_frame(&[0x85]), Err(FrameError::Type(0x85)));
-        assert_eq!(parse_frame(&[0, 0xff, 0xff, 0xff]), Err(FrameError::Length(0xff_ffff)));
-        assert_eq!(frame(&vec![0; MAX_MESSAGE + 1]), Err(EncodeError::TooLong));
-        let longest = frame(&vec![7; MAX_MESSAGE]).unwrap();
-        assert_eq!(parse_frame(&longest).unwrap().unwrap().1, MAX_BUFFERED);
-        // An empty frame is a frame.
-        assert_eq!(parse_frame(&[0, 0, 0, 0]), Ok(Some((&[][..], 4))));
-        for e in [FrameError::Type(1), FrameError::Length(2)] {
-            assert!(!e.to_string().is_empty());
-        }
+        let frame = Frame { payload: vec![0xfe, b'S', b'M', b'B'] };
+        let bytes = frame.to_bytes().unwrap();
+        assert_eq!(bytes, [0, 0, 0, 4, 0xfe, b'S', b'M', b'B']);
+        for n in 0..bytes.len() { assert_eq!(Frame::parse(&bytes[..n]), Err(Error::Incomplete)); }
+        assert_eq!(Frame::parse(&bytes), Ok(frame));
+        assert_eq!(Frame::parse(&[0x85]), Err(Error::FrameType(0x85)));
+        assert_eq!(Frame::parse(&[0, 0xff, 0xff, 0xff]), Err(Error::Length { length: 0xff_ffff, limit: MAX_MESSAGE }));
+        assert_eq!(Frame { payload: vec![0; MAX_MESSAGE + 1] }.to_bytes(), Err(Error::Unwritable));
+        let longest = Frame { payload: vec![7; MAX_MESSAGE] }.to_bytes().unwrap();
+        assert_eq!(longest.len(), MAX_FRAME);
+        assert_eq!(Frame::parse(&longest).unwrap().payload.len(), MAX_MESSAGE);
+        assert_eq!(Frame::parse(&[0, 0, 0, 0]), Ok(Frame { payload: vec![] }));
     }
 
     #[test]
-    fn decoder_splits_a_stream() {
-        let a = Packet::Smb2(chain()).to_frame().unwrap();
-        let b = Packet::Smb2(vec![Message::from_request(Header::new(command::ECHO, 7), &Request::Echo).unwrap()])
-            .to_frame()
-            .unwrap();
-        let stream: Vec<u8> = a.iter().chain(&b).copied().collect();
-        let mut d = Decoder::new();
-        let mut got = Vec::new();
-        for byte in &stream {
-            assert_eq!(d.feed(std::slice::from_ref(byte)), 1);
-            while let Some(f) = d.next_frame() {
-                got.push(Packet::parse(&f.unwrap()).unwrap());
-            }
-        }
-        assert_eq!(got.len(), 2);
-        assert_eq!(got[0], Packet::Smb2(parse_chain(&a[4..]).unwrap()));
-        assert_eq!(d.buffered(), 0);
-        // A broken stream stays broken, and drops what comes after.
-        assert_eq!(d.feed(&[0x81, 0, 0, 0]), 4);
-        assert_eq!(d.next_frame(), Some(Err(FrameError::Type(0x81))));
-        assert_eq!(d.feed(&a), a.len());
-        assert_eq!(d.next_frame(), Some(Err(FrameError::Type(0x81))));
-        assert_eq!(d.buffered(), 0);
+    fn stream_splits_frames() {
+        let first = Packet::compound(chain()).unwrap();
+        let second = Packet::Smb2(vec![Request::Echo.message(7).unwrap()]);
+        let bytes = [Frame::from_packet(&first).unwrap().to_bytes().unwrap(),
+            Frame::from_packet(&second).unwrap().to_bytes().unwrap()].concat();
+        contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_FRAME);
+        let (frames, error) = decode_all(Frames::new, &bytes);
+        assert_eq!(error, None);
+        assert_eq!(frames.iter().map(|f| Packet::parse(&f.payload).unwrap()).collect::<Vec<_>>(), [first, second]);
+        assert_eq!(decode_all(Frames::new, &[0x81, 0, 0, 0]).1, Some(Fail::Protocol(Error::FrameType(0x81))));
     }
 
     #[test]
-    fn decoder_holds_at_most_max_buffered() {
-        let mut d = Decoder::new();
-        let big = frame(&vec![1; MAX_MESSAGE]).unwrap();
+    fn stream_holds_at_most_max_buffered() {
+        let mut d = Stream::new(Frames::new());
+        let big = Frame { payload: vec![1; MAX_MESSAGE] }.to_bytes().unwrap();
         let stream: Vec<u8> = big.iter().chain(&big).copied().collect();
-        assert_eq!(d.feed(&stream), MAX_BUFFERED);
-        assert_eq!(d.feed(&stream[MAX_BUFFERED..]), 0);
-        assert_eq!(d.next_frame().unwrap().unwrap().len(), MAX_MESSAGE);
-        assert_eq!(d.feed(&stream[MAX_BUFFERED..]), MAX_BUFFERED);
-        assert!(d.next_frame().unwrap().is_ok());
-        assert_eq!(d.next_frame(), None);
+        assert_eq!(d.push(&stream), MAX_FRAME);
+        assert_eq!(d.push(&stream[MAX_FRAME..]), 0);
+        assert_eq!(d.next().unwrap().unwrap().payload.len(), MAX_MESSAGE);
+        assert_eq!(d.push(&stream[MAX_FRAME..]), MAX_FRAME);
+        assert!(d.next().unwrap().is_ok());
+        assert_eq!(d.next(), None);
     }
 
     #[test]
-    fn decoder_takes_many_small_frames_in_linear_time() {
-        let one = frame(&[0xff, b'S', b'M', b'B']).unwrap();
-        let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * 200_000).collect();
+    fn stream_takes_many_small_frames_in_linear_time() {
+        let bytes = Frame { payload: b"\xffSMB".to_vec() }.to_bytes().unwrap().repeat(200_000);
         let started = std::time::Instant::now();
-        let mut d = Decoder::new();
-        let mut rest = &stream[..];
-        let mut n = 0;
-        while !rest.is_empty() {
-            rest = &rest[d.feed(rest)..];
-            while let Some(f) = d.next_frame() {
-                f.unwrap();
-                n += 1;
-            }
-        }
-        assert_eq!(n, 200_000);
+        let (frames, error) = decode_all(Frames::new, &bytes);
+        assert_eq!(frames.len(), 200_000);
+        assert_eq!(error, None);
         assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
     }
 
@@ -3894,26 +3790,7 @@ mod tests {
         for e in errors {
             assert!(!e.to_string().is_empty());
         }
-        let encode = [
-            EncodeError::TooLong,
-            EncodeError::Command(1),
-            EncodeError::Status(1),
-            EncodeError::AsyncFlag,
-            EncodeError::Empty,
-            EncodeError::Dialect,
-            EncodeError::Chained,
-            EncodeError::Protocol,
-            EncodeError::NoLocks,
-            EncodeError::NoDialects,
-            EncodeError::Offset,
-            EncodeError::Transform,
-            EncodeError::Channel,
-            EncodeError::ErrorContexts,
-            EncodeError::IoctlOutput,
-        ];
-        for e in encode {
-            assert!(!e.to_string().is_empty());
-        }
+        assert!(!Error::Unwritable.to_string().is_empty());
     }
 
     #[test]
@@ -3926,12 +3803,12 @@ mod tests {
             Ok(Response::ChangeNotify { data: vec![] })
         );
         let resp = Response::ChangeNotify { data: vec![1; 4] };
-        let body = resp.to_body(command::CHANGE_NOTIFY, status::NOTIFY_ENUM_DIR).unwrap();
+        let body = resp.message(&Header::new(command::CHANGE_NOTIFY, 0), status::NOTIFY_ENUM_DIR).map(|m| m.body).unwrap();
         assert_eq!(Response::parse(command::CHANGE_NOTIFY, status::NOTIFY_ENUM_DIR, &body), Ok(resp));
         let error = Response::Error(ErrorResponse::default());
         assert_eq!(
-            error.to_body(command::CHANGE_NOTIFY, status::NOTIFY_ENUM_DIR),
-            Err(EncodeError::Status(status::NOTIFY_ENUM_DIR))
+            error.message(&Header::new(command::CHANGE_NOTIFY, 0), status::NOTIFY_ENUM_DIR).map(|m| m.body),
+            Err(Error::Unwritable)
         );
         // Under any other failure it is read as an error body, and these
         // bytes, read that way, claim 72 error contexts in no data.
@@ -3944,7 +3821,7 @@ mod tests {
         let mut body = le(&[36, 0, 0, 0, 0], &[2, 2, 2, 2, 4]);
         body.extend_from_slice(&[0; 24]);
         assert_eq!(Request::parse(command::NEGOTIATE, &body), Err(Error::NoDialects));
-        assert_eq!(Request::Negotiate(NegotiateRequest::default()).to_body(), Err(EncodeError::NoDialects));
+        assert_eq!(Request::Negotiate(NegotiateRequest::default()).message(0).map(|m| m.body), Err(Error::Unwritable));
     }
 
     #[test]
@@ -3970,9 +3847,9 @@ mod tests {
         let first = ChainedPayload { algorithm: 0, flags: COMPRESSION_FLAG_CHAINED, data: vec![7] };
         let later = ChainedPayload { algorithm: 0, flags: COMPRESSION_FLAG_CHAINED, data: vec![8] };
         let bad = Compressed::Chained { original_size: 9, payloads: vec![first.clone(), later] };
-        assert_eq!(bad.to_bytes(), Err(EncodeError::Chained));
+        assert_eq!(bad.to_bytes(), Err(Error::Unwritable));
         let odd = ChainedPayload { flags: 3, ..first };
-        assert_eq!(Compressed::Chained { original_size: 9, payloads: vec![odd] }.to_bytes(), Err(EncodeError::Chained));
+        assert_eq!(Compressed::Chained { original_size: 9, payloads: vec![odd] }.to_bytes(), Err(Error::Unwritable));
     }
 
     #[test]
@@ -3983,10 +3860,10 @@ mod tests {
         body.extend_from_slice(&[1, 2, 3, 4]);
         body.extend_from_slice(&vec![9; 70000]);
         let req = Request::parse(command::WRITE, &body).unwrap();
-        assert_eq!(req.to_body().unwrap(), body);
+        assert_eq!(req.message(0).map(|m| m.body).unwrap(), body);
         // Both too long for any layout: refused.
         let w = WriteRequest { data: vec![0; 70000], channel: 1, channel_info: vec![1; 65500], ..Default::default() };
-        assert_eq!(Request::Write(w).to_body(), Err(EncodeError::TooLong));
+        assert_eq!(Request::Write(w).message(0).map(|m| m.body), Err(Error::Unwritable));
     }
 
     #[test]
@@ -4005,7 +3882,7 @@ mod tests {
         // IOCTL input and output over the same bytes would write back twice
         // as long; they are refused. (A request has no output at all.)
         let resp = Response::Ioctl(IoctlResponse { output: vec![1; 8], ..Default::default() });
-        let mut body = resp.to_body(command::IOCTL, 0).unwrap();
+        let mut body = resp.message(&Header::new(command::IOCTL, 0), 0).map(|m| m.body).unwrap();
         body[24..28].copy_from_slice(&112u32.to_le_bytes());
         body[28..32].copy_from_slice(&8u32.to_le_bytes());
         assert_eq!(Response::parse(command::IOCTL, 0, &body), Err(Error::Overlap));
@@ -4016,11 +3893,11 @@ mod tests {
             channel_info: vec![2; 4],
             ..Default::default()
         });
-        let mut body = req.to_body().unwrap();
+        let mut body = req.message(0).map(|m| m.body).unwrap();
         body[40..42].copy_from_slice(&116u16.to_le_bytes());
         assert_eq!(Request::parse(command::WRITE, &body), Err(Error::Overlap));
         // CREATE contexts that start inside the name.
-        let mut body = Request::Create(create_request()).to_body().unwrap();
+        let mut body = Request::Create(create_request()).message(0).map(|m| m.body).unwrap();
         body[48..52].copy_from_slice(&128u32.to_le_bytes());
         assert_eq!(Request::parse(command::CREATE, &body), Err(Error::Overlap));
         // A NEGOTIATE response whose contexts start inside the security buffer.
@@ -4030,7 +3907,7 @@ mod tests {
             contexts: vec![NegotiateContext::preauth_integrity(&[1], &[2; 8]).unwrap()],
             ..Default::default()
         });
-        let mut body = resp.to_body(command::NEGOTIATE, 0).unwrap();
+        let mut body = resp.message(&Header::new(command::NEGOTIATE, 0), 0).map(|m| m.body).unwrap();
         body[60..64].copy_from_slice(&136u32.to_le_bytes());
         assert_eq!(Response::parse(command::NEGOTIATE, 0, &body), Err(Error::Overlap));
         // NEGOTIATE request contexts over the dialect list.
@@ -4039,7 +3916,7 @@ mod tests {
             contexts: vec![NegotiateContext { kind: 1, data: vec![] }],
             ..Default::default()
         });
-        let mut body = req.to_body().unwrap();
+        let mut body = req.message(0).map(|m| m.body).unwrap();
         body[28..32].copy_from_slice(&104u32.to_le_bytes());
         assert_eq!(Request::parse(command::NEGOTIATE, &body), Err(Error::Overlap));
     }
@@ -4052,12 +3929,12 @@ mod tests {
             contexts: vec![NegotiateContext { kind: 1, data: vec![1; 6] }],
             ..Default::default()
         });
-        let mut body = req.to_body().unwrap();
+        let mut body = req.message(0).map(|m| m.body).unwrap();
         body.insert(40, 0);
         body[28..32].copy_from_slice(&105u32.to_le_bytes());
         assert_eq!(Request::parse(command::NEGOTIATE, &body), Err(Error::Align(105)));
         // 2.2.13.2: create contexts, their Next and their DataOffset too.
-        let good = Request::Create(create_request()).to_body().unwrap();
+        let good = Request::Create(create_request()).message(0).map(|m| m.body).unwrap();
         let ctx = le32(&good, 48).unwrap() as usize - 64;
         let mut body = good.clone();
         body.insert(ctx, 0);
@@ -4102,7 +3979,7 @@ mod tests {
         let mut chain = header_bytes(command::ECHO, 0, 0, 0, 1, 0, 0);
         chain.extend_from_slice(&[4, 0, 0, 0]);
         chain.resize(MAX_MESSAGE + 1, 0);
-        assert_eq!(parse_chain(&chain), Err(Error::TooLong));
+        assert_eq!(Packet::parse(&chain), Err(Error::TooLong));
         let mut t = protocol::TRANSFORM.to_vec();
         t.resize(MAX_MESSAGE + 1, 0);
         assert_eq!(Transform::parse(&t), Err(Error::TooLong));
@@ -4115,11 +3992,11 @@ mod tests {
         assert_eq!(Response::parse(command::ECHO, 0, &body), Err(Error::TooLong));
         // Writers refuse before they copy or convert.
         let long = Request::Create(CreateRequest { name: vec![0x41; 40000], ..Default::default() });
-        assert_eq!(long.to_body(), Err(EncodeError::TooLong));
+        assert_eq!(long.message(0).map(|m| m.body), Err(Error::Unwritable));
         let long = Request::QueryDirectory(QueryDirectoryRequest { pattern: vec![0x41; 40000], ..Default::default() });
-        assert_eq!(long.to_body(), Err(EncodeError::TooLong));
+        assert_eq!(long.message(0).map(|m| m.body), Err(Error::Unwritable));
         let long = Response::Other { body: vec![0; MAX_MESSAGE + 1] };
-        assert_eq!(long.to_body(0x99, 0), Err(EncodeError::TooLong));
+        assert_eq!(long.message(&Header::new(0x99, 0), 0).map(|m| m.body), Err(Error::Unwritable));
     }
 
     #[test]
@@ -4127,7 +4004,7 @@ mod tests {
         // 2.2.9.1: with EXTENSION_PRESENT the Buffer starts with the
         // extension's 16-byte header, then the path.
         let req = Request::TreeConnect(TreeConnectRequest { flags: 4, path: utf16("\\\\server\\share") });
-        let body = req.to_body().unwrap();
+        let body = req.message(0).map(|m| m.body).unwrap();
         let path = u16s("\\\\server\\share");
         assert_eq!(le16(&body, 2), Ok(4));
         assert_eq!(le16(&body, 4), Ok(88));
@@ -4143,7 +4020,7 @@ mod tests {
         ext.extend_from_slice(&le(&[1, 4, 0], &[2, 2, 4]));
         ext.extend_from_slice(&[1, 2, 3, 4]);
         let read = Request::parse(command::TREE_CONNECT, &ext).unwrap();
-        let back = read.to_body().unwrap();
+        let back = read.message(0).map(|m| m.body).unwrap();
         assert!(back.len() <= ext.len());
         assert_eq!(Request::parse(command::TREE_CONNECT, &back), Ok(read));
         // The path over the extension's header is refused.
@@ -4156,7 +4033,7 @@ mod tests {
     fn ioctl_response_output_is_eight_byte_aligned() {
         // 2.2.32: OutputOffset is InputOffset + InputCount rounded up to 8.
         let resp = Response::Ioctl(IoctlResponse { input: vec![1], output: vec![2], ..Default::default() });
-        let body = resp.to_body(command::IOCTL, 0).unwrap();
+        let body = resp.message(&Header::new(command::IOCTL, 0), 0).map(|m| m.body).unwrap();
         assert_eq!((le32(&body, 24), le32(&body, 28)), (Ok(112), Ok(1)));
         assert_eq!((le32(&body, 32), le32(&body, 36)), (Ok(120), Ok(1)));
         assert_eq!(body[56], 2);
@@ -4171,25 +4048,25 @@ mod tests {
         assert_eq!(Response::parse(command::IOCTL, 0, &bad), Err(Error::Overlap));
         // No output: OutputOffset 0.
         let none = Response::Ioctl(IoctlResponse { input: vec![1], ..Default::default() });
-        assert_eq!(le32(&none.to_body(command::IOCTL, 0).unwrap(), 32), Ok(0));
+        assert_eq!(le32(&none.message(&Header::new(command::IOCTL, 0), 0).map(|m| m.body).unwrap(), 32), Ok(0));
     }
 
     #[test]
     fn failures_get_error_bodies_but_for_the_listed_exceptions() {
         // 3.3.4.4: ACCESS_DENIED is a failure for ECHO, which has no
         // exception, so its body is an error body.
-        assert_eq!(Response::Echo.to_body(command::ECHO, status::ACCESS_DENIED), Err(EncodeError::Status(0xc000_0022)));
+        assert_eq!(Response::Echo.message(&Header::new(command::ECHO, 0), status::ACCESS_DENIED).map(|m| m.body), Err(Error::Unwritable));
         assert_eq!(Response::parse(command::ECHO, status::ACCESS_DENIED, &[4, 0, 0, 0]), Err(Error::StructureSize(4)));
         let read = Response::Read { data: vec![1], data_remaining: 0, flags: 0 };
-        assert_eq!(read.to_body(command::READ, status::END_OF_FILE), Err(EncodeError::Status(status::END_OF_FILE)));
+        assert_eq!(read.message(&Header::new(command::READ, 0), status::END_OF_FILE).map(|m| m.body), Err(Error::Unwritable));
         let create = Response::Create(CreateResponse::default());
-        assert_eq!(create.to_body(command::CREATE, status::BUFFER_OVERFLOW), Err(EncodeError::Status(0x8000_0005)));
+        assert_eq!(create.message(&Header::new(command::CREATE, 0), status::BUFFER_OVERFLOW).map(|m| m.body), Err(Error::Unwritable));
         // The exceptions keep their own bodies.
-        assert!(read.to_body(command::READ, status::BUFFER_OVERFLOW).is_ok());
+        assert!(read.message(&Header::new(command::READ, 0), status::BUFFER_OVERFLOW).map(|m| m.body).is_ok());
         let ioctl = Response::Ioctl(IoctlResponse::default());
-        assert!(ioctl.to_body(command::IOCTL, status::BUFFER_OVERFLOW).is_ok());
-        assert!(ioctl.to_body(command::IOCTL, status::INVALID_PARAMETER).is_ok());
-        assert_eq!(ioctl.to_body(command::IOCTL, status::ACCESS_DENIED), Err(EncodeError::Status(0xc000_0022)));
+        assert!(ioctl.message(&Header::new(command::IOCTL, 0), status::BUFFER_OVERFLOW).map(|m| m.body).is_ok());
+        assert!(ioctl.message(&Header::new(command::IOCTL, 0), status::INVALID_PARAMETER).map(|m| m.body).is_ok());
+        assert_eq!(ioctl.message(&Header::new(command::IOCTL, 0), status::ACCESS_DENIED).map(|m| m.body), Err(Error::Unwritable));
     }
 
     #[test]
@@ -4200,12 +4077,12 @@ mod tests {
             Response::Negotiate(NegotiateResponse { dialect: dialect::SMB_3_1_1, contexts, ..Default::default() })
         };
         // 3.2.5.2: a client refuses none, two, or two of one other kind.
-        assert_eq!(response(vec![]).to_body(0, 0), Err(EncodeError::Dialect));
-        assert_eq!(response(vec![preauth.clone(), preauth.clone()]).to_body(0, 0), Err(EncodeError::Dialect));
+        assert_eq!(response(vec![]).message(&Header::new(0, 0), 0).map(|m| m.body), Err(Error::Unwritable));
+        assert_eq!(response(vec![preauth.clone(), preauth.clone()]).message(&Header::new(0, 0), 0).map(|m| m.body), Err(Error::Unwritable));
         let two_signing = response(vec![preauth.clone(), signing.clone(), signing.clone()]);
-        assert_eq!(two_signing.to_body(0, 0), Err(EncodeError::Dialect));
+        assert_eq!(two_signing.message(&Header::new(0, 0), 0).map(|m| m.body), Err(Error::Unwritable));
         let good = response(vec![preauth, signing]);
-        let mut body = good.to_body(0, 0).unwrap();
+        let mut body = good.message(&Header::new(0, 0), 0).map(|m| m.body).unwrap();
         assert_eq!(Response::parse(0, 0, &body), Ok(good));
         // The same bytes with the preauth context made a signing one.
         let first = le32(&body, 60).unwrap() as usize - HEADER_LEN;
@@ -4234,9 +4111,9 @@ mod tests {
         assert_eq!((w.data, w.channel_info), (b"abc".to_vec(), vec![]));
         // Writers refuse channel info with channel NONE.
         let r = Request::Read(ReadRequest { channel_info: vec![1], ..Default::default() });
-        assert_eq!(r.to_body(), Err(EncodeError::Channel));
+        assert_eq!(r.message(0).map(|m| m.body), Err(Error::Unwritable));
         let w = Request::Write(WriteRequest { channel_info: vec![1], ..Default::default() });
-        assert_eq!(w.to_body(), Err(EncodeError::Channel));
+        assert_eq!(w.message(0).map(|m| m.body), Err(Error::Unwritable));
     }
 
     /// A CREATE request body, with its file name at `name_at` and its
@@ -4269,7 +4146,7 @@ mod tests {
         let want = CreateContext { name: b"AlSi".to_vec(), data: 4096u64.to_le_bytes().to_vec() };
         assert_eq!(c.contexts, [want]);
         // Written back with the name first: at most 7 bytes longer.
-        let back = Request::Create(c.clone()).to_body().unwrap();
+        let back = Request::Create(c.clone()).message(0).map(|m| m.body).unwrap();
         assert!(back.len() <= body.len() + 7);
         assert_eq!(Request::parse(command::CREATE, &back), Ok(Request::Create(c)));
         // Name and data over the same bytes are still refused.
@@ -4310,9 +4187,9 @@ mod tests {
     #[test]
     fn transform_headers_need_flags_one_and_a_message() {
         // 2.2.41 and 3.3.5.2.1.1.
-        assert_eq!(Transform::default().to_bytes(), Err(EncodeError::Transform));
-        assert_eq!(Transform { flags: 1, ..Default::default() }.to_bytes(), Err(EncodeError::Transform));
-        assert_eq!(Transform { flags: 2, data: vec![1], ..Default::default() }.to_bytes(), Err(EncodeError::Transform));
+        assert_eq!(Transform::default().to_bytes(), Err(Error::Unwritable));
+        assert_eq!(Transform { flags: 1, ..Default::default() }.to_bytes(), Err(Error::Unwritable));
+        assert_eq!(Transform { flags: 2, data: vec![1], ..Default::default() }.to_bytes(), Err(Error::Unwritable));
         let good = Transform { flags: 1, data: vec![1], ..Default::default() };
         let mut b = good.to_bytes().unwrap();
         assert_eq!(Packet::parse(&b), Ok(Packet::Transform(good)));
@@ -4329,7 +4206,7 @@ mod tests {
         for algorithm in [1, 2, 3, 5] {
             let short = ChainedPayload { algorithm, flags: 1, data: vec![0; 3] };
             let c = Compressed::Chained { original_size: 9, payloads: vec![short] };
-            assert_eq!(c.to_bytes(), Err(EncodeError::Chained), "{algorithm}");
+            assert_eq!(c.to_bytes(), Err(Error::Unwritable), "{algorithm}");
             let ok = ChainedPayload { algorithm, flags: 1, data: vec![9, 0, 0, 0] };
             let c = Compressed::Chained { original_size: 9, payloads: vec![ok] };
             let mut b = c.to_bytes().unwrap();
@@ -4350,7 +4227,7 @@ mod tests {
     fn error_contexts_fit_their_count() {
         // 2.2.2: ErrorContextCount contexts, each 8-byte aligned.
         let missing = Response::Error(ErrorResponse { context_count: 1, data: vec![] });
-        assert_eq!(missing.to_body(command::CREATE, status::ACCESS_DENIED), Err(EncodeError::ErrorContexts));
+        assert_eq!(missing.message(&Header::new(command::CREATE, 0), status::ACCESS_DENIED).map(|m| m.body), Err(Error::Unwritable));
         assert_eq!(
             Response::parse(command::CREATE, status::ACCESS_DENIED, &[9, 0, 1, 0, 0, 0, 0, 0, 0]),
             Err(Error::Buffer)
@@ -4360,20 +4237,20 @@ mod tests {
         data.extend_from_slice(&[1, 2, 3, 0, 0, 0, 0, 0]);
         data.extend_from_slice(&le(&[0, 0x7264_5253], &[4, 4]));
         let two = Response::Error(ErrorResponse { context_count: 2, data: data.clone() });
-        let body = two.to_body(command::TREE_CONNECT, status::BAD_NETWORK_NAME).unwrap();
+        let body = two.message(&Header::new(command::TREE_CONNECT, 0), status::BAD_NETWORK_NAME).map(|m| m.body).unwrap();
         assert_eq!(Response::parse(command::TREE_CONNECT, status::BAD_NETWORK_NAME, &body), Ok(two));
         // Without the padding the second context does not fit.
         data.drain(11..16);
         let unpadded = Response::Error(ErrorResponse { context_count: 2, data });
-        assert_eq!(unpadded.to_body(command::TREE_CONNECT, status::BAD_NETWORK_NAME), Err(EncodeError::ErrorContexts));
+        assert_eq!(unpadded.message(&Header::new(command::TREE_CONNECT, 0), status::BAD_NETWORK_NAME).map(|m| m.body), Err(Error::Unwritable));
     }
 
     #[test]
     fn ioctl_requests_carry_no_output() {
         // 2.2.31: "OutputCount: The client MUST set this to 0."
         let req = Request::Ioctl(IoctlRequest { output: vec![1], ..Default::default() });
-        assert_eq!(req.to_body(), Err(EncodeError::IoctlOutput));
-        let mut body = Request::Ioctl(IoctlRequest { input: vec![1; 8], ..Default::default() }).to_body().unwrap();
+        assert_eq!(req.message(0).map(|m| m.body), Err(Error::Unwritable));
+        let mut body = Request::Ioctl(IoctlRequest { input: vec![1; 8], ..Default::default() }).message(0).map(|m| m.body).unwrap();
         assert_eq!((le32(&body, 36), le32(&body, 40)), (Ok(0), Ok(0)));
         body[36..40].copy_from_slice(&128u32.to_le_bytes());
         assert!(Request::parse(command::IOCTL, &body).is_ok());
@@ -4548,11 +4425,11 @@ mod tests {
     #[test]
     fn what_writers_accept_reads_back_the_same() {
         for req in requests() {
-            let body = req.to_body().unwrap();
+            let body = req.message(0).map(|m| m.body).unwrap();
             assert_eq!(Request::parse(req.command(), &body), Ok(req.clone()), "{req:?}");
         }
         for (c, s, resp) in responses() {
-            let body = resp.to_body(c, s).unwrap();
+            let body = resp.message(&Header::new(c, 0), s).map(|m| m.body).unwrap();
             assert_eq!(Response::parse(c, s, &body), Ok(resp.clone()), "{resp:?}");
         }
     }
@@ -4568,7 +4445,7 @@ mod tests {
             let m = Message::reply_to(&Header::new(c, 1), s, &resp).unwrap();
             out.push(m.to_bytes().unwrap());
         }
-        out.push(write_chain(&chain()).unwrap());
+        out.push(Packet::compound(chain()).unwrap().to_bytes().unwrap());
         out.push(Transform { flags: 1, data: vec![1; 20], ..Default::default() }.to_bytes().unwrap());
         out.push(
             Compressed::Unchained { original_size: 9, algorithm: 2, offset: 1, data: vec![3; 9] }.to_bytes().unwrap(),
@@ -4605,13 +4482,13 @@ mod tests {
         assert_eq!(bytes, payload);
         for m in &messages {
             if let Ok(req) = m.request() {
-                let body = req.to_body().unwrap();
+                let body = req.message(0).map(|m| m.body).unwrap();
                 assert!(no_longer(m.header.command, &body, &m.body), "{req:?}");
                 assert_eq!(Request::parse(m.header.command, &body), Ok(req));
             }
             for s in [m.header.status, status] {
                 if let Ok(resp) = Response::parse(m.header.command, s, &m.body) {
-                    let body = resp.to_body(m.header.command, s).unwrap();
+                    let body = resp.message(&Header::new(m.header.command, 0), s).map(|m| m.body).unwrap();
                     assert!(no_longer(m.header.command, &body, &m.body), "{resp:?}");
                     assert_eq!(Response::parse(m.header.command, s, &body), Ok(resp));
                 }
@@ -4630,14 +4507,14 @@ mod tests {
                 }
                 read_everything(&whole[..n], status::BUFFER_OVERFLOW);
             }
-            let f = frame(&whole).unwrap();
+            let f = Frame { payload: whole.clone() }.to_bytes().unwrap();
             for n in 0..f.len() {
-                assert_eq!(parse_frame(&f[..n]), Ok(None));
+                assert_eq!(Frame::parse(&f[..n]), Err(Error::Incomplete));
             }
         }
         // Each body cut short of its fixed part is refused.
         for req in requests() {
-            let body = req.to_body().unwrap();
+            let body = req.message(0).map(|m| m.body).unwrap();
             let size = usize::from(le16(&body, 0).unwrap() & !1);
             if matches!(req, Request::Other { .. }) {
                 continue;
@@ -4647,7 +4524,7 @@ mod tests {
             }
         }
         for (c, s, resp) in responses() {
-            let body = resp.to_body(c, s).unwrap();
+            let body = resp.message(&Header::new(c, 0), s).map(|m| m.body).unwrap();
             if matches!(resp, Response::Other { .. }) {
                 continue;
             }
@@ -4658,117 +4535,57 @@ mod tests {
         }
     }
 
-    /// A small deterministic generator, so the fuzz loop needs no crates.
-    struct Lcg(u64);
-
-    impl Lcg {
-        fn next(&mut self) -> u8 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (self.0 >> 33) as u8
-        }
-
-        fn below(&mut self, n: usize) -> usize {
-            let x = (usize::from(self.next()) << 8) | usize::from(self.next());
-            x % n.max(1)
-        }
-    }
-
-    /// Bytes for the fuzz loop: a known message with a few bytes changed or
-    /// cut, or random bytes behind a valid protocol ID.
-    fn buffer(rng: &mut Lcg, corpus: &[Vec<u8>]) -> Vec<u8> {
-        let mut b = if rng.next().is_multiple_of(4) {
-            let len = rng.below(200);
-            let mut b: Vec<u8> = (0..len).map(|_| rng.next()).collect();
-            if b.len() >= 4 {
-                b[..4].copy_from_slice(&[protocol::SMB2, protocol::TRANSFORM, protocol::COMPRESSION][rng.below(3)]);
-            }
-            b
-        } else {
-            corpus[rng.below(corpus.len())].clone()
-        };
-        if !b.is_empty() {
-            for _ in 0..rng.below(4) {
-                let i = rng.below(b.len());
-                b[i] = rng.next();
-            }
-            // Small values in offset and length fields reach more code.
-            if rng.next().is_multiple_of(3) {
-                let i = rng.below(b.len());
-                b[i] = rng.next() % 130;
-            }
-            if rng.next().is_multiple_of(4) {
-                b.truncate(rng.below(b.len() + 1));
-            }
-        }
-        b
-    }
-
-    /// Feeds `data` whole or a byte at a time. Every payload, then the error
-    /// that broke the stream, if one did.
-    fn split(data: &[u8], bytewise: bool) -> (Vec<Vec<u8>>, Option<FrameError>) {
-        let mut d = Decoder::new();
-        let mut out = Vec::new();
-        // A chunk at a time, without collecting the chunks.
-        for chunk in data.chunks(if bytewise { 1 } else { data.len().max(1) }) {
-            let mut rest = chunk;
-            while !rest.is_empty() {
-                let took = d.feed(rest);
-                assert!(d.buffered() <= MAX_BUFFERED);
-                rest = &rest[took..];
-                let mut progress = took > 0;
-                while let Some(r) = d.next_frame() {
-                    match r {
-                        Ok(p) => out.push(p),
-                        Err(e) => return (out, Some(e)),
-                    }
-                    progress = true;
-                }
-                assert!(progress);
-            }
-        }
-        (out, None)
-    }
-
     #[test]
     fn fuzz_loop() {
         let corpus = corpus();
-        let mut rng = Lcg(0x5eed);
-        for _ in 0..50_000 {
-            let payload = buffer(&mut rng, &corpus);
+        let mut rng = Lcg::new(0x5eed);
+        for _ in 0..30_000 {
+            let mut payload = if rng.coin() {
+                corpus[rng.index(corpus.len())].clone()
+            } else {
+                let mut bytes = rng.bytes(200);
+                if bytes.len() >= 4 {
+                    let ids = [protocol::SMB2, protocol::TRANSFORM, protocol::COMPRESSION];
+                    bytes[..4].copy_from_slice(&ids[rng.index(ids.len())]);
+                }
+                bytes
+            };
+            // Small offset and length values reach more body readers.
+            if !payload.is_empty() && rng.index(3) == 0 {
+                let at = rng.index(payload.len());
+                payload[at] = rng.index(130) as u8;
+            }
+            mutate(&mut rng, &mut payload);
+            contract::check_wire::<Packet>(&payload);
             let status = [
                 0,
                 status::BUFFER_OVERFLOW,
                 status::MORE_PROCESSING_REQUIRED,
                 status::ACCESS_DENIED,
                 status::NOTIFY_ENUM_DIR,
-            ][rng.below(5)];
+            ][rng.index(5)];
             read_everything(&payload, status);
             // Bodies alone, under any command.
-            let command = rng.below(0x16) as u16;
+            let command = rng.index(0x16) as u16;
             let body = &payload[payload.len().min(HEADER_LEN)..];
             if let Ok(req) = Request::parse(command, body) {
-                let back = req.to_body().unwrap();
+                let back = req.message(0).map(|m| m.body).unwrap();
                 assert!(no_longer(command, &back, body), "{req:?}");
                 assert_eq!(Request::parse(command, &back), Ok(req));
             }
             if let Ok(resp) = Response::parse(command, status, body) {
-                let back = resp.to_body(command, status).unwrap();
+                let back = resp.message(&Header::new(command, 0), status).map(|m| m.body).unwrap();
                 assert!(no_longer(command, &back, body), "{resp:?}");
                 assert_eq!(Response::parse(command, status, &back), Ok(resp));
             }
-            // The stream: framed payloads and raw bytes, whole and a byte at a time.
-            let mut stream = frame(&payload).unwrap();
-            if rng.next().is_multiple_of(2) {
-                stream.extend(frame(&corpus[rng.below(corpus.len())]).unwrap());
+            let mut stream = Frame { payload }.to_bytes().unwrap();
+            if rng.coin() {
+                Frame { payload: corpus[rng.index(corpus.len())].clone() }.write(&mut stream).unwrap();
             }
-            if rng.next().is_multiple_of(3) {
-                let i = rng.below(stream.len());
-                stream[i] = rng.next();
-            }
-            let whole = split(&stream, false);
-            assert_eq!(split(&stream, true), whole);
-            for p in &whole.0 {
-                read_everything(p, status);
+            mutate(&mut rng, &mut stream);
+            contract::check_decode_with_alloc_limit(Frames::new, &stream, 2 * MAX_FRAME);
+            for frame in decode_all(Frames::new, &stream).0 {
+                read_everything(&frame.payload, status);
             }
         }
     }
