@@ -1,57 +1,59 @@
-//! QUIC datagrams, packets and frames, as a world playing a QUIC server
-//! reads them once protection is removed.
+//! QUIC datagrams and frame payloads after protection is removed.
 #![no_main]
 
-use fictionet::stdlib::quic::{Frame, Packet, Reassembler, parse_frames, split_datagram, write_datagram, write_frames};
+use fictionet::stdlib::{
+    codec::{Wire, contract},
+    quic::{Datagram, Frame, Payload, Reassembler, VarInt},
+};
 use libfuzzer_sys::fuzz_target;
 
-fuzz_target!(|data: &[u8]| {
-    // The first byte picks the short header's connection ID length, up to
-    // 21 so the limit is tried too. The rest is one datagram.
-    let Some((&pick, datagram)) = data.split_first() else { return };
-    let dcid_len = usize::from(pick % 22);
-
-    // Packets read can be written, and the datagram reads back the same.
-    let (packets, _) = split_datagram(datagram, dcid_len);
-    if !packets.is_empty() {
-        let bytes = write_datagram(&packets).unwrap();
-        assert_eq!(split_datagram(&bytes, dcid_len), (packets.clone(), None));
-    }
-    for p in &packets {
-        let bytes = p.to_bytes().unwrap();
-        let (back, used) = Packet::parse(&bytes, dcid_len).unwrap();
-        assert_eq!(&back, p);
-        assert_eq!(used, bytes.len());
-        if let Some(payload) = p.payload() {
-            check_frames(payload);
+fn datagram<const N: usize>(bytes: &[u8]) {
+    contract::check_wire::<Datagram<N>>(bytes);
+    if let Ok(value) = Datagram::<N>::parse(bytes) {
+        for packet in value.0 {
+            if let Some(payload) = packet.payload() {
+                contract::check_wire::<Payload>(payload);
+            }
         }
-    }
-
-    // Any bytes as a payload on their own, and as a single frame.
-    check_frames(datagram);
-    if let Ok((f, used)) = Frame::parse(datagram) {
-        assert!(used > 0 && used <= datagram.len());
-        assert_eq!(parse_frames(&f.to_bytes().unwrap()).unwrap(), [f]);
-    }
-
-    // The bytes as stream data, fed to a reassembler all at once, and a
-    // byte at a time from the last byte back. Both give the same stream.
-    let mut whole = Reassembler::new();
-    let mut bytewise = Reassembler::new();
-    if whole.insert(0, datagram).is_ok() {
-        for (i, b) in datagram.iter().enumerate().rev() {
-            bytewise.insert(i as u64, std::slice::from_ref(b)).unwrap();
-        }
-        assert_eq!(whole.read(), bytewise.read());
-    }
-});
-
-/// Frames read can be written, read back the same, and take no more
-/// bytes than they did.
-fn check_frames(payload: &[u8]) {
-    if let Ok(frames) = parse_frames(payload) {
-        let bytes = write_frames(&frames).unwrap();
-        assert!(bytes.len() <= payload.len());
-        assert_eq!(parse_frames(&bytes).unwrap(), frames);
     }
 }
+
+fuzz_target!(|input: &[u8]| {
+    let Some((&pick, bytes)) = input.split_first() else { return };
+    contract::check_wire::<VarInt>(bytes);
+    contract::check_wire::<Frame>(bytes);
+    contract::check_wire::<Payload>(bytes);
+    // Every legal short-header ID length, plus one past the limit.
+    match pick % 22 {
+        0 => datagram::<0>(bytes),
+        1 => datagram::<1>(bytes),
+        2 => datagram::<2>(bytes),
+        3 => datagram::<3>(bytes),
+        4 => datagram::<4>(bytes),
+        5 => datagram::<5>(bytes),
+        6 => datagram::<6>(bytes),
+        7 => datagram::<7>(bytes),
+        8 => datagram::<8>(bytes),
+        9 => datagram::<9>(bytes),
+        10 => datagram::<10>(bytes),
+        11 => datagram::<11>(bytes),
+        12 => datagram::<12>(bytes),
+        13 => datagram::<13>(bytes),
+        14 => datagram::<14>(bytes),
+        15 => datagram::<15>(bytes),
+        16 => datagram::<16>(bytes),
+        17 => datagram::<17>(bytes),
+        18 => datagram::<18>(bytes),
+        19 => datagram::<19>(bytes),
+        20 => datagram::<20>(bytes),
+        _ => datagram::<21>(bytes),
+    }
+    let mut ordered = Reassembler::new();
+    if ordered.insert(0, bytes).is_ok() {
+        let mut reversed = Reassembler::new();
+        for (offset, byte) in bytes.iter().enumerate().rev() {
+            reversed.insert(offset as u64, std::slice::from_ref(byte)).unwrap();
+        }
+        assert_eq!(ordered.read(), reversed.read());
+    }
+});

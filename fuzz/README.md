@@ -64,8 +64,9 @@ cargo +nightly fuzz list
 | `postgres` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::postgres`: PostgreSQL |
 | `protobuf` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::protobuf`: Protocol Buffers |
 | `proxy_protocol` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::proxy_protocol`: The PROXY protocol |
-| `qpack` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::qpack`: QPACK, the header compression of HTTP/3 |
-| `quic` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::quic`: QUIC |
+| `http3` | bounded frame and stream contracts, field validation, connection routing, and QPACK pause/resume | `stdlib::http3`: HTTP/3 |
+| `qpack` | wire values, bounded instruction contracts, tables, blocked sections, and acknowledgments | `stdlib::qpack`: QPACK, the header compression of HTTP/3 |
+| `quic` | datagram and payload wire contracts, every short-header ID length, and reassembly | `stdlib::quic`: QUIC |
 | `resp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::resp`: RESP, the Redis protocol |
 | `rfb` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::rfb`: RFB, the remote framebuffer protocol behind VNC |
 | `rtp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::rtp`: RTP and RTCP |
