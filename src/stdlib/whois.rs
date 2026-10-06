@@ -1,5 +1,10 @@
 //! WHOIS: reading and writing queries and responses, with no I/O.
 //!
+//! New stacks use [`Queries`] and [`Responses`] with [`codec::Stream`].
+//! Queries accept CRLF and bare LF. Responses produce [`CollectedResponse`]
+//! at EOF, preserving the collector's truncation flag. [`codec::Wire`]
+//! writes query lines with CRLF and response bytes unchanged.
+//!
 //! WHOIS is how people and tools look up who holds a domain name, an IP
 //! block or an AS number. A client connects to a server over TCP, on port
 //! 43, and sends one line of text: the query, ended by CR LF. The server
@@ -73,6 +78,7 @@
 //! assert_eq!(referral.port, 43);
 //! ```
 
+use super::codec::{self, Decode, Step, Wire};
 use std::borrow::Cow;
 
 /// The TCP port WHOIS servers listen on.
@@ -85,6 +91,8 @@ pub const MAX_BUFFERED: usize = MAX_QUERY + 2;
 /// The longest response a [`ResponseDecoder`] keeps, and a [`Response`]
 /// may hold.
 pub const MAX_RESPONSE: usize = 1 << 20;
+/// Input buffer capacity for [`Responses`], independent of its retained byte limit.
+pub const RESPONSE_WINDOW: usize = 4096;
 /// The most fields [`parse_fields`] reads and [`write_fields`] writes.
 pub const MAX_FIELDS: usize = 10_000;
 /// The longest key, in bytes, a line may have to be read as a field.
@@ -944,6 +952,236 @@ fn check_host(host: &str) -> Result<(), EncodeError> {
         && name.split('.').all(|l| !l.is_empty() && l.len() <= 63)
         && host.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'-' | b'_'));
     if ok { Ok(()) } else { Err(EncodeError::Host) }
+}
+
+/// Why an exact query wire value could not be read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QueryParseError {
+    /// A complete query line was refused.
+    Query(QueryError),
+    /// The query line was not terminated.
+    Incomplete,
+    /// Bytes followed the query line.
+    Trailing,
+}
+
+impl core::fmt::Display for QueryParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Query(e) => e.fmt(f),
+            Self::Incomplete => f.write_str("incomplete WHOIS query"),
+            Self::Trailing => f.write_str("bytes after WHOIS query"),
+        }
+    }
+}
+impl core::error::Error for QueryParseError {}
+
+/// Why bytes cannot be read as one WHOIS response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResponseParseError {
+    /// The response exceeds [`MAX_RESPONSE`].
+    TooLong,
+}
+
+impl core::fmt::Display for ResponseParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("WHOIS response exceeds its byte limit")
+    }
+}
+impl core::error::Error for ResponseParseError {}
+
+impl Wire for Query {
+    type ParseError = QueryParseError;
+    type WriteError = QueryError;
+
+    /// Reads exactly one query line, accepting CRLF or bare LF.
+    /// Incomplete input and trailing bytes are errors.
+    fn parse(bytes: &[u8]) -> Result<Self, Self::ParseError> {
+        let mut decoder = Queries::new();
+        match decoder
+            .decode(bytes, true)
+            .map_err(|_| QueryParseError::Incomplete)?
+        {
+            Step::Item(query, used) if used == bytes.len() => query.map_err(QueryParseError::Query),
+            Step::Item(Err(e), _) => Err(QueryParseError::Query(e)),
+            Step::Item(_, _) => Err(QueryParseError::Trailing),
+            _ => Err(QueryParseError::Incomplete),
+        }
+    }
+
+    /// Appends a query with CRLF, leaving `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), QueryError> {
+        check_query(&self.text)?;
+        out.extend_from_slice(self.text.as_bytes());
+        out.extend_from_slice(b"\r\n");
+        Ok(())
+    }
+}
+
+impl Wire for Response {
+    type ParseError = ResponseParseError;
+    type WriteError = EncodeError;
+
+    /// Reads a complete response of at most [`MAX_RESPONSE`] bytes.
+    /// All byte values are accepted; there is no line terminator to strip.
+    fn parse(bytes: &[u8]) -> Result<Self, ResponseParseError> {
+        Self::new(bytes).map_err(|_| ResponseParseError::TooLong)
+    }
+
+    /// Appends response bytes unchanged, refusing an oversized response
+    /// before changing `out`.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+        if self.bytes.len() > MAX_RESPONSE {
+            return Err(EncodeError::TooLong);
+        }
+        out.extend_from_slice(&self.bytes);
+        Ok(())
+    }
+}
+
+/// Reads one query per item with [`super::codec::Lines`].
+///
+/// CRLF and bare LF are accepted, as in [`QueryDecoder`]. Content is
+/// bounded by [`MAX_QUERY`]. Bad and overlong lines are error items; an
+/// unfinished line at EOF is a terminal [`codec::LineError::Unterminated`].
+/// Persistent connections may send several query lines.
+pub struct Queries {
+    lines: codec::Lines,
+}
+
+impl core::fmt::Debug for Queries {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Queries").finish_non_exhaustive()
+    }
+}
+impl Queries {
+    /// Creates a reader with a capacity of [`MAX_QUERY`] plus two bytes.
+    pub fn new() -> Self {
+        Self {
+            lines: codec::Lines::new(MAX_QUERY, codec::Ending::LfOrCrlf),
+        }
+    }
+}
+impl Default for Queries {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl Decode for Queries {
+    type Item = Result<Query, QueryError>;
+    type Error = codec::LineError;
+    const NAME: &'static str = "WHOIS queries";
+
+    fn capacity(&self) -> usize {
+        self.lines.capacity()
+    }
+
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Self::Item>, Self::Error> {
+        let step = self
+            .lines
+            .decode(input, eof)
+            .unwrap_or_else(|never| match never {});
+        Ok(match step {
+            Step::Item(Ok(line), n) => Step::Item(Query::parse_line(&line), n),
+            Step::Item(Err(codec::LineError::TooLong { .. }), n) => {
+                Step::Item(Err(QueryError::TooLong), n)
+            }
+            Step::Item(Err(e), _) => return Err(e),
+            Step::Skip(n) => Step::Skip(n),
+            Step::Need => Step::Need,
+            Step::End => Step::End,
+        })
+    }
+}
+
+/// A response produced at EOF, including whether excess bytes were dropped.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CollectedResponse {
+    /// The first bytes of the response, up to the collector's limit.
+    pub response: Response,
+    /// True only if at least one byte beyond the limit was received.
+    pub truncated: bool,
+}
+
+/// Collects one response at EOF under a byte limit.
+///
+/// Free text has no line framing or terminator requirement. Excess bytes
+/// are consumed without retaining them. The truncation flag matches
+/// [`ResponseDecoder::truncated`], including false at exactly the limit.
+/// Input capacity is [`RESPONSE_WINDOW`]; retained state is bounded by the byte limit.
+#[derive(Clone, Debug)]
+pub struct Responses {
+    limit: usize,
+    bytes: Vec<u8>,
+    truncated: bool,
+    taken: bool,
+}
+
+impl Responses {
+    /// Creates a collector that keeps at most [`MAX_RESPONSE`] bytes.
+    pub fn new() -> Self {
+        Self::with_limit(MAX_RESPONSE)
+    }
+
+    /// Sets the retained byte limit, clamped to [`MAX_RESPONSE`].
+    /// Zero keeps no bytes and still produces a response at EOF.
+    pub fn with_limit(limit: usize) -> Self {
+        Self {
+            limit: limit.min(MAX_RESPONSE),
+            bytes: Vec::new(),
+            truncated: false,
+            taken: false,
+        }
+    }
+
+    /// The maximum number of retained response bytes.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+}
+impl Default for Responses {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl Decode for Responses {
+    type Item = CollectedResponse;
+    type Error = core::convert::Infallible;
+    const NAME: &'static str = "WHOIS response";
+
+    fn capacity(&self) -> usize {
+        RESPONSE_WINDOW
+    }
+    fn held(&self) -> usize {
+        self.bytes.len()
+    }
+
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Self::Item>, Self::Error> {
+        if self.taken {
+            return Ok(Step::End);
+        }
+        let n = input.len().min(self.limit.saturating_sub(self.bytes.len()));
+        self.bytes
+            .extend_from_slice(input.get(..n).unwrap_or_default());
+        self.truncated |= n < input.len();
+        if eof {
+            self.taken = true;
+            return Ok(Step::Item(
+                CollectedResponse {
+                    response: Response {
+                        bytes: core::mem::take(&mut self.bytes),
+                    },
+                    truncated: self.truncated,
+                },
+                input.len(),
+            ));
+        }
+        Ok(if input.is_empty() {
+            Step::Need
+        } else {
+            Step::Skip(input.len())
+        })
+    }
 }
 
 #[cfg(test)]

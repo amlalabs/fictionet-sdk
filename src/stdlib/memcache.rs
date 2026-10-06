@@ -1,6 +1,11 @@
 //! memcached: reading and writing the text protocol, the binary protocol
 //! and UDP frames, with no I/O.
 //!
+//! New stacks use [`Commands`] and [`Responses`] over [`codec::Lines`],
+//! or [`Frames`] for binary packets, with [`codec::Stream`]. Text headers
+//! accept CRLF or bare LF; counted bodies require CRLF. [`codec::Wire`]
+//! parses exact units and writes them transactionally.
+//!
 //! memcached is a cache that keeps values under keys in memory. Web
 //! applications put it in front of slow databases, and many other servers
 //! speak its protocol. Clients reach it over TCP or UDP, usually on port
@@ -73,6 +78,8 @@
 //! assert_eq!(out, b"STORED\r\nVALUE greeting 5 5\r\nhello\r\nEND\r\nERROR\r\n");
 //! ```
 
+use super::codec::{self, Decode, Step, Wire};
+
 /// The port memcached listens on, for both TCP and UDP.
 pub const PORT: u16 = 11211;
 /// The longest key, in bytes.
@@ -128,8 +135,8 @@ pub enum Error {
     Exptime,
     /// A key was longer than [`MAX_KEY`], or held a space or control byte.
     Key,
-    /// The data block was longer than [`MAX_VALUE`], by the length the
-    /// line stated. A decoder skips the block, as memcached does.
+    /// The declared data block length exceeds the configured limit
+    /// ([`MAX_VALUE`] by default). A decoder skips the block, as memcached does.
     TooLarge(usize),
     /// The data block did not end with CR LF. A decoder has skipped it.
     BadDataChunk,
@@ -165,7 +172,7 @@ impl std::fmt::Display for Error {
             Error::Delta => f.write_str("delta not a number from 0 to 2^64 - 1"),
             Error::Exptime => f.write_str("expiration time not a 32-bit signed number"),
             Error::Key => write!(f, "key empty, over {MAX_KEY} bytes, or holding a space or control byte"),
-            Error::TooLarge(n) => write!(f, "data block of {n} bytes, over {MAX_VALUE}"),
+            Error::TooLarge(n) => write!(f, "data block of {n} bytes exceeds the configured limit"),
             Error::BadDataChunk => f.write_str("data block not ended by CR LF"),
         }
     }
@@ -1892,6 +1899,606 @@ fn be16(b: &[u8], i: usize) -> u16 {
 
 fn be32(b: &[u8], i: usize) -> u32 {
     u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]])
+}
+
+/// Maximum bytes retained while assembling a long line or a header and data block.
+pub const MAX_TEXT_HELD: usize = MAX_LINE + MAX_VALUE;
+/// Maximum wire bytes in one text command or response.
+pub const MAX_TEXT_UNIT: usize = MAX_GET_LINE + MAX_VALUE + 2;
+
+/// A terminal text framing fault.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextFrameError {
+    /// A line exceeded its named limit.
+    LineTooLong,
+    /// EOF interrupted a line, counted block, or skipped block.
+    Incomplete,
+}
+impl core::fmt::Display for TextFrameError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::LineTooLong => "memcache text line too long",
+            Self::Incomplete => "incomplete memcache text unit",
+        })
+    }
+}
+impl core::error::Error for TextFrameError {}
+
+/// Why bytes do not contain exactly one complete memcache command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommandParseError {
+    /// A text unit was refused.
+    Text(Error),
+    /// Text framing failed.
+    Framing(TextFrameError),
+    /// The unit ended early.
+    Incomplete,
+    /// Bytes followed the unit.
+    Trailing,
+    /// [`Wire::parse`] re-encodes the command and refuses values that do not
+    /// round trip, even if [`Commands`] yields them successfully.
+    Value,
+}
+impl core::fmt::Display for CommandParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Text(e) => e.fmt(f),
+            Self::Framing(e) => e.fmt(f),
+            Self::Incomplete => f.write_str("incomplete memcache command"),
+            Self::Trailing => f.write_str("bytes after memcache command"),
+            Self::Value => f.write_str("memcache command cannot be written unchanged"),
+        }
+    }
+}
+impl core::error::Error for CommandParseError {}
+
+/// Why bytes do not contain exactly one complete memcache response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResponseParseError {
+    /// A text unit was refused.
+    Text(Error),
+    /// Text framing failed.
+    Framing(TextFrameError),
+    /// The unit ended early.
+    Incomplete,
+    /// Bytes followed the unit.
+    Trailing,
+    /// [`Wire::parse`] re-encodes the response and refuses values that do not
+    /// round trip, even if [`Responses`] yields them successfully.
+    Value,
+}
+impl core::fmt::Display for ResponseParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Text(e) => e.fmt(f),
+            Self::Framing(e) => e.fmt(f),
+            Self::Incomplete => f.write_str("incomplete memcache response"),
+            Self::Trailing => f.write_str("bytes after memcache response"),
+            Self::Value => f.write_str("memcache response cannot be written unchanged"),
+        }
+    }
+}
+impl core::error::Error for ResponseParseError {}
+
+/// Why bytes do not contain exactly one complete memcache packet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PacketParseError {
+    /// A binary header was refused.
+    Binary(BinaryError),
+    /// The unit ended early.
+    Incomplete,
+    /// Bytes followed the unit.
+    Trailing,
+}
+impl core::fmt::Display for PacketParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Binary(e) => e.fmt(f),
+            Self::Incomplete => f.write_str("incomplete memcache packet"),
+            Self::Trailing => f.write_str("bytes after memcache packet"),
+        }
+    }
+}
+impl core::error::Error for PacketParseError {}
+
+struct TextUnits<T> {
+    lines: codec::Lines,
+    partial_line: Vec<u8>,
+    get_lines: bool,
+    long_line: bool,
+    pending: Option<(T, usize)>,
+    data: Vec<u8>,
+    head_bytes: usize,
+    skip: u64,
+    quiet: bool,
+    limit: usize,
+}
+impl<T: core::fmt::Debug> core::fmt::Debug for TextUnits<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("TextUnits")
+            .field("partial_line", &self.partial_line)
+            .field("get_lines", &self.get_lines)
+            .field("long_line", &self.long_line)
+            .field("pending", &self.pending)
+            .field("data", &self.data)
+            .field("head_bytes", &self.head_bytes)
+            .field("skip", &self.skip)
+            .field("quiet", &self.quiet)
+            .field("limit", &self.limit)
+            .finish_non_exhaustive()
+    }
+}
+impl<T> TextUnits<T> {
+    fn new(get_lines: bool, limit: usize) -> Self {
+        Self {
+            lines: codec::Lines::new(MAX_LINE - 2, codec::Ending::LfOrCrlf),
+            partial_line: Vec::new(),
+            get_lines,
+            long_line: false,
+            pending: None,
+            data: Vec::new(),
+            head_bytes: 0,
+            skip: 0,
+            quiet: false,
+            limit: limit.min(MAX_VALUE),
+        }
+    }
+    fn capacity(&self) -> usize {
+        MAX_LINE
+    }
+    fn held(&self) -> usize {
+        self.head_bytes
+            .saturating_add(self.data.len())
+            .saturating_add(self.partial_line.len())
+    }
+
+    fn decode(
+        &mut self,
+        input: &[u8],
+        eof: bool,
+        head: Head<T>,
+        attach: fn(&mut T, Vec<u8>),
+        quiet_block: fn(&T) -> bool,
+    ) -> Result<Step<Result<T, Error>>, TextFrameError> {
+        if self.skip != 0 {
+            let n = usize::try_from(self.skip)
+                .unwrap_or(usize::MAX)
+                .min(input.len());
+            if n == 0 {
+                return if eof {
+                    Err(TextFrameError::Incomplete)
+                } else {
+                    Ok(Step::Need)
+                };
+            }
+            self.skip = self.skip.saturating_sub(n as u64);
+            return Ok(Step::Skip(n));
+        }
+        if let Some((_, length)) = &self.pending {
+            let remaining = length.saturating_sub(self.data.len());
+            if remaining != 0 {
+                let n = remaining.min(input.len());
+                if n == 0 {
+                    return if eof {
+                        Err(TextFrameError::Incomplete)
+                    } else {
+                        Ok(Step::Need)
+                    };
+                }
+                self.data
+                    .extend_from_slice(input.get(..n).unwrap_or_default());
+                return Ok(Step::Skip(n));
+            }
+            let Some(tail) = input.get(..2) else {
+                return if eof {
+                    Err(TextFrameError::Incomplete)
+                } else {
+                    Ok(Step::Need)
+                };
+            };
+            let Some((mut item, _)) = self.pending.take() else {
+                return Err(TextFrameError::Incomplete);
+            };
+            self.head_bytes = 0;
+            self.quiet = tail != b"\r\n" && quiet_block(&item);
+            let data = core::mem::take(&mut self.data);
+            let item = if tail == b"\r\n" {
+                attach(&mut item, data);
+                Ok(item)
+            } else {
+                Err(Error::BadDataChunk)
+            };
+            return Ok(Step::Item(item, 2));
+        }
+        // Classification inspects at most 106 prefix bytes. Once get/gets
+        // is known, only Lines' cursor scans the remaining input.
+        if self.get_lines && !self.long_line && is_get_line(input) {
+            self.long_line = true;
+            self.lines = codec::Lines::new(MAX_GET_LINE - 2, codec::Ending::LfOrCrlf);
+        }
+        let step = self
+            .lines
+            .decode(input, eof)
+            .unwrap_or_else(|never| match never {});
+        match step {
+            Step::Item(Ok(line), n) => {
+                let line = if self.partial_line.is_empty() {
+                    line
+                } else {
+                    let mut whole = core::mem::take(&mut self.partial_line);
+                    whole.extend_from_slice(&line);
+                    whole
+                };
+                self.long_line = false;
+                self.lines = codec::Lines::new(MAX_LINE - 2, codec::Ending::LfOrCrlf);
+                self.quiet = false;
+                match head(&line) {
+                    Ok((item, None)) => Ok(Step::Item(Ok(item), n)),
+                    Ok((item, Some(length))) if length > self.limit => {
+                        self.skip = (length as u64).saturating_add(2);
+                        self.quiet = quiet_block(&item);
+                        Ok(Step::Item(Err(Error::TooLarge(length)), n))
+                    }
+                    Ok((item, Some(length))) => {
+                        self.pending = Some((item, length));
+                        self.head_bytes = line.len();
+                        Ok(Step::Skip(n))
+                    }
+                    Err(Fail { error, skip, quiet }) => {
+                        self.skip = skip;
+                        self.quiet = quiet;
+                        Ok(Step::Item(Err(error), n))
+                    }
+                }
+            }
+            Step::Item(Err(codec::LineError::TooLong { .. }), _) => {
+                Err(TextFrameError::LineTooLong)
+            }
+            Step::Item(Err(_), _) => Err(TextFrameError::Incomplete),
+            Step::Skip(n) => Ok(Step::Skip(n)),
+            Step::Need if self.long_line && input.len() >= MAX_LINE => {
+                // A multiget may span several bounded input windows. Only
+                // consumed bytes move into the line assembly.
+                // Leave a final CR unread so Lines can recognize CRLF
+                // when the LF arrives in the next input window.
+                let remaining = MAX_GET_LINE
+                    .saturating_sub(2)
+                    .saturating_sub(self.partial_line.len());
+                let n = input
+                    .len()
+                    .saturating_sub(usize::from(input.last() == Some(&b'\r')))
+                    .min(remaining);
+                let part = input.get(..n).ok_or(TextFrameError::LineTooLong)?;
+                self.partial_line.extend_from_slice(part);
+                self.lines =
+                    codec::Lines::new(remaining.saturating_sub(n), codec::Ending::LfOrCrlf);
+                Ok(Step::Skip(n))
+            }
+            Step::Need if eof && !self.partial_line.is_empty() => Err(TextFrameError::Incomplete),
+            Step::Need => Ok(Step::Need),
+            Step::End => Ok(Step::End),
+        }
+    }
+}
+
+fn quiet_command(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Store { noreply: true, .. } | Command::Cas { noreply: true, .. }
+    )
+}
+
+/// Reads text commands using [`super::codec::Lines`] and counted bodies.
+///
+/// CRLF and bare LF end headers. Data blocks require trailing CRLF.
+/// Ordinary lines use [`MAX_LINE`]; `get` and `gets` use [`MAX_GET_LINE`].
+/// Input capacity stays at [`MAX_LINE`]; longer multigets assemble consumed
+/// windows under [`MAX_GET_LINE`].
+/// A parsed header supplies its body's exact count. The assembler consumes
+/// that many bytes without interpreting their content. No session mode or
+/// text/binary switch is inferred; choose [`Frames`] for binary streams.
+///
+/// Bad lines and blocks are error items. Oversized blocks and malformed
+/// meta storage blocks are skipped by their declared count, as in
+/// [`CommandDecoder`]. Overlong lines and incomplete EOF end framing.
+/// Held state is bounded by [`MAX_TEXT_HELD`].
+///
+/// [`Wire::parse`] additionally re-encodes each command and refuses values
+/// that do not round trip, including some commands this decoder accepts.
+pub struct Commands {
+    inner: TextUnits<Command>,
+}
+impl core::fmt::Debug for Commands {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Commands")
+            .field("inner", &self.inner)
+            .finish_non_exhaustive()
+    }
+}
+impl Commands {
+    /// Creates a reader accepting data blocks up to [`MAX_VALUE`].
+    pub fn new() -> Self {
+        Self::with_limit(MAX_VALUE)
+    }
+    /// Sets the data block limit, clamped to [`MAX_VALUE`].
+    /// Larger blocks are refused from the header and skipped without storage.
+    pub fn with_limit(limit: usize) -> Self {
+        Self {
+            inner: TextUnits::new(true, limit),
+        }
+    }
+    /// The maximum accepted data block length.
+    pub fn limit(&self) -> usize {
+        self.inner.limit
+    }
+    /// Whether an error item came from a classic command with `noreply`.
+    /// Read this immediately after the error item; the flag persists while
+    /// skipping its block or waiting for more input, until another header is decoded.
+    pub fn quiet_error(&self) -> bool {
+        self.inner.quiet
+    }
+}
+impl Default for Commands {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl Decode for Commands {
+    type Item = Result<Command, Error>;
+    type Error = TextFrameError;
+    const NAME: &'static str = "memcache text commands";
+    fn capacity(&self) -> usize {
+        self.inner.capacity()
+    }
+    fn held(&self) -> usize {
+        self.inner.held()
+    }
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Self::Item>, TextFrameError> {
+        self.inner
+            .decode(input, eof, parse_command, attach_command, quiet_command)
+    }
+}
+
+/// Reads text replies using [`super::codec::Lines`] and counted bodies.
+///
+/// Headers accept CRLF or bare LF under [`MAX_LINE`]. VALUE and VA bodies
+/// use the parsed count and require trailing CRLF. Invalid lines and data
+/// blocks are error items; overlong lines and incomplete EOF are terminal.
+/// Held state is bounded by [`MAX_TEXT_HELD`].
+///
+/// [`Wire::parse`] additionally re-encodes each response and refuses values
+/// that do not round trip, including some responses this decoder accepts.
+pub struct Responses {
+    inner: TextUnits<Response>,
+}
+impl core::fmt::Debug for Responses {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Responses")
+            .field("inner", &self.inner)
+            .finish_non_exhaustive()
+    }
+}
+impl Responses {
+    /// Creates a reader accepting data blocks up to [`MAX_VALUE`].
+    pub fn new() -> Self {
+        Self::with_limit(MAX_VALUE)
+    }
+    /// Sets the data block limit, clamped to [`MAX_VALUE`].
+    pub fn with_limit(limit: usize) -> Self {
+        Self {
+            inner: TextUnits::new(false, limit),
+        }
+    }
+    /// The maximum accepted data block length.
+    pub fn limit(&self) -> usize {
+        self.inner.limit
+    }
+}
+impl Default for Responses {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl Decode for Responses {
+    type Item = Result<Response, Error>;
+    type Error = TextFrameError;
+    const NAME: &'static str = "memcache text replies";
+    fn capacity(&self) -> usize {
+        self.inner.capacity()
+    }
+    fn held(&self) -> usize {
+        self.inner.held()
+    }
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Self::Item>, TextFrameError> {
+        self.inner
+            .decode(input, eof, parse_response, attach_response, |_| false)
+    }
+}
+
+fn exact_command(mut bytes: &[u8]) -> Result<Command, CommandParseError> {
+    let mut decoder = Commands::new();
+    if bytes.len() > MAX_TEXT_UNIT {
+        return Err(CommandParseError::Text(Error::LineTooLong));
+    }
+    loop {
+        match decoder
+            .decode(bytes, true)
+            .map_err(CommandParseError::Framing)?
+        {
+            Step::Item(item, used) if used == bytes.len() => {
+                return item.map_err(CommandParseError::Text);
+            }
+            Step::Item(Err(e), _) => return Err(CommandParseError::Text(e)),
+            Step::Item(_, _) => return Err(CommandParseError::Trailing),
+            Step::Skip(used) => bytes = bytes.get(used..).ok_or(CommandParseError::Incomplete)?,
+            Step::Need | Step::End => return Err(CommandParseError::Incomplete),
+        }
+    }
+}
+
+impl Wire for Command {
+    type ParseError = CommandParseError;
+    type WriteError = Error;
+
+    /// Reads exactly one command under the named line and body limits.
+    /// Incomplete input and trailing bytes are errors. Re-encodes the value
+    /// and refuses commands that do not round trip.
+    fn parse(bytes: &[u8]) -> Result<Self, CommandParseError> {
+        let item = exact_command(bytes)?;
+        let encoded = item.to_bytes().map_err(CommandParseError::Text)?;
+        if exact_command(&encoded).as_ref() != Ok(&item) {
+            return Err(CommandParseError::Value);
+        }
+        Ok(item)
+    }
+
+    /// Appends one command that reads back unchanged. Refused values
+    /// leave `out` unchanged.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        let bytes = self.to_bytes()?;
+        if exact_command(&bytes).as_ref() != Ok(self) {
+            return Err(Error::Format);
+        }
+        out.extend_from_slice(&bytes);
+        Ok(())
+    }
+}
+
+fn exact_response(mut bytes: &[u8]) -> Result<Response, ResponseParseError> {
+    let mut decoder = Responses::new();
+    if bytes.len() > MAX_TEXT_UNIT {
+        return Err(ResponseParseError::Text(Error::LineTooLong));
+    }
+    loop {
+        match decoder
+            .decode(bytes, true)
+            .map_err(ResponseParseError::Framing)?
+        {
+            Step::Item(item, used) if used == bytes.len() => {
+                return item.map_err(ResponseParseError::Text);
+            }
+            Step::Item(Err(e), _) => return Err(ResponseParseError::Text(e)),
+            Step::Item(_, _) => return Err(ResponseParseError::Trailing),
+            Step::Skip(used) => bytes = bytes.get(used..).ok_or(ResponseParseError::Incomplete)?,
+            Step::Need | Step::End => return Err(ResponseParseError::Incomplete),
+        }
+    }
+}
+
+impl Wire for Response {
+    type ParseError = ResponseParseError;
+    type WriteError = Error;
+
+    /// Reads exactly one response under the named line and body limits.
+    /// Incomplete input and trailing bytes are errors. Re-encodes the value
+    /// and refuses responses that do not round trip.
+    fn parse(bytes: &[u8]) -> Result<Self, ResponseParseError> {
+        let item = exact_response(bytes)?;
+        let encoded = item.to_bytes().map_err(ResponseParseError::Text)?;
+        if exact_response(&encoded).as_ref() != Ok(&item) {
+            return Err(ResponseParseError::Value);
+        }
+        Ok(item)
+    }
+
+    /// Appends one response that reads back unchanged, leaving `out`
+    /// unchanged if the value cannot be represented.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        let bytes = self.to_bytes()?;
+        if exact_response(&bytes).as_ref() != Ok(self) {
+            return Err(Error::Format);
+        }
+        out.extend_from_slice(&bytes);
+        Ok(())
+    }
+}
+
+/// Reads binary packets without retaining input.
+///
+/// Capacity is [`BINARY_HEADER_LEN`] plus the body limit. A declared body
+/// exceeding that limit is refused from the 24-byte header. All header
+/// errors are terminal, as in [`BinaryDecoder`]. Partial packets return
+/// [`Step::Need`], so [`codec::Stream`] reports truncation at EOF.
+#[derive(Clone, Copy, Debug)]
+pub struct Frames {
+    limit: usize,
+}
+impl Frames {
+    /// Creates a reader with a body limit of [`MAX_BODY`].
+    pub fn new() -> Self {
+        Self::with_limit(MAX_BODY)
+    }
+    /// Sets the body limit, clamped to [`MAX_BODY`]. Zero accepts empty bodies.
+    pub fn with_limit(limit: usize) -> Self {
+        Self {
+            limit: limit.min(MAX_BODY),
+        }
+    }
+    /// The maximum accepted body size, excluding the header.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+}
+impl Default for Frames {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl Decode for Frames {
+    type Item = Packet;
+    type Error = BinaryError;
+    const NAME: &'static str = "memcache binary";
+    fn capacity(&self) -> usize {
+        BINARY_HEADER_LEN.saturating_add(self.limit)
+    }
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Packet>, BinaryError> {
+        if let Some(&m) = input.first() {
+            Magic::from_byte(m).ok_or(BinaryError::Magic(m))?;
+        }
+        if let Some(header) = input.get(..BINARY_HEADER_LEN) {
+            let key_len = usize::from(be16(header, 2));
+            if key_len > MAX_KEY {
+                return Err(BinaryError::KeyLength(key_len));
+            }
+            let body = usize::try_from(be32(header, 8)).unwrap_or(usize::MAX);
+            if body > self.limit {
+                return Err(BinaryError::BodyLength(body));
+            }
+        }
+        Ok(match Packet::parse(input)? {
+            Some((packet, used)) => Step::Item(packet, used),
+            None => Step::Need,
+        })
+    }
+}
+impl Wire for Packet {
+    type ParseError = PacketParseError;
+    type WriteError = BinaryError;
+
+    /// Reads exactly one binary packet under [`MAX_BODY`].
+    /// Incomplete input and trailing bytes are errors.
+    fn parse(bytes: &[u8]) -> Result<Self, PacketParseError> {
+        match Packet::parse(bytes).map_err(PacketParseError::Binary)? {
+            Some((packet, used)) if used == bytes.len() => Ok(packet),
+            Some(_) => Err(PacketParseError::Trailing),
+            None => Err(PacketParseError::Incomplete),
+        }
+    }
+    /// Appends one packet with a body of at most [`MAX_BODY`] bytes,
+    /// leaving `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), BinaryError> {
+        let body = self
+            .extras
+            .len()
+            .checked_add(self.key.len())
+            .and_then(|n| n.checked_add(self.value.len()))
+            .ok_or(BinaryError::BodyLength(usize::MAX))?;
+        if body > MAX_BODY {
+            return Err(BinaryError::BodyLength(body));
+        }
+        out.extend_from_slice(&self.to_bytes()?);
+        Ok(())
+    }
 }
 
 #[cfg(test)]

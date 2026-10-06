@@ -1,6 +1,10 @@
 //! FTP: reading and writing the control connection's commands and replies,
 //! with no I/O.
 //!
+//! New stacks use [`Commands`] and [`Replies`] with [`codec::Stream`].
+//! Both accept CRLF and bare LF. [`codec::Wire`] provides exact parsing
+//! and strict, transactional writing for [`Command`] and [`Reply`].
+//!
 //! FTP moves files between a client and a server. The client sends
 //! commands over a TCP connection, usually to port 21, one per line, such
 //! as `USER anonymous` or `RETR notes.txt`. The server answers each with a
@@ -71,6 +75,7 @@
 //! assert_eq!(features[1].params.as_deref(), Some("size*;modify*;"));
 //! ```
 
+use super::codec::{self, Decode, Step, Wire};
 use std::borrow::Cow;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
 use std::num::NonZeroU8;
@@ -938,9 +943,9 @@ pub struct Reply {
     pub lines: Vec<String>,
 }
 
-/// Why bytes are not an FTP reply. After any of these but
-/// [`ReplyError::TooManyLines`], the stream holds no more replies a reader
-/// can find, and a client closes the connection.
+/// Why bytes are not an FTP reply. [`ReplyDecoder`] stops after any error
+/// except [`ReplyError::TooManyLines`]. See [`Replies`] for recovery from
+/// malformed first lines and terminal framing errors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReplyError {
     /// A line was longer than [`MAX_LINE`].
@@ -1639,6 +1644,383 @@ fn cut(s: &str, max: usize) -> &str {
 fn push_line(out: &mut Vec<u8>, line: &str) {
     out.extend_from_slice(line.as_bytes());
     out.extend_from_slice(b"\r\n");
+}
+
+/// Maximum text bytes retained while assembling one reply.
+pub const MAX_REPLY_BYTES: usize = MAX_REPLY_LINES * MAX_CONTENT;
+
+/// A terminal fault in [`Commands`] or [`Replies`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecodeError {
+    /// EOF interrupted a line or a multi-line reply.
+    Incomplete,
+    /// A reply's framing can no longer be followed.
+    Reply(ReplyError),
+}
+impl core::fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Incomplete => f.write_str("incomplete FTP control unit"),
+            Self::Reply(e) => e.fmt(f),
+        }
+    }
+}
+impl core::error::Error for DecodeError {}
+
+/// Why bytes do not contain exactly one complete FTP command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommandParseError {
+    /// The command was refused.
+    Command(CommandError),
+    /// The command ended early.
+    Incomplete,
+    /// Bytes followed the command.
+    Trailing,
+}
+impl core::fmt::Display for CommandParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Command(e) => e.fmt(f),
+            Self::Incomplete => f.write_str("incomplete FTP command"),
+            Self::Trailing => f.write_str("bytes after FTP command"),
+        }
+    }
+}
+impl core::error::Error for CommandParseError {}
+
+/// Why bytes do not contain exactly one complete FTP reply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplyParseError {
+    /// The reply was refused.
+    Reply(ReplyError),
+    /// The reply ended early.
+    Incomplete,
+    /// Bytes followed the reply.
+    Trailing,
+}
+impl core::fmt::Display for ReplyParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Reply(e) => e.fmt(f),
+            Self::Incomplete => f.write_str("incomplete FTP reply"),
+            Self::Trailing => f.write_str("bytes after FTP reply"),
+        }
+    }
+}
+impl core::error::Error for ReplyParseError {}
+
+/// A reply cannot be written without changing its value.
+///
+/// Refuses empty or oversized line lists, CR, LF or NUL, oversized text,
+/// and middle lines that would terminate the reply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplyWriteError;
+
+impl core::fmt::Display for ReplyWriteError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("FTP reply cannot be written unchanged")
+    }
+}
+impl core::error::Error for ReplyWriteError {}
+
+// Lines frames physical lines. RFC 2640's CR NUL LF is joined here into
+// one logical line. Only consumed pieces are retained, under MAX_CONTENT.
+struct ControlLines {
+    lines: codec::Lines,
+    partial: Vec<u8>,
+    dropping: bool,
+    prev: [u8; 2],
+}
+impl core::fmt::Debug for ControlLines {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ControlLines")
+            .field("partial", &self.partial)
+            .field("dropping", &self.dropping)
+            .field("prev", &self.prev)
+            .finish_non_exhaustive()
+    }
+}
+impl ControlLines {
+    fn new() -> Self {
+        Self {
+            lines: codec::Lines::new(MAX_CONTENT, codec::Ending::LfOrCrlf),
+            partial: Vec::new(),
+            dropping: false,
+            prev: LINE_START,
+        }
+    }
+
+    fn reset_line(&mut self) {
+        self.lines = codec::Lines::new(
+            MAX_CONTENT.saturating_sub(self.partial.len()),
+            codec::Ending::LfOrCrlf,
+        );
+    }
+
+    fn decode(
+        &mut self,
+        input: &[u8],
+        eof: bool,
+    ) -> Result<Step<Result<Vec<u8>, CommandError>>, DecodeError> {
+        if self.dropping {
+            let n = next_end(self.prev, input).map_or(input.len(), |i| i.saturating_add(1));
+            if n == 0 {
+                return Ok(Step::Need);
+            }
+            let raw = input.get(..n).unwrap_or_default();
+            self.dropping = next_end(self.prev, raw).is_none();
+            self.prev = last_two(self.prev, raw);
+            return Ok(Step::Skip(n));
+        }
+        let step = self
+            .lines
+            .decode(input, eof)
+            .unwrap_or_else(|never| match never {});
+        match step {
+            Step::Item(Ok(line), n) => {
+                let raw = input.get(..n).unwrap_or_default();
+                let escaped = raw.ends_with(b"\r\0\n");
+                if escaped {
+                    if raw.len() > MAX_CONTENT.saturating_sub(self.partial.len()) {
+                        self.partial.clear();
+                        self.dropping = true;
+                        self.prev = last_two(LINE_START, raw);
+                        self.reset_line();
+                        return Ok(Step::Item(Err(CommandError::LineTooLong), n));
+                    }
+                    self.partial.extend_from_slice(raw);
+                    self.reset_line();
+                    Ok(Step::Skip(n))
+                } else {
+                    let mut whole = core::mem::take(&mut self.partial);
+                    whole.extend_from_slice(&line);
+                    self.reset_line();
+                    Ok(Step::Item(Ok(whole), n))
+                }
+            }
+            Step::Item(Err(codec::LineError::TooLong { .. }), n) => {
+                let raw = input.get(..n).unwrap_or_default();
+                self.partial.clear();
+                self.dropping = next_end(LINE_START, raw).is_none();
+                self.prev = last_two(LINE_START, raw);
+                self.reset_line();
+                Ok(Step::Item(Err(CommandError::LineTooLong), n))
+            }
+            Step::Item(Err(_), _) => Err(DecodeError::Incomplete),
+            Step::Need if eof && !self.partial.is_empty() => Err(DecodeError::Incomplete),
+            Step::Need => Ok(Step::Need),
+            Step::Skip(n) => Ok(Step::Skip(n)),
+            Step::End => Ok(Step::End),
+        }
+    }
+}
+
+/// Reads control commands through [`super::codec::Lines`].
+///
+/// CRLF and bare LF are accepted. RFC 2640's CR NUL escaping stays in
+/// this module. Lines are bounded by [`MAX_LINE`], including CRLF.
+/// Malformed and overlong commands are error items. EOF inside a command
+/// is terminal.
+pub struct Commands {
+    lines: ControlLines,
+}
+impl core::fmt::Debug for Commands {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Commands").finish_non_exhaustive()
+    }
+}
+impl Commands {
+    /// Creates a command reader with a capacity of [`MAX_LINE`].
+    pub fn new() -> Self {
+        Self {
+            lines: ControlLines::new(),
+        }
+    }
+}
+impl Default for Commands {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl Decode for Commands {
+    type Item = Result<Command, CommandError>;
+    type Error = DecodeError;
+    const NAME: &'static str = "FTP commands";
+
+    fn capacity(&self) -> usize {
+        MAX_LINE
+    }
+    fn held(&self) -> usize {
+        self.lines.partial.len()
+    }
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Self::Item>, DecodeError> {
+        Ok(match self.lines.decode(input, eof)? {
+            Step::Item(line, n) => Step::Item(line.and_then(|line| Command::parse(&line)), n),
+            Step::Skip(n) => Step::Skip(n),
+            Step::Need => Step::Need,
+            Step::End => Step::End,
+        })
+    }
+}
+
+/// Reads and assembles control replies through [`super::codec::Lines`].
+///
+/// CRLF and bare LF are accepted under [`MAX_LINE`]. Assemblies retain
+/// at most [`MAX_REPLY_LINES`] lines and [`MAX_REPLY_BYTES`] text bytes.
+/// A malformed first line is an error item. Invalid text inside an open
+/// reply or an overlong line ends framing. Too many reply lines produce
+/// one error item at the matching final line. EOF in an assembly is
+/// [`DecodeError::Incomplete`].
+pub struct Replies {
+    lines: ControlLines,
+    builder: Builder,
+    held: usize,
+}
+impl core::fmt::Debug for Replies {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Replies")
+            .field("builder", &self.builder)
+            .field("held", &self.held)
+            .finish_non_exhaustive()
+    }
+}
+impl Replies {
+    /// Creates a reply reader with a capacity of [`MAX_LINE`].
+    pub fn new() -> Self {
+        Self {
+            lines: ControlLines::new(),
+            builder: Builder::default(),
+            held: 0,
+        }
+    }
+}
+impl Default for Replies {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl Decode for Replies {
+    type Item = Result<Reply, ReplyError>;
+    type Error = DecodeError;
+    const NAME: &'static str = "FTP replies";
+
+    fn capacity(&self) -> usize {
+        MAX_LINE
+    }
+    fn held(&self) -> usize {
+        self.held.saturating_add(self.lines.partial.len())
+    }
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Self::Item>, DecodeError> {
+        match self.lines.decode(input, eof)? {
+            Step::Item(Ok(line), n) => {
+                let open = self.builder.open.is_some();
+                let result = self.builder.take(&line);
+                // Each line is visited once; do not rescan the assembly.
+                self.held = match &self.builder.open {
+                    Some((_, _, false)) => self.held.saturating_add(line.len()),
+                    _ => 0,
+                };
+                match result {
+                    Ok(Some(reply)) => Ok(Step::Item(Ok(reply), n)),
+                    Ok(None) => Ok(Step::Skip(n)),
+                    Err(e) if !open || e == ReplyError::TooManyLines => Ok(Step::Item(Err(e), n)),
+                    Err(e) => Err(DecodeError::Reply(e)),
+                }
+            }
+            Step::Item(Err(_), _) => Err(DecodeError::Reply(ReplyError::LineTooLong)),
+            Step::Need if eof && self.builder.open.is_some() => Err(DecodeError::Incomplete),
+            Step::Need => Ok(Step::Need),
+            Step::Skip(n) => Ok(Step::Skip(n)),
+            Step::End => Ok(Step::End),
+        }
+    }
+}
+
+impl Wire for Command {
+    type ParseError = CommandParseError;
+    type WriteError = WriteError;
+
+    /// Reads exactly one control command, accepting CRLF or bare LF.
+    /// Overlong lines are refused before checking for trailing bytes.
+    fn parse(mut bytes: &[u8]) -> Result<Self, CommandParseError> {
+        let mut decoder = Commands::new();
+        loop {
+            match decoder
+                .decode(bytes, true)
+                .map_err(|_| CommandParseError::Incomplete)?
+            {
+                Step::Item(Err(e), _) => return Err(CommandParseError::Command(e)),
+                Step::Item(Ok(command), used) if used == bytes.len() => return Ok(command),
+                Step::Item(_, _) => return Err(CommandParseError::Trailing),
+                Step::Skip(used) => {
+                    bytes = bytes.get(used..).ok_or(CommandParseError::Incomplete)?
+                }
+                Step::Need | Step::End => return Err(CommandParseError::Incomplete),
+            }
+        }
+    }
+    /// Appends a command with CRLF, leaving `out` unchanged on error.
+    /// Refuses lowercase verbs that the parser would uppercase.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+        if self.verb.bytes().any(|b| b.is_ascii_lowercase()) {
+            return Err(WriteError::Verb);
+        }
+        let bytes = self.to_bytes()?;
+        out.extend_from_slice(&bytes);
+        Ok(())
+    }
+}
+
+impl Wire for Reply {
+    type ParseError = ReplyParseError;
+    type WriteError = ReplyWriteError;
+
+    /// Reads exactly one reply accepted by [`Replies`]. CRLF and bare LF
+    /// are accepted; incomplete replies and trailing bytes are errors.
+    fn parse(mut bytes: &[u8]) -> Result<Self, ReplyParseError> {
+        let mut decoder = Replies::new();
+        loop {
+            match decoder.decode(bytes, true).map_err(|e| match e {
+                DecodeError::Incomplete => ReplyParseError::Incomplete,
+                DecodeError::Reply(e) => ReplyParseError::Reply(e),
+            })? {
+                Step::Item(Err(e), _) => return Err(ReplyParseError::Reply(e)),
+                Step::Item(Ok(reply), used) if used == bytes.len() => return Ok(reply),
+                Step::Item(_, _) => return Err(ReplyParseError::Trailing),
+                Step::Skip(used) => bytes = bytes.get(used..).ok_or(ReplyParseError::Incomplete)?,
+                Step::Need | Step::End => return Err(ReplyParseError::Incomplete),
+            }
+        }
+    }
+
+    /// Appends the reply's text verbatim, with code prefixes and CRLF.
+    /// Refuses text that would not read back unchanged before touching
+    /// `out`. [`Reply::to_bytes`] clips and pads text.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), ReplyWriteError> {
+        let count = self.lines.len();
+        if count == 0 || count > MAX_REPLY_LINES {
+            return Err(ReplyWriteError);
+        }
+        for (i, line) in self.lines.iter().enumerate() {
+            let middle = i != 0 && i != count - 1;
+            let limit = if middle { MAX_CONTENT } else { MAX_REPLY_TEXT };
+            if line.len() > limit
+                || line.bytes().any(|b| matches!(b, b'\r' | b'\n' | 0))
+                || (middle && ends(line, self.code))
+            {
+                return Err(ReplyWriteError);
+            }
+        }
+        let code = self.code.get().to_string();
+        for (i, line) in self.lines.iter().enumerate() {
+            if i == 0 || i == count - 1 {
+                out.extend_from_slice(code.as_bytes());
+                out.push(if i == 0 && count > 1 { b'-' } else { b' ' });
+            }
+            push_line(out, line);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

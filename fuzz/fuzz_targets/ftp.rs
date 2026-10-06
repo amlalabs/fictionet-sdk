@@ -2,9 +2,12 @@
 //! reads and writes them.
 #![no_main]
 
+use fictionet::stdlib::codec::contract::{
+    check_decode_with_held_limit, check_wire, check_wire_value,
+};
 use fictionet::stdlib::ftp::{
-    Command, CommandDecoder, Feature, MAX_BUFFERED, MAX_LINE, Reply, ReplyDecoder, ReplyError, Request, parse_eprt,
-    parse_port, write_eprt, write_port,
+    Command, CommandDecoder, Commands, Feature, MAX_BUFFERED, MAX_LINE, MAX_REPLY_BYTES, Replies,
+    Reply, ReplyDecoder, ReplyError, Request, parse_eprt, parse_port, write_eprt, write_port,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -81,6 +84,11 @@ fn one_reply(bytes: &[u8]) -> Reply {
 }
 
 fuzz_target!(|data: &[u8]| {
+    check_decode_with_held_limit(Commands::new, data, MAX_LINE);
+    check_decode_with_held_limit(Replies::new, data, MAX_REPLY_BYTES);
+    check_wire::<Command>(data);
+    check_wire::<Reply>(data);
+
     // The stream as commands, fed on every schedule. A bad line spoils only
     // itself, so every result is kept, and every schedule agrees.
     let got = commands(data, SCHEDULES[0]);
@@ -105,6 +113,7 @@ fuzz_target!(|data: &[u8]| {
     let text = String::from_utf8_lossy(data);
     let (verb, arg) = text.split_once(' ').unwrap_or((&text, ""));
     let built = Command::new(verb, Some(arg));
+    check_wire_value(&built);
     if let Ok(bytes) = built.to_bytes() {
         let mut want = built.clone();
         want.verb.make_ascii_uppercase();
@@ -123,6 +132,7 @@ fuzz_target!(|data: &[u8]| {
     let code = fictionet::stdlib::ftp::ReplyCode::new(100 + u16::from(data.first().copied().unwrap_or(0)) % 500);
     if let Some(code) = code {
         let built = Reply { code, lines: lines.clone() };
+        check_wire_value(&built);
         let bytes = built.to_bytes();
         let back = one_reply(&bytes);
         assert_eq!(back.to_bytes(), bytes);
@@ -143,6 +153,7 @@ fuzz_target!(|data: &[u8]| {
         assert_eq!(replies(data, *s), got);
     }
     for r in got.iter().flatten() {
+        check_wire_value(r);
         // Written and read back, a reply is the same but for a space in
         // front of middle lines that start with three digits.
         let bytes = r.to_bytes();
