@@ -173,6 +173,7 @@ pub mod ip;
 pub mod ipp;
 pub mod ipsec;
 pub mod json;
+pub mod json_schema;
 pub mod kafka;
 pub mod kerberos;
 pub mod l2tp;

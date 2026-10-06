@@ -79,6 +79,8 @@ macro_rules! protocols {
         pub mod ipsec;
         #[path = "../src/stdlib/json.rs"]
         pub mod json;
+        #[path = "../src/stdlib/json_schema.rs"]
+        pub mod json_schema;
         #[path = "../src/stdlib/kafka.rs"]
         pub mod kafka;
         #[path = "../src/stdlib/kerberos.rs"]

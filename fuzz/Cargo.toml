@@ -34,6 +34,13 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
 debug = 1
 
 [[bin]]
+name = "json_schema"
+path = "fuzz_targets/json_schema.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "relay"
 path = "fuzz_targets/relay.rs"
 test = false

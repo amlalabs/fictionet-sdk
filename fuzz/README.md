@@ -18,6 +18,7 @@ cargo +nightly fuzz list
 
 | Target | What it feeds | Code it reaches |
 |---|---|---|
+| `json_schema` | Byte-split schema/instance pairs; document entry pointers, dialects, format assertions and generation, dependentSchemas, unsupported keywords, error caps, deterministic examples | `stdlib::json_schema`: reachable compilation, local refs, exact decimals, bounded validation and generation; generated JSON wire contracts |
 | `observe_modbus` | Capture bytes with codec contract checks for chunking, EOF, and bounds | `observe::protocols::Modbus` |
 | `observe_dns` | Capture bytes with codec contract checks for chunking, EOF, and bounds | `observe::protocols::Dns` |
 | `observe_dhcp` | Capture bytes with codec contract checks for chunking, EOF, and bounds | `observe::protocols::Dhcp` |
