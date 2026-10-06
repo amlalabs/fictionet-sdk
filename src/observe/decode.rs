@@ -6,10 +6,12 @@
 //! [`Dissector`] sees every copied packet of one link in order, so it can
 //! follow TCP streams across packets.
 
+use std::collections::HashMap;
 use std::fmt::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use super::json;
+use fictionet::stdlib::tcp_stream::{FlowKey, Reassembler, Segment, TcpEvent, conversation_key};
 use crate::watch::KeyLine;
 
 /// A field of a layer, and where its bytes are.
@@ -199,7 +201,8 @@ impl Decoded {
 /// Decodes the packets of one link, in order.
 #[derive(Default)]
 pub(crate) struct Dissector {
-    tcp: super::stream::Streams,
+    tcp: Reassembler,
+    conversations: HashMap<FlowKey, super::app::Conversation>,
     /// Stop at the transport layer.
     headers_only: bool,
 }
@@ -379,7 +382,15 @@ impl Dissector {
         let (sport, dport) = (be16(t, 0), be16(t, 2));
         let (seq, ack, flags, win) = (be32(t, 4), be32(t, 8), t[13], be16(t, 14));
         let payload = (at + off, end);
-        let flow = self.tcp.segment(src, sport, dst, dport, seq, ack, flags, end - at - off);
+        let key = (src, sport, dst, dport);
+        let flow = self.tcp.push(Segment { key, seq, ack, flags, payload: if self.headers_only { &[] } else { &p[payload.0..payload.1] } });
+        let (ckey, reversed) = conversation_key(key);
+        if flow.cleared {
+            self.conversations.clear();
+        }
+        if flow.restarted {
+            self.conversations.remove(&ckey);
+        }
         let names = flag_names(flags);
         let mut l = Layer::new("Transmission Control Protocol", 0, (at, at + off));
         let r = |a: usize, b: usize| (at + a, at + b);
@@ -423,12 +434,35 @@ impl Dissector {
             d.tag("reset");
         }
         d.info = info;
-        // Data on a SYN (TCP Fast Open) starts after the SYN's own number.
         if self.headers_only {
             return;
         }
-        let data_seq = if flags & 0x02 != 0 { seq.wrapping_add(1) } else { seq };
-        self.tcp.payload(flow.key, data_seq, flags & 0x01 != 0, p, payload, d, keys);
+        if flow.events.iter().any(|event| matches!(event, TcpEvent::Gap { resumed: false, .. })) {
+            d.tag("gap");
+        }
+        let layers = d.layers.len().checked_add(d.cut);
+        let mut delivered = false;
+        for event in flow.events {
+            match event {
+                TcpEvent::Bytes { offset, bytes, input_offset, .. } => {
+                    let conversation = self.conversations.entry(ckey).or_insert_with(|| super::app::Conversation::new(ckey.1, ckey.3));
+                    let place = super::app::Place { stream_start: offset, buf: 0, offset: input_offset.and_then(|at| payload.0.checked_add(at)), len: bytes.len() };
+                    conversation.data(reversed, &bytes, place, d, keys);
+                    delivered = true;
+                }
+                TcpEvent::Gap { resumed: true, .. } => {
+                    let conversation = self.conversations.entry(ckey).or_insert_with(|| super::app::Conversation::new(ckey.1, ckey.3));
+                    conversation.lost(reversed);
+                }
+                TcpEvent::Gap { resumed: false, .. } => {}
+                // Presenters currently have no close hook. Keep their
+                // state until a SYN replaces the captured connection.
+                TcpEvent::End { .. } => {}
+            }
+        }
+        if delivered && d.layers.len().checked_add(d.cut) == layers && self.conversations.get(&ckey).is_some_and(|c| c.waiting(reversed)) {
+            d.info.push_str(" [part of a longer message]");
+        }
     }
 }
 
@@ -788,6 +822,55 @@ mod tests {
         let d = dis.decode(&tcp(40000, 80, base + 256 * 100, 0x18, &h2_frame(1, 0x4, 11, &[0xbe])), &[]);
         let x = d.layers.last().unwrap().fields.iter().find(|f| f.name == "x").unwrap();
         assert_eq!(x.value.len(), 4000);
+    }
+
+    #[test]
+    fn reassembly_gap_resets_the_http2_header_table() {
+        use fictionet::stdlib::tcp_stream::Limits;
+        let mut dis = Dissector { tcp: Reassembler::new(Limits { max_segments: 1, ..Limits::default() }), ..Dissector::default() };
+        dis.decode(&tcp(40000, 80, 100, 0x02, b""), &[]);
+        let mut first = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+        first.extend(h2_frame(1, 0x4, 1, b"\x40\x01x\x01y"));
+        let initial = dis.decode(&tcp(40000, 80, 101, 0x18, &first), &[]);
+        assert!(initial.layers.iter().any(|l| l.fields.iter().any(|f| f.name == "x" && f.value == "y")));
+        let next = 101 + first.len() as u32;
+        let indexed = h2_frame(1, 0x4, 3, &[0xbe]);
+        dis.decode(&tcp(40000, 80, next + 10, 0x18, &indexed), &[]);
+        let resumed = dis.decode(&tcp(40000, 80, next + 100, 0x18, b"dropped"), &[]);
+        assert!(!resumed.layers.iter().any(|l| l.fields.iter().any(|f| f.name == "x" && f.value == "y")));
+        assert_eq!(resumed.proto, "TCP");
+        assert_eq!(resumed.layers.len(), 2);
+        assert!(resumed.extra.is_empty());
+        assert!(!resumed.tags.contains(&"gap"));
+        let following = dis.decode(&tcp(40000, 80, next + 10 + indexed.len() as u32, 0x18, &indexed), &[]);
+        assert_eq!(following.proto, "TCP");
+        assert_eq!(following.layers.len(), 2);
+    }
+
+    #[test]
+    fn reassembly_gap_before_the_first_bytes_also_stops_http2() {
+        use fictionet::stdlib::tcp_stream::Limits;
+        let mut dis = Dissector { tcp: Reassembler::new(Limits { max_segments: 1, ..Limits::default() }), ..Dissector::default() };
+        dis.decode(&tcp(40000, 80, 100, 0x02, b""), &[]);
+        let mut first = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+        first.extend(h2_frame(1, 0x4, 1, &[0x82]));
+        dis.decode(&tcp(40000, 80, 110, 0x18, &first), &[]);
+        let resumed = dis.decode(&tcp(40000, 80, 1000, 0x18, b"dropped"), &[]);
+        assert_eq!(resumed.proto, "TCP");
+        assert_eq!(resumed.layers.len(), 2);
+        assert!(resumed.extra.is_empty());
+    }
+
+    #[test]
+    fn reassembly_gap_without_held_data_keeps_the_packet_tag() {
+        use fictionet::stdlib::tcp_stream::Limits;
+        let mut dis = Dissector { tcp: Reassembler::new(Limits { max_buffered: 0, ..Limits::default() }), ..Dissector::default() };
+        dis.decode(&tcp(40000, 80, 100, 0x02, b""), &[]);
+        let gap = dis.decode(&tcp(40000, 80, 110, 0x18, b"dropped"), &[]);
+        assert!(gap.tags.contains(&"gap"));
+        let request = dis.decode(&tcp(40000, 80, 101, 0x18, b"GET / HTTP/1.1\r\n\r\n"), &[]);
+        assert_eq!(request.info, "GET / HTTP/1.1");
+        assert_eq!(request.layers.last().unwrap().buf, 0);
     }
 
     fn h2_frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {

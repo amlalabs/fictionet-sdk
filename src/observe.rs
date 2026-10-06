@@ -437,7 +437,6 @@ mod packets;
 mod hpack;
 mod pcap;
 mod session;
-mod stream;
 mod view;
 
 use std::sync::{Arc, Mutex, MutexGuard};

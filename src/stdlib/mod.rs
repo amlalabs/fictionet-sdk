@@ -214,6 +214,8 @@ pub mod ssh;
 pub mod stun;
 pub mod syslog;
 pub mod tcp;
+/// Bounded reassembly of captured TCP segments into ordered byte events.
+pub mod tcp_stream;
 pub mod tds;
 pub mod telnet;
 pub mod tftp;

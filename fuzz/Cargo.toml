@@ -41,6 +41,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "tcp_stream"
+path = "fuzz_targets/tcp_stream.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "packets"
 path = "fuzz_targets/packets.rs"
 test = false
