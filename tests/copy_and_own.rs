@@ -37,6 +37,8 @@ macro_rules! protocols {
         pub mod dtls;
         #[path = "../src/stdlib/enip.rs"]
         pub mod enip;
+        #[path = "../src/stdlib/fast.rs"]
+        pub mod fast;
         #[path = "../src/stdlib/fastcgi.rs"]
         pub mod fastcgi;
         #[path = "../src/stdlib/ftp.rs"]
@@ -247,4 +249,22 @@ fn copied_modbus_uses_the_public_driver_and_map() {
     finish(&mut stream, |item| requests.push(item)).unwrap();
     assert_eq!(requests, [Ok(request)]);
     assert!(stream.is_done());
+}
+
+#[test]
+fn copied_fast_uses_templates_and_the_public_driver() {
+    let templates = fast::Templates::from_xml(br#"<template xmlns="http://www.fixprotocol.org/ns/fast/td/1.1" name="Example" id="1"><uInt32 name="n"><increment value="1"/></uInt32></template>"#).unwrap();
+    let value = fast::Message {
+        template_id: 1,
+        fields: vec![fast::Value::UInt32(1)],
+    };
+    let mut bytes = Vec::new();
+    fast::Encoder::new(templates.clone())
+        .write(&value, &mut bytes)
+        .unwrap();
+    assert_eq!(bytes, [0xc0, 0x81]);
+    let mut stream = Stream::new(fast::Frames::new(templates));
+    assert_eq!(stream.push(&bytes), bytes.len());
+    assert_eq!(stream.next().unwrap().unwrap(), value);
+    assert_eq!(fast::UInt64::parse(&[0x81]).unwrap(), fast::UInt64(1));
 }
