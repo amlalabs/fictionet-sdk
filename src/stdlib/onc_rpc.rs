@@ -1486,7 +1486,7 @@ pub fn silent_on_failure(call: &Call) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::test_support::Lcg;
+    use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::codec::{Fail, Stream, contract, finish, pump, test_support};
     use fictionet::stdlib::portmap::{
         self, ParseError, PmapRequest, PmapResult, Request, RpcbRequest, RpcbResult,

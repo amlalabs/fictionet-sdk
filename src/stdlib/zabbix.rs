@@ -941,7 +941,7 @@ impl Scanner<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Fail, Stream, contract, pump, finish, test_support::{Lcg, mutate, decode_all}};
+    use fictionet::stdlib::codec::{Fail, Stream, contract, pump, finish, Lcg, test_support::{mutate, decode_all}};
 
     fn packet_bytes(flags: u8, data: &[u8], reserved: u32) -> Vec<u8> {
         let mut v = b"ZBXD".to_vec();

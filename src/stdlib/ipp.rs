@@ -1536,7 +1536,7 @@ mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
         Fail, Stream, contract,
-        test_support::{Lcg, decode_all, mutate},
+        Lcg, test_support::{decode_all, mutate},
     };
 
     /// One record's bytes.

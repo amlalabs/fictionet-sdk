@@ -649,7 +649,7 @@ impl Wire for Data {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{contract, test_support::Lcg};
+    use fictionet::stdlib::codec::{contract, Lcg};
 
     fn init() -> Initiation {
         Initiation {

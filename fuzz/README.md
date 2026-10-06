@@ -19,11 +19,17 @@ cargo +nightly fuzz list
 | Target | What it feeds | Code it reaches |
 |---|---|---|
 | `json_schema` | Byte-split schema and instance pairs; dialects, error paths and caps, deterministic examples, and generated-value validation | `stdlib::json_schema`: compilation, local refs, exact decimal assertions, bounded branch evaluation, and generation; JSON wire contracts |
+| `observe_modbus` | Capture bytes with codec contract checks for chunking, EOF, and bounds | `observe::protocols::Modbus` |
+| `observe_dns` | Capture bytes with codec contract checks for chunking, EOF, and bounds | `observe::protocols::Dns` |
+| `observe_dhcp` | Capture bytes with codec contract checks for chunking, EOF, and bounds | `observe::protocols::Dhcp` |
+| `observe_http1` | Capture bytes with codec contract checks for chunking, EOF, and bounds | `observe::protocols::Http1` |
+| `observe_tls` | Capture bytes with codec contract checks for chunking, EOF, and bounds | `observe::protocols::TlsRecords` |
 | `relay` | relay messages | `relay::decode` |
 | `packets` | whole packets | `ip::split_protocols`'s sorting, `icmp::echo_reply`, `dhcp::Message::parse` |
 | `ip_reassembly` | IPv4 and IPv6 fragments, with timing | fragment reassembly in `ip::split_protocols` |
 | `stack` | packets, with checksums made right or not | a machine: `split_protocols`, `tcp::endpoint`, `udp::endpoint`, ping replies, over IPv4 and IPv6 |
 | `tcp` | TCP segments and the world's own calls, structured | `tcp::endpoint`: smoltcp's state machine and the stdlib's code around it |
+| `tcp_stream` | arbitrary segment directions, sequence numbers, flags, payloads, and limits; checks byte accounting, placement, event order, and buffer bounds | `stdlib::tcp_stream::Reassembler`: captured TCP reassembly |
 | `tls` | the client's bytes | `tls::server` (the ClientHello and SNI), `ClientHello::finish`, `TlsConnection` |
 | `dns` | DNS messages | hickory-proto's parser, and attach's resolver reading an answer |
 | `web` | packets, DNS queries, DHCP messages, TCP segments | `web::Sites`: the filter, DHCP, DNS over UDP and TCP, routing, the machines |
@@ -75,6 +81,9 @@ cargo +nightly fuzz list
 | `postgres` | startup, authentication, and typed messages | `stdlib::postgres`: frontend and backend decoders, wire types, and bounded-allocation codec contracts |
 | `protobuf` | wire values and streams checked with bounded codec contracts | `stdlib::protobuf`: Protocol Buffers |
 | `proxy_protocol` | exact wire values, header handoff and bounded codec contracts | `stdlib::proxy_protocol`: The PROXY protocol |
+| `hpack` | wire contracts, complete blocks, settings limits, table recovery, and encode/decode round trips | `stdlib::hpack`: HTTP/2 header compression |
+| `http2` | Frame and preface contracts, every Wire frame type, capture framing, and directional connection EOF and gap handling | `stdlib::http2` |
+| `huffman` | wire contracts, EOS and padding refusal, byte round trips | `stdlib::huffman`: the RFC 7541 code shared by HPACK and QPACK |
 | `qpack` | wire values, bounded instruction contracts, tables, blocked sections, and acknowledgments | `stdlib::qpack`: QPACK, the header compression of HTTP/3 |
 | `quic` | datagram and payload wire contracts, every short-header ID length, and reassembly | `stdlib::quic`: QUIC |
 | `resp` | arbitrary bytes, bounded stream contracts, and strict value and command writers | `stdlib::resp`: RESP, the Redis protocol |

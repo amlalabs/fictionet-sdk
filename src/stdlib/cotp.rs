@@ -1200,7 +1200,7 @@ mod codec_tests {
             check(test_support::chunks(&wire, pattern).collect());
         }
         for seed in 0..32 {
-            let mut rng = test_support::Lcg::new(seed);
+            let mut rng = fictionet::stdlib::codec::Lcg::new(seed);
             check(test_support::random_chunks(&wire, &mut rng, 199).collect());
         }
         contract::check_decode_with_held_limit(|| messages(132, 1024), &wire, 1024);
@@ -1456,7 +1456,7 @@ mod codec_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::test_support::Lcg;
+    use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::codec::{Fail, Stream, contract, pump, test_support};
     use tpkt::{MAX_PACKET, MAX_PAYLOAD, Packet, Packets};
 

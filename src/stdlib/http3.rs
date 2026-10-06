@@ -2225,7 +2225,7 @@ impl Connection {
 mod tests {
     use fictionet::stdlib::codec::{
         contract, Fail, Stream,
-        test_support::{decode_all, Lcg, mutate},
+        Lcg, test_support::{decode_all, mutate},
     };
     use super::*;
 

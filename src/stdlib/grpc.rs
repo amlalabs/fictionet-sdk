@@ -345,6 +345,19 @@ impl codec::Decode for Messages {
     }
 }
 
+impl fictionet::observe::Present for Messages {
+    /// Describes the encoded body without decompressing it.
+    fn summary(item: &Message) -> String {
+        format!("{} bytes{}", item.data.len(), if item.compressed { ", compressed" } else { "" })
+    }
+    /// Places the compressed flag, length prefix, and encoded body.
+    fn fields(item: &Message, bytes: &[u8], layer: &mut fictionet::observe::Layer) {
+        layer.field("Compressed", item.compressed.to_string(), (0, 1));
+        layer.field("Length", item.data.len().to_string(), (1, HEADER_LEN));
+        layer.field("Message", format!("{} bytes", item.data.len()), (HEADER_LEN, bytes.len()));
+    }
+}
+
 // Shared prefix parsing. Only a complete, bounded body is copied.
 fn parse_message(b: &[u8], limit: usize) -> Result<Option<(Message, usize)>, FrameError> {
     let Some(&flag) = b.first() else {
@@ -1661,7 +1674,7 @@ fn trim(mut b: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::test_support::Lcg;
+    use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::codec::{Decode, Fail, Stream, contract, finish, pump, test_support};
 
     #[test]
@@ -1855,7 +1868,7 @@ mod tests {
 
     #[test]
     fn messages_and_wire_contracts() {
-        let mut rng = test_support::Lcg::new(0x67_72_70_63);
+        let mut rng = fictionet::stdlib::codec::Lcg::new(0x67_72_70_63);
         for _ in 0..128 {
             let mut data = [0; 64];
             rng.fill(&mut data);

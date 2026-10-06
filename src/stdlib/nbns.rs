@@ -1325,7 +1325,7 @@ fn reply_list_limit(name: &Name, fixed_data: usize, entry_len: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::codec::{contract, test_support::{Lcg, mutate}};
+    use fictionet::stdlib::codec::{contract, Lcg, test_support::{mutate}};
     use super::*;
 
     const FRED: &[u8; 32] = b"EGFCEFEECACACACACACACACACACACACA";

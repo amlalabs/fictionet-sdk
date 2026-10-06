@@ -1324,7 +1324,7 @@ impl std::error::Error for EncodeError {}
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::codec::{contract, test_support::{Lcg, mutate}};
+    use fictionet::stdlib::codec::{contract, Lcg, test_support::{mutate}};
     use super::*;
 
     /// The CHALLENGE message from \[MS-NLMP\] section 4.2.4.3.

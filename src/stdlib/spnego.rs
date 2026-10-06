@@ -883,7 +883,7 @@ impl Decode for Frames {
 mod tests {
     use fictionet::stdlib::codec::{
         Fail, Stream, contract,
-        test_support::{Lcg, chunks, decode_all, mutate},
+        Lcg, test_support::{chunks, decode_all, mutate},
     };
     use super::*;
 

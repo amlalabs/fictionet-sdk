@@ -3,7 +3,7 @@
 use core::fmt::Debug;
 use fictionet::stdlib::codec::{
     Decode, Fail, Stream, Wire, contract,
-    test_support::{Lcg, decode_all},
+    Lcg, test_support::{decode_all},
 };
 use fictionet::stdlib::{openvpn, rtcp, rtp, snmp, ssh};
 

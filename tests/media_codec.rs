@@ -2,7 +2,7 @@
 
 use fictionet::stdlib::codec::{
     Decode, Fail, Step, Stream, Wire, contract,
-    test_support::{Lcg, decode_all, mutate},
+    Lcg, test_support::{decode_all, mutate},
 };
 use fictionet::stdlib::{rtsp, sdp, sip};
 

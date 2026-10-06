@@ -1181,7 +1181,7 @@ mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
         Fail, Stream, contract, finish, pump,
-        test_support::{Lcg, decode_all, mutate},
+        Lcg, test_support::{decode_all, mutate},
     };
 
     /// Adjacent data events joined, so streams split in different places

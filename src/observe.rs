@@ -212,7 +212,9 @@
 //!
 //! Each copy is decoded the way Wireshark decodes it. Packets on a link are
 //! IPv4 or IPv6 with no Ethernet header. The decoder reads IP, TCP, UDP and
-//! ICMP, then DNS, DHCP, HTTP/1.1, and HTTP/2 with its headers. TCP
+//! ICMP, then DNS, DHCP, HTTP/1.1, and HTTP/2 with its headers. HTTP/2 uses
+//! [`Capture`](crate::stdlib::http2::Capture) through the public registry.
+//! Recognized gRPC calls add message layers from DATA under a shared budget. TCP
 //! connections are followed in order, so a message spread over several
 //! packets is shown whole on the packet that completes it. An HTTP/2 header
 //! that names a table entry the decoder could not follow, for example
@@ -226,6 +228,21 @@
 //! decrypted. TLS 1.2 is shown encrypted. The capture download carries the
 //! keys in the file itself, so Wireshark decrypts both versions with no
 //! setting.
+//!
+//! # User protocols
+//!
+//! Implement [`Present`] on any [`Decode`](crate::stdlib::codec::Decode)
+//! type, including a protocol copied into your crate. Its fields use ranges
+//! relative to the item's raw bytes. [`Observed`] drives it through a
+//! bounded stream; [`Placement`] maps those ranges through exact spans to
+//! packet bytes, or keeps a separate buffer for a reassembled item.
+//!
+//! Add it to [`Registry`] with a matcher for ports or first bytes, or select
+//! its name explicitly with [`Registry::choose`]. Built-ins register through
+//! the same API. [`Dissector::with_registry`] decodes raw IP packets from a
+//! pcap reader or live capture. [`Cx::observe_protocols`](crate::Cx::observe_protocols)
+//! installs the registry for newly watched links, including the dashboard
+//! and `fictionet observe` JSON output. Existing watches keep their state.
 //!
 //! # Who can observe
 //!
@@ -429,15 +446,28 @@
 //! ignores them, as clients should ignore what they do not know, draws
 //! every task on its own.
 
+/// Copyable capture decoders and presenters for the built-in protocols.
+pub mod protocols;
+/// Copyable TLS record presentation, handshake state, and decryption.
+pub mod tls;
+mod conversation;
+
+pub use conversation::Conversation;
+mod present;
+mod registry;
+
+pub use present::{Observed, Place, Placement, Present};
+pub use registry::{Match, Protocol, Registry, Selection, Transport};
+pub use decode::{Decoded, Dissector, Field, Layer};
+pub use crate::watch::KeyLine;
+
 mod app;
 mod decode;
 mod json;
 mod keys;
 mod packets;
-mod hpack;
 mod pcap;
 mod session;
-mod stream;
 mod view;
 
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -669,6 +699,53 @@ mod tests {
         let weak = Arc::downgrade(&graph);
         drop(graph);
         assert!(weak.upgrade().is_none(), "the kept watch held its world alive");
+    }
+
+    #[test]
+    fn a_world_registry_reaches_watch_json_without_a_socket() {
+        use crate::watch::Meter;
+        let graph = Graph::new();
+        let watched = graph.clone();
+        crate::block_on(crate::run::run_with(graph, move |cx| async move {
+            let mut registry = Registry::new();
+            registry.register(
+                "custom",
+                |s| {
+                    if s.ports.0 == 9000 || s.ports.1 == 9000 {
+                        Match::Yes
+                    } else {
+                        Match::No
+                    }
+                },
+                |_| [protocols::Modbus::new(true), protocols::Modbus::new(false)],
+            );
+            cx.observe_protocols(registry);
+            let meter = Meter::new();
+            watched.owns(&meter, 0, 1);
+            let (watch, _subscription) = watch(&watched, meter.id).unwrap();
+            let mut packet = vec![0u8; 40];
+            packet[0] = 0x45;
+            packet[2..4].copy_from_slice(&52u16.to_be_bytes());
+            packet[8] = 64;
+            packet[9] = 6;
+            packet[12..16].copy_from_slice(&[10, 0, 0, 1]);
+            packet[16..20].copy_from_slice(&[10, 0, 0, 2]);
+            packet[20..22].copy_from_slice(&40000u16.to_be_bytes());
+            packet[22..24].copy_from_slice(&9000u16.to_be_bytes());
+            packet[32] = 0x50;
+            packet[33] = 0x18;
+            packet.extend_from_slice(&[0, 7, 0, 0, 0, 6, 1, 3, 0, 2, 0, 1]);
+            meter.sent(0, &crate::Packet(packet));
+            watch.pump();
+            let rows = watch.rows_after(0, 10);
+            assert_eq!(rows.len(), 1);
+            assert!(rows[0].1.contains(r#""proto":"Modbus/TCP""#));
+            let detail = watch.detail(rows[0].0).unwrap();
+            assert!(detail.contains(r#""buf":0,"range":[40,52]"#), "{detail}");
+            assert!(detail.contains("address 2, quantity 1"), "{detail}");
+            Ok(())
+        }))
+        .unwrap();
     }
 
     /// A watch with no subscriber is forgotten after the linger time,

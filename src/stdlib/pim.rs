@@ -1478,7 +1478,7 @@ impl Wire for Datagram {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Wire, Collect, CollectError, Fail, contract, test_support::{Lcg, decode_all, mutate}};
+    use fictionet::stdlib::codec::{Wire, Collect, CollectError, Fail, contract, Lcg, test_support::{decode_all, mutate}};
 
     fn collect(b: &[u8], e: &Endpoints) -> Result<Message, PimError> {
         use fictionet::stdlib::codec::Decode;

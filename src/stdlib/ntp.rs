@@ -717,7 +717,7 @@ impl Wire for Timestamp {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::codec::{contract, test_support::Lcg};
+    use fictionet::stdlib::codec::{contract, Lcg};
     use super::*;
 
     /// A server reply as an SNTP client might receive it: version 4,

@@ -1618,7 +1618,7 @@ impl Wire for MethodData {
 mod tests {
     use fictionet::stdlib::codec::{
         Fail, Stream, contract, finish as finish_stream, pump,
-        test_support::{Lcg, chunks, decode_all, mutate},
+        Lcg, test_support::{chunks, decode_all, mutate},
     };
     use super::*;
 

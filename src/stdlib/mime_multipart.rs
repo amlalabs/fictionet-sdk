@@ -1379,7 +1379,7 @@ fn valid_value(v: &str) -> bool {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{Fail, Stream, contract, finish, pump};
-    use fictionet::stdlib::codec::test_support::{Lcg, decode_all};
+    use fictionet::stdlib::codec::{Lcg, test_support::{decode_all}};
 
     // Tests of raw HTTP bodies omit the entity's Content-Type header.
     fn raw(input: &[u8]) -> &[u8] {

@@ -36,6 +36,13 @@
 //! and the generic codec tools. Named sibling modules stay SDK dependencies.
 //! See the `custom_protocol` example for a copied Modbus module.
 //!
+//! Use [`http2::Connection`] for directional HTTP/2 state and [`http2::Capture`]
+//! with the public observe registry. DATA payloads feed [`grpc::Messages`]
+//! through [`codec::Demux`] under one byte budget across streams.
+//! Use [`hpack::Table`] and [`hpack::Encoder`] for complete HTTP/2 header
+//! blocks. Each direction has its own dynamic table. [`huffman`] supplies
+//! the RFC 7541 string code shared by [`hpack`] and [`qpack`].
+//!
 //! # Three kinds of functions
 //!
 //! Every function in the stdlib is one of three kinds. The kind tells you
@@ -152,7 +159,11 @@ pub mod geneve;
 pub mod git_protocol;
 pub mod gre;
 pub mod grpc;
+pub mod hpack;
+/// HTTP/2 frames, directional state, and capture presentation (RFC 9113).
+pub mod http2;
 pub mod http3;
+pub mod huffman;
 pub mod icmp;
 pub mod iec104;
 pub mod igmp;
@@ -190,6 +201,8 @@ pub mod pim;
 pub mod pop3;
 pub mod portmap;
 pub mod postgres;
+/// RFC 7541 prefix integers shared by HPACK and QPACK.
+pub mod prefix_int;
 pub mod protobuf;
 pub mod proxy_protocol;
 pub mod qpack;
@@ -215,6 +228,8 @@ pub mod ssh;
 pub mod stun;
 pub mod syslog;
 pub mod tcp;
+#[expect(missing_docs, reason = "Reassembly is documented on its public types.")]
+pub mod tcp_stream;
 pub mod tds;
 pub mod telnet;
 pub mod tftp;

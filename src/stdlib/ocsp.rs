@@ -1507,7 +1507,7 @@ impl Wire for ResponseData {
 mod tests {
     use fictionet::stdlib::codec::{
         Fail, Stream, contract,
-        test_support::{Lcg, chunks, mutate},
+        Lcg, test_support::{chunks, mutate},
     };
     use super::*;
 

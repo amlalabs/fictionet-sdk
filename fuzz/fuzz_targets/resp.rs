@@ -3,7 +3,7 @@
 
 use fictionet::stdlib::codec::{
     Decode, Fail, Wire, contract,
-    test_support::{Lcg, decode_all},
+    Lcg, test_support::{decode_all},
 };
 use fictionet::stdlib::resp::{
     Command, Commands, Limits, MAX_FRAME_LEN, MAX_LINE_LEN, ParseError, Resp2, Value, Values, WireError,

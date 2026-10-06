@@ -3,9 +3,11 @@
 
 use fictionet::stdlib::{
     codec::{Stream, Wire, contract, test_support::decode_all, try_pump},
+    huffman::HuffmanString,
+    prefix_int::Integer,
     qpack::{
-        self, DecoderInstruction, DecoderInstructions, EncoderInstruction, EncoderInstructions, FieldSection,
-        HuffmanString, Integer, Representation, SectionResult, Table,
+        self, DecoderInstruction, DecoderInstructions, EncoderInstruction, EncoderInstructions,
+        FieldSection, Representation, SectionResult, Table,
     },
 };
 use libfuzzer_sys::fuzz_target;

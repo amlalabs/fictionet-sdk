@@ -18,7 +18,7 @@
 use super::{
     Buffer, Decode, Fail, Step, Stream, Wire,
     alloc::{rc::Rc, vec::Vec},
-    test_support::{Lcg, chunks, random_chunks},
+    Lcg, test_support::{chunks, random_chunks},
 };
 use core::{cell::RefCell, fmt::Debug};
 

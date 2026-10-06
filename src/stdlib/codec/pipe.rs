@@ -18,6 +18,8 @@ pub struct Span {
     pub inner: Range<u64>,
     /// Corresponding bytes in the outer stream.
     pub outer: Range<u64>,
+    /// Whether these ranges contain identical bytes in the same order.
+    pub exact: bool,
 }
 /// A bounded ring of provenance spans. Offsets saturate at `u64::MAX`.
 #[derive(Clone, Debug)]
@@ -43,6 +45,14 @@ impl Spans {
     /// recorded (earlier fragments of an assembled message) belong to it.
     /// Zero inner length only advances the outer offset.
     pub fn push(&mut self, outer_len: usize, inner_len: usize) {
+        self.record(outer_len, inner_len, false);
+    }
+    /// Records unchanged bytes in both streams. Call `skip` first for an
+    /// outer header. Unlike `push`, this permits partial byte placement.
+    pub fn push_exact(&mut self, len: usize) {
+        self.record(len, len, true);
+    }
+    fn record(&mut self, outer_len: usize, inner_len: usize, exact: bool) {
         let outer_end = self
             .outer_at
             .saturating_add(u64::try_from(outer_len).unwrap_or(u64::MAX));
@@ -63,6 +73,7 @@ impl Spans {
                 self.ring.push_back(Span {
                     inner: self.inner_at..inner_end,
                     outer: self.outer_at..outer_end,
+                    exact,
                 });
             }
         }
@@ -76,6 +87,10 @@ impl Spans {
     /// Retained mappings, oldest first.
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = &Span> {
         self.ring.iter()
+    }
+    /// The maximum number of spans this ring retains.
+    pub fn keep(&self) -> usize {
+        self.keep
     }
     /// The number of retained spans.
     pub fn len(&self) -> usize {
@@ -92,6 +107,42 @@ impl Spans {
     /// The next outer byte offset.
     pub fn outer_offset(&self) -> u64 {
         self.outer_at
+    }
+    /// Resolves any nonempty range covered by exact, contiguous spans.
+    /// Coarse mappings, gaps, evicted spans, and overflow return `None`.
+    pub fn locate_exact(&self, range: Range<u64>) -> Option<Range<u64>> {
+        if range.start >= range.end {
+            return None;
+        }
+        let mut at = range.start;
+        let mut result: Option<Range<u64>> = None;
+        let first = self.ring.partition_point(|span| span.inner.end <= at);
+        for span in self.ring.range(first..) {
+            if !span.exact || span.inner.start > at {
+                return None;
+            }
+            let start = span
+                .outer
+                .start
+                .checked_add(at.checked_sub(span.inner.start)?)?;
+            let end = span
+                .outer
+                .start
+                .checked_add(range.end.min(span.inner.end).checked_sub(span.inner.start)?)?;
+            if end > span.outer.end {
+                return None;
+            }
+            match &mut result {
+                Some(r) if r.end == start => r.end = end,
+                None => result = Some(start..end),
+                _ => return None,
+            }
+            at = range.end.min(span.inner.end);
+            if at == range.end {
+                return result;
+            }
+        }
+        None
     }
     /// Resolves a nonempty range that covers whole spans with contiguous
     /// outer ranges, giving the union of those outer ranges. A partial

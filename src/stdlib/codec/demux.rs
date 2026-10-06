@@ -30,14 +30,15 @@ pub struct Demux<K: Ord, D: Decode> {
     // Only one stream can escape through get_mut before the next owner call.
     dirty: Cell<Option<(K, usize)>>,
     excess: Cell<Option<K>>,
-    make: Box<dyn FnMut(&K) -> D>,
+    make: Box<dyn FnMut(&K) -> D + Send>,
     max_streams: usize,
     max_bytes: usize,
 }
 impl<K: Ord + Clone, D: Decode> Demux<K, D> {
     /// Sets the stream count and shared byte limits. The factory is called
-    /// only when an absent key has a free stream slot.
-    pub fn new(max_streams: usize, max_bytes: usize, make: impl FnMut(&K) -> D + 'static) -> Self {
+    /// only when an absent key has a free stream slot. A sendable factory
+    /// lets this owner move with a capture session between threads.
+    pub fn new(max_streams: usize, max_bytes: usize, make: impl FnMut(&K) -> D + Send + 'static) -> Self {
         Self {
             streams: BTreeMap::new(),
             ready: BTreeSet::new(),
