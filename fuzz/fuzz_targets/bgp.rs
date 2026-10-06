@@ -12,6 +12,10 @@ use fictionet::stdlib::bgp::{
 use fictionet::stdlib::codec::{Decode, Wire, contract, test_support::decode_all};
 use libfuzzer_sys::fuzz_target;
 
+fn encode(message: &Message, context: &Context) -> Result<Vec<u8>, EncodeError> {
+    message.to_frame(context)?.to_bytes()
+}
+
 /// Every combination of the session settings.
 const CONTEXTS: [Context; 4] = [
     Context { four_octet_as: false, enhanced_route_refresh: false },
@@ -106,7 +110,7 @@ fuzz_target!(|data: &[u8]| {
                     }
                     Err(e) => {
                         assert!(strict.is_err());
-                        assert!(Message::Notification(e.notification()).to_frame(&ctx).and_then(|frame| frame.to_bytes()).is_ok());
+                        assert!(encode(&Message::Notification(e.notification()), &ctx).is_ok());
                     }
                 }
             }
@@ -115,17 +119,17 @@ fuzz_target!(|data: &[u8]| {
                 // routes, and reads back the same.
                 Ok(m) => {
                     if mixes(&m) {
-                        assert!(matches!(m.to_frame(&ctx).and_then(|frame| frame.to_bytes()), Err(EncodeError::Unwritable)));
+                        assert!(matches!(encode(&m, &ctx), Err(EncodeError::Unwritable)));
                         continue;
                     }
-                    let bytes = m.to_frame(&ctx).and_then(|frame| frame.to_bytes()).unwrap();
+                    let bytes = encode(&m, &ctx).unwrap();
                     let back = Frame::parse(&bytes).unwrap();
                     assert_eq!(Message::decode(&back, &ctx), Ok(m));
                 }
                 // An error's notification can always be sent.
                 Err(e) => {
                     let n = Message::Notification(e.notification());
-                    assert!(n.to_frame(&ctx).and_then(|frame| frame.to_bytes()).is_ok());
+                    assert!(encode(&n, &ctx).is_ok());
                 }
             }
         }
@@ -136,8 +140,8 @@ fuzz_target!(|data: &[u8]| {
     let read = [Open::parse(data).map(Message::Open), Update::parse(data, &ctx).map(Message::Update)];
     for r in read {
         match r {
-            Ok(m) => assert!(mixes(&m) || m.to_frame(&ctx).and_then(|frame| frame.to_bytes()).is_ok()),
-            Err(e) => assert!(Message::Notification(e.notification()).to_frame(&ctx).and_then(|frame| frame.to_bytes()).is_ok()),
+            Ok(m) => assert!(mixes(&m) || encode(&m, &ctx).is_ok()),
+            Err(e) => assert!(encode(&Message::Notification(e.notification()), &ctx).is_ok()),
         }
     }
     // An UPDATE built from public fields: a frame the writer gives fits in

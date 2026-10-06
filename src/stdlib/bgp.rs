@@ -90,9 +90,7 @@
 
 extern crate alloc;
 
-extern crate self as fictionet;
-
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use super::codec::{Decode, Step, Wire};
 use alloc::{vec, vec::Vec};
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -388,7 +386,8 @@ pub enum Error {
 
 impl Error {
     /// The NOTIFICATION a speaker sends for this error, with the data RFC
-    /// 4271 asks for.
+    /// 4271 asks for. Preserves the stored data. Caller-built errors with
+    /// excess data produce a notification that writing refuses.
     pub fn notification(&self) -> Notification {
         use subcode::{header as h, open as o, update as u};
         let (code, subcode, data) = match self {
@@ -416,16 +415,11 @@ impl Error {
             Error::RouteRefreshLength(m) => (
                 code::ROUTE_REFRESH_MESSAGE,
                 subcode::route_refresh::INVALID_MESSAGE_LENGTH,
-                clipped_notification_data(m),
+                m.clone(),
             ),
         };
         Notification { code, subcode, data }
     }
-}
-
-/// Copies the diagnostic prefix that fits after a NOTIFICATION code and subcode.
-fn clipped_notification_data(data: &[u8]) -> Vec<u8> {
-    data[..data.len().min(MAX_BODY_LEN - 2)].to_vec()
 }
 
 impl core::fmt::Display for Error {
@@ -1981,7 +1975,11 @@ fn be16(b: &[u8], i: usize) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Stream, Fail, contract, pump, finish, test_support::{Lcg, mutate, decode_all}};
+    use crate::stdlib::codec::{Stream, Fail, contract, pump, finish, test_support::{Lcg, mutate, decode_all}};
+
+    fn encode(message: &Message, context: &Context) -> Result<Vec<u8>, EncodeError> {
+        message.to_frame(context)?.to_bytes()
+    }
 
     const TWO: Context = Context { four_octet_as: false, enhanced_route_refresh: false };
     const FOUR: Context = Context { four_octet_as: true, enhanced_route_refresh: false };
@@ -2039,7 +2037,7 @@ mod tests {
         refresh.extend_from_slice(&[0, 2, 0, 1]);
         let mut note = header(23, 3);
         note.extend_from_slice(&[6, 2, 0xaa, 0xbb]);
-        let mp = Message::Update(Update {
+        let mp = encode(&Message::Update(Update {
             withdrawn: vec![],
             attributes: vec![
                 Attribute::MpReach(MpReach {
@@ -2061,22 +2059,20 @@ mod tests {
                 Attribute::Unknown { flags: 0xc0, kind: 32, value: vec![0; 300] },
             ],
             nlri: vec![],
-        })
-        .to_frame(&FOUR).and_then(|frame| frame.to_bytes())
+        }), &FOUR)
         .unwrap();
-        let unreach = Message::Update(Update {
+        let unreach = encode(&Message::Update(Update {
             attributes: vec![Attribute::MpUnreach(MpUnreach {
                 afi: 25,
                 safi: 65,
                 withdrawn: Nlri::Raw(vec![1, 2, 3]),
             })],
             ..Update::default()
-        })
-        .to_frame(&FOUR).and_then(|frame| frame.to_bytes())
+        }), &FOUR)
         .unwrap();
         // A two-octet session that carries the four-octet path and
         // aggregator beside AS_TRANS.
-        let as4 = Message::Update(Update {
+        let as4 = encode(&Message::Update(Update {
             withdrawn: vec![],
             attributes: vec![
                 Attribute::Origin(Origin::Igp),
@@ -2098,8 +2094,7 @@ mod tests {
                 },
             ],
             nlri: vec![v4(198, 51, 100, 0, 24)],
-        })
-        .to_frame(&TWO).and_then(|frame| frame.to_bytes())
+        }), &TWO)
         .unwrap();
         vec![
             (open_bytes(), TWO),
@@ -2116,7 +2111,7 @@ mod tests {
     #[test]
     fn keepalive_example() {
         // RFC 4271 section 4.4: a KEEPALIVE is the header alone, 19 bytes.
-        let b = Message::Keepalive.to_frame(&TWO).and_then(|frame| frame.to_bytes()).unwrap();
+        let b = encode(&Message::Keepalive, &TWO).unwrap();
         let mut want = vec![0xff; 16];
         want.extend_from_slice(&[0, 19, 4]);
         assert_eq!(b, want);
@@ -2140,7 +2135,7 @@ mod tests {
             ]
         );
         assert_eq!(open.asn(), 65001);
-        assert_eq!(Message::Open(open.clone()).to_frame(&TWO).and_then(|frame| frame.to_bytes()).unwrap(), b);
+        assert_eq!(encode(&Message::Open(open.clone()), &TWO).unwrap(), b);
         // Open::new builds the same message.
         let built = Open::new(
             65001,
@@ -2172,7 +2167,7 @@ mod tests {
                 Parameter::Capabilities(vec![]),
             ],
         };
-        let b = Message::Open(open.clone()).to_frame(&TWO).and_then(|frame| frame.to_bytes()).unwrap();
+        let b = encode(&Message::Open(open.clone()), &TWO).unwrap();
         // The graceful restart value: flags 8 in the top bits, time 120.
         let at = b.windows(2).position(|w| w == [64, 6]).unwrap();
         assert_eq!(b[at + 2..at + 8], [0x80, 120, 0, 1, 1, 0x80]);
@@ -2201,11 +2196,11 @@ mod tests {
         assert_eq!(u.nlri, [v4(10, 0, 0, 0, 8)]);
         assert_eq!(u.attribute(attr::NEXT_HOP), Some(&Attribute::NextHop(Ipv4Addr::new(192, 0, 2, 1))));
         assert_eq!(u.attribute(attr::MED), None);
-        assert_eq!(Message::Update(u.clone()).to_frame(&TWO).and_then(|frame| frame.to_bytes()).unwrap(), b);
+        assert_eq!(encode(&Message::Update(u.clone()), &TWO).unwrap(), b);
         // With four-octet AS numbers the AS_PATH reads differently: 1 AS
         // of 4 bytes needs 6 bytes of value, and 4 is too short.
         assert_eq!(decode(&b, &FOUR), Err(Error::MalformedAsPath));
-        let four = Message::Update(u).to_frame(&FOUR).and_then(|frame| frame.to_bytes()).unwrap();
+        let four = encode(&Message::Update(u), &FOUR).unwrap();
         assert_eq!(four.len(), b.len() + 2);
         assert_eq!(four[19 + 4 + 4..19 + 4 + 4 + 9], [0x40, 2, 6, 2, 1, 0, 0, 0xfd, 0xe9]);
     }
@@ -2218,7 +2213,7 @@ mod tests {
         b.extend_from_slice(&[0, 0, 0, 0]);
         assert_eq!(decode(&b, &TWO), Ok(Message::Update(Update::default())));
         let u = Update { withdrawn: vec![v4(192, 168, 0, 0, 16), v4(0, 0, 0, 0, 0)], ..Update::default() };
-        let b = Message::Update(u.clone()).to_frame(&TWO).and_then(|frame| frame.to_bytes()).unwrap();
+        let b = encode(&Message::Update(u.clone()), &TWO).unwrap();
         assert_eq!(b[19..], [0, 4, 16, 192, 168, 0, 0, 0]);
         assert_eq!(decode(&b, &TWO), Ok(Message::Update(u)));
     }
@@ -2254,12 +2249,12 @@ mod tests {
     #[test]
     fn notification_and_route_refresh_examples() {
         let n = Notification { code: code::CEASE, subcode: 2, data: b"bye".to_vec() };
-        let b = Message::Notification(n.clone()).to_frame(&TWO).and_then(|frame| frame.to_bytes()).unwrap();
+        let b = encode(&Message::Notification(n.clone()), &TWO).unwrap();
         assert_eq!(b[16..], [0, 24, 3, 6, 2, b'b', b'y', b'e']);
         assert_eq!(decode(&b, &TWO), Ok(Message::Notification(n.clone())));
         assert_eq!(n.to_string(), "cease (code 6, subcode 2)");
         let r = RouteRefresh { afi: afi::IPV6, subtype: 0, safi: safi::UNICAST };
-        let b = Message::RouteRefresh(r).to_frame(&TWO).and_then(|frame| frame.to_bytes()).unwrap();
+        let b = encode(&Message::RouteRefresh(r), &TWO).unwrap();
         assert_eq!(b[16..], [0, 23, 5, 0, 2, 0, 1]);
         assert_eq!(decode(&b, &TWO), Ok(Message::RouteRefresh(r)));
     }
@@ -2465,7 +2460,7 @@ mod tests {
                 nlri: vec![v4(10, 0, 0, 0, 8)],
                 ..Update::default()
             };
-            assert!(matches!(Message::Update(u).to_frame(&TWO).and_then(|frame| frame.to_bytes()), Err(EncodeError::Unwritable)));
+            assert!(matches!(encode(&Message::Update(u), &TWO), Err(EncodeError::Unwritable)));
         }
         for good in [[1, 0, 0, 0], [10, 0, 0, 1], [126, 255, 255, 255], [128, 0, 0, 1], [223, 255, 255, 254]] {
             assert!(update_body(&body(good), &TWO).is_ok(), "{good:?}");
@@ -2482,7 +2477,7 @@ mod tests {
         b.extend(vec![0u8; 0xfffb]);
         let e = Update::parse(&b, &FOUR).unwrap_err();
         assert_eq!(e, Error::BadMessageLength(u16::MAX));
-        assert!(Message::Notification(e.notification()).to_frame(&FOUR).and_then(|frame| frame.to_bytes()).is_ok());
+        assert!(encode(&Message::Notification(e.notification()), &FOUR).is_ok());
         // 4200 withdrawn /0 routes, one byte each: well formed, but too
         // many for one message.
         let mut withdrawn = vec![0x10, 0x68];
@@ -2499,7 +2494,7 @@ mod tests {
         assert_eq!(longest.len(), MAX_BODY_LEN);
         let u = Update::parse(&longest, &TWO).unwrap();
         assert_eq!(u.withdrawn.len(), MAX_BODY_LEN - 4);
-        assert!(Message::Update(u).to_frame(&TWO).and_then(|frame| frame.to_bytes()).is_ok());
+        assert!(encode(&Message::Update(u), &TWO).is_ok());
     }
 
     #[test]
@@ -2565,9 +2560,35 @@ mod tests {
             let n = e.notification();
             assert_eq!((n.code, n.subcode), (c, s), "{e}");
             // Every notification can be sent.
-            let b = Message::Notification(n.clone()).to_frame(&TWO).and_then(|frame| frame.to_bytes()).unwrap();
+            let b = encode(&Message::Notification(n.clone()), &TWO).unwrap();
             assert_eq!(decode(&b, &TWO), Ok(Message::Notification(n)));
             assert!(!e.to_string().is_empty());
+        }
+    }
+
+    #[test]
+    fn notifications_preserve_caller_supplied_data() {
+        for len in [MAX_BODY_LEN - 2, MAX_BODY_LEN - 1] {
+            let data = vec![7; len];
+            for error in [
+                Error::UnrecognizedWellKnownAttribute(data.clone()),
+                Error::AttributeFlags(data.clone()),
+                Error::AttributeLength(data.clone()),
+                Error::InvalidOrigin(data.clone()),
+                Error::InvalidNextHop(data.clone()),
+                Error::OptionalAttribute(data.clone()),
+                Error::RouteRefreshLength(data.clone()),
+            ] {
+                let notification = error.notification();
+                assert_eq!(notification.data, data);
+                let message = Message::Notification(notification);
+                if len == MAX_BODY_LEN - 2 {
+                    let bytes = encode(&message, &TWO).unwrap();
+                    assert_eq!(decode(&bytes, &TWO), Ok(message));
+                } else {
+                    assert_eq!(message.to_frame(&TWO), Err(EncodeError::Unwritable));
+                }
+            }
         }
     }
 
@@ -2575,7 +2596,7 @@ mod tests {
     fn writers_refuse_what_readers_refuse() {
         let id = Ipv4Addr::new(10, 0, 0, 1);
         let open = |p: Vec<Parameter>| Message::Open(Open { my_as: 1, hold_time: 90, bgp_id: id, parameters: p });
-        let bad = |m: Message, ctx: &Context| m.to_frame(ctx).and_then(|frame| frame.to_bytes()).unwrap_err();
+        let bad = |m: Message, ctx: &Context| encode(&m, ctx).unwrap_err();
         let invalid = |m: Message, ctx: &Context| matches!(bad(m, ctx), EncodeError::Unwritable);
         assert!(invalid(Message::Open(Open { hold_time: 2, ..Open::new(1, 0, id, vec![]) }), &TWO));
         assert!(invalid(Message::Open(Open::new(1, 0, Ipv4Addr::UNSPECIFIED, vec![])), &TWO));
@@ -2591,7 +2612,7 @@ mod tests {
         assert!(invalid(caps(vec![Capability::Other { code: 65, value: vec![0; 4] }]), &TWO));
         assert!(invalid(caps(vec![Capability::Other { code: 9, value: vec![0; 256] }]), &TWO));
         // More than 255 bytes of capabilities take the extended format.
-        assert!(caps(vec![Capability::RouteRefresh; 128]).to_frame(&TWO).and_then(|frame| frame.to_bytes()).is_ok());
+        assert!(encode(&caps(vec![Capability::RouteRefresh; 128]), &TWO).is_ok());
         let gr = |flags, time, n| {
             caps(vec![Capability::GracefulRestart(GracefulRestart {
                 flags,
@@ -2602,7 +2623,7 @@ mod tests {
         assert!(invalid(gr(16, 0, 0), &TWO));
         assert!(invalid(gr(0, 4096, 0), &TWO));
         assert!(invalid(gr(0, 0, 64), &TWO));
-        assert!(gr(15, 4095, 60).to_frame(&TWO).and_then(|frame| frame.to_bytes()).is_ok());
+        assert!(encode(&gr(15, 4095, 60), &TWO).is_ok());
 
         let path = |asns: Vec<u32>| Attribute::AsPath(vec![Segment { kind: SegmentKind::Sequence, asns }]);
         let route = |attributes: Vec<Attribute>| {
@@ -2610,7 +2631,7 @@ mod tests {
         };
         let well_known =
             || vec![Attribute::Origin(Origin::Igp), path(vec![1]), Attribute::NextHop(Ipv4Addr::new(1, 2, 3, 4))];
-        assert!(route(well_known()).to_frame(&TWO).and_then(|frame| frame.to_bytes()).is_ok());
+        assert!(encode(&route(well_known()), &TWO).is_ok());
         // Missing attributes, and one twice.
         assert!(invalid(route(well_known()[..2].to_vec()), &TWO));
         let mut twice = well_known();
@@ -2626,11 +2647,11 @@ mod tests {
         assert!(invalid(with(path(vec![])), &TWO));
         assert!(invalid(with(path(vec![1; 256])), &TWO));
         assert!(invalid(with(path(vec![70000])), &TWO));
-        assert!(with(path(vec![70000])).to_frame(&FOUR).and_then(|frame| frame.to_bytes()).is_ok());
+        assert!(encode(&with(path(vec![70000])), &FOUR).is_ok());
         let mut agg = well_known();
         agg.push(Attribute::Aggregator { asn: 70000, address: id, partial: false });
         assert!(invalid(route(agg.clone()), &TWO));
-        assert!(route(agg).to_frame(&FOUR).and_then(|frame| frame.to_bytes()).is_ok());
+        assert!(encode(&route(agg), &FOUR).is_ok());
         // Unknown attributes that would read as something else.
         let mut u = well_known();
         u.push(Attribute::Unknown { flags: 0xc0, kind: 8, value: vec![] });
@@ -2662,7 +2683,7 @@ mod tests {
         assert!(invalid(reach(vec![0; 16], 2, Nlri::Raw(vec![])), &TWO));
         assert!(invalid(reach(vec![0; 16], 9, Nlri::Prefixes(vec![])), &TWO));
         assert!(invalid(reach(vec![0; 4], 2, Nlri::Prefixes(vec![v4(1, 0, 0, 0, 8)])), &TWO));
-        assert!(reach(vec![0; 4], 9, Nlri::Raw(vec![1, 2, 3])).to_frame(&TWO).and_then(|frame| frame.to_bytes()).is_ok());
+        assert!(encode(&reach(vec![0; 4], 9, Nlri::Raw(vec![1, 2, 3])), &TWO).is_ok());
         // Too much for one message.
         let mut many = well_known();
         many.push(Attribute::Communities { values: vec![1; 1100], partial: false });
@@ -2677,7 +2698,7 @@ mod tests {
         let note = Notification { code: 6, subcode: 0, data: vec![0; MAX_BODY_LEN - 1] };
         assert_eq!(bad(Message::Notification(note), &TWO), EncodeError::Unwritable);
         let note = Notification { code: 6, subcode: 0, data: vec![0; MAX_BODY_LEN - 2] };
-        let b = Message::Notification(note).to_frame(&TWO).and_then(|frame| frame.to_bytes()).unwrap();
+        let b = encode(&Message::Notification(note), &TWO).unwrap();
         assert_eq!(b.len(), MAX_MESSAGE_LEN);
         assert!(decode(&b, &TWO).is_ok());
         assert!(!EncodeError::Unwritable.to_string().is_empty());
@@ -2688,7 +2709,7 @@ mod tests {
         for (b, ctx) in samples() {
             let m = decode(&b, &ctx).unwrap();
             if let Message::Open(open) = &m { contract::check_wire_value(open); }
-            assert_eq!(m.to_frame(&ctx).and_then(|frame| frame.to_bytes()).unwrap(), b, "{m:?}");
+            assert_eq!(encode(&m, &ctx).unwrap(), b, "{m:?}");
         }
     }
 
@@ -2768,22 +2789,22 @@ mod tests {
                     }
                     Err(e) => {
                         assert!(strict.is_err());
-                        assert!(Message::Notification(e.notification()).to_frame(&ctx).and_then(|frame| frame.to_bytes()).is_ok());
+                        assert!(encode(&Message::Notification(e.notification()), &ctx).is_ok());
                     }
                 }
             }
             if let Ok(m) = Message::decode(frame, &ctx) {
                 if mixes(&m) {
-                    assert!(matches!(m.to_frame(&ctx).and_then(|frame| frame.to_bytes()), Err(EncodeError::Unwritable)));
+                    assert!(matches!(encode(&m, &ctx), Err(EncodeError::Unwritable)));
                     continue;
                 }
-                let bytes = m.to_frame(&ctx).and_then(|frame| frame.to_bytes()).unwrap_or_else(|e| panic!("{m:?} cannot be written: {e}"));
+                let bytes = encode(&m, &ctx).unwrap_or_else(|e| panic!("{m:?} cannot be written: {e}"));
                 assert!(bytes.len() <= MAX_MESSAGE_LEN);
                 let back = Frame::parse(&bytes).unwrap();
                 assert_eq!(Message::decode(&back, &ctx), Ok(m));
             } else if let Err(e) = Message::decode(frame, &ctx) {
                 let n = e.notification();
-                assert!(Message::Notification(n).to_frame(&ctx).and_then(|frame| frame.to_bytes()).is_ok());
+                assert!(encode(&Message::Notification(n), &ctx).is_ok());
             }
         }
     }
@@ -2906,7 +2927,7 @@ mod tests {
             attributes: vec![Attribute::Unknown { flags: 0xa0, kind: 99, value: vec![] }],
             ..Update::default()
         };
-        assert!(matches!(Message::Update(bad).to_frame(&TWO).and_then(|frame| frame.to_bytes()), Err(EncodeError::Unwritable)));
+        assert!(matches!(encode(&Message::Update(bad), &TWO), Err(EncodeError::Unwritable)));
     }
 
     #[test]
@@ -2919,7 +2940,7 @@ mod tests {
         assert_eq!(u.withdrawn, [v4(10, 128, 0, 0, 9)]);
         // A prefix with bits set past its length is not written.
         let u = Update { withdrawn: vec![v4(192, 0, 2, 9, 24)], ..Update::default() };
-        assert!(matches!(Message::Update(u).to_frame(&TWO).and_then(|frame| frame.to_bytes()), Err(EncodeError::Unwritable)));
+        assert!(matches!(encode(&Message::Update(u), &TWO), Err(EncodeError::Unwritable)));
     }
 
     #[test]
@@ -2957,7 +2978,7 @@ mod tests {
             ],
             ..Update::default()
         };
-        assert!(matches!(Message::Update(u).to_frame(&TWO).and_then(|frame| frame.to_bytes()), Err(EncodeError::Unwritable)));
+        assert!(matches!(encode(&Message::Update(u), &TWO), Err(EncodeError::Unwritable)));
     }
 
     #[test]
@@ -2973,7 +2994,7 @@ mod tests {
         let n = Error::BadPeerAs.notification();
         assert_eq!((n.code, n.subcode), (2, 2));
         let id = Ipv4Addr::new(10, 0, 0, 1);
-        assert!(matches!(Message::Open(Open::new(0, 90, id, vec![])).to_frame(&TWO).and_then(|frame| frame.to_bytes()), Err(EncodeError::Unwritable)));
+        assert!(matches!(encode(&Message::Open(Open::new(0, 90, id, vec![])), &TWO), Err(EncodeError::Unwritable)));
         // An AS_PATH or AGGREGATOR with AS 0 is malformed.
         assert_eq!(update_body(&[0, 0, 0, 7, 0x40, 2, 4, 2, 1, 0, 0], &TWO), Err(Error::MalformedAsPath));
         let raw = vec![0xc0, 7, 6, 0, 0, 10, 0, 0, 1];
@@ -3012,21 +3033,21 @@ mod tests {
             attributes: vec![Attribute::Origin(Origin::Igp), path.clone(), reach.clone()],
             ..Update::default()
         };
-        assert!(matches!(Message::Update(late).to_frame(&TWO).and_then(|frame| frame.to_bytes()), Err(EncodeError::Unwritable)));
+        assert!(matches!(encode(&Message::Update(late), &TWO), Err(EncodeError::Unwritable)));
         // Withdrawn routes with MP_REACH_NLRI are not written.
         let mixed = Update {
             withdrawn: vec![v4(10, 0, 0, 0, 8)],
             attributes: vec![reach.clone(), Attribute::Origin(Origin::Igp), path.clone()],
             ..Update::default()
         };
-        assert!(matches!(Message::Update(mixed).to_frame(&TWO).and_then(|frame| frame.to_bytes()), Err(EncodeError::Unwritable)));
+        assert!(matches!(encode(&Message::Update(mixed), &TWO), Err(EncodeError::Unwritable)));
         // A reader still takes the old layout, and puts MP_REACH_NLRI first.
         let mut body = vec![0, 0, 0, 31, 0x40, 1, 1, 0, 0x40, 2, 0, 0x80, 14, 21, 0, 2, 1, 16];
         body.extend_from_slice(&[0x20; 16]);
         body.push(0);
         let Message::Update(u) = update_body(&body, &TWO).unwrap() else { panic!() };
         assert_eq!(u.attributes[0].kind(), attr::MP_REACH_NLRI);
-        assert!(Message::Update(u).to_frame(&TWO).and_then(|frame| frame.to_bytes()).is_ok());
+        assert!(encode(&Message::Update(u), &TWO).is_ok());
     }
 
     #[test]
@@ -3186,7 +3207,7 @@ mod tests {
         let route = |a: Attribute, ctx: &Context| {
             let mut u = Update::parse(&route_with(&[]), &TWO).unwrap();
             u.attributes.push(a);
-            Message::Update(u).to_frame(ctx).and_then(|frame| frame.to_bytes())
+            encode(&Message::Update(u), ctx)
         };
         let unknown = |flags, kind, value: &[u8]| Attribute::Unknown { flags, kind, value: value.to_vec() };
         assert!(route(unknown(0xc0, 17, &path[3..]), &TWO).is_ok());
@@ -3216,7 +3237,7 @@ mod tests {
         // The longest such message still fits in a NOTIFICATION.
         let long = Frame { kind: kind::ROUTE_REFRESH, body: [&[0, 2, 2, 1][..], &[0; MAX_BODY_LEN - 4]].concat() };
         let e = Message::decode(&long, &ctx).unwrap_err();
-        assert!(Message::Notification(e.notification()).to_frame(&ctx).and_then(|frame| frame.to_bytes()).is_ok());
+        assert!(encode(&Message::Notification(e.notification()), &ctx).is_ok());
         // The capability is negotiated when both sides send it.
         let id = Ipv4Addr::new(10, 0, 0, 1);
         let err =

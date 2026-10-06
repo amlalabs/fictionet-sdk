@@ -69,9 +69,7 @@
 
 extern crate alloc;
 
-extern crate self as fictionet;
-
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use super::codec::{Decode, Step, Wire};
 use alloc::{collections::BTreeMap, vec::Vec};
 
 /// The TCP port FastCGI applications such as PHP-FPM listen on by
@@ -241,7 +239,7 @@ impl Record {
     /// The UNKNOWN_TYPE management record that answers a management record
     /// of type `unknown`.
     pub fn unknown_type(unknown: u8) -> Record {
-        Record::new(kind::UNKNOWN_TYPE, NULL_REQUEST_ID, &[unknown, 0, 0, 0, 0, 0, 0, 0])
+        Record::new(kind::UNKNOWN_TYPE, NULL_REQUEST_ID, &UnknownType(unknown).to_bytes().unwrap_or_else(|never| match never {}))
     }
 
     /// A GET_VALUES record asking for every name. Refuses excess pair
@@ -1469,7 +1467,7 @@ fn be16(b: &[u8], i: usize) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Stream, Fail, contract, pump, finish, test_support::{Lcg, mutate, decode_all}};
+    use crate::stdlib::codec::{Stream, Fail, contract, pump, finish, test_support::{Lcg, mutate, decode_all}};
 
     fn pair(n: &str, v: &str) -> (Vec<u8>, Vec<u8>) {
         (n.as_bytes().to_vec(), v.as_bytes().to_vec())

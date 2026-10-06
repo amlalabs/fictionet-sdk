@@ -33,12 +33,11 @@ fuzz_target!(|data: &[u8]| {
                 }
             }
         }
-        let mut reader = Reader::new(payload);
-        let _ = reader.tagged_fields();
-        let _ = reader.varlong();
-        let _ = reader.compact_nullable_string();
-        let _ = reader.compact_array_len();
-        let _ = reader.nullable_bytes();
+        contract::check_wire::<TaggedFields>(payload);
+        contract::check_wire::<Varlong>(payload);
+        contract::check_wire::<CompactNullableString>(payload);
+        contract::check_wire::<CompactArrayLength>(payload);
+        contract::check_wire::<NullableBytes>(payload);
     }
     macro_rules! fields {
         ($($ty:ty),*) => { $(contract::check_wire::<$ty>(data);)* };

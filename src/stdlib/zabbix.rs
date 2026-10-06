@@ -55,9 +55,7 @@
 
 extern crate alloc;
 
-extern crate self as fictionet;
-
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use super::codec::{Decode, Step, Wire};
 use alloc::{format, string::{String, ToString}, vec::Vec};
 
 /// The TCP port a Zabbix agent listens on for the server's questions.
@@ -943,7 +941,7 @@ impl Scanner<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Fail, Stream, contract, pump, finish, test_support::{Lcg, mutate, decode_all}};
+    use crate::stdlib::codec::{Fail, Stream, contract, pump, finish, test_support::{Lcg, mutate, decode_all}};
 
     fn packet_bytes(flags: u8, data: &[u8], reserved: u32) -> Vec<u8> {
         let mut v = b"ZBXD".to_vec();

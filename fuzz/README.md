@@ -36,11 +36,11 @@ cargo +nightly fuzz list
 | `amqp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::amqp`: AMQP 0-9-1 |
 | `asn1` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::asn1`: ASN.1 BER and DER |
 | `bacnet` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::bacnet`: BACnet/IP |
-| `bgp` | exact frames, session context, UPDATE handling, and bounded codec contracts | `stdlib::bgp`: BGP-4 |
+| `bgp` | arbitrary bytes and constructed values | `stdlib::bgp`: exact frames, session context, UPDATE handling, and bounded codec contracts |
 | `cotp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::cotp`: TPKT and COTP |
 | `dhcpv6` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::dhcpv6`: DHCPv6 |
 | `enip` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::enip`: EtherNet/IP and CIP |
-| `fastcgi` | exact wire values, request and response state, and bounded codec contracts | `stdlib::fastcgi`: FastCGI |
+| `fastcgi` | arbitrary bytes and constructed values | `stdlib::fastcgi`: exact wire values, request and response state, and bounded codec contracts |
 | `ftp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::ftp`: FTP |
 | `geneve` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::geneve`: Geneve |
 | `git_protocol` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::git_protocol`: The Git wire protocol |
@@ -48,7 +48,7 @@ cargo +nightly fuzz list
 | `imap` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::imap`: IMAP |
 | `imf` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::imf`: Internet Message Format headers |
 | `json` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::json`: JSON |
-| `kafka` | exact wire values, versioned messages, and bounded codec contracts | `stdlib::kafka`: Apache Kafka |
+| `kafka` | arbitrary bytes and constructed values | `stdlib::kafka`: exact wire values, versioned messages, and bounded codec contracts |
 | `kerberos` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::kerberos`: Kerberos V5 |
 | `ldap` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::ldap`: LDAP |
 | `memcache` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::memcache`: memcached |
@@ -82,13 +82,13 @@ cargo +nightly fuzz list
 | `syslog` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::syslog`: Syslog |
 | `telnet` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::telnet`: Telnet |
 | `tftp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::tftp`: TFTP |
-| `thrift` | framed and unframed messages, typed values, and bounded codec contracts | `stdlib::thrift`: Apache Thrift |
+| `thrift` | arbitrary bytes and constructed values | `stdlib::thrift`: framed and unframed messages, typed values, and bounded codec contracts |
 | `urlencoded_form` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::urlencoded_form`: application/x-www-form-urlencoded |
 | `vxlan` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::vxlan`: VXLAN and VXLAN-GPE |
 | `websocket` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::websocket`: WebSocket (RFC 6455) |
 | `x509` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::x509`: X.509 certificates and CRLs |
 | `xml` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::xml`: XML 1.0 |
-| `zabbix` | exact headers, packets, JSON messages, and bounded codec contracts | `stdlib::zabbix`: Zabbix |
+| `zabbix` | arbitrary bytes and constructed values | `stdlib::zabbix`: exact headers, packets, JSON messages, and bounded codec contracts |
 
 The proxy targets compile the `fictionet` binary's proxy modules from
 their source files (`src/proxy.rs` here), because a binary's modules

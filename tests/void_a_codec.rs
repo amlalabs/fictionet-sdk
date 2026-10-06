@@ -2,7 +2,7 @@
 
 use core::fmt::Debug;
 use fictionet::stdlib::codec::{
-    Decode, Fail, Stream, Wire, contract, finish, pump, test_support::decode_all,
+    Decode, Fail, Stream, Wire, contract, finish, pump, test_support::{chunks, decode_all},
 };
 use fictionet::stdlib::{bgp, fastcgi, kafka, thrift, zabbix};
 
@@ -17,6 +17,14 @@ where
     let (items, error) = decode_all(&make, bytes);
     assert_eq!(error, None);
     assert_eq!(items, expected);
+    let mut stream = Stream::new(make());
+    let mut items = Vec::new();
+    for chunk in chunks(bytes, &[1, 7, 2, 31]) {
+        assert_eq!(pump(&mut stream, chunk, |item| items.push(item)).unwrap(), chunk.len());
+    }
+    finish(&mut stream, |item| items.push(item)).unwrap();
+    assert_eq!(items, expected);
+    assert_eq!(stream.offset(), bytes.len() as u64);
 }
 
 fn round_trip<D>(make: impl Fn() -> D, values: &[D::Item]) -> Vec<u8>

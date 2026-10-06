@@ -1,22 +1,11 @@
 //! Thrift frames, messages, and values in the binary and compact protocols.
 #![no_main]
 
-use fictionet::stdlib::codec::{Decode, Stream, Wire, contract, test_support::decode_all};
+use fictionet::stdlib::codec::{Decode, Fail, Stream, Wire, contract, test_support::decode_all};
 use fictionet::stdlib::thrift::{
-    EncodedMessage, Frame, Frames, MAX_FRAME, Messages, Protocol, Type, Value, ValueBody,
+    EncodedMessage, Error, Frame, Frames, MAX_FRAME, MAX_MESSAGE, Messages, ValueBody,
 };
 use libfuzzer_sys::fuzz_target;
-
-fn check_value<const COMPACT: bool, const TYPE: u8>(data: &[u8]) {
-    contract::check_wire::<ValueBody<COMPACT, TYPE>>(data);
-    let protocol = if COMPACT { Protocol::Compact } else { Protocol::Binary };
-    if let Some(ty) = Type::from_binary_code(TYPE)
-        && let Ok((value, used)) = Value::parse(protocol, ty, data)
-    {
-        assert!(used <= data.len());
-        contract::check_wire_value(&ValueBody::<COMPACT, TYPE>(value));
-    }
-}
 
 fuzz_target!(|data: &[u8]| {
     contract::check_decode_with_alloc_limit(Messages::new, data, 2 * Messages::new().capacity());
@@ -41,18 +30,33 @@ fuzz_target!(|data: &[u8]| {
             stream.end();
         }
         while let Some(item) = stream.next() {
-            let Ok((message, protocol)) = item else { break };
+            let Ok(value) = item else { break };
             let end = usize::try_from(stream.offset()).unwrap();
-            let value = EncodedMessage { message, protocol };
             assert_eq!(EncodedMessage::parse(&data[start..end]), Ok(value.clone()));
             contract::check_wire_value(&value);
             start = end;
         }
     }
+    let rest = &data[start..];
+    match stream.failed() {
+        Some(Fail::Protocol(error)) => {
+            let expected = EncodedMessage::parse(rest).unwrap_err();
+            // An exact read checks the total length before the header. The
+            // stream can report a malformed prefix before reaching that limit.
+            if rest.len() <= MAX_MESSAGE && !matches!(expected, Error::Truncated | Error::Trailing) {
+                assert_eq!(*error, expected);
+            }
+        }
+        Some(Fail::Truncated { .. }) => {
+            assert_eq!(EncodedMessage::parse(rest), Err(Error::Truncated));
+        }
+        Some(Fail::Stuck { .. }) => panic!("message decoder made no progress"),
+        None => assert!(rest.is_empty()),
+    }
     macro_rules! values {
         ($($code:literal),*) => { $(
-            check_value::<false, $code>(data);
-            check_value::<true, $code>(data);
+            contract::check_wire::<ValueBody<false, $code>>(data);
+            contract::check_wire::<ValueBody<true, $code>>(data);
         )* };
     }
     values!(2, 3, 4, 6, 8, 10, 11, 12, 13, 14, 15, 16);

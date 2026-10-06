@@ -69,9 +69,7 @@
 
 extern crate alloc;
 
-extern crate self as fictionet;
-
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use super::codec::{Decode, Step, Wire};
 use alloc::{borrow::ToOwned, string::String, vec::Vec};
 
 /// The TCP port Kafka brokers listen on.
@@ -223,7 +221,8 @@ pub enum Error {
     /// A frame's size was negative or over the limit. The stream cannot be
     /// read any further, and a broker closes the connection.
     FrameSize(i32),
-    /// An input payload is longer than [`MAX_FRAME`].
+    /// An input exceeds its size limit: [`MAX_FRAME`] for a payload or
+    /// header, or `MAX_FRAME + 5` for a standalone field.
     TooLarge(usize),
     /// A varint ran past its last allowed byte.
     Varint,
@@ -262,7 +261,7 @@ impl core::fmt::Display for Error {
         match self {
             Error::Truncated => f.write_str("bytes end in the middle of a field"),
             Error::FrameSize(n) => write!(f, "frame size {n} is negative or over the limit"),
-            Error::TooLarge(n) => write!(f, "frame payload of {n} bytes is over {MAX_FRAME}"),
+            Error::TooLarge(n) => write!(f, "input of {n} bytes is over its size limit"),
             Error::Varint => f.write_str("varint is too long"),
             Error::Length(n) => write!(f, "length {n} is out of range"),
             Error::Utf8 => f.write_str("string is not UTF-8"),
@@ -296,29 +295,24 @@ pub struct TaggedField {
 /// read checks that its bytes are there and returns [`Error::Truncated`]
 /// if they are not.
 #[derive(Clone, Debug)]
-pub struct Reader<'a> {
+struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,
 }
 
 impl<'a> Reader<'a> {
     /// A reader at the start of `buf`.
-    pub fn new(buf: &'a [u8]) -> Reader<'a> {
+    fn new(buf: &'a [u8]) -> Reader<'a> {
         Reader { buf, pos: 0 }
     }
 
     /// How many bytes are left.
-    pub fn remaining(&self) -> usize {
+    fn remaining(&self) -> usize {
         self.buf.len() - self.pos
     }
 
-    /// How many bytes have been read.
-    pub fn position(&self) -> usize {
-        self.pos
-    }
-
     /// The next `n` bytes.
-    pub fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
         if n > self.remaining() {
             return Err(Error::Truncated);
         }
@@ -328,14 +322,14 @@ impl<'a> Reader<'a> {
     }
 
     /// Every byte left.
-    pub fn rest(&mut self) -> &'a [u8] {
+    fn rest(&mut self) -> &'a [u8] {
         let s = &self.buf[self.pos..];
         self.pos = self.buf.len();
         s
     }
 
     /// Succeeds if every byte has been read.
-    pub fn finish(&self) -> Result<(), Error> {
+    fn finish(&self) -> Result<(), Error> {
         match self.remaining() {
             0 => Ok(()),
             n => Err(Error::Trailing(n)),
@@ -350,59 +344,59 @@ impl<'a> Reader<'a> {
     }
 
     /// A BOOLEAN: one byte, and any byte but 0 is true.
-    pub fn bool(&mut self) -> Result<bool, Error> {
+    fn bool(&mut self) -> Result<bool, Error> {
         Ok(self.u8()? != 0)
     }
 
     /// One unsigned byte.
-    pub fn u8(&mut self) -> Result<u8, Error> {
+    fn u8(&mut self) -> Result<u8, Error> {
         Ok(self.fixed::<1>()?[0])
     }
 
     /// An INT8.
-    pub fn i8(&mut self) -> Result<i8, Error> {
+    fn i8(&mut self) -> Result<i8, Error> {
         Ok(i8::from_be_bytes(self.fixed()?))
     }
 
     /// An INT16, big-endian.
-    pub fn i16(&mut self) -> Result<i16, Error> {
+    fn i16(&mut self) -> Result<i16, Error> {
         Ok(i16::from_be_bytes(self.fixed()?))
     }
 
     /// A UINT16, big-endian.
-    pub fn u16(&mut self) -> Result<u16, Error> {
+    fn u16(&mut self) -> Result<u16, Error> {
         Ok(u16::from_be_bytes(self.fixed()?))
     }
 
     /// An INT32, big-endian.
-    pub fn i32(&mut self) -> Result<i32, Error> {
+    fn i32(&mut self) -> Result<i32, Error> {
         Ok(i32::from_be_bytes(self.fixed()?))
     }
 
     /// A UINT32, big-endian.
-    pub fn u32(&mut self) -> Result<u32, Error> {
+    fn u32(&mut self) -> Result<u32, Error> {
         Ok(u32::from_be_bytes(self.fixed()?))
     }
 
     /// An INT64, big-endian.
-    pub fn i64(&mut self) -> Result<i64, Error> {
+    fn i64(&mut self) -> Result<i64, Error> {
         Ok(i64::from_be_bytes(self.fixed()?))
     }
 
     /// A FLOAT64: an IEEE 754 double, big-endian.
-    pub fn f64(&mut self) -> Result<f64, Error> {
+    fn f64(&mut self) -> Result<f64, Error> {
         Ok(f64::from_be_bytes(self.fixed()?))
     }
 
     /// A UUID: 16 bytes.
-    pub fn uuid(&mut self) -> Result<[u8; 16], Error> {
+    fn uuid(&mut self) -> Result<[u8; 16], Error> {
         self.fixed()
     }
 
     /// An UNSIGNED_VARINT: 7 bits per byte, low bits first, with the top
     /// bit set on every byte but the last. It takes at most 5 bytes, and
     /// the fifth may hold only the top 4 bits of a u32.
-    pub fn uvarint(&mut self) -> Result<u32, Error> {
+    fn uvarint(&mut self) -> Result<u32, Error> {
         let mut value = 0u32;
         for i in 0..5 {
             let b = self.u8()?;
@@ -419,14 +413,14 @@ impl<'a> Reader<'a> {
 
     /// A VARINT: a zigzag-encoded i32 in an unsigned varint, so small
     /// negative numbers stay short.
-    pub fn varint(&mut self) -> Result<i32, Error> {
+    fn varint(&mut self) -> Result<i32, Error> {
         let v = self.uvarint()?;
         Ok((v >> 1) as i32 ^ -((v & 1) as i32))
     }
 
     /// A VARLONG: a zigzag-encoded i64 in at most 10 bytes, the tenth
     /// holding only the top bit.
-    pub fn varlong(&mut self) -> Result<i64, Error> {
+    fn varlong(&mut self) -> Result<i64, Error> {
         let mut value = 0u64;
         for i in 0..10 {
             let b = self.u8()?;
@@ -447,12 +441,12 @@ impl<'a> Reader<'a> {
     }
 
     /// A STRING: an INT16 length, then that many bytes of UTF-8.
-    pub fn string(&mut self) -> Result<String, Error> {
+    fn string(&mut self) -> Result<String, Error> {
         self.nullable_string()?.ok_or(Error::Null)
     }
 
     /// A NULLABLE_STRING: a STRING, or length -1 for null.
-    pub fn nullable_string(&mut self) -> Result<Option<String>, Error> {
+    fn nullable_string(&mut self) -> Result<Option<String>, Error> {
         match self.i16()? {
             -1 => Ok(None),
             n if n < 0 => Err(Error::Length(n.into())),
@@ -462,12 +456,12 @@ impl<'a> Reader<'a> {
 
     /// A COMPACT_STRING: an unsigned varint holding the length plus 1,
     /// then that many bytes of UTF-8.
-    pub fn compact_string(&mut self) -> Result<String, Error> {
+    fn compact_string(&mut self) -> Result<String, Error> {
         self.compact_nullable_string()?.ok_or(Error::Null)
     }
 
     /// A COMPACT_NULLABLE_STRING: a COMPACT_STRING, or 0 for null.
-    pub fn compact_nullable_string(&mut self) -> Result<Option<String>, Error> {
+    fn compact_nullable_string(&mut self) -> Result<Option<String>, Error> {
         match self.uvarint()? {
             0 => Ok(None),
             n => {
@@ -482,12 +476,12 @@ impl<'a> Reader<'a> {
 
     /// BYTES: an INT32 length, then that many bytes. A length over
     /// [`MAX_FRAME`] is an error.
-    pub fn bytes(&mut self) -> Result<&'a [u8], Error> {
+    fn bytes(&mut self) -> Result<&'a [u8], Error> {
         self.nullable_bytes()?.ok_or(Error::Null)
     }
 
     /// NULLABLE_BYTES: BYTES, or length -1 for null.
-    pub fn nullable_bytes(&mut self) -> Result<Option<&'a [u8]>, Error> {
+    fn nullable_bytes(&mut self) -> Result<Option<&'a [u8]>, Error> {
         match self.i32()? {
             -1 => Ok(None),
             n if n < 0 || n as usize > MAX_FRAME => Err(Error::Length(n.into())),
@@ -497,12 +491,12 @@ impl<'a> Reader<'a> {
 
     /// COMPACT_BYTES: an unsigned varint holding the length plus 1, then
     /// that many bytes. A length over [`MAX_FRAME`] is an error.
-    pub fn compact_bytes(&mut self) -> Result<&'a [u8], Error> {
+    fn compact_bytes(&mut self) -> Result<&'a [u8], Error> {
         self.compact_nullable_bytes()?.ok_or(Error::Null)
     }
 
     /// COMPACT_NULLABLE_BYTES: COMPACT_BYTES, or 0 for null.
-    pub fn compact_nullable_bytes(&mut self) -> Result<Option<&'a [u8]>, Error> {
+    fn compact_nullable_bytes(&mut self) -> Result<Option<&'a [u8]>, Error> {
         match self.uvarint()? {
             0 => Ok(None),
             n => {
@@ -523,7 +517,7 @@ impl<'a> Reader<'a> {
 
     /// An ARRAY's element count: an INT32, or -1 for a null array. The
     /// elements follow, and the caller reads them.
-    pub fn array_len(&mut self) -> Result<Option<usize>, Error> {
+    fn array_len(&mut self) -> Result<Option<usize>, Error> {
         match self.i32()? {
             -1 => Ok(None),
             n if n < 0 => Err(Error::Length(n.into())),
@@ -533,7 +527,7 @@ impl<'a> Reader<'a> {
 
     /// A COMPACT_ARRAY's element count: an unsigned varint holding the
     /// count plus 1, or 0 for a null array.
-    pub fn compact_array_len(&mut self) -> Result<Option<usize>, Error> {
+    fn compact_array_len(&mut self) -> Result<Option<usize>, Error> {
         match self.uvarint()? {
             0 => Ok(None),
             n => self.count((n - 1) as usize).map(Some),
@@ -543,7 +537,7 @@ impl<'a> Reader<'a> {
     /// A tagged-field section: an unsigned varint count, then each field's
     /// tag, size and bytes. Tags must rise and fit in 31 bits, and a size
     /// over [`MAX_FRAME`] is an error.
-    pub fn tagged_fields(&mut self) -> Result<Vec<TaggedField>, Error> {
+    fn tagged_fields(&mut self) -> Result<Vec<TaggedField>, Error> {
         let n = self.uvarint()? as usize;
         if n > MAX_TAGGED_FIELDS || n > self.remaining() {
             return Err(Error::Length(n as i64));
@@ -1233,7 +1227,7 @@ impl RequestHeader {
 
     /// Reads a header from `r`, in the version its API key and version
     /// call for.
-    pub fn read(r: &mut Reader<'_>) -> Result<RequestHeader, Error> {
+    fn read(r: &mut Reader<'_>) -> Result<RequestHeader, Error> {
         let mut peek = r.clone();
         let api_key = peek.i16()?;
         let api_version = peek.i16()?;
@@ -1241,7 +1235,7 @@ impl RequestHeader {
     }
 
     /// Reads a header in header version `version` from `r`.
-    pub fn read_version(r: &mut Reader<'_>, version: u8) -> Result<RequestHeader, Error> {
+    fn read_version(r: &mut Reader<'_>, version: u8) -> Result<RequestHeader, Error> {
         if version > 2 {
             return Err(Error::HeaderVersion(version));
         }
@@ -1284,7 +1278,7 @@ pub struct ResponseHeader {
 
 impl ResponseHeader {
     /// Reads a header in header version `version` from `r`.
-    pub fn read_version(r: &mut Reader<'_>, version: u8) -> Result<ResponseHeader, Error> {
+    fn read_version(r: &mut Reader<'_>, version: u8) -> Result<ResponseHeader, Error> {
         if version > 1 {
             return Err(Error::HeaderVersion(version));
         }
@@ -2182,7 +2176,7 @@ impl Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Stream, Fail, contract, pump, finish, test_support::{Lcg, mutate, decode_all}};
+    use crate::stdlib::codec::{Stream, Fail, contract, pump, finish, test_support::{Lcg, mutate, decode_all}};
 
     enum BodyCase {
         Request(Request),
@@ -2336,7 +2330,7 @@ mod tests {
         // Tagged fields retain their order and contents.
         assert_eq!(r.tagged_fields(), Ok(vec![tag(1, b"yz"), tag(5, b"x")]));
         assert_eq!(r.finish(), Ok(()));
-        assert_eq!(r.position(), b.len());
+        assert_eq!(r.pos, b.len());
     }
 
     #[test]
