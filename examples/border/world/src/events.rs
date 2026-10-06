@@ -1,4 +1,4 @@
-//! `Sites`' events as log lines.
+//! The network's journal entries as log lines.
 //!
 //! Every line names the sandbox it came from. TLS and HTTP lines carry the
 //! connection number, so the eval joins a request to the handshake it rode
@@ -9,7 +9,8 @@
 //!
 //! Requests are logged without anything that could carry the password: the
 //! path without its query (only the query's length), the header names, and
-//! the label the bank's handler put on its response ([`Page`](crate::bank::Page)). A path
+//! the label the bank's handler put on its response
+//! ([`Page`](crate::bank::Page)). A path
 //! segment that holds the password, as sent or percent-encoded, is logged as
 //! `[password]`, and the log's writer takes the password out of any other
 //! field ([`crate::log`]).

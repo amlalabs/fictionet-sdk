@@ -202,7 +202,7 @@ examples/fakewiki/
     Cargo.toml              # depends on fictionet by path; rcgen and the rest stay here
     src/main.rs             # Sites, certificates, startup lookups, state.json, ready file
     src/content.rs          # the handler: asks backend.py for the page, tags the response
-    src/events.rs           # the request log, written from Sites' events
+    src/events.rs           # the request log, written from the network's journal
     src/log.rs              # log.jsonl writer
     backend/backend.py      # FakeWiki's pages over HTTP on 127.0.0.1
     backend/fictionet_world/sites.py   # every host and page, from fixtures/corpus.json
