@@ -5,6 +5,37 @@ use fictionet::stdlib::{
     imap, pop3, smtp,
 };
 
+#[test]
+fn legacy_imap_event_shape() {
+    let mut decoder = imap::Decoder::new();
+    decoder.feed(b"a LOGIN user {4}\r\n");
+    let event = decoder.next_event().unwrap().unwrap();
+    let size = match event {
+        imap::Event::Command(command) => command.args.len(),
+        imap::Event::Continue { tag, size } => {
+            assert_eq!(tag.as_deref(), Some("a"));
+            size
+        }
+    };
+    assert_eq!(size, 4);
+}
+
+#[test]
+fn legacy_pop3_reply_error_shape_and_display() {
+    for error in [
+        pop3::ReplyError::LineTooLong,
+        pop3::ReplyError::BadStatus,
+        pop3::ReplyError::BodyTooLong,
+    ] {
+        let message = match error {
+            pop3::ReplyError::LineTooLong => "reply line too long",
+            pop3::ReplyError::BadStatus => "status is not +OK or -ERR",
+            pop3::ReplyError::BodyTooLong => "reply body too long",
+        };
+        assert_eq!(error.to_string(), message);
+    }
+}
+
 fn read<D: Decode>(
     decoder: D,
     bytes: &[u8],
@@ -164,8 +195,8 @@ fn smtp_modes_are_world_decisions_and_handoff_keeps_unread_bytes() {
     let mut stream = Stream::new(smtp::Server::new());
     assert_eq!(stream.push(b"NO"), 2);
     assert_eq!(stream.next(), None);
-    assert_eq!(stream.decoder().start_data(), Err(smtp::Error::State));
-    assert_eq!(stream.decoder().handoff(), Err(smtp::Error::State));
+    assert_eq!(stream.decoder().start_data(), Err(smtp::DecodeError::State));
+    assert_eq!(stream.decoder().handoff(), Err(smtp::DecodeError::State));
 }
 
 fn pop_replies() -> pop3::Replies {
@@ -273,13 +304,13 @@ fn imap_chunked_literals_commands_and_responses() {
     }
     assert!(matches!(
         expected.first(),
-        Some(Ok(Ok(imap::Event::Continue { size: 5, .. })))
+        Some(Ok(Ok(imap::Input::Continue { size: 5, .. })))
     ));
     assert!(matches!(
         expected.get(3),
         Some(Ok(Err(imap::Error::Syntax { .. })))
     ));
-    let Some(Ok(Ok(imap::Event::Command(command)))) = expected.get(1) else {
+    let Some(Ok(Ok(imap::Input::Command(command)))) = expected.get(1) else {
         panic!()
     };
     assert_eq!(
@@ -294,7 +325,7 @@ fn imap_chunked_literals_commands_and_responses() {
         })
     );
     for command in expected.iter().filter_map(|item| match item {
-        Ok(Ok(imap::Event::Command(command))) => Some(command),
+        Ok(Ok(imap::Input::Command(command))) => Some(command),
         _ => None,
     }) {
         contract::check_wire_value(command);
@@ -302,7 +333,7 @@ fn imap_chunked_literals_commands_and_responses() {
         contract::check_wire::<imap::Command>(&bytes);
         assert_eq!(
             read(imap::Commands::new(), &bytes, &[1]).last(),
-            Some(&Ok(Ok(imap::Event::Command(command.clone()))))
+            Some(&Ok(Ok(imap::Input::Command(command.clone()))))
         );
     }
 
@@ -340,11 +371,11 @@ fn imap_literal_refusal_zero_length_and_limits() {
     assert_eq!(stream.push(bytes), bytes.len());
     assert!(matches!(
         stream.next(),
-        Some(Ok(Ok(imap::Event::Continue { size: 9, .. })))
+        Some(Ok(Ok(imap::Input::Continue { size: 9, .. })))
     ));
     assert!(stream.decoder().refuse_literal());
     assert!(!stream.decoder().refuse_literal());
-    assert!(matches!(stream.next(), Some(Ok(Ok(imap::Event::Command(c)))) if c.tag == "b"));
+    assert!(matches!(stream.next(), Some(Ok(Ok(imap::Input::Command(c)))) if c.tag == "b"));
 
     for bytes in [
         b"a X {0}\r\n\r\n".as_slice(),
@@ -363,9 +394,9 @@ fn imap_literal_refusal_zero_length_and_limits() {
     ));
     assert!(matches!(
         items.get(1),
-        Some(Ok(Ok(imap::Event::Command(_))))
+        Some(Ok(Ok(imap::Input::Command(_))))
     ));
-    for size in [imap::MAX_NON_SYNC_LITERAL + 1, imap::MAX_LITERAL + 1] {
+    for size in [imap::MAX_NON_SYNC + 1, imap::MAX_LITERAL + 1] {
         let bytes = format!("a X {{{size}+}}\r\n");
         contract::check_decode(imap::Commands::new, bytes.as_bytes());
         assert!(matches!(
@@ -409,7 +440,7 @@ fn command_line_errors_recover_and_imap_overflow_ends_streams() {
         imap.first(),
         Some(Ok(Err(imap::Error::Syntax { .. })))
     ));
-    assert!(matches!(imap.last(), Some(Ok(Ok(imap::Event::Command(_))))));
+    assert!(matches!(imap.last(), Some(Ok(Ok(imap::Input::Command(_))))));
 
     let smtp = vec![b'x'; smtp::MAX_LINE];
     contract::check_decode(smtp::Server::new, &smtp);
@@ -475,7 +506,7 @@ fn exact_wire_and_transactional_writers() {
         "a",
         "X",
         vec![imap::Value::Literal {
-            data: vec![b'x'; imap::MAX_NON_SYNC_LITERAL + 1],
+            data: vec![b'x'; imap::MAX_NON_SYNC + 1],
             non_sync: true,
         }],
     ));
@@ -601,7 +632,7 @@ fn pop3_exact_limits_and_assembly_errors() {
     assert_eq!(
         read(expected(), broken, &[1]),
         vec![
-            Ok(Err(pop3::ReplyError::BadBodyLine)),
+            Ok(Err(pop3::ReplyItemError::BadBodyLine)),
             Ok(Ok(pop3::Output::Reply(pop3::Reply::ok("y")))),
         ]
     );
@@ -627,12 +658,9 @@ fn imap_line_text_and_literal_limits() {
     contract::check_wire::<imap::Command>(&bytes);
     assert!(matches!(
         read(imap::Commands::new(), &bytes, &[1]).as_slice(),
-        [Ok(Ok(imap::Event::Command(_)))]
+        [Ok(Ok(imap::Input::Command(_)))]
     ));
-    for (size, non_sync) in [
-        (imap::MAX_LITERAL, false),
-        (imap::MAX_NON_SYNC_LITERAL, true),
-    ] {
+    for (size, non_sync) in [(imap::MAX_LITERAL, false), (imap::MAX_NON_SYNC, true)] {
         let command = imap::Command::new(
             "a",
             "X",
@@ -645,7 +673,7 @@ fn imap_line_text_and_literal_limits() {
         contract::check_wire::<imap::Command>(&bytes);
         assert_eq!(
             read(imap::Commands::new(), &bytes, &[1, 65536]).last(),
-            Some(&Ok(Ok(imap::Event::Command(command))))
+            Some(&Ok(Ok(imap::Input::Command(command))))
         );
     }
     let text = "x".repeat(imap::MAX_TEXT / 2);
@@ -671,7 +699,7 @@ fn imap_line_text_and_literal_limits() {
         items.first(),
         Some(Ok(Err(imap::Error::Syntax { .. })))
     ));
-    assert!(matches!(items.last(), Some(Ok(Ok(imap::Event::Command(c)))) if c.tag == "b"));
+    assert!(matches!(items.last(), Some(Ok(Ok(imap::Input::Command(c)))) if c.tag == "b"));
     let broken = b"* 1 FETCH (BODY[] {2}\r\nx";
     contract::check_decode(imap::Responses::new, broken);
     assert_eq!(
@@ -717,7 +745,7 @@ fn imap_bad_line_end_after_a_counted_literal_keeps_sync() {
     assert!(
         matches!(items.first(), Some(Ok(Err(imap::Error::Syntax { tag: Some(tag), .. }))) if tag == "a")
     );
-    assert!(matches!(items.last(), Some(Ok(Ok(imap::Event::Command(c)))) if c.tag == "b"));
+    assert!(matches!(items.last(), Some(Ok(Ok(imap::Input::Command(c)))) if c.tag == "b"));
     let status = b"* OK text {3}\n* OK next\r\n";
     contract::check_decode(imap::Responses::new, status);
     let items = read(imap::Responses::new(), status, &[1]);
@@ -775,7 +803,7 @@ fn assemblies_stop_at_named_body_limits() {
 }
 
 #[test]
-fn review_smtp_long_command_recovers() {
+fn smtp_long_command_recovers() {
     let bytes = [vec![b'X'; 600], b"\r\nNOOP\r\n".to_vec()].concat();
     for pattern in [&[][..], &[1], &[511, 2, 7]] {
         assert_eq!(
@@ -789,7 +817,7 @@ fn review_smtp_long_command_recovers() {
 }
 
 #[test]
-fn review_pop3_long_command_recovers() {
+fn pop3_long_command_recovers() {
     let bytes = [vec![b'X'; 300], b"\r\nNOOP\r\n".to_vec()].concat();
     for pattern in [&[][..], &[1], &[254, 2, 7]] {
         let items = read(pop3::Commands::new(), &bytes, pattern);
@@ -803,7 +831,7 @@ fn review_pop3_long_command_recovers() {
 }
 
 #[test]
-fn review_pop3_auth_answer() {
+fn pop3_auth_answer() {
     let bytes = [
         b"AUTH GSSAPI\r\n".to_vec(),
         vec![b'Y'; 400],
@@ -831,7 +859,7 @@ fn review_pop3_auth_answer() {
 }
 
 #[test]
-fn review_pop3_auth_challenge() {
+fn pop3_auth_challenge() {
     for size in [600, 1] {
         let challenge = [b"+ ".to_vec(), vec![b'x'; size]].concat();
         let bytes = [challenge.clone(), b"\r\n+OK done\r\n".to_vec()].concat();
@@ -862,7 +890,7 @@ fn review_pop3_auth_challenge() {
 }
 
 #[test]
-fn review_pop3_bad_multiline_status_stops() {
+fn pop3_bad_multiline_status_stops() {
     let expected = || {
         let mut replies = pop3::Replies::new();
         replies.expect(true).unwrap();
@@ -877,7 +905,7 @@ fn review_pop3_bad_multiline_status_stops() {
 }
 
 #[test]
-fn review_smtp_bad_multiline_reply_stops() {
+fn smtp_bad_multiline_reply_stops() {
     let bytes = b"250-a\r\n250-\xff\r\n250 c\r\n354 go\r\n";
     for pattern in [&[][..], &[1], &[4, 3, 1]] {
         let items = read(smtp::Replies::new(), bytes, pattern);
@@ -886,7 +914,7 @@ fn review_smtp_bad_multiline_reply_stops() {
 }
 
 #[test]
-fn review_smtp_data_returns_to_commands() {
+fn smtp_data_returns_to_commands() {
     for message in [b"x\r\n.\r\n".as_slice(), b".\r\n", b"bad\0line\r\n.\r\n"] {
         let mut stream = Stream::new(smtp::Server::new());
         assert_eq!(stream.push(b"DATA\r\n"), 6);
@@ -904,7 +932,7 @@ fn review_smtp_data_returns_to_commands() {
 }
 
 #[test]
-fn review_imap_server_non_sync_literals_keep_following_responses() {
+fn imap_server_non_sync_literals_keep_following_responses() {
     for first in [
         b"* 1 FETCH (BODY[] {3+}\r\n".as_slice(),
         b"* 1 FETCH (BODY[] {5000+}\r\n",
@@ -925,7 +953,7 @@ fn review_imap_server_non_sync_literals_keep_following_responses() {
 }
 
 #[test]
-fn review_imap_idle_done() {
+fn imap_idle_done() {
     for (command, answer) in [
         ("IDLE", "DONE"),
         ("AUTHENTICATE PLAIN", "YQ=="),
@@ -938,16 +966,16 @@ fn review_imap_idle_done() {
                 bytes.as_bytes(),
                 pattern,
                 |decoder, item| {
-                    if matches!(item, Ok(imap::Event::Command(c)) if c.tag == "a") {
+                    if matches!(item, Ok(imap::Input::Command(c)) if c.tag == "a") {
                         decoder.expect_line().unwrap();
                     }
                 },
             );
             assert_eq!(
                 items.get(1),
-                Some(&Ok(Ok(imap::Event::Line(answer.as_bytes().to_vec()))))
+                Some(&Ok(Ok(imap::Input::Line(answer.as_bytes().to_vec()))))
             );
-            assert!(matches!(items.get(2), Some(Ok(Ok(imap::Event::Command(c)))) if c.tag == "b"));
+            assert!(matches!(items.get(2), Some(Ok(Ok(imap::Input::Command(c)))) if c.tag == "b"));
             assert_eq!(items.len(), 3);
         }
     }
@@ -958,14 +986,14 @@ fn smtp_mode_changes_refuse_overlong_lines_until_skipped() {
     let mut stream = Stream::new(smtp::Server::new());
     assert_eq!(stream.push(&[b'X'; 600]), 600);
     assert_eq!(stream.next(), Some(Ok(Err(smtp::Error::LineTooLong))));
-    assert_eq!(stream.decoder().start_data(), Err(smtp::Error::State));
-    assert_eq!(stream.decoder().handoff(), Err(smtp::Error::State));
+    assert_eq!(stream.decoder().start_data(), Err(smtp::DecodeError::State));
+    assert_eq!(stream.decoder().handoff(), Err(smtp::DecodeError::State));
     assert_eq!(stream.next(), None);
-    assert_eq!(stream.decoder().start_data(), Err(smtp::Error::State));
-    assert_eq!(stream.decoder().handoff(), Err(smtp::Error::State));
+    assert_eq!(stream.decoder().start_data(), Err(smtp::DecodeError::State));
+    assert_eq!(stream.decoder().handoff(), Err(smtp::DecodeError::State));
     assert_eq!(stream.push(b"\r"), 1);
     assert_eq!(stream.next(), None);
-    assert_eq!(stream.decoder().handoff(), Err(smtp::Error::State));
+    assert_eq!(stream.decoder().handoff(), Err(smtp::DecodeError::State));
     assert_eq!(stream.push(b"\nNOOP\r\n"), 7);
     assert!(matches!(stream.next(), Some(Ok(Ok(smtp::Input::Command(c)))) if c.verb == "NOOP"));
     stream.decoder().start_data().unwrap();
@@ -1046,14 +1074,14 @@ fn raw_line_modes_require_boundaries() {
     assert_eq!(commands.expect_line(), Err(imap::DecodeError::State));
     assert_eq!(
         commands.decode(b"*\r\n", false),
-        Ok(Step::Item(Ok(imap::Event::Line(b"*".to_vec())), 3))
+        Ok(Step::Item(Ok(imap::Input::Line(b"*".to_vec())), 3))
     );
     for size in [0, 3] {
         let mut commands = imap::Commands::new();
         let bytes = format!("a X {{{size}}}\r\n");
         assert!(matches!(
             commands.decode(bytes.as_bytes(), false),
-            Ok(Step::Item(Ok(imap::Event::Continue { .. }), _))
+            Ok(Step::Item(Ok(imap::Input::Continue { .. }), _))
         ));
         assert_eq!(commands.expect_line(), Err(imap::DecodeError::State));
         assert!(commands.refuse_literal());
@@ -1143,9 +1171,9 @@ fn raw_lines_are_bounded_and_last_for_one_item() {
             let items = read(commands(), &wire, pattern);
             assert_eq!(
                 items.first(),
-                Some(&Ok(Ok(imap::Event::Line(answer.clone()))))
+                Some(&Ok(Ok(imap::Input::Line(answer.clone()))))
             );
-            assert!(matches!(items.get(1), Some(Ok(Ok(imap::Event::Command(c)))) if c.tag == "b"));
+            assert!(matches!(items.get(1), Some(Ok(Ok(imap::Input::Command(c)))) if c.tag == "b"));
             assert_eq!(items.len(), 2);
         }
     }
@@ -1169,7 +1197,9 @@ fn reply_parse_reports_invalid_before_trailing() {
     );
     assert_eq!(
         <pop3::Reply as Wire>::parse(b"abc\r\n+OK x\r\n"),
-        Err(pop3::ParseError::Reply(pop3::ReplyError::BadStatus))
+        Err(pop3::ParseError::Reply(pop3::ReplyItemError::Reply(
+            pop3::ReplyError::BadStatus
+        )))
     );
     let mut replies = pop3::Replies::new();
     replies.expect(false).unwrap();
@@ -1177,10 +1207,127 @@ fn reply_parse_reports_invalid_before_trailing() {
     assert_eq!(
         read(replies, b"abc\r\n+OK x\r\n", &[1]),
         vec![
-            Ok(Err(pop3::ReplyError::BadStatus)),
+            Ok(Err(pop3::ReplyItemError::Reply(
+                pop3::ReplyError::BadStatus
+            ))),
             Ok(Ok(pop3::Output::Reply(pop3::Reply::ok("x")))),
         ]
     );
+}
+
+#[test]
+fn pop3_auth_bare_lf_rejects_one_item_and_keeps_expectation() {
+    let make = || {
+        let mut replies = pop3::Replies::new();
+        replies.expect(false).unwrap();
+        replies.expect_line().unwrap();
+        replies
+    };
+    let bytes = b"+ abc\n+OK done\r\n";
+    let rejected = Err(pop3::ReplyItemError::Reply(pop3::ReplyError::BadStatus));
+    let reply = Ok(pop3::Output::Reply(pop3::Reply::ok("done")));
+    let mut stream = Stream::new(make());
+    assert_eq!(stream.push(bytes), bytes.len());
+    assert_eq!(stream.next(), Some(Ok(rejected.clone())));
+    assert_eq!(stream.decoder().expected(), 1);
+    assert_eq!(stream.next(), Some(Ok(reply.clone())));
+    assert_eq!(stream.decoder().expected(), 0);
+    assert!(stream.failed().is_none());
+    contract::check_decode_with_held_limit(make, bytes, pop3::MAX_REPLY_HELD);
+    for pattern in [&[][..], &[1], &[5, 1, 2]] {
+        assert_eq!(
+            read(make(), bytes, pattern),
+            vec![Ok(rejected.clone()), Ok(reply.clone())]
+        );
+    }
+}
+
+#[test]
+fn imap_parse_reports_invalid_before_trailing() {
+    assert_eq!(
+        <imap::Command as Wire>::parse(b"a APPEND x {99999999}\r\nfoo"),
+        Err(imap::ParseError::Invalid(imap::Error::LiteralTooLarge {
+            tag: Some("a".into()),
+            size: 99999999,
+            waiting: true,
+        }))
+    );
+    assert!(matches!(
+        <imap::Command as Wire>::parse(b"a\r\nb NOOP\r\n"),
+        Err(imap::ParseError::Invalid(imap::Error::Syntax { .. }))
+    ));
+    for bytes in [
+        b"bad\r\n* OK next\r\n".as_slice(),
+        b"* 1 FETCH (BODY[] {1+}\r\nx)\r\n",
+    ] {
+        assert!(matches!(
+            <imap::Response as Wire>::parse(bytes),
+            Err(imap::ParseError::Invalid(imap::Error::Syntax { .. }))
+        ));
+    }
+    assert_eq!(
+        <imap::Command as Wire>::parse(b"a NOOP\r\nb NOOP\r\n"),
+        Err(imap::ParseError::Trailing)
+    );
+    assert_eq!(
+        <imap::Response as Wire>::parse(b"* OK ready\r\n* OK next\r\n"),
+        Err(imap::ParseError::Trailing)
+    );
+}
+
+#[test]
+fn smtp_reply_code_mismatch_is_invalid_in_exact_parse() {
+    for bytes in [
+        b"250-a\r\n251 b\r\n".as_slice(),
+        b"250-a\r\n251 b\r\n250 next\r\n",
+    ] {
+        assert_eq!(
+            <smtp::Reply as Wire>::parse(bytes),
+            Err(smtp::ParseError::Invalid(smtp::Error::ReplyMismatch))
+        );
+        for pattern in [&[][..], &[1], &[5, 1, 2]] {
+            assert_eq!(
+                read(smtp::Replies::new(), bytes, pattern),
+                vec![Err(Fail::Protocol(smtp::DecodeError::Reply(
+                    smtp::Error::ReplyMismatch
+                )))]
+            );
+        }
+    }
+}
+
+#[test]
+fn command_eof_skips_overlong_lines_and_rejects_short_partials() {
+    for pattern in [&[][..], &[1], &[255, 257]] {
+        assert_eq!(
+            read(
+                smtp::Server::new(),
+                &vec![b'X'; smtp::MAX_LINE + 1],
+                pattern
+            ),
+            vec![Ok(Err(smtp::Error::LineTooLong))]
+        );
+        assert_eq!(
+            read(
+                pop3::Commands::new(),
+                &vec![b'X'; pop3::MAX_COMMAND_LINE + 1],
+                pattern
+            ),
+            vec![Ok(Err(pop3::CommandError::LineTooLong))]
+        );
+        assert_eq!(
+            read(smtp::Server::new(), b"NOOP\r", pattern),
+            vec![Err(Fail::Protocol(smtp::DecodeError::Line(
+                codec::LineError::Unterminated
+            )))]
+        );
+        assert_eq!(
+            read(pop3::Commands::new(), b"NOOP\r", pattern),
+            vec![Err(Fail::Protocol(pop3::DecodeError::Line(
+                codec::LineError::Unterminated
+            )))]
+        );
+    }
 }
 
 #[test]

@@ -29,7 +29,10 @@
 //! end, as many servers do.
 //! New stacks use [`Commands`] or [`Replies`] with [`codec::Stream`]. They
 //! require CRLF. Bad or overlong commands are error items, and decoding
-//! resumes at the next line. Bad status lines end the stream when a body
+//! resumes at the next line. At EOF, an overlong command's remaining bytes
+//! are skipped and the stream ends cleanly after its error item; a shorter
+//! partial line ends the stream with [`DecodeError::Line`] wrapping
+//! [`codec::LineError::Unterminated`]. Bad status lines end the stream when a body
 //! was expected; other bad status lines are error items. The [`Wire`]
 //! implementations parse exact values and write transactionally.
 //! Legacy decoders and `to_bytes` methods keep their original behavior.
@@ -533,9 +536,8 @@ pub struct Reply {
     pub body: Option<Vec<u8>>,
 }
 
-/// Why bytes are not a reply. [`Replies`] distinguishes recoverable items
-/// from errors that lose the reply boundary. The legacy [`ReplyDecoder`]
-/// stops at every error.
+/// Why bytes are not a reply. The client has lost its place in the
+/// stream, and a real one closes the connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReplyError {
     /// A status line was longer than [`MAX_REPLY_LINE`], or a body line
@@ -544,8 +546,6 @@ pub enum ReplyError {
     /// The status line did not start with `+OK` or `-ERR` followed by a
     /// space or the end of the line.
     BadStatus,
-    /// A body line used bare LF or contained an embedded CR.
-    BadBodyLine,
     /// The body was longer than [`MAX_BODY`].
     BodyTooLong,
 }
@@ -556,12 +556,40 @@ impl std::fmt::Display for ReplyError {
             ReplyError::LineTooLong => "reply line too long",
             ReplyError::BadStatus => "status is not +OK or -ERR",
             ReplyError::BodyTooLong => "reply body too long",
-            ReplyError::BadBodyLine => "body line requires CRLF without embedded CR",
         })
     }
 }
 
 impl std::error::Error for ReplyError {}
+
+/// Why one item from [`Replies`] was rejected at a known boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplyItemError {
+    /// A malformed status line, or [`ReplyError::BadStatus`] for a raw AUTH
+    /// challenge ending in bare LF.
+    Reply(ReplyError),
+    /// A body line used bare LF or contained an embedded CR. The whole
+    /// reply is rejected at its dot terminator.
+    BadBodyLine,
+}
+
+impl core::fmt::Display for ReplyItemError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Reply(e) => e.fmt(f),
+            Self::BadBodyLine => f.write_str("body line requires CRLF without embedded CR"),
+        }
+    }
+}
+
+impl core::error::Error for ReplyItemError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Reply(e) => Some(e),
+            Self::BadBodyLine => None,
+        }
+    }
+}
 
 impl Reply {
     /// A `+OK` reply with this text.
@@ -1414,7 +1442,7 @@ pub enum ParseError {
     /// A complete command is malformed.
     Command(CommandError),
     /// A complete reply is malformed.
-    Reply(ReplyError),
+    Reply(ReplyItemError),
     /// Line framing or assembly failed.
     Framing(DecodeError),
     /// No complete value was present.
@@ -1494,7 +1522,7 @@ impl Wire for Reply {
         replies.expect(body).map_err(ParseError::Framing)?;
         loop {
             match replies.decode(bytes, true).map_err(|e| match e {
-                DecodeError::Reply(e) => ParseError::Reply(e),
+                DecodeError::Reply(e) => ParseError::Reply(ReplyItemError::Reply(e)),
                 e => ParseError::Framing(e),
             })? {
                 codec::Step::Item(reply, used) => {
@@ -1571,7 +1599,12 @@ pub enum Output {
 /// This retains RFC 2449's command limit, which extends RFC 1939.
 /// Syntax errors, bare LF, and overlong lines are error items; the decoder
 /// skips the rest of an overlong line through LF, then reads the next line.
-/// Unterminated lines end the stream. No input is retained.
+/// Every line error except [`codec::LineError::TooLong`] maps to the existing
+/// [`CommandError::BadCharacter`]: a missing CR is invalid command framing,
+/// and the legacy error type has no line-ending variant. Unterminated lines
+/// end the stream through [`DecodeError::Line`] before this item mapping.
+/// An overlong line cut off at EOF is skipped after its error item, then
+/// ends cleanly. No input is retained.
 /// Call [`expect_line`](Self::expect_line) between items for one raw AUTH
 /// answer, bounded by [`MAX_AUTH_LINE`] bytes excluding CRLF. Input capacity
 /// is always `MAX_AUTH_LINE + 2`, so mode changes fit the same buffer.
@@ -1681,9 +1714,12 @@ impl Decode for Commands {
 /// [`MAX_BODY`] bounds the assembled body. Scanning is linear.
 /// A malformed status line is an error item for a single-line expectation,
 /// and ends the stream for a multiline expectation. A bad body line rejects
-/// its whole reply at the terminator with [`ReplyError::BadBodyLine`]. This
-/// covers bare LF and embedded CR. Line overflow and incomplete bodies end
-/// the stream. Retained state is bounded by [`MAX_REPLY_HELD`].
+/// its whole reply at the terminator with [`ReplyItemError::BadBodyLine`].
+/// This covers bare LF and embedded CR. A bare LF in a raw AUTH challenge
+/// yields [`ReplyItemError::Reply`] wrapping [`ReplyError::BadStatus`] and
+/// leaves the queued expectation for the final reply. Line overflow,
+/// unterminated lines, and incomplete bodies end the stream. Retained state
+/// is bounded by [`MAX_REPLY_HELD`].
 /// The legacy [`ReplyDecoder`] keeps its per-call expectation and void feed.
 ///
 /// ```
@@ -1754,7 +1790,7 @@ impl Replies {
 }
 
 impl Decode for Replies {
-    type Item = Result<Output, ReplyError>;
+    type Item = Result<Output, ReplyItemError>;
     type Error = DecodeError;
     const NAME: &'static str = "POP3 replies";
 
@@ -1763,12 +1799,14 @@ impl Decode for Replies {
     }
 
     fn held(&self) -> usize {
-        self.expected.len()
-            + self.pending.as_ref().map_or(0, |r| {
-                r.text.len()
-                    + r.code.as_ref().map_or(0, String::len)
-                    + r.body.as_ref().map_or(0, Vec::len)
-            })
+        self.expected
+            .len()
+            .saturating_add(self.pending.as_ref().map_or(0, |r| {
+                r.text
+                    .len()
+                    .saturating_add(r.code.as_ref().map_or(0, String::len))
+                    .saturating_add(r.body.as_ref().map_or(0, Vec::len))
+            }))
     }
 
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<codec::Step<Self::Item>, DecodeError> {
@@ -1792,7 +1830,8 @@ impl Decode for Replies {
         if core::mem::take(&mut self.raw_line) {
             self.lines = codec::Lines::new(MAX_REPLY_LINE - 2, codec::Ending::Crlf);
             return Ok(codec::Step::Item(
-                Ok(Output::Line(line.map_err(DecodeError::Line)?)),
+                line.map(Output::Line)
+                    .map_err(|_| ReplyItemError::Reply(ReplyError::BadStatus)),
                 used,
             ));
         }
@@ -1815,16 +1854,24 @@ impl Decode for Replies {
                     return Ok(codec::Step::Skip(used));
                 }
                 Err(e) if multi => return Err(DecodeError::Reply(e)),
-                reply => return Ok(codec::Step::Item(reply.map(Output::Reply), used)),
+                reply => {
+                    return Ok(codec::Step::Item(
+                        reply.map(Output::Reply).map_err(ReplyItemError::Reply),
+                        used,
+                    ));
+                }
             }
         }
         if line.as_deref() == Ok(b".".as_slice()) {
-            let reply = self.pending.take().ok_or(ReplyError::BadStatus);
+            let reply = self
+                .pending
+                .take()
+                .ok_or(ReplyItemError::Reply(ReplyError::BadStatus));
             self.lines = codec::Lines::new(MAX_REPLY_LINE - 2, codec::Ending::Crlf);
             self.body_size = 0;
             return Ok(codec::Step::Item(
                 if core::mem::take(&mut self.rejected) {
-                    Err(ReplyError::BadBodyLine)
+                    Err(ReplyItemError::BadBodyLine)
                 } else {
                     reply.map(Output::Reply)
                 },

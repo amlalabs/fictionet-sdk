@@ -2,9 +2,9 @@
 //! them, and as a world playing a client reads the server's.
 #![no_main]
 
-use fictionet::stdlib::codec::{Wire, contract};
+use fictionet::stdlib::codec::{Decode, Wire, contract};
 use fictionet::stdlib::imap::{
-    Command, Commands, Decoder, Error, Event, MAX_HELD, MAX_LITERAL, MAX_TEXT, Response,
+    Command, Commands, Decoder, Error, Event, Input, MAX_HELD, MAX_LITERAL, MAX_TEXT, Response,
     ResponseDecoder, Responses, Value,
 };
 use libfuzzer_sys::fuzz_target;
@@ -70,7 +70,18 @@ fn responses(data: &[u8], step: usize) -> Vec<Result<Response, Error>> {
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_held_limit(Commands::new, data, MAX_HELD);
+    contract::check_decode_with_held_limit(
+        || {
+            Commands::new().map(|item| {
+                if let Ok(Input::Command(command)) = &item {
+                    contract::check_wire_value(command);
+                }
+                item
+            })
+        },
+        data,
+        MAX_HELD,
+    );
     contract::check_decode_with_held_limit(
         || {
             let mut commands = Commands::new();

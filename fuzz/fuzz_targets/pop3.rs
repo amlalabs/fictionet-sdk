@@ -2,10 +2,10 @@
 //! reads them.
 #![no_main]
 
-use fictionet::stdlib::codec::{Wire, contract};
+use fictionet::stdlib::codec::{Decode, Wire, contract};
 use fictionet::stdlib::pop3::{
-    Command, CommandDecoder, Commands, MAX_AUTH_LINE, MAX_COMMAND_LINE, MAX_EXPECTATIONS,
-    MAX_REPLY_HELD, Replies, Reply, ReplyDecoder, Request, parse_scan_listing,
+    Command, CommandDecoder, Commands, MAX_AUTH_LINE, MAX_COMMAND_LINE, MAX_REPLY_HELD, Output,
+    Replies, Reply, ReplyDecoder, ReplyItemError, Request, parse_scan_listing,
     parse_unique_id_listing, write_scan_listing, write_unique_id_listing,
 };
 use libfuzzer_sys::fuzz_target;
@@ -40,10 +40,15 @@ fuzz_target!(|data: &[u8]| {
         contract::check_decode_with_held_limit(
             || {
                 let mut replies = Replies::new();
-                for _ in 0..MAX_EXPECTATIONS {
+                for _ in 0..4 {
                     replies.expect(multi).unwrap();
                 }
-                replies
+                replies.map(|item: Result<Output, ReplyItemError>| {
+                    if let Ok(Output::Reply(reply)) = &item {
+                        contract::check_wire_value(reply);
+                    }
+                    item
+                })
             },
             data,
             MAX_REPLY_HELD,

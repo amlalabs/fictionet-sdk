@@ -18,7 +18,10 @@
 //! Mail headers can be read separately with [`imf`](crate::stdlib::imf).
 //! New stacks use [`Server`] or [`Replies`] with [`codec::Stream`]. Their
 //! [`Wire`] implementations require exact CRLF framing and write transactionally.
-//! Overlong commands yield one error item and skip to the next line. DATA
+//! Overlong commands yield one error item and skip to the next line. At EOF,
+//! an overlong command's remaining bytes are skipped and the stream ends
+//! cleanly after that item; a shorter partial line ends the stream with
+//! [`DecodeError::Line`] wrapping [`codec::LineError::Unterminated`]. DATA
 //! returns to command mode at its terminator. Overlong DATA or reply lines,
 //! and malformed lines within a multiline reply, end the stream.
 //! Legacy parsers, decoders, and `to_bytes` methods keep their original behavior.
@@ -857,6 +860,8 @@ pub enum DecodeError {
     Incomplete,
     /// A malformed line interrupted a multiline reply.
     Reply(Error),
+    /// A mode change was requested outside a command boundary.
+    State,
 }
 
 impl core::fmt::Display for DecodeError {
@@ -867,6 +872,7 @@ impl core::fmt::Display for DecodeError {
             Self::Allocation => f.write_str("SMTP assembly allocation failed"),
             Self::Incomplete => f.write_str("incomplete SMTP assembly"),
             Self::Reply(e) => e.fmt(f),
+            Self::State => f.write_str("SMTP mode change requires a command boundary"),
         }
     }
 }
@@ -943,7 +949,10 @@ impl Wire for Reply {
     fn parse(mut bytes: &[u8]) -> Result<Self, ParseError> {
         let mut replies = Replies::new();
         loop {
-            match replies.decode(bytes, true).map_err(ParseError::Framing)? {
+            match replies.decode(bytes, true).map_err(|e| match e {
+                DecodeError::Reply(e) => ParseError::Invalid(e),
+                e => ParseError::Framing(e),
+            })? {
                 codec::Step::Item(reply, used) => {
                     let reply = reply.map_err(ParseError::Invalid)?;
                     if used != bytes.len() {
@@ -1021,7 +1030,8 @@ enum Mode {
 /// Malformed or overlong commands are error items; the rest of an overlong
 /// line is skipped through LF. Bad DATA content rejects the message at its
 /// dot terminator. DATA line overflow, unterminated lines, assembly overflow,
-/// and EOF before the dot terminate the stream.
+/// and EOF before the dot terminate the stream. An overlong command cut off
+/// at EOF is skipped after its error item, then ends cleanly.
 /// The legacy [`CommandDecoder`] retains its original behavior.
 ///
 /// Call [`start_data`](Self::start_data) between items after accepting DATA.
@@ -1070,9 +1080,11 @@ impl Server {
     }
 
     /// Starts DATA at a command boundary after the world accepts it.
-    pub fn start_data(&mut self) -> Result<(), Error> {
+    /// Refuses other modes, partial lines, and lines still being skipped
+    /// with [`DecodeError::State`], without changing the mode.
+    pub fn start_data(&mut self) -> Result<(), DecodeError> {
         if self.mode != Mode::Command || self.partial || self.skipping {
-            return Err(Error::State);
+            return Err(DecodeError::State);
         }
         self.mode = Mode::Data;
         self.lines = codec::Lines::new(MAX_DATA_LINE - 1, codec::Ending::Crlf);
@@ -1080,9 +1092,11 @@ impl Server {
     }
 
     /// Ends SMTP decoding at a command boundary for an accepted protocol switch.
-    pub fn handoff(&mut self) -> Result<(), Error> {
+    /// Refuses other modes, partial lines, and lines still being skipped
+    /// with [`DecodeError::State`], without changing the mode.
+    pub fn handoff(&mut self) -> Result<(), DecodeError> {
         if self.mode != Mode::Command || self.partial || self.skipping {
-            return Err(Error::State);
+            return Err(DecodeError::State);
         }
         self.mode = Mode::End;
         Ok(())

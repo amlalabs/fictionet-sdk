@@ -619,13 +619,11 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// What [`Commands`] or the legacy [`Decoder`] has for the world.
+/// What a [`Decoder`] has for the world.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
     /// A whole command.
     Command(Command),
-    /// A raw line without CRLF, selected by [`Commands::expect_line`].
-    Line(Vec<u8>),
     /// The client sent `{size}` and waits for a continuation request. The
     /// world sends one, such as [`Response::continue_req`], and keeps
     /// calling [`Decoder::next_event`]. Or it refuses with
@@ -639,6 +637,26 @@ pub enum Event {
         /// The literal's size, at most [`MAX_LITERAL`].
         size: usize,
     },
+}
+
+/// One command, literal continuation, or raw line from [`Commands`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Input {
+    /// A whole command.
+    Command(Command),
+    /// The client sent `{size}` and waits for a continuation request.
+    /// Send one, such as [`Response::continue_req`], and read the next item,
+    /// or call [`Commands::refuse_literal`] and answer `tag NO`.
+    /// Every line ending in `{size}` requests a continuation, even if its
+    /// start breaks the grammar; the whole command then yields [`Error::Syntax`].
+    Continue {
+        /// The command tag, if well-formed. Continuations share one copy.
+        tag: Option<Arc<str>>,
+        /// The literal's size, at most [`MAX_LITERAL`].
+        size: usize,
+    },
+    /// A raw line without CRLF, selected by [`Commands::expect_line`].
+    Line(Vec<u8>),
 }
 
 /// Splits the byte stream a client sends into commands. Feed it the bytes
@@ -1317,7 +1335,8 @@ fn fit(s: &str, max: usize) -> &str {
 
 /// The longest non-synchronizing literal a client sends, unless the
 /// server says it takes longer ones (RFC 9051, section 4.3).
-const MAX_NON_SYNC: usize = 4096;
+/// [`Commands`] enforces this limit without enabling the LITERAL+ extension.
+pub const MAX_NON_SYNC: usize = 4096;
 
 /// Writes ` value` for each value that fits. `out` holds only text so
 /// far; a CRLF will follow. For a client, where the bytes of each
@@ -1486,9 +1505,6 @@ fn drop_nul(s: &[u8]) -> std::borrow::Cow<'_, [u8]> {
 /// RFC 9051 defines no universal line maximum. The aggregate text limit
 /// [`MAX_TEXT`] also applies across all lines of one message.
 pub const MAX_LINE: usize = MAX_TEXT;
-/// Maximum non-synchronizing literal size under RFC 9051, section 4.3.
-/// The shared decoders do not enable the LITERAL+ extension.
-pub const MAX_NON_SYNC_LITERAL: usize = MAX_NON_SYNC;
 /// Maximum assembled bytes and cached tag bytes in a shared decoder.
 pub const MAX_HELD: usize = MAX_MESSAGE + MAX_LINE;
 
@@ -1565,16 +1581,17 @@ impl Wire for Command {
         let mut commands = Commands::new();
         loop {
             match commands.decode(bytes, true).map_err(ParseError::Framing)? {
-                codec::Step::Item(Ok(Event::Continue { .. }), used) | codec::Step::Skip(used) => {
+                codec::Step::Item(Ok(Input::Continue { .. }), used) | codec::Step::Skip(used) => {
                     bytes = bytes.get(used..).ok_or(ParseError::Incomplete)?;
                 }
                 codec::Step::Item(command, used) => {
+                    let command = command.map_err(ParseError::Invalid)?;
                     if used != bytes.len() {
                         return Err(ParseError::Trailing);
                     }
-                    return match command.map_err(ParseError::Invalid)? {
-                        Event::Command(command) => Ok(command),
-                        Event::Continue { .. } | Event::Line(_) => Err(ParseError::Incomplete),
+                    return match command {
+                        Input::Command(command) => Ok(command),
+                        Input::Continue { .. } | Input::Line(_) => Err(ParseError::Incomplete),
                     };
                 }
                 _ => return Err(ParseError::Incomplete),
@@ -1605,10 +1622,11 @@ impl Wire for Response {
         loop {
             match responses.decode(bytes, true).map_err(ParseError::Framing)? {
                 codec::Step::Item(response, used) => {
+                    let response = response.map_err(ParseError::Invalid)?;
                     if used != bytes.len() {
                         return Err(ParseError::Trailing);
                     }
-                    return response.map_err(ParseError::Invalid);
+                    return Ok(response);
                 }
                 codec::Step::Skip(used) => {
                     bytes = bytes.get(used..).ok_or(ParseError::Incomplete)?
@@ -1700,7 +1718,9 @@ impl MessageLines {
     }
 
     fn held(&self) -> usize {
-        self.message.len() + self.tag.as_ref().map_or(0, |tag| tag.len())
+        self.message
+            .len()
+            .saturating_add(self.tag.as_ref().map_or(0, |tag| tag.len()))
     }
 
     fn append(&mut self, bytes: &[u8]) -> Result<(), DecodeError> {
@@ -1805,11 +1825,7 @@ impl MessageLines {
             .then(|| marker(&line, !self.response))
             .flatten();
         if let Some((size, non_sync)) = literal {
-            let limit = if non_sync {
-                MAX_NON_SYNC_LITERAL
-            } else {
-                MAX_LITERAL
-            };
+            let limit = if non_sync { MAX_NON_SYNC } else { MAX_LITERAL };
             let count = usize::try_from(size)
                 .ok()
                 .filter(|&n| n <= limit)
@@ -1853,7 +1869,7 @@ impl MessageLines {
 /// CRLF is required outside literals. Lines are bounded by [`MAX_LINE`],
 /// aggregate text by [`MAX_TEXT`], each literal by [`MAX_LITERAL`], and
 /// the assembly by [`MAX_MESSAGE`]. Non-synchronizing literals also obey
-/// [`MAX_NON_SYNC_LITERAL`]. Literal bytes may contain CRLF and bypass Lines.
+/// [`MAX_NON_SYNC`]. Literal bytes may contain CRLF and bypass Lines.
 /// Retained state is bounded by [`MAX_HELD`]. Bytewise input takes linear time.
 ///
 /// Syntax failures at known message boundaries are error items. An oversized
@@ -1864,16 +1880,16 @@ impl MessageLines {
 /// [`refuse_literal`](Self::refuse_literal) between items.
 /// For AUTHENTICATE answers and IDLE's `DONE`, call
 /// [`expect_line`](Self::expect_line) between items. It returns one
-/// [`Event::Line`] under the same [`MAX_LINE`] limit, then resumes commands.
+/// [`Input::Line`] under the same [`MAX_LINE`] limit, then resumes commands.
 /// The legacy [`Decoder`] keeps its void feed and original limits.
 ///
 /// ```
-/// use fictionet::stdlib::{codec::Stream, imap::{Commands, Event}};
+/// use fictionet::stdlib::{codec::Stream, imap::{Commands, Input}};
 /// let mut stream = Stream::new(Commands::new());
 /// let bytes = b"a LOGIN user {3}\r\nabc\r\n";
 /// assert_eq!(stream.push(bytes), bytes.len());
-/// assert!(matches!(stream.next(), Some(Ok(Ok(Event::Continue { size: 3, .. })))));
-/// assert!(matches!(stream.next(), Some(Ok(Ok(Event::Command(_))))));
+/// assert!(matches!(stream.next(), Some(Ok(Ok(Input::Continue { size: 3, .. })))));
+/// assert!(matches!(stream.next(), Some(Ok(Ok(Input::Command(_))))));
 /// ```
 pub struct Commands {
     framing: MessageLines,
@@ -1925,7 +1941,7 @@ impl Commands {
 }
 
 impl Decode for Commands {
-    type Item = Result<Event, Error>;
+    type Item = Result<Input, Error>;
     type Error = DecodeError;
     const NAME: &'static str = "IMAP commands";
 
@@ -1948,7 +1964,7 @@ impl Decode for Commands {
                     self.raw_line = false;
                     self.framing.reset();
                     let line = match line {
-                        Ok(line) => Ok(Event::Line(line)),
+                        Ok(line) => Ok(Input::Line(line)),
                         Err(codec::LineError::BareLf) => Err(Error::Syntax {
                             tag: None,
                             reason: "a line must end with CRLF",
@@ -1968,8 +1984,8 @@ impl Decode for Commands {
         Ok(match self.framing.decode(input, eof)? {
             codec::Step::Item(frame, used) => codec::Step::Item(
                 frame.and_then(|frame| match frame {
-                    MailFrame::Continue { tag, size } => Ok(Event::Continue { tag, size }),
-                    MailFrame::Message(bytes) => codec_command(&bytes).map(Event::Command),
+                    MailFrame::Continue { tag, size } => Ok(Input::Continue { tag, size }),
+                    MailFrame::Message(bytes) => codec_command(&bytes).map(Input::Command),
                 }),
                 used,
             ),
