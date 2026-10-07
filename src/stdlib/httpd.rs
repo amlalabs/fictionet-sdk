@@ -52,9 +52,10 @@
 //! handler sets itself is sent as it is.
 //!
 //! HTTP/2 runs on hyper for now, behind the same [`Handler`] trait and the
-//! same events. When the stdlib's own HTTP/2 lands, it becomes a
-//! second `Service` here and [`serve_connection`] picks it; handlers do not
-//! change.
+//! same events, with the same [`Limits`], the same charges to the
+//! connection's [`Budget`] and the same seeded randomness. When the
+//! stdlib's own HTTP/2 lands, it becomes a second `Service` here and
+//! [`serve_connection`] picks it; handlers do not change.
 //!
 //! ```
 //! use bytes::Bytes;
@@ -82,9 +83,12 @@
 //! `uri`, `path`, `query`, `version` (`HTTP/1.1`, `HTTP/2.0`), `headers`
 //! (`[name, value]` pairs in the order of `http::HeaderMap`), `started`
 //! (seconds on the run's clock), `answer` (`handler`, `error`, `cancelled`,
-//! or what the handler set, such as `redirect`), `status`, `sent` (body
-//! bytes handed to the connection) and `complete` (whether the whole body
-//! was). A handler adds its own fields by putting
+//! what the handler set, such as `redirect`, or, over HTTP/2, `too_large`,
+//! `timeout`, `cut_off` or `budget` for a request body the service turned
+//! down), `status`, `sent` (body bytes the connection took) and `complete`
+//! (whether it took the whole body). Over HTTP/1 a byte counts once it is
+//! written, and the event is made after the last one is; over HTTP/2 once
+//! hyper takes it for the stream. A handler adds its own fields by putting
 //! [`Fields`] in its response's
 //! extensions; they come first, and the service's own facts win a clash.
 //! A connection that ends in an error is one `http.error` event, with
@@ -148,6 +152,14 @@ impl Body {
         B::Error: Into<Error>,
     {
         Body(Inner::Stream(Box::pin(IntoBytes(Box::pin(body)))))
+    }
+
+    /// The bytes held in full: 0 for a stream.
+    fn full_len(&self) -> usize {
+        match &self.0 {
+            Inner::Full(b) => b.as_ref().map_or(0, Bytes::len),
+            Inner::Stream(_) => 0,
+        }
     }
 
     /// The bytes, if the body is held in full.
@@ -763,31 +775,43 @@ fn error_event(conn: &ConnInfo, cause: &'static str, detail: String) -> Event {
 // ---------------------------------------------------------------------------
 // HTTP/1 as a service
 
-/// Limits and timers of [`Http1`].
+/// HTTP's limits and timers, for both versions.
 #[derive(Clone, Copy, Debug)]
-pub struct Http1Options {
-    /// Head limits for the decoder.
-    pub limits: http1::Limits,
-    /// The largest request body read; past it the answer is `413` and the
-    /// connection closes. Default 64 MiB.
+pub struct Limits {
+    /// Head limits for HTTP/1's decoder.
+    pub head: http1::Limits,
+    /// The largest request body read. Past it, HTTP/1 hands the handler
+    /// what came, as a body that ends in an error, and closes the
+    /// connection after the answer; HTTP/2 answers the stream `413`.
+    /// Default 64 MiB.
     pub max_body: usize,
-    /// How long a request's head may take to arrive, counted from when the
-    /// service starts waiting for it, which includes the wait between
-    /// requests. Default 30 seconds.
+    /// HTTP/1: how long a request's head may take to arrive, counted from
+    /// when the service starts waiting for it, which includes the wait
+    /// between requests. Default 30 seconds.
     pub header_timeout: Duration,
     /// How long a request's body may take to arrive, counted from its
     /// head, so a client that trickles a body cannot hold the connection
-    /// for ever. Default 30 seconds.
+    /// for ever. HTTP/1 closes the connection; HTTP/2 answers the stream
+    /// `408`. Default 30 seconds.
     pub body_timeout: Duration,
+    /// How long a write may take no bytes before the connection ends: a
+    /// client that stopped reading. Default 30 seconds.
+    pub write_timeout: Duration,
+    /// HTTP/2: the most streams open at once on one connection, which
+    /// the server announces in its settings. Default 100, the least RFC
+    /// 9113 recommends.
+    pub max_streams: u32,
 }
 
-impl Default for Http1Options {
-    fn default() -> Http1Options {
-        Http1Options {
-            limits: http1::Limits::default(),
+impl Default for Limits {
+    fn default() -> Limits {
+        Limits {
+            head: http1::Limits::default(),
             max_body: 64 << 20,
             header_timeout: Duration::from_secs(30),
             body_timeout: Duration::from_secs(30),
+            write_timeout: Duration::from_secs(30),
+            max_streams: 100,
         }
     }
 }
@@ -800,7 +824,7 @@ const BODY: Timer = "body";
 /// HTTP/1.0 and 1.1 for one connection, answering with a [`Handler`].
 pub struct Http1 {
     handler: Arc<dyn Handler>,
-    opts: Http1Options,
+    opts: Limits,
     /// The world's date at the start of the run, for `Date` headers.
     date: Option<SystemTime>,
     /// The head of a request that asked for a protocol upgrade, as bytes,
@@ -815,11 +839,11 @@ pub struct Http1 {
 impl Http1 {
     /// Answers with `handler`, with default options.
     pub fn new(handler: impl Handler) -> Http1 {
-        Http1::with(Arc::new(handler), Http1Options::default())
+        Http1::with(Arc::new(handler), Limits::default())
     }
 
     /// Answers with `handler` and `opts`.
-    pub fn with(handler: Arc<dyn Handler>, opts: Http1Options) -> Http1 {
+    pub fn with(handler: Arc<dyn Handler>, opts: Limits) -> Http1 {
         Http1 { handler, opts, date: None, handoff: None, head: None, body: Vec::new(), too_big: false, started: Instant::ZERO }
     }
 
@@ -868,7 +892,7 @@ impl Http1 {
         let mut request = request;
         request.extensions_mut().insert(ctx.conn().clone());
         let head_only = request.method() == Method::HEAD;
-        let mut tracker = Tracker::new(&request, ctx.conn(), self.started);
+        let tracker = Tracker::new(&request, ctx.conn(), self.started);
         let now = ctx.now();
         let conn = ctx.conn().clone();
         let reply = {
@@ -876,32 +900,14 @@ impl Http1 {
             self.handler.call(request, &mut Exchange::new(now, &mut rng, &conn))
         };
         let close = !keep_alive;
-        match reply {
-            Reply::Now(response) if response.body().bytes().is_some() => {
-                let bytes = response.body().bytes().unwrap_or_default();
-                let len = Some(bytes.len() as u64);
-                let date = date_header(self.date, now);
-                let close = encode(ctx.reply(), version, &response, len, head_only, close, date);
-                let bodiless = head_only || no_body(response.status());
-                if !bodiless {
-                    ctx.reply().extend_from_slice(&bytes);
-                }
-                let extra = response.extensions().get::<Fields>().cloned();
-                let sent = if bodiless { 0 } else { bytes.len() as u64 };
-                if let Some(e) = tracker.finish(extra, Some(response.status()), sent, true) {
-                    ctx.log(e);
-                }
-                self.after(ctx, close)
-            }
-            Reply::Now(response) => {
-                ctx.defer(Streaming::new(None, Some(response), version, head_only, close, tracker).dated(self.date, now));
-                self.after(ctx, close)
-            }
-            Reply::Later(work) => {
-                ctx.defer(Streaming::new(Some(work), None, version, head_only, close, tracker).dated(self.date, now));
-                self.after(ctx, close)
-            }
-        }
+        // Every answer goes out as deferred work, so its event is made
+        // once its bytes are written.
+        let (work, response) = match reply {
+            Reply::Now(response) => (None, Some(response)),
+            Reply::Later(work) => (Some(work), None),
+        };
+        ctx.defer(Streaming::new(work, response, version, head_only, close, tracker).dated(self.date, now));
+        self.after(ctx, close)
     }
 
     fn after(&mut self, ctx: &mut ServeCtx<'_>, close: bool) -> Flow {
@@ -1084,7 +1090,7 @@ impl serve::Service for Http1 {
     type Error = Infallible;
 
     fn decoder(&self) -> http1::Requests {
-        http1::Requests::new(self.opts.limits)
+        http1::Requests::new(self.opts.head)
     }
 
     fn on_open(&mut self, _: &(), ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
@@ -1180,6 +1186,10 @@ const PIECE: usize = 16 * 1024;
 type Making = Pin<Box<dyn Future<Output = Result<Response<Body>, Error>> + Send>>;
 
 /// A response being made or streamed, as deferred work of a connection.
+///
+/// Its event says what the connection took: each piece counts in `sent`
+/// once the driver wrote all of it, and the event is made when the last
+/// piece is written, or when the connection ends first.
 struct Streaming {
     work: Option<Later>,
     making: Option<Making>,
@@ -1193,8 +1203,12 @@ struct Streaming {
     tracker: Tracker,
     extra: Option<Fields>,
     status: Option<StatusCode>,
-    /// Body bytes handed to the connection.
+    /// Body bytes the connection took.
     body_sent: u64,
+    /// Bytes returned to the driver, and the body bytes in the last piece,
+    /// which count once the driver has written that far.
+    returned: u64,
+    in_flight: u64,
     finished: bool,
     /// The world's date at the start of the run, and when the request was
     /// answered, for the `Date` header.
@@ -1218,6 +1232,8 @@ impl Streaming {
             extra: None,
             status: None,
             body_sent: 0,
+            returned: 0,
+            in_flight: 0,
             finished: false,
             date: None,
             asked: Instant::ZERO,
@@ -1230,6 +1246,20 @@ impl Streaming {
         Streaming { date, asked, ..self }
     }
 
+    /// Counts the last piece's body bytes once the driver wrote it all.
+    fn confirm(&mut self, ctx: &PendingCtx<'_>) {
+        if ctx.written() >= self.returned {
+            self.body_sent += std::mem::take(&mut self.in_flight);
+        }
+    }
+
+    /// Hands the driver `bytes`, of which `body` are body bytes.
+    fn piece(&mut self, bytes: Vec<u8>, body: usize) -> Poll<Option<Result<Vec<u8>, Error>>> {
+        self.returned += bytes.len() as u64;
+        self.in_flight = body as u64;
+        Poll::Ready(Some(Ok(bytes)))
+    }
+
     fn end(&mut self, ctx: &mut PendingCtx<'_>, complete: bool) {
         if self.finished {
             return;
@@ -1239,23 +1269,23 @@ impl Streaming {
             ctx.log(e);
         }
     }
-}
 
-impl Streaming {
     /// `piece` as it goes on the wire: a chunk, when chunked.
-    fn frame(&self, piece: Bytes) -> Vec<u8> {
-        if !self.chunked {
-            return piece.to_vec();
+    fn frame(&self, piece: &[u8], out: &mut Vec<u8>) {
+        if self.chunked {
+            out.extend_from_slice(format!("{:x}\r\n", piece.len()).as_bytes());
+            out.extend_from_slice(piece);
+            out.extend_from_slice(b"\r\n");
+        } else {
+            out.extend_from_slice(piece);
         }
-        let mut out = format!("{:x}\r\n", piece.len()).into_bytes();
-        out.extend_from_slice(&piece);
-        out.extend_from_slice(b"\r\n");
-        out
     }
 }
 
 impl Pending for Streaming {
     fn poll_next(&mut self, ctx: &mut PendingCtx<'_>, task: &mut Context<'_>) -> Poll<Option<Result<Vec<u8>, Error>>> {
+        // The driver polls again only once the last piece is written.
+        self.confirm(ctx);
         loop {
             if let Some(work) = self.work.take() {
                 self.making = Some(match ctx.cx() {
@@ -1278,21 +1308,34 @@ impl Pending for Streaming {
                 let len = body.size_hint().exact();
                 let mut head = Vec::new();
                 let now = ctx.cx().map_or(self.asked, Cx::now);
-                let close = encode(&mut head, self.version, &response, len, self.head_only, self.close, date_header(self.date, now));
-                self.close = close;
+                self.close = encode(&mut head, self.version, &response, len, self.head_only, self.close, date_header(self.date, now));
+                if self.close {
+                    // An HTTP/1.0 body of unknown length ends with the
+                    // connection, whatever the request asked for.
+                    ctx.close();
+                }
                 self.status = Some(response.status());
                 self.extra = response.extensions().get::<Fields>().cloned();
                 let bodiless = self.head_only || no_body(response.status());
                 self.chunked = !bodiless && len.is_none() && self.version != Version::HTTP_10;
-                if !bodiless {
-                    self.body = Some(body);
+                if bodiless {
+                    return self.piece(head, 0);
                 }
-                return Poll::Ready(Some(Ok(head)));
+                // A body held in full goes out with the head, a piece at
+                // a time.
+                match body.0 {
+                    Inner::Full(bytes) => self.rest = bytes.unwrap_or_default(),
+                    stream => self.body = Some(Body(stream)),
+                }
+                let piece = self.rest.split_to(self.rest.len().min(PIECE));
+                self.frame(&piece, &mut head);
+                return self.piece(head, piece.len());
             }
             if !self.rest.is_empty() {
                 let piece = self.rest.split_to(self.rest.len().min(PIECE));
-                self.body_sent += piece.len() as u64;
-                return Poll::Ready(Some(Ok(self.frame(piece))));
+                let mut out = Vec::with_capacity(piece.len() + 12);
+                self.frame(&piece, &mut out);
+                return self.piece(out, piece.len());
             }
             let Some(body) = &mut self.body else {
                 self.end(ctx, true);
@@ -1304,12 +1347,8 @@ impl Pending for Streaming {
                     self.body = None;
                     if self.chunked {
                         self.chunked = false;
-                        let done = b"0\r\n\r\n".to_vec();
-                        self.end(ctx, true);
-                        return Poll::Ready(Some(Ok(done)));
+                        return self.piece(b"0\r\n\r\n".to_vec(), 0);
                     }
-                    self.end(ctx, true);
-                    return Poll::Ready(None);
                 }
                 Poll::Ready(Some(Err(e))) => {
                     self.body = None;
@@ -1328,10 +1367,17 @@ impl Pending for Streaming {
     }
 
     fn cancel(&mut self, ctx: &mut PendingCtx<'_>) {
+        self.confirm(ctx);
         if self.status.is_none() {
             self.extra = None;
         }
         self.end(ctx, false);
+    }
+
+    fn held(&self) -> usize {
+        let response = self.response.as_ref().map_or(0, |r| r.body().full_len());
+        let body = self.body.as_ref().map_or(0, Body::full_len);
+        self.rest.len() + response + body
     }
 }
 
@@ -1341,16 +1387,19 @@ impl Pending for Streaming {
 /// How [`serve_connection`] serves a connection.
 #[derive(Clone, Default)]
 pub struct HttpOptions {
-    /// HTTP/1's limits and timers.
-    pub h1: Http1Options,
+    /// Limits and timers, for both versions.
+    pub limits: Limits,
     /// On a connection without TLS, how long the client has from
     /// connecting to send its first bytes. Past it, the connection closes
     /// with an `http.error` event, cause `timeout`. `None` waits as long as
     /// the HTTP/1 head limit allows.
     pub first_bytes: Option<Duration>,
-    /// What HTTP/1 connections are charged to ([`ServeOptions::budget`]).
+    /// What connections are charged to ([`ServeOptions::budget`]): over
+    /// HTTP/1 what the service holds, over HTTP/2 each request's body and
+    /// each response body held in full.
     pub budget: Option<Budget>,
-    /// The seed of HTTP/1 connections' randomness ([`ServeOptions::seed`]).
+    /// The seed of each connection's randomness ([`Exchange::random_u64`]),
+    /// mixed with its number ([`serve::conn_seed`]).
     pub seed: u64,
     /// The world's date and time at the start of the run, for `Date`
     /// headers. `None`: no `Date` header. See [Dates](self#dates).
@@ -1393,17 +1442,18 @@ pub async fn serve_connection<C: Connection + Unpin>(cx: &Cx, conn: C, info: Con
     };
     let conn = Prefixed::new(first, conn);
     if h2 {
-        h2::serve(cx, conn, handler, info, opts.date).await;
+        h2::serve(cx, conn, handler, info, opts).await;
         return;
     }
     let serve_opts = ServeOptions {
         idle: None,
+        write_timeout: Some(opts.limits.write_timeout),
         connection_events: false,
         budget: opts.budget.clone(),
         seed: opts.seed,
         ..ServeOptions::default()
     };
-    let mut service = Http1::with(handler.clone(), opts.h1);
+    let mut service = Http1::with(handler.clone(), opts.limits);
     service.date = opts.date;
     let served = serve::serve(cx, conn, info.clone(), &mut service, &(), &serve_opts).await;
     if let Ok(serve::Served::Upgraded(serve::Upgrade::Handoff, rest)) = served
@@ -1411,7 +1461,7 @@ pub async fn serve_connection<C: Connection + Unpin>(cx: &Cx, conn: C, info: Con
     {
         // A request that asks for an upgrade: hyper's HTTP/1 reads it again
         // and carries the upgrade out.
-        h2::serve_upgrade(cx, Prefixed::new(head, rest), handler, info, opts.date).await;
+        h2::serve_upgrade(cx, Prefixed::new(head, rest), handler, info, opts).await;
     }
 }
 
@@ -1436,7 +1486,7 @@ pub async fn serve_connection<C: Connection + Unpin>(cx: &Cx, conn: C, info: Con
 pub struct Site {
     vhost: VHost,
     default_host: bool,
-    h1: Http1Options,
+    limits: Limits,
     date: Option<SystemTime>,
     vhosts: VirtualHosts,
 }
@@ -1452,7 +1502,7 @@ impl Site {
         Site {
             vhost: VHost { handler, https: false, plain_http: false },
             default_host: false,
-            h1: Http1Options::default(),
+            limits: Limits::default(),
             date: None,
             vhosts: VirtualHosts::new(),
         }
@@ -1480,9 +1530,9 @@ impl Site {
         self
     }
 
-    /// Sets HTTP/1's limits and timers.
-    pub fn options(mut self, h1: Http1Options) -> Site {
-        self.h1 = h1;
+    /// Sets the limits and timers.
+    pub fn limits(mut self, limits: Limits) -> Site {
+        self.limits = limits;
         self
     }
 
@@ -1499,7 +1549,7 @@ impl Accept for Site {
     fn serve(&self, cx: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         let handler: Arc<dyn Handler> = Arc::new(self.vhosts.clone());
         let opts = HttpOptions {
-            h1: self.h1,
+            limits: self.limits,
             first_bytes: (!arrival.info.tls).then_some(arrival.handshake),
             budget: arrival.budget,
             seed: arrival.seed,
@@ -1595,20 +1645,15 @@ impl Website {
 /// HTTP/2 on hyper, until the stdlib's own HTTP/2 lands.
 mod h2 {
     use super::*;
-    use http_body_util::{BodyExt, Limited};
+    use fictionet::stdlib::codec::Lcg;
+    use fictionet::stdlib::serve::{Charge, PanicNote};
     use hyper::body::Incoming;
 
     /// Runs hyper's HTTP/2 server on `conn`.
-    pub(super) async fn serve<C: Connection + Unpin>(
-        cx: &Cx,
-        conn: C,
-        handler: Arc<dyn Handler>,
-        info: ConnInfo,
-        date: Option<SystemTime>,
-    ) {
+    pub(super) async fn serve<C: Connection + Unpin>(cx: &Cx, conn: C, handler: Arc<dyn Handler>, info: ConnInfo, opts: &HttpOptions) {
         let broke = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let io = Io { cx: cx.clone(), conn, broke: broke.clone(), buf: vec![0; 16 * 1024].into_boxed_slice() };
-        let route = Route { cx: cx.clone(), handler, info: Arc::new(info.clone()), date };
+        let io = Io::new(cx, conn, broke.clone(), opts.limits.write_timeout);
+        let route = Route::new(cx, handler, &info, opts);
         // In a browser, `std::time::Instant::now` panics. hyper's timer API
         // is in `Instant`, so there hyper runs without a timer. hyper never
         // writes a `Date` header, which it would take from the host's
@@ -1616,6 +1661,7 @@ mod h2 {
         let browser = cfg!(target_arch = "wasm32");
         let mut builder = hyper::server::conn::http2::Builder::new(Executor { cx: cx.clone() });
         builder.auto_date_header(false);
+        builder.max_concurrent_streams(opts.limits.max_streams);
         if !browser {
             builder.timer(CxTimer { cx: cx.clone() });
         }
@@ -1636,11 +1682,11 @@ mod h2 {
         conn: C,
         handler: Arc<dyn Handler>,
         info: ConnInfo,
-        date: Option<SystemTime>,
+        opts: &HttpOptions,
     ) {
         let broke = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let io = Io { cx: cx.clone(), conn, broke: broke.clone(), buf: vec![0; 16 * 1024].into_boxed_slice() };
-        let route = Route { cx: cx.clone(), handler, info: Arc::new(info.clone()), date };
+        let io = Io::new(cx, conn, broke.clone(), opts.limits.write_timeout);
+        let route = Route::new(cx, handler, &info, opts);
         let mut builder = hyper::server::conn::http1::Builder::new();
         builder.auto_date_header(false);
         if cfg!(target_arch = "wasm32") {
@@ -1698,12 +1744,66 @@ mod h2 {
         broken.then_some("transport")
     }
 
+    /// Answers each request hyper reads, with the connection's limits,
+    /// budget and randomness.
     #[derive(Clone)]
     struct Route {
         cx: Cx,
         handler: Arc<dyn Handler>,
         info: Arc<ConnInfo>,
         date: Option<SystemTime>,
+        limits: Limits,
+        budget: Option<Budget>,
+        /// The connection's generator, seeded as an HTTP/1 connection's is.
+        rng: Arc<Mutex<Lcg>>,
+    }
+
+    impl Route {
+        fn new(cx: &Cx, handler: Arc<dyn Handler>, info: &ConnInfo, opts: &HttpOptions) -> Route {
+            let seed = serve::conn_seed(opts.seed, info.id.unwrap_or(0));
+            Route {
+                cx: cx.clone(),
+                handler,
+                info: Arc::new(info.clone()),
+                date: opts.date,
+                limits: opts.limits,
+                budget: opts.budget.clone(),
+                rng: Arc::new(Mutex::new(Lcg::new(seed))),
+            }
+        }
+
+        /// Reads a request's body, charging it as it comes. `Err` is the
+        /// answer instead.
+        async fn body(&self, body: Incoming, charge: &mut Option<Charge>) -> Result<Bytes, Box<Response<Body>>> {
+            let read = async {
+                let mut body = pin!(body);
+                let mut got = Vec::new();
+                while let Some(frame) = poll_fn(|task| body.as_mut().poll_frame(task)).await {
+                    let Ok(frame) = frame else {
+                        return Err(Box::new(answered(text(StatusCode::BAD_REQUEST, "The request body was cut off.\n"), "cut_off")));
+                    };
+                    let Ok(data) = frame.into_data() else { continue };
+                    let len = got.len() + data.len();
+                    if len > self.limits.max_body {
+                        return Err(Box::new(answered(text(StatusCode::PAYLOAD_TOO_LARGE, "The request body is too large.\n"), "too_large")));
+                    }
+                    if !charge.as_mut().is_none_or(|c| c.set(len)) {
+                        return Err(Box::new(over_budget()));
+                    }
+                    got.extend_from_slice(&data);
+                }
+                Ok(Bytes::from(got))
+            };
+            match self.cx.race(Some(self.cx.now() + self.limits.body_timeout), read).await {
+                Ok(got) => got,
+                Err(_) => Err(Box::new(answered(text(StatusCode::REQUEST_TIMEOUT, "The request body took too long.\n"), "timeout"))),
+            }
+        }
+    }
+
+    /// The answer when the sandbox's budget cannot hold a body.
+    fn over_budget() -> Response<Body> {
+        answered(text(StatusCode::SERVICE_UNAVAILABLE, "The server cannot hold this request now.\n"), "budget")
     }
 
     type Answer = Pin<Box<dyn Future<Output = Result<Response<Counted>, Error>> + Send>>;
@@ -1723,20 +1823,24 @@ mod h2 {
                 status: None,
                 sent: 0,
                 complete: false,
+                _note: PanicNote::new("an httpd handler over HTTP/2", &route.info),
             };
             Box::pin(async move {
                 // Dropped with the future if the client resets the stream.
                 let mut track = track;
+                // Charged a piece at a time: the request's body, then the
+                // response body while it is held in full.
+                let mut charge = route.budget.as_ref().and_then(|b| b.charge(0));
                 let (parts, body) = request.into_parts();
                 let head_only = parts.method == Method::HEAD;
-                let response = match Limited::new(body, 64 << 20).collect().await {
-                    Err(_) => text(StatusCode::PAYLOAD_TOO_LARGE, "The request body is too large.\n"),
+                let response = match route.body(body, &mut charge).await {
+                    Err(answer) => *answer,
                     Ok(body) => {
-                        let mut request = Request::from_parts(parts, Body::from(body.to_bytes()));
+                        let mut request = Request::from_parts(parts, Body::from(body));
                         request.extensions_mut().insert((*route.info).clone());
                         let now = route.cx.now();
-                        let cx = route.cx.clone();
-                        let mut rng = move || cx.random_u64();
+                        let rng = route.rng.clone();
+                        let mut rng = move || rng.lock().unwrap_or_else(|e| e.into_inner()).next();
                         let reply = route.handler.call(request, &mut Exchange::new(now, &mut rng, &route.info));
                         match reply {
                             Reply::Now(r) => r,
@@ -1747,7 +1851,9 @@ mod h2 {
                         }
                     }
                 };
-                let (mut parts, body) = response.into_parts();
+                let (parts, body) = response.into_parts();
+                let fits = charge.as_mut().is_none_or(|c| c.set(body.full_len()));
+                let (mut parts, body) = if fits { (parts, body) } else { over_budget().into_parts() };
                 if !parts.headers.contains_key(DATE)
                     && let Some(date) = date_header(route.date, route.cx.now())
                 {
@@ -1770,8 +1876,11 @@ mod h2 {
                 } else {
                     body
                 };
+                if let Some(c) = &mut charge {
+                    c.set(body.full_len());
+                }
                 parts.extensions = http::Extensions::new();
-                Ok(Response::from_parts(parts, Counted { body, rest: Bytes::new(), track, bodiless }))
+                Ok(Response::from_parts(parts, Counted { body, rest: Bytes::new(), track, bodiless, charge }))
             })
         }
     }
@@ -1785,6 +1894,8 @@ mod h2 {
         status: Option<StatusCode>,
         sent: u64,
         complete: bool,
+        /// Names the connection if the handler or its body panics.
+        _note: PanicNote,
     }
 
     impl Drop for Track {
@@ -1802,6 +1913,8 @@ mod h2 {
         rest: Bytes,
         track: Track,
         bodiless: bool,
+        /// What the body held in full still holds.
+        charge: Option<Charge>,
     }
 
     impl http_body::Body for Counted {
@@ -1813,6 +1926,7 @@ mod h2 {
             if !this.rest.is_empty() {
                 let piece = this.rest.split_to(this.rest.len().min(PIECE));
                 this.track.sent += piece.len() as u64;
+                this.recharge();
                 return Poll::Ready(Some(Ok(Frame::data(piece))));
             }
             let mut polled = Pin::new(&mut this.body).poll_frame(task);
@@ -1832,6 +1946,7 @@ mod h2 {
                 Poll::Ready(None) => this.track.complete = true,
                 Poll::Pending => {}
             }
+            this.recharge();
             polled
         }
 
@@ -1851,6 +1966,15 @@ mod h2 {
         }
     }
 
+    impl Counted {
+        /// Charges what is left to send of a body held in full.
+        fn recharge(&mut self) {
+            if let Some(c) = &mut self.charge {
+                c.set(self.rest.len() + self.body.full_len());
+            }
+        }
+    }
+
     impl Drop for Counted {
         fn drop(&mut self) {
             // hyper may stop polling once the body says it has ended.
@@ -1860,12 +1984,47 @@ mod h2 {
         }
     }
 
-    /// A connection as hyper's `Read` and `Write`.
+    /// The timer of a write that waits.
+    type Stall = Pin<Box<dyn Future<Output = Result<(), fictionet::Cancelled>> + Send>>;
+
+    /// A connection as hyper's `Read` and `Write`. A write that takes no
+    /// bytes for `stall` fails with `TimedOut`, which ends the connection:
+    /// a client that stopped reading.
     struct Io<C> {
         cx: Cx,
         conn: C,
         broke: Arc<std::sync::atomic::AtomicBool>,
         buf: Box<[u8]>,
+        stall: Duration,
+        /// Armed while a write waits.
+        stalled: Option<Stall>,
+    }
+
+    impl<C: Connection + Unpin> Io<C> {
+        fn new(cx: &Cx, conn: C, broke: Arc<std::sync::atomic::AtomicBool>, stall: Duration) -> Io<C> {
+            Io { cx: cx.clone(), conn, broke, buf: vec![0; 16 * 1024].into_boxed_slice(), stall, stalled: None }
+        }
+
+        /// One write, with the stall timer: armed when it waits, cleared
+        /// when bytes go.
+        fn write(&mut self, task: &mut Context<'_>, data: &[u8]) -> Poll<Result<usize, ConnError>> {
+            match self.conn.poll_write(&self.cx, task, data) {
+                Poll::Pending => {
+                    let cx = self.cx.clone();
+                    let stall = self.stall;
+                    let timer = self.stalled.get_or_insert_with(|| Box::pin(async move { cx.sleep(stall).await }));
+                    match timer.as_mut().poll(task) {
+                        Poll::Ready(Ok(())) => Poll::Ready(Err(ConnError::TimedOut)),
+                        Poll::Ready(Err(_)) => Poll::Ready(Err(ConnError::Cancelled)),
+                        Poll::Pending => Poll::Pending,
+                    }
+                }
+                done => {
+                    self.stalled = None;
+                    done
+                }
+            }
+        }
     }
 
     fn to_io(e: ConnError) -> std::io::Error {
@@ -1903,8 +2062,7 @@ mod h2 {
 
     impl<C: Connection + Unpin> hyper::rt::Write for Io<C> {
         fn poll_write(self: Pin<&mut Self>, task: &mut Context<'_>, data: &[u8]) -> Poll<std::io::Result<usize>> {
-            let this = self.get_mut();
-            this.conn.poll_write(&this.cx, task, data).map_err(to_io)
+            self.get_mut().write(task, data).map_err(to_io)
         }
 
         fn is_write_vectored(&self) -> bool {
@@ -1915,7 +2073,7 @@ mod h2 {
             let this = self.get_mut();
             let mut done = 0;
             for buf in bufs.iter().filter(|b| !b.is_empty()) {
-                match this.conn.poll_write(&this.cx, task, buf) {
+                match this.write(task, buf) {
                     Poll::Ready(Ok(n)) => {
                         done += n;
                         if n < buf.len() {
@@ -1927,6 +2085,8 @@ mod h2 {
                     Poll::Ready(Err(_)) | Poll::Pending => break,
                 }
             }
+            // Bytes went: a later wait counts from now.
+            this.stalled = None;
             Poll::Ready(Ok(done))
         }
 

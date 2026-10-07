@@ -88,12 +88,21 @@ A service can also:
   fresh decoder; `Upgrade::Handoff` hands the connection and its unread
   bytes back to whoever called `serve`.
 - **Say what it holds.** `Service::held` reports bytes the service keeps
-  for the connection, such as a request body, so they count against the
-  sandbox's budget with the decoder's own.
+  for the connection, such as a request body, and `Pending::held` what
+  deferred work keeps, such as a response body not yet written. They
+  count against the sandbox's budget with the decoder's own and the reply
+  bytes waiting to be written.
 
-A panic in a call closes that connection, records `conn.panic`, and the
-rest of the world goes on. An error the service returns closes it and
-records `conn.error`.
+An error the service returns closes its connection and records
+`conn.error`. A panic is a bug in the world, and Fictionet does not catch
+it: it ends the run, wherever in the world it happens. As it unwinds,
+the driver names the service and the connection on standard error after
+the panic's own message, so the failed run says where to look.
+
+A write that takes no bytes for `ServeOptions::write_timeout` (10
+seconds) ends the connection: a client that stops reading cannot hold a
+reply, or a service's timers, for ever. A client that resets the
+connection ends it at once, also while a write waits.
 
 ### One protocol, two framings
 
@@ -183,7 +192,8 @@ Other kinds of port:
   `Accept` of the world's own. HTTP is one: `httpd::Site`, below.
 
 Each sandbox may hold 256 connections at once to one machine, and the
-bytes its connections hold together are charged to its budget (256 MiB);
+bytes its connections hold together, read or waiting to be written, are
+charged to its budget (256 MiB);
 `Net::limits` changes these and the handshake and DNS timers. Tests set
 small ones. `Net::seed` seeds every service's randomness, mixed with each
 connection's number, so a run whose connections arrive in the same order
@@ -249,7 +259,17 @@ plugs in the same way.
 
 `Http1` speaks HTTP/1.0 and 1.1 on the stdlib's `http1` decoder. HTTP/2
 runs on hyper behind the same `Handler` trait until the stdlib's own
-HTTP/2 lands; handlers will not change.
+HTTP/2 lands; handlers will not change. Both versions share one set of
+`httpd::Limits` (body size, body and write timers, and 100 streams at
+once on an HTTP/2 connection), charge what they hold to the sandbox's
+budget, and draw a handler's randomness from the connection's seed.
+
+Each request is one `http.request` event. Its `sent` field counts the
+body bytes the connection took, and `complete` says whether it took all
+of them. Over HTTP/1 a byte counts once it is written to the connection,
+and the event is made after the last one is: a client that stops reading
+or resets the connection mid-body leaves `complete: false` and the bytes
+it got. Over HTTP/2 a byte counts once hyper takes it for the stream.
 
 ## 5. Events
 

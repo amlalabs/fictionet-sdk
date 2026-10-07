@@ -487,7 +487,7 @@ impl Host {
             }
             opts.seed ^= seed;
             cx.spawn(move |cx| async move {
-                let _ = serve::serve_datagram(&cx, socket, local, &mut service, &world, &opts).await;
+                serve::serve_datagram(&cx, socket, local, &mut service, &world, &opts).await;
                 Ok(())
             });
         });

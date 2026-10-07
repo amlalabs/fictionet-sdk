@@ -84,8 +84,11 @@
 //!
 //! - **One call at a time.** The service's methods are called in order, in
 //!   the connection's task. Each call's reply is written before the next
-//!   call. A panic in a call closes the connection, records `conn.panic`,
-//!   and is not seen by the rest of the world.
+//!   call.
+//! - **Panics are bugs.** The driver does not catch a panic in a call or
+//!   in deferred work: it ends the run, as a panic anywhere in a world
+//!   does. As it unwinds, the driver names the service and the connection
+//!   on standard error ([`PanicNote`]).
 //! - **Progress, not stalls.** Bytes the decoder takes count as progress,
 //!   whether or not they make an item, so a decoder that skips a long run
 //!   of bytes is never mistaken for a stuck one. A decoder that can take
@@ -108,11 +111,17 @@
 //! - **Idle.** With [`ServeOptions::idle`], a connection that sends nothing
 //!   for that long while the driver waits for it is closed, after
 //!   [`Service::on_end`] with [`End::Idle`].
+//! - **Writes.** A write that takes no bytes for
+//!   [`ServeOptions::write_timeout`] ends the connection with
+//!   [`End::Conn`]`(`[`ConnError::TimedOut`]`)`: a client that stops
+//!   reading. A client that resets the connection ends it at once, also
+//!   while a write waits.
 //! - **Budget.** With [`ServeOptions::budget`], the bytes the connection
-//!   holds (the decoder's capacity and held state, the bytes waiting for
-//!   it, and [`Service::held`]) are charged to a [`Budget`] shared with
-//!   other connections; past it the connection closes with
-//!   [`End::Budget`].
+//!   holds are charged to a [`Budget`] shared with other connections: the
+//!   decoder's capacity and held state, the bytes waiting for it,
+//!   [`Service::held`], the reply bytes not yet written, and what deferred
+//!   work holds ([`Pending::held`]). Past it the connection closes with
+//!   [`End::Budget`], and its deferred work is cancelled.
 //! - **Ends.** [`Service::on_end`] is called once, with why the connection
 //!   ended. Its reply is written when the connection can still take it: the
 //!   client half-closed ([`End::Eof`]), the service closed, the service's
@@ -131,7 +140,7 @@ use std::convert::Infallible;
 use std::future::{Future, poll_fn};
 use std::net::SocketAddr;
 use std::pin::pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
@@ -229,7 +238,6 @@ pub trait Service: Send + 'static {
     }
 
     /// The connection ended, for the reason in `end`. Called once, last.
-    /// Not called after a panic.
     fn on_end(&mut self, _end: End, _world: &Self::World, _ctx: &mut ServeCtx<'_>) -> Result<(), Self::Error> {
         Ok(())
     }
@@ -305,9 +313,6 @@ pub enum End {
     Conn(ConnError),
     /// The world is stopping.
     Cancelled,
-    /// A call into the service panicked. [`Service::on_end`] is not
-    /// called.
-    Panicked,
 }
 
 impl End {
@@ -317,8 +322,8 @@ impl End {
     }
 
     /// The name in a `conn.close` event: `eof`, `closed`, `failed`,
-    /// `idle`, `budget`, `reset`, `broken`, `error`, `cancelled` or
-    /// `panicked`.
+    /// `idle`, `budget`, `reset`, `broken`, `timed_out` (a write took no
+    /// bytes for [`ServeOptions::write_timeout`]), `error` or `cancelled`.
     pub fn as_str(self) -> &'static str {
         match self {
             End::Eof => "eof",
@@ -328,9 +333,9 @@ impl End {
             End::Budget => "budget",
             End::Conn(ConnError::Reset) => "reset",
             End::Conn(ConnError::Broken) => "broken",
+            End::Conn(ConnError::TimedOut) => "timed_out",
             End::Conn(_) => "error",
             End::Cancelled => "cancelled",
-            End::Panicked => "panicked",
         }
     }
 }
@@ -353,12 +358,21 @@ pub trait Pending: Send + 'static {
     /// frames between them. An error on ordered work closes the
     /// connection, since the bytes so far may have broken the protocol's
     /// framing; on keyed work it ends that work ([`Done::Failed`]).
+    ///
+    /// The driver polls the work again only once the bytes it returned
+    /// were written, so [`PendingCtx::written`] then counts them.
     fn poll_next(&mut self, ctx: &mut PendingCtx<'_>, task: &mut Context<'_>) -> Poll<Option<Result<Vec<u8>, fictionet::Error>>>;
 
     /// The connection went away, the world is stopping, or the service
     /// cancelled the work, before it finished. The work is dropped after
     /// this.
     fn cancel(&mut self, _ctx: &mut PendingCtx<'_>) {}
+
+    /// Bytes the work holds while it waits, such as a response body not
+    /// yet returned. Charged to the connection's [`Budget`]. Default 0.
+    fn held(&self) -> usize {
+        0
+    }
 }
 
 /// What deferred work sees while it runs.
@@ -367,6 +381,7 @@ pub struct PendingCtx<'a> {
     events: &'a mut Vec<Event>,
     written: u64,
     conn: &'a ConnInfo,
+    close: bool,
 }
 
 impl PendingCtx<'_> {
@@ -376,9 +391,16 @@ impl PendingCtx<'_> {
         self.cx
     }
 
-    /// Bytes of this work written to the connection so far.
+    /// Bytes of this work the connection took so far: each piece the work
+    /// returned counts once all of it is written.
     pub fn written(&self) -> u64 {
         self.written
+    }
+
+    /// Closes the connection once this work is done and its bytes are
+    /// written: an HTTP/1.0 response whose body ends with the connection.
+    pub fn close(&mut self) {
+        self.close = true;
     }
 
     /// Records an event, from this connection.
@@ -461,9 +483,11 @@ impl WakeHandle {
 ///
 /// Each connection charges what it holds: its decoder's capacity and
 /// held state ([`Decode::capacity`], [`Decode::held`]), the bytes read but
-/// not yet decoded, and [`Service::held`]. A connection that would take
-/// the total past the limit closes with [`End::Budget`]; one that cannot
-/// get its first charge is closed before the service sees it.
+/// not yet decoded, [`Service::held`], the reply bytes not yet written,
+/// and [`Pending::held`]. A connection that would take the total past the
+/// limit closes with [`End::Budget`]; one that cannot get its first charge
+/// is closed before the service sees it. Code that holds bytes outside a
+/// service, such as HTTP/2 on hyper, takes a [`Charge`] of its own.
 #[derive(Clone)]
 pub struct Budget {
     inner: Arc<BudgetInner>,
@@ -512,16 +536,35 @@ impl Budget {
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| used.checked_add(more).filter(|n| *n <= self.inner.limit))
             .is_ok()
     }
+
+    /// A charge of `bytes`, or `None` if they do not fit.
+    pub fn charge(&self, bytes: usize) -> Option<Charge> {
+        let mut charge = Charge { budget: self.clone(), now: 0 };
+        charge.set(bytes).then_some(charge)
+    }
 }
 
-/// One connection's charge on a [`Budget`], given back when dropped.
-struct Charge {
+/// Bytes charged to a [`Budget`], given back when dropped.
+pub struct Charge {
     budget: Budget,
     now: usize,
 }
 
+impl std::fmt::Debug for Charge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Charge").field("bytes", &self.now).finish()
+    }
+}
+
 impl Charge {
-    fn set(&mut self, to: usize) -> bool {
+    /// The bytes charged now.
+    pub fn bytes(&self) -> usize {
+        self.now
+    }
+
+    /// Charges `to` bytes instead. Refuses, changing nothing, if that
+    /// would take the budget past its limit; less always fits.
+    pub fn set(&mut self, to: usize) -> bool {
         if to == self.now {
             return true;
         }
@@ -677,8 +720,8 @@ impl Scratch {
         }
     }
 
-    /// Throws away what a call asked for: after a panic, or a call whose
-    /// output cannot be written.
+    /// Throws away what a call asked for, when its output cannot be
+    /// written.
     fn discard(&mut self) {
         self.reply.clear();
         self.datagrams.clear();
@@ -703,17 +746,58 @@ fn due(timers: &[(Timer, Instant)], now: Instant) -> Option<usize> {
     (*at <= now).then_some(i)
 }
 
-/// Runs `f`, turning a panic into its message.
-fn guarded<R>(f: impl FnOnce() -> R) -> Result<R, String> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|p| {
-        if let Some(s) = p.downcast_ref::<&str>() {
-            (*s).to_owned()
-        } else if let Some(s) = p.downcast_ref::<String>() {
-            s.clone()
-        } else {
-            "a panic with no message".to_owned()
+/// Names a service and its connection in a panic that unwinds past it.
+///
+/// A panic in world code is the world's bug. Fictionet does not catch it:
+/// it ends the run. The panic's own message says where in the code it
+/// happened; a `PanicNote` alive while it unwinds adds which service and
+/// connection, on standard error. [`serve`], [`serve_datagram`] and
+/// HTTP/2 in [`httpd`](crate::stdlib::httpd) keep one while they call
+/// world code.
+pub struct PanicNote {
+    service: &'static str,
+    conn: ConnInfo,
+}
+
+impl PanicNote {
+    /// A note for `service` (such as `std::any::type_name` of it) serving
+    /// `conn`.
+    pub fn new(service: &'static str, conn: &ConnInfo) -> PanicNote {
+        PanicNote { service, conn: conn.clone() }
+    }
+}
+
+impl std::fmt::Display for PanicNote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the panic came from {}", self.service)?;
+        let c = &self.conn;
+        if let Some(id) = c.id {
+            write!(f, ", serving connection {id}")?;
         }
-    })
+        if let Some(peer) = c.peer {
+            write!(f, " from {peer}")?;
+        }
+        if let Some(local) = c.local {
+            write!(f, " to {local} ({})", c.transport.as_str())?;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for PanicNote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PanicNote({self})")
+    }
+}
+
+impl Drop for PanicNote {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            use std::io::Write as _;
+            // Never a second panic while unwinding.
+            let _ = writeln!(std::io::stderr(), "fictionet: {self}");
+        }
+    }
 }
 
 /// A connection's seed: `seed` mixed with its number (SplitMix64), so
@@ -862,6 +946,10 @@ pub struct ServeOptions {
     /// while the driver waits for them. Default 10 seconds. `None` waits
     /// forever.
     pub idle: Option<Duration>,
+    /// End a connection whose write takes no bytes for this long: a client
+    /// that stops reading. Default 10 seconds. `None` waits forever; a
+    /// reset or the world stopping still ends the wait.
+    pub write_timeout: Option<Duration>,
     /// Records both directions.
     pub record: Option<Transcript>,
     /// Faults on the bytes and items.
@@ -888,8 +976,6 @@ pub struct ServeOptions {
     /// [`Net`](crate::stdlib::net::Net) sets it; a connection's sandbox is
     /// given with its `ConnInfo` instead.
     pub sandbox: Option<SandboxOf>,
-    /// Numbers connections, from 1. Clones of these options share it.
-    pub ids: Arc<AtomicU64>,
 }
 
 impl Default for ServeOptions {
@@ -897,6 +983,7 @@ impl Default for ServeOptions {
         ServeOptions {
             max_conns: 64,
             idle: Some(Duration::from_secs(10)),
+            write_timeout: Some(Duration::from_secs(10)),
             record: None,
             faults: None,
             tls: None,
@@ -907,7 +994,6 @@ impl Default for ServeOptions {
             budget: None,
             seed: 0,
             sandbox: None,
-            ids: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -917,6 +1003,7 @@ impl std::fmt::Debug for ServeOptions {
         f.debug_struct("ServeOptions")
             .field("max_conns", &self.max_conns)
             .field("idle", &self.idle)
+            .field("write_timeout", &self.write_timeout)
             .field("record", &self.record.is_some())
             .field("faults", &self.faults)
             .field("tls", &self.tls.is_some())
@@ -960,6 +1047,11 @@ impl ServeOptions {
         ServeOptions { idle, ..self }
     }
 
+    /// Sets the write limit.
+    pub fn write_timeout(self, write_timeout: Option<Duration>) -> ServeOptions {
+        ServeOptions { write_timeout, ..self }
+    }
+
     /// Sets the connection cap.
     pub fn max_conns(self, max_conns: usize) -> ServeOptions {
         ServeOptions { max_conns, ..self }
@@ -979,27 +1071,19 @@ impl ServeOptions {
     pub fn connection_events(self, on: bool) -> ServeOptions {
         ServeOptions { connection_events: on, ..self }
     }
-
-    /// The next connection number.
-    pub fn next_id(&self) -> u64 {
-        self.ids.fetch_add(1, Ordering::Relaxed) + 1
-    }
 }
 
 // ---------------------------------------------------------------------------
 // Handing back
 
 /// Why [`serve`] stopped early. The connection was closed, and the run's
-/// events have a `conn.error` or `conn.panic` event that says why.
+/// events have a `conn.error` event that says why.
 #[derive(Debug)]
 pub enum ServeError<E> {
     /// The service returned this error.
     Service(E),
     /// Ordered deferred work failed.
     Pending(fictionet::Error),
-    /// A call into the service, or its deferred work, panicked with this
-    /// message.
-    Panic(String),
 }
 
 impl<E: core::fmt::Display> core::fmt::Display for ServeError<E> {
@@ -1007,7 +1091,6 @@ impl<E: core::fmt::Display> core::fmt::Display for ServeError<E> {
         match self {
             ServeError::Service(e) => write!(f, "service: {e}"),
             ServeError::Pending(e) => write!(f, "deferred work: {e}"),
-            ServeError::Panic(m) => write!(f, "panic: {m}"),
         }
     }
 }
@@ -1103,6 +1186,8 @@ struct ConnFaults<D: Decode> {
     outbound: Faults,
     /// The second decoder item rules run on. Gone once it fails or ends.
     front: Option<Stream<D>>,
+    /// Why item rules stopped, until the driver records it.
+    stopped: Option<&'static str>,
 }
 
 // The fault engine hands the replacement type by reference, `&Vec<u8>`.
@@ -1133,6 +1218,7 @@ where
             inbound: Faults::new(seed, FAULT_OUTPUT, FAULT_HELD),
             outbound: Faults::new(seed ^ 1, FAULT_OUTPUT, FAULT_HELD),
             front: Some(Stream::new(decoder)),
+            stopped: None,
         }
     }
 
@@ -1216,6 +1302,7 @@ where
                 if !left.is_empty() {
                     queue.push_back(Segment::Bytes(left, 0));
                 }
+                self.stopped = Some(if front.failed().is_some() { "failed" } else { "ended" });
                 self.front = None;
                 return;
             }
@@ -1228,11 +1315,24 @@ where
                 }
                 if !rest.is_empty() {
                     queue.push_back(Segment::Bytes(rest.to_vec(), 0));
+                    self.stopped = Some("stuck");
                     self.front = None;
                 }
                 return;
             }
         }
+    }
+
+    /// The `conn.faults` event for item rules that stopped since the last
+    /// call: the client's bytes went on unchanged from there.
+    fn stopped(&mut self) -> Option<Event> {
+        let why = self.stopped.take()?;
+        let summary = match why {
+            "failed" => "item faults stopped: the client's bytes did not decode",
+            "ended" => "item faults stopped: the decoder ended",
+            _ => "item faults stopped: the decoder could take no more",
+        };
+        Some(Event::new("conn", "faults").level(Level::Notice).summary(summary).field("stopped", why))
     }
 
     /// Runs the outbound byte rules over one chunk: the bytes to write and
@@ -1255,21 +1355,25 @@ where
 
 /// What the driver writes, in order.
 enum Out {
-    Bytes(Vec<u8>),
+    /// Bytes, and the work (by number) whose piece of that many bytes is
+    /// all written once they are.
+    Bytes(Vec<u8>, Option<(u64, u64)>),
     Delay(Duration),
 }
 
-/// Async work the driver runs, with what it wrote so far.
+/// Async work the driver runs, with what the connection took of it so far.
 struct Work {
+    id: u64,
     pending: Box<dyn Pending>,
     written: u64,
+    /// Close the connection once it is done ([`PendingCtx::close`]).
+    close: bool,
 }
 
 /// What went wrong beyond the connection's end.
 enum Failure<E> {
     Service(E),
     Pending(fictionet::Error),
-    Panic(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1327,6 +1431,8 @@ struct Core<S: Service> {
     charge: Option<Charge>,
     /// The decoder was swapped for a fresh one ([`Upgrade::Decoder`]).
     fresh: bool,
+    /// The number of the next deferred work.
+    next_work: u64,
 }
 
 impl<S: Service> Core<S>
@@ -1362,6 +1468,7 @@ where
             budget: opts.budget.clone(),
             charge: None,
             fresh: false,
+            next_work: 0,
         }
     }
 
@@ -1382,6 +1489,8 @@ where
     /// The bytes this connection holds, as charged to its budget.
     fn holding(&mut self, service: &S) -> usize {
         let queued: usize = self.queue.iter().map(|s| if let Segment::Bytes(b, at) = s { b.len() - at } else { 0 }).sum();
+        let out: usize = self.out.iter().map(|o| if let Out::Bytes(b, _) = o { b.len() } else { 0 }).sum();
+        let work: usize = self.ordered.iter().chain(self.keyed.iter().map(|(_, w)| w)).map(|w| w.pending.held()).sum();
         self.stream
             .decoder()
             .capacity()
@@ -1389,6 +1498,33 @@ where
             .saturating_add(self.stream.held())
             .saturating_add(queued)
             .saturating_add(service.held())
+            .saturating_add(out)
+            .saturating_add(work)
+    }
+
+    /// Charges what the connection holds now. Past the budget, nothing
+    /// more is written and the deferred work is cancelled; the connection
+    /// ends with [`End::Budget`], and `on_end` may still reply.
+    fn recharge(&mut self, service: &S) {
+        if self.charge.is_none() || matches!(self.state, State::Ended(_) | State::Upgrading(_)) {
+            return;
+        }
+        let need = self.holding(service);
+        if self.charge.as_mut().is_some_and(|c| c.set(need)) {
+            return;
+        }
+        self.out.clear();
+        self.cancel_all(true);
+        match self.state {
+            State::Running => self.finish(End::Budget),
+            State::Ending { called: false, .. } => self.state = State::Ending { end: End::Budget, called: false },
+            _ => self.end_now(End::Budget),
+        }
+        // What is left, such as the decoder's capacity, still counts.
+        let need = self.holding(service);
+        if let Some(c) = &mut self.charge {
+            c.set(need.min(c.bytes()));
+        }
     }
 
     /// Bytes from the client.
@@ -1396,7 +1532,17 @@ where
         self.s.bytes_in += bytes.len() as u64;
         self.idle_from = now;
         match &mut self.faults {
-            Some(f) => f.inbound(bytes, false, &mut self.queue),
+            Some(f) => {
+                f.inbound(bytes, false, &mut self.queue);
+                self.s.events.extend(f.stopped());
+            }
+            None if self.queue.is_empty() => {
+                // Straight into the decoder's buffer: one copy, not two.
+                let n = self.stream.push(bytes);
+                if n < bytes.len() {
+                    self.queue.push_back(Segment::Bytes(bytes[n..].to_vec(), 0));
+                }
+            }
             None => self.queue.push_back(Segment::Bytes(bytes.to_vec(), 0)),
         }
     }
@@ -1406,7 +1552,21 @@ where
         self.eof = true;
         if let Some(f) = &mut self.faults {
             f.inbound(&[], true, &mut self.queue);
+            self.s.events.extend(f.stopped());
         }
+    }
+
+    /// `n` bytes of the work numbered `id` were written.
+    fn wrote(&mut self, credit: Option<(u64, u64)>) {
+        let Some((id, n)) = credit else { return };
+        if let Some(w) = self.ordered.iter_mut().chain(self.keyed.iter_mut().map(|(_, w)| w)).find(|w| w.id == id) {
+            w.written += n;
+        }
+    }
+
+    fn new_work(&mut self, pending: Box<dyn Pending>) -> Work {
+        self.next_work += 1;
+        Work { id: self.next_work, pending, written: 0, close: false }
     }
 
     /// The connection broke, or the world is stopping.
@@ -1431,34 +1591,38 @@ where
         unread
     }
 
-    fn push_out(&mut self, bytes: Vec<u8>) {
+    /// Queues `bytes` to write, through the outbound faults. `work` is the
+    /// number of the work they came from: it is credited with their length
+    /// once the last of them is written.
+    fn push_out(&mut self, bytes: Vec<u8>, work: Option<u64>) {
         if bytes.is_empty() {
             return;
         }
+        let credit = work.map(|id| (id, bytes.len() as u64));
         let (bytes, delay) = match &mut self.faults {
             Some(f) => f.outbound(bytes),
             None => (bytes, None),
         };
         match delay {
-            None => self.out.push_back(Out::Bytes(bytes)),
+            None => self.out.push_back(Out::Bytes(bytes, credit)),
             Some(FaultDelay { at, duration }) => {
                 let mut bytes = bytes;
                 let rest = bytes.split_off(at.min(bytes.len()));
-                self.out.push_back(Out::Bytes(bytes));
+                self.out.push_back(Out::Bytes(bytes, None));
                 self.out.push_back(Out::Delay(duration));
-                self.out.push_back(Out::Bytes(rest));
+                self.out.push_back(Out::Bytes(rest, credit));
             }
         }
     }
 
     fn pending_ctx<'a>(cx: Option<&'a Cx>, events: &'a mut Vec<Event>, written: u64, conn: &'a ConnInfo) -> PendingCtx<'a> {
-        PendingCtx { cx, events, written, conn }
+        PendingCtx { cx, events, written, conn, close: false }
     }
 
     fn cancel_work(&mut self, mut work: Work) {
         let mut events = Vec::new();
         let mut ctx = Self::pending_ctx(self.cx.as_ref(), &mut events, work.written, &self.info);
-        let _ = guarded(|| work.pending.cancel(&mut ctx));
+        work.pending.cancel(&mut ctx);
         self.s.events.append(&mut events);
     }
 
@@ -1476,10 +1640,11 @@ where
     /// Takes what the last call asked for: its reply, its deferred work.
     fn collect(&mut self) {
         let reply = std::mem::take(&mut self.s.reply);
-        self.push_out(reply);
+        self.push_out(reply, None);
         self.s.datagrams.clear();
         for pending in std::mem::take(&mut self.s.ordered) {
-            self.ordered.push_back(Work { pending, written: 0 });
+            let work = self.new_work(pending);
+            self.ordered.push_back(work);
         }
         for (key, work) in std::mem::take(&mut self.s.keyed) {
             if let Some(i) = self.keyed.iter().position(|(k, _)| *k == key) {
@@ -1487,18 +1652,10 @@ where
                 self.cancel_work(old);
             }
             if let Some(pending) = work {
-                self.keyed.push((key, Work { pending, written: 0 }));
+                let work = self.new_work(pending);
+                self.keyed.push((key, work));
             }
         }
-    }
-
-    /// A call panicked: nothing it asked for happens, and the connection
-    /// ends with no more calls.
-    fn panicked(&mut self, message: String) {
-        self.s.discard();
-        self.failure = Some(Failure::Panic(message));
-        self.cancel_all(true);
-        self.end_now(End::Panicked);
     }
 
     /// Ends at once: no more calls, nothing more written.
@@ -1514,16 +1671,15 @@ where
     fn call(&mut self, now: Instant, f: impl FnOnce(&mut ServeCtx<'_>) -> Result<Flow, S::Error>) {
         let result = {
             let mut ctx = ServeCtx { s: &mut self.s, now, conn: &self.info, timers: &self.timers };
-            guarded(|| f(&mut ctx))
+            f(&mut ctx)
         };
         match result {
-            Err(message) => self.panicked(message),
-            Ok(Err(e)) => {
+            Err(e) => {
                 self.collect();
                 self.failure.get_or_insert(Failure::Service(e));
                 self.finish(End::Closed);
             }
-            Ok(Ok(flow)) => {
+            Ok(flow) => {
                 self.collect();
                 if flow != Flow::Continue && self.held_flow.is_none() {
                     self.held_flow = Some(flow);
@@ -1571,20 +1727,15 @@ where
         self.s.unread = self.stream.unread().to_vec();
         let result = {
             let mut ctx = ServeCtx { s: &mut self.s, now, conn: &self.info, timers: &self.timers };
-            guarded(|| service.on_fail(&fail, world, &mut ctx))
+            service.on_fail(&fail, world, &mut ctx)
         };
         self.s.unread = Vec::new();
         self.decode_fail = Some(fail);
-        match result {
-            Err(message) => self.panicked(message),
-            Ok(result) => {
-                self.collect();
-                if let Err(e) = result {
-                    self.failure.get_or_insert(Failure::Service(e));
-                }
-                self.finish(End::Failed);
-            }
+        self.collect();
+        if let Err(e) = result {
+            self.failure.get_or_insert(Failure::Service(e));
         }
+        self.finish(End::Failed);
     }
 
     /// Moves bytes from the queue into the decoder, up to a fault delay.
@@ -1630,6 +1781,7 @@ where
     /// One step: at most one call into the service.
     fn advance(&mut self, service: &mut S, world: &S::World, now: Instant) -> Next {
         arm(&mut self.timers, &mut self.s.timers, now);
+        self.recharge(service);
         match self.state {
             State::Ended(end) => return Next::Closed(end),
             State::Upgrading(how) => return Next::Upgrade(how),
@@ -1643,15 +1795,6 @@ where
         if let Some(flow) = self.held_flow.take() {
             self.apply(flow, service);
             return Next::Again;
-        }
-        if self.charge.is_some() {
-            let need = self.holding(service);
-            if let Some(charge) = &mut self.charge
-                && !charge.set(need)
-            {
-                self.finish(End::Budget);
-                return Next::Again;
-            }
         }
         // A due timer before more input, so input cannot starve it.
         if let Some(i) = due(&self.timers, now) {
@@ -1732,24 +1875,18 @@ where
         self.state = State::Ending { end, called: true };
         let result = {
             let mut ctx = ServeCtx { s: &mut self.s, now, conn: &self.info, timers: &self.timers };
-            guarded(|| service.on_end(end, world, &mut ctx))
+            service.on_end(end, world, &mut ctx)
         };
-        match result {
-            Err(message) => {
-                self.panicked(message);
-                return Next::Again;
-            }
-            Ok(Err(e)) => {
-                self.failure.get_or_insert(Failure::Service(e));
-            }
-            Ok(Ok(())) => {}
+        if let Err(e) = result {
+            self.failure.get_or_insert(Failure::Service(e));
         }
         self.s.keyed.clear();
         if end.writable() {
             let reply = std::mem::take(&mut self.s.reply);
-            self.push_out(reply);
+            self.push_out(reply, None);
             for pending in std::mem::take(&mut self.s.ordered) {
-                self.ordered.push_back(Work { pending, written: 0 });
+                let work = self.new_work(pending);
+                self.ordered.push_back(work);
             }
         }
         self.s.discard();
@@ -1762,27 +1899,27 @@ where
         let mut progress = false;
         if let Some(work) = self.ordered.front_mut() {
             let mut events = Vec::new();
-            let polled = {
-                let mut ctx = PendingCtx { cx: self.cx.as_ref(), events: &mut events, written: work.written, conn: &self.info };
-                guarded(|| work.pending.poll_next(&mut ctx, task))
+            let (polled, close) = {
+                let mut ctx = PendingCtx { cx: self.cx.as_ref(), events: &mut events, written: work.written, conn: &self.info, close: false };
+                (work.pending.poll_next(&mut ctx, task), ctx.close)
             };
+            work.close |= close;
+            let (id, close) = (work.id, work.close);
             self.s.events.append(&mut events);
             match polled {
-                Err(message) => {
-                    self.panicked(message);
+                Poll::Pending => {}
+                Poll::Ready(Some(Ok(bytes))) => {
+                    self.push_out(bytes, Some(id));
                     return true;
                 }
-                Ok(Poll::Pending) => {}
-                Ok(Poll::Ready(Some(Ok(bytes)))) => {
-                    work.written += bytes.len() as u64;
-                    self.push_out(bytes);
-                    return true;
-                }
-                Ok(Poll::Ready(None)) => {
+                Poll::Ready(None) => {
                     self.ordered.pop_front();
+                    if close {
+                        self.finish_after_work();
+                    }
                     return true;
                 }
-                Ok(Poll::Ready(Some(Err(e)))) => {
+                Poll::Ready(Some(Err(e))) => {
                     self.ordered.pop_front();
                     self.failure.get_or_insert(Failure::Pending(e));
                     for work in std::mem::take(&mut self.ordered) {
@@ -1796,37 +1933,50 @@ where
         let mut i = 0;
         while i < self.keyed.len() && self.state == State::Running {
             let mut events = Vec::new();
-            let polled = {
+            let (polled, close) = {
                 let (_, work) = &mut self.keyed[i];
-                let mut ctx = PendingCtx { cx: self.cx.as_ref(), events: &mut events, written: work.written, conn: &self.info };
-                guarded(|| work.pending.poll_next(&mut ctx, task))
+                let mut ctx = PendingCtx { cx: self.cx.as_ref(), events: &mut events, written: work.written, conn: &self.info, close: false };
+                (work.pending.poll_next(&mut ctx, task), ctx.close)
             };
+            self.keyed[i].1.close |= close;
             self.s.events.append(&mut events);
             let done = match polled {
-                Err(message) => {
-                    self.panicked(message);
-                    return true;
-                }
-                Ok(Poll::Pending) => {
+                Poll::Pending => {
                     i += 1;
                     continue;
                 }
-                Ok(Poll::Ready(Some(Ok(bytes)))) => {
-                    self.keyed[i].1.written += bytes.len() as u64;
-                    self.push_out(bytes);
+                Poll::Ready(Some(Ok(bytes))) => {
+                    let id = self.keyed[i].1.id;
+                    self.push_out(bytes, Some(id));
                     progress = true;
                     i += 1;
                     continue;
                 }
-                Ok(Poll::Ready(None)) => Done::Finished,
-                Ok(Poll::Ready(Some(Err(e)))) => Done::Failed(e.to_string()),
+                Poll::Ready(None) => Done::Finished,
+                Poll::Ready(Some(Err(e))) => Done::Failed(e.to_string()),
             };
-            let (key, _) = self.keyed.remove(i);
+            let (key, work) = self.keyed.remove(i);
             progress = true;
             self.idle_from = now;
             self.call(now, |ctx| service.on_done(key, done, world, ctx));
+            if work.close {
+                self.finish_after_work();
+            }
         }
         progress
+    }
+
+    /// Work that asked to close the connection is done: the connection
+    /// ends as if the service returned [`Flow::Close`], and ordered work
+    /// after it is cancelled, since its bytes cannot follow.
+    fn finish_after_work(&mut self) {
+        if self.state != State::Running {
+            return;
+        }
+        for work in std::mem::take(&mut self.ordered) {
+            self.cancel_work(work);
+        }
+        self.finish(End::Closed);
     }
 }
 
@@ -1855,6 +2005,47 @@ fn conn_end(e: ConnError) -> End {
 /// Records an event from the connection `info`.
 fn record(cx: &Cx, info: &ConnInfo, event: Event) {
     cx.record(event.conn(info));
+}
+
+/// Writes all of `data`, unless the client resets the connection, the
+/// world stops, or a write takes no bytes for `stall`: a client that
+/// stopped reading. Returns how the connection ends if it does.
+async fn write_all<C: Connection>(cx: &Cx, conn: &mut C, data: &[u8], stall: Option<Duration>) -> Result<(), End> {
+    let mut data = data;
+    let mut sleep = pin!(stall.map(|d| cx.sleep_until(cx.now() + d)));
+    let mut cancelled = pin!(cx.cancelled());
+    poll_fn(|task| {
+        let mut moved = false;
+        while !data.is_empty() {
+            match conn.poll_write(cx, task, data) {
+                Poll::Ready(Ok(0)) => return Poll::Ready(Err(End::Conn(ConnError::Closed))),
+                Poll::Ready(Ok(n)) => {
+                    data = &data[n..];
+                    moved = true;
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(conn_end(e))),
+                Poll::Pending => break,
+            }
+        }
+        if data.is_empty() {
+            return Poll::Ready(Ok(()));
+        }
+        if cancelled.as_mut().poll(task).is_ready() {
+            return Poll::Ready(Err(End::Cancelled));
+        }
+        if conn.poll_gone(task).is_ready() {
+            return Poll::Ready(Err(End::Conn(ConnError::Reset)));
+        }
+        if moved {
+            sleep.set(stall.map(|d| cx.sleep_until(cx.now() + d)));
+        }
+        match sleep.as_mut().as_pin_mut().map(|s| s.poll(task)) {
+            Some(Poll::Ready(Ok(()))) => Poll::Ready(Err(End::Conn(ConnError::TimedOut))),
+            Some(Poll::Ready(Err(_))) => Poll::Ready(Err(End::Cancelled)),
+            _ => Poll::Pending,
+        }
+    })
+    .await
 }
 
 /// Serves one connection with `service` until it ends: TLS first with
@@ -1960,6 +2151,7 @@ where
     if first && opts.connection_events {
         record(cx, &info, Event::new("conn", "open").summary("connection opened"));
     }
+    let _note = PanicNote::new(std::any::type_name::<S>(), &info);
     let mut core: Core<S> = Core::new(Some(cx.clone()), service, info, opts, Some(wake), cx.now());
     core.open(service, world, cx.now());
     let tag = core.info.id.unwrap_or(0);
@@ -1967,6 +2159,8 @@ where
     let mut out_offset = 0u64;
     let mut run = 0u32;
     loop {
+        // What is out counts against the budget while it is written.
+        core.recharge(service);
         if !core.s.events.is_empty() {
             for event in std::mem::take(&mut core.s.events) {
                 record(cx, &core.info, event);
@@ -1975,8 +2169,9 @@ where
         // Write what is out, through the transcript.
         while let Some(out) = core.out.pop_front() {
             match out {
-                Out::Bytes(bytes) => {
+                Out::Bytes(bytes, credit) => {
                     if bytes.is_empty() {
+                        core.wrote(credit);
                         continue;
                     }
                     if let Some(t) = &opts.record {
@@ -1984,8 +2179,9 @@ where
                         t.observe::<(), String>(tag, Direction::ServerToClient, StreamEvent::Skipped { bytes: &bytes, range: out_offset..end });
                     }
                     out_offset = out_offset.saturating_add(bytes.len() as u64);
-                    if let Err(e) = conn.write_all(cx, &bytes).await {
-                        core.broken(conn_end(e));
+                    match write_all(cx, &mut conn, &bytes, opts.write_timeout).await {
+                        Ok(()) => core.wrote(credit),
+                        Err(end) => core.broken(end),
                     }
                 }
                 Out::Delay(d) => {
@@ -1995,7 +2191,7 @@ where
                 }
             }
         }
-            let now = cx.now();
+        let now = cx.now();
         let next = core.advance(service, world, now);
         match next {
             Next::Again => {
@@ -2082,10 +2278,6 @@ where
                         let event = Event::new("conn", "error").level(Level::Notice).summary(format!("deferred work failed: {e}")).field("error", e.to_string()).field("kind", "deferred");
                         record(cx, &info, event);
                     }
-                    Some(Failure::Panic(m)) => {
-                        let event = Event::new("conn", "panic").level(Level::Alarm).summary(format!("the service panicked: {m}")).field("message", m.as_str());
-                        record(cx, &info, event);
-                    }
                     None => {}
                 }
                 if opts.connection_events {
@@ -2095,7 +2287,6 @@ where
                 return match failure {
                     Some(Failure::Service(e)) => Err(ServeError::Service(e)),
                     Some(Failure::Pending(e)) => Err(ServeError::Pending(e)),
-                    Some(Failure::Panic(m)) => Err(ServeError::Panic(m)),
                     None => Ok(Served::Closed(end)),
                 };
             }
@@ -2234,7 +2425,8 @@ pub async fn accept_tls<C: Connection>(
 /// region is cancelled. With [`ServeOptions::tls`], each connection shakes
 /// hands first. Past [`ServeOptions::max_conns`], a new connection is
 /// reset; each counts until its socket is gone, so a client that never
-/// finishes closing cannot open more. Returns the accepting task.
+/// finishes closing cannot open more. Connections are numbered from 1, in
+/// the order they are accepted. Returns the accepting task.
 pub fn listen<S, M>(cx: &Cx, mut listener: Listener, world: Arc<S::World>, make: M, opts: ServeOptions) -> Task
 where
     S: Service,
@@ -2244,6 +2436,7 @@ where
     let make = Arc::new(make);
     cx.spawn(move |cx| async move {
         let open = Arc::new(AtomicUsize::new(0));
+        let mut ids = 0u64;
         loop {
             let conn = match listener.accept(&cx).await {
                 Ok(conn) => conn,
@@ -2255,7 +2448,8 @@ where
                 continue;
             };
             conn.hold_until_gone(Box::new(guard));
-            let info = ConnInfo::new(opts.next_id(), conn.local_addr(), conn.peer_addr());
+            ids += 1;
+            let info = ConnInfo::new(ids, conn.local_addr(), conn.peer_addr());
             let (world, make, opts) = (world.clone(), make.clone(), opts.clone());
             cx.spawn(move |cx| async move {
                 let mut service = make();
@@ -2303,20 +2497,15 @@ impl Drop for Counted {
 /// `send_to`), and a decoder failure is answered with
 /// [`Service::on_fail`]. [`Flow::Close`] drops the rest of a datagram.
 /// Deferred work is not run. A service error is recorded as `conn.error`
-/// and serving goes on; a panic is recorded as `conn.panic` and ends it.
-pub async fn serve_datagram<S>(
-    cx: &Cx,
-    mut socket: Socket,
-    local: SocketAddr,
-    service: &mut S,
-    world: &S::World,
-    opts: &ServeOptions,
-) -> Result<(), ServeError<S::Error>>
+/// and serving goes on. A panic is not caught: it ends the run, as it
+/// does over a connection.
+pub async fn serve_datagram<S>(cx: &Cx, mut socket: Socket, local: SocketAddr, service: &mut S, world: &S::World, opts: &ServeOptions)
 where
     S: Service,
     <S::Decode as Decode>::Error: Clone + Send,
 {
     let base = ConnInfo { local: Some(local), transport: Transport::Udp, ..ConnInfo::default() };
+    let _note = PanicNote::new(std::any::type_name::<S>(), &base);
     let mut s = Scratch::new(conn_seed(opts.seed, u64::from(local.port())));
     let mut timers: Vec<(Timer, Instant)> = Vec::new();
     let wake = s.wake.clone();
@@ -2327,38 +2516,30 @@ where
                   socket: &mut Socket,
                   info: &ConnInfo,
                   f: &mut dyn FnMut(&mut ServeCtx<'_>) -> Result<Flow, S::Error>|
-     -> Result<Flow, String> {
+     -> Flow {
         let result = {
             let mut ctx = ServeCtx { s: &mut *s, now: cx.now(), conn: info, timers };
-            guarded(|| f(&mut ctx))
+            f(&mut ctx)
         };
         for event in std::mem::take(&mut s.events) {
             record(cx, info, event);
         }
         let flow = match result {
-            Err(m) => {
-                s.discard();
-                let event = Event::new("conn", "panic").level(Level::Alarm).summary(format!("the service panicked: {m}")).field("message", m.as_str());
-                record(cx, info, event);
-                return Err(m);
-            }
-            Ok(Err(e)) => {
+            Err(e) => {
                 let event = Event::new("conn", "error").level(Level::Notice).summary(format!("the service failed: {e}")).field("error", e.to_string()).field("kind", "service");
                 record(cx, info, event);
                 Flow::Close
             }
-            Ok(Ok(flow)) => flow,
+            Ok(flow) => flow,
         };
         for (to, bytes) in s.datagrams.drain(..) {
             socket.send_to(&bytes, to);
         }
         s.ordered.clear();
         s.keyed.clear();
-        Ok(flow)
+        flow
     };
-    if let Err(m) = called(&mut s, &timers, &mut socket, &base, &mut |ctx| service.on_open(world, ctx)) {
-        return Err(ServeError::Panic(m));
-    }
+    called(&mut s, &timers, &mut socket, &base, &mut |ctx| service.on_open(world, ctx));
     s.reply.clear();
     let mut run = 0u32;
     loop {
@@ -2366,16 +2547,12 @@ where
         arm(&mut timers, &mut s.timers, now);
         if let Some(i) = due(&timers, now) {
             let (name, _) = timers.remove(i);
-            if let Err(m) = called(&mut s, &timers, &mut socket, &base, &mut |ctx| service.on_timer(name, world, ctx)) {
-                return Err(ServeError::Panic(m));
-            }
+            called(&mut s, &timers, &mut socket, &base, &mut |ctx| service.on_timer(name, world, ctx));
             s.reply.clear();
             continue;
         }
         if wake.take() {
-            if let Err(m) = called(&mut s, &timers, &mut socket, &base, &mut |ctx| service.on_wake(world, ctx)) {
-                return Err(ServeError::Panic(m));
-            }
+            called(&mut s, &timers, &mut socket, &base, &mut |ctx| service.on_wake(world, ctx));
             s.reply.clear();
             continue;
         }
@@ -2403,6 +2580,7 @@ where
         let Ok((datagram, from)) = got else { break };
         let sandbox = opts.sandbox.as_ref().and_then(|f| f(from.ip()));
         let info = ConnInfo { peer: Some(from), sandbox, ..base.clone() };
+        let _note = PanicNote::new(std::any::type_name::<S>(), &info);
         s.bytes_in = s.bytes_in.saturating_add(datagram.len() as u64);
         let mut stream = Stream::with_buffer(service.decoder(), datagram.len());
         let taken = stream.push(&datagram);
@@ -2431,14 +2609,12 @@ where
                         s.unread = Vec::new();
                         flow
                     } else {
-                        Ok(Flow::Close)
+                        Flow::Close
                     }
                 }
             };
-            match flow {
-                Err(m) => return Err(ServeError::Panic(m)),
-                Ok(Flow::Continue) => {}
-                Ok(_) => break,
+            if flow != Flow::Continue {
+                break;
             }
         }
         // The replies to one datagram's items go back as one datagram.
@@ -2452,7 +2628,6 @@ where
         }
     }
     wake.close();
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2468,8 +2643,6 @@ pub enum HarnessError<D, S> {
     Service(S),
     /// Ordered deferred work failed.
     Pending(fictionet::Error),
-    /// A call panicked with this message.
-    Panic(String),
     /// The connection is closed: no more bytes are taken.
     Closed,
     /// The service asked for this upgrade; see [`Harness::resume`].
@@ -2482,7 +2655,6 @@ impl<D: core::fmt::Display, S: core::fmt::Display> core::fmt::Display for Harnes
             HarnessError::Decode(e) => write!(f, "decoder: {e}"),
             HarnessError::Service(e) => write!(f, "service: {e}"),
             HarnessError::Pending(e) => write!(f, "deferred work: {e}"),
-            HarnessError::Panic(m) => write!(f, "panic: {m}"),
             HarnessError::Closed => f.write_str("the connection is closed"),
             HarnessError::Upgraded(u) => write!(f, "the service asked for an upgrade: {}", u.as_str()),
         }
@@ -2609,7 +2781,6 @@ where
             return Err(match f {
                 Failure::Service(e) => HarnessError::Service(e),
                 Failure::Pending(e) => HarnessError::Pending(e),
-                Failure::Panic(m) => HarnessError::Panic(m),
             });
         }
         if let Some(fail) = self.core.decode_fail.take() {
@@ -2624,12 +2795,16 @@ where
         Ok(reply)
     }
 
+    /// Takes what is out as written, after charging it as the driver
+    /// does.
     fn drain(&mut self, reply: &mut Vec<u8>) {
+        self.core.recharge(&self.service);
         self.events.append(&mut self.core.s.events);
         while let Some(out) = self.core.out.pop_front() {
-            if let Out::Bytes(b) = out {
+            if let Out::Bytes(b, credit) = out {
                 self.output.extend_from_slice(&b);
                 reply.extend_from_slice(&b);
+                self.core.wrote(credit);
             }
         }
     }
