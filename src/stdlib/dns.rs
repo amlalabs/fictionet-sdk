@@ -20,8 +20,8 @@
 //! use fictionet::stdlib::dns::rr::{RData, Record, rdata::A};
 //! use fictionet::{Cx, Result, stdlib::udp};
 //!
-//! async fn serve_dns(cx: &Cx, socket: &mut udp::Socket) -> Result {
-//!     while let Ok((bytes, from)) = socket.recv(cx).await {
+//! async fn serve_dns(fcx: &Cx, socket: &mut udp::Socket) -> Result {
+//!     while let Ok((bytes, from)) = socket.recv(fcx).await {
 //!         let Ok(query) = Message::from_vec(&bytes) else { continue };
 //!
 //!         let mut reply = Message::response(query.metadata.id, query.metadata.op_code);

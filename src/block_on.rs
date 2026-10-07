@@ -26,12 +26,12 @@ use std::task::{Context, Poll, Wake, Waker};
 ///
 /// ```no_run
 /// # use fictionet::{Attachments, Cx, Result};
-/// # async fn world(_cx: Cx, _attachments: Attachments) -> Result { Ok(()) }
+/// # async fn world(_fcx: Cx, _attachments: Attachments) -> Result { Ok(()) }
 /// fn main() -> fictionet::Result {
 ///     let (attacher, attachments) = fictionet::attachments();
 ///     let socket = fictionet::WorldSocket::UnixSocket("/run/fictionet/world.sock".into());
 ///     let _listening = fictionet::listen(socket, attacher)?;
-///     fictionet::block_on(fictionet::run(|cx| world(cx, attachments)))
+///     fictionet::block_on(fictionet::run(|fcx| world(fcx, attachments)))
 /// }
 /// ```
 pub fn block_on<F: Future>(future: F) -> F::Output {
@@ -54,10 +54,10 @@ fn park_on<F: Future>(future: F) -> F::Output {
         }
     }
     let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
-    let mut task = Context::from_waker(&waker);
+    let mut cx = Context::from_waker(&waker);
     let mut future = std::pin::pin!(future);
     loop {
-        if let Poll::Ready(output) = future.as_mut().poll(&mut task) {
+        if let Poll::Ready(output) = future.as_mut().poll(&mut cx) {
             return output;
         }
         // A wake that came during the poll leaves a token, so this returns
@@ -82,10 +82,10 @@ fn spin_on<F: Future>(future: F) -> F::Output {
     }
     let woken = Arc::new(Woken(AtomicBool::new(false)));
     let waker = Waker::from(woken.clone());
-    let mut task = Context::from_waker(&waker);
+    let mut cx = Context::from_waker(&waker);
     let mut future = std::pin::pin!(future);
     loop {
-        if let Poll::Ready(output) = future.as_mut().poll(&mut task) {
+        if let Poll::Ready(output) = future.as_mut().poll(&mut cx) {
             return output;
         }
         // Nothing else runs in this thread while it waits, so only a timer

@@ -581,22 +581,22 @@ mod tests {
         let g = graph.clone();
         let (spawn_line, seen) = (Arc::new(AtomicU64::new(0)), Arc::new(Mutex::new(None)));
         let (line, s) = (spawn_line.clone(), seen.clone());
-        let out = crate::block_on(crate::run::run_with(graph.clone(), move |cx| async move {
+        let out = crate::block_on(crate::run::run_with(graph.clone(), move |fcx| async move {
             let (mut a, mut b) = crate::pair();
             line.store(u64::from(line!()) + 1, Ordering::SeqCst);
-            let echo = cx.spawn(move |cx| async move {
-                while let Ok(p) = b.recv(&cx).await {
+            let echo = fcx.spawn(move |fcx| async move {
+                while let Ok(p) = b.recv(&fcx).await {
                     b.send(p);
                 }
                 Ok(())
             });
             for i in 0..10u8 {
                 a.send(Packet(vec![i; 100]));
-                a.recv(&cx).await?;
+                a.recv(&fcx).await?;
             }
             *s.lock().unwrap() = Some(snapshot(&g));
             drop(a);
-            Ok(echo.join(&cx).await?)
+            Ok(echo.join(&fcx).await?)
         }));
         out.unwrap();
         let (tasks, links) = seen.lock().unwrap().take().unwrap();
@@ -628,10 +628,10 @@ mod tests {
     fn pairs_count_their_packets() {
         use crate::prelude::*;
         use crate::Interface;
-        crate::block_on(crate::run(|cx| async move {
+        crate::block_on(crate::run(|fcx| async move {
             let (mut a, mut b) = crate::pair();
             a.send(Packet(vec![0; 40]));
-            b.recv(&cx).await?;
+            b.recv(&fcx).await?;
             assert_eq!(a.meter().totals(), [1, 40, 0, 0]);
             Ok(())
         }))

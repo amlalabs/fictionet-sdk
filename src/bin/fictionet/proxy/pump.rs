@@ -37,14 +37,14 @@ pub(crate) async fn tunnel(client: &mut TcpStream, world: &mut Compat<TcpConnect
     {
         let mut up = std::pin::pin!(copy_counting(&mut cr, &mut ww, &mut moved.up, Side::Client));
         let mut down = std::pin::pin!(copy_counting(&mut wr, &mut cw, &mut moved.down, Side::World));
-        std::future::poll_fn(|task| {
-            if !up_done && let Poll::Ready(r) = up.as_mut().poll(task) {
+        std::future::poll_fn(|cx| {
+            if !up_done && let Poll::Ready(r) = up.as_mut().poll(cx) {
                 up_done = true;
                 if let Err(e) = r {
                     error.get_or_insert(e);
                 }
             }
-            if !down_done && let Poll::Ready(r) = down.as_mut().poll(task) {
+            if !down_done && let Poll::Ready(r) = down.as_mut().poll(cx) {
                 down_done = true;
                 if let Err(e) = r {
                     error.get_or_insert(e);
@@ -106,13 +106,13 @@ pub(crate) async fn until_down_ends<U: Future, D: Future>(up: U, down: D) -> (Op
     let mut up = std::pin::pin!(up);
     let mut down = std::pin::pin!(down);
     let mut up_result = None;
-    let down_result = std::future::poll_fn(|task| {
+    let down_result = std::future::poll_fn(|cx| {
         if up_result.is_none()
-            && let Poll::Ready(r) = up.as_mut().poll(task)
+            && let Poll::Ready(r) = up.as_mut().poll(cx)
         {
             up_result = Some(r);
         }
-        down.as_mut().poll(task)
+        down.as_mut().poll(cx)
     })
     .await;
     if up_result.is_none() {

@@ -84,7 +84,7 @@ impl std::fmt::Display for Fail {
 /// The stack. Clones share it.
 #[derive(Clone)]
 pub(crate) struct Stack {
-    cx: Cx,
+    fcx: Cx,
     tcp: tcp::Endpoint,
     udp: udp::Endpoint,
     dns: SocketAddr,
@@ -128,15 +128,15 @@ impl Drop for Waiting<'_> {
 }
 
 impl Stack {
-    /// Starts the stack at `addr` on `link`, in `cx`'s region.
-    pub(crate) fn new(cx: &Cx, link: Link, addr: Ipv4Addr, dns: Ipv4Addr) -> Stack {
-        let (tcp_end, udp_end, _icmp, _other) = ip::split_protocols(cx, link);
+    /// Starts the stack at `addr` on `link`, in `fcx`'s region.
+    pub(crate) fn new(fcx: &Cx, link: Link, addr: Ipv4Addr, dns: Ipv4Addr) -> Stack {
+        let (tcp_end, udp_end, _icmp, _other) = ip::split_protocols(fcx, link);
         let unreachable = Arc::new(Unreachable::default());
         let watched = Watch { inner: tcp_end, unreachable: unreachable.clone() };
         Stack {
-            cx: cx.clone(),
-            tcp: tcp::endpoint(cx, watched, IpAddr::V4(addr)),
-            udp: udp::endpoint(cx, udp_end, IpAddr::V4(addr)),
+            fcx: fcx.clone(),
+            tcp: tcp::endpoint(fcx, watched, IpAddr::V4(addr)),
+            udp: udp::endpoint(fcx, udp_end, IpAddr::V4(addr)),
             dns: SocketAddr::new(IpAddr::V4(dns), 53),
             unreachable,
             cache: Arc::default(),
@@ -144,8 +144,8 @@ impl Stack {
         }
     }
 
-    pub(crate) fn cx(&self) -> &Cx {
-        &self.cx
+    pub(crate) fn fcx(&self) -> &Cx {
+        &self.fcx
     }
 
     /// The world's address for `host`.
@@ -195,13 +195,13 @@ impl Stack {
     /// Asks the world's DNS server for `name`'s `A` record.
     async fn lookup(&self, name: &str) -> Result<(Ipv4Addr, u32), Fail> {
         let mut socket = self.bind_ephemeral()?;
-        let id = self.cx.random_u64() as u16;
+        let id = self.fcx.random_u64() as u16;
         let q = dns::query(name, id).ok_or(Fail::NoSuchName)?;
         for wait in DNS_WAITS {
             socket.send_to(&q, self.dns);
             let deadline = tokio::time::Instant::now() + wait;
             loop {
-                match tokio::time::timeout_at(deadline, socket.recv(&self.cx)).await {
+                match tokio::time::timeout_at(deadline, socket.recv(&self.fcx)).await {
                     Err(_) => break,
                     Ok(Err(RecvError::Closed | RecvError::Cancelled)) => return Err(Fail::WorldGone),
                     Ok(Ok((bytes, from))) => match dns::answer(&bytes, from, self.dns, name, id) {
@@ -219,7 +219,7 @@ impl Stack {
     /// A UDP socket on a free port from 49152 up, picked at random.
     fn bind_ephemeral(&self) -> Result<udp::Socket, Fail> {
         let span = (65536 - EPHEMERAL as u32) as u64;
-        let start = self.cx.random_u64() % span;
+        let start = self.fcx.random_u64() % span;
         for i in 0..64 {
             let port = EPHEMERAL + ((start + i) % span) as u16;
             if let Ok(s) = self.udp.bind(port) {
@@ -238,7 +238,7 @@ impl Stack {
         let addr = self.resolve(host).await?;
         let to = SocketAddr::new(IpAddr::V4(addr), port);
         let icmp = self.unreachable.watch(to);
-        let opened = race(self.tcp.connect(&self.cx, to), icmp);
+        let opened = race(self.tcp.connect(&self.fcx, to), icmp);
         match tokio::time::timeout(CONNECT_TIMEOUT, opened).await {
             Err(_) => Err(Fail::TimedOut),
             Ok(Either::Left(Ok(conn))) => Ok((conn, addr)),
@@ -314,9 +314,9 @@ struct Watch {
 }
 
 impl Interface for Watch {
-    fn poll_recv(&mut self, cx: &Cx, task: &mut Context<'_>) -> Poll<Result<Packet, RecvError>> {
+    fn poll_recv(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<Packet, RecvError>> {
         loop {
-            match self.inner.poll_recv(cx, task) {
+            match self.inner.poll_recv(fcx, cx) {
                 Poll::Ready(Ok(p)) => match unreachable_about(&p.0) {
                     Some((about, code)) => self.unreachable.report(about, code),
                     None => return Poll::Ready(Ok(p)),
@@ -363,11 +363,11 @@ pub(crate) enum Either<A, B> {
 pub(crate) async fn race<A: Future, B: Future>(a: A, b: B) -> Either<A::Output, B::Output> {
     let mut a = pin!(a);
     let mut b = pin!(b);
-    poll_fn(|task| {
-        if let Poll::Ready(x) = a.as_mut().poll(task) {
+    poll_fn(|cx| {
+        if let Poll::Ready(x) = a.as_mut().poll(cx) {
             return Poll::Ready(Either::Left(x));
         }
-        if let Poll::Ready(y) = b.as_mut().poll(task) {
+        if let Poll::Ready(y) = b.as_mut().poll(cx) {
             return Poll::Ready(Either::Right(y));
         }
         Poll::Pending

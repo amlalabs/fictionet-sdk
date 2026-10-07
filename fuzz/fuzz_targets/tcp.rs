@@ -80,10 +80,10 @@ fn seq_lt(a: u32, b: u32) -> bool {
 
 /// Reads what the world sent: checks each segment, and learns the world's
 /// sequence numbers and the connections it opened.
-fn drain(cx: &fictionet::Cx, raw: &mut End, flows: &mut Vec<Flow>, me: IpAddr, world_addr: IpAddr, isn: u32) {
+fn drain(fcx: &fictionet::Cx, raw: &mut End, flows: &mut Vec<Flow>, me: IpAddr, world_addr: IpAddr, isn: u32) {
     let waker = std::task::Waker::noop();
-    let mut task = std::task::Context::from_waker(waker);
-    while let std::task::Poll::Ready(Ok(p)) = raw.poll_recv(cx, &mut task) {
+    let mut cx = std::task::Context::from_waker(waker);
+    while let std::task::Poll::Ready(Ok(p)) = raw.poll_recv(fcx, &mut cx) {
         let p = p.0;
         let (at, end) = if me.is_ipv4() {
             assert_eq!(p[0] >> 4, 4);
@@ -122,14 +122,14 @@ fn drain(cx: &fictionet::Cx, raw: &mut End, flows: &mut Vec<Flow>, me: IpAddr, w
 }
 
 fuzz_target!(|input: Input| {
-    world_seeded(input.isn as u64, move |cx| async move {
+    world_seeded(input.isn as u64, move |fcx| async move {
         let (world_addr, me): (IpAddr, IpAddr) = if input.v6 {
             ("fd00::1".parse().unwrap(), "fd00::2".parse().unwrap())
         } else {
             ("10.0.0.1".parse().unwrap(), "10.0.0.2".parse().unwrap())
         };
         let (mut raw, side) = pair();
-        let endpoint = tcp::endpoint(&cx, side, world_addr);
+        let endpoint = tcp::endpoint(&fcx, side, world_addr);
         let mut listener = Some(endpoint.listen(80).unwrap());
         let mut flows: Vec<Flow> = (0..3).map(|i| Flow { mine: 1000 + i, theirs: if i == 2 { 81 } else { 80 }, next: input.isn, expect: None }).collect();
         let mut conns: Vec<TcpConnection> = Vec::new();
@@ -157,7 +157,7 @@ fuzz_target!(|input: Input| {
                     raw.send(Packet(tcp_packet(me, world_addr, &seg)));
                 }
                 Op::Pump(n) => {
-                    settle(&cx, 1 + n as usize % 8).await;
+                    settle(&fcx, 1 + n as usize % 8).await;
                     let mut i = 0;
                     while i < connecting.len() {
                         match poll_once(connecting[i].as_mut()).await {
@@ -174,11 +174,11 @@ fuzz_target!(|input: Input| {
                 Op::Sleep(ms) => {
                     let ms = (ms as u64 % 12).min(sleep_budget() - slept);
                     slept += ms;
-                    let _ = cx.sleep(std::time::Duration::from_millis(ms)).await;
+                    let _ = fcx.sleep(std::time::Duration::from_millis(ms)).await;
                 }
                 Op::Accept => {
                     if let Some(l) = &mut listener
-                        && let Some(Ok(c)) = poll_once(l.accept(&cx)).await
+                        && let Some(Ok(c)) = poll_once(l.accept(&fcx)).await
                     {
                         conns.push(c);
                     }
@@ -186,9 +186,9 @@ fuzz_target!(|input: Input| {
                 Op::Connect(port) => {
                     if connecting.len() < 4 {
                         let endpoint = endpoint.clone();
-                        let cx2 = cx.clone();
+                        let fcx2 = fcx.clone();
                         let to = std::net::SocketAddr::new(me, 2000 + port as u16 % 4);
-                        let mut fut: Connecting = Box::pin(async move { endpoint.connect(&cx2, to).await });
+                        let mut fut: Connecting = Box::pin(async move { endpoint.connect(&fcx2, to).await });
                         if let Some(r) = poll_once(fut.as_mut()).await {
                             if let Ok(c) = r {
                                 conns.push(c);
@@ -202,20 +202,20 @@ fuzz_target!(|input: Input| {
                     if !conns.is_empty() {
                         let i = conn as usize % conns.len();
                         let mut buf = vec![0u8; len as usize % 70_000];
-                        let _ = poll_once(conns[i].read(&cx, &mut buf)).await;
+                        let _ = poll_once(conns[i].read(&fcx, &mut buf)).await;
                     }
                 }
                 Op::Write { conn, len } => {
                     if !conns.is_empty() {
                         let i = conn as usize % conns.len();
                         let d: Vec<u8> = (0..len as usize * 4).map(|i| i as u8).collect();
-                        let _ = poll_once(conns[i].write(&cx, &d)).await;
+                        let _ = poll_once(conns[i].write(&fcx, &d)).await;
                     }
                 }
                 Op::Shutdown(conn) => {
                     if !conns.is_empty() {
                         let i = conn as usize % conns.len();
-                        let _ = poll_once(conns[i].shutdown(&cx)).await;
+                        let _ = poll_once(conns[i].shutdown(&fcx)).await;
                     }
                 }
                 Op::Drop(conn) => {
@@ -226,12 +226,12 @@ fuzz_target!(|input: Input| {
                 }
                 Op::DropListener => drop(listener.take()),
             }
-            drain(&cx, &mut raw, &mut flows, me, world_addr, input.isn);
+            drain(&fcx, &mut raw, &mut flows, me, world_addr, input.isn);
         }
         drop(conns);
         drop(connecting);
         drop(listener);
-        settle(&cx, 4).await;
-        drain(&cx, &mut raw, &mut flows, me, world_addr, input.isn);
+        settle(&fcx, 4).await;
+        drain(&fcx, &mut raw, &mut flows, me, world_addr, input.isn);
     });
 });

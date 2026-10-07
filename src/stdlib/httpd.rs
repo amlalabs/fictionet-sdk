@@ -214,10 +214,10 @@ impl http_body::Body for Body {
     type Data = Bytes;
     type Error = Error;
 
-    fn poll_frame(self: Pin<&mut Self>, task: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, Error>>> {
+    fn poll_frame(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, Error>>> {
         match &mut self.get_mut().0 {
             Inner::Full(b) => Poll::Ready(b.take().map(|b| Ok(Frame::data(b)))),
-            Inner::Stream(s) => s.as_mut().poll_frame(task),
+            Inner::Stream(s) => s.as_mut().poll_frame(cx),
         }
     }
 
@@ -248,10 +248,10 @@ where
     type Data = Bytes;
     type Error = Error;
 
-    fn poll_frame(mut self: Pin<&mut Self>, task: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, Error>>> {
+    fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, Error>>> {
         self.0
             .as_mut()
-            .poll_frame(task)
+            .poll_frame(cx)
             .map(|f| f.map(|r| r.map(|f| f.map_data(|mut d| d.copy_to_bytes(d.remaining()))).map_err(Into::into)))
     }
 
@@ -418,7 +418,7 @@ impl Router {
         F: Fn(Cx, Request<Bytes>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Response<Bytes>> + Send + 'static,
     {
-        let f: AsyncRoute = Arc::new(move |cx, r| Box::pin(f(cx, r)));
+        let f: AsyncRoute = Arc::new(move |fcx, r| Box::pin(f(fcx, r)));
         self.routes.push((method, path.to_owned(), Route::Async(f)));
         self
     }
@@ -468,7 +468,7 @@ impl Handler for Router {
         };
         match route {
             Route::Sync(f) => Reply::Now(f(ex, request).map(Body::from)),
-            Route::Async(f) => Reply::Later(Box::new(move |cx| Box::pin(async move { Ok(f(cx, request).await.map(Body::from)) }))),
+            Route::Async(f) => Reply::Later(Box::new(move |fcx| Box::pin(async move { Ok(f(fcx, request).await.map(Body::from)) }))),
         }
     }
 }
@@ -527,9 +527,9 @@ where
 {
     fn call(&self, request: Request<Body>, _ex: &mut Exchange<'_>) -> Reply {
         let mut service = self.service.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        Reply::Later(Box::new(move |_cx| {
+        Reply::Later(Box::new(move |_fcx| {
             Box::pin(async move {
-                poll_fn(|task| service.poll_ready(task)).await.map_err(Into::into)?;
+                poll_fn(|cx| service.poll_ready(cx)).await.map_err(Into::into)?;
                 let response = service.call(request).await.map_err(Into::into)?;
                 Ok(response.map(Body::new))
             })
@@ -1283,18 +1283,18 @@ impl Streaming {
 }
 
 impl Pending for Streaming {
-    fn poll_next(&mut self, ctx: &mut PendingCtx<'_>, task: &mut Context<'_>) -> Poll<Option<Result<Vec<u8>, Error>>> {
+    fn poll_next(&mut self, ctx: &mut PendingCtx<'_>, cx: &mut Context<'_>) -> Poll<Option<Result<Vec<u8>, Error>>> {
         // The driver polls again only once the last piece is written.
         self.confirm(ctx);
         loop {
             if let Some(work) = self.work.take() {
-                self.making = Some(match ctx.cx() {
-                    Some(cx) => work(cx.clone()),
-                    None => Box::pin(std::future::ready(Err(fictionet::Error::msg("this answer needs a Cx: give the harness one with Harness::with_cx")))),
+                self.making = Some(match ctx.fcx() {
+                    Some(fcx) => work(fcx.clone()),
+                    None => Box::pin(std::future::ready(Err(fictionet::Error::msg("this answer needs a Cx: give the harness one with Harness::with_fcx")))),
                 });
             }
             if let Some(making) = &mut self.making {
-                let response = match making.as_mut().poll(task) {
+                let response = match making.as_mut().poll(cx) {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(Ok(r)) => r,
                     Poll::Ready(Err(e)) => error_response(&e),
@@ -1307,7 +1307,7 @@ impl Pending for Streaming {
                 let response = Response::from_parts(parts, Body::empty());
                 let len = body.size_hint().exact();
                 let mut head = Vec::new();
-                let now = ctx.cx().map_or(self.asked, Cx::now);
+                let now = ctx.fcx().map_or(self.asked, Cx::now);
                 self.close = encode(&mut head, self.version, &response, len, self.head_only, self.close, date_header(self.date, now));
                 if self.close {
                     // An HTTP/1.0 body of unknown length ends with the
@@ -1341,7 +1341,7 @@ impl Pending for Streaming {
                 self.end(ctx, true);
                 return Poll::Ready(None);
             };
-            match Pin::new(body).poll_frame(task) {
+            match Pin::new(body).poll_frame(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(None) => {
                     self.body = None;
@@ -1415,9 +1415,9 @@ const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 ///
 /// Returns `Ok(())` when the connection ended, however it ended: a
 /// connection's failure is the connection's, and the run's events say what
-/// it was. Returns [`Cancelled`] if `cx`'s
+/// it was. Returns [`Cancelled`] if `fcx`'s
 /// [region](fictionet::Cx#regions) is cancelled first.
-pub async fn serve_connection<C: Connection + Unpin>(cx: &Cx, conn: C, info: ConnInfo, handler: Arc<dyn Handler>, opts: &HttpOptions) -> Result<(), Cancelled> {
+pub async fn serve_connection<C: Connection + Unpin>(fcx: &Cx, conn: C, info: ConnInfo, handler: Arc<dyn Handler>, opts: &HttpOptions) -> Result<(), Cancelled> {
     let mut conn = conn;
     let mut first = Vec::new();
     let h2 = if info.tls {
@@ -1427,21 +1427,21 @@ pub async fn serve_connection<C: Connection + Unpin>(cx: &Cx, conn: C, info: Con
         let preface = async {
             let mut buf = [0u8; 24];
             while first.len() < PREFACE.len() && PREFACE.starts_with(&first) {
-                match conn.read(cx, &mut buf[..PREFACE.len() - first.len()]).await {
+                match conn.read(fcx, &mut buf[..PREFACE.len() - first.len()]).await {
                     Ok(0) | Err(_) => return false,
                     Ok(n) => first.extend_from_slice(&buf[..n]),
                 }
             }
             true
         };
-        match cx.race(opts.first_bytes.map(|d| cx.now() + d), preface).await {
+        match fcx.race(opts.first_bytes.map(|d| fcx.now() + d), preface).await {
             Ok(true) => {}
-            Ok(false) if cx.is_cancelled() => return Err(Cancelled),
+            Ok(false) if fcx.is_cancelled() => return Err(Cancelled),
             Ok(false) => return Ok(()),
             Err(RaceError::Cancelled) => return Err(Cancelled),
             Err(RaceError::Deadline) => {
                 let secs = opts.first_bytes.map_or(0, |d| d.as_secs());
-                cx.record(error_event(&info, "timeout", format!("no bytes within {secs} seconds of connecting")).conn(&info));
+                fcx.record(error_event(&info, "timeout", format!("no bytes within {secs} seconds of connecting")).conn(&info));
                 return Ok(());
             }
         }
@@ -1449,7 +1449,7 @@ pub async fn serve_connection<C: Connection + Unpin>(cx: &Cx, conn: C, info: Con
     };
     let conn = Prefixed::new(first, conn);
     if h2 {
-        return h2::serve(cx, conn, handler, info, opts).await;
+        return h2::serve(fcx, conn, handler, info, opts).await;
     }
     let serve_opts = ServeOptions {
         idle: None,
@@ -1461,11 +1461,11 @@ pub async fn serve_connection<C: Connection + Unpin>(cx: &Cx, conn: C, info: Con
     };
     let mut service = Http1::with(handler.clone(), opts.limits);
     service.date = opts.date;
-    match serve::serve(cx, conn, info.clone(), &mut service, &(), &serve_opts).await {
+    match serve::serve(fcx, conn, info.clone(), &mut service, &(), &serve_opts).await {
         Ok(serve::Served::Upgraded(serve::Upgrade::Handoff, rest)) => match service.take_handoff() {
             // A request that asks for an upgrade: hyper's HTTP/1 reads it
             // again and carries the upgrade out.
-            Some(head) => h2::serve_upgrade(cx, Prefixed::new(head, rest), handler, info, opts).await,
+            Some(head) => h2::serve_upgrade(fcx, Prefixed::new(head, rest), handler, info, opts).await,
             None => Ok(()),
         },
         Err(serve::ServeError::Cancelled) => Err(Cancelled),
@@ -1555,7 +1555,7 @@ impl Server {
 }
 
 impl Accept for Server {
-    fn serve(&self, cx: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    fn serve(&self, fcx: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         let handler: Arc<dyn Handler> = Arc::new(self.vhosts.clone());
         let opts = HttpOptions {
             limits: self.limits,
@@ -1566,7 +1566,7 @@ impl Accept for Server {
         };
         let (conn, info) = (arrival.conn, arrival.info);
         Box::pin(async move {
-            let _ = serve_connection(&cx, conn, info, handler, &opts).await;
+            let _ = serve_connection(&fcx, conn, info, handler, &opts).await;
         })
     }
 
@@ -1647,7 +1647,7 @@ impl Website {
                 let mut secure = Server::shared(self.handler).https();
                 secure.default_host = self.default_host;
                 secure.date = self.date;
-                host.tls_accept(443, Sni::Names, move |cx| config(cx), secure)
+                host.tls_accept(443, Sni::Names, move |fcx| config(fcx), secure)
             }
         }
     }
@@ -1661,24 +1661,24 @@ mod h2 {
     use hyper::body::Incoming;
 
     /// Runs hyper's HTTP/2 server on `conn`.
-    pub(super) async fn serve<C: Connection + Unpin>(cx: &Cx, conn: C, handler: Arc<dyn Handler>, info: ConnInfo, opts: &HttpOptions) -> Result<(), Cancelled> {
+    pub(super) async fn serve<C: Connection + Unpin>(fcx: &Cx, conn: C, handler: Arc<dyn Handler>, info: ConnInfo, opts: &HttpOptions) -> Result<(), Cancelled> {
         let broke = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let io = Io::new(cx, conn, broke.clone(), opts.limits.write_timeout);
-        let route = Route::new(cx, handler, &info, opts);
+        let io = Io::new(fcx, conn, broke.clone(), opts.limits.write_timeout);
+        let route = Route::new(fcx, handler, &info, opts);
         // In a browser, `std::time::Instant::now` panics. hyper's timer API
         // is in `Instant`, so there hyper runs without a timer. hyper never
         // writes a `Date` header, which it would take from the host's
         // clock: the route writes the world's.
         let browser = cfg!(target_arch = "wasm32");
-        let mut builder = hyper::server::conn::http2::Builder::new(Executor { cx: cx.clone() });
+        let mut builder = hyper::server::conn::http2::Builder::new(Executor { fcx: fcx.clone() });
         builder.auto_date_header(false);
         builder.max_concurrent_streams(opts.limits.streams);
         if !browser {
-            builder.timer(CxTimer { cx: cx.clone() });
+            builder.timer(CxTimer { fcx: fcx.clone() });
         }
         // hyper reads all the time on HTTP/2, so a reset ends it on its own.
         let served = builder.serve_connection(io, route);
-        finish(cx, &info, &broke, cx.race(None, served).await)
+        finish(fcx, &info, &broke, fcx.race(None, served).await)
     }
 
     /// Runs hyper's HTTP/1 server on `conn`, with upgrades: where
@@ -1688,40 +1688,40 @@ mod h2 {
     /// work, and the connection goes to whatever awaits it once the `101`
     /// is sent. Other requests on the connection are answered as usual.
     pub(super) async fn serve_upgrade<C: Connection + Unpin + Send + 'static>(
-        cx: &Cx,
+        fcx: &Cx,
         conn: C,
         handler: Arc<dyn Handler>,
         info: ConnInfo,
         opts: &HttpOptions,
     ) -> Result<(), Cancelled> {
         let broke = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let io = Io::new(cx, conn, broke.clone(), opts.limits.write_timeout);
-        let route = Route::new(cx, handler, &info, opts);
+        let io = Io::new(fcx, conn, broke.clone(), opts.limits.write_timeout);
+        let route = Route::new(fcx, handler, &info, opts);
         let mut builder = hyper::server::conn::http1::Builder::new();
         builder.auto_date_header(false);
         if cfg!(target_arch = "wasm32") {
             builder.header_read_timeout(None);
         } else {
-            builder.timer(CxTimer { cx: cx.clone() });
+            builder.timer(CxTimer { fcx: fcx.clone() });
         }
         let served = builder.serve_connection(io, route).with_upgrades();
-        finish(cx, &info, &broke, cx.race(None, served).await)
+        finish(fcx, &info, &broke, fcx.race(None, served).await)
     }
 
-    /// How a connection hyper served ends: [`Cancelled`] if `cx`'s region
+    /// How a connection hyper served ends: [`Cancelled`] if `fcx`'s region
     /// was cancelled, whether hyper saw it first or its I/O did; otherwise
     /// it ended, and an error is recorded.
-    fn finish(cx: &Cx, info: &ConnInfo, broke: &std::sync::atomic::AtomicBool, raced: Result<Result<(), hyper::Error>, RaceError>) -> Result<(), Cancelled> {
+    fn finish(fcx: &Cx, info: &ConnInfo, broke: &std::sync::atomic::AtomicBool, raced: Result<Result<(), hyper::Error>, RaceError>) -> Result<(), Cancelled> {
         let Ok(result) = raced else { return Err(Cancelled) };
-        if cx.is_cancelled() {
+        if fcx.is_cancelled() {
             return Err(Cancelled);
         }
-        report(cx, info, broke, result);
+        report(fcx, info, broke, result);
         Ok(())
     }
 
     /// Records how a connection hyper served ended, if in an error.
-    fn report(cx: &Cx, info: &ConnInfo, broke: &std::sync::atomic::AtomicBool, result: Result<(), hyper::Error>) {
+    fn report(fcx: &Cx, info: &ConnInfo, broke: &std::sync::atomic::AtomicBool, result: Result<(), hyper::Error>) {
         let broke = broke.load(std::sync::atomic::Ordering::Relaxed);
         let cause = match &result {
             Err(e) => match error_cause(e) {
@@ -1733,7 +1733,7 @@ mod h2 {
             Ok(()) => None,
         };
         if let Some((cause, detail)) = cause {
-            cx.record(error_event(info, cause, detail).conn(info));
+            fcx.record(error_event(info, cause, detail).conn(info));
         }
     }
 
@@ -1769,7 +1769,7 @@ mod h2 {
     /// budget and randomness.
     #[derive(Clone)]
     struct Route {
-        cx: Cx,
+        fcx: Cx,
         handler: Arc<dyn Handler>,
         info: Arc<ConnInfo>,
         date: Option<SystemTime>,
@@ -1780,10 +1780,10 @@ mod h2 {
     }
 
     impl Route {
-        fn new(cx: &Cx, handler: Arc<dyn Handler>, info: &ConnInfo, opts: &HttpOptions) -> Route {
+        fn new(fcx: &Cx, handler: Arc<dyn Handler>, info: &ConnInfo, opts: &HttpOptions) -> Route {
             let seed = serve::conn_seed(opts.seed, info.id.unwrap_or(0));
             Route {
-                cx: cx.clone(),
+                fcx: fcx.clone(),
                 handler,
                 info: Arc::new(info.clone()),
                 date: opts.date,
@@ -1799,7 +1799,7 @@ mod h2 {
             let read = async {
                 let mut body = pin!(body);
                 let mut got = Vec::new();
-                while let Some(frame) = poll_fn(|task| body.as_mut().poll_frame(task)).await {
+                while let Some(frame) = poll_fn(|cx| body.as_mut().poll_frame(cx)).await {
                     let Ok(frame) = frame else {
                         return Err(Box::new(answered(text(StatusCode::BAD_REQUEST, "The request body was cut off.\n"), "cut_off")));
                     };
@@ -1815,7 +1815,7 @@ mod h2 {
                 }
                 Ok(Bytes::from(got))
             };
-            match self.cx.race(Some(self.cx.now() + self.limits.body_timeout), read).await {
+            match self.fcx.race(Some(self.fcx.now() + self.limits.body_timeout), read).await {
                 Ok(got) => got,
                 Err(_) => Err(Box::new(answered(text(StatusCode::REQUEST_TIMEOUT, "The request body took too long.\n"), "timeout"))),
             }
@@ -1837,8 +1837,8 @@ mod h2 {
         fn call(&self, request: Request<Incoming>) -> Answer {
             let route = self.clone();
             let track = Track {
-                tracker: Tracker::new(&request, &route.info, route.cx.now()),
-                cx: route.cx.clone(),
+                tracker: Tracker::new(&request, &route.info, route.fcx.now()),
+                fcx: route.fcx.clone(),
                 info: route.info.clone(),
                 extra: None,
                 status: None,
@@ -1859,13 +1859,13 @@ mod h2 {
                     Ok(body) => {
                         let mut request = Request::from_parts(parts, Body::from(body));
                         request.extensions_mut().insert((*route.info).clone());
-                        let now = route.cx.now();
+                        let now = route.fcx.now();
                         let rng = route.rng.clone();
                         let mut rng = move || rng.lock().unwrap_or_else(|e| e.into_inner()).next();
                         let reply = route.handler.call(request, &mut Exchange::new(now, &mut rng, &route.info));
                         match reply {
                             Reply::Now(r) => r,
-                            Reply::Later(work) => match work(route.cx.clone()).await {
+                            Reply::Later(work) => match work(route.fcx.clone()).await {
                                 Ok(r) => r,
                                 Err(e) => error_response(&e),
                             },
@@ -1876,7 +1876,7 @@ mod h2 {
                 let fits = charge.as_mut().is_none_or(|c| c.set(body.full_len()));
                 let (mut parts, body) = if fits { (parts, body) } else { over_budget().into_parts() };
                 if !parts.headers.contains_key(DATE)
-                    && let Some(date) = date_header(route.date, route.cx.now())
+                    && let Some(date) = date_header(route.date, route.fcx.now())
                 {
                     parts.headers.insert(DATE, date);
                 }
@@ -1909,7 +1909,7 @@ mod h2 {
     /// One request's event, sent when it is dropped.
     struct Track {
         tracker: Tracker,
-        cx: Cx,
+        fcx: Cx,
         info: Arc<ConnInfo>,
         extra: Option<Fields>,
         status: Option<StatusCode>,
@@ -1922,7 +1922,7 @@ mod h2 {
     impl Drop for Track {
         fn drop(&mut self) {
             if let Some(e) = self.tracker.finish(self.extra.take(), self.status, self.sent, self.complete) {
-                self.cx.record(e.conn(&self.info));
+                self.fcx.record(e.conn(&self.info));
             }
         }
     }
@@ -1942,7 +1942,7 @@ mod h2 {
         type Data = Bytes;
         type Error = Error;
 
-        fn poll_frame(self: Pin<&mut Self>, task: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, Error>>> {
+        fn poll_frame(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, Error>>> {
             let this = self.get_mut();
             if !this.rest.is_empty() {
                 let piece = this.rest.split_to(this.rest.len().min(PIECE));
@@ -1950,7 +1950,7 @@ mod h2 {
                 this.recharge();
                 return Poll::Ready(Some(Ok(Frame::data(piece))));
             }
-            let mut polled = Pin::new(&mut this.body).poll_frame(task);
+            let mut polled = Pin::new(&mut this.body).poll_frame(cx);
             if let Poll::Ready(Some(Ok(frame))) = &mut polled
                 && let Some(data) = frame.data_mut()
                 && data.len() > PIECE
@@ -2012,7 +2012,7 @@ mod h2 {
     /// bytes for `stall` fails with `TimedOut`, which ends the connection:
     /// a client that stopped reading.
     struct Io<C> {
-        cx: Cx,
+        fcx: Cx,
         conn: C,
         broke: Arc<std::sync::atomic::AtomicBool>,
         buf: Box<[u8]>,
@@ -2022,19 +2022,19 @@ mod h2 {
     }
 
     impl<C: Connection + Unpin> Io<C> {
-        fn new(cx: &Cx, conn: C, broke: Arc<std::sync::atomic::AtomicBool>, stall: Duration) -> Io<C> {
-            Io { cx: cx.clone(), conn, broke, buf: vec![0; 16 * 1024].into_boxed_slice(), stall, stalled: None }
+        fn new(fcx: &Cx, conn: C, broke: Arc<std::sync::atomic::AtomicBool>, stall: Duration) -> Io<C> {
+            Io { fcx: fcx.clone(), conn, broke, buf: vec![0; 16 * 1024].into_boxed_slice(), stall, stalled: None }
         }
 
         /// One write, with the stall timer: armed when it waits, cleared
         /// when bytes go.
-        fn write(&mut self, task: &mut Context<'_>, data: &[u8]) -> Poll<Result<usize, ConnError>> {
-            match self.conn.poll_write(&self.cx, task, data) {
+        fn write(&mut self, cx: &mut Context<'_>, data: &[u8]) -> Poll<Result<usize, ConnError>> {
+            match self.conn.poll_write(&self.fcx, cx, data) {
                 Poll::Pending => {
-                    let cx = self.cx.clone();
+                    let fcx = self.fcx.clone();
                     let stall = self.stall;
-                    let timer = self.stalled.get_or_insert_with(|| Box::pin(async move { cx.sleep(stall).await }));
-                    match timer.as_mut().poll(task) {
+                    let timer = self.stalled.get_or_insert_with(|| Box::pin(async move { fcx.sleep(stall).await }));
+                    match timer.as_mut().poll(cx) {
                         Poll::Ready(Ok(())) => Poll::Ready(Err(ConnError::TimedOut)),
                         Poll::Ready(Err(_)) => Poll::Ready(Err(ConnError::Cancelled)),
                         Poll::Pending => Poll::Pending,
@@ -2049,10 +2049,10 @@ mod h2 {
     }
 
     impl<C: Connection + Unpin> hyper::rt::Read for Io<C> {
-        fn poll_read(self: Pin<&mut Self>, task: &mut Context<'_>, mut buf: hyper::rt::ReadBufCursor<'_>) -> Poll<std::io::Result<()>> {
+        fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, mut buf: hyper::rt::ReadBufCursor<'_>) -> Poll<std::io::Result<()>> {
             let this = self.get_mut();
             let want = buf.remaining().min(this.buf.len());
-            match this.conn.poll_read(&this.cx, task, &mut this.buf[..want]) {
+            match this.conn.poll_read(&this.fcx, cx, &mut this.buf[..want]) {
                 Poll::Ready(Ok(n)) => {
                     buf.put_slice(&this.buf[..n]);
                     Poll::Ready(Ok(()))
@@ -2069,19 +2069,19 @@ mod h2 {
     }
 
     impl<C: Connection + Unpin> hyper::rt::Write for Io<C> {
-        fn poll_write(self: Pin<&mut Self>, task: &mut Context<'_>, data: &[u8]) -> Poll<std::io::Result<usize>> {
-            self.get_mut().write(task, data).map_err(std::io::Error::from)
+        fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, data: &[u8]) -> Poll<std::io::Result<usize>> {
+            self.get_mut().write(cx, data).map_err(std::io::Error::from)
         }
 
         fn is_write_vectored(&self) -> bool {
             true
         }
 
-        fn poll_write_vectored(self: Pin<&mut Self>, task: &mut Context<'_>, bufs: &[std::io::IoSlice<'_>]) -> Poll<std::io::Result<usize>> {
+        fn poll_write_vectored(self: Pin<&mut Self>, cx: &mut Context<'_>, bufs: &[std::io::IoSlice<'_>]) -> Poll<std::io::Result<usize>> {
             let this = self.get_mut();
             let mut done = 0;
             for buf in bufs.iter().filter(|b| !b.is_empty()) {
-                match this.write(task, buf) {
+                match this.write(cx, buf) {
                     Poll::Ready(Ok(n)) => {
                         done += n;
                         if n < buf.len() {
@@ -2098,20 +2098,20 @@ mod h2 {
             Poll::Ready(Ok(done))
         }
 
-        fn poll_flush(self: Pin<&mut Self>, _task: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))
         }
 
-        fn poll_shutdown(self: Pin<&mut Self>, task: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
             let this = self.get_mut();
-            this.conn.poll_shutdown(&this.cx, task).map_err(std::io::Error::from)
+            this.conn.poll_shutdown(&this.fcx, cx).map_err(std::io::Error::from)
         }
     }
 
     /// Runs hyper's streams as tasks, which end when the world stops.
     #[derive(Clone)]
     struct Executor {
-        cx: Cx,
+        fcx: Cx,
     }
 
     impl<F> hyper::rt::Executor<F> for Executor
@@ -2119,11 +2119,11 @@ mod h2 {
         F: Future<Output = ()> + Send + 'static,
     {
         fn execute(&self, work: F) {
-            self.cx.spawn(move |cx| async move {
+            self.fcx.spawn(move |fcx| async move {
                 let mut work = pin!(work);
-                let mut stopping = pin!(cx.cancelled());
-                poll_fn(|task| {
-                    if work.as_mut().poll(task).is_ready() || stopping.as_mut().poll(task).is_ready() {
+                let mut stopping = pin!(fcx.cancelled());
+                poll_fn(|cx| {
+                    if work.as_mut().poll(cx).is_ready() || stopping.as_mut().poll(cx).is_ready() {
                         return Poll::Ready(());
                     }
                     Poll::Pending
@@ -2137,17 +2137,17 @@ mod h2 {
     /// hyper's timer, on the run's clock.
     #[derive(Clone)]
     struct CxTimer {
-        cx: Cx,
+        fcx: Cx,
     }
 
     impl hyper::rt::Timer for CxTimer {
         fn sleep(&self, duration: Duration) -> Pin<Box<dyn hyper::rt::Sleep>> {
-            let cx = self.cx.clone();
+            let fcx = self.fcx.clone();
             Box::pin(CxSleep(Box::pin(async move {
                 // A cancelled sleep never fires: hyper's sleeps cannot say
                 // they were cancelled, and firing would run every one of
                 // its timeouts at once. The connection ends by the cancel.
-                if cx.sleep(duration).await.is_err() {
+                if fcx.sleep(duration).await.is_err() {
                     std::future::pending::<()>().await;
                 }
             })))
@@ -2169,8 +2169,8 @@ mod h2 {
     impl Future for CxSleep {
         type Output = ();
 
-        fn poll(self: Pin<&mut Self>, task: &mut Context<'_>) -> Poll<()> {
-            self.get_mut().0.as_mut().poll(task)
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            self.get_mut().0.as_mut().poll(cx)
         }
     }
 
@@ -2185,10 +2185,10 @@ mod h2 {
         /// firing.
         #[test]
         fn a_cancelled_sleep_never_fires() {
-            fictionet::block_on(fictionet::run(|cx| async move {
+            fictionet::block_on(fictionet::run(|fcx| async move {
                 let slot: Arc<Mutex<Option<Cx>>> = Arc::default();
                 let s = slot.clone();
-                let _ = cx
+                let _ = fcx
                     .region(|inner| async move {
                         *s.lock().unwrap() = Some(inner.clone());
                         inner.cancel();
@@ -2197,12 +2197,12 @@ mod h2 {
                     .await;
                 let inner = slot.lock().unwrap().take().unwrap();
                 assert!(inner.is_cancelled());
-                let mut sleep = CxTimer { cx: inner }.sleep(Duration::from_secs(5));
+                let mut sleep = CxTimer { fcx: inner }.sleep(Duration::from_secs(5));
                 let pending = |sleep: &mut Pin<Box<dyn hyper::rt::Sleep>>| {
                     sleep.as_mut().poll(&mut Context::from_waker(std::task::Waker::noop())).is_pending()
                 };
                 assert!(pending(&mut sleep));
-                cx.sleep(Duration::from_millis(5)).await?;
+                fcx.sleep(Duration::from_millis(5)).await?;
                 assert!(pending(&mut sleep));
                 Ok(())
             }))

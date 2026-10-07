@@ -23,21 +23,21 @@
 //! # use fictionet::Cx;
 //! # use fictionet::stdlib::{tcp, tls, Connection};
 //! # use rustls::ServerConfig;
-//! # async fn serve_stripe(_cx: &Cx, _conn: impl Connection) {}
-//! # async fn accept(cx: Cx, mut listener: tcp::Listener, real: Arc<ServerConfig>, fake: Arc<ServerConfig>) {
-//! while let Ok(tcp) = listener.accept(&cx).await {
+//! # async fn serve_stripe(_fcx: &Cx, _conn: impl Connection) {}
+//! # async fn accept(fcx: Cx, mut listener: tcp::Listener, real: Arc<ServerConfig>, fake: Arc<ServerConfig>) {
+//! while let Ok(tcp) = listener.accept(&fcx).await {
 //!     let (real, fake) = (real.clone(), fake.clone()); // Arc<ServerConfig>s
-//!     cx.spawn(move |cx| async move {
+//!     fcx.spawn(move |fcx| async move {
 //!         // Reads the client's hello. Nothing is sent to the client yet.
 //!         // One bad connection is not a failure of the world, so errors end
 //!         // this task with Ok(()).
-//!         let Ok(hello) = tls::server(&cx, tcp).await else { return Ok(()) };
+//!         let Ok(hello) = tls::server(&fcx, tcp).await else { return Ok(()) };
 //!
 //!         // A fake certificate 10% of the time.
-//!         let config = if cx.random_f64() < 0.1 { fake } else { real };
+//!         let config = if fcx.random_f64() < 0.1 { fake } else { real };
 //!
-//!         let Ok(conn) = hello.finish(&cx, config).await else { return Ok(()) };
-//!         serve_stripe(&cx, conn).await;
+//!         let Ok(conn) = hello.finish(&fcx, config).await else { return Ok(()) };
+//!         serve_stripe(&fcx, conn).await;
 //!         Ok(())
 //!     });
 //! }
@@ -69,14 +69,14 @@ use rustls::{ConfigBuilder, WantsVersions};
 use crate::Cx;
 use crate::stdlib::{ConnError, Connection};
 
-/// Starts a rustls server config whose time and randomness come from `cx`.
+/// Starts a rustls server config whose time and randomness come from `fcx`.
 ///
 /// rustls reads the current time, to check certificate validity and ticket
 /// lifetimes, and draws random values for the handshake. A config built
 /// with rustls's own builder takes both from the operating system. This
 /// builder takes them from the world instead:
 ///
-/// - **Time** is `start` plus the time since the run started, from `cx`.
+/// - **Time** is `start` plus the time since the run started, from `fcx`.
 ///   `start` is the world's date and time when the run started, which the
 ///   world takes from its arguments (see [No dates](crate::time#no-dates)).
 ///   So a world set in 2019 checks certificates against 2019.
@@ -100,8 +100,8 @@ use crate::stdlib::{ConnError, Connection};
 /// ```
 /// # use fictionet::{Cx, Result, stdlib::tls};
 /// # use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-/// # fn make(cx: Cx, start: std::time::SystemTime, chain: Vec<CertificateDer<'static>>, key: PrivateKeyDer<'static>) -> Result {
-/// let config = tls::config_builder(&cx, start, rustls::crypto::ring::default_provider())
+/// # fn make(fcx: Cx, start: std::time::SystemTime, chain: Vec<CertificateDer<'static>>, key: PrivateKeyDer<'static>) -> Result {
+/// let config = tls::config_builder(&fcx, start, rustls::crypto::ring::default_provider())
 ///     .with_safe_default_protocol_versions()?
 ///     .with_no_client_auth()
 ///     .with_single_cert(chain, key)?;
@@ -110,18 +110,18 @@ use crate::stdlib::{ConnError, Connection};
 /// # }
 /// ```
 pub fn config_builder(
-    cx: &Cx,
+    fcx: &Cx,
     start: SystemTime,
     provider: CryptoProvider,
 ) -> ConfigBuilder<ServerConfig, WantsVersions> {
     let provider = CryptoProvider { secure_random: &CxRandom, ..provider };
-    let clock = CxClock { cx: cx.clone(), start };
+    let clock = CxClock { fcx: fcx.clone(), start };
     ServerConfig::builder_with_details(Arc::new(provider), Arc::new(clock))
 }
 
 /// The world's date: `start` plus the run's clock.
 struct CxClock {
-    cx: Cx,
+    fcx: Cx,
     start: SystemTime,
 }
 
@@ -133,7 +133,7 @@ impl std::fmt::Debug for CxClock {
 
 impl TimeProvider for CxClock {
     fn current_time(&self) -> Option<UnixTime> {
-        let now = self.start.checked_add(self.cx.now().since_start())?;
+        let now = self.start.checked_add(self.fcx.now().since_start())?;
         Some(UnixTime::since_unix_epoch(now.duration_since(UNIX_EPOCH).ok()?))
     }
 }
@@ -143,8 +143,8 @@ thread_local! {
     static CURRENT: RefCell<Option<Cx>> = const { RefCell::new(None) };
 }
 
-/// Runs `f` with `cx` as the source of [`CxRandom`].
-fn with_cx<T>(cx: &Cx, f: impl FnOnce() -> T) -> T {
+/// Runs `f` with `fcx` as the source of [`CxRandom`].
+fn with_fcx<T>(fcx: &Cx, f: impl FnOnce() -> T) -> T {
     struct Restore(Option<Cx>);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -152,7 +152,7 @@ fn with_cx<T>(cx: &Cx, f: impl FnOnce() -> T) -> T {
             CURRENT.with(|c| *c.borrow_mut() = previous);
         }
     }
-    let previous = CURRENT.with(|c| c.borrow_mut().replace(cx.clone()));
+    let previous = CURRENT.with(|c| c.borrow_mut().replace(fcx.clone()));
     let _restore = Restore(previous);
     f()
 }
@@ -160,16 +160,16 @@ fn with_cx<T>(cx: &Cx, f: impl FnOnce() -> T) -> T {
 /// rustls's `SecureRandom`, from the `Cx` of the TLS work that draws it.
 ///
 /// rustls keeps it as a `&'static`, so it cannot hold a `Cx` itself: it
-/// reads the one [`with_cx`] set for this thread.
+/// reads the one [`with_fcx`] set for this thread.
 #[derive(Debug)]
 struct CxRandom;
 
 impl SecureRandom for CxRandom {
     fn fill(&self, buf: &mut [u8]) -> Result<(), GetRandomFailed> {
         CURRENT.with(|c| match &*c.borrow() {
-            Some(cx) => {
+            Some(fcx) => {
                 for chunk in buf.chunks_mut(8) {
-                    chunk.copy_from_slice(&cx.random_u64().to_le_bytes()[..chunk.len()]);
+                    chunk.copy_from_slice(&fcx.random_u64().to_le_bytes()[..chunk.len()]);
                 }
                 Ok(())
             }
@@ -205,9 +205,9 @@ impl<C: Connection> Io<C> {
     }
 
     /// Hands all of `out` to `conn`.
-    fn poll_flush(&mut self, cx: &Cx, task: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
+    fn poll_flush(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
         while self.out_pos < self.out.len() {
-            match self.conn.poll_write(cx, task, &self.out[self.out_pos..]) {
+            match self.conn.poll_write(fcx, cx, &self.out[self.out_pos..]) {
                 Poll::Ready(Ok(0)) => return Poll::Ready(Err(ConnError::Closed)),
                 Poll::Ready(Ok(n)) => self.out_pos += n,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -220,10 +220,10 @@ impl<C: Connection> Io<C> {
     }
 
     /// Reads more bytes from `conn` into `inbuf`, or sets `eof`.
-    fn poll_fill(&mut self, cx: &Cx, task: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
+    fn poll_fill(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
         let old = self.inbuf.len();
         self.inbuf.resize(old + READ_CHUNK, 0);
-        let result = self.conn.poll_read(cx, task, &mut self.inbuf[old..]);
+        let result = self.conn.poll_read(fcx, cx, &mut self.inbuf[old..]);
         let n = match &result {
             Poll::Ready(Ok(n)) => *n,
             _ => 0,
@@ -252,7 +252,7 @@ impl<C: Connection> Io<C> {
     /// Feeds `inbuf` (or the end of input) to rustls and processes it. On a
     /// TLS error, queues the alert rustls made and fails with what went
     /// wrong.
-    fn feed(&mut self, cx: &Cx, tls: &mut ServerConnection) -> Result<(), HandshakeError> {
+    fn feed(&mut self, fcx: &Cx, tls: &mut ServerConnection) -> Result<(), HandshakeError> {
         if self.inbuf.is_empty() {
             if self.eof {
                 // Tells rustls the input ended.
@@ -265,7 +265,7 @@ impl<C: Connection> Io<C> {
             }
             self.inbuf.drain(..n);
         }
-        let result = with_cx(cx, || tls.process_new_packets().map(|_| ()));
+        let result = with_fcx(fcx, || tls.process_new_packets().map(|_| ()));
         if let Err(e) = result {
             self.take_output(tls);
             return Err(match e {
@@ -365,17 +365,17 @@ impl HandshakeError {
 /// Fails with [`ConnError::Broken`] if the client's first message is not a
 /// TLS hello, or if the client closes the connection before it sent a whole
 /// hello. An error of the connection underneath, such as
-/// [`ConnError::Cancelled`] when `cx`'s [region](crate::Cx#regions) is
+/// [`ConnError::Cancelled`] when `fcx`'s [region](crate::Cx#regions) is
 /// cancelled, comes out as it is.
-pub async fn server<C: Connection>(cx: &Cx, conn: C) -> Result<ClientHello<C>, ConnError> {
-    server_detailed(cx, conn).await.map_err(HandshakeError::into_conn)
+pub async fn server<C: Connection>(fcx: &Cx, conn: C) -> Result<ClientHello<C>, ConnError> {
+    server_detailed(fcx, conn).await.map_err(HandshakeError::into_conn)
 }
 
 /// [`server`], failing with how the hello went wrong.
-pub async fn server_detailed<C: Connection>(cx: &Cx, conn: C) -> Result<ClientHello<C>, HandshakeError> {
+pub async fn server_detailed<C: Connection>(fcx: &Cx, conn: C) -> Result<ClientHello<C>, HandshakeError> {
     let mut io = Io::new(conn);
     let mut acceptor = Acceptor::default();
-    let accepted = poll_fn(|task| {
+    let accepted = poll_fn(|cx| {
         loop {
             if !io.inbuf.is_empty() {
                 let n = acceptor.read_tls(&mut &io.inbuf[..]).map_err(|e| HandshakeError::Failed(e.to_string()))?;
@@ -391,7 +391,7 @@ pub async fn server_detailed<C: Connection>(cx: &Cx, conn: C) -> Result<ClientHe
             if io.eof {
                 return Poll::Ready(Err(HandshakeError::Closed));
             }
-            match io.poll_fill(cx, task) {
+            match io.poll_fill(fcx, cx) {
                 Poll::Ready(Ok(())) => {}
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e.into())),
                 Poll::Pending => return Poll::Pending,
@@ -441,11 +441,11 @@ impl<C: Connection> ClientHello<C> {
     /// Refuses the name the client asked for: sends the `unrecognized_name`
     /// alert and closes the connection. Dropping the hello instead closes the
     /// connection with no alert.
-    pub async fn reject(self, cx: &Cx) -> Result<(), ConnError> {
+    pub async fn reject(self, fcx: &Cx) -> Result<(), ConnError> {
         use crate::stdlib::ConnectionExt;
         let mut conn = self.conn;
-        conn.write_all(cx, &UNRECOGNIZED_NAME).await?;
-        conn.shutdown(cx).await
+        conn.write_all(fcx, &UNRECOGNIZED_NAME).await?;
+        conn.shutdown(fcx).await
     }
 
     /// Finishes the handshake with `config`.
@@ -453,32 +453,32 @@ impl<C: Connection> ClientHello<C> {
     /// Fails with [`ConnError::Broken`] if the handshake fails, for example
     /// because the client rejected the certificate. An error of the
     /// connection underneath comes out as it is.
-    pub async fn finish(self, cx: &Cx, config: Arc<ServerConfig>) -> Result<TlsConnection<C>, ConnError> {
-        self.finish_detailed(cx, config).await.map_err(HandshakeError::into_conn)
+    pub async fn finish(self, fcx: &Cx, config: Arc<ServerConfig>) -> Result<TlsConnection<C>, ConnError> {
+        self.finish_detailed(fcx, config).await.map_err(HandshakeError::into_conn)
     }
 
     /// [`finish`](ClientHello::finish), failing with how the handshake went
     /// wrong.
     pub async fn finish_detailed(
         self,
-        cx: &Cx,
+        fcx: &Cx,
         config: Arc<ServerConfig>,
     ) -> Result<TlsConnection<C>, HandshakeError> {
         let mut io = Io { conn: self.conn, inbuf: self.inbuf, out: Vec::new(), out_pos: 0, eof: false };
-        let config = crate::observe::observed_config(cx, config, self.server_name.as_deref());
-        let mut tls = match with_cx(cx, || self.accepted.into_connection(config)) {
+        let config = crate::observe::observed_config(fcx, config, self.server_name.as_deref());
+        let mut tls = match with_fcx(fcx, || self.accepted.into_connection(config)) {
             Ok(tls) => tls,
             Err((e, mut alert)) => {
                 // Best effort: tell the client why, then close.
                 let _ = alert.write_all(&mut io.out);
-                let _ = poll_fn(|task| io.poll_flush(cx, task)).await;
+                let _ = poll_fn(|cx| io.poll_flush(fcx, cx)).await;
                 return Err(HandshakeError::Failed(e.to_string()));
             }
         };
-        let result = poll_fn(|task| {
+        let result = poll_fn(|cx| {
             loop {
                 io.take_output(&mut tls);
-                match io.poll_flush(cx, task) {
+                match io.poll_flush(fcx, cx) {
                     Poll::Ready(Ok(())) => {}
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e.into())),
                     Poll::Pending => return Poll::Pending,
@@ -487,13 +487,13 @@ impl<C: Connection> ClientHello<C> {
                     return Poll::Ready(Ok(()));
                 }
                 if !io.inbuf.is_empty() {
-                    io.feed(cx, &mut tls)?;
+                    io.feed(fcx, &mut tls)?;
                     continue;
                 }
                 if io.eof {
                     return Poll::Ready(Err(HandshakeError::Closed));
                 }
-                match io.poll_fill(cx, task) {
+                match io.poll_fill(fcx, cx) {
                     Poll::Ready(Ok(())) => {}
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e.into())),
                     Poll::Pending => return Poll::Pending,
@@ -506,7 +506,7 @@ impl<C: Connection> ClientHello<C> {
             Err(e) => {
                 // Send the alert rustls made, if there is one.
                 if !io.out.is_empty() {
-                    let _ = poll_fn(|task| io.poll_flush(cx, task)).await;
+                    let _ = poll_fn(|cx| io.poll_flush(fcx, cx)).await;
                 }
                 Err(e)
             }
@@ -540,12 +540,12 @@ impl<C: Connection> TlsConnection<C> {
 impl<C: Connection> Connection for TlsConnection<C> {
     fn poll_read(
         &mut self,
-        cx: &Cx,
-        task: &mut Context<'_>,
+        fcx: &Cx,
+        cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<Result<usize, ConnError>> {
         // A cancel comes first, before plaintext already decrypted.
-        if cx.is_cancelled() {
+        if fcx.is_cancelled() {
             return Poll::Ready(Err(ConnError::Cancelled));
         }
         if buf.is_empty() {
@@ -563,12 +563,12 @@ impl<C: Connection> Connection for TlsConnection<C> {
             }
             if !self.io.inbuf.is_empty() || self.io.eof {
                 let eof_seen = self.io.inbuf.is_empty();
-                let fed = self.io.feed(cx, &mut self.tls);
+                let fed = self.io.feed(fcx, &mut self.tls);
                 // rustls may have something to send: a key update, a ticket
                 // or an alert. Hand it on if `conn` has room now; otherwise
                 // the next write or read sends it.
                 self.io.take_output(&mut self.tls);
-                let _ = self.io.poll_flush(cx, task);
+                let _ = self.io.poll_flush(fcx, cx);
                 if fed.is_err() {
                     return Poll::Ready(Err(ConnError::Broken));
                 }
@@ -585,22 +585,22 @@ impl<C: Connection> Connection for TlsConnection<C> {
                 }
                 continue;
             }
-            match self.io.poll_fill(cx, task) {
+            match self.io.poll_fill(fcx, cx) {
                 Poll::Ready(Ok(())) => {}
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => {
                     // Output queued by an earlier read still goes out.
-                    let _ = self.io.poll_flush(cx, task);
+                    let _ = self.io.poll_flush(fcx, cx);
                     return Poll::Pending;
                 }
             }
         }
     }
 
-    fn poll_write(&mut self, cx: &Cx, task: &mut Context<'_>, data: &[u8]) -> Poll<Result<usize, ConnError>> {
+    fn poll_write(&mut self, fcx: &Cx, cx: &mut Context<'_>, data: &[u8]) -> Poll<Result<usize, ConnError>> {
         if let Some(n) = self.taken {
             // The caller retries the same bytes; they are already encrypted.
-            return match self.io.poll_flush(cx, task) {
+            return match self.io.poll_flush(fcx, cx) {
                 Poll::Ready(Ok(())) => {
                     self.taken = None;
                     Poll::Ready(Ok(n))
@@ -611,7 +611,7 @@ impl<C: Connection> Connection for TlsConnection<C> {
         if self.closing {
             return Poll::Ready(Err(ConnError::Closed));
         }
-        match self.io.poll_flush(cx, task) {
+        match self.io.poll_flush(fcx, cx) {
             Poll::Ready(Ok(())) => {}
             other => return other.map(|r| r.map(|()| 0)),
         }
@@ -624,7 +624,7 @@ impl<C: Connection> Connection for TlsConnection<C> {
             Ok(n) => n,
         };
         self.io.take_output(&mut self.tls);
-        match self.io.poll_flush(cx, task) {
+        match self.io.poll_flush(fcx, cx) {
             Poll::Ready(Ok(())) => Poll::Ready(Ok(n)),
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             Poll::Pending => {
@@ -635,19 +635,19 @@ impl<C: Connection> Connection for TlsConnection<C> {
     }
 
     /// Sends `close_notify`, then shuts down the connection underneath.
-    fn poll_shutdown(&mut self, cx: &Cx, task: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
+    fn poll_shutdown(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
         if !self.closing {
             self.closing = true;
             self.tls.send_close_notify();
             self.io.take_output(&mut self.tls);
         }
-        match self.io.poll_flush(cx, task) {
-            Poll::Ready(Ok(())) => self.io.conn.poll_shutdown(cx, task),
+        match self.io.poll_flush(fcx, cx) {
+            Poll::Ready(Ok(())) => self.io.conn.poll_shutdown(fcx, cx),
             other => other,
         }
     }
 
-    fn poll_gone(&self, task: &mut Context<'_>) -> Poll<()> {
-        self.io.conn.poll_gone(task)
+    fn poll_gone(&self, cx: &mut Context<'_>) -> Poll<()> {
+        self.io.conn.poll_gone(cx)
     }
 }

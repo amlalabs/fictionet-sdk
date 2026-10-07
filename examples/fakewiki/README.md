@@ -162,7 +162,7 @@ Three containers:
     as `X-Fakewiki-*` headers. The handler strips those headers and puts the
     fields in the response's extensions, as event fields, which never reach
     the agent.
-  * The request log is written from the run's events (`cx.events()`): one
+  * The request log is written from the run's events (`fcx.events()`): one
     `dns` line per query, `tls_reject` and `tls_error` for handshakes that did not
     finish, and one `http` line per request. The `http` line of a page carries the
     fields the handler put in the extensions, so it holds what the agent asked for

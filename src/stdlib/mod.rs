@@ -112,13 +112,13 @@
 //! use fictionet::{Attachments, Cx, Result, stdlib, time::ms};
 //! use fictionet::stdlib::{ip, tcp};
 //!
-//! async fn world(cx: Cx, mut attachments: Attachments) -> Result {
-//!     let agent = attachments.get(&cx, "agent").await?;
-//!     let link = stdlib::delay(&cx, ms(50), agent);
-//!     let (tcp, _udp, _icmp, _other) = ip::split_protocols(&cx, link);
-//!     let machine = tcp::endpoint(&cx, tcp, "10.0.0.1".parse()?);
+//! async fn world(fcx: Cx, mut attachments: Attachments) -> Result {
+//!     let agent = attachments.get(&fcx, "agent").await?;
+//!     let link = stdlib::delay(&fcx, ms(50), agent);
+//!     let (tcp, _udp, _icmp, _other) = ip::split_protocols(&fcx, link);
+//!     let machine = tcp::endpoint(&fcx, tcp, "10.0.0.1".parse()?);
 //!     let mut listener = machine.listen(80)?;
-//!     while let Ok(conn) = listener.accept(&cx).await {
+//!     while let Ok(conn) = listener.accept(&fcx).await {
 //!         // serve `conn`, usually in a task of its own
 //!         drop(conn);
 //!     }
@@ -497,7 +497,7 @@ pub use connection::{ConnError, Connection, ConnectionExt};
 ///   later.
 /// - Packets sent into the returned end reach `inner` `by` later.
 ///
-/// So a round trip through `delay(&cx, ms(50), ..)` takes 100 ms. Each
+/// So a round trip through `delay(&fcx, ms(50), ..)` takes 100 ms. Each
 /// packet is delayed on its own: ten packets sent together all arrive `by`
 /// later, together.
 ///
@@ -522,12 +522,12 @@ pub use connection::{ConnError, Connection, ConnectionExt};
 /// How it works: `delay` makes two connected interfaces with
 /// [`pair`](crate::pair), returns one, and starts a task with
 /// [`Cx::spawn`] that holds the other and `inner`. The task stamps each
-/// packet with `cx.now() + by` and puts it in a queue for its direction. Because the delay is fixed, each queue is
+/// packet with `fcx.now() + by` and puts it in a queue for its direction. Because the delay is fixed, each queue is
 /// already in the order packets leave. The task waits for whichever comes
 /// first: a packet from either side, or the time at the front of a queue.
 #[track_caller]
-pub fn delay(cx: &Cx, by: Duration, inner: impl Interface) -> End {
-    shape(cx, "delay", inner, move |queue: &Queue, now: Instant, _len: usize| {
+pub fn delay(fcx: &Cx, by: Duration, inner: impl Interface) -> End {
+    shape(fcx, "delay", inner, move |queue: &Queue, now: Instant, _len: usize| {
         // Each packet waits `by` from when it arrived. The queue stays in
         // release order because `by` is fixed.
         let _ = queue;
@@ -562,9 +562,9 @@ pub fn delay(cx: &Cx, by: Duration, inner: impl Interface) -> End {
 ///
 /// ```
 /// # use fictionet::{Attachment, Cx, stdlib};
-/// # fn wire(cx: Cx, sandbox: Attachment) {
+/// # fn wire(fcx: Cx, sandbox: Attachment) {
 /// // A 10 Mbit/s link with room for 100 waiting packets each way.
-/// let link = stdlib::bottleneck(&cx, 10_000_000, 100, sandbox);
+/// let link = stdlib::bottleneck(&fcx, 10_000_000, 100, sandbox);
 /// # drop(link);
 /// # }
 /// ```
@@ -577,8 +577,8 @@ pub fn delay(cx: &Cx, by: Duration, inner: impl Interface) -> End {
 /// drops are recorded as `bottleneck.drop` [repeats](crate::events#repeats),
 /// with how many packets were waiting (`waiting`).
 #[track_caller]
-pub fn bottleneck(cx: &Cx, bits_per_second: u64, queue: usize, inner: impl Interface) -> End {
-    shape(cx, "bottleneck", inner, move |waiting: &Queue, now: Instant, len: usize| {
+pub fn bottleneck(fcx: &Cx, bits_per_second: u64, queue: usize, inner: impl Interface) -> End {
+    shape(fcx, "bottleneck", inner, move |waiting: &Queue, now: Instant, len: usize| {
         if waiting.packets.len() >= queue {
             return None;
         }
@@ -618,8 +618,8 @@ pub enum Direction {
 ///
 /// ```
 /// # use fictionet::{Attachment, Cx, stdlib};
-/// # fn wire(cx: Cx, sandbox: Attachment) {
-/// let lossy = stdlib::filter(&cx, sandbox, |cx, _direction, _packet| cx.random_f64() >= 0.02);
+/// # fn wire(fcx: Cx, sandbox: Attachment) {
+/// let lossy = stdlib::filter(&fcx, sandbox, |fcx, _direction, _packet| fcx.random_f64() >= 0.02);
 /// # drop(lossy);
 /// # }
 /// ```
@@ -633,19 +633,19 @@ pub enum Direction {
 /// The task stops when either interface closes, or when the caller's
 /// [region](Cx#regions) is cancelled.
 #[track_caller]
-pub fn filter<F>(cx: &Cx, inner: impl Interface, mut keep: F) -> End
+pub fn filter<F>(fcx: &Cx, inner: impl Interface, mut keep: F) -> End
 where
     F: FnMut(&Cx, Direction, &Packet) -> bool + Send + 'static,
 {
     let (outer, mine) = link_pair();
-    cx.spawn_as(|| "filter".into(), move |cx| async move {
+    fcx.spawn_as(|| "filter".into(), move |fcx| async move {
         // Port 0 is `inner`, port 1 our end of the new pair.
         let mut ports = Ports::new(vec![Box::new(inner), Box::new(mine)]);
         loop {
-            match ports.next(&cx, None, |_| Poll::Pending).await? {
+            match ports.next(&fcx, None, |_| Poll::Pending).await? {
                 Event::Packet(i, packet) => {
                     let direction = if i == 0 { Direction::FromInner } else { Direction::ToInner };
-                    if keep(&cx, direction, &packet) {
+                    if keep(&fcx, direction, &packet) {
                         ports.send(1 - i, packet);
                     }
                 }
@@ -709,21 +709,21 @@ fn link_pair() -> (End, End) {
 /// `admit(queue, now, len)` gives the time it leaves, or `None` to drop it.
 /// Leaving times must not go down within a direction.
 #[track_caller]
-fn shape<F>(cx: &Cx, name: &'static str, inner: impl Interface, admit: F) -> End
+fn shape<F>(fcx: &Cx, name: &'static str, inner: impl Interface, admit: F) -> End
 where
     F: Fn(&Queue, Instant, usize) -> Option<Instant> + Send + 'static,
 {
     let (outer, mine) = link_pair();
-    cx.spawn_as(move || name.into(), move |cx| async move {
+    fcx.spawn_as(move || name.into(), move |fcx| async move {
         // Port 0 is `inner`, port 1 our end of the new pair. A packet from
         // port `i` waits in `queues[i]`, then goes out on port `1 - i`.
         let mut ports = Ports::new(vec![Box::new(inner), Box::new(mine)]);
         let mut queues = [Queue::default(), Queue::default()];
         loop {
             let deadline = queues.iter().filter_map(|q| q.packets.front().map(|(t, _)| *t)).min();
-            match ports.next(&cx, deadline, |_| Poll::Pending).await? {
+            match ports.next(&fcx, deadline, |_| Poll::Pending).await? {
                 Event::Packet(i, packet) => {
-                    let now = cx.now();
+                    let now = fcx.now();
                     let cost = packet.0.len() + PACKET_COST;
                     let fits = queues[i].bytes + cost <= LINK_STORE;
                     if let Some(leaves) = admit(&queues[i], now, packet.0.len()).filter(|_| fits) {
@@ -731,11 +731,11 @@ where
                         queues[i].packets.push_back((leaves, packet));
                     } else {
                         let waiting = queues[i].packets.len();
-                        crate::observe::record_drop(&cx, name, &packet, "the queue was full", crate::events::Fields::new().with("waiting", waiting as u64));
+                        crate::observe::record_drop(&fcx, name, &packet, "the queue was full", crate::events::Fields::new().with("waiting", waiting as u64));
                     }
                 }
                 Event::Timer => {
-                    let now = cx.now();
+                    let now = fcx.now();
                     let mut sent = 0;
                     for (i, queue) in queues.iter_mut().enumerate() {
                         while sent < BUDGET {
@@ -943,31 +943,31 @@ impl Ports {
 
     /// Waits for the next event: a packet or a close on any port, the
     /// deadline, or `extra` being ready. Yields first if the budget is
-    /// spent. Returns early with [`Cancelled`] if `cx`'s
+    /// spent. Returns early with [`Cancelled`] if `fcx`'s
     /// [region](Cx#regions) is cancelled.
     pub async fn next(
         &mut self,
-        cx: &Cx,
+        fcx: &Cx,
         deadline: Option<Instant>,
         mut extra: impl FnMut(&mut Context<'_>) -> Poll<()>,
     ) -> Result<Event, Cancelled> {
         if self.run >= BUDGET {
             self.run = 0;
-            cx.yield_now().await?;
+            fcx.yield_now().await?;
         }
-        if cx.is_cancelled() {
+        if fcx.is_cancelled() {
             return Err(Cancelled);
         }
-        if let Some(d) = deadline && d <= cx.now() {
+        if let Some(d) = deadline && d <= fcx.now() {
             self.run += 1;
             return Ok(Event::Timer);
         }
-        let mut sleep = pin!(deadline.map(|d| cx.sleep_until(d)));
+        let mut sleep = pin!(deadline.map(|d| fcx.sleep_until(d)));
         let mut waited = false;
-        let event = poll_fn(|task| {
+        let event = poll_fn(|cx| {
             // The extra source first: a router takes new routes before it
             // forwards packets sent after they were added.
-            if extra(task).is_ready() {
+            if extra(cx).is_ready() {
                 return Poll::Ready(Ok(Event::Extra));
             }
             // Register the task before looking at the queue, so a slot that
@@ -975,15 +975,15 @@ impl Ports {
             {
                 let mut r = self.lock_ready();
                 match &r.task {
-                    Some(w) if w.will_wake(task.waker()) => {}
-                    _ => r.task = Some(task.waker().clone()),
+                    Some(w) if w.will_wake(cx.waker()) => {}
+                    _ => r.task = Some(cx.waker().clone()),
                 }
             }
             loop {
                 let Some(i) = self.lock_ready().pop() else { break };
                 let Some(port) = self.ports[i].as_mut() else { continue };
-                let mut slot_task = Context::from_waker(&self.wakers[i]);
-                match port.poll_recv(cx, &mut slot_task) {
+                let mut slot_cx = Context::from_waker(&self.wakers[i]);
+                match port.poll_recv(fcx, &mut slot_cx) {
                     Poll::Ready(Ok(packet)) => {
                         // It may hold more. It goes to the back, after the
                         // others that are ready, so each gets its turn.
@@ -1000,13 +1000,13 @@ impl Ports {
                 }
             }
             if let Some(sleep) = sleep.as_mut().as_pin_mut() {
-                match sleep.poll(task) {
+                match sleep.poll(cx) {
                     Poll::Ready(Ok(())) => return Poll::Ready(Ok(Event::Timer)),
                     Poll::Ready(Err(Cancelled)) => return Poll::Ready(Err(Cancelled)),
                     Poll::Pending => {}
                 }
             }
-            if cx.register_cancel(task.waker(), &mut self.wait) {
+            if fcx.register_cancel(cx.waker(), &mut self.wait) {
                 return Poll::Ready(Err(Cancelled));
             }
             waited = true;
@@ -1031,23 +1031,23 @@ mod tests {
 
     /// Sends `n` 1,500-byte packets into `inner`'s other end, giving the
     /// link's task turns as it goes.
-    async fn flood(cx: &Cx, into: &mut End, n: usize) -> crate::Result {
+    async fn flood(fcx: &Cx, into: &mut End, n: usize) -> crate::Result {
         for i in 0..n {
             into.send(Packet(vec![0x45; 1500]));
             if i % 32 == 31 {
-                cx.yield_now().await?;
+                fcx.yield_now().await?;
             }
         }
         for _ in 0..1000 {
-            cx.yield_now().await?;
+            fcx.yield_now().await?;
         }
         Ok(())
     }
 
     /// Takes every packet that is ready on `end` now.
-    async fn drain(cx: &Cx, end: &mut End) -> usize {
+    async fn drain(fcx: &Cx, end: &mut End) -> usize {
         let mut n = 0;
-        while let Poll::Ready(Ok(_)) = poll_fn(|t| Poll::Ready(end.poll_recv(cx, t))).await {
+        while let Poll::Ready(Ok(_)) = poll_fn(|t| Poll::Ready(end.poll_recv(fcx, t))).await {
             n += 1;
         }
         n
@@ -1055,16 +1055,16 @@ mod tests {
 
     #[test]
     fn a_delay_drops_what_does_not_fit() {
-        block_on(run(|cx| async move {
+        block_on(run(|fcx| async move {
             let (mut sandbox, inner) = pair();
-            let mut far = delay(&cx, Duration::from_secs(1), inner);
-            flood(&cx, &mut sandbox, FIT + 500).await?;
-            assert_eq!(drain(&cx, &mut far).await, 0, "nothing leaves before the delay");
-            cx.sleep(Duration::from_millis(1200)).await?;
-            assert_eq!(drain(&cx, &mut far).await, FIT, "the delay kept 32 MiB and dropped the rest");
+            let mut far = delay(&fcx, Duration::from_secs(1), inner);
+            flood(&fcx, &mut sandbox, FIT + 500).await?;
+            assert_eq!(drain(&fcx, &mut far).await, 0, "nothing leaves before the delay");
+            fcx.sleep(Duration::from_millis(1200)).await?;
+            assert_eq!(drain(&fcx, &mut far).await, FIT, "the delay kept 32 MiB and dropped the rest");
             // Room again, once the queue has emptied.
             sandbox.send(Packet(vec![1; 100]));
-            assert_eq!(far.recv(&cx).await?, Packet(vec![1; 100]));
+            assert_eq!(far.recv(&fcx).await?, Packet(vec![1; 100]));
             Ok(())
         }))
         .unwrap();
@@ -1074,20 +1074,20 @@ mod tests {
     /// packet, so the flood pushes nothing else out of the log.
     #[test]
     fn a_flooded_bottleneck_counts_its_drops() {
-        block_on(run(|cx| async move {
+        block_on(run(|fcx| async move {
             let (mut sandbox, inner) = pair();
-            let _far = bottleneck(&cx, 0, 10, inner);
-            cx.record(crate::events::Event::new("http", "request"));
+            let _far = bottleneck(&fcx, 0, 10, inner);
+            fcx.record(crate::events::Event::new("http", "request"));
             let flood = crate::events::MAX_EVENTS + 10_000;
             for i in 0..flood {
                 sandbox.send(Packet(vec![0x45; 20]));
                 if i % 32 == 31 {
-                    cx.yield_now().await?;
+                    fcx.yield_now().await?;
                 }
             }
-            cx.sleep(Duration::from_millis(1500)).await?;
-            cx.record(crate::events::Event::new("http", "request"));
-            let events = cx.events();
+            fcx.sleep(Duration::from_millis(1500)).await?;
+            fcx.record(crate::events::Event::new("http", "request"));
+            let events = fcx.events();
             assert_eq!(events.of("http", "request").len(), 2);
             let drops = events.of("bottleneck", "drop");
             assert!(drops.len() <= 4, "{drops:?}");
@@ -1100,11 +1100,11 @@ mod tests {
 
     #[test]
     fn an_unread_bottleneck_output_stops_growing() {
-        block_on(run(|cx| async move {
+        block_on(run(|fcx| async move {
             let (mut sandbox, inner) = pair();
-            let mut far = bottleneck(&cx, u64::MAX, 64, inner);
-            flood(&cx, &mut sandbox, FIT + 500).await?;
-            assert_eq!(drain(&cx, &mut far).await, FIT, "the output kept 32 MiB and dropped the rest");
+            let mut far = bottleneck(&fcx, u64::MAX, 64, inner);
+            flood(&fcx, &mut sandbox, FIT + 500).await?;
+            assert_eq!(drain(&fcx, &mut far).await, FIT, "the output kept 32 MiB and dropped the rest");
             Ok(())
         }))
         .unwrap();

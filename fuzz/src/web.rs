@@ -81,10 +81,10 @@ impl tower_service::Service<Request<fictionet::stdlib::web::Body>> for Broken {
 }
 
 /// Starts the sites, with events on, and returns the attacher.
-pub fn serve(cx: &Cx) -> Attacher {
+pub fn serve(fcx: &Cx) -> Attacher {
     let (der, key) = cert();
     let config = Arc::new(
-        tls::config_builder(cx, UNIX_EPOCH + Duration::from_secs(1_800_000_000), rustls::crypto::ring::default_provider())
+        tls::config_builder(fcx, UNIX_EPOCH + Duration::from_secs(1_800_000_000), rustls::crypto::ring::default_provider())
             .with_safe_default_protocol_versions()
             .unwrap()
             .with_no_client_auth()
@@ -105,12 +105,12 @@ pub fn serve(cx: &Cx) -> Attacher {
         }
     });
     // Format each event, as a world that logs them would.
-    cx.events().subscribe(|e| {
+    fcx.events().subscribe(|e| {
         let _ = format!("{e:?}");
         let _ = fictionet::stdlib::codec::Wire::to_bytes(&e.to_json());
     });
     let (attacher, attachments) = attachments();
-    sites.serve(cx, attachments).unwrap();
+    sites.serve(fcx, attachments).unwrap();
     attacher
 }
 
@@ -123,15 +123,15 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn new(cx: &Cx, attacher: &Attacher, name: &str, addr: Ipv4Addr) -> Client {
+    pub fn new(fcx: &Cx, attacher: &Attacher, name: &str, addr: Ipv4Addr) -> Client {
         use fictionet::stdlib::{ip, tcp, udp};
         let end = attacher.attach(name).unwrap();
-        let (t, u, icmp, _other) = ip::split_protocols(cx, end);
-        Client { tcp: tcp::endpoint(cx, t, addr.into()), udp: udp::endpoint(cx, u, addr.into()), _icmp: icmp }
+        let (t, u, icmp, _other) = ip::split_protocols(fcx, end);
+        Client { tcp: tcp::endpoint(fcx, t, addr.into()), udp: udp::endpoint(fcx, u, addr.into()), _icmp: icmp }
     }
 
     /// Looks `name` up at the gateway. `None` if there is no address.
-    pub async fn lookup(&self, cx: &Cx, name: &str) -> Option<Ipv4Addr> {
+    pub async fn lookup(&self, fcx: &Cx, name: &str) -> Option<Ipv4Addr> {
         use fictionet::stdlib::dns::op::{Message, Query};
         use fictionet::stdlib::dns::rr::{Name, RData, RecordType};
         let mut socket = self.udp.bind(5353).ok()?;
@@ -139,7 +139,7 @@ impl Client {
         m.metadata.id = 7;
         m.add_query(Query::query(Name::from_ascii(format!("{name}.")).ok()?, RecordType::A));
         socket.send_to(&m.to_vec().ok()?, "10.0.0.1:53".parse().unwrap());
-        let (reply, _) = socket.recv(cx).await.ok()?;
+        let (reply, _) = socket.recv(fcx).await.ok()?;
         let reply = Message::from_vec(&reply).ok()?;
         reply.answers.iter().find_map(|r| match &r.data {
             RData::A(a) => Some(a.0),

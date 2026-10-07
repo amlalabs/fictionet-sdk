@@ -71,11 +71,11 @@
 //! ```
 //! use fictionet::{Attachments, Cx, Result, stdlib, time::ms};
 //!
-//! async fn world(cx: Cx, mut attachments: Attachments, args: Vec<String>) -> Result {
-//!     let agent = attachments.get(&cx, "agent").await?;
-//!     let link = stdlib::delay(&cx, ms(50), agent);
-//!     let (v4, v6, _) = stdlib::ip::split_versions(&cx, link);
-//!     // route v4 and v6 with stdlib::route::router(&cx, ...)
+//! async fn world(fcx: Cx, mut attachments: Attachments, args: Vec<String>) -> Result {
+//!     let agent = attachments.get(&fcx, "agent").await?;
+//!     let link = stdlib::delay(&fcx, ms(50), agent);
+//!     let (v4, v6, _) = stdlib::ip::split_versions(&fcx, link);
+//!     // route v4 and v6 with stdlib::route::router(&fcx, ...)
 //!     Ok(())
 //! }
 //! ```
@@ -125,13 +125,13 @@
 //!
 //! ```no_run
 //! # use fictionet::{Attachments, Cx, Result};
-//! # async fn world(_cx: Cx, _attachments: Attachments, _args: Vec<String>) -> Result { Ok(()) }
+//! # async fn world(_fcx: Cx, _attachments: Attachments, _args: Vec<String>) -> Result { Ok(()) }
 //! fn main() -> fictionet::Result {
 //!     let (attacher, attachments) = fictionet::attachments();
 //!     let socket = fictionet::WorldSocket::UnixSocket("/run/fictionet/world.sock".into());
 //!     let _listening = fictionet::listen(socket, attacher)?;
 //!     let args = std::env::args().skip(1).collect();
-//!     fictionet::block_on(fictionet::run(|cx| world(cx, attachments, args)))
+//!     fictionet::block_on(fictionet::run(|fcx| world(fcx, attachments, args)))
 //! }
 //! ```
 //!
@@ -195,13 +195,13 @@
 //!     }
 //! }
 //!
-//! fn world(cx: &Cx, attachments: Attachments) -> Result {
+//! fn world(fcx: &Cx, attachments: Attachments) -> Result {
 //!     let site = Router::new().get("/", |_, _| http::Response::new("hello\n".into()));
-//!     cx.events().to_file(std::env::temp_dir().join("events.jsonl"))?;
+//!     fcx.events().to_file(std::env::temp_dir().join("events.jsonl"))?;
 //!     Net::new()
 //!         .host("www", |h| h.dns_name("www.example.test").accept(80, Server::new(site)))
 //!         .host("echo", |h| h.dns_name("echo.example.test").tcp(7, Arc::new(()), || Echo))
-//!         .serve(cx, attachments)
+//!         .serve(fcx, attachments)
 //! }
 //! ```
 //!
@@ -413,13 +413,13 @@ pub enum RecvError {
 pub trait Interface: Send + 'static {
     /// Polls for the next packet from the other end.
     ///
-    /// Returns `Poll::Pending` and arranges for `task` to be woken when a
-    /// packet arrives, the other end closes, or `cx`'s region is cancelled.
+    /// Returns `Poll::Pending` and arranges for `cx`'s waker to be woken when a
+    /// packet arrives, the other end closes, or `fcx`'s region is cancelled.
     ///
     /// Callers use [`recv`](InterfaceExt::recv) instead. It is a polling
     /// method, not an `async fn`, so that `Box<dyn Interface>` works without
     /// allocating per packet. `std::future::Future` is built the same way.
-    fn poll_recv(&mut self, cx: &Cx, task: &mut Context<'_>) -> Poll<Result<Packet, RecvError>>;
+    fn poll_recv(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<Packet, RecvError>>;
 
     /// Sends a packet to the other end.
     ///
@@ -450,8 +450,8 @@ pub trait Interface: Send + 'static {
 }
 
 impl Interface for Box<dyn Interface> {
-    fn poll_recv(&mut self, cx: &Cx, task: &mut Context<'_>) -> Poll<Result<Packet, RecvError>> {
-        (**self).poll_recv(cx, task)
+    fn poll_recv(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<Packet, RecvError>> {
+        (**self).poll_recv(fcx, cx)
     }
 
     fn send(&mut self, packet: Packet) {
@@ -471,11 +471,11 @@ pub trait InterfaceExt: Interface {
     ///
     /// Returns [`RecvError::Closed`] once the other end is gone and every
     /// packet it sent has been received. Returns early with
-    /// [`RecvError::Cancelled`] if `cx`'s [region](Cx#regions) is cancelled.
+    /// [`RecvError::Cancelled`] if `fcx`'s [region](Cx#regions) is cancelled.
     /// So a loop that waits on `recv` stops on its own when its region is
     /// cancelled, with no extra code.
-    fn recv<'a>(&'a mut self, cx: &'a Cx) -> Recv<'a, Self> {
-        Recv { interface: self, cx }
+    fn recv<'a>(&'a mut self, fcx: &'a Cx) -> Recv<'a, Self> {
+        Recv { interface: self, fcx }
     }
 }
 
@@ -484,15 +484,15 @@ impl<I: Interface + ?Sized> InterfaceExt for I {}
 /// The future returned by [`recv`](InterfaceExt::recv).
 pub struct Recv<'a, I: ?Sized> {
     interface: &'a mut I,
-    cx: &'a Cx,
+    fcx: &'a Cx,
 }
 
 impl<I: Interface + ?Sized> Future for Recv<'_, I> {
     type Output = Result<Packet, RecvError>;
 
-    fn poll(self: Pin<&mut Self>, task: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        this.interface.poll_recv(this.cx, task)
+        this.interface.poll_recv(this.fcx, cx)
     }
 }
 
@@ -524,7 +524,7 @@ impl std::error::Error for RecvError {
     "# use fictionet::{Attachments, Cx, Result, stdlib::web};\n",
     "# use rustls::ServerConfig;\n",
     "# struct Certs { wikipedia: Arc<ServerConfig>, stripe: Arc<ServerConfig> }\n",
-    "# async fn world(cx: Cx, attachments: Attachments, wiki: axum::Router, fake_stripe: axum::Router, certs: Certs) -> Result {\n",
+    "# async fn world(fcx: Cx, attachments: Attachments, wiki: axum::Router, fake_stripe: axum::Router, certs: Certs) -> Result {\n",
     include_str!("../docs/readme/sites.rs"),
     "# Ok(())\n",
     "# }\n",

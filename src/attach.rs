@@ -125,23 +125,23 @@ impl std::fmt::Debug for Attachment {
 }
 
 impl Interface for Attachment {
-    fn poll_recv(&mut self, cx: &Cx, task: &mut Context<'_>) -> Poll<Result<Packet, RecvError>> {
+    fn poll_recv(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<Packet, RecvError>> {
         match &mut self.link {
-            Link::Cable(end) => end.poll_recv(cx, task),
+            Link::Cable(end) => end.poll_recv(fcx, cx),
             #[cfg(not(target_arch = "wasm32"))]
             Link::Socket(link) => {
                 let current = crate::watch::current_task();
                 if current != self.seen && current != 0 {
                     self.seen = current;
-                    cx.graph().owns(&self.meter, 0, current);
+                    fcx.graph().owns(&self.meter, 0, current);
                 }
-                let polled = link.poll_recv(cx, task);
+                let polled = link.poll_recv(fcx, cx);
                 if let Poll::Ready(Ok(packet)) = &polled {
                     self.meter.sent(1, packet);
                 }
                 polled
             }
-            Link::Mapped { interface, .. } => interface.poll_recv(cx, task),
+            Link::Mapped { interface, .. } => interface.poll_recv(fcx, cx),
         }
     }
 
@@ -178,11 +178,11 @@ impl Interface for Attachment {
 ///
 /// ```
 /// # use fictionet::{Attachments, Cx, Result};
-/// # async fn world(_cx: Cx, _attachments: Attachments, _args: Vec<String>) -> Result { Ok(()) }
+/// # async fn world(_fcx: Cx, _attachments: Attachments, _args: Vec<String>) -> Result { Ok(()) }
 /// # fn main() -> Result {
 /// let (attacher, attachments) = fictionet::attachments();
 /// let agent = attacher.attach("agent")?; // the test holds the sandbox's end
-/// let world = fictionet::run(|cx| world(cx, attachments, vec![]));
+/// let world = fictionet::run(|fcx| world(fcx, attachments, vec![]));
 /// // send packets on `agent` and check what comes back while `world` runs
 /// # drop(agent);
 /// # fictionet::block_on(world)
@@ -284,16 +284,16 @@ impl Attacher {
         Ok(NameGuard { hub: self.hub.clone(), name: name.to_owned() })
     }
 
-    /// Ready once the [`Attachments`] is dropped. Until then, `task` is
+    /// Ready once the [`Attachments`] is dropped. Until then, `cx`'s waker is
     /// woken when it is.
-    fn poll_closed(&self, task: &mut Context<'_>) -> Poll<()> {
+    fn poll_closed(&self, cx: &mut Context<'_>) -> Poll<()> {
         let mut state = self.hub.state.lock().unwrap();
         if state.closed {
             return Poll::Ready(());
         }
         match &state.feeder {
-            Some(w) if w.will_wake(task.waker()) => {}
-            _ => state.feeder = Some(task.waker().clone()),
+            Some(w) if w.will_wake(cx.waker()) => {}
+            _ => state.feeder = Some(cx.waker().clone()),
         }
         Poll::Pending
     }
@@ -355,9 +355,9 @@ impl std::error::Error for AttachError {}
 /// A world that serves every sandbox the same way loops over `next`:
 ///
 /// ```
-/// # async fn world(cx: fictionet::Cx, mut attachments: fictionet::Attachments) -> fictionet::Result {
+/// # async fn world(fcx: fictionet::Cx, mut attachments: fictionet::Attachments) -> fictionet::Result {
 /// loop {
-///     let sandbox = attachments.next(&cx).await?;
+///     let sandbox = attachments.next(&fcx).await?;
 ///     // wire `sandbox` into the world
 /// #   drop(sandbox);
 /// }
@@ -379,22 +379,22 @@ impl Attachments {
     /// detaches and attaches again under the same name, the new one is
     /// returned.
     ///
-    /// Returns early with [`Cancelled`] if `cx`'s [region](Cx#regions) is
+    /// Returns early with [`Cancelled`] if `fcx`'s [region](Cx#regions) is
     /// cancelled.
-    pub async fn get(&mut self, cx: &Cx, name: &str) -> Result<Attachment, Cancelled> {
+    pub async fn get(&mut self, fcx: &Cx, name: &str) -> Result<Attachment, Cancelled> {
         let mut wait = CancelWait::default();
-        let found = poll_fn(|task| self.poll_take(cx, task, &mut wait, |a| a.name == name)).await;
+        let found = poll_fn(|cx| self.poll_take(fcx, cx, &mut wait, |a| a.name == name)).await;
         found.map(Attachment::unwrap_pending)
     }
 
     /// Waits for the next sandbox that has not been handed out yet, in the
     /// order they attached.
     ///
-    /// Returns early with [`Cancelled`] if `cx`'s [region](Cx#regions) is
+    /// Returns early with [`Cancelled`] if `fcx`'s [region](Cx#regions) is
     /// cancelled.
-    pub async fn next(&mut self, cx: &Cx) -> Result<Attachment, Cancelled> {
+    pub async fn next(&mut self, fcx: &Cx) -> Result<Attachment, Cancelled> {
         let mut wait = CancelWait::default();
-        let found = poll_fn(|task| self.poll_take(cx, task, &mut wait, |_| true)).await;
+        let found = poll_fn(|cx| self.poll_take(fcx, cx, &mut wait, |_| true)).await;
         found.map(Attachment::unwrap_pending)
     }
 
@@ -408,21 +408,21 @@ impl Attachments {
     /// ```
     /// # use fictionet::{Attachments, Cx, Result, stdlib::{self, web}, time::ms};
     /// # fn site_for(_host: &str) -> Option<web::Site> { None }
-    /// # fn world(cx: Cx, attachments: Attachments) -> Result {
-    /// let slow = attachments.map(&cx, |cx, sandbox| stdlib::delay(cx, ms(200), sandbox));
-    /// web::Sites::new(site_for).serve(&cx, slow)?;
+    /// # fn world(fcx: Cx, attachments: Attachments) -> Result {
+    /// let slow = attachments.map(&fcx, |fcx, sandbox| stdlib::delay(fcx, ms(200), sandbox));
+    /// web::Sites::new(site_for).serve(&fcx, slow)?;
     /// # Ok(())
     /// # }
     /// ```
     ///
-    /// `map` returns immediately. It starts a background task in `cx`'s
+    /// `map` returns immediately. It starts a background task in `fcx`'s
     /// [region](Cx#regions) that takes each sandbox as it attaches and
     /// passes it on to the new `Attachments`. When the world takes a
     /// sandbox from there, with [`get`](Attachments::get) or
     /// [`next`](Attachments::next), `map` calls `wrap` with it and hands
     /// what `wrap` returns to the world, as an [`Attachment`] with the same
     /// [`name`](Attachment::name) and [`mtu`](Attachment::mtu). `wrap` gets
-    /// the `Cx` of `map`'s task, so the tasks it starts belong to `cx`'s
+    /// the `Cx` of `map`'s task, so the tasks it starts belong to `fcx`'s
     /// region. It can look at the sandbox's name to treat sandboxes
     /// differently. Calls to `map` can be chained, and the first one's
     /// `wrap` is closest to the sandbox.
@@ -453,7 +453,7 @@ impl Attachments {
     /// The task stops when the region is cancelled, or when the returned
     /// `Attachments` is dropped. Either way, it drops `self`, so sandboxes
     /// that attach after that are turned away.
-    pub fn map<F, I>(mut self, cx: &Cx, wrap: F) -> Attachments
+    pub fn map<F, I>(mut self, fcx: &Cx, wrap: F) -> Attachments
     where
         F: FnMut(&Cx, Attachment) -> I + Send + 'static,
         I: Interface,
@@ -461,14 +461,14 @@ impl Attachments {
         let hub = Arc::new(Hub::default());
         let out = Attacher { hub: hub.clone() };
         let wrap = Arc::new(Mutex::new(wrap));
-        cx.spawn(move |cx| async move {
+        fcx.spawn(move |fcx| async move {
             let mut wait = CancelWait::default();
             loop {
-                let next = poll_fn(|task| {
-                    if out.poll_closed(task).is_ready() {
+                let next = poll_fn(|cx| {
+                    if out.poll_closed(cx).is_ready() {
                         return Poll::Ready(None);
                     }
-                    self.poll_take(&cx, task, &mut wait, |_| true).map(Some)
+                    self.poll_take(&fcx, cx, &mut wait, |_| true).map(Some)
                 })
                 .await;
                 // `None`: the new `Attachments` was dropped. A cancel ends
@@ -481,10 +481,10 @@ impl Attachments {
                 // nothing would read them in turn: the agent could fill the
                 // world's memory. Until then, the packets stay where the
                 // sandbox's own attachment keeps them.
-                let (wrap, cx) = (wrap.clone(), cx.clone());
+                let (wrap, fcx) = (wrap.clone(), fcx.clone());
                 sandbox.wraps.push(Box::new(move |sandbox: Attachment| {
                     let (name, mtu, gone) = (sandbox.name.clone(), sandbox.mtu, sandbox.detached_check());
-                    let interface = Box::new((wrap.lock().unwrap_or_else(|e| e.into_inner()))(&cx, sandbox));
+                    let interface = Box::new((wrap.lock().unwrap_or_else(|e| e.into_inner()))(&fcx, sandbox));
                     // The wrapped interface counts its own packets, so this
                     // meter stays unused: `observe_link` hands out the
                     // interface's.
@@ -500,19 +500,19 @@ impl Attachments {
     /// Takes the first pending attachment that `wanted` picks.
     fn poll_take(
         &mut self,
-        cx: &Cx,
-        task: &mut Context<'_>,
+        fcx: &Cx,
+        cx: &mut Context<'_>,
         wait: &mut CancelWait,
         wanted: impl Fn(&Attachment) -> bool,
     ) -> Poll<Result<Attachment, Cancelled>> {
-        if cx.is_cancelled() {
+        if fcx.is_cancelled() {
             return Poll::Ready(Err(Cancelled));
         }
         let mut gone = VecDeque::new();
         {
             let mut state = self.hub.state.lock().unwrap();
-            if !std::ptr::eq(state.graph.as_ptr(), Arc::as_ptr(cx.graph())) {
-                state.graph = Arc::downgrade(cx.graph());
+            if !std::ptr::eq(state.graph.as_ptr(), Arc::as_ptr(fcx.graph())) {
+                state.graph = Arc::downgrade(fcx.graph());
             }
             if state.pending.iter().any(Attachment::detached) {
                 let (dead, live) = std::mem::take(&mut state.pending).into_iter().partition(Attachment::detached);
@@ -525,14 +525,14 @@ impl Attachments {
                 return Poll::Ready(Ok(found));
             }
             match &state.waker {
-                Some(w) if w.will_wake(task.waker()) => {}
-                _ => state.waker = Some(task.waker().clone()),
+                Some(w) if w.will_wake(cx.waker()) => {}
+                _ => state.waker = Some(cx.waker().clone()),
             }
         }
         // Dropped outside the lock: closing them frees their names, which
         // takes the lock.
         drop(gone);
-        if cx.register_cancel(task.waker(), wait) {
+        if fcx.register_cancel(cx.waker(), wait) {
             return Poll::Ready(Err(Cancelled));
         }
         Poll::Pending

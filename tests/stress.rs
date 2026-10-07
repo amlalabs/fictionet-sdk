@@ -87,17 +87,17 @@ fn many_attachments_lose_nothing_and_idle_costs_nothing() {
     let world = std::thread::Builder::new()
         .name("world".into())
         .spawn(move || {
-            block_on(run(move |cx| async move {
+            block_on(run(move |fcx| async move {
                 // A long timer stays pending the whole time.
-                cx.spawn(|cx| async move {
-                    cx.sleep(Duration::from_secs(3600)).await?;
+                fcx.spawn(|fcx| async move {
+                    fcx.sleep(Duration::from_secs(3600)).await?;
                     Ok(())
                 });
                 for _ in 0..CLIENTS {
-                    let mut a = attachments.next(&cx).await?;
-                    cx.spawn(move |cx| async move {
+                    let mut a = attachments.next(&fcx).await?;
+                    fcx.spawn(move |fcx| async move {
                         loop {
-                            match a.recv(&cx).await {
+                            match a.recv(&fcx).await {
                                 Ok(p) => a.send(p),
                                 Err(RecvError::Closed) => return Ok(()),
                                 Err(e) => return Err(e.into()),
@@ -108,7 +108,7 @@ fn many_attachments_lose_nothing_and_idle_costs_nothing() {
                 ready_tx.send(()).unwrap();
                 // Wait for the test to say stop, then fail the region to
                 // cancel the timer.
-                let _ = stopped.recv(&cx).await;
+                let _ = stopped.recv(&fcx).await;
                 Err(fictionet::Error::msg("stop"))
             }))
             .map_err(|e| e.to_string())

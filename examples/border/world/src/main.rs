@@ -91,9 +91,9 @@ fn serve(argv: impl Iterator<Item = String>) -> fictionet::Result {
     }
 
     let (attacher, attachments) = fictionet::attachments();
-    fictionet::block_on(fictionet::run(move |cx| async move {
-        let lookups = border_world::start(&cx, scenario.clone(), ids, log, attachments)?;
-        border_world::look_up_all(&cx, &lookups, &scenario).await?;
+    fictionet::block_on(fictionet::run(move |fcx| async move {
+        let lookups = border_world::start(&fcx, scenario.clone(), ids, log, attachments)?;
+        border_world::look_up_all(&fcx, &lookups, &scenario).await?;
         let _listening = fictionet::listen(fictionet::WorldSocket::UnixSocket(args.socket.clone().into()), attacher)?;
         std::fs::write(&state_path, serde_json::to_string_pretty(&state)?)?;
         if let Some(dir) = args.ready.parent() {

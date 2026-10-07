@@ -67,9 +67,9 @@ impl World {
             // A tokio runtime polls the world: axum runs WebSockets in tokio
             // tasks.
             let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
-            let _ = rt.block_on(fictionet::run(move |cx| async move {
+            let _ = rt.block_on(fictionet::run(move |fcx| async move {
                 let config = Arc::new(
-                    tls::config_builder(&cx, SystemTime::now(), rustls::crypto::ring::default_provider())
+                    tls::config_builder(&fcx, SystemTime::now(), rustls::crypto::ring::default_provider())
                         .with_safe_default_protocol_versions()?
                         .with_no_client_auth()
                         .with_single_cert(chain, key)?,
@@ -79,7 +79,7 @@ impl World {
                     .route("/mb", get(|| async { vec![b'x'; 1 << 20] }))
                     .route("/upload", post(upload).layer(DefaultBodyLimit::disable()));
                 let secure = axum::Router::new().route("/", get(|| async { "secure site\n" }));
-                cx.events().subscribe(move |e| {
+                fcx.events().subscribe(move |e| {
                     if e.is("dns", "query")
                         && e.u64("qtype") == Some(1)
                         && let Some(name) = e.str("name")
@@ -107,9 +107,9 @@ impl World {
                     })),
                     _ => None,
                 })
-                .serve(&cx, attachments)?;
+                .serve(&fcx, attachments)?;
                 while !stop2.load(Ordering::SeqCst) {
-                    cx.sleep(fictionet::time::ms(20)).await?;
+                    fcx.sleep(fictionet::time::ms(20)).await?;
                 }
                 // Ends the run: every attachment closes.
                 Err::<(), fictionet::Error>(fictionet::Error::msg("stopped"))
@@ -135,12 +135,12 @@ impl World {
             let (attacher, mut attachments) = fictionet::attachments();
             let listening = fictionet::listen(fictionet::WorldSocket::UnixSocket(sock2.clone().into()), attacher).unwrap();
             ready_tx.send(()).unwrap();
-            let _ = fictionet::block_on(fictionet::run(move |cx| async move {
-                cx.spawn(move |cx| async move {
-                    while let Ok(mut sandbox) = attachments.next(&cx).await {
+            let _ = fictionet::block_on(fictionet::run(move |fcx| async move {
+                fcx.spawn(move |fcx| async move {
+                    while let Ok(mut sandbox) = attachments.next(&fcx).await {
                         let seen = seen2.clone();
-                        cx.spawn(move |cx| async move {
-                            while let Ok(p) = sandbox.recv(&cx).await {
+                        fcx.spawn(move |fcx| async move {
+                            while let Ok(p) = sandbox.recv(&fcx).await {
                                 if let Some(addrs) = p.0.get(12..20) {
                                     seen.lock().unwrap().insert(addrs.try_into().unwrap());
                                 }
@@ -151,7 +151,7 @@ impl World {
                     Ok(())
                 });
                 while !stop2.load(Ordering::SeqCst) {
-                    cx.sleep(fictionet::time::ms(20)).await?;
+                    fcx.sleep(fictionet::time::ms(20)).await?;
                 }
                 // Ends the run: every attachment closes.
                 Err::<(), fictionet::Error>(fictionet::Error::msg("stopped"))

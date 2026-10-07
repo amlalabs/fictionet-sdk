@@ -148,15 +148,15 @@ impl Bucket {
 }
 
 /// Runs the path for one sandbox until it detaches.
-pub async fn run(cx: Cx, mut sandbox: impl Interface, mut inner: End, shared: Arc<Shared>, name: Arc<str>) -> fictionet::Result {
+pub async fn run(fcx: Cx, mut sandbox: impl Interface, mut inner: End, shared: Arc<Shared>, name: Arc<str>) -> fictionet::Result {
     let scenario = shared.scenario.clone();
     let (mut home, home_side) = pair();
-    router(&cx, home_side, HOME.router, Some((&shared, name.clone())));
+    router(&fcx, home_side, HOME.router, Some((&shared, name.clone())));
     let (mut foreign, foreign_side) = pair();
-    router(&cx, foreign_side, FOREIGN.router, None);
+    router(&fcx, foreign_side, FOREIGN.router, None);
 
     let mut on_the_way = OnTheWay::default();
-    let mut time_exceeded_budget = Bucket::new(cx.now(), TIME_EXCEEDED_PER_SECOND);
+    let mut time_exceeded_budget = Bucket::new(fcx.now(), TIME_EXCEEDED_PER_SECOND);
     let mut id: u16 = 0;
     let mut run = 0u32;
     let mut first = 0usize;
@@ -165,9 +165,9 @@ pub async fn run(cx: Cx, mut sandbox: impl Interface, mut inner: End, shared: Ar
         // served, so a busy end cannot starve the others. A packet whose
         // time has come wakes the task too.
         let got = {
-            let sleep = on_the_way.next_time().map(|at| cx.sleep_until(at));
+            let sleep = on_the_way.next_time().map(|at| fcx.sleep_until(at));
             let mut sleep = pin!(sleep);
-            std::future::poll_fn(|task| {
+            std::future::poll_fn(|cx| {
                 for k in 0..4 {
                     let i = (first + k) % 4;
                     let end: &mut dyn Interface = match i {
@@ -176,12 +176,12 @@ pub async fn run(cx: Cx, mut sandbox: impl Interface, mut inner: End, shared: Ar
                         2 => &mut home,
                         _ => &mut foreign,
                     };
-                    if let Poll::Ready(r) = end.poll_recv(&cx, task) {
+                    if let Poll::Ready(r) = end.poll_recv(&fcx, cx) {
                         return Poll::Ready(r.map(|p| Some((i, p))));
                     }
                 }
                 if let Some(sleep) = sleep.as_mut().as_pin_mut()
-                    && let Poll::Ready(r) = sleep.poll(task)
+                    && let Poll::Ready(r) = sleep.poll(cx)
                 {
                     return Poll::Ready(r.map(|()| None).map_err(RecvError::from));
                 }
@@ -192,7 +192,7 @@ pub async fn run(cx: Cx, mut sandbox: impl Interface, mut inner: End, shared: Ar
         let (from, packet) = match got {
             // The time of the first packet on its way has come.
             Ok(None) => {
-                let now = cx.now();
+                let now = fcx.now();
                 let mut sent = 0;
                 while sent < 64 {
                     let Some((to, packet)) = on_the_way.due(now) else { break };
@@ -207,7 +207,7 @@ pub async fn run(cx: Cx, mut sandbox: impl Interface, mut inner: End, shared: Ar
                 run += sent;
                 if run >= 64 {
                     run = 0;
-                    cx.yield_now().await?;
+                    fcx.yield_now().await?;
                 }
                 continue;
             }
@@ -219,7 +219,7 @@ pub async fn run(cx: Cx, mut sandbox: impl Interface, mut inner: End, shared: Ar
             Err(e @ RecvError::Cancelled) => return Err(e.into()),
         };
         first = (from + 1) % 4;
-        let now = cx.now();
+        let now = fcx.now();
         match from {
             0 => {
                 let Some(dst) = v4_dst(&packet.0) else {
@@ -306,7 +306,7 @@ pub async fn run(cx: Cx, mut sandbox: impl Interface, mut inner: End, shared: Ar
         run += 1;
         if run >= 64 {
             run = 0;
-            if cx.yield_now().await.is_err() {
+            if fcx.yield_now().await.is_err() {
                 return Ok(());
             }
         }
@@ -315,13 +315,13 @@ pub async fn run(cx: Cx, mut sandbox: impl Interface, mut inner: End, shared: Ar
 
 /// Starts a router's machine at `addr` on `side`: pings, RSTs, "port
 /// unreachable", and the BGP speaker if `bgp` is given.
-fn router(cx: &Cx, side: End, addr: Ipv4Addr, bgp: Option<(&Arc<Shared>, Arc<str>)>) {
-    let (tcp, udp, mut icmp, _other) = ip::split_protocols(cx, side);
-    let tcp = tcp::endpoint(cx, tcp, addr.into());
+fn router(fcx: &Cx, side: End, addr: Ipv4Addr, bgp: Option<(&Arc<Shared>, Arc<str>)>) {
+    let (tcp, udp, mut icmp, _other) = ip::split_protocols(fcx, side);
+    let tcp = tcp::endpoint(fcx, tcp, addr.into());
     // No UDP ports: every datagram gets "port unreachable".
-    let _udp = udp::endpoint(cx, udp, addr.into());
-    cx.spawn(move |cx| async move {
-        while let Ok(packet) = icmp.recv(&cx).await {
+    let _udp = udp::endpoint(fcx, udp, addr.into());
+    fcx.spawn(move |fcx| async move {
+        while let Ok(packet) = icmp.recv(&fcx).await {
             if let Some(reply) = icmp::echo_reply(&packet, addr.into()) {
                 icmp.send(reply);
             }
@@ -331,7 +331,7 @@ fn router(cx: &Cx, side: End, addr: Ipv4Addr, bgp: Option<(&Arc<Shared>, Arc<str
     if let Some((shared, name)) = bgp {
         if let Ok(listener) = tcp.listen(179) {
             let (scenario, log) = (shared.scenario.clone(), shared.log.clone());
-            cx.spawn(move |cx| bgp::serve(cx, listener, scenario, log, name));
+            fcx.spawn(move |fcx| bgp::serve(fcx, listener, scenario, log, name));
         }
     }
 }

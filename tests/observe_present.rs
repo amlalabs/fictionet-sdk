@@ -182,12 +182,12 @@ fn a_live_world_uses_the_registered_decoder_in_observe_json() {
     let listening =
         fictionet::listen(fictionet::WorldSocket::UnixSocket(path.clone()), attacher).unwrap();
     let world = std::thread::spawn(move || {
-        fictionet::block_on(fictionet::run(move |cx| async move {
-            cx.observe_protocols(registry());
-            let Ok(mut sandbox) = attachments.next(&cx).await else {
+        fictionet::block_on(fictionet::run(move |fcx| async move {
+            fcx.observe_protocols(registry());
+            let Ok(mut sandbox) = attachments.next(&fcx).await else {
                 return Ok(());
             };
-            while let Ok(packet) = sandbox.recv(&cx).await {
+            while let Ok(packet) = sandbox.recv(&fcx).await {
                 sandbox.send(packet);
             }
             Ok(())

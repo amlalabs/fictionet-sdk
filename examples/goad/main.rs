@@ -74,10 +74,10 @@ fn main() -> Result {
         println!("  {name:<11} {addr}");
     }
 
-    fictionet::block_on(fictionet::run(move |cx| async move {
-        let lan = route::lan(&cx, subnet, None);
+    fictionet::block_on(fictionet::run(move |fcx| async move {
+        let lan = route::lan(&fcx, subnet, None);
         loop {
-            let sandbox = attachments.next(&cx).await?;
+            let sandbox = attachments.next(&fcx).await?;
             let name = sandbox.name().to_owned();
             let Some(&addr) = members.get(name.as_str()) else {
                 println!("turned away {name}: no address is assigned to that member");
@@ -85,7 +85,7 @@ fn main() -> Result {
             };
             println!("attached {name} at {addr}");
             let event = Event::new("goad", "member_attached").summary(format!("{name} attached at {addr}")).field("name", name.as_str()).field("address", addr.to_string());
-            cx.record(event);
+            fcx.record(event);
             lan.add(addr, Box::new(sandbox) as Box<dyn Interface>)?;
         }
     }))

@@ -128,12 +128,12 @@ impl std::error::Error for ParseWorldSocketError {}
 ///
 /// ```no_run
 /// # use fictionet::{Attachments, Cx, Result};
-/// # async fn world(_cx: Cx, _attachments: Attachments) -> Result { Ok(()) }
+/// # async fn world(_fcx: Cx, _attachments: Attachments) -> Result { Ok(()) }
 /// # fn main() -> Result {
 /// let (attacher, attachments) = fictionet::attachments();
 /// let socket = fictionet::WorldSocket::UnixSocket("/run/fictionet/world.sock".into());
 /// let _listening = fictionet::listen(socket, attacher)?;
-/// fictionet::block_on(fictionet::run(|cx| world(cx, attachments)))
+/// fictionet::block_on(fictionet::run(|fcx| world(fcx, attachments)))
 /// # }
 /// ```
 pub fn listen(socket: WorldSocket, attacher: Attacher) -> std::io::Result<Listening> {
@@ -556,9 +556,9 @@ impl SocketLink {
         self.slot.release_name();
     }
 
-    pub(crate) fn poll_recv(&mut self, cx: &Cx, task: &mut Context<'_>) -> Poll<Result<Packet, RecvError>> {
+    pub(crate) fn poll_recv(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<Packet, RecvError>> {
         // A cancel comes first, as it does for every wait.
-        if cx.is_cancelled() {
+        if fcx.is_cancelled() {
             return Poll::Ready(Err(RecvError::Cancelled));
         }
         if self.closed {
@@ -566,7 +566,7 @@ impl SocketLink {
         }
         if self.budget == 0 {
             self.budget = BUDGET;
-            task.waker().wake_by_ref();
+            cx.waker().wake_by_ref();
             return Poll::Pending;
         }
         let fd = self.slot.fd.as_raw_fd();
@@ -601,9 +601,9 @@ impl SocketLink {
                     // Hand the connection to the helper thread, then read
                     // once more: a packet may have come in before the
                     // waker was in place.
-                    *self.slot.waker.lock().unwrap() = Some(task.waker().clone());
+                    *self.slot.waker.lock().unwrap() = Some(cx.waker().clone());
                     registered = true;
-                    if cx.register_cancel(task.waker(), &mut self.wait) {
+                    if fcx.register_cancel(cx.waker(), &mut self.wait) {
                         return Poll::Ready(Err(RecvError::Cancelled));
                     }
                 }

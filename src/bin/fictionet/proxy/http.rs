@@ -108,7 +108,7 @@ pub(crate) async fn serve(mut client: TcpStream, stack: Stack, token: Token) {
             return answer(&mut client, status, &fail.to_string()).await;
         }
     };
-    let mut world = conn.into_tokio(stack.cx());
+    let mut world = conn.into_tokio(stack.fcx());
     let rest = buf.split_off(len);
     match req.target {
         Target::Connect { .. } => {

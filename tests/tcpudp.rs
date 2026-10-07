@@ -40,8 +40,8 @@ where
     Fut: Future<Output = fictionet::Result> + Send + 'static,
 {
     let result = within(limit, move || {
-        block_on(run(move |cx| async move {
-            f(cx).await?;
+        block_on(run(move |fcx| async move {
+            f(fcx).await?;
             Err(fictionet::Error::from(Done))
         }))
     });
@@ -60,16 +60,16 @@ fn ip(s: &str) -> IpAddr {
 }
 
 /// Two TCP machines on one cable.
-fn two_tcp(cx: &Cx, a: &str, b: &str) -> (tcp::Endpoint, tcp::Endpoint) {
+fn two_tcp(fcx: &Cx, a: &str, b: &str) -> (tcp::Endpoint, tcp::Endpoint) {
     let (ca, cb) = pair();
-    (tcp::endpoint(cx, ca, ip(a)), tcp::endpoint(cx, cb, ip(b)))
+    (tcp::endpoint(fcx, ca, ip(a)), tcp::endpoint(fcx, cb, ip(b)))
 }
 
-async fn read_to_end(cx: &Cx, conn: &mut impl Connection) -> Result<Vec<u8>, ConnError> {
+async fn read_to_end(fcx: &Cx, conn: &mut impl Connection) -> Result<Vec<u8>, ConnError> {
     let mut out = Vec::new();
     let mut buf = vec![0; 64 * 1024];
     loop {
-        let n = conn.read(cx, &mut buf).await?;
+        let n = conn.read(fcx, &mut buf).await?;
         if n == 0 {
             return Ok(out);
         }
@@ -79,17 +79,17 @@ async fn read_to_end(cx: &Cx, conn: &mut impl Connection) -> Result<Vec<u8>, Con
 
 /// Sends `data` and reads until EOF at the same time, on one connection.
 /// Shuts down after the last byte. Returns what it read.
-async fn duplex(cx: &Cx, conn: &mut impl Connection, data: &[u8]) -> Result<Vec<u8>, ConnError> {
+async fn duplex(fcx: &Cx, conn: &mut impl Connection, data: &[u8]) -> Result<Vec<u8>, ConnError> {
     let mut sent = 0;
     let mut shut = false;
     let mut got = Vec::new();
     let mut eof = false;
     let mut buf = vec![0; 64 * 1024];
-    poll_fn(|task| {
+    poll_fn(|cx| {
         loop {
             let mut progress = false;
             if sent < data.len() {
-                match conn.poll_write(cx, task, &data[sent..]) {
+                match conn.poll_write(fcx, cx, &data[sent..]) {
                     Poll::Ready(Ok(n)) => {
                         assert!(n > 0, "poll_write must never return Ok(0)");
                         sent += n;
@@ -99,7 +99,7 @@ async fn duplex(cx: &Cx, conn: &mut impl Connection, data: &[u8]) -> Result<Vec<
                     Poll::Pending => {}
                 }
             } else if !shut {
-                match conn.poll_shutdown(cx, task) {
+                match conn.poll_shutdown(fcx, cx) {
                     Poll::Ready(Ok(())) => {
                         shut = true;
                         progress = true;
@@ -109,7 +109,7 @@ async fn duplex(cx: &Cx, conn: &mut impl Connection, data: &[u8]) -> Result<Vec<
                 }
             }
             if !eof {
-                match conn.poll_read(cx, task, &mut buf) {
+                match conn.poll_read(fcx, cx, &mut buf) {
                     Poll::Ready(Ok(0)) => {
                         eof = true;
                         progress = true;
@@ -148,28 +148,28 @@ fn pattern(len: usize, seed: u64) -> Vec<u8> {
 #[test]
 fn connect_accept_echo_and_addresses() {
     for (a, b) in [(A, B), ("fd00::1", "fd00::2")] {
-        world(Duration::from_secs(10), move |cx| async move {
-            let (ea, eb) = two_tcp(&cx, a, b);
+        world(Duration::from_secs(10), move |fcx| async move {
+            let (ea, eb) = two_tcp(&fcx, a, b);
             assert_eq!(ea.addr(), ip(a));
             let mut listener = eb.listen(80)?;
             assert!(eb.listen(80).is_err(), "a second listener on the same port");
-            let server = cx.spawn(move |cx| async move {
-                let mut conn = listener.accept(&cx).await?;
+            let server = fcx.spawn(move |fcx| async move {
+                let mut conn = listener.accept(&fcx).await?;
                 assert_eq!(conn.local_addr(), SocketAddr::new(ip(b), 80));
                 assert_eq!(conn.peer_addr().ip(), ip(a));
-                let data = read_to_end(&cx, &mut conn).await?;
-                conn.write_all(&cx, &data).await?;
-                conn.shutdown(&cx).await?;
+                let data = read_to_end(&fcx, &mut conn).await?;
+                conn.write_all(&fcx, &data).await?;
+                conn.shutdown(&fcx).await?;
                 Ok(())
             });
-            let mut conn = ea.connect(&cx, SocketAddr::new(ip(b), 80)).await?;
+            let mut conn = ea.connect(&fcx, SocketAddr::new(ip(b), 80)).await?;
             assert_eq!(conn.peer_addr(), SocketAddr::new(ip(b), 80));
             assert_eq!(conn.local_addr().ip(), ip(a));
             assert!(conn.local_addr().port() >= 49152);
-            conn.write_all(&cx, b"hello, world").await?;
-            conn.shutdown(&cx).await?;
-            assert_eq!(read_to_end(&cx, &mut conn).await?, b"hello, world");
-            server.join(&cx).await?;
+            conn.write_all(&fcx, b"hello, world").await?;
+            conn.shutdown(&fcx).await?;
+            assert_eq!(read_to_end(&fcx, &mut conn).await?, b"hello, world");
+            server.join(&fcx).await?;
             Ok(())
         });
     }
@@ -180,23 +180,23 @@ fn ten_megabytes_both_ways() {
     const LEN: usize = 10 * 1024 * 1024;
     let elapsed = Arc::new(Mutex::new(Duration::ZERO));
     let e = elapsed.clone();
-    world(Duration::from_secs(120), move |cx| async move {
-        let (ea, eb) = two_tcp(&cx, A, B);
+    world(Duration::from_secs(120), move |fcx| async move {
+        let (ea, eb) = two_tcp(&fcx, A, B);
         let mut listener = eb.listen(9000)?;
         let up = pattern(LEN, 1);
         let down = pattern(LEN, 2);
         let (up2, down2) = (up.clone(), down.clone());
         let started = Instant::now();
-        let server = cx.spawn(move |cx| async move {
-            let mut conn = listener.accept(&cx).await?;
-            let got = duplex(&cx, &mut conn, &down2).await?;
+        let server = fcx.spawn(move |fcx| async move {
+            let mut conn = listener.accept(&fcx).await?;
+            let got = duplex(&fcx, &mut conn, &down2).await?;
             assert!(got == up2, "the server got different bytes");
             Ok(())
         });
-        let mut conn = ea.connect(&cx, SocketAddr::new(ip(B), 9000)).await?;
-        let got = duplex(&cx, &mut conn, &up).await?;
+        let mut conn = ea.connect(&fcx, SocketAddr::new(ip(B), 9000)).await?;
+        let got = duplex(&fcx, &mut conn, &up).await?;
         assert!(got == down, "the client got different bytes");
-        server.join(&cx).await?;
+        server.join(&fcx).await?;
         *e.lock().unwrap() = started.elapsed();
         Ok(())
     });
@@ -207,18 +207,18 @@ fn ten_megabytes_both_ways() {
 
 #[test]
 fn a_closed_port_refuses_at_once() {
-    world(Duration::from_secs(10), |cx| async move {
-        let (ea, eb) = two_tcp(&cx, A, B);
+    world(Duration::from_secs(10), |fcx| async move {
+        let (ea, eb) = two_tcp(&fcx, A, B);
         let _open = eb.listen(80)?;
-        assert_eq!(ea.connect(&cx, SocketAddr::new(ip(B), 22)).await.err(), Some(ConnError::Refused));
+        assert_eq!(ea.connect(&fcx, SocketAddr::new(ip(B), 22)).await.err(), Some(ConnError::Refused));
         // Time the machine's answer alone: a SYN in, the RST out.
         let (mut raw, b) = pair();
-        let _eb = tcp::endpoint(&cx, b, ip(B));
+        let _eb = tcp::endpoint(&fcx, b, ip(B));
         let mut times = Vec::new();
         for port in 1..=200u16 {
             let started = Instant::now();
             raw.send(tcp_syn(ip(A), 40000 + port, ip(B), port));
-            let p = raw.recv(&cx).await?;
+            let p = raw.recv(&fcx).await?;
             times.push(started.elapsed());
             assert_eq!(p.0[20 + 13] & 0x04, 0x04, "a RST for port {port}");
         }
@@ -233,19 +233,19 @@ fn a_closed_port_refuses_at_once() {
 
 #[test]
 fn five_hundred_closed_ports_in_under_a_second() {
-    world(Duration::from_secs(20), |cx| async move {
-        let (ea, eb) = two_tcp(&cx, A, B);
+    world(Duration::from_secs(20), |fcx| async move {
+        let (ea, eb) = two_tcp(&fcx, A, B);
         let _open = eb.listen(80)?;
         let started = Instant::now();
         for port in 1000..1500 {
-            let r = ea.connect(&cx, SocketAddr::new(ip(B), port)).await;
+            let r = ea.connect(&fcx, SocketAddr::new(ip(B), port)).await;
             assert_eq!(r.err(), Some(ConnError::Refused), "port {port}");
         }
         let t = started.elapsed();
         eprintln!("500 refusals took {t:?}");
         assert!(t < Duration::from_secs(1), "500 refusals took {t:?}");
         // The open port still works.
-        let conn = ea.connect(&cx, SocketAddr::new(ip(B), 80)).await?;
+        let conn = ea.connect(&fcx, SocketAddr::new(ip(B), 80)).await?;
         drop(conn);
         Ok(())
     });
@@ -253,20 +253,20 @@ fn five_hundred_closed_ports_in_under_a_second() {
 
 #[test]
 fn two_hundred_concurrent_connections() {
-    world(Duration::from_secs(60), |cx| async move {
-        let (ea, eb) = two_tcp(&cx, A, B);
+    world(Duration::from_secs(60), |fcx| async move {
+        let (ea, eb) = two_tcp(&fcx, A, B);
         let mut listener = eb.listen(7)?;
-        cx.spawn(move |cx| async move {
+        fcx.spawn(move |fcx| async move {
             loop {
-                let mut conn = match listener.accept(&cx).await {
+                let mut conn = match listener.accept(&fcx).await {
                     Ok(c) => c,
                     Err(ConnError::Cancelled) => return Ok(()),
                     Err(e) => return Err(e.into()),
                 };
-                cx.spawn(move |cx| async move {
-                    let data = read_to_end(&cx, &mut conn).await?;
-                    conn.write_all(&cx, &data).await?;
-                    conn.shutdown(&cx).await?;
+                fcx.spawn(move |fcx| async move {
+                    let data = read_to_end(&fcx, &mut conn).await?;
+                    conn.write_all(&fcx, &data).await?;
+                    conn.shutdown(&fcx).await?;
                     Ok(())
                 });
             }
@@ -275,16 +275,16 @@ fn two_hundred_concurrent_connections() {
         let mut clients = Vec::new();
         for i in 0..200u64 {
             let ea = ea.clone();
-            clients.push(cx.spawn(move |cx| async move {
-                let mut conn = ea.connect(&cx, SocketAddr::new(ip(B), 7)).await?;
+            clients.push(fcx.spawn(move |fcx| async move {
+                let mut conn = ea.connect(&fcx, SocketAddr::new(ip(B), 7)).await?;
                 let data = pattern(20_000 + i as usize * 100, i + 10);
-                let got = duplex(&cx, &mut conn, &data).await?;
+                let got = duplex(&fcx, &mut conn, &data).await?;
                 assert!(got == data, "connection {i} got different bytes");
                 Ok(())
             }));
         }
         for c in clients {
-            c.join(&cx).await?;
+            c.join(&fcx).await?;
         }
         eprintln!("200 concurrent echoes took {:?}", started.elapsed());
         Ok(())
@@ -293,50 +293,50 @@ fn two_hundred_concurrent_connections() {
 
 #[test]
 fn shutdown_half_closes() {
-    world(Duration::from_secs(10), |cx| async move {
-        let (ea, eb) = two_tcp(&cx, A, B);
+    world(Duration::from_secs(10), |fcx| async move {
+        let (ea, eb) = two_tcp(&fcx, A, B);
         let mut listener = eb.listen(80)?;
-        let server = cx.spawn(move |cx| async move {
-            let mut conn = listener.accept(&cx).await?;
+        let server = fcx.spawn(move |fcx| async move {
+            let mut conn = listener.accept(&fcx).await?;
             // The client's FIN: everything, then EOF, and EOF again.
-            assert_eq!(read_to_end(&cx, &mut conn).await?, b"request");
+            assert_eq!(read_to_end(&fcx, &mut conn).await?, b"request");
             let mut buf = [0; 16];
-            assert_eq!(conn.read(&cx, &mut buf).await?, 0);
+            assert_eq!(conn.read(&fcx, &mut buf).await?, 0);
             // This side can still send after the peer's FIN.
-            conn.write_all(&cx, b"response").await?;
-            conn.shutdown(&cx).await?;
+            conn.write_all(&fcx, b"response").await?;
+            conn.shutdown(&fcx).await?;
             // Writing after shutdown fails.
-            assert_eq!(conn.write(&cx, b"x").await.err(), Some(ConnError::Closed));
+            assert_eq!(conn.write(&fcx, b"x").await.err(), Some(ConnError::Closed));
             Ok(())
         });
-        let mut conn = ea.connect(&cx, SocketAddr::new(ip(B), 80)).await?;
+        let mut conn = ea.connect(&fcx, SocketAddr::new(ip(B), 80)).await?;
         // An empty write takes nothing and does not wait.
-        assert_eq!(conn.write(&cx, b"").await?, 0);
-        conn.write_all(&cx, b"request").await?;
-        conn.shutdown(&cx).await?;
-        assert_eq!(conn.write(&cx, b"more").await.err(), Some(ConnError::Closed));
+        assert_eq!(conn.write(&fcx, b"").await?, 0);
+        conn.write_all(&fcx, b"request").await?;
+        conn.shutdown(&fcx).await?;
+        assert_eq!(conn.write(&fcx, b"more").await.err(), Some(ConnError::Closed));
         // Shutting down twice is fine.
-        conn.shutdown(&cx).await?;
+        conn.shutdown(&fcx).await?;
         // Reading still works after this side's shutdown.
-        assert_eq!(read_to_end(&cx, &mut conn).await?, b"response");
-        server.join(&cx).await?;
+        assert_eq!(read_to_end(&fcx, &mut conn).await?, b"response");
+        server.join(&fcx).await?;
         Ok(())
     });
 }
 
 #[test]
 fn write_waits_for_room_and_never_takes_zero() {
-    world(Duration::from_secs(20), |cx| async move {
-        let (ea, eb) = two_tcp(&cx, A, B);
+    world(Duration::from_secs(20), |fcx| async move {
+        let (ea, eb) = two_tcp(&fcx, A, B);
         let mut listener = eb.listen(80)?;
-        let mut conn = ea.connect(&cx, SocketAddr::new(ip(B), 80)).await?;
-        let mut server = listener.accept(&cx).await?;
+        let mut conn = ea.connect(&fcx, SocketAddr::new(ip(B), 80)).await?;
+        let mut server = listener.accept(&fcx).await?;
         // The server does not read, so the client fills the window and its
         // own buffer, then waits.
         let mut written = 0usize;
         let data = vec![7u8; 64 * 1024];
         loop {
-            let r = poll_fn(|task| match conn.poll_write(&cx, task, &data) {
+            let r = poll_fn(|cx| match conn.poll_write(&fcx, cx, &data) {
                 Poll::Pending => Poll::Ready(None),
                 Poll::Ready(r) => Poll::Ready(Some(r)),
             })
@@ -349,8 +349,8 @@ fn write_waits_for_room_and_never_takes_zero() {
                 Some(Err(e)) => return Err(e.into()),
                 None => {
                     // Let the endpoints move what they can, then try once more.
-                    cx.sleep(Duration::from_millis(20)).await?;
-                    let again = poll_fn(|task| Poll::Ready(conn.poll_write(&cx, task, &data))).await;
+                    fcx.sleep(Duration::from_millis(20)).await?;
+                    let again = poll_fn(|cx| Poll::Ready(conn.poll_write(&fcx, cx, &data))).await;
                     if again.is_pending() {
                         break;
                     }
@@ -363,58 +363,58 @@ fn write_waits_for_room_and_never_takes_zero() {
         }
         assert!(written >= 256 * 1024, "only {written} bytes fit");
         // Reading on the server makes room, and write_all finishes.
-        let reader = cx.spawn(move |cx| async move {
-            let got = read_to_end(&cx, &mut server).await?;
+        let reader = fcx.spawn(move |fcx| async move {
+            let got = read_to_end(&fcx, &mut server).await?;
             assert_eq!(got.len(), written + 100_000);
             Ok(())
         });
-        conn.write_all(&cx, &vec![1u8; 100_000]).await?;
-        conn.shutdown(&cx).await?;
-        reader.join(&cx).await?;
+        conn.write_all(&fcx, &vec![1u8; 100_000]).await?;
+        conn.shutdown(&fcx).await?;
+        reader.join(&fcx).await?;
         Ok(())
     });
 }
 
 #[test]
 fn reset_reaches_reads_and_writes() {
-    world(Duration::from_secs(10), |cx| async move {
-        let (ea, eb) = two_tcp(&cx, A, B);
+    world(Duration::from_secs(10), |fcx| async move {
+        let (ea, eb) = two_tcp(&fcx, A, B);
         let mut listener = eb.listen(80)?;
-        let mut conn = ea.connect(&cx, SocketAddr::new(ip(B), 80)).await?;
-        let server = listener.accept(&cx).await?;
-        conn.write_all(&cx, b"never read").await?;
-        cx.sleep(Duration::from_millis(20)).await?;
+        let mut conn = ea.connect(&fcx, SocketAddr::new(ip(B), 80)).await?;
+        let server = listener.accept(&fcx).await?;
+        conn.write_all(&fcx, b"never read").await?;
+        fcx.sleep(Duration::from_millis(20)).await?;
         // Dropping a connection with unread bytes resets it.
         drop(server);
         let mut buf = [0; 16];
-        assert_eq!(conn.read(&cx, &mut buf).await.err(), Some(ConnError::Reset));
-        assert_eq!(conn.write(&cx, b"x").await.err(), Some(ConnError::Reset));
-        assert_eq!(conn.shutdown(&cx).await.err(), Some(ConnError::Reset));
+        assert_eq!(conn.read(&fcx, &mut buf).await.err(), Some(ConnError::Reset));
+        assert_eq!(conn.write(&fcx, b"x").await.err(), Some(ConnError::Reset));
+        assert_eq!(conn.shutdown(&fcx).await.err(), Some(ConnError::Reset));
         Ok(())
     });
 }
 
 #[test]
 fn dropping_a_connection_sends_fin() {
-    world(Duration::from_secs(10), |cx| async move {
-        let (ea, eb) = two_tcp(&cx, A, B);
+    world(Duration::from_secs(10), |fcx| async move {
+        let (ea, eb) = two_tcp(&fcx, A, B);
         let mut listener = eb.listen(80)?;
-        let mut conn = ea.connect(&cx, SocketAddr::new(ip(B), 80)).await?;
-        let mut server = listener.accept(&cx).await?;
-        server.write_all(&cx, b"bye").await?;
+        let mut conn = ea.connect(&fcx, SocketAddr::new(ip(B), 80)).await?;
+        let mut server = listener.accept(&fcx).await?;
+        server.write_all(&fcx, b"bye").await?;
         drop(server);
-        assert_eq!(read_to_end(&cx, &mut conn).await?, b"bye");
+        assert_eq!(read_to_end(&fcx, &mut conn).await?, b"bye");
         Ok(())
     });
 }
 
 #[test]
 fn dropping_a_listener_frees_the_port_and_refuses() {
-    world(Duration::from_secs(10), |cx| async move {
-        let (ea, eb) = two_tcp(&cx, A, B);
+    world(Duration::from_secs(10), |fcx| async move {
+        let (ea, eb) = two_tcp(&fcx, A, B);
         let listener = eb.listen(80)?;
         drop(listener);
-        let r = ea.connect(&cx, SocketAddr::new(ip(B), 80)).await;
+        let r = ea.connect(&fcx, SocketAddr::new(ip(B), 80)).await;
         assert_eq!(r.err(), Some(ConnError::Refused));
         let _again = eb.listen(80)?;
         Ok(())
@@ -423,10 +423,10 @@ fn dropping_a_listener_frees_the_port_and_refuses() {
 
 #[test]
 fn connect_checks_its_target() {
-    world(Duration::from_secs(10), |cx| async move {
-        let (ea, _eb) = two_tcp(&cx, A, B);
-        assert_eq!(ea.connect(&cx, "[fd00::2]:80".parse().unwrap()).await.err(), Some(ConnError::Refused));
-        assert_eq!(ea.connect(&cx, SocketAddr::new(ip(B), 0)).await.err(), Some(ConnError::Refused));
+    world(Duration::from_secs(10), |fcx| async move {
+        let (ea, _eb) = two_tcp(&fcx, A, B);
+        assert_eq!(ea.connect(&fcx, "[fd00::2]:80".parse().unwrap()).await.err(), Some(ConnError::Refused));
+        assert_eq!(ea.connect(&fcx, SocketAddr::new(ip(B), 0)).await.err(), Some(ConnError::Refused));
         Ok(())
     });
 }
@@ -435,45 +435,45 @@ fn connect_checks_its_target() {
 fn cancellation_ends_accept_read_write_and_connect() {
     let results = Arc::new(Mutex::new(Vec::new()));
     let r = results.clone();
-    world(Duration::from_secs(10), move |cx| async move {
-        let (ea, eb) = two_tcp(&cx, A, B);
+    world(Duration::from_secs(10), move |fcx| async move {
+        let (ea, eb) = two_tcp(&fcx, A, B);
         let mut listener = eb.listen(80)?;
         // One connection where nothing is sent, so the server's read waits,
         // and one where the server never reads, so the client's write waits.
-        let _quiet = ea.connect(&cx, SocketAddr::new(ip(B), 80)).await?;
-        let mut server = listener.accept(&cx).await?;
-        let mut conn = ea.connect(&cx, SocketAddr::new(ip(B), 80)).await?;
-        let _not_reading = listener.accept(&cx).await?;
+        let _quiet = ea.connect(&fcx, SocketAddr::new(ip(B), 80)).await?;
+        let mut server = listener.accept(&fcx).await?;
+        let mut conn = ea.connect(&fcx, SocketAddr::new(ip(B), 80)).await?;
+        let _not_reading = listener.accept(&fcx).await?;
         let r1 = r.clone();
-        cx.spawn(move |cx| async move {
-            let res = listener.accept(&cx).await.err();
+        fcx.spawn(move |fcx| async move {
+            let res = listener.accept(&fcx).await.err();
             r1.lock().unwrap().push(("accept", res));
             Ok(())
         });
         let r2 = r.clone();
-        cx.spawn(move |cx| async move {
+        fcx.spawn(move |fcx| async move {
             let mut buf = [0; 8];
-            let res = server.read(&cx, &mut buf).await.err();
+            let res = server.read(&fcx, &mut buf).await.err();
             r2.lock().unwrap().push(("read", res));
             Ok(())
         });
         let r3 = r.clone();
-        cx.spawn(move |cx| async move {
+        fcx.spawn(move |fcx| async move {
             // Fills the window, since the server never reads, then waits.
-            let res = conn.write_all(&cx, &vec![0; 4 * 1024 * 1024]).await.err();
+            let res = conn.write_all(&fcx, &vec![0; 4 * 1024 * 1024]).await.err();
             r3.lock().unwrap().push(("write", res));
             Ok(())
         });
         // A machine that never answers, so connect waits.
         let (silent, _keep) = pair();
-        let ec = tcp::endpoint(&cx, silent, ip("10.0.0.3"));
+        let ec = tcp::endpoint(&fcx, silent, ip("10.0.0.3"));
         let r4 = r.clone();
-        cx.spawn(move |cx| async move {
-            let res = ec.connect(&cx, SocketAddr::new(ip(B), 80)).await.err();
+        fcx.spawn(move |fcx| async move {
+            let res = ec.connect(&fcx, SocketAddr::new(ip(B), 80)).await.err();
             r4.lock().unwrap().push(("connect", res));
             Ok(())
         });
-        cx.sleep(Duration::from_millis(100)).await?;
+        fcx.sleep(Duration::from_millis(100)).await?;
         assert!(r.lock().unwrap().is_empty(), "nothing should have ended yet: {:?}", r.lock().unwrap());
         Ok(())
     });
@@ -492,19 +492,19 @@ fn cancellation_ends_accept_read_write_and_connect() {
 
 #[test]
 fn a_closed_cable_stops_the_endpoint() {
-    world(Duration::from_secs(10), |cx| async move {
+    world(Duration::from_secs(10), |fcx| async move {
         let (a, b) = pair();
         let (c, d) = pair();
-        let ea = tcp::endpoint(&cx, a, ip(A));
+        let ea = tcp::endpoint(&fcx, a, ip(A));
         // Relay b <-> c by hand, so the test can cut the cable.
-        let relay = cx.spawn(move |cx| async move {
+        let relay = fcx.spawn(move |fcx| async move {
             let (mut b, mut c) = (b, c);
             loop {
-                let p = poll_fn(|task| {
-                    if let Poll::Ready(r) = b.poll_recv(&cx, task) {
+                let p = poll_fn(|cx| {
+                    if let Poll::Ready(r) = b.poll_recv(&fcx, cx) {
                         return Poll::Ready(r.map(|p| (true, p)));
                     }
-                    c.poll_recv(&cx, task).map(|r| r.map(|p| (false, p)))
+                    c.poll_recv(&fcx, cx).map(|r| r.map(|p| (false, p)))
                 })
                 .await;
                 match p {
@@ -517,19 +517,19 @@ fn a_closed_cable_stops_the_endpoint() {
                 }
             }
         });
-        let eb = tcp::endpoint(&cx, d, ip(B));
+        let eb = tcp::endpoint(&fcx, d, ip(B));
         let mut listener = eb.listen(80)?;
-        let mut conn = ea.connect(&cx, SocketAddr::new(ip(B), 80)).await?;
-        let mut server = listener.accept(&cx).await?;
+        let mut conn = ea.connect(&fcx, SocketAddr::new(ip(B), 80)).await?;
+        let mut server = listener.accept(&fcx).await?;
         CUT.store(true, std::sync::atomic::Ordering::SeqCst);
         // One more packet makes the relay notice and drop both cables.
-        conn.write_all(&cx, b"x").await?;
-        relay.join(&cx).await?;
-        assert_eq!(listener.accept(&cx).await.err(), Some(ConnError::Closed));
+        conn.write_all(&fcx, b"x").await?;
+        relay.join(&fcx).await?;
+        assert_eq!(listener.accept(&fcx).await.err(), Some(ConnError::Closed));
         let mut buf = [0; 8];
-        assert_eq!(server.read(&cx, &mut buf).await.err(), Some(ConnError::Closed));
-        assert_eq!(conn.read(&cx, &mut buf).await.err(), Some(ConnError::Closed));
-        assert_eq!(ea.connect(&cx, SocketAddr::new(ip(B), 80)).await.err(), Some(ConnError::Closed));
+        assert_eq!(server.read(&fcx, &mut buf).await.err(), Some(ConnError::Closed));
+        assert_eq!(conn.read(&fcx, &mut buf).await.err(), Some(ConnError::Closed));
+        assert_eq!(ea.connect(&fcx, SocketAddr::new(ip(B), 80)).await.err(), Some(ConnError::Closed));
         Ok(())
     });
 }
@@ -541,18 +541,18 @@ fn cut_now() -> bool {
 
 #[test]
 fn packets_for_other_addresses_are_dropped() {
-    world(Duration::from_secs(10), |cx| async move {
+    world(Duration::from_secs(10), |fcx| async move {
         let (mut raw, b) = pair();
-        let _eb = tcp::endpoint(&cx, b, ip(B));
+        let _eb = tcp::endpoint(&fcx, b, ip(B));
         // A SYN to 10.0.0.9, not B: no answer.
         raw.send(tcp_syn(ip(A), 4000, ip("10.0.0.9"), 80));
         // A SYN to B on a closed port: a RST.
         raw.send(tcp_syn(ip(A), 4001, ip(B), 81));
-        let p = raw.recv(&cx).await?;
+        let p = raw.recv(&fcx).await?;
         let flags = p.0[20 + 13];
         assert_eq!(flags & 0x04, 0x04, "a RST");
         assert_eq!(u16::from_be_bytes([p.0[22], p.0[23]]), 4001);
-        let next = poll_fn(|task| Poll::Ready(raw.poll_recv(&cx, task))).await;
+        let next = poll_fn(|cx| Poll::Ready(raw.poll_recv(&fcx, cx))).await;
         assert!(next.is_pending(), "only one answer");
         Ok(())
     });
@@ -563,15 +563,15 @@ fn packets_for_other_addresses_are_dropped() {
 #[test]
 fn udp_echo() {
     for (a, b) in [(A, B), ("fd00::1", "fd00::2")] {
-        world(Duration::from_secs(10), move |cx| async move {
+        world(Duration::from_secs(10), move |fcx| async move {
             let (ca, cb) = pair();
-            let ua = udp::endpoint(&cx, ca, ip(a));
-            let ub = udp::endpoint(&cx, cb, ip(b));
+            let ua = udp::endpoint(&fcx, ca, ip(a));
+            let ub = udp::endpoint(&fcx, cb, ip(b));
             let mut server = ub.bind(53)?;
             assert!(ub.bind(53).is_err(), "a second socket on the same port");
-            cx.spawn(move |cx| async move {
+            fcx.spawn(move |fcx| async move {
                 loop {
-                    let (data, from) = match server.recv(&cx).await {
+                    let (data, from) = match server.recv(&fcx).await {
                         Ok(d) => d,
                         Err(_) => return Ok(()),
                     };
@@ -582,16 +582,16 @@ fn udp_echo() {
             for i in 0..100u32 {
                 let msg = format!("datagram {i}").into_bytes();
                 client.send_to(&msg, SocketAddr::new(ip(b), 53));
-                let (data, from) = client.recv(&cx).await?;
+                let (data, from) = client.recv(&fcx).await?;
                 assert_eq!(data, msg);
                 assert_eq!(from, SocketAddr::new(ip(b), 53));
             }
             // A big one and an empty one.
             let big = pattern(8000, 3);
             client.send_to(&big, SocketAddr::new(ip(b), 53));
-            assert_eq!(client.recv(&cx).await?.0, big);
+            assert_eq!(client.recv(&fcx).await?.0, big);
             client.send_to(b"", SocketAddr::new(ip(b), 53));
-            assert_eq!(client.recv(&cx).await?.0, b"");
+            assert_eq!(client.recv(&fcx).await?.0, b"");
             Ok(())
         });
     }
@@ -603,13 +603,13 @@ fn udp_echo() {
 #[test]
 fn udp_the_largest_datagrams_that_fit_are_sent() {
     for (a, b, max) in [(A, B, 65_507usize), ("fd00::1", "fd00::2", 65_527)] {
-        world(Duration::from_secs(10), move |cx| async move {
+        world(Duration::from_secs(10), move |fcx| async move {
             let (ca, mut raw) = pair();
-            let ua = udp::endpoint(&cx, ca, ip(a));
+            let ua = udp::endpoint(&fcx, ca, ip(a));
             let mut s = ua.bind(1000)?;
             let to = SocketAddr::new(ip(b), 2000);
             s.send_to(&pattern(max, 5), to);
-            let p = raw.recv(&cx).await?;
+            let p = raw.recv(&fcx).await?;
             let header = if ip(a).is_ipv4() { 20 } else { 40 };
             assert_eq!(p.0.len(), header + 8 + max);
             assert_eq!(&p.0[header + 8..], &pattern(max, 5)[..]);
@@ -621,7 +621,7 @@ fn udp_the_largest_datagrams_that_fit_are_sent() {
             }
             s.send_to(&pattern(max + 1, 5), to);
             s.send_to(b"after", to);
-            let p = raw.recv(&cx).await?;
+            let p = raw.recv(&fcx).await?;
             assert_eq!(&p.0[header + 8..], b"after", "one byte more is dropped");
             Ok(())
         });
@@ -631,13 +631,13 @@ fn udp_the_largest_datagrams_that_fit_are_sent() {
 #[test]
 fn udp_closed_port_gets_port_unreachable() {
     for (a, b) in [(A, B), ("fd00::1", "fd00::2")] {
-        world(Duration::from_secs(10), move |cx| async move {
+        world(Duration::from_secs(10), move |fcx| async move {
             let (mut raw, cb) = pair();
-            let ub = udp::endpoint(&cx, cb, ip(b));
+            let ub = udp::endpoint(&fcx, cb, ip(b));
             let _open = ub.bind(53)?;
             let sent = udp_packet(ip(a), 4000, ip(b), 99, b"anyone?");
             raw.send(sent.clone());
-            let reply = raw.recv(&cx).await?;
+            let reply = raw.recv(&fcx).await?;
             let r = &reply.0;
             if ip(a).is_ipv4() {
                 assert_eq!(r[9], 1, "ICMP");
@@ -657,8 +657,8 @@ fn udp_closed_port_gets_port_unreachable() {
             raw.send(udp_packet(ip(a), 4000, ip(b), 53, b"hi"));
             let other = if ip(b).is_ipv4() { "10.9.9.9" } else { "fd00::99" };
             raw.send(udp_packet(ip(a), 4000, ip(other), 99, b"hi"));
-            cx.sleep(Duration::from_millis(20)).await?;
-            let next = poll_fn(|task| Poll::Ready(raw.poll_recv(&cx, task))).await;
+            fcx.sleep(Duration::from_millis(20)).await?;
+            let next = poll_fn(|cx| Poll::Ready(raw.poll_recv(&fcx, cx))).await;
             assert!(next.is_pending(), "no more answers");
             Ok(())
         });
@@ -667,20 +667,20 @@ fn udp_closed_port_gets_port_unreachable() {
 
 #[test]
 fn udp_packets_have_good_checksums_and_bad_ones_are_dropped() {
-    world(Duration::from_secs(10), |cx| async move {
+    world(Duration::from_secs(10), |fcx| async move {
         let (mut raw, cb) = pair();
-        let ub = udp::endpoint(&cx, cb, ip(B));
+        let ub = udp::endpoint(&fcx, cb, ip(B));
         let mut sock = ub.bind(53)?;
         let mut bad = udp_packet(ip(A), 4000, ip(B), 53, b"bad");
         let n = bad.0.len();
         bad.0[n - 1] ^= 0xff;
         raw.send(bad);
         raw.send(udp_packet(ip(A), 4000, ip(B), 53, b"good"));
-        let (data, from) = sock.recv(&cx).await?;
+        let (data, from) = sock.recv(&fcx).await?;
         assert_eq!(data, b"good");
         assert_eq!(from, SocketAddr::new(ip(A), 4000));
         sock.send_to(b"answer", from);
-        let p = raw.recv(&cx).await?;
+        let p = raw.recv(&fcx).await?;
         assert_eq!(checksum(&p.0[..20]), 0);
         assert_eq!(transport_checksum(source(&p.0).unwrap(), destination(&p.0).unwrap(), 17, &p.0[20..]), 0);
         assert_eq!(&p.0[28..], b"answer");
@@ -692,21 +692,21 @@ fn udp_packets_have_good_checksums_and_bad_ones_are_dropped() {
 fn udp_recv_ends_on_cancel_and_on_close() {
     let results = Arc::new(Mutex::new(Vec::new()));
     let r = results.clone();
-    world(Duration::from_secs(10), move |cx| async move {
+    world(Duration::from_secs(10), move |fcx| async move {
         let (ca, _keep) = pair();
-        let ua = udp::endpoint(&cx, ca, ip(A));
+        let ua = udp::endpoint(&fcx, ca, ip(A));
         let mut sock = ua.bind(1)?;
         let r1 = r.clone();
-        cx.spawn(move |cx| async move {
-            let res = sock.recv(&cx).await.err();
+        fcx.spawn(move |fcx| async move {
+            let res = sock.recv(&fcx).await.err();
             r1.lock().unwrap().push(res);
             Ok(())
         });
         let (cb, gone) = pair();
         drop(gone);
-        let ub = udp::endpoint(&cx, cb, ip(B));
+        let ub = udp::endpoint(&fcx, cb, ip(B));
         let mut sock = ub.bind(1)?;
-        assert_eq!(sock.recv(&cx).await.err(), Some(RecvError::Closed));
+        assert_eq!(sock.recv(&fcx).await.err(), Some(RecvError::Closed));
         Ok(())
     });
     assert_eq!(*results.lock().unwrap(), [Some(RecvError::Cancelled)]);
@@ -747,22 +747,22 @@ fn tcp_through_tokio_io() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
     let result = rt.block_on(async {
-        let world = run(|cx| async move {
-            let (ea, eb) = two_tcp(&cx, A, B);
+        let world = run(|fcx| async move {
+            let (ea, eb) = two_tcp(&fcx, A, B);
             let mut listener = eb.listen(80)?;
-            let server_cx = cx.clone();
+            let server_fcx = fcx.clone();
             let server = tokio::spawn(async move {
-                let conn = listener.accept(&server_cx).await.unwrap();
-                let mut io = conn.into_tokio(&server_cx);
+                let conn = listener.accept(&server_fcx).await.unwrap();
+                let mut io = conn.into_tokio(&server_fcx);
                 let mut data = Vec::new();
                 io.read_to_end(&mut data).await.unwrap();
                 io.write_all(&data).await.unwrap();
                 io.shutdown().await.unwrap();
             });
-            let conn = ea.connect(&cx, SocketAddr::new(ip(B), 80)).await?;
-            let client_cx = cx.clone();
+            let conn = ea.connect(&fcx, SocketAddr::new(ip(B), 80)).await?;
+            let client_fcx = fcx.clone();
             let client = tokio::spawn(async move {
-                let mut io = conn.into_tokio(&client_cx);
+                let mut io = conn.into_tokio(&client_fcx);
                 let data = pattern(1_000_000, 9);
                 io.write_all(&data).await.unwrap();
                 io.shutdown().await.unwrap();
@@ -780,14 +780,14 @@ fn tcp_through_tokio_io() {
 }
 
 /// Relays packets between two cables, dropping the ones `drop_it` picks.
-fn lossy_relay(cx: &Cx, mut b: impl Interface, mut c: impl Interface, mut drop_it: impl FnMut(&Packet) -> bool + Send + 'static) {
-    cx.spawn(move |cx| async move {
+fn lossy_relay(fcx: &Cx, mut b: impl Interface, mut c: impl Interface, mut drop_it: impl FnMut(&Packet) -> bool + Send + 'static) {
+    fcx.spawn(move |fcx| async move {
         loop {
-            let p = poll_fn(|task| {
-                if let Poll::Ready(r) = b.poll_recv(&cx, task) {
+            let p = poll_fn(|cx| {
+                if let Poll::Ready(r) = b.poll_recv(&fcx, cx) {
                     return Poll::Ready(r.map(|p| (true, p)));
                 }
-                c.poll_recv(&cx, task).map(|r| r.map(|p| (false, p)))
+                c.poll_recv(&fcx, cx).map(|r| r.map(|p| (false, p)))
             })
             .await;
             match p {
@@ -819,32 +819,32 @@ fn a_fin_is_acked_before_a_dropped_connection_is_forgotten() {
 fn fin_then_drop(gap: Duration) {
     let seen: Arc<Mutex<Vec<(IpAddr, u8)>>> = Arc::default();
     let log = seen.clone();
-    world(Duration::from_secs(10), move |cx| async move {
+    world(Duration::from_secs(10), move |fcx| async move {
         let (a, b) = pair();
         let (c, d) = pair();
-        lossy_relay(&cx, b, c, move |p| {
+        lossy_relay(&fcx, b, c, move |p| {
             let v = &p.0;
             if v.len() >= 40 && v[9] == 6 {
                 log.lock().unwrap().push((IpAddr::from([v[12], v[13], v[14], v[15]]), v[33]));
             }
             false
         });
-        let ea = tcp::endpoint(&cx, a, ip(A));
-        let eb = tcp::endpoint(&cx, d, ip(B));
+        let ea = tcp::endpoint(&fcx, a, ip(A));
+        let eb = tcp::endpoint(&fcx, d, ip(B));
         let mut listener = eb.listen(80)?;
-        let mut conn = ea.connect(&cx, SocketAddr::new(ip(B), 80)).await?;
-        let mut server = listener.accept(&cx).await?;
-        conn.shutdown(&cx).await?;
-        assert_eq!(read_to_end(&cx, &mut server).await?, b"");
-        server.write_all(&cx, b"bye").await?;
+        let mut conn = ea.connect(&fcx, SocketAddr::new(ip(B), 80)).await?;
+        let mut server = listener.accept(&fcx).await?;
+        conn.shutdown(&fcx).await?;
+        assert_eq!(read_to_end(&fcx, &mut server).await?, b"");
+        server.write_all(&fcx, b"bye").await?;
         if !gap.is_zero() {
-            cx.sleep(gap).await?;
+            fcx.sleep(gap).await?;
         }
         drop(server);
-        assert_eq!(read_to_end(&cx, &mut conn).await?, b"bye");
+        assert_eq!(read_to_end(&fcx, &mut conn).await?, b"bye");
         drop(conn);
         // Longer than the server's first retransmission timeout.
-        cx.sleep(Duration::from_millis(1500)).await?;
+        fcx.sleep(Duration::from_millis(1500)).await?;
         Ok(())
     });
     let seen = seen.lock().unwrap();
@@ -859,32 +859,32 @@ fn fin_then_drop(gap: Duration) {
 fn transfers_survive_lost_packets() {
     let elapsed = Arc::new(Mutex::new(Duration::ZERO));
     let e = elapsed.clone();
-    world(Duration::from_secs(60), move |cx| async move {
+    world(Duration::from_secs(60), move |fcx| async move {
         let (a, b) = pair();
         let (c, d) = pair();
         // Drop one packet in 50, SYNs and FINs included.
         let mut n = 0u64;
-        lossy_relay(&cx, b, c, move |_| {
+        lossy_relay(&fcx, b, c, move |_| {
             n += 1;
             n % 50 == 7
         });
-        let ea = tcp::endpoint(&cx, a, ip(A));
-        let eb = tcp::endpoint(&cx, d, ip(B));
+        let ea = tcp::endpoint(&fcx, a, ip(A));
+        let eb = tcp::endpoint(&fcx, d, ip(B));
         let mut listener = eb.listen(80)?;
         let up = pattern(512 * 1024, 4);
         let down = pattern(256 * 1024, 5);
         let (up2, down2) = (up.clone(), down.clone());
         let started = Instant::now();
-        let server = cx.spawn(move |cx| async move {
-            let mut conn = listener.accept(&cx).await?;
-            let got = duplex(&cx, &mut conn, &down2).await?;
+        let server = fcx.spawn(move |fcx| async move {
+            let mut conn = listener.accept(&fcx).await?;
+            let got = duplex(&fcx, &mut conn, &down2).await?;
             assert!(got == up2, "the server got different bytes");
             Ok(())
         });
-        let mut conn = ea.connect(&cx, SocketAddr::new(ip(B), 80)).await?;
-        let got = duplex(&cx, &mut conn, &up).await?;
+        let mut conn = ea.connect(&fcx, SocketAddr::new(ip(B), 80)).await?;
+        let got = duplex(&fcx, &mut conn, &up).await?;
         assert!(got == down, "the client got different bytes");
-        server.join(&cx).await?;
+        server.join(&fcx).await?;
         *e.lock().unwrap() = started.elapsed();
         Ok(())
     });
@@ -893,9 +893,9 @@ fn transfers_survive_lost_packets() {
 
 #[test]
 fn every_closed_port_is_refused() {
-    world(Duration::from_secs(120), |cx| async move {
+    world(Duration::from_secs(120), |fcx| async move {
         let (mut raw, b) = pair();
-        let eb = tcp::endpoint(&cx, b, ip(B));
+        let eb = tcp::endpoint(&fcx, b, ip(B));
         let _open = eb.listen(443)?;
         let started = Instant::now();
         // Many SYNs in flight at once, as from a port scan.
@@ -906,7 +906,7 @@ fn every_closed_port_is_refused() {
                 raw.send(tcp_syn(ip(A), 50000, ip(B), port));
             }
             for _ in chunk {
-                let p = raw.recv(&cx).await?;
+                let p = raw.recv(&fcx).await?;
                 let flags = p.0[20 + 13];
                 let port = u16::from_be_bytes([p.0[20], p.0[21]]);
                 if port == 443 {
@@ -927,13 +927,13 @@ fn every_closed_port_is_refused() {
 
 #[test]
 fn dropping_a_listener_resets_connections_not_yet_accepted() {
-    world(Duration::from_secs(10), |cx| async move {
-        let (ea, eb) = two_tcp(&cx, A, B);
+    world(Duration::from_secs(10), |fcx| async move {
+        let (ea, eb) = two_tcp(&fcx, A, B);
         let listener = eb.listen(80)?;
-        let mut conn = ea.connect(&cx, SocketAddr::new(ip(B), 80)).await?;
+        let mut conn = ea.connect(&fcx, SocketAddr::new(ip(B), 80)).await?;
         drop(listener);
         let mut buf = [0; 8];
-        assert_eq!(conn.read(&cx, &mut buf).await.err(), Some(ConnError::Reset));
+        assert_eq!(conn.read(&fcx, &mut buf).await.err(), Some(ConnError::Reset));
         Ok(())
     });
 }
@@ -955,19 +955,19 @@ impl Connection for TakesNothing {
 
 #[test]
 fn boxed_connections_and_write_all() {
-    world(Duration::from_secs(10), |cx| async move {
-        let (ea, eb) = two_tcp(&cx, A, B);
+    world(Duration::from_secs(10), |fcx| async move {
+        let (ea, eb) = two_tcp(&fcx, A, B);
         let mut listener = eb.listen(80)?;
-        let client: Box<dyn Connection> = Box::new(ea.connect(&cx, SocketAddr::new(ip(B), 80)).await?);
-        let server: Box<dyn Connection> = Box::new(listener.accept(&cx).await?);
+        let client: Box<dyn Connection> = Box::new(ea.connect(&fcx, SocketAddr::new(ip(B), 80)).await?);
+        let server: Box<dyn Connection> = Box::new(listener.accept(&fcx).await?);
         let mut conns = [client, server];
-        conns[0].write_all(&cx, b"through a box").await?;
-        conns[0].shutdown(&cx).await?;
-        assert_eq!(read_to_end(&cx, &mut conns[1]).await?, b"through a box");
+        conns[0].write_all(&fcx, b"through a box").await?;
+        conns[0].shutdown(&fcx).await?;
+        assert_eq!(read_to_end(&fcx, &mut conns[1]).await?, b"through a box");
         // write_all stops instead of looping when nothing is taken.
         let mut broken: Box<dyn Connection> = Box::new(TakesNothing);
-        assert_eq!(broken.write_all(&cx, b"x").await.err(), Some(ConnError::Closed));
-        assert_eq!(broken.write_all(&cx, b"").await.err(), None);
+        assert_eq!(broken.write_all(&fcx, b"x").await.err(), Some(ConnError::Closed));
+        assert_eq!(broken.write_all(&fcx, b"").await.err(), None);
         Ok(())
     });
 }
@@ -982,29 +982,29 @@ fn thread_cpu() -> Duration {
 /// happens.
 #[test]
 fn idle_endpoints_stay_idle() {
-    world(Duration::from_secs(20), |cx| async move {
-        let (ea, eb) = two_tcp(&cx, A, B);
+    world(Duration::from_secs(20), |fcx| async move {
+        let (ea, eb) = two_tcp(&fcx, A, B);
         let mut listener = eb.listen(80)?;
         // Open, half-closed, closed and dropped connections, and one
         // waiting in the accept queue.
         let mut keep = Vec::new();
         for i in 0..6 {
-            let mut c = ea.connect(&cx, SocketAddr::new(ip(B), 80)).await?;
-            let mut s = listener.accept(&cx).await?;
-            c.write_all(&cx, b"hello").await?;
+            let mut c = ea.connect(&fcx, SocketAddr::new(ip(B), 80)).await?;
+            let mut s = listener.accept(&fcx).await?;
+            c.write_all(&fcx, b"hello").await?;
             match i {
                 0 => {}
-                1 => c.shutdown(&cx).await?,
+                1 => c.shutdown(&fcx).await?,
                 2 => {
-                    c.shutdown(&cx).await?;
-                    s.shutdown(&cx).await?;
+                    c.shutdown(&fcx).await?;
+                    s.shutdown(&fcx).await?;
                 }
                 _ => {}
             }
             if i == 4 {
                 drop(c);
                 let mut buf = [0; 5];
-                s.read(&cx, &mut buf).await?;
+                s.read(&fcx, &mut buf).await?;
                 keep.push(s);
                 continue;
             }
@@ -1016,10 +1016,10 @@ fn idle_endpoints_stay_idle() {
             keep.push(c);
             keep.push(s);
         }
-        let _waiting = ea.connect(&cx, SocketAddr::new(ip(B), 80)).await?;
-        cx.sleep(Duration::from_millis(100)).await?;
+        let _waiting = ea.connect(&fcx, SocketAddr::new(ip(B), 80)).await?;
+        fcx.sleep(Duration::from_millis(100)).await?;
         let before = thread_cpu();
-        cx.sleep(Duration::from_secs(1)).await?;
+        fcx.sleep(Duration::from_secs(1)).await?;
         let used = thread_cpu() - before;
         eprintln!("one idle second used {used:?} of CPU");
         assert!(used < Duration::from_millis(20), "idle endpoints used {used:?}");

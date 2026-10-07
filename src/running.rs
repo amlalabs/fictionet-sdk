@@ -15,7 +15,7 @@
 //!
 //! ```no_run
 //! # use fictionet::{Attachments, Cx, Result};
-//! # async fn world(_cx: Cx, _attachments: Attachments, _args: Vec<String>) -> Result { Ok(()) }
+//! # async fn world(_fcx: Cx, _attachments: Attachments, _args: Vec<String>) -> Result { Ok(()) }
 //! fn main() -> fictionet::Result {
 //!     // 1. A channel for sandboxes.
 //!     let (attacher, attachments) = fictionet::attachments();
@@ -27,7 +27,7 @@
 //!
 //!     // 3. The world, as one future. Nothing runs yet.
 //!     let args: Vec<String> = std::env::args().skip(1).collect();
-//!     let world = fictionet::run(move |cx| world(cx, attachments, args));
+//!     let world = fictionet::run(move |fcx| world(fcx, attachments, args));
 //!
 //!     // 4. Poll that future on this thread until the world ends.
 //!     fictionet::block_on(world)
@@ -56,7 +56,7 @@
 //!    closes the socket, and `let _ = listen(...)` drops it on the spot.
 //! 3. **[`run(f)`](crate::run)** returns a future and does nothing else.
 //!    When the future is first polled, it makes the world's
-//!    [`Cx`](crate::Cx) and starts `f(cx)` as the first task. Every task the
+//!    [`Cx`](crate::Cx) and starts `f(fcx)` as the first task. Every task the
 //!    world starts with [`Cx::spawn`](crate::Cx::spawn), and every stdlib
 //!    task, is polled inside this same future.
 //! 4. **[`block_on`](crate::block_on)** polls the future on the current
@@ -67,18 +67,18 @@
 //! reach the internet or a database. There is no central daemon: each world
 //! is its own process.
 //!
-//! Inside the world, [`attachments.get(&cx, "agent")`](crate::Attachments::get)
+//! Inside the world, [`attachments.get(&fcx, "agent")`](crate::Attachments::get)
 //! `.await` waits until the
 //! sandbox named `agent` attaches, and returns its `Attachment`. A world can
 //! also take every sandbox as it arrives, as the `ping_world` example does:
 //!
 //! ```
 //! # use fictionet::{Attachment, Attachments, Cx, Result};
-//! # async fn serve(_cx: Cx, _sandbox: Attachment) -> Result { Ok(()) }
-//! # async fn world(cx: Cx, mut attachments: Attachments) -> Result {
+//! # async fn serve(_fcx: Cx, _sandbox: Attachment) -> Result { Ok(()) }
+//! # async fn world(fcx: Cx, mut attachments: Attachments) -> Result {
 //! loop {
-//!     let sandbox = attachments.next(&cx).await?;
-//!     cx.spawn(move |cx| serve(cx, sandbox));
+//!     let sandbox = attachments.next(&fcx).await?;
+//!     fcx.spawn(move |fcx| serve(fcx, sandbox));
 //! }
 //! # }
 //! ```
@@ -144,7 +144,7 @@
 //! use fictionet::{Cx, Result};
 //! use tokio::io::AsyncReadExt;
 //!
-//! async fn read_feed(cx: Cx, mut feed: tokio::net::TcpStream) -> Result {
+//! async fn read_feed(fcx: Cx, mut feed: tokio::net::TcpStream) -> Result {
 //!     let mut buf = vec![0; 4096];
 //!     loop {
 //!         tokio::select! {
@@ -155,7 +155,7 @@
 //!                 }
 //!                 // use buf[..n]
 //!             }
-//!             _ = cx.cancelled() => return Ok(()), // the region was cancelled
+//!             _ = fcx.cancelled() => return Ok(()), // the region was cancelled
 //!         }
 //!     }
 //! }
@@ -167,7 +167,7 @@
 //! `std::net` read, cannot be raced at all: it stops every task in the run
 //! until it returns. Move it to a thread of its own with
 //! `std::thread::spawn`, send the result back over a channel, and race the
-//! channel against `cx.cancelled()`. The thread itself keeps running until
+//! channel against `fcx.cancelled()`. The thread itself keeps running until
 //! the call returns, so give the call a time limit of its own, such as
 //! `TcpStream::set_read_timeout`. Avoid tokio's `spawn_blocking` for this:
 //! a tokio runtime waits for its blocking calls when it shuts down, so one
@@ -206,11 +206,11 @@
 //!
 //! ```no_run
 //! # use fictionet::{Attachments, Cx, Result};
-//! # async fn world(_cx: Cx, _attachments: Attachments) -> Result { Ok(()) }
+//! # async fn world(_fcx: Cx, _attachments: Attachments) -> Result { Ok(()) }
 //! # fn main() -> Result {
 //! # let (_attacher, attachments) = fictionet::attachments();
 //! let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-//! runtime.block_on(fictionet::run(move |cx| world(cx, attachments)))
+//! runtime.block_on(fictionet::run(move |fcx| world(fcx, attachments)))
 //! # }
 //! ```
 //!
@@ -236,9 +236,9 @@
 //! use fictionet::{Attachments, Cx, Interface, Packet, Result};
 //!
 //! /// The world under test: it sends every packet from "agent" straight back.
-//! async fn world(cx: Cx, mut attachments: Attachments) -> Result {
-//!     let mut agent = attachments.get(&cx, "agent").await?;
-//!     while let Ok(packet) = agent.recv(&cx).await {
+//! async fn world(fcx: Cx, mut attachments: Attachments) -> Result {
+//!     let mut agent = attachments.get(&fcx, "agent").await?;
+//!     while let Ok(packet) = agent.recv(&fcx).await {
 //!         agent.send(packet);
 //!     }
 //!     Ok(())
@@ -248,12 +248,12 @@
 //! // The test plays the sandbox "agent": it holds the sandbox's end.
 //! let mut agent = attacher.attach("agent").unwrap();
 //!
-//! let test = fictionet::run(move |cx| async move {
-//!     cx.spawn(move |cx| world(cx, attachments));
+//! let test = fictionet::run(move |fcx| async move {
+//!     fcx.spawn(move |fcx| world(fcx, attachments));
 //!     agent.send(Packet(vec![0x45, 0, 0, 20]));
-//!     assert_eq!(agent.recv(&cx).await?, Packet(vec![0x45, 0, 0, 20]));
+//!     assert_eq!(agent.recv(&fcx).await?, Packet(vec![0x45, 0, 0, 20]));
 //!     // The checks passed. Stop the world, and every task in it.
-//!     cx.cancel();
+//!     fcx.cancel();
 //!     Ok(())
 //! });
 //!
@@ -266,7 +266,7 @@
 //! task. Both are polled on one thread, taking turns. The three outcomes
 //! stay apart:
 //!
-//! - **The checks pass.** `cx.cancel()` stops the world cleanly. Each task
+//! - **The checks pass.** `fcx.cancel()` stops the world cleanly. Each task
 //!   ends through its own code, and `run` returns `Ok(())`. The `Cancelled`
 //!   that a task passes up with `?` is never a failure, and other errors
 //!   that tasks return after the cancel are not reported either. A task

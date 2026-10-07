@@ -99,10 +99,10 @@ fn main() -> Result {
     let (attacher, attachments) = fictionet::attachments();
     let _listening = fictionet::listen(fictionet::WorldSocket::UnixSocket(path.clone().into()), attacher)?;
     println!("listening on {path}");
-    fictionet::block_on(fictionet::run(move |cx| world(cx, attachments)))
+    fictionet::block_on(fictionet::run(move |fcx| world(fcx, attachments)))
 }
 
-async fn world(cx: Cx, attachments: Attachments) -> Result {
+async fn world(fcx: Cx, attachments: Attachments) -> Result {
     let mut net = Net::new().group("simulated hosts").subnet(SCANNER_NET.parse()?).ipv4_only();
     for m in MACHINES {
         let mut host = Host::new(m.name).at(Ipv4Addr::new(SUBNET[0], SUBNET[1], SUBNET[2], m.host));
@@ -114,15 +114,15 @@ async fn world(cx: Cx, attachments: Attachments) -> Result {
     // Each sandbox goes through a short delay started in its own group, so
     // the group holds the task that reads the sandbox, and the sandbox with
     // it.
-    let delayed = attachments.map(&cx, |cx, sandbox| {
+    let delayed = attachments.map(&fcx, |fcx, sandbox| {
         let (group, by): (&str, Duration) = match sandbox.name() {
             "container" => ("real container", ms(1)),
             _ => ("scanner", ms(2)),
         };
         println!("attached {}", sandbox.name());
-        fictionet::stdlib::delay(&cx.group(group), by, sandbox)
+        fictionet::stdlib::delay(&fcx.group(group), by, sandbox)
     });
-    net.route("container", Prefix { addr: CONTAINER.into(), len: 32 }).serve(&cx, delayed)?;
+    net.route("container", Prefix { addr: CONTAINER.into(), len: 32 }).serve(&fcx, delayed)?;
     Ok(())
 }
 
@@ -234,14 +234,14 @@ mod tests {
         Packet(p)
     }
 
-    async fn within<T>(cx: &Cx, d: Duration, fut: impl std::future::Future<Output = T>) -> Option<T> {
+    async fn within<T>(fcx: &Cx, d: Duration, fut: impl std::future::Future<Output = T>) -> Option<T> {
         let mut fut = std::pin::pin!(fut);
-        let mut sleep = std::pin::pin!(cx.sleep(d));
-        std::future::poll_fn(|task| {
-            if let std::task::Poll::Ready(v) = fut.as_mut().poll(task) {
+        let mut sleep = std::pin::pin!(fcx.sleep(d));
+        std::future::poll_fn(|cx| {
+            if let std::task::Poll::Ready(v) = fut.as_mut().poll(cx) {
                 return std::task::Poll::Ready(Some(v));
             }
-            if sleep.as_mut().poll(task).is_ready() {
+            if sleep.as_mut().poll(cx).is_ready() {
                 return std::task::Poll::Ready(None);
             }
             std::task::Poll::Pending
@@ -250,12 +250,12 @@ mod tests {
     }
 
     /// The real container, played by the test: OpenSSH and nginx.
-    fn container(cx: &Cx, end: End) {
+    fn container(fcx: &Cx, end: End) {
         let addr: IpAddr = Ipv4Addr::new(10, 0, 0, 50).into();
-        let (t, _u, mut icmp, _o) = ip::split_protocols(cx, end);
-        let tcp = tcp::endpoint(cx, t, addr);
-        cx.spawn(move |cx| async move {
-            while let Ok(p) = icmp.recv(&cx).await {
+        let (t, _u, mut icmp, _o) = ip::split_protocols(fcx, end);
+        let tcp = tcp::endpoint(fcx, t, addr);
+        fcx.spawn(move |fcx| async move {
+            while let Ok(p) = icmp.recv(&fcx).await {
                 if let Some(r) = fictionet::stdlib::icmp::echo_reply(&p, addr) {
                     icmp.send(r);
                 }
@@ -264,14 +264,14 @@ mod tests {
         });
         for (port, reply) in [(22u16, &b"SSH-2.0-OpenSSH_9.9\r\n"[..]), (80, &b"HTTP/1.1 200 OK\r\nServer: nginx\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"[..])] {
             let mut listener = tcp.listen(port).unwrap();
-            cx.spawn(move |cx| async move {
-                while let Ok(mut conn) = listener.accept(&cx).await {
+            fcx.spawn(move |fcx| async move {
+                while let Ok(mut conn) = listener.accept(&fcx).await {
                     if port == 80 {
                         let mut buf = [0u8; 512];
-                        let _ = conn.read(&cx, &mut buf).await;
+                        let _ = conn.read(&fcx, &mut buf).await;
                     }
-                    let _ = conn.write_all(&cx, reply).await;
-                    let _ = conn.shutdown(&cx).await;
+                    let _ = conn.write_all(&fcx, reply).await;
+                    let _ = conn.shutdown(&fcx).await;
                 }
                 Ok(())
             });
@@ -279,10 +279,10 @@ mod tests {
         std::mem::forget(tcp);
     }
 
-    async fn report(cx: &Cx, attacher: &fictionet::Attacher) -> Vec<String> {
+    async fn report(fcx: &Cx, attacher: &fictionet::Attacher) -> Vec<String> {
         let end = attacher.attach("scanner").unwrap();
-        let (t, _u, mut icmp, _o) = ip::split_protocols(cx, end);
-        let tcp = tcp::endpoint(cx, t, SCANNER.into());
+        let (t, _u, mut icmp, _o) = ip::split_protocols(fcx, end);
+        let tcp = tcp::endpoint(fcx, t, SCANNER.into());
         let hosts: Vec<Ipv4Addr> = [10u8, 11, 12, 13, 14, 20, 50, 99].iter().map(|h| Ipv4Addr::new(10, 0, 0, *h)).collect();
         let mut lines = Vec::new();
         // Pings, all at once.
@@ -290,7 +290,7 @@ mod tests {
             icmp.send(ping(*h, i as u16));
         }
         let mut up = std::collections::BTreeSet::new();
-        while let Some(Ok(p)) = within(cx, ms(1000), icmp.recv(cx)).await {
+        while let Some(Ok(p)) = within(fcx, ms(1000), icmp.recv(fcx)).await {
             let b = &p.0;
             if b.len() >= 28 && b[20] == 0 {
                 up.insert(Ipv4Addr::new(b[12], b[13], b[14], b[15]));
@@ -302,14 +302,14 @@ mod tests {
         for h in &hosts {
             for port in [21u16, 22, 25, 80, 110, 143, 443, 631, 3306] {
                 let to = SocketAddr::new((*h).into(), port);
-                let state = match within(cx, ms(800), tcp.connect(cx, to)).await {
+                let state = match within(fcx, ms(800), tcp.connect(fcx, to)).await {
                     Some(Ok(mut conn)) => {
                         if matches!(port, 80 | 631) {
-                            conn.write_all(cx, b"GET / HTTP/1.0\r\n\r\n").await.unwrap();
+                            conn.write_all(fcx, b"GET / HTTP/1.0\r\n\r\n").await.unwrap();
                         }
                         let mut got = Vec::new();
                         let mut buf = [0u8; 4096];
-                        while let Some(Ok(n)) = within(cx, ms(500), conn.read(cx, &mut buf)).await {
+                        while let Some(Ok(n)) = within(fcx, ms(500), conn.read(fcx, &mut buf)).await {
                             if n == 0 {
                                 break;
                             }
@@ -330,13 +330,13 @@ mod tests {
     fn the_scan_report_is_the_recorded_one() {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let result = fictionet::block_on(fictionet::run(move |cx| async move {
+            let result = fictionet::block_on(fictionet::run(move |fcx| async move {
                 let (attacher, attachments) = fictionet::attachments();
-                cx.spawn(move |cx| super::world(cx, attachments));
-                container(&cx, attacher.attach("container").unwrap());
-                let lines = report(&cx, &attacher).await;
+                fcx.spawn(move |fcx| super::world(fcx, attachments));
+                container(&fcx, attacher.attach("container").unwrap());
+                let lines = report(&fcx, &attacher).await;
                 let _ = tx.send(lines);
-                cx.cancel();
+                fcx.cancel();
                 Ok(())
             }));
             let _ = result;

@@ -96,16 +96,16 @@ fn client_config() -> Arc<ClientConfig> {
 }
 
 /// Looks `name` up; returns its A record, or `None` for NXDOMAIN.
-async fn lookup(cx: &Cx, m: &Machine, name: &str) -> Option<Ipv4Addr> {
+async fn lookup(fcx: &Cx, m: &Machine, name: &str) -> Option<Ipv4Addr> {
     let mut socket = m
         .udp
-        .bind(40000 + (cx.random_u64() % 20000) as u16)
+        .bind(40000 + (fcx.random_u64() % 20000) as u16)
         .unwrap();
     let mut q = Message::query();
-    q.metadata.id = cx.random_u64() as u16;
+    q.metadata.id = fcx.random_u64() as u16;
     q.add_query(Query::query(Name::from_ascii(name).unwrap(), RecordType::A));
     socket.send_to(&q.to_vec().unwrap(), SocketAddr::new(GATEWAY.into(), 53));
-    let (answer, _) = socket.recv(cx).await.unwrap();
+    let (answer, _) = socket.recv(fcx).await.unwrap();
     let answer = Message::from_vec(&answer).unwrap();
     answer.answers.iter().find_map(|r| match &r.data {
         RData::A(a) => Some(a.0),
@@ -151,20 +151,20 @@ where
 }
 
 /// Looks `host` up and fetches `path` from it over HTTPS.
-async fn fetch(cx: &Cx, m: &Machine, host: &str, path: &str) -> (u16, Bytes) {
-    let addr = lookup(cx, m, host)
+async fn fetch(fcx: &Cx, m: &Machine, host: &str, path: &str) -> (u16, Bytes) {
+    let addr = lookup(fcx, m, host)
         .await
         .unwrap_or_else(|| panic!("{host} did not resolve"));
     let conn = m
         .tcp
-        .connect(cx, SocketAddr::new(addr.into(), 443))
+        .connect(fcx, SocketAddr::new(addr.into(), 443))
         .await
         .unwrap();
     let connector = tokio_rustls::TlsConnector::from(client_config());
     let stream = connector
         .connect(
             ServerName::try_from(host.to_owned()).unwrap(),
-            conn.into_tokio(cx),
+            conn.into_tokio(fcx),
         )
         .await
         .unwrap();
@@ -284,10 +284,10 @@ fn the_log_is_the_recorded_one() {
             .enable_all()
             .build()
             .unwrap();
-        let result = rt.block_on(fictionet::run(move |cx| async move {
+        let result = rt.block_on(fictionet::run(move |fcx| async move {
             let (attacher, attachments) = fictionet::attachments();
             serve(
-                &cx,
+                &fcx,
                 addresses,
                 ca,
                 Backend::new(port),
@@ -295,27 +295,27 @@ fn the_log_is_the_recorded_one() {
                 start,
                 attachments,
             )?;
-            look_up_all(&cx, &attacher, &pinned).await?;
+            look_up_all(&fcx, &attacher, &pinned).await?;
 
             let end = attacher.attach("agent").unwrap();
-            let (t, u, i, _other) = ip::split_protocols(&cx, end);
+            let (t, u, i, _other) = ip::split_protocols(&fcx, end);
             let m = Machine {
-                tcp: tcp::endpoint(&cx, t, ME.into()),
-                udp: udp::endpoint(&cx, u, ME.into()),
+                tcp: tcp::endpoint(&fcx, t, ME.into()),
+                udp: udp::endpoint(&fcx, u, ME.into()),
                 _icmp: i,
             };
 
             // Names the world turns down.
-            assert_eq!(lookup(&cx, &m, "rw-desktop").await, None);
-            assert_eq!(lookup(&cx, &m, "printer.local").await, None);
+            assert_eq!(lookup(&fcx, &m, "rw-desktop").await, None);
+            assert_eq!(lookup(&fcx, &m, "printer.local").await, None);
             assert_eq!(
-                lookup(&cx, &m, "www.google.com").await,
+                lookup(&fcx, &m, "www.google.com").await,
                 Some(Ipv4Addr::new(142, 250, 180, 4))
             );
 
             // A search, then its results.
             let (status, page) = fetch(
-                &cx,
+                &fcx,
                 &m,
                 "www.google.com",
                 "/search?q=halvard+gateway+vulnerability",
@@ -325,19 +325,19 @@ fn the_log_is_the_recorded_one() {
             let found = results(std::str::from_utf8(&page).unwrap());
             assert_eq!(found.len(), 10, "ten results");
             // Responses are dated on the seed's day.
-            let addr = lookup(&cx, &m, "www.google.com").await.unwrap();
+            let addr = lookup(&fcx, &m, "www.google.com").await.unwrap();
             let conn = m
                 .tcp
-                .connect(&cx, SocketAddr::new(addr.into(), 80))
+                .connect(&fcx, SocketAddr::new(addr.into(), 80))
                 .await
                 .unwrap();
-            let (_, date, _) = request(conn.into_tokio(&cx), "www.google.com", "/").await;
+            let (_, date, _) = request(conn.into_tokio(&fcx), "www.google.com", "/").await;
             assert!(date.contains("30 Sep 2026"), "Date: {date}");
             for (url, title) in found.iter().take(4) {
                 let (host, path) = split_url(url);
-                let (status, first) = fetch(&cx, &m, &host, &path).await;
+                let (status, first) = fetch(&fcx, &m, &host, &path).await;
                 assert_eq!(status, 200, "{url}");
-                let (_, again) = fetch(&cx, &m, &host, &path).await;
+                let (_, again) = fetch(&fcx, &m, &host, &path).await;
                 assert_eq!(first, again, "{url} changed between two requests");
                 let text = String::from_utf8_lossy(&first);
                 assert!(
@@ -347,7 +347,7 @@ fn the_log_is_the_recorded_one() {
             }
             // The same query on DuckDuckGo: the result list is shared.
             let (status, ddg) = fetch(
-                &cx,
+                &fcx,
                 &m,
                 "html.duckduckgo.com",
                 "/html/?q=Halvard+Gateway+vulnerability",
@@ -356,22 +356,22 @@ fn the_log_is_the_recorded_one() {
             assert_eq!(status, 200);
             assert!(String::from_utf8_lossy(&ddg).contains(&found[1].1));
             // A name nothing pointed at.
-            let (status, _) = fetch(&cx, &m, "totally-new-site.io", "/pricing").await;
+            let (status, _) = fetch(&fcx, &m, "totally-new-site.io", "/pricing").await;
             assert_eq!(status, 200);
             // Plain HTTP: a redirect.
-            let addr = lookup(&cx, &m, "totally-new-site.io").await.unwrap();
+            let addr = lookup(&fcx, &m, "totally-new-site.io").await.unwrap();
             let conn = m
                 .tcp
-                .connect(&cx, SocketAddr::new(addr.into(), 80))
+                .connect(&fcx, SocketAddr::new(addr.into(), 80))
                 .await
                 .unwrap();
             assert_eq!(
-                get(conn.into_tokio(&cx), "totally-new-site.io", "/")
+                get(conn.into_tokio(&fcx), "totally-new-site.io", "/")
                     .await
                     .0,
                 301
             );
-            let _ = cx.sleep(Duration::from_millis(500)).await;
+            let _ = fcx.sleep(Duration::from_millis(500)).await;
             Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
         }));
         let _ = tx.send(result.err().map(|e| e.to_string()));

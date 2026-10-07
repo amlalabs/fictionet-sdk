@@ -40,8 +40,8 @@ fn dst(to: u8) -> Ipv4Addr {
 }
 
 fuzz_target!(|steps: Vec<Step>| {
-    world(move |cx| async move {
-        let attacher = serve(&cx);
+    world(move |fcx| async move {
+        let attacher = serve(&fcx);
         let mut end = attacher.attach("agent").unwrap();
         let me = IpAddr::V4(ME);
         for step in steps {
@@ -101,15 +101,15 @@ fuzz_target!(|steps: Vec<Step>| {
                     tcp_packet(me, dst(to).into(), &seg)
                 }
                 Step::Pump(n) => {
-                    settle(&cx, 1 + n as usize % 16).await;
-                    while let Some(Ok(_)) = poll_once(fictionet::InterfaceExt::recv(&mut end, &cx)).await {}
+                    settle(&fcx, 1 + n as usize % 16).await;
+                    while let Some(Ok(_)) = poll_once(fictionet::InterfaceExt::recv(&mut end, &fcx)).await {}
                     continue;
                 }
             };
             end.send(Packet(packet));
         }
-        settle(&cx, 16).await;
+        settle(&fcx, 16).await;
         drop(end);
-        settle(&cx, 8).await;
+        settle(&fcx, 8).await;
     });
 });

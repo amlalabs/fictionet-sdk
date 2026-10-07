@@ -20,7 +20,8 @@ use crate::timer::timers;
 /// executor, so all four go through a `Cx`. That is why every stdlib
 /// function that waits or starts a task takes `&Cx` as its first argument, and why the core works under
 /// any async runtime. [`run`](crate::run) gives the world function its
-/// first `Cx`.
+/// first `Cx`. In signatures and examples it is called `fcx`; `cx` is the
+/// std task context, as in tokio and futures.
 ///
 /// # Regions
 ///
@@ -117,7 +118,7 @@ impl Cx {
         // A deadline past what the clock can hold never comes: the sleep
         // waits until it is cancelled.
         let deadline = self.run.start.checked_add(deadline.since_start());
-        Sleep { cx: self, deadline, timer: None, wait: CancelWait::default() }.await
+        Sleep { fcx: self, deadline, timer: None, wait: CancelWait::default() }.await
     }
 
     /// Waits for `d` to pass.
@@ -127,7 +128,7 @@ impl Cx {
     pub async fn sleep(&self, d: Duration) -> Result<(), Cancelled> {
         match self.now().since_start().checked_add(d) {
             Some(deadline) => self.sleep_until(Instant::from_since_start(deadline)).await,
-            None => Sleep { cx: self, deadline: None, timer: None, wait: CancelWait::default() }.await,
+            None => Sleep { fcx: self, deadline: None, timer: None, wait: CancelWait::default() }.await,
         }
     }
 
@@ -145,7 +146,7 @@ impl Cx {
     /// A random number from 0 up to, but not including, 1.
     ///
     /// Use it for choices such as "10% of the time":
-    /// `cx.random_f64() < 0.1`.
+    /// `fcx.random_f64() < 0.1`.
     pub fn random_f64(&self) -> f64 {
         (self.random_u64() >> 11) as f64 / (1u64 << 53) as f64
     }
@@ -162,7 +163,7 @@ impl Cx {
     /// cancelled.
     pub async fn yield_now(&self) -> Result<(), Cancelled> {
         let mut yielded = false;
-        poll_fn(|task| {
+        poll_fn(|cx| {
             if self.is_cancelled() {
                 return Poll::Ready(Err(Cancelled));
             }
@@ -170,7 +171,7 @@ impl Cx {
                 return Poll::Ready(Ok(()));
             }
             yielded = true;
-            task.waker().wake_by_ref();
+            cx.waker().wake_by_ref();
             Poll::Pending
         })
         .await
@@ -242,8 +243,8 @@ impl Cx {
     /// ```
     /// # use fictionet::{Cx, Interface, Result};
     /// # use fictionet::stdlib::{ip, tcp};
-    /// fn office(cx: &Cx, uplink: impl Interface) -> Result {
-    ///     let lan = cx.group("office LAN");
+    /// fn office(fcx: &Cx, uplink: impl Interface) -> Result {
+    ///     let lan = fcx.group("office LAN");
     ///     let (tcp, _udp, _icmp, _other) = ip::split_protocols(&lan, uplink);
     ///     let printer = tcp::endpoint(&lan, tcp, "10.1.0.20".parse()?);
     ///     let _ipp = printer.listen(631)?;
@@ -287,9 +288,9 @@ impl Cx {
     /// its events, whether or not anyone reads them.
     ///
     /// ```
-    /// # fn handled(cx: &fictionet::Cx) {
+    /// # fn handled(fcx: &fictionet::Cx) {
     /// use fictionet::events::Event;
-    /// cx.record(Event::new("shop", "order").summary("an order for 3 pumps").field("count", 3u32));
+    /// fcx.record(Event::new("shop", "order").summary("an order for 3 pumps").field("count", 3u32));
     /// # }
     /// ```
     pub fn record(&self, event: Event) {
@@ -330,8 +331,8 @@ impl Cx {
     /// Returns immediately if it already is.
     pub async fn cancelled(&self) {
         let mut wait = CancelWait::default();
-        poll_fn(|task| {
-            if self.is_cancelled() || self.register_cancel(task.waker(), &mut wait) {
+        poll_fn(|cx| {
+            if self.is_cancelled() || self.register_cancel(cx.waker(), &mut wait) {
                 Poll::Ready(())
             } else {
                 Poll::Pending
@@ -348,11 +349,11 @@ impl Cx {
     /// [`std::future::poll_fn`]: the first one ready gives the output.
     ///
     /// ```
-    /// # fictionet::block_on(fictionet::run(|cx| async move {
+    /// # fictionet::block_on(fictionet::run(|fcx| async move {
     /// use fictionet::RaceError;
-    /// let late = cx.race(Some(cx.now() + std::time::Duration::from_millis(5)), std::future::pending::<()>()).await;
+    /// let late = fcx.race(Some(fcx.now() + std::time::Duration::from_millis(5)), std::future::pending::<()>()).await;
     /// assert_eq!(late, Err(RaceError::Deadline));
-    /// assert_eq!(cx.race(None, async { 7 }).await, Ok(7));
+    /// assert_eq!(fcx.race(None, async { 7 }).await, Ok(7));
     /// # Ok(()) }))?;
     /// # Ok::<(), fictionet::Error>(())
     /// ```
@@ -360,15 +361,15 @@ impl Cx {
         let mut fut = std::pin::pin!(fut);
         let mut sleep = std::pin::pin!(deadline.map(|d| self.sleep_until(d)));
         let mut cancelled = std::pin::pin!(self.cancelled());
-        poll_fn(|task| {
-            if let Poll::Ready(v) = fut.as_mut().poll(task) {
+        poll_fn(|cx| {
+            if let Poll::Ready(v) = fut.as_mut().poll(cx) {
                 return Poll::Ready(Ok(v));
             }
-            if cancelled.as_mut().poll(task).is_ready() {
+            if cancelled.as_mut().poll(cx).is_ready() {
                 return Poll::Ready(Err(RaceError::Cancelled));
             }
             if let Some(sleep) = sleep.as_mut().as_pin_mut() {
-                match sleep.poll(task) {
+                match sleep.poll(cx) {
                     Poll::Ready(Ok(())) => return Poll::Ready(Err(RaceError::Deadline)),
                     Poll::Ready(Err(_)) => return Poll::Ready(Err(RaceError::Cancelled)),
                     Poll::Pending => {}
@@ -461,7 +462,7 @@ impl Cx {
             }
         }
         drop(work);
-        poll_fn(|task| child.poll_done(task)).await;
+        poll_fn(|cx| child.poll_done(cx)).await;
         guard.0 = None;
         match child.take_error() {
             Some(e) => Err(e),
@@ -636,24 +637,24 @@ impl Task {
     /// task's own error, the same one its region keeps, as [`Cx::spawn`]
     /// says. It is ready before the failure cancels the region, so a joiner
     /// in that same region still gets it. If the task ended with a cancel,
-    /// or `cx`'s region is cancelled before the task ends, or the run is
+    /// or `fcx`'s region is cancelled before the task ends, or the run is
     /// dropped, this returns [`JoinError::Cancelled`].
-    pub async fn join(self, cx: &Cx) -> Result<(), JoinError> {
+    pub async fn join(self, fcx: &Cx) -> Result<(), JoinError> {
         let mut wait = CancelWait::default();
-        poll_fn(|task| {
+        poll_fn(|cx| {
             let mut state = self.join.state.lock().unwrap();
             if let Some(result) = state.result.take() {
                 return Poll::Ready(result);
             }
-            if cx.is_cancelled() {
+            if fcx.is_cancelled() {
                 return Poll::Ready(Err(JoinError::Cancelled));
             }
             match &state.waker {
-                Some(w) if w.will_wake(task.waker()) => {}
-                _ => state.waker = Some(task.waker().clone()),
+                Some(w) if w.will_wake(cx.waker()) => {}
+                _ => state.waker = Some(cx.waker().clone()),
             }
             drop(state);
-            if cx.register_cancel(task.waker(), &mut wait) {
+            if fcx.register_cancel(cx.waker(), &mut wait) {
                 return Poll::Ready(Err(JoinError::Cancelled));
             }
             Poll::Pending
@@ -847,12 +848,12 @@ impl Region {
         }
     }
 
-    fn poll_done(&self, task: &mut Context<'_>) -> Poll<()> {
+    fn poll_done(&self, cx: &mut Context<'_>) -> Poll<()> {
         let mut state = self.state.lock().unwrap();
         if state.live == 0 {
             Poll::Ready(())
         } else {
-            state.done = Some(task.waker().clone());
+            state.done = Some(cx.waker().clone());
             Poll::Pending
         }
     }
@@ -864,7 +865,7 @@ impl Region {
 
 /// The future behind [`Cx::sleep_until`].
 struct Sleep<'a> {
-    cx: &'a Cx,
+    fcx: &'a Cx,
     /// `None` is a deadline too far away to represent: it never comes.
     deadline: Option<crate::sys::Instant>,
     timer: Option<u64>,
@@ -874,9 +875,9 @@ struct Sleep<'a> {
 impl Future for Sleep<'_> {
     type Output = Result<(), Cancelled>;
 
-    fn poll(self: Pin<&mut Self>, task: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        if this.cx.is_cancelled() {
+        if this.fcx.is_cancelled() {
             return Poll::Ready(Err(Cancelled));
         }
         if let Some(deadline) = this.deadline {
@@ -884,11 +885,11 @@ impl Future for Sleep<'_> {
                 return Poll::Ready(Ok(()));
             }
             match this.timer {
-                None => this.timer = Some(timers().add(deadline, task.waker().clone())),
-                Some(id) => timers().update(id, task.waker()),
+                None => this.timer = Some(timers().add(deadline, cx.waker().clone())),
+                Some(id) => timers().update(id, cx.waker()),
             }
         }
-        if this.cx.register_cancel(task.waker(), &mut this.wait) {
+        if this.fcx.register_cancel(cx.waker(), &mut this.wait) {
             return Poll::Ready(Err(Cancelled));
         }
         Poll::Pending
@@ -918,29 +919,29 @@ pub(crate) struct Timer {
 
 impl Timer {
     /// Polls for `deadline` to pass: `Ready(Ok(()))` once it has. Until
-    /// then, `task` is woken when it passes or when `cx`'s region is
+    /// then, `cx`'s waker is woken when it passes or when `fcx`'s region is
     /// cancelled.
-    pub(crate) fn poll_until(&mut self, cx: &Cx, task: &mut Context<'_>, deadline: Instant) -> Poll<Result<(), Cancelled>> {
-        if cx.is_cancelled() {
+    pub(crate) fn poll_until(&mut self, fcx: &Cx, cx: &mut Context<'_>, deadline: Instant) -> Poll<Result<(), Cancelled>> {
+        if fcx.is_cancelled() {
             return Poll::Ready(Err(Cancelled));
         }
         // A deadline past what the clock can hold never comes.
-        match cx.run.start.checked_add(deadline.since_start()) {
+        match fcx.run.start.checked_add(deadline.since_start()) {
             Some(at) => {
                 if crate::sys::Instant::now() >= at {
                     self.clear();
                     return Poll::Ready(Ok(()));
                 }
                 match self.entry {
-                    Some(id) if self.deadline == Some(at) => timers().update(id, task.waker()),
-                    Some(id) => timers().reset(id, at, task.waker()),
-                    None => self.entry = Some(timers().add(at, task.waker().clone())),
+                    Some(id) if self.deadline == Some(at) => timers().update(id, cx.waker()),
+                    Some(id) => timers().reset(id, at, cx.waker()),
+                    None => self.entry = Some(timers().add(at, cx.waker().clone())),
                 }
                 self.deadline = Some(at);
             }
             None => self.clear(),
         }
-        if cx.register_cancel(task.waker(), &mut self.wait) {
+        if fcx.register_cancel(cx.waker(), &mut self.wait) {
             return Poll::Ready(Err(Cancelled));
         }
         Poll::Pending
@@ -986,28 +987,28 @@ mod tests {
     fn a_timer_fires_at_its_latest_deadline() {
         /// Polls `timer` for `first`, then for `then` until it fires.
         /// Returns how long that took.
-        async fn wait(cx: &Cx, timer: &mut Timer, first: Duration, then: Duration) -> Result<std::time::Duration, Cancelled> {
+        async fn wait(fcx: &Cx, timer: &mut Timer, first: Duration, then: Duration) -> Result<std::time::Duration, Cancelled> {
             let start = std::time::Instant::now();
-            let base = cx.now();
+            let base = fcx.now();
             let mut moved = false;
-            std::future::poll_fn(|task| {
+            std::future::poll_fn(|cx| {
                 if !moved {
                     moved = true;
-                    assert!(timer.poll_until(cx, task, base + first).is_pending());
+                    assert!(timer.poll_until(fcx, cx, base + first).is_pending());
                 }
-                timer.poll_until(cx, task, base + then)
+                timer.poll_until(fcx, cx, base + then)
             })
             .await?;
             Ok(start.elapsed())
         }
-        block_on(run(|cx| async move {
+        block_on(run(|fcx| async move {
             let mut timer = Timer::default();
             // Moved later: the old deadline does not end the wait.
-            let waited = wait(&cx, &mut timer, ms(10), ms(120)).await?;
+            let waited = wait(&fcx, &mut timer, ms(10), ms(120)).await?;
             assert!(waited >= std::time::Duration::from_millis(120), "{waited:?}");
             // Moved earlier: it fires at the new deadline, after it fired once
             // already under the same entry.
-            let waited = wait(&cx, &mut timer, ms(400), ms(30)).await?;
+            let waited = wait(&fcx, &mut timer, ms(400), ms(30)).await?;
             assert!(waited >= std::time::Duration::from_millis(30), "{waited:?}");
             assert!(waited < std::time::Duration::from_millis(400), "{waited:?}");
             Ok(())
@@ -1019,12 +1020,12 @@ mod tests {
     fn a_nested_region_waits_for_its_work_and_keeps_its_error() {
         let ended = Arc::new(AtomicUsize::new(0));
         let e = ended.clone();
-        block_on(run(move |cx| async move {
+        block_on(run(move |fcx| async move {
             // Ok: waits for the region's work.
             let e1 = e.clone();
-            cx.region(|cx| async move {
-                cx.spawn(move |cx| async move {
-                    cx.sleep(ms(20)).await?;
+            fcx.region(|fcx| async move {
+                fcx.spawn(move |fcx| async move {
+                    fcx.sleep(ms(20)).await?;
                     e1.fetch_add(1, Ordering::SeqCst);
                     Ok(())
                 });
@@ -1036,20 +1037,20 @@ mod tests {
             // A task's error cancels the nested region only, and comes back
             // from `region` instead of failing the run.
             let e2 = e.clone();
-            let res = cx
-                .region(|cx| async move {
-                    cx.spawn(move |cx| async move {
-                        let r = cx.sleep(std::time::Duration::from_secs(60)).await;
+            let res = fcx
+                .region(|fcx| async move {
+                    fcx.spawn(move |fcx| async move {
+                        let r = fcx.sleep(std::time::Duration::from_secs(60)).await;
                         assert_eq!(r, Err(Cancelled));
                         e2.fetch_add(1, Ordering::SeqCst);
                         Ok(())
                     });
-                    cx.spawn(|_cx| async { Err(crate::Error::msg("conn failed")) });
+                    fcx.spawn(|_fcx| async { Err(crate::Error::msg("conn failed")) });
                     Ok(())
                 })
                 .await;
             assert_eq!(res.unwrap_err().to_string(), "conn failed");
-            assert!(!cx.is_cancelled());
+            assert!(!fcx.is_cancelled());
             assert_eq!(e.load(Ordering::SeqCst), 2);
             Ok(())
         }))
@@ -1062,24 +1063,24 @@ mod tests {
     fn dropping_a_region_cancels_its_work() {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let out = block_on(run(|cx| async move {
+            let out = block_on(run(|fcx| async move {
                 let started = Arc::new(AtomicUsize::new(0));
                 let s = started.clone();
-                let mut region = std::pin::pin!(cx.region(|cx| async move {
-                    cx.spawn(move |cx| async move {
+                let mut region = std::pin::pin!(fcx.region(|fcx| async move {
+                    fcx.spawn(move |fcx| async move {
                         s.fetch_add(1, Ordering::SeqCst);
-                        cx.sleep(std::time::Duration::from_secs(60)).await?;
+                        fcx.sleep(std::time::Duration::from_secs(60)).await?;
                         Ok(())
                     });
-                    cx.sleep(std::time::Duration::from_secs(60)).await?;
+                    fcx.sleep(std::time::Duration::from_secs(60)).await?;
                     Ok(())
                 }));
                 // Poll the region until its task has started, then give up
                 // on it, as a timeout would.
-                poll_fn(|task| {
-                    let _ = region.as_mut().poll(task);
+                poll_fn(|cx| {
+                    let _ = region.as_mut().poll(cx);
                     if started.load(Ordering::SeqCst) == 1 { Poll::Ready(()) } else {
-                        task.waker().wake_by_ref();
+                        cx.waker().wake_by_ref();
                         Poll::Pending
                     }
                 })
@@ -1105,16 +1106,16 @@ mod tests {
                 self.0.cancel();
             }
         }
-        let res = block_on(run(|cx| async move {
+        let res = block_on(run(|fcx| async move {
             use crate::Interface;
             let (inside, outside) = crate::pair();
             let watcher = Arc::new(Mutex::new(Some(outside)));
             let w = watcher.clone();
-            let res = cx
-                .region(move |cx| {
-                    let wake = Waker::from(Arc::new(CancelOnWake(cx.clone())));
+            let res = fcx
+                .region(move |fcx| {
+                    let wake = Waker::from(Arc::new(CancelOnWake(fcx.clone())));
                     let mut outside = w.lock().unwrap();
-                    let polled = outside.as_mut().unwrap().poll_recv(&cx, &mut Context::from_waker(&wake));
+                    let polled = outside.as_mut().unwrap().poll_recv(&fcx, &mut Context::from_waker(&wake));
                     assert!(polled.is_pending());
                     poll_fn(move |_| {
                         let _held = &inside;
@@ -1133,24 +1134,24 @@ mod tests {
     /// nothing, is not cancelled, and its joiner hears `Cancelled`.
     #[test]
     fn a_task_that_ends_with_a_cancel_does_not_fail_its_region() {
-        let res = block_on(run(|cx| async move {
+        let res = block_on(run(|fcx| async move {
             let mut stopped = None;
-            cx.region(|inner| {
+            fcx.region(|inner| {
                 stopped = Some(inner.clone());
                 inner.cancel();
                 async { Ok(()) }
             })
             .await?;
             let stopped = stopped.unwrap();
-            let task = cx.spawn(move |_cx| async move {
+            let task = fcx.spawn(move |_fcx| async move {
                 // A wrapper's `Cancelled` variant counts too.
                 let (mut a, _b) = crate::pair();
                 use crate::InterfaceExt;
                 a.recv(&stopped).await?;
                 Ok(())
             });
-            assert!(matches!(task.join(&cx).await, Err(JoinError::Cancelled)));
-            assert!(!cx.is_cancelled());
+            assert!(matches!(task.join(&fcx).await, Err(JoinError::Cancelled)));
+            assert!(!fcx.is_cancelled());
             Ok(())
         }));
         assert!(res.is_ok(), "{res:?}");
@@ -1161,8 +1162,8 @@ mod tests {
     /// work used to say so.
     #[test]
     fn a_region_says_whether_it_was_stopped_or_cut_short() {
-        let res = block_on(run(|cx| async move {
-            let stopped = cx
+        let res = block_on(run(|fcx| async move {
+            let stopped = fcx
                 .region(|inner| async move {
                     inner.cancel();
                     inner.sleep(std::time::Duration::from_secs(60)).await?;
@@ -1170,14 +1171,14 @@ mod tests {
                 })
                 .await;
             assert!(stopped.is_ok(), "{stopped:?}");
-            let outer = cx.clone();
-            let cut = cx
+            let outer = fcx.clone();
+            let cut = fcx
                 .region(|inner| async move {
                     let (mut a, _b) = crate::pair();
                     use crate::InterfaceExt;
-                    outer.spawn(move |cx| async move {
-                        cx.sleep(ms(10)).await?;
-                        cx.cancel();
+                    outer.spawn(move |fcx| async move {
+                        fcx.sleep(ms(10)).await?;
+                        fcx.cancel();
                         Ok(())
                     });
                     a.recv(&inner).await?;
@@ -1193,13 +1194,13 @@ mod tests {
 
     #[test]
     fn cancelling_a_region_cancels_regions_inside_it() {
-        let res = block_on(run(|cx| async move {
-            cx.spawn(|cx| async move {
-                let inner = cx.region(|cx| async move { cx.sleep(std::time::Duration::from_secs(60)).await.map_err(Into::into) }).await;
+        let res = block_on(run(|fcx| async move {
+            fcx.spawn(|fcx| async move {
+                let inner = fcx.region(|fcx| async move { fcx.sleep(std::time::Duration::from_secs(60)).await.map_err(Into::into) }).await;
                 assert!(inner.unwrap_err().is::<Cancelled>());
                 Ok(())
             });
-            cx.sleep(ms(10)).await?;
+            fcx.sleep(ms(10)).await?;
             Err(crate::Error::msg("outer"))
         }));
         assert_eq!(res.unwrap_err().to_string(), "outer");

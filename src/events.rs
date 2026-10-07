@@ -11,13 +11,13 @@
 //!
 //! ```
 //! use fictionet::events::{Event, Level};
-//! # fictionet::block_on(fictionet::run(|cx| async move {
-//! cx.record(Event::new("modbus", "write_register")
+//! # fictionet::block_on(fictionet::run(|fcx| async move {
+//! fcx.record(Event::new("modbus", "write_register")
 //!     .summary("register 40001 = 900")
 //!     .level(Level::Alarm)
 //!     .field("register", 40001u32)
 //!     .field("value", 900u32));
-//! let events = cx.events().of("modbus", "write_register");
+//! let events = fcx.events().of("modbus", "write_register");
 //! assert_eq!(events[0].u64("value"), Some(900));
 //! # Ok(()) }))?;
 //! # Ok::<(), fictionet::Error>(())
@@ -1006,34 +1006,34 @@ impl EventLog {
     /// it is (`world_date`): the world owns its dates, and services take
     /// them from it, never from the host's clock.
     /// [`Net`](crate::stdlib::net::Net) records it when it starts serving.
-    pub fn start(&self, cx: &Cx, fields: Fields) {
+    pub fn start(&self, fcx: &Cx, fields: Fields) {
         let wall = if cfg!(target_arch = "wasm32") {
             Value::Null
         } else {
-            cx.graph().start_wall.duration_since(crate::sys::UNIX_EPOCH).map_or(Value::Null, |d| float(d.as_secs_f64()))
+            fcx.graph().start_wall.duration_since(crate::sys::UNIX_EPOCH).map_or(Value::Null, |d| float(d.as_secs_f64()))
         };
         let event = Event::new("run", "start").summary("the run started").fields(fields).field("wall", wall);
-        cx.record_at(Instant::ZERO, event);
+        fcx.record_at(Instant::ZERO, event);
     }
 
     /// Waits until `n` held events match `pick`, checking every 10 ms on
     /// the run's clock, for at most `limit`. Returns those events, or every
     /// match so far if the time ran out. Each check first records the
     /// counts of [repeats](self#repeats) that are due. Returns early with
-    /// [`Cancelled`](crate::Cancelled) if `cx`'s [region](Cx#regions) is
+    /// [`Cancelled`](crate::Cancelled) if `fcx`'s [region](Cx#regions) is
     /// cancelled.
-    pub async fn wait(&self, cx: &Cx, n: usize, limit: std::time::Duration, mut pick: impl FnMut(&Event) -> bool) -> Result<Vec<Event>, crate::Cancelled> {
-        let deadline = cx.now() + limit;
+    pub async fn wait(&self, fcx: &Cx, n: usize, limit: std::time::Duration, mut pick: impl FnMut(&Event) -> bool) -> Result<Vec<Event>, crate::Cancelled> {
+        let deadline = fcx.now() + limit;
         loop {
-            self.store.advance(cx.now());
+            self.store.advance(fcx.now());
             let got: Vec<Event> = {
                 let s = lock(&self.store.state);
                 held(&s, 0).filter(|e| pick(e)).map(|e| (**e).clone()).collect()
             };
-            if got.len() >= n || cx.now() >= deadline {
+            if got.len() >= n || fcx.now() >= deadline {
                 return Ok(got);
             }
-            cx.sleep(std::time::Duration::from_millis(10)).await?;
+            fcx.sleep(std::time::Duration::from_millis(10)).await?;
         }
     }
 }
@@ -1289,12 +1289,12 @@ mod tests {
         let out = sink.clone();
         let kept = Arc::new(Mutex::new(None));
         let keep = kept.clone();
-        crate::block_on(crate::run(|cx| async move {
-            cx.events().to_writer(Box::new(out));
+        crate::block_on(crate::run(|fcx| async move {
+            fcx.events().to_writer(Box::new(out));
             for i in 0..500u32 {
-                cx.record(Event::new("test", "tick").field("i", i));
+                fcx.record(Event::new("test", "tick").field("i", i));
             }
-            *keep.lock().unwrap() = Some(cx.events());
+            *keep.lock().unwrap() = Some(fcx.events());
             Ok(())
         }))
         .unwrap();
@@ -1310,12 +1310,12 @@ mod tests {
         let out = sink.clone();
         let kept = Arc::new(Mutex::new(None));
         let keep = kept.clone();
-        crate::block_on(crate::run(|cx| async move {
-            cx.events().to_writer(Box::new(out));
+        crate::block_on(crate::run(|fcx| async move {
+            fcx.events().to_writer(Box::new(out));
             for i in 0..300u32 {
-                cx.record(Event::new("test", "tick").field("i", i));
+                fcx.record(Event::new("test", "tick").field("i", i));
             }
-            *keep.lock().unwrap() = Some(cx.events());
+            *keep.lock().unwrap() = Some(fcx.events());
             Ok(())
         }))
         .unwrap();
@@ -1331,15 +1331,15 @@ mod tests {
     /// the run's clock, with the task that recorded them.
     #[test]
     fn every_run_records_its_events() {
-        crate::block_on(crate::run(|cx| async move {
-            assert!(!cx.observed());
-            cx.record(Event::new("world", "hello").field("n", 1u32));
-            cx.sleep(std::time::Duration::from_millis(5)).await?;
-            cx.record(Event::new("world", "hello").field("n", 2u32));
-            let events = cx.events().all();
+        crate::block_on(crate::run(|fcx| async move {
+            assert!(!fcx.observed());
+            fcx.record(Event::new("world", "hello").field("n", 1u32));
+            fcx.sleep(std::time::Duration::from_millis(5)).await?;
+            fcx.record(Event::new("world", "hello").field("n", 2u32));
+            let events = fcx.events().all();
             assert_eq!(events.len(), 2);
             assert_eq!((events[0].seq, events[1].seq), (1, 2));
-            assert!(events[0].at < events[1].at && events[1].at <= cx.now());
+            assert!(events[0].at < events[1].at && events[1].at <= fcx.now());
             assert_eq!(events[0].origin.as_ref().map(|o| o.task), Some(1), "the world function is the first task");
             let json = events[1].to_line();
             assert!(json.contains(r#""source":"world","kind":"hello""#) && json.contains(r#""node":"t1""#), "{json}");

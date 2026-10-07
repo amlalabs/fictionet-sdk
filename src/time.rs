@@ -8,10 +8,10 @@
 //!
 //! ```
 //! # use fictionet::{Cx, Result, time::ms};
-//! # async fn tick(cx: Cx) -> Result {
-//! let started = cx.now();
-//! cx.sleep(ms(50)).await?;
-//! assert!(cx.now() >= started + ms(50));
+//! # async fn tick(fcx: Cx) -> Result {
+//! let started = fcx.now();
+//! fcx.sleep(ms(50)).await?;
+//! assert!(fcx.now() >= started + ms(50));
 //! # Ok(())
 //! # }
 //! ```

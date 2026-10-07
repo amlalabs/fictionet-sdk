@@ -300,10 +300,10 @@ impl Ca {
     /// that would end within 30 days of the later one.
     pub fn config(
         &self,
-        cx: &Cx,
+        fcx: &Cx,
         host: &str,
     ) -> fictionet::Result<(Arc<ServerConfig>, String, String)> {
-        let world_now = time::OffsetDateTime::from(self.start + cx.now().since_start());
+        let world_now = time::OffsetDateTime::from(self.start + fcx.now().since_start());
         let host_now = time::OffsetDateTime::now_utc();
         let not_before = world_now.min(host_now) - time::Duration::days(30);
         let not_after = (not_before + time::Duration::days(90))
@@ -322,7 +322,7 @@ impl Ca {
         let key = KeyPair::generate()?;
         let cert = params.signed_by(&key, &self.issuer, &self.key)?;
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
-        let config = tls::config_builder(cx, self.start, rustls::crypto::ring::default_provider())
+        let config = tls::config_builder(fcx, self.start, rustls::crypto::ring::default_provider())
             .with_safe_default_protocol_versions()?
             .with_no_client_auth()
             .with_single_cert(vec![cert.der().clone(), self.der.clone()], key)?;
@@ -337,9 +337,9 @@ impl Ca {
 /// address from `addresses`, with a certificate from `ca` made at its first
 /// handshake, every request answered by `backend` and logged, and every
 /// response dated from `start`, the world's date at the start of the run.
-/// Returns at once; the network runs in `cx`'s region.
+/// Returns at once; the network runs in `fcx`'s region.
 pub fn serve(
-    cx: &Cx,
+    fcx: &Cx,
     addresses: Arc<Addresses>,
     ca: Arc<Ca>,
     backend: Backend,
@@ -347,8 +347,8 @@ pub fn serve(
     start: SystemTime,
     attachments: fictionet::Attachments,
 ) -> fictionet::Result {
-    events::log_to(cx, log);
-    let world = cx.clone();
+    events::log_to(fcx, log);
+    let world = fcx.clone();
     web::Sites::new(move |host: &str| {
         if let Err(why) = admit(host) {
             world.record(
@@ -369,13 +369,13 @@ pub fn serve(
         );
         let (ca, name) = (ca.clone(), host.to_owned());
         let config: Arc<OnceLock<Arc<ServerConfig>>> = Arc::new(OnceLock::new());
-        Some(web::Site::new(backend.clone()).at(addr).tls(move |cx| {
+        Some(web::Site::new(backend.clone()).at(addr).tls(move |fcx| {
             config
                 .get_or_init(|| {
                     let (config, not_before, not_after) = ca
-                        .config(cx, &name)
+                        .config(fcx, &name)
                         .expect("a certificate for an admitted name");
-                    cx.record(
+                    fcx.record(
                         Event::new("adaptive", "cert")
                             .summary(format!("a certificate for {name}"))
                             .field("host", name.as_str())
@@ -390,7 +390,7 @@ pub fn serve(
     .date(start)
     // The agent's sandbox has IPv6 off.
     .ipv4_only()
-    .serve(cx, attachments)?;
+    .serve(fcx, attachments)?;
     Ok(())
 }
 
@@ -468,7 +468,7 @@ const LOOKUP_FROM: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 254)
 /// for every answer. This makes `Sites` run its callback for each host, so
 /// the fixed addresses answer before the first sandbox attaches, also for
 /// an agent that connects by address without DNS.
-pub async fn look_up_all(cx: &Cx, attacher: &Attacher, hosts: &[String]) -> fictionet::Result {
+pub async fn look_up_all(fcx: &Cx, attacher: &Attacher, hosts: &[String]) -> fictionet::Result {
     let mut end: End = attacher
         .attach(events::LOOKUPS)
         .map_err(|e| fictionet::Error::msg(format!("lookups: {e}")))?;
@@ -478,14 +478,14 @@ pub async fn look_up_all(cx: &Cx, attacher: &Attacher, hosts: &[String]) -> fict
         end.send(Packet(dns_query_packet(id, host)));
         waiting.insert(id, host);
     }
-    let deadline = cx.now() + Duration::from_secs(10);
-    let mut sleep = pin!(cx.sleep_until(deadline));
+    let deadline = fcx.now() + Duration::from_secs(10);
+    let mut sleep = pin!(fcx.sleep_until(deadline));
     while !waiting.is_empty() {
-        let packet = poll_fn(|task| {
-            if let Poll::Ready(r) = end.poll_recv(cx, task) {
+        let packet = poll_fn(|cx| {
+            if let Poll::Ready(r) = end.poll_recv(fcx, cx) {
                 return Poll::Ready(r.ok());
             }
-            match sleep.as_mut().poll(task) {
+            match sleep.as_mut().poll(cx) {
                 Poll::Ready(_) => Poll::Ready(None),
                 Poll::Pending => Poll::Pending,
             }

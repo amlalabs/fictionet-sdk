@@ -13,8 +13,8 @@
 //! ```
 //! # use fictionet::prelude::*;
 //! # use fictionet::{Cx, Interface, stdlib::icmp};
-//! # async fn answer(cx: Cx, mut icmp: impl Interface, addr: std::net::IpAddr) {
-//! while let Ok(packet) = icmp.recv(&cx).await {
+//! # async fn answer(fcx: Cx, mut icmp: impl Interface, addr: std::net::IpAddr) {
+//! while let Ok(packet) = icmp.recv(&fcx).await {
 //!     if let Some(reply) = icmp::echo_reply(&packet, addr) {
 //!         icmp.send(reply);
 //!     }

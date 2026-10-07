@@ -96,20 +96,20 @@ fn main() -> Result {
 
     // web::proxy() needs a tokio runtime polling the world.
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-    runtime.block_on(fictionet::run(move |cx| async move { world(&cx, chain, key, attachments) }))
+    runtime.block_on(fictionet::run(move |fcx| async move { world(&fcx, chain, key, attachments) }))
 }
 
 /// Builds the world's sites on `attachments`, with `chain` and `key` for
 /// every HTTPS name.
 fn world(
-    cx: &fictionet::Cx,
+    fcx: &fictionet::Cx,
     chain: Vec<rustls::pki_types::CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
     attachments: fictionet::Attachments,
 ) -> Result {
     {
         let config = Arc::new(
-            tls::config_builder(cx, SystemTime::now(), rustls::crypto::ring::default_provider())
+            tls::config_builder(fcx, SystemTime::now(), rustls::crypto::ring::default_provider())
                 .with_safe_default_protocol_versions()?
                 .with_no_client_auth()
                 .with_single_cert(chain, key)?,
@@ -161,7 +161,7 @@ fn world(
                 _ => None,
             }
         })
-        .serve(cx, attachments)?;
+        .serve(fcx, attachments)?;
         Ok(())
     }
 }
@@ -240,13 +240,13 @@ mod tests {
         _icmp: End,
     }
 
-    async fn dns(cx: &Cx, m: &Machine, name: &str, kind: RecordType) -> String {
-        let mut socket = m.udp.bind(40000 + (cx.random_u64() % 20000) as u16).unwrap();
+    async fn dns(fcx: &Cx, m: &Machine, name: &str, kind: RecordType) -> String {
+        let mut socket = m.udp.bind(40000 + (fcx.random_u64() % 20000) as u16).unwrap();
         let mut q = Message::query();
         q.metadata.id = 7;
         q.add_query(Query::query(Name::from_ascii(name).unwrap(), kind));
         socket.send_to(&q.to_vec().unwrap(), SocketAddr::new(Ipv4Addr::new(10, 0, 0, 1).into(), 53));
-        let (bytes, _) = socket.recv(cx).await.unwrap();
+        let (bytes, _) = socket.recv(fcx).await.unwrap();
         let r = Message::from_vec(&bytes).unwrap();
         let addrs: Vec<String> = r
             .answers
@@ -300,20 +300,20 @@ mod tests {
         format!("{method} {host}{uri} {version:?} {status} {headers:?} {shown}")
     }
 
-    async fn report(cx: &Cx, attacher: &fictionet::Attacher, roots: Arc<rustls::RootCertStore>) -> Vec<String> {
+    async fn report(fcx: &Cx, attacher: &fictionet::Attacher, roots: Arc<rustls::RootCertStore>) -> Vec<String> {
         let end = attacher.attach("agent").unwrap();
-        let (t, u, i, _o) = ip::split_protocols(cx, end);
-        let m = Machine { tcp: tcp::endpoint(cx, t, ME.into()), udp: udp::endpoint(cx, u, ME.into()), _icmp: i };
+        let (t, u, i, _o) = ip::split_protocols(fcx, end);
+        let m = Machine { tcp: tcp::endpoint(fcx, t, ME.into()), udp: udp::endpoint(fcx, u, ME.into()), _icmp: i };
         let mut lines = Vec::new();
         for name in ["example.test", "www.example.test", "shared.test", "plain.test", "v4only.test", "v6only.test", "nope.test"] {
-            lines.push(dns(cx, &m, name, RecordType::A).await);
-            lines.push(dns(cx, &m, name, RecordType::AAAA).await);
+            lines.push(dns(fcx, &m, name, RecordType::A).await);
+            lines.push(dns(fcx, &m, name, RecordType::AAAA).await);
         }
         let tls = |addr: IpAddr, sni: &'static str, alpn: &'static [u8]| {
             let roots = roots.clone();
             let m = &m;
             async move {
-                let conn = m.tcp.connect(cx, SocketAddr::new(addr, 443)).await.unwrap();
+                let conn = m.tcp.connect(fcx, SocketAddr::new(addr, 443)).await.unwrap();
                 let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
                     .with_safe_default_protocol_versions()
                     .unwrap()
@@ -321,7 +321,7 @@ mod tests {
                     .with_no_client_auth();
                 config.alpn_protocols = vec![alpn.to_vec()];
                 tokio_rustls::TlsConnector::from(Arc::new(config))
-                    .connect(ServerName::try_from(sni).unwrap(), conn.into_tokio(cx))
+                    .connect(ServerName::try_from(sni).unwrap(), conn.into_tokio(fcx))
                     .await
                     .unwrap()
             }
@@ -336,7 +336,7 @@ mod tests {
         lines.push(ask(tls(shared, "example.test", b"http/1.1").await, false, "GET", "/nowhere", "example.test", vec![]).await);
         let plain = |addr: IpAddr| {
             let m = &m;
-            async move { m.tcp.connect(cx, SocketAddr::new(addr, 80)).await.unwrap().into_tokio(cx) }
+            async move { m.tcp.connect(fcx, SocketAddr::new(addr, 80)).await.unwrap().into_tokio(fcx) }
         };
         lines.push(ask(plain(shared).await, false, "GET", "/a?b=c", "example.test", vec![]).await);
         lines.push(ask(plain(shared).await, false, "GET", "/x", "shared.test", vec![]).await);
@@ -370,12 +370,12 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
-            let _ = rt.block_on(fictionet::run(move |cx| async move {
+            let _ = rt.block_on(fictionet::run(move |fcx| async move {
                 let (attacher, attachments) = fictionet::attachments();
-                super::world(&cx, chain, key, attachments)?;
-                let lines = report(&cx, &attacher, roots).await;
+                super::world(&fcx, chain, key, attachments)?;
+                let lines = report(&fcx, &attacher, roots).await;
                 let _ = tx.send(lines);
-                cx.cancel();
+                fcx.cancel();
                 Ok(())
             }));
         });

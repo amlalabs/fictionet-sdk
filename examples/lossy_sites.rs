@@ -14,19 +14,19 @@ fn main() -> fictionet::Result {
     let _listening = fictionet::listen(fictionet::WorldSocket::UnixSocket(path.clone().into()), attacher)?;
     println!("listening on {path}");
 
-    fictionet::block_on(fictionet::run(|cx| async move {
+    fictionet::block_on(fictionet::run(|fcx| async move {
         let app = axum::Router::new().route("/", axum::routing::get(|| async { "hello over a lossy link\n" }));
 
-        // `cx.random_f64()` is below 0.05 one time in twenty: drop those.
-        let lossy = attachments.map(&cx, |cx, sandbox| {
-            stdlib::filter(cx, sandbox, |cx, _direction, _packet| cx.random_f64() >= LOSS)
+        // `fcx.random_f64()` is below 0.05 one time in twenty: drop those.
+        let lossy = attachments.map(&fcx, |fcx, sandbox| {
+            stdlib::filter(fcx, sandbox, |fcx, _direction, _packet| fcx.random_f64() >= LOSS)
         });
 
         web::Sites::new(move |host: &str| match host {
             "example.test" => Some(web::Site::new(app.clone())),
             _ => None,
         })
-        .serve(&cx, lossy)?;
+        .serve(&fcx, lossy)?;
         Ok(())
     }))
 }

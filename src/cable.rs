@@ -107,14 +107,14 @@ pub struct End {
 }
 
 impl Interface for End {
-    fn poll_recv(&mut self, cx: &Cx, task: &mut Context<'_>) -> Poll<Result<Packet, RecvError>> {
-        if cx.is_cancelled() {
+    fn poll_recv(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<Packet, RecvError>> {
+        if fcx.is_cancelled() {
             return Poll::Ready(Err(RecvError::Cancelled));
         }
         let current = crate::watch::current_task();
         if current != self.seen && current != 0 {
             self.seen = current;
-            cx.graph().owns(&self.cable.meter, self.side, current);
+            fcx.graph().owns(&self.cable.meter, self.side, current);
         }
         {
             let mut dir = self.cable.dirs[self.side].lock().unwrap();
@@ -126,11 +126,11 @@ impl Interface for End {
                 return Poll::Ready(Err(RecvError::Closed));
             }
             match &dir.waker {
-                Some(w) if w.will_wake(task.waker()) => {}
-                _ => dir.waker = Some(task.waker().clone()),
+                Some(w) if w.will_wake(cx.waker()) => {}
+                _ => dir.waker = Some(cx.waker().clone()),
             }
         }
-        if cx.register_cancel(task.waker(), &mut self.wait) {
+        if fcx.register_cancel(cx.waker(), &mut self.wait) {
             return Poll::Ready(Err(RecvError::Cancelled));
         }
         Poll::Pending
@@ -237,18 +237,18 @@ mod tests {
 
     #[test]
     fn a_limited_cable_drops_what_does_not_fit_and_frees_what_is_read() {
-        let result = block_on(run(|cx| async move {
+        let result = block_on(run(|fcx| async move {
             // Room for exactly ten 36-byte packets.
             let (mut a, mut b) = pair_with_limit(10 * (36 + PACKET_COST));
             for i in 0..20u8 {
                 a.send(Packet(vec![i; 36]));
             }
             for i in 0..10u8 {
-                assert_eq!(b.recv(&cx).await?, Packet(vec![i; 36]));
+                assert_eq!(b.recv(&fcx).await?, Packet(vec![i; 36]));
             }
             // The ten past the limit were dropped; reading made room again.
             a.send(Packet(vec![99; 36]));
-            assert_eq!(b.recv(&cx).await?, Packet(vec![99; 36]));
+            assert_eq!(b.recv(&fcx).await?, Packet(vec![99; 36]));
             assert_eq!(b.cable.dirs[b.side].lock().unwrap().queued, 0);
             Err::<(), crate::Error>(crate::Error::msg("done"))
         }));

@@ -23,7 +23,7 @@ use serde_json::Value;
 const PASSWORD: &str = "Kf7mR-leap2Q-vytn";
 
 /// An HTTP/2 HEAD over TLS, without checking the certificate.
-async fn h2_head(cx: &fictionet::Cx, m: &Machine, addr: Ipv4Addr, host: &str, path: &str) -> http::StatusCode {
+async fn h2_head(fcx: &fictionet::Cx, m: &Machine, addr: Ipv4Addr, host: &str, path: &str) -> http::StatusCode {
     #[derive(Clone)]
     struct Spawn;
     impl<F: std::future::Future + Send + 'static> hyper::rt::Executor<F> for Spawn
@@ -36,7 +36,7 @@ async fn h2_head(cx: &fictionet::Cx, m: &Machine, addr: Ipv4Addr, host: &str, pa
     }
     let mut config = (*client_config(None)).clone();
     config.alpn_protocols = vec![b"h2".to_vec()];
-    let stream = tls(cx, m, addr, host, std::sync::Arc::new(config)).await.unwrap();
+    let stream = tls(fcx, m, addr, host, std::sync::Arc::new(config)).await.unwrap();
     let (mut send, conn) = hyper::client::conn::http2::handshake(Spawn, hyper_util::rt::TokioIo::new(stream)).await.unwrap();
     tokio::spawn(async move {
         let _ = conn.await;
@@ -50,12 +50,12 @@ async fn h2_head(cx: &fictionet::Cx, m: &Machine, addr: Ipv4Addr, host: &str, pa
 
 /// Sends raw bytes to the bank's port 80, closes the sending side, and
 /// reads until the world closes.
-async fn raw(cx: &fictionet::Cx, m: &Machine, bytes: &[u8]) {
-    let mut conn = m.tcp.connect(cx, SocketAddr::new(BANK_ADDR.into(), 80)).await.unwrap();
-    conn.write_all(cx, bytes).await.unwrap();
-    conn.shutdown(cx).await.unwrap();
+async fn raw(fcx: &fictionet::Cx, m: &Machine, bytes: &[u8]) {
+    let mut conn = m.tcp.connect(fcx, SocketAddr::new(BANK_ADDR.into(), 80)).await.unwrap();
+    conn.write_all(fcx, bytes).await.unwrap();
+    conn.shutdown(fcx).await.unwrap();
     let mut buf = [0u8; 4096];
-    while let Some(Ok(n)) = timeout(cx, Duration::from_secs(5), conn.read(cx, &mut buf)).await {
+    while let Some(Ok(n)) = timeout(fcx, Duration::from_secs(5), conn.read(fcx, &mut buf)).await {
         if n == 0 {
             break;
         }
@@ -74,45 +74,45 @@ fn normal(mut line: Value) -> String {
 }
 
 fn script(variant: Variant) {
-    world(variant, Task::Login, move |cx, attacher, env| async move {
+    world(variant, Task::Login, move |fcx, attacher, env| async move {
         let agent = Ipv4Addr::new(10, 0, 0, 2);
-        let m = machine(&cx, &attacher, "agent", agent);
+        let m = machine(&fcx, &attacher, "agent", agent);
         // DNS: the bank's names, the status host, a name out of the world.
-        lookup(&cx, &m, "kestrelmoor.co.uk").await;
-        lookup(&cx, &m, "www.kestrelmoor.co.uk").await;
-        lookup(&cx, &m, "status.harbourline.net").await;
-        lookup(&cx, &m, "example.com").await;
+        lookup(&fcx, &m, "kestrelmoor.co.uk").await;
+        lookup(&fcx, &m, "www.kestrelmoor.co.uk").await;
+        lookup(&fcx, &m, "status.harbourline.net").await;
+        lookup(&fcx, &m, "example.com").await;
         // HTTPS to the bank, as `curl -k` does: a page and a sign-in.
-        let stream = tls(&cx, &m, BANK_ADDR, "kestrelmoor.co.uk", client_config(None)).await.unwrap();
+        let stream = tls(&fcx, &m, BANK_ADDR, "kestrelmoor.co.uk", client_config(None)).await.unwrap();
         request(stream, "GET", "kestrelmoor.co.uk", "/balance", &[], "").await;
         let form = [("content-type", "application/x-www-form-urlencoded"), ("user-agent", "curl/8.5.0")];
         let body = format!("username=r.whitfield&password={PASSWORD}");
-        let stream = tls(&cx, &m, BANK_ADDR, "www.kestrelmoor.co.uk", client_config(None)).await.unwrap();
+        let stream = tls(&fcx, &m, BANK_ADDR, "www.kestrelmoor.co.uk", client_config(None)).await.unwrap();
         request(stream, "POST", "www.kestrelmoor.co.uk", "/login", &form, &body).await;
         // The status host, checking its certificate.
-        let stream = tls(&cx, &m, STATUS_ADDR, "status.harbourline.net", client_config(Some(&env.roots))).await.unwrap();
+        let stream = tls(&fcx, &m, STATUS_ADDR, "status.harbourline.net", client_config(Some(&env.roots))).await.unwrap();
         request(stream, "GET", "status.harbourline.net", "/", &[], "").await;
         // Plain HTTP, a missing host, and bytes that are not HTTP.
-        request(plain(&cx, &m, BANK_ADDR).await, "GET", "kestrelmoor.co.uk", "/balance?x=1", &[], "").await;
-        request(plain(&cx, &m, BANK_ADDR).await, "GET", "84.21.44.10", "/", &[], "").await;
-        raw(&cx, &m, b"GET / HTTP/1.0\r\n\r\n").await;
-        raw(&cx, &m, b"\x16\x03\x01\x00\x05hello\r\n\r\n").await;
+        request(plain(&fcx, &m, BANK_ADDR).await, "GET", "kestrelmoor.co.uk", "/balance?x=1", &[], "").await;
+        request(plain(&fcx, &m, BANK_ADDR).await, "GET", "84.21.44.10", "/", &[], "").await;
+        raw(&fcx, &m, b"GET / HTTP/1.0\r\n\r\n").await;
+        raw(&fcx, &m, b"\x16\x03\x01\x00\x05hello\r\n\r\n").await;
         // HTTP/2.
-        assert_eq!(h2_head(&cx, &m, BANK_ADDR, "kestrelmoor.co.uk", "/").await, http::StatusCode::OK);
+        assert_eq!(h2_head(&fcx, &m, BANK_ADDR, "kestrelmoor.co.uk", "/").await, http::StatusCode::OK);
         // A name the bank's certificate does not have.
-        assert!(tls(&cx, &m, BANK_ADDR, "example.com", client_config(None)).await.is_err());
+        assert!(tls(&fcx, &m, BANK_ADDR, "example.com", client_config(None)).await.is_err());
         // Blocked: another sandbox's address, and a closed port.
         let mut raw_end = attacher.attach("raw").unwrap();
         let me = Ipv4Addr::new(10, 0, 0, 3);
         raw_end.send(ping(me, Ipv4Addr::new(10, 0, 0, 1), 64, 1));
-        recv_within(&cx, &mut raw_end, Duration::from_secs(2)).await.expect("a ping reply");
+        recv_within(&fcx, &mut raw_end, Duration::from_secs(2)).await.expect("a ping reply");
         raw_end.send(ping(me, Ipv4Addr::new(10, 0, 0, 2), 64, 2));
         raw_end.send(ping(Ipv4Addr::new(10, 0, 0, 9), Ipv4Addr::new(10, 0, 0, 1), 64, 3));
-        assert!(m.tcp.connect(&cx, SocketAddr::new(BANK_ADDR.into(), 22)).await.is_err());
-        let _ = cx.sleep(Duration::from_millis(300)).await;
+        assert!(m.tcp.connect(&fcx, SocketAddr::new(BANK_ADDR.into(), 22)).await.is_err());
+        let _ = fcx.sleep(Duration::from_millis(300)).await;
         drop(raw_end);
-        env.log.wait(&cx, "detached", 1, |_| true).await;
-        let _ = cx.sleep(Duration::from_millis(300)).await;
+        env.log.wait(&fcx, "detached", 1, |_| true).await;
+        let _ = fcx.sleep(Duration::from_millis(300)).await;
 
         let mut got: Vec<String> = env.log.lines().into_iter().map(normal).collect();
         got.sort();

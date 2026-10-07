@@ -20,18 +20,18 @@ fn start_world(path: &str) -> fictionet::Listening {
     let (attacher, mut attachments) = fictionet::attachments();
     let listening = fictionet::listen(fictionet::WorldSocket::UnixSocket(path.into()), attacher).unwrap();
     std::thread::spawn(move || {
-        let _ = fictionet::block_on(fictionet::run(move |cx| async move {
-            cx.spawn(move |cx| async move {
-                while let Ok(a) = attachments.next(&cx).await {
+        let _ = fictionet::block_on(fictionet::run(move |fcx| async move {
+            fcx.spawn(move |fcx| async move {
+                while let Ok(a) = attachments.next(&fcx).await {
                     drop(a);
                 }
                 Ok(())
             });
             let mut n = 0i64;
             loop {
-                cx.record(fictionet::events::Event::new("test", "tick").field("n", n));
+                fcx.record(fictionet::events::Event::new("test", "tick").field("n", n));
                 n += 1;
-                cx.sleep(fictionet::time::ms(50)).await?;
+                fcx.sleep(fictionet::time::ms(50)).await?;
             }
         }));
     });
@@ -147,30 +147,30 @@ fn start_two_links(path: &str) -> fictionet::Listening {
     let (attacher, mut attachments) = fictionet::attachments();
     let listening = fictionet::listen(fictionet::WorldSocket::UnixSocket(path.into()), attacher).unwrap();
     std::thread::spawn(move || {
-        let _ = fictionet::block_on(fictionet::run(move |cx| async move {
+        let _ = fictionet::block_on(fictionet::run(move |fcx| async move {
             // Observers find a world once it takes attachments.
-            cx.spawn(move |cx| async move {
-                while let Ok(a) = attachments.next(&cx).await {
+            fcx.spawn(move |fcx| async move {
+                while let Ok(a) = attachments.next(&fcx).await {
                     drop(a);
                 }
                 Ok(())
             });
-            let lan = cx.group("lan");
+            let lan = fcx.group("lan");
             for _ in 0..2 {
                 let (mut a, mut b) = fictionet::pair();
-                lan.spawn(move |cx| async move {
-                    while let Ok(p) = b.recv(&cx).await {
+                lan.spawn(move |fcx| async move {
+                    while let Ok(p) = b.recv(&fcx).await {
                         b.send(p);
                     }
                     Ok(())
                 });
-                cx.spawn(move |cx| async move {
+                fcx.spawn(move |fcx| async move {
                     loop {
                         // An IPv4 header with nothing after it.
                         let p = vec![0x45, 0, 0, 20, 0, 0, 0, 0, 64, 17, 0, 0, 10, 0, 0, 1, 10, 0, 0, 2];
                         a.send(fictionet::Packet(p));
-                        a.recv(&cx).await?;
-                        cx.sleep(fictionet::time::ms(20)).await?;
+                        a.recv(&fcx).await?;
+                        fcx.sleep(fictionet::time::ms(20)).await?;
                     }
                 });
             }
@@ -262,16 +262,16 @@ fn a_watch_exits_0_when_the_world_ends() {
     // The world runs a while, then returns; its socket closes as a world
     // binary's would when `main` returns.
     let world_thread = std::thread::spawn(move || {
-        let _ = fictionet::block_on(fictionet::run(move |cx| async move {
-            cx.spawn(move |cx| async move {
-                while let Ok(a) = attachments.next(&cx).await {
+        let _ = fictionet::block_on(fictionet::run(move |fcx| async move {
+            fcx.spawn(move |fcx| async move {
+                while let Ok(a) = attachments.next(&fcx).await {
                     drop(a);
                 }
                 Ok(())
             });
-            cx.sleep(fictionet::time::ms(1500)).await?;
+            fcx.sleep(fictionet::time::ms(1500)).await?;
             // Ends the run, with the task above.
-            cx.cancel();
+            fcx.cancel();
             Ok(())
         }));
         drop(listening);

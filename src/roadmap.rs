@@ -263,7 +263,7 @@
 //! # The lab
 //!
 //! The lab will be a second way to run a world, next to
-//! [`run`](crate::run): `fictionet::lab(seed, |cx| world(..))`. The world
+//! [`run`](crate::run): `fictionet::lab(seed, |fcx| world(..))`. The world
 //! code stays the same. Only what stands behind [`Cx`](crate::Cx) changes.
 //! Its design is still open, but these are its goals:
 //!
@@ -290,9 +290,9 @@
 //! A lab run with the same seed, the same world and the same inputs will
 //! make the same decisions at the same times. The same packets will be
 //! delayed, dropped or answered, in the same order, at the same lab
-//! instants, and every `cx.random_*` call will return the same number.
+//! instants, and every `fcx.random_*` call will return the same number.
 //!
 //! It will not promise the same bytes. Anything that draws randomness from
-//! the operating system instead of `cx` differs from run to run. The main
+//! the operating system instead of `fcx` differs from run to run. The main
 //! case is TLS key exchange: see
 //! [`tls::config_builder`](crate::stdlib::tls::config_builder).

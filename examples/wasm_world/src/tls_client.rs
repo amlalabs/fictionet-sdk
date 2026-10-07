@@ -24,17 +24,17 @@ impl<C: Connection> TlsClient<C> {
     }
 
     /// Finishes the handshake.
-    pub(crate) async fn handshake(&mut self, cx: &Cx) -> Result<(), ConnError> {
-        std::future::poll_fn(|task| {
+    pub(crate) async fn handshake(&mut self, fcx: &Cx) -> Result<(), ConnError> {
+        std::future::poll_fn(|cx| {
             loop {
-                match self.poll_flush(cx, task) {
+                match self.poll_flush(fcx, cx) {
                     Poll::Ready(Ok(())) => {}
                     other => return other,
                 }
                 if !self.tls.is_handshaking() {
                     return Poll::Ready(Ok(()));
                 }
-                match self.poll_fill(cx, task) {
+                match self.poll_fill(fcx, cx) {
                     Poll::Ready(Ok(true)) => {}
                     Poll::Ready(Ok(false)) => return Poll::Ready(Err(ConnError::Closed)),
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -46,7 +46,7 @@ impl<C: Connection> TlsClient<C> {
     }
 
     /// Writes out what rustls has to send.
-    fn poll_flush(&mut self, cx: &Cx, task: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
+    fn poll_flush(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
         loop {
             if self.out.is_empty() {
                 if !self.tls.wants_write() {
@@ -54,7 +54,7 @@ impl<C: Connection> TlsClient<C> {
                 }
                 self.tls.write_tls(&mut self.out).map_err(|_| ConnError::Broken)?;
             }
-            match self.conn.poll_write(cx, task, &self.out) {
+            match self.conn.poll_write(fcx, cx, &self.out) {
                 Poll::Ready(Ok(n)) => {
                     self.out.drain(..n);
                 }
@@ -66,8 +66,8 @@ impl<C: Connection> TlsClient<C> {
 
     /// Reads once from the connection into rustls. `Ok(false)` at the end
     /// of the stream.
-    fn poll_fill(&mut self, cx: &Cx, task: &mut Context<'_>) -> Poll<Result<bool, ConnError>> {
-        let n = match self.conn.poll_read(cx, task, &mut self.inbuf) {
+    fn poll_fill(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<bool, ConnError>> {
+        let n = match self.conn.poll_read(fcx, cx, &mut self.inbuf) {
             Poll::Ready(Ok(n)) => n,
             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
             Poll::Pending => return Poll::Pending,
@@ -86,9 +86,9 @@ impl<C: Connection> TlsClient<C> {
 }
 
 impl<C: Connection> Connection for TlsClient<C> {
-    fn poll_read(&mut self, cx: &Cx, task: &mut Context<'_>, buf: &mut [u8]) -> Poll<Result<usize, ConnError>> {
+    fn poll_read(&mut self, fcx: &Cx, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<Result<usize, ConnError>> {
         // A cancel comes first, before plaintext already decrypted.
-        if cx.is_cancelled() {
+        if fcx.is_cancelled() {
             return Poll::Ready(Err(ConnError::Cancelled));
         }
         loop {
@@ -98,10 +98,10 @@ impl<C: Connection> Connection for TlsClient<C> {
                 Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Poll::Ready(Ok(0)),
                 Err(_) => return Poll::Ready(Err(ConnError::Broken)),
             }
-            if let Poll::Ready(Err(e)) = self.poll_flush(cx, task) {
+            if let Poll::Ready(Err(e)) = self.poll_flush(fcx, cx) {
                 return Poll::Ready(Err(e));
             }
-            match self.poll_fill(cx, task) {
+            match self.poll_fill(fcx, cx) {
                 Poll::Ready(Ok(true)) => {}
                 Poll::Ready(Ok(false)) => return Poll::Ready(Ok(0)),
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -110,19 +110,19 @@ impl<C: Connection> Connection for TlsClient<C> {
         }
     }
 
-    fn poll_write(&mut self, cx: &Cx, task: &mut Context<'_>, data: &[u8]) -> Poll<Result<usize, ConnError>> {
-        if let Poll::Ready(Err(e)) = self.poll_flush(cx, task) {
+    fn poll_write(&mut self, fcx: &Cx, cx: &mut Context<'_>, data: &[u8]) -> Poll<Result<usize, ConnError>> {
+        if let Poll::Ready(Err(e)) = self.poll_flush(fcx, cx) {
             return Poll::Ready(Err(e));
         }
         let n = self.tls.writer().write(data).map_err(|_| ConnError::Broken)?;
-        let _ = self.poll_flush(cx, task);
+        let _ = self.poll_flush(fcx, cx);
         Poll::Ready(Ok(n))
     }
 
-    fn poll_shutdown(&mut self, cx: &Cx, task: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
+    fn poll_shutdown(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
         self.tls.send_close_notify();
-        match self.poll_flush(cx, task) {
-            Poll::Ready(Ok(())) => self.conn.poll_shutdown(cx, task),
+        match self.poll_flush(fcx, cx) {
+            Poll::Ready(Ok(())) => self.conn.poll_shutdown(fcx, cx),
             other => other,
         }
     }

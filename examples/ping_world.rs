@@ -25,23 +25,23 @@ fn main() -> Result {
     let (attacher, mut attachments) = fictionet::attachments();
     let _listening = fictionet::listen(fictionet::WorldSocket::UnixSocket(path.clone().into()), attacher)?;
     println!("listening on {path}");
-    fictionet::block_on(fictionet::run(move |cx| async move {
+    fictionet::block_on(fictionet::run(move |fcx| async move {
         // `next` returns `Cancelled` when the world stops, and `?` ends
         // the loop with it.
         loop {
-            let sandbox = attachments.next(&cx).await?;
-            cx.spawn(move |cx| serve(cx, sandbox));
+            let sandbox = attachments.next(&fcx).await?;
+            fcx.spawn(move |fcx| serve(fcx, sandbox));
         }
     }))
 }
 
-async fn serve(cx: Cx, sandbox: Attachment) -> Result {
+async fn serve(fcx: Cx, sandbox: Attachment) -> Result {
     let name = sandbox.name().to_owned();
     println!("attached {name} mtu {}", sandbox.mtu());
-    let (_tcp, _udp, mut pings, _other) = ip::split_protocols(&cx, sandbox);
+    let (_tcp, _udp, mut pings, _other) = ip::split_protocols(&fcx, sandbox);
     let mut answered = 0u64;
     loop {
-        match pings.recv(&cx).await {
+        match pings.recv(&fcx).await {
             Ok(packet) => {
                 // Answer at whatever address the sandbox pinged.
                 let Some(addr) = destination(&packet) else { continue };

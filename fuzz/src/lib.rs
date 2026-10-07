@@ -32,8 +32,8 @@ where
     Fut: Future<Output = ()> + Send + 'static,
 {
     fictionet::fuzzing::seed_random(seed);
-    let result = block_on(run(move |cx| {
-        let fut = f(cx);
+    let result = block_on(run(move |fcx| {
+        let fut = f(fcx);
         async move {
             fut.await;
             Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
@@ -43,16 +43,16 @@ where
 }
 
 /// Lets the world's other tasks run `n` turns.
-pub async fn settle(cx: &Cx, n: usize) {
+pub async fn settle(fcx: &Cx, n: usize) {
     for _ in 0..n {
-        let _ = cx.yield_now().await;
+        let _ = fcx.yield_now().await;
     }
 }
 
 /// Polls `fut` once. `None` if it is not done yet.
 pub async fn poll_once<F: Future>(fut: F) -> Option<F::Output> {
     let mut fut = pin!(fut);
-    poll_fn(|task| Poll::Ready(match fut.as_mut().poll(task) {
+    poll_fn(|cx| Poll::Ready(match fut.as_mut().poll(cx) {
         Poll::Ready(v) => Some(v),
         Poll::Pending => None,
     }))
@@ -134,7 +134,7 @@ impl MemConn {
 }
 
 impl Connection for MemConn {
-    fn poll_read(&mut self, _cx: &Cx, _task: &mut Context<'_>, buf: &mut [u8]) -> Poll<Result<usize, ConnError>> {
+    fn poll_read(&mut self, _fcx: &Cx, _cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<Result<usize, ConnError>> {
         let want = match self.pieces.get(self.piece) {
             Some(&n) => n.max(1),
             None => usize::MAX,
@@ -146,7 +146,7 @@ impl Connection for MemConn {
         Poll::Ready(Ok(n))
     }
 
-    fn poll_write(&mut self, _cx: &Cx, _task: &mut Context<'_>, data: &[u8]) -> Poll<Result<usize, ConnError>> {
+    fn poll_write(&mut self, _fcx: &Cx, _cx: &mut Context<'_>, data: &[u8]) -> Poll<Result<usize, ConnError>> {
         if self.shut {
             return Poll::Ready(Err(ConnError::Closed));
         }
@@ -154,7 +154,7 @@ impl Connection for MemConn {
         Poll::Ready(Ok(data.len()))
     }
 
-    fn poll_shutdown(&mut self, _cx: &Cx, _task: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
+    fn poll_shutdown(&mut self, _fcx: &Cx, _cx: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
         self.shut = true;
         Poll::Ready(Ok(()))
     }

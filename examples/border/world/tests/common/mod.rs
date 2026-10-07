@@ -60,13 +60,13 @@ impl Buf {
     }
 
     /// Waits up to 5 s for `n` lines of `kind` that `keep` keeps.
-    pub async fn wait(&self, cx: &Cx, kind: &str, n: usize, keep: impl Fn(&Value) -> bool) -> Vec<Value> {
+    pub async fn wait(&self, fcx: &Cx, kind: &str, n: usize, keep: impl Fn(&Value) -> bool) -> Vec<Value> {
         for _ in 0..500 {
             let got: Vec<Value> = self.of(kind).into_iter().filter(|l| keep(l)).collect();
             if got.len() >= n {
                 return got;
             }
-            let _ = cx.sleep(fictionet::time::Duration::from_millis(10)).await;
+            let _ = fcx.sleep(fictionet::time::Duration::from_millis(10)).await;
         }
         panic!("fewer than {n} {kind} lines: {:#?}", self.lines());
     }
@@ -99,7 +99,7 @@ where
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
-        let result = rt.block_on(fictionet::run(move |cx| async move {
+        let result = rt.block_on(fictionet::run(move |fcx| async move {
             let scenario = Arc::new(Scenario::new(variant, task, Prefix::parse("10.0.0.0/24").unwrap()));
             let (ids, root) = {
                 let ca = Ca::root("Test Root CA")?;
@@ -110,9 +110,9 @@ where
             let buf = Buf::default();
             let log = Log::start(Box::new(buf.clone()), scenario.clone());
             let (attacher, attachments) = fictionet::attachments();
-            let lookups = border_world::start(&cx, scenario.clone(), ids, log, attachments)?;
-            border_world::look_up_all(&cx, &lookups, &scenario).await?;
-            f(cx, attacher, Env { roots: Arc::new(roots), log: buf, scenario }).await?;
+            let lookups = border_world::start(&fcx, scenario.clone(), ids, log, attachments)?;
+            border_world::look_up_all(&fcx, &lookups, &scenario).await?;
+            f(fcx, attacher, Env { roots: Arc::new(roots), log: buf, scenario }).await?;
             Err(fictionet::Error::from(Done))
         }));
         let _ = tx.send(result);
@@ -125,14 +125,14 @@ where
 }
 
 /// Waits for `fut` at most `d`.
-pub async fn timeout<T>(cx: &Cx, d: Duration, fut: impl Future<Output = T>) -> Option<T> {
+pub async fn timeout<T>(fcx: &Cx, d: Duration, fut: impl Future<Output = T>) -> Option<T> {
     let mut fut = pin!(fut);
-    let mut sleep = pin!(cx.sleep(d));
-    poll_fn(|task| {
-        if let Poll::Ready(v) = fut.as_mut().poll(task) {
+    let mut sleep = pin!(fcx.sleep(d));
+    poll_fn(|cx| {
+        if let Poll::Ready(v) = fut.as_mut().poll(cx) {
             return Poll::Ready(Some(v));
         }
-        if sleep.as_mut().poll(task).is_ready() {
+        if sleep.as_mut().poll(cx).is_ready() {
             return Poll::Ready(None);
         }
         Poll::Pending
@@ -147,21 +147,21 @@ pub struct Machine {
     pub icmp: End,
 }
 
-pub fn machine(cx: &Cx, attacher: &Attacher, name: &str, addr: Ipv4Addr) -> Machine {
+pub fn machine(fcx: &Cx, attacher: &Attacher, name: &str, addr: Ipv4Addr) -> Machine {
     let end = attacher.attach(name).unwrap();
-    let (tcp, udp, icmp, _other) = ip::split_protocols(cx, end);
-    Machine { tcp: tcp::endpoint(cx, tcp, addr.into()), udp: udp::endpoint(cx, udp, addr.into()), icmp }
+    let (tcp, udp, icmp, _other) = ip::split_protocols(fcx, end);
+    Machine { tcp: tcp::endpoint(fcx, tcp, addr.into()), udp: udp::endpoint(fcx, udp, addr.into()), icmp }
 }
 
 /// Looks `name` up at the gateway. Returns the response code and the
 /// addresses.
-pub async fn lookup(cx: &Cx, m: &Machine, name: &str) -> (ResponseCode, Vec<Ipv4Addr>) {
-    let mut socket = m.udp.bind(40000 + (cx.random_u64() % 20000) as u16).unwrap();
+pub async fn lookup(fcx: &Cx, m: &Machine, name: &str) -> (ResponseCode, Vec<Ipv4Addr>) {
+    let mut socket = m.udp.bind(40000 + (fcx.random_u64() % 20000) as u16).unwrap();
     let mut q = Message::query();
-    q.metadata.id = cx.random_u64() as u16;
+    q.metadata.id = fcx.random_u64() as u16;
     q.add_query(Query::query(Name::from_ascii(name).unwrap(), RecordType::A));
     socket.send_to(&q.to_vec().unwrap(), SocketAddr::new(GATEWAY.into(), 53));
-    let (bytes, _) = timeout(cx, Duration::from_secs(5), socket.recv(cx)).await.expect("a DNS answer").unwrap();
+    let (bytes, _) = timeout(fcx, Duration::from_secs(5), socket.recv(fcx)).await.expect("a DNS answer").unwrap();
     let r = Message::from_vec(&bytes).unwrap();
     let addrs = r
         .answers
@@ -229,10 +229,10 @@ pub fn client_config(roots: Option<&Arc<RootCertStore>>) -> Arc<ClientConfig> {
 pub type TlsStream = tokio_rustls::client::TlsStream<fictionet::tokio::Compat<tcp::TcpConnection>>;
 
 /// Connects to `addr:443` and shakes hands for `sni`.
-pub async fn tls(cx: &Cx, m: &Machine, addr: Ipv4Addr, sni: &str, config: Arc<ClientConfig>) -> std::io::Result<TlsStream> {
-    let conn = m.tcp.connect(cx, SocketAddr::new(addr.into(), 443)).await.map_err(std::io::Error::other)?;
+pub async fn tls(fcx: &Cx, m: &Machine, addr: Ipv4Addr, sni: &str, config: Arc<ClientConfig>) -> std::io::Result<TlsStream> {
+    let conn = m.tcp.connect(fcx, SocketAddr::new(addr.into(), 443)).await.map_err(std::io::Error::other)?;
     let connector = tokio_rustls::TlsConnector::from(config);
-    connector.connect(ServerName::try_from(sni.to_owned()).unwrap(), conn.into_tokio(cx)).await
+    connector.connect(ServerName::try_from(sni.to_owned()).unwrap(), conn.into_tokio(fcx)).await
 }
 
 /// The answer to one HTTP/1.1 request.
@@ -263,12 +263,12 @@ where
 }
 
 /// Opens plain TCP to `addr:80`, for [`request`].
-pub async fn plain(cx: &Cx, m: &Machine, addr: Ipv4Addr) -> fictionet::tokio::Compat<tcp::TcpConnection> {
-    m.tcp.connect(cx, SocketAddr::new(addr.into(), 80)).await.unwrap().into_tokio(cx)
+pub async fn plain(fcx: &Cx, m: &Machine, addr: Ipv4Addr) -> fictionet::tokio::Compat<tcp::TcpConnection> {
+    m.tcp.connect(fcx, SocketAddr::new(addr.into(), 80)).await.unwrap().into_tokio(fcx)
 }
 
 /// Reads one whole BGP message: its kind and body.
-pub async fn bgp_read(cx: &Cx, conn: &mut tcp::TcpConnection, buf: &mut Vec<u8>) -> Result<(bgp::Kind, Vec<u8>), ConnError> {
+pub async fn bgp_read(fcx: &Cx, conn: &mut tcp::TcpConnection, buf: &mut Vec<u8>) -> Result<(bgp::Kind, Vec<u8>), ConnError> {
     loop {
         if buf.len() >= bgp::HEADER {
             let (kind, len) = bgp::parse_header(buf).expect("a good header");
@@ -279,7 +279,7 @@ pub async fn bgp_read(cx: &Cx, conn: &mut tcp::TcpConnection, buf: &mut Vec<u8>)
             }
         }
         let mut chunk = [0u8; 4096];
-        let n = conn.read(cx, &mut chunk).await?;
+        let n = conn.read(fcx, &mut chunk).await?;
         if n == 0 {
             return Err(ConnError::Closed);
         }
@@ -330,8 +330,8 @@ pub fn ping(src: Ipv4Addr, dst: Ipv4Addr, ttl: u8, seq: u16) -> Packet {
 }
 
 /// The next packet on `end`, within `d`.
-pub async fn recv_within(cx: &Cx, end: &mut End, d: Duration) -> Option<Packet> {
-    timeout(cx, d, end.recv(cx)).await.and_then(|r| r.ok())
+pub async fn recv_within(fcx: &Cx, end: &mut End, d: Duration) -> Option<Packet> {
+    timeout(fcx, d, end.recv(fcx)).await.and_then(|r| r.ok())
 }
 
 /// Source, TTL, protocol and payload of an IPv4 packet; the header checksum

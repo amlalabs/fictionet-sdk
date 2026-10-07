@@ -119,14 +119,14 @@
 //! ```
 //! # use fictionet::{Cx, End, Result};
 //! # use fictionet::stdlib::{ip, tcp};
-//! fn machine(cx: &Cx, side: End, name: &str, addr: std::net::IpAddr) -> Result {
-//!     let host = cx.group(format!("{name} {addr}"));
+//! fn machine(fcx: &Cx, side: End, name: &str, addr: std::net::IpAddr) -> Result {
+//!     let host = fcx.group(format!("{name} {addr}"));
 //!     let (tcp, _udp, _icmp, _other) = ip::split_protocols(&host, side);
 //!     let _ssh = tcp::endpoint(&host, tcp, addr).listen(22)?;
 //!     Ok(())
 //! }
-//! # fn wire(cx: Cx, sides: Vec<End>) -> Result {
-//! let hosts = cx.group("simulated hosts");
+//! # fn wire(fcx: Cx, sides: Vec<End>) -> Result {
+//! let hosts = fcx.group("simulated hosts");
 //! for (side, n) in sides.into_iter().zip(10u8..) {
 //!     machine(&hosts, side, "www", std::net::Ipv4Addr::new(10, 0, 0, n).into())?;
 //! }
@@ -176,8 +176,8 @@
 //! ```
 //! # use fictionet::Cx;
 //! use fictionet::events::Event;
-//! fn sold(cx: &Cx, item: &str, count: u32) {
-//!     cx.record(Event::new("shop", "order").summary(format!("{count} × {item}")).field("item", item).field("count", count));
+//! fn sold(fcx: &Cx, item: &str, count: u32) {
+//!     fcx.record(Event::new("shop", "order").summary(format!("{count} × {item}")).field("item", item).field("count", count));
 //! }
 //! ```
 //!
@@ -598,7 +598,7 @@ pub(crate) fn existing_watch(graph: &Graph, id: u64) -> Option<Arc<LinkWatch>> {
 /// with the packet's addresses and protocol (a
 /// [repeat](crate::events#repeats)). Its length, its destination port and
 /// `detail` change with each packet, so they are its detail.
-pub(crate) fn record_drop(cx: &Cx, source: &'static str, packet: &crate::Packet, why: &'static str, detail: crate::events::Fields) {
+pub(crate) fn record_drop(fcx: &Cx, source: &'static str, packet: &crate::Packet, why: &'static str, detail: crate::events::Fields) {
     use crate::events::{Event, Level, opt};
     let h = crate::stdlib::ip::Header::parse_truncated(&packet.0);
     let port = h.as_ref().and_then(|h| h.dst_port(&packet.0));
@@ -615,7 +615,7 @@ pub(crate) fn record_drop(cx: &Cx, source: &'static str, packet: &crate::Packet,
         .field("why", why);
     let mut all = crate::events::Fields::new().with("len", packet.0.len() as u64).with("dst_port", opt(port.map(u32::from)));
     all.extend(detail);
-    cx.record_repeat(event, all);
+    fcx.record_repeat(event, all);
 }
 
 /// A link an [`Interface`](crate::Interface) belongs to, so the stdlib can
@@ -664,7 +664,7 @@ mod tests {
         use crate::watch::Meter;
         let graph = Graph::new();
         let watched = graph.clone();
-        crate::block_on(crate::run::run_with(graph, move |cx| async move {
+        crate::block_on(crate::run::run_with(graph, move |fcx| async move {
             let mut registry = Registry::new();
             registry.register(
                 "custom",
@@ -677,7 +677,7 @@ mod tests {
                 },
                 |_| [protocols::Modbus::new(true), protocols::Modbus::new(false)],
             );
-            cx.observe_protocols(registry);
+            fcx.observe_protocols(registry);
             let meter = Meter::new();
             watched.owns(&meter, 0, 1);
             let (watch, _subscription) = watch(&watched, meter.id).unwrap();
@@ -731,11 +731,11 @@ mod tests {
     /// `filter` shows as `filter`, at the line that called it.
     #[test]
     fn filter_reports_its_caller() {
-        crate::block_on(crate::run(|cx| async move {
+        crate::block_on(crate::run(|fcx| async move {
             let (a, _b) = crate::pair();
             let line = line!() + 1;
-            let _f = crate::stdlib::filter(&cx, a, |_, _, _| true);
-            let tasks: Vec<_> = cx.graph().state().tasks.values().cloned().collect();
+            let _f = crate::stdlib::filter(&fcx, a, |_, _, _| true);
+            let tasks: Vec<_> = fcx.graph().state().tasks.values().cloned().collect();
             assert!(tasks.iter().any(|t| t.name == "filter" && t.file == file!() && t.line == line), "{tasks:?}");
             Ok(())
         }))
@@ -745,15 +745,15 @@ mod tests {
     /// A router records a route it removes, with no observer.
     #[test]
     fn routers_record_routes_they_remove() {
-        crate::block_on(crate::run(|cx| async move {
+        crate::block_on(crate::run(|fcx| async move {
             let (a, b) = crate::pair();
             let (c, d) = crate::pair();
-            let router = crate::stdlib::route::router(&cx, vec![("10.0.0.0/24".parse().unwrap(), Box::new(a))]);
+            let router = crate::stdlib::route::router(&fcx, vec![("10.0.0.0/24".parse().unwrap(), Box::new(a))]);
             router.add("10.0.1.0/24".parse().unwrap(), Box::new(c));
-            assert!(!cx.observed());
+            assert!(!fcx.observed());
             drop(b);
-            cx.sleep(Duration::from_millis(10)).await?;
-            let removed = cx.events().of("router", "route_removed");
+            fcx.sleep(Duration::from_millis(10)).await?;
+            let removed = fcx.events().of("router", "route_removed");
             assert_eq!(removed.len(), 1);
             assert_eq!(removed[0].str("prefix"), Some("10.0.0.0/24"));
             drop(d);

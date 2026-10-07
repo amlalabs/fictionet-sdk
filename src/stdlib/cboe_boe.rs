@@ -2974,7 +2974,7 @@ impl Exchange {
         }
     }
 
-    fn returns(&self, kind: u8, cx: Context<'_>) -> Optional<ReturnTable> {
+    fn returns(&self, kind: u8, fcx: Context<'_>) -> Optional<ReturnTable> {
         let Some(mut out) = self
             .returns
             .get(&kind)
@@ -2983,7 +2983,7 @@ impl Exchange {
             return Optional::new();
         };
         for f in &mut out.fields {
-            if let Some(v) = value(f.id(), &cx) {
+            if let Some(v) = value(f.id(), &fcx) {
                 *f = v;
             }
         }
@@ -3599,8 +3599,8 @@ fn valid_cl_ord_id(id: &ClOrdId) -> bool {
 }
 
 /// The value of return field `id` from what is known, if anything is.
-fn value(id: FieldId, cx: &Context<'_>) -> Option<Opt> {
-    let o = cx.order;
+fn value(id: FieldId, fcx: &Context<'_>) -> Option<Opt> {
+    let o = fcx.order;
     Some(match id {
         FieldId::Side => Opt::Side(o?.side),
         FieldId::Price => Opt::Price(o?.price.unwrap_or_default()),
@@ -3610,10 +3610,10 @@ fn value(id: FieldId, cx: &Context<'_>) -> Option<Opt> {
         FieldId::OrderQty => Opt::OrderQty(o?.order_qty),
         FieldId::LeavesQty => Opt::LeavesQty(o?.leaves_qty),
         FieldId::OrigClOrdId => Opt::OrigClOrdId(o?.orig_cl_ord_id?),
-        FieldId::LastShares => Opt::LastShares(cx.last_shares),
-        FieldId::LastPx => Opt::LastPx(cx.last_px),
-        FieldId::BaseLiquidityIndicator => Opt::BaseLiquidityIndicator(cx.liquidity),
-        FieldId::MassCancelId => Opt::MassCancelId(cx.mass_cancel_id?),
+        FieldId::LastShares => Opt::LastShares(fcx.last_shares),
+        FieldId::LastPx => Opt::LastPx(fcx.last_px),
+        FieldId::BaseLiquidityIndicator => Opt::BaseLiquidityIndicator(fcx.liquidity),
+        FieldId::MassCancelId => Opt::MassCancelId(fcx.mass_cancel_id?),
         FieldId::DisplayPrice | FieldId::WorkingPrice => {
             let p = o?.price.unwrap_or_default();
             if id == FieldId::DisplayPrice {

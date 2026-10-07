@@ -36,8 +36,8 @@ struct Tun {
 }
 
 impl Interface for Tun {
-    fn poll_recv(&mut self, cx: &Cx, task: &mut std::task::Context<'_>) -> Poll<Result<Packet, RecvError>> {
-        self.rx.poll_recv(cx, task)
+    fn poll_recv(&mut self, fcx: &Cx, cx: &mut std::task::Context<'_>) -> Poll<Result<Packet, RecvError>> {
+        self.rx.poll_recv(fcx, cx)
     }
     fn send(&mut self, packet: Packet) {
         unsafe { libc::write(self.fd.as_raw_fd(), packet.0.as_ptr().cast(), packet.0.len()) };
@@ -79,12 +79,12 @@ fn sh(cmd: &str) {
 /// directions, while `LOSS` is set (per mille).
 static LOSS: AtomicUsize = AtomicUsize::new(0);
 
-fn demux(cx: &Cx, tun: Tun) -> [End; 4] {
+fn demux(fcx: &Cx, tun: Tun) -> [End; 4] {
     let (a, wa) = pair();
     let (b, wb) = pair();
     let (c, wc) = pair();
     let (d, wd) = pair();
-    cx.spawn(move |cx| async move {
+    fcx.spawn(move |fcx| async move {
         let mut tun = tun;
         let mut sides = [wa, wb, wc, wd];
         let mut seed = 0x9e3779b97f4a7c15u64;
@@ -104,12 +104,12 @@ fn demux(cx: &Cx, tun: Tun) -> [End; 4] {
             seed % 1000 < loss
         };
         loop {
-            let ev = poll_fn(|task| {
-                if let Poll::Ready(r) = tun.poll_recv(&cx, task) {
+            let ev = poll_fn(|cx| {
+                if let Poll::Ready(r) = tun.poll_recv(&fcx, cx) {
                     return Poll::Ready(r.map(|p| (None, p)));
                 }
                 for (i, s) in sides.iter_mut().enumerate() {
-                    if let Poll::Ready(r) = s.poll_recv(&cx, task) {
+                    if let Poll::Ready(r) = s.poll_recv(&fcx, cx) {
                         return Poll::Ready(r.map(|p| (Some(i), p)));
                     }
                 }
@@ -118,7 +118,7 @@ fn demux(cx: &Cx, tun: Tun) -> [End; 4] {
             .await;
             let lost = matches!(&ev, Ok((_, p)) if lose(p));
             if let Ok((from, p)) = &ev {
-                trace_packet(&cx, from.is_none(), p, trace, lost);
+                trace_packet(&fcx, from.is_none(), p, trace, lost);
             }
             match ev {
                 Ok(_) if lost => {}
@@ -145,7 +145,7 @@ fn demux(cx: &Cx, tun: Tun) -> [End; 4] {
 static RING: Mutex<std::collections::VecDeque<String>> = Mutex::new(std::collections::VecDeque::new());
 static LAST: Mutex<Option<Instant>> = Mutex::new(None);
 
-fn trace_packet(cx: &Cx, from_kernel: bool, p: &Packet, print: bool, lost: bool) {
+fn trace_packet(fcx: &Cx, from_kernel: bool, p: &Packet, print: bool, lost: bool) {
     *LAST.lock().unwrap() = Some(Instant::now());
     let (proto, hdr) = if p.0[0] >> 4 == 4 { (p.0[9], (p.0[0] & 15) as usize * 4) } else { (p.0[6], 40) };
     if proto != 6 {
@@ -155,7 +155,7 @@ fn trace_packet(cx: &Cx, from_kernel: bool, p: &Packet, print: bool, lost: bool)
     let off = ((t[12] >> 4) as usize) * 4;
     let line = format!(
         "{:>12.6} {} {}>{} seq={} ack={} flags={:02x} win={} len={}{}",
-        cx.now().since_start().as_secs_f64(),
+        fcx.now().since_start().as_secs_f64(),
         if from_kernel { "K>W" } else { "W>K" },
         u16::from_be_bytes([t[0], t[1]]),
         u16::from_be_bytes([t[2], t[3]]),
@@ -192,41 +192,41 @@ fn pattern(len: usize, seed: u64) -> Vec<u8> {
 /// `DOWNLOAD` bytes and closes.
 const DOWNLOAD: usize = 20 * 1024 * 1024;
 
-fn serve(cx: &Cx, ep: &tcp::Endpoint) -> fictionet::Result {
+fn serve(fcx: &Cx, ep: &tcp::Endpoint) -> fictionet::Result {
     let mut echo = ep.listen(80)?;
-    cx.spawn(move |cx| async move {
-        while let Ok(mut conn) = echo.accept(&cx).await {
-            cx.spawn(move |cx| async move {
+    fcx.spawn(move |fcx| async move {
+        while let Ok(mut conn) = echo.accept(&fcx).await {
+            fcx.spawn(move |fcx| async move {
                 let mut buf = vec![0; 65536];
                 loop {
-                    match conn.read(&cx, &mut buf).await {
+                    match conn.read(&fcx, &mut buf).await {
                         Ok(0) => break,
                         Ok(n) => {
-                            if conn.write_all(&cx, &buf[..n]).await.is_err() {
+                            if conn.write_all(&fcx, &buf[..n]).await.is_err() {
                                 return Ok(());
                             }
                         }
                         Err(_) => return Ok(()),
                     }
                 }
-                let _ = conn.shutdown(&cx).await;
+                let _ = conn.shutdown(&fcx).await;
                 // Wait for the client's FIN so the FIN is not lost on drop.
-                let _ = conn.read(&cx, &mut buf).await;
+                let _ = conn.read(&fcx, &mut buf).await;
                 Ok(())
             });
         }
         Ok(())
     });
     let mut down = ep.listen(81)?;
-    cx.spawn(move |cx| async move {
+    fcx.spawn(move |fcx| async move {
         let data = Arc::new(pattern(DOWNLOAD, 7));
-        while let Ok(mut conn) = down.accept(&cx).await {
+        while let Ok(mut conn) = down.accept(&fcx).await {
             let data = data.clone();
-            cx.spawn(move |cx| async move {
-                if conn.write_all(&cx, &data).await.is_ok() {
-                    let _ = conn.shutdown(&cx).await;
+            fcx.spawn(move |fcx| async move {
+                if conn.write_all(&fcx, &data).await.is_ok() {
+                    let _ = conn.shutdown(&fcx).await;
                     let mut buf = [0; 16];
-                    let _ = conn.read(&cx, &mut buf).await;
+                    let _ = conn.read(&fcx, &mut buf).await;
                 }
                 Ok(())
             });
@@ -236,10 +236,10 @@ fn serve(cx: &Cx, ep: &tcp::Endpoint) -> fictionet::Result {
     Ok(())
 }
 
-fn udp_echo(cx: &Cx, ep: &udp::Endpoint) -> fictionet::Result {
+fn udp_echo(fcx: &Cx, ep: &udp::Endpoint) -> fictionet::Result {
     let mut s = ep.bind(53)?;
-    cx.spawn(move |cx| async move {
-        while let Ok((data, from)) = s.recv(&cx).await {
+    fcx.spawn(move |fcx| async move {
+        while let Ok((data, from)) = s.recv(&fcx).await {
             s.send_to(&data, from);
         }
         Ok(())
@@ -364,16 +364,16 @@ fn a_linux_client_through_tun() {
     let log = Arc::new(Mutex::new(Vec::new()));
     let (done_tx, done_rx) = mpsc::channel::<()>();
     let l = log.clone();
-    let result = block_on(run(move |cx| async move {
-        let [t4, u4, t6, u6] = demux(&cx, tun);
-        let tcp4 = tcp::endpoint(&cx, t4, "10.9.0.2".parse()?);
-        let udp4 = udp::endpoint(&cx, u4, "10.9.0.2".parse()?);
-        let tcp6 = tcp::endpoint(&cx, t6, "fd09::2".parse()?);
-        let udp6 = udp::endpoint(&cx, u6, "fd09::2".parse()?);
-        serve(&cx, &tcp4)?;
-        serve(&cx, &tcp6)?;
-        udp_echo(&cx, &udp4)?;
-        udp_echo(&cx, &udp6)?;
+    let result = block_on(run(move |fcx| async move {
+        let [t4, u4, t6, u6] = demux(&fcx, tun);
+        let tcp4 = tcp::endpoint(&fcx, t4, "10.9.0.2".parse()?);
+        let udp4 = udp::endpoint(&fcx, u4, "10.9.0.2".parse()?);
+        let tcp6 = tcp::endpoint(&fcx, t6, "fd09::2".parse()?);
+        let udp6 = udp::endpoint(&fcx, u6, "fd09::2".parse()?);
+        serve(&fcx, &tcp4)?;
+        serve(&fcx, &tcp6)?;
+        udp_echo(&fcx, &udp4)?;
+        udp_echo(&fcx, &udp6)?;
         let checks = std::thread::spawn(move || {
             client(&l);
             let _ = done_tx.send(());
@@ -384,7 +384,7 @@ fn a_linux_client_through_tun() {
             match done_rx.try_recv() {
                 Ok(()) => break,
                 Err(mpsc::TryRecvError::Empty) => {
-                    cx.sleep(Duration::from_millis(50)).await?;
+                    fcx.sleep(Duration::from_millis(50)).await?;
                     let quiet = LAST.lock().unwrap().is_some_and(|t| t.elapsed() > Duration::from_secs(5));
                     if quiet && !dumped {
                         dumped = true;

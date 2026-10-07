@@ -28,7 +28,7 @@
 //! # use rustls::ServerConfig;
 //! # struct Certs { wikipedia: Arc<ServerConfig>, stripe: Arc<ServerConfig>, bad: Arc<ServerConfig>, github: Arc<ServerConfig> }
 //! # fn my_certs(_args: &[String]) -> Result<Certs> { unimplemented!() }
-//! async fn world(cx: Cx, attachments: Attachments, args: Vec<String>) -> Result {
+//! async fn world(fcx: Cx, attachments: Attachments, args: Vec<String>) -> Result {
 //! #   let wiki: axum::Router = axum::Router::new();
 //! #   let fake_stripe: axum::Router = axum::Router::new();
 //!     // Yours: an Arc<ServerConfig> per certificate, each issued by the world's CA.
@@ -45,7 +45,7 @@
 //!             web::Site::new(fake_stripe.clone()) // an axum::Router
 //!                 .tls({
 //!                     let (real, fake) = (certs.stripe.clone(), certs.bad.clone());
-//!                     move |cx| if cx.random_f64() < 0.1 { fake.clone() } else { real.clone() }
+//!                     move |fcx| if fcx.random_f64() < 0.1 { fake.clone() } else { real.clone() }
 //!                 }),
 //!         ),
 //! #       #[cfg(feature = "tokio")]
@@ -55,7 +55,7 @@
 //!         ),
 //!         _ => None, // NXDOMAIN: the world stays closed
 //!     })
-//!     .serve(&cx, attachments)?;
+//!     .serve(&fcx, attachments)?;
 //!     Ok(()) // the sites keep running after the world returns
 //! }
 //! ```
@@ -396,10 +396,10 @@
 //! ```
 //! # use fictionet::{Attachments, Cx, Result, stdlib::web};
 //! # fn site_for(_host: &str) -> Option<web::Site> { None }
-//! # fn world(cx: Cx, attachments: Attachments) -> Result {
-//! let events = cx.events();
+//! # fn world(fcx: Cx, attachments: Attachments) -> Result {
+//! let events = fcx.events();
 //! events.to_file("/var/lib/fictionet/events.jsonl")?;
-//! web::Sites::new(site_for).serve(&cx, attachments)?;
+//! web::Sites::new(site_for).serve(&fcx, attachments)?;
 //! // At the end of the sample: events.lost() must be zero.
 //! # Ok(())
 //! # }
@@ -494,9 +494,9 @@
 //! ```
 //! # use fictionet::{Attachments, Cx, Result, stdlib::{self, web}, time::ms};
 //! # fn site_for(_host: &str) -> Option<web::Site> { None }
-//! # fn world(cx: Cx, attachments: Attachments) -> Result {
-//! let far = attachments.map(&cx, |cx, sandbox| stdlib::delay(cx, ms(200), sandbox));
-//! web::Sites::new(site_for).serve(&cx, far)?;
+//! # fn world(fcx: Cx, attachments: Attachments) -> Result {
+//! let far = attachments.map(&fcx, |fcx, sandbox| stdlib::delay(fcx, ms(200), sandbox));
+//! web::Sites::new(site_for).serve(&fcx, far)?;
 //! # Ok(())
 //! # }
 //! ```
@@ -644,13 +644,13 @@ impl Sites {
     /// Builds the network and starts it. Every sandbox in `attachments`,
     /// including ones that attach later, is connected to the sites.
     ///
-    /// Returns immediately. The network runs in background tasks in `cx`'s
+    /// Returns immediately. The network runs in background tasks in `fcx`'s
     /// [region](crate::Cx#regions), and keeps running after the world
     /// returns, until that region is cancelled.
     ///
     /// Fails only if a [`subnet`](Sites::subnet) is not one it can use.
-    pub fn serve(self, cx: &Cx, attachments: Attachments) -> Result<(), Error> {
-        self.into_net().serve(cx, attachments)
+    pub fn serve(self, fcx: &Cx, attachments: Attachments) -> Result<(), Error> {
+        self.into_net().serve(fcx, attachments)
     }
 }
 
@@ -740,7 +740,7 @@ impl Site {
 
     /// Serves the site over HTTPS. `config_for` runs on every handshake and
     /// returns the TLS config to use, so it can choose differently each time,
-    /// with randomness from `cx`. To use one config every time, return a
+    /// with randomness from `fcx`. To use one config every time, return a
     /// clone of it.
     ///
     /// `serve` replaces the ALPN list of the returned config with `h2` and
@@ -845,7 +845,7 @@ impl tower_service::Service<Request<Body>> for Proxy {
     type Error = Error;
     type Future = std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self::Response, Error>> + Send>>;
 
-    fn poll_ready(&mut self, _task: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Error>> {
+    fn poll_ready(&mut self, _cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Error>> {
         std::task::Poll::Ready(Ok(()))
     }
 

@@ -13,13 +13,13 @@
 //! ```
 //! # use fictionet::{Cx, End, Result};
 //! # use fictionet::stdlib::{ip, tcp, udp};
-//! # fn dns(cx: Cx, dns_side: End) -> Result {
-//! let (tcp, udp, icmp, _other) = ip::split_protocols(&cx, dns_side);
+//! # fn dns(fcx: Cx, dns_side: End) -> Result {
+//! let (tcp, udp, icmp, _other) = ip::split_protocols(&fcx, dns_side);
 //!
-//! let tcp = tcp::endpoint(&cx, tcp, "1.1.1.1".parse()?);
+//! let tcp = tcp::endpoint(&fcx, tcp, "1.1.1.1".parse()?);
 //! let mut tcp_listener = tcp.listen(53)?;
 //!
-//! let udp = udp::endpoint(&cx, udp, "1.1.1.1".parse()?);
+//! let udp = udp::endpoint(&fcx, udp, "1.1.1.1".parse()?);
 //! let mut socket = udp.bind(53)?;
 //!
 //! // `icmp` is an interface of ICMP packets: answer pings on it with
@@ -105,13 +105,13 @@ fn capped() -> (End, End) {
 /// bytes more for each packet. Past that, packets are dropped, as on a
 /// congested link.
 #[track_caller]
-pub fn split_versions(cx: &Cx, inner: impl Interface) -> (End, End, End) {
+pub fn split_versions(fcx: &Cx, inner: impl Interface) -> (End, End, End) {
     let (v4, v4_mine) = capped();
     let (v6, v6_mine) = capped();
     let (other, other_mine) = capped();
-    cx.spawn_as(|| "split_versions".into(), move |cx| async move {
+    fcx.spawn_as(|| "split_versions".into(), move |fcx| async move {
         let ports = Ports::new(vec![Box::new(inner), Box::new(v4_mine), Box::new(v6_mine), Box::new(other_mine)]);
-        split(cx, ports, None, |packet| match version(&packet.0) {
+        split(fcx, ports, None, |packet| match version(&packet.0) {
             Some(4) => 1,
             Some(6) => 2,
             _ => 3,
@@ -129,17 +129,17 @@ pub fn split_versions(cx: &Cx, inner: impl Interface) -> (End, End, End) {
 /// It ends when the region is cancelled, when port 0 closes, or when every
 /// other port has closed.
 async fn split(
-    cx: Cx,
+    fcx: Cx,
     mut ports: Ports,
     mut reassembly: Option<Reassembly>,
     sort: impl Fn(&Packet) -> usize,
 ) -> fictionet::Result {
     loop {
         let deadline = reassembly.as_ref().and_then(|r| r.next_expiry());
-        match ports.next(&cx, deadline, |_| Poll::Pending).await? {
+        match ports.next(&fcx, deadline, |_| Poll::Pending).await? {
             Event::Packet(0, packet) => {
                 let packet = match reassembly.as_mut() {
-                    Some(r) => match r.intake(packet, cx.now()) {
+                    Some(r) => match r.intake(packet, fcx.now()) {
                         Intake::Whole(p) => p,
                         Intake::Waiting => continue,
                         Intake::Refused { answer, .. } => {
@@ -157,7 +157,7 @@ async fn split(
             Event::Packet(_, packet) => ports.send(0, packet),
             Event::Timer => {
                 if let Some(r) = reassembly.as_mut() {
-                    r.expire(cx.now());
+                    r.expire(fcx.now());
                 }
             }
             Event::Closed(0) | Event::Extra => return Ok(()),
@@ -236,12 +236,12 @@ async fn split(
 /// is dropped. Each fragment costs the same small amount of work, however
 /// many are waiting.
 #[track_caller]
-pub fn split_protocols(cx: &Cx, inner: impl Interface) -> (End, End, End, End) {
+pub fn split_protocols(fcx: &Cx, inner: impl Interface) -> (End, End, End, End) {
     let (tcp, tcp_mine) = capped();
     let (udp, udp_mine) = capped();
     let (icmp, icmp_mine) = capped();
     let (other, other_mine) = capped();
-    cx.spawn_as(|| "split_protocols".into(), move |cx| async move {
+    fcx.spawn_as(|| "split_protocols".into(), move |fcx| async move {
         let ports = Ports::new(vec![
             Box::new(inner),
             Box::new(tcp_mine),
@@ -249,7 +249,7 @@ pub fn split_protocols(cx: &Cx, inner: impl Interface) -> (End, End, End, End) {
             Box::new(icmp_mine),
             Box::new(other_mine),
         ]);
-        split(cx, ports, Some(Reassembly::default()), |packet| match protocol_end(&packet.0) {
+        split(fcx, ports, Some(Reassembly::default()), |packet| match protocol_end(&packet.0) {
             protocol::TCP => 1,
             protocol::UDP => 2,
             protocol::ICMP | protocol::ICMPV6 => 3,
@@ -1479,16 +1479,16 @@ mod tests {
     /// packet the agent sends there.
     #[test]
     fn an_interface_never_read_holds_at_most_its_queue() {
-        let result = crate::block_on(crate::run(|cx| async move {
+        let result = crate::block_on(crate::run(|fcx| async move {
             let (mut raw, side) = crate::pair();
-            let (_tcp, _udp, _icmp, other) = split_protocols(&cx, side);
+            let (_tcp, _udp, _icmp, other) = split_protocols(&fcx, side);
             // 20 MiB of protocol 99, which goes to `other`.
             for _ in 0..20 * 1024 {
                 let h = v4_header(99, Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(10, 0, 0, 1), 0, &[], 1000);
                 let mut p = h;
                 p.extend_from_slice(&[0; 1000]);
                 raw.send(Packet(p));
-                cx.yield_now().await?;
+                fcx.yield_now().await?;
             }
             assert!(other.queued() <= QUEUE, "{} bytes wait", other.queued());
             assert!(other.queued() > QUEUE / 2, "{} bytes wait", other.queued());

@@ -21,15 +21,15 @@
 //! ```
 //! # use fictionet::{Cx, Result, pair};
 //! # use fictionet::stdlib::{ip, tcp};
-//! # async fn stripe(cx: Cx) -> Result {
+//! # async fn stripe(fcx: Cx) -> Result {
 //! // A link between the router and Stripe's machine.
 //! let (router_side, stripe_side) = pair();
 //! // ...give router_side to the router for 104.18.32.7/32...
 //!
-//! let (tcp, _udp, _icmp, _other) = ip::split_protocols(&cx, stripe_side);
-//! let stripe = tcp::endpoint(&cx, tcp, "104.18.32.7".parse()?);
+//! let (tcp, _udp, _icmp, _other) = ip::split_protocols(&fcx, stripe_side);
+//! let stripe = tcp::endpoint(&fcx, tcp, "104.18.32.7".parse()?);
 //! let mut listener = stripe.listen(443)?;
-//! while let Ok(conn) = listener.accept(&cx).await {
+//! while let Ok(conn) = listener.accept(&fcx).await {
 //!     // TLS, then HTTP
 //! #   drop(conn);
 //! }
@@ -119,8 +119,8 @@ const ACK_DELAY: Duration = Duration::from_millis(10);
 /// nothing for one minute, as when it never closes its side. ICMP messages
 /// that reach this layer are dropped, so it does no path MTU discovery.
 #[track_caller]
-pub fn endpoint(cx: &Cx, inner: impl Interface, addr: IpAddr) -> Endpoint {
-    endpoint_with(cx, inner, addr, Options::default())
+pub fn endpoint(fcx: &Cx, inner: impl Interface, addr: IpAddr) -> Endpoint {
+    endpoint_with(fcx, inner, addr, Options::default())
 }
 
 /// Settings for [`endpoint_with`]. The default is what [`endpoint`] uses.
@@ -194,19 +194,19 @@ impl Options {
 /// ```
 /// # use fictionet::{Cx, End, Result};
 /// # use fictionet::stdlib::tcp;
-/// # fn machine(cx: &Cx, tcp_packets: End) -> Result {
+/// # fn machine(fcx: &Cx, tcp_packets: End) -> Result {
 /// let options = tcp::Options::default().buffer(1 << 20);
-/// let machine = tcp::endpoint_with(cx, tcp_packets, "10.0.0.1".parse()?, options);
+/// let machine = tcp::endpoint_with(fcx, tcp_packets, "10.0.0.1".parse()?, options);
 /// # drop(machine);
 /// # Ok(())
 /// # }
 /// ```
 #[track_caller]
-pub fn endpoint_with(cx: &Cx, inner: impl Interface, addr: IpAddr, options: Options) -> Endpoint {
+pub fn endpoint_with(fcx: &Cx, inner: impl Interface, addr: IpAddr, options: Options) -> Endpoint {
     let mut dev = Dev::default();
     let mut config = Config::new(HardwareAddress::Ip);
-    config.random_seed = cx.random_u64();
-    let mut iface = Iface::new(config, &mut dev, smol_now(cx));
+    config.random_seed = fcx.random_u64();
+    let mut iface = Iface::new(config, &mut dev, smol_now(fcx));
     iface.update_ip_addrs(|addrs| {
         let prefix = if addr.is_ipv4() { 32 } else { 128 };
         addrs.push(IpCidr::new(addr.into(), prefix)).expect("one address fits");
@@ -228,7 +228,7 @@ pub fn endpoint_with(cx: &Cx, inner: impl Interface, addr: IpAddr, options: Opti
             conns: HashMap::new(),
             by_tuple: HashMap::new(),
             ports: HashMap::new(),
-            next_port: EPHEMERAL + (cx.random_u64() % (65536 - EPHEMERAL as u64)) as u16,
+            next_port: EPHEMERAL + (fcx.random_u64() % (65536 - EPHEMERAL as u64)) as u16,
             orphans: Vec::new(),
             stopped: false,
             driver: None,
@@ -237,16 +237,16 @@ pub fn endpoint_with(cx: &Cx, inner: impl Interface, addr: IpAddr, options: Opti
         }),
     });
     let driver = shared.clone();
-    cx.spawn_as(|| "tcp::endpoint".into(), move |cx| async move {
-        drive(&cx, &driver, inner).await;
+    fcx.spawn_as(|| "tcp::endpoint".into(), move |fcx| async move {
+        drive(&fcx, &driver, inner).await;
         driver.stop();
         Ok(())
     });
     Endpoint { shared }
 }
 
-fn smol_now(cx: &Cx) -> smoltcp::time::Instant {
-    smoltcp::time::Instant::from_micros(cx.now().since_start().as_micros() as i64)
+fn smol_now(fcx: &Cx) -> smoltcp::time::Instant {
+    smoltcp::time::Instant::from_micros(fcx.now().since_start().as_micros() as i64)
 }
 
 /// The packets going into and out of smoltcp.
@@ -1006,18 +1006,18 @@ impl Shared {
 }
 
 /// The endpoint's one task: packets in, smoltcp, packets out, timers.
-async fn drive(cx: &Cx, shared: &Shared, mut inner: impl Interface) {
+async fn drive(fcx: &Cx, shared: &Shared, mut inner: impl Interface) {
     let mut timer = crate::cx::Timer::default();
     let mut batch: Vec<Vec<u8>> = Vec::with_capacity(64);
     let mut out: Vec<Vec<u8>> = Vec::new();
-    poll_fn(|task| {
-        if cx.is_cancelled() {
+    poll_fn(|cx| {
+        if fcx.is_cancelled() {
             return Poll::Ready(());
         }
         let received;
         let mut closed = false;
         while batch.len() < 64 {
-            match inner.poll_recv(cx, task) {
+            match inner.poll_recv(fcx, cx) {
                 Poll::Ready(Ok(p)) => batch.push(p.0),
                 Poll::Ready(Err(_)) => {
                     closed = true;
@@ -1029,10 +1029,10 @@ async fn drive(cx: &Cx, shared: &Shared, mut inner: impl Interface) {
         let next = {
             let mut st = shared.state.lock().unwrap();
             match &st.driver {
-                Some(w) if w.will_wake(task.waker()) => {}
-                _ => st.driver = Some(task.waker().clone()),
+                Some(w) if w.will_wake(cx.waker()) => {}
+                _ => st.driver = Some(cx.waker().clone()),
             }
-            let now = smol_now(cx);
+            let now = smol_now(fcx);
             st.iface.poll_maintenance(now);
             received = batch.len();
             let st = &mut *st;
@@ -1074,19 +1074,19 @@ async fn drive(cx: &Cx, shared: &Shared, mut inner: impl Interface) {
         if received == 64 {
             // Maybe more is waiting: give the rest of the run a turn, then
             // come back.
-            task.waker().wake_by_ref();
+            cx.waker().wake_by_ref();
             return Poll::Pending;
         }
         let deadline = next.map(|t| Instant::from_since_start(Duration::from_micros(t.total_micros().max(0) as u64)));
         match deadline {
             None => timer.clear(),
             Some(d) => {
-                if timer.poll_until(cx, task, d).is_ready() {
+                if timer.poll_until(fcx, cx, d).is_ready() {
                     // A timer is due, or the region was cancelled. Come back
                     // next turn, so a timer that keeps asking to run now
                     // cannot hold the thread.
                     timer.clear();
-                    task.waker().wake_by_ref();
+                    cx.waker().wake_by_ref();
                 }
             }
         }
@@ -1156,8 +1156,8 @@ impl Endpoint {
     /// address, or if every local port from 49152 up is taken. Fails with
     /// [`ConnError::TimedOut`] if nothing answers for two minutes, and with
     /// [`ConnError::Closed`] once the endpoint has stopped.
-    pub async fn connect(&self, cx: &Cx, to: SocketAddr) -> Result<TcpConnection, ConnError> {
-        if cx.is_cancelled() {
+    pub async fn connect(&self, fcx: &Cx, to: SocketAddr) -> Result<TcpConnection, ConnError> {
+        if fcx.is_cancelled() {
             return Err(ConnError::Cancelled);
         }
         let addr = self.shared.addr;
@@ -1194,8 +1194,8 @@ impl Endpoint {
             TcpConnection { shared: self.shared.clone(), handle: h, local, remote: to, read_wait: CancelWait::default(), write_wait: CancelWait::default() }
         };
         let mut wait = CancelWait::default();
-        poll_fn(|task| {
-            if cx.is_cancelled() {
+        poll_fn(|cx| {
+            if fcx.is_cancelled() {
                 return Poll::Ready(Err(ConnError::Cancelled));
             }
             {
@@ -1205,7 +1205,7 @@ impl Endpoint {
                 }
                 let s = st.sock(conn.handle);
                 match s.state() {
-                    TcpState::SynSent | TcpState::SynReceived => s.register_send_waker(task.waker()),
+                    TcpState::SynSent | TcpState::SynReceived => s.register_send_waker(cx.waker()),
                     TcpState::Closed => {
                         return Poll::Ready(Err(match st.closed_reason(conn.handle) {
                             ConnError::Reset => ConnError::Refused,
@@ -1215,7 +1215,7 @@ impl Endpoint {
                     _ => return Poll::Ready(Ok(())),
                 }
             }
-            if cx.register_cancel(task.waker(), &mut wait) {
+            if fcx.register_cancel(cx.waker(), &mut wait) {
                 return Poll::Ready(Err(ConnError::Cancelled));
             }
             Poll::Pending
@@ -1235,7 +1235,7 @@ pub struct Listener {
 impl Listener {
     /// Waits for the next connection.
     ///
-    /// Returns early with [`ConnError::Cancelled`] if `cx`'s
+    /// Returns early with [`ConnError::Cancelled`] if `fcx`'s
     /// [region](crate::Cx#regions) is cancelled, and fails with
     /// [`ConnError::Closed`] once the endpoint has stopped.
     ///
@@ -1245,12 +1245,12 @@ impl Listener {
     /// that, that address's connection attempts are dropped until some of
     /// its connections are accepted or give up. So one peer that sends
     /// SYNs and never finishes the handshake cannot lock others out.
-    pub async fn accept(&mut self, cx: &Cx) -> Result<TcpConnection, ConnError> {
+    pub async fn accept(&mut self, fcx: &Cx) -> Result<TcpConnection, ConnError> {
         let port = self.port;
         let shared = &self.shared;
         let wait = &mut self.wait;
-        poll_fn(|task| {
-            if cx.is_cancelled() {
+        poll_fn(|cx| {
+            if fcx.is_cancelled() {
                 return Poll::Ready(Err(ConnError::Cancelled));
             }
             {
@@ -1273,11 +1273,11 @@ impl Listener {
                     }));
                 }
                 match &l.waker {
-                    Some(w) if w.will_wake(task.waker()) => {}
-                    _ => l.waker = Some(task.waker().clone()),
+                    Some(w) if w.will_wake(cx.waker()) => {}
+                    _ => l.waker = Some(cx.waker().clone()),
                 }
             }
-            if cx.register_cancel(task.waker(), wait) {
+            if fcx.register_cancel(cx.waker(), wait) {
                 return Poll::Ready(Err(ConnError::Cancelled));
             }
             Poll::Pending
@@ -1367,8 +1367,8 @@ pub struct GoneWatch {
 
 impl GoneWatch {
     /// Ready once the connection was reset, or is gone.
-    pub fn poll_gone(&self, task: &mut Context<'_>) -> Poll<()> {
-        poll_gone(&self.shared, self.handle, task)
+    pub fn poll_gone(&self, cx: &mut Context<'_>) -> Poll<()> {
+        poll_gone(&self.shared, self.handle, cx)
     }
 
     /// Resets the connection, as [`TcpConnection::reset`] does, after the
@@ -1394,7 +1394,7 @@ impl GoneWatch {
 }
 
 /// Ready once the connection `handle` was reset, or is gone.
-fn poll_gone(shared: &Shared, handle: Id, task: &mut Context<'_>) -> Poll<()> {
+fn poll_gone(shared: &Shared, handle: Id, cx: &mut Context<'_>) -> Poll<()> {
     let mut st = shared.state.lock().unwrap();
     if st.stopped {
         return Poll::Ready(());
@@ -1403,8 +1403,8 @@ fn poll_gone(shared: &Shared, handle: Id, task: &mut Context<'_>) -> Poll<()> {
         None => Poll::Ready(()),
         Some(c) if c.rst => Poll::Ready(()),
         Some(c) => {
-            if !c.gone.iter().any(|w| w.will_wake(task.waker())) {
-                c.gone.push(task.waker().clone());
+            if !c.gone.iter().any(|w| w.will_wake(cx.waker())) {
+                c.gone.push(cx.waker().clone());
             }
             Poll::Pending
         }
@@ -1422,11 +1422,11 @@ impl Drop for TcpConnection {
 impl Connection for TcpConnection {
     fn poll_read(
         &mut self,
-        cx: &Cx,
-        task: &mut Context<'_>,
+        fcx: &Cx,
+        cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<Result<usize, ConnError>> {
-        if cx.is_cancelled() {
+        if fcx.is_cancelled() {
             return Poll::Ready(Err(ConnError::Cancelled));
         }
         {
@@ -1439,7 +1439,7 @@ impl Connection for TcpConnection {
                 return Poll::Ready(Ok(0));
             }
             match st.sock(h).recv_slice(buf) {
-                Ok(0) => st.sock(h).register_recv_waker(task.waker()),
+                Ok(0) => st.sock(h).register_recv_waker(cx.waker()),
                 Ok(n) => {
                     let c = st.conns.get_mut(&h).unwrap();
                     c.read = c.read.wrapping_add(n as u32);
@@ -1456,14 +1456,14 @@ impl Connection for TcpConnection {
                 }
             }
         }
-        if cx.register_cancel(task.waker(), &mut self.read_wait) {
+        if fcx.register_cancel(cx.waker(), &mut self.read_wait) {
             return Poll::Ready(Err(ConnError::Cancelled));
         }
         Poll::Pending
     }
 
-    fn poll_write(&mut self, cx: &Cx, task: &mut Context<'_>, data: &[u8]) -> Poll<Result<usize, ConnError>> {
-        if cx.is_cancelled() {
+    fn poll_write(&mut self, fcx: &Cx, cx: &mut Context<'_>, data: &[u8]) -> Poll<Result<usize, ConnError>> {
+        if fcx.is_cancelled() {
             return Poll::Ready(Err(ConnError::Cancelled));
         }
         {
@@ -1481,7 +1481,7 @@ impl Connection for TcpConnection {
             let s = st.sock(h);
             match s.state() {
                 TcpState::Established | TcpState::CloseWait => match s.send_slice(data) {
-                    Ok(0) => s.register_send_waker(task.waker()),
+                    Ok(0) => s.register_send_waker(cx.waker()),
                     Ok(n) => {
                         st.soiled(h);
                         st.kick();
@@ -1494,7 +1494,7 @@ impl Connection for TcpConnection {
                 _ => return Poll::Ready(Err(ConnError::Closed)),
             }
         }
-        if cx.register_cancel(task.waker(), &mut self.write_wait) {
+        if fcx.register_cancel(cx.waker(), &mut self.write_wait) {
             return Poll::Ready(Err(ConnError::Cancelled));
         }
         Poll::Pending
@@ -1502,7 +1502,7 @@ impl Connection for TcpConnection {
 
     /// Sends a FIN, after every byte already written. Returns immediately.
     /// It never waits, so a cancel does not stop it.
-    fn poll_shutdown(&mut self, _cx: &Cx, _task: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
+    fn poll_shutdown(&mut self, _fcx: &Cx, _cx: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
         let mut st = self.shared.state.lock().unwrap();
         if st.stopped {
             return Poll::Ready(Err(ConnError::Closed));
@@ -1516,8 +1516,8 @@ impl Connection for TcpConnection {
         st.kick();
         Poll::Ready(Ok(()))
     }
-    fn poll_gone(&self, task: &mut Context<'_>) -> Poll<()> {
-        poll_gone(&self.shared, self.handle, task)
+    fn poll_gone(&self, cx: &mut Context<'_>) -> Poll<()> {
+        poll_gone(&self.shared, self.handle, cx)
     }
 }
 
@@ -1558,9 +1558,9 @@ mod tests {
     fn syns_past_the_backlog_get_a_rst() {
         assert_eq!(Options::default().backlog, 4096);
         assert_eq!((Options::default().backlog(0).backlog, Options::default().backlog(1 << 20).backlog), (1, MAX_BACKLOG));
-        let result = block_on(run(|cx| async move {
+        let result = block_on(run(|fcx| async move {
             let (mut raw, side) = pair();
-            let server = endpoint_with(&cx, side, "10.0.0.1".parse().unwrap(), Options::default().backlog(4));
+            let server = endpoint_with(&fcx, side, "10.0.0.1".parse().unwrap(), Options::default().backlog(4));
             let _listener = server.listen(80)?;
             let to: SocketAddr = "10.0.0.1:80".parse().unwrap();
             for port in 1000..1010u16 {
@@ -1568,7 +1568,7 @@ mod tests {
             }
             let (mut syn_acks, mut rsts) = (0, 0);
             while syn_acks + rsts < 10 {
-                let p = raw.recv(&cx).await?;
+                let p = raw.recv(&fcx).await?;
                 let t = Header::parse_whole(&p.0).unwrap().payload(&p.0).to_vec();
                 match t[13] {
                     0x12 => syn_acks += 1,
@@ -1586,9 +1586,9 @@ mod tests {
     /// at most one spare listening socket, not one per SYN.
     #[test]
     fn a_burst_of_reset_handshakes_leaves_no_pool_of_sockets() {
-        let result = block_on(run(|cx| async move {
+        let result = block_on(run(|fcx| async move {
             let (mut raw, side) = pair();
-            let server = endpoint(&cx, side, "10.0.0.1".parse().unwrap());
+            let server = endpoint(&fcx, side, "10.0.0.1".parse().unwrap());
             let _listener = server.listen(80)?;
             let to: SocketAddr = "10.0.0.1:80".parse().unwrap();
             for port in 1000..1250u16 {
@@ -1596,7 +1596,7 @@ mod tests {
             }
             let mut acks = 0;
             while acks < 250 {
-                let p = raw.recv(&cx).await?;
+                let p = raw.recv(&fcx).await?;
                 let ip = Header::parse_whole(&p.0).unwrap();
                 let t = ip.payload(&p.0);
                 assert_eq!(t[13], 0x12, "a SYN-ACK");
@@ -1606,7 +1606,7 @@ mod tests {
                 raw.send(segment(from, to, 8, isn.wrapping_add(1), 0x04));
                 acks += 1;
             }
-            cx.sleep(Duration::from_millis(100)).await?;
+            fcx.sleep(Duration::from_millis(100)).await?;
             let st = server.shared.state.lock().unwrap();
             let l = &st.listeners[&80];
             assert!(l.embryonic.is_empty() && l.ready.is_empty());
@@ -1623,22 +1623,22 @@ mod tests {
     /// working.
     #[test]
     fn the_socket_set_shrinks_after_a_crowd_leaves() {
-        let result = block_on(run(|cx| async move {
+        let result = block_on(run(|fcx| async move {
             let (a, b) = pair();
-            let server = endpoint(&cx, a, "10.0.0.1".parse().unwrap());
-            let client = endpoint(&cx, b, "10.0.0.2".parse().unwrap());
+            let server = endpoint(&fcx, a, "10.0.0.1".parse().unwrap());
+            let client = endpoint(&fcx, b, "10.0.0.2".parse().unwrap());
             let mut listener = server.listen(80)?;
-            let mut keep_c = client.connect(&cx, "10.0.0.1:80".parse().unwrap()).await?;
-            let mut keep_s = listener.accept(&cx).await?;
+            let mut keep_c = client.connect(&fcx, "10.0.0.1:80".parse().unwrap()).await?;
+            let mut keep_s = listener.accept(&fcx).await?;
             let mut crowd = Vec::new();
             for _ in 0..400 {
-                let c = client.connect(&cx, "10.0.0.1:80".parse().unwrap()).await?;
-                let s = listener.accept(&cx).await?;
+                let c = client.connect(&fcx, "10.0.0.1:80".parse().unwrap()).await?;
+                let s = listener.accept(&fcx).await?;
                 crowd.push((c, s));
             }
             assert!(server.shared.state.lock().unwrap().slots >= 401);
             drop(crowd);
-            cx.sleep(Duration::from_millis(300)).await?;
+            fcx.sleep(Duration::from_millis(300)).await?;
             for e in [&server, &client] {
                 let st = e.shared.state.lock().unwrap();
                 assert!(st.handles.len() <= 3, "{} sockets left", st.handles.len());
@@ -1650,17 +1650,17 @@ mod tests {
             let data = pattern(1 << 20, 9);
             let writer = {
                 let data = data.clone();
-                cx.spawn(move |cx| async move {
-                    keep_s.write_all(&cx, &data).await?;
+                fcx.spawn(move |fcx| async move {
+                    keep_s.write_all(&fcx, &data).await?;
                     Ok(())
                 })
             };
             let mut got = vec![0u8; 1 << 20];
             let mut at = 0;
             while at < got.len() {
-                at += keep_c.read(&cx, &mut got[at..]).await?;
+                at += keep_c.read(&fcx, &mut got[at..]).await?;
             }
-            writer.join(&cx).await?;
+            writer.join(&fcx).await?;
             assert!(got == data, "the connection that stayed open still works");
             Err::<(), crate::Error>(fictionet::Error::msg("done"))
         }));
@@ -1671,17 +1671,17 @@ mod tests {
     /// a minute, not the two minutes of an open one.
     #[test]
     fn a_dropped_connection_waits_a_minute_at_most() {
-        let result = block_on(run(|cx| async move {
+        let result = block_on(run(|fcx| async move {
             let (a, b) = pair();
-            let server = endpoint(&cx, a, "10.0.0.1".parse().unwrap());
-            let client = endpoint(&cx, b, "10.0.0.2".parse().unwrap());
+            let server = endpoint(&fcx, a, "10.0.0.1".parse().unwrap());
+            let client = endpoint(&fcx, b, "10.0.0.2".parse().unwrap());
             let mut listener = server.listen(80)?;
-            let _c = client.connect(&cx, "10.0.0.1:80".parse().unwrap()).await?;
-            let s = listener.accept(&cx).await?;
+            let _c = client.connect(&fcx, "10.0.0.1:80".parse().unwrap()).await?;
+            let s = listener.accept(&fcx).await?;
             let h = s.handle;
             assert_eq!(server.shared.state.lock().unwrap().get(h).timeout(), Some(TIMEOUT.into()));
             drop(s);
-            cx.sleep(Duration::from_millis(50)).await?;
+            fcx.sleep(Duration::from_millis(50)).await?;
             let st = server.shared.state.lock().unwrap();
             assert_eq!(st.get(h).state(), TcpState::FinWait2, "the client never closes its side");
             assert_eq!(st.get(h).timeout(), Some(ORPHAN_TIMEOUT.into()));
@@ -1696,14 +1696,14 @@ mod tests {
         assert_eq!(Options::default().buffer(1).buffer, MIN_BUFFER);
         assert_eq!(Options::default().buffer(usize::MAX).buffer, MAX_BUFFER);
         for size in [MIN_BUFFER, 1 << 20] {
-            let result = block_on(run(move |cx| async move {
+            let result = block_on(run(move |fcx| async move {
                 let (a, b) = pair();
                 let options = Options::default().buffer(size);
-                let server = endpoint_with(&cx, a, "10.0.0.1".parse().unwrap(), options);
-                let client = endpoint_with(&cx, b, "10.0.0.2".parse().unwrap(), options);
+                let server = endpoint_with(&fcx, a, "10.0.0.1".parse().unwrap(), options);
+                let client = endpoint_with(&fcx, b, "10.0.0.2".parse().unwrap(), options);
                 let mut listener = server.listen(80)?;
-                let mut c = client.connect(&cx, "10.0.0.1:80".parse().unwrap()).await?;
-                let mut s = listener.accept(&cx).await?;
+                let mut c = client.connect(&fcx, "10.0.0.1:80".parse().unwrap()).await?;
+                let mut s = listener.accept(&fcx).await?;
                 for (ep, h) in [(&server, s.handle), (&client, c.handle)] {
                     let st = ep.shared.state.lock().unwrap();
                     assert_eq!(st.get(h).recv_capacity(), size);
@@ -1713,14 +1713,14 @@ mod tests {
                 // than the default.
                 let data = pattern(3 << 20, 7);
                 let sent = data.clone();
-                let writer = cx.spawn(move |cx| async move { Ok(s.write_all(&cx, &sent).await?) });
+                let writer = fcx.spawn(move |fcx| async move { Ok(s.write_all(&fcx, &sent).await?) });
                 let mut got = vec![0u8; data.len()];
                 let mut at = 0;
                 while at < got.len() {
-                    at += c.read(&cx, &mut got[at..]).await?;
+                    at += c.read(&fcx, &mut got[at..]).await?;
                 }
                 assert!(got == data, "the data came through unchanged with {size}-byte buffers");
-                writer.join(&cx).await?;
+                writer.join(&fcx).await?;
                 Err::<(), crate::Error>(fictionet::Error::msg("done"))
             }));
             assert_eq!(result.unwrap_err().to_string(), "done");
@@ -1729,13 +1729,13 @@ mod tests {
 
     #[test]
     fn quiet_connections_give_their_buffer_pages_back() {
-        let result = block_on(run(|cx| async move {
+        let result = block_on(run(|fcx| async move {
             let (a, b) = pair();
-            let server = endpoint(&cx, a, "10.0.0.1".parse().unwrap());
-            let client = endpoint(&cx, b, "10.0.0.2".parse().unwrap());
+            let server = endpoint(&fcx, a, "10.0.0.1".parse().unwrap());
+            let client = endpoint(&fcx, b, "10.0.0.2".parse().unwrap());
             let mut listener = server.listen(80)?;
-            let mut c = client.connect(&cx, "10.0.0.1:80".parse().unwrap()).await?;
-            let mut s = listener.accept(&cx).await?;
+            let mut c = client.connect(&fcx, "10.0.0.1:80".parse().unwrap()).await?;
+            let mut s = listener.accept(&fcx).await?;
             // A fresh connection costs (almost) no pages.
             assert!(resident(&server) <= 4, "{}", resident(&server));
 
@@ -1746,12 +1746,12 @@ mod tests {
                 let slot = Arc::new(Mutex::new(None));
                 let writer = {
                     let (down, slot) = (down.clone(), slot.clone());
-                    cx.spawn(move |cx| async move {
-                        s.write_all(&cx, &down).await?;
+                    fcx.spawn(move |fcx| async move {
+                        s.write_all(&fcx, &down).await?;
                         let mut got = vec![0u8; 1 << 20];
                         let mut at = 0;
                         while at < got.len() {
-                            at += s.read(&cx, &mut got[at..]).await?;
+                            at += s.read(&fcx, &mut got[at..]).await?;
                         }
                         *slot.lock().unwrap() = Some((s, got));
                         Ok(())
@@ -1760,11 +1760,11 @@ mod tests {
                 let mut got = vec![0u8; 1 << 20];
                 let mut at = 0;
                 while at < got.len() {
-                    at += c.read(&cx, &mut got[at..]).await?;
+                    at += c.read(&fcx, &mut got[at..]).await?;
                 }
                 assert!(got == down, "the download came through unchanged in round {round}");
-                c.write_all(&cx, &up).await?;
-                writer.join(&cx).await?;
+                c.write_all(&fcx, &up).await?;
+                writer.join(&fcx).await?;
                 let (back, got_up) = slot.lock().unwrap().take().unwrap();
                 s = back;
                 assert!(got_up == up, "the upload came through unchanged in round {round}");
@@ -1772,7 +1772,7 @@ mod tests {
                 assert!(resident(&server) >= 64, "{}", resident(&server));
                 // Once the connection is quiet, its pages go back, while it
                 // stays open.
-                cx.sleep(Duration::from_millis(2500)).await?;
+                fcx.sleep(Duration::from_millis(2500)).await?;
                 assert_eq!(resident(&server), 0);
                 assert_eq!(resident(&client), 0);
             }

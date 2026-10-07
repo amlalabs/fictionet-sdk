@@ -84,10 +84,10 @@ pub fn args() -> Result<Args, String> {
 
 /// Builds the network: one site per FakeWiki host at its own address, with
 /// its certificate, every request logged. `leaves` holds each host's
-/// certificate chain and key. Returns at once; the network runs in `cx`'s
+/// certificate chain and key. Returns at once; the network runs in `fcx`'s
 /// region.
 pub fn serve(
-    cx: &Cx,
+    fcx: &Cx,
     hosts: &HashMap<String, Ipv4Addr>,
     leaves: HashMap<String, Leaf>,
     content: Content,
@@ -96,14 +96,14 @@ pub fn serve(
 ) -> fictionet::Result {
     let mut configs = HashMap::new();
     for (host, (chain, key)) in leaves {
-        let config = tls::config_builder(cx, SystemTime::now(), rustls::crypto::ring::default_provider())
+        let config = tls::config_builder(fcx, SystemTime::now(), rustls::crypto::ring::default_provider())
             .with_safe_default_protocol_versions()?
             .with_no_client_auth()
             .with_single_cert(chain, key)?;
         configs.insert(host, Arc::new(config));
     }
     let site_hosts = hosts.clone();
-    events::log_to(cx, hosts.clone(), log);
+    events::log_to(fcx, hosts.clone(), log);
     web::Sites::new(move |host: &str| {
         let addr = *site_hosts.get(host)?;
         let config = configs.get(host)?.clone();
@@ -112,7 +112,7 @@ pub fn serve(
     // The agent's sandbox has IPv6 off, and the sites keep their real
     // IPv4 addresses only.
     .ipv4_only()
-    .serve(cx, attachments)?;
+    .serve(fcx, attachments)?;
     Ok(())
 }
 
@@ -189,7 +189,7 @@ const LOOKUP_FROM: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 254)
 /// Asks the gateway's DNS for every host, as a sandbox would, and waits
 /// for every answer. This makes `Sites` run its callback for each host, so
 /// each site and its address exist before the first sandbox attaches.
-pub async fn look_up_all(cx: &Cx, attacher: &Attacher, hosts: &[String]) -> fictionet::Result {
+pub async fn look_up_all(fcx: &Cx, attacher: &Attacher, hosts: &[String]) -> fictionet::Result {
     let mut end: End = attacher.attach(events::LOOKUPS).map_err(|e| fictionet::Error::msg(format!("lookups: {e}")))?;
     let mut waiting: HashMap<u16, &str> = HashMap::new();
     for (i, host) in hosts.iter().enumerate() {
@@ -197,14 +197,14 @@ pub async fn look_up_all(cx: &Cx, attacher: &Attacher, hosts: &[String]) -> fict
         end.send(Packet(dns_query_packet(id, host)));
         waiting.insert(id, host);
     }
-    let deadline = cx.now() + Duration::from_secs(10);
-    let mut sleep = pin!(cx.sleep_until(deadline));
+    let deadline = fcx.now() + Duration::from_secs(10);
+    let mut sleep = pin!(fcx.sleep_until(deadline));
     while !waiting.is_empty() {
-        let packet = poll_fn(|task| {
-            if let Poll::Ready(r) = end.poll_recv(cx, task) {
+        let packet = poll_fn(|cx| {
+            if let Poll::Ready(r) = end.poll_recv(fcx, cx) {
                 return Poll::Ready(r.ok());
             }
-            match sleep.as_mut().poll(task) {
+            match sleep.as_mut().poll(cx) {
                 Poll::Ready(_) => Poll::Ready(None),
                 Poll::Pending => Poll::Pending,
             }

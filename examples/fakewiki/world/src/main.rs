@@ -70,13 +70,13 @@ fn real_main() -> fictionet::Result {
 
     // The network itself needs no tokio; the content client does.
     let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
-    runtime.block_on(fictionet::run(move |cx| async move {
-        serve(&cx, &hosts, leaves, content, log, attachments)?;
+    runtime.block_on(fictionet::run(move |fcx| async move {
+        serve(&fcx, &hosts, leaves, content, log, attachments)?;
 
         // Look every host up once, so each FakeWiki address answers from
         // the start, as in the Python world, even for an agent that
         // connects by address without DNS.
-        look_up_all(&cx, &attacher, &host_list).await?;
+        look_up_all(&fcx, &attacher, &host_list).await?;
         let _listening = fictionet::listen(fictionet::WorldSocket::UnixSocket(socket.into()), attacher)?;
 
         std::fs::write(&state_path, serde_json::to_string_pretty(&state)?)?;

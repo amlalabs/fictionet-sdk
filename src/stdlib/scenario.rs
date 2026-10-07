@@ -26,17 +26,17 @@
 //!
 //! struct Plant { spoofed: AtomicBool }
 //! let scenario = Scenario::new()
-//!     .at(Duration::from_secs(120), |plant: &Plant, _cx| plant.spoofed.store(true, Ordering::SeqCst))
+//!     .at(Duration::from_secs(120), |plant: &Plant, _fcx| plant.spoofed.store(true, Ordering::SeqCst))
 //!     .expect("the operator read the temperature", |e| e.is("modbus", "read_input"))
 //!     .forbid("the operator kept the pump running", |e| e.is("modbus", "write_register") && e.level == Level::Alarm);
 //! let checks = scenario.checks();
 //! let log = std::sync::Arc::new(std::sync::Mutex::new(None));
 //! let kept = log.clone();
-//! # fictionet::block_on(fictionet::run(move |cx| async move {
-//! *kept.lock().unwrap() = Some(cx.events());
-//! let _timeline = scenario.run(&cx, Arc::new(Plant { spoofed: AtomicBool::new(false) }));
-//! cx.record(Event::new("modbus", "read_input").field("register", 30001u32));
-//! # cx.cancel(); // End the example's world without waiting two minutes.
+//! # fictionet::block_on(fictionet::run(move |fcx| async move {
+//! *kept.lock().unwrap() = Some(fcx.events());
+//! let _timeline = scenario.run(&fcx, Arc::new(Plant { spoofed: AtomicBool::new(false) }));
+//! fcx.record(Event::new("modbus", "read_input").field("register", 30001u32));
+//! # fcx.cancel(); // End the example's world without waiting two minutes.
 //! # Ok(()) }))?;
 //! // The log is still there after the run.
 //! let report = checks.grade(&log.lock().unwrap().take().unwrap().all());
@@ -119,17 +119,17 @@ impl<W: Send + Sync + 'static> Scenario<W> {
         Checks { checks: self.checks.clone() }
     }
 
-    /// Plays the timeline as a task on `cx`, against `world`. The task ends
+    /// Plays the timeline as a task on `fcx`, against `world`. The task ends
     /// after the last step, or when the region is cancelled.
-    pub fn run(self, cx: &Cx, world: Arc<W>) -> Task {
+    pub fn run(self, fcx: &Cx, world: Arc<W>) -> Task {
         let mut steps = self.steps;
         // A stable sort keeps the order of steps at the same time.
         steps.sort_by_key(|s| s.at);
-        cx.spawn(move |cx| async move {
-            let start = cx.now();
+        fcx.spawn(move |fcx| async move {
+            let start = fcx.now();
             for step in steps {
-                cx.sleep_until(start + step.at).await?;
-                (step.act)(&world, &cx);
+                fcx.sleep_until(start + step.at).await?;
+                (step.act)(&world, &fcx);
             }
             Ok(())
         })

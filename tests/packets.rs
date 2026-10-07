@@ -35,19 +35,19 @@ where
 }
 
 /// Waits up to 1 s for a packet on `end`.
-async fn recv_soon(cx: &Cx, end: &mut End) -> Packet {
-    recv_within(cx, end, ms(1000)).await.expect("no packet arrived")
+async fn recv_soon(fcx: &Cx, end: &mut End) -> Packet {
+    recv_within(fcx, end, ms(1000)).await.expect("no packet arrived")
 }
 
 /// Waits up to `limit` for a packet. `None` if none came.
-async fn recv_within(cx: &Cx, end: &mut End, limit: Duration) -> Option<Packet> {
-    let deadline = cx.now() + limit;
-    let mut sleep = Box::pin(cx.sleep_until(deadline));
-    std::future::poll_fn(|task| {
-        if let Poll::Ready(r) = end.poll_recv(cx, task) {
+async fn recv_within(fcx: &Cx, end: &mut End, limit: Duration) -> Option<Packet> {
+    let deadline = fcx.now() + limit;
+    let mut sleep = Box::pin(fcx.sleep_until(deadline));
+    std::future::poll_fn(|cx| {
+        if let Poll::Ready(r) = end.poll_recv(fcx, cx) {
             return Poll::Ready(r.ok());
         }
-        if sleep.as_mut().poll(task).is_ready() {
+        if sleep.as_mut().poll(cx).is_ready() {
             return Poll::Ready(None);
         }
         Poll::Pending
@@ -68,45 +68,45 @@ fn tagged(tag: u8, len: usize) -> Packet {
 
 #[test]
 fn delay_holds_every_packet_both_ways_and_keeps_order() {
-    world(|cx| async move {
+    world(|fcx| async move {
         let (mut sandbox, world_side) = pair();
-        let mut link = delay(&cx, ms(50), world_side);
+        let mut link = delay(&fcx, ms(50), world_side);
 
         // Ten packets sent together arrive together, 50 ms later, in order.
-        let sent = cx.now();
+        let sent = fcx.now();
         for i in 0..10 {
             sandbox.send(tagged(i, 100));
         }
         for i in 0..10 {
-            let p = recv_soon(&cx, &mut link).await;
+            let p = recv_soon(&fcx, &mut link).await;
             assert_eq!(p.0[0], i, "order kept");
-            let waited = cx.now().since_start() - sent.since_start();
+            let waited = fcx.now().since_start() - sent.since_start();
             assert!(waited >= ms(50), "packet {i} came after {waited:?}");
             assert!(waited < ms(150), "packet {i} came after {waited:?}");
         }
 
         // The other direction too.
-        let sent = cx.now();
+        let sent = fcx.now();
         for i in 0..10 {
             link.send(tagged(100 + i, 100));
         }
         for i in 0..10 {
-            let p = recv_soon(&cx, &mut sandbox).await;
+            let p = recv_soon(&fcx, &mut sandbox).await;
             assert_eq!(p.0[0], 100 + i);
-            let waited = cx.now().since_start() - sent.since_start();
+            let waited = fcx.now().since_start() - sent.since_start();
             assert!(waited >= ms(50) && waited < ms(150), "{waited:?}");
         }
 
         // Packets sent apart stay apart: each is held for 50 ms from when
         // it was sent, not from when the one before it left.
-        let t0 = cx.now();
+        let t0 = fcx.now();
         sandbox.send(tagged(1, 10));
-        cx.sleep(ms(30)).await?;
+        fcx.sleep(ms(30)).await?;
         sandbox.send(tagged(2, 10));
-        recv_soon(&cx, &mut link).await;
-        let first = cx.now().since_start() - t0.since_start();
-        recv_soon(&cx, &mut link).await;
-        let second = cx.now().since_start() - t0.since_start();
+        recv_soon(&fcx, &mut link).await;
+        let first = fcx.now().since_start() - t0.since_start();
+        recv_soon(&fcx, &mut link).await;
+        let second = fcx.now().since_start() - t0.since_start();
         assert!(first >= ms(50) && first < ms(75), "{first:?}");
         assert!(second >= ms(80) && second < ms(105), "{second:?}");
         Ok(())
@@ -115,16 +115,16 @@ fn delay_holds_every_packet_both_ways_and_keeps_order() {
 
 #[test]
 fn delay_ends_when_either_cable_closes() {
-    world(|cx| async move {
+    world(|fcx| async move {
         let (sandbox, world_side) = pair();
-        let mut link = delay(&cx, ms(10), world_side);
+        let mut link = delay(&fcx, ms(10), world_side);
         drop(sandbox);
-        assert_eq!(link.recv(&cx).await, Err(RecvError::Closed));
+        assert_eq!(link.recv(&fcx).await, Err(RecvError::Closed));
 
         let (mut sandbox, world_side) = pair();
-        let link = delay(&cx, ms(10), world_side);
+        let link = delay(&fcx, ms(10), world_side);
         drop(link);
-        assert_eq!(sandbox.recv(&cx).await, Err(RecvError::Closed));
+        assert_eq!(sandbox.recv(&fcx).await, Err(RecvError::Closed));
         Ok(())
     });
 }
@@ -133,19 +133,19 @@ fn delay_ends_when_either_cable_closes() {
 
 #[test]
 fn bottleneck_sends_at_the_rate() {
-    world(|cx| async move {
+    world(|fcx| async move {
         let (mut sandbox, world_side) = pair();
         // 1 Mbit/s: a 1,250-byte packet takes 10 ms.
-        let mut link = bottleneck(&cx, 1_000_000, 100, world_side);
-        let t0 = cx.now();
+        let mut link = bottleneck(&fcx, 1_000_000, 100, world_side);
+        let t0 = fcx.now();
         for i in 0..20 {
             sandbox.send(tagged(i, 1250));
         }
         let mut times = Vec::new();
         for i in 0..20 {
-            let p = recv_soon(&cx, &mut link).await;
+            let p = recv_soon(&fcx, &mut link).await;
             assert_eq!(p.0[0], i);
-            times.push(cx.now().since_start() - t0.since_start());
+            times.push(fcx.now().since_start() - t0.since_start());
         }
         assert!(times[0] >= ms(10), "first after {:?}", times[0]);
         assert!(times[19] >= ms(200), "last after {:?}", times[19]);
@@ -155,14 +155,14 @@ fn bottleneck_sends_at_the_rate() {
         assert!(times[9] >= ms(100) && times[9] < ms(200), "tenth after {:?}", times[9]);
 
         // The other direction has its own rate and queue.
-        let t0 = cx.now();
+        let t0 = fcx.now();
         for i in 0..5 {
             link.send(tagged(i, 1250));
         }
         for i in 0..5 {
-            assert_eq!(recv_soon(&cx, &mut sandbox).await.0[0], i);
+            assert_eq!(recv_soon(&fcx, &mut sandbox).await.0[0], i);
         }
-        let took = cx.now().since_start() - t0.since_start();
+        let took = fcx.now().since_start() - t0.since_start();
         assert!(took >= ms(50) && took < ms(150), "{took:?}");
         Ok(())
     });
@@ -170,22 +170,22 @@ fn bottleneck_sends_at_the_rate() {
 
 #[test]
 fn bottleneck_queue_of_ten_drops_the_eleventh_of_a_burst() {
-    world(|cx| async move {
+    world(|fcx| async move {
         for direction in 0..2 {
             let (mut sandbox, world_side) = pair();
-            let mut link = bottleneck(&cx, 1_000_000, 10, world_side);
+            let mut link = bottleneck(&fcx, 1_000_000, 10, world_side);
             let (from, to) = if direction == 0 { (&mut sandbox, &mut link) } else { (&mut link, &mut sandbox) };
             for i in 0..11 {
                 from.send(tagged(i, 1250));
             }
             for i in 0..10 {
-                assert_eq!(recv_soon(&cx, to).await.0[0], i);
+                assert_eq!(recv_soon(&fcx, to).await.0[0], i);
             }
-            assert!(recv_within(&cx, to, ms(100)).await.is_none(), "the 11th was not dropped");
+            assert!(recv_within(&fcx, to, ms(100)).await.is_none(), "the 11th was not dropped");
 
             // Once the queue has drained, packets pass again.
             from.send(tagged(42, 1250));
-            assert_eq!(recv_soon(&cx, to).await.0[0], 42);
+            assert_eq!(recv_soon(&fcx, to).await.0[0], 42);
         }
         Ok(())
     });
@@ -228,19 +228,19 @@ const B6: [u8; 16] = [0x26, 0x06, 0x47, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x11, 0
 
 #[test]
 fn split_versions_sorts_by_version_and_merges_back() {
-    world(|cx| async move {
+    world(|fcx| async move {
         let (mut sandbox, world_side) = pair();
-        let (mut v4, mut v6, mut other) = ip::split_versions(&cx, world_side);
+        let (mut v4, mut v6, mut other) = ip::split_versions(&fcx, world_side);
         let p4 = v4_udp(A4, B4, b"four");
         let p6 = v6_udp(A6, B6, b"six");
         sandbox.send(Packet(p4.clone()));
         sandbox.send(Packet(p6.clone()));
         sandbox.send(Packet(vec![]));
         sandbox.send(Packet(vec![0x50, 1, 2]));
-        assert_eq!(recv_soon(&cx, &mut v4).await.0, p4);
-        assert_eq!(recv_soon(&cx, &mut v6).await.0, p6);
-        assert_eq!(recv_soon(&cx, &mut other).await.0, Vec::<u8>::new());
-        assert_eq!(recv_soon(&cx, &mut other).await.0, vec![0x50, 1, 2]);
+        assert_eq!(recv_soon(&fcx, &mut v4).await.0, p4);
+        assert_eq!(recv_soon(&fcx, &mut v6).await.0, p6);
+        assert_eq!(recv_soon(&fcx, &mut other).await.0, Vec::<u8>::new());
+        assert_eq!(recv_soon(&fcx, &mut other).await.0, vec![0x50, 1, 2]);
 
         // Packets sent into any end go out on the cable being split.
         v6.send(Packet(p6.clone()));
@@ -248,7 +248,7 @@ fn split_versions_sorts_by_version_and_merges_back() {
         v4.send(Packet(p4.clone()));
         let mut got = Vec::new();
         for _ in 0..3 {
-            got.push(recv_soon(&cx, &mut sandbox).await.0);
+            got.push(recv_soon(&fcx, &mut sandbox).await.0);
         }
         got.sort();
         let mut want = vec![p6, vec![9], p4];
@@ -257,9 +257,9 @@ fn split_versions_sorts_by_version_and_merges_back() {
 
         // Closing the split cable closes all three ends.
         drop(sandbox);
-        assert_eq!(v4.recv(&cx).await, Err(RecvError::Closed));
-        assert_eq!(v6.recv(&cx).await, Err(RecvError::Closed));
-        assert_eq!(other.recv(&cx).await, Err(RecvError::Closed));
+        assert_eq!(v4.recv(&fcx).await, Err(RecvError::Closed));
+        assert_eq!(v6.recv(&fcx).await, Err(RecvError::Closed));
+        assert_eq!(other.recv(&fcx).await, Err(RecvError::Closed));
         Ok(())
     });
 }
@@ -282,9 +282,9 @@ fn icmp6_error(type_: u8, code: u8, rest: [u8; 4], quoted: &[u8]) -> Vec<u8> {
 
 #[test]
 fn split_protocols_sorts_by_protocol_and_icmp_errors_by_the_quoted_packet() {
-    world(|cx| async move {
+    world(|fcx| async move {
         let (mut sandbox, world_side) = pair();
-        let (mut tcp, mut udp, mut icmp_end, mut other) = ip::split_protocols(&cx, world_side);
+        let (mut tcp, mut udp, mut icmp_end, mut other) = ip::split_protocols(&fcx, world_side);
 
         let tcp4 = v4_tcp(A4, B4, b"hello");
         let udp4 = v4_udp(A4, B4, b"query");
@@ -315,22 +315,22 @@ fn split_protocols_sorts_by_protocol_and_icmp_errors_by_the_quoted_packet() {
         for p in [&tcp4, &udp4, &tcp6, &udp6, &ping4, &ping6, &gre, &hbh, &port_unreachable, &frag_needed, &too_big, &unreachable6, &about_ping] {
             sandbox.send(Packet(p.clone()));
         }
-        assert_eq!(recv_soon(&cx, &mut tcp).await.0, tcp4);
-        assert_eq!(recv_soon(&cx, &mut tcp).await.0, tcp6);
-        assert_eq!(recv_soon(&cx, &mut tcp).await.0, frag_needed);
-        assert_eq!(recv_soon(&cx, &mut tcp).await.0, too_big);
-        assert_eq!(recv_soon(&cx, &mut udp).await.0, udp4);
-        assert_eq!(recv_soon(&cx, &mut udp).await.0, udp6);
+        assert_eq!(recv_soon(&fcx, &mut tcp).await.0, tcp4);
+        assert_eq!(recv_soon(&fcx, &mut tcp).await.0, tcp6);
+        assert_eq!(recv_soon(&fcx, &mut tcp).await.0, frag_needed);
+        assert_eq!(recv_soon(&fcx, &mut tcp).await.0, too_big);
+        assert_eq!(recv_soon(&fcx, &mut udp).await.0, udp4);
+        assert_eq!(recv_soon(&fcx, &mut udp).await.0, udp6);
         // The hop-by-hop header asks nothing of the host, and is taken out.
-        assert_eq!(recv_soon(&cx, &mut udp).await.0, udp6);
-        assert_eq!(recv_soon(&cx, &mut udp).await.0, port_unreachable);
-        assert_eq!(recv_soon(&cx, &mut udp).await.0, unreachable6);
-        assert_eq!(recv_soon(&cx, &mut icmp_end).await.0, ping4);
-        assert_eq!(recv_soon(&cx, &mut icmp_end).await.0, ping6);
-        assert_eq!(recv_soon(&cx, &mut icmp_end).await.0, about_ping);
-        assert_eq!(recv_soon(&cx, &mut other).await.0, gre);
+        assert_eq!(recv_soon(&fcx, &mut udp).await.0, udp6);
+        assert_eq!(recv_soon(&fcx, &mut udp).await.0, port_unreachable);
+        assert_eq!(recv_soon(&fcx, &mut udp).await.0, unreachable6);
+        assert_eq!(recv_soon(&fcx, &mut icmp_end).await.0, ping4);
+        assert_eq!(recv_soon(&fcx, &mut icmp_end).await.0, ping6);
+        assert_eq!(recv_soon(&fcx, &mut icmp_end).await.0, about_ping);
+        assert_eq!(recv_soon(&fcx, &mut other).await.0, gre);
         for end in [&mut tcp, &mut udp, &mut icmp_end, &mut other] {
-            assert!(recv_within(&cx, end, ms(30)).await.is_none(), "an extra packet");
+            assert!(recv_within(&fcx, end, ms(30)).await.is_none(), "an extra packet");
         }
 
         // Everything sent into the ends goes out on the split cable.
@@ -339,7 +339,7 @@ fn split_protocols_sorts_by_protocol_and_icmp_errors_by_the_quoted_packet() {
         icmp_end.send(Packet(ping4.clone()));
         other.send(Packet(gre.clone()));
         for _ in 0..4 {
-            recv_soon(&cx, &mut sandbox).await;
+            recv_soon(&fcx, &mut sandbox).await;
         }
         Ok(())
     });
@@ -421,9 +421,9 @@ fn fragment_v6(packet: &[u8], sizes: &[usize], id: u32) -> Vec<Vec<u8>> {
 
 #[test]
 fn split_protocols_reassembles_fragments_that_arrive_out_of_order() {
-    world(|cx| async move {
+    world(|fcx| async move {
         let (mut sandbox, world_side) = pair();
-        let (_tcp, mut udp, _icmp, mut other) = ip::split_protocols(&cx, world_side);
+        let (_tcp, mut udp, _icmp, mut other) = ip::split_protocols(&fcx, world_side);
 
         let payload: Vec<u8> = (0..3000u32).map(|i| (i * 7) as u8).collect();
         let (whole, frags) = fragment_v4(&v4_udp(A4, B4, &payload), &[1480, 1480]);
@@ -432,7 +432,7 @@ fn split_protocols_reassembles_fragments_that_arrive_out_of_order() {
         for i in [2, 0, 1] {
             sandbox.send(Packet(frags[i].clone()));
         }
-        let got = recv_soon(&cx, &mut udp).await.0;
+        let got = recv_soon(&fcx, &mut udp).await.0;
         assert_eq!(got, whole);
         assert_eq!(internet_checksum(&[], &got[..20]), 0, "header checksum");
 
@@ -442,7 +442,7 @@ fn split_protocols_reassembles_fragments_that_arrive_out_of_order() {
         for i in [1, 2, 0] {
             sandbox.send(Packet(frags6[i].clone()));
         }
-        assert_eq!(recv_soon(&cx, &mut udp).await.0, whole6);
+        assert_eq!(recv_soon(&fcx, &mut udp).await.0, whole6);
 
         // Two packets whose fragments arrive interleaved.
         let (whole_a, frags_a) = fragment_v4(&v4_udp(A4, B4, &payload[..1000]), &[504]);
@@ -452,8 +452,8 @@ fn split_protocols_reassembles_fragments_that_arrive_out_of_order() {
         for f in [&frags_b[2], &frags_a[1], &frags_b[0], &frags_a[0], &frags_b[1]] {
             sandbox.send(Packet(f.clone()));
         }
-        assert_eq!(recv_soon(&cx, &mut udp).await.0, whole_a);
-        assert_eq!(recv_soon(&cx, &mut udp).await.0, whole_b);
+        assert_eq!(recv_soon(&fcx, &mut udp).await.0, whole_a);
+        assert_eq!(recv_soon(&fcx, &mut udp).await.0, whole_b);
 
         // Overlapping fragments drop the whole packet.
         let mut bad_id = v4_udp(A4, B4, &payload[..1600]);
@@ -463,14 +463,14 @@ fn split_protocols_reassembles_fragments_that_arrive_out_of_order() {
         sandbox.send(Packet(frags_c[0].clone()));
         sandbox.send(Packet(overlap[1].clone())); // bytes 400..1200 overlap 0..800
         sandbox.send(Packet(frags_c[1].clone()));
-        assert!(recv_within(&cx, &mut udp, ms(50)).await.is_none(), "overlapping fragments were joined");
-        assert!(recv_within(&cx, &mut other, ms(10)).await.is_none());
+        assert!(recv_within(&fcx, &mut udp, ms(50)).await.is_none(), "overlapping fragments were joined");
+        assert!(recv_within(&fcx, &mut other, ms(10)).await.is_none());
 
         // A packet in one fragment (an atomic fragment) passes at once.
         let atomic = fragment_v6(&whole6, &[], 5);
         assert_eq!(atomic.len(), 1);
         sandbox.send(Packet(atomic[0].clone()));
-        assert_eq!(recv_soon(&cx, &mut udp).await.0, whole6);
+        assert_eq!(recv_soon(&fcx, &mut udp).await.0, whole6);
         Ok(())
     });
 }
@@ -500,7 +500,7 @@ fn prefixes_parse() {
 
 #[test]
 fn router_longest_prefix_add_replace_and_removal_on_close() {
-    world(|cx| async move {
+    world(|fcx| async move {
         let (a_router, mut a) = pair();
         let (b_router, mut b) = pair();
         let (c_router, mut c) = pair();
@@ -511,7 +511,7 @@ fn router_longest_prefix_add_replace_and_removal_on_close() {
             ("0.0.0.0/0".parse()?, Box::new(c_router)),
             ("::/0".parse()?, Box::new(d_router)),
         ];
-        let r = router(&cx, routes);
+        let r = router(&fcx, routes);
 
         // Longest prefix wins, from any cable. The router lowers the TTL.
         let hop = |src, dst, payload: &[u8]| {
@@ -520,17 +520,17 @@ fn router_longest_prefix_add_replace_and_removal_on_close() {
             v
         };
         c.send(to4([10, 1, 2, 3], 1));
-        assert_eq!(recv_soon(&cx, &mut b).await.0, hop(A4, [10, 1, 2, 3], &[1]));
+        assert_eq!(recv_soon(&fcx, &mut b).await.0, hop(A4, [10, 1, 2, 3], &[1]));
         c.send(to4([10, 2, 0, 1], 2));
-        assert_eq!(recv_soon(&cx, &mut a).await.0, hop(A4, [10, 2, 0, 1], &[2]));
+        assert_eq!(recv_soon(&fcx, &mut a).await.0, hop(A4, [10, 2, 0, 1], &[2]));
         a.send(to4([8, 8, 8, 8], 3));
-        assert_eq!(recv_soon(&cx, &mut c).await.0[28], 3);
+        assert_eq!(recv_soon(&fcx, &mut c).await.0[28], 3);
         // Back out the cable it came in on, when that is the best route.
         c.send(to4([9, 9, 9, 9], 4));
-        assert_eq!(recv_soon(&cx, &mut c).await.0[28], 4);
+        assert_eq!(recv_soon(&fcx, &mut c).await.0[28], 4);
         // IPv6 matches IPv6 prefixes only.
         a.send(Packet(v6_udp(A6, B6, &[5])));
-        assert_eq!(recv_soon(&cx, &mut d).await.0[48], 5);
+        assert_eq!(recv_soon(&fcx, &mut d).await.0[48], 5);
         // Junk is dropped.
         a.send(Packet(vec![0x45, 0]));
         a.send(Packet(vec![]));
@@ -539,28 +539,28 @@ fn router_longest_prefix_add_replace_and_removal_on_close() {
         let (e_router, mut e) = pair();
         r.add("10.1.2.0/24".parse()?, Box::new(e_router));
         c.send(to4([10, 1, 2, 3], 6));
-        assert_eq!(recv_soon(&cx, &mut e).await.0[28], 6);
+        assert_eq!(recv_soon(&fcx, &mut e).await.0[28], 6);
         c.send(to4([10, 1, 3, 3], 7));
-        assert_eq!(recv_soon(&cx, &mut b).await.0[28], 7);
+        assert_eq!(recv_soon(&fcx, &mut b).await.0[28], 7);
 
         // Replace 10.1.0.0/16: the old cable is dropped.
         let (f_router, mut f) = pair();
         r.add("10.1.0.0/16".parse()?, Box::new(f_router));
-        assert_eq!(b.recv(&cx).await, Err(RecvError::Closed));
+        assert_eq!(b.recv(&fcx).await, Err(RecvError::Closed));
         c.send(to4([10, 1, 3, 3], 8));
-        assert_eq!(recv_soon(&cx, &mut f).await.0[28], 8);
+        assert_eq!(recv_soon(&fcx, &mut f).await.0[28], 8);
 
         // A closed cable loses its route: the next best one takes over.
         drop(e);
-        cx.sleep(ms(20)).await?;
+        fcx.sleep(ms(20)).await?;
         c.send(to4([10, 1, 2, 3], 9));
-        assert_eq!(recv_soon(&cx, &mut f).await.0[28], 9);
+        assert_eq!(recv_soon(&fcx, &mut f).await.0[28], 9);
         // And with no route left for an address, packets are dropped.
         drop(c);
-        cx.sleep(ms(20)).await?;
+        fcx.sleep(ms(20)).await?;
         a.send(to4([8, 8, 8, 8], 10));
         for end in [&mut a, &mut d, &mut f] {
-            assert!(recv_within(&cx, end, ms(30)).await.is_none());
+            assert!(recv_within(&fcx, end, ms(30)).await.is_none());
         }
 
         // The router ends once its last cable has closed and the handle is
@@ -573,18 +573,18 @@ fn router_longest_prefix_add_replace_and_removal_on_close() {
 
 #[test]
 fn router_keeps_running_while_the_handle_can_add_routes() {
-    world(|cx| async move {
+    world(|fcx| async move {
         let (a_router, a) = pair();
-        let r = router(&cx, vec![("10.0.0.0/8".parse()?, Box::new(a_router) as Box<dyn Interface>)]);
+        let r = router(&fcx, vec![("10.0.0.0/8".parse()?, Box::new(a_router) as Box<dyn Interface>)]);
         drop(a);
-        cx.sleep(ms(20)).await?;
+        fcx.sleep(ms(20)).await?;
         // Every cable is closed, but the handle is alive: a new route works.
         let (b_router, mut b) = pair();
         let (c_router, mut c) = pair();
         r.add("10.0.0.0/8".parse()?, Box::new(b_router));
         r.add("0.0.0.0/0".parse()?, Box::new(c_router));
         c.send(to4([10, 0, 0, 1], 1));
-        assert_eq!(recv_soon(&cx, &mut b).await.0[28], 1);
+        assert_eq!(recv_soon(&fcx, &mut b).await.0[28], 1);
         drop(r);
         drop((b, c));
         Ok(())
@@ -593,9 +593,9 @@ fn router_keeps_running_while_the_handle_can_add_routes() {
 
 #[test]
 fn lan_forwards_unicast_and_floods_ip_group_traffic() {
-    world(|cx| async move {
+    world(|fcx| async move {
         let network: Prefix = "192.168.56.0/24".parse()?;
-        let lan = lan(&cx, network, None);
+        let lan = lan(&fcx, network, None);
         let (a_lan, mut a) = pair();
         let (b_lan, mut b) = pair();
         let (c_lan, mut c) = pair();
@@ -605,8 +605,8 @@ fn lan_forwards_unicast_and_floods_ip_group_traffic() {
 
         // Unicast goes only to the member that owns the destination.
         a.send(Packet(v4_udp([192, 168, 56, 10], [192, 168, 56, 11], &[1])));
-        assert_eq!(recv_soon(&cx, &mut b).await.0[28], 1);
-        assert!(recv_within(&cx, &mut c, ms(20)).await.is_none());
+        assert_eq!(recv_soon(&fcx, &mut b).await.0[28], 1);
+        assert!(recv_within(&fcx, &mut c, ms(20)).await.is_none());
 
         // The subnet broadcast, limited broadcast and multicast are copied
         // to every member except the sender.
@@ -616,17 +616,17 @@ fn lan_forwards_unicast_and_floods_ip_group_traffic() {
             ([224, 0, 0, 252], 4),
         ] {
             a.send(Packet(v4_udp([192, 168, 56, 10], dst, &[tag])));
-            assert_eq!(recv_soon(&cx, &mut b).await.0[28], tag);
-            assert_eq!(recv_soon(&cx, &mut c).await.0[28], tag);
-            assert!(recv_within(&cx, &mut a, ms(20)).await.is_none());
+            assert_eq!(recv_soon(&fcx, &mut b).await.0[28], tag);
+            assert_eq!(recv_soon(&fcx, &mut c).await.0[28], tag);
+            assert!(recv_within(&fcx, &mut a, ms(20)).await.is_none());
         }
 
         // Reconnecting an address replaces the old member.
         let (new_b_lan, mut new_b) = pair();
         lan.add("192.168.56.11".parse()?, Box::new(new_b_lan))?;
-        assert_eq!(b.recv(&cx).await, Err(RecvError::Closed));
+        assert_eq!(b.recv(&fcx).await, Err(RecvError::Closed));
         a.send(Packet(v4_udp([192, 168, 56, 10], [192, 168, 56, 11], &[5])));
-        assert_eq!(recv_soon(&cx, &mut new_b).await.0[28], 5);
+        assert_eq!(recv_soon(&fcx, &mut new_b).await.0[28], 5);
 
         let (outside_lan, _outside) = pair();
         assert!(lan.add("192.168.57.1".parse()?, Box::new(outside_lan)).is_err());
@@ -639,8 +639,8 @@ fn lan_forwards_unicast_and_floods_ip_group_traffic() {
 
 #[test]
 fn lan_sends_off_subnet_unicast_to_the_gateway_or_drops_it() {
-    world(|cx| async move {
-        let lan = lan(&cx, "192.168.56.0/24".parse()?, None);
+    world(|fcx| async move {
+        let lan = lan(&fcx, "192.168.56.0/24".parse()?, None);
         let (a_lan, mut a) = pair();
         let (b_lan, mut b) = pair();
         lan.add("192.168.56.10".parse()?, Box::new(a_lan))?;
@@ -649,48 +649,48 @@ fn lan_sends_off_subnet_unicast_to_the_gateway_or_drops_it() {
         // With no gateway, a packet for another subnet goes nowhere, and
         // the LAN carries on.
         a.send(Packet(v4_udp([192, 168, 56, 10], [10, 0, 0, 1], &[1])));
-        assert!(recv_within(&cx, &mut b, ms(20)).await.is_none());
+        assert!(recv_within(&fcx, &mut b, ms(20)).await.is_none());
         a.send(Packet(v4_udp([192, 168, 56, 10], [192, 168, 56, 11], &[2])));
-        assert_eq!(recv_soon(&cx, &mut b).await.0[28], 2);
+        assert_eq!(recv_soon(&fcx, &mut b).await.0[28], 2);
 
         // With one, it goes there. The gateway's packets come in like a
         // member's: unicast to the owner, broadcast to everyone.
         let (gw_lan, mut gw) = pair();
         lan.gateway(Box::new(gw_lan))?;
         a.send(Packet(v4_udp([192, 168, 56, 10], [10, 0, 0, 1], &[3])));
-        assert_eq!(recv_soon(&cx, &mut gw).await.0[28], 3);
+        assert_eq!(recv_soon(&fcx, &mut gw).await.0[28], 3);
         gw.send(Packet(v4_udp([10, 0, 0, 1], [192, 168, 56, 11], &[4])));
-        assert_eq!(recv_soon(&cx, &mut b).await.0[28], 4);
-        assert!(recv_within(&cx, &mut a, ms(20)).await.is_none());
+        assert_eq!(recv_soon(&fcx, &mut b).await.0[28], 4);
+        assert!(recv_within(&fcx, &mut a, ms(20)).await.is_none());
         gw.send(Packet(v4_udp([10, 0, 0, 1], [192, 168, 56, 255], &[5])));
-        assert_eq!(recv_soon(&cx, &mut a).await.0[28], 5);
-        assert_eq!(recv_soon(&cx, &mut b).await.0[28], 5);
+        assert_eq!(recv_soon(&fcx, &mut a).await.0[28], 5);
+        assert_eq!(recv_soon(&fcx, &mut b).await.0[28], 5);
 
         // Members' broadcasts and multicasts stay among the members.
         a.send(Packet(v4_udp([192, 168, 56, 10], [192, 168, 56, 255], &[6])));
         a.send(Packet(v4_udp([192, 168, 56, 10], [224, 0, 0, 252], &[7])));
-        assert_eq!(recv_soon(&cx, &mut b).await.0[28], 6);
-        assert_eq!(recv_soon(&cx, &mut b).await.0[28], 7);
-        assert!(recv_within(&cx, &mut gw, ms(20)).await.is_none());
+        assert_eq!(recv_soon(&fcx, &mut b).await.0[28], 6);
+        assert_eq!(recv_soon(&fcx, &mut b).await.0[28], 7);
+        assert!(recv_within(&fcx, &mut gw, ms(20)).await.is_none());
 
         // A packet from the gateway for another subnet is dropped, not
         // sent back.
         gw.send(Packet(v4_udp([10, 0, 0, 1], [10, 0, 0, 2], &[8])));
-        assert!(recv_within(&cx, &mut gw, ms(20)).await.is_none());
+        assert!(recv_within(&fcx, &mut gw, ms(20)).await.is_none());
 
         // A new gateway replaces the old one, which is closed.
         let (gw2_lan, mut gw2) = pair();
         lan.gateway(Box::new(gw2_lan))?;
-        assert_eq!(gw.recv(&cx).await, Err(RecvError::Closed));
+        assert_eq!(gw.recv(&fcx).await, Err(RecvError::Closed));
         a.send(Packet(v4_udp([192, 168, 56, 10], [10, 0, 0, 1], &[9])));
-        assert_eq!(recv_soon(&cx, &mut gw2).await.0[28], 9);
+        assert_eq!(recv_soon(&fcx, &mut gw2).await.0[28], 9);
 
         // When the gateway closes, the LAN is sealed again.
         drop(gw2);
-        cx.sleep(ms(20)).await?;
+        fcx.sleep(ms(20)).await?;
         a.send(Packet(v4_udp([192, 168, 56, 10], [10, 0, 0, 1], &[10])));
         for end in [&mut a, &mut b] {
-            assert!(recv_within(&cx, end, ms(20)).await.is_none());
+            assert!(recv_within(&fcx, end, ms(20)).await.is_none());
         }
 
         drop(lan);
@@ -704,10 +704,10 @@ const LLMNR6: [u8; 16] = [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 3];
 
 #[test]
 fn lan_carries_one_address_family() {
-    world(|cx| async move {
+    world(|fcx| async move {
         // IPv6 on an IPv4 LAN is dropped: link-local multicast and unicast
         // alike, gateway or not. IPv4 still flows.
-        let lan4 = lan(&cx, "192.168.56.0/24".parse()?, None);
+        let lan4 = lan(&fcx, "192.168.56.0/24".parse()?, None);
         let (a_lan, mut a) = pair();
         let (b_lan, mut b) = pair();
         let (gw_lan, mut gw) = pair();
@@ -719,15 +719,15 @@ fn lan_carries_one_address_family() {
         // IPv4 link-local stays on the LAN too: no member, so dropped.
         a.send(Packet(v4_udp([192, 168, 56, 10], [169, 254, 1, 1], &[3])));
         a.send(Packet(v4_udp([192, 168, 56, 10], [192, 168, 56, 11], &[4])));
-        assert_eq!(recv_soon(&cx, &mut b).await.0[28], 4);
+        assert_eq!(recv_soon(&fcx, &mut b).await.0[28], 4);
         for end in [&mut a, &mut b, &mut gw] {
-            assert!(recv_within(&cx, end, ms(20)).await.is_none());
+            assert!(recv_within(&fcx, end, ms(20)).await.is_none());
         }
 
         // An IPv6 LAN forwards unicast, floods multicast, takes no IPv4
         // member and drops IPv4 packets. Link-local unicast is on the LAN,
         // so it never reaches the gateway.
-        let lan6 = lan(&cx, "fd00::/64".parse()?, None);
+        let lan6 = lan(&fcx, "fd00::/64".parse()?, None);
         let fd = |host: u8| -> [u8; 16] { [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, host] };
         let (c_lan, mut c) = pair();
         let (d_lan, mut d) = pair();
@@ -740,17 +740,17 @@ fn lan_carries_one_address_family() {
         let (x_lan, _x) = pair();
         assert!(lan6.add("192.168.56.10".parse()?, Box::new(x_lan)).is_err());
         c.send(Packet(v6_udp(fd(0x10), fd(0x11), &[5])));
-        assert_eq!(recv_soon(&cx, &mut d).await.0[48], 5);
-        assert!(recv_within(&cx, &mut e, ms(20)).await.is_none());
+        assert_eq!(recv_soon(&fcx, &mut d).await.0[48], 5);
+        assert!(recv_within(&fcx, &mut e, ms(20)).await.is_none());
         c.send(Packet(v6_udp(fd(0x10), LLMNR6, &[6])));
-        assert_eq!(recv_soon(&cx, &mut d).await.0[48], 6);
-        assert_eq!(recv_soon(&cx, &mut e).await.0[48], 6);
+        assert_eq!(recv_soon(&fcx, &mut d).await.0[48], 6);
+        assert_eq!(recv_soon(&fcx, &mut e).await.0[48], 6);
         c.send(Packet(v6_udp(fd(0x10), B6, &[7])));
-        assert_eq!(recv_soon(&cx, &mut gw6).await.0[48], 7);
+        assert_eq!(recv_soon(&fcx, &mut gw6).await.0[48], 7);
         c.send(Packet(v6_udp(LL_A, [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x11], &[8])));
         c.send(Packet(v4_udp(A4, B4, &[9])));
         for end in [&mut c, &mut d, &mut e, &mut gw6] {
-            assert!(recv_within(&cx, end, ms(20)).await.is_none());
+            assert!(recv_within(&fcx, end, ms(20)).await.is_none());
         }
 
         drop((lan4, lan6));
@@ -761,8 +761,8 @@ fn lan_carries_one_address_family() {
 
 #[test]
 fn lan_forgets_a_member_whose_interface_closed() {
-    world(|cx| async move {
-        let lan = lan(&cx, "192.168.56.0/24".parse()?, None);
+    world(|fcx| async move {
+        let lan = lan(&fcx, "192.168.56.0/24".parse()?, None);
         let (a_lan, mut a) = pair();
         let (b_lan, b) = pair();
         let (c_lan, mut c) = pair();
@@ -770,19 +770,19 @@ fn lan_forgets_a_member_whose_interface_closed() {
         lan.add("192.168.56.11".parse()?, Box::new(b_lan))?;
         lan.add("192.168.56.22".parse()?, Box::new(c_lan))?;
         drop(b);
-        cx.sleep(ms(20)).await?;
+        fcx.sleep(ms(20)).await?;
 
         // Unicast for it goes nowhere. Broadcast still reaches the rest.
         a.send(Packet(v4_udp([192, 168, 56, 10], [192, 168, 56, 11], &[1])));
-        assert!(recv_within(&cx, &mut c, ms(20)).await.is_none());
+        assert!(recv_within(&fcx, &mut c, ms(20)).await.is_none());
         a.send(Packet(v4_udp([192, 168, 56, 10], [192, 168, 56, 255], &[2])));
-        assert_eq!(recv_soon(&cx, &mut c).await.0[28], 2);
+        assert_eq!(recv_soon(&fcx, &mut c).await.0[28], 2);
 
         // The address is free for a new member.
         let (b2_lan, mut b2) = pair();
         lan.add("192.168.56.11".parse()?, Box::new(b2_lan))?;
         a.send(Packet(v4_udp([192, 168, 56, 10], [192, 168, 56, 11], &[3])));
-        assert_eq!(recv_soon(&cx, &mut b2).await.0[28], 3);
+        assert_eq!(recv_soon(&fcx, &mut b2).await.0[28], 3);
 
         // The LAN ends once every member has closed and the handle is
         // gone. The run then ends, which `world` checks.
@@ -799,8 +799,8 @@ struct LoggedSend {
 }
 
 impl Interface for LoggedSend {
-    fn poll_recv(&mut self, cx: &Cx, task: &mut Context<'_>) -> Poll<Result<Packet, RecvError>> {
-        self.inner.poll_recv(cx, task)
+    fn poll_recv(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<Packet, RecvError>> {
+        self.inner.poll_recv(fcx, cx)
     }
     fn send(&mut self, packet: Packet) {
         self.log.lock().unwrap().push('s');
@@ -815,9 +815,9 @@ impl Interface for LoggedSend {
 fn lan_fan_out_counts_toward_the_budget() {
     let log = Arc::new(Mutex::new(Vec::new()));
     let l = log.clone();
-    world(move |cx| async move {
+    world(move |fcx| async move {
         let done = Arc::new(AtomicBool::new(false));
-        let lan = lan(&cx, "10.0.0.0/24".parse()?, None);
+        let lan = lan(&fcx, "10.0.0.0/24".parse()?, None);
         let (sender_lan, mut sender) = pair();
         lan.add("10.0.0.1".parse()?, Box::new(sender_lan))?;
         let mut members = Vec::new();
@@ -830,10 +830,10 @@ fn lan_fan_out_counts_toward_the_budget() {
         for i in 0..200u32 {
             sender.send(Packet(v4_udp([10, 0, 0, 1], [10, 0, 0, 255], &i.to_be_bytes())));
         }
-        ticker(&cx, l.clone(), done.clone());
+        ticker(&fcx, l.clone(), done.clone());
         for far in &mut members {
             for _ in 0..200 {
-                recv_soon(&cx, far).await;
+                recv_soon(&fcx, far).await;
             }
         }
         done.store(true, Ordering::SeqCst);
@@ -850,8 +850,8 @@ fn lan_fan_out_counts_toward_the_budget() {
 
 #[test]
 fn a_router_with_no_routes_and_no_handle_ends() {
-    world(|cx| async move {
-        drop(router(&cx, Vec::new()));
+    world(|fcx| async move {
+        drop(router(&fcx, Vec::new()));
         Ok(())
     });
 }
@@ -865,8 +865,8 @@ struct Logged {
 }
 
 impl Interface for Logged {
-    fn poll_recv(&mut self, cx: &Cx, task: &mut Context<'_>) -> Poll<Result<Packet, RecvError>> {
-        let r = self.inner.poll_recv(cx, task);
+    fn poll_recv(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<Packet, RecvError>> {
+        let r = self.inner.poll_recv(fcx, cx);
         if let Poll::Ready(Ok(_)) = r {
             self.log.lock().unwrap().push('p');
         }
@@ -878,11 +878,11 @@ impl Interface for Logged {
 }
 
 /// Starts a ticker that logs `t` once per turn of the run until `done`.
-fn ticker(cx: &Cx, log: Arc<Mutex<Vec<char>>>, done: Arc<AtomicBool>) {
-    cx.spawn(move |cx| async move {
+fn ticker(fcx: &Cx, log: Arc<Mutex<Vec<char>>>, done: Arc<AtomicBool>) {
+    fcx.spawn(move |fcx| async move {
         while !done.load(Ordering::SeqCst) {
             log.lock().unwrap().push('t');
-            cx.yield_now().await?;
+            fcx.yield_now().await?;
         }
         Ok(())
     });
@@ -898,22 +898,22 @@ fn each_task_yields_after_64_packets_in_a_row() {
     for which in ["split_versions", "split_protocols", "router", "delay", "bottleneck"] {
         let log = Arc::new(Mutex::new(Vec::new()));
         let l = log.clone();
-        world(move |cx| async move {
+        world(move |fcx| async move {
             let done = Arc::new(AtomicBool::new(false));
             let (mut sandbox, world_side) = pair();
             for i in 0..1000u32 {
                 sandbox.send(Packet(v4_udp(A4, B4, &i.to_be_bytes())));
             }
-            ticker(&cx, l.clone(), done.clone());
+            ticker(&fcx, l.clone(), done.clone());
             let inner = Logged { inner: world_side, log: l.clone() };
             let mut out: End = match which {
-                "split_versions" => ip::split_versions(&cx, inner).0,
-                "split_protocols" => ip::split_protocols(&cx, inner).1,
-                "delay" => delay(&cx, ms(1), inner),
-                "bottleneck" => bottleneck(&cx, u64::MAX, 2000, inner),
+                "split_versions" => ip::split_versions(&fcx, inner).0,
+                "split_protocols" => ip::split_protocols(&fcx, inner).1,
+                "delay" => delay(&fcx, ms(1), inner),
+                "bottleneck" => bottleneck(&fcx, u64::MAX, 2000, inner),
                 _ => {
                     let (out_router, out) = pair();
-                    let r = router(&cx, vec![
+                    let r = router(&fcx, vec![
                         ("0.0.0.0/0".parse()?, Box::new(inner) as Box<dyn Interface>),
                         ("1.1.1.1/32".parse()?, Box::new(out_router)),
                     ]);
@@ -922,7 +922,7 @@ fn each_task_yields_after_64_packets_in_a_row() {
                 }
             };
             for _ in 0..1000 {
-                recv_soon(&cx, &mut out).await;
+                recv_soon(&fcx, &mut out).await;
             }
             done.store(true, Ordering::SeqCst);
             Ok(())
@@ -1027,12 +1027,12 @@ fn echo_reply_v6_has_correct_checksums() {
 
 #[test]
 fn a_ping_loop_answers_through_split_protocols() {
-    world(|cx| async move {
+    world(|fcx| async move {
         let (mut sandbox, world_side) = pair();
-        let (_tcp, _udp, mut icmp_end, _other) = ip::split_protocols(&cx, world_side);
+        let (_tcp, _udp, mut icmp_end, _other) = ip::split_protocols(&fcx, world_side);
         let addr = IpAddr::V4(Ipv4Addr::from(B4));
-        cx.spawn(move |cx| async move {
-            while let Ok(packet) = icmp_end.recv(&cx).await {
+        fcx.spawn(move |fcx| async move {
+            while let Ok(packet) = icmp_end.recv(&fcx).await {
                 if let Some(reply) = icmp::echo_reply(&packet, addr) {
                     icmp_end.send(reply);
                 }
@@ -1047,7 +1047,7 @@ fn a_ping_loop_answers_through_split_protocols() {
         for f in frags.iter().rev() {
             sandbox.send(Packet(f.clone()));
         }
-        let reply = recv_soon(&cx, &mut sandbox).await.0;
+        let reply = recv_soon(&fcx, &mut sandbox).await.0;
         assert_eq!(reply.len(), whole.len());
         assert_eq!(reply[20], 0);
         assert_eq!(internet_checksum(&[], &reply[20..]), 0);
@@ -1061,30 +1061,30 @@ fn every_task_stops_when_its_region_is_cancelled() {
     // The world fails while every kind of task is running with its cables
     // still open. The run then ends with the error instead of waiting.
     let result = within(Duration::from_secs(5), || {
-        block_on(run(|cx| async move {
+        block_on(run(|fcx| async move {
             let mut keep = Vec::new();
             let (a, b) = pair();
             keep.push(a);
-            keep.push(delay(&cx, ms(10), b));
+            keep.push(delay(&fcx, ms(10), b));
             let (a, b) = pair();
             keep.push(a);
-            keep.push(bottleneck(&cx, 1000, 10, b));
+            keep.push(bottleneck(&fcx, 1000, 10, b));
             let (a, b) = pair();
             keep.push(a);
-            let (x, y, z) = ip::split_versions(&cx, b);
+            let (x, y, z) = ip::split_versions(&fcx, b);
             keep.extend([x, y, z]);
             let (a, b) = pair();
             keep.push(a);
-            let (w, x, y, z) = ip::split_protocols(&cx, b);
+            let (w, x, y, z) = ip::split_protocols(&fcx, b);
             keep.extend([w, x, y, z]);
             let (a, b) = pair();
             keep.push(a);
-            let r = router(&cx, vec![("0.0.0.0/0".parse()?, Box::new(b) as Box<dyn Interface>)]);
+            let r = router(&fcx, vec![("0.0.0.0/0".parse()?, Box::new(b) as Box<dyn Interface>)]);
             let (a, b) = pair();
             keep.push(a);
-            let l = lan(&cx, "10.0.0.0/24".parse()?, None);
+            let l = lan(&fcx, "10.0.0.0/24".parse()?, None);
             l.add("10.0.0.2".parse()?, Box::new(b))?;
-            cx.sleep(ms(20)).await?;
+            fcx.sleep(ms(20)).await?;
             let _keep = (keep, r, l);
             Err(fictionet::Error::msg("stop"))
         }))

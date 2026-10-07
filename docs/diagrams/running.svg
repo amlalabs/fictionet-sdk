@@ -1,7 +1,7 @@
 <div style="overflow-x:auto;margin:1.25em 0">
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 410" role="img" aria-labelledby="fn-running-t fn-running-d" style="display:block;width:100%;max-width:720px;min-width:480px;height:auto">
 <title id="fn-running-t">The four calls of a world program</title>
-<desc id="fn-running-d">Inside the world process, main makes four calls in order. 1: attachments() makes a channel with two halves, the Attacher and the Attachments. 2: listen(socket, attacher), given a WorldSocket such as WorldSocket::UnixSocket(path), returns immediately and starts a helper thread. 3: run(|cx| world(cx, attachments)) makes one future. Nothing runs yet. 4: block_on polls that future on main's thread, which runs world(cx, attachments) as the first task. Outside the process, each fictionet attach connects to world.sock. The helper thread reads its hello, answers accept or refuse, and puts the accepted sandbox into the channel. The world takes it from the Attachments as an Attachment named agent.</desc>
+<desc id="fn-running-d">Inside the world process, main makes four calls in order. 1: attachments() makes a channel with two halves, the Attacher and the Attachments. 2: listen(socket, attacher), given a WorldSocket such as WorldSocket::UnixSocket(path), returns immediately and starts a helper thread. 3: run(|fcx| world(fcx, attachments)) makes one future. Nothing runs yet. 4: block_on polls that future on main's thread, which runs world(fcx, attachments) as the first task. Outside the process, each fictionet attach connects to world.sock. The helper thread reads its hello, answers accept or refuse, and puts the accepted sandbox into the channel. The world takes it from the Attachments as an Attachment named agent.</desc>
 <defs><marker id="fn-running-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
 <g fill="none" stroke="currentColor" stroke-width="1.25">
 <rect x="10" y="98" width="580" height="302" rx="10" stroke-dasharray="2 4"/>
@@ -35,7 +35,7 @@
 <text x="155" y="165" text-anchor="middle" font-size="11.5">Attacher + Attachments</text>
 <text x="155" y="218" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="12">listen(socket, attacher)</text>
 <text x="155" y="235" text-anchor="middle" font-size="11.5">returns immediately</text>
-<text x="155" y="288" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="12">run(|cx| world(cx, ..))</text>
+<text x="155" y="288" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="12">run(|fcx| world(fcx, ..))</text>
 <text x="155" y="305" text-anchor="middle" font-size="11.5">one future, not yet polled</text>
 <text x="155" y="358" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="12">block_on(future)</text>
 <text x="155" y="375" text-anchor="middle" font-size="11.5">polls it on main’s thread</text>
@@ -46,9 +46,9 @@
 <text x="450" y="243" text-anchor="middle" font-size="11.5">the sandbox into the channel</text>
 <text x="458" y="282" font-size="11.5">through the</text>
 <text x="458" y="297" font-size="11.5">Attacher</text>
-<text x="450" y="340" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="12">world(cx, attachments)</text>
+<text x="450" y="340" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="12">world(fcx, attachments)</text>
 <text x="450" y="358" text-anchor="middle" font-size="11.5">the first task of the run:</text>
-<text x="450" y="374" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="11">attachments.get(&amp;cx, "agent")</text>
+<text x="450" y="374" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="11">attachments.get(&amp;fcx, "agent")</text>
 </g>
 </svg>
 </div>

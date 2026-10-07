@@ -60,7 +60,7 @@ pub(crate) async fn serve(mut client: TcpStream, stack: Stack, token: Token) {
         std::net::SocketAddr::V4(a) => Some(a),
         std::net::SocketAddr::V6(_) => None,
     };
-    let mut world = conn.into_tokio(stack.cx());
+    let mut world = conn.into_tokio(stack.fcx());
     if client.write_all(&reply(ReplyCode::Succeeded, bound)).await.is_err() {
         return log(&format!("{what} ({}) reply 0, but the client closed the connection first", IpAddr::V4(addr)));
     }

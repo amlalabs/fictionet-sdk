@@ -58,10 +58,10 @@ where
     Fut: Future<Output = fictionet::Result> + Send + 'static,
 {
     let result = within(Duration::from_secs(60), move || {
-        block_on(run(move |cx| async move {
+        block_on(run(move |fcx| async move {
             let (attacher, attachments) = fictionet::attachments();
-            let env = sites(&cx).serve_with(&cx, attachments)?;
-            f(cx, attacher, env).await?;
+            let env = sites(&fcx).serve_with(&fcx, attachments)?;
+            f(fcx, attacher, env).await?;
             Err(fictionet::Error::from(Done))
         }))
     });
@@ -73,14 +73,14 @@ where
 }
 
 /// Waits for `fut` at most `d`.
-async fn timeout<T>(cx: &Cx, d: Duration, fut: impl Future<Output = T>) -> Option<T> {
+async fn timeout<T>(fcx: &Cx, d: Duration, fut: impl Future<Output = T>) -> Option<T> {
     let mut fut = pin!(fut);
-    let mut sleep = pin!(cx.sleep(d));
-    poll_fn(|task| {
-        if let Poll::Ready(v) = fut.as_mut().poll(task) {
+    let mut sleep = pin!(fcx.sleep(d));
+    poll_fn(|cx| {
+        if let Poll::Ready(v) = fut.as_mut().poll(cx) {
             return Poll::Ready(Some(v));
         }
-        if sleep.as_mut().poll(task).is_ready() {
+        if sleep.as_mut().poll(cx).is_ready() {
             return Poll::Ready(None);
         }
         Poll::Pending
@@ -107,8 +107,8 @@ struct TestSites {
 }
 
 impl TestSites {
-    fn serve_with(self, cx: &Cx, attachments: fictionet::Attachments) -> fictionet::Result<Env> {
-        self.sites.serve(cx, attachments)?;
+    fn serve_with(self, fcx: &Cx, attachments: fictionet::Attachments) -> fictionet::Result<Env> {
+        self.sites.serve(fcx, attachments)?;
         Ok(self.env)
     }
 }
@@ -171,7 +171,7 @@ fn events_site() -> axum::Router {
 ///   2001:db8:50::20.
 /// - `inside6.test`: asks for an address inside the sandboxes' IPv6 subnet.
 /// - everything else: NXDOMAIN.
-fn sites(cx: &Cx) -> TestSites {
+fn sites(fcx: &Cx) -> TestSites {
     let certs = certs(&[
         "secure.test",
         "shared.test",
@@ -185,7 +185,7 @@ fn sites(cx: &Cx) -> TestSites {
         "v6only.test",
     ]);
     let config = Arc::new(
-        tls::config_builder(cx, SystemTime::now(), rustls::crypto::ring::default_provider())
+        tls::config_builder(fcx, SystemTime::now(), rustls::crypto::ring::default_provider())
             .with_safe_default_protocol_versions()
             .unwrap()
             .with_no_client_auth()
@@ -330,23 +330,23 @@ struct Machine {
     _icmp: End,
 }
 
-fn machine(cx: &Cx, attacher: &Attacher, name: &str, addr: impl Into<IpAddr>) -> Machine {
+fn machine(fcx: &Cx, attacher: &Attacher, name: &str, addr: impl Into<IpAddr>) -> Machine {
     let end = attacher.attach(name).unwrap();
-    let (tcp, udp, icmp, _other) = ip::split_protocols(cx, end);
+    let (tcp, udp, icmp, _other) = ip::split_protocols(fcx, end);
     let addr = addr.into();
-    Machine { tcp: tcp::endpoint(cx, tcp, addr), udp: udp::endpoint(cx, udp, addr), _icmp: icmp }
+    Machine { tcp: tcp::endpoint(fcx, tcp, addr), udp: udp::endpoint(fcx, udp, addr), _icmp: icmp }
 }
 
 /// Asks the gateway's DNS over UDP. Returns the response code and the A
 /// records.
-async fn dns(cx: &Cx, m: &Machine, name: &str, kind: RecordType) -> (ResponseCode, Vec<Ipv4Addr>) {
-    let mut socket = m.udp.bind(40000 + (cx.random_u64() % 20000) as u16).unwrap();
+async fn dns(fcx: &Cx, m: &Machine, name: &str, kind: RecordType) -> (ResponseCode, Vec<Ipv4Addr>) {
+    let mut socket = m.udp.bind(40000 + (fcx.random_u64() % 20000) as u16).unwrap();
     let mut q = Message::query();
-    q.metadata.id = cx.random_u64() as u16;
+    q.metadata.id = fcx.random_u64() as u16;
     q.metadata.recursion_desired = true;
     q.add_query(Query::query(Name::from_ascii(name).unwrap(), kind));
     socket.send_to(&q.to_vec().unwrap(), SocketAddr::new(GATEWAY.into(), 53));
-    let (bytes, from) = timeout(cx, Duration::from_secs(5), socket.recv(cx)).await.expect("a DNS answer").unwrap();
+    let (bytes, from) = timeout(fcx, Duration::from_secs(5), socket.recv(fcx)).await.expect("a DNS answer").unwrap();
     assert_eq!(from, SocketAddr::new(GATEWAY.into(), 53));
     parse_dns(&bytes, q.metadata.id)
 }
@@ -367,8 +367,8 @@ fn parse_dns(bytes: &[u8], id: u16) -> (ResponseCode, Vec<Ipv4Addr>) {
     (r.metadata.response_code, addrs)
 }
 
-async fn lookup(cx: &Cx, m: &Machine, name: &str) -> Ipv4Addr {
-    let (code, addrs) = dns(cx, m, name, RecordType::A).await;
+async fn lookup(fcx: &Cx, m: &Machine, name: &str) -> Ipv4Addr {
+    let (code, addrs) = dns(fcx, m, name, RecordType::A).await;
     assert_eq!(code, ResponseCode::NoError, "{name}");
     assert_eq!(addrs.len(), 1, "{name}");
     addrs[0]
@@ -410,7 +410,7 @@ impl<C: Connection + Unpin> TlsClient<C> {
         TlsClient { conn, tls, out: Vec::new(), inbuf: vec![0; 4096].into_boxed_slice(), pending: Vec::new() }
     }
 
-    fn poll_flush(&mut self, cx: &Cx, task: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
+    fn poll_flush(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
         loop {
             if self.out.is_empty() {
                 if !self.tls.wants_write() {
@@ -418,7 +418,7 @@ impl<C: Connection + Unpin> TlsClient<C> {
                 }
                 self.tls.write_tls(&mut self.out).unwrap();
             }
-            match self.conn.poll_write(cx, task, &self.out) {
+            match self.conn.poll_write(fcx, cx, &self.out) {
                 Poll::Ready(Ok(n)) => {
                     self.out.drain(..n);
                 }
@@ -430,13 +430,13 @@ impl<C: Connection + Unpin> TlsClient<C> {
 
     /// Reads from the connection into rustls once. `Ok(false)` at the end
     /// of the stream.
-    fn poll_fill(&mut self, cx: &Cx, task: &mut Context<'_>) -> Poll<Result<bool, TlsError>> {
+    fn poll_fill(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<bool, TlsError>> {
         let fresh;
         let mut data: &[u8] = if !self.pending.is_empty() {
             fresh = std::mem::take(&mut self.pending);
             &fresh
         } else {
-            let n = match self.conn.poll_read(cx, task, &mut self.inbuf) {
+            let n = match self.conn.poll_read(fcx, cx, &mut self.inbuf) {
                 Poll::Ready(Ok(n)) => n,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(TlsError::Conn(e))),
                 Poll::Pending => return Poll::Pending,
@@ -457,7 +457,7 @@ impl<C: Connection + Unpin> TlsClient<C> {
             let r = self.tls.process_new_packets();
             if let Err(e) = r {
                 // Send our alert, best effort.
-                let _ = self.poll_flush(cx, task);
+                let _ = self.poll_flush(fcx, cx);
                 return Poll::Ready(Err(TlsError::Tls(e)));
             }
             if data.is_empty() {
@@ -466,10 +466,10 @@ impl<C: Connection + Unpin> TlsClient<C> {
         }
     }
 
-    async fn handshake(&mut self, cx: &Cx) -> Result<(), TlsError> {
-        poll_fn(|task| {
+    async fn handshake(&mut self, fcx: &Cx) -> Result<(), TlsError> {
+        poll_fn(|cx| {
             loop {
-                match self.poll_flush(cx, task) {
+                match self.poll_flush(fcx, cx) {
                     Poll::Ready(Ok(())) => {}
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(TlsError::Conn(e))),
                     Poll::Pending => return Poll::Pending,
@@ -477,7 +477,7 @@ impl<C: Connection + Unpin> TlsClient<C> {
                 if !self.tls.is_handshaking() {
                     return Poll::Ready(Ok(()));
                 }
-                match self.poll_fill(cx, task) {
+                match self.poll_fill(fcx, cx) {
                     Poll::Ready(Ok(true)) => {}
                     Poll::Ready(Ok(false)) => return Poll::Ready(Err(TlsError::Conn(ConnError::Closed))),
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -490,7 +490,7 @@ impl<C: Connection + Unpin> TlsClient<C> {
 }
 
 impl<C: Connection + Unpin> Connection for TlsClient<C> {
-    fn poll_read(&mut self, cx: &Cx, task: &mut Context<'_>, buf: &mut [u8]) -> Poll<Result<usize, ConnError>> {
+    fn poll_read(&mut self, fcx: &Cx, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<Result<usize, ConnError>> {
         loop {
             match self.tls.reader().read(buf) {
                 Ok(n) => return Poll::Ready(Ok(n)),
@@ -498,10 +498,10 @@ impl<C: Connection + Unpin> Connection for TlsClient<C> {
                 Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Poll::Ready(Ok(0)),
                 Err(_) => return Poll::Ready(Err(ConnError::Broken)),
             }
-            if let Poll::Ready(Err(e)) = self.poll_flush(cx, task) {
+            if let Poll::Ready(Err(e)) = self.poll_flush(fcx, cx) {
                 return Poll::Ready(Err(e));
             }
-            match self.poll_fill(cx, task) {
+            match self.poll_fill(fcx, cx) {
                 Poll::Ready(Ok(true)) => {}
                 Poll::Ready(Ok(false)) => {
                     return match self.tls.reader().read(buf) {
@@ -515,19 +515,19 @@ impl<C: Connection + Unpin> Connection for TlsClient<C> {
         }
     }
 
-    fn poll_write(&mut self, cx: &Cx, task: &mut Context<'_>, data: &[u8]) -> Poll<Result<usize, ConnError>> {
-        if let Poll::Ready(Err(e)) = self.poll_flush(cx, task) {
+    fn poll_write(&mut self, fcx: &Cx, cx: &mut Context<'_>, data: &[u8]) -> Poll<Result<usize, ConnError>> {
+        if let Poll::Ready(Err(e)) = self.poll_flush(fcx, cx) {
             return Poll::Ready(Err(e));
         }
         let n = self.tls.writer().write(data).unwrap();
-        let _ = self.poll_flush(cx, task);
+        let _ = self.poll_flush(fcx, cx);
         Poll::Ready(Ok(n))
     }
 
-    fn poll_shutdown(&mut self, cx: &Cx, task: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
+    fn poll_shutdown(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
         self.tls.send_close_notify();
-        match self.poll_flush(cx, task) {
-            Poll::Ready(Ok(())) => self.conn.poll_shutdown(cx, task),
+        match self.poll_flush(fcx, cx) {
+            Poll::Ready(Ok(())) => self.conn.poll_shutdown(fcx, cx),
             other => other,
         }
     }
@@ -537,19 +537,19 @@ impl<C: Connection + Unpin> Connection for TlsClient<C> {
 // A hyper client over a Connection
 
 struct Io<C> {
-    cx: Cx,
+    fcx: Cx,
     conn: C,
 }
 
 impl<C: Connection + Unpin> hyper::rt::Read for Io<C> {
     fn poll_read(
         self: Pin<&mut Self>,
-        task: &mut Context<'_>,
+        cx: &mut Context<'_>,
         mut buf: hyper::rt::ReadBufCursor<'_>,
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
         let mut tmp = vec![0u8; buf.remaining().min(16 * 1024)];
-        match this.conn.poll_read(&this.cx, task, &mut tmp) {
+        match this.conn.poll_read(&this.fcx, cx, &mut tmp) {
             Poll::Ready(Ok(n)) => {
                 buf.put_slice(&tmp[..n]);
                 Poll::Ready(Ok(()))
@@ -561,16 +561,16 @@ impl<C: Connection + Unpin> hyper::rt::Read for Io<C> {
 }
 
 impl<C: Connection + Unpin> hyper::rt::Write for Io<C> {
-    fn poll_write(self: Pin<&mut Self>, task: &mut Context<'_>, data: &[u8]) -> Poll<std::io::Result<usize>> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, data: &[u8]) -> Poll<std::io::Result<usize>> {
         let this = self.get_mut();
-        this.conn.poll_write(&this.cx, task, data).map_err(std::io::Error::other)
+        this.conn.poll_write(&this.fcx, cx, data).map_err(std::io::Error::other)
     }
     fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Poll::Ready(Ok(()))
     }
-    fn poll_shutdown(self: Pin<&mut Self>, task: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        this.conn.poll_shutdown(&this.cx, task).map_err(std::io::Error::other)
+        this.conn.poll_shutdown(&this.fcx, cx).map_err(std::io::Error::other)
     }
 }
 
@@ -600,18 +600,18 @@ struct Got {
 }
 
 impl Client {
-    async fn new<C: Connection + Unpin>(cx: &Cx, conn: C, h2: bool) -> Client {
-        let io = Io { cx: cx.clone(), conn };
+    async fn new<C: Connection + Unpin>(fcx: &Cx, conn: C, h2: bool) -> Client {
+        let io = Io { fcx: fcx.clone(), conn };
         if h2 {
-            let (send, conn) = hyper::client::conn::http2::handshake(Exec(cx.clone()), io).await.unwrap();
-            cx.spawn(move |_| async move {
+            let (send, conn) = hyper::client::conn::http2::handshake(Exec(fcx.clone()), io).await.unwrap();
+            fcx.spawn(move |_| async move {
                 let _ = conn.await;
                 Ok(())
             });
             Client::H2(send)
         } else {
             let (send, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
-            cx.spawn(move |_| async move {
+            fcx.spawn(move |_| async move {
                 let _ = conn.await;
                 Ok(())
             });
@@ -649,16 +649,16 @@ impl Client {
 
 /// Opens a TLS connection from `m` to `addr:443` with `sni` and `alpn`.
 async fn tls_connect(
-    cx: &Cx,
+    fcx: &Cx,
     m: &Machine,
     env: &Env,
     addr: impl Into<IpAddr>,
     sni: &str,
     alpn: &[&[u8]],
 ) -> Result<TlsClient<tcp::TcpConnection>, TlsError> {
-    let tcp = m.tcp.connect(cx, SocketAddr::new(addr.into(), 443)).await.map_err(TlsError::Conn)?;
+    let tcp = m.tcp.connect(fcx, SocketAddr::new(addr.into(), 443)).await.map_err(TlsError::Conn)?;
     let mut client = TlsClient::new(tcp, &env.roots, sni, alpn);
-    client.handshake(cx).await?;
+    client.handshake(fcx).await?;
     Ok(client)
 }
 
@@ -667,32 +667,32 @@ async fn tls_connect(
 
 #[test]
 fn dns_answers_sites_nodata_and_nxdomain() {
-    world(|cx, attacher, env| async move {
-        let m = machine(&cx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+    world(|fcx, attacher, env| async move {
+        let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
 
         // A site with `at` gets that address; the same answer every time.
-        assert_eq!(lookup(&cx, &m, "secure.test").await, SECURE_ADDR);
-        assert_eq!(lookup(&cx, &m, "secure.test.").await, SECURE_ADDR);
-        assert_eq!(lookup(&cx, &m, "SeCuRe.TeSt").await, SECURE_ADDR);
+        assert_eq!(lookup(&fcx, &m, "secure.test").await, SECURE_ADDR);
+        assert_eq!(lookup(&fcx, &m, "secure.test.").await, SECURE_ADDR);
+        assert_eq!(lookup(&fcx, &m, "SeCuRe.TeSt").await, SECURE_ADDR);
         // Without `at`, an address from 198.18.0.0/15.
-        let plain = lookup(&cx, &m, "plain.test").await;
+        let plain = lookup(&fcx, &m, "plain.test").await;
         assert_eq!(plain, Ipv4Addr::new(198, 18, 0, 1));
-        assert_eq!(lookup(&cx, &m, "broken.test").await, Ipv4Addr::new(198, 18, 0, 2));
-        assert_eq!(lookup(&cx, &m, "plain.test").await, plain);
+        assert_eq!(lookup(&fcx, &m, "broken.test").await, Ipv4Addr::new(198, 18, 0, 2));
+        assert_eq!(lookup(&fcx, &m, "plain.test").await, plain);
 
         // Other types of a site's name: NODATA. (AAAA is in the IPv6 tests.)
-        assert_eq!(dns(&cx, &m, "secure.test", RecordType::MX).await, (ResponseCode::NoError, vec![]));
+        assert_eq!(dns(&fcx, &m, "secure.test", RecordType::MX).await, (ResponseCode::NoError, vec![]));
         // Names the callback turned down: NXDOMAIN, for every type.
-        assert_eq!(dns(&cx, &m, "nope.test", RecordType::A).await, (ResponseCode::NXDomain, vec![]));
-        assert_eq!(dns(&cx, &m, "nope.test", RecordType::AAAA).await, (ResponseCode::NXDomain, vec![]));
+        assert_eq!(dns(&fcx, &m, "nope.test", RecordType::A).await, (ResponseCode::NXDomain, vec![]));
+        assert_eq!(dns(&fcx, &m, "nope.test", RecordType::AAAA).await, (ResponseCode::NXDomain, vec![]));
         // A site that asks for an address inside the sandboxes' subnet.
-        assert_eq!(dns(&cx, &m, "inside.test", RecordType::A).await, (ResponseCode::NXDomain, vec![]));
+        assert_eq!(dns(&fcx, &m, "inside.test", RecordType::A).await, (ResponseCode::NXDomain, vec![]));
 
         // The callback ran once per name: secure, plain, broken, nope, inside.
         assert_eq!(env.calls.load(Ordering::SeqCst), 5);
 
         // DNS over TCP, two queries on one connection.
-        let mut conn = m.tcp.connect(&cx, SocketAddr::new(GATEWAY.into(), 53)).await.unwrap();
+        let mut conn = m.tcp.connect(&fcx, SocketAddr::new(GATEWAY.into(), 53)).await.unwrap();
         for (name, id) in [("secure.test", 7u16), ("nope.test", 8)] {
             let mut q = Message::query();
             q.metadata.id = id;
@@ -700,11 +700,11 @@ fn dns_answers_sites_nodata_and_nxdomain() {
             let bytes = q.to_vec().unwrap();
             let mut framed = (bytes.len() as u16).to_be_bytes().to_vec();
             framed.extend_from_slice(&bytes);
-            conn.write_all(&cx, &framed).await.unwrap();
+            conn.write_all(&fcx, &framed).await.unwrap();
             let mut len = [0u8; 2];
-            read_exact(&cx, &mut conn, &mut len).await;
+            read_exact(&fcx, &mut conn, &mut len).await;
             let mut reply = vec![0u8; u16::from_be_bytes(len) as usize];
-            read_exact(&cx, &mut conn, &mut reply).await;
+            read_exact(&fcx, &mut conn, &mut reply).await;
             let got = parse_dns(&reply, id);
             if name == "secure.test" {
                 assert_eq!(got, (ResponseCode::NoError, vec![SECURE_ADDR]));
@@ -717,10 +717,10 @@ fn dns_answers_sites_nodata_and_nxdomain() {
     });
 }
 
-async fn read_exact<C: Connection>(cx: &Cx, conn: &mut C, buf: &mut [u8]) {
+async fn read_exact<C: Connection>(fcx: &Cx, conn: &mut C, buf: &mut [u8]) {
     let mut at = 0;
     while at < buf.len() {
-        let n = conn.read(cx, &mut buf[at..]).await.unwrap();
+        let n = conn.read(fcx, &mut buf[at..]).await.unwrap();
         assert!(n > 0, "the stream ended early");
         at += n;
     }
@@ -731,14 +731,14 @@ async fn read_exact<C: Connection>(cx: &Cx, conn: &mut C, buf: &mut [u8]) {
 
 #[test]
 fn https_with_http2_and_http11() {
-    world(|cx, attacher, env| async move {
-        let m = machine(&cx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
-        let addr = lookup(&cx, &m, "secure.test").await;
+    world(|fcx, attacher, env| async move {
+        let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+        let addr = lookup(&fcx, &m, "secure.test").await;
 
         // A client that offers h2 gets HTTP/2.
-        let conn = tls_connect(&cx, &m, &env, addr, "secure.test", &[b"h2", b"http/1.1"]).await.unwrap();
+        let conn = tls_connect(&fcx, &m, &env, addr, "secure.test", &[b"h2", b"http/1.1"]).await.unwrap();
         assert_eq!(conn.tls.alpn_protocol(), Some(b"h2".as_slice()));
-        let mut client = Client::new(&cx, conn, true).await;
+        let mut client = Client::new(&fcx, conn, true).await;
         let got = client.get("https", "secure.test", "/a/b?c=d").await;
         assert_eq!(got.status, StatusCode::OK);
         assert_eq!(got.version, Version::HTTP_2);
@@ -749,21 +749,21 @@ fn https_with_http2_and_http11() {
         let mut tasks = Vec::new();
         for _ in 0..20 {
             let mut c = Client::H2(send.clone());
-            tasks.push(cx.spawn(move |_| async move {
+            tasks.push(fcx.spawn(move |_| async move {
                 let got = c.get("https", "secure.test", "/x").await;
                 assert_eq!(got.status, StatusCode::OK);
                 Ok(())
             }));
         }
         for t in tasks {
-            t.join(&cx).await?;
+            t.join(&fcx).await?;
         }
         assert_eq!(env.served.load(Ordering::SeqCst), 21);
 
         // A client that offers only http/1.1 gets it.
-        let conn = tls_connect(&cx, &m, &env, addr, "secure.test", &[b"http/1.1"]).await.unwrap();
+        let conn = tls_connect(&fcx, &m, &env, addr, "secure.test", &[b"http/1.1"]).await.unwrap();
         assert_eq!(conn.tls.alpn_protocol(), Some(b"http/1.1".as_slice()));
-        let mut client = Client::new(&cx, conn, false).await;
+        let mut client = Client::new(&fcx, conn, false).await;
         let got = client.get("https", "secure.test", "/").await;
         assert_eq!(got.status, StatusCode::OK);
         assert_eq!(got.version, Version::HTTP_11);
@@ -773,9 +773,9 @@ fn https_with_http2_and_http11() {
         assert_eq!(got.body, "secure https secure.test 443 HTTP/1.1 #23");
 
         // A client that offers no ALPN at all gets HTTP/1.1.
-        let conn = tls_connect(&cx, &m, &env, addr, "secure.test", &[]).await.unwrap();
+        let conn = tls_connect(&fcx, &m, &env, addr, "secure.test", &[]).await.unwrap();
         assert_eq!(conn.tls.alpn_protocol(), None);
-        let mut client = Client::new(&cx, conn, false).await;
+        let mut client = Client::new(&fcx, conn, false).await;
         assert_eq!(client.get("https", "secure.test", "/").await.status, StatusCode::OK);
         Ok(())
     });
@@ -789,7 +789,7 @@ fn dates_come_from_the_world() {
     let june_2019 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_559_347_200);
     for date in [Some(june_2019), None] {
         let result = within(Duration::from_secs(60), move || {
-            block_on(run(move |cx| async move {
+            block_on(run(move |fcx| async move {
                 let (attacher, attachments) = fictionet::attachments();
                 let site = axum::Router::new()
                     .route("/own", axum::routing::get(|| async { ([("date", "Mon, 01 Jan 2001 00:00:00 GMT")], "own") }))
@@ -798,12 +798,12 @@ fn dates_come_from_the_world() {
                 if let Some(date) = date {
                     sites = sites.date(date);
                 }
-                sites.serve(&cx, attachments)?;
-                let m = machine(&cx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
-                let addr = lookup(&cx, &m, "dated.test").await;
+                sites.serve(&fcx, attachments)?;
+                let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+                let addr = lookup(&fcx, &m, "dated.test").await;
                 for h2 in [false, true] {
-                    let conn = m.tcp.connect(&cx, SocketAddr::new(addr.into(), 80)).await.unwrap();
-                    let mut client = Client::new(&cx, conn, h2).await;
+                    let conn = m.tcp.connect(&fcx, SocketAddr::new(addr.into(), 80)).await.unwrap();
+                    let mut client = Client::new(&fcx, conn, h2).await;
                     let got = client.get("http", "dated.test", "/").await;
                     assert_eq!(got.body, "hello");
                     assert_eq!(got.version, if h2 { Version::HTTP_2 } else { Version::HTTP_11 });
@@ -828,15 +828,15 @@ fn dates_come_from_the_world() {
 
 #[test]
 fn port_80_redirects_tls_sites_and_serves_the_others() {
-    world(|cx, attacher, _env| async move {
-        let m = machine(&cx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
-        let addr = lookup(&cx, &m, "secure.test").await;
-        assert_eq!(lookup(&cx, &m, "shared.test").await, addr);
-        let plain = lookup(&cx, &m, "plain.test").await;
+    world(|fcx, attacher, _env| async move {
+        let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+        let addr = lookup(&fcx, &m, "secure.test").await;
+        assert_eq!(lookup(&fcx, &m, "shared.test").await, addr);
+        let plain = lookup(&fcx, &m, "plain.test").await;
 
         // A site with TLS: 301 to https, with the path and query.
-        let conn = m.tcp.connect(&cx, SocketAddr::new(addr.into(), 80)).await.unwrap();
-        let mut client = Client::new(&cx, conn, false).await;
+        let conn = m.tcp.connect(&fcx, SocketAddr::new(addr.into(), 80)).await.unwrap();
+        let mut client = Client::new(&fcx, conn, false).await;
         let got = client.get("http", "secure.test", "/a/b?c=d").await;
         assert_eq!(got.status, StatusCode::MOVED_PERMANENTLY);
         assert_eq!(got.headers["location"], "https://secure.test/a/b?c=d");
@@ -847,32 +847,32 @@ fn port_80_redirects_tls_sites_and_serves_the_others() {
 
         // A site with its own address, over HTTP/1.1 and HTTP/2 with prior
         // knowledge.
-        let conn = m.tcp.connect(&cx, SocketAddr::new(plain.into(), 80)).await.unwrap();
-        let mut client = Client::new(&cx, conn, false).await;
+        let conn = m.tcp.connect(&fcx, SocketAddr::new(plain.into(), 80)).await.unwrap();
+        let mut client = Client::new(&fcx, conn, false).await;
         assert_eq!(client.get("http", "plain.test", "/q").await.body, "plain http plain.test 80 HTTP/1.1 /q");
-        let conn = m.tcp.connect(&cx, SocketAddr::new(plain.into(), 80)).await.unwrap();
-        let mut client = Client::new(&cx, conn, true).await;
+        let conn = m.tcp.connect(&fcx, SocketAddr::new(plain.into(), 80)).await.unwrap();
+        let mut client = Client::new(&fcx, conn, true).await;
         let got = client.get("http", "plain.test", "/r").await;
         assert_eq!(got.version, Version::HTTP_2);
         assert_eq!(got.body, "plain http plain.test 80 HTTP/2.0 /r");
 
         // Port 443 is closed on a machine with no TLS site.
-        assert_eq!(m.tcp.connect(&cx, SocketAddr::new(plain.into(), 443)).await.err(), Some(ConnError::Refused));
+        assert_eq!(m.tcp.connect(&fcx, SocketAddr::new(plain.into(), 443)).await.err(), Some(ConnError::Refused));
         Ok(())
     });
 }
 
 #[test]
 fn a_tls_site_with_plain_http_answers_port_80_itself() {
-    world_events(|cx, attacher, env, log| async move {
-        let m = machine(&cx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
-        assert_eq!(lookup(&cx, &m, "both.test").await, BOTH_ADDR);
+    world_events(|fcx, attacher, env, log| async move {
+        let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+        assert_eq!(lookup(&fcx, &m, "both.test").await, BOTH_ADDR);
 
         // Port 80: the handler answers, with an http Target, over HTTP/1.1
         // and HTTP/2 with prior knowledge. No redirect.
         for h2 in [false, true] {
-            let conn = m.tcp.connect(&cx, SocketAddr::new(BOTH_ADDR.into(), 80)).await.unwrap();
-            let mut client = Client::new(&cx, conn, h2).await;
+            let conn = m.tcp.connect(&fcx, SocketAddr::new(BOTH_ADDR.into(), 80)).await.unwrap();
+            let mut client = Client::new(&fcx, conn, h2).await;
             let got = client.get("http", "both.test", "/a?b=c").await;
             assert_eq!(got.status, StatusCode::OK);
             assert!(got.headers.get("location").is_none());
@@ -881,14 +881,14 @@ fn a_tls_site_with_plain_http_answers_port_80_itself() {
         }
 
         // Port 443 still serves it over TLS.
-        let conn = tls_connect(&cx, &m, &env, BOTH_ADDR, "both.test", &[b"http/1.1"]).await.unwrap();
-        let mut client = Client::new(&cx, conn, false).await;
+        let conn = tls_connect(&fcx, &m, &env, BOTH_ADDR, "both.test", &[b"http/1.1"]).await.unwrap();
+        let mut client = Client::new(&fcx, conn, false).await;
         let got = client.get("https", "both.test", "/").await;
         assert_eq!(got.status, StatusCode::OK);
         assert!(got.body.starts_with("secure https both.test 443 HTTP/1.1 #"), "{}", got.body);
 
         // Each plain request is a Handler event on port 80, with no SNI.
-        let seen = wait_for(&cx, &log, 3, http_seen).await;
+        let seen = wait_for(&fcx, &log, 3, http_seen).await;
         let plain: Vec<_> = seen.iter().filter(|h| local(h).port() == 80).collect();
         assert_eq!(plain.len(), 2);
         for h in plain {
@@ -897,9 +897,9 @@ fn a_tls_site_with_plain_http_answers_port_80_itself() {
         }
 
         // A TLS site without it still redirects, at the same time.
-        let secure = lookup(&cx, &m, "secure.test").await;
-        let conn = m.tcp.connect(&cx, SocketAddr::new(secure.into(), 80)).await.unwrap();
-        let mut client = Client::new(&cx, conn, false).await;
+        let secure = lookup(&fcx, &m, "secure.test").await;
+        let conn = m.tcp.connect(&fcx, SocketAddr::new(secure.into(), 80)).await.unwrap();
+        let mut client = Client::new(&fcx, conn, false).await;
         assert_eq!(client.get("http", "secure.test", "/").await.status, StatusCode::MOVED_PERMANENTLY);
         Ok(())
     });
@@ -907,16 +907,16 @@ fn a_tls_site_with_plain_http_answers_port_80_itself() {
 
 #[test]
 fn a_host_that_is_not_this_site_gets_421() {
-    world(|cx, attacher, env| async move {
-        let m = machine(&cx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
-        let addr = lookup(&cx, &m, "secure.test").await;
-        lookup(&cx, &m, "shared.test").await;
-        let plain = lookup(&cx, &m, "plain.test").await;
+    world(|fcx, attacher, env| async move {
+        let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+        let addr = lookup(&fcx, &m, "secure.test").await;
+        lookup(&fcx, &m, "shared.test").await;
+        let plain = lookup(&fcx, &m, "plain.test").await;
 
         for h2 in [true, false] {
             let alpn: &[&[u8]] = if h2 { &[b"h2"] } else { &[b"http/1.1"] };
-            let conn = tls_connect(&cx, &m, &env, addr, "secure.test", alpn).await.unwrap();
-            let mut client = Client::new(&cx, conn, h2).await;
+            let conn = tls_connect(&fcx, &m, &env, addr, "secure.test", alpn).await.unwrap();
+            let mut client = Client::new(&fcx, conn, h2).await;
             // A name with no site at all.
             assert_eq!(client.get("https", "nope.test", "/").await.status, StatusCode::MISDIRECTED_REQUEST);
             // A site at another address.
@@ -928,8 +928,8 @@ fn a_host_that_is_not_this_site_gets_421() {
         }
 
         // Plain HTTP too.
-        let conn = m.tcp.connect(&cx, SocketAddr::new(plain.into(), 80)).await.unwrap();
-        let mut client = Client::new(&cx, conn, false).await;
+        let conn = m.tcp.connect(&fcx, SocketAddr::new(plain.into(), 80)).await.unwrap();
+        let mut client = Client::new(&fcx, conn, false).await;
         assert_eq!(client.get("http", "secure.test", "/").await.status, StatusCode::MISDIRECTED_REQUEST);
         assert_eq!(client.get("http", "198.18.0.1", "/").await.status, StatusCode::MISDIRECTED_REQUEST);
         Ok(())
@@ -938,11 +938,11 @@ fn a_host_that_is_not_this_site_gets_421() {
 
 #[test]
 fn a_failing_handler_gets_500() {
-    world(|cx, attacher, _env| async move {
-        let m = machine(&cx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
-        let addr = lookup(&cx, &m, "broken.test").await;
-        let conn = m.tcp.connect(&cx, SocketAddr::new(addr.into(), 80)).await.unwrap();
-        let mut client = Client::new(&cx, conn, false).await;
+    world(|fcx, attacher, _env| async move {
+        let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+        let addr = lookup(&fcx, &m, "broken.test").await;
+        let conn = m.tcp.connect(&fcx, SocketAddr::new(addr.into(), 80)).await.unwrap();
+        let mut client = Client::new(&fcx, conn, false).await;
         assert_eq!(client.get("http", "broken.test", "/").await.status, StatusCode::INTERNAL_SERVER_ERROR);
         Ok(())
     });
@@ -950,14 +950,14 @@ fn a_failing_handler_gets_500() {
 
 #[test]
 fn an_unknown_tls_name_is_rejected_with_unrecognized_name() {
-    world(|cx, attacher, env| async move {
-        let m = machine(&cx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
-        let addr = lookup(&cx, &m, "secure.test").await;
-        lookup(&cx, &m, "shared.test").await;
+    world(|fcx, attacher, env| async move {
+        let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+        let addr = lookup(&fcx, &m, "secure.test").await;
+        lookup(&fcx, &m, "shared.test").await;
         let calls = env.calls.load(Ordering::SeqCst);
         // A name with no site; a site here without TLS; a site elsewhere.
         for sni in ["nope.test", "shared.test", "plain.test"] {
-            match tls_connect(&cx, &m, &env, addr, sni, &[b"h2"]).await {
+            match tls_connect(&fcx, &m, &env, addr, sni, &[b"h2"]).await {
                 Err(TlsError::Tls(rustls::Error::AlertReceived(rustls::AlertDescription::UnrecognisedName))) => {}
                 Err(e) => panic!("{sni}: expected unrecognized_name, got {e:?}"),
                 Ok(_) => panic!("{sni}: the handshake should fail"),
@@ -1014,8 +1014,8 @@ fn parse(p: &Packet) -> (Ipv4Addr, Ipv4Addr, u8, Vec<u8>) {
     (src, dst, b[9], b[20..].to_vec())
 }
 
-async fn recv_within(cx: &Cx, end: &mut End, d: Duration) -> Option<Packet> {
-    timeout(cx, d, end.recv(cx)).await.map(|r| r.unwrap())
+async fn recv_within(fcx: &Cx, end: &mut End, d: Duration) -> Option<Packet> {
+    timeout(fcx, d, end.recv(fcx)).await.map(|r| r.unwrap())
 }
 
 const SHORT: Duration = Duration::from_millis(300);
@@ -1025,7 +1025,7 @@ const SHORT: Duration = Duration::from_millis(300);
 
 #[test]
 fn unknown_addresses_get_host_unreachable_and_sites_appear_on_lookup() {
-    world(|cx, attacher, _env| async move {
+    world(|fcx, attacher, _env| async move {
         let me = Ipv4Addr::new(10, 0, 0, 2);
         let mut raw = attacher.attach("a").unwrap();
 
@@ -1033,7 +1033,7 @@ fn unknown_addresses_get_host_unreachable_and_sites_appear_on_lookup() {
         // the gateway, quoting the packet.
         let sent = ping(me, Ipv4Addr::new(192, 0, 2, 1), 1);
         raw.send(sent.clone());
-        let reply = recv_within(&cx, &mut raw, Duration::from_secs(2)).await.expect("host unreachable");
+        let reply = recv_within(&fcx, &mut raw, Duration::from_secs(2)).await.expect("host unreachable");
         let (src, dst, proto, icmp) = parse(&reply);
         assert_eq!((src, dst, proto), (GATEWAY, me, 1));
         assert_eq!((icmp[0], icmp[1]), (3, 1));
@@ -1042,7 +1042,7 @@ fn unknown_addresses_get_host_unreachable_and_sites_appear_on_lookup() {
 
         // A site's address before its name was looked up: unreachable too.
         raw.send(ping(me, Ipv4Addr::new(198, 18, 0, 1), 2));
-        let (_, _, _, icmp) = parse(&recv_within(&cx, &mut raw, Duration::from_secs(2)).await.unwrap());
+        let (_, _, _, icmp) = parse(&recv_within(&fcx, &mut raw, Duration::from_secs(2)).await.unwrap());
         assert_eq!((icmp[0], icmp[1]), (3, 1));
 
         // Look the name up (raw DNS over UDP), then the address answers.
@@ -1050,21 +1050,21 @@ fn unknown_addresses_get_host_unreachable_and_sites_appear_on_lookup() {
         q.metadata.id = 99;
         q.add_query(Query::query(Name::from_ascii("plain.test").unwrap(), RecordType::A));
         raw.send(udp(me, 5353, GATEWAY, 53, &q.to_vec().unwrap()));
-        let (src, _, proto, u) = parse(&recv_within(&cx, &mut raw, Duration::from_secs(2)).await.unwrap());
+        let (src, _, proto, u) = parse(&recv_within(&fcx, &mut raw, Duration::from_secs(2)).await.unwrap());
         assert_eq!((src, proto), (GATEWAY, 17));
         assert_eq!(parse_dns(&u[8..], 99), (ResponseCode::NoError, vec![Ipv4Addr::new(198, 18, 0, 1)]));
         raw.send(ping(me, Ipv4Addr::new(198, 18, 0, 1), 3));
-        let (src, dst, _, icmp) = parse(&recv_within(&cx, &mut raw, Duration::from_secs(2)).await.unwrap());
+        let (src, dst, _, icmp) = parse(&recv_within(&fcx, &mut raw, Duration::from_secs(2)).await.unwrap());
         assert_eq!((src, dst, icmp[0]), (Ipv4Addr::new(198, 18, 0, 1), me, 0), "an echo reply from the site");
 
         // The gateway answers pings.
         raw.send(ping(me, GATEWAY, 4));
-        let (src, _, _, icmp) = parse(&recv_within(&cx, &mut raw, Duration::from_secs(2)).await.unwrap());
+        let (src, _, _, icmp) = parse(&recv_within(&fcx, &mut raw, Duration::from_secs(2)).await.unwrap());
         assert_eq!((src, icmp[0]), (GATEWAY, 0));
 
         // UDP to a site: port unreachable, so clients fail at once.
         raw.send(udp(me, 5000, Ipv4Addr::new(198, 18, 0, 1), 9999, b"x"));
-        let (_, _, proto, icmp) = parse(&recv_within(&cx, &mut raw, Duration::from_secs(2)).await.unwrap());
+        let (_, _, proto, icmp) = parse(&recv_within(&fcx, &mut raw, Duration::from_secs(2)).await.unwrap());
         assert_eq!((proto, icmp[0], icmp[1]), (1, 3, 3));
 
         // An ICMP error gets no ICMP error back. IPv6 to the unspecified
@@ -1077,22 +1077,22 @@ fn unknown_addresses_get_host_unreachable_and_sites_appear_on_lookup() {
         let mut v6 = vec![0x60, 0, 0, 0, 0, 0, 59, 64];
         v6.extend_from_slice(&[0; 32]);
         raw.send(Packet(v6));
-        assert!(recv_within(&cx, &mut raw, SHORT).await.is_none());
+        assert!(recv_within(&fcx, &mut raw, SHORT).await.is_none());
         Ok(())
     });
 }
 
 #[test]
 fn sandboxes_cannot_reach_each_other() {
-    world(|cx, attacher, _env| async move {
+    world(|fcx, attacher, _env| async move {
         let (a_addr, b_addr) = (Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(10, 0, 0, 3));
         let mut a = attacher.attach("a").unwrap();
         let mut b = attacher.attach("b").unwrap();
         // Both bind their addresses with a ping to the gateway.
         a.send(ping(a_addr, GATEWAY, 1));
-        assert!(recv_within(&cx, &mut a, Duration::from_secs(2)).await.is_some());
+        assert!(recv_within(&fcx, &mut a, Duration::from_secs(2)).await.is_some());
         b.send(ping(b_addr, GATEWAY, 1));
-        assert!(recv_within(&cx, &mut b, Duration::from_secs(2)).await.is_some());
+        assert!(recv_within(&fcx, &mut b, Duration::from_secs(2)).await.is_some());
 
         // a to b: nothing arrives at b, and a hears nothing back.
         a.send(ping(a_addr, b_addr, 2));
@@ -1102,19 +1102,19 @@ fn sandboxes_cannot_reach_each_other() {
         a.send(udp(a_addr, 1000, Ipv4Addr::BROADCAST, 2000, b"hello"));
         // Nor to an address in the subnet that no one has.
         a.send(ping(a_addr, Ipv4Addr::new(10, 0, 0, 77), 4));
-        assert!(recv_within(&cx, &mut b, SHORT).await.is_none());
-        assert!(recv_within(&cx, &mut a, Duration::from_millis(10)).await.is_none());
+        assert!(recv_within(&fcx, &mut b, SHORT).await.is_none());
+        assert!(recv_within(&fcx, &mut a, Duration::from_millis(10)).await.is_none());
 
         // Both still reach the gateway.
         b.send(ping(b_addr, GATEWAY, 5));
-        assert!(recv_within(&cx, &mut b, Duration::from_secs(2)).await.is_some());
+        assert!(recv_within(&fcx, &mut b, Duration::from_secs(2)).await.is_some());
         Ok(())
     });
 }
 
 #[test]
 fn spoofed_and_taken_sources_are_dropped() {
-    world(|cx, attacher, _env| async move {
+    world(|fcx, attacher, _env| async move {
         let (a_addr, b_addr) = (Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(10, 0, 0, 3));
         let mut a = attacher.attach("a").unwrap();
         let mut b = attacher.attach("b").unwrap();
@@ -1125,21 +1125,21 @@ fn spoofed_and_taken_sources_are_dropped() {
             a.send(ping(src, GATEWAY, 1));
         }
         a.send(ping(Ipv4Addr::UNSPECIFIED, GATEWAY, 1));
-        assert!(recv_within(&cx, &mut a, SHORT).await.is_none());
+        assert!(recv_within(&fcx, &mut a, SHORT).await.is_none());
 
         // a binds 10.0.0.2.
         a.send(ping(a_addr, GATEWAY, 2));
-        assert!(recv_within(&cx, &mut a, Duration::from_secs(2)).await.is_some());
+        assert!(recv_within(&fcx, &mut a, Duration::from_secs(2)).await.is_some());
         // b cannot take it.
         b.send(ping(a_addr, GATEWAY, 3));
-        assert!(recv_within(&cx, &mut b, SHORT).await.is_none());
-        assert!(recv_within(&cx, &mut a, Duration::from_millis(10)).await.is_none());
+        assert!(recv_within(&fcx, &mut b, SHORT).await.is_none());
+        assert!(recv_within(&fcx, &mut a, Duration::from_millis(10)).await.is_none());
         // a cannot send from any other address now.
         a.send(ping(b_addr, GATEWAY, 4));
-        assert!(recv_within(&cx, &mut a, SHORT).await.is_none());
+        assert!(recv_within(&fcx, &mut a, SHORT).await.is_none());
         // b binds 10.0.0.3, which a just tried to use.
         b.send(ping(b_addr, GATEWAY, 5));
-        assert!(recv_within(&cx, &mut b, Duration::from_secs(2)).await.is_some());
+        assert!(recv_within(&fcx, &mut b, Duration::from_secs(2)).await.is_some());
 
         // When a detaches, its address is free again.
         drop(a);
@@ -1147,7 +1147,7 @@ fn spoofed_and_taken_sources_are_dropped() {
         let mut freed = false;
         for seq in 0..50 {
             c.send(ping(a_addr, GATEWAY, seq));
-            if recv_within(&cx, &mut c, Duration::from_millis(50)).await.is_some() {
+            if recv_within(&fcx, &mut c, Duration::from_millis(50)).await.is_some() {
                 freed = true;
                 break;
             }
@@ -1169,9 +1169,9 @@ fn dhcp_msg(kind: u8, xid: u32, mac: u8) -> dhcp::Message {
 
 /// Sends a DHCP message from `src` to `dst` and returns the reply's IP
 /// destination and message.
-async fn dhcp_ask(cx: &Cx, end: &mut End, src: Ipv4Addr, dst: Ipv4Addr, m: &dhcp::Message) -> Option<(Ipv4Addr, dhcp::Message)> {
+async fn dhcp_ask(fcx: &Cx, end: &mut End, src: Ipv4Addr, dst: Ipv4Addr, m: &dhcp::Message) -> Option<(Ipv4Addr, dhcp::Message)> {
     end.send(udp(src, 68, dst, 67, &m.to_bytes().unwrap()));
-    let p = recv_within(cx, end, SHORT).await?;
+    let p = recv_within(fcx, end, SHORT).await?;
     let (from, to, proto, u) = parse(&p);
     assert_eq!((from, proto), (GATEWAY, 17));
     assert_eq!(&u[..4], &[0, 67, 0, 68]);
@@ -1184,14 +1184,14 @@ async fn dhcp_ask(cx: &Cx, end: &mut End, src: Ipv4Addr, dst: Ipv4Addr, m: &dhcp
 
 #[test]
 fn dhcp_lease_renewal_and_restart() {
-    world(|cx, attacher, _env| async move {
+    world(|fcx, attacher, _env| async move {
         let any = Ipv4Addr::UNSPECIFIED;
         let bc = Ipv4Addr::BROADCAST;
         let mut a = attacher.attach("a").unwrap();
 
         // DISCOVER from 0.0.0.0: OFFER of the lowest free address, with the
         // settings.
-        let (to, offer) = dhcp_ask(&cx, &mut a, any, bc, &dhcp_msg(dhcp::DISCOVER, 1, 1)).await.expect("an offer");
+        let (to, offer) = dhcp_ask(&fcx, &mut a, any, bc, &dhcp_msg(dhcp::DISCOVER, 1, 1)).await.expect("an offer");
         assert_eq!(to, bc);
         assert_eq!(offer.message_type(), Some(dhcp::OFFER));
         let addr = offer.yiaddr;
@@ -1205,76 +1205,76 @@ fn dhcp_lease_renewal_and_restart() {
         // The offer is held: another sandbox cannot bind it statically.
         let mut b = attacher.attach("b").unwrap();
         b.send(ping(addr, GATEWAY, 1));
-        assert!(recv_within(&cx, &mut b, SHORT).await.is_none());
+        assert!(recv_within(&fcx, &mut b, SHORT).await.is_none());
         // b's own DISCOVER gets the next address, even if it asks for a's.
         let mut discover = dhcp_msg(dhcp::DISCOVER, 2, 2);
         discover.push(dhcp::opt::REQUESTED_IP, addr.octets());
-        let (_, offer_b) = dhcp_ask(&cx, &mut b, any, bc, &discover).await.unwrap();
+        let (_, offer_b) = dhcp_ask(&fcx, &mut b, any, bc, &discover).await.unwrap();
         assert_eq!(offer_b.yiaddr, Ipv4Addr::new(10, 0, 0, 3));
         // b asking to bind a's address: NAK.
         let mut request = dhcp_msg(dhcp::REQUEST, 3, 2);
         request.push(dhcp::opt::REQUESTED_IP, addr.octets());
         request.push(dhcp::opt::SERVER_ID, GATEWAY.octets());
-        let (_, nak) = dhcp_ask(&cx, &mut b, any, bc, &request).await.unwrap();
+        let (_, nak) = dhcp_ask(&fcx, &mut b, any, bc, &request).await.unwrap();
         assert_eq!(nak.message_type(), Some(dhcp::NAK));
 
         // a takes its offer.
         let mut request = dhcp_msg(dhcp::REQUEST, 4, 1);
         request.push(dhcp::opt::REQUESTED_IP, addr.octets());
         request.push(dhcp::opt::SERVER_ID, GATEWAY.octets());
-        let (to, ack) = dhcp_ask(&cx, &mut a, any, bc, &request).await.unwrap();
+        let (to, ack) = dhcp_ask(&fcx, &mut a, any, bc, &request).await.unwrap();
         assert_eq!(to, bc);
         assert_eq!(ack.message_type(), Some(dhcp::ACK));
         assert_eq!(ack.yiaddr, addr);
 
         // Bound: pings from the address work, from others do not.
         a.send(ping(addr, GATEWAY, 2));
-        assert!(recv_within(&cx, &mut a, Duration::from_secs(2)).await.is_some());
+        assert!(recv_within(&fcx, &mut a, Duration::from_secs(2)).await.is_some());
         a.send(ping(Ipv4Addr::new(10, 0, 0, 9), GATEWAY, 3));
-        assert!(recv_within(&cx, &mut a, SHORT).await.is_none());
+        assert!(recv_within(&fcx, &mut a, SHORT).await.is_none());
 
         // Renewal: unicast from the address, with ciaddr. ACK to the address.
         let mut renew = dhcp_msg(dhcp::REQUEST, 5, 1);
         renew.ciaddr = addr;
-        let (to, ack) = dhcp_ask(&cx, &mut a, addr, GATEWAY, &renew).await.unwrap();
+        let (to, ack) = dhcp_ask(&fcx, &mut a, addr, GATEWAY, &renew).await.unwrap();
         assert_eq!((to, ack.message_type(), ack.yiaddr), (addr, Some(dhcp::ACK), addr));
         // Rebinding: broadcast from the address.
-        let (_, ack) = dhcp_ask(&cx, &mut a, addr, bc, &renew).await.unwrap();
+        let (_, ack) = dhcp_ask(&fcx, &mut a, addr, bc, &renew).await.unwrap();
         assert_eq!(ack.message_type(), Some(dhcp::ACK));
 
         // DHCP from an address that is not a's: dropped.
         let mut other = dhcp_msg(dhcp::REQUEST, 6, 1);
         other.ciaddr = Ipv4Addr::new(10, 0, 0, 9);
-        assert!(dhcp_ask(&cx, &mut a, Ipv4Addr::new(10, 0, 0, 9), GATEWAY, &other).await.is_none());
+        assert!(dhcp_ask(&fcx, &mut a, Ipv4Addr::new(10, 0, 0, 9), GATEWAY, &other).await.is_none());
 
         // Restart: from 0.0.0.0 again, the same address.
-        let (_, offer) = dhcp_ask(&cx, &mut a, any, bc, &dhcp_msg(dhcp::DISCOVER, 7, 1)).await.unwrap();
+        let (_, offer) = dhcp_ask(&fcx, &mut a, any, bc, &dhcp_msg(dhcp::DISCOVER, 7, 1)).await.unwrap();
         assert_eq!(offer.yiaddr, addr);
         // INIT-REBOOT for another address: NAK; for its own: ACK.
         let mut reboot = dhcp_msg(dhcp::REQUEST, 8, 1);
         reboot.push(dhcp::opt::REQUESTED_IP, Ipv4Addr::new(10, 0, 0, 20).octets());
-        let (_, nak) = dhcp_ask(&cx, &mut a, any, bc, &reboot).await.unwrap();
+        let (_, nak) = dhcp_ask(&fcx, &mut a, any, bc, &reboot).await.unwrap();
         assert_eq!(nak.message_type(), Some(dhcp::NAK));
         let mut reboot = dhcp_msg(dhcp::REQUEST, 9, 1);
         reboot.push(dhcp::opt::REQUESTED_IP, addr.octets());
-        let (_, ack) = dhcp_ask(&cx, &mut a, any, bc, &reboot).await.unwrap();
+        let (_, ack) = dhcp_ask(&fcx, &mut a, any, bc, &reboot).await.unwrap();
         assert_eq!((ack.message_type(), ack.yiaddr), (Some(dhcp::ACK), addr));
         // The agent changing its MAC does not get it a second address.
-        let (_, offer) = dhcp_ask(&cx, &mut a, any, bc, &dhcp_msg(dhcp::DISCOVER, 10, 99)).await.unwrap();
+        let (_, offer) = dhcp_ask(&fcx, &mut a, any, bc, &dhcp_msg(dhcp::DISCOVER, 10, 99)).await.unwrap();
         assert_eq!(offer.yiaddr, addr);
 
         // A REQUEST naming another server is ignored.
         let mut elsewhere = dhcp_msg(dhcp::REQUEST, 11, 3);
         elsewhere.push(dhcp::opt::REQUESTED_IP, Ipv4Addr::new(10, 0, 0, 30).octets());
         elsewhere.push(dhcp::opt::SERVER_ID, Ipv4Addr::new(10, 0, 0, 254).octets());
-        assert!(dhcp_ask(&cx, &mut b, any, bc, &elsewhere).await.is_none());
+        assert!(dhcp_ask(&fcx, &mut b, any, bc, &elsewhere).await.is_none());
 
         // b takes its offer; then a detaches, and a new sandbox asking for
         // a's old address gets it.
         let mut request = dhcp_msg(dhcp::REQUEST, 12, 2);
         request.push(dhcp::opt::REQUESTED_IP, offer_b.yiaddr.octets());
         request.push(dhcp::opt::SERVER_ID, GATEWAY.octets());
-        let (_, ack) = dhcp_ask(&cx, &mut b, any, bc, &request).await.unwrap();
+        let (_, ack) = dhcp_ask(&fcx, &mut b, any, bc, &request).await.unwrap();
         assert_eq!(ack.message_type(), Some(dhcp::ACK));
         drop(a);
         let mut c = attacher.attach("c").unwrap();
@@ -1282,12 +1282,12 @@ fn dhcp_lease_renewal_and_restart() {
         for xid in 100..150 {
             let mut d = dhcp_msg(dhcp::DISCOVER, xid, 4);
             d.push(dhcp::opt::REQUESTED_IP, addr.octets());
-            let (_, offer) = dhcp_ask(&cx, &mut c, any, bc, &d).await.unwrap();
+            let (_, offer) = dhcp_ask(&fcx, &mut c, any, bc, &d).await.unwrap();
             if offer.yiaddr == addr {
                 got = Some(offer.yiaddr);
                 break;
             }
-            cx.sleep(Duration::from_millis(20)).await?;
+            fcx.sleep(Duration::from_millis(20)).await?;
         }
         assert_eq!(got, Some(addr), "a's address is free once a detached");
 
@@ -1295,16 +1295,16 @@ fn dhcp_lease_renewal_and_restart() {
         let mut d = attacher.attach("d").unwrap();
         let d_addr = Ipv4Addr::new(10, 0, 0, 40);
         d.send(ping(d_addr, GATEWAY, 1));
-        assert!(recv_within(&cx, &mut d, Duration::from_secs(2)).await.is_some());
+        assert!(recv_within(&fcx, &mut d, Duration::from_secs(2)).await.is_some());
         let mut inform = dhcp_msg(dhcp::INFORM, 13, 5);
         inform.ciaddr = d_addr;
-        let (to, ack) = dhcp_ask(&cx, &mut d, d_addr, GATEWAY, &inform).await.unwrap();
+        let (to, ack) = dhcp_ask(&fcx, &mut d, d_addr, GATEWAY, &inform).await.unwrap();
         assert_eq!((to, ack.message_type(), ack.yiaddr), (d_addr, Some(dhcp::ACK), Ipv4Addr::UNSPECIFIED));
         assert_eq!(ack.option_u32(dhcp::opt::LEASE_TIME), None);
         assert_eq!(ack.option_addr(dhcp::opt::DNS), Some(GATEWAY));
         // And DHCP to the server from a static sandbox asking for a lease
         // gets its static address.
-        let (_, offer) = dhcp_ask(&cx, &mut d, any, bc, &dhcp_msg(dhcp::DISCOVER, 14, 5)).await.unwrap();
+        let (_, offer) = dhcp_ask(&fcx, &mut d, any, bc, &dhcp_msg(dhcp::DISCOVER, 14, 5)).await.unwrap();
         assert_eq!(offer.yiaddr, d_addr);
         Ok(())
     });
@@ -1325,19 +1325,19 @@ fn dhcp_messages_round_trip() {
 #[test]
 fn a_subnet_that_cannot_work_is_an_error() {
     let result = within(Duration::from_secs(10), || {
-        block_on(run(|cx| async move {
+        block_on(run(|fcx| async move {
             for bad in ["10.0.0.0/31", "10.0.0.0/4", "fe80::/64", "ff00::/8", "::/8", "2001:db8::/127", "2001:db8::/4"] {
                 let (_attacher, attachments) = fictionet::attachments();
-                let r = web::Sites::new(|_| None).subnet(bad.parse()?).serve(&cx, attachments);
+                let r = web::Sites::new(|_| None).subnet(bad.parse()?).serve(&fcx, attachments);
                 assert!(r.is_err(), "{bad}");
             }
             // Another subnet works, with its gateway at .1.
             let (attacher, attachments) = fictionet::attachments();
-            web::Sites::new(|_| None).subnet("172.16.5.0/24".parse()?).serve(&cx, attachments)?;
+            web::Sites::new(|_| None).subnet("172.16.5.0/24".parse()?).serve(&fcx, attachments)?;
             let mut a = attacher.attach("a").unwrap();
             let gw = Ipv4Addr::new(172, 16, 5, 1);
             a.send(ping(Ipv4Addr::new(172, 16, 5, 9), gw, 1));
-            let (src, _, _, icmp) = parse(&recv_within(&cx, &mut a, Duration::from_secs(2)).await.unwrap());
+            let (src, _, _, icmp) = parse(&recv_within(&fcx, &mut a, Duration::from_secs(2)).await.unwrap());
             assert_eq!((src, icmp[0]), (gw, 0));
             Err(fictionet::Error::from(Done))
         }))
@@ -1352,19 +1352,19 @@ fn the_sites_keep_running_after_the_world_returns() {
     let (attacher, attachments) = fictionet::attachments();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let r = block_on(run(move |cx| async move {
-            web::Sites::new(|h| (h == "plain.test").then(|| web::Site::new(Plain("plain")))).serve(&cx, attachments)?;
-            let _ = tx.send(cx.clone());
+        let r = block_on(run(move |fcx| async move {
+            web::Sites::new(|h| (h == "plain.test").then(|| web::Site::new(Plain("plain")))).serve(&fcx, attachments)?;
+            let _ = tx.send(fcx.clone());
             Ok(())
         }));
         let _ = r;
     });
-    let cx = rx.recv().unwrap();
+    let fcx = rx.recv().unwrap();
     let mut a = attacher.attach("a").unwrap();
     let me = Ipv4Addr::new(10, 0, 0, 2);
     a.send(ping(me, GATEWAY, 1));
     let reply = within(Duration::from_secs(5), move || {
-        block_on(async move { timeout(&cx, Duration::from_secs(2), a.recv(&cx)).await })
+        block_on(async move { timeout(&fcx, Duration::from_secs(2), a.recv(&fcx)).await })
     });
     let (src, _, _, icmp) = parse(&reply.expect("a reply").unwrap());
     assert_eq!((src, icmp[0]), (GATEWAY, 0));
@@ -1372,11 +1372,11 @@ fn the_sites_keep_running_after_the_world_returns() {
 
 #[test]
 fn the_target_is_from_the_connection_not_the_headers() {
-    world(|cx, attacher, env| async move {
-        let m = machine(&cx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
-        let addr = lookup(&cx, &m, "secure.test").await;
-        let conn = tls_connect(&cx, &m, &env, addr, "secure.test", &[b"http/1.1"]).await.unwrap();
-        let Client::H1(mut send) = Client::new(&cx, conn, false).await else { unreachable!() };
+    world(|fcx, attacher, env| async move {
+        let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+        let addr = lookup(&fcx, &m, "secure.test").await;
+        let conn = tls_connect(&fcx, &m, &env, addr, "secure.test", &[b"http/1.1"]).await.unwrap();
+        let Client::H1(mut send) = Client::new(&fcx, conn, false).await else { unreachable!() };
         // An absolute URI with another scheme and port, and forwarding
         // headers: the Target still says https, secure.test, 443.
         send.ready().await.unwrap();
@@ -1402,13 +1402,13 @@ fn the_target_is_from_the_connection_not_the_headers() {
 async fn the_proxy_answers_502_when_the_real_site_cannot_be_reached() {
     let result = tokio::time::timeout(
         Duration::from_secs(30),
-        run(|cx| async move {
+        run(|fcx| async move {
             let (attacher, attachments) = fictionet::attachments();
-            web::Sites::new(|h| (h == "nowhere.invalid").then(|| web::Site::new(web::proxy()))).serve(&cx, attachments)?;
-            let m = machine(&cx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
-            let addr = lookup(&cx, &m, "nowhere.invalid").await;
-            let conn = m.tcp.connect(&cx, SocketAddr::new(addr.into(), 80)).await.unwrap();
-            let mut client = Client::new(&cx, conn, false).await;
+            web::Sites::new(|h| (h == "nowhere.invalid").then(|| web::Site::new(web::proxy()))).serve(&fcx, attachments)?;
+            let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+            let addr = lookup(&fcx, &m, "nowhere.invalid").await;
+            let conn = m.tcp.connect(&fcx, SocketAddr::new(addr.into(), 80)).await.unwrap();
+            let mut client = Client::new(&fcx, conn, false).await;
             let got = client.get("http", "nowhere.invalid", "/").await;
             assert_eq!(got.status, StatusCode::BAD_GATEWAY, "{}", got.body);
             assert!(got.body.contains("nowhere.invalid"), "{}", got.body);
@@ -1441,21 +1441,21 @@ fn echo_socket() -> axum::Router {
 /// Makes a client's WebSocket handshake on `conn` for `host`, then sends
 /// `text` and returns the first message back.
 #[cfg(feature = "tokio")]
-async fn websocket_echo<C: Connection>(cx: &Cx, conn: &mut C, host: &str, text: &str) -> fictionet::stdlib::websocket::Message {
+async fn websocket_echo<C: Connection>(fcx: &Cx, conn: &mut C, host: &str, text: &str) -> fictionet::stdlib::websocket::Message {
     use fictionet::stdlib::codec::{Stream, Wire};
     use fictionet::stdlib::websocket::{Message as Ws, Messages, Role};
     let request = format!(
         "GET /echo HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
          Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
     );
-    conn.write_all(cx, request.as_bytes()).await.unwrap();
+    conn.write_all(fcx, request.as_bytes()).await.unwrap();
     let mut got = Vec::new();
     let mut buf = [0u8; 4096];
     let head_end = loop {
         if let Some(i) = got.windows(4).position(|w| w == b"\r\n\r\n") {
             break i + 4;
         }
-        let n = conn.read(cx, &mut buf).await.unwrap();
+        let n = conn.read(fcx, &mut buf).await.unwrap();
         assert!(n > 0, "the server closed during the handshake: {:?}", String::from_utf8_lossy(&got));
         got.extend_from_slice(&buf[..n]);
     };
@@ -1463,14 +1463,14 @@ async fn websocket_echo<C: Connection>(cx: &Cx, conn: &mut C, host: &str, text: 
     assert!(head.starts_with("http/1.1 101"), "{head}");
     assert!(head.contains("sec-websocket-accept: s3pplmbitxaq9kygzzhzrbk+xoo="), "{head}");
     let frame = Ws::Text(text.to_owned()).to_frame(Some([1, 2, 3, 4])).unwrap();
-    conn.write_all(cx, &frame.to_bytes().unwrap()).await.unwrap();
+    conn.write_all(fcx, &frame.to_bytes().unwrap()).await.unwrap();
     let mut stream = Stream::new(Messages::new(Role::Client));
     assert_eq!(stream.push(&got[head_end..]), got.len() - head_end);
     loop {
         if let Some(m) = stream.next() {
             return m.unwrap();
         }
-        let n = conn.read(cx, &mut buf).await.unwrap();
+        let n = conn.read(fcx, &mut buf).await.unwrap();
         assert!(n > 0, "the server closed the WebSocket");
         assert_eq!(stream.push(&buf[..n]), n);
     }
@@ -1483,13 +1483,13 @@ async fn websocket_echo<C: Connection>(cx: &Cx, conn: &mut C, host: &str, text: 
 async fn websockets_work_through_sites() {
     let result = tokio::time::timeout(
         Duration::from_secs(30),
-        run(|cx| async move {
+        run(|fcx| async move {
             let (attacher, attachments) = fictionet::attachments();
-            web::Sites::new(|h| (h == "ws.test").then(|| web::Site::new(echo_socket()))).serve(&cx, attachments)?;
-            let m = machine(&cx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
-            let addr = lookup(&cx, &m, "ws.test").await;
-            let mut conn = m.tcp.connect(&cx, SocketAddr::new(addr.into(), 80)).await.unwrap();
-            let reply = websocket_echo(&cx, &mut conn, "ws.test", "hello").await;
+            web::Sites::new(|h| (h == "ws.test").then(|| web::Site::new(echo_socket()))).serve(&fcx, attachments)?;
+            let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+            let addr = lookup(&fcx, &m, "ws.test").await;
+            let mut conn = m.tcp.connect(&fcx, SocketAddr::new(addr.into(), 80)).await.unwrap();
+            let reply = websocket_echo(&fcx, &mut conn, "ws.test", "hello").await;
             assert_eq!(reply, fictionet::stdlib::websocket::Message::Text("echo: hello".into()));
             Err(fictionet::Error::from(Done))
         }),
@@ -1518,11 +1518,11 @@ fn fragment(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, id: u16, offset: usize, mor
 /// different packet, must not stall the gateway for everyone else.
 #[test]
 fn a_flood_of_unfinished_fragments_does_not_stall_the_gateway() {
-    world(|cx, attacher, _env| async move {
+    world(|fcx, attacher, _env| async move {
         let me = Ipv4Addr::new(10, 0, 0, 2);
         let mut raw = attacher.attach("a").unwrap();
         raw.send(ping(me, GATEWAY, 1));
-        assert!(recv_within(&cx, &mut raw, Duration::from_secs(2)).await.is_some());
+        assert!(recv_within(&fcx, &mut raw, Duration::from_secs(2)).await.is_some());
         let started = std::time::Instant::now();
         for i in 0..60_000u32 {
             let proto = [17u8, 6, 1][(i % 3) as usize];
@@ -1531,7 +1531,7 @@ fn a_flood_of_unfinished_fragments_does_not_stall_the_gateway() {
         // A ping sent after the flood is answered once the gateway has gone
         // through every fragment before it. That must be quick.
         raw.send(ping(me, GATEWAY, 2));
-        let reply = recv_within(&cx, &mut raw, Duration::from_secs(5)).await;
+        let reply = recv_within(&fcx, &mut raw, Duration::from_secs(5)).await;
         assert!(reply.is_some(), "no ping reply {:?} after the flood started", started.elapsed());
         eprintln!("60,000 fragments went through in {:?}", started.elapsed());
         Ok(())
@@ -1563,7 +1563,7 @@ const FIN: u8 = 0x01;
 /// ports (ours) of those the other side closed (FIN or RST) while the rest
 /// were being opened. They then sit idle; the raw end never answers again
 /// unless asked.
-async fn open_idle(cx: &Cx, raw: &mut End, me: Ipv4Addr, to: SocketAddr, n: u16) -> (usize, std::collections::BTreeSet<u16>) {
+async fn open_idle(fcx: &Cx, raw: &mut End, me: Ipv4Addr, to: SocketAddr, n: u16) -> (usize, std::collections::BTreeSet<u16>) {
     let IpAddr::V4(dst) = to.ip() else { unreachable!() };
     let mut open = 0;
     let mut opened = std::collections::HashSet::new();
@@ -1574,7 +1574,7 @@ async fn open_idle(cx: &Cx, raw: &mut End, me: Ipv4Addr, to: SocketAddr, n: u16)
         }
         let mut left = batch.len();
         while left > 0 {
-            let Some(p) = recv_within(cx, raw, Duration::from_secs(5)).await else { break };
+            let Some(p) = recv_within(fcx, raw, Duration::from_secs(5)).await else { break };
             let (_, _, proto, t) = parse(&p);
             if proto != 6 {
                 continue;
@@ -1597,21 +1597,21 @@ async fn open_idle(cx: &Cx, raw: &mut End, me: Ipv4Addr, to: SocketAddr, n: u16)
 }
 
 /// Times one HTTPS request from a fresh connection.
-async fn timed_get(cx: &Cx, m: &Machine, env: &Env) -> Duration {
+async fn timed_get(fcx: &Cx, m: &Machine, env: &Env) -> Duration {
     let started = std::time::Instant::now();
-    let conn = tls_connect(cx, m, env, SECURE_ADDR, "secure.test", &[b"http/1.1"]).await.unwrap();
-    let mut client = Client::new(cx, conn, false).await;
+    let conn = tls_connect(fcx, m, env, SECURE_ADDR, "secure.test", &[b"http/1.1"]).await.unwrap();
+    let mut client = Client::new(fcx, conn, false).await;
     assert_eq!(client.get("https", "secure.test", "/").await.status, StatusCode::OK);
     started.elapsed()
 }
 
 /// Ports (ours) of the connections the other side closed (FIN or RST)
 /// within `d`, counting each port once.
-async fn closed_ports(cx: &Cx, raw: &mut End, d: Duration) -> std::collections::BTreeSet<u16> {
+async fn closed_ports(fcx: &Cx, raw: &mut End, d: Duration) -> std::collections::BTreeSet<u16> {
     let mut closed = std::collections::BTreeSet::new();
     let until = std::time::Instant::now() + d;
     while let Some(left) = until.checked_duration_since(std::time::Instant::now()) {
-        let Some(p) = recv_within(cx, raw, left).await else { break };
+        let Some(p) = recv_within(fcx, raw, left).await else { break };
         let (_, _, proto, t) = parse(&p);
         if proto == 6 && t[13] & (FIN | RST) != 0 {
             closed.insert(u16::from_be_bytes([t[2], t[3]]));
@@ -1624,17 +1624,17 @@ async fn closed_ports(cx: &Cx, raw: &mut End, d: Duration) -> std::collections::
 /// others share. Past that, the machine resets new ones at once.
 #[test]
 fn one_sandbox_cannot_hold_thousands_of_connections_open() {
-    world(|cx, attacher, env| async move {
+    world(|fcx, attacher, env| async move {
         let me = Ipv4Addr::new(10, 0, 0, 2);
         let mut raw = attacher.attach("a").unwrap();
-        let b = machine(&cx, &attacher, "b", Ipv4Addr::new(10, 0, 0, 3));
-        assert_eq!(lookup(&cx, &b, "secure.test").await, SECURE_ADDR);
-        let (open, mut closed) = open_idle(&cx, &mut raw, me, SocketAddr::new(SECURE_ADDR.into(), 443), 1000).await;
+        let b = machine(&fcx, &attacher, "b", Ipv4Addr::new(10, 0, 0, 3));
+        assert_eq!(lookup(&fcx, &b, "secure.test").await, SECURE_ADDR);
+        let (open, mut closed) = open_idle(&fcx, &mut raw, me, SocketAddr::new(SECURE_ADDR.into(), 443), 1000).await;
         assert_eq!(open, 1000);
-        closed.extend(closed_ports(&cx, &mut raw, Duration::from_secs(1)).await);
+        closed.extend(closed_ports(&fcx, &mut raw, Duration::from_secs(1)).await);
         assert_eq!(closed.len(), 1000 - 256, "all past the first 256 are closed");
         // The other sandbox is served as before.
-        let took = timed_get(&cx, &b, &env).await;
+        let took = timed_get(&fcx, &b, &env).await;
         assert!(took < Duration::from_secs(1), "{took:?}");
         Ok(())
     });
@@ -1643,13 +1643,13 @@ fn one_sandbox_cannot_hold_thousands_of_connections_open() {
 /// One HTTP/1.0 request on a fresh connection. Reads to the end, and
 /// gives back the connection without closing this side, so it stays in
 /// CLOSE_WAIT. `None` if the machine reset it.
-async fn get_and_hold(cx: &Cx, m: &Machine, to: Ipv4Addr) -> Option<(String, tcp::TcpConnection)> {
-    let mut conn = m.tcp.connect(cx, SocketAddr::new(to.into(), 80)).await.ok()?;
-    conn.write_all(cx, b"GET / HTTP/1.0\r\nHost: plain.test\r\n\r\n").await.ok()?;
+async fn get_and_hold(fcx: &Cx, m: &Machine, to: Ipv4Addr) -> Option<(String, tcp::TcpConnection)> {
+    let mut conn = m.tcp.connect(fcx, SocketAddr::new(to.into(), 80)).await.ok()?;
+    conn.write_all(fcx, b"GET / HTTP/1.0\r\nHost: plain.test\r\n\r\n").await.ok()?;
     let mut got = Vec::new();
     let mut buf = [0u8; 4096];
     loop {
-        match conn.read(cx, &mut buf).await {
+        match conn.read(fcx, &mut buf).await {
             Ok(0) => break,
             Ok(n) => got.extend_from_slice(&buf[..n]),
             Err(_) => return None,
@@ -1664,29 +1664,29 @@ async fn get_and_hold(cx: &Cx, m: &Machine, to: Ipv4Addr) -> Option<(String, tcp
 /// it may connect again.
 #[test]
 fn connections_left_half_open_still_count() {
-    world(|cx, attacher, _env| async move {
-        let a = machine(&cx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
-        let to = lookup(&cx, &a, "plain.test").await;
+    world(|fcx, attacher, _env| async move {
+        let a = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+        let to = lookup(&fcx, &a, "plain.test").await;
         let mut held = Vec::new();
         for i in 0..256 {
-            let (text, conn) = get_and_hold(&cx, &a, to).await.unwrap_or_else(|| panic!("connection {i} was reset"));
+            let (text, conn) = get_and_hold(&fcx, &a, to).await.unwrap_or_else(|| panic!("connection {i} was reset"));
             assert!(text.starts_with("HTTP/1.0 200"), "{text}");
             held.push(conn);
         }
         // The server closed all 256; the sandbox did not.
         for _ in 0..20 {
-            assert!(get_and_hold(&cx, &a, to).await.is_none(), "a connection past the 256 was served");
+            assert!(get_and_hold(&fcx, &a, to).await.is_none(), "a connection past the 256 was served");
         }
         // Another sandbox is served as before.
-        let b = machine(&cx, &attacher, "b", Ipv4Addr::new(10, 0, 0, 3));
-        assert_eq!(lookup(&cx, &b, "plain.test").await, to);
-        let (text, _conn) = get_and_hold(&cx, &b, to).await.expect("the other sandbox is served");
+        let b = machine(&fcx, &attacher, "b", Ipv4Addr::new(10, 0, 0, 3));
+        assert_eq!(lookup(&fcx, &b, "plain.test").await, to);
+        let (text, _conn) = get_and_hold(&fcx, &b, to).await.expect("the other sandbox is served");
         assert!(text.starts_with("HTTP/1.0 200"), "{text}");
         // Closing them frees the count.
         drop(held);
-        cx.sleep(Duration::from_millis(200)).await?;
+        fcx.sleep(Duration::from_millis(200)).await?;
         for _ in 0..20 {
-            let (text, _conn) = get_and_hold(&cx, &a, to).await.expect("served again after closing");
+            let (text, _conn) = get_and_hold(&fcx, &a, to).await.expect("served again after closing");
             assert!(text.starts_with("HTTP/1.0 200"), "{text}");
         }
         Ok(())
@@ -1698,7 +1698,7 @@ fn connections_left_half_open_still_count() {
 /// seconds.
 #[test]
 fn connections_that_send_nothing_are_closed() {
-    world(|cx, attacher, _env| async move {
+    world(|fcx, attacher, _env| async move {
         let me = Ipv4Addr::new(10, 0, 0, 2);
         let mut raw = attacher.attach("a").unwrap();
         let plain = Ipv4Addr::new(198, 18, 0, 1);
@@ -1708,13 +1708,13 @@ fn connections_that_send_nothing_are_closed() {
             q.metadata.id = 7;
             q.add_query(Query::query(Name::from_ascii(name).unwrap(), RecordType::A));
             raw.send(udp(me, 5353, GATEWAY, 53, &q.to_vec().unwrap()));
-            assert!(recv_within(&cx, &mut raw, Duration::from_secs(2)).await.is_some());
+            assert!(recv_within(&fcx, &mut raw, Duration::from_secs(2)).await.is_some());
         }
         for (n, to) in [SocketAddr::new(SECURE_ADDR.into(), 443), SocketAddr::new(plain.into(), 80), SocketAddr::new(GATEWAY.into(), 53)].into_iter().enumerate() {
             let n = n as u16;
             // Ports 10000, 11000 and 12000.
             raw.send(tcp_seg(me, 10_000 + n * 1000, match to.ip() { IpAddr::V4(a) => a, _ => unreachable!() }, to.port(), 1000, 0, SYN, &[]));
-            let p = recv_within(&cx, &mut raw, Duration::from_secs(2)).await.expect("a SYN-ACK");
+            let p = recv_within(&fcx, &mut raw, Duration::from_secs(2)).await.expect("a SYN-ACK");
             let (_, _, _, t) = parse(&p);
             assert_eq!(t[13] & (SYN | ACK), SYN | ACK);
             let seq = u32::from_be_bytes([t[4], t[5], t[6], t[7]]);
@@ -1722,8 +1722,8 @@ fn connections_that_send_nothing_are_closed() {
             raw.send(tcp_seg(me, 10_000 + n * 1000, dst, to.port(), 1001, seq.wrapping_add(1), ACK, &[]));
         }
         let started = std::time::Instant::now();
-        assert!(closed_ports(&cx, &mut raw, Duration::from_secs(8)).await.is_empty(), "closed too early");
-        let closed = closed_ports(&cx, &mut raw, Duration::from_secs(4)).await;
+        assert!(closed_ports(&fcx, &mut raw, Duration::from_secs(8)).await.is_empty(), "closed too early");
+        let closed = closed_ports(&fcx, &mut raw, Duration::from_secs(4)).await;
         assert_eq!(closed.into_iter().collect::<Vec<_>>(), vec![10_000, 11_000, 12_000], "after {:?}", started.elapsed());
         Ok(())
     });
@@ -1733,16 +1733,16 @@ fn connections_that_send_nothing_are_closed() {
 /// lock the others out of a site they share.
 #[test]
 fn a_syn_flood_from_one_sandbox_does_not_lock_out_the_others() {
-    world(|cx, attacher, env| async move {
+    world(|fcx, attacher, env| async move {
         let me = Ipv4Addr::new(10, 0, 0, 2);
         let mut raw = attacher.attach("a").unwrap();
-        let b = machine(&cx, &attacher, "b", Ipv4Addr::new(10, 0, 0, 3));
-        assert_eq!(lookup(&cx, &b, "secure.test").await, SECURE_ADDR);
+        let b = machine(&fcx, &attacher, "b", Ipv4Addr::new(10, 0, 0, 3));
+        assert_eq!(lookup(&fcx, &b, "secure.test").await, SECURE_ADDR);
         for i in 0..2000u16 {
             raw.send(tcp_seg(me, 10_000 + i, SECURE_ADDR, 443, 1000, 0, SYN, &[]));
         }
         let mut synacks = 0;
-        while let Some(p) = recv_within(&cx, &mut raw, Duration::from_millis(500)).await {
+        while let Some(p) = recv_within(&fcx, &mut raw, Duration::from_millis(500)).await {
             let (_, _, _, t) = parse(&p);
             if t[13] & (SYN | ACK) == SYN | ACK {
                 synacks += 1;
@@ -1751,17 +1751,17 @@ fn a_syn_flood_from_one_sandbox_does_not_lock_out_the_others() {
         // Some got through, but not all: one address has a share of the
         // backlog, not all of it.
         assert!(synacks > 0 && synacks < 2000, "{synacks} SYN-ACKs");
-        let r = timeout(&cx, Duration::from_secs(5), timed_get(&cx, &b, &env)).await;
+        let r = timeout(&fcx, Duration::from_secs(5), timed_get(&fcx, &b, &env)).await;
         assert!(r.is_some(), "the other sandbox could not reach the site");
         Ok(())
     });
 }
 
 /// The median of five HTTPS requests from fresh connections.
-async fn median_get(cx: &Cx, m: &Machine, env: &Env) -> Duration {
+async fn median_get(fcx: &Cx, m: &Machine, env: &Env) -> Duration {
     let mut times = Vec::new();
     for _ in 0..5 {
-        times.push(timed_get(cx, m, env).await);
+        times.push(timed_get(fcx, m, env).await);
     }
     times.sort();
     times[2]
@@ -1773,12 +1773,12 @@ async fn median_get(cx: &Cx, m: &Machine, env: &Env) -> Duration {
 /// down: lookups stay quick, and so does every other request.
 #[test]
 fn ten_thousand_sites_do_not_slow_the_network() {
-    world(|cx, attacher, env| async move {
+    world(|fcx, attacher, env| async move {
         let me = Ipv4Addr::new(10, 0, 0, 2);
         let mut raw = attacher.attach("a").unwrap();
-        let b = machine(&cx, &attacher, "b", Ipv4Addr::new(10, 0, 0, 3));
-        assert_eq!(lookup(&cx, &b, "secure.test").await, SECURE_ADDR);
-        let before = median_get(&cx, &b, &env).await;
+        let b = machine(&fcx, &attacher, "b", Ipv4Addr::new(10, 0, 0, 3));
+        assert_eq!(lookup(&fcx, &b, "secure.test").await, SECURE_ADDR);
+        let before = median_get(&fcx, &b, &env).await;
         let n = 10_000u32;
         let started = std::time::Instant::now();
         for i in 0..n {
@@ -1788,7 +1788,7 @@ fn ten_thousand_sites_do_not_slow_the_network() {
             raw.send(udp(me, 5353, GATEWAY, 53, &q.to_vec().unwrap()));
         }
         let mut answers = 0;
-        while answers < n && recv_within(&cx, &mut raw, Duration::from_secs(10)).await.is_some() {
+        while answers < n && recv_within(&fcx, &mut raw, Duration::from_secs(10)).await.is_some() {
             answers += 1;
         }
         let took = started.elapsed();
@@ -1797,9 +1797,9 @@ fn ten_thousand_sites_do_not_slow_the_network() {
         // The last site answers.
         let last = Ipv4Addr::from(u32::from(Ipv4Addr::new(198, 18, 0, 0)) + n);
         raw.send(ping(me, last, 1));
-        let (src, _, _, icmp) = parse(&recv_within(&cx, &mut raw, Duration::from_secs(2)).await.unwrap());
+        let (src, _, _, icmp) = parse(&recv_within(&fcx, &mut raw, Duration::from_secs(2)).await.unwrap());
         assert_eq!((src, icmp[0]), (last, 0));
-        let after = median_get(&cx, &b, &env).await;
+        let after = median_get(&fcx, &b, &env).await;
         assert!(after < before * 3, "a request took {before:?} before and {after:?} after");
         Ok(())
     });
@@ -1810,22 +1810,22 @@ fn ten_thousand_sites_do_not_slow_the_network() {
 /// asking does not run the callback.
 #[test]
 fn a_name_never_looked_up_is_not_served_by_host_or_sni() {
-    world(|cx, attacher, env| async move {
-        let m = machine(&cx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
-        let addr = lookup(&cx, &m, "secure.test").await;
-        let wild = lookup(&cx, &m, "one.wild.test").await;
+    world(|fcx, attacher, env| async move {
+        let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+        let addr = lookup(&fcx, &m, "secure.test").await;
+        let wild = lookup(&fcx, &m, "one.wild.test").await;
         let calls = env.calls.load(Ordering::SeqCst);
         for h2 in [true, false] {
             let alpn: &[&[u8]] = if h2 { &[b"h2"] } else { &[b"http/1.1"] };
-            let conn = tls_connect(&cx, &m, &env, addr, "secure.test", alpn).await.unwrap();
-            let mut client = Client::new(&cx, conn, h2).await;
+            let conn = tls_connect(&fcx, &m, &env, addr, "secure.test", alpn).await.unwrap();
+            let mut client = Client::new(&fcx, conn, h2).await;
             assert_eq!(client.get("https", "two.wild.test", "/").await.status, StatusCode::MISDIRECTED_REQUEST);
         }
-        let conn = m.tcp.connect(&cx, SocketAddr::new(wild.into(), 80)).await.unwrap();
-        let mut client = Client::new(&cx, conn, false).await;
+        let conn = m.tcp.connect(&fcx, SocketAddr::new(wild.into(), 80)).await.unwrap();
+        let mut client = Client::new(&fcx, conn, false).await;
         assert_eq!(client.get("http", "one.wild.test", "/").await.body, "wild http one.wild.test 80 HTTP/1.1 /");
         assert_eq!(client.get("http", "two.wild.test", "/").await.status, StatusCode::MISDIRECTED_REQUEST);
-        match tls_connect(&cx, &m, &env, addr, "two.wild.test", &[b"h2"]).await {
+        match tls_connect(&fcx, &m, &env, addr, "two.wild.test", &[b"h2"]).await {
             Err(TlsError::Tls(rustls::Error::AlertReceived(rustls::AlertDescription::UnrecognisedName))) => {}
             Err(e) => panic!("expected unrecognized_name, got {e:?}"),
             Ok(_) => panic!("the handshake should fail"),
@@ -1840,24 +1840,24 @@ fn a_name_never_looked_up_is_not_served_by_host_or_sni() {
 /// cancels as soon as it opens them.
 #[test]
 fn http2_with_a_thousand_streams_and_cancelled_ones() {
-    world(|cx, attacher, env| async move {
-        let m = machine(&cx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
-        let addr = lookup(&cx, &m, "secure.test").await;
-        let conn = tls_connect(&cx, &m, &env, addr, "secure.test", &[b"h2"]).await.unwrap();
-        let client = Client::new(&cx, conn, true).await;
+    world(|fcx, attacher, env| async move {
+        let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+        let addr = lookup(&fcx, &m, "secure.test").await;
+        let conn = tls_connect(&fcx, &m, &env, addr, "secure.test", &[b"h2"]).await.unwrap();
+        let client = Client::new(&fcx, conn, true).await;
         let Client::H2(send) = &client else { unreachable!() };
         let started = std::time::Instant::now();
         let mut tasks = Vec::new();
         for i in 0..1000 {
             let mut c = Client::H2(send.clone());
-            tasks.push(cx.spawn(move |cx| async move {
+            tasks.push(fcx.spawn(move |fcx| async move {
                 if i % 10 == 0 {
                     // Opened and dropped at once: the client resets it.
                     let Client::H2(s) = &mut c else { unreachable!() };
                     s.ready().await.unwrap();
                     let r = Request::get("https://secure.test/x").body(Empty::new()).unwrap();
                     let fut = s.send_request(r);
-                    let _ = timeout(&cx, Duration::from_micros(1), fut).await;
+                    let _ = timeout(&fcx, Duration::from_micros(1), fut).await;
                 } else {
                     let got = c.get("https", "secure.test", "/x").await;
                     assert_eq!(got.status, StatusCode::OK);
@@ -1866,7 +1866,7 @@ fn http2_with_a_thousand_streams_and_cancelled_ones() {
             }));
         }
         for t in tasks {
-            t.join(&cx).await?;
+            t.join(&fcx).await?;
         }
         eprintln!("1,000 streams in {:?}", started.elapsed());
         assert!(env.served.load(Ordering::SeqCst) >= 900);
@@ -1883,7 +1883,7 @@ fn http2_with_a_thousand_streams_and_cancelled_ones() {
 /// and answers a good query after each.
 #[test]
 fn malformed_dns_does_not_break_the_server() {
-    world(|cx, attacher, _env| async move {
+    world(|fcx, attacher, _env| async move {
         let me = Ipv4Addr::new(10, 0, 0, 2);
         let mut raw = attacher.attach("a").unwrap();
         let good = {
@@ -1922,8 +1922,8 @@ fn malformed_dns_does_not_break_the_server() {
             },
         ];
         for _ in 0..200 {
-            let len = (cx.random_u64() % 600) as usize;
-            bad.push((0..len).map(|_| cx.random_u64() as u8).collect());
+            let len = (fcx.random_u64() % 600) as usize;
+            bad.push((0..len).map(|_| fcx.random_u64() as u8).collect());
         }
         for m in &bad {
             raw.send(udp(me, 5353, GATEWAY, 53, m));
@@ -1946,7 +1946,7 @@ fn malformed_dns_does_not_break_the_server() {
         // Then the good query: its answer must come.
         raw.send(udp(me, 5355, GATEWAY, 53, &good));
         let mut answered = false;
-        while let Some(p) = recv_within(&cx, &mut raw, Duration::from_secs(2)).await {
+        while let Some(p) = recv_within(&fcx, &mut raw, Duration::from_secs(2)).await {
             let (_, _, proto, u) = parse(&p);
             if proto == 17 && u16::from_be_bytes([u[2], u[3]]) == 5355 {
                 assert_eq!(parse_dns(&u[8..], 4242), (ResponseCode::NoError, vec![SECURE_ADDR]));
@@ -1958,20 +1958,20 @@ fn malformed_dns_does_not_break_the_server() {
 
         // Over TCP: a length that promises more than comes, then garbage,
         // on separate connections; then a good query on a new one.
-        let b = machine(&cx, &attacher, "b", Ipv4Addr::new(10, 0, 0, 3));
+        let b = machine(&fcx, &attacher, "b", Ipv4Addr::new(10, 0, 0, 3));
         let dns_tcp = SocketAddr::new(GATEWAY.into(), 53);
-        let mut c1 = b.tcp.connect(&cx, dns_tcp).await.unwrap();
-        c1.write_all(&cx, &[0xff, 0xff, 1, 2, 3]).await.unwrap();
-        let mut c2 = b.tcp.connect(&cx, dns_tcp).await.unwrap();
-        c2.write_all(&cx, &[0, 3, 1, 2, 3, 0, 0]).await.unwrap();
-        let mut c3 = b.tcp.connect(&cx, dns_tcp).await.unwrap();
+        let mut c1 = b.tcp.connect(&fcx, dns_tcp).await.unwrap();
+        c1.write_all(&fcx, &[0xff, 0xff, 1, 2, 3]).await.unwrap();
+        let mut c2 = b.tcp.connect(&fcx, dns_tcp).await.unwrap();
+        c2.write_all(&fcx, &[0, 3, 1, 2, 3, 0, 0]).await.unwrap();
+        let mut c3 = b.tcp.connect(&fcx, dns_tcp).await.unwrap();
         let mut framed = (good.len() as u16).to_be_bytes().to_vec();
         framed.extend_from_slice(&good);
-        c3.write_all(&cx, &framed).await.unwrap();
+        c3.write_all(&fcx, &framed).await.unwrap();
         let mut len = [0u8; 2];
-        read_exact(&cx, &mut c3, &mut len).await;
+        read_exact(&fcx, &mut c3, &mut len).await;
         let mut reply = vec![0u8; u16::from_be_bytes(len) as usize];
-        read_exact(&cx, &mut c3, &mut reply).await;
+        read_exact(&fcx, &mut c3, &mut reply).await;
         assert_eq!(parse_dns(&reply, 4242), (ResponseCode::NoError, vec![SECURE_ADDR]));
         Ok(())
     });
@@ -1981,7 +1981,7 @@ fn malformed_dns_does_not_break_the_server() {
 /// the next sandbox that takes its address: the connections are ended.
 #[test]
 fn a_detached_sandboxs_traffic_does_not_reach_the_next_holder_of_its_address() {
-    world(|cx, attacher, _env| async move {
+    world(|fcx, attacher, _env| async move {
         let me = Ipv4Addr::new(10, 0, 0, 2);
         let mut a = attacher.attach("a").unwrap();
         // a looks plain.test up and opens a connection by hand.
@@ -1989,15 +1989,15 @@ fn a_detached_sandboxs_traffic_does_not_reach_the_next_holder_of_its_address() {
         q.metadata.id = 1;
         q.add_query(Query::query(Name::from_ascii("plain.test").unwrap(), RecordType::A));
         a.send(udp(me, 5353, GATEWAY, 53, &q.to_vec().unwrap()));
-        let (_, _, _, u) = parse(&recv_within(&cx, &mut a, Duration::from_secs(2)).await.unwrap());
+        let (_, _, _, u) = parse(&recv_within(&fcx, &mut a, Duration::from_secs(2)).await.unwrap());
         let plain = parse_dns(&u[8..], 1).1[0];
         a.send(tcp_seg(me, 40_000, plain, 80, 1000, 0, SYN, &[]));
-        let (_, _, _, t) = parse(&recv_within(&cx, &mut a, Duration::from_secs(2)).await.unwrap());
+        let (_, _, _, t) = parse(&recv_within(&fcx, &mut a, Duration::from_secs(2)).await.unwrap());
         let seq = u32::from_be_bytes([t[4], t[5], t[6], t[7]]);
         // The request, then a detaches before taking the answer.
         let request = b"GET /secret HTTP/1.1\r\nHost: plain.test\r\n\r\n";
         a.send(tcp_seg(me, 40_000, plain, 80, 1001, seq.wrapping_add(1), ACK, request));
-        cx.sleep(Duration::from_millis(50)).await?;
+        fcx.sleep(Duration::from_millis(50)).await?;
         drop(a);
 
         // b takes the same address as soon as it is free.
@@ -2005,14 +2005,14 @@ fn a_detached_sandboxs_traffic_does_not_reach_the_next_holder_of_its_address() {
         let mut bound = false;
         for i in 0..100 {
             b.send(ping(me, GATEWAY, i));
-            if recv_within(&cx, &mut b, Duration::from_millis(20)).await.is_some() {
+            if recv_within(&fcx, &mut b, Duration::from_millis(20)).await.is_some() {
                 bound = true;
                 break;
             }
         }
         assert!(bound);
         // Nothing of a's answer reaches b, even after retransmissions.
-        while let Some(p) = recv_within(&cx, &mut b, Duration::from_secs(3)).await {
+        while let Some(p) = recv_within(&fcx, &mut b, Duration::from_secs(3)).await {
             let (src, _, proto, t) = parse(&p);
             if proto == 6 {
                 let data = &t[((t[12] >> 4) as usize) * 4..];
@@ -2027,33 +2027,33 @@ fn a_detached_sandboxs_traffic_does_not_reach_the_next_holder_of_its_address() {
 /// nothing else.
 #[test]
 fn a_huge_or_garbage_tls_hello_closes_only_that_connection() {
-    world(|cx, attacher, env| async move {
-        let m = machine(&cx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
-        let addr = lookup(&cx, &m, "secure.test").await;
+    world(|fcx, attacher, env| async move {
+        let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+        let addr = lookup(&fcx, &m, "secure.test").await;
         let to = SocketAddr::new(addr.into(), 443);
         // A handshake record header that promises 16 KiB, repeated: a hello
         // far larger than any real one.
-        let mut huge = m.tcp.connect(&cx, to).await.unwrap();
+        let mut huge = m.tcp.connect(&fcx, to).await.unwrap();
         let mut record = vec![22, 3, 1, 0x40, 0];
         record.extend(std::iter::repeat_n(0u8, 0x4000));
         let mut closed = false;
         for _ in 0..32 {
-            if huge.write_all(&cx, &record).await.is_err() {
+            if huge.write_all(&fcx, &record).await.is_err() {
                 closed = true;
                 break;
             }
         }
         let mut buf = [0u8; 64];
-        let end = timeout(&cx, Duration::from_secs(2), huge.read(&cx, &mut buf)).await;
+        let end = timeout(&fcx, Duration::from_secs(2), huge.read(&fcx, &mut buf)).await;
         assert!(closed || matches!(end, Some(Ok(0)) | Some(Err(_))), "the huge hello was not refused: {end:?}");
         // Plain garbage.
-        let mut junk = m.tcp.connect(&cx, to).await.unwrap();
-        junk.write_all(&cx, b"GET / HTTP/1.1\r\nHost: secure.test\r\n\r\n").await.unwrap();
-        let end = timeout(&cx, Duration::from_secs(2), junk.read(&cx, &mut buf)).await;
+        let mut junk = m.tcp.connect(&fcx, to).await.unwrap();
+        junk.write_all(&fcx, b"GET / HTTP/1.1\r\nHost: secure.test\r\n\r\n").await.unwrap();
+        let end = timeout(&fcx, Duration::from_secs(2), junk.read(&fcx, &mut buf)).await;
         assert!(matches!(end, Some(Ok(0)) | Some(Err(_))), "garbage was not refused: {end:?}");
         // A real client is still served.
-        let conn = tls_connect(&cx, &m, &env, addr, "secure.test", &[b"h2"]).await.unwrap();
-        let mut client = Client::new(&cx, conn, true).await;
+        let conn = tls_connect(&fcx, &m, &env, addr, "secure.test", &[b"h2"]).await.unwrap();
+        let mut client = Client::new(&fcx, conn, true).await;
         assert_eq!(client.get("https", "secure.test", "/").await.status, StatusCode::OK);
         Ok(())
     });
@@ -2071,12 +2071,12 @@ where
 {
     let subnet: fictionet::stdlib::route::Prefix = subnet.parse().unwrap();
     let result = within(Duration::from_secs(60), move || {
-        block_on(run(move |cx| async move {
+        block_on(run(move |fcx| async move {
             let (attacher, attachments) = fictionet::attachments();
             web::Sites::new(|host| host.ends_with(".test").then(|| web::Site::new(Plain("auto"))))
                 .subnet(subnet)
-                .serve(&cx, attachments)?;
-            f(cx, attacher).await?;
+                .serve(&fcx, attachments)?;
+            f(fcx, attacher).await?;
             Err(fictionet::Error::from(Done))
         }))
     });
@@ -2089,13 +2089,13 @@ where
 
 /// A DNS A query from `me` to `gw` on a raw attachment: the answer's code
 /// and addresses, or `None` if none came within 2 s.
-async fn raw_dns(cx: &Cx, raw: &mut End, me: Ipv4Addr, gw: Ipv4Addr, name: &str, id: u16) -> Option<(ResponseCode, Vec<Ipv4Addr>)> {
+async fn raw_dns(fcx: &Cx, raw: &mut End, me: Ipv4Addr, gw: Ipv4Addr, name: &str, id: u16) -> Option<(ResponseCode, Vec<Ipv4Addr>)> {
     let mut q = Message::query();
     q.metadata.id = id;
     q.add_query(Query::query(Name::from_ascii(name).unwrap(), RecordType::A));
     raw.send(udp(me, 5353, gw, 53, &q.to_vec().unwrap()));
     loop {
-        let p = recv_within(cx, raw, Duration::from_secs(2)).await?;
+        let p = recv_within(fcx, raw, Duration::from_secs(2)).await?;
         let (src, _, proto, u) = parse(&p);
         if src == gw && proto == 17 {
             return Some(parse_dns(&u[8..], id));
@@ -2107,19 +2107,19 @@ async fn raw_dns(cx: &Cx, raw: &mut End, me: Ipv4Addr, gw: Ipv4Addr, name: &str,
 /// first site does not take the gateway's address and DNS keeps answering.
 #[test]
 fn automatic_addresses_skip_the_sandboxes_subnet() {
-    world_on_subnet("198.18.0.0/24", |cx, attacher| async move {
+    world_on_subnet("198.18.0.0/24", |fcx, attacher| async move {
         let gw = Ipv4Addr::new(198, 18, 0, 1);
         let me = Ipv4Addr::new(198, 18, 0, 2);
         let mut raw = attacher.attach("a").unwrap();
-        let (code, first) = raw_dns(&cx, &mut raw, me, gw, "one.test", 1).await.expect("DNS answers");
+        let (code, first) = raw_dns(&fcx, &mut raw, me, gw, "one.test", 1).await.expect("DNS answers");
         assert_eq!(code, ResponseCode::NoError);
         assert_eq!(first, vec![Ipv4Addr::new(198, 18, 1, 0)]);
-        let (_, second) = raw_dns(&cx, &mut raw, me, gw, "two.test", 2).await.expect("DNS still answers");
+        let (_, second) = raw_dns(&fcx, &mut raw, me, gw, "two.test", 2).await.expect("DNS still answers");
         assert_eq!(second, vec![Ipv4Addr::new(198, 18, 1, 1)]);
         // The gateway still answers pings, and so does the site.
         for (to, seq) in [(gw, 1), (first[0], 2)] {
             raw.send(ping(me, to, seq));
-            let p = recv_within(&cx, &mut raw, SHORT).await.expect("an echo reply");
+            let p = recv_within(&fcx, &mut raw, SHORT).await.expect("an echo reply");
             let (from, _, proto, icmp) = parse(&p);
             assert_eq!((from, proto, icmp[0]), (to, 1, 0));
         }
@@ -2131,12 +2131,12 @@ fn automatic_addresses_skip_the_sandboxes_subnet() {
 /// the settings, and the INFORM binds nothing.
 #[test]
 fn dhcp_inform_as_the_first_packet_is_answered() {
-    world(|cx, attacher, _env| async move {
+    world(|fcx, attacher, _env| async move {
         let me = Ipv4Addr::new(10, 0, 0, 9);
         let mut a = attacher.attach("a").unwrap();
         let mut m = dhcp_msg(dhcp::INFORM, 7, 1);
         m.ciaddr = me;
-        let (to, reply) = dhcp_ask(&cx, &mut a, me, GATEWAY, &m).await.expect("an answer to INFORM");
+        let (to, reply) = dhcp_ask(&fcx, &mut a, me, GATEWAY, &m).await.expect("an answer to INFORM");
         assert_eq!(to, me);
         assert_eq!(reply.message_type(), Some(dhcp::ACK));
         assert_eq!(reply.option_addr(dhcp::opt::DNS), Some(GATEWAY));
@@ -2144,21 +2144,21 @@ fn dhcp_inform_as_the_first_packet_is_answered() {
         // Not bound: another sandbox can still take 10.0.0.9.
         let mut b = attacher.attach("b").unwrap();
         b.send(ping(me, GATEWAY, 1));
-        assert!(recv_within(&cx, &mut b, SHORT).await.is_some(), "b binds 10.0.0.9");
+        assert!(recv_within(&fcx, &mut b, SHORT).await.is_some(), "b binds 10.0.0.9");
         // Now a's INFORM from 10.0.0.9 is not answered, and neither is its ping.
-        assert!(dhcp_ask(&cx, &mut a, me, GATEWAY, &m).await.is_none());
+        assert!(dhcp_ask(&fcx, &mut a, me, GATEWAY, &m).await.is_none());
         a.send(ping(me, GATEWAY, 2));
-        assert!(recv_within(&cx, &mut a, SHORT).await.is_none());
+        assert!(recv_within(&fcx, &mut a, SHORT).await.is_none());
         Ok(())
     });
 }
 
 /// Reads `conn` to its end.
-async fn read_all<C: Connection>(cx: &Cx, conn: &mut C) -> Vec<u8> {
+async fn read_all<C: Connection>(fcx: &Cx, conn: &mut C) -> Vec<u8> {
     let mut all = Vec::new();
     let mut buf = [0u8; 4096];
     loop {
-        match timeout(cx, Duration::from_secs(5), conn.read(cx, &mut buf)).await.expect("the response ends") {
+        match timeout(fcx, Duration::from_secs(5), conn.read(fcx, &mut buf)).await.expect("the response ends") {
             Ok(0) | Err(_) => return all,
             Ok(n) => all.extend_from_slice(&buf[..n]),
         }
@@ -2169,19 +2169,19 @@ async fn read_all<C: Connection>(cx: &Cx, conn: &mut C) -> Vec<u8> {
 /// one that streams goes out chunked on HTTP/1.1.
 #[test]
 fn a_known_length_is_sent_as_content_length() {
-    world(|cx, attacher, env| async move {
-        let m = machine(&cx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
-        let plain = lookup(&cx, &m, "plain.test").await;
-        let events = lookup(&cx, &m, "events.test").await;
-        let mut conn = m.tcp.connect(&cx, SocketAddr::new(plain.into(), 80)).await.unwrap();
-        conn.write_all(&cx, b"GET /len HTTP/1.1\r\nHost: plain.test\r\nConnection: close\r\n\r\n").await.unwrap();
-        let got = String::from_utf8(read_all(&cx, &mut conn).await).unwrap().to_lowercase();
+    world(|fcx, attacher, env| async move {
+        let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+        let plain = lookup(&fcx, &m, "plain.test").await;
+        let events = lookup(&fcx, &m, "events.test").await;
+        let mut conn = m.tcp.connect(&fcx, SocketAddr::new(plain.into(), 80)).await.unwrap();
+        conn.write_all(&fcx, b"GET /len HTTP/1.1\r\nHost: plain.test\r\nConnection: close\r\n\r\n").await.unwrap();
+        let got = String::from_utf8(read_all(&fcx, &mut conn).await).unwrap().to_lowercase();
         let body = "plain http plain.test 80 HTTP/1.1 /len";
         assert!(got.contains(&format!("content-length: {}\r\n", body.len())), "{got:?}");
         assert!(!got.contains("transfer-encoding"), "{got:?}");
         // axum's 4 MiB Vec has a known length too, over TLS.
-        let conn = tls_connect(&cx, &m, &env, events, "events.test", &[b"http/1.1"]).await.unwrap();
-        let mut client = Client::new(&cx, conn, false).await;
+        let conn = tls_connect(&fcx, &m, &env, events, "events.test", &[b"http/1.1"]).await.unwrap();
+        let mut client = Client::new(&fcx, conn, false).await;
         let got = client.get("https", "events.test", "/big").await;
         assert_eq!(got.headers["content-length"], BIG.to_string());
         assert_eq!(got.body.len(), BIG);
@@ -2194,22 +2194,22 @@ fn a_known_length_is_sent_as_content_length() {
 /// handler's body on HTTP/2 even for `HEAD`, which breaks the stream.
 #[test]
 fn head_gets_the_headers_and_no_body_on_both_versions() {
-    world(|cx, attacher, env| async move {
-        let m = machine(&cx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
-        let secure = lookup(&cx, &m, "secure.test").await;
-        let events = lookup(&cx, &m, "events.test").await;
+    world(|fcx, attacher, env| async move {
+        let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+        let secure = lookup(&fcx, &m, "secure.test").await;
+        let events = lookup(&fcx, &m, "events.test").await;
         for h2 in [true, false] {
             let alpn: &[&[u8]] = if h2 { &[b"h2"] } else { &[b"http/1.1"] };
-            let conn = tls_connect(&cx, &m, &env, secure, "secure.test", alpn).await.unwrap();
-            let mut client = Client::new(&cx, conn, h2).await;
+            let conn = tls_connect(&fcx, &m, &env, secure, "secure.test", alpn).await.unwrap();
+            let mut client = Client::new(&fcx, conn, h2).await;
             let get = client.get("https", "secure.test", "/x").await;
             let head = client.send(http::Method::HEAD, "https", "secure.test", "/x").await;
             assert_eq!((head.status, head.body.as_str()), (StatusCode::OK, ""), "h2 {h2}");
             // The page ends with a request count, #1 then #2: same length.
             assert_eq!(head.headers["content-length"], get.body.len().to_string(), "h2 {h2}");
             // A whole 4 MiB body is left out too, and so is Sites' own 421.
-            let conn = tls_connect(&cx, &m, &env, events, "events.test", alpn).await.unwrap();
-            let mut client = Client::new(&cx, conn, h2).await;
+            let conn = tls_connect(&fcx, &m, &env, events, "events.test", alpn).await.unwrap();
+            let mut client = Client::new(&fcx, conn, h2).await;
             let big = client.send(http::Method::HEAD, "https", "events.test", "/big").await;
             assert_eq!((big.status, big.body.len()), (StatusCode::OK, 0), "h2 {h2}");
             assert_eq!(big.headers["content-length"], BIG.to_string(), "h2 {h2}");
@@ -2227,10 +2227,10 @@ fn head_gets_the_headers_and_no_body_on_both_versions() {
 /// or any other name. A site that has its own name there keeps it.
 #[test]
 fn the_default_host_answers_hosts_with_no_site_of_their_own() {
-    world(|cx, attacher, _env| async move {
-        let m = machine(&cx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
-        assert_eq!(lookup(&cx, &m, "default.test").await, DEFAULT_ADDR);
-        assert_eq!(lookup(&cx, &m, "other.test").await, DEFAULT_ADDR);
+    world(|fcx, attacher, _env| async move {
+        let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+        assert_eq!(lookup(&fcx, &m, "default.test").await, DEFAULT_ADDR);
+        assert_eq!(lookup(&fcx, &m, "other.test").await, DEFAULT_ADDR);
         let ask = |host: &str| format!("GET /p HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
         for (host, want) in [
             ("203.0.113.40", "default http 203.0.113.40 80 HTTP/1.1 /p"),
@@ -2238,18 +2238,18 @@ fn the_default_host_answers_hosts_with_no_site_of_their_own() {
             ("default.test", "default http default.test 80 HTTP/1.1 /p"),
             ("other.test", "other http other.test 80 HTTP/1.1 /p"),
         ] {
-            let got = String::from_utf8(raw_http(&cx, &m, DEFAULT_ADDR, ask(host).as_bytes()).await).unwrap();
+            let got = String::from_utf8(raw_http(&fcx, &m, DEFAULT_ADDR, ask(host).as_bytes()).await).unwrap();
             assert!(got.starts_with("HTTP/1.1 200 OK") && got.ends_with(want), "{host}: {got:?}");
         }
         // A TLS site that is the default redirects plain HTTP to https, at
         // the host the client named.
-        assert_eq!(lookup(&cx, &m, "tls-default.test").await, TLS_DEFAULT_ADDR);
-        let got = String::from_utf8(raw_http(&cx, &m, TLS_DEFAULT_ADDR, ask("203.0.113.41").as_bytes()).await).unwrap();
+        assert_eq!(lookup(&fcx, &m, "tls-default.test").await, TLS_DEFAULT_ADDR);
+        let got = String::from_utf8(raw_http(&fcx, &m, TLS_DEFAULT_ADDR, ask("203.0.113.41").as_bytes()).await).unwrap();
         assert!(got.starts_with("HTTP/1.1 301"), "{got:?}");
         assert!(got.to_lowercase().contains("location: https://203.0.113.41/p\r\n"), "{got:?}");
         // Without a default, the same request gets 421.
-        assert_eq!(lookup(&cx, &m, "secure.test").await, SECURE_ADDR);
-        let got = String::from_utf8(raw_http(&cx, &m, SECURE_ADDR, ask("203.0.113.10").as_bytes()).await).unwrap();
+        assert_eq!(lookup(&fcx, &m, "secure.test").await, SECURE_ADDR);
+        let got = String::from_utf8(raw_http(&fcx, &m, SECURE_ADDR, ask("203.0.113.10").as_bytes()).await).unwrap();
         assert!(got.starts_with("HTTP/1.1 421"), "{got:?}");
         Ok(())
     });
@@ -2260,26 +2260,26 @@ fn the_default_host_answers_hosts_with_no_site_of_their_own() {
 /// HTTP and over TLS.
 #[test]
 fn a_client_that_half_closes_after_its_request_gets_the_response() {
-    world(|cx, attacher, env| async move {
-        let m = machine(&cx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
-        let plain = lookup(&cx, &m, "plain.test").await;
-        let secure = lookup(&cx, &m, "secure.test").await;
+    world(|fcx, attacher, env| async move {
+        let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+        let plain = lookup(&fcx, &m, "plain.test").await;
+        let secure = lookup(&fcx, &m, "secure.test").await;
         let requests: [&[u8]; 2] = [
             b"GET /h HTTP/1.1\r\nHost: plain.test\r\nConnection: close\r\n\r\n",
             b"GET /h HTTP/1.0\r\nHost: plain.test\r\n\r\n",
         ];
         for request in requests {
-            let mut conn = m.tcp.connect(&cx, SocketAddr::new(plain.into(), 80)).await.unwrap();
-            conn.write_all(&cx, request).await.unwrap();
-            conn.shutdown(&cx).await.unwrap();
-            let got = String::from_utf8(read_all(&cx, &mut conn).await).unwrap();
+            let mut conn = m.tcp.connect(&fcx, SocketAddr::new(plain.into(), 80)).await.unwrap();
+            conn.write_all(&fcx, request).await.unwrap();
+            conn.shutdown(&fcx).await.unwrap();
+            let got = String::from_utf8(read_all(&fcx, &mut conn).await).unwrap();
             assert!(got.starts_with("HTTP/1.") && got.contains(" 200 OK"), "{request:?} got {got:?}");
             assert!(got.contains("plain http plain.test 80"), "{got:?}");
         }
-        let mut conn = tls_connect(&cx, &m, &env, secure, "secure.test", &[b"http/1.1"]).await.unwrap();
-        conn.write_all(&cx, b"GET / HTTP/1.1\r\nHost: secure.test\r\nConnection: close\r\n\r\n").await.unwrap();
-        conn.shutdown(&cx).await.unwrap();
-        let got = String::from_utf8(read_all(&cx, &mut conn).await).unwrap();
+        let mut conn = tls_connect(&fcx, &m, &env, secure, "secure.test", &[b"http/1.1"]).await.unwrap();
+        conn.write_all(&fcx, b"GET / HTTP/1.1\r\nHost: secure.test\r\nConnection: close\r\n\r\n").await.unwrap();
+        conn.shutdown(&fcx).await.unwrap();
+        let got = String::from_utf8(read_all(&fcx, &mut conn).await).unwrap();
         assert!(got.starts_with("HTTP/1.1 200 OK"), "{got:?}");
         Ok(())
     });
@@ -2297,8 +2297,8 @@ struct Log {
 }
 
 impl Log {
-    fn new(cx: &Cx) -> Log {
-        Log { events: cx.events(), from: Arc::default() }
+    fn new(fcx: &Cx) -> Log {
+        Log { events: fcx.events(), from: Arc::default() }
     }
 
     /// Moves the mark past every event so far.
@@ -2314,12 +2314,12 @@ where
     Fut: Future<Output = fictionet::Result> + Send + 'static,
 {
     let result = within(Duration::from_secs(60), move || {
-        block_on(run(move |cx| async move {
+        block_on(run(move |fcx| async move {
             let (attacher, attachments) = fictionet::attachments();
-            let t = sites(&cx);
-            let env = t.serve_with(&cx, attachments)?;
-            let log = Log::new(&cx);
-            f(cx, attacher, env, log).await?;
+            let t = sites(&fcx);
+            let env = t.serve_with(&fcx, attachments)?;
+            let log = Log::new(&fcx);
+            f(fcx, attacher, env, log).await?;
             Err(fictionet::Error::from(Done))
         }))
     });
@@ -2337,9 +2337,9 @@ fn picked<T>(log: &Log, pick: impl FnMut(&Entry) -> Option<T>) -> Vec<T> {
 
 /// Waits up to 5 s until `pick` keeps `n` events after the log's mark,
 /// and returns them.
-async fn wait_for<T>(cx: &Cx, log: &Log, n: usize, mut pick: impl FnMut(&Entry) -> Option<T>) -> Vec<T> {
+async fn wait_for<T>(fcx: &Cx, log: &Log, n: usize, mut pick: impl FnMut(&Entry) -> Option<T>) -> Vec<T> {
     let from = log.from.load(Ordering::SeqCst);
-    let got = log.events.wait(cx, n, Duration::from_secs(5), |e| e.seq > from && pick(e).is_some()).await.expect("the world stopped");
+    let got = log.events.wait(fcx, n, Duration::from_secs(5), |e| e.seq > from && pick(e).is_some()).await.expect("the world stopped");
     if got.len() < n {
         panic!("fewer than {n} such events: {:#?}", log.events.all());
     }
@@ -2436,30 +2436,30 @@ fn blocked_row(e: &Entry) -> BlockedRow<'_> {
 
 #[test]
 fn events_attach_bind_and_detach() {
-    world_events(|cx, attacher, _env, log| async move {
+    world_events(|fcx, attacher, _env, log| async move {
         let me = Ipv4Addr::new(10, 0, 0, 2);
         let mut a = attacher.attach("a").unwrap();
         a.send(ping(me, GATEWAY, 1));
-        assert!(recv_within(&cx, &mut a, Duration::from_secs(2)).await.is_some());
+        assert!(recv_within(&fcx, &mut a, Duration::from_secs(2)).await.is_some());
 
         // A sandbox that gets its address from DHCP.
         let (any, bc) = (Ipv4Addr::UNSPECIFIED, Ipv4Addr::BROADCAST);
         let mut d = attacher.attach("d").unwrap();
-        let (_, offer) = dhcp_ask(&cx, &mut d, any, bc, &dhcp_msg(dhcp::DISCOVER, 1, 1)).await.expect("an offer");
+        let (_, offer) = dhcp_ask(&fcx, &mut d, any, bc, &dhcp_msg(dhcp::DISCOVER, 1, 1)).await.expect("an offer");
         let got = offer.yiaddr;
         let mut request = dhcp_msg(dhcp::REQUEST, 1, 1);
         request.push(dhcp::opt::REQUESTED_IP, got.octets());
         request.push(dhcp::opt::SERVER_ID, GATEWAY.octets());
-        let (_, ack) = dhcp_ask(&cx, &mut d, any, bc, &request).await.expect("an ack");
+        let (_, ack) = dhcp_ask(&fcx, &mut d, any, bc, &request).await.expect("an ack");
         assert_eq!(ack.message_type(), Some(dhcp::ACK));
         // A renewal binds nothing new.
         let mut renew = dhcp_msg(dhcp::REQUEST, 2, 1);
         renew.ciaddr = got;
-        let (_, ack) = dhcp_ask(&cx, &mut d, got, GATEWAY, &renew).await.expect("an ack");
+        let (_, ack) = dhcp_ask(&fcx, &mut d, got, GATEWAY, &renew).await.expect("an ack");
         assert_eq!(ack.message_type(), Some(dhcp::ACK));
 
         drop(a);
-        wait_for(&cx, &log, 1, seen("net", "detached")).await;
+        wait_for(&fcx, &log, 1, seen("net", "detached")).await;
 
         let of = |name: &str| picked(&log, |e| (e.source == "net" && &*sandbox_of(e)?.name == name).then(|| e.clone()));
         let a_events = of("a");
@@ -2482,11 +2482,11 @@ fn events_attach_bind_and_detach() {
 /// Opens a TCP connection by hand from a raw sandbox to `to`, and sends
 /// `data` on it. Returns our port and the next sequence numbers (ours,
 /// theirs).
-async fn raw_connect(cx: &Cx, raw: &mut End, me: Ipv4Addr, to: SocketAddr, port: u16, data: &[u8]) -> (u32, u32) {
+async fn raw_connect(fcx: &Cx, raw: &mut End, me: Ipv4Addr, to: SocketAddr, port: u16, data: &[u8]) -> (u32, u32) {
     let IpAddr::V4(dst) = to.ip() else { unreachable!() };
     raw.send(tcp_seg(me, port, dst, to.port(), 1000, 0, SYN, &[]));
     loop {
-        let p = recv_within(cx, raw, Duration::from_secs(2)).await.expect("a SYN-ACK");
+        let p = recv_within(fcx, raw, Duration::from_secs(2)).await.expect("a SYN-ACK");
         let (_, _, proto, t) = parse(&p);
         if proto == 6 && t[13] & (SYN | ACK) == SYN | ACK {
             let theirs = u32::from_be_bytes([t[4], t[5], t[6], t[7]]).wrapping_add(1);
@@ -2501,31 +2501,31 @@ async fn raw_connect(cx: &Cx, raw: &mut End, me: Ipv4Addr, to: SocketAddr, port:
 
 #[test]
 fn events_name_each_attachment_by_id() {
-    world_events(|cx, attacher, _env, log| async move {
+    world_events(|fcx, attacher, _env, log| async move {
         let me = Ipv4Addr::new(10, 0, 0, 2);
         let mut a = attacher.attach("a").unwrap();
-        let (_, addrs) = raw_dns(&cx, &mut a, me, GATEWAY, "slow.test", 1).await.unwrap();
+        let (_, addrs) = raw_dns(&fcx, &mut a, me, GATEWAY, "slow.test", 1).await.unwrap();
         let slow = addrs[0];
-        let _ = raw_dns(&cx, &mut a, me, GATEWAY, "secure.test", 2).await.unwrap();
+        let _ = raw_dns(&fcx, &mut a, me, GATEWAY, "secure.test", 2).await.unwrap();
         // A request whose handler never answers, and a TLS handshake that
         // never starts, both still open when the sandbox detaches.
-        raw_connect(&cx, &mut a, me, SocketAddr::new(slow.into(), 80), 30_000, b"GET /wait HTTP/1.1\r\nHost: slow.test\r\n\r\n").await;
-        raw_connect(&cx, &mut a, me, SocketAddr::new(SECURE_ADDR.into(), 443), 30_001, &[]).await;
-        let _ = cx.sleep(Duration::from_millis(100)).await;
+        raw_connect(&fcx, &mut a, me, SocketAddr::new(slow.into(), 80), 30_000, b"GET /wait HTTP/1.1\r\nHost: slow.test\r\n\r\n").await;
+        raw_connect(&fcx, &mut a, me, SocketAddr::new(SECURE_ADDR.into(), 443), 30_001, &[]).await;
+        let _ = fcx.sleep(Duration::from_millis(100)).await;
         drop(a);
-        wait_for(&cx, &log, 1, seen("net", "detached")).await;
+        wait_for(&fcx, &log, 1, seen("net", "detached")).await;
 
         // The same name and address again: a new id.
         let mut a = attacher.attach("a").unwrap();
-        let _ = raw_dns(&cx, &mut a, me, GATEWAY, "secure.test", 3).await.unwrap();
+        let _ = raw_dns(&fcx, &mut a, me, GATEWAY, "secure.test", 3).await.unwrap();
 
-        let http = wait_for(&cx, &log, 1, http_seen).await;
+        let http = wait_for(&fcx, &log, 1, http_seen).await;
         assert_eq!((http[0].str("answer"), http[0].u64("status"), flag(&http[0], "complete")), (Some("cancelled"), None, false));
         assert_eq!((sandbox_of(&http[0]).unwrap().id, http[0].str("host"), http[0].str("path")), (1, Some("slow.test"), Some("/wait")));
         assert_eq!(local(&http[0]), SocketAddr::from((slow, 80)));
-        let tls = wait_for(&cx, &log, 1, tls_seen).await;
+        let tls = wait_for(&fcx, &log, 1, tls_seen).await;
         assert_eq!((sandbox_of(&tls[0]).unwrap().id, outcome(&tls[0])), (1, "detached".to_owned()));
-        let dns = wait_for(&cx, &log, 3, dns_seen).await;
+        let dns = wait_for(&fcx, &log, 3, dns_seen).await;
         let ids: Vec<u64> = dns.iter().map(|d| sandbox_of(d).unwrap().id).collect();
         assert_eq!(ids, vec![1, 1, 2]);
         assert!(dns.iter().all(|d| is(sandbox_of(d).unwrap(), "a", Some(me))));
@@ -2537,31 +2537,31 @@ fn events_name_each_attachment_by_id() {
 
 #[test]
 fn events_for_dns_queries() {
-    world_events(|cx, attacher, env, log| async move {
+    world_events(|fcx, attacher, env, log| async move {
         let me = Ipv4Addr::new(10, 0, 0, 2);
-        let m = machine(&cx, &attacher, "a", me);
-        assert_eq!(lookup(&cx, &m, "secure.test").await, SECURE_ADDR);
-        assert_eq!(lookup(&cx, &m, "Secure.Test.").await, SECURE_ADDR);
-        assert_eq!(dns(&cx, &m, "secure.test", RecordType::AAAA).await, (ResponseCode::NoError, vec![]));
-        assert_eq!(dns(&cx, &m, "nope.test", RecordType::A).await.0, ResponseCode::NXDomain);
+        let m = machine(&fcx, &attacher, "a", me);
+        assert_eq!(lookup(&fcx, &m, "secure.test").await, SECURE_ADDR);
+        assert_eq!(lookup(&fcx, &m, "Secure.Test.").await, SECURE_ADDR);
+        assert_eq!(dns(&fcx, &m, "secure.test", RecordType::AAAA).await, (ResponseCode::NoError, vec![]));
+        assert_eq!(dns(&fcx, &m, "nope.test", RecordType::A).await.0, ResponseCode::NXDomain);
 
         // Over TCP.
-        let mut conn = m.tcp.connect(&cx, SocketAddr::new(GATEWAY.into(), 53)).await.unwrap();
+        let mut conn = m.tcp.connect(&fcx, SocketAddr::new(GATEWAY.into(), 53)).await.unwrap();
         let mut q = Message::query();
         q.metadata.id = 7;
         q.add_query(Query::query(Name::from_ascii("nope.test").unwrap(), RecordType::A));
         let bytes = q.to_vec().unwrap();
         let mut framed = (bytes.len() as u16).to_be_bytes().to_vec();
         framed.extend_from_slice(&bytes);
-        conn.write_all(&cx, &framed).await.unwrap();
+        conn.write_all(&fcx, &framed).await.unwrap();
         let mut len = [0u8; 2];
-        read_exact(&cx, &mut conn, &mut len).await;
+        read_exact(&fcx, &mut conn, &mut len).await;
 
         let mut socket = m.udp.bind(4444).unwrap();
         let gw = SocketAddr::new(GATEWAY.into(), 53);
         // A message with a header but nothing readable after it: FORMERR.
         socket.send_to(&[0, 9, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0xff], gw);
-        let (reply, _) = timeout(&cx, Duration::from_secs(2), socket.recv(&cx)).await.unwrap().unwrap();
+        let (reply, _) = timeout(&fcx, Duration::from_secs(2), socket.recv(&fcx)).await.unwrap().unwrap();
         assert_eq!(reply[3] & 0x0f, 1, "FORMERR");
         // Two questions in one message: FORMERR, and no name.
         let mut q = Message::query();
@@ -2569,12 +2569,12 @@ fn events_for_dns_queries() {
         q.add_query(Query::query(Name::from_ascii("secure.test").unwrap(), RecordType::A));
         q.add_query(Query::query(Name::from_ascii("nope.test").unwrap(), RecordType::A));
         socket.send_to(&q.to_vec().unwrap(), gw);
-        let (reply, _) = timeout(&cx, Duration::from_secs(2), socket.recv(&cx)).await.unwrap().unwrap();
+        let (reply, _) = timeout(&fcx, Duration::from_secs(2), socket.recv(&fcx)).await.unwrap().unwrap();
         assert_eq!(reply[3] & 0x0f, 1, "FORMERR");
         // Too short to answer at all.
         socket.send_to(b"xx", gw);
 
-        let got = wait_for(&cx, &log, 8, dns_seen).await;
+        let got = wait_for(&fcx, &log, 8, dns_seen).await;
         assert!(got.iter().all(|d| is(sandbox_of(d).unwrap(), "a", Some(me))), "{got:#?}");
         let summary: Vec<_> = got.iter().map(|d| (flag(d, "tcp"), d.str("name"), d.u64("qtype"), answer(d))).collect();
         let a = |s: &str| s.to_owned();
@@ -2610,21 +2610,21 @@ fn client_config(roots: &Arc<RootCertStore>, alpn: &[&[u8]]) -> Arc<ClientConfig
 
 #[test]
 fn events_for_tls_handshakes() {
-    world_events(|cx, attacher, env, log| async move {
+    world_events(|fcx, attacher, env, log| async move {
         let me = Ipv4Addr::new(10, 0, 0, 2);
-        let m = machine(&cx, &attacher, "a", me);
-        assert_eq!(lookup(&cx, &m, "secure.test").await, SECURE_ADDR);
-        assert_eq!(lookup(&cx, &m, "shared.test").await, SECURE_ADDR);
-        assert_eq!(lookup(&cx, &m, "events.test").await, EVENTS_ADDR);
+        let m = machine(&fcx, &attacher, "a", me);
+        assert_eq!(lookup(&fcx, &m, "secure.test").await, SECURE_ADDR);
+        assert_eq!(lookup(&fcx, &m, "shared.test").await, SECURE_ADDR);
+        assert_eq!(lookup(&fcx, &m, "events.test").await, EVENTS_ADDR);
         let to = |addr: Ipv4Addr| SocketAddr::new(addr.into(), 443);
 
         // 1. Accepted, with h2.
-        let conn = tls_connect(&cx, &m, &env, SECURE_ADDR, "secure.test", &[b"h2", b"http/1.1"]).await.unwrap();
+        let conn = tls_connect(&fcx, &m, &env, SECURE_ADDR, "secure.test", &[b"h2", b"http/1.1"]).await.unwrap();
         drop(conn);
         // 2. No SNI (a client that connected to a bare address).
-        assert!(tls_connect(&cx, &m, &env, SECURE_ADDR, "203.0.113.10", &[]).await.is_err());
+        assert!(tls_connect(&fcx, &m, &env, SECURE_ADDR, "203.0.113.10", &[]).await.is_err());
         // 3. A name with no TLS site at this address.
-        assert!(tls_connect(&cx, &m, &env, SECURE_ADDR, "shared.test", &[]).await.is_err());
+        assert!(tls_connect(&fcx, &m, &env, SECURE_ADDR, "shared.test", &[]).await.is_err());
         // 4. A client that does not trust the world's CA: it sends unknown_ca.
         let mut other_ca = CertificateParams::new(Vec::<String>::new()).unwrap();
         other_ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -2633,11 +2633,11 @@ fn events_for_tls_handshakes() {
         let mut other = RootCertStore::empty();
         other.add(other_ca.der().clone()).unwrap();
         let other = Arc::new(other);
-        let tcp = m.tcp.connect(&cx, to(SECURE_ADDR)).await.unwrap();
+        let tcp = m.tcp.connect(&fcx, to(SECURE_ADDR)).await.unwrap();
         let mut client = TlsClient::new(tcp, &other, "secure.test", &[]);
-        assert!(client.handshake(&cx).await.is_err());
+        assert!(client.handshake(&fcx).await.is_err());
         // 5. A hello split over several segments.
-        let mut tcp = m.tcp.connect(&cx, to(EVENTS_ADDR)).await.unwrap();
+        let mut tcp = m.tcp.connect(&fcx, to(EVENTS_ADDR)).await.unwrap();
         let mut tls = ClientConnection::new(
             client_config(&env.roots, &[b"http/1.1"]),
             ServerName::try_from("events.test".to_owned()).unwrap(),
@@ -2649,20 +2649,20 @@ fn events_for_tls_handshakes() {
         }
         assert!(hello.len() > 100);
         for chunk in hello.chunks(hello.len() / 3 + 1) {
-            tcp.write_all(&cx, chunk).await.unwrap();
-            let _ = cx.sleep(Duration::from_millis(30)).await;
+            tcp.write_all(&fcx, chunk).await.unwrap();
+            let _ = fcx.sleep(Duration::from_millis(30)).await;
         }
         let mut client = TlsClient::with(tcp, tls);
-        client.handshake(&cx).await.unwrap();
+        client.handshake(&fcx).await.unwrap();
         drop(client);
         // 6. Closed before a hello.
-        let mut tcp = m.tcp.connect(&cx, to(SECURE_ADDR)).await.unwrap();
-        tcp.shutdown(&cx).await.unwrap();
+        let mut tcp = m.tcp.connect(&fcx, to(SECURE_ADDR)).await.unwrap();
+        tcp.shutdown(&fcx).await.unwrap();
         // 7. Not TLS at all.
-        let mut tcp = m.tcp.connect(&cx, to(SECURE_ADDR)).await.unwrap();
-        tcp.write_all(&cx, b"GET / HTTP/1.1\r\nHost: secure.test\r\n\r\n").await.unwrap();
+        let mut tcp = m.tcp.connect(&fcx, to(SECURE_ADDR)).await.unwrap();
+        tcp.write_all(&fcx, b"GET / HTTP/1.1\r\nHost: secure.test\r\n\r\n").await.unwrap();
 
-        let got = wait_for(&cx, &log, 7, tls_seen).await;
+        let got = wait_for(&fcx, &log, 7, tls_seen).await;
         assert!(got.iter().all(|t| is(sandbox_of(t).unwrap(), "a", Some(me))), "{got:#?}");
         let summary: Vec<_> = got.iter().map(|t| (addr(t, "addr"), t.str("sni"), outcome(t))).collect();
         let (secure, events) = (Some(IpAddr::V4(SECURE_ADDR)), Some(IpAddr::V4(EVENTS_ADDR)));
@@ -2683,33 +2683,33 @@ fn events_for_tls_handshakes() {
 
 /// Sends `request` on a new connection to `addr:80` and reads until the
 /// server closes it.
-async fn raw_http(cx: &Cx, m: &Machine, addr: Ipv4Addr, request: &[u8]) -> Vec<u8> {
-    let mut conn = m.tcp.connect(cx, SocketAddr::new(addr.into(), 80)).await.unwrap();
-    conn.write_all(cx, request).await.unwrap();
-    read_all(cx, &mut conn).await
+async fn raw_http(fcx: &Cx, m: &Machine, addr: Ipv4Addr, request: &[u8]) -> Vec<u8> {
+    let mut conn = m.tcp.connect(fcx, SocketAddr::new(addr.into(), 80)).await.unwrap();
+    conn.write_all(fcx, request).await.unwrap();
+    read_all(fcx, &mut conn).await
 }
 
 #[test]
 fn events_for_http_requests() {
-    world_events(|cx, attacher, env, log| async move {
+    world_events(|fcx, attacher, env, log| async move {
         let me = Ipv4Addr::new(10, 0, 0, 2);
-        let m = machine(&cx, &attacher, "a", me);
-        assert_eq!(lookup(&cx, &m, "events.test").await, EVENTS_ADDR);
-        assert_eq!(lookup(&cx, &m, "secure.test").await, SECURE_ADDR);
-        let broken = lookup(&cx, &m, "broken.test").await;
+        let m = machine(&fcx, &attacher, "a", me);
+        assert_eq!(lookup(&fcx, &m, "events.test").await, EVENTS_ADDR);
+        assert_eq!(lookup(&fcx, &m, "secure.test").await, SECURE_ADDR);
+        let broken = lookup(&fcx, &m, "broken.test").await;
 
         // Three HTTP/2 requests on one connection, from a handler that puts
         // a Page in its response's extensions.
-        let before = cx.now();
-        let conn = tls_connect(&cx, &m, &env, EVENTS_ADDR, "events.test", &[b"h2"]).await.unwrap();
-        let mut client = Client::new(&cx, conn, true).await;
+        let before = fcx.now();
+        let conn = tls_connect(&fcx, &m, &env, EVENTS_ADDR, "events.test", &[b"h2"]).await.unwrap();
+        let mut client = Client::new(&fcx, conn, true).await;
         for path in ["/page", "/page?x=1", "/page"] {
             let got = client.get("https", "events.test", path).await;
             assert_eq!(got.status, StatusCode::OK);
             assert_eq!(got.body, "page sni=Some(\"events.test\")");
         }
-        let tls = wait_for(&cx, &log, 1, tls_seen).await.remove(0);
-        let pages = wait_for(&cx, &log, 3, http_seen).await;
+        let tls = wait_for(&fcx, &log, 1, tls_seen).await.remove(0);
+        let pages = wait_for(&fcx, &log, 3, http_seen).await;
         let mut last = before.since_start().as_secs_f64();
         for (h, path) in pages.iter().zip(["/page", "/page?x=1", "/page"]) {
             assert!(is(sandbox_of(h).unwrap(), "a", Some(me)));
@@ -2736,16 +2736,16 @@ fn events_for_http_requests() {
         log.clear();
 
         // Answers from Sites itself, on port 80.
-        let tcp = m.tcp.connect(&cx, SocketAddr::new(SECURE_ADDR.into(), 80)).await.unwrap();
-        let mut client = Client::new(&cx, tcp, false).await;
+        let tcp = m.tcp.connect(&fcx, SocketAddr::new(SECURE_ADDR.into(), 80)).await.unwrap();
+        let mut client = Client::new(&fcx, tcp, false).await;
         assert_eq!(client.get("http", "secure.test", "/x?y=1").await.status, StatusCode::MOVED_PERMANENTLY);
         assert_eq!(client.get("http", "unknown.test", "/").await.status, StatusCode::MISDIRECTED_REQUEST);
-        let tcp = m.tcp.connect(&cx, SocketAddr::new(broken.into(), 80)).await.unwrap();
-        let mut client = Client::new(&cx, tcp, false).await;
+        let tcp = m.tcp.connect(&fcx, SocketAddr::new(broken.into(), 80)).await.unwrap();
+        let mut client = Client::new(&fcx, tcp, false).await;
         assert_eq!(client.get("http", "broken.test", "/").await.status, StatusCode::INTERNAL_SERVER_ERROR);
-        let reply = raw_http(&cx, &m, SECURE_ADDR, b"GET / HTTP/1.0\r\n\r\n").await;
+        let reply = raw_http(&fcx, &m, SECURE_ADDR, b"GET / HTTP/1.0\r\n\r\n").await;
         assert!(reply.starts_with(b"HTTP/1.0 400"), "{}", String::from_utf8_lossy(&reply));
-        let got = wait_for(&cx, &log, 4, http_seen).await;
+        let got = wait_for(&fcx, &log, 4, http_seen).await;
         let summary: Vec<_> =
             got.iter().map(|h| (h.str("answer"), h.u64("status"), h.str("host"), local(h).port(), h.str("sni"), extra(h), flag(h, "complete"))).collect();
         assert_eq!(
@@ -2766,19 +2766,19 @@ fn events_for_http_requests() {
         log.clear();
 
         // HEAD: no body, complete once sent.
-        let conn = tls_connect(&cx, &m, &env, EVENTS_ADDR, "events.test", &[b"http/1.1"]).await.unwrap();
-        let Client::H1(mut send) = Client::new(&cx, conn, false).await else { unreachable!() };
+        let conn = tls_connect(&fcx, &m, &env, EVENTS_ADDR, "events.test", &[b"http/1.1"]).await.unwrap();
+        let Client::H1(mut send) = Client::new(&fcx, conn, false).await else { unreachable!() };
         send.ready().await.unwrap();
         let r = send.send_request(Request::head("/page").header("host", "events.test").body(Empty::new()).unwrap()).await.unwrap();
         assert_eq!(r.status(), StatusCode::OK);
         drop(r);
-        let got = wait_for(&cx, &log, 1, http_seen).await;
+        let got = wait_for(&fcx, &log, 1, http_seen).await;
         assert_eq!((got[0].str("method"), got[0].u64("sent"), flag(&got[0], "complete")), (Some("HEAD"), Some(0), true));
         log.clear();
 
         // A whole download, then one the client cuts short.
-        let conn = tls_connect(&cx, &m, &env, EVENTS_ADDR, "events.test", &[b"h2"]).await.unwrap();
-        let mut client = Client::new(&cx, conn, true).await;
+        let conn = tls_connect(&fcx, &m, &env, EVENTS_ADDR, "events.test", &[b"h2"]).await.unwrap();
+        let mut client = Client::new(&fcx, conn, true).await;
         assert_eq!(client.get("https", "events.test", "/big").await.body.len(), BIG);
         let Client::H2(send) = &mut client else { unreachable!() };
         send.ready().await.unwrap();
@@ -2788,7 +2788,7 @@ fn events_for_http_requests() {
         assert!(first.is_data());
         // Dropping the body resets the stream.
         drop(body);
-        let got = wait_for(&cx, &log, 2, http_seen).await;
+        let got = wait_for(&fcx, &log, 2, http_seen).await;
         assert_eq!((got[0].u64("sent"), flag(&got[0], "complete")), (Some(BIG as u64), true));
         assert!(!flag(&got[1], "complete"), "{:?}", got[1]);
         let sent = got[1].u64("sent").unwrap();
@@ -2801,35 +2801,35 @@ fn events_for_http_requests() {
         // is reset, and the connection goes on.
         send.ready().await.unwrap();
         let waiting = send.send_request(Request::get("https://events.test/wait").body(Empty::new()).unwrap());
-        assert!(timeout(&cx, Duration::from_millis(200), waiting).await.is_none(), "no answer to /wait");
-        let got = wait_for(&cx, &log, 1, http_seen).await;
+        assert!(timeout(&fcx, Duration::from_millis(200), waiting).await.is_none(), "no answer to /wait");
+        let got = wait_for(&fcx, &log, 1, http_seen).await;
         let g = &got[0];
         assert_eq!((g.str("answer"), g.u64("status"), g.u64("sent"), flag(g, "complete")), (Some("cancelled"), None, Some(0), false));
         assert_eq!(g.str("path"), Some("/wait"));
         assert_eq!(client.get("https", "events.test", "/page").await.status, StatusCode::OK);
-        assert_eq!(wait_for(&cx, &log, 2, http_seen).await.len(), 2);
+        assert_eq!(wait_for(&fcx, &log, 2, http_seen).await.len(), 2);
         Ok(())
     });
 }
 
 #[test]
 fn events_for_a_client_that_resets_mid_request() {
-    world_events(|cx, attacher, _env, log| async move {
+    world_events(|fcx, attacher, _env, log| async move {
         let me = Ipv4Addr::new(10, 0, 0, 2);
         let mut raw = attacher.attach("a").unwrap();
-        let (_, addrs) = raw_dns(&cx, &mut raw, me, GATEWAY, "slow.test", 1).await.unwrap();
+        let (_, addrs) = raw_dns(&fcx, &mut raw, me, GATEWAY, "slow.test", 1).await.unwrap();
         let slow = addrs[0];
         let to = SocketAddr::new(slow.into(), 80);
         // HTTP/1.1, the handler never answers, the client resets.
-        let (seq, ack) = raw_connect(&cx, &mut raw, me, to, 30_000, b"GET /wait HTTP/1.1\r\nHost: slow.test\r\n\r\n").await;
-        let _ = cx.sleep(Duration::from_millis(100)).await;
+        let (seq, ack) = raw_connect(&fcx, &mut raw, me, to, 30_000, b"GET /wait HTTP/1.1\r\nHost: slow.test\r\n\r\n").await;
+        let _ = fcx.sleep(Duration::from_millis(100)).await;
         assert!(picked(&log, http_seen).is_empty());
         raw.send(tcp_seg(me, 30_000, slow, 80, seq, ack, RST, &[]));
-        let got = wait_for(&cx, &log, 1, http_seen).await;
+        let got = wait_for(&fcx, &log, 1, http_seen).await;
         assert_eq!((got[0].str("answer"), got[0].u64("status"), flag(&got[0], "complete")), (Some("cancelled"), None, false));
         assert_eq!((got[0].str("version"), got[0].str("host")), (Some("HTTP/1.1"), Some("slow.test")));
         // A reset is the client going away, not an HTTP error.
-        let _ = cx.sleep(Duration::from_millis(100)).await;
+        let _ = fcx.sleep(Duration::from_millis(100)).await;
         assert!(picked(&log, error_seen).is_empty());
         assert_eq!(picked(&log, http_seen).len(), 1, "exactly one event");
         Ok(())
@@ -2853,7 +2853,7 @@ fn a_reset_mid_request_drops_the_handler_without_events() {
     let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag = dropped.clone();
     let result = within(Duration::from_secs(30), move || {
-        block_on(run(move |cx| async move {
+        block_on(run(move |fcx| async move {
             let (attacher, attachments) = fictionet::attachments();
             let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let (seen, set) = (started.clone(), flag.clone());
@@ -2869,18 +2869,18 @@ fn a_reset_mid_request_drops_the_handler_without_events() {
                     }
                 }),
             );
-            web::Sites::new(move |host| (host == "hang.test").then(|| web::Site::new(app.clone()))).serve(&cx, attachments)?;
+            web::Sites::new(move |host| (host == "hang.test").then(|| web::Site::new(app.clone()))).serve(&fcx, attachments)?;
 
             let me = Ipv4Addr::new(10, 0, 0, 2);
             let mut raw = attacher.attach("a").unwrap();
-            let (_, addrs) = raw_dns(&cx, &mut raw, me, GATEWAY, "hang.test", 1).await.unwrap();
+            let (_, addrs) = raw_dns(&fcx, &mut raw, me, GATEWAY, "hang.test", 1).await.unwrap();
             let to = SocketAddr::new(addrs[0].into(), 80);
-            let (seq, ack) = raw_connect(&cx, &mut raw, me, to, 30_000, b"GET /hang HTTP/1.1\r\nHost: hang.test\r\n\r\n").await;
+            let (seq, ack) = raw_connect(&fcx, &mut raw, me, to, 30_000, b"GET /hang HTTP/1.1\r\nHost: hang.test\r\n\r\n").await;
             for _ in 0..100 {
                 if started.load(Ordering::SeqCst) {
                     break;
                 }
-                let _ = cx.sleep(Duration::from_millis(10)).await;
+                let _ = fcx.sleep(Duration::from_millis(10)).await;
             }
             assert!(started.load(Ordering::SeqCst), "the handler started");
             assert!(!flag.load(Ordering::SeqCst));
@@ -2889,7 +2889,7 @@ fn a_reset_mid_request_drops_the_handler_without_events() {
                 if flag.load(Ordering::SeqCst) {
                     break;
                 }
-                let _ = cx.sleep(Duration::from_millis(10)).await;
+                let _ = fcx.sleep(Duration::from_millis(10)).await;
             }
             // Checked here: stopping the world would drop the handler too.
             assert!(flag.load(Ordering::SeqCst), "the handler was dropped within 1 s of the reset");
@@ -2905,16 +2905,16 @@ fn a_reset_mid_request_drops_the_handler_without_events() {
 #[test]
 fn the_world_stops_while_handlers_wait() {
     let started = std::time::Instant::now();
-    world_events(|cx, attacher, _env, log| async move {
-        let m = machine(&cx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
-        let slow = lookup(&cx, &m, "slow.test").await;
+    world_events(|fcx, attacher, _env, log| async move {
+        let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+        let slow = lookup(&fcx, &m, "slow.test").await;
         let to = SocketAddr::new(slow.into(), 80);
-        let mut h1 = m.tcp.connect(&cx, to).await.unwrap();
-        h1.write_all(&cx, b"GET /wait HTTP/1.1\r\nHost: slow.test\r\n\r\n").await.unwrap();
+        let mut h1 = m.tcp.connect(&fcx, to).await.unwrap();
+        h1.write_all(&fcx, b"GET /wait HTTP/1.1\r\nHost: slow.test\r\n\r\n").await.unwrap();
         // HTTP/2 with prior knowledge: the preface, empty SETTINGS, and one
         // GET /wait on stream 1 (HPACK: :method GET, :scheme http, then
         // :path and :authority as literals).
-        let mut h2 = m.tcp.connect(&cx, to).await.unwrap();
+        let mut h2 = m.tcp.connect(&fcx, to).await.unwrap();
         let mut bytes = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
         bytes.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 0, 0]);
         let mut block = vec![0x82, 0x86, 0x04, 5];
@@ -2923,8 +2923,8 @@ fn the_world_stops_while_handlers_wait() {
         block.extend_from_slice(b"slow.test");
         bytes.extend_from_slice(&[0, 0, block.len() as u8, 1, 0x05, 0, 0, 0, 1]);
         bytes.extend_from_slice(&block);
-        h2.write_all(&cx, &bytes).await.unwrap();
-        let _ = cx.sleep(Duration::from_millis(300)).await;
+        h2.write_all(&fcx, &bytes).await.unwrap();
+        let _ = fcx.sleep(Duration::from_millis(300)).await;
         assert!(picked(&log, http_seen).is_empty(), "both handlers still wait");
         // Keep both connections open while the world stops.
         let _keep = (h1, h2);
@@ -2935,36 +2935,36 @@ fn the_world_stops_while_handlers_wait() {
 
 #[test]
 fn events_for_bytes_that_are_not_http() {
-    world_events(|cx, attacher, env, log| async move {
-        let m = machine(&cx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
-        let plain = lookup(&cx, &m, "plain.test").await;
-        assert_eq!(lookup(&cx, &m, "events.test").await, EVENTS_ADDR);
+    world_events(|fcx, attacher, env, log| async move {
+        let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+        let plain = lookup(&fcx, &m, "plain.test").await;
+        assert_eq!(lookup(&fcx, &m, "events.test").await, EVENTS_ADDR);
 
         // Garbage on port 80.
-        raw_http(&cx, &m, plain, b"\x16\x03\x01\x00\x05hello\r\n\r\n").await;
+        raw_http(&fcx, &m, plain, b"\x16\x03\x01\x00\x05hello\r\n\r\n").await;
         // HTTP/2 with prior knowledge, then a SETTINGS frame of a size no
         // SETTINGS frame can have.
         let mut bad = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
         bad.extend_from_slice(&[0, 0, 5, 4, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5]);
-        raw_http(&cx, &m, plain, &bad).await;
+        raw_http(&fcx, &m, plain, &bad).await;
         // Clean closes make no event: a whole request, and nothing at all.
-        let ok = raw_http(&cx, &m, plain, b"GET / HTTP/1.1\r\nHost: plain.test\r\nConnection: close\r\n\r\n").await;
+        let ok = raw_http(&fcx, &m, plain, b"GET / HTTP/1.1\r\nHost: plain.test\r\nConnection: close\r\n\r\n").await;
         assert!(ok.starts_with(b"HTTP/1.1 200"));
-        let mut conn = m.tcp.connect(&cx, SocketAddr::new(plain.into(), 80)).await.unwrap();
-        conn.shutdown(&cx).await.unwrap();
-        let _ = read_all(&cx, &mut conn).await;
+        let mut conn = m.tcp.connect(&fcx, SocketAddr::new(plain.into(), 80)).await.unwrap();
+        conn.shutdown(&fcx).await.unwrap();
+        let _ = read_all(&fcx, &mut conn).await;
         // After a TLS handshake, a record that does not decrypt.
-        let mut client = tls_connect(&cx, &m, &env, EVENTS_ADDR, "events.test", &[b"http/1.1"]).await.unwrap();
+        let mut client = tls_connect(&fcx, &m, &env, EVENTS_ADDR, "events.test", &[b"http/1.1"]).await.unwrap();
         // First a request, so the server has finished its handshake.
-        client.write_all(&cx, b"GET /page HTTP/1.1\r\nHost: events.test\r\n\r\n").await.unwrap();
+        client.write_all(&fcx, b"GET /page HTTP/1.1\r\nHost: events.test\r\n\r\n").await.unwrap();
         let mut buf = [0u8; 16];
-        read_exact(&cx, &mut client, &mut buf).await;
+        read_exact(&fcx, &mut client, &mut buf).await;
         let mut record = vec![23, 3, 3, 0, 40];
         record.extend_from_slice(&[0x55; 40]);
-        client.conn.write_all(&cx, &record).await.unwrap();
+        client.conn.write_all(&fcx, &record).await.unwrap();
 
-        let got = wait_for(&cx, &log, 3, error_seen).await;
-        let _ = cx.sleep(Duration::from_millis(200)).await;
+        let got = wait_for(&fcx, &log, 3, error_seen).await;
+        let _ = fcx.sleep(Duration::from_millis(200)).await;
         assert_eq!(picked(&log, error_seen).len(), 3, "{:#?}", picked(&log, error_seen));
         let summary: Vec<_> = got.iter().map(|b| (local(b), b.str("cause"))).collect();
         assert_eq!(
@@ -2985,36 +2985,36 @@ fn events_for_bytes_that_are_not_http() {
 /// Takes 10 seconds: a client that connects and sends nothing.
 #[test]
 fn events_for_clients_that_send_nothing() {
-    world_events(|cx, attacher, _env, log| async move {
-        let m = machine(&cx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
-        assert_eq!(lookup(&cx, &m, "secure.test").await, SECURE_ADDR);
+    world_events(|fcx, attacher, _env, log| async move {
+        let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+        assert_eq!(lookup(&fcx, &m, "secure.test").await, SECURE_ADDR);
         let started = std::time::Instant::now();
-        let _quiet_80 = m.tcp.connect(&cx, SocketAddr::new(SECURE_ADDR.into(), 80)).await.unwrap();
-        let _quiet_443 = m.tcp.connect(&cx, SocketAddr::new(SECURE_ADDR.into(), 443)).await.unwrap();
-        let tls = wait_for_long(&cx, &log, tls_seen).await;
+        let _quiet_80 = m.tcp.connect(&fcx, SocketAddr::new(SECURE_ADDR.into(), 80)).await.unwrap();
+        let _quiet_443 = m.tcp.connect(&fcx, SocketAddr::new(SECURE_ADDR.into(), 443)).await.unwrap();
+        let tls = wait_for_long(&fcx, &log, tls_seen).await;
         let took = started.elapsed();
         assert!(took >= Duration::from_secs(10) && took < Duration::from_millis(10_500), "{took:?}");
         assert_eq!((tls.str("sni"), outcome(&tls)), (None, "timed_out".to_owned()));
-        let bad = wait_for(&cx, &log, 1, error_seen).await;
+        let bad = wait_for(&fcx, &log, 1, error_seen).await;
         assert_eq!((local(&bad[0]).port(), bad[0].str("cause")), (80, Some("timeout")));
         Ok(())
     });
 }
 
 /// Waits up to 12 s for the first event `pick` keeps.
-async fn wait_for_long<T>(cx: &Cx, log: &Log, mut pick: impl FnMut(&Entry) -> Option<T>) -> T {
+async fn wait_for_long<T>(fcx: &Cx, log: &Log, mut pick: impl FnMut(&Entry) -> Option<T>) -> T {
     for _ in 0..1200 {
         if let Some(t) = picked(log, &mut pick).into_iter().next() {
             return t;
         }
-        let _ = cx.sleep(Duration::from_millis(10)).await;
+        let _ = fcx.sleep(Duration::from_millis(10)).await;
     }
     panic!("no such event: {:#?}", log.events.all());
 }
 
 #[test]
 fn events_for_blocked_packets() {
-    world_events(|cx, attacher, _env, log| async move {
+    world_events(|fcx, attacher, _env, log| async move {
         let me = Ipv4Addr::new(10, 0, 0, 2);
         let mut raw = attacher.attach("a").unwrap();
 
@@ -3030,25 +3030,25 @@ fn events_for_blocked_packets() {
         raw.send(udp(Ipv4Addr::UNSPECIFIED, 68, Ipv4Addr::BROADCAST, 67, b"not dhcp"));
         // Bind, then break the rules.
         raw.send(ping(me, GATEWAY, 2));
-        assert!(recv_within(&cx, &mut raw, Duration::from_secs(2)).await.is_some());
+        assert!(recv_within(&fcx, &mut raw, Duration::from_secs(2)).await.is_some());
         raw.send(ping(Ipv4Addr::new(10, 0, 0, 9), GATEWAY, 3));
         raw.send(ping(me, Ipv4Addr::new(10, 0, 0, 3), 4));
         raw.send(udp(me, 1000, Ipv4Addr::BROADCAST, 2000, b"hi"));
         // No machine there: host unreachable.
         raw.send(ping(me, Ipv4Addr::new(192, 0, 2, 1), 5));
-        let (_, _, _, icmp) = parse(&recv_within(&cx, &mut raw, Duration::from_secs(2)).await.unwrap());
+        let (_, _, _, icmp) = parse(&recv_within(&fcx, &mut raw, Duration::from_secs(2)).await.unwrap());
         assert_eq!((icmp[0], icmp[1]), (3, 1));
         // Closed ports at a machine and at the gateway.
-        let (_, addrs) = raw_dns(&cx, &mut raw, me, GATEWAY, "plain.test", 5).await.unwrap();
+        let (_, addrs) = raw_dns(&fcx, &mut raw, me, GATEWAY, "plain.test", 5).await.unwrap();
         let plain = addrs[0];
         for (dst, port) in [(plain, 22), (plain, 443), (GATEWAY, 80)] {
             raw.send(tcp_seg(me, 30_000, dst, port, 1, 0, SYN, &[]));
-            let (_, _, proto, t) = parse(&recv_within(&cx, &mut raw, Duration::from_secs(2)).await.unwrap());
+            let (_, _, proto, t) = parse(&recv_within(&fcx, &mut raw, Duration::from_secs(2)).await.unwrap());
             assert_eq!((proto, t[13] & RST), (6, RST), "a RST from {dst}:{port}");
         }
         for (dst, port) in [(plain, 9999), (GATEWAY, 5000)] {
             raw.send(udp(me, 1000, dst, port, b"hi"));
-            let (_, _, proto, icmp) = parse(&recv_within(&cx, &mut raw, Duration::from_secs(2)).await.unwrap());
+            let (_, _, proto, icmp) = parse(&recv_within(&fcx, &mut raw, Duration::from_secs(2)).await.unwrap());
             assert_eq!((proto, icmp[0], icmp[1]), (1, 3, 3), "port unreachable from {dst}:{port}");
         }
         // UDP with a bad checksum is dropped below Sites, unreported.
@@ -3056,15 +3056,15 @@ fn events_for_blocked_packets() {
         let n = bad.0.len();
         bad.0[n - 1] ^= 0xff;
         raw.send(bad);
-        assert!(recv_within(&cx, &mut raw, SHORT).await.is_none());
+        assert!(recv_within(&fcx, &mut raw, SHORT).await.is_none());
         // Open ports make no event.
         raw.send(tcp_seg(me, 30_001, plain, 80, 1, 0, SYN, &[]));
-        assert!(recv_within(&cx, &mut raw, Duration::from_secs(2)).await.is_some());
+        assert!(recv_within(&fcx, &mut raw, Duration::from_secs(2)).await.is_some());
 
         // Each is recorded as it comes, except a repeat within a second:
         // the second closed TCP port at the same machine is counted, and
         // its count recorded a second later.
-        let got = wait_for(&cx, &log, 12, blocked_seen).await;
+        let got = wait_for(&fcx, &log, 12, blocked_seen).await;
         let summary: Vec<_> = got.iter().map(blocked_row).collect();
         let v4 = |a: Ipv4Addr| Some(IpAddr::V4(a));
         assert_eq!(
@@ -3093,11 +3093,11 @@ fn events_for_blocked_packets() {
 
         // Past the limit of connections to one machine: the first refused
         // is recorded, and the rest counted.
-        let (_, addrs) = raw_dns(&cx, &mut raw, me, GATEWAY, "secure.test", 6).await.unwrap();
+        let (_, addrs) = raw_dns(&fcx, &mut raw, me, GATEWAY, "secure.test", 6).await.unwrap();
         assert_eq!(addrs, vec![SECURE_ADDR]);
-        let (open, _) = open_idle(&cx, &mut raw, me, SocketAddr::new(SECURE_ADDR.into(), 443), 300).await;
+        let (open, _) = open_idle(&fcx, &mut raw, me, SocketAddr::new(SECURE_ADDR.into(), 443), 300).await;
         assert_eq!(open, 300);
-        let got = wait_for(&cx, &log, 2, blocked_seen).await;
+        let got = wait_for(&fcx, &log, 2, blocked_seen).await;
         assert_eq!(got.len(), 2);
         assert_eq!((got[0].u64("count"), got[0].u64("dst_port")), (Some(1), Some(443)));
         assert_eq!(got[1].u64("count"), Some(43));
@@ -3116,21 +3116,21 @@ fn a_port_scan_cannot_push_out_the_events_a_grader_reads() {
     let path = std::env::temp_dir().join(format!("fictionet-scan-{}.jsonl", std::process::id()));
     let kept: Arc<std::sync::Mutex<Option<EventLog>>> = Arc::default();
     let (keep, file) = (kept.clone(), path.clone());
-    world_events(move |cx, attacher, env, log| async move {
+    world_events(move |fcx, attacher, env, log| async move {
         log.events.to_file(&file)?;
         // What a grader reads: a lookup, a TLS handshake and a request.
-        let m = machine(&cx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
-        assert_eq!(lookup(&cx, &m, "secure.test").await, SECURE_ADDR);
-        let conn = tls_connect(&cx, &m, &env, SECURE_ADDR, "secure.test", &[b"http/1.1"]).await.unwrap();
-        let mut client = Client::new(&cx, conn, false).await;
+        let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+        assert_eq!(lookup(&fcx, &m, "secure.test").await, SECURE_ADDR);
+        let conn = tls_connect(&fcx, &m, &env, SECURE_ADDR, "secure.test", &[b"http/1.1"]).await.unwrap();
+        let mut client = Client::new(&fcx, conn, false).await;
         assert_eq!(client.get("https", "secure.test", "/").await.status, StatusCode::OK);
 
         // The scan, from another sandbox: every port but the open ones.
         let me = Ipv4Addr::new(10, 0, 0, 3);
         let mut raw = attacher.attach("b").unwrap();
         raw.send(ping(me, GATEWAY, 1));
-        assert!(recv_within(&cx, &mut raw, Duration::from_secs(2)).await.is_some());
-        let (_, addrs) = raw_dns(&cx, &mut raw, me, GATEWAY, "plain.test", 2).await.unwrap();
+        assert!(recv_within(&fcx, &mut raw, Duration::from_secs(2)).await.is_some());
+        let (_, addrs) = raw_dns(&fcx, &mut raw, me, GATEWAY, "plain.test", 2).await.unwrap();
         let plain = addrs[0];
         let ports: Vec<u16> = (1..).filter(|p| ![80, 443].contains(p)).take(usize::from(SCAN)).collect();
         for batch in ports.chunks(500) {
@@ -3138,7 +3138,7 @@ fn a_port_scan_cannot_push_out_the_events_a_grader_reads() {
                 raw.send(tcp_seg(me, 40_000, plain, port, 1, 0, SYN, &[]));
             }
             for _ in batch {
-                let (_, _, _, t) = parse(&recv_within(&cx, &mut raw, Duration::from_secs(2)).await.expect("a RST"));
+                let (_, _, _, t) = parse(&recv_within(&fcx, &mut raw, Duration::from_secs(2)).await.expect("a RST"));
                 assert_eq!(t[13] & RST, RST);
             }
         }
@@ -3235,14 +3235,14 @@ fn parse6(p: &Packet) -> (Ipv6Addr, Ipv6Addr, u8, Vec<u8>) {
 /// A DNS query for `name` from `me` to `server` on a raw attachment, over
 /// IPv6: the answer's code and addresses, or `None` if none came within
 /// 2 s.
-async fn raw_dns6(cx: &Cx, raw: &mut End, me: Ipv6Addr, server: Ipv6Addr, name: &str, kind: RecordType) -> Option<(ResponseCode, Vec<IpAddr>)> {
-    let id = cx.random_u64() as u16;
+async fn raw_dns6(fcx: &Cx, raw: &mut End, me: Ipv6Addr, server: Ipv6Addr, name: &str, kind: RecordType) -> Option<(ResponseCode, Vec<IpAddr>)> {
+    let id = fcx.random_u64() as u16;
     let mut q = Message::query();
     q.metadata.id = id;
     q.add_query(Query::query(Name::from_ascii(name).unwrap(), kind));
     raw.send(udp6(me, 5353, server, 53, &q.to_vec().unwrap()));
     loop {
-        let p = recv_within(cx, raw, Duration::from_secs(2)).await?;
+        let p = recv_within(fcx, raw, Duration::from_secs(2)).await?;
         let (src, _, next, u) = parse6(&p);
         if src == server && next == 17 {
             return Some(parse_dns_all(&u[8..], id));
@@ -3269,64 +3269,64 @@ fn parse_dns_all(bytes: &[u8], id: u16) -> (ResponseCode, Vec<IpAddr>) {
 
 /// Asks `server`'s DNS over UDP from `m`, over either IP version. Returns
 /// the response code and the A and AAAA records.
-async fn dns_at(cx: &Cx, m: &Machine, server: IpAddr, name: &str, kind: RecordType) -> (ResponseCode, Vec<IpAddr>) {
-    let mut socket = m.udp.bind(40000 + (cx.random_u64() % 20000) as u16).unwrap();
+async fn dns_at(fcx: &Cx, m: &Machine, server: IpAddr, name: &str, kind: RecordType) -> (ResponseCode, Vec<IpAddr>) {
+    let mut socket = m.udp.bind(40000 + (fcx.random_u64() % 20000) as u16).unwrap();
     let mut q = Message::query();
-    q.metadata.id = cx.random_u64() as u16;
+    q.metadata.id = fcx.random_u64() as u16;
     q.add_query(Query::query(Name::from_ascii(name).unwrap(), kind));
     socket.send_to(&q.to_vec().unwrap(), SocketAddr::new(server, 53));
-    let (bytes, from) = timeout(cx, Duration::from_secs(5), socket.recv(cx)).await.expect("a DNS answer").unwrap();
+    let (bytes, from) = timeout(fcx, Duration::from_secs(5), socket.recv(fcx)).await.expect("a DNS answer").unwrap();
     assert_eq!(from, SocketAddr::new(server, 53));
     parse_dns_all(&bytes, q.metadata.id)
 }
 
 #[test]
 fn dns_answers_aaaa_for_each_family_a_site_has() {
-    world(|cx, attacher, env| async move {
-        let m = machine(&cx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+    world(|fcx, attacher, env| async move {
+        let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
         let gw = IpAddr::V4(GATEWAY);
         let ok = |addrs: &[IpAddr]| (ResponseCode::NoError, addrs.to_vec());
         let v6 = |s: &str| IpAddr::V6(s.parse().unwrap());
 
         // A site with only an IPv4 `at` gets an automatic IPv6 address,
         // from 2001:2::/48, and keeps it.
-        assert_eq!(dns_at(&cx, &m, gw, "secure.test", RecordType::AAAA).await, ok(&[v6("2001:2::1")]));
-        assert_eq!(dns_at(&cx, &m, gw, "secure.test", RecordType::A).await, ok(&[SECURE_ADDR.into()]));
-        assert_eq!(dns_at(&cx, &m, gw, "SECURE.test.", RecordType::AAAA).await, ok(&[v6("2001:2::1")]));
+        assert_eq!(dns_at(&fcx, &m, gw, "secure.test", RecordType::AAAA).await, ok(&[v6("2001:2::1")]));
+        assert_eq!(dns_at(&fcx, &m, gw, "secure.test", RecordType::A).await, ok(&[SECURE_ADDR.into()]));
+        assert_eq!(dns_at(&fcx, &m, gw, "SECURE.test.", RecordType::AAAA).await, ok(&[v6("2001:2::1")]));
         // A site at two addresses of its own.
-        assert_eq!(dns_at(&cx, &m, gw, "dual.test", RecordType::A).await, ok(&[DUAL_ADDR.into()]));
-        assert_eq!(dns_at(&cx, &m, gw, "dual.test", RecordType::AAAA).await, ok(&[DUAL_ADDR6.into()]));
+        assert_eq!(dns_at(&fcx, &m, gw, "dual.test", RecordType::A).await, ok(&[DUAL_ADDR.into()]));
+        assert_eq!(dns_at(&fcx, &m, gw, "dual.test", RecordType::AAAA).await, ok(&[DUAL_ADDR6.into()]));
         // Sites of one family: NODATA for the other.
-        assert_eq!(dns_at(&cx, &m, gw, "v4only.test", RecordType::AAAA).await, ok(&[]));
-        assert_eq!(dns_at(&cx, &m, gw, "v4only.test", RecordType::A).await, ok(&[Ipv4Addr::new(198, 18, 0, 1).into()]));
-        assert_eq!(dns_at(&cx, &m, gw, "v6only.test", RecordType::A).await, ok(&[]));
-        assert_eq!(dns_at(&cx, &m, gw, "v6only.test", RecordType::AAAA).await, ok(&[V6ONLY_ADDR6.into()]));
+        assert_eq!(dns_at(&fcx, &m, gw, "v4only.test", RecordType::AAAA).await, ok(&[]));
+        assert_eq!(dns_at(&fcx, &m, gw, "v4only.test", RecordType::A).await, ok(&[Ipv4Addr::new(198, 18, 0, 1).into()]));
+        assert_eq!(dns_at(&fcx, &m, gw, "v6only.test", RecordType::A).await, ok(&[]));
+        assert_eq!(dns_at(&fcx, &m, gw, "v6only.test", RecordType::AAAA).await, ok(&[V6ONLY_ADDR6.into()]));
         // An address inside the sandboxes' IPv6 subnet, and a name with no
         // site: NXDOMAIN for both types.
         for name in ["inside6.test", "nope.test"] {
             for kind in [RecordType::A, RecordType::AAAA] {
-                assert_eq!(dns_at(&cx, &m, gw, name, kind).await, (ResponseCode::NXDomain, vec![]), "{name} {kind}");
+                assert_eq!(dns_at(&fcx, &m, gw, name, kind).await, (ResponseCode::NXDomain, vec![]), "{name} {kind}");
             }
         }
         // The callback ran once per name.
         assert_eq!(env.calls.load(Ordering::SeqCst), 6);
 
         // DNS also answers at the gateway's IPv6 address, over UDP and TCP.
-        let m6 = machine(&cx, &attacher, "b", ME6);
-        assert_eq!(dns_at(&cx, &m6, GATEWAY6.into(), "dual.test", RecordType::AAAA).await, ok(&[DUAL_ADDR6.into()]));
-        assert_eq!(dns_at(&cx, &m6, GATEWAY6.into(), "dual.test", RecordType::A).await, ok(&[DUAL_ADDR.into()]));
-        let mut conn = m6.tcp.connect(&cx, SocketAddr::new(GATEWAY6.into(), 53)).await.unwrap();
+        let m6 = machine(&fcx, &attacher, "b", ME6);
+        assert_eq!(dns_at(&fcx, &m6, GATEWAY6.into(), "dual.test", RecordType::AAAA).await, ok(&[DUAL_ADDR6.into()]));
+        assert_eq!(dns_at(&fcx, &m6, GATEWAY6.into(), "dual.test", RecordType::A).await, ok(&[DUAL_ADDR.into()]));
+        let mut conn = m6.tcp.connect(&fcx, SocketAddr::new(GATEWAY6.into(), 53)).await.unwrap();
         let mut q = Message::query();
         q.metadata.id = 77;
         q.add_query(Query::query(Name::from_ascii("v6only.test").unwrap(), RecordType::AAAA));
         let bytes = q.to_vec().unwrap();
         let mut framed = (bytes.len() as u16).to_be_bytes().to_vec();
         framed.extend_from_slice(&bytes);
-        conn.write_all(&cx, &framed).await.unwrap();
+        conn.write_all(&fcx, &framed).await.unwrap();
         let mut len = [0u8; 2];
-        read_exact(&cx, &mut conn, &mut len).await;
+        read_exact(&fcx, &mut conn, &mut len).await;
         let mut reply = vec![0u8; u16::from_be_bytes(len) as usize];
-        read_exact(&cx, &mut conn, &mut reply).await;
+        read_exact(&fcx, &mut conn, &mut reply).await;
         assert_eq!(parse_dns_all(&reply, 77), ok(&[V6ONLY_ADDR6.into()]));
         Ok(())
     });
@@ -3334,67 +3334,67 @@ fn dns_answers_aaaa_for_each_family_a_site_has() {
 
 #[test]
 fn https_http2_and_plain_http_over_ipv6() {
-    world_events(|cx, attacher, env, log| async move {
-        let m = machine(&cx, &attacher, "a", ME6);
-        let (_, addrs) = dns_at(&cx, &m, GATEWAY6.into(), "dual.test", RecordType::AAAA).await;
+    world_events(|fcx, attacher, env, log| async move {
+        let m = machine(&fcx, &attacher, "a", ME6);
+        let (_, addrs) = dns_at(&fcx, &m, GATEWAY6.into(), "dual.test", RecordType::AAAA).await;
         assert_eq!(addrs, vec![IpAddr::V6(DUAL_ADDR6)]);
 
         // HTTP/2 and HTTP/1.1 over TLS, to the site's IPv6 address.
-        let conn = tls_connect(&cx, &m, &env, DUAL_ADDR6, "dual.test", &[b"h2", b"http/1.1"]).await.unwrap();
+        let conn = tls_connect(&fcx, &m, &env, DUAL_ADDR6, "dual.test", &[b"h2", b"http/1.1"]).await.unwrap();
         assert_eq!(conn.tls.alpn_protocol(), Some(b"h2".as_slice()));
-        let mut client = Client::new(&cx, conn, true).await;
+        let mut client = Client::new(&fcx, conn, true).await;
         let got = client.get("https", "dual.test", "/").await;
         assert_eq!((got.status, got.version), (StatusCode::OK, Version::HTTP_2));
         assert_eq!(got.body, "secure https dual.test 443 HTTP/2.0 #1");
-        let conn = tls_connect(&cx, &m, &env, DUAL_ADDR6, "dual.test", &[b"http/1.1"]).await.unwrap();
-        let mut client = Client::new(&cx, conn, false).await;
+        let conn = tls_connect(&fcx, &m, &env, DUAL_ADDR6, "dual.test", &[b"http/1.1"]).await.unwrap();
+        let mut client = Client::new(&fcx, conn, false).await;
         assert_eq!(client.get("https", "dual.test", "/").await.body, "secure https dual.test 443 HTTP/1.1 #2");
 
         // The site keeps its state across families: it is one site.
-        let m4 = machine(&cx, &attacher, "b", Ipv4Addr::new(10, 0, 0, 2));
-        let conn = tls_connect(&cx, &m4, &env, DUAL_ADDR, "dual.test", &[b"h2"]).await.unwrap();
-        let mut client = Client::new(&cx, conn, true).await;
+        let m4 = machine(&fcx, &attacher, "b", Ipv4Addr::new(10, 0, 0, 2));
+        let conn = tls_connect(&fcx, &m4, &env, DUAL_ADDR, "dual.test", &[b"h2"]).await.unwrap();
+        let mut client = Client::new(&fcx, conn, true).await;
         assert_eq!(client.get("https", "dual.test", "/").await.body, "secure https dual.test 443 HTTP/2.0 #3");
 
         // An IPv6-only site.
-        let (_, addrs) = dns_at(&cx, &m, GATEWAY6.into(), "v6only.test", RecordType::AAAA).await;
+        let (_, addrs) = dns_at(&fcx, &m, GATEWAY6.into(), "v6only.test", RecordType::AAAA).await;
         assert_eq!(addrs, vec![IpAddr::V6(V6ONLY_ADDR6)]);
-        let conn = tls_connect(&cx, &m, &env, V6ONLY_ADDR6, "v6only.test", &[b"h2"]).await.unwrap();
-        let mut client = Client::new(&cx, conn, true).await;
+        let conn = tls_connect(&fcx, &m, &env, V6ONLY_ADDR6, "v6only.test", &[b"h2"]).await.unwrap();
+        let mut client = Client::new(&fcx, conn, true).await;
         assert_eq!(client.get("https", "v6only.test", "/").await.body, "secure https v6only.test 443 HTTP/2.0 #4");
 
         // Port 80: a TLS site redirects to https. A plain site at its
         // automatic IPv6 address answers. A request that names the bare
         // address in brackets gets 421, as it would over IPv4.
-        let conn = m.tcp.connect(&cx, SocketAddr::new(DUAL_ADDR6.into(), 80)).await.unwrap();
-        let mut client = Client::new(&cx, conn, false).await;
+        let conn = m.tcp.connect(&fcx, SocketAddr::new(DUAL_ADDR6.into(), 80)).await.unwrap();
+        let mut client = Client::new(&fcx, conn, false).await;
         let got = client.get("http", "dual.test", "/a?b").await;
         assert_eq!(got.status, StatusCode::MOVED_PERMANENTLY);
         assert_eq!(got.headers["location"], "https://dual.test/a?b");
-        let (_, plain) = dns_at(&cx, &m, GATEWAY6.into(), "plain.test", RecordType::AAAA).await;
-        let conn = m.tcp.connect(&cx, SocketAddr::new(plain[0], 80)).await.unwrap();
-        let mut client = Client::new(&cx, conn, false).await;
+        let (_, plain) = dns_at(&fcx, &m, GATEWAY6.into(), "plain.test", RecordType::AAAA).await;
+        let conn = m.tcp.connect(&fcx, SocketAddr::new(plain[0], 80)).await.unwrap();
+        let mut client = Client::new(&fcx, conn, false).await;
         assert_eq!(client.get("http", "plain.test", "/q").await.body, "plain http plain.test 80 HTTP/1.1 /q");
         let got = client.get("http", &format!("[{}]", plain[0]), "/q").await;
         assert_eq!(got.status, StatusCode::MISDIRECTED_REQUEST);
 
         // A TLS handshake to the bare address carries no SNI, and is
         // rejected.
-        let tcp = m.tcp.connect(&cx, SocketAddr::new(DUAL_ADDR6.into(), 443)).await.unwrap();
+        let tcp = m.tcp.connect(&fcx, SocketAddr::new(DUAL_ADDR6.into(), 443)).await.unwrap();
         let mut bare = TlsClient::new(tcp, &env.roots, &DUAL_ADDR6.to_string(), &[]);
-        assert!(bare.handshake(&cx).await.is_err());
+        assert!(bare.handshake(&fcx).await.is_err());
 
         // The events name the IPv6 addresses.
-        let tls = wait_for(&cx, &log, 5, tls_seen).await;
+        let tls = wait_for(&fcx, &log, 5, tls_seen).await;
         assert_eq!(addr(&tls[0], "addr"), Some(IpAddr::V6(DUAL_ADDR6)));
         assert_eq!(sandbox_of(&tls[0]).unwrap().addr_v6, Some(ME6));
         assert_eq!(sandbox_of(&tls[0]).unwrap().addr, None);
         assert_eq!((addr(&tls[4], "addr"), outcome(&tls[4])), (Some(IpAddr::V6(DUAL_ADDR6)), "rejected".to_owned()));
-        let http = wait_for(&cx, &log, 7, http_seen).await;
+        let http = wait_for(&fcx, &log, 7, http_seen).await;
         assert_eq!(local(&http[0]), SocketAddr::new(DUAL_ADDR6.into(), 443));
         assert_eq!(local(&http[2]), SocketAddr::new(DUAL_ADDR.into(), 443));
         assert_eq!(sandbox_of(&http[2]).unwrap().addr, Some(Ipv4Addr::new(10, 0, 0, 2)));
-        let dns = wait_for(&cx, &log, 3, dns_seen).await;
+        let dns = wait_for(&fcx, &log, 3, dns_seen).await;
         assert_eq!(answer(&dns[0]), format!("addr {DUAL_ADDR6}"));
         assert_eq!(dns[0].u64("qtype"), Some(28));
         Ok(())
@@ -3403,42 +3403,42 @@ fn https_http2_and_plain_http_over_ipv6() {
 
 #[test]
 fn ipv6_pings_closed_ports_and_unknown_addresses() {
-    world(|cx, attacher, _env| async move {
+    world(|fcx, attacher, _env| async move {
         let mut raw = attacher.attach("a").unwrap();
         let reply = |p: Packet| parse6(&p);
 
         // The gateway answers pings.
         raw.send(ping6(ME6, GATEWAY6, 1));
-        let (src, dst, next, icmp) = reply(recv_within(&cx, &mut raw, Duration::from_secs(2)).await.expect("an echo reply"));
+        let (src, dst, next, icmp) = reply(recv_within(&fcx, &mut raw, Duration::from_secs(2)).await.expect("an echo reply"));
         assert_eq!((src, dst, next, icmp[0]), (GATEWAY6, ME6, 58, 129));
 
         // An address that no site has: ICMPv6 address unreachable, at once,
         // from the gateway, quoting the packet.
         let sent = ping6(ME6, NOWHERE6, 2);
         raw.send(sent.clone());
-        let (src, dst, next, icmp) = reply(recv_within(&cx, &mut raw, Duration::from_secs(2)).await.expect("unreachable"));
+        let (src, dst, next, icmp) = reply(recv_within(&fcx, &mut raw, Duration::from_secs(2)).await.expect("unreachable"));
         assert_eq!((src, dst, next), (GATEWAY6, ME6, 58));
         assert_eq!((icmp[0], icmp[1]), (1, 3));
         assert_eq!(&icmp[8..], &sent.0[..]);
 
         // Once its name is looked up, a site's IPv6 address answers pings.
-        let (code, addrs) = raw_dns6(&cx, &mut raw, ME6, GATEWAY6, "plain.test", RecordType::AAAA).await.expect("DNS answers");
+        let (code, addrs) = raw_dns6(&fcx, &mut raw, ME6, GATEWAY6, "plain.test", RecordType::AAAA).await.expect("DNS answers");
         assert_eq!(code, ResponseCode::NoError);
         let IpAddr::V6(plain) = addrs[0] else { panic!("{addrs:?}") };
         raw.send(ping6(ME6, plain, 3));
-        let (src, _, _, icmp) = reply(recv_within(&cx, &mut raw, Duration::from_secs(2)).await.unwrap());
+        let (src, _, _, icmp) = reply(recv_within(&fcx, &mut raw, Duration::from_secs(2)).await.unwrap());
         assert_eq!((src, icmp[0]), (plain, 129));
 
         // A closed TCP port gets a RST; UDP gets port unreachable.
         raw.send(syn6(ME6, 30_000, plain, 22));
-        let (_, _, next, t) = reply(recv_within(&cx, &mut raw, Duration::from_secs(2)).await.unwrap());
+        let (_, _, next, t) = reply(recv_within(&fcx, &mut raw, Duration::from_secs(2)).await.unwrap());
         assert_eq!((next, t[13] & RST), (6, RST));
         raw.send(udp6(ME6, 1000, plain, 9999, b"hi"));
-        let (_, _, next, icmp) = reply(recv_within(&cx, &mut raw, Duration::from_secs(2)).await.unwrap());
+        let (_, _, next, icmp) = reply(recv_within(&fcx, &mut raw, Duration::from_secs(2)).await.unwrap());
         assert_eq!((next, icmp[0], icmp[1]), (58, 1, 4));
         // Port 80 is open.
         raw.send(syn6(ME6, 30_001, plain, 80));
-        let (_, _, next, t) = reply(recv_within(&cx, &mut raw, Duration::from_secs(2)).await.unwrap());
+        let (_, _, next, t) = reply(recv_within(&fcx, &mut raw, Duration::from_secs(2)).await.unwrap());
         assert_eq!((next, t[13] & (SYN | ACK)), (6, SYN | ACK));
 
         // No error for an ICMPv6 error, or for a router solicitation from a
@@ -3448,14 +3448,14 @@ fn ipv6_pings_closed_ports_and_unknown_addresses() {
         raw.send(checksummed6(ME6, NOWHERE6, 58, err, 2));
         let rs = checksummed6("fe80::1".parse().unwrap(), "ff02::2".parse().unwrap(), 58, vec![133, 0, 0, 0, 0, 0, 0, 0], 2);
         raw.send(rs);
-        assert!(recv_within(&cx, &mut raw, SHORT).await.is_none());
+        assert!(recv_within(&fcx, &mut raw, SHORT).await.is_none());
         Ok(())
     });
 }
 
 #[test]
 fn ipv6_addresses_are_bound_to_one_sandbox() {
-    world_events(|cx, attacher, _env, log| async move {
+    world_events(|fcx, attacher, _env, log| async move {
         let me4 = Ipv4Addr::new(10, 0, 0, 2);
         let mut a = attacher.attach("a").unwrap();
         // What a Linux sandbox sends first: a router solicitation from its
@@ -3464,15 +3464,15 @@ fn ipv6_addresses_are_bound_to_one_sandbox() {
         a.send(checksummed6(link_local, "ff02::2".parse().unwrap(), 58, vec![133, 0, 0, 0, 0, 0, 0, 0], 2));
         // Then its global address: bound. Then its IPv4 address: bound too.
         a.send(ping6(ME6, GATEWAY6, 1));
-        assert!(recv_within(&cx, &mut a, Duration::from_secs(2)).await.is_some());
+        assert!(recv_within(&fcx, &mut a, Duration::from_secs(2)).await.is_some());
         a.send(ping(me4, GATEWAY, 2));
-        assert!(recv_within(&cx, &mut a, Duration::from_secs(2)).await.is_some());
+        assert!(recv_within(&fcx, &mut a, Duration::from_secs(2)).await.is_some());
         // Another source, another sandbox, an address with no site.
         a.send(ping6("2001:db8::9".parse().unwrap(), GATEWAY6, 3));
         a.send(ping6(ME6, "2001:db8::3".parse().unwrap(), 4));
         a.send(ping6(link_local, GATEWAY6, 5));
         a.send(ping6(ME6, NOWHERE6, 6));
-        assert!(recv_within(&cx, &mut a, Duration::from_secs(2)).await.is_some(), "unreachable");
+        assert!(recv_within(&fcx, &mut a, Duration::from_secs(2)).await.is_some(), "unreachable");
 
         // A second sandbox cannot take the first one's address, the
         // gateway's, the subnet's first address, or one outside the subnet.
@@ -3480,9 +3480,9 @@ fn ipv6_addresses_are_bound_to_one_sandbox() {
         for src in [ME6, GATEWAY6, "2001:db8::".parse().unwrap(), "2001:db8:1::5".parse().unwrap()] {
             b.send(ping6(src, GATEWAY6, 7));
         }
-        assert!(recv_within(&cx, &mut b, SHORT).await.is_none());
+        assert!(recv_within(&fcx, &mut b, SHORT).await.is_none());
 
-        let got = wait_for(&cx, &log, 9, blocked_seen).await;
+        let got = wait_for(&fcx, &log, 9, blocked_seen).await;
         let summary: Vec<_> =
             got.iter().map(|b| (&*sandbox_of(b).unwrap().name, b.str("why").unwrap(), sandbox_of(b).unwrap().addr_v6, addr(b, "src"), addr(b, "dst"))).collect();
         let v6 = |a: Ipv6Addr| Some(IpAddr::V6(a));
@@ -3504,7 +3504,7 @@ fn ipv6_addresses_are_bound_to_one_sandbox() {
 
         // One `bound` for each family, and a `detached` that names both.
         drop(a);
-        wait_for(&cx, &log, 1, seen("net", "detached")).await;
+        wait_for(&fcx, &log, 1, seen("net", "detached")).await;
         let a_events = picked(&log, |e| (e.source == "net" && e.kind != "blocked" && &*sandbox_of(e)?.name == "a").then(|| e.clone()));
         let kinds: Vec<_> = a_events.iter().map(|e| e.kind).collect();
         assert_eq!(kinds, ["attached", "bound", "bound", "detached"], "{a_events:#?}");
@@ -3516,7 +3516,7 @@ fn ipv6_addresses_are_bound_to_one_sandbox() {
 
         // Now the address is free, and the second sandbox can take it.
         b.send(ping6(ME6, GATEWAY6, 8));
-        let (src, dst, _, icmp) = parse6(&recv_within(&cx, &mut b, Duration::from_secs(2)).await.expect("an echo reply"));
+        let (src, dst, _, icmp) = parse6(&recv_within(&fcx, &mut b, Duration::from_secs(2)).await.expect("an echo reply"));
         assert_eq!((src, dst, icmp[0]), (GATEWAY6, ME6, 129));
         Ok(())
     });
@@ -3529,11 +3529,11 @@ where
     Fut: Future<Output = fictionet::Result> + Send + 'static,
 {
     let result = within(Duration::from_secs(60), move || {
-        block_on(run(move |cx| async move {
+        block_on(run(move |fcx| async move {
             let (attacher, attachments) = fictionet::attachments();
-            make().serve(&cx, attachments)?;
-            let log = Log::new(&cx);
-            f(cx, attacher, log).await?;
+            make().serve(&fcx, attachments)?;
+            let log = Log::new(&fcx);
+            f(fcx, attacher, log).await?;
             Err(fictionet::Error::from(Done))
         }))
     });
@@ -3553,19 +3553,19 @@ fn an_ipv4_only_network_drops_ipv6_and_answers_aaaa_with_nodata() {
         })
         .ipv4_only()
     };
-    world_of(make, |cx, attacher, log| async move {
-        let m = machine(&cx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+    world_of(make, |fcx, attacher, log| async move {
+        let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
         let gw = IpAddr::V4(GATEWAY);
         // An IPv6 `at` is not used: the site gets an automatic IPv4 address.
-        assert_eq!(dns_at(&cx, &m, gw, "one.test", RecordType::A).await, (ResponseCode::NoError, vec![Ipv4Addr::new(198, 18, 0, 1).into()]));
-        assert_eq!(dns_at(&cx, &m, gw, "one.test", RecordType::AAAA).await, (ResponseCode::NoError, vec![]));
+        assert_eq!(dns_at(&fcx, &m, gw, "one.test", RecordType::A).await, (ResponseCode::NoError, vec![Ipv4Addr::new(198, 18, 0, 1).into()]));
+        assert_eq!(dns_at(&fcx, &m, gw, "one.test", RecordType::AAAA).await, (ResponseCode::NoError, vec![]));
         // An IPv6-only site has no address at all.
-        assert_eq!(dns_at(&cx, &m, gw, "six.test", RecordType::AAAA).await, (ResponseCode::NXDomain, vec![]));
+        assert_eq!(dns_at(&fcx, &m, gw, "six.test", RecordType::AAAA).await, (ResponseCode::NXDomain, vec![]));
 
         let mut raw = attacher.attach("b").unwrap();
         raw.send(ping6(ME6, GATEWAY6, 1));
-        assert!(recv_within(&cx, &mut raw, SHORT).await.is_none());
-        let got = wait_for(&cx, &log, 1, blocked_seen).await;
+        assert!(recv_within(&fcx, &mut raw, SHORT).await.is_none());
+        let got = wait_for(&fcx, &log, 1, blocked_seen).await;
         assert_eq!((got[0].str("why"), addr(&got[0], "dst")), (Some("Ipv6"), Some(IpAddr::V6(GATEWAY6))));
         Ok(())
     });
@@ -3578,16 +3578,16 @@ fn automatic_ipv6_addresses_skip_the_sandboxes_subnet() {
         web::Sites::new(|host| host.ends_with(".test").then(|| web::Site::new(Plain("auto"))))
             .subnet("2001:2::/64".parse().unwrap())
     };
-    world_of(make, |cx, attacher, _log| async move {
+    world_of(make, |fcx, attacher, _log| async move {
         let (gw, me): (Ipv6Addr, Ipv6Addr) = ("2001:2::1".parse().unwrap(), "2001:2::2".parse().unwrap());
         let mut raw = attacher.attach("a").unwrap();
-        let (_, first) = raw_dns6(&cx, &mut raw, me, gw, "one.test", RecordType::AAAA).await.expect("DNS answers");
+        let (_, first) = raw_dns6(&fcx, &mut raw, me, gw, "one.test", RecordType::AAAA).await.expect("DNS answers");
         assert_eq!(first, vec![IpAddr::V6("2001:2:0:1::".parse().unwrap())]);
-        let (_, second) = raw_dns6(&cx, &mut raw, me, gw, "two.test", RecordType::AAAA).await.expect("DNS answers");
+        let (_, second) = raw_dns6(&fcx, &mut raw, me, gw, "two.test", RecordType::AAAA).await.expect("DNS answers");
         assert_eq!(second, vec![IpAddr::V6("2001:2:0:1::1".parse().unwrap())]);
         let IpAddr::V6(site) = first[0] else { unreachable!() };
         raw.send(ping6(me, site, 1));
-        let (src, _, _, icmp) = parse6(&recv_within(&cx, &mut raw, SHORT).await.expect("an echo reply"));
+        let (src, _, _, icmp) = parse6(&recv_within(&fcx, &mut raw, SHORT).await.expect("an echo reply"));
         assert_eq!((src, icmp[0]), (site, 129));
         Ok(())
     });
@@ -3598,11 +3598,11 @@ fn automatic_ipv6_addresses_skip_the_sandboxes_subnet() {
         web::Sites::new(|host| host.ends_with(".test").then(|| web::Site::new(Plain("auto"))))
             .subnet("2001::/16".parse().unwrap())
     };
-    world_of(make, |cx, attacher, _log| async move {
-        let m = machine(&cx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+    world_of(make, |fcx, attacher, _log| async move {
+        let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
         let gw = IpAddr::V4(GATEWAY);
-        assert_eq!(dns_at(&cx, &m, gw, "one.test", RecordType::AAAA).await, (ResponseCode::NoError, vec![]));
-        assert_eq!(dns_at(&cx, &m, gw, "one.test", RecordType::A).await, (ResponseCode::NoError, vec![Ipv4Addr::new(198, 18, 0, 1).into()]));
+        assert_eq!(dns_at(&fcx, &m, gw, "one.test", RecordType::AAAA).await, (ResponseCode::NoError, vec![]));
+        assert_eq!(dns_at(&fcx, &m, gw, "one.test", RecordType::A).await, (ResponseCode::NoError, vec![Ipv4Addr::new(198, 18, 0, 1).into()]));
         Ok(())
     });
 }
@@ -3640,30 +3640,30 @@ fn with_header(packet: &Packet, next: u8, header: &[u8]) -> Packet {
 /// that packet and read its data.
 #[test]
 fn fragments_do_not_outlive_their_sandbox() {
-    world(|cx, attacher, _| async move {
+    world(|fcx, attacher, _| async move {
         let mut a = attacher.attach("a").unwrap();
         let whole = echo6_with(b"SECRET-Atailtail");
         a.send(fragment6(ME6, GATEWAY6, 12345, 0, true, 58, &whole.0[40..56]));
-        assert!(recv_within(&cx, &mut a, Duration::from_millis(20)).await.is_none());
+        assert!(recv_within(&fcx, &mut a, Duration::from_millis(20)).await.is_none());
         drop(a);
         // b takes the address once a's filter has let it go.
         let mut b = attacher.attach("b").unwrap();
         let mut bound = false;
         for seq in 0..100 {
             b.send(ping6(ME6, GATEWAY6, seq));
-            if recv_within(&cx, &mut b, Duration::from_millis(20)).await.is_some() {
+            if recv_within(&fcx, &mut b, Duration::from_millis(20)).await.is_some() {
                 bound = true;
                 break;
             }
         }
         assert!(bound);
         b.send(fragment6(ME6, GATEWAY6, 12345, 16, false, 58, &whole.0[56..]));
-        assert!(recv_within(&cx, &mut b, SHORT).await.is_none(), "a's fragment completed b's packet");
+        assert!(recv_within(&fcx, &mut b, SHORT).await.is_none(), "a's fragment completed b's packet");
         // b's own fragments still make a packet.
         let mine = echo6_with(b"b's own packet!!");
         b.send(fragment6(ME6, GATEWAY6, 777, 0, true, 58, &mine.0[40..56]));
         b.send(fragment6(ME6, GATEWAY6, 777, 16, false, 58, &mine.0[56..]));
-        let reply = recv_within(&cx, &mut b, SHORT).await.expect("an echo reply");
+        let reply = recv_within(&fcx, &mut b, SHORT).await.expect("an echo reply");
         let (_, dst, next, body) = parse6(&reply);
         assert_eq!((dst, next, body[0]), (ME6, 58, 129));
         assert_eq!(&body[8..], b"b's own packet!!");
@@ -3676,7 +3676,7 @@ fn fragments_do_not_outlive_their_sandbox() {
 /// it again.
 #[test]
 fn conflicting_fragments_drop_the_packet() {
-    world(|cx, attacher, _| async move {
+    world(|fcx, attacher, _| async move {
         let mut raw = attacher.attach("a").unwrap();
         let whole = echo6_with(b"abcdefghABCDEFGH");
         let first = &whole.0[40..56];
@@ -3685,16 +3685,16 @@ fn conflicting_fragments_drop_the_packet() {
         raw.send(fragment6(ME6, GATEWAY6, 9876, 0, true, 58, first));
         raw.send(fragment6(ME6, GATEWAY6, 9876, 0, true, 58, &conflicting));
         raw.send(fragment6(ME6, GATEWAY6, 9876, 16, false, 58, &whole.0[56..]));
-        assert!(recv_within(&cx, &mut raw, SHORT).await.is_none(), "a packet with conflicting fragments was delivered");
+        assert!(recv_within(&fcx, &mut raw, SHORT).await.is_none(), "a packet with conflicting fragments was delivered");
         // The same fragments again, without the conflict: still dropped.
         raw.send(fragment6(ME6, GATEWAY6, 9876, 0, true, 58, first));
         raw.send(fragment6(ME6, GATEWAY6, 9876, 16, false, 58, &whole.0[56..]));
-        assert!(recv_within(&cx, &mut raw, SHORT).await.is_none(), "a dropped packet was started again");
+        assert!(recv_within(&fcx, &mut raw, SHORT).await.is_none(), "a dropped packet was started again");
         // An exact copy of a fragment is not a conflict.
         raw.send(fragment6(ME6, GATEWAY6, 9877, 0, true, 58, first));
         raw.send(fragment6(ME6, GATEWAY6, 9877, 0, true, 58, first));
         raw.send(fragment6(ME6, GATEWAY6, 9877, 16, false, 58, &whole.0[56..]));
-        let reply = recv_within(&cx, &mut raw, SHORT).await.expect("an echo reply");
+        let reply = recv_within(&fcx, &mut raw, SHORT).await.expect("an echo reply");
         let (_, _, next, body) = parse6(&reply);
         assert_eq!((next, body[0]), (58, 129));
         assert_eq!(&body[8..], b"abcdefghABCDEFGH");
@@ -3706,7 +3706,7 @@ fn conflicting_fragments_drop_the_packet() {
 /// at the gateway and at a site.
 #[test]
 fn tcp_behind_extension_headers_is_accepted() {
-    world(|cx, attacher, _| async move {
+    world(|fcx, attacher, _| async move {
         let mut raw = attacher.attach("a").unwrap();
         let headers: [(u8, [u8; 8]); 3] = [
             (60, [6, 0, 0, 0, 0, 0, 0, 0]),       // Destination Options: Pad1 only.
@@ -3716,7 +3716,7 @@ fn tcp_behind_extension_headers_is_accepted() {
         for (i, (next, header)) in headers.into_iter().enumerate() {
             let syn = syn6(ME6, 40000 + i as u16, GATEWAY6, 53);
             raw.send(with_header(&syn, next, &header));
-            let reply = recv_within(&cx, &mut raw, SHORT).await.expect("a reply");
+            let reply = recv_within(&fcx, &mut raw, SHORT).await.expect("a reply");
             let (_, dst, proto, body) = parse6(&reply);
             assert_eq!((dst, proto), (ME6, 6), "header {i}");
             assert_eq!(u16::from_be_bytes([body[2], body[3]]), 40000 + i as u16);
@@ -3724,13 +3724,13 @@ fn tcp_behind_extension_headers_is_accepted() {
         }
         // A site's machine: look one up, then send it a SYN behind
         // Destination Options.
-        let (_, addrs) = raw_dns6(&cx, &mut raw, ME6, GATEWAY6, "plain.test", RecordType::AAAA).await.unwrap();
+        let (_, addrs) = raw_dns6(&fcx, &mut raw, ME6, GATEWAY6, "plain.test", RecordType::AAAA).await.unwrap();
         let IpAddr::V6(site) = addrs[0] else { panic!("an AAAA record") };
         let syn = syn6(ME6, 41000, site, 80);
         let mut body = vec![6, 0, 0, 0, 0, 0, 0, 0];
         body.extend_from_slice(&syn.0[40..]);
         raw.send(ipv6(ME6, site, 60, &body));
-        let reply = recv_within(&cx, &mut raw, SHORT).await.expect("a reply from the site");
+        let reply = recv_within(&fcx, &mut raw, SHORT).await.expect("a reply from the site");
         let (src, _, proto, body) = parse6(&reply);
         assert_eq!((src, proto, body[13]), (site, 6, SYN | ACK));
         Ok(())
@@ -3742,12 +3742,12 @@ fn tcp_behind_extension_headers_is_accepted() {
 /// ICMPv6 "parameter problem" that points at the byte at fault.
 #[test]
 fn extension_headers_a_host_must_refuse_are_refused() {
-    world(|cx, attacher, _| async move {
+    world(|fcx, attacher, _| async move {
         let mut raw = attacher.attach("a").unwrap();
         let ping = ping6(ME6, GATEWAY6, 7);
         // An unknown option whose type says to discard: nothing comes back.
         raw.send(with_header(&ping, 60, &[58, 0, 0x40, 0, 0, 0, 0, 0]));
-        assert!(recv_within(&cx, &mut raw, SHORT).await.is_none(), "a discard option was delivered");
+        assert!(recv_within(&fcx, &mut raw, SHORT).await.is_none(), "a discard option was delivered");
         // (next header, header, code, pointer)
         let refused: [(u8, Vec<u8>, u8, u32); 4] = [
             // An unknown routing type with a segment left: points at the type.
@@ -3762,17 +3762,17 @@ fn extension_headers_a_host_must_refuse_are_refused() {
         for (next, header, code, pointer) in refused {
             let sent = with_header(&ping, next, &header);
             raw.send(sent.clone());
-            let reply = recv_within(&cx, &mut raw, SHORT).await.expect("a parameter problem");
+            let reply = recv_within(&fcx, &mut raw, SHORT).await.expect("a parameter problem");
             let (src, dst, proto, body) = parse6(&reply);
             assert_eq!((src, dst, proto), (GATEWAY6, ME6, 58));
             assert_eq!((body[0], body[1]), (4, code), "{header:?}");
             assert_eq!(u32::from_be_bytes([body[4], body[5], body[6], body[7]]), pointer, "{header:?}");
             assert_eq!(&body[8..], &sent.0[..], "the packet is quoted");
-            assert!(recv_within(&cx, &mut raw, Duration::from_millis(50)).await.is_none(), "{header:?} was delivered too");
+            assert!(recv_within(&fcx, &mut raw, Duration::from_millis(50)).await.is_none(), "{header:?} was delivered too");
         }
         // A routing header with no segments left asks nothing of the host.
         raw.send(with_header(&ping, 43, &[58, 0, 250, 0, 0, 0, 0, 0]));
-        let reply = recv_within(&cx, &mut raw, SHORT).await.expect("an echo reply");
+        let reply = recv_within(&fcx, &mut raw, SHORT).await.expect("an echo reply");
         assert_eq!(parse6(&reply).3[0], 129);
         Ok(())
     });
@@ -3782,7 +3782,7 @@ fn extension_headers_a_host_must_refuse_are_refused() {
 /// IPv6, DNS drops it, even when the sum over the datagram comes out right.
 #[test]
 fn dns_drops_a_zero_udp_checksum_over_ipv6() {
-    world(|cx, attacher, _| async move {
+    world(|fcx, attacher, _| async move {
         let mut raw = attacher.attach("a").unwrap();
         let mut q = Message::query();
         q.metadata.id = 0;
@@ -3799,12 +3799,12 @@ fn dns_drops_a_zero_udp_checksum_over_ipv6() {
         u[8..].copy_from_slice(&bytes);
         assert_eq!(ip::transport_checksum(ME6.into(), GATEWAY6.into(), 17, &u), 0);
         raw.send(ipv6(ME6, GATEWAY6, 17, &u));
-        assert!(recv_within(&cx, &mut raw, SHORT).await.is_none(), "a zero UDP checksum was accepted over IPv6");
+        assert!(recv_within(&fcx, &mut raw, SHORT).await.is_none(), "a zero UDP checksum was accepted over IPv6");
         // The same datagram as a sender must send it: 0xffff for a sum of
         // zero. That is answered.
         u[6..8].copy_from_slice(&[0xff, 0xff]);
         raw.send(ipv6(ME6, GATEWAY6, 17, &u));
-        let reply = recv_within(&cx, &mut raw, SHORT).await.expect("a DNS answer");
+        let reply = recv_within(&fcx, &mut raw, SHORT).await.expect("a DNS answer");
         let (_, _, next, body) = parse6(&reply);
         assert_eq!(next, 17);
         let answer = Message::from_vec(&body[8..]).unwrap();
@@ -3819,27 +3819,27 @@ fn dns_drops_a_zero_udp_checksum_over_ipv6() {
 #[test]
 fn dns_makes_no_more_sites_than_the_limit() {
     let make = || web::Sites::new(|_| Some(web::Site::new(Plain("wildcard")).ipv6_only())).max_sites(8);
-    world_of(make, |cx, attacher, log| async move {
+    world_of(make, |fcx, attacher, log| async move {
         let mut raw = attacher.attach("a").unwrap();
         for i in 0..8 {
             // A questions make the site too, and get NODATA.
-            let answer = raw_dns6(&cx, &mut raw, ME6, GATEWAY6, &format!("n{i}.test"), RecordType::A).await.unwrap();
+            let answer = raw_dns6(&fcx, &mut raw, ME6, GATEWAY6, &format!("n{i}.test"), RecordType::A).await.unwrap();
             assert_eq!(answer, (ResponseCode::NoError, vec![]));
         }
         for name in ["n8.test", "n9.test", "n8.test"] {
-            let answer = raw_dns6(&cx, &mut raw, ME6, GATEWAY6, name, RecordType::AAAA).await.unwrap();
+            let answer = raw_dns6(&fcx, &mut raw, ME6, GATEWAY6, name, RecordType::AAAA).await.unwrap();
             assert_eq!(answer, (ResponseCode::ServFail, vec![]), "{name}");
         }
         assert_eq!(picked(&log, dns_seen).iter().filter(|d| answer(d) == "error 2").count(), 3);
         // The first eight still answer, and have machines.
         let site0 = Ipv6Addr::from(u128::from("2001:2::".parse::<Ipv6Addr>().unwrap()) + 1);
-        let answer = raw_dns6(&cx, &mut raw, ME6, GATEWAY6, "n0.test", RecordType::AAAA).await.unwrap();
+        let answer = raw_dns6(&fcx, &mut raw, ME6, GATEWAY6, "n0.test", RecordType::AAAA).await.unwrap();
         assert_eq!(answer, (ResponseCode::NoError, vec![site0.into()]));
         let base = u128::from("2001:2::".parse::<Ipv6Addr>().unwrap());
         for i in 1..=9u16 {
             let addr = Ipv6Addr::from(base + u128::from(i));
             raw.send(ping6(ME6, addr, i));
-            let reply = recv_within(&cx, &mut raw, SHORT).await.expect("a reply");
+            let reply = recv_within(&fcx, &mut raw, SHORT).await.expect("a reply");
             let (src, _, _, body) = parse6(&reply);
             if i <= 8 {
                 assert_eq!((src, body[0]), (addr, 129), "site {i} answers pings");
@@ -3865,24 +3865,24 @@ fn nested6(outer_id: u32, inner: &Packet) -> Packet {
 /// later sandbox could complete it.
 #[test]
 fn a_fragment_inside_a_fragment_is_dropped() {
-    world(|cx, attacher, _| async move {
+    world(|fcx, attacher, _| async move {
         let mut a = attacher.attach("a").unwrap();
         let whole = echo6_with(b"SECRET-Atailtail");
         a.send(nested6(1, &fragment6(ME6, GATEWAY6, 4242, 0, true, 58, &whole.0[40..56])));
-        assert!(recv_within(&cx, &mut a, Duration::from_millis(20)).await.is_none());
+        assert!(recv_within(&fcx, &mut a, Duration::from_millis(20)).await.is_none());
         drop(a);
         let mut b = attacher.attach("b").unwrap();
         let mut bound = false;
         for seq in 0..100 {
             b.send(ping6(ME6, GATEWAY6, seq));
-            if recv_within(&cx, &mut b, Duration::from_millis(20)).await.is_some() {
+            if recv_within(&fcx, &mut b, Duration::from_millis(20)).await.is_some() {
                 bound = true;
                 break;
             }
         }
         assert!(bound);
         b.send(nested6(2, &fragment6(ME6, GATEWAY6, 4242, 16, false, 58, &whole.0[56..])));
-        assert!(recv_within(&cx, &mut b, SHORT).await.is_none(), "a nested fragment completed a's packet");
+        assert!(recv_within(&fcx, &mut b, SHORT).await.is_none(), "a nested fragment completed a's packet");
         Ok(())
     });
 }
@@ -3891,7 +3891,7 @@ fn a_fragment_inside_a_fragment_is_dropped() {
 /// fragment's, and a first fragment must hold the whole chain (RFC 7112).
 #[test]
 fn every_fragments_headers_are_checked() {
-    world(|cx, attacher, _| async move {
+    world(|fcx, attacher, _| async move {
         let mut raw = attacher.attach("a").unwrap();
         // The last fragment behind Hop-by-Hop with an option that says to
         // discard: the packet is never delivered.
@@ -3901,19 +3901,19 @@ fn every_fragments_headers_are_checked() {
         let mut body = vec![44, 0, 0x40, 0, 0, 0, 0, 0];
         body.extend_from_slice(&last.0[40..]);
         raw.send(ipv6(ME6, GATEWAY6, 0, &body));
-        assert!(recv_within(&cx, &mut raw, SHORT).await.is_none(), "a discard option on a later fragment was ignored");
+        assert!(recv_within(&fcx, &mut raw, SHORT).await.is_none(), "a discard option on a later fragment was ignored");
         // A Destination Options header cut in two by the fragments: the
         // first fragment gets "parameter problem" code 3, pointer 0.
         let mut dest = vec![58, 1, 1, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         dest.extend_from_slice(&whole.0[40..]);
         let first = fragment6(ME6, GATEWAY6, 32, 0, true, 60, &dest[..8]);
         raw.send(first.clone());
-        let reply = recv_within(&cx, &mut raw, SHORT).await.expect("a parameter problem");
+        let reply = recv_within(&fcx, &mut raw, SHORT).await.expect("a parameter problem");
         let (src, _, proto, body) = parse6(&reply);
         assert_eq!((src, proto, body[0], body[1]), (GATEWAY6, 58, 4, 3));
         assert_eq!(&body[4..8], &[0, 0, 0, 0]);
         raw.send(fragment6(ME6, GATEWAY6, 32, 8, false, 60, &dest[8..]));
-        assert!(recv_within(&cx, &mut raw, SHORT).await.is_none(), "a split chain was delivered");
+        assert!(recv_within(&fcx, &mut raw, SHORT).await.is_none(), "a split chain was delivered");
         Ok(())
     });
 }
@@ -3922,13 +3922,13 @@ fn every_fragments_headers_are_checked() {
 /// (RFC 4443, section 2.4).
 #[test]
 fn a_redirect_gets_no_parameter_problem() {
-    world(|cx, attacher, _| async move {
+    world(|fcx, attacher, _| async move {
         let mut raw = attacher.attach("a").unwrap();
         raw.send(ping6(ME6, GATEWAY6, 1));
-        assert!(recv_within(&cx, &mut raw, SHORT).await.is_some());
+        assert!(recv_within(&fcx, &mut raw, SHORT).await.is_some());
         let redirect = checksummed6(ME6, GATEWAY6, 58, [vec![137, 0, 0, 0], vec![0; 36]].concat(), 2);
         raw.send(with_header(&redirect, 60, &[58, 0, 0x80, 0, 0, 0, 0, 0]));
-        assert!(recv_within(&cx, &mut raw, SHORT).await.is_none(), "a redirect got an error");
+        assert!(recv_within(&fcx, &mut raw, SHORT).await.is_none(), "a redirect got an error");
         Ok(())
     });
 }
@@ -3938,18 +3938,18 @@ fn a_redirect_gets_no_parameter_problem() {
 /// to answer "parameter problem".
 #[test]
 fn refused_headers_to_nowhere_get_address_unreachable() {
-    world(|cx, attacher, _| async move {
+    world(|fcx, attacher, _| async move {
         let mut raw = attacher.attach("a").unwrap();
         raw.send(ping6(ME6, GATEWAY6, 1));
-        assert!(recv_within(&cx, &mut raw, SHORT).await.is_some());
+        assert!(recv_within(&fcx, &mut raw, SHORT).await.is_some());
         let ping = ping6(ME6, NOWHERE6, 2);
         let mut body = vec![58, 0, 250, 1, 0, 0, 0, 0];
         body.extend_from_slice(&ping.0[40..]);
         raw.send(ipv6(ME6, NOWHERE6, 43, &body));
-        let reply = recv_within(&cx, &mut raw, SHORT).await.expect("an answer");
+        let reply = recv_within(&fcx, &mut raw, SHORT).await.expect("an answer");
         let (src, _, proto, body) = parse6(&reply);
         assert_eq!((src, proto, body[0], body[1]), (GATEWAY6, 58, 1, 3));
-        assert!(recv_within(&cx, &mut raw, Duration::from_millis(50)).await.is_none());
+        assert!(recv_within(&fcx, &mut raw, Duration::from_millis(50)).await.is_none());
         Ok(())
     });
 }

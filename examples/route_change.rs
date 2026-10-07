@@ -24,12 +24,12 @@ const TIME_LIMIT: Duration = Duration::from_secs(10);
 
 /// Starts a machine at `addr` on `side` that answers every HTTP request
 /// on port 80 with `body`.
-fn web_machine(cx: &Cx, side: impl Interface, addr: IpAddr, body: &'static str) -> fictionet::Result {
-    let (tcp, _udp, _icmp, _other) = ip::split_protocols(cx, side);
-    let mut listener = tcp::endpoint(cx, tcp, addr).listen(80)?;
+fn web_machine(fcx: &Cx, side: impl Interface, addr: IpAddr, body: &'static str) -> fictionet::Result {
+    let (tcp, _udp, _icmp, _other) = ip::split_protocols(fcx, side);
+    let mut listener = tcp::endpoint(fcx, tcp, addr).listen(80)?;
     let open = Arc::new(AtomicUsize::new(0));
-    cx.spawn(move |cx| async move {
-        while let Ok(mut conn) = listener.accept(&cx).await {
+    fcx.spawn(move |fcx| async move {
+        while let Ok(mut conn) = listener.accept(&fcx).await {
             if open.fetch_add(1, Ordering::Relaxed) >= MAX_CONNECTIONS {
                 // Too many.
                 open.fetch_sub(1, Ordering::Relaxed);
@@ -39,10 +39,10 @@ fn web_machine(cx: &Cx, side: impl Interface, addr: IpAddr, body: &'static str) 
             let open = open.clone();
             // One task per connection. It returns `Ok` whatever happens,
             // so a client that misbehaves cannot fail the world.
-            cx.spawn(move |cx| async move {
+            fcx.spawn(move |fcx| async move {
                 tokio::select! {
-                    _ = answer(&cx, &mut conn, body) => {}
-                    _ = cx.sleep(TIME_LIMIT) => {}
+                    _ = answer(&fcx, &mut conn, body) => {}
+                    _ = fcx.sleep(TIME_LIMIT) => {}
                 }
                 conn.reset();
                 open.fetch_sub(1, Ordering::Relaxed);
@@ -56,12 +56,12 @@ fn web_machine(cx: &Cx, side: impl Interface, addr: IpAddr, body: &'static str) 
 
 /// Reads one request, answers it with `body`, and waits for the client to
 /// close its side: by then it has read the answer.
-async fn answer(cx: &Cx, conn: &mut tcp::TcpConnection, body: &str) {
+async fn answer(fcx: &Cx, conn: &mut tcp::TcpConnection, body: &str) {
     // Read until the blank line that ends the headers, up to 8 KiB.
     let mut request = [0u8; 8192];
     let mut len = 0;
     while !request[..len].windows(4).any(|w| w == b"\r\n\r\n") {
-        match conn.read(cx, &mut request[len..]).await {
+        match conn.read(fcx, &mut request[len..]).await {
             Ok(0) | Err(_) => return,
             Ok(n) => len += n,
         }
@@ -70,10 +70,10 @@ async fn answer(cx: &Cx, conn: &mut tcp::TcpConnection, body: &str) {
     let content = if request.starts_with(b"HEAD ") { "" } else { body };
     let response =
         format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{content}", body.len());
-    if conn.write_all(cx, response.as_bytes()).await.is_err() || conn.shutdown(cx).await.is_err() {
+    if conn.write_all(fcx, response.as_bytes()).await.is_err() || conn.shutdown(fcx).await.is_err() {
         return;
     }
-    while let Ok(1..) = conn.read(cx, &mut request).await {}
+    while let Ok(1..) = conn.read(fcx, &mut request).await {}
 }
 
 fn main() -> fictionet::Result {
@@ -84,15 +84,15 @@ fn main() -> fictionet::Result {
     let _listening = fictionet::listen(fictionet::WorldSocket::UnixSocket(path.clone().into()), attacher)?;
     println!("listening on {path}");
 
-    fictionet::block_on(fictionet::run(move |cx| async move {
-        let agent = attachments.get(&cx, "agent").await?;
+    fictionet::block_on(fictionet::run(move |fcx| async move {
+        let agent = attachments.get(&fcx, "agent").await?;
         let (to_bank, bank_side) = pair();
-        web_machine(&cx, bank_side, "203.0.113.10".parse()?, "the real bank\n")?;
+        web_machine(&fcx, bank_side, "203.0.113.10".parse()?, "the real bank\n")?;
 
         // The sandbox's subnet leads to the sandbox, and the bank's
         // network to the bank.
         let router = route::router(
-            &cx,
+            &fcx,
             vec![
                 ("10.0.0.0/24".parse()?, Box::new(agent) as Box<dyn Interface>),
                 ("203.0.113.0/24".parse()?, Box::new(to_bank)),
@@ -100,13 +100,13 @@ fn main() -> fictionet::Result {
         );
         println!("agent attached: 203.0.113.0/24 leads to the bank");
 
-        cx.sleep(Duration::from_secs(after)).await?;
+        fcx.sleep(Duration::from_secs(after)).await?;
 
         // A more specific route wins, as in a real hijack: the bank's
         // address now leads to the impostor. The rest of 203.0.113.0/24
         // still leads to the bank.
         let (to_impostor, impostor_side) = pair();
-        web_machine(&cx, impostor_side, "203.0.113.10".parse()?, "an impostor\n")?;
+        web_machine(&fcx, impostor_side, "203.0.113.10".parse()?, "an impostor\n")?;
         router.add("203.0.113.10/32".parse()?, Box::new(to_impostor));
         println!("{after} s later: 203.0.113.10/32 leads to the impostor");
         Ok(())

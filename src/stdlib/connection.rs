@@ -27,7 +27,7 @@ use fictionet::{Cancelled, Cx};
 /// `Box<dyn Connection>`, which is itself a `Connection`.
 ///
 /// For libraries that expect tokio's `AsyncRead` and `AsyncWrite`, such as
-/// hyper and axum, call `conn.into_tokio(&cx)` from the `fictionet::tokio`
+/// hyper and axum, call `conn.into_tokio(&fcx)` from the `fictionet::tokio`
 /// module (feature `tokio`).
 ///
 /// A connection knows nothing about addresses. To see who connected, ask
@@ -40,8 +40,8 @@ pub trait Connection: Send + 'static {
     /// nothing more.
     fn poll_read(
         &mut self,
-        cx: &Cx,
-        task: &mut Context<'_>,
+        fcx: &Cx,
+        cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<Result<usize, ConnError>>;
 
@@ -54,11 +54,11 @@ pub trait Connection: Send + 'static {
     /// Bytes that were taken are on their way. There is no separate flush,
     /// so a middleware such as TLS must hand its output on before it reports
     /// bytes as taken.
-    fn poll_write(&mut self, cx: &Cx, task: &mut Context<'_>, data: &[u8]) -> Poll<Result<usize, ConnError>>;
+    fn poll_write(&mut self, fcx: &Cx, cx: &mut Context<'_>, data: &[u8]) -> Poll<Result<usize, ConnError>>;
 
     /// Polls to say this side will send nothing more. For TCP this sends a
     /// FIN. For TLS it first sends `close_notify`. Reading still works.
-    fn poll_shutdown(&mut self, cx: &Cx, task: &mut Context<'_>) -> Poll<Result<(), ConnError>>;
+    fn poll_shutdown(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<(), ConnError>>;
 
     /// Ready once the other side has reset the connection, or it is gone,
     /// without reading from it: for a server that is busy with a request
@@ -66,7 +66,7 @@ pub trait Connection: Send + 'static {
     /// connection that cannot tell, such as a test pipe, is never ready,
     /// which is the default. Middleware passes it on to the connection
     /// underneath.
-    fn poll_gone(&self, _task: &mut Context<'_>) -> Poll<()> {
+    fn poll_gone(&self, _cx: &mut Context<'_>) -> Poll<()> {
         Poll::Pending
     }
 }
@@ -74,23 +74,23 @@ pub trait Connection: Send + 'static {
 impl Connection for Box<dyn Connection> {
     fn poll_read(
         &mut self,
-        cx: &Cx,
-        task: &mut Context<'_>,
+        fcx: &Cx,
+        cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<Result<usize, ConnError>> {
-        (**self).poll_read(cx, task, buf)
+        (**self).poll_read(fcx, cx, buf)
     }
 
-    fn poll_write(&mut self, cx: &Cx, task: &mut Context<'_>, data: &[u8]) -> Poll<Result<usize, ConnError>> {
-        (**self).poll_write(cx, task, data)
+    fn poll_write(&mut self, fcx: &Cx, cx: &mut Context<'_>, data: &[u8]) -> Poll<Result<usize, ConnError>> {
+        (**self).poll_write(fcx, cx, data)
     }
 
-    fn poll_shutdown(&mut self, cx: &Cx, task: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
-        (**self).poll_shutdown(cx, task)
+    fn poll_shutdown(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
+        (**self).poll_shutdown(fcx, cx)
     }
 
-    fn poll_gone(&self, task: &mut Context<'_>) -> Poll<()> {
-        (**self).poll_gone(task)
+    fn poll_gone(&self, cx: &mut Context<'_>) -> Poll<()> {
+        (**self).poll_gone(cx)
     }
 }
 
@@ -103,20 +103,20 @@ pub trait ConnectionExt: Connection {
     /// other side will send nothing more.
     fn read<'a>(
         &'a mut self,
-        cx: &'a Cx,
+        fcx: &'a Cx,
         buf: &'a mut [u8],
     ) -> impl Future<Output = Result<usize, ConnError>> + Send + 'a {
-        std::future::poll_fn(move |task| self.poll_read(cx, task, buf))
+        std::future::poll_fn(move |cx| self.poll_read(fcx, cx, buf))
     }
 
     /// Writes some of `data`. Returns how many bytes were taken, which may be
     /// fewer than `data.len()`. Waits only while there is no room at all.
     fn write<'a>(
         &'a mut self,
-        cx: &'a Cx,
+        fcx: &'a Cx,
         data: &'a [u8],
     ) -> impl Future<Output = Result<usize, ConnError>> + Send + 'a {
-        std::future::poll_fn(move |task| self.poll_write(cx, task, data))
+        std::future::poll_fn(move |cx| self.poll_write(fcx, cx, data))
     }
 
     /// Writes all of `data`, calling [`write`](ConnectionExt::write) until
@@ -125,12 +125,12 @@ pub trait ConnectionExt: Connection {
     /// looping forever.
     fn write_all<'a>(
         &'a mut self,
-        cx: &'a Cx,
+        fcx: &'a Cx,
         mut data: &'a [u8],
     ) -> impl Future<Output = Result<(), ConnError>> + Send + 'a {
         async move {
             while !data.is_empty() {
-                let n = self.write(cx, data).await?;
+                let n = self.write(fcx, data).await?;
                 if n == 0 {
                     return Err(ConnError::Closed);
                 }
@@ -141,8 +141,8 @@ pub trait ConnectionExt: Connection {
     }
 
     /// Says this side will send nothing more. Reading still works.
-    fn shutdown<'a>(&'a mut self, cx: &'a Cx) -> impl Future<Output = Result<(), ConnError>> + Send + 'a {
-        std::future::poll_fn(move |task| self.poll_shutdown(cx, task))
+    fn shutdown<'a>(&'a mut self, fcx: &'a Cx) -> impl Future<Output = Result<(), ConnError>> + Send + 'a {
+        std::future::poll_fn(move |cx| self.poll_shutdown(fcx, cx))
     }
 }
 

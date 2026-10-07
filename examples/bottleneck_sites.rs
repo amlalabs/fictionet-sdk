@@ -21,8 +21,8 @@ const QUEUE: usize = 100;
 type Counts = Arc<[AtomicU64; 2]>;
 
 /// A filter that counts packets by direction and passes them all.
-fn count(cx: &fictionet::Cx, inner: impl fictionet::Interface, counts: Counts) -> fictionet::End {
-    stdlib::filter(cx, inner, move |_, direction, _| {
+fn count(fcx: &fictionet::Cx, inner: impl fictionet::Interface, counts: Counts) -> fictionet::End {
+    stdlib::filter(fcx, inner, move |_, direction, _| {
         let i = if direction == Direction::ToInner { 0 } else { 1 };
         counts[i].fetch_add(1, Ordering::Relaxed);
         true
@@ -35,33 +35,33 @@ fn main() -> fictionet::Result {
     let _listening = fictionet::listen(fictionet::WorldSocket::UnixSocket(path.clone().into()), attacher)?;
     println!("listening on {path}");
 
-    fictionet::block_on(fictionet::run(|cx| async move {
+    fictionet::block_on(fictionet::run(|fcx| async move {
         let app = axum::Router::new()
             .route("/4mb", get(|| async { vec![b'x'; 4 << 20] }))
             .route("/upload", post(|body: axum::body::Bytes| async move { format!("got {} bytes\n", body.len()) }))
             // The agent sends this body, so keep a limit on it.
             .layer(DefaultBodyLimit::max(8 << 20));
 
-        let slow = attachments.map(&cx, |cx, sandbox| {
+        let slow = attachments.map(&fcx, |fcx, sandbox| {
             // Count packets on both sides of the bottleneck. A packet
             // that went in on one side and never came out of the other
             // was dropped by the queue.
             let name = sandbox.name().to_owned();
             let near: Counts = Arc::default();
             let far: Counts = Arc::default();
-            let link = count(cx, sandbox, near.clone());
-            let link = stdlib::bottleneck(cx, RATE, QUEUE, link);
-            let link = count(cx, link, far.clone());
+            let link = count(fcx, sandbox, near.clone());
+            let link = stdlib::bottleneck(fcx, RATE, QUEUE, link);
+            let link = count(fcx, link, far.clone());
 
             // Each time the packets stop for a second, report. The queues
             // are empty by then, so the counts are exact. When the sandbox
             // detaches, the filters stop and drop their counts, and so
             // this task stops too.
-            cx.spawn(move |cx| async move {
+            fcx.spawn(move |fcx| async move {
                 let total = |c: &Counts| c[0].load(Ordering::Relaxed) + c[1].load(Ordering::Relaxed);
                 let (mut last, mut reported) = (0, 0);
                 while Arc::strong_count(&near) > 1 {
-                    cx.sleep(ms(1000)).await?;
+                    fcx.sleep(ms(1000)).await?;
                     let now = total(&far);
                     if now == last && now != reported {
                         reported = now;
@@ -87,7 +87,7 @@ fn main() -> fictionet::Result {
             "example.test" => Some(web::Site::new(app.clone())),
             _ => None,
         })
-        .serve(&cx, slow)?;
+        .serve(&fcx, slow)?;
         Ok(())
     }))
 }

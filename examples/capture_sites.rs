@@ -71,13 +71,13 @@ fn main() -> fictionet::Result {
     });
 
     let start = SystemTime::now().duration_since(UNIX_EPOCH)?;
-    fictionet::block_on(fictionet::run(move |cx| async move {
+    fictionet::block_on(fictionet::run(move |fcx| async move {
         let app = axum::Router::new().route("/", axum::routing::get(|| async { "hello, captured\n" }));
 
-        let watched = attachments.map(&cx, move |cx, sandbox| {
+        let watched = attachments.map(&fcx, move |fcx, sandbox| {
             let (tx, lost) = (tx.clone(), lost.clone());
-            stdlib::filter(cx, sandbox, move |cx, _direction, packet| {
-                let at = start + cx.now().since_start();
+            stdlib::filter(fcx, sandbox, move |fcx, _direction, packet| {
+                let at = start + fcx.now().since_start();
                 if tx.try_send((at, packet.0.clone())).is_err() {
                     lost.fetch_add(1, Ordering::Relaxed);
                 }
@@ -89,7 +89,7 @@ fn main() -> fictionet::Result {
             "example.test" => Some(web::Site::new(app.clone())),
             _ => None,
         })
-        .serve(&cx, watched)?;
+        .serve(&fcx, watched)?;
         Ok(())
     }))
 }

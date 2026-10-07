@@ -24,7 +24,7 @@ fn temp_socket() -> String {
 }
 
 /// A CA, and a server and client config for `secret.test`.
-fn configs(cx: &Cx) -> (Arc<ServerConfig>, Arc<ClientConfig>) {
+fn configs(fcx: &Cx) -> (Arc<ServerConfig>, Arc<ClientConfig>) {
     let mut ca = CertificateParams::new(Vec::<String>::new()).unwrap();
     ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     let ca_key = KeyPair::generate().unwrap();
@@ -35,7 +35,7 @@ fn configs(cx: &Cx) -> (Arc<ServerConfig>, Arc<ClientConfig>) {
     let cert = leaf.signed_by(&key, &ca, &ca_key).unwrap();
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
     let provider = rustls::crypto::ring::default_provider();
-    let server = tls::config_builder(cx, SystemTime::now(), provider.clone())
+    let server = tls::config_builder(fcx, SystemTime::now(), provider.clone())
         .with_safe_default_protocol_versions()
         .unwrap()
         .with_no_client_auth()
@@ -54,7 +54,7 @@ fn configs(cx: &Cx) -> (Arc<ServerConfig>, Arc<ClientConfig>) {
 /// Speaks TLS as a client over `conn`: finishes the handshake, changes
 /// its keys with a KeyUpdate (which asks the server to change its own),
 /// sends one request and returns the response.
-async fn fetch<C: Connection>(cx: &Cx, mut conn: C, config: Arc<ClientConfig>, request: &[u8]) -> Result<Vec<u8>> {
+async fn fetch<C: Connection>(fcx: &Cx, mut conn: C, config: Arc<ClientConfig>, request: &[u8]) -> Result<Vec<u8>> {
     let mut tls = ClientConnection::new(config, ServerName::try_from("secret.test").unwrap())?;
     let mut sent = false;
     let mut response = Vec::new();
@@ -68,7 +68,7 @@ async fn fetch<C: Connection>(cx: &Cx, mut conn: C, config: Arc<ClientConfig>, r
         while tls.wants_write() {
             let mut out = Vec::new();
             tls.write_tls(&mut out)?;
-            conn.write_all(cx, &out).await?;
+            conn.write_all(fcx, &out).await?;
         }
         match tls.reader().read_to_end(&mut response) {
             Ok(_) => return Ok(response),
@@ -79,7 +79,7 @@ async fn fetch<C: Connection>(cx: &Cx, mut conn: C, config: Arc<ClientConfig>, r
         if response.ends_with(b"hello") {
             return Ok(response);
         }
-        let n = conn.read(cx, &mut buf).await?;
+        let n = conn.read(fcx, &mut buf).await?;
         if n == 0 {
             return Ok(response);
         }
@@ -101,37 +101,37 @@ fn an_observer_sees_http_inside_tls() {
     let fetched = Arc::new(std::sync::Mutex::new(None));
     let (g, f) = (go.clone(), fetched.clone());
     std::thread::spawn(move || {
-        let _ = fictionet::block_on(fictionet::run(move |cx| async move {
+        let _ = fictionet::block_on(fictionet::run(move |fcx| async move {
             // Taking attachments is what lets the world socket find this run.
-            cx.spawn(move |cx| async move {
-                let _ = attachments.next(&cx).await;
+            fcx.spawn(move |fcx| async move {
+                let _ = attachments.next(&fcx).await;
                 Ok(())
             });
-            let (server_cfg, client_cfg) = configs(&cx);
+            let (server_cfg, client_cfg) = configs(&fcx);
             let (a, b) = fictionet::pair();
-            let client = tcp::endpoint(&cx, a, "10.0.0.2".parse()?);
-            let server = tcp::endpoint(&cx, b, "10.0.0.1".parse()?);
+            let client = tcp::endpoint(&fcx, a, "10.0.0.2".parse()?);
+            let server = tcp::endpoint(&fcx, b, "10.0.0.1".parse()?);
             let mut listener = server.listen(443)?;
-            cx.spawn(move |cx| async move {
-                let conn = listener.accept(&cx).await?;
-                let mut conn = tls::server(&cx, conn).await?.finish(&cx, server_cfg).await?;
+            fcx.spawn(move |fcx| async move {
+                let conn = listener.accept(&fcx).await?;
+                let mut conn = tls::server(&fcx, conn).await?.finish(&fcx, server_cfg).await?;
                 let mut request = Vec::new();
                 let mut buf = [0u8; 4096];
                 while !request.windows(4).any(|w| w == b"\r\n\r\n") {
-                    let n = conn.read(&cx, &mut buf).await?;
+                    let n = conn.read(&fcx, &mut buf).await?;
                     request.extend_from_slice(&buf[..n]);
                 }
-                conn.write_all(&cx, b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello").await?;
-                conn.shutdown(&cx).await?;
+                conn.write_all(&fcx, b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello").await?;
+                conn.shutdown(&fcx).await?;
                 Ok(())
             });
             while !g.load(Ordering::SeqCst) {
-                cx.sleep(ms(10)).await?;
+                fcx.sleep(ms(10)).await?;
             }
-            let conn = client.connect(&cx, "10.0.0.1:443".parse()?).await?;
-            let response = fetch(&cx, conn, client_cfg, b"GET /secret HTTP/1.1\r\nhost: secret.test\r\n\r\n").await?;
+            let conn = client.connect(&fcx, "10.0.0.1:443".parse()?).await?;
+            let response = fetch(&fcx, conn, client_cfg, b"GET /secret HTTP/1.1\r\nhost: secret.test\r\n\r\n").await?;
             *f.lock().unwrap() = Some(response);
-            cx.sleep(std::time::Duration::from_secs(60)).await?;
+            fcx.sleep(std::time::Duration::from_secs(60)).await?;
             Ok(())
         }));
     });

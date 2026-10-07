@@ -211,7 +211,7 @@ fn percentile(sorted: &[u64], p: f64) -> f64 {
     sorted[((sorted.len() as f64 * p) as usize).min(sorted.len() - 1)] as f64 / 1000.0
 }
 
-/// Ends the run once the world is done: `cx.cancel()` stops the tasks it
+/// Ends the run once the world is done: `fcx.cancel()` stops the tasks it
 /// left running, and the run ends with `Cancelled`, which is expected.
 fn finish(result: fictionet::Result) {
     if let Err(e) = result
@@ -238,8 +238,8 @@ struct Counted<I> {
 }
 
 impl<I: Interface> Interface for Counted<I> {
-    fn poll_recv(&mut self, cx: &Cx, task: &mut Context<'_>) -> Poll<Result<Packet, RecvError>> {
-        let r = self.inner.poll_recv(cx, task);
+    fn poll_recv(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<Packet, RecvError>> {
+        let r = self.inner.poll_recv(fcx, cx);
         if let Poll::Ready(Ok(_)) = r {
             self.counts.delivered.fetch_add(1, Ordering::Relaxed);
         }
@@ -282,11 +282,11 @@ struct TcpOpts {
     buffer: Option<usize>,
 }
 
-fn endpoint(cx: &Cx, inner: impl Interface, addr: &str, opts: TcpOpts) -> tcp::Endpoint {
+fn endpoint(fcx: &Cx, inner: impl Interface, addr: &str, opts: TcpOpts) -> tcp::Endpoint {
     let addr = addr.parse().unwrap();
     match opts.buffer {
-        None => tcp::endpoint(cx, inner, addr),
-        Some(b) => tcp::endpoint_with(cx, inner, addr, tcp::Options::default().buffer(b)),
+        None => tcp::endpoint(fcx, inner, addr),
+        Some(b) => tcp::endpoint_with(fcx, inner, addr, tcp::Options::default().buffer(b)),
     }
 }
 
@@ -296,7 +296,7 @@ fn endpoint(cx: &Cx, inner: impl Interface, addr: &str, opts: TcpOpts) -> tcp::E
 fn tcp_bulk(topology: Topology, flows: usize, idle: usize, per_flow: usize, opts: TcpOpts) -> Bulk {
     let out = Arc::new(Mutex::new(None));
     let result = out.clone();
-    finish(block_on(run(move |cx| async move {
+    finish(block_on(run(move |fcx| async move {
         let (a, b, _keep): (End, End, Vec<Box<dyn Send>>) = match topology {
             Topology::Direct => {
                 let (a, b) = pair();
@@ -304,29 +304,29 @@ fn tcp_bulk(topology: Topology, flows: usize, idle: usize, per_flow: usize, opts
             }
             Topology::Delay(ms) => {
                 let (a, b) = pair();
-                let b = stdlib::delay(&cx, fictionet::time::ms(ms), b);
+                let b = stdlib::delay(&fcx, fictionet::time::ms(ms), b);
                 (a, b, Vec::new())
             }
             Topology::Path => {
                 let (a, ar) = pair();
                 let (br, b) = pair();
                 let router = stdlib::route::router(
-                    &cx,
+                    &fcx,
                     vec![("10.0.0.1/32".parse()?, Box::new(ar)), ("10.0.0.2/32".parse()?, Box::new(br))],
                 );
-                let (a, u1, i1, o1) = ip::split_protocols(&cx, a);
-                let (b, u2, i2, o2) = ip::split_protocols(&cx, b);
+                let (a, u1, i1, o1) = ip::split_protocols(&fcx, a);
+                let (b, u2, i2, o2) = ip::split_protocols(&fcx, b);
                 (a, b, vec![Box::new(router), Box::new(u1), Box::new(i1), Box::new(o1), Box::new(u2), Box::new(i2), Box::new(o2)])
             }
         };
         let (ca, cb) = (Arc::new(Counts::default()), Arc::new(Counts::default()));
-        let client = endpoint(&cx, Counted { inner: a, counts: ca.clone() }, "10.0.0.1", opts);
-        let server = endpoint(&cx, Counted { inner: b, counts: cb.clone() }, "10.0.0.2", opts);
+        let client = endpoint(&fcx, Counted { inner: a, counts: ca.clone() }, "10.0.0.1", opts);
+        let server = endpoint(&fcx, Counted { inner: b, counts: cb.clone() }, "10.0.0.2", opts);
         let mut listener = server.listen(80)?;
         let mut conns = Vec::new();
         for _ in 0..flows + idle {
-            let c = client.connect(&cx, "10.0.0.2:80".parse()?).await?;
-            let s = listener.accept(&cx).await?;
+            let c = client.connect(&fcx, "10.0.0.2:80".parse()?).await?;
+            let s = listener.accept(&fcx).await?;
             conns.push((c, s));
         }
         let quiet = conns.split_off(flows);
@@ -336,54 +336,54 @@ fn tcp_bulk(topology: Topology, flows: usize, idle: usize, per_flow: usize, opts
         let start = Instant::now();
         let mut joins = Vec::new();
         for (mut c, mut s) in conns {
-            joins.push(cx.spawn(move |cx| async move {
+            joins.push(fcx.spawn(move |fcx| async move {
                 let buf = vec![0x5a; 65536];
                 let mut left = per_flow;
                 while left > 0 {
                     let n = left.min(buf.len());
-                    s.write_all(&cx, &buf[..n]).await?;
+                    s.write_all(&fcx, &buf[..n]).await?;
                     left -= n;
                 }
                 // Wait for the reader's one-byte "done", so the writer's
                 // side stays open until every byte has arrived.
                 let mut done = [0];
-                c_read_exact(&cx, &mut s, &mut done).await?;
+                c_read_exact(&fcx, &mut s, &mut done).await?;
                 Ok(())
             }));
-            joins.push(cx.spawn(move |cx| async move {
+            joins.push(fcx.spawn(move |fcx| async move {
                 let mut buf = vec![0; 65536];
                 let mut left = per_flow;
                 while left > 0 {
                     let n = left.min(buf.len());
-                    c_read_exact(&cx, &mut c, &mut buf[..n]).await?;
+                    c_read_exact(&fcx, &mut c, &mut buf[..n]).await?;
                     assert!(buf[..n].iter().all(|&v| v == 0x5a), "TCP delivered the wrong bytes");
                     left -= n;
                 }
-                c.write_all(&cx, &[1]).await?;
+                c.write_all(&fcx, &[1]).await?;
                 Ok(())
             }));
         }
         for j in joins {
-            j.join(&cx).await?;
+            j.join(&fcx).await?;
         }
         let secs = start.elapsed().as_secs_f64();
         let allocs = allocs() - a0;
         // Let the last ACKs and FINs land before counting what was lost.
-        cx.sleep(fictionet::time::ms(200)).await?;
+        fcx.sleep(fictionet::time::ms(200)).await?;
         let sent = ca.sent.load(Ordering::Relaxed) + cb.sent.load(Ordering::Relaxed) - sent0;
         let got = ca.delivered.load(Ordering::Relaxed) + cb.delivered.load(Ordering::Relaxed) - got0;
         *result.lock().unwrap() = Some(Bulk { secs, sent, lost: sent.saturating_sub(got), allocs });
         drop(quiet);
-        cx.cancel();
+        fcx.cancel();
         Ok(())
     })));
     out.lock().unwrap().take().expect("the run reported")
 }
 
-async fn c_read_exact(cx: &Cx, c: &mut tcp::TcpConnection, buf: &mut [u8]) -> fictionet::Result {
+async fn c_read_exact(fcx: &Cx, c: &mut tcp::TcpConnection, buf: &mut [u8]) -> fictionet::Result {
     let mut at = 0;
     while at < buf.len() {
-        let n = c.read(cx, &mut buf[at..]).await?;
+        let n = c.read(fcx, &mut buf[at..]).await?;
         assert!(n > 0, "the connection ended early");
         at += n;
     }
@@ -502,11 +502,11 @@ fn sched(o: &Options) {
 fn ping_pong(n: usize) -> (f64, u64) {
     let out = Arc::new(Mutex::new((0.0, 0)));
     let result = out.clone();
-    finish(block_on(run(move |cx| async move {
+    finish(block_on(run(move |fcx| async move {
         let (mut a, mut b) = pair();
-        let echo = cx.spawn(move |cx| async move {
+        let echo = fcx.spawn(move |fcx| async move {
             for _ in 0..n {
-                let p = b.recv(&cx).await?;
+                let p = b.recv(&fcx).await?;
                 b.send(p);
             }
             Ok(())
@@ -516,11 +516,11 @@ fn ping_pong(n: usize) -> (f64, u64) {
         let start = Instant::now();
         for _ in 0..n {
             a.send(p);
-            p = a.recv(&cx).await?;
+            p = a.recv(&fcx).await?;
         }
-        echo.join(&cx).await?;
+        echo.join(&fcx).await?;
         *result.lock().unwrap() = (start.elapsed().as_secs_f64(), allocs() - a0);
-        cx.cancel();
+        fcx.cancel();
         Ok(())
     })));
     *out.lock().unwrap()
@@ -530,18 +530,18 @@ fn ping_pong(n: usize) -> (f64, u64) {
 fn tcp_exchanges(n: usize) -> (f64, u64) {
     let out = Arc::new(Mutex::new((0.0, 0)));
     let result = out.clone();
-    finish(block_on(run(move |cx| async move {
+    finish(block_on(run(move |fcx| async move {
         let (a, b) = pair();
-        let client = tcp::endpoint(&cx, a, "10.0.0.1".parse()?);
-        let server = tcp::endpoint(&cx, b, "10.0.0.2".parse()?);
+        let client = tcp::endpoint(&fcx, a, "10.0.0.1".parse()?);
+        let server = tcp::endpoint(&fcx, b, "10.0.0.2".parse()?);
         let mut listener = server.listen(80)?;
-        let mut c = client.connect(&cx, "10.0.0.2:80".parse()?).await?;
-        let mut s = listener.accept(&cx).await?;
-        let echo = cx.spawn(move |cx| async move {
+        let mut c = client.connect(&fcx, "10.0.0.2:80".parse()?).await?;
+        let mut s = listener.accept(&fcx).await?;
+        let echo = fcx.spawn(move |fcx| async move {
             let mut buf = [0; 64];
             for _ in 0..n {
-                c_read_exact(&cx, &mut s, &mut buf).await?;
-                s.write_all(&cx, &buf).await?;
+                c_read_exact(&fcx, &mut s, &mut buf).await?;
+                s.write_all(&fcx, &buf).await?;
             }
             Ok(())
         });
@@ -549,12 +549,12 @@ fn tcp_exchanges(n: usize) -> (f64, u64) {
         let a0 = allocs();
         let start = Instant::now();
         for _ in 0..n {
-            c.write_all(&cx, &[0x5a; 64]).await?;
-            c_read_exact(&cx, &mut c, &mut buf).await?;
+            c.write_all(&fcx, &[0x5a; 64]).await?;
+            c_read_exact(&fcx, &mut c, &mut buf).await?;
         }
-        echo.join(&cx).await?;
+        echo.join(&fcx).await?;
         *result.lock().unwrap() = (start.elapsed().as_secs_f64(), allocs() - a0);
-        cx.cancel();
+        fcx.cancel();
         Ok(())
     })));
     *out.lock().unwrap()
@@ -582,33 +582,33 @@ fn memory(o: &Options) {
 fn unread(kind: &'static str, n: usize) -> (i64, u64) {
     let out = Arc::new(Mutex::new((0, 0)));
     let result = out.clone();
-    finish(block_on(run(move |cx| async move {
+    finish(block_on(run(move |fcx| async move {
         let (mut a, b) = pair();
         let mut far = if kind.starts_with("delay") {
-            stdlib::delay(&cx, fictionet::time::ms(60_000), b)
+            stdlib::delay(&fcx, fictionet::time::ms(60_000), b)
         } else {
-            stdlib::bottleneck(&cx, 1_000_000_000_000, 64, b)
+            stdlib::bottleneck(&fcx, 1_000_000_000_000, 64, b)
         };
         let before = live();
         for i in 0..n {
             a.send(Packet(vec![0x45; 1500]));
             if i % 32 == 31 {
-                cx.yield_now().await?;
+                fcx.yield_now().await?;
             }
         }
         // Give the link's task turns to take every packet from its input.
         for _ in 0..1000 {
-            cx.yield_now().await?;
+            fcx.yield_now().await?;
         }
         let grew = live() - before;
         // Count what the bottleneck released into its output. A delay
         // releases nothing within the run.
         let mut kept = 0;
-        while let Poll::Ready(Ok(_)) = poll_fn(|t| Poll::Ready(far.poll_recv(&cx, t))).await {
+        while let Poll::Ready(Ok(_)) = poll_fn(|t| Poll::Ready(far.poll_recv(&fcx, t))).await {
             kept += 1;
         }
         *result.lock().unwrap() = (grew, kept);
-        cx.cancel();
+        fcx.cancel();
         Ok(())
     })));
     *out.lock().unwrap()
@@ -695,10 +695,10 @@ fn listen_echo(n: usize, outstanding: usize) -> (f64, u64) {
     let (attacher, mut attachments) = fictionet::attachments();
     let listening = listen(WorldSocket::UnixSocket(path.clone()), attacher).unwrap();
     let world = std::thread::spawn(move || {
-        finish(block_on(run(move |cx| async move {
-            let mut agent = attachments.get(&cx, "agent").await?;
+        finish(block_on(run(move |fcx| async move {
+            let mut agent = attachments.get(&fcx, "agent").await?;
             loop {
-                match agent.recv(&cx).await {
+                match agent.recv(&fcx).await {
                     Ok(p) => agent.send(p),
                     Err(_) => return Ok(()),
                 }
@@ -857,20 +857,20 @@ struct Machine {
     _icmp: End,
 }
 
-fn machine(cx: &Cx, attacher: &Attacher, name: &str, addr: Ipv4Addr) -> Machine {
+fn machine(fcx: &Cx, attacher: &Attacher, name: &str, addr: Ipv4Addr) -> Machine {
     let end = attacher.attach(name).unwrap();
-    let (tcp, udp, icmp, _other) = ip::split_protocols(cx, end);
-    Machine { tcp: tcp::endpoint(cx, tcp, addr.into()), udp: udp::endpoint(cx, udp, addr.into()), _icmp: icmp }
+    let (tcp, udp, icmp, _other) = ip::split_protocols(fcx, end);
+    Machine { tcp: tcp::endpoint(fcx, tcp, addr.into()), udp: udp::endpoint(fcx, udp, addr.into()), _icmp: icmp }
 }
 
-async fn lookup(cx: &Cx, m: &Machine, name: &str) -> Ipv4Addr {
-    let mut socket = m.udp.bind(40000 + (cx.random_u64() % 20000) as u16).unwrap();
+async fn lookup(fcx: &Cx, m: &Machine, name: &str) -> Ipv4Addr {
+    let mut socket = m.udp.bind(40000 + (fcx.random_u64() % 20000) as u16).unwrap();
     let mut q = Message::query();
-    q.metadata.id = cx.random_u64() as u16;
+    q.metadata.id = fcx.random_u64() as u16;
     q.metadata.recursion_desired = true;
     q.add_query(Query::query(Name::from_ascii(name).unwrap(), RecordType::A));
     socket.send_to(&q.to_vec().unwrap(), SocketAddr::new(GATEWAY.into(), 53));
-    let (bytes, _) = socket.recv(cx).await.unwrap();
+    let (bytes, _) = socket.recv(fcx).await.unwrap();
     let r = Message::from_vec(&bytes).unwrap();
     assert_eq!(r.metadata.message_type, MessageType::Response);
     assert_eq!(r.metadata.response_code, ResponseCode::NoError, "{name}");
@@ -917,11 +917,11 @@ fn http_run(case: HttpCase) -> HttpRun {
     let out = Arc::new(Mutex::new(None));
     let result = out.clone();
     let wait_for = ready.clone();
-    finish(block_on(run(move |cx| async move {
+    finish(block_on(run(move |fcx| async move {
         let (roots, chain, key) = certs();
         let roots = Arc::new(roots);
         let config = Arc::new(
-            tls::config_builder(&cx, SystemTime::now(), rustls::crypto::ring::default_provider())
+            tls::config_builder(&fcx, SystemTime::now(), rustls::crypto::ring::default_provider())
                 .with_safe_default_protocol_versions()?
                 .with_no_client_auth()
                 .with_single_cert(chain, key)?,
@@ -932,22 +932,22 @@ fn http_run(case: HttpCase) -> HttpRun {
             Some(web::Site::new(page.clone()).tls(move |_| config.clone()))
         });
         if case.hooks {
-            cx.events().subscribe(|_| {});
+            fcx.events().subscribe(|_| {});
         }
-        sites.serve(&cx, attachments)?;
+        sites.serve(&fcx, attachments)?;
         let machines: Vec<Machine> =
-            (0..case.sandboxes).map(|i| machine(&cx, &attacher, &format!("sandbox{i}"), Ipv4Addr::new(10, 0, 0, 2 + i as u8))).collect();
-        let addr = lookup(&cx, &machines[0], "bench.test").await;
+            (0..case.sandboxes).map(|i| machine(&fcx, &attacher, &format!("sandbox{i}"), Ipv4Addr::new(10, 0, 0, 2 + i as u8))).collect();
+        let addr = lookup(&fcx, &machines[0], "bench.test").await;
         for i in 1..case.sites {
-            lookup(&cx, &machines[0], &format!("site{i}.test")).await;
+            lookup(&fcx, &machines[0], &format!("site{i}.test")).await;
         }
         let mut clients = Vec::new();
         for m in &machines {
-            let conn = m.tcp.connect(&cx, SocketAddr::new(addr.into(), 443)).await?;
+            let conn = m.tcp.connect(&fcx, SocketAddr::new(addr.into(), 443)).await?;
             let alpn: &[u8] = if case.h2 { b"h2" } else { b"http/1.1" };
             let mut t = TlsClient::new(conn, &roots, "bench.test", alpn);
-            t.handshake(&cx).await.map_err(|e| fictionet::Error::msg(format!("{e:?}")))?;
-            let mut c = Client::new(&cx, t, case.h2).await;
+            t.handshake(&fcx).await.map_err(|e| fictionet::Error::msg(format!("{e:?}")))?;
+            let mut c = Client::new(&fcx, t, case.h2).await;
             for _ in 0..100 {
                 c.get().await;
             }
@@ -956,7 +956,7 @@ fn http_run(case: HttpCase) -> HttpRun {
         // Wait until the observer is watching, while the world runs.
         if case.watch != Watch::None {
             while !wait_for.load(Ordering::Acquire) {
-                cx.sleep(fictionet::time::ms(5)).await?;
+                fcx.sleep(fictionet::time::ms(5)).await?;
             }
         }
         let each = case.requests / case.sandboxes;
@@ -967,7 +967,7 @@ fn http_run(case: HttpCase) -> HttpRun {
         let mut tasks = Vec::new();
         for mut c in clients {
             let lat = lat.clone();
-            tasks.push(cx.spawn(move |_| async move {
+            tasks.push(fcx.spawn(move |_| async move {
                 let mut samples = Vec::with_capacity(each);
                 for _ in 0..each {
                     let t = Instant::now();
@@ -982,12 +982,12 @@ fn http_run(case: HttpCase) -> HttpRun {
             }));
         }
         for t in tasks {
-            t.join(&cx).await?;
+            t.join(&fcx).await?;
         }
         let secs = start.elapsed().as_secs_f64();
         let (a1, cpu1) = (allocs() - a0, cpu_us() - cpu0);
         // Rows still on their way belong to the timed requests.
-        cx.sleep(fictionet::time::ms(150)).await?;
+        fcx.sleep(fictionet::time::ms(150)).await?;
         timing.store(false, Ordering::Release);
         let mut l = lat.lock().unwrap();
         l.sort_unstable();
@@ -1001,7 +1001,7 @@ fn http_run(case: HttpCase) -> HttpRun {
             allocs_per_request: a1 as f64 / total as f64,
             rows: 0,
         });
-        cx.cancel();
+        fcx.cancel();
         Ok(())
     })));
     stop.store(true, Ordering::Release);
@@ -1112,7 +1112,7 @@ impl<C: Connection + Unpin> TlsClient<C> {
         TlsClient { conn, tls, out: Vec::new(), inbuf: vec![0; 16384].into_boxed_slice(), pending: Vec::new() }
     }
 
-    fn poll_flush(&mut self, cx: &Cx, task: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
+    fn poll_flush(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
         loop {
             if self.out.is_empty() {
                 if !self.tls.wants_write() {
@@ -1120,7 +1120,7 @@ impl<C: Connection + Unpin> TlsClient<C> {
                 }
                 self.tls.write_tls(&mut self.out).unwrap();
             }
-            match self.conn.poll_write(cx, task, &self.out) {
+            match self.conn.poll_write(fcx, cx, &self.out) {
                 Poll::Ready(Ok(n)) => {
                     self.out.drain(..n);
                 }
@@ -1132,13 +1132,13 @@ impl<C: Connection + Unpin> TlsClient<C> {
 
     /// Reads from the connection into rustls once. `Ok(false)` at the end
     /// of the stream.
-    fn poll_fill(&mut self, cx: &Cx, task: &mut Context<'_>) -> Poll<Result<bool, ConnError>> {
+    fn poll_fill(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<bool, ConnError>> {
         let fresh;
         let mut data: &[u8] = if !self.pending.is_empty() {
             fresh = std::mem::take(&mut self.pending);
             &fresh
         } else {
-            let n = match self.conn.poll_read(cx, task, &mut self.inbuf) {
+            let n = match self.conn.poll_read(fcx, cx, &mut self.inbuf) {
                 Poll::Ready(Ok(n)) => n,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
@@ -1163,10 +1163,10 @@ impl<C: Connection + Unpin> TlsClient<C> {
         }
     }
 
-    async fn handshake(&mut self, cx: &Cx) -> Result<(), ConnError> {
-        poll_fn(|task| {
+    async fn handshake(&mut self, fcx: &Cx) -> Result<(), ConnError> {
+        poll_fn(|cx| {
             loop {
-                match self.poll_flush(cx, task) {
+                match self.poll_flush(fcx, cx) {
                     Poll::Ready(Ok(())) => {}
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                     Poll::Pending => return Poll::Pending,
@@ -1174,7 +1174,7 @@ impl<C: Connection + Unpin> TlsClient<C> {
                 if !self.tls.is_handshaking() {
                     return Poll::Ready(Ok(()));
                 }
-                match self.poll_fill(cx, task) {
+                match self.poll_fill(fcx, cx) {
                     Poll::Ready(Ok(true)) => {}
                     Poll::Ready(Ok(false)) => return Poll::Ready(Err(ConnError::Closed)),
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -1187,7 +1187,7 @@ impl<C: Connection + Unpin> TlsClient<C> {
 }
 
 impl<C: Connection + Unpin> Connection for TlsClient<C> {
-    fn poll_read(&mut self, cx: &Cx, task: &mut Context<'_>, buf: &mut [u8]) -> Poll<Result<usize, ConnError>> {
+    fn poll_read(&mut self, fcx: &Cx, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<Result<usize, ConnError>> {
         loop {
             match self.tls.reader().read(buf) {
                 Ok(n) => return Poll::Ready(Ok(n)),
@@ -1195,10 +1195,10 @@ impl<C: Connection + Unpin> Connection for TlsClient<C> {
                 Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Poll::Ready(Ok(0)),
                 Err(_) => return Poll::Ready(Err(ConnError::Broken)),
             }
-            if let Poll::Ready(Err(e)) = self.poll_flush(cx, task) {
+            if let Poll::Ready(Err(e)) = self.poll_flush(fcx, cx) {
                 return Poll::Ready(Err(e));
             }
-            match self.poll_fill(cx, task) {
+            match self.poll_fill(fcx, cx) {
                 Poll::Ready(Ok(true)) => {}
                 Poll::Ready(Ok(false)) => return Poll::Ready(Ok(self.tls.reader().read(buf).unwrap_or(0))),
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -1207,19 +1207,19 @@ impl<C: Connection + Unpin> Connection for TlsClient<C> {
         }
     }
 
-    fn poll_write(&mut self, cx: &Cx, task: &mut Context<'_>, data: &[u8]) -> Poll<Result<usize, ConnError>> {
-        if let Poll::Ready(Err(e)) = self.poll_flush(cx, task) {
+    fn poll_write(&mut self, fcx: &Cx, cx: &mut Context<'_>, data: &[u8]) -> Poll<Result<usize, ConnError>> {
+        if let Poll::Ready(Err(e)) = self.poll_flush(fcx, cx) {
             return Poll::Ready(Err(e));
         }
         let n = self.tls.writer().write(data).unwrap();
-        let _ = self.poll_flush(cx, task);
+        let _ = self.poll_flush(fcx, cx);
         Poll::Ready(Ok(n))
     }
 
-    fn poll_shutdown(&mut self, cx: &Cx, task: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
+    fn poll_shutdown(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
         self.tls.send_close_notify();
-        match self.poll_flush(cx, task) {
-            Poll::Ready(Ok(())) => self.conn.poll_shutdown(cx, task),
+        match self.poll_flush(fcx, cx) {
+            Poll::Ready(Ok(())) => self.conn.poll_shutdown(fcx, cx),
             other => other,
         }
     }
@@ -1228,16 +1228,16 @@ impl<C: Connection + Unpin> Connection for TlsClient<C> {
 // A hyper client over a `Connection`.
 
 struct Io<C> {
-    cx: Cx,
+    fcx: Cx,
     conn: C,
 }
 
 impl<C: Connection + Unpin> hyper::rt::Read for Io<C> {
-    fn poll_read(self: Pin<&mut Self>, task: &mut Context<'_>, mut buf: hyper::rt::ReadBufCursor<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, mut buf: hyper::rt::ReadBufCursor<'_>) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
         let mut tmp = [0u8; 16 * 1024];
         let tmp = &mut tmp[..buf.remaining().min(16 * 1024)];
-        match this.conn.poll_read(&this.cx, task, tmp) {
+        match this.conn.poll_read(&this.fcx, cx, tmp) {
             Poll::Ready(Ok(n)) => {
                 buf.put_slice(&tmp[..n]);
                 Poll::Ready(Ok(()))
@@ -1249,16 +1249,16 @@ impl<C: Connection + Unpin> hyper::rt::Read for Io<C> {
 }
 
 impl<C: Connection + Unpin> hyper::rt::Write for Io<C> {
-    fn poll_write(self: Pin<&mut Self>, task: &mut Context<'_>, data: &[u8]) -> Poll<std::io::Result<usize>> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, data: &[u8]) -> Poll<std::io::Result<usize>> {
         let this = self.get_mut();
-        this.conn.poll_write(&this.cx, task, data).map_err(std::io::Error::other)
+        this.conn.poll_write(&this.fcx, cx, data).map_err(std::io::Error::other)
     }
     fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Poll::Ready(Ok(()))
     }
-    fn poll_shutdown(self: Pin<&mut Self>, task: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        this.conn.poll_shutdown(&this.cx, task).map_err(std::io::Error::other)
+        this.conn.poll_shutdown(&this.fcx, cx).map_err(std::io::Error::other)
     }
 }
 
@@ -1280,18 +1280,18 @@ enum Client {
 }
 
 impl Client {
-    async fn new<C: Connection + Unpin>(cx: &Cx, conn: C, h2: bool) -> Client {
-        let io = Io { cx: cx.clone(), conn };
+    async fn new<C: Connection + Unpin>(fcx: &Cx, conn: C, h2: bool) -> Client {
+        let io = Io { fcx: fcx.clone(), conn };
         if h2 {
-            let (send, conn) = hyper::client::conn::http2::handshake(Exec(cx.clone()), io).await.unwrap();
-            cx.spawn(move |_| async move {
+            let (send, conn) = hyper::client::conn::http2::handshake(Exec(fcx.clone()), io).await.unwrap();
+            fcx.spawn(move |_| async move {
                 let _ = conn.await;
                 Ok(())
             });
             Client::H2(send)
         } else {
             let (send, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
-            cx.spawn(move |_| async move {
+            fcx.spawn(move |_| async move {
                 let _ = conn.await;
                 Ok(())
             });
@@ -1371,9 +1371,9 @@ fn proxy_run(burst: usize, sequential: usize) -> ((u64, f64), (u64, f64)) {
     let world = {
         let (queries, stop) = (queries.clone(), stop.clone());
         std::thread::spawn(move || {
-            finish(block_on(run(move |cx| async move {
+            finish(block_on(run(move |fcx| async move {
                 let page = Page(Bytes::from_static(b"plain site\n"));
-                cx.events().subscribe(move |e| {
+                fcx.events().subscribe(move |e| {
                     if e.is("dns", "query")
                         && let Some(name) = e.str("name")
                         && e.u64("qtype") == Some(1)
@@ -1381,11 +1381,11 @@ fn proxy_run(burst: usize, sequential: usize) -> ((u64, f64), (u64, f64)) {
                         *queries.lock().unwrap().entry(name.to_owned()).or_default() += 1;
                     }
                 });
-                web::Sites::new(move |host: &str| (host == "plain.test").then(|| web::Site::new(page.clone()).plain_http())).serve(&cx, attachments)?;
+                web::Sites::new(move |host: &str| (host == "plain.test").then(|| web::Site::new(page.clone()).plain_http())).serve(&fcx, attachments)?;
                 while !stop.load(Ordering::Acquire) {
-                    cx.sleep(fictionet::time::ms(10)).await?;
+                    fcx.sleep(fictionet::time::ms(10)).await?;
                 }
-                cx.cancel();
+                fcx.cancel();
                 Ok(())
             })));
         })

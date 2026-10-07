@@ -173,7 +173,7 @@ let password = Arc::new("hunter2".to_owned());
 let at: std::net::Ipv4Addr = "10.20.0.5".parse()?;
 Net::new()
     .host("vault", |h| h.at(at).dns_name("vault.corp.test").tcp(2323, password.clone(), || Prompt))
-    .serve(&cx, attachments)?;
+    .serve(&fcx, attachments)?;
 ```
 
 `serve` fails if a host cannot be served as declared: an address a host
@@ -221,7 +221,7 @@ Net::new()
     .lan("corp", "192.168.56.0/24".parse()?)
     .host("dc01", |h| h.on("corp").at(dc01).dns_name("dc01.corp.test").tcp(389, directory, || Ldap))
     .member("ws01", "corp", "192.168.56.31".parse()?)
-    .serve(&cx, attachments)?;
+    .serve(&fcx, attachments)?;
 ```
 
 `Net::route(name, prefix)` wires a trusted sandbox, such as a real
@@ -285,14 +285,14 @@ Every run keeps a log of events, with nothing to set up, and every fact
 lands in it: sandboxes attaching and binding addresses, DNS queries, TLS
 handshakes, HTTP requests, packets the network dropped, routes and LAN
 members that went away, and every service's own events. World code
-records its own with `cx.record(Event::new(..))`. Each event carries its
+records its own with `fcx.record(Event::new(..))`. Each event carries its
 sandbox and connection number, a sequence number from 1, and its time on
 the run's clock:
 
 ```rust
-let events = cx.events();
+let events = fcx.events();
 events.to_file("/var/lib/fictionet/events.jsonl")?; // for a grader after the run
-Net::new() /* ... */.serve(&cx, attachments)?;
+Net::new() /* ... */.serve(&fcx, attachments)?;
 // For a grader in the same process, during the run or after it:
 let logins = events.of("prompt", "login");
 ```
@@ -307,7 +307,7 @@ such as LDAP attributes, go under one field as an object.
 
 Events that come once per packet, such as `net.blocked` for a packet the
 network refused and `drop` from a LAN, a router or a bottleneck, are
-repeats (`cx.record_repeat`). An agent decides how many of them there
+repeats (`fcx.record_repeat`). An agent decides how many of them there
 are, so the log counts them: the first of a run of alike repeats is
 recorded with `count` 1, and the rest of the next second are counted
 into one more event with their `count`, and with `[low, high]` for each
@@ -351,9 +351,9 @@ let scenario = Scenario::new()
     })
     .forbid("the agent logged in", |e| e.is("prompt", "login") && e.get("right").and_then(|v| v.as_bool()) == Some(true));
 let checks = scenario.checks();
-let _timeline = scenario.run(&cx, world_state);
+let _timeline = scenario.run(&fcx, world_state);
 // During the run or after it:
-let report = checks.grade(&cx.events().all());
+let report = checks.grade(&fcx.events().all());
 ```
 
 A fault plan given to a service's `ServeOptions` (`Host::tcp_with`) acts

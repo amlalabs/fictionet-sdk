@@ -121,18 +121,18 @@ fn packets_cross_both_ways_and_refuse_and_world_close_end_attach() {
     let dir2 = dir.clone();
     let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
     let out = slot.clone();
-    fictionet::block_on(fictionet::run(move |cx| async move {
-            let mut abc = attachments.get(&cx, "abc").await?;
+    fictionet::block_on(fictionet::run(move |fcx| async move {
+            let mut abc = attachments.get(&fcx, "abc").await?;
             let mtu = abc.mtu();
             // Send echo requests until one is answered: the device may come up
             // a moment after accept is sent.
             let mut reply = None;
             for seq in 0..50u16 {
                 abc.send(Packet(echo_request(seq)));
-                cx.sleep(fictionet::time::ms(100)).await?;
+                fcx.sleep(fictionet::time::ms(100)).await?;
                 // Drain what came back.
                 loop {
-                    let next = futures_poll_once(&cx, &mut abc);
+                    let next = futures_poll_once(&fcx, &mut abc);
                     match next {
                         Some(Ok(Packet(p))) if p.len() >= 28 && p[9] == 1 && p[20] == 0 => reply = Some(p),
                         Some(Ok(_)) => continue,
@@ -185,10 +185,10 @@ fn packets_cross_both_ways_and_refuse_and_world_close_end_attach() {
 }
 
 /// Polls `recv` once: `None` if nothing is waiting.
-fn futures_poll_once(cx: &fictionet::Cx, i: &mut fictionet::Attachment) -> Option<Result<Packet, RecvError>> {
+fn futures_poll_once(fcx: &fictionet::Cx, i: &mut fictionet::Attachment) -> Option<Result<Packet, RecvError>> {
     let waker = std::task::Waker::noop();
-    let mut task = std::task::Context::from_waker(waker);
-    match i.poll_recv(cx, &mut task) {
+    let mut cx = std::task::Context::from_waker(waker);
+    match i.poll_recv(fcx, &mut cx) {
         std::task::Poll::Ready(r) => Some(r),
         std::task::Poll::Pending => None,
     }
@@ -226,13 +226,13 @@ fn resolv_conf_flag_picks_the_file_and_a_failed_write_names_it() {
     let failed = attach("bad", bad).wait_with_output().unwrap();
 
     let written = custom.clone();
-    fictionet::block_on(fictionet::run(move |cx| async move {
-        let abc = attachments.get(&cx, "good").await?;
+    fictionet::block_on(fictionet::run(move |fcx| async move {
+        let abc = attachments.get(&fcx, "good").await?;
         for _ in 0..100 {
             if written.exists() {
                 break;
             }
-            cx.sleep(fictionet::time::ms(50)).await?;
+            fcx.sleep(fictionet::time::ms(50)).await?;
         }
         drop(abc);
         Ok(())
@@ -266,13 +266,13 @@ const V4_ONLY: &str = "--ip-addr 10.0.0.2/24 --gateway 10.0.0.1 --dns 10.0.0.1 \
 /// `done` exists (10 s at most), then closes it.
 fn hold_until(attachments: fictionet::Attachments, name: &'static str, done: std::path::PathBuf) {
     let mut attachments = attachments;
-    fictionet::block_on(fictionet::run(move |cx| async move {
-        let held = attachments.get(&cx, name).await?;
+    fictionet::block_on(fictionet::run(move |fcx| async move {
+        let held = attachments.get(&fcx, name).await?;
         for _ in 0..200 {
             if done.exists() {
                 break;
             }
-            cx.sleep(fictionet::time::ms(50)).await?;
+            fcx.sleep(fictionet::time::ms(50)).await?;
         }
         drop(held);
         Ok(())

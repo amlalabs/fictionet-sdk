@@ -82,14 +82,14 @@ use crate::{Cx, Result};
 /// #         pub async fn connect(_: &str) -> fictionet::Result<PgPool> { Ok(PgPool) }
 /// #     }
 /// # }
-/// # async fn world(_cx: fictionet::Cx, _a: fictionet::Attachments, _db: sqlx::PgPool) -> fictionet::Result { Ok(()) }
+/// # async fn world(_fcx: fictionet::Cx, _a: fictionet::Attachments, _db: sqlx::PgPool) -> fictionet::Result { Ok(()) }
 /// #[tokio::main]
 /// async fn main() -> fictionet::Result {
 ///     let db = sqlx::PgPool::connect("postgres://...").await?;
 ///     let (attacher, attachments) = fictionet::attachments();
 ///     let socket = fictionet::WorldSocket::UnixSocket("/run/fictionet/world.sock".into());
 ///     let _listening = fictionet::listen(socket, attacher)?;
-///     fictionet::run(|cx| world(cx, attachments, db)).await
+///     fictionet::run(|fcx| world(fcx, attachments, db)).await
 /// }
 /// ```
 pub async fn run<F, Fut>(world: F) -> Result
@@ -111,7 +111,7 @@ where
     let mut state =
         RunState { shared: shared.clone(), root: root.clone(), slots: HashMap::new(), turn: VecDeque::new(), incoming: Vec::new() };
     Cx { run: shared, region: root, group: None }.spawn_as(|| Cow::Borrowed("world"), world);
-    std::future::poll_fn(move |task| state.poll(task)).await
+    std::future::poll_fn(move |cx| state.poll(cx)).await
 }
 
 type BoxFuture = Pin<Box<dyn Future<Output = Result> + Send>>;
@@ -279,14 +279,14 @@ struct RunState {
 }
 
 impl RunState {
-    fn poll(&mut self, task: &mut Context<'_>) -> Poll<Result> {
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Result> {
         let mut turn = std::mem::take(&mut self.turn);
         debug_assert!(turn.is_empty());
         {
             let mut q = self.shared.queue.lock().unwrap();
             match &q.outer {
-                Some(w) if w.will_wake(task.waker()) => {}
-                _ => q.outer = Some(task.waker().clone()),
+                Some(w) if w.will_wake(cx.waker()) => {}
+                _ => q.outer = Some(cx.waker().clone()),
             }
             q.polling = true;
             std::mem::swap(&mut q.incoming, &mut self.incoming);
@@ -371,7 +371,7 @@ impl RunState {
         drop(q);
         if more {
             // Give the executor its turn too, then come back.
-            task.waker().wake_by_ref();
+            cx.waker().wake_by_ref();
         }
         Poll::Pending
     }

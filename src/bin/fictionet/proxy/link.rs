@@ -185,8 +185,8 @@ async fn write_queued(shared: Arc<Shared>) {
 }
 
 impl Interface for Link {
-    fn poll_recv(&mut self, cx: &Cx, task: &mut Context<'_>) -> Poll<Result<Packet, RecvError>> {
-        if cx.is_cancelled() {
+    fn poll_recv(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<Packet, RecvError>> {
+        if fcx.is_cancelled() {
             return Poll::Ready(Err(RecvError::Cancelled));
         }
         let shared = &self.shared;
@@ -194,7 +194,7 @@ impl Interface for Link {
             if shared.closed.load(Ordering::SeqCst) {
                 return Poll::Ready(Err(RecvError::Closed));
             }
-            let mut guard = match shared.fd.poll_read_ready(task) {
+            let mut guard = match shared.fd.poll_read_ready(cx) {
                 Poll::Ready(Ok(g)) => g,
                 Poll::Ready(Err(e)) => {
                     shared.close(Some(format!("waiting to read from the world: {e}")));

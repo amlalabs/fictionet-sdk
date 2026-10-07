@@ -274,12 +274,12 @@ pub fn parse_update(b: &[u8]) -> Result<Update, Error> {
 // The speaker
 
 /// Accepts BGP sessions on `listener` until it closes, one task each.
-pub async fn serve(cx: Cx, mut listener: Listener, scenario: Arc<Scenario>, log: Log, sandbox: Arc<str>) -> fictionet::Result {
-    while let Ok(conn) = listener.accept(&cx).await {
+pub async fn serve(fcx: Cx, mut listener: Listener, scenario: Arc<Scenario>, log: Log, sandbox: Arc<str>) -> fictionet::Result {
+    while let Ok(conn) = listener.accept(&fcx).await {
         let (scenario, log, sandbox) = (scenario.clone(), log.clone(), sandbox.clone());
-        cx.spawn(move |cx| async move {
+        fcx.spawn(move |fcx| async move {
             let peer = conn.peer_addr();
-            let mut session = Session::new(cx, conn, scenario, log, sandbox, peer, OUR_HOLD);
+            let mut session = Session::new(fcx, conn, scenario, log, sandbox, peer, OUR_HOLD);
             session.run().await;
             Ok(())
         });
@@ -292,7 +292,7 @@ struct Ended;
 
 /// One BGP session.
 pub struct Session {
-    cx: Cx,
+    fcx: Cx,
     conn: TcpConnection,
     scenario: Arc<Scenario>,
     log: Log,
@@ -316,10 +316,10 @@ enum Next {
 
 impl Session {
     /// A session on `conn` that offers `our_hold` seconds as its hold time.
-    pub fn new(cx: Cx, conn: TcpConnection, scenario: Arc<Scenario>, log: Log, sandbox: Arc<str>, peer: SocketAddr, our_hold: u16) -> Session {
-        let hold_deadline = cx.now() + OPEN_WAIT;
+    pub fn new(fcx: Cx, conn: TcpConnection, scenario: Arc<Scenario>, log: Log, sandbox: Arc<str>, peer: SocketAddr, our_hold: u16) -> Session {
+        let hold_deadline = fcx.now() + OPEN_WAIT;
         Session {
-            cx,
+            fcx,
             conn,
             scenario,
             log,
@@ -345,15 +345,15 @@ impl Session {
     }
 
     async fn send(&mut self, message: &[u8], observed: Value) -> Result<(), Ended> {
-        let cx = self.cx.clone();
+        let fcx = self.fcx.clone();
         let done = {
-            let mut write = pin!(self.conn.write_all(&cx, message));
-            let mut wait = pin!(cx.sleep(WRITE_WAIT));
-            std::future::poll_fn(|task| {
-                if let Poll::Ready(r) = write.as_mut().poll(task) {
+            let mut write = pin!(self.conn.write_all(&fcx, message));
+            let mut wait = pin!(fcx.sleep(WRITE_WAIT));
+            std::future::poll_fn(|cx| {
+                if let Poll::Ready(r) = write.as_mut().poll(cx) {
                     return Poll::Ready(r.is_ok());
                 }
-                if wait.as_mut().poll(task).is_ready() {
+                if wait.as_mut().poll(cx).is_ready() {
                     return Poll::Ready(false);
                 }
                 Poll::Pending
@@ -390,7 +390,7 @@ impl Session {
                 if self.buf.len() >= HEADER + body {
                     let message: Vec<u8> = self.buf.drain(..HEADER + body).skip(HEADER).collect();
                     // Any message restarts the hold timer.
-                    self.hold_deadline = self.cx.now() + self.hold;
+                    self.hold_deadline = self.fcx.now() + self.hold;
                     return Ok(Next::Message(kind, message));
                 }
             }
@@ -398,16 +398,16 @@ impl Session {
                 Some(k) if k < self.hold_deadline => k,
                 _ => self.hold_deadline,
             };
-            let cx = self.cx.clone();
+            let fcx = self.fcx.clone();
             let mut chunk = [0u8; 4096];
             let read = {
-                let mut read = pin!(self.conn.read(&cx, &mut chunk));
-                let mut wait = pin!(cx.sleep_until(due));
-                std::future::poll_fn(|task| {
-                    if let Poll::Ready(r) = read.as_mut().poll(task) {
+                let mut read = pin!(self.conn.read(&fcx, &mut chunk));
+                let mut wait = pin!(fcx.sleep_until(due));
+                std::future::poll_fn(|cx| {
+                    if let Poll::Ready(r) = read.as_mut().poll(cx) {
                         return Poll::Ready(Some(r));
                     }
-                    if wait.as_mut().poll(task).is_ready() {
+                    if wait.as_mut().poll(cx).is_ready() {
                         return Poll::Ready(None);
                     }
                     Poll::Pending
@@ -420,9 +420,9 @@ impl Session {
                     self.observe(json!({"event": "peer_closed"}));
                     return Err(Ended);
                 }
-                None if cx.is_cancelled() => return Err(Ended),
+                None if fcx.is_cancelled() => return Err(Ended),
                 None => {
-                    let now = cx.now();
+                    let now = fcx.now();
                     if now >= self.hold_deadline {
                         return Err(self.fail(HOLD_EXPIRED, "hold timer expired").await);
                     }
@@ -482,7 +482,7 @@ impl Session {
         }
         let negotiated = self.our_hold.min(peer.hold);
         self.hold = if negotiated == 0 { IDLE_HOLD_ZERO } else { Duration::from_secs(u64::from(negotiated)) };
-        self.hold_deadline = self.cx.now() + self.hold;
+        self.hold_deadline = self.fcx.now() + self.hold;
         self.send(&keepalive(), json!({"event": "sent", "message": "KEEPALIVE", "hold": negotiated})).await?;
 
         // OpenConfirm: the peer's KEEPALIVE.
@@ -495,7 +495,7 @@ impl Session {
         self.observe(json!({"event": "received", "message": "KEEPALIVE"}));
         self.observe(json!({"event": "established", "hold": negotiated}));
         if negotiated != 0 {
-            self.keepalive_at = Some(self.cx.now() + self.hold / 3);
+            self.keepalive_at = Some(self.fcx.now() + self.hold / 3);
         }
 
         // Established: announce, then hold the session.

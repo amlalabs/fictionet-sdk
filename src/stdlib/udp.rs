@@ -53,15 +53,15 @@ const DATAGRAM_COST: usize = 64;
 /// as with a full socket buffer. ICMP messages that
 /// reach this layer, such as errors about datagrams it sent, are dropped.
 #[track_caller]
-pub fn endpoint(cx: &Cx, inner: impl Interface, addr: IpAddr) -> Endpoint {
+pub fn endpoint(fcx: &Cx, inner: impl Interface, addr: IpAddr) -> Endpoint {
     let shared = Arc::new(Shared {
         addr,
         inner: Mutex::new(Box::new(inner)),
-        state: Mutex::new(State { sockets: HashMap::new(), stopped: false, ip_id: cx.random_u64() as u16, groups: Vec::new() }),
+        state: Mutex::new(State { sockets: HashMap::new(), stopped: false, ip_id: fcx.random_u64() as u16, groups: Vec::new() }),
     });
     let driver = shared.clone();
-    cx.spawn_as(|| "udp::endpoint".into(), move |cx| async move {
-        drive(&cx, &driver).await;
+    fcx.spawn_as(|| "udp::endpoint".into(), move |fcx| async move {
+        drive(&fcx, &driver).await;
         let wakers: Vec<Waker> = {
             let mut st = driver.state.lock().unwrap();
             st.stopped = true;
@@ -98,13 +98,13 @@ struct Queue {
     waker: Option<Waker>,
 }
 
-async fn drive(cx: &Cx, shared: &Shared) {
+async fn drive(fcx: &Cx, shared: &Shared) {
     loop {
         let mut n = 0;
         loop {
-            let next = poll_fn(|task| {
+            let next = poll_fn(|cx| {
                 let mut inner = shared.inner.lock().unwrap();
-                match inner.poll_recv(cx, task) {
+                match inner.poll_recv(fcx, cx) {
                     Poll::Ready(r) => Poll::Ready(Some(r)),
                     // Only wait when nothing came in this round; otherwise
                     // hand back to yield.
@@ -125,7 +125,7 @@ async fn drive(cx: &Cx, shared: &Shared) {
                 None => break,
             }
         }
-        if n == 64 && cx.yield_now().await.is_err() {
+        if n == 64 && fcx.yield_now().await.is_err() {
             return;
         }
     }
@@ -241,16 +241,16 @@ pub struct Socket {
 impl Socket {
     /// Waits for the next datagram. Returns its bytes and who sent it.
     ///
-    /// Returns early with [`RecvError::Cancelled`] if `cx`'s
+    /// Returns early with [`RecvError::Cancelled`] if `fcx`'s
     /// [region](crate::Cx#regions) is cancelled, and fails with
     /// [`RecvError::Closed`] once the endpoint has stopped and every
     /// datagram already queued for this socket has been received.
-    pub async fn recv(&mut self, cx: &Cx) -> Result<(Vec<u8>, SocketAddr), RecvError> {
+    pub async fn recv(&mut self, fcx: &Cx) -> Result<(Vec<u8>, SocketAddr), RecvError> {
         let port = self.port;
         let shared = &self.shared;
         let wait = &mut self.wait;
-        poll_fn(|task| {
-            if cx.is_cancelled() {
+        poll_fn(|cx| {
+            if fcx.is_cancelled() {
                 return Poll::Ready(Err(RecvError::Cancelled));
             }
             {
@@ -265,11 +265,11 @@ impl Socket {
                     return Poll::Ready(Err(RecvError::Closed));
                 }
                 match &q.waker {
-                    Some(w) if w.will_wake(task.waker()) => {}
-                    _ => q.waker = Some(task.waker().clone()),
+                    Some(w) if w.will_wake(cx.waker()) => {}
+                    _ => q.waker = Some(cx.waker().clone()),
                 }
             }
-            if cx.register_cancel(task.waker(), wait) {
+            if fcx.register_cancel(cx.waker(), wait) {
                 return Poll::Ready(Err(RecvError::Cancelled));
             }
             Poll::Pending
@@ -350,21 +350,21 @@ mod tests {
     /// held 1,024 of any size, 64 MiB of the largest.
     #[test]
     fn a_socket_holds_at_most_its_queue_in_bytes() {
-        let result = block_on(run(|cx| async move {
+        let result = block_on(run(|fcx| async move {
             let (mut raw, side) = pair();
-            let mut socket = endpoint(&cx, side, "10.0.0.1".parse().unwrap()).bind(53)?;
+            let mut socket = endpoint(&fcx, side, "10.0.0.1".parse().unwrap()).bind(53)?;
             let big = vec![7; 60_000];
             for _ in 0..40 {
                 raw.send(datagram(&big));
             }
-            cx.sleep(crate::time::ms(10)).await?;
+            fcx.sleep(crate::time::ms(10)).await?;
             let fits = QUEUE / (big.len() + DATAGRAM_COST);
             for _ in 0..fits {
-                assert_eq!(socket.recv(&cx).await?.0.len(), big.len());
+                assert_eq!(socket.recv(&fcx).await?.0.len(), big.len());
             }
             // The rest were dropped, and the room is there again.
             raw.send(datagram(b"after"));
-            assert_eq!(socket.recv(&cx).await?.0, b"after");
+            assert_eq!(socket.recv(&fcx).await?.0, b"after");
             Err::<(), crate::Error>(fictionet::Error::msg("done"))
         }));
         assert_eq!(result.unwrap_err().to_string(), "done");

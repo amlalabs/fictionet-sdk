@@ -64,20 +64,20 @@ pub fn identities(scenario: &Scenario, world_ca: &Ca) -> Result<Identities> {
     Ok(Identities { bank, status })
 }
 
-fn server_config(cx: &Cx, leaf: Leaf) -> Result<Arc<tls::ServerConfig>> {
-    let config = tls::config_builder(cx, SystemTime::now(), rustls::crypto::ring::default_provider())
+fn server_config(fcx: &Cx, leaf: Leaf) -> Result<Arc<tls::ServerConfig>> {
+    let config = tls::config_builder(fcx, SystemTime::now(), rustls::crypto::ring::default_provider())
         .with_safe_default_protocol_versions()?
         .with_no_client_auth()
         .with_single_cert(leaf.chain, leaf.key)?;
     Ok(Arc::new(config))
 }
 
-/// Builds the network in `cx`'s region and serves every sandbox in
+/// Builds the network in `fcx`'s region and serves every sandbox in
 /// `attachments`. Returns an attacher straight into `Sites`, for the
 /// world's own lookups ([`look_up_all`]).
-pub fn start(cx: &Cx, scenario: Arc<Scenario>, ids: Identities, log: Log, mut attachments: Attachments) -> Result<Attacher> {
-    let bank_config = server_config(cx, ids.bank)?;
-    let status_config = server_config(cx, ids.status)?;
+pub fn start(fcx: &Cx, scenario: Arc<Scenario>, ids: Identities, log: Log, mut attachments: Attachments) -> Result<Attacher> {
+    let bank_config = server_config(fcx, ids.bank)?;
+    let status_config = server_config(fcx, ids.status)?;
     let served_by = if scenario.hijacked() { ServedBy::Impostor } else { ServedBy::Bank };
     let bank = Bank::new(scenario.clone(), served_by);
     let hijacked = scenario.hijacked();
@@ -102,7 +102,7 @@ pub fn start(cx: &Cx, scenario: Arc<Scenario>, ids: Identities, log: Log, mut at
     // The events of everything the network does: the ones the log keeps
     // become log lines ([`events::line`]). Only those sources go to the log's
     // thread, so a flood of other events cannot crowd them out of its queue.
-    cx.events().subscribe(move |event| {
+    fcx.events().subscribe(move |event| {
         if events::LOGGED.contains(&event.source) {
             hook.entry(event);
         }
@@ -111,19 +111,19 @@ pub fn start(cx: &Cx, scenario: Arc<Scenario>, ids: Identities, log: Log, mut at
         .subnet(RoutePrefix { addr: scenario.subnet.addr.into(), len: scenario.subnet.len })
         // The scenarios are IPv4 networks, and the agent has IPv6 off.
         .ipv4_only()
-        .serve(cx, inner_attachments)?;
+        .serve(fcx, inner_attachments)?;
 
     // Each sandbox reaches `Sites` through its path.
     let shared = Arc::new(path::Shared { scenario: scenario.clone(), log: log.clone() });
     let to_sites = inner.clone();
-    cx.spawn(move |cx| async move {
+    fcx.spawn(move |fcx| async move {
         loop {
-            let sandbox = attachments.next(&cx).await?;
+            let sandbox = attachments.next(&fcx).await?;
             let name: Arc<str> = Arc::from(sandbox.name());
             match to_sites.attach(&name) {
                 Ok(end) => {
                     let shared = shared.clone();
-                    cx.spawn(move |cx| path::run(cx, sandbox, end, shared, name));
+                    fcx.spawn(move |fcx| path::run(fcx, sandbox, end, shared, name));
                 }
                 Err(e) => {
                     log.line(json!({"type": "attach_failed", "name": &*name, "error": e.to_string()}));
@@ -168,7 +168,7 @@ pub fn state(scenario: &Scenario) -> Value {
 /// waits for every answer. `Sites` makes a site when its name is first
 /// looked up, so this makes the bank's and the status host's addresses
 /// answer from the start, also for an agent that connects by address.
-pub async fn look_up_all(cx: &Cx, attacher: &Attacher, scenario: &Scenario) -> Result {
+pub async fn look_up_all(fcx: &Cx, attacher: &Attacher, scenario: &Scenario) -> Result {
     let from = SocketAddrV4::new(Ipv4Addr::from(u32::from(scenario.subnet.addr) + 254), 40000);
     let gateway = scenario.gateway();
     let mut end: End = attacher.attach(events::LOOKUPS).map_err(|e| fictionet::Error::msg(format!("lookups: {e}")))?;
@@ -179,13 +179,13 @@ pub async fn look_up_all(cx: &Cx, attacher: &Attacher, scenario: &Scenario) -> R
         end.send(Packet(dns_query_packet(from, gateway, id, name)));
         waiting.insert(id, name);
     }
-    let mut sleep = pin!(cx.sleep(Duration::from_secs(10)));
+    let mut sleep = pin!(fcx.sleep(Duration::from_secs(10)));
     while !waiting.is_empty() {
-        let packet = poll_fn(|task| {
-            if let Poll::Ready(r) = end.poll_recv(cx, task) {
+        let packet = poll_fn(|cx| {
+            if let Poll::Ready(r) = end.poll_recv(fcx, cx) {
                 return Poll::Ready(r.ok());
             }
-            match sleep.as_mut().poll(task) {
+            match sleep.as_mut().poll(cx) {
                 Poll::Ready(_) => Poll::Ready(None),
                 Poll::Pending => Poll::Pending,
             }

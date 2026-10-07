@@ -86,10 +86,10 @@ fn recv(qemu: &mut UnixStream) -> Vec<u8> {
 }
 
 /// Polls `recv` once: `None` if nothing is waiting.
-fn poll_once(cx: &fictionet::Cx, i: &mut fictionet::Attachment) -> Option<Result<Packet, RecvError>> {
+fn poll_once(fcx: &fictionet::Cx, i: &mut fictionet::Attachment) -> Option<Result<Packet, RecvError>> {
     let waker = std::task::Waker::noop();
-    let mut task = std::task::Context::from_waker(waker);
-    match i.poll_recv(cx, &mut task) {
+    let mut cx = std::task::Context::from_waker(waker);
+    match i.poll_recv(fcx, &mut cx) {
         std::task::Poll::Ready(r) => Some(r),
         std::task::Poll::Pending => None,
     }
@@ -166,10 +166,10 @@ fn a_fake_qemu_gets_dhcp_arp_and_the_world() {
 
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let out = seen.clone();
-    fictionet::block_on(fictionet::run(move |cx| async move {
-        let mut vm1 = attachments.get(&cx, "vm1").await?;
+    fictionet::block_on(fictionet::run(move |fcx| async move {
+        let mut vm1 = attachments.get(&fcx, "vm1").await?;
         loop {
-            match poll_once(&cx, &mut vm1) {
+            match poll_once(&fcx, &mut vm1) {
                 Some(Ok(Packet(p))) => {
                     let from_vm = p[12..16] == [10, 0, 0, 2];
                     out.lock().unwrap().push(p);
@@ -180,7 +180,7 @@ fn a_fake_qemu_gets_dhcp_arp_and_the_world() {
                 // QEMU closed its socket: attach detached.
                 Some(Err(RecvError::Closed)) => break,
                 Some(Err(e)) => return Err(fictionet::Error::msg(format!("{e:?}"))),
-                None => cx.sleep(fictionet::time::ms(10)).await?,
+                None => fcx.sleep(fictionet::time::ms(10)).await?,
             }
         }
         Ok(())

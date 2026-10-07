@@ -84,13 +84,13 @@ fn client_config(alpn: &[u8]) -> Arc<ClientConfig> {
     Arc::new(config)
 }
 
-async fn lookup(cx: &Cx, m: &Machine, name: &str, kind: RecordType) {
-    let mut socket = m.udp.bind(40000 + (cx.random_u64() % 20000) as u16).unwrap();
+async fn lookup(fcx: &Cx, m: &Machine, name: &str, kind: RecordType) {
+    let mut socket = m.udp.bind(40000 + (fcx.random_u64() % 20000) as u16).unwrap();
     let mut q = Message::query();
-    q.metadata.id = cx.random_u64() as u16;
+    q.metadata.id = fcx.random_u64() as u16;
     q.add_query(Query::query(Name::from_ascii(name).unwrap(), kind));
     socket.send_to(&q.to_vec().unwrap(), SocketAddr::new(GATEWAY.into(), 53));
-    socket.recv(cx).await.unwrap();
+    socket.recv(fcx).await.unwrap();
 }
 
 /// One HTTP/1.1 request; returns the status.
@@ -115,10 +115,10 @@ where
     status
 }
 
-async fn tls(cx: &Cx, m: &Machine, addr: Ipv4Addr, sni: &str) -> std::io::Result<impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> {
-    let conn = m.tcp.connect(cx, SocketAddr::new(addr.into(), 443)).await.map_err(std::io::Error::other)?;
+async fn tls(fcx: &Cx, m: &Machine, addr: Ipv4Addr, sni: &str) -> std::io::Result<impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> {
+    let conn = m.tcp.connect(fcx, SocketAddr::new(addr.into(), 443)).await.map_err(std::io::Error::other)?;
     let connector = tokio_rustls::TlsConnector::from(client_config(b"http/1.1"));
-    connector.connect(ServerName::try_from(sni.to_owned()).unwrap(), conn.into_tokio(cx)).await
+    connector.connect(ServerName::try_from(sni.to_owned()).unwrap(), conn.into_tokio(fcx)).await
 }
 
 /// A CA in a fresh directory, as `ca.py` leaves it: `ca.pem` and `ca.key`.
@@ -168,40 +168,40 @@ fn the_log_is_the_recorded_one() {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
-        let result = rt.block_on(fictionet::run(move |cx| async move {
+        let result = rt.block_on(fictionet::run(move |fcx| async move {
             let (attacher, attachments) = fictionet::attachments();
             let host_list: Vec<String> = hosts.keys().cloned().collect();
-            serve(&cx, &hosts, leaves, Content::new(port), log, attachments)?;
-            look_up_all(&cx, &attacher, &host_list).await?;
+            serve(&fcx, &hosts, leaves, Content::new(port), log, attachments)?;
+            look_up_all(&fcx, &attacher, &host_list).await?;
 
             let end = attacher.attach("agent").unwrap();
-            let (t, u, i, _other) = ip::split_protocols(&cx, end);
-            let m = Machine { tcp: tcp::endpoint(&cx, t, ME.into()), udp: udp::endpoint(&cx, u, ME.into()), _icmp: i };
+            let (t, u, i, _other) = ip::split_protocols(&fcx, end);
+            let m = Machine { tcp: tcp::endpoint(&fcx, t, ME.into()), udp: udp::endpoint(&fcx, u, ME.into()), _icmp: i };
             let wiki = hosts["en.wikipedia.org"];
-            lookup(&cx, &m, "en.wikipedia.org", RecordType::A).await;
-            lookup(&cx, &m, "en.wikipedia.org", RecordType::AAAA).await;
-            lookup(&cx, &m, "example.com", RecordType::A).await;
-            lookup(&cx, &m, "rw-desktop", RecordType::A).await;
+            lookup(&fcx, &m, "en.wikipedia.org", RecordType::A).await;
+            lookup(&fcx, &m, "en.wikipedia.org", RecordType::AAAA).await;
+            lookup(&fcx, &m, "example.com", RecordType::A).await;
+            lookup(&fcx, &m, "rw-desktop", RecordType::A).await;
             // The first three documents, over HTTPS, and one HEAD.
             for url in documents.iter().take(3) {
                 let uri: http::Uri = url.parse().unwrap();
                 let host = uri.host().unwrap().to_owned();
-                let stream = tls(&cx, &m, hosts[&host], &host).await.unwrap();
+                let stream = tls(&fcx, &m, hosts[&host], &host).await.unwrap();
                 assert_eq!(get(stream, "GET", &host, uri.path()).await, 200, "{url}");
             }
-            let stream = tls(&cx, &m, wiki, "en.wikipedia.org").await.unwrap();
+            let stream = tls(&fcx, &m, wiki, "en.wikipedia.org").await.unwrap();
             get(stream, "HEAD", "en.wikipedia.org", "/wiki/Main_Page").await;
-            let stream = tls(&cx, &m, wiki, "en.wikipedia.org").await.unwrap();
+            let stream = tls(&fcx, &m, wiki, "en.wikipedia.org").await.unwrap();
             get(stream, "GET", "en.wikipedia.org", "/no/such/page?q=1").await;
             // A host at another address, over this connection.
-            let stream = tls(&cx, &m, wiki, "en.wikipedia.org").await.unwrap();
+            let stream = tls(&fcx, &m, wiki, "en.wikipedia.org").await.unwrap();
             assert_eq!(get(stream, "GET", "www.gov.uk", "/").await, 421);
             // Plain HTTP: a redirect.
-            let conn = m.tcp.connect(&cx, SocketAddr::new(IpAddr::V4(wiki), 80)).await.unwrap();
-            assert_eq!(get(conn.into_tokio(&cx), "GET", "en.wikipedia.org", "/wiki/X").await, 301);
+            let conn = m.tcp.connect(&fcx, SocketAddr::new(IpAddr::V4(wiki), 80)).await.unwrap();
+            assert_eq!(get(conn.into_tokio(&fcx), "GET", "en.wikipedia.org", "/wiki/X").await, 301);
             // A name the world does not serve.
-            assert!(tls(&cx, &m, wiki, "example.com").await.is_err());
-            let _ = cx.sleep(Duration::from_millis(500)).await;
+            assert!(tls(&fcx, &m, wiki, "example.com").await.is_err());
+            let _ = fcx.sleep(Duration::from_millis(500)).await;
             Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
         }));
         let _ = tx.send(result.err().map(|e| e.to_string()));

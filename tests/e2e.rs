@@ -45,8 +45,8 @@ where
     Fut: Future<Output = fictionet::Result> + Send + 'static,
 {
     let result = within(limit, move || {
-        block_on(run(move |cx| async move {
-            f(cx).await?;
+        block_on(run(move |fcx| async move {
+            f(fcx).await?;
             Err(fictionet::Error::from(Done))
         }))
     });
@@ -87,33 +87,33 @@ struct Client<C> {
 }
 
 impl<C: Connection> Client<C> {
-    async fn connect(cx: &Cx, conn: C, config: Arc<ClientConfig>, name: &str) -> Result<Self, ClientError> {
+    async fn connect(fcx: &Cx, conn: C, config: Arc<ClientConfig>, name: &str) -> Result<Self, ClientError> {
         let name = ServerName::try_from(name.to_owned()).unwrap();
         let tls = ClientConnection::new(config, name).unwrap();
         let mut c = Client { conn, tls };
         while c.tls.is_handshaking() {
-            c.flush(cx).await?;
+            c.flush(fcx).await?;
             if !c.tls.is_handshaking() {
                 break;
             }
-            c.read_more(cx).await?;
+            c.read_more(fcx).await?;
         }
-        c.flush(cx).await?;
+        c.flush(fcx).await?;
         Ok(c)
     }
 
-    async fn flush(&mut self, cx: &Cx) -> Result<(), ClientError> {
+    async fn flush(&mut self, fcx: &Cx) -> Result<(), ClientError> {
         while self.tls.wants_write() {
             let mut out = Vec::new();
             self.tls.write_tls(&mut out).unwrap();
-            self.conn.write_all(cx, &out).await?;
+            self.conn.write_all(fcx, &out).await?;
         }
         Ok(())
     }
 
-    async fn read_more(&mut self, cx: &Cx) -> Result<(), ClientError> {
+    async fn read_more(&mut self, fcx: &Cx) -> Result<(), ClientError> {
         let mut buf = vec![0; 16 * 1024];
-        let n = self.conn.read(cx, &mut buf).await?;
+        let n = self.conn.read(fcx, &mut buf).await?;
         if n == 0 && self.tls.is_handshaking() {
             return Err(ClientError::Truncated);
         }
@@ -121,7 +121,7 @@ impl<C: Connection> Client<C> {
         loop {
             self.tls.read_tls(&mut data).unwrap();
             let r = self.tls.process_new_packets();
-            let _ = self.flush(cx).await;
+            let _ = self.flush(fcx).await;
             r.map_err(ClientError::Tls)?;
             if data.is_empty() {
                 return Ok(());
@@ -130,31 +130,31 @@ impl<C: Connection> Client<C> {
     }
 
     /// Reads application data. `Ok(0)` is the server's close_notify.
-    async fn read(&mut self, cx: &Cx, buf: &mut [u8]) -> Result<usize, ClientError> {
+    async fn read(&mut self, fcx: &Cx, buf: &mut [u8]) -> Result<usize, ClientError> {
         loop {
             match self.tls.reader().read(buf) {
                 Ok(n) => return Ok(n),
-                Err(e) if e.kind() == ErrorKind::WouldBlock => self.read_more(cx).await?,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => self.read_more(fcx).await?,
                 Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Err(ClientError::Truncated),
                 Err(e) => panic!("{e}"),
             }
         }
     }
 
-    async fn write_all(&mut self, cx: &Cx, mut data: &[u8]) -> Result<(), ClientError> {
+    async fn write_all(&mut self, fcx: &Cx, mut data: &[u8]) -> Result<(), ClientError> {
         while !data.is_empty() {
             let n = self.tls.writer().write(&data[..data.len().min(16 * 1024)]).unwrap();
             data = &data[n..];
-            self.flush(cx).await?;
+            self.flush(fcx).await?;
         }
         Ok(())
     }
 
     /// Sends close_notify and a FIN. Reading still works.
-    async fn close(&mut self, cx: &Cx) -> Result<(), ClientError> {
+    async fn close(&mut self, fcx: &Cx) -> Result<(), ClientError> {
         self.tls.send_close_notify();
-        self.flush(cx).await?;
-        self.conn.shutdown(cx).await?;
+        self.flush(fcx).await?;
+        self.conn.shutdown(fcx).await?;
         Ok(())
     }
 }
@@ -207,9 +207,9 @@ const DOWN: usize = 2 * 1024 * 1024;
 
 /// One machine: its cable split by protocol, and a TCP endpoint on the TCP
 /// end. Pings and UDP are left unanswered.
-fn machine(cx: &Cx, cable: impl Interface, addr: IpAddr) -> tcp::Endpoint {
-    let (tcp, _udp, _icmp, _other) = ip::split_protocols(cx, cable);
-    tcp::endpoint(cx, tcp, addr)
+fn machine(fcx: &Cx, cable: impl Interface, addr: IpAddr) -> tcp::Endpoint {
+    let (tcp, _udp, _icmp, _other) = ip::split_protocols(fcx, cable);
+    tcp::endpoint(fcx, tcp, addr)
 }
 
 fn https_through_a_router(server_addr: &str, client_addr: &str, server_prefix: &str, client_prefix: &str) {
@@ -217,25 +217,25 @@ fn https_through_a_router(server_addr: &str, client_addr: &str, server_prefix: &
     let client_ip: IpAddr = client_addr.parse().unwrap();
     let server_prefix: route::Prefix = server_prefix.parse().unwrap();
     let client_prefix: route::Prefix = client_prefix.parse().unwrap();
-    world(Duration::from_secs(60), move |cx| async move {
+    world(Duration::from_secs(60), move |fcx| async move {
         let certs = certs(NAME);
 
         // Two cables into the router. The client's link has 5 ms of delay
         // each way.
         let (router_to_server, server_cable) = pair();
         let (router_to_client, client_cable) = pair();
-        let client_cable = delay(&cx, Duration::from_millis(5), client_cable);
+        let client_cable = delay(&fcx, Duration::from_millis(5), client_cable);
         let _router = route::router(
-            &cx,
+            &fcx,
             vec![
                 (server_prefix, Box::new(router_to_server) as Box<dyn Interface>),
                 (client_prefix, Box::new(router_to_client)),
             ],
         );
-        let server = machine(&cx, server_cable, server_ip);
-        let client = machine(&cx, client_cable, client_ip);
+        let server = machine(&fcx, server_cable, server_ip);
+        let client = machine(&fcx, client_cable, client_ip);
 
-        let mut config = tls::config_builder(&cx, SystemTime::now(), rustls::crypto::ring::default_provider())
+        let mut config = tls::config_builder(&fcx, SystemTime::now(), rustls::crypto::ring::default_provider())
             .with_safe_default_protocol_versions()?
             .with_no_client_auth()
             .with_single_cert(certs.chain, certs.key)?;
@@ -243,27 +243,27 @@ fn https_through_a_router(server_addr: &str, client_addr: &str, server_prefix: &
         let config: Arc<ServerConfig> = Arc::new(config);
 
         let mut listener = server.listen(443)?;
-        let served = cx.spawn(move |cx| async move {
-            let conn = listener.accept(&cx).await?;
+        let served = fcx.spawn(move |fcx| async move {
+            let conn = listener.accept(&fcx).await?;
             assert_eq!(conn.peer_addr().ip(), client_ip);
-            let hello = tls::server(&cx, conn).await?;
+            let hello = tls::server(&fcx, conn).await?;
             assert_eq!(hello.server_name(), Some(NAME));
-            let mut conn = hello.finish(&cx, config).await?;
+            let mut conn = hello.finish(&fcx, config).await?;
             assert_eq!(conn.alpn(), Some(&b"http/1.1"[..]));
             assert_eq!(conn.inner().local_addr(), SocketAddr::new(server_ip, 443));
             // Read the whole upload, up to the client's close_notify.
             let mut got = Vec::new();
             let mut buf = vec![0; 64 * 1024];
             loop {
-                let n = conn.read(&cx, &mut buf).await?;
+                let n = conn.read(&fcx, &mut buf).await?;
                 if n == 0 {
                     break;
                 }
                 got.extend_from_slice(&buf[..n]);
             }
             assert!(got == pattern(UP, 1), "the upload arrived changed ({} bytes)", got.len());
-            conn.write_all(&cx, &pattern(DOWN, 2)).await?;
-            conn.shutdown(&cx).await?;
+            conn.write_all(&fcx, &pattern(DOWN, 2)).await?;
+            conn.shutdown(&fcx).await?;
             Ok(())
         });
 
@@ -272,23 +272,23 @@ fn https_through_a_router(server_addr: &str, client_addr: &str, server_prefix: &
             .with_root_certificates(certs.roots)
             .with_no_client_auth();
         client_config.alpn_protocols = vec![b"http/1.1".to_vec()];
-        let conn = client.connect(&cx, SocketAddr::new(server_ip, 443)).await?;
+        let conn = client.connect(&fcx, SocketAddr::new(server_ip, 443)).await?;
         assert_eq!(conn.local_addr().ip(), client_ip);
-        let mut tls = Client::connect(&cx, conn, Arc::new(client_config), NAME).await?;
+        let mut tls = Client::connect(&fcx, conn, Arc::new(client_config), NAME).await?;
         assert_eq!(tls.tls.alpn_protocol(), Some(&b"http/1.1"[..]));
-        tls.write_all(&cx, &pattern(UP, 1)).await?;
-        tls.close(&cx).await?;
+        tls.write_all(&fcx, &pattern(UP, 1)).await?;
+        tls.close(&fcx).await?;
         let mut got = Vec::new();
         let mut buf = vec![0; 64 * 1024];
         loop {
-            let n = tls.read(&cx, &mut buf).await?;
+            let n = tls.read(&fcx, &mut buf).await?;
             if n == 0 {
                 break;
             }
             got.extend_from_slice(&buf[..n]);
         }
         assert!(got == pattern(DOWN, 2), "the download arrived changed ({} bytes)", got.len());
-        served.join(&cx).await?;
+        served.join(&fcx).await?;
         Ok(())
     });
 }
@@ -320,8 +320,8 @@ fn carries_data(p: &[u8]) -> bool {
 }
 
 impl<I: Interface> Interface for Count<I> {
-    fn poll_recv(&mut self, cx: &Cx, task: &mut Context<'_>) -> Poll<Result<Packet, RecvError>> {
-        let r = self.inner.poll_recv(cx, task);
+    fn poll_recv(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<Packet, RecvError>> {
+        let r = self.inner.poll_recv(fcx, cx);
         if let Poll::Ready(Ok(p)) = &r {
             self.counts.lock().unwrap()[carries_data(&p.0) as usize] += 1;
         }
@@ -342,26 +342,26 @@ impl<I: Interface> Interface for Count<I> {
 fn a_receiver_acks_every_second_segment() {
     let counts = Arc::new(Mutex::new([0usize; 4]));
     let seen = counts.clone();
-    world(Duration::from_secs(60), move |cx| async move {
+    world(Duration::from_secs(60), move |fcx| async move {
         let (a, b) = pair();
-        let b = delay(&cx, Duration::from_millis(5), b);
+        let b = delay(&fcx, Duration::from_millis(5), b);
         let b = Count { inner: b, counts: seen };
-        let sender = tcp::endpoint(&cx, a, "10.0.0.1".parse().unwrap());
-        let receiver = tcp::endpoint(&cx, b, "10.0.0.2".parse().unwrap());
+        let sender = tcp::endpoint(&fcx, a, "10.0.0.1".parse().unwrap());
+        let receiver = tcp::endpoint(&fcx, b, "10.0.0.2".parse().unwrap());
         let mut listener = sender.listen(80)?;
-        let sent = cx.spawn(move |cx| async move {
-            let mut conn = listener.accept(&cx).await?;
-            conn.write_all(&cx, &pattern(DOWN, 3)).await?;
-            conn.shutdown(&cx).await?;
+        let sent = fcx.spawn(move |fcx| async move {
+            let mut conn = listener.accept(&fcx).await?;
+            conn.write_all(&fcx, &pattern(DOWN, 3)).await?;
+            conn.shutdown(&fcx).await?;
             let mut buf = [0; 1];
-            let _ = conn.read(&cx, &mut buf).await;
+            let _ = conn.read(&fcx, &mut buf).await;
             Ok(())
         });
-        let mut conn = receiver.connect(&cx, "10.0.0.1:80".parse().unwrap()).await?;
+        let mut conn = receiver.connect(&fcx, "10.0.0.1:80".parse().unwrap()).await?;
         let mut got = 0;
         let mut buf = vec![0; 64 * 1024];
         loop {
-            let n = conn.read(&cx, &mut buf).await?;
+            let n = conn.read(&fcx, &mut buf).await?;
             if n == 0 {
                 break;
             }
@@ -369,7 +369,7 @@ fn a_receiver_acks_every_second_segment() {
         }
         assert_eq!(got, DOWN);
         drop(conn);
-        sent.join(&cx).await?;
+        sent.join(&fcx).await?;
         Ok(())
     });
     // [received without data, received with data, sent without, sent with]

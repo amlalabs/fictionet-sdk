@@ -343,27 +343,27 @@ mod tests {
         let _sandbox = attacher.attach("agent").unwrap();
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let s = seen.clone();
-        crate::block_on(crate::run::run_with(graph.clone(), move |cx| async move {
-            let lan = cx.group("office LAN");
+        crate::block_on(crate::run::run_with(graph.clone(), move |fcx| async move {
+            let lan = fcx.group("office LAN");
             let hosts = lan.group("hosts");
             // Taken with the world's `Cx`, read by a task in the group.
-            let sandbox = attachments.get(&cx, "agent").await?;
+            let sandbox = attachments.get(&fcx, "agent").await?;
             let slow = delay(&lan, ms(1), sandbox);
             let (to_host, host) = crate::pair();
-            route::router(&cx, vec![("0.0.0.0/0".parse()?, Box::new(slow) as Box<dyn Interface>), ("10.0.0.5/32".parse()?, Box::new(to_host))]);
-            hosts.spawn(move |cx| async move {
+            route::router(&fcx, vec![("0.0.0.0/0".parse()?, Box::new(slow) as Box<dyn Interface>), ("10.0.0.5/32".parse()?, Box::new(to_host))]);
+            hosts.spawn(move |fcx| async move {
                 // A task started by a grouped task is in the group too.
-                cx.spawn(move |cx| async move {
+                fcx.spawn(move |fcx| async move {
                     let mut host = host;
-                    let _ = host.recv(&cx).await;
+                    let _ = host.recv(&fcx).await;
                     Ok(())
                 });
                 Ok(())
             });
-            cx.sleep(ms(30)).await?;
+            fcx.sleep(ms(30)).await?;
             let (_, (_, data)) = snapshot(&g, None);
             s.lock().unwrap().push(data);
-            cx.cancel();
+            fcx.cancel();
             Ok(())
         }))
         .unwrap();

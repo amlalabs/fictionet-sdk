@@ -54,8 +54,8 @@ fn mem_pair() -> (MemConn, MemConn) {
 }
 
 impl Connection for MemConn {
-    fn poll_read(&mut self, cx: &Cx, task: &mut Context<'_>, buf: &mut [u8]) -> Poll<Result<usize, ConnError>> {
-        if cx.is_cancelled() {
+    fn poll_read(&mut self, fcx: &Cx, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<Result<usize, ConnError>> {
+        if fcx.is_cancelled() {
             return Poll::Ready(Err(ConnError::Cancelled));
         }
         let mut p = self.rx.lock().unwrap();
@@ -63,7 +63,7 @@ impl Connection for MemConn {
             if p.write_closed {
                 return Poll::Ready(Ok(0));
             }
-            p.reader = Some(task.waker().clone());
+            p.reader = Some(cx.waker().clone());
             return Poll::Pending;
         }
         let n = buf.len().min(p.buf.len());
@@ -76,8 +76,8 @@ impl Connection for MemConn {
         Poll::Ready(Ok(n))
     }
 
-    fn poll_write(&mut self, cx: &Cx, task: &mut Context<'_>, data: &[u8]) -> Poll<Result<usize, ConnError>> {
-        if cx.is_cancelled() {
+    fn poll_write(&mut self, fcx: &Cx, cx: &mut Context<'_>, data: &[u8]) -> Poll<Result<usize, ConnError>> {
+        if fcx.is_cancelled() {
             return Poll::Ready(Err(ConnError::Cancelled));
         }
         let mut p = self.tx.lock().unwrap();
@@ -89,7 +89,7 @@ impl Connection for MemConn {
         }
         let room = PIPE_CAPACITY - p.buf.len();
         if room == 0 {
-            p.writer = Some(task.waker().clone());
+            p.writer = Some(cx.waker().clone());
             return Poll::Pending;
         }
         let n = room.min(data.len());
@@ -100,7 +100,7 @@ impl Connection for MemConn {
         Poll::Ready(Ok(n))
     }
 
-    fn poll_shutdown(&mut self, _cx: &Cx, _task: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
+    fn poll_shutdown(&mut self, _fcx: &Cx, _cx: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
         let mut p = self.tx.lock().unwrap();
         p.write_closed = true;
         if let Some(w) = p.reader.take() {
@@ -150,34 +150,34 @@ impl From<ConnError> for ClientError {
 }
 
 impl Client {
-    async fn connect(cx: &Cx, conn: MemConn, config: Arc<ClientConfig>, name: &str) -> Result<Client, ClientError> {
+    async fn connect(fcx: &Cx, conn: MemConn, config: Arc<ClientConfig>, name: &str) -> Result<Client, ClientError> {
         let name = ServerName::try_from(name.to_owned()).unwrap();
         let tls = ClientConnection::new(config, name).unwrap();
         let mut c = Client { conn, tls };
         while c.tls.is_handshaking() {
-            c.flush(cx).await?;
+            c.flush(fcx).await?;
             if !c.tls.is_handshaking() {
                 break;
             }
-            c.read_more(cx).await?;
+            c.read_more(fcx).await?;
         }
-        c.flush(cx).await?;
+        c.flush(fcx).await?;
         Ok(c)
     }
 
-    async fn flush(&mut self, cx: &Cx) -> Result<(), ClientError> {
+    async fn flush(&mut self, fcx: &Cx) -> Result<(), ClientError> {
         while self.tls.wants_write() {
             let mut out = Vec::new();
             self.tls.write_tls(&mut out).unwrap();
-            self.conn.write_all(cx, &out).await?;
+            self.conn.write_all(fcx, &out).await?;
         }
         Ok(())
     }
 
     /// Reads one chunk from the connection and processes it.
-    async fn read_more(&mut self, cx: &Cx) -> Result<(), ClientError> {
+    async fn read_more(&mut self, fcx: &Cx) -> Result<(), ClientError> {
         let mut buf = vec![0; 16 * 1024];
-        let n = self.conn.read(cx, &mut buf).await?;
+        let n = self.conn.read(fcx, &mut buf).await?;
         if n == 0 && self.tls.is_handshaking() {
             return Err(ClientError::Truncated);
         }
@@ -186,7 +186,7 @@ impl Client {
             self.tls.read_tls(&mut data).unwrap();
             let r = self.tls.process_new_packets();
             // Send any alert or reply before reporting.
-            let _ = self.flush(cx).await;
+            let _ = self.flush(fcx).await;
             r.map_err(ClientError::Tls)?;
             if data.is_empty() {
                 return Ok(());
@@ -195,30 +195,30 @@ impl Client {
     }
 
     /// Reads application data. `Ok(0)` is the server's close_notify.
-    async fn read(&mut self, cx: &Cx, buf: &mut [u8]) -> Result<usize, ClientError> {
+    async fn read(&mut self, fcx: &Cx, buf: &mut [u8]) -> Result<usize, ClientError> {
         loop {
             match self.tls.reader().read(buf) {
                 Ok(n) => return Ok(n),
-                Err(e) if e.kind() == ErrorKind::WouldBlock => self.read_more(cx).await?,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => self.read_more(fcx).await?,
                 Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Err(ClientError::Truncated),
                 Err(e) => panic!("{e}"),
             }
         }
     }
 
-    async fn write_all(&mut self, cx: &Cx, mut data: &[u8]) -> Result<(), ClientError> {
+    async fn write_all(&mut self, fcx: &Cx, mut data: &[u8]) -> Result<(), ClientError> {
         while !data.is_empty() {
             let n = self.tls.writer().write(&data[..data.len().min(16 * 1024)]).unwrap();
             data = &data[n..];
-            self.flush(cx).await?;
+            self.flush(fcx).await?;
         }
         Ok(())
     }
 
-    async fn close(&mut self, cx: &Cx) -> Result<(), ClientError> {
+    async fn close(&mut self, fcx: &Cx) -> Result<(), ClientError> {
         self.tls.send_close_notify();
-        self.flush(cx).await?;
-        self.conn.shutdown(cx).await?;
+        self.flush(fcx).await?;
+        self.conn.shutdown(fcx).await?;
         Ok(())
     }
 }
@@ -277,9 +277,9 @@ fn provider() -> rustls::crypto::CryptoProvider {
 }
 
 /// A server config for `name`, issued by `ca`, offering `alpn`.
-fn server_config(cx: &Cx, ca: &Ca, name: &str, alpn: &[&[u8]]) -> Arc<ServerConfig> {
+fn server_config(fcx: &Cx, ca: &Ca, name: &str, alpn: &[&[u8]]) -> Arc<ServerConfig> {
     let (chain, key) = ca.issue(&[name], 2000, 2100, ExtendedKeyUsagePurpose::ServerAuth);
-    let mut config = tls::config_builder(cx, SystemTime::now(), provider())
+    let mut config = tls::config_builder(fcx, SystemTime::now(), provider())
         .with_safe_default_protocol_versions()
         .unwrap()
         .with_no_client_auth()
@@ -315,39 +315,39 @@ fn client_config(ca: &Ca, alpn: &[&[u8]]) -> Arc<ClientConfig> {
 #[test]
 fn handshake_with_sni_and_alpn() {
     within(Duration::from_secs(20), || {
-        block_on(run(|cx| async move {
+        block_on(run(|fcx| async move {
             let ca = Ca::new();
-            let config = server_config(&cx, &ca, "example.test", &[b"h2", b"http/1.1"]);
+            let config = server_config(&fcx, &ca, "example.test", &[b"h2", b"http/1.1"]);
             let client_config = client_config(&ca, &[b"h2", b"http/1.1"]);
             let (server_side, client_side) = mem_pair();
 
-            let server = cx.spawn(move |cx| async move {
-                let hello = tls::server(&cx, server_side).await?;
+            let server = fcx.spawn(move |fcx| async move {
+                let hello = tls::server(&fcx, server_side).await?;
                 assert_eq!(hello.server_name(), Some("example.test"));
                 assert_eq!(hello.alpn(), vec![&b"h2"[..], &b"http/1.1"[..]]);
-                let mut conn = hello.finish(&cx, config).await?;
+                let mut conn = hello.finish(&fcx, config).await?;
                 assert_eq!(conn.alpn(), Some(&b"h2"[..]));
                 let mut buf = [0; 4];
                 let mut got = 0;
                 while got < 4 {
-                    got += conn.read(&cx, &mut buf[got..]).await?;
+                    got += conn.read(&fcx, &mut buf[got..]).await?;
                 }
                 assert_eq!(&buf, b"ping");
-                conn.write_all(&cx, b"pong").await?;
-                conn.shutdown(&cx).await?;
+                conn.write_all(&fcx, b"pong").await?;
+                conn.shutdown(&fcx).await?;
                 Ok(())
             });
 
-            let mut client = Client::connect(&cx, client_side, client_config, "example.test").await.unwrap();
+            let mut client = Client::connect(&fcx, client_side, client_config, "example.test").await.unwrap();
             assert_eq!(client.tls.alpn_protocol(), Some(&b"h2"[..]));
-            client.write_all(&cx, b"ping").await.unwrap();
+            client.write_all(&fcx, b"ping").await.unwrap();
             let mut buf = [0; 4];
             let mut got = 0;
             while got < 4 {
-                got += client.read(&cx, &mut buf[got..]).await.unwrap();
+                got += client.read(&fcx, &mut buf[got..]).await.unwrap();
             }
             assert_eq!(&buf, b"pong");
-            Ok(server.join(&cx).await?)
+            Ok(server.join(&fcx).await?)
         }))
     })
     .unwrap();
@@ -356,47 +356,47 @@ fn handshake_with_sni_and_alpn() {
 #[test]
 fn the_world_picks_a_config_per_handshake() {
     within(Duration::from_secs(20), || {
-        block_on(run(|cx| async move {
+        block_on(run(|fcx| async move {
             let ca = Ca::new();
-            let a = server_config(&cx, &ca, "a.test", &[]);
-            let b = server_config(&cx, &ca, "b.test", &[]);
+            let a = server_config(&fcx, &ca, "a.test", &[]);
+            let b = server_config(&fcx, &ca, "b.test", &[]);
             let client_config = client_config(&ca, &[]);
 
             for name in ["a.test", "b.test", "a.test"] {
                 let (server_side, client_side) = mem_pair();
                 let (a, b) = (a.clone(), b.clone());
-                let server = cx.spawn(move |cx| async move {
-                    let hello = tls::server(&cx, server_side).await?;
+                let server = fcx.spawn(move |fcx| async move {
+                    let hello = tls::server(&fcx, server_side).await?;
                     let config = if hello.server_name() == Some("a.test") { a } else { b };
-                    let mut conn = hello.finish(&cx, config).await?;
-                    conn.write_all(&cx, b"hi").await?;
-                    conn.shutdown(&cx).await?;
+                    let mut conn = hello.finish(&fcx, config).await?;
+                    conn.write_all(&fcx, b"hi").await?;
+                    conn.shutdown(&fcx).await?;
                     Ok(())
                 });
                 // The client checks the certificate matches the name, so the
                 // handshake succeeds only if the server picked the right one.
-                let mut client = Client::connect(&cx, client_side, client_config.clone(), name).await.unwrap();
+                let mut client = Client::connect(&fcx, client_side, client_config.clone(), name).await.unwrap();
                 let mut buf = [0; 2];
                 let mut got = 0;
                 while got < 2 {
-                    got += client.read(&cx, &mut buf[got..]).await.unwrap();
+                    got += client.read(&fcx, &mut buf[got..]).await.unwrap();
                 }
                 assert_eq!(&buf, b"hi");
-                server.join(&cx).await?;
+                server.join(&fcx).await?;
             }
 
             // The wrong config fails the handshake on the client's side.
             let (server_side, client_side) = mem_pair();
             let a2 = a.clone();
-            let server = cx.spawn(move |cx| async move {
-                let hello = tls::server(&cx, server_side).await?;
+            let server = fcx.spawn(move |fcx| async move {
+                let hello = tls::server(&fcx, server_side).await?;
                 assert_eq!(hello.server_name(), Some("b.test"));
-                assert_eq!(hello.finish(&cx, a2).await.err(), Some(ConnError::Broken));
+                assert_eq!(hello.finish(&fcx, a2).await.err(), Some(ConnError::Broken));
                 Ok(())
             });
-            let err = Client::connect(&cx, client_side, client_config, "b.test").await.err().unwrap();
+            let err = Client::connect(&fcx, client_side, client_config, "b.test").await.err().unwrap();
             assert!(matches!(err, ClientError::Tls(rustls::Error::InvalidCertificate(_))), "{err:?}");
-            Ok(server.join(&cx).await?)
+            Ok(server.join(&fcx).await?)
         }))
     })
     .unwrap();
@@ -405,22 +405,22 @@ fn the_world_picks_a_config_per_handshake() {
 #[test]
 fn reject_sends_unrecognized_name() {
     within(Duration::from_secs(20), || {
-        block_on(run(|cx| async move {
+        block_on(run(|fcx| async move {
             let ca = Ca::new();
             let client_config = client_config(&ca, &[]);
             let (server_side, client_side) = mem_pair();
-            let server = cx.spawn(move |cx| async move {
-                let hello = tls::server(&cx, server_side).await?;
+            let server = fcx.spawn(move |fcx| async move {
+                let hello = tls::server(&fcx, server_side).await?;
                 assert_eq!(hello.server_name(), Some("unknown.test"));
-                hello.reject(&cx).await?;
+                hello.reject(&fcx).await?;
                 Ok(())
             });
-            let err = Client::connect(&cx, client_side, client_config, "unknown.test").await.err().unwrap();
+            let err = Client::connect(&fcx, client_side, client_config, "unknown.test").await.err().unwrap();
             assert!(
                 matches!(err, ClientError::Tls(rustls::Error::AlertReceived(AlertDescription::UnrecognisedName))),
                 "{err:?}"
             );
-            Ok(server.join(&cx).await?)
+            Ok(server.join(&fcx).await?)
         }))
     })
     .unwrap();
@@ -429,18 +429,18 @@ fn reject_sends_unrecognized_name() {
 #[test]
 fn a_dropped_hello_closes_with_no_alert() {
     within(Duration::from_secs(20), || {
-        block_on(run(|cx| async move {
+        block_on(run(|fcx| async move {
             let ca = Ca::new();
             let client_config = client_config(&ca, &[]);
             let (server_side, client_side) = mem_pair();
-            let server = cx.spawn(move |cx| async move {
-                drop(tls::server(&cx, server_side).await?);
+            let server = fcx.spawn(move |fcx| async move {
+                drop(tls::server(&fcx, server_side).await?);
                 Ok(())
             });
-            let err = Client::connect(&cx, client_side, client_config, "x.test").await.err().unwrap();
+            let err = Client::connect(&fcx, client_side, client_config, "x.test").await.err().unwrap();
             // The client reads the end of the stream, not an alert.
             assert!(matches!(err, ClientError::Truncated), "{err:?}");
-            Ok(server.join(&cx).await?)
+            Ok(server.join(&fcx).await?)
         }))
     })
     .unwrap();
@@ -449,27 +449,27 @@ fn a_dropped_hello_closes_with_no_alert() {
 #[test]
 fn a_first_message_that_is_not_a_hello_is_broken() {
     within(Duration::from_secs(20), || {
-        block_on(run(|cx| async move {
+        block_on(run(|fcx| async move {
             let (server_side, mut client_side) = mem_pair();
-            let server = cx.spawn(move |cx| async move {
-                assert_eq!(tls::server(&cx, server_side).await.err(), Some(ConnError::Broken));
+            let server = fcx.spawn(move |fcx| async move {
+                assert_eq!(tls::server(&fcx, server_side).await.err(), Some(ConnError::Broken));
                 Ok(())
             });
-            client_side.write_all(&cx, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").await?;
-            server.join(&cx).await?;
+            client_side.write_all(&fcx, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").await?;
+            server.join(&fcx).await?;
             // Nothing was sent back.
             let mut buf = [0; 16];
-            assert_eq!(client_side.read(&cx, &mut buf).await?, 0);
+            assert_eq!(client_side.read(&fcx, &mut buf).await?, 0);
 
             // A client that closes before its hello is complete.
             let (server_side, mut client_side) = mem_pair();
-            let server = cx.spawn(move |cx| async move {
-                assert_eq!(tls::server(&cx, server_side).await.err(), Some(ConnError::Broken));
+            let server = fcx.spawn(move |fcx| async move {
+                assert_eq!(tls::server(&fcx, server_side).await.err(), Some(ConnError::Broken));
                 Ok(())
             });
-            client_side.write_all(&cx, &[22, 3, 1, 0, 200, 1]).await?;
-            client_side.shutdown(&cx).await?;
-            Ok(server.join(&cx).await?)
+            client_side.write_all(&fcx, &[22, 3, 1, 0, 200, 1]).await?;
+            client_side.shutdown(&fcx).await?;
+            Ok(server.join(&fcx).await?)
         }))
     })
     .unwrap();
@@ -483,7 +483,7 @@ fn client_auth_at(start: SystemTime) -> (Result<(), ConnError>, Result<(), Strin
         let r = result.clone();
         let outcome = Arc::new(Mutex::new(None));
         let o = outcome.clone();
-        block_on(run(move |cx| async move {
+        block_on(run(move |fcx| async move {
             let ca = Ca::new();
             // Valid only in 2019.
             let (client_chain, client_key) = ca.issue(&["client.test"], 2019, 2020, ExtendedKeyUsagePurpose::ClientAuth);
@@ -495,7 +495,7 @@ fn client_auth_at(start: SystemTime) -> (Result<(), ConnError>, Result<(), Strin
             .build()
             .unwrap();
             let config = Arc::new(
-                tls::config_builder(&cx, start, provider())
+                tls::config_builder(&fcx, start, provider())
                     .with_safe_default_protocol_versions()
                     .unwrap()
                     .with_client_cert_verifier(verifier)
@@ -513,18 +513,18 @@ fn client_auth_at(start: SystemTime) -> (Result<(), ConnError>, Result<(), Strin
             );
 
             let (server_side, client_side) = mem_pair();
-            let server = cx.spawn(move |cx| async move {
-                let hello = tls::server(&cx, server_side).await?;
-                let finished = hello.finish(&cx, config).await;
+            let server = fcx.spawn(move |fcx| async move {
+                let hello = tls::server(&fcx, server_side).await?;
+                let finished = hello.finish(&fcx, config).await;
                 let ok = finished.is_ok();
                 if let Ok(mut conn) = finished {
-                    conn.write_all(&cx, b"ok").await?;
+                    conn.write_all(&fcx, b"ok").await?;
                 }
                 *r.lock().unwrap() = Some(ok);
                 Ok(())
             });
             let client = async {
-                let mut c = Client::connect(&cx, client_side, client_config, "example.test")
+                let mut c = Client::connect(&fcx, client_side, client_config, "example.test")
                     .await
                     .map_err(|e| format!("{e:?}"))?;
                 // In TLS 1.3 the client finishes first; the server's verdict
@@ -532,12 +532,12 @@ fn client_auth_at(start: SystemTime) -> (Result<(), ConnError>, Result<(), Strin
                 let mut buf = [0; 2];
                 let mut got = 0;
                 while got < 2 {
-                    got += c.read(&cx, &mut buf[got..]).await.map_err(|e| format!("{e:?}"))?;
+                    got += c.read(&fcx, &mut buf[got..]).await.map_err(|e| format!("{e:?}"))?;
                 }
                 Ok::<_, String>(())
             };
             let client_result = client.await;
-            server.join(&cx).await?;
+            server.join(&fcx).await?;
             let server_ok = result.lock().unwrap().unwrap();
             *o.lock().unwrap() = Some((if server_ok { Ok(()) } else { Err(ConnError::Broken) }, client_result));
             Ok(())
@@ -562,23 +562,23 @@ fn certificates_are_checked_against_the_worlds_date() {
 #[test]
 fn close_notify_both_ways() {
     within(Duration::from_secs(20), || {
-        block_on(run(|cx| async move {
+        block_on(run(|fcx| async move {
             let ca = Ca::new();
-            let config = server_config(&cx, &ca, "example.test", &[]);
+            let config = server_config(&fcx, &ca, "example.test", &[]);
             let client_config = client_config(&ca, &[]);
             let (server_side, client_side) = mem_pair();
 
-            let server = cx.spawn(move |cx| async move {
-                let mut conn = tls::server(&cx, server_side).await?.finish(&cx, config).await?;
-                conn.write_all(&cx, b"bye").await?;
-                conn.shutdown(&cx).await?;
+            let server = fcx.spawn(move |fcx| async move {
+                let mut conn = tls::server(&fcx, server_side).await?.finish(&fcx, config).await?;
+                conn.write_all(&fcx, b"bye").await?;
+                conn.shutdown(&fcx).await?;
                 // Writing after shutdown fails.
-                assert!(conn.write(&cx, b"more").await.is_err());
+                assert!(conn.write(&fcx, b"more").await.is_err());
                 // Reading still works, until the client's close_notify.
                 let mut got = Vec::new();
                 let mut buf = [0; 64];
                 loop {
-                    let n = conn.read(&cx, &mut buf).await?;
+                    let n = conn.read(&fcx, &mut buf).await?;
                     if n == 0 {
                         break;
                     }
@@ -588,22 +588,22 @@ fn close_notify_both_ways() {
                 Ok(())
             });
 
-            let mut client = Client::connect(&cx, client_side, client_config, "example.test").await.unwrap();
+            let mut client = Client::connect(&fcx, client_side, client_config, "example.test").await.unwrap();
             let mut got = Vec::new();
             let mut buf = [0; 64];
             loop {
                 // Ok(0) from rustls means a real close_notify; a bare end of
                 // stream would be `Truncated`.
-                let n = client.read(&cx, &mut buf).await.unwrap();
+                let n = client.read(&fcx, &mut buf).await.unwrap();
                 if n == 0 {
                     break;
                 }
                 got.extend_from_slice(&buf[..n]);
             }
             assert_eq!(got, b"bye");
-            client.write_all(&cx, b"last words").await.unwrap();
-            client.close(&cx).await.unwrap();
-            Ok(server.join(&cx).await?)
+            client.write_all(&fcx, b"last words").await.unwrap();
+            client.close(&fcx).await.unwrap();
+            Ok(server.join(&fcx).await?)
         }))
     })
     .unwrap();
@@ -617,24 +617,24 @@ fn pattern(i: usize) -> u8 {
 fn five_megabytes_each_way() {
     const SIZE: usize = 5 * 1024 * 1024;
     within(Duration::from_secs(120), || {
-        block_on(run(|cx| async move {
+        block_on(run(|fcx| async move {
             let ca = Ca::new();
-            let config = server_config(&cx, &ca, "example.test", &[]);
+            let config = server_config(&fcx, &ca, "example.test", &[]);
             let client_config = client_config(&ca, &[]);
             let (server_side, client_side) = mem_pair();
             let data: Arc<Vec<u8>> = Arc::new((0..SIZE).map(pattern).collect());
 
             let d = data.clone();
-            let server = cx.spawn(move |cx| async move {
-                let mut conn = tls::server(&cx, server_side).await?.finish(&cx, config).await?;
+            let server = fcx.spawn(move |fcx| async move {
+                let mut conn = tls::server(&fcx, server_side).await?.finish(&fcx, config).await?;
                 // Odd-sized writes, so records do not line up with them.
                 for chunk in d.chunks(70_001) {
-                    conn.write_all(&cx, chunk).await?;
+                    conn.write_all(&fcx, chunk).await?;
                 }
                 let mut received = 0usize;
                 let mut buf = vec![0; 50_000];
                 loop {
-                    let n = conn.read(&cx, &mut buf).await?;
+                    let n = conn.read(&fcx, &mut buf).await?;
                     if n == 0 {
                         break;
                     }
@@ -644,24 +644,24 @@ fn five_megabytes_each_way() {
                     received += n;
                 }
                 assert_eq!(received, SIZE);
-                conn.shutdown(&cx).await?;
+                conn.shutdown(&fcx).await?;
                 Ok(())
             });
 
-            let mut client = Client::connect(&cx, client_side, client_config, "example.test").await.unwrap();
+            let mut client = Client::connect(&fcx, client_side, client_config, "example.test").await.unwrap();
             let mut received = Vec::with_capacity(SIZE);
             let mut buf = vec![0; 40_000];
             while received.len() < SIZE {
-                let n = client.read(&cx, &mut buf).await.unwrap();
+                let n = client.read(&fcx, &mut buf).await.unwrap();
                 assert!(n > 0);
                 received.extend_from_slice(&buf[..n]);
             }
             assert!(received == *data);
-            client.write_all(&cx, &data).await.unwrap();
-            client.close(&cx).await.unwrap();
-            let n = client.read(&cx, &mut buf).await.unwrap();
+            client.write_all(&fcx, &data).await.unwrap();
+            client.close(&fcx).await.unwrap();
+            let n = client.read(&fcx, &mut buf).await.unwrap();
             assert_eq!(n, 0);
-            Ok(server.join(&cx).await?)
+            Ok(server.join(&fcx).await?)
         }))
     })
     .unwrap();
@@ -670,9 +670,9 @@ fn five_megabytes_each_way() {
 #[test]
 fn tls12_clients_work_too() {
     within(Duration::from_secs(20), || {
-        block_on(run(|cx| async move {
+        block_on(run(|fcx| async move {
             let ca = Ca::new();
-            let config = server_config(&cx, &ca, "example.test", &[b"http/1.1"]);
+            let config = server_config(&fcx, &ca, "example.test", &[b"http/1.1"]);
             // The config draws random values through Fictionet, not ring.
             assert_eq!(format!("{:?}", config.crypto_provider().secure_random), "CxRandom");
             let mut client_config = ClientConfig::builder_with_provider(Arc::new(provider()))
@@ -682,26 +682,26 @@ fn tls12_clients_work_too() {
                 .with_no_client_auth();
             client_config.alpn_protocols = vec![b"http/1.1".to_vec()];
             let (server_side, client_side) = mem_pair();
-            let server = cx.spawn(move |cx| async move {
-                let mut conn = tls::server(&cx, server_side).await?.finish(&cx, config).await?;
+            let server = fcx.spawn(move |fcx| async move {
+                let mut conn = tls::server(&fcx, server_side).await?.finish(&fcx, config).await?;
                 assert_eq!(conn.alpn(), Some(&b"http/1.1"[..]));
-                conn.write_all(&cx, b"twelve").await?;
-                conn.shutdown(&cx).await?;
+                conn.write_all(&fcx, b"twelve").await?;
+                conn.shutdown(&fcx).await?;
                 Ok(())
             });
-            let mut client = Client::connect(&cx, client_side, Arc::new(client_config), "example.test").await.unwrap();
+            let mut client = Client::connect(&fcx, client_side, Arc::new(client_config), "example.test").await.unwrap();
             assert_eq!(client.tls.protocol_version(), Some(rustls::ProtocolVersion::TLSv1_2));
             let mut got = Vec::new();
             let mut buf = [0; 64];
             loop {
-                let n = client.read(&cx, &mut buf).await.unwrap();
+                let n = client.read(&fcx, &mut buf).await.unwrap();
                 if n == 0 {
                     break;
                 }
                 got.extend_from_slice(&buf[..n]);
             }
             assert_eq!(got, b"twelve");
-            Ok(server.join(&cx).await?)
+            Ok(server.join(&fcx).await?)
         }))
     })
     .unwrap();
@@ -713,29 +713,29 @@ fn tls12_clients_work_too() {
 #[test]
 fn a_cancel_comes_first_and_is_never_a_broken_handshake() {
     within(Duration::from_secs(20), || {
-        block_on(run(|cx| async move {
+        block_on(run(|fcx| async move {
             let ca = Ca::new();
-            let config = server_config(&cx, &ca, "example.test", &[]);
+            let config = server_config(&fcx, &ca, "example.test", &[]);
             let client_config = client_config(&ca, &[]);
             let (server_side, client_side) = mem_pair();
             let (tx, rx) = mpsc::channel();
-            let server = cx.spawn(move |cx| async move {
-                let _ = cx
-                    .region(|rcx| async move {
-                        let mut conn = tls::server(&rcx, server_side).await?.finish(&rcx, config).await?;
+            let server = fcx.spawn(move |fcx| async move {
+                let _ = fcx
+                    .region(|region_fcx| async move {
+                        let mut conn = tls::server(&region_fcx, server_side).await?.finish(&region_fcx, config).await?;
                         // One byte now: rustls holds the rest, decrypted.
                         let mut one = [0; 1];
-                        assert_eq!(conn.read(&rcx, &mut one).await?, 1);
-                        rcx.cancel();
-                        let _ = tx.send(conn.read(&rcx, &mut one).await);
+                        assert_eq!(conn.read(&region_fcx, &mut one).await?, 1);
+                        region_fcx.cancel();
+                        let _ = tx.send(conn.read(&region_fcx, &mut one).await);
                         Ok(())
                     })
                     .await;
                 Ok(())
             });
-            let mut client = Client::connect(&cx, client_side, client_config, "example.test").await.unwrap();
-            client.write_all(&cx, b"hello").await.unwrap();
-            server.join(&cx).await?;
+            let mut client = Client::connect(&fcx, client_side, client_config, "example.test").await.unwrap();
+            client.write_all(&fcx, b"hello").await.unwrap();
+            server.join(&fcx).await?;
             assert_eq!(rx.recv().unwrap(), Err(ConnError::Cancelled));
             Ok(())
         }))
@@ -743,17 +743,17 @@ fn a_cancel_comes_first_and_is_never_a_broken_handshake() {
     .unwrap();
 
     within(Duration::from_secs(20), || {
-        block_on(run(|cx| async move {
+        block_on(run(|fcx| async move {
             let (server_side, _client_side) = mem_pair();
-            cx.region(|rcx| async move {
-                let stopper = rcx.clone();
-                rcx.spawn(move |cx| async move {
-                    cx.sleep(Duration::from_millis(20)).await?;
+            fcx.region(|region_fcx| async move {
+                let stopper = region_fcx.clone();
+                region_fcx.spawn(move |fcx| async move {
+                    fcx.sleep(Duration::from_millis(20)).await?;
                     stopper.cancel();
                     Ok(())
                 });
                 // The client never says hello.
-                let res = tls::server_detailed(&rcx, server_side).await;
+                let res = tls::server_detailed(&region_fcx, server_side).await;
                 assert!(matches!(res, Err(tls::HandshakeError::Cancelled)), "{:?}", res.err());
                 Ok(())
             })

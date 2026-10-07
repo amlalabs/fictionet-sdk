@@ -80,11 +80,11 @@ fn real_main() -> fictionet::Result {
         .worker_threads(2)
         .enable_all()
         .build()?;
-    runtime.block_on(fictionet::run(move |cx| async move {
-        serve(&cx, addresses, ca, backend, log, start, attachments)?;
+    runtime.block_on(fictionet::run(move |fcx| async move {
+        serve(&fcx, addresses, ca, backend, log, start, attachments)?;
         // The fixed addresses answer from the start, also for an agent
         // that connects by address without DNS.
-        look_up_all(&cx, &attacher, &pinned).await?;
+        look_up_all(&fcx, &attacher, &pinned).await?;
         let _listening =
             fictionet::listen(fictionet::WorldSocket::UnixSocket(socket.into()), attacher)?;
 

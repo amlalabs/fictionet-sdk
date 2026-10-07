@@ -25,7 +25,7 @@ payload. Supply TLS key log entries when decryption is wanted, or `&[]`.
 The returned `Decoded` exposes layers, fields, tags, and summaries.
 `write_layers` and `write_buffers` use the dashboard's JSON format.
 
-For a running world, call `cx.observe_protocols(registry)` before observers
+For a running world, call `fcx.observe_protocols(registry)` before observers
 start watching links. New watches use that registry. The existing
 `fictionet observe` command and dashboard then show the custom protocol
 without binary changes. Watches already running retain their registry and

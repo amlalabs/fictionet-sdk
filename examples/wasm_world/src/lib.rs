@@ -65,12 +65,12 @@ pub struct Fetched {
 pub async fn fetch(https: bool, version: Version) -> Result<Fetched> {
     let fetched = Arc::new(Mutex::new(None));
     let out = fetched.clone();
-    let ended = run(move |cx| async move {
+    let ended = run(move |fcx| async move {
         let certs = certs()?;
         // The world's date: certificates are checked against it.
         let date = std::time::Duration::from_secs(1_767_225_600); // 2026-01-01
         let server = Arc::new(
-            tls::config_builder(&cx, std::time::UNIX_EPOCH + date, rustls::crypto::ring::default_provider())
+            tls::config_builder(&fcx, std::time::UNIX_EPOCH + date, rustls::crypto::ring::default_provider())
                 .with_safe_default_protocol_versions()?
                 .with_no_client_auth()
                 .with_single_cert(certs.chain, certs.key)?,
@@ -90,28 +90,28 @@ pub async fn fetch(https: bool, version: Version) -> Result<Fetched> {
             ),
             _ => None,
         });
-        sites.serve(&cx, attachments)?;
+        sites.serve(&fcx, attachments)?;
 
         // The sandbox: an IP stack of its own on the attachment's cable.
         let cable = attacher.attach("agent")?;
-        let (tcp_packets, udp_packets, _icmp, _other) = ip::split_protocols(&cx, cable);
-        let tcp = tcp::endpoint(&cx, tcp_packets, SANDBOX.into());
-        let udp = udp::endpoint(&cx, udp_packets, SANDBOX.into());
+        let (tcp_packets, udp_packets, _icmp, _other) = ip::split_protocols(&fcx, cable);
+        let tcp = tcp::endpoint(&fcx, tcp_packets, SANDBOX.into());
+        let udp = udp::endpoint(&fcx, udp_packets, SANDBOX.into());
 
-        let address = lookup(&cx, &udp, NAME).await?;
+        let address = lookup(&fcx, &udp, NAME).await?;
         let response = if https {
-            let conn = tcp.connect(&cx, SocketAddr::new(address.into(), 443)).await?;
+            let conn = tcp.connect(&fcx, SocketAddr::new(address.into(), 443)).await?;
             let mut client = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
                 .with_safe_default_protocol_versions()?
                 .with_root_certificates(certs.roots)
                 .with_no_client_auth();
             client.alpn_protocols = vec![if version == Version::HTTP_2 { b"h2".to_vec() } else { b"http/1.1".to_vec() }];
             let mut conn = TlsClient::new(conn, Arc::new(client), NAME)?;
-            conn.handshake(&cx).await?;
-            get(&cx, conn, "https", version, "/from-the-browser").await?
+            conn.handshake(&fcx).await?;
+            get(&fcx, conn, "https", version, "/from-the-browser").await?
         } else {
-            let conn = tcp.connect(&cx, SocketAddr::new(address.into(), 80)).await?;
-            get(&cx, conn, "http", version, "/from-the-browser").await?
+            let conn = tcp.connect(&fcx, SocketAddr::new(address.into(), 80)).await?;
+            get(&fcx, conn, "http", version, "/from-the-browser").await?
         };
         let status = response.status().as_u16();
         let version = response.version();
@@ -174,15 +174,15 @@ impl std::fmt::Display for Done {
 impl std::error::Error for Done {}
 
 /// Asks the world's DNS server for the A record of `name`.
-async fn lookup(cx: &Cx, udp: &udp::Endpoint, name: &str) -> Result<Ipv4Addr> {
-    let mut socket = udp.bind(40000 + (cx.random_u64() % 20000) as u16)?;
+async fn lookup(fcx: &Cx, udp: &udp::Endpoint, name: &str) -> Result<Ipv4Addr> {
+    let mut socket = udp.bind(40000 + (fcx.random_u64() % 20000) as u16)?;
     let mut query = Message::query();
-    query.metadata.id = cx.random_u64() as u16;
+    query.metadata.id = fcx.random_u64() as u16;
     query.metadata.recursion_desired = true;
     query.add_query(Query::query(Name::from_ascii(name)?, RecordType::A));
     socket.send_to(&query.to_vec()?, SocketAddr::new(GATEWAY.into(), 53));
     // The world's links lose nothing, so one query is enough.
-    let (bytes, _from) = socket.recv(cx).await?;
+    let (bytes, _from) = socket.recv(fcx).await?;
     let answer = Message::from_vec(&bytes)?;
     if answer.metadata.response_code != ResponseCode::NoError {
         return Err(fictionet::Error::msg(format!("DNS answered {} for {name}", answer.metadata.response_code)));
@@ -221,17 +221,17 @@ fn certs() -> Result<Certs> {
 
 /// Sends one GET for `path` to [`NAME`] over `conn` with hyper's client.
 async fn get<C: Connection + Unpin>(
-    cx: &Cx,
+    fcx: &Cx,
     conn: C,
     scheme: &str,
     version: Version,
     path: &str,
 ) -> Result<Response<Incoming>> {
-    let io = Io { cx: cx.clone(), conn };
+    let io = Io { fcx: fcx.clone(), conn };
     let empty = Empty::<Bytes>::new;
     if version == Version::HTTP_2 {
-        let (mut send, conn) = hyper::client::conn::http2::handshake(Exec(cx.clone()), io).await?;
-        cx.spawn(move |_| async move {
+        let (mut send, conn) = hyper::client::conn::http2::handshake(Exec(fcx.clone()), io).await?;
+        fcx.spawn(move |_| async move {
             let _ = conn.await;
             Ok(())
         });
@@ -239,7 +239,7 @@ async fn get<C: Connection + Unpin>(
         Ok(send.send_request(request).await?)
     } else {
         let (mut send, conn) = hyper::client::conn::http1::handshake(io).await?;
-        cx.spawn(move |_| async move {
+        fcx.spawn(move |_| async move {
             let _ = conn.await;
             Ok(())
         });
@@ -250,19 +250,19 @@ async fn get<C: Connection + Unpin>(
 
 /// A stdlib connection as hyper's I/O.
 struct Io<C> {
-    cx: Cx,
+    fcx: Cx,
     conn: C,
 }
 
 impl<C: Connection + Unpin> hyper::rt::Read for Io<C> {
     fn poll_read(
         self: Pin<&mut Self>,
-        task: &mut Context<'_>,
+        cx: &mut Context<'_>,
         mut buf: hyper::rt::ReadBufCursor<'_>,
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
         let mut chunk = vec![0u8; buf.remaining().min(16 * 1024)];
-        match this.conn.poll_read(&this.cx, task, &mut chunk) {
+        match this.conn.poll_read(&this.fcx, cx, &mut chunk) {
             Poll::Ready(Ok(n)) => {
                 buf.put_slice(&chunk[..n]);
                 Poll::Ready(Ok(()))
@@ -274,18 +274,18 @@ impl<C: Connection + Unpin> hyper::rt::Read for Io<C> {
 }
 
 impl<C: Connection + Unpin> hyper::rt::Write for Io<C> {
-    fn poll_write(self: Pin<&mut Self>, task: &mut Context<'_>, data: &[u8]) -> Poll<std::io::Result<usize>> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, data: &[u8]) -> Poll<std::io::Result<usize>> {
         let this = self.get_mut();
-        this.conn.poll_write(&this.cx, task, data).map_err(std::io::Error::other)
+        this.conn.poll_write(&this.fcx, cx, data).map_err(std::io::Error::other)
     }
 
     fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, task: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        this.conn.poll_shutdown(&this.cx, task).map_err(std::io::Error::other)
+        this.conn.poll_shutdown(&this.fcx, cx).map_err(std::io::Error::other)
     }
 }
 

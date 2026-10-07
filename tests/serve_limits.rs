@@ -42,8 +42,8 @@ where
 {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let r = block_on(run(move |cx| async move {
-            f(cx).await?;
+        let r = block_on(run(move |fcx| async move {
+            f(fcx).await?;
             Err(fictionet::Error::from(Done))
         }));
         let _ = tx.send(r);
@@ -59,27 +59,27 @@ const SERVER: Ipv4Addr = Ipv4Addr::new(10, 9, 0, 1);
 
 /// Two machines joined by a cable: a server at 10.9.0.1 and a client at
 /// 10.9.0.2.
-fn two_machines(cx: &Cx) -> (tcp::Endpoint, tcp::Endpoint) {
+fn two_machines(fcx: &Cx) -> (tcp::Endpoint, tcp::Endpoint) {
     let (a, b) = pair();
-    let (at, _au, _ai, _ao) = ip::split_protocols(cx, a);
-    let (bt, _bu, _bi, _bo) = ip::split_protocols(cx, b);
+    let (at, _au, _ai, _ao) = ip::split_protocols(fcx, a);
+    let (bt, _bu, _bi, _bo) = ip::split_protocols(fcx, b);
     let client: IpAddr = Ipv4Addr::new(10, 9, 0, 2).into();
-    (tcp::endpoint(cx, at, SERVER.into()), tcp::endpoint(cx, bt, client))
+    (tcp::endpoint(fcx, at, SERVER.into()), tcp::endpoint(fcx, bt, client))
 }
 
 /// Serves HTTP on `port` of `server` with `handler` and `opts`, numbering
 /// connections from 1.
-fn serve_http(cx: &Cx, server: &tcp::Endpoint, port: u16, handler: Arc<dyn Handler>, opts: HttpOptions) -> fictionet::Result {
+fn serve_http(fcx: &Cx, server: &tcp::Endpoint, port: u16, handler: Arc<dyn Handler>, opts: HttpOptions) -> fictionet::Result {
     let mut listener = server.listen(port)?;
-    cx.spawn(move |cx| async move {
+    fcx.spawn(move |fcx| async move {
         let mut id = 0;
         loop {
-            let conn = listener.accept(&cx).await?;
+            let conn = listener.accept(&fcx).await?;
             id += 1;
             let info = ConnInfo::new(id, conn.local_addr(), conn.peer_addr());
             let (handler, opts) = (handler.clone(), opts.clone());
-            cx.spawn(move |cx| async move {
-                Ok(httpd::serve_connection(&cx, conn, info, handler, &opts).await?)
+            fcx.spawn(move |fcx| async move {
+                Ok(httpd::serve_connection(&fcx, conn, info, handler, &opts).await?)
             });
         }
     });
@@ -87,11 +87,11 @@ fn serve_http(cx: &Cx, server: &tcp::Endpoint, port: u16, handler: Arc<dyn Handl
 }
 
 /// Reads until `want` bytes arrived, the stream ends, or a second passes.
-async fn read_some<C: Connection>(cx: &Cx, conn: &mut C, want: usize) -> Vec<u8> {
+async fn read_some<C: Connection>(fcx: &Cx, conn: &mut C, want: usize) -> Vec<u8> {
     let mut got = Vec::new();
     let mut buf = [0u8; 4096];
     while got.len() < want {
-        match cx.race(Some(cx.now() + Duration::from_secs(1)), conn.read(cx, &mut buf)).await {
+        match fcx.race(Some(fcx.now() + Duration::from_secs(1)), conn.read(fcx, &mut buf)).await {
             Ok(Ok(n)) if n > 0 => got.extend_from_slice(&buf[..n]),
             _ => break,
         }
@@ -166,14 +166,14 @@ fn a_response_body_waiting_to_be_written_counts_against_the_budget() {
 /// Before, the driver waited for ever on a client that stopped reading.
 #[test]
 fn a_client_that_stops_reading_times_out() {
-    world(|cx| async move {
-        let (server, client) = two_machines(&cx);
-        let kept = cx.events();
+    world(|fcx| async move {
+        let (server, client) = two_machines(&fcx);
+        let kept = fcx.events();
         let opts = ServeOptions::default().idle(None).write_timeout(Some(Duration::from_millis(300)));
-        serve::listen(&cx, server.listen(7)?, Arc::new(()), || Loud { size: 16 << 20 }, opts);
-        let mut conn = client.connect(&cx, SocketAddr::new(SERVER.into(), 7)).await?;
-        conn.write_all(&cx, b"go\n").await?;
-        let closed = kept.wait(&cx, 1, Duration::from_secs(10), |e| e.is("conn", "close")).await?;
+        serve::listen(&fcx, server.listen(7)?, Arc::new(()), || Loud { size: 16 << 20 }, opts);
+        let mut conn = client.connect(&fcx, SocketAddr::new(SERVER.into(), 7)).await?;
+        conn.write_all(&fcx, b"go\n").await?;
+        let closed = kept.wait(&fcx, 1, Duration::from_secs(10), |e| e.is("conn", "close")).await?;
         assert_eq!(closed.first().and_then(|e| e.str("end")), Some("timed_out"));
         drop(conn);
         Ok(())
@@ -245,34 +245,34 @@ fn an_http10_body_of_unknown_length_closes_the_connection() {
 /// before reading it.
 #[test]
 fn a_response_cut_off_by_a_reset_is_logged_incomplete() {
-    world(|cx| async move {
-        let (server, client) = two_machines(&cx);
-        let kept = cx.events();
+    world(|fcx| async move {
+        let (server, client) = two_machines(&fcx);
+        let kept = fcx.events();
         let size = 8 << 20;
-        serve_http(&cx, &server, 80, Arc::new(page(size)), HttpOptions::default())?;
-        let mut conn = client.connect(&cx, SocketAddr::new(SERVER.into(), 80)).await?;
-        conn.write_all(&cx, b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n").await?;
-        let head = read_some(&cx, &mut conn, 64).await;
+        serve_http(&fcx, &server, 80, Arc::new(page(size)), HttpOptions::default())?;
+        let mut conn = client.connect(&fcx, SocketAddr::new(SERVER.into(), 80)).await?;
+        conn.write_all(&fcx, b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n").await?;
+        let head = read_some(&fcx, &mut conn, 64).await;
         assert!(head.starts_with(b"HTTP/1.1 200 OK\r\n"));
         conn.reset();
-        let request = kept.wait(&cx, 1, Duration::from_secs(10), |e| e.is("http", "request")).await?;
+        let request = kept.wait(&fcx, 1, Duration::from_secs(10), |e| e.is("http", "request")).await?;
         let request = request.first().expect("an http.request event");
         assert_eq!(field_bool(request, "complete"), Some(false));
         assert!(field_u64(request, "sent").unwrap() < size as u64);
 
         // A response read to the end is complete.
-        let mut conn = client.connect(&cx, SocketAddr::new(SERVER.into(), 80)).await?;
-        conn.write_all(&cx, b"GET / HTTP/1.1\r\nHost: a.test\r\nConnection: close\r\n\r\n").await?;
+        let mut conn = client.connect(&fcx, SocketAddr::new(SERVER.into(), 80)).await?;
+        conn.write_all(&fcx, b"GET / HTTP/1.1\r\nHost: a.test\r\nConnection: close\r\n\r\n").await?;
         let mut all = Vec::new();
         let mut buf = vec![0u8; 64 << 10];
         loop {
-            match conn.read(&cx, &mut buf).await? {
+            match conn.read(&fcx, &mut buf).await? {
                 0 => break,
                 n => all.extend_from_slice(&buf[..n]),
             }
         }
         assert!(all.len() > size);
-        let done = kept.wait(&cx, 2, Duration::from_secs(10), |e| e.is("http", "request")).await?;
+        let done = kept.wait(&fcx, 2, Duration::from_secs(10), |e| e.is("http", "request")).await?;
         assert_eq!(field_bool(&done[1], "complete"), Some(true));
         assert_eq!(field_u64(&done[1], "sent"), Some(size as u64));
         Ok(())
@@ -286,16 +286,16 @@ fn a_response_cut_off_by_a_reset_is_logged_incomplete() {
 /// once: 100, not hyper's 200.
 #[test]
 fn http2_caps_the_streams_a_connection_opens() {
-    world(|cx| async move {
-        let (server, client) = two_machines(&cx);
-        serve_http(&cx, &server, 80, Arc::new(page(2)), HttpOptions::default())?;
-        let mut conn = client.connect(&cx, SocketAddr::new(SERVER.into(), 80)).await?;
-        conn.write_all(&cx, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\x00\x00\x00\x04\x00\x00\x00\x00\x00").await?;
-        let mut got = read_some(&cx, &mut conn, 9).await;
+    world(|fcx| async move {
+        let (server, client) = two_machines(&fcx);
+        serve_http(&fcx, &server, 80, Arc::new(page(2)), HttpOptions::default())?;
+        let mut conn = client.connect(&fcx, SocketAddr::new(SERVER.into(), 80)).await?;
+        conn.write_all(&fcx, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\x00\x00\x00\x04\x00\x00\x00\x00\x00").await?;
+        let mut got = read_some(&fcx, &mut conn, 9).await;
         assert_eq!(got[3], 4, "the first frame is SETTINGS");
         let len = usize::from(got[0]) << 16 | usize::from(got[1]) << 8 | usize::from(got[2]);
         if got.len() < 9 + len {
-            let more = read_some(&cx, &mut conn, 9 + len - got.len()).await;
+            let more = read_some(&fcx, &mut conn, 9 + len - got.len()).await;
             got.extend_from_slice(&more);
         }
         let settings: Vec<(u16, u32)> = got[9..9 + len]
@@ -313,9 +313,9 @@ fn http2_caps_the_streams_a_connection_opens() {
 /// the run's own randomness.
 #[test]
 fn http2_has_the_limits_budget_and_seed_of_http1() {
-    world(|cx| async move {
-        let (server, client) = two_machines(&cx);
-        let kept = cx.events();
+    world(|fcx| async move {
+        let (server, client) = two_machines(&fcx);
+        let kept = fcx.events();
         let router = Router::new()
             .get("/dice", |ex, _| http::Response::new(Bytes::from(ex.random_u64().to_string())))
             .post("/echo", |_, request: http::Request<Bytes>| http::Response::new(request.into_body()));
@@ -325,10 +325,10 @@ fn http2_has_the_limits_budget_and_seed_of_http1() {
             seed: 7,
             ..HttpOptions::default()
         };
-        serve_http(&cx, &server, 80, Arc::new(router), opts)?;
-        let conn = client.connect(&cx, SocketAddr::new(SERVER.into(), 80)).await?;
-        let (mut send, driving) = hyper::client::conn::http2::handshake(Exec(cx.clone()), Io { cx: cx.clone(), conn }).await?;
-        cx.spawn(move |_| async move {
+        serve_http(&fcx, &server, 80, Arc::new(router), opts)?;
+        let conn = client.connect(&fcx, SocketAddr::new(SERVER.into(), 80)).await?;
+        let (mut send, driving) = hyper::client::conn::http2::handshake(Exec(fcx.clone()), Io { fcx: fcx.clone(), conn }).await?;
+        fcx.spawn(move |_| async move {
             let _ = driving.await;
             Ok(())
         });
@@ -355,7 +355,7 @@ fn http2_has_the_limits_budget_and_seed_of_http1() {
         let (status, _) = ask(http::Method::POST, "/echo", vec![b'c'; 3500]).await?;
         assert_eq!(status, 413);
 
-        let events = kept.wait(&cx, 4, Duration::from_secs(5), |e| e.is("http", "request")).await?;
+        let events = kept.wait(&fcx, 4, Duration::from_secs(5), |e| e.is("http", "request")).await?;
         let answers: Vec<_> = events.iter().map(|e| e.str("answer").unwrap_or("").to_owned()).collect();
         assert_eq!(answers, ["handler", "handler", "budget", "too_large"]);
         Ok(())
@@ -366,15 +366,15 @@ fn http2_has_the_limits_budget_and_seed_of_http1() {
 // A hyper client over a Connection
 
 struct Io<C> {
-    cx: Cx,
+    fcx: Cx,
     conn: C,
 }
 
 impl<C: Connection + Unpin> hyper::rt::Read for Io<C> {
-    fn poll_read(self: Pin<&mut Self>, task: &mut Context<'_>, mut buf: hyper::rt::ReadBufCursor<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, mut buf: hyper::rt::ReadBufCursor<'_>) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
         let mut tmp = vec![0u8; buf.remaining().min(16 * 1024)];
-        match this.conn.poll_read(&this.cx, task, &mut tmp) {
+        match this.conn.poll_read(&this.fcx, cx, &mut tmp) {
             Poll::Ready(Ok(n)) => {
                 buf.put_slice(&tmp[..n]);
                 Poll::Ready(Ok(()))
@@ -386,16 +386,16 @@ impl<C: Connection + Unpin> hyper::rt::Read for Io<C> {
 }
 
 impl<C: Connection + Unpin> hyper::rt::Write for Io<C> {
-    fn poll_write(self: Pin<&mut Self>, task: &mut Context<'_>, data: &[u8]) -> Poll<std::io::Result<usize>> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, data: &[u8]) -> Poll<std::io::Result<usize>> {
         let this = self.get_mut();
-        this.conn.poll_write(&this.cx, task, data).map_err(std::io::Error::other)
+        this.conn.poll_write(&this.fcx, cx, data).map_err(std::io::Error::other)
     }
     fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Poll::Ready(Ok(()))
     }
-    fn poll_shutdown(self: Pin<&mut Self>, task: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        this.conn.poll_shutdown(&this.cx, task).map_err(std::io::Error::other)
+        this.conn.poll_shutdown(&this.fcx, cx).map_err(std::io::Error::other)
     }
 }
 

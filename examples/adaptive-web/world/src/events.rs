@@ -22,9 +22,9 @@ use crate::log::Log;
 /// queries are not logged; the sites they make are.
 pub const LOOKUPS: &str = "adaptive-web-world-lookups";
 
-/// Writes the request log from `cx`'s run's events.
-pub fn log_to(cx: &Cx, log: Arc<Log>) {
-    cx.events().subscribe(move |event| {
+/// Writes the request log from `fcx`'s run's events.
+pub fn log_to(fcx: &Cx, log: Arc<Log>) {
+    fcx.events().subscribe(move |event| {
         if let Some(line) = line(event) {
             log.write(line);
         }

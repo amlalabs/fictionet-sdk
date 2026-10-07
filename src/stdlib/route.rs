@@ -123,16 +123,16 @@ fn mask(addr: IpAddr, len: u8) -> IpAddr {
 /// ```
 /// # use fictionet::{Cx, End, Interface, Result, pair};
 /// # use fictionet::stdlib::{ip, route, tcp};
-/// # fn wire(cx: Cx, toward_sandbox: End) -> Result {
+/// # fn wire(fcx: Cx, toward_sandbox: End) -> Result {
 /// let (router_side, stripe_side) = pair();
 /// let (router_side_dns, dns_side) = pair();
-/// route::router(&cx, vec![
+/// route::router(&fcx, vec![
 ///     ("0.0.0.0/0".parse()?, Box::new(toward_sandbox) as Box<dyn Interface>),
 ///     ("104.18.32.7/32".parse()?, Box::new(router_side)),
 ///     ("1.1.1.1/32".parse()?, Box::new(router_side_dns)),
 /// ]);
-/// let (tcp, _udp, _icmp, _other) = ip::split_protocols(&cx, stripe_side);
-/// let stripe = tcp::endpoint(&cx, tcp, "104.18.32.7".parse()?);
+/// let (tcp, _udp, _icmp, _other) = ip::split_protocols(&fcx, stripe_side);
+/// let stripe = tcp::endpoint(&fcx, tcp, "104.18.32.7".parse()?);
 /// # drop((dns_side, stripe));
 /// # Ok(())
 /// # }
@@ -158,7 +158,7 @@ fn mask(addr: IpAddr, len: u8) -> IpAddr {
 /// addresses are its own, not forwarded, and keep their TTL. A router
 /// told to [`keep_ttl`](Router::keep_ttl) changes no packet.
 #[track_caller]
-pub fn router(cx: &Cx, routes: Vec<(Prefix, Box<dyn Interface>)>) -> Router {
+pub fn router(fcx: &Cx, routes: Vec<(Prefix, Box<dyn Interface>)>) -> Router {
     let shared = Arc::new(Mutex::new(Shared {
         adds: routes,
         waker: None,
@@ -169,7 +169,7 @@ pub fn router(cx: &Cx, routes: Vec<(Prefix, Box<dyn Interface>)>) -> Router {
         settings_changed: false,
     }));
     let router = Router { handle: Arc::new(Handle { shared: shared.clone() }) };
-    cx.spawn_as(|| "router".into(), move |cx| async move {
+    fcx.spawn_as(|| "router".into(), move |fcx| async move {
         // However the task ends, later routes are dropped immediately.
         let _stopped = Stopped(shared.clone());
         let mut ports = Ports::new(Vec::new());
@@ -189,7 +189,7 @@ pub fn router(cx: &Cx, routes: Vec<(Prefix, Box<dyn Interface>)>) -> Router {
             for (prefix, interface) in adds {
                 let prefix = prefix.canonical();
                 if let Some(link) = interface.observe_link() {
-                    cx.graph().label(&link.0, format!("{}/{}", prefix.addr, prefix.len));
+                    fcx.graph().label(&link.0, format!("{}/{}", prefix.addr, prefix.len));
                 }
                 match table.routes.get(&prefix) {
                     Some(&i) => ports.replace(i, interface),
@@ -203,14 +203,14 @@ pub fn router(cx: &Cx, routes: Vec<(Prefix, Box<dyn Interface>)>) -> Router {
                 return Ok(());
             }
             let event = ports
-                .next(&cx, None, |task| {
+                .next(&fcx, None, |cx| {
                     let mut s = lock(&shared);
                     if !s.adds.is_empty() || s.settings_changed || (s.handles_gone && !handles_gone) {
                         return Poll::Ready(());
                     }
                     match &s.waker {
-                        Some(w) if w.will_wake(task.waker()) => {}
-                        _ => s.waker = Some(task.waker().clone()),
+                        Some(w) if w.will_wake(cx.waker()) => {}
+                        _ => s.waker = Some(cx.waker().clone()),
                     }
                     Poll::Pending
                 })
@@ -223,7 +223,7 @@ pub fn router(cx: &Cx, routes: Vec<(Prefix, Box<dyn Interface>)>) -> Router {
                         && !ip::source(&packet.0).is_some_and(|src| is_own(addrs, src))
                         && ip::hop(&mut packet.0) == ip::Hop::Expired
                     {
-                        expired(&cx, addrs, &table, &mut ports, packet);
+                        expired(&fcx, addrs, &table, &mut ports, packet);
                         continue;
                     }
                     if let Some(i) = table.best(dst) {
@@ -234,7 +234,7 @@ pub fn router(cx: &Cx, routes: Vec<(Prefix, Box<dyn Interface>)>) -> Router {
                     if let Some(prefix) = table.by_port.get(&i) {
                         let prefix = format!("{}/{}", prefix.addr, prefix.len);
                         let event = events::Event::new("router", "route_removed").level(Level::Notice).summary(format!("{prefix}: its interface closed")).field("prefix", prefix);
-                        cx.record(event);
+                        fcx.record(event);
                     }
                     table.remove_port(i)
                 }
@@ -248,10 +248,10 @@ pub fn router(cx: &Cx, routes: Vec<(Prefix, Box<dyn Interface>)>) -> Router {
 /// Drops a packet whose TTL or hop limit ran out, records the drop, and
 /// sends the "time exceeded" answer back toward its source, when the router
 /// has an address of its family.
-fn expired(cx: &Cx, addrs: Addrs, table: &Table, ports: &mut Ports, packet: Packet) {
+fn expired(fcx: &Cx, addrs: Addrs, table: &Table, ports: &mut Ports, packet: Packet) {
     let v4 = ip::version(&packet.0) == Some(4);
     let why = if v4 { "its TTL ran out" } else { "its hop limit ran out" };
-    crate::observe::record_drop(cx, "router", &packet, why, events::Fields::new());
+    crate::observe::record_drop(fcx, "router", &packet, why, events::Fields::new());
     let (a4, a6) = addrs;
     let from = if v4 { a4.map(IpAddr::V4) } else { a6.map(IpAddr::V6) };
     let answer = from.and_then(|from| crate::stdlib::icmp::time_exceeded(&packet.0, from));
@@ -495,13 +495,13 @@ impl Router {
 /// ```
 /// # use fictionet::{Cx, End, Interface, Result, pair};
 /// # use fictionet::stdlib::route;
-/// # fn wire(cx: Cx, toward_sandbox: End, dc_side: End, pc_side: End) -> Result {
-/// let lan = route::lan(&cx, "192.168.56.0/24".parse()?, None);
+/// # fn wire(fcx: Cx, toward_sandbox: End, dc_side: End, pc_side: End) -> Result {
+/// let lan = route::lan(&fcx, "192.168.56.0/24".parse()?, None);
 /// lan.add("192.168.56.10".parse()?, Box::new(dc_side))?;
 /// lan.add("192.168.56.100".parse()?, Box::new(pc_side))?;
 /// let (lan_side, router_side) = pair();
 /// lan.gateway(Box::new(lan_side))?;
-/// route::router(&cx, vec![
+/// route::router(&fcx, vec![
 ///     ("192.168.56.0/24".parse()?, Box::new(router_side) as Box<dyn Interface>),
 ///     ("0.0.0.0/0".parse()?, Box::new(toward_sandbox)),
 /// ]);
@@ -514,11 +514,11 @@ impl Router {
 /// is cancelled, or when every member and the gateway have closed and the
 /// last [`Lan`] handle has been dropped.
 #[track_caller]
-pub fn lan(cx: &Cx, subnet: Prefix, on_drop: Option<OnDrop>) -> Lan {
+pub fn lan(fcx: &Cx, subnet: Prefix, on_drop: Option<OnDrop>) -> Lan {
     let subnet = subnet.canonical();
     let shared = Arc::new(Mutex::new(LanShared { joins: Vec::new(), waker: None, handles_gone: false, stopped: false }));
     let lan = Lan { handle: Arc::new(LanHandle { subnet, shared: shared.clone() }) };
-    cx.spawn_as(|| "lan".into(), move |cx| async move {
+    fcx.spawn_as(|| "lan".into(), move |fcx| async move {
         // However the task ends, later members are dropped immediately.
         let _stopped = LanStopped(shared.clone());
         let mut ports = Ports::new(Vec::new());
@@ -532,27 +532,27 @@ pub fn lan(cx: &Cx, subnet: Prefix, on_drop: Option<OnDrop>) -> Lan {
             };
             handles_gone = handles_gone || gone;
             for join in joins {
-                members.join(&cx, &mut ports, join);
+                members.join(&fcx, &mut ports, join);
             }
             if members.is_empty() && handles_gone {
                 return Ok(());
             }
             let event = ports
-                .next(&cx, None, |task| {
+                .next(&fcx, None, |cx| {
                     let mut s = lock(&shared);
                     if !s.joins.is_empty() || (s.handles_gone && !handles_gone) {
                         return Poll::Ready(());
                     }
                     match &s.waker {
-                        Some(w) if w.will_wake(task.waker()) => {}
-                        _ => s.waker = Some(task.waker().clone()),
+                        Some(w) if w.will_wake(cx.waker()) => {}
+                        _ => s.waker = Some(cx.waker().clone()),
                     }
                     Poll::Pending
                 })
                 .await?;
             match event {
-                Event::Packet(from, packet) => members.forward(&cx, &mut ports, subnet, from, packet),
-                Event::Closed(i) => members.remove_port(&cx, i),
+                Event::Packet(from, packet) => members.forward(&fcx, &mut ports, subnet, from, packet),
+                Event::Closed(i) => members.remove_port(&fcx, i),
                 Event::Extra | Event::Timer => {}
             }
         }
@@ -597,16 +597,16 @@ pub type OnDrop = Arc<dyn Fn(&Cx, &Packet, &'static str) + Send + Sync>;
 /// Records that the LAN dropped `packet`, and why, and tells the
 /// `on_drop` sink. Every drop goes through here, so the reporting is one
 /// piece.
-fn dropped(cx: &Cx, on_drop: &Option<OnDrop>, packet: &Packet, why: &'static str) {
+fn dropped(fcx: &Cx, on_drop: &Option<OnDrop>, packet: &Packet, why: &'static str) {
     if let Some(f) = on_drop {
-        f(cx, packet, why);
+        f(fcx, packet, why);
     }
-    crate::observe::record_drop(cx, "lan", packet, why, events::Fields::new());
+    crate::observe::record_drop(fcx, "lan", packet, why, events::Fields::new());
 }
 
 /// Records a change to a LAN's members.
-fn member_event(cx: &Cx, kind: &'static str, member: String, what: &str) {
-    cx.record(events::Event::new("lan", kind).level(Level::Notice).summary(format!("{member}: {what}")).field("member", member));
+fn member_event(fcx: &Cx, kind: &'static str, member: String, what: &str) {
+    fcx.record(events::Event::new("lan", kind).level(Level::Notice).summary(format!("{member}: {what}")).field("member", member));
 }
 
 /// A LAN's members: which port each address goes out on, and the gateway.
@@ -635,16 +635,16 @@ impl Members {
 
     /// Adds a member or the gateway. One already there is replaced, which
     /// closes its interface.
-    fn join(&mut self, cx: &Cx, ports: &mut Ports, join: Join) {
+    fn join(&mut self, fcx: &Cx, ports: &mut Ports, join: Join) {
         match join {
             Join::Member(addr, interface) => {
                 if let Some(link) = interface.observe_link() {
-                    cx.graph().label(&link.0, addr.to_string());
+                    fcx.graph().label(&link.0, addr.to_string());
                 }
                 match self.by_addr.get(&addr).copied() {
                     Some(i) => {
                         ports.replace(i, interface);
-                        member_event(cx, "member_replaced", addr.to_string(), "a new interface took over, and the old one is closed");
+                        member_event(fcx, "member_replaced", addr.to_string(), "a new interface took over, and the old one is closed");
                     }
                     None => {
                         let i = ports.add(interface);
@@ -655,12 +655,12 @@ impl Members {
             }
             Join::Gateway(interface) => {
                 if let Some(link) = interface.observe_link() {
-                    cx.graph().label(&link.0, "gateway".into());
+                    fcx.graph().label(&link.0, "gateway".into());
                 }
                 match self.gateway {
                     Some(i) => {
                         ports.replace(i, interface);
-                        member_event(cx, "member_replaced", "the gateway".into(), "a new interface took over, and the old one is closed");
+                        member_event(fcx, "member_replaced", "the gateway".into(), "a new interface took over, and the old one is closed");
                     }
                     None => self.gateway = Some(ports.add(interface)),
                 }
@@ -669,25 +669,25 @@ impl Members {
     }
 
     /// Forgets the member or gateway whose port closed.
-    fn remove_port(&mut self, cx: &Cx, port: usize) {
+    fn remove_port(&mut self, fcx: &Cx, port: usize) {
         if let Some(addr) = self.by_port.remove(&port) {
             self.by_addr.remove(&addr);
-            member_event(cx, "member_removed", addr.to_string(), "its interface closed");
+            member_event(fcx, "member_removed", addr.to_string(), "its interface closed");
         } else if self.gateway == Some(port) {
             self.gateway = None;
-            member_event(cx, "member_removed", "the gateway".into(), "its interface closed");
+            member_event(fcx, "member_removed", "the gateway".into(), "its interface closed");
         }
     }
 
     /// Sends `packet`, which arrived on port `from`, where it belongs, or
     /// drops it with an event.
-    fn forward(&self, cx: &Cx, ports: &mut Ports, subnet: Prefix, from: usize, packet: Packet) {
+    fn forward(&self, fcx: &Cx, ports: &mut Ports, subnet: Prefix, from: usize, packet: Packet) {
         let Some(dst) = ip::destination(&packet.0) else {
-            return dropped(cx, &self.on_drop, &packet, "not an IP packet");
+            return dropped(fcx, &self.on_drop, &packet, "not an IP packet");
         };
         if dst.is_ipv4() != subnet.addr.is_ipv4() {
             let why = if dst.is_ipv4() { "IPv4 on an IPv6 LAN" } else { "IPv6 on an IPv4 LAN" };
-            return dropped(cx, &self.on_drop, &packet, why);
+            return dropped(fcx, &self.on_drop, &packet, why);
         }
         if floods(subnet, dst) {
             // Every member but the sender. The gateway gets none of it.
@@ -701,15 +701,15 @@ impl Members {
             ports.spend(sent);
         } else if subnet.contains(dst) || link_local(dst) {
             match self.by_addr.get(&dst) {
-                Some(&to) if to == from => dropped(cx, &self.on_drop, &packet, "sent to its own address"),
+                Some(&to) if to == from => dropped(fcx, &self.on_drop, &packet, "sent to its own address"),
                 Some(&to) => ports.send(to, packet),
-                None => dropped(cx, &self.on_drop, &packet, "no member at that address"),
+                None => dropped(fcx, &self.on_drop, &packet, "no member at that address"),
             }
         } else {
             match self.gateway {
                 Some(to) if to != from => ports.send(to, packet),
-                Some(_) => dropped(cx, &self.on_drop, &packet, "from the gateway, for an address outside the subnet"),
-                None => dropped(cx, &self.on_drop, &packet, "outside the subnet, and the LAN has no gateway"),
+                Some(_) => dropped(fcx, &self.on_drop, &packet, "from the gateway, for an address outside the subnet"),
+                None => dropped(fcx, &self.on_drop, &packet, "outside the subnet, and the LAN has no gateway"),
             }
         }
     }
@@ -854,9 +854,9 @@ mod tests {
     }
 
     /// The packet waiting on `iface`, if any, without waiting.
-    fn ready(cx: &Cx, iface: &mut crate::End) -> Option<Packet> {
-        let mut task = std::task::Context::from_waker(Waker::noop());
-        match iface.poll_recv(cx, &mut task) {
+    fn ready(fcx: &Cx, iface: &mut crate::End) -> Option<Packet> {
+        let mut cx = std::task::Context::from_waker(Waker::noop());
+        match iface.poll_recv(fcx, &mut cx) {
             Poll::Ready(Ok(p)) => Some(p),
             _ => None,
         }
@@ -878,19 +878,19 @@ mod tests {
     /// says so, and the sender hears "time exceeded".
     #[test]
     fn a_routing_loop_ends_when_the_ttl_runs_out() {
-        crate::block_on(crate::run(|cx| async move {
+        crate::block_on(crate::run(|fcx| async move {
             let (r1_s4, mut s4) = crate::pair();
             let (r1_s6, mut s6) = crate::pair();
             let (r1_r2, r2_r1) = crate::pair();
             let (r1_r2_6, r2_r1_6) = crate::pair();
-            let r1 = router(&cx, vec![
+            let r1 = router(&fcx, vec![
                 ("10.0.0.2/32".parse()?, Box::new(r1_s4) as Box<dyn Interface>),
                 ("fd00::2/128".parse()?, Box::new(r1_s6)),
                 ("0.0.0.0/0".parse()?, Box::new(r1_r2)),
                 ("::/0".parse()?, Box::new(r1_r2_6)),
             ]);
             r1.address("10.0.0.1".parse()?);
-            let r2 = router(&cx, vec![
+            let r2 = router(&fcx, vec![
                 ("0.0.0.0/0".parse()?, Box::new(r2_r1) as Box<dyn Interface>),
                 ("::/0".parse()?, Box::new(r2_r1_6)),
             ]);
@@ -901,23 +901,23 @@ mod tests {
             s4.send(ip("10.0.0.2", "192.0.2.1", 5));
             // Hop limit 4: r1, r2, r1, and r2 drops it.
             s6.send(ip("fd00::2", "2001:db8::1", 4));
-            cx.sleep(Duration::from_millis(100)).await?;
+            fcx.sleep(Duration::from_millis(100)).await?;
 
-            let answer = ready(&cx, &mut s4).expect("a time exceeded answer");
+            let answer = ready(&fcx, &mut s4).expect("a time exceeded answer");
             assert_eq!(ip::source(&answer.0), Some("10.0.0.1".parse()?));
             assert_eq!((answer.0[9], answer.0[20], answer.0[21]), (ip::protocol::ICMP, 11, 0));
-            assert!(ready(&cx, &mut s4).is_none());
-            let answer = ready(&cx, &mut s6).expect("a time exceeded answer");
+            assert!(ready(&fcx, &mut s4).is_none());
+            let answer = ready(&fcx, &mut s6).expect("a time exceeded answer");
             assert_eq!(ip::source(&answer.0), Some("fd00:1::1".parse()?));
             assert_eq!((answer.0[6], answer.0[40], answer.0[41]), (ip::protocol::ICMPV6, 3, 0));
             // r1 forwarded r2's answer: one hop.
             assert_eq!(answer.0[7], 63);
 
-            let drops: Vec<String> = cx.events().of("router", "drop").into_iter().map(|e| e.summary).collect();
+            let drops: Vec<String> = fcx.events().of("router", "drop").into_iter().map(|e| e.summary).collect();
             assert_eq!(drops.len(), 2, "{drops:?}");
             assert!(drops.iter().any(|d| d == "10.0.0.2 → 192.0.2.1: its TTL ran out"), "{drops:?}");
             assert!(drops.iter().any(|d| d.ends_with("its hop limit ran out")), "{drops:?}");
-            cx.cancel();
+            fcx.cancel();
             Ok(())
         }))
         .unwrap();
@@ -927,31 +927,31 @@ mod tests {
     /// holds. The router's own packets keep theirs.
     #[test]
     fn forwarding_lowers_the_ttl() {
-        crate::block_on(crate::run(|cx| async move {
+        crate::block_on(crate::run(|fcx| async move {
             let (ra, mut a) = crate::pair();
             let (rb, mut b) = crate::pair();
             let (rg, mut g) = crate::pair();
-            let r = router(&cx, vec![
+            let r = router(&fcx, vec![
                 ("10.0.0.2/32".parse()?, Box::new(ra) as Box<dyn Interface>),
                 ("10.0.0.3/32".parse()?, Box::new(rb)),
                 ("10.0.0.1/32".parse()?, Box::new(rg)),
             ]);
             r.address("10.0.0.1".parse()?);
             a.send(ip("10.0.0.2", "10.0.0.3", 64));
-            let p = b.recv(&cx).await?;
+            let p = b.recv(&fcx).await?;
             assert_eq!(p.0[8], 63);
             assert_eq!(ip::checksum(&p.0[..20]), 0, "the header checksum holds");
             // An expired packet for the router itself is still delivered.
             a.send(ip("10.0.0.2", "10.0.0.1", 1));
-            assert_eq!(g.recv(&cx).await?.0[8], 1);
+            assert_eq!(g.recv(&fcx).await?.0[8], 1);
             g.send(ip("10.0.0.1", "10.0.0.2", 64));
-            assert_eq!(a.recv(&cx).await?.0[8], 64);
+            assert_eq!(a.recv(&fcx).await?.0[8], 64);
             // A private router changes nothing, and forwards even TTL 1.
             r.keep_ttl();
-            cx.sleep(Duration::from_millis(1)).await?;
+            fcx.sleep(Duration::from_millis(1)).await?;
             a.send(ip("10.0.0.2", "10.0.0.3", 1));
-            assert_eq!(b.recv(&cx).await?.0[8], 1);
-            cx.cancel();
+            assert_eq!(b.recv(&fcx).await?.0[8], 1);
+            fcx.cancel();
             Ok(())
         }))
         .unwrap();
@@ -987,13 +987,13 @@ mod tests {
 
     #[test]
     fn member_addresses_are_unicast_in_the_subnet() {
-        crate::block_on(crate::run(|cx| async move {
-            let lan = lan(&cx, "192.168.56.0/24".parse()?, None);
+        crate::block_on(crate::run(|fcx| async move {
+            let lan = lan(&fcx, "192.168.56.0/24".parse()?, None);
             for bad in ["192.168.57.1", "192.168.56.255", "255.255.255.255", "224.0.0.252", "0.0.0.0", "fd00::1"] {
                 let (end, mut far) = crate::pair();
                 let err = lan.add(bad.parse()?, Box::new(end)).unwrap_err().to_string();
                 assert!(err.contains(bad), "{bad}: {err}");
-                assert_eq!(far.recv(&cx).await, Err(crate::RecvError::Closed), "{bad}: the interface is dropped");
+                assert_eq!(far.recv(&fcx).await, Err(crate::RecvError::Closed), "{bad}: the interface is dropped");
             }
             let (end, _far) = crate::pair();
             lan.add("192.168.56.0".parse()?, Box::new(end))?;
@@ -1006,13 +1006,13 @@ mod tests {
     /// each with its reason, with no observer.
     #[test]
     fn drops_and_member_changes_are_recorded() {
-        crate::block_on(crate::run(|cx| async move {
-            let lan = lan(&cx, "192.168.56.0/24".parse()?, None);
+        crate::block_on(crate::run(|fcx| async move {
+            let lan = lan(&fcx, "192.168.56.0/24".parse()?, None);
             let (a_lan, mut a) = crate::pair();
             let (b_lan, _b) = crate::pair();
             lan.add("192.168.56.10".parse()?, Box::new(a_lan))?;
             lan.add("192.168.56.11".parse()?, Box::new(b_lan))?;
-            assert!(!cx.observed());
+            assert!(!fcx.observed());
             a.send(v4([192, 168, 56, 10], [192, 168, 56, 12]));
             a.send(v4([192, 168, 56, 10], [10, 0, 0, 1]));
             a.send(v4([192, 168, 56, 10], [192, 168, 56, 10]));
@@ -1020,11 +1020,11 @@ mod tests {
             a.send(Packet(vec![1, 2, 3]));
             let (b2_lan, b2) = crate::pair();
             lan.add("192.168.56.11".parse()?, Box::new(b2_lan))?;
-            cx.sleep(Duration::from_millis(20)).await?;
+            fcx.sleep(Duration::from_millis(20)).await?;
             drop(b2);
-            cx.sleep(Duration::from_millis(20)).await?;
+            fcx.sleep(Duration::from_millis(20)).await?;
 
-            let events: Vec<(&str, String)> = cx.events().all().into_iter().filter(|e| e.source == "lan").map(|e| (e.kind, e.summary)).collect();
+            let events: Vec<(&str, String)> = fcx.events().all().into_iter().filter(|e| e.source == "lan").map(|e| (e.kind, e.summary)).collect();
             let drops: Vec<&str> = events.iter().filter(|(k, _)| *k == "drop").map(|(_, t)| t.as_str()).collect();
             let reasons = [
                 "no member at that address",
@@ -1053,12 +1053,12 @@ mod tests {
     /// dropped.
     #[test]
     fn joining_a_stopped_lan_fails() {
-        crate::block_on(crate::run(|cx| async move {
+        crate::block_on(crate::run(|fcx| async move {
             let kept: Arc<Mutex<Option<Lan>>> = Arc::default();
             let k = kept.clone();
-            let r = cx
-                .region(|cx| async move {
-                    *lock(&k) = Some(lan(&cx, "10.0.0.0/24".parse()?, None));
+            let r = fcx
+                .region(|fcx| async move {
+                    *lock(&k) = Some(lan(&fcx, "10.0.0.0/24".parse()?, None));
                     Err(fictionet::Error::msg("stop"))
                 })
                 .await;
@@ -1066,10 +1066,10 @@ mod tests {
             let lan = lock(&kept).take().unwrap();
             let (end, mut far) = crate::pair();
             assert_eq!(lan.add("10.0.0.2".parse()?, Box::new(end)).unwrap_err().to_string(), "the LAN has stopped");
-            assert_eq!(far.recv(&cx).await, Err(crate::RecvError::Closed));
+            assert_eq!(far.recv(&fcx).await, Err(crate::RecvError::Closed));
             let (end, mut far) = crate::pair();
             assert_eq!(lan.gateway(Box::new(end)).unwrap_err().to_string(), "the LAN has stopped");
-            assert_eq!(far.recv(&cx).await, Err(crate::RecvError::Closed));
+            assert_eq!(far.recv(&fcx).await, Err(crate::RecvError::Closed));
             Ok(())
         }))
         .unwrap();

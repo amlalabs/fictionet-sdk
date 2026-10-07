@@ -53,25 +53,25 @@ impl Input {
 
 /// Reads from `conn`, giving the world turns while nothing comes. `None`
 /// once it has stayed quiet.
-async fn read_quiet(cx: &Cx, conn: &mut TcpConnection, buf: &mut [u8]) -> Option<Result<usize, ConnError>> {
+async fn read_quiet(fcx: &Cx, conn: &mut TcpConnection, buf: &mut [u8]) -> Option<Result<usize, ConnError>> {
     for _ in 0..64 {
-        if let Some(r) = poll_once(conn.read(cx, buf)).await {
+        if let Some(r) = poll_once(conn.read(fcx, buf)).await {
             return Some(r);
         }
-        settle(cx, 1).await;
+        settle(fcx, 1).await;
     }
     None
 }
 
-async fn write_quiet(cx: &Cx, conn: &mut TcpConnection, mut data: &[u8]) -> bool {
+async fn write_quiet(fcx: &Cx, conn: &mut TcpConnection, mut data: &[u8]) -> bool {
     for _ in 0..4096 {
         if data.is_empty() {
             return true;
         }
-        match poll_once(conn.write(cx, data)).await {
+        match poll_once(conn.write(fcx, data)).await {
             Some(Ok(n)) => data = &data[n..],
             Some(Err(_)) => return false,
-            None => settle(cx, 1).await,
+            None => settle(fcx, 1).await,
         }
     }
     false
@@ -84,20 +84,20 @@ struct Tls {
 }
 
 impl Tls {
-    async fn flush(&mut self, cx: &Cx) -> bool {
+    async fn flush(&mut self, fcx: &Cx) -> bool {
         let mut out = Vec::new();
         while self.tls.wants_write() {
             if self.tls.write_tls(&mut out).is_err() {
                 return false;
             }
         }
-        write_quiet(cx, &mut self.conn, &out).await
+        write_quiet(fcx, &mut self.conn, &out).await
     }
 
     /// Reads one piece from the connection into rustls. False at the end.
-    async fn fill(&mut self, cx: &Cx) -> bool {
+    async fn fill(&mut self, fcx: &Cx) -> bool {
         let mut buf = vec![0u8; 16 * 1024];
-        match read_quiet(cx, &mut self.conn, &mut buf).await {
+        match read_quiet(fcx, &mut self.conn, &mut buf).await {
             Some(Ok(n)) if n > 0 => {
                 let mut at = &buf[..n];
                 while !at.is_empty() {
@@ -115,41 +115,41 @@ impl Tls {
         }
     }
 
-    async fn handshake(&mut self, cx: &Cx) -> bool {
+    async fn handshake(&mut self, fcx: &Cx) -> bool {
         while self.tls.is_handshaking() {
-            if !self.flush(cx).await || !self.fill(cx).await {
+            if !self.flush(fcx).await || !self.fill(fcx).await {
                 return false;
             }
         }
-        self.flush(cx).await
+        self.flush(fcx).await
     }
 }
 
 fuzz_target!(|data: &[u8]| {
     let Some(input) = Input::read(data) else { return };
-    world(move |cx| async move {
-        let attacher = serve(&cx);
-        let client = Client::new(&cx, &attacher, "agent", Ipv4Addr::new(10, 0, 0, 2));
+    world(move |fcx| async move {
+        let attacher = serve(&fcx);
+        let client = Client::new(&fcx, &attacher, "agent", Ipv4Addr::new(10, 0, 0, 2));
         let (addr, port) = if input.dns {
             (Ipv4Addr::new(10, 0, 0, 1), 53)
         } else {
-            let Some(addr) = client.lookup(&cx, input.name).await else { return };
+            let Some(addr) = client.lookup(&fcx, input.name).await else { return };
             (addr, if input.mode == 0 { 80 } else { 443 })
         };
-        let Ok(mut conn) = client.tcp.connect(&cx, SocketAddr::new(addr.into(), port)).await else { return };
+        let Ok(mut conn) = client.tcp.connect(&fcx, SocketAddr::new(addr.into(), port)).await else { return };
         let chunk = if input.chunk == 0 { usize::MAX } else { input.chunk };
         if input.mode == 0 || input.dns {
             for piece in input.bytes.chunks(chunk.min(input.bytes.len().max(1))) {
-                if !write_quiet(&cx, &mut conn, piece).await {
+                if !write_quiet(&fcx, &mut conn, piece).await {
                     return;
                 }
-                settle(&cx, 2).await;
+                settle(&fcx, 2).await;
             }
             if input.half_close {
-                let _ = conn.shutdown(&cx).await;
+                let _ = conn.shutdown(&fcx).await;
             }
             let mut buf = vec![0u8; 64 * 1024];
-            while let Some(Ok(n)) = read_quiet(&cx, &mut conn, &mut buf).await {
+            while let Some(Ok(n)) = read_quiet(&fcx, &mut conn, &mut buf).await {
                 if n == 0 {
                     break;
                 }
@@ -164,27 +164,27 @@ fuzz_target!(|data: &[u8]| {
         let name = rustls::pki_types::ServerName::try_from(input.name.to_owned()).unwrap();
         let tls = rustls::ClientConnection::new(client_config(alpn), name).unwrap();
         let mut tls = Tls { conn, tls };
-        if !tls.handshake(&cx).await {
+        if !tls.handshake(&fcx).await {
             return;
         }
         for piece in input.bytes.chunks(chunk.min(input.bytes.len().max(1))) {
-            if tls.tls.writer().write_all(piece).is_err() || !tls.flush(&cx).await {
+            if tls.tls.writer().write_all(piece).is_err() || !tls.flush(&fcx).await {
                 return;
             }
-            settle(&cx, 2).await;
+            settle(&fcx, 2).await;
         }
         if input.half_close {
             tls.tls.send_close_notify();
-            let _ = tls.flush(&cx).await;
+            let _ = tls.flush(&fcx).await;
         }
         let mut buf = vec![0u8; 64 * 1024];
-        while tls.fill(&cx).await {
+        while tls.fill(&fcx).await {
             while let Ok(n) = tls.tls.reader().read(&mut buf) {
                 if n == 0 {
                     break;
                 }
             }
-            let _ = tls.flush(&cx).await;
+            let _ = tls.flush(&fcx).await;
         }
     });
 });

@@ -20,9 +20,9 @@
 //! ```
 //! # use fictionet::{Attachments, Cx, Result, stdlib::{self, web}, time::ms};
 //! # fn site_for(_host: &str) -> Option<web::Site> { None }
-//! # fn world(cx: Cx, attachments: Attachments) -> Result {
-//! let far = attachments.map(&cx, |cx, sandbox| stdlib::delay(cx, ms(200), sandbox));
-//! web::Sites::new(site_for).serve(&cx, far)?;
+//! # fn world(fcx: Cx, attachments: Attachments) -> Result {
+//! let far = attachments.map(&fcx, |fcx, sandbox| stdlib::delay(fcx, ms(200), sandbox));
+//! web::Sites::new(site_for).serve(&fcx, far)?;
 //! # Ok(())
 //! # }
 //! ```
@@ -41,7 +41,7 @@
 //! - [`stdlib::filter`](crate::stdlib::filter) calls your code with every
 //!   packet. Your code can look at the packet, and can drop it.
 //!
-//! These nest: `bottleneck(cx, rate, queue, delay(cx, ms(40), sandbox))` is
+//! These nest: `bottleneck(fcx, rate, queue, delay(fcx, ms(40), sandbox))` is
 //! a slow link that is also far away. `map` calls can be chained too, and
 //! the first is closest to the sandbox. The function gets the sandbox
 //! itself, so it can read [`name`](crate::Attachment::name) and give each

@@ -26,20 +26,20 @@ fn start_world(path: &str) -> fictionet::Listening {
     let (attacher, mut attachments) = fictionet::attachments();
     let listening = fictionet::listen(fictionet::WorldSocket::UnixSocket(path.into()), attacher).unwrap();
     std::thread::spawn(move || {
-        let _ = fictionet::block_on(fictionet::run(move |cx| async move {
-            while let Ok(mut sandbox) = attachments.next(&cx).await {
-                cx.spawn(move |cx| async move {
+        let _ = fictionet::block_on(fictionet::run(move |fcx| async move {
+            while let Ok(mut sandbox) = attachments.next(&fcx).await {
+                fcx.spawn(move |fcx| async move {
                     let (mut mine, mut theirs) = fictionet::pair();
-                    cx.spawn(move |cx| async move {
-                        while let Ok(p) = theirs.recv(&cx).await {
-                            cx.record(fictionet::events::Event::new("test", "echo").field("len", p.0.len() as u64));
+                    fcx.spawn(move |fcx| async move {
+                        while let Ok(p) = theirs.recv(&fcx).await {
+                            fcx.record(fictionet::events::Event::new("test", "echo").field("len", p.0.len() as u64));
                             theirs.send(p);
                         }
                         Ok(())
                     });
-                    while let Ok(p) = sandbox.recv(&cx).await {
+                    while let Ok(p) = sandbox.recv(&fcx).await {
                         mine.send(p);
-                        let back = mine.recv(&cx).await?;
+                        let back = mine.recv(&fcx).await?;
                         sandbox.send(back);
                     }
                     Ok(())
