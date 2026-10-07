@@ -57,7 +57,11 @@
 //! after that, in the task that recorded, so they must return quickly and
 //! never block. The `sites` group of the performance suite (`cargo bench
 //! --bench perf -- sites`) measures the cost on HTTPS requests, which
-//! record one event each.
+//! record one `http.request` event each. On a busy 24-core machine, a
+//! median of three runs took 9.5 µs of CPU per HTTP/1.1 request from ten
+//! sandboxes, against 7.9 µs before every run kept its events, and 12.9 µs
+//! per HTTP/2 request against 11.5 µs. Most of it is building the event:
+//! its headers and fields are about 25 allocations.
 //!
 //! # Why "event"
 //!
