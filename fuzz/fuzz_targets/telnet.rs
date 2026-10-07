@@ -72,7 +72,7 @@ fuzz_target!(|data: &[u8]| {
     for binary in [false, true] {
         for limit in [1, telnet::MAX_DATA] {
             let make = || {
-                let mut events = Events::with_data_limit(limit);
+                let mut events = Events::with_limit(limit);
                 events.set_binary(binary);
                 events
             };

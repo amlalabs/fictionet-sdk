@@ -752,13 +752,13 @@ pub struct Frames {
 impl Frames {
     /// Reads frames for `role` with data payloads up to [`MAX_PAYLOAD`].
     pub fn new(role: Role) -> Self {
-        Self::with_limit(role, MAX_PAYLOAD)
+        Self { role, limit: MAX_PAYLOAD, closed: false }
     }
 
     /// Sets the data payload limit, clamped to [`MAX_PAYLOAD`]. Zero
     /// permits empty data frames. Control frames keep their protocol limit.
-    pub fn with_limit(role: Role, limit: usize) -> Self {
-        Self { role, limit: limit.min(MAX_PAYLOAD), closed: false }
+    pub fn with_limit(self, limit: usize) -> Self {
+        Self { limit: limit.min(MAX_PAYLOAD), ..self }
     }
 
     /// The largest accepted data payload, excluding its header.
@@ -851,13 +851,14 @@ pub struct Messages {
 impl Messages {
     /// Reads messages up to [`MAX_MESSAGE`] for the receiving `role`.
     pub fn new(role: Role) -> Self {
-        Self::with_limit(role, MAX_MESSAGE)
+        Self::from_frames(Frames::new(role).with_limit(MAX_MESSAGE), MAX_MESSAGE)
     }
 
     /// Uses `limit` for data frames and assembled messages, clamped to
-    /// [`MAX_MESSAGE`]. Control frames retain their 125-byte limit.
-    pub fn with_limit(role: Role, limit: usize) -> Self {
-        Self::from_frames(Frames::with_limit(role, limit), limit)
+    /// [`MAX_MESSAGE`]. Control frames retain their 125-byte limit. Call it
+    /// before decoding: a message in progress is dropped.
+    pub fn with_limit(self, limit: usize) -> Self {
+        Self::from_frames(self.frames.with_limit(limit), limit)
     }
 
     /// Wraps a frame decoder with a separate message limit. The frame
@@ -2057,22 +2058,22 @@ mod tests {
     #[test]
     fn decoder_bounds_message_size() {
         // A frame over the limit is refused from its header alone.
-        let mut d = Stream::new(Messages::with_limit(Role::Client, 10));
+        let mut d = Stream::new(Messages::new(Role::Client).with_limit(10));
         push(&mut d, &[0x82, 11]);
         assert_eq!(d.next(), Some(Err(Fail::Protocol(AssembleError::Inner(Error::TooBig)))));
         // Fragments that add up to more than the limit.
-        let mut d = Stream::new(Messages::with_limit(Role::Client, 10));
+        let mut d = Stream::new(Messages::new(Role::Client).with_limit(10));
         push(&mut d, &[0x02, 6, 0, 0, 0, 0, 0, 0]);
         assert_eq!(d.next(), None);
         push(&mut d, &[0x80, 5]);
         assert_eq!(d.next(), Some(Err(Fail::Protocol(AssembleError::Inner(Error::TooBig)))));
         // Exactly the limit is fine, and control frames do not count.
-        let mut d = Stream::new(Messages::with_limit(Role::Client, 3));
+        let mut d = Stream::new(Messages::new(Role::Client).with_limit(3));
         push(&mut d, &[0x02, 2, 1, 2, 0x89, 5, 1, 2, 3, 4, 5, 0x80, 1, 3]);
         assert_eq!(d.next(), Some(Ok(Message::Ping(vec![1, 2, 3, 4, 5]))));
         assert_eq!(d.next(), Some(Ok(Message::Binary(vec![1, 2, 3]))));
         // The limit is clamped.
-        assert_eq!(Messages::with_limit(Role::Client, usize::MAX).limit(), MAX_MESSAGE);
+        assert_eq!(Messages::new(Role::Client).with_limit(usize::MAX).limit(), MAX_MESSAGE);
     }
 
     #[test]
@@ -2109,9 +2110,9 @@ mod tests {
 
     #[test]
     fn decoder_has_accessors_and_clones() {
-        let frames = Frames::with_limit(Role::Server, 100);
+        let frames = Frames::new(Role::Server).with_limit(100);
         assert_eq!((frames.role(), frames.limit()), (Role::Server, 100));
-        let mut messages = Messages::with_limit(Role::Client, 100);
+        let mut messages = Messages::new(Role::Client).with_limit(100);
         assert_eq!(messages.decode(&HEL, false), Ok(codec::Step::Skip(HEL.len())));
         let mut copy = messages.clone();
         assert_eq!(messages.decode(&LO, false), copy.decode(&LO, false));
@@ -2446,7 +2447,7 @@ mod tests {
     #[test]
     fn review_push_is_bounded() {
         // One large push with a tiny limit holds at most one control frame.
-        let mut d = Stream::new(Messages::with_limit(Role::Client, 1));
+        let mut d = Stream::new(Messages::new(Role::Client).with_limit(1));
         let _ = d.push(&vec![0x82; 1 << 20]);
         assert!(d.buffered() <= MAX_HEADER_LEN + MAX_CONTROL_PAYLOAD, "{}", d.buffered());
         // Repeated pushes without taking messages out stop growing.
@@ -2591,7 +2592,7 @@ mod tests {
 
     #[test]
     fn review_push_takes_what_fits_and_loops_end() {
-        let mut d = Stream::new(Messages::with_limit(Role::Client, 3));
+        let mut d = Stream::new(Messages::new(Role::Client).with_limit(3));
         assert_eq!(d.decoder().capacity(), MAX_HEADER_LEN + MAX_CONTROL_PAYLOAD);
         let stream = [0x8a, 0x00].repeat(200);
         let took = d.push(&stream);
@@ -2601,7 +2602,7 @@ mod tests {
         assert_eq!(d.push(&stream[took..]), 2);
         // A frame over the limit fails from its header, so a full decoder
         // never waits for more.
-        let mut d = Stream::new(Messages::with_limit(Role::Client, 3));
+        let mut d = Stream::new(Messages::new(Role::Client).with_limit(3));
         let big = [&[0x82, 126, 0x01, 0x00][..], &[0; 256]].concat();
         let took = d.push(&big);
         assert_eq!(took, d.decoder().capacity());

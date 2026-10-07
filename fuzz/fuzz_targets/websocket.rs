@@ -49,8 +49,8 @@ fuzz_target!(|data: &[u8]| {
         .first()
         .map_or(MAX_MESSAGE, |&b| if b & 1 == 0 { MAX_MESSAGE } else { usize::from(b) });
     for role in [Role::Server, Role::Client] {
-        let frames = || Frames::with_limit(role, limit);
-        let messages = || Messages::with_limit(role, limit);
+        let frames = || Frames::new(role).with_limit(limit);
+        let messages = || Messages::new(role).with_limit(limit);
         bounded(frames, data);
         bounded(messages, data);
         contract::check_decode_with_held_limit(messages, data, limit);

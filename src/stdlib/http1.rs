@@ -25,10 +25,12 @@ pub const MAX_PENDING_REQUESTS: usize = 128;
 /// The most empty CRLF lines ignored before each request line: eight.
 pub const MAX_EMPTY_LINES: usize = 8;
 
-/// Head and streaming buffer limits. Line lengths exclude CRLF.
+/// Head, streaming buffer and whole-message limits. Line lengths exclude
+/// CRLF.
 ///
 /// Defaults are 8 KiB per start line, 8 KiB per header line, 100 headers,
-/// 64 KiB for the complete head, and 8 KiB per body event. The head limit
+/// 64 KiB for the complete head, 8 KiB per body event, and for the
+/// whole-message decoders [`MAX_BODY`] and [`MAX_MESSAGE`]. The head limit
 /// includes every CRLF and the final empty line. Decoders clamp byte limits
 /// to [`Buffer::MAX_LIMIT`] and raise a zero body block size to one.
 /// Ignored empty lines before a request do not count toward its head limit.
@@ -47,6 +49,14 @@ pub struct Limits {
     /// Boundaries do not depend on input chunking. Use smaller blocks for
     /// low latency on close-delimited streams.
     pub body_chunk: usize,
+    /// Maximum body bytes of one whole message, clamped to [`MAX_BODY`].
+    /// Only [`RequestMessages`] and [`ResponseMessages`] use it; the event
+    /// decoders stream a body of any length. Default: [`MAX_BODY`].
+    pub body: usize,
+    /// Maximum wire bytes of one whole message, with its head and chunk
+    /// framing, clamped to [`MAX_MESSAGE`]. Only [`RequestMessages`] and
+    /// [`ResponseMessages`] use it. Default: [`MAX_MESSAGE`].
+    pub message: usize,
 }
 
 impl Default for Limits {
@@ -57,6 +67,8 @@ impl Default for Limits {
             headers: 100,
             head: 65536,
             body_chunk: 8192,
+            body: MAX_BODY,
+            message: MAX_MESSAGE,
         }
     }
 }
@@ -354,7 +366,7 @@ pub enum Event<H> {
 /// is followed by End. Every CONNECT request also ends HTTP after Done.
 /// To accept it, send a 2xx response and use [`Stream::into_parts`] for the
 /// unread tunnel bytes. To reject it and keep reading HTTP, use
-/// `stream.swap(Requests::new(limits))`, or close the connection.
+/// `stream.swap(Requests::with_limits(limits))`, or close the connection.
 /// Upgrade offers are treated as ordinary HTTP requests. Up to
 /// [`MAX_EMPTY_LINES`] empty CRLF lines are ignored before each request line.
 /// A partial buffered head or body returns Need at EOF for the driver's
@@ -363,7 +375,7 @@ pub enum Event<H> {
 ///
 /// ```
 /// use fictionet::stdlib::{codec::Stream, http1::{Event, Limits, Requests}};
-/// let mut stream = Stream::new(Requests::new(Limits::default()));
+/// let mut stream = Stream::new(Requests::new());
 /// let bytes = b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n";
 /// assert_eq!(stream.push(bytes), bytes.len());
 /// assert!(matches!(stream.next(), Some(Ok(Event::Head(_)))));
@@ -375,8 +387,13 @@ pub struct Requests {
 }
 
 impl Requests {
+    /// Creates a request decoder with the default limits.
+    pub fn new() -> Self {
+        Self::with_limits(Limits::default())
+    }
+
     /// Creates a request decoder with the given limits.
-    pub fn new(limits: Limits) -> Self {
+    pub fn with_limits(limits: Limits) -> Self {
         Self {
             core: Reader::new(limits),
             empty_lines: 0,
@@ -386,7 +403,7 @@ impl Requests {
 
 impl Default for Requests {
     fn default() -> Self {
-        Self::new(Limits::default())
+        Self::new()
     }
 }
 
@@ -458,8 +475,13 @@ pub struct Responses {
 }
 
 impl Responses {
+    /// Creates a response decoder with the default limits.
+    pub fn new() -> Self {
+        Self::with_limits(Limits::default())
+    }
+
     /// Creates a response decoder with the given limits.
-    pub fn new(limits: Limits) -> Self {
+    pub fn with_limits(limits: Limits) -> Self {
         Self {
             core: Reader::new(limits),
             methods: VecDeque::new(),
@@ -480,7 +502,7 @@ impl Responses {
 
 impl Default for Responses {
     fn default() -> Self {
-        Self::new(Limits::default())
+        Self::new()
     }
 }
 
@@ -568,17 +590,18 @@ pub struct RequestMessages {
 }
 
 impl RequestMessages {
-    /// Creates a decoder with these head limits and default message bounds.
-    pub fn new(limits: Limits) -> Self {
-        Self::with_limits(limits, MAX_BODY, MAX_MESSAGE)
+    /// Creates a decoder with the default limits.
+    pub fn new() -> Self {
+        Self::with_limits(Limits::default())
     }
-    /// Creates a decoder with smaller body and wire byte bounds. Bounds
-    /// are clamped to MAX_BODY and MAX_MESSAGE. Head limits are unchanged.
-    pub fn with_limits(mut limits: Limits, body: usize, wire: usize) -> Self {
-        let message = Message::new(body, wire);
+    /// Creates a decoder with these limits. [`Limits::body`] and
+    /// [`Limits::message`] bound the whole message, clamped to
+    /// [`MAX_BODY`] and [`MAX_MESSAGE`].
+    pub fn with_limits(mut limits: Limits) -> Self {
+        let message = Message::new(limits.body, limits.message);
         limits.body_chunk = limits.body_chunk.min(message.body_limit.saturating_add(1));
         Self {
-            inner: Requests::new(limits),
+            inner: Requests::with_limits(limits),
             message,
         }
     }
@@ -586,7 +609,7 @@ impl RequestMessages {
 
 impl Default for RequestMessages {
     fn default() -> Self {
-        Self::new(Limits::default())
+        Self::new()
     }
 }
 
@@ -618,17 +641,18 @@ pub struct ResponseMessages {
 }
 
 impl ResponseMessages {
-    /// Creates a decoder with these head limits and default message bounds.
-    pub fn new(limits: Limits) -> Self {
-        Self::with_limits(limits, MAX_BODY, MAX_MESSAGE)
+    /// Creates a decoder with the default limits.
+    pub fn new() -> Self {
+        Self::with_limits(Limits::default())
     }
-    /// Creates a decoder with body and wire byte bounds, clamped to MAX_BODY
-    /// and MAX_MESSAGE. Head limits are unchanged.
-    pub fn with_limits(mut limits: Limits, body: usize, wire: usize) -> Self {
-        let message = Message::new(body, wire);
+    /// Creates a decoder with these limits. [`Limits::body`] and
+    /// [`Limits::message`] bound the whole message, clamped to
+    /// [`MAX_BODY`] and [`MAX_MESSAGE`].
+    pub fn with_limits(mut limits: Limits) -> Self {
+        let message = Message::new(limits.body, limits.message);
         limits.body_chunk = limits.body_chunk.min(message.body_limit.saturating_add(1));
         Self {
-            inner: Responses::new(limits),
+            inner: Responses::with_limits(limits),
             message,
         }
     }
@@ -641,7 +665,7 @@ impl ResponseMessages {
 
 impl Default for ResponseMessages {
     fn default() -> Self {
-        Self::new(Limits::default())
+        Self::new()
     }
 }
 
@@ -2057,8 +2081,8 @@ mod tests {
             let request = Request::parse(bytes).unwrap();
             contract::check_wire::<Request>(bytes);
             contract::check_wire_value(&request.head);
-            contract::check_decode_with_held_limit(|| Requests::new(small()), bytes, 0);
-            let (events, failure) = test_support::decode_all(|| Requests::new(small()), bytes);
+            contract::check_decode_with_held_limit(|| Requests::with_limits(small()), bytes, 0);
+            let (events, failure) = test_support::decode_all(|| Requests::with_limits(small()), bytes);
             assert_eq!(failure, None);
             assert_eq!(events.first(), Some(&Event::Head(request.head)));
             assert_eq!(events.last(), Some(&Event::Done));
@@ -2078,7 +2102,7 @@ mod tests {
             assert_eq!(response.body, b"hello");
             contract::check_wire_value(&response.head);
             contract::check_decode_with_held_limit(
-                || Responses::new(small()),
+                || Responses::with_limits(small()),
                 bytes,
                 MAX_PENDING_REQUESTS,
             );
@@ -2097,8 +2121,9 @@ mod tests {
             headers: 1,
             head: bytes.len(),
             body_chunk: 1,
+            ..Limits::default()
         };
-        let (_, error) = test_support::decode_all(|| Requests::new(exact), bytes);
+        let (_, error) = test_support::decode_all(|| Requests::with_limits(exact), bytes);
         assert_eq!(error, None);
         let cases = [
             (
@@ -2133,10 +2158,10 @@ mod tests {
         ];
         for (limits, error) in cases {
             assert_eq!(
-                test_support::decode_all(|| Requests::new(limits), bytes).1,
+                test_support::decode_all(|| Requests::with_limits(limits), bytes).1,
                 Some(Fail::Protocol(error))
             );
-            contract::check_decode(|| Requests::new(limits), bytes);
+            contract::check_decode(|| Requests::with_limits(limits), bytes);
         }
         let response = b"HTTP/1.1 204 No Content\r\nX: y\r\n\r\n";
         let exact = Limits {
@@ -2145,9 +2170,10 @@ mod tests {
             headers: 1,
             head: response.len(),
             body_chunk: 1,
+            ..Limits::default()
         };
         assert_eq!(
-            test_support::decode_all(|| Responses::new(exact), response).1,
+            test_support::decode_all(|| Responses::with_limits(exact), response).1,
             None
         );
         for limits in [
@@ -2169,11 +2195,11 @@ mod tests {
             },
         ] {
             assert!(
-                test_support::decode_all(|| Responses::new(limits), response)
+                test_support::decode_all(|| Responses::with_limits(limits), response)
                     .1
                     .is_some()
             );
-            contract::check_decode(|| Responses::new(limits), response);
+            contract::check_decode(|| Responses::with_limits(limits), response);
         }
         let huge = Limits {
             start_line: usize::MAX,
@@ -2181,10 +2207,12 @@ mod tests {
             headers: usize::MAX,
             head: usize::MAX,
             body_chunk: usize::MAX,
+            body: usize::MAX,
+            message: usize::MAX,
         };
-        assert!(Requests::new(huge).capacity() <= Buffer::MAX_LIMIT);
+        assert!(Requests::with_limits(huge).capacity() <= Buffer::MAX_LIMIT);
         assert_eq!(
-            Requests::new(Limits {
+            Requests::with_limits(Limits {
                 body_chunk: 0,
                 ..small()
             })
@@ -2197,7 +2225,7 @@ mod tests {
 
     #[test]
     fn one_byte_feeding_and_large_bodies_stay_bounded() {
-        let mut stream = Stream::new(Requests::new(small()));
+        let mut stream = Stream::new(Requests::with_limits(small()));
         let mut events = Vec::new();
         for chunk in test_support::chunks(CHUNKED, &[1]) {
             assert_eq!(
@@ -2209,7 +2237,7 @@ mod tests {
         finish(&mut stream, |e| events.push(e)).unwrap();
         assert_eq!(
             events,
-            test_support::decode_all(|| Requests::new(small()), CHUNKED).0
+            test_support::decode_all(|| Requests::with_limits(small()), CHUNKED).0
         );
         let body = vec![b'x'; 100_003];
         let bytes = request_with(&format!("Content-Length: {}\r\n", body.len()), &body);
@@ -2218,7 +2246,7 @@ mod tests {
             body_chunk: 97,
             ..small()
         };
-        let mut stream = Stream::new(Requests::new(limits));
+        let mut stream = Stream::new(Requests::with_limits(limits));
         let mut total = 0usize;
         pump(&mut stream, &bytes, |e| {
             if let Event::Body(b) = e {
@@ -2232,7 +2260,7 @@ mod tests {
         assert!(stream.buffered() <= 1024);
         // The declared chunk is much larger than any allocation needed to parse it.
         let bytes = request_with("Transfer-Encoding: chunked\r\n", b"ffffffffffffffff\r\nab");
-        let mut stream = Stream::new(Requests::new(small()));
+        let mut stream = Stream::new(Requests::with_limits(small()));
         assert_eq!(stream.push(&bytes), bytes.len());
         assert!(matches!(stream.next(), Some(Ok(Event::Head(_)))));
         assert_eq!(stream.next(), Some(Ok(Event::Body(b"ab".to_vec()))));
@@ -2386,7 +2414,7 @@ mod tests {
         assert_eq!(failure, Some(Fail::Truncated { unread: 1 }));
         for head in [0, 1, 2] {
             let make = || {
-                Requests::new(Limits {
+                Requests::with_limits(Limits {
                     head,
                     start_line: 0,
                     ..small()
@@ -2648,26 +2676,22 @@ mod tests {
     #[test]
     fn whole_messages_refuse_declared_lengths_from_the_head() {
         let head = b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1000000\r\n\r\n";
-        let mut stream = Stream::new(RequestMessages::with_limits(Limits::default(), 10, 4096));
+        let mut stream = Stream::new(RequestMessages::with_limits(Limits { body: 10, message: 4096, ..Limits::default() }));
         assert_eq!(stream.push(head), head.len());
         assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::BodyTooLong))));
-        let mut stream = Stream::new(RequestMessages::with_limits(
-            Limits::default(),
-            MAX_BODY,
-            4096,
-        ));
+        let mut stream = Stream::new(RequestMessages::with_limits(Limits { body: MAX_BODY, message: 4096, ..Limits::default() }));
         assert_eq!(stream.push(head), head.len());
         assert_eq!(
             stream.next(),
             Some(Err(Fail::Protocol(Error::MessageTooLong)))
         );
-        let mut stream = Stream::new(ResponseMessages::with_limits(Limits::default(), 10, 4096));
+        let mut stream = Stream::new(ResponseMessages::with_limits(Limits { body: 10, message: 4096, ..Limits::default() }));
         let head = b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n";
         assert_eq!(stream.push(head), head.len());
         assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::BodyTooLong))));
         // A chunk larger than the remaining body bound is refused from its size line.
         let chunked = request_with("Transfer-Encoding: chunked\r\n", b"4\r\nabcd\r\n10\r\n");
-        let mut stream = Stream::new(RequestMessages::with_limits(small(), 10, 4096));
+        let mut stream = Stream::new(RequestMessages::with_limits(Limits { body: 10, message: 4096, ..small() }));
         assert_eq!(stream.push(&chunked), chunked.len());
         assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::BodyTooLong))));
     }
@@ -2675,7 +2699,7 @@ mod tests {
     #[test]
     fn whole_messages_hold_no_input_while_they_need_more() {
         for limits in [Limits::default(), small()] {
-            let mut decoder = RequestMessages::with_limits(limits, MAX_BODY, MAX_MESSAGE);
+            let mut decoder = RequestMessages::with_limits(Limits { body: MAX_BODY, message: MAX_MESSAGE, ..limits });
             let partial = request_with("Content-Length: 10\r\n", b"hello");
             assert!(matches!(decoder.decode(&partial, false), Ok(Step::Need)));
             assert_eq!(decoder.held(), 0);
@@ -2688,7 +2712,7 @@ mod tests {
             assert_eq!(decoder.held(), 0);
         }
         let chunked = request_with("Transfer-Encoding: chunked\r\n", b"2\r\nhe\r\n3\r\nllo\r\n");
-        let mut decoder = RequestMessages::with_limits(small(), MAX_BODY, MAX_MESSAGE);
+        let mut decoder = RequestMessages::with_limits(Limits { body: MAX_BODY, message: MAX_MESSAGE, ..small() });
         assert!(matches!(decoder.decode(&chunked, false), Ok(Step::Need)));
         assert_eq!(decoder.held(), 0);
         let mut done = chunked.clone();
@@ -2705,7 +2729,7 @@ mod tests {
     #[test]
     fn whole_messages_obey_contracts_and_limits() {
         let pipeline = [CHUNKED, GET, POST].concat();
-        let make = || RequestMessages::with_limits(small(), 5, CHUNKED.len());
+        let make = || RequestMessages::with_limits(Limits { body: 5, message: CHUNKED.len(), ..small() });
         contract::check_decode_with_held_limit(make, &pipeline, CHUNKED.len() + 5);
         contract::check_decode_with_alloc_limit(make, &pipeline, (CHUNKED.len() + 1) * 2);
         let (messages, error) = test_support::decode_all(make, &pipeline);
@@ -2719,13 +2743,13 @@ mod tests {
             ]
         );
         for bytes in [CHUNKED, POST] {
-            let make = || RequestMessages::with_limits(small(), 4, 512);
+            let make = || RequestMessages::with_limits(Limits { body: 4, message: 512, ..small() });
             assert_eq!(
                 test_support::decode_all(make, bytes).1,
                 Some(Fail::Protocol(Error::BodyTooLong))
             );
             contract::check_decode(make, bytes);
-            let make = || RequestMessages::with_limits(small(), 5, bytes.len() - 1);
+            let make = || RequestMessages::with_limits(Limits { body: 5, message: bytes.len() - 1, ..small() });
             assert_eq!(
                 test_support::decode_all(make, bytes).1,
                 Some(Fail::Protocol(Error::MessageTooLong))
@@ -2734,11 +2758,11 @@ mod tests {
         }
         for bytes in [GET, b"", b"\r", b"\r\n", b"GET"] {
             for limit in [0, 1, 2, GET.len() - 1, GET.len()] {
-                contract::check_decode(|| RequestMessages::with_limits(small(), 0, limit), bytes);
+                contract::check_decode(|| RequestMessages::with_limits(Limits { body: 0, message: limit, ..small() }), bytes);
             }
         }
         let make = || {
-            let mut decoder = ResponseMessages::with_limits(small(), 5, 128);
+            let mut decoder = ResponseMessages::with_limits(Limits { body: 5, message: 128, ..small() });
             decoder.expect_method("HEAD").unwrap();
             decoder.expect_method("GET").unwrap();
             decoder
@@ -2751,13 +2775,13 @@ mod tests {
         assert!(responses[1].body.is_empty());
         assert_eq!(responses[2].body, b"hello");
         for bytes in [OK, b"HTTP/1.1 200 OK\r\n\r\nhello"] {
-            let make = || ResponseMessages::with_limits(small(), 5, bytes.len());
+            let make = || ResponseMessages::with_limits(Limits { body: 5, message: bytes.len(), ..small() });
             contract::check_decode(make, bytes);
             assert_eq!(
                 test_support::decode_all(make, bytes),
                 (vec![Response::parse(bytes).unwrap()], None)
             );
-            let make = || ResponseMessages::with_limits(small(), 4, 128);
+            let make = || ResponseMessages::with_limits(Limits { body: 4, message: 128, ..small() });
             contract::check_decode(make, bytes);
             assert_eq!(
                 test_support::decode_all(make, bytes).1,
@@ -2828,16 +2852,16 @@ mod tests {
             ..Limits::default()
         };
         assert_eq!(
-            test_support::decode_all(|| Responses::new(limits), short).1,
+            test_support::decode_all(|| Responses::with_limits(limits), short).1,
             Some(Fail::Protocol(Error::HeadTooLong))
         );
-        contract::check_decode(|| Responses::new(limits), short);
+        contract::check_decode(|| Responses::with_limits(limits), short);
         let limits = Limits {
             start_line: 12,
             ..Limits::default()
         };
         assert_eq!(
-            test_support::decode_all(|| Responses::new(limits), short).1,
+            test_support::decode_all(|| Responses::with_limits(limits), short).1,
             Some(Fail::Protocol(Error::StartLineTooLong))
         );
         let limits = Limits {
@@ -2846,10 +2870,10 @@ mod tests {
             ..Limits::default()
         };
         assert_eq!(
-            test_support::decode_all(|| Responses::new(limits), short).1,
+            test_support::decode_all(|| Responses::with_limits(limits), short).1,
             None
         );
-        contract::check_decode(|| Responses::new(limits), short);
+        contract::check_decode(|| Responses::with_limits(limits), short);
         let mut head = response.head;
         head.reason = vec![b'a'; Limits::default().start_line - 13];
         contract::check_wire_value(&head);
@@ -2962,7 +2986,7 @@ mod tests {
         for (method, status) in [("HEAD", 200), ("GET", 100), ("GET", 204), ("GET", 304)] {
             let bytes = format!("HTTP/1.1 {status} Fine\r\nContent-Length: 999\r\n\r\n");
             let make = || {
-                let mut d = Responses::new(small());
+                let mut d = Responses::with_limits(small());
                 d.expect_method(method).unwrap();
                 d
             };
@@ -3049,7 +3073,7 @@ mod tests {
     #[test]
     fn read_until_close_flushes_last_block_only_at_eof() {
         let bytes = b"HTTP/1.1 200 OK\r\n\r\nhello";
-        let mut stream = Stream::new(Responses::new(small()));
+        let mut stream = Stream::new(Responses::with_limits(small()));
         assert_eq!(stream.push(bytes), bytes.len());
         assert!(matches!(stream.next(), Some(Ok(Event::Head(_)))));
         assert_eq!(stream.next(), Some(Ok(Event::Body(b"he".to_vec()))));
@@ -3060,7 +3084,7 @@ mod tests {
         assert_eq!(stream.next(), Some(Ok(Event::Done)));
         assert_eq!(stream.next(), None);
         assert!(stream.is_done());
-        contract::check_decode(|| Responses::new(small()), bytes);
+        contract::check_decode(|| Responses::with_limits(small()), bytes);
     }
 
     #[test]
@@ -3135,7 +3159,7 @@ mod tests {
         let head = b"CONNECT example.test:443 HTTP/1.1\r\nHost: example.test:443\r\n\r\n";
         let bytes = [head.as_slice(), GET].concat();
         let limits = Limits::default();
-        let mut stream = Stream::new(Requests::new(limits));
+        let mut stream = Stream::new(Requests::with_limits(limits));
         let mut events = Vec::new();
         assert_eq!(
             pump(&mut stream, &bytes, |e| events.push(e)),
@@ -3144,7 +3168,7 @@ mod tests {
         assert!(matches!(events.as_slice(), [Event::Head(_), Event::Done]));
         assert!(stream.is_done());
         assert_eq!(stream.unread(), GET);
-        let mut stream = stream.swap(Requests::new(limits));
+        let mut stream = stream.swap(Requests::with_limits(limits));
         events.clear();
         finish(&mut stream, |e| events.push(e)).unwrap();
         assert_eq!(events, test_support::decode_all(Requests::default, GET).0);
@@ -3369,7 +3393,7 @@ mod tests {
             }))
         );
         let assemble = || {
-            Assemble::new(Requests::new(small()), 10, |e| match e {
+            Assemble::new(Requests::with_limits(small()), 10, |e| match e {
                 Event::Head(h) => Fragment::Whole(h),
                 Event::Body(data) => Fragment::Part { data, last: false },
                 Event::Done => Fragment::Part {
@@ -3386,7 +3410,7 @@ mod tests {
         let bytes = response_with("Connection: close\r\nContent-Length: 4\r\n", b"a\nb\n");
         let pipe = || {
             Pipe::new(
-                Responses::new(small()),
+                Responses::with_limits(small()),
                 Lines::new(16, Ending::LfOrCrlf),
                 |event| match event {
                     Event::Body(data) => Carry::Bytes(data),
@@ -3420,11 +3444,11 @@ mod tests {
                 CHUNKED.to_vec()
             };
             test_support::mutate(&mut rng, &mut bytes);
-            contract::check_decode(|| Requests::new(small()), &bytes);
+            contract::check_decode(|| Requests::with_limits(small()), &bytes);
             contract::check_wire::<Request>(&bytes);
             let mut response = OK.to_vec();
             test_support::mutate(&mut rng, &mut response);
-            contract::check_decode(|| Responses::new(small()), &response);
+            contract::check_decode(|| Responses::with_limits(small()), &response);
             contract::check_wire::<Response>(&response);
         }
         for _ in 0..16 {

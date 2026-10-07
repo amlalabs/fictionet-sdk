@@ -41,27 +41,27 @@ fn decoder_contracts_and_chunking() {
         b"0123456789012345678901234567890123456789\n",
     ];
     for bytes in samples {
-        check_decode(|| RawLines::new(limits.line), bytes);
-        check_decode(|| Events::new(limits), bytes);
-        check_decode_with_held_limit(|| RawLines::new(limits.line), bytes, 0);
+        check_decode(|| RawLines::with_limit(limits.line), bytes);
+        check_decode(|| Events::with_limits(limits), bytes);
+        check_decode_with_held_limit(|| RawLines::with_limit(limits.line), bytes, 0);
         check_decode_with_held_limit(
-            || Events::new(limits),
+            || Events::with_limits(limits),
             bytes,
             limits.event + 2 * limits.line,
         );
-        let expected = decode_all(|| Events::new(limits), bytes);
-        assert_eq!(run(Events::new(limits), chunks(bytes, &[1])), expected);
-        let raw = decode_all(|| RawLines::new(limits.line), bytes);
-        assert_eq!(run(RawLines::new(limits.line), chunks(bytes, &[1])), raw);
+        let expected = decode_all(|| Events::with_limits(limits), bytes);
+        assert_eq!(run(Events::with_limits(limits), chunks(bytes, &[1])), expected);
+        let raw = decode_all(|| RawLines::with_limit(limits.line), bytes);
+        assert_eq!(run(RawLines::with_limit(limits.line), chunks(bytes, &[1])), raw);
         for seed in 0..16 {
             let mut rng = Lcg::new(seed);
             assert_eq!(
-                run(Events::new(limits), random_chunks(bytes, &mut rng, 17)),
+                run(Events::with_limits(limits), random_chunks(bytes, &mut rng, 17)),
                 expected
             );
             assert_eq!(
                 run(
-                    RawLines::new(limits.line),
+                    RawLines::with_limit(limits.line),
                     random_chunks(bytes, &mut rng, 17)
                 ),
                 raw
@@ -72,11 +72,11 @@ fn decoder_contracts_and_chunking() {
     for line in 0..8 {
         for event in [0, 1, 12, 32] {
             check_decode(
-                || RawLines::new(line),
+                || RawLines::with_limit(line),
                 b"\xef\xbb\xbfdata\r\n\r\ndata:xxx\n\n",
             );
             check_decode(
-                || Events::new(Limits { line, event }),
+                || Events::with_limits(Limits { line, event }),
                 b"\xef\xbb\xbfdata\r\n\r\ndata:xxx\n\n",
             );
         }
@@ -169,10 +169,10 @@ fn mutations_and_small_limit_contracts() {
         for _ in 0..8 {
             mutate(&mut rng, &mut data);
         }
-        check_decode(|| RawLines::new(24), &data);
+        check_decode(|| RawLines::with_limit(24), &data);
         check_decode(
             || {
-                Events::new(Limits {
+                Events::with_limits(Limits {
                     line: 24,
                     event: 64,
                 })

@@ -11,8 +11,8 @@ use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     check_decode(RawLines::default, data);
-    check_decode_with_held_limit(|| RawLines::new(32), data, 0);
-    check_decode(|| RawLines::new(0), data);
+    check_decode_with_held_limit(|| RawLines::with_limit(32), data, 0);
+    check_decode(|| RawLines::with_limit(0), data);
     check_wire::<Line>(data);
     for line in decode_all(RawLines::default, data).0 {
         check_wire_value(&line);

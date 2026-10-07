@@ -4,14 +4,13 @@
 use fictionet::stdlib::codec::{Decode, Wire, contract, test_support::decode_all};
 use fictionet::stdlib::{
     json::Limits,
-    jsonrpc::{MAX_LINE, Message, Messages},
+    jsonrpc::{Message, Messages},
 };
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|input: &[u8]| {
-    let (max, limits, data) = match input {
+    let (limits, data) = match input {
         [a, b, rest @ ..] if a & 0x80 != 0 => (
-            usize::from(*b) * 4,
             Limits {
                 size: usize::from(*b) * 4,
                 depth: usize::from(a & 15),
@@ -19,9 +18,9 @@ fuzz_target!(|input: &[u8]| {
             },
             rest,
         ),
-        _ => (MAX_LINE, Limits::default(), input),
+        _ => (Limits::default(), input),
     };
-    let make = || Messages::with_limits(max, limits);
+    let make = || Messages::with_limits(limits);
     contract::check_decode_with_alloc_limit(make, data, 2 * make().capacity());
     contract::check_decode_with_held_limit(make, data, 0);
     contract::check_wire::<Message>(data);

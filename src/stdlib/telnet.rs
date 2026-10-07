@@ -15,7 +15,7 @@
 //! reads one [`Event`] at a time, and hands negotiations to [`Negotiation`].
 //! It writes each returned reply event and changes binary mode between items.
 //! The default delivers each data byte immediately. Batch readers can use
-//! [`Events::with_data_limit`] to wait for larger runs. [`Event`] uses NVT
+//! [`Events::with_limit`] to wait for larger runs. [`Event`] uses NVT
 //! encoding; [`BinaryEvent`] carries an event in binary mode.
 //! Unknown commands and interrupted or oversized subnegotiations produce
 //! [`Event::Error`] items. The stream then continues.
@@ -461,7 +461,7 @@ pub const MAX_EVENT_WIRE: usize = 2 * MAX_SUBNEGOTIATION + 5;
 ///
 /// By default, each data byte is delivered as its own event, so interactive
 /// sessions receive input without waiting for a command or EOF. Batch readers
-/// can use [`Self::with_data_limit`]: data runs then end at a command, the
+/// can use [`Self::with_limit`]: data runs then end at a command, the
 /// configured limit, or EOF, waiting across chunk boundaries so partitioning
 /// never changes the items.
 /// A trailing NVT CR waits for its next byte or EOF. Scan cursors keep
@@ -515,13 +515,13 @@ impl Default for Events {
 impl Events {
     /// Starts in NVT mode, delivering one data byte per event.
     pub fn new() -> Self {
-        Self::with_data_limit(1)
+        Self::with_limit(1)
     }
 
     /// Sets the decoded data run limit, clamped to 1 through [`MAX_DATA`].
     /// Limits above 1 batch data until a command, the limit, or EOF.
     /// Subnegotiations keep their separate [`MAX_SUBNEGOTIATION`] limit.
-    pub fn with_data_limit(limit: usize) -> Self {
+    pub fn with_limit(limit: usize) -> Self {
         Self {
             binary: false,
             data_limit: limit.clamp(1, MAX_DATA),
@@ -547,7 +547,7 @@ impl Events {
     }
 
     /// The most decoded bytes in each data item.
-    pub fn data_limit(&self) -> usize {
+    pub fn limit(&self) -> usize {
         self.data_limit
     }
 
@@ -771,7 +771,7 @@ impl Event {
         if bytes.len() > MAX_EVENT_WIRE {
             return Err(EventParseError::TooLong);
         }
-        let mut decoder = Events::with_data_limit(MAX_DATA);
+        let mut decoder = Events::with_limit(MAX_DATA);
         decoder.set_binary(binary);
         match decoder
             .decode(bytes, true)
@@ -1199,7 +1199,7 @@ mod tests {
     }
 
     fn decode(bytes: &[u8]) -> Vec<Event> {
-        let (events, failure) = decode_all(|| Events::with_data_limit(MAX_DATA), bytes);
+        let (events, failure) = decode_all(|| Events::with_limit(MAX_DATA), bytes);
         assert_eq!(failure, None);
         merged(events)
     }
@@ -1235,7 +1235,7 @@ mod tests {
         assert_eq!(stream.next(), Some(Ok(data(b"\r"))));
         assert_eq!(data(b"a\rb\r\n\r").to_bytes().unwrap(), b"a\r\0b\r\n\r\0");
         assert_eq!(BinaryEvent(data(b"\r")).to_bytes().unwrap(), b"\r");
-        let mut events = Events::with_data_limit(MAX_DATA);
+        let mut events = Events::with_limit(MAX_DATA);
         events.set_binary(true);
         assert!(events.binary());
         assert_eq!(decode_all(|| events, b"\r\0"), (vec![data(b"\r\0")], None));
@@ -1506,10 +1506,10 @@ mod tests {
     fn partitions_and_prefixes_obey_contract() {
         let bytes = sample();
         contract::check_decode_with_alloc_limit(Events::new, &bytes, 2 * MAX_EVENT_WIRE);
-        contract::check_decode_with_alloc_limit(|| Events::with_data_limit(MAX_DATA), &bytes, 2 * MAX_EVENT_WIRE);
+        contract::check_decode_with_alloc_limit(|| Events::with_limit(MAX_DATA), &bytes, 2 * MAX_EVENT_WIRE);
         let whole = decode(&bytes);
         for cut in 0..=bytes.len() {
-            let (part, _) = decode_all(|| Events::with_data_limit(MAX_DATA), &bytes[..cut]);
+            let (part, _) = decode_all(|| Events::with_limit(MAX_DATA), &bytes[..cut]);
             let mut part = merged(part);
             if let Some(Event::Data(a)) = part.last() {
                 let Some(Event::Data(b)) = whole.get(part.len() - 1) else { panic!("prefix {cut}") };
@@ -1537,7 +1537,7 @@ mod tests {
                     event.write(&mut bytes).unwrap();
                 }
             }
-            let mut decoder = Events::with_data_limit(MAX_DATA);
+            let mut decoder = Events::with_limit(MAX_DATA);
             decoder.set_binary(binary);
             let (back, failure) = decode_all(|| decoder, &bytes);
             assert_eq!(failure, None);
@@ -1897,7 +1897,7 @@ mod tests {
             mutate(&mut rng, &mut bytes);
             let binary = rng.coin();
             let make = || {
-                let mut decoder = Events::with_data_limit(MAX_DATA);
+                let mut decoder = Events::with_limit(MAX_DATA);
                 decoder.set_binary(binary);
                 decoder
             };

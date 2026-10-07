@@ -13,7 +13,7 @@ fuzz_target!(|data: &[u8]| {
     check_decode(Events::default, data);
     check_decode_with_held_limit(
         || {
-            Events::new(Limits {
+            Events::with_limits(Limits {
                 line: 32,
                 event: 128,
             })
@@ -21,7 +21,7 @@ fuzz_target!(|data: &[u8]| {
         data,
         192,
     );
-    check_decode(|| Events::new(Limits { line: 0, event: 0 }), data);
+    check_decode(|| Events::with_limits(Limits { line: 0, event: 0 }), data);
     check_wire::<Event>(data);
     for event in decode_all(Events::default, data).0 {
         check_wire_value(&event);

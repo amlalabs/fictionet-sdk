@@ -11,9 +11,10 @@ fuzz_target!(|data: &[u8]| {
         headers: 16,
         head: 2048,
         body_chunk: 31,
+        ..Limits::default()
     };
-    contract::check_decode_with_held_limit(|| Requests::new(limits), data, 0);
-    contract::check_decode_with_alloc_limit(|| Requests::new(limits), data, 4096);
+    contract::check_decode_with_held_limit(|| Requests::with_limits(limits), data, 0);
+    contract::check_decode_with_alloc_limit(|| Requests::with_limits(limits), data, 4096);
     contract::check_decode(|| Collect::<Request>::new(4096), data);
     contract::check_wire::<Request>(data);
     contract::check_wire::<RequestHead>(data);

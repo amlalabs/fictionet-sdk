@@ -36,7 +36,7 @@ fn telnet_default_delivers_login_without_waiting_for_more_input() {
         assert_eq!(stream.next(), None);
         assert!(!stream.is_done());
         assert_eq!(stream.buffered(), 0);
-        assert_eq!(stream.decoder().data_limit(), 1);
+        assert_eq!(stream.decoder().limit(), 1);
     }
     bounded(tn::Events::new, b"root\r\n");
     bounded(tn::Events::default, b"root\r\n");
@@ -54,7 +54,7 @@ fn telnet_chunked_wire_round_trip() {
     bounded(tn::Events::new, &bytes);
     contract::check_decode_with_held_limit(tn::Events::new, &bytes, 0);
     assert_eq!(
-        decode_all(|| tn::Events::with_data_limit(tn::MAX_DATA), &bytes),
+        decode_all(|| tn::Events::with_limit(tn::MAX_DATA), &bytes),
         (events.clone(), None)
     );
     let typed = [
@@ -82,7 +82,7 @@ impl Negotiated {
         let mut options = tn::Negotiation::new();
         options.allow_remote(tn::option::BINARY, true);
         Self {
-            decoder: tn::Events::with_data_limit(tn::MAX_DATA),
+            decoder: tn::Events::with_limit(tn::MAX_DATA),
             options,
         }
     }
@@ -141,7 +141,7 @@ fn telnet_binary_changes_between_items_in_one_buffer() {
     bounded(Negotiated::new, &bytes);
     for pattern in [&[][..], &[1], &[2, 1, 13]] {
         // Here the world changes the decoder through Stream::decoder.
-        let mut stream = Stream::new(tn::Events::with_data_limit(tn::MAX_DATA));
+        let mut stream = Stream::new(tn::Events::with_limit(tn::MAX_DATA));
         let mut session = Negotiated::new();
         let mut got = Vec::new();
         for part in chunks(&bytes, pattern) {
@@ -171,7 +171,7 @@ fn telnet_binary_changes_between_items_in_one_buffer() {
 
 #[test]
 fn telnet_data_runs_are_bounded_and_chunk_invariant() {
-    let mut stream = Stream::new(tn::Events::with_data_limit(tn::MAX_DATA));
+    let mut stream = Stream::new(tn::Events::with_limit(tn::MAX_DATA));
     assert_eq!(stream.push(b"root\r\n"), 6);
     assert_eq!(stream.next(), None);
     assert!(!stream.is_done());
@@ -185,19 +185,19 @@ fn telnet_data_runs_are_bounded_and_chunk_invariant() {
     let mut bytes = Wire::to_bytes(&event).unwrap();
     bytes.extend_from_slice(b"xyz");
     bounded(tn::Events::new, &bytes);
-    bounded(|| tn::Events::with_data_limit(tn::MAX_DATA), &bytes);
+    bounded(|| tn::Events::with_limit(tn::MAX_DATA), &bytes);
     assert_eq!(
-        decode_all(|| tn::Events::with_data_limit(tn::MAX_DATA), &bytes).0,
+        decode_all(|| tn::Events::with_limit(tn::MAX_DATA), &bytes).0,
         [event, tn::Event::Data(b"xyz".to_vec())]
     );
-    bounded(|| tn::Events::with_data_limit(1), b"\r\0\xff\xffx");
+    bounded(|| tn::Events::with_limit(1), b"\r\0\xff\xffx");
     assert_eq!(
-        decode_all(|| tn::Events::with_data_limit(1), b"\r\0\xff\xffx").0,
+        decode_all(|| tn::Events::with_limit(1), b"\r\0\xff\xffx").0,
         [tn::Event::Data(vec![13]), tn::Event::Data(vec![255]), tn::Event::Data(vec![b'x'])]
     );
-    assert_eq!(tn::Events::with_data_limit(0).data_limit(), 1);
+    assert_eq!(tn::Events::with_limit(0).limit(), 1);
     assert_eq!(
-        tn::Events::with_data_limit(usize::MAX).data_limit(),
+        tn::Events::with_limit(usize::MAX).limit(),
         tn::MAX_DATA
     );
 }
@@ -319,7 +319,7 @@ fn telnet_wire_is_exact_strict_and_transactional() {
             tn::Event::parse(&out)
         };
         assert_eq!(parsed, Ok(data.clone()));
-        let mut decoder = tn::Events::with_data_limit(tn::MAX_DATA);
+        let mut decoder = tn::Events::with_limit(tn::MAX_DATA);
         decoder.set_binary(binary);
         assert_eq!(decode_all(|| decoder, &out).0, core::slice::from_ref(&data));
     }
@@ -354,7 +354,7 @@ fn websocket_masked_fragmented_text_with_interleaved_controls() {
         }
         bounded(|| ws::Frames::new(role), &bytes);
         bounded(|| ws::Messages::new(role), &bytes);
-        contract::check_decode_with_held_limit(|| ws::Messages::with_limit(role, 256), &bytes, 256);
+        contract::check_decode_with_held_limit(|| ws::Messages::new(role).with_limit(256), &bytes, 256);
         assert_eq!(decode_all(|| ws::Frames::new(role), &bytes), (frames.clone(), None));
         assert_eq!(
             decode_all(|| ws::Messages::new(role), &bytes),
@@ -379,7 +379,7 @@ fn websocket_message_limit_has_one_error_and_close_code() {
         frame(true, ws::Opcode::Continuation, &[0; 26], None),
     ]);
     for bytes in [single, fragmented] {
-        let make = || ws::Messages::with_limit(ws::Role::Client, 125);
+        let make = || ws::Messages::new(ws::Role::Client).with_limit(125);
         bounded(make, &bytes);
         let (items, failure) = decode_all(make, &bytes);
         assert!(items.is_empty());
@@ -461,16 +461,16 @@ fn websocket_refuses_frame_and_assembly_limits_from_headers() {
     let bytes = frame_bytes(&[frame(true, ws::Opcode::Binary, &[0; 130], Some([1; 4]))]);
     let h = ws::Header::parse(&bytes).unwrap().unwrap();
     let header = bytes.get(..h.header_len).unwrap();
-    let mut stream = Stream::new(ws::Frames::with_limit(ws::Role::Server, 3));
+    let mut stream = Stream::new(ws::Frames::new(ws::Role::Server).with_limit(3));
     assert_eq!(stream.push(header), header.len());
     assert_eq!(stream.next(), Some(Err(Fail::Protocol(ws::Error::TooBig))));
     assert_eq!(stream.next(), None);
     assert_eq!(stream.unread(), header);
-    bounded(|| ws::Frames::with_limit(ws::Role::Server, 3), &bytes);
+    bounded(|| ws::Frames::new(ws::Role::Server).with_limit(3), &bytes);
 
     let first = frame_bytes(&[frame(false, ws::Opcode::Text, b"abc", None)]);
     let last = frame_bytes(&[frame(true, ws::Opcode::Continuation, b"def", None)]);
-    let make = || ws::Messages::from_frames(ws::Frames::with_limit(ws::Role::Client, 8), 5);
+    let make = || ws::Messages::from_frames(ws::Frames::new(ws::Role::Client).with_limit(8), 5);
     let mut stream = Stream::new(make());
     assert_eq!(stream.push(&first), first.len());
     assert_eq!(stream.next(), None);
@@ -488,11 +488,11 @@ fn websocket_refuses_frame_and_assembly_limits_from_headers() {
         Some(Fail::Protocol(AssembleError::Inner(ws::Error::TooBig)))
     );
     assert_eq!(
-        ws::Frames::with_limit(ws::Role::Client, usize::MAX).limit(),
+        ws::Frames::new(ws::Role::Client).with_limit(usize::MAX).limit(),
         ws::MAX_PAYLOAD
     );
     assert_eq!(
-        ws::Messages::with_limit(ws::Role::Client, usize::MAX).limit(),
+        ws::Messages::new(ws::Role::Client).with_limit(usize::MAX).limit(),
         ws::MAX_MESSAGE
     );
 }
@@ -523,7 +523,7 @@ fn websocket_close_preserves_trailing_bytes_for_parts_and_swap() {
     assert_eq!(stream.push(&bytes), bytes.len());
     assert_eq!(stream.next(), Some(Ok(ws::Message::Close(Some(ws::Close::new(1000))))));
     assert_eq!(stream.next(), None);
-    let mut stream = stream.swap(tn::Events::with_data_limit(tn::MAX_DATA));
+    let mut stream = stream.swap(tn::Events::with_limit(tn::MAX_DATA));
     assert_eq!(stream.offset(), u64::try_from(close_bytes.len()).unwrap());
     stream.end();
     assert_eq!(stream.next(), Some(Ok(tn::Event::Data(b"after\rclose".to_vec()))));
@@ -536,7 +536,7 @@ fn websocket_close_interrupts_assembly_and_pump_accounts_for_unaccepted_tail() {
         frame_bytes(&[frame(false, ws::Opcode::Text, b"unfinished", None), frame(true, ws::Opcode::Close, &[], None)]);
     let end = bytes.len();
     bytes.extend(vec![42; 512]);
-    let mut stream = Stream::new(ws::Messages::with_limit(ws::Role::Client, 16));
+    let mut stream = Stream::new(ws::Messages::new(ws::Role::Client).with_limit(16));
     let mut items = vec![];
     let accepted = pump(&mut stream, &bytes, |item| items.push(item)).unwrap();
     assert_eq!(items, [ws::Message::Close(None)]);
@@ -545,7 +545,7 @@ fn websocket_close_interrupts_assembly_and_pump_accounts_for_unaccepted_tail() {
     let (buffer, _) = stream.into_parts();
     let tail = [buffer.unread(), bytes.get(accepted..).unwrap()].concat();
     assert_eq!(tail, bytes.get(end..).unwrap());
-    bounded(|| ws::Messages::with_limit(ws::Role::Client, 16), &bytes);
+    bounded(|| ws::Messages::new(ws::Role::Client).with_limit(16), &bytes);
 }
 
 #[test]
@@ -605,9 +605,9 @@ fn websocket_eof_distinguishes_frames_from_incomplete_messages() {
         frame(true, ws::Opcode::Ping, &[42; 125], None),
         frame(true, ws::Opcode::Continuation, &[], None),
     ]);
-    bounded(|| ws::Messages::with_limit(ws::Role::Client, 0), &bytes);
+    bounded(|| ws::Messages::new(ws::Role::Client).with_limit(0), &bytes);
     assert_eq!(
-        decode_all(|| ws::Messages::with_limit(ws::Role::Client, 0), &bytes),
+        decode_all(|| ws::Messages::new(ws::Role::Client).with_limit(0), &bytes),
         (vec![ws::Message::Ping(vec![42; 125]), ws::Message::Binary(vec![])], None)
     );
 }
@@ -637,12 +637,12 @@ fn interactive_contracts_on_generated_inputs() {
     for round in 0..160 {
         let bytes = rng.bytes(96);
         bounded(tn::Events::new, &bytes);
-        bounded(|| tn::Events::with_data_limit(7), &bytes);
+        bounded(|| tn::Events::with_limit(7), &bytes);
         contract::check_wire::<tn::Event>(&bytes);
         contract::check_wire::<tn::Subnegotiation>(&bytes);
         contract::check_wire::<ws::Frame>(&bytes);
         let role = if round % 2 == 0 { ws::Role::Server } else { ws::Role::Client };
-        bounded(|| ws::Frames::with_limit(role, 64), &bytes);
-        bounded(|| ws::Messages::with_limit(role, 64), &bytes);
+        bounded(|| ws::Frames::new(role).with_limit(64), &bytes);
+        bounded(|| ws::Messages::new(role).with_limit(64), &bytes);
     }
 }

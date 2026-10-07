@@ -230,18 +230,14 @@ fn copied_message_decoders_preserve_bytes_and_share_wire_traits() {
         b"{}"
     );
     contract::check_decode(
-        || copied::ResponseMessages::new(copied::Limits::default()),
+        || copied::ResponseMessages::new(),
         b"HTTP/1.1 204 \r\n\r\n",
     );
 }
 
 #[test]
 fn message_buffer_bounds_do_not_change_between_messages() {
-    let mut stream = Stream::new(RequestMessages::with_limits(
-        Limits::default(),
-        2,
-        FIRST.len(),
-    ));
+    let mut stream = Stream::new(RequestMessages::with_limits(Limits { body: 2, message: FIRST.len(), ..Limits::default() }));
     let capacity = FIRST.len().checked_add(1).unwrap();
     let input = [FIRST, SECOND, FIRST, SECOND].concat();
     let mut rest = input.as_slice();

@@ -11,8 +11,10 @@ fuzz_target!(|data: &[u8]| {
         headers: 16,
         head: 2048,
         body_chunk: 31,
+        body: 1024,
+        message: 4096,
     };
-    let make = || RequestMessages::with_limits(limits, 1024, 4096);
+    let make = || RequestMessages::with_limits(limits);
     contract::check_decode_with_held_limit(make, data, 3072);
     contract::check_decode_with_alloc_limit(make, data, 8194);
     // Also exercise valid pipelined messages with arbitrary body bytes.

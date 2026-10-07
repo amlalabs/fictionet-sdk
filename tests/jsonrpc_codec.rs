@@ -200,7 +200,7 @@ fn recoverable_errors_and_eof_contracts() {
         b"\n{\"jsonrpc\":\"2.0\",\"method\":\"ok\"}\n".to_vec(),
     ]
     .concat();
-    let make = || Messages::with_limits(40, Limits::default());
+    let make = || Messages::with_limits(Limits { size: 40, ..Limits::default() });
     contract::check_decode(make, &oversized);
     let (items, failure) = decode_all(make, &oversized);
     assert_eq!(failure, None);
@@ -211,7 +211,7 @@ fn recoverable_errors_and_eof_contracts() {
     ));
     assert!(items.last().unwrap().is_ok());
     for limit in [0, 1, 2, 32, 64] {
-        contract::check_decode(|| Messages::with_limits(limit, Limits::default()), bytes);
+        contract::check_decode(|| Messages::with_limits(Limits { size: limit, ..Limits::default() }), bytes);
         contract::check_decode(|| Collect::<Body>::new(limit), bytes);
     }
 }
@@ -422,7 +422,7 @@ fn bounded_body_pipe_and_independent_stdio_streams() {
         (vec![Layered::Inner(expected)], None)
     );
 
-    let mut streams = Demux::new(2, 1024, |_| Messages::with_limits(64, Limits::default()));
+    let mut streams = Demux::new(2, 1024, |_| Messages::with_limits(Limits { size: 64, ..Limits::default() }));
     let bytes = b"{\"jsonrpc\":\"2.0\",\"method\":\"ping\"}\n";
     for key in [1, 2] {
         assert_eq!(streams.push(&key, bytes), bytes.len());
@@ -448,6 +448,6 @@ fn mutations_preserve_decoder_and_writer_contracts() {
         contract::check_wire::<Batch>(&input);
         contract::check_wire::<Body>(&input);
         input.push(b'\n');
-        contract::check_decode(|| Messages::with_limits(256, Limits::default()), &input);
+        contract::check_decode(|| Messages::with_limits(Limits { size: 256, ..Limits::default() }), &input);
     }
 }

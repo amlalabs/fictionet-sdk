@@ -13,10 +13,11 @@ fuzz_target!(|data: &[u8]| {
         headers: 16,
         head: 2048,
         body_chunk: 31,
+        ..Limits::default()
     };
     for method in ["GET", "HEAD", "CONNECT"] {
         let make = || {
-            let mut decoder = Responses::new(limits);
+            let mut decoder = Responses::with_limits(limits);
             decoder.expect_method(method).unwrap();
             decoder.expect_method("GET").unwrap();
             decoder
@@ -28,7 +29,7 @@ fuzz_target!(|data: &[u8]| {
             assert_eq!(Response::parse_for(&out, method), Ok(response));
         }
     }
-    contract::check_decode_with_alloc_limit(|| Responses::new(limits), data, 4096);
+    contract::check_decode_with_alloc_limit(|| Responses::with_limits(limits), data, 4096);
     contract::check_decode(|| Collect::<Response>::new(4096), data);
     contract::check_wire::<Response>(data);
     contract::check_wire::<ResponseHead>(data);

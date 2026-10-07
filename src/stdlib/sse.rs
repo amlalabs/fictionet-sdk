@@ -32,7 +32,7 @@
 //!     b"event: endpoint\ndata: /messages\n\nevent: message\nda",
 //!     b"ta: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n",
 //! ];
-//! let mut events = Stream::new(Events::new(Limits::default()));
+//! let mut events = Stream::new(Events::new());
 //! let mut forwarded_body = Vec::new();
 //! for chunk in body_chunks {
 //!     try_pump(&mut events, chunk, |mut event| {
@@ -419,9 +419,14 @@ pub struct RawLines {
     cost: usize,
 }
 impl RawLines {
+    /// Reads lines of up to [`MAX_LINE`] content bytes.
+    pub fn new() -> Self {
+        Self::with_limit(MAX_LINE)
+    }
+
     /// Sets the maximum line content length, clamped like [`Lines::new`].
     /// Line excess is terminal rather than a recoverable item.
-    pub fn new(max_line: usize) -> Self {
+    pub fn with_limit(max_line: usize) -> Self {
         let limit = max_line.min(Buffer::MAX_LIMIT.saturating_sub(2));
         Self {
             lines: Lines::new(limit, Ending::LfOrCrOrCrlf),
@@ -434,7 +439,7 @@ impl RawLines {
 impl Default for RawLines {
     /// Uses [`MAX_LINE`].
     fn default() -> Self {
-        Self::new(MAX_LINE)
+        Self::new()
     }
 }
 impl Decode for RawLines {
@@ -515,11 +520,18 @@ pub struct Events {
     retry: Option<String>,
 }
 impl Events {
-    /// Starts an event stream with empty ID state and no retry override.
-    pub fn new(limits: Limits) -> Self {
+    /// Starts an event stream with the default limits, empty ID state and
+    /// no retry override.
+    pub fn new() -> Self {
+        Self::with_limits(Limits::default())
+    }
+
+    /// Starts an event stream with `limits`, empty ID state and no retry
+    /// override.
+    pub fn with_limits(limits: Limits) -> Self {
         let limits = limits.bounded();
         Self {
-            lines: RawLines::new(limits.line),
+            lines: RawLines::with_limit(limits.line),
             limits,
             used: 0,
             data: String::new(),
@@ -587,7 +599,7 @@ impl Events {
 impl Default for Events {
     /// Uses [`Limits::default`].
     fn default() -> Self {
-        Self::new(Limits::default())
+        Self::new()
     }
 }
 impl Decode for Events {
@@ -940,18 +952,18 @@ mod tests {
     fn raw_line_limits_and_utf8_expansion() {
         for bytes in [&b"12345\n"[..], b"12345", b"123456", b"\xff\xff\n"] {
             assert_eq!(
-                decode_all(|| RawLines::new(4), bytes).1,
+                decode_all(|| RawLines::with_limit(4), bytes).1,
                 Some(Fail::Protocol(Error::LineTooLong { limit: 4 }))
             );
         }
-        assert_eq!(decode_all(|| RawLines::new(4), b"data\r\n").1, None);
+        assert_eq!(decode_all(|| RawLines::with_limit(4), b"data\r\n").1, None);
         assert_eq!(
-            decode_all(|| RawLines::new(0), b"\xef\xbb\xbf\r\n").0,
+            decode_all(|| RawLines::with_limit(0), b"\xef\xbb\xbf\r\n").0,
             [Line::Empty]
         );
-        assert_eq!(RawLines::new(usize::MAX).capacity(), Buffer::MAX_LIMIT);
+        assert_eq!(RawLines::with_limit(usize::MAX).capacity(), Buffer::MAX_LIMIT);
         assert_eq!(
-            Events::new(Limits {
+            Events::with_limits(Limits {
                 line: usize::MAX,
                 event: usize::MAX
             })
@@ -973,7 +985,7 @@ mod tests {
             let bytes = line.repeat(40);
             assert_eq!(
                 decode_all(
-                    || Events::new(Limits {
+                    || Events::with_limits(Limits {
                         line: 32,
                         event: 64
                     }),
@@ -983,7 +995,7 @@ mod tests {
                 Some(Fail::Protocol(Error::EventTooLong { limit: 64 }))
             );
         }
-        let mut raw = Stream::new(RawLines::new(8));
+        let mut raw = Stream::new(RawLines::with_limit(8));
         for _ in 0..4096 {
             pump(&mut raw, b":\n", |_| {}).unwrap();
             assert_eq!(raw.held(), 0);
@@ -999,12 +1011,12 @@ mod tests {
             event: bytes.len(),
         };
         assert_eq!(
-            decode_all(|| Events::new(limits), &bytes),
+            decode_all(|| Events::with_limits(limits), &bytes),
             (vec![value], None)
         );
         assert_eq!(
             decode_all(
-                || Events::new(Limits {
+                || Events::with_limits(Limits {
                     event: limits.event - 1,
                     ..limits
                 }),
@@ -1019,7 +1031,7 @@ mod tests {
         // event's independent encoding does not.
         assert_eq!(
             decode_all(
-                || Events::new(Limits {
+                || Events::with_limits(Limits {
                     line: 32,
                     event: 20
                 }),

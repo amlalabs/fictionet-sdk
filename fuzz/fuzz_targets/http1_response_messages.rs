@@ -11,10 +11,12 @@ fuzz_target!(|data: &[u8]| {
         headers: 16,
         head: 2048,
         body_chunk: 31,
+        body: 1024,
+        message: 4096,
     };
     for method in ["GET", "HEAD", "CONNECT"] {
         let make = || {
-            let mut decoder = ResponseMessages::with_limits(limits, 1024, 4096);
+            let mut decoder = ResponseMessages::with_limits(limits);
             decoder.expect_method(method).unwrap();
             decoder.expect_method("GET").unwrap();
             decoder
@@ -32,7 +34,7 @@ fuzz_target!(|data: &[u8]| {
     );
     input.extend_from_slice(body);
     let make = || {
-        let mut decoder = ResponseMessages::with_limits(limits, 1024, 4096);
+        let mut decoder = ResponseMessages::with_limits(limits);
         decoder.expect_method("HEAD").unwrap();
         decoder.expect_method("GET").unwrap();
         decoder

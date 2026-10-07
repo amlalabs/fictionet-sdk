@@ -1121,14 +1121,15 @@ impl Messages {
     /// Uses a 1 MiB line limit and default JSON limits: depth 128 and 100,000
     /// values. The driver's capacity is the line limit plus two ending bytes.
     pub fn new() -> Self {
-        Self::with_limits(MAX_LINE, Limits::default())
+        Self::with_limits(Limits::default())
     }
-    /// Sets the content limit and JSON limits. The line cap is clamped to
-    /// [`MAX_LINE`]; JSON caps are clamped by [`json::parse_with`]. A zero
-    /// line limit accepts only empty content, reported as a blank-line error.
-    pub fn with_limits(max_line: usize, limits: Limits) -> Self {
+    /// Sets the JSON limits. [`Limits::size`] is also the line's content
+    /// limit, clamped to [`MAX_LINE`]; the other caps are clamped by
+    /// [`json::parse_with`]. A zero size accepts only empty content,
+    /// reported as a blank-line error.
+    pub fn with_limits(limits: Limits) -> Self {
         Self {
-            lines: Lines::new(max_line.min(MAX_LINE), Ending::LfOrCrlf).map(Box::new(
+            lines: Lines::new(limits.size.min(MAX_LINE), Ending::LfOrCrlf).map(Box::new(
                 move |line: Result<Vec<u8>, LineError>| {
                     let line = line.map_err(|error| problem(ErrorKind::Line(error)))?;
                     if line.iter().all(|b| matches!(b, b' ' | b'\t' | b'\r')) {
@@ -1580,7 +1581,7 @@ mod tests {
         );
         let bytes = format!("{}\n{good}\n", "x".repeat(300));
         let (items, failure) = decode_all(
-            || Messages::with_limits(64, Limits::default()),
+            || Messages::with_limits(Limits { size: 64, ..Limits::default() }),
             bytes.as_bytes(),
         );
         assert_eq!(failure, None);
@@ -1593,7 +1594,7 @@ mod tests {
         for ending in ["\n", "\r\n"] {
             assert!(
                 decode_all(
-                    || Messages::with_limits(good.len(), Limits::default()),
+                    || Messages::with_limits(Limits { size: good.len(), ..Limits::default() }),
                     format!("{good}{ending}").as_bytes()
                 )
                 .0
@@ -1604,7 +1605,7 @@ mod tests {
         }
         assert_eq!(Messages::new().capacity(), MAX_LINE + 2);
         assert_eq!(
-            Messages::with_limits(usize::MAX, Limits::default()).capacity(),
+            Messages::with_limits(Limits { size: usize::MAX, ..Limits::default() }).capacity(),
             MAX_LINE + 2
         );
         assert_eq!(Messages::new().held(), 0);
@@ -1617,7 +1618,7 @@ mod tests {
                 .is_err()
         );
         assert_eq!(
-            decode_all(|| Messages::with_limits(0, Limits::default()), b"\n")
+            decode_all(|| Messages::with_limits(Limits { size: 0, ..Limits::default() }), b"\n")
                 .0
                 .first()
                 .unwrap()
@@ -1697,7 +1698,7 @@ mod tests {
             assert!(parse_incoming_with(text, &limits).is_err());
             assert!(
                 decode_all(
-                    || Messages::with_limits(MAX_LINE, limits),
+                    || Messages::with_limits(limits),
                     &[text.as_slice(), b"\n"].concat()
                 )
                 .0

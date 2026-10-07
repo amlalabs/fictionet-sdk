@@ -1090,7 +1090,7 @@ impl serve::Service for Http1 {
     type Error = Infallible;
 
     fn decoder(&self) -> http1::Requests {
-        http1::Requests::new(self.opts.head)
+        http1::Requests::with_limits(self.opts.head)
     }
 
     fn on_open(&mut self, _: &(), ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
