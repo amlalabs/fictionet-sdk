@@ -1250,6 +1250,7 @@ impl Service for Mail {
 fn the_harness_resumes_after_starttls() {
     let mut h = Harness::new(Mail { tls: false }, ());
     assert_eq!(h.open().unwrap(), b"220 mail ready\r\n");
+    let wake = h.wake_handle();
     let got = h.push(b"STARTTLS\r\n");
     assert!(matches!(got, Err(HarnessError::Upgraded(Upgrade::Tls))), "{got:?}");
     assert_eq!(h.output(), b"220 mail ready\r\n220 go ahead\r\n");
@@ -1258,6 +1259,8 @@ fn the_harness_resumes_after_starttls() {
     conn.id = Some(1);
     h.resume(conn).unwrap();
     assert_eq!(h.push(b"EHLO\r\n").unwrap(), b"250 hello tls=true sni=mail.test\r\n");
+    // A handle taken before STARTTLS still wakes the service after it.
+    assert!(!wake.is_closed());
 }
 
 #[test]
@@ -1301,17 +1304,20 @@ fn net_performs_starttls_for_a_service_that_asks() {
     assert!(result.unwrap_err().downcast_ref::<Done>().is_some());
 }
 
+/// Fills waiting for one connection.
+type Inbox = Arc<Mutex<Vec<String>>>;
+
 /// An exchange's order book: each subscriber's wake handle, and the fills
 /// waiting for it.
 #[derive(Default)]
 struct Book {
-    subscribers: Mutex<Vec<(serve::WakeHandle, Arc<Mutex<Vec<String>>>)>>,
+    subscribers: Mutex<Vec<(serve::WakeHandle, Inbox)>>,
 }
 
 /// `sub` subscribes the connection to fills; `fill X` sends X to every
 /// subscriber, from this connection, through the others' wake handles.
 struct Trader {
-    inbox: Arc<Mutex<Vec<String>>>,
+    inbox: Inbox,
 }
 
 impl Service for Trader {

@@ -1342,6 +1342,8 @@ struct Core<S: Service> {
     decode_fail: Option<Fail<<S::Decode as Decode>::Error>>,
     budget: Option<Budget>,
     charge: Option<Charge>,
+    /// The decoder was swapped for a fresh one ([`Upgrade::Decoder`]).
+    fresh: bool,
 }
 
 impl<S: Service> Core<S>
@@ -1376,6 +1378,7 @@ where
             decode_fail: None,
             budget: opts.budget.clone(),
             charge: None,
+            fresh: false,
         }
     }
 
@@ -1568,13 +1571,13 @@ where
             Flow::Upgrade(Upgrade::Decoder) => {
                 let unread = self.stream.unread().to_vec();
                 self.stream = Stream::with_buffer(service.decoder(), self.read_buffer);
+                self.fresh = true;
                 if !unread.is_empty() {
                     self.queue.push_front(Segment::Bytes(unread, 0));
                 }
             }
             Flow::Upgrade(how) => {
                 self.cancel_all(true);
-                self.s.wake.close();
                 self.state = State::Upgrading(how);
             }
         }
@@ -1704,6 +1707,10 @@ where
             if self.stream.is_done() {
                 if self.eof && self.queue.is_empty() && self.stream.unread().is_empty() {
                     self.finish(End::Eof);
+                } else if self.fresh && self.stream.offset() == 0 {
+                    // A fresh decoder that ends before it reads a byte
+                    // would end again and again: hand the bytes on.
+                    self.held_flow = Some(Flow::Upgrade(Upgrade::Handoff));
                 } else {
                     // The decoder ended: the rest belongs to what comes
                     // next, which the service decides.
@@ -1846,14 +1853,13 @@ where
 /// How big each read is.
 const READ: usize = 16 * 1024;
 
-/// What woke the driver while it waited.
-enum Woke {
-    Read(Result<usize, ConnError>),
-    Work,
-    Wake,
-    Time,
-    Cancelled,
-    Gone,
+/// What woke the driver while it waited. Everything is polled each
+/// time, so busy deferred work cannot starve the reads, nor the reverse.
+#[derive(Default)]
+struct Woke {
+    read: Option<Result<usize, ConnError>>,
+    gone: bool,
+    cancelled: bool,
 }
 
 fn conn_end(e: ConnError) -> End {
@@ -2030,36 +2036,35 @@ where
                     let mut cancelled = pin!(cx.cancelled());
                     poll_fn(|task| {
                         if cancelled.as_mut().poll(task).is_ready() {
-                            return Poll::Ready(Woke::Cancelled);
+                            return Poll::Ready(Woke { cancelled: true, ..Woke::default() });
                         }
-                        if core.has_work() && core.poll_work(service, world, cx.now(), task) {
-                            return Poll::Ready(Woke::Work);
-                        }
-                        if wake && core.s.wake.poll(task).is_ready() {
-                            return Poll::Ready(Woke::Wake);
-                        }
+                        let mut woke = Woke::default();
+                        let mut any = core.has_work() && core.poll_work(service, world, cx.now(), task);
+                        any |= wake && core.s.wake.poll(task).is_ready();
                         if read && let Poll::Ready(r) = conn.poll_read(cx, task, buf) {
-                            return Poll::Ready(Woke::Read(r));
+                            woke.read = Some(r);
+                            any = true;
                         }
-                        if conn.poll_gone(task).is_ready() {
-                            return Poll::Ready(Woke::Gone);
+                        woke.gone = conn.poll_gone(task).is_ready();
+                        any |= woke.gone;
+                        if let Some(s) = sleep.as_mut().as_pin_mut() {
+                            any |= s.poll(task).is_ready();
                         }
-                        if let Some(s) = sleep.as_mut().as_pin_mut()
-                            && s.poll(task).is_ready()
-                        {
-                            return Poll::Ready(Woke::Time);
-                        }
-                        Poll::Pending
+                        if any { Poll::Ready(woke) } else { Poll::Pending }
                     })
                     .await
                 };
-                match woke {
-                    Woke::Read(Ok(0)) => core.input_eof(),
-                    Woke::Read(Ok(n)) => core.input(&buf[..n], cx.now()),
-                    Woke::Read(Err(e)) => core.broken(conn_end(e)),
-                    Woke::Gone => core.broken(End::Conn(ConnError::Reset)),
-                    Woke::Cancelled => core.broken(End::Cancelled),
-                    Woke::Work | Woke::Wake | Woke::Time => {}
+                if woke.cancelled {
+                    core.broken(End::Cancelled);
+                }
+                match woke.read {
+                    Some(Ok(0)) => core.input_eof(),
+                    Some(Ok(n)) => core.input(&buf[..n], cx.now()),
+                    Some(Err(e)) => core.broken(conn_end(e)),
+                    None => {}
+                }
+                if woke.gone {
+                    core.broken(End::Conn(ConnError::Reset));
                 }
             }
             Next::Upgrade(how) => {
@@ -2070,6 +2075,10 @@ where
                     record(cx, journal, &core.info, Event::new("conn", "upgrade").summary(format!("connection upgraded: {}", how.as_str())).field("to", how.as_str()));
                 }
                 let unread = core.unread();
+                // The service goes on after TLS, with the same handle.
+                if how != Upgrade::Tls {
+                    core.s.wake.close();
+                }
                 return Ok(Served::Upgraded(how, Prefixed::new(unread, conn)));
             }
             Next::Closed(end) => {
@@ -2731,7 +2740,7 @@ where
         }
         self.reported = false;
         let unread = self.core.unread();
-        let wake = WakeHandle::new();
+        let wake = self.core.s.wake.clone();
         let cx = self.core.cx.take();
         let mut core = Core::new(cx, &self.service, conn, &self.opts, Some(wake), self.now);
         core.s.bytes_in = self.core.s.bytes_in;
