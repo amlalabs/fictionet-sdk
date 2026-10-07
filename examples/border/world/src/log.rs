@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use fictionet::stdlib::journal::Entry;
+use fictionet::events::Event as Entry;
 use serde_json::{Map, Value, json};
 
 use crate::bank::ACCOUNT;
@@ -80,7 +80,7 @@ impl Log {
         }
     }
 
-    /// Logs a journal entry. Called from the journal's callback: it never
+    /// Logs an event. Called from the event log's callback: it never
     /// waits.
     pub fn entry(&self, entry: &Entry) {
         self.send(Record::Entry(entry.clone()));

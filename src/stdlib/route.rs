@@ -21,6 +21,7 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Poll, Waker};
 
+use crate::events::{self, Level};
 use crate::stdlib::{Event, Ports, wire};
 use crate::{Cx, Error, Interface, Packet};
 
@@ -200,10 +201,10 @@ pub fn router(cx: &Cx, routes: Vec<(Prefix, Box<dyn Interface>)>) -> Router {
                     }
                 }
                 Event::Closed(i) => {
-                    if let Some(prefix) = table.by_port.get(&i)
-                        && cx.observed()
-                    {
-                        cx.graph().note("route_removed", format!("{}/{}: its interface closed", prefix.addr, prefix.len), None);
+                    if let Some(prefix) = table.by_port.get(&i) {
+                        let prefix = format!("{}/{}", prefix.addr, prefix.len);
+                        let event = events::Event::new("router", "route_removed").level(Level::Notice).summary(format!("{prefix}: its interface closed")).field("prefix", prefix);
+                        cx.record(event);
                     }
                     table.remove_port(i)
                 }
@@ -368,14 +369,15 @@ impl Router {
 /// whatever its subnet: a packet for one goes to the member with exactly
 /// that address, or is dropped. It never goes to the gateway.
 ///
-/// Every packet the LAN drops is noted for observers with the reason: no
-/// member at the destination, no gateway for an address outside the
-/// subnet, a packet from the gateway for such an address, a member's own
-/// address, the other address family, or not an IP packet. A member that
-/// is replaced or whose interface closes is noted too. Notes are kept only
-/// while an observer such as the dashboard is connected. `on_drop`, when
-/// given, hears every drop with its reason as well, observer or not, as
-/// [`net::Net`](crate::stdlib::net::Net) uses to journal them.
+/// Every packet the LAN drops is recorded as a `lan.drop`
+/// [event](crate::events) with the reason: no member at the destination,
+/// no gateway for an address outside the subnet, a packet from the gateway
+/// for such an address, a member's own address, the other address family,
+/// or not an IP packet. A member that is replaced or whose interface closes
+/// is recorded too (`lan.member_replaced`, `lan.member_removed`). `on_drop`,
+/// when given, hears every drop with its reason as well, as
+/// [`net::Net`](crate::stdlib::net::Net) uses to name the sandbox that
+/// sent it.
 ///
 /// This is how virtual machines attached with `fictionet attach --type tap`
 /// share a subnet. Attach answers each VM's ARP itself and hands the LAN
@@ -492,15 +494,19 @@ fn link_local(addr: IpAddr) -> bool {
 /// Hears every packet a [`lan`] drops, with the reason.
 pub type OnDrop = Arc<dyn Fn(&Cx, &Packet, &'static str) + Send + Sync>;
 
-/// Tells observers and the `on_drop` sink that the LAN dropped `packet`,
-/// and why. Every drop goes through here, so the reporting is one piece.
+/// Records that the LAN dropped `packet`, and why, and tells the
+/// `on_drop` sink. Every drop goes through here, so the reporting is one
+/// piece.
 fn dropped(cx: &Cx, on_drop: &Option<OnDrop>, packet: &Packet, why: &'static str) {
     if let Some(f) = on_drop {
         f(cx, packet, why);
     }
-    if cx.observed() {
-        crate::observe::note_dropped(cx, packet, why);
-    }
+    crate::observe::record_drop(cx, "lan", packet, why);
+}
+
+/// Records a change to a LAN's members.
+fn member_event(cx: &Cx, kind: &'static str, member: String, what: &str) {
+    cx.record(events::Event::new("lan", kind).level(Level::Notice).summary(format!("{member}: {what}")).field("member", member));
 }
 
 /// A LAN's members: which port each address goes out on, and the gateway.
@@ -538,9 +544,7 @@ impl Members {
                 match self.by_addr.get(&addr).copied() {
                     Some(i) => {
                         ports.replace(i, interface);
-                        if cx.observed() {
-                            cx.graph().note("lan_member_replaced", format!("{addr}: a new interface took over, and the old one is closed"), None);
-                        }
+                        member_event(cx, "member_replaced", addr.to_string(), "a new interface took over, and the old one is closed");
                     }
                     None => {
                         let i = ports.add(interface);
@@ -556,9 +560,7 @@ impl Members {
                 match self.gateway {
                     Some(i) => {
                         ports.replace(i, interface);
-                        if cx.observed() {
-                            cx.graph().note("lan_member_replaced", "the gateway: a new interface took over, and the old one is closed".into(), None);
-                        }
+                        member_event(cx, "member_replaced", "the gateway".into(), "a new interface took over, and the old one is closed");
                     }
                     None => self.gateway = Some(ports.add(interface)),
                 }
@@ -570,19 +572,15 @@ impl Members {
     fn remove_port(&mut self, cx: &Cx, port: usize) {
         if let Some(addr) = self.by_port.remove(&port) {
             self.by_addr.remove(&addr);
-            if cx.observed() {
-                cx.graph().note("lan_member_removed", format!("{addr}: its interface closed"), None);
-            }
+            member_event(cx, "member_removed", addr.to_string(), "its interface closed");
         } else if self.gateway == Some(port) {
             self.gateway = None;
-            if cx.observed() {
-                cx.graph().note("lan_member_removed", "the gateway: its interface closed".into(), None);
-            }
+            member_event(cx, "member_removed", "the gateway".into(), "its interface closed");
         }
     }
 
     /// Sends `packet`, which arrived on port `from`, where it belongs, or
-    /// drops it with a note.
+    /// drops it with an event.
     fn forward(&self, cx: &Cx, ports: &mut Ports, subnet: Prefix, from: usize, packet: Packet) {
         let Some(dst) = wire::destination(&packet.0) else {
             return dropped(cx, &self.on_drop, &packet, "not an IP packet");
@@ -737,7 +735,6 @@ impl Lan {
 mod tests {
     use super::*;
     use crate::InterfaceExt;
-    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     /// A bare IPv4 header, protocol 253 (for experiments), no payload.
@@ -801,21 +798,17 @@ mod tests {
         .unwrap();
     }
 
-    /// Each kind of drop, a replaced member and a closed one are noted
-    /// while observed, each with its reason.
+    /// Each kind of drop, a replaced member and a closed one are recorded,
+    /// each with its reason, with no observer.
     #[test]
-    fn drops_and_member_changes_are_noted_while_observed() {
+    fn drops_and_member_changes_are_recorded() {
         crate::block_on(crate::run(|cx| async move {
             let lan = lan(&cx, "192.168.56.0/24".parse()?, None);
             let (a_lan, mut a) = crate::pair();
             let (b_lan, _b) = crate::pair();
             lan.add("192.168.56.10".parse()?, Box::new(a_lan))?;
             lan.add("192.168.56.11".parse()?, Box::new(b_lan))?;
-            a.send(v4([192, 168, 56, 10], [192, 168, 56, 12]));
-            cx.sleep(Duration::from_millis(20)).await?;
-            assert!(cx.graph().state().notes.is_empty(), "nothing is kept while unobserved");
-
-            cx.graph().viewers.fetch_add(1, Ordering::Relaxed);
+            assert!(!cx.observed());
             a.send(v4([192, 168, 56, 10], [192, 168, 56, 12]));
             a.send(v4([192, 168, 56, 10], [10, 0, 0, 1]));
             a.send(v4([192, 168, 56, 10], [192, 168, 56, 10]));
@@ -827,8 +820,8 @@ mod tests {
             drop(b2);
             cx.sleep(Duration::from_millis(20)).await?;
 
-            let notes: Vec<(&str, String)> = cx.graph().state().notes.iter().map(|n| (n.kind, n.text.clone())).collect();
-            let drops: Vec<&str> = notes.iter().filter(|(k, _)| *k == "drop").map(|(_, t)| t.as_str()).collect();
+            let events: Vec<(&str, String)> = cx.events().all().into_iter().filter(|e| e.source == "lan").map(|e| (e.kind, e.summary)).collect();
+            let drops: Vec<&str> = events.iter().filter(|(k, _)| *k == "drop").map(|(_, t)| t.as_str()).collect();
             let reasons = [
                 "no member at that address",
                 "outside the subnet, and the LAN has no gateway",
@@ -841,11 +834,11 @@ mod tests {
                 assert!(text.ends_with(why), "{text:?} should end with {why:?}");
             }
             assert!(drops[0].starts_with("192.168.56.10 → 192.168.56.12"), "{:?}", drops[0]);
-            let changes: Vec<_> = notes.iter().filter(|(k, _)| *k != "drop").collect();
+            let changes: Vec<_> = events.iter().filter(|(k, _)| *k != "drop").collect();
             assert_eq!(changes.len(), 2, "{changes:?}");
-            assert_eq!(changes[0].0, "lan_member_replaced");
+            assert_eq!(changes[0].0, "member_replaced");
             assert!(changes[0].1.starts_with("192.168.56.11"));
-            assert_eq!(changes[1].0, "lan_member_removed");
+            assert_eq!(changes[1].0, "member_removed");
             assert!(changes[1].1.starts_with("192.168.56.11"));
             Ok(())
         }))

@@ -30,13 +30,13 @@
 //! - **Services.** A [`serve::Service`] is the server side of one protocol
 //!   for one connection, written with no I/O. [`serve::serve`] and
 //!   [`serve::listen`] run it over a connection or a listener. HTTP is one
-//!   ([`httpd`]). Every service records what it sees in one
-//!   [`journal`].
+//!   ([`httpd`]). Every service records what it sees as
+//!   [events](crate::events) in the run's one log.
 //! - **Networks.** [`net::Net`] builds all of the above for you: the
 //!   sandboxes' subnet, DNS, addresses, a router, one machine per address,
 //!   and each host's services. [`web::Sites`] is a preset on it for a world
 //!   of websites. Start there. [`scenario`] changes a running world on a
-//!   timeline and grades its journal.
+//!   timeline and grades its events.
 //!
 //! Every piece is ordinary code built from the same public items, so you
 //! can wire a network by hand when `Net` does not fit. To put a link in
@@ -231,7 +231,6 @@
 //! | [`ipp`] | IPP, the Internet Printing Protocol: requests, responses and their attribute groups. | yes | yes |  |  |  | yes | yes |
 //! | [`ipsec`] | IPsec ESP and AH headers. | yes |  |  |  |  | yes | yes |
 //! | [`itch`] | Nasdaq TotalView-ITCH 5.0: every message, a framer and a bounded order book. | yes | yes | `Book` |  |  | yes | yes |
-//! | [`journal`] | One log for a whole world: every service's facts in one shape, to a file, callbacks, memory or the dashboard. |  |  |  |  |  |  | yes |
 //! | [`json`] | JSON text to a tree of values and back, under limits. | yes | yes |  |  |  | yes | yes |
 //! | [`json_schema`] | Checked JSON schemas: compile one, validate values against it, and generate values from it. |  |  |  |  |  | yes | yes |
 //! | [`jsonrpc`] | JSON-RPC 2.0 requests, notifications, responses and batches, over lines or HTTP bodies. | yes | yes |  |  |  | yes | yes |
@@ -279,7 +278,7 @@
 //! | [`rtp`] | RTP media packets and their header extensions, told apart from RTCP. | yes |  |  |  |  | yes | yes |
 //! | [`rtsp`] | RTSP messages and interleaved data, with transport and range headers. | yes | yes |  |  |  | yes | yes |
 //! | [`sbe`] | FIX Simple Binary Encoding 1.0 at run time: load a schema's XML, then read and write its messages. | yes | yes |  |  |  | yes | yes |
-//! | [`scenario`] | A timeline of changes to a running world, and the facts a grader expects or forbids in its journal. |  |  |  |  |  |  | yes |
+//! | [`scenario`] | A timeline of changes to a running world, and the facts a grader expects or forbids in its events. |  |  |  |  |  |  | yes |
 //! | [`sdp`] | SDP session descriptions, with ICE candidates and RTP maps. | yes | yes |  |  |  | yes | yes |
 //! | [`serve`] | Services: the `Service` trait, the driver that runs one over a connection or a UDP socket, `listen`, a test harness, transcripts and fault plans. |  |  |  |  |  | yes | yes |
 //! | [`sftp`] | SFTP version 3 packets, requests and responses. | yes | yes |  |  |  | yes | yes |
@@ -402,7 +401,6 @@ pub mod ip;
 pub mod ipp;
 pub mod ipsec;
 pub mod itch;
-pub mod journal;
 pub mod json;
 pub mod json_schema;
 pub mod jsonrpc;
@@ -732,9 +730,9 @@ where
                     if let Some(leaves) = admit(&queues[i], now, packet.0.len()).filter(|_| fits) {
                         queues[i].bytes += cost;
                         queues[i].packets.push_back((leaves, packet));
-                    } else if cx.observed() {
+                    } else {
                         let waiting = queues[i].packets.len();
-                        crate::observe::note_drop(&cx, &packet, waiting);
+                        crate::observe::record_drop(&cx, name, &packet, &format!("the queue was full, {waiting} packets waiting"));
                     }
                 }
                 Event::Timer => {

@@ -159,20 +159,20 @@
 //!   the [`Host`](stdlib::net::Host)s it is given: the sandboxes' subnet with
 //!   DHCP, DNS for every host's names, a router, one machine per address, and
 //!   each host's services on their ports.
-//! - [`stdlib::journal`]: one log for everything the network and its
-//!   services do, as a file a grader reads after the run, callbacks, or the
-//!   dashboard.
+//! - [`events`]: one log for everything the network and its services do,
+//!   kept by every run, and read as a file a grader reads after the run,
+//!   callbacks, or the dashboard.
 //!
 //! HTTP is a service too ([`stdlib::httpd`]): a router whose handlers get
 //! byte bodies, or any tower service such as an axum `Router`. Here a web
-//! server and a line-echo service run on two hosts, with a journal on disk:
+//! server and a line-echo service run on two hosts, with the events on disk:
 //!
 //! ```
 //! use std::sync::Arc;
 //! use fictionet::{Attachments, Cx, Result};
 //! use fictionet::stdlib::codec::{Ending, LineError, Lines};
 //! use fictionet::stdlib::httpd::{Router, Site};
-//! use fictionet::stdlib::journal::{Event, Journal};
+//! use fictionet::events::Event;
 //! use fictionet::stdlib::net::Net;
 //! use fictionet::stdlib::serve::{Flow, ServeCtx, Service};
 //!
@@ -197,8 +197,8 @@
 //!
 //! fn world(cx: &Cx, attachments: Attachments) -> Result {
 //!     let site = Router::new().get("/", |_, _| http::Response::new("hello\n".into()));
+//!     cx.events().to_file(std::env::temp_dir().join("events.jsonl"))?;
 //!     Net::new()
-//!         .journal(Journal::new().to_file(std::env::temp_dir().join("journal.jsonl"))?)
 //!         .host("www", |h| h.dns_name("www.example.test").accept(80, Site::new(site)))
 //!         .host("echo", |h| h.dns_name("echo.example.test").tcp(7, Arc::new(()), || Echo))
 //!         .serve(cx, attachments)
@@ -206,7 +206,7 @@
 //! ```
 //!
 //! [`stdlib::web::Sites`] is a preset on `Net` for a world of websites. The
-//! guide in `docs/services.md` walks through services, `Net`, the journal
+//! guide in `docs/services.md` walks through services, `Net`, events
 //! and scenarios step by step.
 //!
 //! # Protocols
@@ -224,8 +224,8 @@
 //!
 //! # Watching a world
 //!
-//! Everything the network and its services do goes to one
-//! [`journal`](stdlib::journal): a file a grader reads after the run,
+//! Everything the network and its services do goes to one log of
+//! [`events`], which every run keeps: a file a grader reads after the run,
 //! callbacks, or the dashboard. The world itself can be watched while it
 //! runs, with nothing to turn on in world code ([`observe`]):
 //! `fictionet dashboard` draws its tasks and links and decodes the packets
@@ -301,6 +301,7 @@ pub mod attaching;
 mod block_on;
 mod cable;
 mod cx;
+pub mod events;
 #[cfg(fuzzing)]
 #[doc(hidden)]
 pub mod fuzzing;

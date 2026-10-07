@@ -8,8 +8,8 @@
 //! relaxed atomic load per packet while nothing watches.
 //!
 //! Every [`run`](crate::run) also has a [`Graph`]: its tasks, where each
-//! was spawned, which task uses which end of each link, and notes from the
-//! stdlib.
+//! was spawned, which task uses which end of each link, and the run's
+//! [events](crate::events).
 
 use std::borrow::Cow;
 use std::cell::Cell;
@@ -359,25 +359,6 @@ pub(crate) struct LinkInfo {
     pub(crate) label: Option<Arc<str>>,
 }
 
-/// Something the stdlib or world code reported.
-#[derive(Clone, Debug)]
-pub(crate) struct Note {
-    pub(crate) seq: u64,
-    pub(crate) at: Duration,
-    pub(crate) task: u64,
-    /// `drop`, `route_removed` or `tls_keys` from the stdlib, or `event`
-    /// from world code.
-    pub(crate) kind: &'static str,
-    pub(crate) text: String,
-    /// A custom event's name and JSON payload.
-    pub(crate) event: Option<(String, String)>,
-    /// The packet the note is about, kept only while observed.
-    pub(crate) packet: Option<Arc<[u8]>>,
-    /// The task's name, file and line, and its parent, kept with the note
-    /// since the task may end first.
-    pub(crate) from: Option<(String, &'static str, u32, u64)>,
-}
-
 /// One line of an `SSLKEYLOGFILE`: a TLS secret and the client random it
 /// belongs to.
 #[derive(Clone, Debug)]
@@ -390,7 +371,6 @@ pub struct KeyLine {
     pub secret: Vec<u8>,
 }
 
-const MAX_NOTES: usize = 5000;
 /// How many TLS secrets a world keeps, about 4,000 sessions. Past that,
 /// the oldest are forgotten.
 pub(crate) const MAX_KEYS: usize = 20_000;
@@ -402,9 +382,11 @@ pub(crate) const MAX_KEYS: usize = 20_000;
 pub(crate) struct Graph {
     pub(crate) start: Instant,
     pub(crate) start_wall: SystemTime,
-    /// Observer sessions subscribed to the world's events. While there are
-    /// none, custom events and packet copies are not kept.
+    /// Observer sessions connected to the world. While there are none,
+    /// packet copies and TLS keys are not kept.
     pub(crate) viewers: AtomicUsize,
+    /// The run's events, kept whether or not anyone observes.
+    pub(crate) events: Arc<crate::events::Store>,
     /// The id of the next group.
     next_group: AtomicU64,
     state: Mutex<GraphState>,
@@ -420,8 +402,6 @@ pub(crate) struct GraphState {
     pub(crate) links: HashMap<u64, LinkInfo, Ids>,
     /// The link count at which dead links are next swept out.
     sweep_at: usize,
-    pub(crate) notes: VecDeque<Note>,
-    pub(crate) next_note: u64,
     pub(crate) keys: VecDeque<KeyLine>,
     /// How many keys have ever been added, so watches can take new ones
     /// after old ones are forgotten.
@@ -437,7 +417,8 @@ impl Graph {
             start_wall: SystemTime::now(),
             viewers: AtomicUsize::new(0),
             next_group: AtomicU64::new(1),
-            state: Mutex::new(GraphState { next_note: 1, sweep_at: 64, ..GraphState::default() }),
+            state: Mutex::new(GraphState { sweep_at: 64, ..GraphState::default() }),
+            events: crate::events::Store::new(),
             watches: Mutex::default(),
             protocols: Mutex::default(),
         })
@@ -489,6 +470,8 @@ impl Graph {
         s.ended = true;
         s.tasks.clear();
         drop(s);
+        // Nothing more is recorded: let callbacks and file writers go.
+        self.events.close();
         // Nothing more crosses the world's links: stop watching them.
         let watches = std::mem::take(&mut *lock(&self.watches));
         drop(watches);
@@ -527,30 +510,14 @@ impl Graph {
         Self::link(&mut s, meter).label = Some(Arc::from(label));
     }
 
-    fn push_note(&self, mut note: Note) {
-        let mut s = self.state();
-        note.from = s.tasks.get(&note.task).map(|t| (short_name(&t.name), t.file, t.line, t.parent));
-        note.seq = s.next_note;
-        s.next_note += 1;
-        s.notes.push_back(note);
-        if s.notes.len() > MAX_NOTES {
-            s.notes.pop_front();
+    /// The task `task` as an event records it, if it is running.
+    pub(crate) fn origin(&self, task: u64) -> Option<crate::events::Origin> {
+        if task == 0 {
+            return None;
         }
-    }
-
-    /// Adds a note from the current task.
-    pub(crate) fn note(&self, kind: &'static str, text: String, packet: Option<&[u8]>) {
-        // The start of the packet is enough to tell what it was.
-        let packet = if self.observed() { packet.map(|p| Arc::from(&p[..p.len().min(256)])) } else { None };
-        let note = Note { seq: 0, at: self.since_start(), task: current_task(), kind, text, event: None, packet, from: None };
-        self.push_note(note);
-    }
-
-    /// Adds a custom event from world code. `at` is the `Cx` clock.
-    pub(crate) fn event(&self, at: Duration, name: String, json: String) {
-        let note =
-            Note { seq: 0, at, task: current_task(), kind: "event", text: String::new(), event: Some((name, json)), packet: None, from: None };
-        self.push_note(note);
+        let s = self.state();
+        let t = s.tasks.get(&task)?;
+        Some(crate::events::Origin { task, name: t.name.clone(), file: t.file, line: t.line, parent: t.parent })
     }
 
     pub(crate) fn key(&self, line: KeyLine) {

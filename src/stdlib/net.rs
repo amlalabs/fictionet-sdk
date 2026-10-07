@@ -17,7 +17,7 @@
 //! ```
 //! # use std::sync::Arc;
 //! # use fictionet::{Attachments, Cx, Result};
-//! # use fictionet::stdlib::{httpd, journal::Journal, net::{Host, Net}, serve};
+//! # use fictionet::stdlib::{httpd, net::{Host, Net}, serve};
 //! # struct Ldap; struct Plc; struct Directory; struct Plant;
 //! # macro_rules! svc { ($t:ty, $w:ty) => {
 //! # impl serve::Service for $t {
@@ -30,8 +30,8 @@
 //! let directory = Arc::new(Directory);
 //! let plant = Arc::new(Plant);
 //! let intranet = httpd::Router::new().get("/", |_, _| http::Response::new("intranet\n".into()));
+//! cx.events().to_file("/tmp/office-events.jsonl")?;
 //! Net::new()
-//!     .journal(Journal::new().to_file("/tmp/office-journal.jsonl")?)
 //!     .host("dc01", |h| h.at("10.20.0.10".parse::<std::net::Ipv4Addr>().unwrap()).dns_name("dc01.corp.test").tcp(389, directory.clone(), || Ldap))
 //!     .host("www", |h| h.dns_name("intranet.corp.test").accept(80, httpd::Site::new(intranet)))
 //!     .host("plc1", |h| h.at("10.30.0.5".parse::<std::net::Ipv4Addr>().unwrap()).tcp(502, plant, || Plc))
@@ -71,7 +71,7 @@
 //!   [`Host::on`] and attached virtual machines with [`Net::member`], as
 //!   machines on one Ethernet: broadcast and multicast reach every member.
 //!   The router sends the LAN's prefix to its gateway, the LAN's first
-//!   address answers DNS, and every packet the LAN drops is journaled.
+//!   address answers DNS, and every packet the LAN drops is recorded.
 //! - **Machines** answer pings, reset TCP to closed ports and answer UDP to
 //!   closed ports with "port unreachable". A sandbox may have 256
 //!   connections open at once to one machine
@@ -83,8 +83,9 @@
 //!   it is closed.
 //! - **Every link** inside the network holds at most 4 MiB of packets each
 //!   way; past that, packets are dropped, as on a congested link.
-//! - **The journal**, if set ([`Net::journal`]), gets every fact: a
-//!   `journal.start` entry first, `net` events for sandboxes attaching,
+//! - **Events.** The network records every fact in the run's
+//!   [events](crate::events): a `run.start` event first, `net` events for
+//!   sandboxes attaching,
 //!   binding, detaching and packets dropped (`net.blocked`), `dns.query`
 //!   for every DNS message, `tls.handshake` for every handshake on a TLS
 //!   port, and each service's own events. Every event names its sandbox
@@ -112,7 +113,7 @@ use fictionet::stdlib::dhcp::{self, opt};
 use fictionet::stdlib::dns::op::{Edns, Message, MessageType, OpCode, ResponseCode};
 use fictionet::stdlib::dns::rr::{DNSClass, RData, Record, RecordType, rdata::A, rdata::AAAA};
 use fictionet::stdlib::ip::{Header, Intake, Reassembly};
-use fictionet::stdlib::journal::{ConnInfo, Event, Fields, Journal, Level, Sandbox, opt as jopt};
+use fictionet::events::{ConnInfo, Event, Fields, Level, Sandbox, opt as jopt};
 use fictionet::stdlib::route::{self, Prefix, Router};
 use fictionet::stdlib::serve::{self, Budget, Counted, ServeOptions, Service, TlsSelect};
 use fictionet::stdlib::tls::ServerConfig;
@@ -228,8 +229,6 @@ pub struct Arrival {
     /// The TCP socket underneath, to keep a count until it is gone
     /// ([`tcp::GoneWatch::hold_until_gone`]) or to reset it.
     pub socket: tcp::GoneWatch,
-    /// The network's journal.
-    pub journal: Option<Journal>,
     /// The budget of the sandbox it came from.
     pub budget: Option<Budget>,
     /// [`Limits::handshake`]: how long a client has to send its first
@@ -287,11 +286,9 @@ where
 {
     fn serve(&self, cx: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         let Some(guard) = Counted::enter(&self.open, self.opts.max_conns) else {
-            if let Some(j) = &arrival.journal {
-                let (src, dst) = (arrival.info.peer, arrival.info.local);
-                let event = blocked_event(BlockedWhy::TooManyConnections, Some(PROTO_TCP), src.map(|a| a.ip()), dst.map(|a| a.ip()), dst.map(|a| a.port()));
-                j.record(&cx, &arrival.info, event);
-            }
+            let (src, dst) = (arrival.info.peer, arrival.info.local);
+            let event = blocked_event(BlockedWhy::TooManyConnections, Some(PROTO_TCP), src.map(|a| a.ip()), dst.map(|a| a.ip()), dst.map(|a| a.port()));
+            cx.record(event.conn(&arrival.info));
             arrival.socket.reset();
             return Box::pin(async {});
         };
@@ -299,9 +296,6 @@ where
         let mut service = (self.make)();
         let world = self.world.clone();
         let mut opts = self.opts.clone();
-        if arrival.journal.is_some() {
-            opts.journal = arrival.journal;
-        }
         if opts.budget.is_none() {
             opts.budget = arrival.budget;
         }
@@ -314,8 +308,8 @@ where
 }
 
 /// Starts serving a UDP port of a machine: the socket, its address, the
-/// journal, the seed, and who the sandboxes are.
-type UdpStart = Arc<dyn Fn(&Cx, udp::Socket, SocketAddr, Option<Journal>, u64, Option<serve::SandboxOf>) + Send + Sync>;
+/// seed, and who the sandboxes are.
+type UdpStart = Arc<dyn Fn(&Cx, udp::Socket, SocketAddr, u64, Option<serve::SandboxOf>) + Send + Sync>;
 
 /// Which names a TLS service on a port answers to, by the SNI the client
 /// sends.
@@ -406,7 +400,7 @@ impl Host {
 
     /// Serves TCP `port` with a [`Service`] made by `make` for each
     /// connection, sharing `world`. Connections are numbered, and the
-    /// service's events reach the network's journal.
+    /// service's events name the sandbox each came from.
     pub fn tcp<S, M>(self, port: u16, world: Arc<S::World>, make: M) -> Host
     where
         S: Service,
@@ -417,9 +411,8 @@ impl Host {
     }
 
     /// The same with these options: a transcript, a fault plan, an idle
-    /// limit, a connection cap, a STARTTLS config. The network's journal
-    /// replaces any in `opts`, and the sandbox's budget applies when
-    /// `opts` has none.
+    /// limit, a connection cap, a STARTTLS config. The sandbox's budget
+    /// applies when `opts` has none.
     pub fn tcp_with<S, M>(self, port: u16, world: Arc<S::World>, make: M, opts: ServeOptions) -> Host
     where
         S: Service,
@@ -474,20 +467,19 @@ impl Host {
         self.udp_with(port, world, make, ServeOptions::default())
     }
 
-    /// The same with these options. The network's journal replaces any in
-    /// `opts`.
+    /// The same with these options. The network names each datagram's
+    /// sandbox ([`ServeOptions::sandbox`]).
     pub fn udp_with<S, M>(mut self, port: u16, world: Arc<S::World>, make: M, opts: ServeOptions) -> Host
     where
         S: Service,
         M: Fn() -> S + Send + Sync + 'static,
         <S::Decode as Decode>::Error: Clone + Send,
     {
-        let start: UdpStart = Arc::new(move |cx, socket, local, journal, seed, sandbox| {
+        let start: UdpStart = Arc::new(move |cx, socket, local, seed, sandbox| {
             let mut service = make();
             let world = world.clone();
             let mut opts = opts.clone();
-            if journal.is_some() {
-                opts.journal = journal;
+            if sandbox.is_some() {
                 opts.sandbox = sandbox;
             }
             opts.seed ^= seed;
@@ -516,7 +508,6 @@ pub struct Net {
     hosts: Vec<Host>,
     resolver: Option<Arc<Resolver>>,
     max_hosts: usize,
-    journal: Option<Journal>,
     routes: Vec<(String, Prefix)>,
     registry: Option<fictionet::observe::Registry>,
     group: String,
@@ -543,7 +534,6 @@ impl Net {
             hosts: Vec::new(),
             resolver: None,
             max_hosts: MAX_HOSTS,
-            journal: None,
             routes: Vec::new(),
             registry: None,
             group: "net".to_owned(),
@@ -573,13 +563,9 @@ impl Net {
         Net { ipv6: false, ..self }
     }
 
-    /// Records every fact in `journal`.
-    pub fn journal(self, journal: Journal) -> Net {
-        Net { journal: Some(journal), ..self }
-    }
-
-    /// Adds the fields of the `journal.start` entry the network records
-    /// first ([`Journal::start`]), such as the date the world says it is.
+    /// Adds the fields of the `run.start` event the network records first
+    /// ([`EventLog::start`](fictionet::events::EventLog::start)), such as
+    /// the date the world says it is.
     pub fn start_fields(self, start: Fields) -> Net {
         Net { start, ..self }
     }
@@ -629,7 +615,7 @@ impl Net {
     /// LAN's gateway, so sandboxes and the other hosts reach its members,
     /// and members reach everything else through it. The LAN's first
     /// address (`.1` of a `/24`) answers DNS as the network's gateway does,
-    /// for members to use. Every packet the LAN drops is journaled as
+    /// for members to use. Every packet the LAN drops is recorded as
     /// `net.blocked`, with `why` `Lan` and the reason in `detail`.
     ///
     /// [`serve`](Net::serve) fails if `prefix` overlaps the sandboxes'
@@ -642,7 +628,7 @@ impl Net {
     /// Attaches the sandbox called `name` to the LAN `lan` at `addr`, with
     /// no filter, no address binding and no DHCP: a trusted member, such
     /// as a GOAD virtual machine attached with `fictionet attach --type
-    /// tap`. Journal entries name it as a sandbox. [`serve`](Net::serve)
+    /// tap`. Events name it as a sandbox. [`serve`](Net::serve)
     /// fails if there is no such LAN, `addr` is not a member address of it,
     /// or another member has it.
     pub fn member(mut self, name: &str, lan: &str, addr: IpAddr) -> Net {
@@ -682,9 +668,7 @@ impl Net {
     pub fn serve(self, cx: &Cx, mut attachments: Attachments) -> Result<(), Error> {
         let subnet = Subnet::new(self.subnet)?;
         let subnet6 = if self.ipv6 { Some(Subnet6::new(self.subnet_v6)?) } else { None };
-        if let Some(journal) = &self.journal {
-            journal.start(cx, self.start);
-        }
+        cx.events().start(cx, self.start);
         if let Some(registry) = self.registry {
             cx.observe_protocols(registry);
         }
@@ -704,7 +688,6 @@ impl Net {
             cx.spawn(move |cx| unreachable(cx, unreachable_side, gateway.into()));
         }
         let hooks = Arc::new(Hooks {
-            journal: self.journal,
             by_addr: Mutex::default(),
             conns: AtomicU64::new(0),
             attached: Mutex::default(),
@@ -768,9 +751,8 @@ impl Net {
 // ---------------------------------------------------------------------------
 // What the network's tasks share
 
-/// The journal, and what events need to name sandboxes.
+/// What events need to name sandboxes.
 struct Hooks {
-    journal: Option<Journal>,
     /// The sandbox that last bound each address. An entry stays after its
     /// sandbox detaches, until another binds the address, so packets and
     /// connections still on their way name the sandbox that sent them.
@@ -782,15 +764,8 @@ struct Hooks {
 }
 
 impl Hooks {
-    /// Whether events are recorded: a journal is set.
-    fn on(&self) -> bool {
-        self.journal.is_some()
-    }
-
     fn record(&self, cx: &Cx, conn: &ConnInfo, event: Event) {
-        if let Some(j) = &self.journal {
-            j.record(cx, conn, event);
-        }
+        cx.record(event.conn(conn));
     }
 
     fn sandbox_at(&self, addr: IpAddr) -> Sandbox {
@@ -1065,7 +1040,7 @@ fn overlap(a: &Prefix, b: &Prefix) -> bool {
 }
 
 /// Starts the network's LANs: each wired to the router through its
-/// gateway, with its drops journaled. Checks them and their members.
+/// gateway, with its drops recorded. Checks them and their members.
 fn make_lans(
     cx: &Cx,
     router: &Router,
@@ -1089,13 +1064,11 @@ fn make_lans(
         if let Some((other, _)) = made.iter().find(|(n, l)| **n == name || overlap(&prefix, &l.prefix)) {
             return Err(format!("LAN {name}: {}/{} overlaps LAN {other}", prefix.addr, prefix.len).into());
         }
-        let journal = hooks.clone();
+        let names = hooks.clone();
         let on_drop: route::OnDrop = Arc::new(move |cx: &Cx, packet: &Packet, why: &'static str| {
-            if journal.on() {
-                let src = Header::parse_truncated(&packet.0).map(|h| h.src);
-                let conn = src.map_or_else(ConnInfo::default, |a| sandbox_only(journal.sandbox_at(a)));
-                journal.record(cx, &conn, blocked(BlockedWhy::Lan, &packet.0).field("detail", why));
-            }
+            let src = Header::parse_truncated(&packet.0).map(|h| h.src);
+            let conn = src.map_or_else(ConnInfo::default, |a| sandbox_only(names.sandbox_at(a)));
+            names.record(cx, &conn, blocked(BlockedWhy::Lan, &packet.0).field("detail", why));
         });
         let lan = route::lan(&cx.group(format!("lan {name}")), prefix, Some(on_drop));
         let (lan_side, router_side) = link();
@@ -1254,7 +1227,7 @@ impl Shared {
     }
 
     /// A member sandbox attached: it joins its LAN at its address, with no
-    /// filter, and the journal knows it by that address.
+    /// filter, and events know it by that address.
     fn join_lan(&self, cx: &Cx, name: &str, lan: &str, addr: IpAddr, sandbox: Attachment) {
         let Some(seg) = self.lans.get(lan) else { return };
         let owner = lock(&self.leases).new_owner();
@@ -1265,18 +1238,14 @@ impl Shared {
             addr: if let IpAddr::V4(a) = addr { Some(a) } else { None },
             addr_v6: if let IpAddr::V6(a) = addr { Some(a) } else { None },
         };
-        if hooks.on() {
-            lock(&hooks.by_addr).insert(addr, me.clone());
-            lock(&hooks.attached).insert(owner);
-        }
+        lock(&hooks.by_addr).insert(addr, me.clone());
+        lock(&hooks.attached).insert(owner);
         let joined = seg.lan.add(addr, Box::new(sandbox));
-        if hooks.on() {
-            let event = match joined {
-                Ok(()) => Event::new("net", "attached").summary(format!("sandbox {name} joined LAN {lan} at {addr}")),
-                Err(e) => Event::new("net", "error").level(Level::Notice).summary(format!("sandbox {name} could not join LAN {lan}: {e}")).field("error", e.to_string()),
-            };
-            hooks.record(cx, &sandbox_only(me), event.field("lan", lan).field("addr", addr.to_string()));
-        }
+        let event = match joined {
+            Ok(()) => Event::new("net", "attached").summary(format!("sandbox {name} joined LAN {lan} at {addr}")),
+            Err(e) => Event::new("net", "error").level(Level::Notice).summary(format!("sandbox {name} could not join LAN {lan}: {e}")).field("error", e.to_string()),
+        };
+        hooks.record(cx, &sandbox_only(me), event.field("lan", lan).field("addr", addr.to_string()));
     }
 
     /// The budget of the sandbox at `peer`.
@@ -1418,7 +1387,6 @@ impl Machine {
 
     /// Adds a host's services.
     fn add(self: &Arc<Self>, host: &Host) -> Result<(), String> {
-        let journal = self.shared.upgrade().and_then(|s| s.hooks.journal.clone());
         let seed = self.shared.upgrade().map_or(0, |s| s.seed);
         let sandbox: Option<serve::SandboxOf> = self.shared.upgrade().map(|s| {
             let hooks = s.hooks.clone();
@@ -1432,7 +1400,7 @@ impl Machine {
                         return Err(format!("UDP port {number} at {addr} is already served"));
                     }
                     let socket = self.udp.bind(*number).map_err(|e| format!("UDP port {number} at {addr}: {e}"))?;
-                    start(&self.cx, socket, SocketAddr::new(addr, *number), journal.clone(), seed, sandbox.clone());
+                    start(&self.cx, socket, SocketAddr::new(addr, *number), seed, sandbox.clone());
                 }
                 PortSpec::Tcp(accept) => {
                     let port = self.port(*number)?;
@@ -1499,14 +1467,12 @@ fn host_prefix(addr: IpAddr) -> Prefix {
     Prefix { addr, len: if addr.is_ipv4() { 32 } else { 128 } }
 }
 
-/// Tells the journal that a connection was reset for being past its
-/// sandbox's limit.
+/// Records that a connection was reset for being past its sandbox's
+/// limit.
 fn too_many(cx: &Cx, hooks: &Hooks, conn: &tcp::TcpConnection) {
-    if hooks.on() {
-        let (peer, local) = (conn.peer_addr(), conn.local_addr());
-        let event = blocked_event(BlockedWhy::TooManyConnections, Some(PROTO_TCP), Some(peer.ip()), Some(local.ip()), Some(local.port()));
-        hooks.record(cx, &sandbox_only(hooks.sandbox_at(peer.ip())), event);
-    }
+    let (peer, local) = (conn.peer_addr(), conn.local_addr());
+    let event = blocked_event(BlockedWhy::TooManyConnections, Some(PROTO_TCP), Some(peer.ip()), Some(local.ip()), Some(local.port()));
+    hooks.record(cx, &sandbox_only(hooks.sandbox_at(peer.ip())), event);
 }
 
 /// Accepts connections on one port of a machine. Each is served in its own
@@ -1523,7 +1489,7 @@ async fn accept(cx: Cx, mut listener: tcp::Listener, machine: Arc<Machine>, port
                     continue;
                 };
                 conn.hold_until_gone(Box::new(guard));
-                let sandbox = hooks.on().then(|| hooks.sandbox_at(conn.peer_addr().ip()));
+                let sandbox = Some(hooks.sandbox_at(conn.peer_addr().ip()));
                 let info = ConnInfo::new(hooks.next_conn(), conn.local_addr(), conn.peer_addr()).from_sandbox(sandbox);
                 let accepted = cx.now();
                 let port = port.clone();
@@ -1553,7 +1519,6 @@ async fn connection(cx: Cx, conn: tcp::TcpConnection, info: ConnInfo, accepted: 
         conn,
         info,
         socket: socket.clone(),
-        journal: hooks.journal.clone(),
         budget: Some(shared.budget(peer)),
         handshake: shared.limits.handshake,
         seed: shared.seed,
@@ -1578,9 +1543,8 @@ async fn connection(cx: Cx, conn: tcp::TcpConnection, info: ConnInfo, accepted: 
     });
     let sandbox_id = info.sandbox.as_ref().map(|s| s.id);
     let detached = || sandbox_id.is_some_and(|id| !hooks.is_attached(id));
-    let journal = hooks.journal.as_ref();
     let deadline = accepted + shared.limits.handshake;
-    let Some((tls, info)) = serve::accept_tls(&cx, conn, &info, &select, deadline, journal, detached).await else {
+    let Some((tls, info)) = serve::accept_tls(&cx, conn, &info, &select, deadline, detached).await else {
         return;
     };
     let Some(name) = lock(&chosen).take() else { return };
@@ -1759,10 +1723,8 @@ async fn dns_udp(cx: Cx, mut socket: udp::Socket, shared: Arc<Shared>) -> fictio
     let hooks = shared.hooks.clone();
     while let Ok((query, from)) = socket.recv(&cx).await {
         let answered = answer(&shared, &query);
-        if hooks.on() {
-            let info = ConnInfo { sandbox: Some(hooks.sandbox_at(from.ip())), peer: Some(from), ..ConnInfo::default() };
-            hooks.record(&cx, &info, answered.event(false));
-        }
+        let info = ConnInfo { sandbox: Some(hooks.sandbox_at(from.ip())), peer: Some(from), ..ConnInfo::default() };
+        hooks.record(&cx, &info, answered.event(false));
         if let Some(reply) = answered.reply {
             socket.send_to(&reply, from);
         }
@@ -1800,12 +1762,12 @@ async fn dns_tcp(cx: Cx, mut listener: tcp::Listener, shared: Arc<Shared>) -> fi
 
 async fn dns_conn(cx: &Cx, mut conn: tcp::TcpConnection, shared: &Arc<Shared>) -> Result<(), ConnError> {
     let hooks = shared.hooks.clone();
-    let info = hooks.on().then(|| ConnInfo {
+    let info = ConnInfo {
         sandbox: Some(hooks.sandbox_at(conn.peer_addr().ip())),
         peer: Some(conn.peer_addr()),
         local: Some(conn.local_addr()),
         ..ConnInfo::default()
-    });
+    };
     loop {
         let read = async {
             let mut len = [0u8; 2];
@@ -1821,9 +1783,7 @@ async fn dns_conn(cx: &Cx, mut conn: tcp::TcpConnection, shared: &Arc<Shared>) -
         let Ok(read) = cx.race(Some(cx.now() + shared.limits.dns_tcp_idle), read).await else { return Ok(()) };
         let Some(query) = read? else { return Ok(()) };
         let answered = answer(shared, &query);
-        if let Some(info) = &info {
-            hooks.record(cx, info, answered.event(true));
-        }
+        hooks.record(cx, &info, answered.event(true));
         let Some(reply) = answered.reply else { continue };
         let Ok(n) = u16::try_from(reply.len()) else { continue };
         let mut framed = n.to_be_bytes().to_vec();
@@ -2080,9 +2040,7 @@ struct Release {
 impl Drop for Release {
     fn drop(&mut self) {
         let shared = &self.shared;
-        if shared.hooks.on() {
-            lock(&shared.hooks.attached).remove(&self.owner);
-        }
+        lock(&shared.hooks.attached).remove(&self.owner);
         let (bound, bound6) = {
             let leases = lock(&shared.leases);
             let v4 = leases.of(self.owner).and_then(|(a, bound)| bound.then_some(a));
@@ -2103,11 +2061,9 @@ impl Drop for Release {
             }
         }
         lock(&shared.leases).release_all(self.owner);
-        if shared.hooks.on() {
-            let sandbox = Sandbox { id: self.owner, name: self.name.clone(), addr: bound, addr_v6: bound6 };
-            let event = Event::new("net", "detached").summary(format!("sandbox {} detached", self.name));
-            shared.hooks.record(&self.cx, &sandbox_only(sandbox), event);
-        }
+        let sandbox = Sandbox { id: self.owner, name: self.name.clone(), addr: bound, addr_v6: bound6 };
+        let event = Event::new("net", "detached").summary(format!("sandbox {} detached", self.name));
+        shared.hooks.record(&self.cx, &sandbox_only(sandbox), event);
     }
 }
 
@@ -2116,7 +2072,6 @@ async fn filter(cx: Cx, sandbox: Attachment, shared: Arc<Shared>) -> fictionet::
     let name: Arc<str> = Arc::from(sandbox.name());
     let owner = lock(&shared.leases).new_owner();
     let mut f = Filter {
-        on: shared.hooks.on(),
         shared: shared.clone(),
         owner,
         name: name.clone(),
@@ -2127,11 +2082,9 @@ async fn filter(cx: Cx, sandbox: Attachment, shared: Arc<Shared>) -> fictionet::
         route6: None,
         reassembly: Reassembly::default(),
     };
-    if f.on {
-        lock(&shared.hooks.attached).insert(owner);
-        let event = Event::new("net", "attached").summary(format!("sandbox {name} attached"));
-        shared.hooks.record(&cx, &sandbox_only(f.me()), event);
-    }
+    lock(&shared.hooks.attached).insert(owner);
+    let event = Event::new("net", "attached").summary(format!("sandbox {name} attached"));
+    shared.hooks.record(&cx, &sandbox_only(f.me()), event);
     let _release = Release { shared, owner, cx: cx.clone(), name };
     loop {
         let deadline = f.reassembly.next_expiry();
@@ -2222,7 +2175,6 @@ fn blocked(why: BlockedWhy, p: &[u8]) -> Event {
 
 struct Filter {
     shared: Arc<Shared>,
-    on: bool,
     owner: u64,
     name: Arc<str>,
     ports: Ports,
@@ -2239,9 +2191,7 @@ impl Filter {
     }
 
     fn block(&self, cx: &Cx, why: BlockedWhy, packet: &[u8]) {
-        if self.on {
-            self.shared.hooks.record(cx, &sandbox_only(self.me()), blocked(why, packet));
-        }
+        self.shared.hooks.record(cx, &sandbox_only(self.me()), blocked(why, packet));
     }
 
     fn bound_now(&mut self, cx: &Cx, addr: IpAddr, by_dhcp: bool) {
@@ -2252,19 +2202,17 @@ impl Filter {
             IpAddr::V4(a) => (self.bound, self.route4) = (Some(a), Some(port)),
             IpAddr::V6(a) => (self.bound6, self.route6) = (Some(a), Some(port)),
         }
-        if self.on {
-            let sandbox = self.me();
-            let mut by_addr = lock(&self.shared.hooks.by_addr);
-            for a in self.bound.map(IpAddr::V4).into_iter().chain(self.bound6.map(IpAddr::V6)) {
-                by_addr.insert(a, sandbox.clone());
-            }
-            drop(by_addr);
-            let event = Event::new("net", "bound")
-                .summary(format!("sandbox {} bound {addr}", self.name))
-                .field("by_dhcp", by_dhcp)
-                .field("addr", addr.to_string());
-            self.shared.hooks.record(cx, &sandbox_only(sandbox), event);
+        let sandbox = self.me();
+        let mut by_addr = lock(&self.shared.hooks.by_addr);
+        for a in self.bound.map(IpAddr::V4).into_iter().chain(self.bound6.map(IpAddr::V6)) {
+            by_addr.insert(a, sandbox.clone());
         }
+        drop(by_addr);
+        let event = Event::new("net", "bound")
+            .summary(format!("sandbox {} bound {addr}", self.name))
+            .field("by_dhcp", by_dhcp)
+            .field("addr", addr.to_string());
+        self.shared.hooks.record(cx, &sandbox_only(sandbox), event);
     }
 
     fn sent_v4(&mut self, cx: &Cx, packet: Packet) {
@@ -2368,9 +2316,7 @@ impl Filter {
                 }
             }
         };
-        if self.on
-            && let Some(why) = self.shared.refused(&packet.0)
-        {
+        if let Some(why) = self.shared.refused(&packet.0) {
             self.block(cx, why, &packet.0);
         }
         if let Some(port) = route {

@@ -1,5 +1,5 @@
 //! The service layer: `serve` (the Service trait, the driver, the
-//! harness, transcripts and faults), `journal`, `httpd`, `net` and
+//! harness, transcripts and faults), events, `httpd`, `net` and
 //! `scenario`, each tested on its own and together in one world: a PLC
 //! that speaks Modbus/TCP and a web server, on one `Net`, with the
 //! dashboard's decoder reading both from the packets.
@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -22,7 +22,7 @@ use fictionet::stdlib::codec::{
 use fictionet::stdlib::dns::op::{Message, Query};
 use fictionet::stdlib::dns::rr::{Name, RData, RecordType};
 use fictionet::stdlib::httpd::{self, Http1, Router};
-use fictionet::stdlib::journal::{ConnInfo, Entry, Event, Fields, Journal, Level};
+use fictionet::events::{ConnInfo, Event, Fields, Level};
 use fictionet::stdlib::json;
 use fictionet::stdlib::modbus::{self, Exception, Frame, Request as MbRequest, Response as MbResponse};
 use fictionet::stdlib::net::Net;
@@ -535,10 +535,9 @@ fn virtual_hosts_pick_a_site_by_host() {
 fn listen_serves_each_connection_and_records_it() {
     world(|cx| async move {
         let (server, _su, client, _cu) = two_machines(&cx);
-        let journal = Journal::new();
-        let kept = journal.keep(100);
+        let kept = cx.events();
         let transcript = Transcript::new(100, 1 << 16);
-        let opts = ServeOptions::default().journal(journal).record(transcript.clone());
+        let opts = ServeOptions::default().record(transcript.clone());
         serve::listen(&cx, server.listen(7)?, Arc::new(()), || Echo, opts);
         let mut conn = client.connect(&cx, SocketAddr::new(SERVER.into(), 7)).await?;
         assert_eq!(read_some(&cx, &mut conn, 6).await, b"hello\n");
@@ -549,8 +548,8 @@ fn listen_serves_each_connection_and_records_it() {
         assert_eq!(read_some(&cx, &mut conn, 100).await, b"bye\n");
         let entries = kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("conn", "close")).await;
         assert_eq!(entries.len(), 1);
-        let all = kept.entries();
-        let kinds: Vec<String> = all.iter().map(|e| format!("{}.{}", e.event.service, e.event.kind)).collect();
+        let all = kept.all();
+        let kinds: Vec<String> = all.iter().map(|e| format!("{}.{}", e.source, e.kind)).collect();
         assert_eq!(kinds, ["conn.open", "echo.line", "echo.line", "echo.later", "echo.line", "echo.line", "conn.close"]);
         assert!(all.iter().all(|e| e.conn.id == Some(1) && e.conn.peer.map(|p| p.ip()) == Some(Ipv4Addr::new(10, 9, 0, 2).into())));
         assert_eq!(all[3].get("written").and_then(json::Value::as_u64), Some(2));
@@ -576,13 +575,13 @@ fn timers_tick_and_idle_connections_close() {
         assert_eq!(read_some(&cx, &mut conn, 100).await, b"tick\ntick\ntick\n");
         assert!(cx.now().since_start() - started.since_start() >= Duration::from_millis(90));
 
-        let journal = Journal::new();
-        let kept = journal.keep(100);
-        let opts = ServeOptions::default().journal(journal).idle(Some(Duration::from_millis(100)));
+        let kept = cx.events();
+        let opts = ServeOptions::default().idle(Some(Duration::from_millis(100)));
         serve::listen(&cx, server.listen(2)?, Arc::new(()), || Echo, opts);
         let mut conn = client.connect(&cx, SocketAddr::new(SERVER.into(), 2)).await?;
         assert_eq!(read_some(&cx, &mut conn, 100).await, b"hello\n");
-        let closed = kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("conn", "close")).await;
+        let on_2 = |e: &Event| e.is("conn", "close") && e.conn.local.map(|a| a.port()) == Some(2);
+        let closed = kept.wait(&cx, 1, Duration::from_secs(2), on_2).await;
         assert_eq!(closed[0].get("end").and_then(json::Value::as_str), Some("idle"));
         Ok(())
     });
@@ -699,55 +698,39 @@ fn serve_datagram_answers_each_datagram() {
 }
 
 // ---------------------------------------------------------------------------
-// The journal
+// Events
 
 #[test]
-fn the_journal_writes_json_lines_and_keeps_what_it_is_asked_to() {
-    let path = std::env::temp_dir().join(format!("fictionet-journal-{}.jsonl", std::process::id()));
+fn every_run_keeps_its_events_and_writes_them_as_json_lines() {
+    let path = std::env::temp_dir().join(format!("fictionet-events-{}.jsonl", std::process::id()));
     let p = path.clone();
     world(move |cx| async move {
-        let journal = Journal::new().to_file(&p)?;
-        let kept = journal.keep(2);
+        let events = cx.events();
         let conn = ConnInfo::new(9, "10.0.0.1:80".parse().unwrap(), "10.0.0.2:4000".parse().unwrap());
         for i in 0..3u64 {
-            journal.record(&cx, &conn, Event::new("test", "n").summary(format!("n={i}")).field("i", i).field("none", fictionet::stdlib::journal::opt(None::<u64>)));
+            cx.record(Event::new("test", "n").conn(&conn).summary(format!("n={i}")).field("i", i).field("none", fictionet::events::opt(None::<u64>)));
         }
-        assert_eq!(kept.entries().iter().map(|e| e.seq).collect::<Vec<_>>(), [2, 3]);
-        assert_eq!(kept.dropped(), 1);
-        assert_eq!(journal.lost(), 0);
-        let layer = kept.entries()[0].layer();
+        // A file set after the first events still gets them all.
+        events.to_file(&p)?;
+        assert_eq!(events.all().iter().map(|e| e.seq).collect::<Vec<_>>(), [1, 2, 3]);
+        assert_eq!(events.dropped(), 0);
+        let layer = events.all()[1].layer();
         assert_eq!(layer.name, "test.n");
         assert_eq!(layer.summary, "n=1");
         cx.sleep(Duration::from_millis(100)).await?;
+        assert_eq!(events.lost(), 0);
         Ok(())
     });
     let text = std::fs::read_to_string(&path).unwrap();
     let lines: Vec<json::Value> = text.lines().map(|l| json::Value::parse(l.as_bytes()).unwrap()).collect();
     assert_eq!(lines.len(), 3);
-    assert_eq!(lines[1].get("service").and_then(json::Value::as_str), Some("test"));
+    assert_eq!(lines[1].get("source").and_then(json::Value::as_str), Some("test"));
     assert_eq!(lines[1].get("conn").and_then(json::Value::as_u64), Some(9));
     assert_eq!(lines[1].get("peer").and_then(json::Value::as_str), Some("10.0.0.2:4000"));
     let fields = lines[1].get("fields").unwrap();
     assert_eq!(fields.get("i").and_then(json::Value::as_u64), Some(1));
     assert!(fields.get("none").unwrap().is_null());
     let _ = std::fs::remove_file(&path);
-}
-
-#[test]
-fn a_journal_with_no_sink_records_nothing() {
-    world(|cx| async move {
-        let journal = Journal::new().dashboard(false);
-        assert!(!journal.wants(&cx));
-        let counted = Arc::new(AtomicU64::new(0));
-        let c = counted.clone();
-        journal.subscribe(move |_| {
-            c.fetch_add(1, Ordering::SeqCst);
-        });
-        assert!(journal.wants(&cx));
-        journal.record(&cx, &ConnInfo::default(), Event::new("x", "y"));
-        assert_eq!(counted.load(Ordering::SeqCst), 1);
-        Ok(())
-    });
 }
 
 // ---------------------------------------------------------------------------
@@ -785,8 +768,7 @@ async fn lookup(cx: &Cx, s: &Sandbox, name: &str) -> Option<Ipv4Addr> {
 #[test]
 fn a_plc_and_a_web_server_on_one_net_with_observe_decoding_both() {
     world(|cx| async move {
-        let journal = Journal::new();
-        let kept = journal.keep(1000);
+        let kept = cx.events();
         let plant = Arc::new(Plant { limit: 1000, ..Plant::default() });
         plant.registers.lock().unwrap()[3] = 451;
         let hmi = Router::new().get("/", {
@@ -806,7 +788,6 @@ fn a_plc_and_a_web_server_on_one_net_with_observe_decoding_both() {
             })
         });
         Net::new()
-            .journal(journal.clone())
             .ipv4_only()
             .host("plc", |h| h.at(PLC_ADDR).dns_name("plc1.plant.test").tcp(modbus::PORT, plant.clone(), || Plc))
             .host("hmi", |h| h.dns_name("hmi.plant.test").accept(80, httpd::Site::new(hmi)))
@@ -829,16 +810,16 @@ fn a_plc_and_a_web_server_on_one_net_with_observe_decoding_both() {
         web.write_all(&cx, b"GET / HTTP/1.1\r\nHost: hmi.plant.test\r\nConnection: close\r\n\r\n").await?;
         let page = String::from_utf8(read_some(&cx, &mut web, 1 << 16).await).unwrap();
         assert!(page.starts_with("HTTP/1.1 200 OK") && page.ends_with("setpoint 1500\n"), "{page}");
-        // A port with no service: refused, and journaled as blocked.
+        // A port with no service: refused, and recorded as blocked.
         assert_eq!(s.tcp.connect(&cx, SocketAddr::new(PLC_ADDR.into(), 102)).await.err(), Some(ConnError::Refused));
 
-        let alarm = kept.wait(&cx, 1, Duration::from_secs(2), |e| e.event.level == Level::Alarm).await;
-        assert_eq!(alarm[0].event.kind, "write_register");
-        let sandbox_name = |e: &Entry| e.conn.sandbox.as_ref().map(|s| s.name.to_string());
+        let alarm = kept.wait(&cx, 1, Duration::from_secs(2), |e| e.level == Level::Alarm).await;
+        assert_eq!(alarm[0].kind, "write_register");
+        let sandbox_name = |e: &Event| e.conn.sandbox.as_ref().map(|s| s.name.to_string());
         assert_eq!(sandbox_name(&alarm[0]).as_deref(), Some("operator"));
         assert_eq!(alarm[0].conn.local, Some(SocketAddr::new(PLC_ADDR.into(), 502)));
         kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("http", "request")).await;
-        let kinds: BTreeSet<String> = kept.entries().iter().map(|e| format!("{}.{}", e.event.service, e.event.kind)).collect();
+        let kinds: BTreeSet<String> = kept.all().iter().map(|e| format!("{}.{}", e.source, e.kind)).collect();
         for want in ["net.attached", "net.bound", "dns.query", "modbus.read", "modbus.write_register", "http.request", "net.blocked"] {
             assert!(kinds.contains(want), "no {want} in {kinds:?}");
         }
@@ -859,8 +840,7 @@ fn a_plc_and_a_web_server_on_one_net_with_observe_decoding_both() {
 #[test]
 fn net_serves_udp_services_and_trusted_sandboxes() {
     world(|cx| async move {
-        let journal = Journal::new();
-        let kept = journal.keep(1000);
+        let kept = cx.events();
         let counter = Arc::new(AtomicUsize::new(0));
         /// Counts datagrams.
         struct Udp;
@@ -879,7 +859,6 @@ fn net_serves_udp_services_and_trusted_sandboxes() {
         }
         let (attacher, attachments) = fictionet::attachments();
         Net::new()
-            .journal(journal)
             .ipv4_only()
             .host("svc", |h| h.at(Ipv4Addr::new(10, 40, 0, 1)).tcp(7, Arc::new(()), || Echo).udp(9, counter.clone(), || Udp))
             .route("box", Prefix { addr: Ipv4Addr::new(10, 50, 0, 7).into(), len: 32 })
@@ -893,7 +872,7 @@ fn net_serves_udp_services_and_trusted_sandboxes() {
         // A datagram's events name its sandbox, as a connection's do.
         let datagram = kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("udp", "datagram")).await;
         assert_eq!(datagram[0].conn.sandbox.as_ref().map(|s| s.name.to_string()).as_deref(), Some("agent"));
-        assert_eq!(datagram[0].conn.transport, fictionet::stdlib::journal::Transport::Udp);
+        assert_eq!(datagram[0].conn.transport, fictionet::events::Transport::Udp);
 
         // The trusted sandbox at its fixed address, reached from the agent.
         let boxed = sandbox(&cx, attacher.attach("box")?, Ipv4Addr::new(10, 50, 0, 7));
@@ -907,7 +886,7 @@ fn net_serves_udp_services_and_trusted_sandboxes() {
         assert_eq!(read_some(&cx, &mut ssh, 14).await, b"SSH-2.0-real\r\n");
 
         // The service's own events carry the connection, numbered by Net.
-        assert!(kept.entries().iter().all(|e| e.event.service != "echo"), "no line was sent yet");
+        assert!(kept.all().iter().all(|e| e.source != "echo"), "no line was sent yet");
         conn.write_all(&cx, b"hi\n").await?;
         let lines = kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("echo", "line")).await;
         assert_eq!(lines[0].conn.id, Some(1));
@@ -920,10 +899,9 @@ fn net_serves_udp_services_and_trusted_sandboxes() {
 // Scenarios
 
 #[test]
-fn a_scenario_changes_the_world_on_time_and_grades_the_journal() {
+fn a_scenario_changes_the_world_on_time_and_grades_the_events() {
     world(|cx| async move {
-        let journal = Journal::new();
-        let kept = journal.keep(100);
+        let kept = cx.events();
         let plant = Arc::new(Plant { limit: 1000, ..Plant::default() });
         let faults = FaultPlan::default();
         let scenario = Scenario::new()
@@ -935,7 +913,7 @@ fn a_scenario_changes_the_world_on_time_and_grades_the_journal() {
                 Plan { seed: 3, outbound: vec![Rule { when: Trigger::Always, fault: ByteFault::Drop(None) }], ..Plan::default() },
             )
             .expect("a read", |e| e.is("modbus", "read"))
-            .forbid("an unsafe write", |e| e.event.level == Level::Alarm)
+            .forbid("an unsafe write", |e| e.level == Level::Alarm)
             .expect("a payment", |e| e.is("bank", "pay"));
         let checks = scenario.checks();
         let started = cx.now();
@@ -949,7 +927,6 @@ fn a_scenario_changes_the_world_on_time_and_grades_the_journal() {
 
         let (attacher, attachments) = fictionet::attachments();
         Net::new()
-            .journal(journal)
             .ipv4_only()
             .host("plc", |h| h.at(PLC_ADDR).tcp_with(502, plant, || Plc, ServeOptions::default().faults(faults.clone())))
             .serve(&cx, attachments)?;
@@ -959,7 +936,7 @@ fn a_scenario_changes_the_world_on_time_and_grades_the_journal() {
         // Every reply is dropped by the plan the scenario set.
         assert_eq!(read_some(&cx, &mut conn, 11).await, b"");
         kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("modbus", "read")).await;
-        let report = checks.grade(&kept.entries());
+        let report = checks.grade(&kept.all());
         let passed: Vec<(String, bool, usize)> = report.facts.iter().map(|g| (g.fact.clone(), g.passed(), g.count)).collect();
         assert_eq!(
             passed,
@@ -1050,13 +1027,11 @@ fn net_routes_tls_by_name_to_each_service() {
     let (config, roots) = tls_pair(&["a.test", "b.test"]);
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
     let result = rt.block_on(run(move |cx| async move {
-        let journal = Journal::new();
-        let kept = journal.keep(1000);
+        let kept = cx.events();
         let (attacher, attachments) = fictionet::attachments();
         let (ca, cb) = (config.clone(), config.clone());
         let addr = Ipv4Addr::new(10, 40, 0, 2);
         Net::new()
-            .journal(journal)
             .ipv4_only()
             .add_host(
                 fictionet::stdlib::net::Host::new("tls")
@@ -1186,9 +1161,8 @@ fn a_decoder_that_skips_a_long_line_keeps_the_connection_open() {
     assert!(!h.closed());
     world(move |cx| async move {
         let (server, _su, client, _cu) = two_machines(&cx);
-        let journal = Journal::new();
-        let kept = journal.keep(100);
-        serve::listen(&cx, server.listen(7)?, Arc::new(()), || Short, ServeOptions::default().journal(journal));
+        let kept = cx.events();
+        serve::listen(&cx, server.listen(7)?, Arc::new(()), || Short, ServeOptions::default());
         let mut conn = client.connect(&cx, SocketAddr::new(SERVER.into(), 7)).await?;
         conn.write_all(&cx, &input).await?;
         assert_eq!(read_some(&cx, &mut conn, 8).await, b"long\nok\n");
@@ -1274,13 +1248,11 @@ fn net_performs_starttls_for_a_service_that_asks() {
     let (config, roots) = tls_pair(&["mail.test"]);
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
     let result = rt.block_on(run(move |cx| async move {
-        let journal = Journal::new();
-        let kept = journal.keep(1000);
+        let kept = cx.events();
         let (attacher, attachments) = fictionet::attachments();
         let addr = Ipv4Addr::new(10, 40, 0, 25);
         let opts = ServeOptions::default().starttls(config.clone());
         Net::new()
-            .journal(journal)
             .ipv4_only()
             .host("mail", |h| h.at(addr).dns_name("mail.test").tcp_with(25, Arc::new(()), || Mail { tls: false }, opts))
             .serve(&cx, attachments)?;
@@ -1662,8 +1634,8 @@ impl Service for Fragile {
     }
 }
 
-/// A panic closes its connection, is journaled, and the world goes on.
-/// Before, it ended the whole run. A service error is journaled too.
+/// A panic closes its connection, is recorded, and the world goes on.
+/// Before, it ended the whole run. A service error is recorded too.
 #[test]
 fn a_panic_or_an_error_closes_only_its_connection() {
     let mut h = Harness::new(Fragile, ());
@@ -1671,10 +1643,9 @@ fn a_panic_or_an_error_closes_only_its_connection() {
     assert_eq!(h.end_reason(), Some(Ended::Panicked));
     world(|cx| async move {
         let (attacher, attachments) = fictionet::attachments();
-        let journal = Journal::new();
-        let kept = journal.keep(1000);
+        let kept = cx.events();
         let addr = Ipv4Addr::new(10, 40, 0, 9);
-        Net::new().journal(journal).ipv4_only().host("svc", |h| h.at(addr).tcp(7, Arc::new(()), || Fragile)).serve(&cx, attachments)?;
+        Net::new().ipv4_only().host("svc", |h| h.at(addr).tcp(7, Arc::new(()), || Fragile)).serve(&cx, attachments)?;
         let s = sandbox(&cx, attacher.attach("agent")?, ME);
         let to = SocketAddr::new(addr.into(), 7);
         let mut a = s.tcp.connect(&cx, to).await?;
@@ -1716,14 +1687,12 @@ fn net_caps_connections_per_service_and_bytes_per_sandbox() {
     }
     world(|cx| async move {
         let (attacher, attachments) = fictionet::attachments();
-        let journal = Journal::new();
-        let kept = journal.keep(1000);
+        let kept = cx.events();
         let addr = Ipv4Addr::new(10, 40, 0, 3);
         let limits = fictionet::stdlib::net::Limits { sandbox_budget: 100 << 10, ..Default::default() };
         let capped = ServeOptions::default().max_conns(1).connection_events(false);
         let wide = ServeOptions::default();
         Net::new()
-            .journal(journal)
             .ipv4_only()
             .limits(limits)
             .host("svc", |h| h.at(addr).tcp_with(7, Arc::new(()), || Echo, capped).tcp_with(8, Arc::new(()), || Wide, wide))
@@ -1771,23 +1740,27 @@ fn net_refuses_a_host_it_cannot_serve() {
     });
 }
 
-/// A journal that nobody read when the connection opened still gets the
-/// connection's later events once a sink is added. Before, whether to log
-/// was decided once, at the start.
+/// A reader set after a connection opened still sees that connection's
+/// earlier events, and its later ones.
 #[test]
-fn a_sink_added_mid_connection_sees_its_events() {
+fn a_reader_added_mid_connection_sees_its_events() {
     world(|cx| async move {
         let (server, _su, client, _cu) = two_machines(&cx);
-        let journal = Journal::new().dashboard(false);
-        serve::listen(&cx, server.listen(7)?, Arc::new(()), || Echo, ServeOptions::default().journal(journal.clone()));
+        serve::listen(&cx, server.listen(7)?, Arc::new(()), || Echo, ServeOptions::default());
         let mut conn = client.connect(&cx, SocketAddr::new(SERVER.into(), 7)).await?;
         conn.write_all(&cx, b"before\n").await?;
         assert_eq!(read_some(&cx, &mut conn, 13).await, b"hello\nbefore\n");
-        let kept = journal.keep(100);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let s = seen.clone();
+        cx.events().subscribe(move |e| {
+            if e.is("echo", "line") {
+                s.lock().unwrap().push(e.summary.clone());
+            }
+        });
         conn.write_all(&cx, b"after\n").await?;
         assert_eq!(read_some(&cx, &mut conn, 6).await, b"after\n");
-        let lines = kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("echo", "line")).await;
-        assert_eq!(lines[0].event.summary, "after");
+        cx.events().wait(&cx, 2, Duration::from_secs(2), |e| e.is("echo", "line")).await;
+        assert_eq!(*seen.lock().unwrap(), ["before", "after"]);
         Ok(())
     });
 }
@@ -1838,18 +1811,17 @@ fn a_seeded_run_repeats_its_randomness() {
     assert_ne!(first, draws(8));
 }
 
-/// The network's journal starts with an entry that puts the run's clock on
-/// a calendar.
+/// A network's events start with one that puts the run's clock on a
+/// calendar.
 #[test]
-fn a_net_journal_starts_with_a_wall_clock_anchor() {
+fn a_net_starts_its_events_with_a_wall_clock_anchor() {
     world(|cx| async move {
-        let journal = Journal::new();
-        let kept = journal.keep(100);
+        let kept = cx.events();
         let (_attacher, attachments) = fictionet::attachments();
         let date = Fields::new().with("world_date", "2026-10-06");
-        Net::new().journal(journal).start_fields(date).serve(&cx, attachments)?;
-        let first = &kept.entries()[0];
-        assert!(first.is("journal", "start"));
+        Net::new().start_fields(date).serve(&cx, attachments)?;
+        let first = &kept.all()[0];
+        assert!(first.is("run", "start"));
         assert_eq!(first.at, fictionet::time::Instant::ZERO);
         assert_eq!(first.str("world_date"), Some("2026-10-06"));
         assert!(first.get("wall").and_then(json::Value::as_f64).is_some_and(|w| w > 1.7e9));
@@ -1893,7 +1865,7 @@ fn a_connection_counts_until_its_socket_is_gone() {
 
 /// A LAN joins Net: a host placed on it, a VM attached to it as a member,
 /// DNS at the LAN's first address, the agent reaching the LAN through the
-/// router, multicast from a host to a member, and LAN drops journaled.
+/// router, multicast from a host to a member, and LAN drops recorded.
 #[test]
 fn hosts_and_members_share_a_lan_on_the_net() {
     /// Sends `tick` to a multicast group every 20 ms.
@@ -1919,15 +1891,13 @@ fn hosts_and_members_share_a_lan_on_the_net() {
         }
     }
     world(|cx| async move {
-        let journal = Journal::new();
-        let kept = journal.keep(1000);
+        let kept = cx.events();
         let (attacher, attachments) = fictionet::attachments();
         let lan: Prefix = "192.168.56.0/24".parse()?;
         let dc: Ipv4Addr = "192.168.56.10".parse()?;
         let ws: Ipv4Addr = "192.168.56.31".parse()?;
         let group = SocketAddr::new(Ipv4Addr::new(239, 1, 1, 1).into(), 30001);
         Net::new()
-            .journal(journal)
             .ipv4_only()
             .lan("corp", lan)
             .host("dc01", |h| h.on("corp").at(dc).dns_name("dc01.corp.test").tcp(389, Arc::new(()), || Echo))
@@ -1962,16 +1932,16 @@ fn hosts_and_members_share_a_lan_on_the_net() {
         conn.write_all(&cx, b"hi\n").await?;
         assert_eq!(read_some(&cx, &mut conn, 3).await, b"hi\n");
         // An address on the LAN with no member: the LAN drops it, and the
-        // journal says so.
+        // events say so.
         let mut u = agent.udp.bind(5000)?;
         u.send_to(b"anyone?", SocketAddr::new(Ipv4Addr::new(192, 168, 56, 99).into(), 7));
         let drops = kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("net", "blocked") && e.str("why") == Some("Lan")).await;
         assert_eq!(drops[0].str("detail"), Some("no member at that address"));
         assert_eq!(drops[0].conn.sandbox.as_ref().map(|s| s.name.to_string()).as_deref(), Some("agent"));
-        // The VM is named in the journal like any sandbox.
+        // The VM is named in events like any sandbox.
         let joined = kept.of("net", "attached");
         assert!(joined.iter().any(|e| e.conn.sandbox.as_ref().is_some_and(|s| &*s.name == "ws01")));
-        let vm_lines: Vec<Entry> = kept.entries().into_iter().filter(|e| e.conn.sandbox.as_ref().is_some_and(|s| &*s.name == "ws01") && e.is("dns", "query")).collect();
+        let vm_lines: Vec<Event> = kept.all().into_iter().filter(|e| e.conn.sandbox.as_ref().is_some_and(|s| &*s.name == "ws01") && e.is("dns", "query")).collect();
         assert!(!vm_lines.is_empty());
         Ok(())
     });

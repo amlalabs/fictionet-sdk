@@ -766,8 +766,8 @@ struct HttpCase {
     body: usize,
     sites: usize,
     watch: Watch,
-    /// Whether the world sets a journal with a callback (one that does
-    /// nothing).
+    /// Whether the world subscribes a callback (one that does nothing) to
+    /// its events.
     hooks: bool,
 }
 
@@ -830,7 +830,7 @@ fn http_row(t: &mut Table, reps: usize, case: HttpCase) {
         if case.h2 { "HTTP/2" } else { "HTTP/1.1" },
         case.sandboxes,
         if case.sites > 1 { format!(", {} sites", case.sites) } else { String::new() },
-        if case.hooks { ", journal set" } else { "" },
+        if case.hooks { ", events subscribed" } else { "" },
         match case.watch {
             Watch::None => "",
             Watch::Graph => ", graph watched",
@@ -927,14 +927,12 @@ fn http_run(case: HttpCase) -> HttpRun {
                 .with_single_cert(chain, key)?,
         );
         let page = Page(Bytes::from(vec![b'x'; case.body]));
-        let mut sites = web::Sites::new(move |_| {
+        let sites = web::Sites::new(move |_| {
             let config = config.clone();
             Some(web::Site::new(page.clone()).tls(move |_| config.clone()))
         });
         if case.hooks {
-            let journal = fictionet::stdlib::journal::Journal::new();
-            journal.subscribe(|_| {});
-            sites = sites.journal(journal);
+            cx.events().subscribe(|_| {});
         }
         sites.serve(&cx, attachments)?;
         let machines: Vec<Machine> =
@@ -1375,20 +1373,15 @@ fn proxy_run(burst: usize, sequential: usize) -> ((u64, f64), (u64, f64)) {
         std::thread::spawn(move || {
             finish(block_on(run(move |cx| async move {
                 let page = Page(Bytes::from_static(b"plain site\n"));
-                web::Sites::new(move |host: &str| (host == "plain.test").then(|| web::Site::new(page.clone()).plain_http()))
-                    .journal({
-                        let journal = fictionet::stdlib::journal::Journal::new();
-                        journal.subscribe(move |e| {
-                            if e.is("dns", "query")
-                                && let Some(name) = e.str("name")
-                                && e.u64("qtype") == Some(1)
-                            {
-                                *queries.lock().unwrap().entry(name.to_owned()).or_default() += 1;
-                            }
-                        });
-                        journal
-                    })
-                    .serve(&cx, attachments)?;
+                cx.events().subscribe(move |e| {
+                    if e.is("dns", "query")
+                        && let Some(name) = e.str("name")
+                        && e.u64("qtype") == Some(1)
+                    {
+                        *queries.lock().unwrap().entry(name.to_owned()).or_default() += 1;
+                    }
+                });
+                web::Sites::new(move |host: &str| (host == "plain.test").then(|| web::Site::new(page.clone()).plain_http())).serve(&cx, attachments)?;
                 while !stop.load(Ordering::Acquire) {
                     cx.sleep(fictionet::time::ms(10)).await?;
                 }

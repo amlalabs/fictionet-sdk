@@ -163,7 +163,7 @@
 //!    │ ◀── reply 1: {"event":"counters",.. ── │  part: one value each
 //!    │ ── request 2: {"op":"graph"} ────────▶ │
 //!    │ ◀── reply 2: {"t":..,"nodes":[..]} ─── │  END: request 2 is answered
-//!    │ ◀── reply 1: {"event":"note",.. ────── │  the stream goes on
+//!    │ ◀── reply 1: {"event":"event",.. ───── │  the stream goes on
 //!    │ ── request 3: {"op":"cancel","id":1} ▶ │
 //!    │ ◀── reply 1: {"event":"end",..} ────── │  END: the stream is over
 //!    │ ◀── reply 3: {"ok":true} ──────────── │  END

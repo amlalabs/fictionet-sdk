@@ -1,10 +1,10 @@
-//! The request log, written from the journal of everything the network
+//! The request log, written from the events of everything the network
 //! does: one line per DNS query, rejected or failed TLS handshake, and HTTP
 //! request, in the formats FakeWiki's main.py used.
 //!
 //! The handler ([`content`](crate::content)) puts what it knows about a
 //! page (its kind, topic, source and stance) in its response's extensions
-//! as journal fields ([`Page::fields`]). The `http.request` entry brings
+//! as event fields ([`Page::fields`]). The `http.request` event brings
 //! them back here, so one `http` line holds both what the agent asked for
 //! and what it was shown.
 
@@ -12,7 +12,8 @@ use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
-use fictionet::stdlib::journal::{Entry, Fields, Journal, opt};
+use fictionet::Cx;
+use fictionet::events::{Event as Entry, Fields, opt};
 use fictionet::stdlib::json::Value as J;
 use serde_json::{Value, json};
 
@@ -36,7 +37,7 @@ pub struct Page {
 }
 
 impl Page {
-    /// The page as fields of its request's journal entry.
+    /// The page as fields of its request's event.
     pub fn fields(&self) -> Fields {
         Fields::new()
             .with("kind", self.kind.as_str())
@@ -48,15 +49,13 @@ impl Page {
     }
 }
 
-/// The journal that writes the request log.
-pub fn journal(hosts: HashMap<String, Ipv4Addr>, log: Arc<Log>) -> Journal {
-    let journal = Journal::new();
-    journal.subscribe(move |entry| {
-        if let Some(line) = line(&hosts, entry) {
+/// Writes the request log from `cx`'s run's events.
+pub fn log_to(cx: &Cx, hosts: HashMap<String, Ipv4Addr>, log: Arc<Log>) {
+    cx.events().subscribe(move |event| {
+        if let Some(line) = line(&hosts, event) {
             log.write(line);
         }
     });
-    journal
 }
 
 fn text(e: &Entry, name: &str) -> Option<String> {
@@ -67,7 +66,7 @@ fn text(e: &Entry, name: &str) -> Option<String> {
 fn line(hosts: &HashMap<String, Ipv4Addr>, e: &Entry) -> Option<Value> {
     let name = e.conn.sandbox.as_ref().map(|s| s.name.clone());
     let ours = name.as_deref() == Some(LOOKUPS);
-    match (e.event.service, e.event.kind) {
+    match (e.source, e.kind) {
         ("net", "attached") if !ours => {
             println!("attached {}", name.as_deref().unwrap_or(""));
             None

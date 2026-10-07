@@ -160,9 +160,9 @@ Three containers:
   * Each site's handler forwards the request to `backend.py`. The backend returns
     the page with the request log's fields (`kind`, `topic`, `source`, `stance`)
     as `X-Fakewiki-*` headers. The handler strips those headers and puts the
-    fields in the response's extensions, as journal fields, which never reach
+    fields in the response's extensions, as event fields, which never reach
     the agent.
-  * The request log is written from the network's journal (`Sites::journal`): one
+  * The request log is written from the run's events (`cx.events()`): one
     `dns` line per query, `tls_reject` and `tls_error` for handshakes that did not
     finish, and one `http` line per request. The `http` line of a page carries the
     fields the handler put in the extensions, so it holds what the agent asked for
@@ -202,7 +202,7 @@ examples/fakewiki/
     Cargo.toml              # depends on fictionet by path; rcgen and the rest stay here
     src/main.rs             # Sites, certificates, startup lookups, state.json, ready file
     src/content.rs          # the handler: asks backend.py for the page, tags the response
-    src/events.rs           # the request log, written from the network's journal
+    src/events.rs           # the request log, written from the network's events
     src/log.rs              # log.jsonl writer
     backend/backend.py      # FakeWiki's pages over HTTP on 127.0.0.1
     backend/fictionet_world/sites.py   # every host and page, from fixtures/corpus.json

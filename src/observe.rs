@@ -70,7 +70,7 @@
 //! $ fictionet observe --world unix:/run/fictionet/world.sock watch
 //! {"event":"snapshot","data":{"t":123.288818,"started":1790989827708,"ended":false,"nodes":[{"id":"s7","kind":"sandbox","name":"agent"},...
 //! {"event":"counters","data":{"t":123.538718,"edges":{"e2":[1642,110577,1642,117625],...}}}
-//! {"event":"note","data":{"seq":527,"t":123.324772,"node":"t7","kind":"event","task":"names::serve_udp",...,"name":"dns_query","data":{"sandbox":"agent","name":"example.test","answer":"203.0.113.10"}}}
+//! {"event":"event","data":{"seq":527,"at":123.324772,"source":"dns","kind":"query",...,"fields":{"name":"example.test","qtype":1,...},"node":"t7",...}}
 //! ```
 //!
 //! `watch` runs until you stop it. `fictionet observe --help` lists every
@@ -161,47 +161,38 @@
 //! the same [region](crate::Cx#regions). [`Cx::group`](crate::Cx::group)
 //! says what a group costs.
 //!
-//! # Custom events
+//! # Events
 //!
-//! World code can send events of its own. Observers see each one with the
-//! task that sent it and the time on the world's clock. The dashboard lists
-//! them under **Events**, and a click shows the task. The `web_world`
-//! example sends one per HTTP request, from its
-//! [journal](crate::stdlib::journal):
+//! Every run keeps its [events](crate::events): what the stdlib's
+//! services and network pieces saw, and what world code records with
+//! [`Cx::record`](crate::Cx::record). The log keeps them whether or not
+//! anyone watches, so an observer that connects late first sees what the
+//! log still holds, then each new event as it comes. The dashboard lists
+//! them under **Events**, each with the task that recorded it and the time
+//! on the world's clock, and a click shows the task. The `web_world`
+//! example's sites record one event per DNS query, TLS handshake and HTTP
+//! request.
 //!
 //! ```
 //! # use fictionet::Cx;
-//! # use fictionet::stdlib::journal::Entry;
-//! fn observed(cx: &Cx, entry: &Entry) {
-//!     if entry.is("http", "request") {
-//!         cx.event("http_request")
-//!             .str("method", entry.str("method").unwrap_or(""))
-//!             .str("path", entry.str("path").unwrap_or(""))
-//!             .int("status", entry.u64("status").unwrap_or(0) as i64)
-//!             .emit();
-//!     }
+//! use fictionet::events::Event;
+//! fn sold(cx: &Cx, item: &str, count: u32) {
+//!     cx.record(Event::new("shop", "order").summary(format!("{count} × {item}")).field("item", item).field("count", count));
 //! }
 //! ```
 //!
-//! A [`Journal`](crate::stdlib::journal::Journal) also shows every entry
-//! to observers itself, as an event named `service.kind` (`dns.query`,
-//! `http.request`), unless the world turns that off.
+//! The core records events of its own:
 //!
-//! [`Cx::event`](crate::Cx::event) builds a flat JSON object field by
-//! field. [`Cx::emit`](crate::Cx::emit) takes any JSON text, such as the
-//! output of `serde_json`. Both cost almost nothing while no observer is
-//! following the world: the event is never made, and nothing is kept.
-//! [`Cx::observed`](crate::Cx::observed) tells you whether an observer is
-//! following, so you can skip expensive work too.
-//!
-//! The stdlib sends events of its own:
-//!
-//! - [`bottleneck`](crate::stdlib::bottleneck) reports each packet its full
-//!   queue drops, and the dashboard counts them on its node.
-//! - A [router](crate::stdlib::route::router) reports a route it removes
-//!   because the route's interface closed.
-//! - The [TLS](crate::stdlib::tls) server reports each session whose keys
-//!   it kept (see below).
+//! - [`bottleneck`](crate::stdlib::bottleneck) records each packet its full
+//!   queue drops (`bottleneck.drop`), and the dashboard counts them on its
+//!   node.
+//! - A [router](crate::stdlib::route::router) records a route it removes
+//!   because the route's interface closed (`router.route_removed`).
+//! - A [LAN](crate::stdlib::route::lan) records each packet it drops
+//!   (`lan.drop`) and each member replaced or gone (`lan.member_replaced`,
+//!   `lan.member_removed`).
+//! - The [TLS](crate::stdlib::tls) server records each session whose keys
+//!   it kept for observers (`tls.keys`, see below).
 //!
 //! # Packets, decoding and decryption
 //!
@@ -283,7 +274,9 @@
 //! Each task's start and end, and each task's first use of a link end, take
 //! one lock. A task that does nothing but read one end of a pair costs
 //! about 165 ns more to spawn and end: a median of 586 ns, against 420 ns.
-//! Events, TLS keys and packet copies cost nothing until someone observes.
+//! TLS keys and packet copies cost nothing until someone observes. Events
+//! are recorded either way; [`events`](crate::events#what-it-costs) says
+//! what that costs.
 //!
 //! Watching links is not free once traffic is heavy. Each watched packet
 //! takes two locks, and the packets kept are decoded and turned into JSON
@@ -309,9 +302,9 @@
 //! |---|---|---|
 //! | `world` | | `{"observe":1,"fictionet":"0.0.0","running":true,"ended":false,"started":1790989827708,"t":123.28}` |
 //! | `graph` | | the [graph](#the-graph) as it is now |
-//! | `watch` | | a stream: the graph, then [what changes](#changes) |
+//! | `watch` | `after`: an event number, optional | a stream: the graph, then [what changes](#changes) |
 //! | `counters` | | `{"t":..,"edges":{"e7":[p,b,p,b],..}}` for every link |
-//! | `notes` | `after`: a note number | `{"notes":[..]}`, the [notes](#notes) after that one |
+//! | `events` | `after`: an event number; `max`: at most this many, default 1,000 | `{"events":[..]}`, the [events](#events-1) after that one |
 //! | `link` | `link`: such as `"e7"` | one edge, with its `counters` |
 //! | `packets` | `link`, `after`: a packet number | a stream: `link`, then each [packet](#packets) |
 //! | `packet` | `link`, `seq` | one packet's [layers and bytes](#packets) |
@@ -347,7 +340,7 @@
 //!           {"id":"s7","kind":"sandbox","name":"agent"}],
 //!  "edges":[{"id":"e7","a":"t11","b":"s7","label":null}],
 //!  "counters":{"e7":[95987,136344354,56916,2816859]},
-//!  "notes":[...]}
+//!  "events":[...]}
 //! ```
 //!
 //! - `t` is seconds since the world started, on its clock. `started` is
@@ -390,28 +383,33 @@
 //!   comes before the nodes in it, and `group_end` after them.
 //! - `counters`: `{"t":..,"edges":{..}}`, only the links whose counts
 //!   changed. Counts only grow, so a rate is the difference over the time.
-//! - `note`: one new [note](#notes).
+//! - `event`: one new [event](#events-1). With `after`, `watch` first
+//!   sends every event the log holds after that number, a thousand every
+//!   quarter second, then each new one: `"after":0` replays the whole log.
 //! - `ended`: `{"t":..}`, once the world has ended.
 //!
 //! Clients should ignore events and fields they do not know.
 //!
-//! ## Notes
+//! ## Events
 //!
-//! A note is an event from the stdlib or from world code:
+//! An event, in the `events` reply, the snapshot and the `event` messages
+//! of `watch`, is [`Event::to_json`](crate::events::Event::to_json):
 //!
 //! ```text
-//! {"seq":527,"t":123.32,"node":"t7","kind":"event","task":"names::serve_udp",
-//!  "file":"src/stdlib/net.rs","line":442,"parent":"t1",
-//!  "name":"dns_query","data":{"sandbox":"agent","name":"example.test","answer":"203.0.113.10"}}
+//! {"seq":527,"at":123.32,"source":"dns","kind":"query","level":"info",
+//!  "summary":"example.test A: 203.0.113.10","sandbox":{"id":1,"name":"agent",
+//!  "addr":"10.0.0.2","addr_v6":null},"conn":null,"local":null,"peer":"10.0.0.2:47583",
+//!  "transport":"tcp","sni":null,"fields":{"name":"example.test","qtype":1,...},
+//!  "node":"t7","task":"net::serve_dns","file":"src/stdlib/net.rs","line":1750,"parent":"t1"}
 //! ```
 //!
-//! `seq` numbers notes from 1. `node` is the task that sent it, and `task`,
-//! `file`, `line` and `parent` describe that task, since a short task may
-//! have ended before anyone reads the note. `kind` is `event` for world
-//! code's events, with `name` and `data`. The stdlib's are `drop`,
-//! `route_removed` and `tls_keys`, with a `text`, and `packet`, whether the
-//! note kept the packet it is about. The world keeps its latest 5,000
-//! notes.
+//! `seq` numbers the run's events from 1, with no gaps, and `at` is when it
+//! happened, in seconds on the world's clock. `node` is the task that
+//! recorded it, and `task`, `file`, `line` and `parent` describe that task,
+//! since a short task may have ended before anyone reads the event. The
+//! world keeps its latest 50,000 events, up to 16 MiB of them. A reader that asks
+//! for events the log no longer holds gets one `events.dropped` event
+//! first, whose `count` field says how many it missed.
 //!
 //! ## Packets
 //!
@@ -585,105 +583,21 @@ pub(crate) fn existing_watch(graph: &Graph, id: u64) -> Option<Arc<LinkWatch>> {
     lock(&graph.watches).get(&id).cloned()
 }
 
-/// A custom event, built field by field, from [`Cx::event`].
-///
-/// While no observer is subscribed, the builder holds nothing and every
-/// method returns immediately, so building an event costs almost nothing.
-#[must_use = "an event is sent by calling emit"]
-pub struct Event<'a> {
-    cx: &'a Cx,
-    /// The name and the JSON object so far, only while observed.
-    building: Option<(String, json::Object)>,
-}
-
-impl<'a> Event<'a> {
-    pub(crate) fn new(cx: &'a Cx, name: &str) -> Event<'a> {
-        let building = cx.graph().observed().then(|| (name.to_owned(), json::Object::new()));
-        Event { cx, building }
-    }
-
-    fn with(mut self, f: impl FnOnce(json::Object) -> json::Object) -> Event<'a> {
-        if let Some((name, object)) = self.building.take() {
-            self.building = Some((name, f(object)));
-        }
-        self
-    }
-
-    /// Adds a text field.
-    pub fn str(self, key: &str, value: &str) -> Event<'a> {
-        self.with(|o| o.str(key, value))
-    }
-
-    /// Adds a number field. Numbers that are not finite become `null`.
-    pub fn num(self, key: &str, value: impl Into<f64>) -> Event<'a> {
-        let v: f64 = value.into();
-        self.with(|o| if v.is_finite() { o.num(key, v) } else { o.raw(key, "null") })
-    }
-
-    /// Adds a whole-number field.
-    pub fn int(self, key: &str, value: impl Into<i64>) -> Event<'a> {
-        let v: i64 = value.into();
-        self.with(|o| o.num(key, v))
-    }
-
-    /// Adds a true or false field.
-    pub fn bool(self, key: &str, value: bool) -> Event<'a> {
-        self.with(|o| o.bool(key, value))
-    }
-
-    /// Sends the event to the observers.
-    pub fn emit(self) {
-        if let Some((name, object)) = self.building {
-            self.cx.graph().event(self.cx.now().since_start(), name, object.done());
-        }
-    }
-}
-
-impl std::fmt::Debug for Event<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Event").field("observed", &self.building.is_some()).finish()
-    }
-}
-
-/// Why [`Cx::emit`] refused an event.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct NotJson;
-
-impl std::fmt::Display for NotJson {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("the event's payload is not one JSON value")
-    }
-}
-
-impl std::error::Error for NotJson {}
-
-/// Sends a custom event whose payload is JSON text already.
-pub(crate) fn emit(cx: &Cx, name: &str, payload: &str) -> Result<(), NotJson> {
-    let graph = cx.graph();
-    if !graph.observed() {
-        return Ok(());
-    }
-    if !json::is_value(payload) {
-        return Err(NotJson);
-    }
-    // One line, so it can go in a server-sent event or a line of output.
-    graph.event(cx.now().since_start(), name.to_owned(), json::compact(payload));
-    Ok(())
-}
-
-/// Tells observers that a queue dropped `packet` with `waiting` packets
-/// ahead of it.
-pub(crate) fn note_drop(cx: &Cx, packet: &crate::Packet, waiting: usize) {
-    note_dropped(cx, packet, &format!("the queue was full, {waiting} packets waiting"));
-}
-
-/// Tells observers that `packet` was dropped, and `why`: a note of kind
-/// `drop` with the packet's addresses, protocol and length.
-pub(crate) fn note_dropped(cx: &Cx, packet: &crate::Packet, why: &str) {
+/// Records that `source` dropped `packet`, and `why`: a `drop` event with
+/// the packet's addresses, protocol and length.
+pub(crate) fn record_drop(cx: &Cx, source: &'static str, packet: &crate::Packet, why: &str) {
     // Only the headers: this runs on the world's own thread.
     let d = decode::Dissector::headers_only().decode(&packet.0, &[]);
-    let text = format!("{} → {} {} ({} bytes): {why}", d.src, d.dst, d.proto, packet.0.len());
-    cx.graph().note("drop", text, Some(&packet.0));
+    let summary = format!("{} → {} {} ({} bytes): {why}", d.src, d.dst, d.proto, packet.0.len());
+    let event = crate::events::Event::new(source, "drop")
+        .level(crate::events::Level::Notice)
+        .summary(summary)
+        .field("src", d.src)
+        .field("dst", d.dst)
+        .field("protocol", d.proto)
+        .field("len", packet.0.len() as u64)
+        .field("why", why);
+    cx.record(event);
 }
 
 /// A link an [`Interface`](crate::Interface) belongs to, so the stdlib can
@@ -701,7 +615,6 @@ impl std::fmt::Debug for LinkHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::Ordering;
 
     /// A link is copied only while a `packets` stream subscribes, and a
     /// kept watch does not keep its world alive.
@@ -811,51 +724,21 @@ mod tests {
         .unwrap();
     }
 
-    /// A router keeps a note of a route it removes only while observed.
+    /// A router records a route it removes, with no observer.
     #[test]
-    fn route_notes_are_kept_only_while_observed() {
+    fn routers_record_routes_they_remove() {
         crate::block_on(crate::run(|cx| async move {
             let (a, b) = crate::pair();
             let (c, d) = crate::pair();
             let router = crate::stdlib::route::router(&cx, vec![("10.0.0.0/24".parse().unwrap(), Box::new(a))]);
             router.add("10.0.1.0/24".parse().unwrap(), Box::new(c));
+            assert!(!cx.observed());
             drop(b);
             cx.sleep(Duration::from_millis(10)).await?;
-            assert!(cx.graph().state().notes.is_empty());
-            cx.graph().viewers.fetch_add(1, Ordering::Relaxed);
+            let removed = cx.events().of("router", "route_removed");
+            assert_eq!(removed.len(), 1);
+            assert_eq!(removed[0].str("prefix"), Some("10.0.0.0/24"));
             drop(d);
-            cx.sleep(Duration::from_millis(10)).await?;
-            let notes: Vec<_> = cx.graph().state().notes.iter().map(|n| n.kind).collect();
-            assert_eq!(notes, ["route_removed"]);
-            Ok(())
-        }))
-        .unwrap();
-    }
-
-    /// With no observer, events are not built and nothing is kept. With
-    /// one, each event is kept with its task and time.
-    #[test]
-    fn events_are_kept_only_while_observed() {
-        crate::block_on(crate::run(|cx| async move {
-            assert!(!cx.observed());
-            cx.event("request").str("host", "example.test").int("status", 200).emit();
-            assert_eq!(cx.emit("raw", "not json"), Ok(()), "unobserved payloads are not read");
-            assert!(cx.graph().state().notes.is_empty());
-
-            cx.graph().viewers.fetch_add(1, Ordering::Relaxed);
-            assert!(cx.observed());
-            cx.event("request").str("host", "example.test").int("status", 200).bool("tls", true).num("ms", 1.5).emit();
-            assert_eq!(cx.emit("raw", r#" {"a":[1,2]} "#), Ok(()));
-            assert_eq!(cx.emit("bad", "{"), Err(NotJson));
-            let notes: Vec<_> = cx.graph().state().notes.iter().cloned().collect();
-            assert_eq!(notes.len(), 2);
-            let (name, data) = notes[0].event.clone().unwrap();
-            assert_eq!(name, "request");
-            assert_eq!(data, r#"{"host":"example.test","status":200,"tls":true,"ms":1.5}"#);
-            assert_eq!(notes[1].event.clone().unwrap().1, r#"{"a":[1,2]}"#);
-            // The world function is the first task.
-            assert_eq!(notes[0].task, 1);
-            assert!(notes[0].at <= notes[1].at && notes[1].at <= cx.now().since_start());
             Ok(())
         }))
         .unwrap();

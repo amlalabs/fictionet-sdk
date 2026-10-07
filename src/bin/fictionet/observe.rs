@@ -17,9 +17,10 @@ keylog) are written to stdout as they are.
 Requests:
   world                   the world's API version and whether it runs
   graph                   the tasks, sandboxes and links, with counters (the default)
-  watch                   the graph, then every change, as JSON lines
+  watch [<after>]         the graph, then every change, as JSON lines; with <after>,
+                          first every event the world kept after that number
   counters                packets and bytes on every link
-  notes [<after>]         drops, route removals, TLS keys and custom events
+  events [<after>]        the events the world kept after that number (from 0), up to 1000
   link <link>             one link, such as e12
   packets <link>          a link's packets as they cross it, decoded
   packet <link> <seq>     one packet's layers and bytes (while the link is watched)
@@ -37,9 +38,8 @@ pub(crate) fn request(words: &[String]) -> Result<String, String> {
     Ok(match w.as_slice() {
         [] | ["graph"] => r#"{"op":"graph"}"#.into(),
         [json] if json.starts_with('{') => (*json).to_owned(),
-        [op @ ("world" | "watch" | "counters" | "keylog")] => format!(r#"{{"op":"{op}"}}"#),
-        ["notes"] => r#"{"op":"notes"}"#.into(),
-        ["notes", after] => format!(r#"{{"op":"notes","after":{}}}"#, number(after)?),
+        [op @ ("world" | "watch" | "counters" | "keylog" | "events")] => format!(r#"{{"op":"{op}"}}"#),
+        [op @ ("watch" | "events"), after] => format!(r#"{{"op":"{op}","after":{}}}"#, number(after)?),
         [op @ ("link" | "packets" | "pcap"), l] => format!(r#"{{"op":"{op}","link":{}}}"#, link(l)),
         ["packet", l, seq] => format!(r#"{{"op":"packet","link":{},"seq":{}}}"#, link(l), number(seq)?),
         _ => return Err(format!("unknown request: {}", words.join(" "))),
@@ -149,7 +149,8 @@ mod tests {
         assert_eq!(request(&words("watch")).unwrap(), r#"{"op":"watch"}"#);
         assert_eq!(request(&words("packets e12")).unwrap(), r#"{"op":"packets","link":"e12"}"#);
         assert_eq!(request(&words("packet e12 40")).unwrap(), r#"{"op":"packet","link":"e12","seq":40}"#);
-        assert_eq!(request(&words("notes 7")).unwrap(), r#"{"op":"notes","after":7}"#);
+        assert_eq!(request(&words("events 7")).unwrap(), r#"{"op":"events","after":7}"#);
+        assert_eq!(request(&words("watch 0")).unwrap(), r#"{"op":"watch","after":0}"#);
         assert!(request(&words("packet e12 x")).is_err());
         assert!(request(&words("fly")).is_err());
     }
