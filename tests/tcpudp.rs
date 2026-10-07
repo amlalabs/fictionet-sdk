@@ -741,13 +741,15 @@ fn tcp_syn(src: IpAddr, sport: u16, dst: IpAddr, dport: u16) -> Packet {
 }
 
 /// A connection handed to tokio code with `into_tokio`, served from tokio
-/// tasks on other threads while a tokio runtime polls the run.
+/// tasks on other threads while a tokio runtime polls the run. It has no
+/// wall-clock limit of its own, so a loaded machine cannot fail it;
+/// nextest's slow-timeout (`.config/nextest.toml`) stops a run that hangs.
 #[test]
 fn tcp_through_tokio_io() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
     let result = rt.block_on(async {
-        let world = run(|fcx| async move {
+        run(|fcx| async move {
             let (ea, eb) = two_tcp(&fcx, A, B);
             let mut listener = eb.listen(80)?;
             let server_fcx = fcx.clone();
@@ -773,8 +775,8 @@ fn tcp_through_tokio_io() {
             server.await?;
             client.await?;
             Err(fictionet::Error::from(Done))
-        });
-        tokio::time::timeout(Duration::from_secs(20), world).await.expect("timed out")
+        })
+        .await
     });
     assert!(result.unwrap_err().downcast_ref::<Done>().is_some());
 }

@@ -672,6 +672,17 @@ impl State {
         self.remove_socket(h);
     }
 
+    /// smoltcp ignores ACKs that advance no data in LAST-ACK, including
+    /// window updates and duplicate ACKs needed to recover lost data.
+    /// Keep the socket in ESTABLISHED or CLOSE-WAIT until every queued
+    /// byte is acknowledged. Then send the FIN. This also keeps the FIN
+    /// from reaching the peer ahead of a hole and being discarded.
+    fn close_if_drained(&mut self, h: Id) {
+        if self.conns[&h].shut && self.get(h).send_queue() == 0 {
+            self.sock(h).close();
+        }
+    }
+
     /// Hands a socket whose handle is gone to the driver, which removes it
     /// once it has closed. Unread data means the application lost bytes,
     /// so the peer gets a RST, as from a kernel.
@@ -680,15 +691,16 @@ impl State {
             self.remove_conn(h);
             return;
         }
-        let s = self.sock(h);
-        if abort || s.can_recv() {
-            s.abort();
+        if abort || self.get(h).can_recv() {
+            self.sock(h).abort();
         } else {
-            s.close();
+            self.conns.get_mut(&h).unwrap().shut = true;
+            self.close_if_drained(h);
         }
         // A FIN-WAIT-2 orphan should not live on keepalives, and a peer
         // that never closes its side keeps it only for a minute, as Linux
         // does (tcp_fin_timeout).
+        let s = self.sock(h);
         s.set_keep_alive(None);
         s.set_timeout(Some(ORPHAN_TIMEOUT.into()));
         self.orphans.push(h);
@@ -747,7 +759,8 @@ impl State {
         }
         let mut packet = packet;
         let mut extra = None;
-        if let Some(&h) = self.by_tuple.get(&(dst, src)) {
+        let handle = self.by_tuple.get(&(dst, src)).copied();
+        if let Some(h) = handle {
             let c = self.conns.get_mut(&h).unwrap();
             c.rst |= rst;
             c.fin |= fin;
@@ -781,13 +794,18 @@ impl State {
                 self.sockets.get_mut::<stcp::Socket>(self.handles[&h]).set_ack_delay(None);
             }
         }
-        if let Some(p) = extra {
-            self.dev.rx = Some(p);
-            self.iface.poll_ingress_single(now, &mut self.dev, &mut self.sockets);
+        if let Some((p, count)) = extra {
+            for _ in 0..count {
+                self.dev.rx = Some(p.clone());
+                self.iface.poll_ingress_single(now, &mut self.dev, &mut self.sockets);
+            }
         }
         self.dev.rx = Some(packet);
         self.iface.poll_ingress_single(now, &mut self.dev, &mut self.sockets);
         self.dev.rx = None;
+        if let Some(h) = handle {
+            self.close_if_drained(h);
+        }
         if listening {
             // At most one idle socket took the SYN.
             let l = self.listeners.get_mut(&dst.port()).unwrap();
@@ -889,7 +907,7 @@ impl State {
     }
 }
 
-/// Works around two places where smoltcp ignores what an ACK says.
+/// Repairs ACK handling in smoltcp. Returns a copy and how often to feed it.
 ///
 /// 1. smoltcp reads the acknowledgment of a segment only if the segment's
 ///    sequence number is inside its receive window. Window scaling rounds
@@ -901,14 +919,20 @@ impl State {
 ///    window is closed. So when a segment from the peer starts past what
 ///    this side has received and carries a new acknowledgment or window,
 ///    smoltcp first gets a copy without data at the expected sequence
-///    number, which it always accepts. This returns that copy.
+///    number.
 /// 2. smoltcp counts an ACK as a duplicate (for fast retransmit) only if
 ///    the window is unchanged. Linux's duplicate ACKs often change the
 ///    window by a little, so smoltcp waits for its retransmission timer
 ///    (at least one second) instead. A pure ACK with SACK blocks that
 ///    repeats the last acknowledgment is a duplicate (RFC 6675), so its
-///    window is set back to the last one smoltcp saw.
-fn repair_ack(c: &mut Conn, s: &stcp::Socket<'static>, ip: &Header, packet: &mut Vec<u8>) -> Option<Vec<u8>> {
+///    window is set back to the last one smoltcp saw. Transitions to or
+///    from zero must still reach smoltcp.
+/// 3. A zero window can replace the retransmission timer while bytes are
+///    still in flight. Probes start past those bytes. Reopening the window
+///    cancels probing but does not restore their retransmission timer.
+///    Feed the window update, then three copies as duplicate ACKs, to
+///    trigger fast retransmit if any bytes are still unacknowledged.
+fn repair_ack(c: &mut Conn, s: &stcp::Socket<'static>, ip: &Header, packet: &mut Vec<u8>) -> Option<(Vec<u8>, usize)> {
     let irs = c.irs?;
     let t = &packet[ip.payload.clone()];
     let off = ((t[12] >> 4) as usize) * 4;
@@ -917,7 +941,9 @@ fn repair_ack(c: &mut Conn, s: &stcp::Socket<'static>, ip: &Header, packet: &mut
     }
     // Only a packet smoltcp would accept may be changed, so it is checked
     // before it is copied or changed.
-    let intact = || transport_checksum(ip.src, ip.dst, TCP, t) == 0;
+    if transport_checksum(ip.src, ip.dst, TCP, t) != 0 {
+        return None;
+    }
     let seq = u32::from_be_bytes([t[4], t[5], t[6], t[7]]);
     let ack = u32::from_be_bytes([t[8], t[9], t[10], t[11]]);
     let win = u16::from_be_bytes([t[14], t[15]]);
@@ -926,18 +952,19 @@ fn repair_ack(c: &mut Conn, s: &stcp::Socket<'static>, ip: &Header, packet: &mut
     let rcv_nxt = irs.wrapping_add(1).wrapping_add(c.read).wrapping_add(s.recv_queue() as u32).wrapping_add(fin_in as u32);
     let ahead = (seq.wrapping_sub(rcv_nxt) as i32) > 0;
     let last = c.last_fed.replace((ack, win));
-    if ahead && last != Some((ack, win)) && intact() {
+    let reopened = win != 0 && last.is_some_and(|(_, w)| w == 0) && s.send_queue() != 0 && (ahead || seq == rcv_nxt);
+    if reopened || ahead && last != Some((ack, win)) {
         // A copy with no data and no FIN, at the expected sequence number.
         let tcp_at = ip.payload.start;
         let mut copy = packet[..tcp_at + off].to_vec();
         copy[tcp_at + 4..tcp_at + 8].copy_from_slice(&rcv_nxt.to_be_bytes());
         copy[tcp_at + 13] = 0x10;
         fix_lengths(&mut copy, tcp_at, ip.src, ip.dst);
-        return Some(copy);
+        return Some((copy, if reopened { 4 } else { 1 }));
     }
     let pure = off == t.len() && !fin;
     if !ahead && pure && let Some((last_ack, last_win)) = last
-        && last_ack == ack && last_win != win && has_sack(&t[20..off]) && intact()
+        && last_ack == ack && last_win != win && last_win != 0 && win != 0 && has_sack(&t[20..off])
     {
         let tcp_at = ip.payload.start;
         packet[tcp_at + 14..tcp_at + 16].copy_from_slice(&last_win.to_be_bytes());
@@ -1500,8 +1527,9 @@ impl Connection for TcpConnection {
         Poll::Pending
     }
 
-    /// Sends a FIN, after every byte already written. Returns immediately.
-    /// It never waits, so a cancel does not stop it.
+    /// Sends a FIN once the peer has acknowledged every byte already
+    /// written (see `close_if_drained`). Returns immediately. It never
+    /// waits, so a cancel does not stop it.
     fn poll_shutdown(&mut self, _fcx: &Cx, _cx: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
         let mut st = self.shared.state.lock().unwrap();
         if st.stopped {
@@ -1511,8 +1539,8 @@ impl Connection for TcpConnection {
         if st.sock(h).state() == TcpState::Closed && !st.conns[&h].shut {
             return Poll::Ready(Err(st.closed_reason(h)));
         }
-        st.sock(h).close();
         st.conns.get_mut(&h).unwrap().shut = true;
+        st.close_if_drained(h);
         st.kick();
         Poll::Ready(Ok(()))
     }
@@ -1550,6 +1578,119 @@ mod tests {
         let sum = transport_checksum(src.ip(), dst.ip(), TCP, &t);
         t[16..18].copy_from_slice(&sum.to_be_bytes());
         crate::stdlib::ip::packet(src.ip(), dst.ip(), TCP, &t)
+    }
+
+    /// Drives the stack at one fixed time, without running its background task.
+    fn egress(st: &mut State, now: smoltcp::time::Instant) -> Vec<Vec<u8>> {
+        while st.iface.poll_egress(now, &mut st.dev, &mut st.sockets) != smoltcp::iface::PollResult::None {}
+        std::mem::take(&mut st.dev.tx)
+    }
+
+    #[test]
+    fn a_window_update_after_shutdown_retransmits_refused_data() {
+        for drop_handle in [false, true] {
+            window_reopens(drop_handle, b"abcdefghijkl");
+        }
+    }
+
+    #[test]
+    fn a_window_update_retransmits_the_last_unacked_bytes() {
+        window_reopens(false, b"abcdefgh");
+    }
+
+    #[test]
+    fn sack_acks_preserve_zero_window_changes() {
+        let local: SocketAddr = "10.0.0.1:80".parse().unwrap();
+        let peer: SocketAddr = "10.0.0.2:1234".parse().unwrap();
+        let s = stcp::Socket::new(stcp::SocketBuffer::new(vec![0; MIN_BUFFER]), stcp::SocketBuffer::new(vec![0; MIN_BUFFER]));
+        for (old, win, expected) in [(123, 0u16, 0), (0, 123, 123), (123, 456, 123)] {
+            let mut c = Conn::new(local, peer, false);
+            c.irs = Some(7);
+            c.last_fed = Some((100, old));
+            let mut p = segment(peer, local, 8, 100, 0x10).0;
+            p[32] = 8 << 4;
+            p[34..36].copy_from_slice(&win.to_be_bytes());
+            p.extend_from_slice(&[5, 10, 0, 0, 0, 104, 0, 0, 0, 105, 0, 0]);
+            fix_lengths(&mut p, 20, peer.ip(), local.ip());
+            let ip = Header::parse_whole(&p).unwrap();
+            assert!(repair_ack(&mut c, &s, &ip, &mut p).is_none());
+            assert_eq!(u16::from_be_bytes(p[34..36].try_into().unwrap()), expected);
+            assert_eq!(c.last_fed, Some((100, expected)));
+            assert_eq!(transport_checksum(peer.ip(), local.ip(), TCP, &p[20..]), 0);
+        }
+    }
+
+    fn window_reopens(drop_handle: bool, data: &'static [u8]) {
+        let result = block_on(run(move |fcx| async move {
+            let (side, _raw) = pair();
+            let local: SocketAddr = "10.0.0.1:80".parse().unwrap();
+            let peer: SocketAddr = "10.0.0.2:1234".parse().unwrap();
+            let server = endpoint(&fcx, side, local.ip());
+            let mut listener = server.listen(local.port())?;
+            let now = smoltcp::time::Instant::from_millis(100);
+            let incoming = |seq, ack, flags, win: u16| {
+                let mut p = segment(peer, local, seq, ack, flags).0;
+                p[34..36].copy_from_slice(&win.to_be_bytes());
+                fix_lengths(&mut p, 20, peer.ip(), local.ip());
+                p
+            };
+            let start = {
+                let mut st = server.shared.state.lock().unwrap();
+                st.ingress(local.ip(), now, incoming(7, 0, 0x02, 8));
+                let packets = egress(&mut st, now);
+                let t = Header::parse_whole(&packets[0]).unwrap().payload(&packets[0]);
+                assert_eq!(t[13], 0x12);
+                let start = u32::from_be_bytes(t[4..8].try_into().unwrap()).wrapping_add(1);
+                // The peer closes its send half before reading the reply.
+                st.ingress(local.ip(), now, incoming(8, start, 0x11, 8));
+                st.housekeeping(now);
+                egress(&mut st, now);
+                start
+            };
+            let mut conn = listener.accept(&fcx).await?;
+            let h = conn.handle;
+            conn.write_all(&fcx, data).await?;
+            if drop_handle {
+                drop(conn);
+            } else {
+                conn.shutdown(&fcx).await?;
+                assert_eq!(conn.write_all(&fcx, b"late").await, Err(ConnError::Closed));
+            }
+            let mut st = server.shared.state.lock().unwrap();
+            let sent = egress(&mut st, now);
+            assert!(sent.iter().any(|p| {
+                let t = Header::parse_whole(p).unwrap().payload(p);
+                t[((t[12] >> 4) as usize) * 4..] == data[..8]
+            }));
+            // Only the first four bytes arrived. The other four were sent
+            // on a stale window and refused after the window closed.
+            st.ingress(local.ip(), now, incoming(9, start.wrapping_add(4), 0x10, 0));
+            assert_eq!(st.get(h).send_queue(), data.len() - 4);
+            egress(&mut st, now);
+            st.ingress(local.ip(), now, incoming(9, start.wrapping_add(4), 0x10, 32768));
+            let sent = egress(&mut st, now);
+            drop(st);
+            assert!(sent.iter().any(|p| {
+                let t = Header::parse_whole(p).unwrap().payload(p);
+                u32::from_be_bytes(t[4..8].try_into().unwrap()) == start.wrapping_add(4)
+                    && t[((t[12] >> 4) as usize) * 4..].starts_with(b"efgh")
+            }), "the refused bytes must be retransmitted when the window opens");
+            // The FIN follows the data's ACK, so a hole cannot hide it.
+            assert!(sent.iter().all(|p| Header::parse_whole(p).unwrap().payload(p)[13] & 1 == 0));
+            let end = start.wrapping_add(data.len() as u32);
+            let mut st = server.shared.state.lock().unwrap();
+            st.ingress(local.ip(), now, incoming(9, end, 0x10, 32768));
+            let sent = egress(&mut st, now);
+            assert!(sent.iter().any(|p| {
+                let t = Header::parse_whole(p).unwrap().payload(p);
+                t[13] & 1 != 0 && u32::from_be_bytes(t[4..8].try_into().unwrap()) == end
+            }), "all data was acknowledged, so the FIN must follow");
+            st.ingress(local.ip(), now, incoming(9, end.wrapping_add(1), 0x10, 32768));
+            assert_eq!(st.get(h).state(), TcpState::Closed);
+            drop(st);
+            Err::<(), crate::Error>(fictionet::Error::msg("done"))
+        }));
+        assert_eq!(result.unwrap_err().to_string(), "done");
     }
 
     /// A listening port holds at most its backlog of connections not
