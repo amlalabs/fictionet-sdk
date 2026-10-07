@@ -1,7 +1,7 @@
 //! `fictionet attach --type tun`: a TUN device in the sandbox's network
 //! namespace, relayed to the world over its Unix socket.
 
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{self, Write};
 use std::net::IpAddr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -294,11 +294,14 @@ pub(crate) fn resolv_conf(servers: &[IpAddr]) -> String {
 /// that joins attach's network with `network_mode: "service:..."` has the
 /// same host file mounted, so it sees the change too.
 /// With both `--no-dns` and `--no-dns-v6`, the file lists no servers.
+/// Attach runs as root, so it never writes through a symlink or a hard
+/// link at `path` (see [`world::open_own_file`]).
 fn write_resolv_conf(path: &Path, servers: &[IpAddr]) -> io::Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
-    let mut f = OpenOptions::new().write(true).create(true).truncate(true).open(path)?;
+    let mut f = world::open_own_file(path, false)?;
+    f.set_len(0)?;
     f.write_all(resolv_conf(servers).as_bytes())?;
     f.flush()
 }
@@ -404,6 +407,29 @@ mod tests {
             crate::args::Parsed::Run(a) => a,
             other => panic!("parsed as {other:?}"),
         }
+    }
+
+    /// A symlink at the resolv.conf path is an error, and its target is
+    /// left alone.
+    #[test]
+    fn resolv_conf_is_never_written_through_a_symlink() {
+        let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("fn-resolv-{}-{n}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("shadow");
+        fs::write(&target, "keep\n").unwrap();
+        let path = dir.join("resolv.conf");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let servers = ["10.0.0.1".parse().unwrap()];
+        let e = write_resolv_conf(&path, &servers).unwrap_err();
+        assert!(e.to_string().contains("symlink"), "{e}");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "keep\n");
+        // A plain file is rewritten in place.
+        let plain = dir.join("plain.conf");
+        fs::write(&plain, "an older and longer file than the new one\n".repeat(4)).unwrap();
+        write_resolv_conf(&plain, &servers).unwrap();
+        assert_eq!(fs::read_to_string(&plain).unwrap(), resolv_conf(&servers));
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
