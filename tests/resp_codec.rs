@@ -1,14 +1,12 @@
-//! Chunked bodies and RESP streams through the shared codec driver.
+//! RESP (Redis) commands and values through the shared codec driver.
 
 use fictionet::stdlib::codec::{
     Decode, Fail, Lcg, Stream, Wire, contract, finish, pump,
     test_support::{decode_all, mutate},
 };
-use fictionet::stdlib::{resp, sdp, wake_on_lan as wol};
+use fictionet::stdlib::resp;
 
 const RESP_LIMIT: usize = 128;
-const SDP: &[u8] = b"v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\ns=call\r\nc=IN IP4 192.0.2.1\r\nt=0 0\r\nm=audio 49170 RTP/AVP 96\r\na=rtpmap:96 opus/48000/2\r\na=sendonly\r\n";
-const MAC: wol::Mac = [0, 1, 2, 3, 4, 5];
 
 fn resp_limits() -> resp::Limits {
     resp::Limits {
@@ -241,186 +239,6 @@ fn resp_scan_resumes_across_lines_and_aggregates() {
 }
 
 #[test]
-fn sdp_offer_and_answer_at_eof() {
-    contract::check_decode_with_held_limit(sdp::Descriptions::new, SDP, sdp::MAX_LEN);
-    contract::check_wire::<sdp::SessionDescription>(SDP);
-    let offer = sdp::SessionDescription::parse(SDP).unwrap();
-    for input in [
-        SDP.to_vec(),
-        SDP.iter().copied().filter(|b| *b != b'\r').collect(),
-        SDP[..SDP.len() - 2].to_vec(),
-        SDP[..SDP.len() - 1].to_vec(),
-    ] {
-        let mut stream = Stream::new(sdp::Descriptions::new());
-        contract::check_decode_with_alloc_limit(
-            sdp::Descriptions::new,
-            &input,
-            2 * (sdp::MAX_LINE_LEN + 2),
-        );
-        pump(&mut stream, &input, |_| panic!("description before EOF")).unwrap();
-        assert!(stream.held() <= sdp::MAX_LEN);
-        let mut descriptions = Vec::new();
-        finish(&mut stream, |d| descriptions.push(d)).unwrap();
-        assert_eq!(descriptions.as_slice(), core::slice::from_ref(&offer));
-        assert_eq!(stream.held(), 0);
-        let mut answer = descriptions.pop().unwrap();
-        answer.origin.username = "peer".into();
-        answer.media[0].attributes.pop();
-        answer.media[0]
-            .attributes
-            .push(sdp::Direction::RecvOnly.to_attribute());
-        let bytes = Wire::to_bytes(&answer).unwrap();
-        contract::check_wire::<sdp::SessionDescription>(&bytes);
-        assert_eq!(
-            decode_all(sdp::Descriptions::new, &bytes),
-            (vec![answer], None)
-        );
-    }
-    let mut bad = offer;
-    bad.name = "bad\nname".into();
-    contract::check_wire_value(&bad);
-    let mut out = b"prefix".to_vec();
-    assert!(Wire::write(&bad, &mut out).is_err());
-    assert_eq!(out, b"prefix");
-    for bytes in [&b""[..], b"v=0\n", b"v=0\nx=bad\n"] {
-        contract::check_decode_with_alloc_limit(
-            sdp::Descriptions::new,
-            bytes,
-            2 * sdp::Descriptions::new().capacity(),
-        );
-        assert_eq!(
-            decode_all(sdp::Descriptions::new, bytes),
-            (
-                vec![],
-                Some(Fail::Protocol(
-                    sdp::SessionDescription::parse(bytes).unwrap_err()
-                ))
-            )
-        );
-    }
-}
-
-#[test]
-fn sdp_rejects_oversize_lines_and_bodies() {
-    let mut stream = Stream::new(sdp::Descriptions::new());
-    let capacity = stream.decoder().capacity();
-    assert_eq!(capacity, sdp::MAX_LINE_LEN + 2);
-    assert_eq!(stream.push(&vec![b'x'; capacity + 1]), capacity);
-    assert_eq!(
-        stream.next(),
-        Some(Err(Fail::Protocol(sdp::Error::LineTooLong { line: 1 })))
-    );
-    assert!(stream.next().is_none());
-    let mut body = SDP.to_vec();
-    let line = format!("a=x:{}\r\n", "y".repeat(1000));
-    while body.len() + line.len() + 6 <= sdp::MAX_LEN {
-        body.extend_from_slice(line.as_bytes());
-    }
-    let remaining = sdp::MAX_LEN - body.len();
-    body.extend_from_slice(format!("a=x:{}\r\n", "z".repeat(remaining - 6)).as_bytes());
-    assert_eq!(body.len(), sdp::MAX_LEN);
-    assert!(decode_all(sdp::Descriptions::new, &body).1.is_none());
-    body.extend_from_slice(b"a=x\r\n");
-    for input in [
-        body.clone(),
-        body.into_iter().filter(|b| *b != b'\r').collect(),
-    ] {
-        assert_eq!(
-            decode_all(sdp::Descriptions::new, &input),
-            (vec![], Some(Fail::Protocol(sdp::Error::TooLong)))
-        );
-    }
-    let mut lines = b"v=0\no=- 1 1 IN IP4 192.0.2.1\ns=x\nt=0 0\n".to_vec();
-    lines.extend_from_slice(&b"a=x\n".repeat(sdp::MAX_LINES - 4));
-    assert!(decode_all(sdp::Descriptions::new, &lines).1.is_none());
-    lines.extend_from_slice(b"a=x\n");
-    assert_eq!(
-        decode_all(sdp::Descriptions::new, &lines),
-        (vec![], Some(Fail::Protocol(sdp::Error::TooManyLines)))
-    );
-}
-
-#[test]
-fn wake_on_lan_payload_and_exact_packet() {
-    for password in [
-        None,
-        Some(wol::Password::Four([1, 2, 3, 4])),
-        Some(wol::Password::Six([1, 2, 3, 4, 5, 6])),
-    ] {
-        let packet = wol::MagicPacket { mac: MAC, password };
-        contract::check_wire_value(&packet);
-        let bytes = Wire::to_bytes(&packet).unwrap();
-        contract::check_wire::<wol::MagicPacket>(&bytes);
-        let mut payload = b"prefix".to_vec();
-        payload.extend_from_slice(&bytes);
-        contract::check_decode_with_alloc_limit(
-            wol::Packets::new,
-            &payload,
-            2 * wol::Packets::new().capacity(),
-        );
-        assert!(<wol::MagicPacket as Wire>::parse(&payload).is_err());
-        let mut stream = Stream::new(wol::Packets::new());
-        pump(&mut stream, &payload, |_| panic!("packet before EOF")).unwrap();
-        let mut got = Vec::new();
-        finish(&mut stream, |p| got.push(p)).unwrap();
-        assert_eq!(got, [(6, packet)]);
-        assert_eq!(
-            <wol::MagicPacket as Wire>::parse(&Wire::to_bytes(&got[0].1).unwrap()),
-            Ok(packet)
-        );
-    }
-    let bytes = wol::MagicPacket::new(MAC).to_bytes().unwrap();
-    for tail in [1, 2, 3, 5, 7] {
-        let mut payload = bytes.clone();
-        payload.extend(vec![7; tail]);
-        assert!(<wol::MagicPacket as Wire>::parse(&payload).is_err());
-        assert_eq!(
-            decode_all(wol::Packets::new, &payload),
-            (vec![(0, wol::MagicPacket::new(MAC))], None)
-        );
-    }
-    contract::check_decode_with_alloc_limit(
-        wol::Packets::new,
-        b"no packet",
-        2 * wol::Packets::new().capacity(),
-    );
-    assert_eq!(
-        decode_all(wol::Packets::new, b"no packet"),
-        (vec![], Some(Fail::Protocol(wol::ParseError::NotFound)))
-    );
-}
-
-#[test]
-fn wake_on_lan_rejects_oversize_payload() {
-    let mut payload = vec![0; wol::MAX_PAYLOAD - wol::PACKET_LEN];
-    payload.extend(wol::MagicPacket::new(MAC).to_bytes().unwrap());
-    assert_eq!(
-        decode_all(wol::Packets::new, &payload),
-        (
-            vec![(
-                wol::MAX_PAYLOAD - wol::PACKET_LEN,
-                wol::MagicPacket::new(MAC)
-            )],
-            None
-        )
-    );
-    payload.push(0);
-    let mut stream = Stream::new(wol::Packets::new());
-    assert_eq!(stream.decoder().capacity(), wol::MAX_PAYLOAD + 1);
-    assert_eq!(stream.push(&payload), wol::MAX_PAYLOAD + 1);
-    assert_eq!(
-        stream.next(),
-        Some(Err(Fail::Protocol(wol::ParseError::TooLong)))
-    );
-    assert!(stream.next().is_none());
-    contract::check_decode_with_alloc_limit(
-        wol::Packets::new,
-        &payload,
-        2 * wol::Packets::new().capacity(),
-    );
-}
-
-#[test]
 fn small_resp_capacity_drains_a_long_pipeline() {
     let limits = resp::Limits {
         max_frame_len: 4,
@@ -435,48 +253,26 @@ fn small_resp_capacity_drains_a_long_pipeline() {
 }
 
 #[test]
-fn contracts_on_mutated_values_and_bodies() {
+fn resp_contracts_on_mutated_values() {
     let mut rng = Lcg::new(0x5eed);
-    let packet = wol::MagicPacket::with_password(MAC, wol::Password::Six([9; 6]))
-        .to_bytes()
-        .unwrap();
-    let resp = b"|1\r\n+k\r\n%?\r\n+a\r\n:1\r\n.\r\n>2\r\n+event\r\n*?\r\n$?\r\n;1\r\nx\r\n;0\r\n*-1\r\n.\r\n";
-    for seed in [resp.as_slice(), SDP, packet.as_slice()] {
-        for _ in 0..64 {
-            let mut bytes = seed.to_vec();
-            for _ in 0..rng.index(4) {
-                mutate(&mut rng, &mut bytes);
-            }
-            let end = rng.index(bytes.len() + 1);
-            bytes.truncate(end);
-            // Compare strict encodings so NaN retains its wire equality.
-            contract::check_decode_with_alloc_limit(
-                || resp::Values::new().map(|v| Wire::to_bytes(&v)),
-                &bytes,
-                2 * (resp::Values::new().map(|v| Wire::to_bytes(&v))).capacity(),
-            );
-            contract::check_decode_with_alloc_limit(
-                resp::Commands::new,
-                &bytes,
-                2 * resp::Commands::new().capacity(),
-            );
-            contract::check_decode_with_held_limit(sdp::Descriptions::new, &bytes, sdp::MAX_LEN);
-            contract::check_decode_with_alloc_limit(
-                wol::Packets::new,
-                &bytes,
-                2 * wol::Packets::new().capacity(),
-            );
-            // Adapter consistency: SDP parse uses Descriptions; Packets uses find.
-            let expected = match sdp::SessionDescription::parse(&bytes) {
-                Ok(desc) => (vec![desc], None),
-                Err(e) => (vec![], Some(Fail::Protocol(e))),
-            };
-            assert_eq!(decode_all(sdp::Descriptions::new, &bytes), expected);
-            let expected = match wol::MagicPacket::find(&bytes) {
-                Ok(packet) => (vec![packet], None),
-                Err(e) => (vec![], Some(Fail::Protocol(e))),
-            };
-            assert_eq!(decode_all(wol::Packets::new, &bytes), expected);
+    let seed = b"|1\r\n+k\r\n%?\r\n+a\r\n:1\r\n.\r\n>2\r\n+event\r\n*?\r\n$?\r\n;1\r\nx\r\n;0\r\n*-1\r\n.\r\n";
+    for _ in 0..64 {
+        let mut bytes = seed.to_vec();
+        for _ in 0..rng.index(4) {
+            mutate(&mut rng, &mut bytes);
         }
+        let end = rng.index(bytes.len() + 1);
+        bytes.truncate(end);
+        // Compare strict encodings so NaN retains its wire equality.
+        contract::check_decode_with_alloc_limit(
+            || resp::Values::new().map(|v| Wire::to_bytes(&v)),
+            &bytes,
+            2 * (resp::Values::new().map(|v| Wire::to_bytes(&v))).capacity(),
+        );
+        contract::check_decode_with_alloc_limit(
+            resp::Commands::new,
+            &bytes,
+            2 * resp::Commands::new().capacity(),
+        );
     }
 }

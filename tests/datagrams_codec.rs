@@ -1,13 +1,14 @@
-//! One datagram per bounded collection, with exact wire round trips.
+//! One datagram per bounded collection, with exact wire round trips, and
+//! Wake-on-LAN magic packets found in a datagram's payload.
 
 use core::fmt::Debug;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use fictionet::stdlib::codec::{
-    Collect, CollectError, Decode, Fail, Stream, Wire, contract,
-    test_support::{chunks, decode_all},
+    Collect, CollectError, Decode, Fail, Lcg, Stream, Wire, contract, finish, pump,
+    test_support::{chunks, decode_all, mutate},
 };
-use fictionet::stdlib::{geneve, gre, igmp, ipsec, ospf, pim, rip, vrrp};
+use fictionet::stdlib::{geneve, gre, igmp, ipsec, ospf, pim, rip, vrrp, wake_on_lan as wol};
 
 fn round_trip<M>(value: &M, limit: usize) -> Vec<u8>
 where
@@ -477,4 +478,113 @@ fn streams_report_header_errors_once() {
     parse_failure::<geneve::Packet>(&[0x40], geneve::MAX_DATAGRAM);
     parse_failure::<igmp::Message>(&[0xff], igmp::MAX_MESSAGE);
     parse_failure::<ipsec::EspPacket>(&[0; 4], ipsec::MAX_PACKET);
+}
+
+const MAC: wol::Mac = [0, 1, 2, 3, 4, 5];
+
+#[test]
+fn wake_on_lan_payload_and_exact_packet() {
+    for password in [
+        None,
+        Some(wol::Password::Four([1, 2, 3, 4])),
+        Some(wol::Password::Six([1, 2, 3, 4, 5, 6])),
+    ] {
+        let packet = wol::MagicPacket { mac: MAC, password };
+        contract::check_wire_value(&packet);
+        let bytes = Wire::to_bytes(&packet).unwrap();
+        contract::check_wire::<wol::MagicPacket>(&bytes);
+        let mut payload = b"prefix".to_vec();
+        payload.extend_from_slice(&bytes);
+        contract::check_decode_with_alloc_limit(
+            wol::Packets::new,
+            &payload,
+            2 * wol::Packets::new().capacity(),
+        );
+        assert!(<wol::MagicPacket as Wire>::parse(&payload).is_err());
+        let mut stream = Stream::new(wol::Packets::new());
+        pump(&mut stream, &payload, |_| panic!("packet before EOF")).unwrap();
+        let mut got = Vec::new();
+        finish(&mut stream, |p| got.push(p)).unwrap();
+        assert_eq!(got, [(6, packet)]);
+        assert_eq!(
+            <wol::MagicPacket as Wire>::parse(&Wire::to_bytes(&got[0].1).unwrap()),
+            Ok(packet)
+        );
+    }
+    let bytes = wol::MagicPacket::new(MAC).to_bytes().unwrap();
+    for tail in [1, 2, 3, 5, 7] {
+        let mut payload = bytes.clone();
+        payload.extend(vec![7; tail]);
+        assert!(<wol::MagicPacket as Wire>::parse(&payload).is_err());
+        assert_eq!(
+            decode_all(wol::Packets::new, &payload),
+            (vec![(0, wol::MagicPacket::new(MAC))], None)
+        );
+    }
+    contract::check_decode_with_alloc_limit(
+        wol::Packets::new,
+        b"no packet",
+        2 * wol::Packets::new().capacity(),
+    );
+    assert_eq!(
+        decode_all(wol::Packets::new, b"no packet"),
+        (vec![], Some(Fail::Protocol(wol::ParseError::NotFound)))
+    );
+}
+
+#[test]
+fn wake_on_lan_rejects_oversize_payload() {
+    let mut payload = vec![0; wol::MAX_PAYLOAD - wol::PACKET_LEN];
+    payload.extend(wol::MagicPacket::new(MAC).to_bytes().unwrap());
+    assert_eq!(
+        decode_all(wol::Packets::new, &payload),
+        (
+            vec![(
+                wol::MAX_PAYLOAD - wol::PACKET_LEN,
+                wol::MagicPacket::new(MAC)
+            )],
+            None
+        )
+    );
+    payload.push(0);
+    let mut stream = Stream::new(wol::Packets::new());
+    assert_eq!(stream.decoder().capacity(), wol::MAX_PAYLOAD + 1);
+    assert_eq!(stream.push(&payload), wol::MAX_PAYLOAD + 1);
+    assert_eq!(
+        stream.next(),
+        Some(Err(Fail::Protocol(wol::ParseError::TooLong)))
+    );
+    assert!(stream.next().is_none());
+    contract::check_decode_with_alloc_limit(
+        wol::Packets::new,
+        &payload,
+        2 * wol::Packets::new().capacity(),
+    );
+}
+
+#[test]
+fn wake_on_lan_contracts_on_mutated_payloads() {
+    let mut rng = Lcg::new(0x5eed);
+    let seed = wol::MagicPacket::with_password(MAC, wol::Password::Six([9; 6]))
+        .to_bytes()
+        .unwrap();
+    for _ in 0..64 {
+        let mut bytes = seed.clone();
+        for _ in 0..rng.index(4) {
+            mutate(&mut rng, &mut bytes);
+        }
+        let end = rng.index(bytes.len() + 1);
+        bytes.truncate(end);
+        contract::check_decode_with_alloc_limit(
+            wol::Packets::new,
+            &bytes,
+            2 * wol::Packets::new().capacity(),
+        );
+        // Adapter consistency: the decoder finds the packet as `find` does.
+        let expected = match wol::MagicPacket::find(&bytes) {
+            Ok(packet) => (vec![packet], None),
+            Err(e) => (vec![], Some(Fail::Protocol(e))),
+        };
+        assert_eq!(decode_all(wol::Packets::new, &bytes), expected);
+    }
 }

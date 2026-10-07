@@ -1,12 +1,13 @@
-//! RTSP and SIP lines, bodies, recovery, and strict wire values.
+//! RTSP and SIP lines, SDP bodies, recovery, and strict wire values.
 
 use fictionet::stdlib::codec::{
-    Decode, Fail, Lcg, Step, Stream, Wire, contract,
+    Decode, Fail, Lcg, Step, Stream, Wire, contract, finish, pump,
     test_support::{decode_all, mutate},
 };
 use fictionet::stdlib::{rtsp, sdp, sip};
 
 const SDP: &[u8] = b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=media\r\nt=0 0\r\n";
+const SDP_CALL: &[u8] = b"v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\ns=call\r\nc=IN IP4 192.0.2.1\r\nt=0 0\r\nm=audio 49170 RTP/AVP 96\r\na=rtpmap:96 opus/48000/2\r\na=sendonly\r\n";
 
 fn rtsp_body() -> rtsp::Message {
     let mut message = rtsp::Message::request(rtsp::Version::Rtsp20, "ANNOUNCE", "rtsp://camera/media");
@@ -573,4 +574,124 @@ fn sip_header_readers_refuse_canonical_expansion_over_the_limit() {
     contract::check_wire::<sip::Contacts>(uri.as_bytes());
     assert_eq!(sip::NameAddr::parse(uri.as_bytes()), Err(sip::Error::TooLong));
     assert_eq!(sip::Contacts::parse(uri.as_bytes()), Err(sip::Error::TooLong));
+}
+
+#[test]
+fn sdp_offer_and_answer_at_eof() {
+    contract::check_decode_with_held_limit(sdp::Descriptions::new, SDP_CALL, sdp::MAX_LEN);
+    contract::check_wire::<sdp::SessionDescription>(SDP_CALL);
+    let offer = sdp::SessionDescription::parse(SDP_CALL).unwrap();
+    for input in [
+        SDP_CALL.to_vec(),
+        SDP_CALL.iter().copied().filter(|b| *b != b'\r').collect(),
+        SDP_CALL[..SDP_CALL.len() - 2].to_vec(),
+        SDP_CALL[..SDP_CALL.len() - 1].to_vec(),
+    ] {
+        let mut stream = Stream::new(sdp::Descriptions::new());
+        contract::check_decode_with_alloc_limit(
+            sdp::Descriptions::new,
+            &input,
+            2 * (sdp::MAX_LINE_LEN + 2),
+        );
+        pump(&mut stream, &input, |_| panic!("description before EOF")).unwrap();
+        assert!(stream.held() <= sdp::MAX_LEN);
+        let mut descriptions = Vec::new();
+        finish(&mut stream, |d| descriptions.push(d)).unwrap();
+        assert_eq!(descriptions.as_slice(), core::slice::from_ref(&offer));
+        assert_eq!(stream.held(), 0);
+        let mut answer = descriptions.pop().unwrap();
+        answer.origin.username = "peer".into();
+        answer.media[0].attributes.pop();
+        answer.media[0]
+            .attributes
+            .push(sdp::Direction::RecvOnly.to_attribute());
+        let bytes = Wire::to_bytes(&answer).unwrap();
+        contract::check_wire::<sdp::SessionDescription>(&bytes);
+        assert_eq!(
+            decode_all(sdp::Descriptions::new, &bytes),
+            (vec![answer], None)
+        );
+    }
+    let mut bad = offer;
+    bad.name = "bad\nname".into();
+    contract::check_wire_value(&bad);
+    let mut out = b"prefix".to_vec();
+    assert!(Wire::write(&bad, &mut out).is_err());
+    assert_eq!(out, b"prefix");
+    for bytes in [&b""[..], b"v=0\n", b"v=0\nx=bad\n"] {
+        contract::check_decode_with_alloc_limit(
+            sdp::Descriptions::new,
+            bytes,
+            2 * sdp::Descriptions::new().capacity(),
+        );
+        assert_eq!(
+            decode_all(sdp::Descriptions::new, bytes),
+            (
+                vec![],
+                Some(Fail::Protocol(
+                    sdp::SessionDescription::parse(bytes).unwrap_err()
+                ))
+            )
+        );
+    }
+}
+
+#[test]
+fn sdp_rejects_oversize_lines_and_bodies() {
+    let mut stream = Stream::new(sdp::Descriptions::new());
+    let capacity = stream.decoder().capacity();
+    assert_eq!(capacity, sdp::MAX_LINE_LEN + 2);
+    assert_eq!(stream.push(&vec![b'x'; capacity + 1]), capacity);
+    assert_eq!(
+        stream.next(),
+        Some(Err(Fail::Protocol(sdp::Error::LineTooLong { line: 1 })))
+    );
+    assert!(stream.next().is_none());
+    let mut body = SDP_CALL.to_vec();
+    let line = format!("a=x:{}\r\n", "y".repeat(1000));
+    while body.len() + line.len() + 6 <= sdp::MAX_LEN {
+        body.extend_from_slice(line.as_bytes());
+    }
+    let remaining = sdp::MAX_LEN - body.len();
+    body.extend_from_slice(format!("a=x:{}\r\n", "z".repeat(remaining - 6)).as_bytes());
+    assert_eq!(body.len(), sdp::MAX_LEN);
+    assert!(decode_all(sdp::Descriptions::new, &body).1.is_none());
+    body.extend_from_slice(b"a=x\r\n");
+    for input in [
+        body.clone(),
+        body.into_iter().filter(|b| *b != b'\r').collect(),
+    ] {
+        assert_eq!(
+            decode_all(sdp::Descriptions::new, &input),
+            (vec![], Some(Fail::Protocol(sdp::Error::TooLong)))
+        );
+    }
+    let mut lines = b"v=0\no=- 1 1 IN IP4 192.0.2.1\ns=x\nt=0 0\n".to_vec();
+    lines.extend_from_slice(&b"a=x\n".repeat(sdp::MAX_LINES - 4));
+    assert!(decode_all(sdp::Descriptions::new, &lines).1.is_none());
+    lines.extend_from_slice(b"a=x\n");
+    assert_eq!(
+        decode_all(sdp::Descriptions::new, &lines),
+        (vec![], Some(Fail::Protocol(sdp::Error::TooManyLines)))
+    );
+}
+
+#[test]
+fn sdp_contracts_on_mutated_bodies() {
+    let mut rng = Lcg::new(0x5eed);
+    for _ in 0..64 {
+        let mut bytes = SDP_CALL.to_vec();
+        for _ in 0..rng.index(4) {
+            mutate(&mut rng, &mut bytes);
+        }
+        let end = rng.index(bytes.len() + 1);
+        bytes.truncate(end);
+        contract::check_decode_with_held_limit(sdp::Descriptions::new, &bytes, sdp::MAX_LEN);
+        // Adapter consistency: the decoder parses the whole body at EOF.
+        let expected = match sdp::SessionDescription::parse(&bytes) {
+            Ok(desc) => (vec![desc], None),
+            Err(e) => (vec![], Some(Fail::Protocol(e))),
+        };
+        assert_eq!(decode_all(sdp::Descriptions::new, &bytes), expected);
+    }
 }

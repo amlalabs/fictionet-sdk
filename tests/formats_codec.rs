@@ -1,3 +1,6 @@
+//! Data formats: JSON, XML, protobuf, multipart, URL-encoded forms, gRPC
+//! bodies.
+
 use fictionet::stdlib::codec::{Decode, Fail, Stream, Wire, contract, finish, pump};
 use fictionet::stdlib::codec::{
     Lcg,

@@ -1,3 +1,4 @@
+//! Length-framed application streams: BGP, FastCGI, Kafka, Thrift, Zabbix.
 //! Bounded frame streams, exact wire values, and protocol errors.
 
 use core::fmt::Debug;
