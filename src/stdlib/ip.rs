@@ -1047,6 +1047,17 @@ impl Header {
     pub fn payload<'a>(&self, packet: &'a [u8]) -> &'a [u8] {
         packet.get(self.payload.clone()).unwrap_or_default()
     }
+
+    /// The destination port of a TCP or UDP packet, which this header was
+    /// read from. `None` for other protocols, for a fragment after the
+    /// first, and when the port's bytes are not there.
+    pub fn dst_port(&self, packet: &[u8]) -> Option<u16> {
+        if self.fragment_offset != 0 || !matches!(self.protocol, 6 | 17) {
+            return None;
+        }
+        let t = self.payload(packet);
+        (t.len() >= 4).then(|| u16::from_be_bytes([t[2], t[3]]))
+    }
 }
 
 /// Builds an IP packet from `src` to `dst` around `payload`, with a TTL or

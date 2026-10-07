@@ -367,9 +367,11 @@
 //!   ([`httpd`](crate::stdlib::httpd#events) lists the fields);
 //! - `http.error`: every connection on port 80 or 443 that ended in an HTTP
 //!   error (`cause`: `protocol`, `timeout` or `transport`);
-//! - `net.blocked`: every packet `Sites` itself drops or refuses, with
+//! - `net.blocked`: the packets `Sites` itself drops or refuses, with
 //!   `why` (see [`BlockedWhy`](crate::stdlib::net::BlockedWhy)),
-//!   `protocol`, `src`, `dst` and `dst_port`.
+//!   `protocol`, `src`, `dst`, `dst_port` and `count`. These are
+//!   [repeats](crate::events#repeats): a scan or a flood is counted, not
+//!   kept packet by packet.
 //!
 //! Every event names the sandbox it came from; events about a connection
 //! carry its number, from 1, on both ports. A connection's `tls.handshake`

@@ -294,6 +294,20 @@ impl Cx {
         graph.events.push(event);
     }
 
+    /// Records `event` as a repeat: one of a run of alike events that a
+    /// flood can make, such as a packet the network refused or dropped.
+    /// `detail` holds the facts that change with each repeat, such as a
+    /// port or a length. The log records the first of a run, then counts
+    /// the rest, and keeps repeats within bounds of their own, so they
+    /// never push out other events. See
+    /// [Repeats](crate::events#repeats).
+    pub fn record_repeat(&self, mut event: Event, detail: crate::events::Fields) {
+        let graph = &self.run.graph;
+        event.at = self.now();
+        event.origin = graph.origin(crate::watch::current_task());
+        graph.events.push_repeat(event, detail);
+    }
+
     /// The run's [event log](crate::events): what it holds, and readers
     /// for what comes. The handle stays readable after the run is over.
     pub fn events(&self) -> EventLog {

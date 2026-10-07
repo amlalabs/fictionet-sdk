@@ -14,7 +14,9 @@
 //! folded: the first line of a kind for one sandbox, source and destination
 //! in each second is written as it comes, and the rest of that second are
 //! counted and written as one more line of the same kind with `"count": n`
-//! (and for `blocked`, `"ports": [lowest, highest]`).
+//! (and for `blocked`, `"ports": [lowest, highest]`). The network already
+//! counts the packets it blocks the same way, so its counted `blocked`
+//! lines are written as they come.
 //!
 //! **No password.** A line never holds the account's password: the writer
 //! takes it out of every line, in any case, as `[password]`.
@@ -100,7 +102,8 @@ const FOLDED: [&str; 3] = ["blocked", "ttl_exceeded", "unreachable"];
 /// folded.
 fn fold_key(line: &Map<String, Value>) -> Option<String> {
     let kind = line.get("type")?.as_str()?;
-    if !FOLDED.contains(&kind) {
+    // A line with a count is a fold already: the network's own.
+    if !FOLDED.contains(&kind) || line.contains_key("count") {
         return None;
     }
     let sandbox = match line.get("sandbox") {
@@ -276,6 +279,16 @@ mod tests {
         let clean = scrub(text);
         assert_eq!(clean, "{\"path\":\"/login/[password]\",\"ua\":\"[password]\"}");
         assert_eq!(scrub("nothing here".into()), "nothing here");
+    }
+
+    /// The network's own counted `blocked` lines are written as they come,
+    /// not counted again.
+    #[test]
+    fn counted_lines_are_not_folded_again() {
+        let first = json!({"type": "blocked", "sandbox": {"id": 1}, "why": "ClosedPort", "src": "10.0.0.2", "dst": "84.21.44.10", "dst_port": 1});
+        let counted = json!({"type": "blocked", "sandbox": {"id": 1}, "why": "ClosedPort", "src": "10.0.0.2", "dst": "84.21.44.10", "count": 999, "ports": [2, 1000]});
+        assert!(fold_key(first.as_object().unwrap()).is_some());
+        assert_eq!(fold_key(counted.as_object().unwrap()), None);
     }
 
     #[test]

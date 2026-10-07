@@ -72,6 +72,18 @@ pub fn line(scenario: &Scenario, e: &Entry) -> Option<Value> {
             "cause": f("cause"),
             "detail": e.str("detail").unwrap_or_default().chars().take(200).collect::<String>(),
         })),
+        // The network counts repeats: past the first of a run, one event
+        // counts the rest, with the lowest and highest port.
+        ("net", "blocked") if e.u64("count").is_some_and(|n| n > 1) || matches!(e.get("dst_port"), Some(J::Array(_))) => Some(json!({
+            "type": "blocked",
+            "sandbox": sandbox(e),
+            "why": f("why"),
+            "protocol": f("protocol"),
+            "src": f("src"),
+            "dst": f("dst"),
+            "count": f("count"),
+            "ports": f("dst_port"),
+        })),
         ("net", "blocked") => Some(json!({
             "type": "blocked",
             "sandbox": sandbox(e),
