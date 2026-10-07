@@ -78,6 +78,8 @@
 //! assert_eq!(hello.frame(&ends).and_then(|frame| frame.to_bytes()).unwrap(), bytes);
 //! ```
 
+use fictionet::stdlib::codec::{Reader as ByteReader, Truncated, Trailing};
+
 use fictionet::stdlib::codec::Wire;
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -738,54 +740,17 @@ fn check_scope(groups: &[BootstrapGroup]) -> Result<(), Error> {
 
 /// Reads fields from the front of a byte slice. Every read checks the
 /// length first.
-struct Reader<'a> {
-    b: &'a [u8],
+struct Addresses<'a> {
+    cursor: ByteReader<'a>,
     /// The length of an address in the packet's family: 4 or 16.
     addr_len: usize,
 }
 
-impl<'a> Reader<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
-        if self.b.len() < n {
-            return Err(Error::Truncated);
-        }
-        let (head, rest) = self.b.split_at(n);
-        self.b = rest;
-        Ok(head)
-    }
-
-    fn u8(&mut self) -> Result<u8, Error> {
-        Ok(self.take(1)?[0])
-    }
-
-    fn u16(&mut self) -> Result<u16, Error> {
-        let b = self.take(2)?;
-        Ok(u16::from_be_bytes([b[0], b[1]]))
-    }
-
-    fn u32(&mut self) -> Result<u32, Error> {
-        let b = self.take(4)?;
-        Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
-    }
-
-    fn is_empty(&self) -> bool {
-        self.b.is_empty()
-    }
-
-    fn end(&self) -> Result<(), Error> {
-        if self.b.is_empty() {
-            Ok(())
-        } else {
-            Err(Error::Trailing {
-                remaining: self.b.len(),
-            })
-        }
-    }
-
+impl<'a> Addresses<'a> {
     /// The family and encoding type bytes, checked, and the address
     /// length they give. The family must be the packet's.
     fn family(&mut self) -> Result<usize, Error> {
-        let fam = self.u8()?;
+        let fam = self.cursor.u8()?;
         let len = match fam {
             family::IPV4 => 4,
             family::IPV6 => 16,
@@ -794,7 +759,7 @@ impl<'a> Reader<'a> {
         if len != self.addr_len {
             return Err(Error::FamilyMismatch(fam));
         }
-        let enc = self.u8()?;
+        let enc = self.cursor.u8()?;
         if enc != 0 {
             return Err(Error::Encoding(enc));
         }
@@ -802,7 +767,7 @@ impl<'a> Reader<'a> {
     }
 
     fn address(&mut self, len: usize) -> Result<IpAddr, Error> {
-        let b = self.take(len)?;
+        let b = self.cursor.take(len)?;
         Ok(if len == 4 {
             IpAddr::V4(Ipv4Addr::new(b[0], b[1], b[2], b[3]))
         } else {
@@ -820,8 +785,8 @@ impl<'a> Reader<'a> {
     /// A group: its mask length is at most the address length.
     fn group(&mut self) -> Result<Group, Error> {
         let len = self.family()?;
-        let flags = self.u8()?;
-        let mask_len = self.u8()?;
+        let flags = self.cursor.u8()?;
+        let mask_len = self.cursor.u8()?;
         if usize::from(mask_len) > len * 8 {
             return Err(Error::MaskLen(mask_len));
         }
@@ -833,8 +798,8 @@ impl<'a> Reader<'a> {
     /// bit comes with the R bit.
     fn source(&mut self) -> Result<Source, Error> {
         let len = self.family()?;
-        let flags = self.u8()?;
-        let mask_len = self.u8()?;
+        let flags = self.cursor.u8()?;
+        let mask_len = self.cursor.u8()?;
         if usize::from(mask_len) != len * 8 {
             return Err(Error::MaskLen(mask_len));
         }
@@ -850,33 +815,33 @@ impl<'a> Reader<'a> {
 fn parse_hello_option(kind: u16, value: &[u8], addr_len: usize) -> Result<HelloOption, Error> {
     // The value came from a 16-bit length, so its length fits.
     let bad = || Error::OptionLength { kind, len: value.len() as u16 };
-    let mut r = Reader { b: value, addr_len };
+    let mut r = Addresses { cursor: ByteReader::new(value), addr_len };
     let fixed = |n: usize| if value.len() == n { Ok(()) } else { Err(bad()) };
     Ok(match kind {
         option::HOLDTIME => {
             fixed(2)?;
-            HelloOption::Holdtime(r.u16()?)
+            HelloOption::Holdtime(r.cursor.u16_be()?)
         }
         option::LAN_PRUNE_DELAY => {
             fixed(4)?;
-            let delay = r.u16()?;
+            let delay = r.cursor.u16_be()?;
             HelloOption::LanPruneDelay {
                 tracking: delay & 0x8000 != 0,
                 propagation_delay: delay & 0x7fff,
-                override_interval: r.u16()?,
+                override_interval: r.cursor.u16_be()?,
             }
         }
         option::DR_PRIORITY => {
             fixed(4)?;
-            HelloOption::DrPriority(r.u32()?)
+            HelloOption::DrPriority(r.cursor.u32_be()?)
         }
         option::GENERATION_ID => {
             fixed(4)?;
-            HelloOption::GenerationId(r.u32()?)
+            HelloOption::GenerationId(r.cursor.u32_be()?)
         }
         option::ADDRESS_LIST => {
             let mut list = Vec::new();
-            while !r.is_empty() {
+            while !r.cursor.is_empty() {
                 list.push(r.unicast()?);
             }
             HelloOption::AddressList(list)
@@ -934,21 +899,21 @@ impl Message {
         if !checksum_matches(got, want) && !whole_register() {
             return Err(Error::Checksum);
         }
-        let mut r = Reader { b: &b[HEADER_LEN..], addr_len: endpoints.address_len() };
+        let mut r = Addresses { cursor: ByteReader::new(&b[HEADER_LEN..]), addr_len: endpoints.address_len() };
         let message = match b[0] & 0x0f {
             kind::HELLO => {
                 let mut options = Vec::new();
-                while !r.is_empty() {
-                    let kind = r.u16()?;
-                    let len = r.u16()?;
-                    let value = r.take(usize::from(len))?;
+                while !r.cursor.is_empty() {
+                    let kind = r.cursor.u16_be()?;
+                    let len = r.cursor.u16_be()?;
+                    let value = r.cursor.take(usize::from(len))?;
                     options.push(parse_hello_option(kind, value, r.addr_len)?);
                 }
                 Message::Hello(options)
             }
             kind::REGISTER => {
-                let flags = r.u32()?;
-                let packet = r.take(r.b.len())?;
+                let flags = r.cursor.u32_be()?;
+                let packet = r.cursor.rest();
                 check_inner(packet, r.addr_len)?;
                 Message::Register(Register { null: flags & 0x4000_0000 != 0, packet: packet.to_vec() })
             }
@@ -959,14 +924,14 @@ impl Message {
             }
             kind::JOIN_PRUNE => {
                 let upstream = r.unicast()?;
-                let _reserved = r.u8()?;
-                let count = r.u8()?;
-                let holdtime = r.u16()?;
+                let _reserved = r.cursor.u8()?;
+                let count = r.cursor.u8()?;
+                let holdtime = r.cursor.u16_be()?;
                 let mut groups = Vec::new();
                 for _ in 0..count {
                     let group = Group { zone: false, ..r.group()? };
-                    let joined = r.u16()?;
-                    let pruned = r.u16()?;
+                    let joined = r.cursor.u16_be()?;
+                    let pruned = r.cursor.u16_be()?;
                     // Each source takes at least 8 bytes, so the lists
                     // grow only as the bytes allow.
                     let mut joins = Vec::new();
@@ -984,31 +949,31 @@ impl Message {
                 Message::JoinPrune(JoinPrune { upstream, holdtime, groups })
             }
             kind::BOOTSTRAP => {
-                let fragment_tag = r.u16()?;
-                let hash_mask_len = r.u8()?;
-                let priority = r.u8()?;
+                let fragment_tag = r.cursor.u16_be()?;
+                let hash_mask_len = r.cursor.u8()?;
+                let priority = r.cursor.u8()?;
                 let bsr = r.unicast()?;
                 if hash_mask_len > full_mask(bsr) {
                     return Err(Error::MaskLen(hash_mask_len));
                 }
                 let mut groups: Vec<BootstrapGroup> = Vec::new();
-                while !r.is_empty() {
+                while !r.cursor.is_empty() {
                     let mut group = r.group()?;
                     // RFC 5059 section 4.1: the Z bit of every group but
                     // the first is ignored on receipt.
                     group.zone &= groups.is_empty();
-                    let rp_count = r.u8()?;
-                    let fragment_count = r.u8()?;
-                    let _reserved = r.u16()?;
+                    let rp_count = r.cursor.u8()?;
+                    let fragment_count = r.cursor.u8()?;
+                    let _reserved = r.cursor.u16_be()?;
                     if fragment_count > rp_count {
                         return Err(Error::Count);
                     }
                     let mut rps = Vec::new();
                     for _ in 0..fragment_count {
                         let address = r.unicast()?;
-                        let holdtime = r.u16()?;
-                        let priority = r.u8()?;
-                        let _reserved = r.u8()?;
+                        let holdtime = r.cursor.u16_be()?;
+                        let priority = r.cursor.u8()?;
+                        let _reserved = r.cursor.u8()?;
                         rps.push(BootstrapRp { address, holdtime, priority });
                     }
                     groups.push(BootstrapGroup { group, rp_count, rps });
@@ -1020,8 +985,8 @@ impl Message {
             kind::ASSERT => {
                 let group = Group { zone: false, ..r.group()? };
                 let source = r.unicast()?;
-                let pref = r.u32()?;
-                let metric = r.u32()?;
+                let pref = r.cursor.u32_be()?;
+                let metric = r.cursor.u32_be()?;
                 Message::Assert(Assert {
                     group,
                     source,
@@ -1031,9 +996,9 @@ impl Message {
                 })
             }
             kind::CANDIDATE_RP_ADVERTISEMENT => {
-                let count = r.u8()?;
-                let priority = r.u8()?;
-                let holdtime = r.u16()?;
+                let count = r.cursor.u8()?;
+                let priority = r.cursor.u8()?;
+                let holdtime = r.cursor.u16_be()?;
                 let rp = r.unicast()?;
                 let mut groups = Vec::new();
                 for _ in 0..count {
@@ -1041,9 +1006,9 @@ impl Message {
                 }
                 Message::CandidateRp(CandidateRp { priority, holdtime, rp, groups })
             }
-            kind => Message::Other { kind, body: r.take(r.b.len())?.to_vec() },
+            kind => Message::Other { kind, body: r.cursor.rest().to_vec() },
         };
-        r.end()?;
+        r.cursor.finish()?;
         Ok(message)
     }
 
@@ -1473,6 +1438,16 @@ impl Wire for Datagram {
         out.extend_from_slice(&self.0);
         Ok(())
     }
+}
+
+impl From<Truncated> for Error {
+    #[inline]
+    fn from(_: Truncated) -> Self { Error::Truncated }
+}
+
+impl From<Trailing> for Error {
+    #[inline]
+    fn from(error: Trailing) -> Self { Error::Trailing { remaining: error.0 } }
 }
 
 #[cfg(test)]

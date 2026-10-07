@@ -120,7 +120,7 @@
 //! assert_eq!(&bytes[8..12], &7u32.to_le_bytes());
 //! ```
 
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire, Reader as ByteReader, Truncated};
 
 /// The TCP port OPC UA servers listen on.
 pub const PORT: u16 = 4840;
@@ -432,8 +432,7 @@ impl std::error::Error for Error {
 /// all, however many values are read through it.
 #[derive(Debug)]
 pub struct Reader<'a> {
-    bytes: &'a [u8],
-    pos: usize,
+    cursor: ByteReader<'a>,
     depth: usize,
     values: usize,
     /// How many DataValues the value being read is inside.
@@ -445,8 +444,7 @@ impl<'a> Reader<'a> {
     /// A reader at the start of `bytes`.
     pub fn new(bytes: &'a [u8]) -> Reader<'a> {
         Reader {
-            bytes,
-            pos: 0,
+            cursor: ByteReader::new(bytes),
             depth: 0,
             values: 0,
             data_values: 0,
@@ -455,77 +453,78 @@ impl<'a> Reader<'a> {
     }
 
     /// How many bytes are left.
+    #[inline]
     pub fn remaining(&self) -> usize {
-        self.bytes.len() - self.pos
+        self.cursor.remaining()
     }
 
     /// The next `n` bytes.
+    #[inline]
     pub fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
-        if n > self.remaining() {
-            return Err(Error::End);
-        }
-        let out = &self.bytes[self.pos..self.pos + n];
-        self.pos += n;
-        Ok(out)
+        self.cursor.take(n).map_err(Error::from)
     }
 
     /// Every byte left.
+    #[inline]
     pub fn rest(&mut self) -> &'a [u8] {
-        let out = &self.bytes[self.pos..];
-        self.pos = self.bytes.len();
-        out
+        self.cursor.rest()
     }
 
     /// Fails with [`Error::Trailing`] if any bytes are left.
+    #[inline]
     pub fn finish(&self) -> Result<(), Error> {
-        match self.remaining() {
-            0 => Ok(()),
-            n => Err(Error::Trailing(n)),
-        }
+        self.cursor.finish().map_err(|e| Error::Trailing(e.0))
     }
 
+    #[inline]
     fn array<const N: usize>(&mut self) -> Result<[u8; N], Error> {
-        let mut out = [0u8; N];
-        out.copy_from_slice(self.take(N)?);
-        Ok(out)
+        self.cursor.array().map_err(Error::from)
     }
 
     /// A Byte.
+    #[inline]
     pub fn u8(&mut self) -> Result<u8, Error> {
-        Ok(self.array::<1>()?[0])
+        self.cursor.u8().map_err(Error::from)
     }
     /// An SByte.
+    #[inline]
     pub fn i8(&mut self) -> Result<i8, Error> {
-        Ok(i8::from_le_bytes(self.array()?))
+        self.cursor.i8().map_err(Error::from)
     }
     /// A Boolean: any byte but 0 is true.
     pub fn bool(&mut self) -> Result<bool, Error> {
         Ok(self.u8()? != 0)
     }
     /// A UInt16.
+    #[inline]
     pub fn u16(&mut self) -> Result<u16, Error> {
-        Ok(u16::from_le_bytes(self.array()?))
+        self.cursor.u16_le().map_err(Error::from)
     }
     /// An Int16.
+    #[inline]
     pub fn i16(&mut self) -> Result<i16, Error> {
-        Ok(i16::from_le_bytes(self.array()?))
+        self.cursor.i16_le().map_err(Error::from)
     }
     /// A UInt32.
+    #[inline]
     pub fn u32(&mut self) -> Result<u32, Error> {
-        Ok(u32::from_le_bytes(self.array()?))
+        self.cursor.u32_le().map_err(Error::from)
     }
     /// An Int32.
+    #[inline]
     pub fn i32(&mut self) -> Result<i32, Error> {
-        Ok(i32::from_le_bytes(self.array()?))
+        self.cursor.i32_le().map_err(Error::from)
     }
     /// A UInt64.
+    #[inline]
     pub fn u64(&mut self) -> Result<u64, Error> {
-        Ok(u64::from_le_bytes(self.array()?))
+        self.cursor.u64_le().map_err(Error::from)
     }
     /// An Int64, read as it is. A DateTime goes through
     /// [`Reader::date_time`].
+    #[inline]
     pub fn i64(&mut self) -> Result<i64, Error> {
-        Ok(i64::from_le_bytes(self.array()?))
+        self.cursor.i64_le().map_err(Error::from)
     }
     /// A DateTime: 100-nanosecond intervals since January 1, 1601 (UTC).
     /// Anything at or before the
@@ -535,12 +534,14 @@ impl<'a> Reader<'a> {
         Ok(clamp_date_time(self.i64()?))
     }
     /// A Float.
+    #[inline]
     pub fn f32(&mut self) -> Result<f32, Error> {
-        Ok(f32::from_le_bytes(self.array()?))
+        self.cursor.array().map(f32::from_le_bytes).map_err(Error::from)
     }
     /// A Double.
+    #[inline]
     pub fn f64(&mut self) -> Result<f64, Error> {
-        Ok(f64::from_le_bytes(self.array()?))
+        self.cursor.f64_le().map_err(Error::from)
     }
 
     /// A length prefix: `None` for -1 (null), and otherwise a length no
@@ -3565,6 +3566,11 @@ impl Wire for Service {
         out.extend_from_slice(&w.into_bytes()?);
         Ok(())
     }
+}
+
+impl From<Truncated> for Error {
+    #[inline]
+    fn from(_: Truncated) -> Self { Error::End }
 }
 
 #[cfg(test)]

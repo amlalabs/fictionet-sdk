@@ -74,6 +74,8 @@
 //! assert_eq!(bytes[bytes.len() - 6..], *b"Z\0\0\0\x05I");
 //! ```
 
+use fictionet::stdlib::codec::Reader as ByteReader;
+
 use fictionet::stdlib::codec::{Decode, Step, Wire};
 
 /// The TCP port PostgreSQL servers listen on.
@@ -1315,7 +1317,7 @@ impl Wire for Password {
     /// missing NUL, invalid UTF-8, and bodies beyond [`MAX_AUTH_MESSAGE`] minus four.
     fn parse(body: &[u8]) -> Result<Self, Error> {
         auth_body_limit(body)?;
-        let mut r = Reader { b: body, tag: frontend_tag::AUTH_RESPONSE };
+        let mut r = Fields { cursor: ByteReader::new(body), tag: frontend_tag::AUTH_RESPONSE };
         let password = r.cstr()?;
         r.end()?;
         Ok(Self(password))
@@ -1361,7 +1363,7 @@ impl Wire for SaslInitialResponse {
     /// and bodies beyond [`MAX_AUTH_MESSAGE`] minus four.
     fn parse(body: &[u8]) -> Result<Self, Error> {
         auth_body_limit(body)?;
-        let mut r = Reader { b: body, tag: frontend_tag::AUTH_RESPONSE };
+        let mut r = Fields { cursor: ByteReader::new(body), tag: frontend_tag::AUTH_RESPONSE };
         let mechanism = r.cstr()?;
         let data = r.value()?;
         r.end()?;
@@ -2150,7 +2152,7 @@ fn split_startup(b: &[u8]) -> Result<Option<(&[u8], usize)>, Error> {
 
 /// Reads a startup-phase body, which starts with a known code.
 fn startup_body(body: &[u8]) -> Result<FrontendMessage, Error> {
-    let mut r = Reader { b: body, tag: 0 };
+    let mut r = Fields { cursor: ByteReader::new(body), tag: 0 };
     let code = r.u32()?;
     let message = match code {
         SSL_REQUEST_CODE => FrontendMessage::SslRequest,
@@ -2183,7 +2185,7 @@ fn startup_body(body: &[u8]) -> Result<FrontendMessage, Error> {
 /// Reads a typed frontend body. `tag` is a known frontend type.
 fn frontend_body(tag: u8, body: &[u8]) -> Result<FrontendMessage, Error> {
     use frontend_tag as t;
-    let mut r = Reader { b: body, tag };
+    let mut r = Fields { cursor: ByteReader::new(body), tag };
     let message = match tag {
         t::BIND => {
             let portal = r.cstr()?;
@@ -2242,7 +2244,7 @@ fn frontend_body(tag: u8, body: &[u8]) -> Result<FrontendMessage, Error> {
 /// Reads a backend body. `tag` is a known backend type.
 fn backend_body(tag: u8, body: &[u8]) -> Result<BackendMessage, Error> {
     use backend_tag as t;
-    let mut r = Reader { b: body, tag };
+    let mut r = Fields { cursor: ByteReader::new(body), tag };
     let message = match tag {
         t::AUTHENTICATION => {
             let code = r.u32()?;
@@ -2410,48 +2412,48 @@ fn format_for(formats: &[Format], i: usize) -> Format {
 }
 
 /// Reads fields from the front of a body.
-struct Reader<'a> {
-    b: &'a [u8],
+struct Fields<'a> {
+    cursor: ByteReader<'a>,
     /// The message's type byte, or 0 for a startup-phase message.
     tag: u8,
 }
 
-impl<'a> Reader<'a> {
+impl<'a> Fields<'a> {
+    #[inline]
     fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
-        if self.b.len() < n {
-            return Err(Error::Truncated { tag: self.tag });
-        }
-        let (head, rest) = self.b.split_at(n);
-        self.b = rest;
-        Ok(head)
+        self.cursor.take(n).map_err(|_| Error::Truncated { tag: self.tag })
     }
 
+    #[inline]
     fn u8(&mut self) -> Result<u8, Error> {
-        Ok(self.take(1)?[0])
+        self.cursor.u8().map_err(|_| Error::Truncated { tag: self.tag })
     }
 
+    #[inline]
     fn u16(&mut self) -> Result<u16, Error> {
-        let b = self.take(2)?;
-        Ok(u16::from_be_bytes([b[0], b[1]]))
+        self.cursor.u16_be().map_err(|_| Error::Truncated { tag: self.tag })
     }
 
+    #[inline]
     fn i16(&mut self) -> Result<i16, Error> {
-        Ok(self.u16()? as i16)
+        self.cursor.i16_be().map_err(|_| Error::Truncated { tag: self.tag })
     }
 
+    #[inline]
     fn u32(&mut self) -> Result<u32, Error> {
-        let b = self.take(4)?;
-        Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+        self.cursor.u32_be().map_err(|_| Error::Truncated { tag: self.tag })
     }
 
+    #[inline]
     fn i32(&mut self) -> Result<i32, Error> {
-        Ok(self.u32()? as i32)
+        self.cursor.i32_be().map_err(|_| Error::Truncated { tag: self.tag })
     }
 
     fn cstr(&mut self) -> Result<String, Error> {
-        let end = self.b.iter().position(|&c| c == 0).ok_or(Error::UnterminatedString { tag: self.tag })?;
-        let s = std::str::from_utf8(&self.b[..end]).map_err(|_| Error::NotUtf8 { tag: self.tag })?;
-        self.b = &self.b[end + 1..];
+        let rest = self.cursor.clone().rest();
+        let end = rest.iter().position(|&c| c == 0).ok_or(Error::UnterminatedString { tag: self.tag })?;
+        let s = std::str::from_utf8(&rest[..end]).map_err(|_| Error::NotUtf8 { tag: self.tag })?;
+        self.cursor.skip(end + 1).map_err(|_| Error::Truncated { tag: self.tag })?;
         Ok(s.to_owned())
     }
 
@@ -2488,12 +2490,14 @@ impl<'a> Reader<'a> {
         (0..n).map(|_| self.value()).collect()
     }
 
+    #[inline]
     fn rest(&mut self) -> &'a [u8] {
-        std::mem::take(&mut self.b)
+        self.cursor.rest()
     }
 
+    #[inline]
     fn end(&self) -> Result<(), Error> {
-        if self.b.is_empty() { Ok(()) } else { Err(Error::TrailingBytes { tag: self.tag }) }
+        self.cursor.finish().map_err(|_| Error::TrailingBytes { tag: self.tag })
     }
 }
 

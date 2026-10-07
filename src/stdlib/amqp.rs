@@ -73,7 +73,7 @@
 //! assert!(decoder.next().is_none());
 //! ```
 
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire, Reader as ByteReader, Truncated};
 
 /// The TCP port AMQP brokers listen on.
 pub const PORT: u16 = 5672;
@@ -649,7 +649,7 @@ impl Wire for Table {
     /// malformed fields, duplicate names, excess nesting, more than
     /// [`MAX_PAYLOAD`] bytes, and trailing bytes.
     fn parse(b: &[u8]) -> Result<Table, Error> {
-        let mut r = Reader::payload(b)?;
+        let mut r = Fields::payload(b)?;
         let t = r.table(1)?;
         r.finish()?;
         Ok(t)
@@ -895,7 +895,7 @@ impl Wire for ContentHeader {
     /// nesting, more than [`MAX_PAYLOAD`] bytes, and trailing bytes.
     fn parse(payload: &[u8]) -> Result<ContentHeader, Error> {
         use property_flag as p;
-        let mut r = Reader::payload(payload)?;
+        let mut r = Fields::payload(payload)?;
         let class_id = r.u16()?;
         if class_id != class::BASIC {
             return Err(Error::ContentClass(class_id));
@@ -910,7 +910,7 @@ impl Wire for ContentHeader {
             return Err(Error::PropertyFlags(flags));
         }
         let on = |bit: u16| flags & bit != 0;
-        let s = |r: &mut Reader, bit: u16| if on(bit) { r.shortstr().map(Some) } else { Ok(None) };
+        let s = |r: &mut Fields, bit: u16| if on(bit) { r.shortstr().map(Some) } else { Ok(None) };
         let content_type = s(&mut r, p::CONTENT_TYPE)?;
         let content_encoding = s(&mut r, p::CONTENT_ENCODING)?;
         let headers = if on(p::HEADERS) { Some(r.table(1)?) } else { None };
@@ -1303,7 +1303,7 @@ impl Wire for Method {
     /// Reads exactly one payload. Refuses malformed fields, excess nesting, oversized input, and trailing bytes.
     fn parse(payload: &[u8]) -> Result<Method, Error> {
         use Method::*;
-        let mut r = Reader::payload(payload)?;
+        let mut r = Fields::payload(payload)?;
         let class_id = r.u16()?;
         let method_id = r.u16()?;
         let m = match (class_id, method_id) {
@@ -1716,56 +1716,61 @@ impl Wire for Method {
 /// Reads fields from a payload, front to back. Bits share an octet with
 /// the bits right before them, lowest bit first, as the specification
 /// packs them.
-struct Reader<'a> {
-    b: &'a [u8],
-    pos: usize,
+struct Fields<'a> {
+    cursor: ByteReader<'a>,
     bit_byte: u8,
     /// The next bit of `bit_byte` to read, or 0 when no bit octet is open.
     bit_next: u8,
 }
 
-impl<'a> Reader<'a> {
-    fn new(b: &'a [u8]) -> Reader<'a> {
-        Reader { b, pos: 0, bit_byte: 0, bit_next: 0 }
+impl<'a> Fields<'a> {
+    fn new(b: &'a [u8]) -> Fields<'a> {
+        Fields { cursor: ByteReader::new(b), bit_byte: 0, bit_next: 0 }
     }
 
     /// A reader for a whole payload. A payload no frame can hold is
     /// refused, since what it holds could not be written back.
-    fn payload(b: &'a [u8]) -> Result<Reader<'a>, Error> {
+    fn payload(b: &'a [u8]) -> Result<Fields<'a>, Error> {
         if b.len() > MAX_PAYLOAD {
             return Err(Error::PayloadTooLarge(b.len()));
         }
-        Ok(Reader::new(b))
+        Ok(Fields::new(b))
     }
 
+    #[inline]
     fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
         self.bit_next = 0;
-        let end = self.pos.checked_add(n).ok_or(Error::Truncated)?;
-        let s = self.b.get(self.pos..end).ok_or(Error::Truncated)?;
-        self.pos = end;
-        Ok(s)
+        self.cursor.take(n).map_err(Error::from)
     }
 
+    #[inline]
     fn array<const N: usize>(&mut self) -> Result<[u8; N], Error> {
-        let mut a = [0u8; N];
-        a.copy_from_slice(self.take(N)?);
-        Ok(a)
+        self.bit_next = 0;
+        self.cursor.array().map_err(Error::from)
     }
 
+    #[inline]
     fn u8(&mut self) -> Result<u8, Error> {
-        Ok(self.array::<1>()?[0])
+        self.bit_next = 0;
+        self.cursor.u8().map_err(Error::from)
     }
 
+    #[inline]
     fn u16(&mut self) -> Result<u16, Error> {
-        self.array().map(u16::from_be_bytes)
+        self.bit_next = 0;
+        self.cursor.u16_be().map_err(Error::from)
     }
 
+    #[inline]
     fn u32(&mut self) -> Result<u32, Error> {
-        self.array().map(u32::from_be_bytes)
+        self.bit_next = 0;
+        self.cursor.u32_be().map_err(Error::from)
     }
 
+    #[inline]
     fn u64(&mut self) -> Result<u64, Error> {
-        self.array().map(u64::from_be_bytes)
+        self.bit_next = 0;
+        self.cursor.u64_be().map_err(Error::from)
     }
 
     fn bit(&mut self) -> Result<bool, Error> {
@@ -1803,9 +1808,9 @@ impl<'a> Reader<'a> {
         if depth > MAX_DEPTH {
             return Err(Error::TooDeep);
         }
-        let mut inner = Reader::new(self.long_bytes()?);
+        let mut inner = Fields::new(self.long_bytes()?);
         let mut entries = Vec::new();
-        while inner.pos < inner.b.len() {
+        while !inner.cursor.is_empty() {
             let name = inner.shortstr()?;
             let value = inner.value(depth)?;
             entries.push((name, value));
@@ -1834,9 +1839,9 @@ impl<'a> Reader<'a> {
                 if depth + 1 > MAX_DEPTH {
                     return Err(Error::TooDeep);
                 }
-                let mut inner = Reader::new(self.long_bytes()?);
+                let mut inner = Fields::new(self.long_bytes()?);
                 let mut values = Vec::new();
-                while inner.pos < inner.b.len() {
+                while !inner.cursor.is_empty() {
                     values.push(inner.value(depth + 1)?);
                 }
                 FieldValue::Array(values)
@@ -1849,8 +1854,9 @@ impl<'a> Reader<'a> {
         })
     }
 
+    #[inline]
     fn finish(&self) -> Result<(), Error> {
-        if self.pos == self.b.len() { Ok(()) } else { Err(Error::Trailing) }
+        self.cursor.finish().map_err(|_| Error::Trailing)
     }
 }
 
@@ -1862,7 +1868,7 @@ fn has_duplicates(entries: &[(String, FieldValue)]) -> bool {
     names.windows(2).any(|w| w[0] == w[1])
 }
 
-/// Writes fields into a payload, packing bits as [`Reader`] reads them.
+/// Writes fields into a payload, packing bits as [`Fields`] reads them.
 struct Writer {
     out: Vec<u8>,
     /// The open bit octet's index and how many of its bits are used.
@@ -2043,6 +2049,11 @@ impl Writer {
         self.check()?;
         Ok(self.out)
     }
+}
+
+impl From<Truncated> for Error {
+    #[inline]
+    fn from(_: Truncated) -> Self { Error::Truncated }
 }
 
 #[cfg(test)]

@@ -85,6 +85,8 @@
 //! assert_eq!(back.cookie, [0xaa; 16]);
 //! ```
 
+use fictionet::stdlib::codec::{Reader, Truncated};
+
 use fictionet::stdlib::codec::Wire;
 
 /// The UDP port CoAP over DTLS listens on.
@@ -476,17 +478,17 @@ impl Record {
     /// every byte left.
     fn parse_prefix(b: &[u8], cid_len: u8) -> Result<(Self, usize), Error> {
         let Some(&first) = b.first() else { return Err(Error::Empty) };
-        let short = |_: Short| Error::RecordTruncated;
+        let short = |_: Truncated| Error::RecordTruncated;
         let mut r = Reader::new(b);
         if first & unified_bits::FIXED_MASK == unified_bits::FIXED {
             r.u8().map_err(short)?;
             let connection_id =
                 if first & unified_bits::CID != 0 { Some(r.take(usize::from(cid_len)).map_err(short)?.to_vec()) } else { None };
             let sequence =
-                if first & unified_bits::SEQ16 != 0 { Sequence::Long(r.u16().map_err(short)?) } else { Sequence::Short(r.u8().map_err(short)?) };
+                if first & unified_bits::SEQ16 != 0 { Sequence::Long(r.u16_be().map_err(short)?) } else { Sequence::Short(r.u8().map_err(short)?) };
             let has_length = first & unified_bits::LENGTH != 0;
             let payload = if has_length {
-                let len = usize::from(r.u16().map_err(short)?);
+                let len = usize::from(r.u16_be().map_err(short)?);
                 if len > MAX_UNIFIED_PAYLOAD {
                     return Err(Error::Length(len));
                 }
@@ -505,22 +507,22 @@ impl Record {
                 has_length,
                 payload: payload.to_vec(),
             };
-            return Ok((Record::Unified(record), r.at));
+            return Ok((Record::Unified(record), r.position()));
         }
         let Some(content_type) = ContentType::new(first) else { return Err(Error::ContentType(first)) };
         r.u8().map_err(short)?;
-        let version = r.u16().map_err(short)?;
-        let epoch = r.u16().map_err(short)?;
+        let version = r.u16_be().map_err(short)?;
+        let epoch = r.u16_be().map_err(short)?;
         let sequence = r.u48().map_err(short)?;
         let connection_id =
             if content_type == ContentType::TLS12_CID { r.take(usize::from(cid_len)).map_err(short)?.to_vec() } else { Vec::new() };
-        let len = usize::from(r.u16().map_err(short)?);
+        let len = usize::from(r.u16_be().map_err(short)?);
         if len > plain_limit(epoch) {
             return Err(Error::Length(len));
         }
         let fragment = r.take(len).map_err(short)?.to_vec();
         let record = PlainRecord { content_type, version, epoch, sequence, connection_id, fragment };
-        Ok((Record::Plain(record), r.at))
+        Ok((Record::Plain(record), r.position()))
     }
 }
 
@@ -623,10 +625,10 @@ impl Fragment {
     fn parse_prefix(b: &[u8]) -> Result<(Fragment, usize), Error> {
         let mut r = Reader::new(b);
         let msg_type = r.u8()?;
-        let length = r.u24()?;
-        let message_seq = r.u16()?;
-        let offset = r.u24()?;
-        let fragment_length = r.u24()?;
+        let length = r.u24_be()?;
+        let message_seq = r.u16_be()?;
+        let offset = r.u24_be()?;
+        let fragment_length = r.u24_be()?;
         if length as usize > MAX_MESSAGE_LEN {
             return Err(Error::TooLong(length));
         }
@@ -634,7 +636,7 @@ impl Fragment {
             return Err(Error::FragmentRange);
         }
         let body = r.take(fragment_length as usize)?.to_vec();
-        Ok((Fragment { msg_type, length, message_seq, offset, body }, r.at))
+        Ok((Fragment { msg_type, length, message_seq, offset, body }, r.position()))
     }
 
     /// Whether this fragment covers its whole message.
@@ -1055,7 +1057,7 @@ fn extensions(r: &mut Reader<'_>) -> Result<Option<Vec<Extension>>, Error> {
     let mut out = Vec::new();
     let mut seen = TypeSet::new();
     while e.remaining() > 0 {
-        let typ = e.u16().map_err(|_| Error::Extensions)?;
+        let typ = e.u16_be().map_err(|_| Error::Extensions)?;
         let data = e.vec16().map_err(|_| Error::Extensions)?;
         if !seen.insert(typ) {
             return Err(Error::DuplicateExtension(typ));
@@ -1113,69 +1115,31 @@ fn put_vec8(out: &mut Vec<u8>, b: &[u8]) -> Result<(), Error> {
     Ok(())
 }
 
-/// The bytes ran out.
-struct Short;
-
-impl From<Short> for Error {
-    fn from(_: Short) -> Error {
+impl From<Truncated> for Error {
+    fn from(_: Truncated) -> Error {
         Error::FieldTruncated
     }
 }
 
-/// Reads big-endian fields from a slice, checking every length.
-struct Reader<'a> {
-    b: &'a [u8],
-    at: usize,
+trait ReadFields<'a> {
+    fn u48(&mut self) -> Result<u64, Truncated>;
+    fn vec8(&mut self) -> Result<&'a [u8], Truncated>;
+    fn vec16(&mut self) -> Result<&'a [u8], Truncated>;
 }
 
-impl<'a> Reader<'a> {
-    fn new(b: &'a [u8]) -> Reader<'a> {
-        Reader { b, at: 0 }
-    }
-
-    fn take(&mut self, n: usize) -> Result<&'a [u8], Short> {
-        let end = self.at.checked_add(n).ok_or(Short)?;
-        let s = self.b.get(self.at..end).ok_or(Short)?;
-        self.at = end;
-        Ok(s)
-    }
-
-    fn rest(&mut self) -> &'a [u8] {
-        let s = self.b.get(self.at..).unwrap_or(&[]);
-        self.at = self.b.len();
-        s
-    }
-
-    fn remaining(&self) -> usize {
-        self.b.len().saturating_sub(self.at)
-    }
-
-    fn u8(&mut self) -> Result<u8, Short> {
-        Ok(self.take(1)?[0])
-    }
-
-    fn u16(&mut self) -> Result<u16, Short> {
-        let s = self.take(2)?;
-        Ok(u16::from_be_bytes([s[0], s[1]]))
-    }
-
-    fn u24(&mut self) -> Result<u32, Short> {
-        let s = self.take(3)?;
-        Ok(u32::from_be_bytes([0, s[0], s[1], s[2]]))
-    }
-
-    fn u48(&mut self) -> Result<u64, Short> {
+impl<'a> ReadFields<'a> for Reader<'a> {
+    fn u48(&mut self) -> Result<u64, Truncated> {
         let s = self.take(6)?;
         Ok(u64::from_be_bytes([0, 0, s[0], s[1], s[2], s[3], s[4], s[5]]))
     }
 
-    fn vec8(&mut self) -> Result<&'a [u8], Short> {
+    fn vec8(&mut self) -> Result<&'a [u8], Truncated> {
         let n = self.u8()?;
         self.take(usize::from(n))
     }
 
-    fn vec16(&mut self) -> Result<&'a [u8], Short> {
-        let n = self.u16()?;
+    fn vec16(&mut self) -> Result<&'a [u8], Truncated> {
+        let n = self.u16_be()?;
         self.take(usize::from(n))
     }
 }
@@ -1323,7 +1287,7 @@ impl Wire for ClientHello {
     /// Refuses malformed or trailing input.
     fn parse(b: &[u8]) -> Result<ClientHello, Error> {
         let mut r = Reader::new(b);
-        let version = r.u16()?;
+        let version = r.u16_be()?;
         let random = random(&mut r)?;
         let session_id = session_id(&mut r)?;
         let cookie = r.vec8()?.to_vec();
@@ -1377,10 +1341,10 @@ impl Wire for ServerHello {
     /// Refuses malformed or trailing input.
     fn parse(b: &[u8]) -> Result<ServerHello, Error> {
         let mut r = Reader::new(b);
-        let version = r.u16()?;
+        let version = r.u16_be()?;
         let random = random(&mut r)?;
         let session_id = session_id(&mut r)?;
-        let cipher_suite = r.u16()?;
+        let cipher_suite = r.u16_be()?;
         let compression_method = r.u8()?;
         let extensions = extensions(&mut r)?;
         Ok(ServerHello { version, random, session_id, cipher_suite, compression_method, extensions })
@@ -1412,7 +1376,7 @@ impl Wire for HelloVerifyRequest {
     /// Refuses malformed or trailing input.
     fn parse(b: &[u8]) -> Result<HelloVerifyRequest, Error> {
         let mut r = Reader::new(b);
-        let version = r.u16()?;
+        let version = r.u16_be()?;
         let cookie = r.vec8()?.to_vec();
         if r.remaining() != 0 {
             return Err(Error::BodyTrailing);

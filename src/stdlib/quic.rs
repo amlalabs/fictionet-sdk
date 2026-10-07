@@ -78,6 +78,8 @@
 //! assert_eq!(Payload::parse(payload).unwrap().0, [hello, Frame::Padding(10)]);
 //! ```
 
+use fictionet::stdlib::codec::{Reader, Truncated};
+
 use fictionet::stdlib::codec::Wire;
 
 /// The UDP port QUIC servers for HTTP/3 listen on.
@@ -652,7 +654,7 @@ impl Packet {
         if first & 0x80 == 0 {
             return parse_short(first, &mut r, short_dcid_len);
         }
-        let version = r.u32()?;
+        let version = r.u32_be()?;
         let dcid = r.cid()?;
         let scid = r.cid()?;
         if version == VERSION_NEGOTIATION {
@@ -712,7 +714,7 @@ impl Packet {
             LongKind::ZeroRtt => Packet::ZeroRtt { version, dcid, scid, number, payload },
             _ => Packet::Handshake { version, dcid, scid, number, payload },
         };
-        Ok((p, r.pos))
+        Ok((p, r.position()))
     }
 
     /// The packet's bytes. It fails if a field cannot be written: a
@@ -928,7 +930,7 @@ fn parse_short(first: u8, r: &mut Reader<'_>, dcid_len: usize) -> Result<(Packet
     let number = pn_from(r.take(usize::from(pn_len))?, pn_len);
     let payload = r.rest().to_vec();
     let p = Packet::Short { spin: first & 0x20 != 0, key_phase: first & 0x04 != 0, dcid, number, payload };
-    Ok((p, r.pos))
+    Ok((p, r.position()))
 }
 
 fn pn_from(bytes: &[u8], len: u8) -> PacketNumber {
@@ -1284,7 +1286,7 @@ impl Frame {
         }
         let mut r = Reader::new(b);
         let frame = parse_frame(&mut r)?;
-        Ok((frame, r.pos))
+        Ok((frame, r.position()))
     }
 
     /// The frame's type. A STREAM frame's type has its flags set as
@@ -1492,9 +1494,9 @@ fn put(out: &mut Vec<u8>, values: &[u64]) -> Result<(), Error> {
 }
 
 fn parse_frame(r: &mut Reader<'_>) -> Result<Frame, Error> {
-    let start = r.pos;
+    let start = r.position();
     let ty = r.varint()?;
-    if varint_len(ty) != Some(r.pos - start) {
+    if varint_len(ty) != Some(r.position() - start) {
         return Err(Error::LongFrameType(ty));
     }
     // A frame cut short by the payload's end is badly formatted.
@@ -1506,8 +1508,8 @@ fn parse_body(ty: u64, r: &mut Reader<'_>) -> Result<Frame, Error> {
     let frame = match ty {
         t::PADDING => {
             let mut n = 1;
-            while r.peek() == Some(0) {
-                r.pos += 1;
+            while r.peek_u8() == Some(0) {
+                r.skip(1)?;
                 n += 1;
             }
             Frame::Padding(n)
@@ -1522,7 +1524,7 @@ fn parse_body(ty: u64, r: &mut Reader<'_>) -> Result<Frame, Error> {
             }
             let first_range = r.varint()?;
             // Each range takes at least 2 bytes.
-            let mut ranges = Vec::with_capacity((count as usize).min(r.left() / 2));
+            let mut ranges = Vec::with_capacity((count as usize).min(r.remaining() / 2));
             for _ in 0..count {
                 ranges.push(AckRange { gap: r.varint()?, len: r.varint()? });
             }
@@ -1655,7 +1657,7 @@ impl Wire for Payload {
         }
         let mut reader = Reader::new(bytes);
         let mut frames = Vec::new();
-        while reader.left() > 0 {
+        while reader.remaining() > 0 {
             if frames.len() == MAX_FRAMES {
                 return Err(Error::TooManyFrames);
             }
@@ -1771,59 +1773,20 @@ impl Reassembler {
     }
 }
 
-/// Reads fields from a byte slice. `pos` never passes the slice's end.
-struct Reader<'a> {
-    b: &'a [u8],
-    pos: usize,
+trait ReadFields<'a> {
+    fn take_u64(&mut self, n: u64) -> Result<&'a [u8], Error>;
+    fn varint(&mut self) -> Result<u64, Error>;
+    fn cid(&mut self) -> Result<Vec<u8>, Error>;
 }
 
-impl<'a> Reader<'a> {
-    fn new(b: &'a [u8]) -> Reader<'a> {
-        Reader { b, pos: 0 }
-    }
-
-    fn left(&self) -> usize {
-        self.b.len().saturating_sub(self.pos)
-    }
-
-    fn peek(&self) -> Option<u8> {
-        self.b.get(self.pos).copied()
-    }
-
-    fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
-        let end = self.pos.checked_add(n).ok_or(Error::Truncated)?;
-        let s = self.b.get(self.pos..end).ok_or(Error::Truncated)?;
-        self.pos = end;
-        Ok(s)
-    }
-
+impl<'a> ReadFields<'a> for Reader<'a> {
     fn take_u64(&mut self, n: u64) -> Result<&'a [u8], Error> {
-        self.take(usize::try_from(n).map_err(|_| Error::Truncated)?)
-    }
-
-    fn rest(&mut self) -> &'a [u8] {
-        let s = self.b.get(self.pos..).unwrap_or_default();
-        self.pos = self.b.len();
-        s
-    }
-
-    fn array<const N: usize>(&mut self) -> Result<[u8; N], Error> {
-        let mut a = [0; N];
-        a.copy_from_slice(self.take(N)?);
-        Ok(a)
-    }
-
-    fn u8(&mut self) -> Result<u8, Error> {
-        Ok(self.array::<1>()?[0])
-    }
-
-    fn u32(&mut self) -> Result<u32, Error> {
-        Ok(u32::from_be_bytes(self.array()?))
+        self.take(usize::try_from(n).map_err(|_| Error::Truncated)?).map_err(Error::from)
     }
 
     fn varint(&mut self) -> Result<u64, Error> {
-        let (v, n) = read_varint(self.b.get(self.pos..).unwrap_or_default())?;
-        self.pos += n;
+        let (v, n) = read_varint(self.clone().rest())?;
+        self.skip(n)?;
         Ok(v)
     }
 
@@ -1831,6 +1794,11 @@ impl<'a> Reader<'a> {
         let n = usize::from(self.u8()?);
         Ok(self.take(n)?.to_vec())
     }
+}
+
+impl From<Truncated> for Error {
+    #[inline]
+    fn from(_: Truncated) -> Self { Error::Truncated }
 }
 
 #[cfg(test)]

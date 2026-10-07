@@ -93,7 +93,7 @@
 //! assert_eq!(reply.len(), 16 + 8 + 2 + 4 + 2 + 4 + 24);
 //! ```
 
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire, Reader, Truncated};
 
 /// The TCP port of the endpoint mapper.
 pub const PORT: u16 = 135;
@@ -1153,7 +1153,7 @@ fn parse_fragment(f: &[u8]) -> Result<Pdu, Error> {
             value: f[t + SEC_TRAILER_LEN..].to_vec(),
         });
     }
-    let mut r = R { b: &f[..end], pos: HEADER_LEN, le };
+    let mut r = Fields { cursor: { let mut r = Reader::new(&f[..end]); r.skip(HEADER_LEN)?; r }, le };
     let body = match kind {
         ptype::REQUEST => {
             let (alloc_hint, context_id, opnum) = (r.u32()?, r.u16()?, r.u16()?);
@@ -1184,7 +1184,7 @@ fn parse_fragment(f: &[u8]) -> Result<Pdu, Error> {
         ptype::BIND_NAK => {
             let reason = r.u16()?;
             let mut versions = Vec::new();
-            if r.pos < r.b.len() {
+            if !r.cursor.is_empty() {
                 let n = r.u8()?;
                 for _ in 0..n {
                     let v = r.take(2)?;
@@ -1204,7 +1204,7 @@ fn parse_fragment(f: &[u8]) -> Result<Pdu, Error> {
     Ok(Pdu { version_minor, flags: pdu_flags, drep, call_id, body, auth })
 }
 
-fn read_bind(r: &mut R) -> Result<Bind, Error> {
+fn read_bind(r: &mut Fields) -> Result<Bind, Error> {
     let (max_xmit_frag, max_recv_frag, assoc_group) = (r.u16()?, r.u16()?, r.u32()?);
     let n = r.u8()?;
     r.take(3)?;
@@ -1223,14 +1223,14 @@ fn read_bind(r: &mut R) -> Result<Bind, Error> {
     Ok(Bind { max_xmit_frag, max_recv_frag, assoc_group, contexts })
 }
 
-fn read_bind_ack(r: &mut R) -> Result<BindAck, Error> {
+fn read_bind_ack(r: &mut Fields) -> Result<BindAck, Error> {
     let (max_xmit_frag, max_recv_frag, assoc_group) = (r.u16()?, r.u16()?, r.u32()?);
     let n = r.u16()?;
     let secondary_address = r.take(usize::from(n))?.to_vec();
     if secondary_address.last().is_some_and(|&b| b != 0) {
         return Err(Error::Address);
     }
-    r.take((4 - r.pos % 4) % 4)?;
+    r.take((4 - r.cursor.position() % 4) % 4)?;
     let k = r.u8()?;
     r.take(3)?;
     let mut results = Vec::new();
@@ -1243,32 +1243,30 @@ fn read_bind_ack(r: &mut R) -> Result<BindAck, Error> {
 
 /// Reads fields from a fragment, counting `pos` from the PDU's start so
 /// alignment works.
-struct R<'a> {
-    b: &'a [u8],
-    pos: usize,
+struct Fields<'a> {
+    cursor: Reader<'a>,
     le: bool,
 }
 
-impl<'a> R<'a> {
+impl<'a> Fields<'a> {
+    #[inline]
     fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
-        let end = self.pos.checked_add(n).filter(|&e| e <= self.b.len()).ok_or(Error::Truncated)?;
-        let s = &self.b[self.pos..end];
-        self.pos = end;
-        Ok(s)
+        self.cursor.take(n).map_err(Error::from)
     }
 
+    #[inline]
     fn u8(&mut self) -> Result<u8, Error> {
-        Ok(self.take(1)?[0])
+        self.cursor.u8().map_err(Error::from)
     }
 
+    #[inline]
     fn u16(&mut self) -> Result<u16, Error> {
-        let s = self.take(2)?;
-        Ok(rd16(self.le, s, 0))
+        if self.le { self.cursor.u16_le() } else { self.cursor.u16_be() }.map_err(Error::from)
     }
 
+    #[inline]
     fn u32(&mut self) -> Result<u32, Error> {
-        let s = self.take(4)?;
-        Ok(rd32(self.le, s, 0))
+        if self.le { self.cursor.u32_le() } else { self.cursor.u32_be() }.map_err(Error::from)
     }
 
     fn uuid(&mut self) -> Result<Uuid, Error> {
@@ -1285,10 +1283,9 @@ impl<'a> R<'a> {
         Ok(SyntaxId { uuid, major: v as u16, minor: (v >> 16) as u16 })
     }
 
+    #[inline]
     fn rest(&mut self) -> Vec<u8> {
-        let s = self.b[self.pos..].to_vec();
-        self.pos = self.b.len();
-        s
+        self.cursor.rest().to_vec()
     }
 }
 
@@ -1460,6 +1457,11 @@ impl Reassembler {
             Ok(None)
         }
     }
+}
+
+impl From<Truncated> for Error {
+    #[inline]
+    fn from(_: Truncated) -> Self { Error::Truncated }
 }
 
 #[cfg(test)]

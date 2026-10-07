@@ -58,6 +58,8 @@ pub const TWO_BYTE_PROFILE: u16 = 0x1000;
 // ---------------------------------------------------------------------------
 // RTP
 
+use fictionet::stdlib::codec::{Reader, Truncated};
+
 use fictionet::stdlib::{codec::Wire, rtcp};
 
 /// One RTP packet: the header's fields, the extension and the payload.
@@ -181,24 +183,20 @@ impl Wire for Packet {
             return Err(Error::TooLong(b.len()));
         }
         let mut r = Reader::new(b);
-        let b0 = r.u8().ok_or(Error::Truncated)?;
+        let b0 = r.u8()?;
         let version = b0 >> 6;
         if version != VERSION {
             return Err(Error::Version(version));
         }
-        let b1 = r.u8().ok_or(Error::Truncated)?;
-        let (Some(sequence), Some(timestamp), Some(ssrc)) = (r.u16(), r.u32(), r.u32()) else {
-            return Err(Error::Truncated);
-        };
+        let b1 = r.u8()?;
+        let (sequence, timestamp, ssrc) = (r.u16_be()?, r.u32_be()?, r.u32_be()?);
         let mut csrcs = Vec::new();
         for _ in 0..b0 & 0x0f {
-            csrcs.push(r.u32().ok_or(Error::Truncated)?);
+            csrcs.push(r.u32_be()?);
         }
         let extension = if b0 & 0x10 != 0 {
-            let (Some(profile), Some(words)) = (r.u16(), r.u16()) else {
-                return Err(Error::Truncated);
-            };
-            let data = r.take(usize::from(words) * 4).ok_or(Error::Truncated)?;
+            let (profile, words) = (r.u16_be()?, r.u16_be()?);
+            let data = r.take(usize::from(words) * 4)?;
             Some(parse_extension(profile, data)?)
         } else {
             None
@@ -471,42 +469,9 @@ fn has_early_padding(datagram: &rtcp::Datagram) -> bool {
     })
 }
 
-/// Reads big-endian numbers from a slice, giving `None` past its end.
-struct Reader<'a> {
-    b: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Reader<'a> {
-    fn new(b: &'a [u8]) -> Reader<'a> {
-        Reader { b, pos: 0 }
-    }
-
-    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
-        let end = self.pos.checked_add(n)?;
-        let s = self.b.get(self.pos..end)?;
-        self.pos = end;
-        Some(s)
-    }
-
-    fn u8(&mut self) -> Option<u8> {
-        self.take(1).map(|s| s[0])
-    }
-
-    fn u16(&mut self) -> Option<u16> {
-        self.take(2).map(|s| u16::from_be_bytes([s[0], s[1]]))
-    }
-
-    fn u32(&mut self) -> Option<u32> {
-        self.take(4)
-            .map(|s| u32::from_be_bytes([s[0], s[1], s[2], s[3]]))
-    }
-
-    fn rest(&mut self) -> &'a [u8] {
-        let s = self.b.get(self.pos..).unwrap_or(&[]);
-        self.pos = self.b.len();
-        s
-    }
+impl From<Truncated> for Error {
+    #[inline]
+    fn from(_: Truncated) -> Self { Error::Truncated }
 }
 
 #[cfg(test)]

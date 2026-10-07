@@ -57,6 +57,8 @@
 //! assert!(!window.accept(0));
 //! ```
 
+use fictionet::stdlib::codec::{Reader, Truncated};
+
 use fictionet::stdlib::codec::Wire;
 
 /// The UDP port WireGuard peers usually listen on.
@@ -454,38 +456,15 @@ fn header(kind: u8, len: usize) -> Vec<u8> {
     out
 }
 
-/// Reads fields in order after the type field. A field past the end is a
-/// length error, though callers check lengths first.
-struct Reader<'a> {
-    b: &'a [u8],
-    pos: usize,
-    kind: u8,
-}
-
-impl<'a> Reader<'a> {
-    /// A reader for a message of type `kind` that must be `len` bytes.
-    fn exact(b: &'a [u8], kind: u8, len: usize) -> Result<Reader<'a>, Error> {
-        let found = check_type(b)?;
-        if found != kind {
-            return Err(Error::Unexpected { want: kind, found });
-        }
-        if b.len() != len {
-            return Err(Error::Length { kind, len: b.len() });
-        }
-        Ok(Reader { b, pos: 4, kind })
-    }
-
-    fn array<const N: usize>(&mut self) -> Result<[u8; N], Error> {
-        let short = Error::Length { kind: self.kind, len: self.b.len() };
-        let end = self.pos.checked_add(N).ok_or(short)?;
-        let a = self.b.get(self.pos..end).and_then(|s| <[u8; N]>::try_from(s).ok()).ok_or(short)?;
-        self.pos = end;
-        Ok(a)
-    }
-
-    fn u32(&mut self) -> Result<u32, Error> {
-        Ok(u32::from_le_bytes(self.array()?))
-    }
+/// Checks a fixed message's type and length before reading its fields.
+#[inline]
+fn exact(b: &[u8], kind: u8, len: usize) -> Result<Reader<'_>, Error> {
+    let found = check_type(b)?;
+    if found != kind { return Err(Error::Unexpected { want: kind, found }); }
+    if b.len() != len { return Err(Error::Length { kind, len: b.len() }); }
+    let mut r = Reader::new(b);
+    r.skip(4).map_err(|_| Error::Length { kind, len: b.len() })?;
+    Ok(r)
 }
 
 impl Wire for Message {
@@ -526,14 +505,15 @@ impl Wire for Initiation {
     /// [`INITIATION_LEN`] bytes with type 1.
     /// Refuses invalid headers and lengths. Reads the whole input.
     fn parse(b: &[u8]) -> Result<Initiation, Error> {
-        let mut r = Reader::exact(b, message_type::INITIATION, INITIATION_LEN)?;
+        let mut r = exact(b, message_type::INITIATION, INITIATION_LEN)?;
+        let short = |_: Truncated| Error::Length { kind: message_type::INITIATION, len: b.len() };
         Ok(Initiation {
-            sender: r.u32()?,
-            ephemeral: r.array()?,
-            encrypted_static: r.array()?,
-            encrypted_timestamp: r.array()?,
-            mac1: r.array()?,
-            mac2: r.array()?,
+            sender: r.u32_le().map_err(short)?,
+            ephemeral: r.array().map_err(short)?,
+            encrypted_static: r.array().map_err(short)?,
+            encrypted_timestamp: r.array().map_err(short)?,
+            mac1: r.array().map_err(short)?,
+            mac2: r.array().map_err(short)?,
         })
     }
 
@@ -559,14 +539,15 @@ impl Wire for Response {
     /// bytes with type 2.
     /// Refuses invalid headers and lengths. Reads the whole input.
     fn parse(b: &[u8]) -> Result<Response, Error> {
-        let mut r = Reader::exact(b, message_type::RESPONSE, RESPONSE_LEN)?;
+        let mut r = exact(b, message_type::RESPONSE, RESPONSE_LEN)?;
+        let short = |_: Truncated| Error::Length { kind: message_type::RESPONSE, len: b.len() };
         Ok(Response {
-            sender: r.u32()?,
-            receiver: r.u32()?,
-            ephemeral: r.array()?,
-            encrypted_nothing: r.array()?,
-            mac1: r.array()?,
-            mac2: r.array()?,
+            sender: r.u32_le().map_err(short)?,
+            receiver: r.u32_le().map_err(short)?,
+            ephemeral: r.array().map_err(short)?,
+            encrypted_nothing: r.array().map_err(short)?,
+            mac1: r.array().map_err(short)?,
+            mac2: r.array().map_err(short)?,
         })
     }
 
@@ -592,8 +573,9 @@ impl Wire for CookieReply {
     /// bytes with type 3.
     /// Refuses invalid headers and lengths. Reads the whole input.
     fn parse(b: &[u8]) -> Result<CookieReply, Error> {
-        let mut r = Reader::exact(b, message_type::COOKIE_REPLY, COOKIE_REPLY_LEN)?;
-        Ok(CookieReply { receiver: r.u32()?, nonce: r.array()?, encrypted_cookie: r.array()? })
+        let mut r = exact(b, message_type::COOKIE_REPLY, COOKIE_REPLY_LEN)?;
+        let short = |_: Truncated| Error::Length { kind: message_type::COOKIE_REPLY, len: b.len() };
+        Ok(CookieReply { receiver: r.u32_le().map_err(short)?, nonce: r.array().map_err(short)?, encrypted_cookie: r.array().map_err(short)? })
     }
 
     /// Appends the complete 64-byte cookie reply. Refuses no values.
@@ -623,9 +605,11 @@ impl Wire for Data {
         if b.len() < MIN_DATA_LEN || b.len() > MAX_MESSAGE {
             return Err(Error::Length { kind, len: b.len() });
         }
-        let mut r = Reader { b, pos: 4, kind };
-        let receiver = r.u32()?;
-        let counter = u64::from_le_bytes(r.array()?);
+        let mut r = Reader::new(b);
+        let short = |_: Truncated| Error::Length { kind, len: b.len() };
+        r.skip(4).map_err(short)?;
+        let receiver = r.u32_le().map_err(short)?;
+        let counter = r.u64_le().map_err(short)?;
         let encrypted = b.get(DATA_HEADER_LEN..).unwrap_or_default().to_vec();
         Ok(Data { receiver, counter, encrypted })
     }

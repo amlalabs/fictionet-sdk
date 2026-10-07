@@ -76,7 +76,7 @@
 //! assert_eq!(Packet::parse_with(&wire[2..], Wrapping::None), Ok(reply));
 //! ```
 
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire, Reader, Truncated};
 
 /// The port OpenVPN servers listen on, over UDP and over TCP.
 pub const PORT: u16 = 1194;
@@ -452,39 +452,16 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// Reads fields from the front of a slice.
-struct Reader<'a> {
-    b: &'a [u8],
+trait ReadFields<'a> {
+    fn session_id(&mut self) -> Result<SessionId, Error>;
 }
 
-impl<'a> Reader<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
-        if self.b.len() < n {
-            return Err(Error::Truncated);
-        }
-        let (head, rest) = self.b.split_at(n);
-        self.b = rest;
-        Ok(head)
-    }
-
-    fn u8(&mut self) -> Result<u8, Error> {
-        Ok(self.take(1)?[0])
-    }
-
-    fn u32(&mut self) -> Result<u32, Error> {
-        let b = self.take(4)?;
-        Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
-    }
-
+impl<'a> ReadFields<'a> for Reader<'a> {
     fn session_id(&mut self) -> Result<SessionId, Error> {
         let b = self.take(SESSION_ID_LEN)?;
         let mut id = [0; SESSION_ID_LEN];
         id.copy_from_slice(b);
         Ok(id)
-    }
-
-    fn rest(&mut self) -> &'a [u8] {
-        std::mem::take(&mut self.b)
     }
 }
 
@@ -505,7 +482,7 @@ impl Packet {
         if b.len() > MAX_PACKET {
             return Err(Error::TooLong(b.len()));
         }
-        let mut r = Reader { b };
+        let mut r = Reader::new(b);
         let (op, key_id) = split_first_byte(r.u8().map_err(|_| Error::Empty)?);
         match op {
             opcode::P_DATA_V1 => return Ok(Packet::DataV1 { key_id, payload: r.rest().to_vec() }),
@@ -532,11 +509,11 @@ impl Packet {
             Wrapping::None => None,
             Wrapping::TlsAuth { hmac_len } => {
                 let hmac = r.take(hmac_len)?.to_vec();
-                Some(TlsAuth { hmac, packet_id: r.u32()?, net_time: r.u32()? })
+                Some(TlsAuth { hmac, packet_id: r.u32_be()?, net_time: r.u32_be()? })
             }
             Wrapping::TlsCrypt => {
-                let packet_id = r.u32()?;
-                let net_time = r.u32()?;
+                let packet_id = r.u32_be()?;
+                let net_time = r.u32_be()?;
                 let mut tag = [0; TLS_CRYPT_TAG_LEN];
                 tag.copy_from_slice(r.take(TLS_CRYPT_TAG_LEN)?);
                 let ciphertext = r.rest();
@@ -554,12 +531,12 @@ impl Packet {
         } else {
             let mut ids = Vec::with_capacity(usize::from(count));
             for _ in 0..count {
-                ids.push(r.u32()?);
+                ids.push(r.u32_be()?);
             }
             Some(Ack { ids, remote_session_id: r.session_id()? })
         };
         // OpenVPN reads no message ID from P_ACK_V1 and ignores the rest.
-        let message_id = if kind == ControlKind::AckV1 { 0 } else { r.u32()? };
+        let message_id = if kind == ControlKind::AckV1 { 0 } else { r.u32_be()? };
         let payload = r.rest().to_vec();
         let body = Control { session_id, tls_auth, ack, message_id, payload };
         Ok(Packet::Control { kind, key_id, body: ControlBody::Plain(body) })
@@ -870,6 +847,11 @@ impl Decode for Frames {
             None => Step::Need,
         })
     }
+}
+
+impl From<Truncated> for Error {
+    #[inline]
+    fn from(_: Truncated) -> Self { Error::Truncated }
 }
 
 #[cfg(test)]

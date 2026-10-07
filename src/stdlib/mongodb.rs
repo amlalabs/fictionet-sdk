@@ -74,6 +74,8 @@
 //! assert_eq!(m.body.get("ok"), Some(&Bson::Double(1.0)));
 //! ```
 
+use fictionet::stdlib::codec::Reader;
+
 use fictionet::stdlib::codec::{Decode, Step, Wire};
 
 /// The TCP port MongoDB servers listen on.
@@ -613,73 +615,30 @@ impl Wire for Document {
     }
 }
 
-/// A cursor over bytes. It never reads past them.
-struct Reader<'a> {
-    b: &'a [u8],
-    pos: usize,
+trait ReadFields<'a> {
+    fn cstring(&mut self) -> Result<String, Error>;
+    fn string(&mut self) -> Result<String, Error>;
+    fn document(&mut self, depth: usize, max: usize, budget: &mut usize) -> Result<Document, Error>;
 }
 
-impl<'a> Reader<'a> {
-    fn new(b: &'a [u8]) -> Reader<'a> {
-        Reader { b, pos: 0 }
-    }
-
-    fn rest(&self) -> &'a [u8] {
-        self.b.get(self.pos..).unwrap_or(&[])
-    }
-
-    fn done(&self) -> bool {
-        self.pos >= self.b.len()
-    }
-
-    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
-        let end = self.pos.checked_add(n)?;
-        let s = self.b.get(self.pos..end)?;
-        self.pos = end;
-        Some(s)
-    }
-
-    fn array<const N: usize>(&mut self) -> Option<[u8; N]> {
-        self.take(N)?.try_into().ok()
-    }
-
-    fn u8(&mut self) -> Option<u8> {
-        self.array::<1>().map(|[b]| b)
-    }
-
-    fn i32(&mut self) -> Option<i32> {
-        self.array().map(i32::from_le_bytes)
-    }
-
-    fn u32(&mut self) -> Option<u32> {
-        self.array().map(u32::from_le_bytes)
-    }
-
-    fn i64(&mut self) -> Option<i64> {
-        self.array().map(i64::from_le_bytes)
-    }
-
-    fn u64(&mut self) -> Option<u64> {
-        self.array().map(u64::from_le_bytes)
-    }
-
+impl<'a> ReadFields<'a> for Reader<'a> {
     /// A zero-terminated UTF-8 string.
     fn cstring(&mut self) -> Result<String, Error> {
-        let rest = self.rest();
+        let rest = self.clone().rest();
         let n = rest.iter().position(|&c| c == 0).ok_or(Error::Terminator)?;
         let s = std::str::from_utf8(&rest[..n]).map_err(|_| Error::Utf8)?;
-        self.pos += n + 1;
+        self.skip(n + 1).map_err(|_| Error::BsonTruncated)?;
         Ok(s.to_owned())
     }
 
     /// A BSON string: a length that counts the trailing zero, the bytes,
     /// and the zero.
     fn string(&mut self) -> Result<String, Error> {
-        let n = self.i32().ok_or(Error::BsonTruncated)?;
+        let n = self.i32_le().map_err(|_| Error::BsonTruncated)?;
         if n < 1 {
             return Err(Error::BsonLength(n));
         }
-        let bytes = self.take(n as usize).ok_or(Error::BsonTruncated)?;
+        let bytes = self.take(n as usize).map_err(|_| Error::BsonTruncated)?;
         let (&last, text) = bytes.split_last().ok_or(Error::BsonTruncated)?;
         if last != 0 {
             return Err(Error::Terminator);
@@ -690,8 +649,8 @@ impl<'a> Reader<'a> {
     /// The document at the cursor, one level deeper than `depth`.
     fn document(&mut self, depth: usize, max: usize, budget: &mut usize) -> Result<Document, Error> {
         let next = depth.checked_add(1).ok_or(Error::Depth)?;
-        let (doc, used) = parse_document(self.rest(), next, max, budget)?;
-        self.pos += used;
+        let (doc, used) = parse_document(self.clone().rest(), next, max, budget)?;
+        self.skip(used).map_err(|_| Error::BsonTruncated)?;
         Ok(doc)
     }
 }
@@ -713,10 +672,10 @@ fn parse_document(b: &[u8], depth: usize, max: usize, budget: &mut usize) -> Res
     if last != 0 {
         return Err(Error::Terminator);
     }
-    let mut r = Reader { b: inner, pos: 4 };
+    let mut r = Reader::new(&inner[4..]);
     let mut elements = Vec::new();
-    while !r.done() {
-        let ty = r.u8().ok_or(Error::BsonTruncated)?;
+    while !r.is_empty() {
+        let ty = r.u8().map_err(|_| Error::BsonTruncated)?;
         if ty == 0 {
             return Err(Error::Terminator);
         }
@@ -732,7 +691,7 @@ fn parse_value(r: &mut Reader<'_>, ty: u8, depth: usize, max: usize, budget: &mu
     use element_type as t;
     const T: Error = Error::BsonTruncated;
     Ok(match ty {
-        t::DOUBLE => Bson::Double(f64::from_le_bytes(r.array().ok_or(T)?)),
+        t::DOUBLE => Bson::Double(f64::from_le_bytes(r.array().map_err(|_| T)?)),
         t::STRING => Bson::String(r.string()?),
         t::DOCUMENT => Bson::Document(r.document(depth, max, budget)?),
         t::ARRAY => {
@@ -747,23 +706,23 @@ fn parse_value(r: &mut Reader<'_>, ty: u8, depth: usize, max: usize, budget: &mu
             Bson::Array(values)
         }
         t::BINARY => {
-            let n = r.i32().ok_or(T)?;
+            let n = r.i32_le().map_err(|_| T)?;
             if n < 0 {
                 return Err(Error::BsonLength(n));
             }
-            let subtype = r.u8().ok_or(T)?;
-            let bytes = r.take(n as usize).ok_or(T)?;
+            let subtype = r.u8().map_err(|_| T)?;
+            let bytes = r.take(n as usize).map_err(|_| T)?;
             check_binary(subtype, bytes)?;
             Bson::Binary { subtype, bytes: bytes.to_vec() }
         }
         t::UNDEFINED => Bson::Undefined,
-        t::OBJECT_ID => Bson::ObjectId(r.array().ok_or(T)?),
-        t::BOOLEAN => match r.u8().ok_or(T)? {
+        t::OBJECT_ID => Bson::ObjectId(r.array().map_err(|_| T)?),
+        t::BOOLEAN => match r.u8().map_err(|_| T)? {
             0 => Bson::Boolean(false),
             1 => Bson::Boolean(true),
             b => return Err(Error::Bool(b)),
         },
-        t::DATE_TIME => Bson::DateTime(r.i64().ok_or(T)?),
+        t::DATE_TIME => Bson::DateTime(r.i64_le().map_err(|_| T)?),
         t::NULL => Bson::Null,
         t::REGEX => {
             let pattern = r.cstring()?;
@@ -773,32 +732,32 @@ fn parse_value(r: &mut Reader<'_>, ty: u8, depth: usize, max: usize, budget: &mu
         }
         t::DB_POINTER => {
             let namespace = r.string()?;
-            Bson::DbPointer { namespace, id: r.array().ok_or(T)? }
+            Bson::DbPointer { namespace, id: r.array().map_err(|_| T)? }
         }
         t::JAVASCRIPT => Bson::JavaScript(r.string()?),
         t::SYMBOL => Bson::Symbol(r.string()?),
         t::JAVASCRIPT_WITH_SCOPE => {
             // The total length counts itself, the string and the document.
-            let total = r.i32().ok_or(T)?;
+            let total = r.i32_le().map_err(|_| T)?;
             if total < 14 {
                 return Err(Error::BsonLength(total));
             }
-            let body = r.take(total as usize - 4).ok_or(T)?;
+            let body = r.take(total as usize - 4).map_err(|_| T)?;
             let mut inner = Reader::new(body);
             let code = inner.string()?;
             let scope = inner.document(depth, max, budget)?;
-            if !inner.done() {
+            if !inner.is_empty() {
                 return Err(Error::BsonLength(total));
             }
             Bson::JavaScriptWithScope { code, scope }
         }
-        t::INT32 => Bson::Int32(r.i32().ok_or(T)?),
+        t::INT32 => Bson::Int32(r.i32_le().map_err(|_| T)?),
         t::TIMESTAMP => {
-            let v = r.u64().ok_or(T)?;
+            let v = r.u64_le().map_err(|_| T)?;
             Bson::Timestamp { time: (v >> 32) as u32, increment: v as u32 }
         }
-        t::INT64 => Bson::Int64(r.i64().ok_or(T)?),
-        t::DECIMAL128 => Bson::Decimal128(r.array().ok_or(T)?),
+        t::INT64 => Bson::Int64(r.i64_le().map_err(|_| T)?),
+        t::DECIMAL128 => Bson::Decimal128(r.array().map_err(|_| T)?),
         t::MIN_KEY => Bson::MinKey,
         t::MAX_KEY => Bson::MaxKey,
         other => return Err(Error::Type(other)),
@@ -1040,8 +999,8 @@ impl Wire for Header {
         }
         let mut r = Reader::new(b);
         let e = Error::Truncated;
-        Ok(Header { length: r.i32().ok_or(e)?, request_id: r.i32().ok_or(e)?,
-            response_to: r.i32().ok_or(e)?, op_code: r.i32().ok_or(e)? })
+        Ok(Header { length: r.i32_le().map_err(|_| e)?, request_id: r.i32_le().map_err(|_| e)?,
+            response_to: r.i32_le().map_err(|_| e)?, op_code: r.i32_le().map_err(|_| e)? })
     }
 
     /// Appends the four header fields without refusing any field value.
@@ -1219,10 +1178,10 @@ impl Message {
             op_code::COMPRESSED => {
                 let mut r = Reader::new(data);
                 let t = Error::Truncated;
-                let original_op_code = r.i32().ok_or(t)?;
-                let uncompressed_size = r.i32().ok_or(t)?;
-                let compressor = r.u8().ok_or(t)?;
-                let data = r.rest();
+                let original_op_code = r.i32_le().map_err(|_| t)?;
+                let uncompressed_size = r.i32_le().map_err(|_| t)?;
+                let compressor = r.u8().map_err(|_| t)?;
+                let data = r.clone().rest();
                 check_uncompressed(uncompressed_size, compressor, data)?;
                 Body::Compressed(Compressed { original_op_code, uncompressed_size, compressor, data: data.to_vec() })
             }
@@ -1445,7 +1404,7 @@ fn check_fields(body: &Document, sequences: &[Sequence]) -> Result<(), Error> {
 
 fn parse_msg(frame: &[u8], data: &[u8]) -> Result<Msg, Error> {
     let t = Error::Truncated;
-    let flags = Reader::new(data).u32().ok_or(t)?;
+    let flags = Reader::new(data).u32_le().map_err(|_| t)?;
     if flags & flag::REQUIRED & !flag::KNOWN != 0 {
         return Err(Error::Flags(flags));
     }
@@ -1469,23 +1428,23 @@ fn parse_msg(frame: &[u8], data: &[u8]) -> Result<Msg, Error> {
     let mut documents = 0usize;
     let mut bodies = Vec::new();
     let mut sequences = Vec::new();
-    while !r.done() {
-        match r.u8().ok_or(t)? {
+    while !r.is_empty() {
+        match r.u8().map_err(|_| t)? {
             0 => {
                 if !bodies.is_empty() {
                     return Err(Error::BodyCount(2));
                 }
-                let (doc, used) = parse_document(r.rest(), 1, MAX_COMMAND_SIZE, &mut budget)?;
-                r.pos += used;
+                let (doc, used) = parse_document(r.clone().rest(), 1, MAX_COMMAND_SIZE, &mut budget)?;
+                r.skip(used).map_err(|_| t)?;
                 bodies.push(doc);
             }
             1 => {
-                let size = r.i32().ok_or(t)?;
+                let size = r.i32_le().map_err(|_| t)?;
                 // The size counts itself and at least the identifier's zero.
-                if size < 5 || size as usize - 4 > r.rest().len() {
+                if size < 5 || size as usize - 4 > r.remaining() {
                     return Err(Error::SequenceLength(size));
                 }
-                let mut s = Reader::new(r.take(size as usize - 4).ok_or(t)?);
+                let mut s = Reader::new(r.take(size as usize - 4).map_err(|_| t)?);
                 let identifier = s.cstring()?;
                 if sequences.len() >= MAX_SEQUENCES {
                     return Err(Error::TooManySequences);
@@ -1494,13 +1453,13 @@ fn parse_msg(frame: &[u8], data: &[u8]) -> Result<Msg, Error> {
                     return Err(Error::DuplicateIdentifier);
                 }
                 let mut docs = Vec::new();
-                while !s.done() {
+                while !s.is_empty() {
                     documents += 1;
                     if docs.len() >= MAX_DOCUMENTS || documents > 2 * MAX_DOCUMENTS {
                         return Err(Error::TooManyDocuments);
                     }
-                    let (doc, used) = parse_document(s.rest(), 1, MAX_DOCUMENT_SIZE, &mut budget)?;
-                    s.pos += used;
+                    let (doc, used) = parse_document(s.clone().rest(), 1, MAX_DOCUMENT_SIZE, &mut budget)?;
+                    s.skip(used).map_err(|_| t)?;
                     docs.push(doc);
                 }
                 sequences.push(Sequence { identifier, documents: docs });
@@ -1556,21 +1515,21 @@ fn write_msg(m: &Msg, budget: &mut usize, out: &mut Vec<u8>) -> Result<(), Error
 fn parse_query(data: &[u8]) -> Result<Query, Error> {
     let t = Error::Truncated;
     let mut r = Reader::new(data);
-    let flags = r.u32().ok_or(t)?;
+    let flags = r.u32_le().map_err(|_| t)?;
     let collection = r.cstring()?;
-    let number_to_skip = r.i32().ok_or(t)?;
-    let number_to_return = r.i32().ok_or(t)?;
+    let number_to_skip = r.i32_le().map_err(|_| t)?;
+    let number_to_return = r.i32_le().map_err(|_| t)?;
     let mut budget = MAX_ELEMENTS;
-    let (query, used) = parse_document(r.rest(), 1, MAX_COMMAND_SIZE, &mut budget)?;
-    r.pos += used;
-    let fields = if r.done() {
+    let (query, used) = parse_document(r.clone().rest(), 1, MAX_COMMAND_SIZE, &mut budget)?;
+    r.skip(used).map_err(|_| t)?;
+    let fields = if r.is_empty() {
         None
     } else {
-        let (fields, used) = parse_document(r.rest(), 1, MAX_COMMAND_SIZE, &mut budget)?;
-        r.pos += used;
+        let (fields, used) = parse_document(r.clone().rest(), 1, MAX_COMMAND_SIZE, &mut budget)?;
+        r.skip(used).map_err(|_| t)?;
         Some(fields)
     };
-    if !r.done() {
+    if !r.is_empty() {
         return Err(Error::Trailing);
     }
     Ok(Query { flags, collection, number_to_skip, number_to_return, query, fields })
@@ -1579,21 +1538,21 @@ fn parse_query(data: &[u8]) -> Result<Query, Error> {
 fn parse_reply(data: &[u8]) -> Result<Reply, Error> {
     let t = Error::Truncated;
     let mut r = Reader::new(data);
-    let flags = r.u32().ok_or(t)?;
-    let cursor_id = r.i64().ok_or(t)?;
-    let starting_from = r.i32().ok_or(t)?;
-    let number = r.i32().ok_or(t)?;
+    let flags = r.u32_le().map_err(|_| t)?;
+    let cursor_id = r.i64_le().map_err(|_| t)?;
+    let starting_from = r.i32_le().map_err(|_| t)?;
+    let number = r.i32_le().map_err(|_| t)?;
     if number < 0 || number as usize > MAX_DOCUMENTS {
         return Err(Error::NumberReturned(number));
     }
     let mut budget = MAX_ELEMENTS;
     let mut documents = Vec::new();
-    while !r.done() {
+    while !r.is_empty() {
         if documents.len() == number as usize {
             return Err(Error::NumberReturned(number));
         }
-        let (doc, used) = parse_document(r.rest(), 1, MAX_COMMAND_SIZE, &mut budget)?;
-        r.pos += used;
+        let (doc, used) = parse_document(r.clone().rest(), 1, MAX_COMMAND_SIZE, &mut budget)?;
+        r.skip(used).map_err(|_| t)?;
         documents.push(doc);
     }
     if documents.len() != number as usize {

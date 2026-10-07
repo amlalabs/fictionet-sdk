@@ -39,7 +39,7 @@
 //!
 //! [spec]: https://www.fixtrading.org/wp-content/uploads/download-manager-files/FAST-Specification-1-x-1.pdf
 
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire, Reader, Truncated};
 use fictionet::stdlib::xml;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -199,16 +199,15 @@ impl Atom {
 
 // A probe remembers only an input position. It never owns input. Retrying a
 // partial ASCII entity resumes scanning; integer retries inspect at most 10 bytes.
-struct Reader<'a> {
+struct Fields<'a> {
     input: &'a [u8],
-    pos: usize,
+    cursor: Reader<'a>,
     probe: &'a mut usize,
 }
-impl Reader<'_> {
+impl Fields<'_> {
     fn byte(&mut self) -> Result<u8, Error> {
-        limit(add(self.pos, 1)?, MAX_MESSAGE_BYTES, "MAX_MESSAGE_BYTES")?;
-        let b = self.input.get(self.pos).copied().ok_or(Error::Truncated)?;
-        self.pos += 1;
+        limit(add(self.cursor.position(), 1)?, MAX_MESSAGE_BYTES, "MAX_MESSAGE_BYTES")?;
+        let b = self.cursor.u8()?;
         Ok(b)
     }
     fn integer(&mut self, signed: bool, nullable: bool) -> Result<Option<i128>, Error> {
@@ -245,7 +244,7 @@ impl Reader<'_> {
     }
     fn bytes(&mut self, ascii: bool, nullable: bool, scan: bool) -> Result<Atom, Error> {
         let (start, end) = if ascii {
-            let start = self.pos;
+            let start = self.cursor.position();
             let mut end = (*self.probe).max(start);
             loop {
                 limit(
@@ -263,7 +262,7 @@ impl Reader<'_> {
                     break;
                 }
             }
-            self.pos = end;
+            self.cursor.skip(end - self.cursor.position())?;
             *self.probe = 0;
             let mut data_start = start;
             if self.input.get(data_start).is_some_and(|b| b & 0x7f == 0) {
@@ -288,13 +287,10 @@ impl Reader<'_> {
             };
             let n = usize::try_from(n).map_err(|_| Error::Range)?;
             limit(n, MAX_STRING_BYTES, "MAX_STRING_BYTES")?;
-            let start = self.pos;
+            let start = self.cursor.position();
             let end = add(start, n)?;
             limit(end, MAX_MESSAGE_BYTES, "MAX_MESSAGE_BYTES")?;
-            if end > self.input.len() {
-                return Err(Error::Truncated);
-            }
-            self.pos = end;
+            self.cursor.skip(n)?;
             (start, end)
         };
         limit(end - start, MAX_STRING_BYTES, "MAX_STRING_BYTES")?;
@@ -564,13 +560,13 @@ unit!(
 );
 fn parse_atom(input: &[u8], kind: Kind, optional: bool) -> Result<Atom, Error> {
     let mut probe = 0;
-    let mut r = Reader {
+    let mut r = Fields {
         input,
-        pos: 0,
+        cursor: Reader::new(input),
         probe: &mut probe,
     };
     let a = r.raw(kind, optional, false)?;
-    if r.pos != input.len() {
+    if r.cursor.position() != input.len() {
         return Err(Error::Trailing);
     }
     Ok(a)
@@ -653,8 +649,8 @@ struct Map {
     bit: usize,
 }
 impl Map {
-    fn read(r: &mut Reader<'_>) -> Result<Self, Error> {
-        let start = r.pos;
+    fn read(r: &mut Fields<'_>) -> Result<Self, Error> {
+        let start = r.cursor.position();
         let mut end = (*r.probe).max(start);
         loop {
             limit(add(end - start, 1)?, MAX_PMAP_BYTES, "MAX_PMAP_BYTES")?;
@@ -667,7 +663,7 @@ impl Map {
                 if end - start > 1 && b == 0x80 {
                     return Err(Error::Overlong);
                 }
-                r.pos = end;
+                r.cursor.skip(end - r.cursor.position())?;
                 *r.probe = 0;
                 return Ok(Self {
                     start,
@@ -708,13 +704,13 @@ impl Wire for PresenceMap {
     /// trailing bytes, and maps exceeding [`MAX_PMAP_BYTES`].
     fn parse(input: &[u8]) -> Result<Self, Error> {
         let mut probe = 0;
-        let mut r = Reader {
+        let mut r = Fields {
             input,
-            pos: 0,
+            cursor: Reader::new(input),
             probe: &mut probe,
         };
         let mut map = Map::read(&mut r)?;
-        if r.pos != input.len() {
+        if r.cursor.position() != input.len() {
             return Err(Error::Trailing);
         }
         let mut bits = Vec::new();
@@ -1998,7 +1994,7 @@ fn combine_bytes(
     Ok(Atom::Bytes(result))
 }
 fn read_delta(
-    r: &mut Reader<'_>,
+    r: &mut Fields<'_>,
     field: &Field,
     previous: Option<&Atom>,
     scan: bool,
@@ -2035,7 +2031,7 @@ fn read_delta(
     }
 }
 fn read_field(
-    r: &mut Reader<'_>,
+    r: &mut Fields<'_>,
     map: &mut Map,
     field: &Field,
     ty: usize,
@@ -2103,7 +2099,7 @@ impl Budget {
     }
 }
 fn read_id(
-    r: &mut Reader<'_>,
+    r: &mut Fields<'_>,
     map: &mut Map,
     state: &mut State,
     d: &Definitions,
@@ -2119,7 +2115,7 @@ fn read_id(
 }
 #[allow(clippy::too_many_arguments)]
 fn read_body(
-    r: &mut Reader<'_>,
+    r: &mut Fields<'_>,
     map: &mut Map,
     d: &Definitions,
     body_id: usize,
@@ -2253,7 +2249,7 @@ fn read_body(
     Ok(values)
 }
 fn read_segment_body(
-    r: &mut Reader<'_>,
+    r: &mut Fields<'_>,
     d: &Definitions,
     body: usize,
     ty: usize,
@@ -2276,9 +2272,9 @@ fn read_message(
     state: &mut State,
 ) -> Result<(Message, usize), Error> {
     let mut probe = 0;
-    let mut r = Reader {
+    let mut r = Fields {
         input,
-        pos: 0,
+        cursor: Reader::new(input),
         probe: &mut probe,
     };
     let mut map = Map::read(&mut r)?;
@@ -2299,7 +2295,7 @@ fn read_message(
             template_id,
             fields,
         },
-        r.pos,
+        r.cursor.position(),
     ))
 }
 
@@ -2454,9 +2450,9 @@ impl Scanner {
                 return Ok(self.pos);
             };
             if !matches!(frame.header, Header::None) {
-                let mut r = Reader {
+                let mut r = Fields {
                     input,
-                    pos: self.pos,
+                    cursor: { let mut cursor = Reader::new(input); cursor.skip(self.pos)?; cursor },
                     probe: &mut self.probe,
                 };
                 let mut map = Map::read(&mut r)?;
@@ -2472,7 +2468,7 @@ impl Scanner {
                 }
                 frame.map = map;
                 frame.header = Header::None;
-                self.pos = r.pos;
+                self.pos = r.cursor.position();
                 *self.frames.last_mut().ok_or(Error::Template)? = frame;
             }
             let body = d.bodies.get(frame.body).ok_or(Error::Template)?;
@@ -2521,9 +2517,9 @@ impl Scanner {
                 )?,
                 _ => {}
             }
-            let mut r = Reader {
+            let mut r = Fields {
                 input,
-                pos: self.pos,
+                cursor: { let mut cursor = Reader::new(input); cursor.skip(self.pos)?; cursor },
                 probe: &mut self.probe,
             };
             let mut child = None;
@@ -2606,7 +2602,7 @@ impl Scanner {
                     child = Some((0, false, 1, true));
                 }
             }
-            self.pos = r.pos;
+            self.pos = r.cursor.position();
             self.value()?;
             if rows > 0 {
                 self.value()?;
@@ -3243,6 +3239,11 @@ impl Encoder {
         out.extend_from_slice(&bytes);
         Ok(())
     }
+}
+
+impl From<Truncated> for Error {
+    #[inline]
+    fn from(_: Truncated) -> Self { Error::Truncated }
 }
 
 #[cfg(test)]

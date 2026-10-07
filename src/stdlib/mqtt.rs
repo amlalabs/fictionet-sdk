@@ -54,7 +54,7 @@
 //! assert!(!topic_matches("#", "$SYS/broker/uptime"));
 //! ```
 
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire, Reader, Truncated, Trailing};
 
 /// The TCP port MQTT brokers listen on, without TLS.
 pub const PORT: u16 = 1883;
@@ -612,59 +612,29 @@ fn frame(b: &[u8], max: usize) -> Result<Option<(u8, std::ops::Range<usize>)>, E
     Ok(Some((first, start..end)))
 }
 
-/// Reads a packet's fields in order, failing on any that runs past the end.
-struct Reader<'a> {
-    b: &'a [u8],
+trait ReadFields<'a> {
+    fn packet_id(&mut self) -> Result<u16, Error>;
+    fn binary(&mut self) -> Result<&'a [u8], Error>;
+    fn string(&mut self) -> Result<String, Error>;
 }
 
-impl<'a> Reader<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
-        if self.b.len() < n {
-            return Err(Error::Truncated);
-        }
-        let (head, tail) = self.b.split_at(n);
-        self.b = tail;
-        Ok(head)
-    }
-
-    fn u8(&mut self) -> Result<u8, Error> {
-        let [b] = self.take(1)? else { return Err(Error::Truncated) };
-        Ok(*b)
-    }
-
-    fn u16(&mut self) -> Result<u16, Error> {
-        let [a, b] = self.take(2)? else { return Err(Error::Truncated) };
-        Ok(u16::from_be_bytes([*a, *b]))
-    }
-
+impl<'a> ReadFields<'a> for Reader<'a> {
     fn packet_id(&mut self) -> Result<u16, Error> {
-        match self.u16()? {
+        match self.u16_be()? {
             0 => Err(Error::PacketIdZero),
             id => Ok(id),
         }
     }
 
     fn binary(&mut self) -> Result<&'a [u8], Error> {
-        let n = self.u16()?;
-        self.take(usize::from(n))
+        let n = self.u16_be()?;
+        self.take(usize::from(n)).map_err(Error::from)
     }
 
     fn string(&mut self) -> Result<String, Error> {
         let s = std::str::from_utf8(self.binary()?).map_err(|_| Error::Utf8)?;
         check_string(s)?;
         Ok(s.to_owned())
-    }
-
-    fn rest(&mut self) -> &'a [u8] {
-        std::mem::take(&mut self.b)
-    }
-
-    fn is_empty(&self) -> bool {
-        self.b.is_empty()
-    }
-
-    fn end(&self) -> Result<(), Error> {
-        if self.b.is_empty() { Ok(()) } else { Err(Error::TrailingBytes) }
     }
 }
 
@@ -886,7 +856,7 @@ impl Packet {
 
 /// Reads a packet's body, given its first byte, which [`frame`] checked.
 fn parse_body(first: u8, body: &[u8]) -> Result<Packet, Error> {
-    let mut r = Reader { b: body };
+    let mut r = Reader::new(body);
     let flags = first & 0x0f;
     let packet = match first >> 4 {
         packet_type::CONNECT => Packet::Connect(parse_connect(&mut r)?),
@@ -968,7 +938,7 @@ fn parse_body(first: u8, body: &[u8]) -> Result<Packet, Error> {
         packet_type::DISCONNECT => Packet::Disconnect,
         t => return Err(Error::ReservedType(t)),
     };
-    r.end()?;
+    r.finish()?;
     Ok(packet)
 }
 
@@ -991,7 +961,7 @@ fn parse_connect(r: &mut Reader<'_>) -> Result<Connect, Error> {
     if bad {
         return Err(Error::ConnectFlags(flags));
     }
-    let keep_alive = r.u16()?;
+    let keep_alive = r.u16_be()?;
     let client_id = r.string()?;
     let will = if has_will {
         let topic = r.string()?;
@@ -1098,6 +1068,16 @@ impl Decode for Packets {
         let body = input.get(body).ok_or(Error::Truncated)?;
         Ok(Step::Item(parse_body(first, body)?, used))
     }
+}
+
+impl From<Truncated> for Error {
+    #[inline]
+    fn from(_: Truncated) -> Self { Error::Truncated }
+}
+
+impl From<Trailing> for Error {
+    #[inline]
+    fn from(_: Trailing) -> Self { Error::TrailingBytes }
 }
 
 #[cfg(test)]

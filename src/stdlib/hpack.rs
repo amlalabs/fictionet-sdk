@@ -20,6 +20,8 @@
 //! # Ok::<(), fictionet::stdlib::hpack::Error>(())
 //! ```
 
+use fictionet::stdlib::codec::{Reader, Truncated, Trailing};
+
 use fictionet::stdlib::{codec::Wire, huffman, prefix_int};
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -153,44 +155,30 @@ pub const STATIC_TABLE: [(&str, &str); 61] = [
     ("www-authenticate", ""),
 ];
 
-struct Cursor<'a> {
-    bytes: &'a [u8],
-    at: usize,
+trait ReadFields<'a> {
+    fn integer(&mut self, prefix: u8) -> Result<u64, Error>;
+    fn string(&mut self, limit: usize) -> Result<Vec<u8>, Error>;
 }
-impl Cursor<'_> {
-    fn peek(&self) -> Result<u8, Error> {
-        self.bytes.get(self.at).copied().ok_or(Error::Truncated)
-    }
-    fn byte(&mut self) -> Result<u8, Error> {
-        let b = self.peek()?;
-        self.at = self.at.checked_add(1).ok_or(Error::IntegerOverflow)?;
-        Ok(b)
-    }
-    fn end(&self) -> Result<(), Error> {
-        if self.at == self.bytes.len() {
-            Ok(())
-        } else {
-            Err(Error::Trailing)
-        }
-    }
+
+impl<'a> ReadFields<'a> for Reader<'a> {
     fn integer(&mut self, prefix: u8) -> Result<u64, Error> {
-        let bytes = self.bytes.get(self.at..).ok_or(Error::Truncated)?;
+        let bytes = self.clone().rest();
         let (value, used) = prefix_int::read(bytes, prefix).map_err(|error| match error {
             prefix_int::Error::Truncated => Error::Truncated,
             _ => Error::IntegerOverflow,
         })?;
-        self.at = self.at.checked_add(used).ok_or(Error::IntegerOverflow)?;
+        self.skip(used)?;
         Ok(value)
     }
+
     fn string(&mut self, limit: usize) -> Result<Vec<u8>, Error> {
-        let coded = self.peek()? & 0x80 != 0;
+        let coded = self.peek_u8().ok_or(Error::Truncated)? & 0x80 != 0;
         let len = usize::try_from(self.integer(7)?).map_err(|_| Error::StringTooLong)?;
         if len > limit {
             return Err(Error::StringTooLong);
         }
-        let end = self.at.checked_add(len).ok_or(Error::StringTooLong)?;
-        let bytes = self.bytes.get(self.at..end).ok_or(Error::Truncated)?;
-        self.at = end;
+        self.position().checked_add(len).ok_or(Error::StringTooLong)?;
+        let bytes = self.take(len)?;
         if coded {
             huffman::decode_limited(bytes, limit).map_err(|e| match e {
                 huffman::Error::TooLong => Error::StringTooLong,
@@ -229,9 +217,9 @@ impl Wire for StringLiteral {
 
     /// Reads one string. Refuses truncation, trailing bytes, overflow, bad Huffman, and limits.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        let mut c = Cursor { bytes, at: 0 };
+        let mut c = Reader::new(bytes);
         let value = c.string(MAX_STRING)?;
-        c.end()?;
+        c.finish()?;
         Ok(Self(value))
     }
 
@@ -269,14 +257,14 @@ impl Wire for Field {
     /// table references, nonliterals,
     /// truncation, trailing bytes, bad Huffman, integer overflow, and string limits.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        let mut c = Cursor { bytes, at: 0 };
-        let first = c.byte()?;
+        let mut c = Reader::new(bytes);
+        let first = c.u8()?;
         if !matches!(first, 0 | 0x10) {
             return Err(Error::ContextRequired);
         }
         let name = c.string(MAX_STRING)?;
         let value = c.string(MAX_STRING)?;
-        c.end()?;
+        c.finish()?;
         Ok(Self {
             name,
             value,
@@ -499,7 +487,7 @@ impl Table {
         }
         let mut out = Block::default();
         let mut used = 0;
-        let mut c = Cursor { bytes, at: 0 };
+        let mut c = Reader::new(bytes);
         let string_limit = if self.settings.is_none() {
             MAX_BLOCK * 8 / 5
         } else {
@@ -508,8 +496,8 @@ impl Table {
         let mut fields_started = false;
         let mut updates = 0;
         let mut previous = 0;
-        while c.at < bytes.len() {
-            let first = c.peek()?;
+        while c.position() < bytes.len() {
+            let first = c.peek_u8().ok_or(Error::Truncated)?;
             if first & 0xe0 == 0x20 {
                 let size = usize::try_from(c.integer(5)?).map_err(|_| Error::TableSize)?;
                 if self.settings.is_some()
@@ -709,6 +697,16 @@ impl Encoder {
         }
         Ok(())
     }
+}
+
+impl From<Truncated> for Error {
+    #[inline]
+    fn from(_: Truncated) -> Self { Error::Truncated }
+}
+
+impl From<Trailing> for Error {
+    #[inline]
+    fn from(_: Trailing) -> Self { Error::Trailing }
 }
 
 #[cfg(test)]

@@ -65,7 +65,7 @@
 //! );
 //! ```
 
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire, Reader, Truncated, Trailing};
 
 /// The SSH subsystem name a client asks for to start SFTP.
 pub const SUBSYSTEM: &str = "sftp";
@@ -509,25 +509,25 @@ impl Attrs {
     }
 
     fn read(r: &mut Reader<'_>) -> Result<Attrs, Error> {
-        let flags = r.u32()?;
+        let flags = r.u32_be()?;
         if flags & !attr_flags::ALL != 0 {
             return Err(Error::AttrFlags(flags));
         }
         let mut a = Attrs::default();
         if flags & attr_flags::SIZE != 0 {
-            a.size = Some(r.u64()?);
+            a.size = Some(r.u64_be()?);
         }
         if flags & attr_flags::UIDGID != 0 {
-            a.uid_gid = Some((r.u32()?, r.u32()?));
+            a.uid_gid = Some((r.u32_be()?, r.u32_be()?));
         }
         if flags & attr_flags::PERMISSIONS != 0 {
-            a.permissions = Some(r.u32()?);
+            a.permissions = Some(r.u32_be()?);
         }
         if flags & attr_flags::ACMODTIME != 0 {
-            a.times = Some((r.u32()?, r.u32()?));
+            a.times = Some((r.u32_be()?, r.u32_be()?));
         }
         if flags & attr_flags::EXTENDED != 0 {
-            let count = r.u32()?;
+            let count = r.u32_be()?;
             if usize::try_from(count).map_or(true, |c| c > MAX_ATTR_EXTENSIONS) {
                 return Err(Error::TooMany);
             }
@@ -679,21 +679,21 @@ impl Request {
     /// [`Packet::id`] for the id.
     pub fn from_packet(packet: &Packet) -> Result<Request, Error> {
         use packet_type as t;
-        let mut r = Reader::new(packet)?;
+        let mut r = packet_reader(packet)?;
         if packet.kind == t::INIT {
-            let version = r.u32()?;
+            let version = r.u32_be()?;
             let extensions = r.extensions()?;
             return Ok(Request::Init { version, extensions });
         }
         if !matches!(packet.kind, t::OPEN..=t::SYMLINK | t::EXTENDED) {
             return Err(Error::UnknownType(packet.kind));
         }
-        let id = r.u32()?;
+        let id = r.u32_be()?;
         let req = match packet.kind {
-            t::OPEN => Request::Open { id, path: r.path()?, flags: r.u32()?, attrs: Attrs::read(&mut r)? },
+            t::OPEN => Request::Open { id, path: r.path()?, flags: r.u32_be()?, attrs: Attrs::read(&mut r)? },
             t::CLOSE => Request::Close { id, handle: r.handle()? },
-            t::READ => Request::Read { id, handle: r.handle()?, offset: r.u64()?, len: r.u32()? },
-            t::WRITE => Request::Write { id, handle: r.handle()?, offset: r.u64()?, data: r.string(MAX_DATA)? },
+            t::READ => Request::Read { id, handle: r.handle()?, offset: r.u64_be()?, len: r.u32_be()? },
+            t::WRITE => Request::Write { id, handle: r.handle()?, offset: r.u64_be()?, data: r.string(MAX_DATA)? },
             t::LSTAT => Request::Lstat { id, path: r.path()? },
             t::FSTAT => Request::Fstat { id, handle: r.handle()? },
             t::SETSTAT => Request::Setstat { id, path: r.path()?, attrs: Attrs::read(&mut r)? },
@@ -717,7 +717,7 @@ impl Request {
                 Request::Extended { id, name, data: data.to_vec() }
             }
         };
-        r.end()?;
+        r.finish()?;
         Ok(req)
     }
 
@@ -873,24 +873,24 @@ impl Response {
     /// tag.
     pub fn from_packet(packet: &Packet) -> Result<Response, Error> {
         use packet_type as t;
-        let mut r = Reader::new(packet)?;
+        let mut r = packet_reader(packet)?;
         let resp = match packet.kind {
             t::VERSION => {
-                let version = r.u32()?;
+                let version = r.u32_be()?;
                 let extensions = r.extensions()?;
                 return Ok(Response::Version { version, extensions });
             }
             t::STATUS => {
-                let (id, status) = (r.u32()?, Status::from_code(r.u32()?));
-                if r.b.is_empty() {
+                let (id, status) = (r.u32_be()?, Status::from_code(r.u32_be()?));
+                if r.is_empty() {
                     return Ok(Response::Status { id, status, message: Vec::new(), language: Vec::new() });
                 }
                 Response::Status { id, status, message: r.string(MAX_TEXT)?, language: r.string(MAX_TEXT)? }
             }
-            t::HANDLE => Response::Handle { id: r.u32()?, handle: r.handle()? },
-            t::DATA => Response::Data { id: r.u32()?, data: r.string(MAX_DATA)? },
+            t::HANDLE => Response::Handle { id: r.u32_be()?, handle: r.handle()? },
+            t::DATA => Response::Data { id: r.u32_be()?, data: r.string(MAX_DATA)? },
             t::NAME => {
-                let (id, count) = (r.u32()?, r.u32()?);
+                let (id, count) = (r.u32_be()?, r.u32_be()?);
                 if usize::try_from(count).map_or(true, |c| c > MAX_NAMES) {
                     return Err(Error::TooMany);
                 }
@@ -901,9 +901,9 @@ impl Response {
                 }
                 Response::Name { id, names }
             }
-            t::ATTRS => Response::Attrs { id: r.u32()?, attrs: Attrs::read(&mut r)? },
+            t::ATTRS => Response::Attrs { id: r.u32_be()?, attrs: Attrs::read(&mut r)? },
             t::EXTENDED_REPLY => {
-                let id = r.u32()?;
+                let id = r.u32_be()?;
                 let data = r.rest();
                 if data.len() > MAX_DATA {
                     return Err(Error::TooLong);
@@ -912,7 +912,7 @@ impl Response {
             }
             k => return Err(Error::UnknownType(k)),
         };
-        r.end()?;
+        r.finish()?;
         Ok(resp)
     }
 
@@ -978,43 +978,19 @@ impl Response {
 
 }
 
-/// Reads fields from a packet body, front to back.
-struct Reader<'a> {
-    b: &'a [u8],
+trait ReadFields<'a> {
+    fn string(&mut self, max: usize) -> Result<Vec<u8>, Error>;
+    fn path(&mut self) -> Result<Vec<u8>, Error>;
+    fn handle(&mut self) -> Result<Vec<u8>, Error>;
+    fn extension(&mut self) -> Result<Extension, Error>;
+    fn raw_string(&mut self) -> Result<&'a [u8], Error>;
+    fn extensions(&mut self) -> Result<Vec<Extension>, Error>;
 }
 
-impl<'a> Reader<'a> {
-    /// A reader of `packet`'s body. A body longer than a packet can hold
-    /// is refused, so whatever reads from it can be written again.
-    fn new(packet: &'a Packet) -> Result<Reader<'a>, Error> {
-        if packet.body.len() >= MAX_PACKET {
-            return Err(Error::TooLong);
-        }
-        Ok(Reader { b: &packet.body })
-    }
-
-    fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
-        if n > self.b.len() {
-            return Err(Error::Truncated);
-        }
-        let (head, rest) = self.b.split_at(n);
-        self.b = rest;
-        Ok(head)
-    }
-
-    fn u32(&mut self) -> Result<u32, Error> {
-        let b = self.take(4)?;
-        Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
-    }
-
-    fn u64(&mut self) -> Result<u64, Error> {
-        let b = self.take(8)?;
-        Ok(u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
-    }
-
+impl<'a> ReadFields<'a> for Reader<'a> {
     /// A string: a 4-byte length, then that many bytes, at most `max`.
     fn string(&mut self, max: usize) -> Result<Vec<u8>, Error> {
-        let n = usize::try_from(self.u32()?).unwrap_or(usize::MAX);
+        let n = usize::try_from(self.u32_be()?).unwrap_or(usize::MAX);
         if n > max {
             return Err(Error::TooLong);
         }
@@ -1035,8 +1011,8 @@ impl<'a> Reader<'a> {
 
     /// A string of any length that fits in the body, not copied.
     fn raw_string(&mut self) -> Result<&'a [u8], Error> {
-        let n = usize::try_from(self.u32()?).unwrap_or(usize::MAX);
-        self.take(n)
+        let n = usize::try_from(self.u32_be()?).unwrap_or(usize::MAX);
+        self.take(n).map_err(Error::from)
     }
 
     /// Extension pairs up to the end of the body. The specification says
@@ -1045,21 +1021,13 @@ impl<'a> Reader<'a> {
     /// than refused. The body bounds what is read.
     fn extensions(&mut self) -> Result<Vec<Extension>, Error> {
         let mut out = Vec::new();
-        while !self.b.is_empty() {
+        while !self.is_empty() {
             let (name, data) = (self.raw_string()?, self.raw_string()?);
             if out.len() < MAX_EXTENSIONS && name.len() <= MAX_EXTENSION_NAME && data.len() <= MAX_TEXT {
                 out.push(Extension { name: name.to_vec(), data: data.to_vec() });
             }
         }
         Ok(out)
-    }
-
-    fn rest(&mut self) -> &'a [u8] {
-        std::mem::take(&mut self.b)
-    }
-
-    fn end(&self) -> Result<(), Error> {
-        if self.b.is_empty() { Ok(()) } else { Err(Error::Trailing) }
     }
 }
 
@@ -1124,9 +1092,9 @@ impl Wire for Attrs {
 
     /// Reads attributes. Refuses unknown flags, excess fields, and trailing bytes.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        let mut reader = Reader { b: bytes };
+        let mut reader = Reader::new(bytes);
         let value = Self::read(&mut reader)?;
-        reader.end()?;
+        reader.finish()?;
         Ok(value)
     }
 
@@ -1138,6 +1106,21 @@ impl Wire for Attrs {
         out.extend_from_slice(&bytes);
         Ok(())
     }
+}
+
+impl From<Truncated> for Error {
+    #[inline]
+    fn from(_: Truncated) -> Self { Error::Truncated }
+}
+
+impl From<Trailing> for Error {
+    #[inline]
+    fn from(_: Trailing) -> Self { Error::Trailing }
+}
+
+fn packet_reader(packet: &Packet) -> Result<Reader<'_>, Error> {
+    if packet.body.len() >= MAX_PACKET { return Err(Error::TooLong); }
+    Ok(Reader::new(&packet.body))
 }
 
 #[cfg(test)]

@@ -69,7 +69,7 @@
 
 extern crate alloc;
 
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire, Reader, Truncated, Trailing};
 use alloc::{borrow::ToOwned, string::String, vec::Vec};
 
 /// The TCP port Kafka brokers listen on.
@@ -291,106 +291,41 @@ pub struct TaggedField {
     pub data: Vec<u8>,
 }
 
-/// Reads Kafka's primitive types from a byte slice, front to back. Every
-/// read checks that its bytes are there and returns [`Error::Truncated`]
-/// if they are not.
-#[derive(Clone, Debug)]
-struct Reader<'a> {
-    buf: &'a [u8],
-    pos: usize,
+trait ReadFields<'a> {
+    fn bool(&mut self) -> Result<bool, Error>;
+    fn uuid(&mut self) -> Result<[u8; 16], Error>;
+    fn uvarint(&mut self) -> Result<u32, Error>;
+    fn varint(&mut self) -> Result<i32, Error>;
+    fn varlong(&mut self) -> Result<i64, Error>;
+    fn utf8(&mut self, n: usize) -> Result<String, Error>;
+    fn string(&mut self) -> Result<String, Error>;
+    fn nullable_string(&mut self) -> Result<Option<String>, Error>;
+    fn compact_string(&mut self) -> Result<String, Error>;
+    fn compact_nullable_string(&mut self) -> Result<Option<String>, Error>;
+    fn bytes(&mut self) -> Result<&'a [u8], Error>;
+    fn nullable_bytes(&mut self) -> Result<Option<&'a [u8]>, Error>;
+    fn compact_bytes(&mut self) -> Result<&'a [u8], Error>;
+    fn compact_nullable_bytes(&mut self) -> Result<Option<&'a [u8]>, Error>;
+    fn count(&self, n: usize) -> Result<usize, Error>;
+    fn array_len(&mut self) -> Result<Option<usize>, Error>;
+    fn compact_array_len(&mut self) -> Result<Option<usize>, Error>;
+    fn tagged_fields(&mut self) -> Result<Vec<TaggedField>, Error>;
+    fn str_f(&mut self, flex: bool) -> Result<String, Error>;
+    fn nstr_f(&mut self, flex: bool) -> Result<Option<String>, Error>;
+    fn arr_f(&mut self, flex: bool) -> Result<Option<usize>, Error>;
+    fn tags_f(&mut self, flex: bool) -> Result<Vec<TaggedField>, Error>;
+    fn i32s(&mut self, flex: bool) -> Result<Vec<i32>, Error>;
 }
 
-impl<'a> Reader<'a> {
-    /// A reader at the start of `buf`.
-    fn new(buf: &'a [u8]) -> Reader<'a> {
-        Reader { buf, pos: 0 }
-    }
-
-    /// How many bytes are left.
-    fn remaining(&self) -> usize {
-        self.buf.len() - self.pos
-    }
-
-    /// The next `n` bytes.
-    fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
-        if n > self.remaining() {
-            return Err(Error::Truncated);
-        }
-        let s = &self.buf[self.pos..self.pos + n];
-        self.pos += n;
-        Ok(s)
-    }
-
-    /// Every byte left.
-    fn rest(&mut self) -> &'a [u8] {
-        let s = &self.buf[self.pos..];
-        self.pos = self.buf.len();
-        s
-    }
-
-    /// Succeeds if every byte has been read.
-    fn finish(&self) -> Result<(), Error> {
-        match self.remaining() {
-            0 => Ok(()),
-            n => Err(Error::Trailing(n)),
-        }
-    }
-
-    fn fixed<const N: usize>(&mut self) -> Result<[u8; N], Error> {
-        let s = self.take(N)?;
-        let mut a = [0u8; N];
-        a.copy_from_slice(s);
-        Ok(a)
-    }
-
+impl<'a> ReadFields<'a> for Reader<'a> {
     /// A BOOLEAN: one byte, and any byte but 0 is true.
     fn bool(&mut self) -> Result<bool, Error> {
         Ok(self.u8()? != 0)
     }
 
-    /// One unsigned byte.
-    fn u8(&mut self) -> Result<u8, Error> {
-        Ok(self.fixed::<1>()?[0])
-    }
-
-    /// An INT8.
-    fn i8(&mut self) -> Result<i8, Error> {
-        Ok(i8::from_be_bytes(self.fixed()?))
-    }
-
-    /// An INT16, big-endian.
-    fn i16(&mut self) -> Result<i16, Error> {
-        Ok(i16::from_be_bytes(self.fixed()?))
-    }
-
-    /// A UINT16, big-endian.
-    fn u16(&mut self) -> Result<u16, Error> {
-        Ok(u16::from_be_bytes(self.fixed()?))
-    }
-
-    /// An INT32, big-endian.
-    fn i32(&mut self) -> Result<i32, Error> {
-        Ok(i32::from_be_bytes(self.fixed()?))
-    }
-
-    /// A UINT32, big-endian.
-    fn u32(&mut self) -> Result<u32, Error> {
-        Ok(u32::from_be_bytes(self.fixed()?))
-    }
-
-    /// An INT64, big-endian.
-    fn i64(&mut self) -> Result<i64, Error> {
-        Ok(i64::from_be_bytes(self.fixed()?))
-    }
-
-    /// A FLOAT64: an IEEE 754 double, big-endian.
-    fn f64(&mut self) -> Result<f64, Error> {
-        Ok(f64::from_be_bytes(self.fixed()?))
-    }
-
     /// A UUID: 16 bytes.
     fn uuid(&mut self) -> Result<[u8; 16], Error> {
-        self.fixed()
+        self.array().map_err(Error::from)
     }
 
     /// An UNSIGNED_VARINT: 7 bits per byte, low bits first, with the top
@@ -447,7 +382,7 @@ impl<'a> Reader<'a> {
 
     /// A NULLABLE_STRING: a STRING, or length -1 for null.
     fn nullable_string(&mut self) -> Result<Option<String>, Error> {
-        match self.i16()? {
+        match self.i16_be()? {
             -1 => Ok(None),
             n if n < 0 => Err(Error::Length(n.into())),
             n => self.utf8(n as usize).map(Some),
@@ -482,10 +417,10 @@ impl<'a> Reader<'a> {
 
     /// NULLABLE_BYTES: BYTES, or length -1 for null.
     fn nullable_bytes(&mut self) -> Result<Option<&'a [u8]>, Error> {
-        match self.i32()? {
+        match self.i32_be()? {
             -1 => Ok(None),
             n if n < 0 || n as usize > MAX_FRAME => Err(Error::Length(n.into())),
-            n => self.take(n as usize).map(Some),
+            n => self.take(n as usize).map(Some).map_err(Error::from),
         }
     }
 
@@ -504,7 +439,7 @@ impl<'a> Reader<'a> {
                 if len > MAX_FRAME {
                     return Err(Error::Length(len as i64));
                 }
-                self.take(len).map(Some)
+                self.take(len).map(Some).map_err(Error::from)
             }
         }
     }
@@ -518,7 +453,7 @@ impl<'a> Reader<'a> {
     /// An ARRAY's element count: an INT32, or -1 for a null array. The
     /// elements follow, and the caller reads them.
     fn array_len(&mut self) -> Result<Option<usize>, Error> {
-        match self.i32()? {
+        match self.i32_be()? {
             -1 => Ok(None),
             n if n < 0 => Err(Error::Length(n.into())),
             n => self.count(n as usize).map(Some),
@@ -561,8 +496,6 @@ impl<'a> Reader<'a> {
         Ok(out)
     }
 
-    // The same reads in the classic or the flexible form.
-
     fn str_f(&mut self, flex: bool) -> Result<String, Error> {
         if flex { self.compact_string() } else { self.string() }
     }
@@ -583,7 +516,7 @@ impl<'a> Reader<'a> {
         let n = self.arr_f(flex)?.ok_or(Error::Null)?;
         let mut out = Vec::new();
         for _ in 0..n {
-            out.push(self.i32()?);
+            out.push(self.i32_be()?);
         }
         Ok(out)
     }
@@ -653,7 +586,7 @@ pub struct Int16(
     pub i16,
 );
 
-wire_field!(Int16, |r: &mut Reader<'_>| r.i16(), |w: &mut Writer, v: &i16| w.i16(*v));
+wire_field!(Int16, |r: &mut Reader<'_>| r.i16_be(), |w: &mut Writer, v: &i16| w.i16(*v));
 
 /// A UINT16.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -662,7 +595,7 @@ pub struct Uint16(
     pub u16,
 );
 
-wire_field!(Uint16, |r: &mut Reader<'_>| r.u16(), |w: &mut Writer, v: &u16| w.u16(*v));
+wire_field!(Uint16, |r: &mut Reader<'_>| r.u16_be(), |w: &mut Writer, v: &u16| w.u16(*v));
 
 /// An INT32.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -671,7 +604,7 @@ pub struct Int32(
     pub i32,
 );
 
-wire_field!(Int32, |r: &mut Reader<'_>| r.i32(), |w: &mut Writer, v: &i32| w.i32(*v));
+wire_field!(Int32, |r: &mut Reader<'_>| r.i32_be(), |w: &mut Writer, v: &i32| w.i32(*v));
 
 /// A UINT32.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -680,7 +613,7 @@ pub struct Uint32(
     pub u32,
 );
 
-wire_field!(Uint32, |r: &mut Reader<'_>| r.u32(), |w: &mut Writer, v: &u32| w.u32(*v));
+wire_field!(Uint32, |r: &mut Reader<'_>| r.u32_be(), |w: &mut Writer, v: &u32| w.u32(*v));
 
 /// An INT64.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -689,7 +622,7 @@ pub struct Int64(
     pub i64,
 );
 
-wire_field!(Int64, |r: &mut Reader<'_>| r.i64(), |w: &mut Writer, v: &i64| w.i64(*v));
+wire_field!(Int64, |r: &mut Reader<'_>| r.i64_be(), |w: &mut Writer, v: &i64| w.i64(*v));
 
 /// A FLOAT64, compared by its bits.
 #[derive(Clone, Debug)]
@@ -698,7 +631,7 @@ pub struct Float64(
     pub f64,
 );
 
-wire_field!(Float64, |r: &mut Reader<'_>| r.f64(), |w: &mut Writer, v: &f64| w.f64(*v));
+wire_field!(Float64, |r: &mut Reader<'_>| r.f64_be(), |w: &mut Writer, v: &f64| w.f64(*v));
 
 /// A UUID.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -842,7 +775,7 @@ impl PartialEq for Float64 {
 impl Eq for Float64 {}
 
 fn read_array_count(reader: &mut Reader<'_>, compact: bool) -> Result<Option<usize>, Error> {
-    let count = if compact { i64::from(reader.uvarint()?) - 1 } else { i64::from(reader.i32()?) };
+    let count = if compact { i64::from(reader.uvarint()?) - 1 } else { i64::from(reader.i32_be()?) };
     match count {
         -1 => Ok(None),
         n if n >= 0 && n <= MAX_ARRAY as i64 => Ok(Some(n as usize)),
@@ -1229,8 +1162,8 @@ impl RequestHeader {
     /// call for.
     fn read(r: &mut Reader<'_>) -> Result<RequestHeader, Error> {
         let mut peek = r.clone();
-        let api_key = peek.i16()?;
-        let api_version = peek.i16()?;
+        let api_key = peek.i16_be()?;
+        let api_version = peek.i16_be()?;
         RequestHeader::read_version(r, request_header_version(api_key, api_version))
     }
 
@@ -1239,9 +1172,9 @@ impl RequestHeader {
         if version > 2 {
             return Err(Error::HeaderVersion(version));
         }
-        let api_key = r.i16()?;
-        let api_version = r.i16()?;
-        let correlation_id = r.i32()?;
+        let api_key = r.i16_be()?;
+        let api_version = r.i16_be()?;
+        let correlation_id = r.i32_be()?;
         let client_id = if version >= 1 { r.nullable_string()? } else { None };
         let tagged_fields = if version >= 2 { r.tagged_fields()? } else { Vec::new() };
         Ok(RequestHeader { api_key, api_version, correlation_id, client_id, tagged_fields })
@@ -1282,7 +1215,7 @@ impl ResponseHeader {
         if version > 1 {
             return Err(Error::HeaderVersion(version));
         }
-        let correlation_id = r.i32()?;
+        let correlation_id = r.i32_be()?;
         let tagged_fields = if version >= 1 { r.tagged_fields()? } else { Vec::new() };
         Ok(ResponseHeader { correlation_id, tagged_fields })
     }
@@ -1442,7 +1375,7 @@ impl ApiVersionsRequest {
             out.client_software_version = r.compact_string()?;
             if version >= 5 {
                 out.cluster_id = r.compact_nullable_string()?;
-                out.node_id = r.i32()?;
+                out.node_id = r.i32_be()?;
             }
             out.tagged_fields = r.tagged_fields()?;
         }
@@ -1519,18 +1452,18 @@ impl ApiVersionsResponse {
         check_version(api_key::API_VERSIONS, version)?;
         let flex = version >= 3;
         let mut r = Reader::new(body);
-        let error_code = r.i16()?;
+        let error_code = r.i16_be()?;
         let n = r.arr_f(flex)?.ok_or(Error::Null)?;
         let mut api_keys = Vec::new();
         for _ in 0..n {
             api_keys.push(ApiVersion {
-                api_key: r.i16()?,
-                min_version: r.i16()?,
-                max_version: r.i16()?,
+                api_key: r.i16_be()?,
+                min_version: r.i16_be()?,
+                max_version: r.i16_be()?,
                 tagged_fields: r.tags_f(flex)?,
             });
         }
-        let throttle_time_ms = if version >= 1 { r.i32()? } else { 0 };
+        let throttle_time_ms = if version >= 1 { r.i32_be()? } else { 0 };
         let tagged_fields = r.tags_f(flex)?;
         r.finish()?;
         check_feature_tags(&tagged_fields)?;
@@ -1571,8 +1504,8 @@ fn check_feature_tags(fields: &[TaggedField]) -> Result<(), Error> {
         let n = r.compact_array_len()?.ok_or(Error::Null)?;
         for _ in 0..n {
             r.compact_string()?;
-            r.i16()?;
-            r.i16()?;
+            r.i16_be()?;
+            r.i16_be()?;
             r.tagged_fields()?;
         }
         Ok(())
@@ -1581,11 +1514,11 @@ fn check_feature_tags(fields: &[TaggedField]) -> Result<(), Error> {
         let mut r = Reader::new(&f.data);
         let read = match f.tag {
             0 | 2 => features(&mut r),
-            1 => r.i64().map(drop),
+            1 => r.i64_be().map(drop).map_err(Error::from),
             3 => r.bool().map(drop),
             _ => continue,
         };
-        if read.and_then(|()| r.finish()).is_err() {
+        if read.and_then(|()| r.finish().map_err(Error::from)).is_err() {
             return Err(Error::Invalid(match f.tag {
                 0 => "supported features (tag 0)",
                 1 => "finalized features epoch (tag 1)",
@@ -1901,13 +1834,13 @@ impl MetadataResponse {
         let mut r = Reader::new(body);
         let mut out = MetadataResponse::default();
         if version >= 3 {
-            out.throttle_time_ms = r.i32()?;
+            out.throttle_time_ms = r.i32_be()?;
         }
         let n = r.arr_f(flex)?.ok_or(Error::Null)?;
         for _ in 0..n {
-            let node_id = r.i32()?;
+            let node_id = r.i32_be()?;
             let host = r.str_f(flex)?;
-            let port = r.i32()?;
+            let port = r.i32_be()?;
             let rack = if version >= 1 { r.nstr_f(flex)? } else { None };
             let tagged_fields = r.tags_f(flex)?;
             out.brokers.push(MetadataBroker { node_id, host, port, rack, tagged_fields });
@@ -1916,11 +1849,11 @@ impl MetadataResponse {
             out.cluster_id = r.nstr_f(flex)?;
         }
         if version >= 1 {
-            out.controller_id = r.i32()?;
+            out.controller_id = r.i32_be()?;
         }
         let n = r.arr_f(flex)?.ok_or(Error::Null)?;
         for _ in 0..n {
-            let mut t = MetadataTopic { error_code: r.i16()?, ..MetadataTopic::default() };
+            let mut t = MetadataTopic { error_code: r.i16_be()?, ..MetadataTopic::default() };
             t.name = if version >= 12 { r.nstr_f(flex)? } else { Some(r.str_f(flex)?) };
             if version >= 10 {
                 t.topic_id = r.uuid()?;
@@ -1931,13 +1864,13 @@ impl MetadataResponse {
             let n = r.arr_f(flex)?.ok_or(Error::Null)?;
             for _ in 0..n {
                 let mut p = MetadataPartition {
-                    error_code: r.i16()?,
-                    partition_index: r.i32()?,
-                    leader_id: r.i32()?,
+                    error_code: r.i16_be()?,
+                    partition_index: r.i32_be()?,
+                    leader_id: r.i32_be()?,
                     ..MetadataPartition::default()
                 };
                 if version >= 7 {
-                    p.leader_epoch = r.i32()?;
+                    p.leader_epoch = r.i32_be()?;
                 }
                 p.replica_nodes = r.i32s(flex)?;
                 p.isr_nodes = r.i32s(flex)?;
@@ -1948,16 +1881,16 @@ impl MetadataResponse {
                 t.partitions.push(p);
             }
             if version >= 8 {
-                t.topic_authorized_operations = r.i32()?;
+                t.topic_authorized_operations = r.i32_be()?;
             }
             t.tagged_fields = r.tags_f(flex)?;
             out.topics.push(t);
         }
         if (8..=10).contains(&version) {
-            out.cluster_authorized_operations = r.i32()?;
+            out.cluster_authorized_operations = r.i32_be()?;
         }
         if version >= 13 {
-            out.error_code = r.i16()?;
+            out.error_code = r.i16_be()?;
         }
         out.tagged_fields = r.tags_f(flex)?;
         r.finish()?;
@@ -2173,6 +2106,16 @@ impl Response {
     }
 }
 
+impl From<Truncated> for Error {
+    #[inline]
+    fn from(_: Truncated) -> Self { Error::Truncated }
+}
+
+impl From<Trailing> for Error {
+    #[inline]
+    fn from(error: Trailing) -> Self { Error::Trailing(error.0) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2311,12 +2254,12 @@ mod tests {
         let mut r = Reader::new(&b);
         assert_eq!(r.bool(), Ok(true));
         assert_eq!(r.i8(), Ok(-3));
-        assert_eq!(r.i16(), Ok(-300));
-        assert_eq!(r.u16(), Ok(65000));
-        assert_eq!(r.i32(), Ok(-70000));
-        assert_eq!(r.u32(), Ok(4_000_000_000));
-        assert_eq!(r.i64(), Ok(-1 << 40));
-        assert_eq!(r.f64(), Ok(1.5));
+        assert_eq!(r.i16_be(), Ok(-300));
+        assert_eq!(r.u16_be(), Ok(65000));
+        assert_eq!(r.i32_be(), Ok(-70000));
+        assert_eq!(r.u32_be(), Ok(4_000_000_000));
+        assert_eq!(r.i64_be(), Ok(-1 << 40));
+        assert_eq!(r.f64_be(), Ok(1.5));
         assert_eq!(r.uuid(), Ok(id));
         assert_eq!(r.string().as_deref(), Ok("héllo"));
         assert_eq!(r.nullable_string(), Ok(None));
@@ -2333,7 +2276,7 @@ mod tests {
         // Tagged fields retain their order and contents.
         assert_eq!(r.tagged_fields(), Ok(vec![tag(1, b"yz"), tag(5, b"x")]));
         assert_eq!(r.finish(), Ok(()));
-        assert_eq!(r.pos, b.len());
+        assert_eq!(r.position(), b.len());
     }
 
     #[test]
@@ -2383,8 +2326,8 @@ mod tests {
         assert_eq!(Reader::new(&many).tagged_fields(), Err(Error::Length(MAX_TAGGED_FIELDS as i64 + 1)));
         // Trailing bytes.
         let r = Reader::new(&[1, 2]);
-        assert_eq!(r.finish(), Err(Error::Trailing(2)));
-        assert_eq!(Reader::new(&[]).i64(), Err(Error::Truncated));
+        assert_eq!(r.finish().map_err(Error::from), Err(Error::Trailing(2)));
+        assert_eq!(Reader::new(&[]).i64_be().map_err(Error::from), Err(Error::Truncated));
     }
 
     #[test]

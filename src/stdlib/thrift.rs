@@ -72,7 +72,7 @@
 
 extern crate alloc;
 
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire, Reader as ByteReader, Truncated};
 use alloc::{string::String, vec, vec::Vec};
 
 /// The TCP port Thrift servers commonly listen on.
@@ -367,12 +367,12 @@ impl Value {
     /// Refuses invalid encodings and values over [`MAX_VALUE_LEN`],
     /// [`MAX_DEPTH`], or [`MAX_VALUES`].
     fn parse_prefix(protocol: Protocol, ty: Type, b: &[u8]) -> Result<(Value, usize), Error> {
-        let mut r = Reader::new(&b[..b.len().min(MAX_VALUE_LEN + 1)], protocol.compact());
+        let mut r = Fields::new(&b[..b.len().min(MAX_VALUE_LEN + 1)], protocol.compact());
         let result = r.value(ty, 1);
-        if r.pos > MAX_VALUE_LEN || (result == Err(Error::Truncated) && b.len() > MAX_VALUE_LEN) {
+        if r.cursor.position() > MAX_VALUE_LEN || (result == Err(Error::Truncated) && b.len() > MAX_VALUE_LEN) {
             return Err(Error::TooLong);
         }
-        Ok((result?, r.pos))
+        Ok((result?, r.cursor.position()))
     }
 }
 
@@ -479,11 +479,11 @@ impl Message {
     /// and how many bytes of `b` it took. A reply should use the same
     /// protocol.
     fn parse_prefix(b: &[u8]) -> Result<(Message, Protocol, usize), Error> {
-        let mut r = Reader::new(b, false);
+        let mut r = Fields::new(b, false);
         let (name, kind, seq, protocol) = r.head()?;
         r.enter(1)?;
         let body = r.fields(1)?;
-        Ok((Message { name, kind, seq, body }, protocol, r.pos))
+        Ok((Message { name, kind, seq, body }, protocol, r.cursor.position()))
     }
 
     fn encode(&self, protocol: Protocol) -> Result<Vec<u8>, Error> {
@@ -807,11 +807,11 @@ impl EncodedMessages {
             self.values = 0;
         }
         while let Some(&task) = self.tasks.last() {
-            let mut r = Reader::new(input.get(self.pos..).ok_or(Error::Truncated)?, self.compact);
+            let mut r = Fields::new(input.get(self.pos..).ok_or(Error::Truncated)?, self.compact);
             r.values = self.values;
             match step(task, &mut r, &mut self.tasks) {
                 Ok(()) => {
-                    self.pos += r.pos;
+                    self.pos += r.cursor.position();
                     self.values = r.values;
                     self.compact = r.compact;
                     debug_assert!(self.tasks.len() <= 2 * MAX_DEPTH);
@@ -899,7 +899,7 @@ enum Task {
 /// Reads one piece of a message for `task`, then updates `tasks`. The
 /// tasks are changed only after every read has succeeded, so a piece that
 /// is cut short can be read again from its start.
-fn step(task: Task, r: &mut Reader, tasks: &mut Vec<Task>) -> Result<(), Error> {
+fn step(task: Task, r: &mut Fields, tasks: &mut Vec<Task>) -> Result<(), Error> {
     match task {
         Task::Head => {
             r.head()?;
@@ -939,7 +939,7 @@ fn step(task: Task, r: &mut Reader, tasks: &mut Vec<Task>) -> Result<(), Error> 
                     // message is read.
                     r.enter(depth)?;
                     let n = r.len(MAX_BINARY_LEN)?;
-                    r.take(n)?;
+                    r.cursor.take(n)?;
                     None
                 }
                 _ => {
@@ -970,39 +970,15 @@ fn step(task: Task, r: &mut Reader, tasks: &mut Vec<Task>) -> Result<(), Error> 
 }
 
 /// Reads values from a byte slice, counting them against [`MAX_VALUES`].
-struct Reader<'a> {
-    b: &'a [u8],
-    pos: usize,
+struct Fields<'a> {
+    cursor: ByteReader<'a>,
     compact: bool,
     values: usize,
 }
 
-impl<'a> Reader<'a> {
-    fn new(b: &'a [u8], compact: bool) -> Reader<'a> {
-        Reader { b, pos: 0, compact, values: 0 }
-    }
-
-    fn remaining(&self) -> usize {
-        self.b.len() - self.pos
-    }
-
-    fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
-        if n > self.remaining() {
-            return Err(Error::Truncated);
-        }
-        let s = &self.b[self.pos..self.pos + n];
-        self.pos += n;
-        Ok(s)
-    }
-
-    fn array<const N: usize>(&mut self) -> Result<[u8; N], Error> {
-        let mut a = [0u8; N];
-        a.copy_from_slice(self.take(N)?);
-        Ok(a)
-    }
-
-    fn u8(&mut self) -> Result<u8, Error> {
-        Ok(self.array::<1>()?[0])
+impl<'a> Fields<'a> {
+    fn new(b: &'a [u8], compact: bool) -> Fields<'a> {
+        Fields { cursor: ByteReader::new(b), compact, values: 0 }
     }
 
     /// A variable-length integer of at most `max_bytes` bytes, no bigger
@@ -1010,7 +986,7 @@ impl<'a> Reader<'a> {
     fn varint(&mut self, max_bytes: usize, max: u64) -> Result<u64, Error> {
         let mut v: u128 = 0;
         for i in 0..max_bytes {
-            let byte = self.u8()?;
+            let byte = self.cursor.u8()?;
             v |= u128::from(byte & 0x7f) << (7 * i);
             if byte & 0x80 == 0 {
                 return if v > u128::from(max) { Err(Error::BadVarint) } else { Ok(v as u64) };
@@ -1032,12 +1008,12 @@ impl<'a> Reader<'a> {
         if self.compact {
             i16::try_from(self.zigzag32()?).map_err(|_| Error::BadVarint)
         } else {
-            Ok(i16::from_be_bytes(self.array()?))
+            Ok(i16::from_be_bytes(self.cursor.array()?))
         }
     }
 
     fn i32v(&mut self) -> Result<i32, Error> {
-        if self.compact { self.zigzag32() } else { Ok(i32::from_be_bytes(self.array()?)) }
+        if self.compact { self.zigzag32() } else { Ok(i32::from_be_bytes(self.cursor.array()?)) }
     }
 
     fn i64v(&mut self) -> Result<i64, Error> {
@@ -1045,25 +1021,25 @@ impl<'a> Reader<'a> {
             let n = self.varint(10, u64::MAX)?;
             Ok(((n >> 1) as i64) ^ -((n & 1) as i64))
         } else {
-            Ok(i64::from_be_bytes(self.array()?))
+            Ok(i64::from_be_bytes(self.cursor.array()?))
         }
     }
 
     /// A length or count, checked against `limit`.
     fn len(&mut self, limit: usize) -> Result<usize, Error> {
-        let n = if self.compact { i64::from(self.varint32()?) } else { i64::from(i32::from_be_bytes(self.array()?)) };
+        let n = if self.compact { i64::from(self.varint32()?) } else { i64::from(i32::from_be_bytes(self.cursor.array()?)) };
         if n < 0 || n as u64 > limit as u64 { Err(Error::Length(n)) } else { Ok(n as usize) }
     }
 
     fn name(&mut self) -> Result<String, Error> {
         let n = self.len(MAX_BINARY_LEN)?;
-        String::from_utf8(self.take(n)?.to_vec()).map_err(|_| Error::BadUtf8)
+        String::from_utf8(self.cursor.take(n)?.to_vec()).map_err(|_| Error::BadUtf8)
     }
 
     /// A message's header: everything before its struct. It picks the
     /// protocol from the first byte and reads the rest in it.
     fn head(&mut self) -> Result<(String, MessageType, i32, Protocol), Error> {
-        let first = *self.b.get(self.pos).ok_or(Error::Truncated)?;
+        let first = self.cursor.peek_u8().ok_or(Error::Truncated)?;
         let protocol = match first {
             0x82 => Protocol::Compact,
             0x80 => Protocol::Binary,
@@ -1073,8 +1049,8 @@ impl<'a> Reader<'a> {
         self.compact = protocol.compact();
         let (name, kind, seq) = match protocol {
             Protocol::Compact => {
-                self.u8()?;
-                let h = self.u8()?;
+                self.cursor.u8()?;
+                let h = self.cursor.u8()?;
                 if h & 0x1f != 1 {
                     return Err(Error::BadVersion(u32::from(h & 0x1f)));
                 }
@@ -1084,7 +1060,7 @@ impl<'a> Reader<'a> {
                 (self.name()?, kind, seq)
             }
             Protocol::Binary => {
-                let word = u32::from_be_bytes(self.array()?);
+                let word = u32::from_be_bytes(self.cursor.array()?);
                 if word & 0xffff_0000 != 0x8001_0000 {
                     return Err(Error::BadVersion(word));
                 }
@@ -1095,7 +1071,7 @@ impl<'a> Reader<'a> {
             }
             Protocol::BinaryOld => {
                 let name = self.name()?;
-                let code = self.u8()?;
+                let code = self.cursor.u8()?;
                 let kind = MessageType::from_code(code).ok_or(Error::BadMessageType(code))?;
                 (name, kind, self.i32v()?)
             }
@@ -1119,26 +1095,26 @@ impl<'a> Reader<'a> {
         self.enter(depth)?;
         Ok(match ty {
             Type::Bool => {
-                let b = self.u8()?;
+                let b = self.cursor.u8()?;
                 match (self.compact, b) {
                     (_, 1) => Value::Bool(true),
                     (false, 0) | (true, 0 | 2) => Value::Bool(false),
                     _ => return Err(Error::BadBool(b)),
                 }
             }
-            Type::Byte => Value::Byte(self.u8()? as i8),
+            Type::Byte => Value::Byte(self.cursor.u8()? as i8),
             Type::I16 => Value::I16(self.i16v()?),
             Type::I32 => Value::I32(self.i32v()?),
             Type::I64 => Value::I64(self.i64v()?),
             Type::Double => {
-                let a = self.array()?;
+                let a = self.cursor.array()?;
                 Value::Double(if self.compact { f64::from_le_bytes(a) } else { f64::from_be_bytes(a) })
             }
             Type::Binary => {
                 let n = self.len(MAX_BINARY_LEN)?;
-                Value::Binary(self.take(n)?.to_vec())
+                Value::Binary(self.cursor.take(n)?.to_vec())
             }
-            Type::Uuid => Value::Uuid(self.array()?),
+            Type::Uuid => Value::Uuid(self.cursor.array()?),
             Type::Struct => Value::Struct(self.fields(depth)?),
             Type::List => Value::List(self.list(depth)?),
             Type::Set => Value::Set(self.list(depth)?),
@@ -1168,7 +1144,7 @@ impl<'a> Reader<'a> {
     /// A field's number and type, or `None` at a struct's stop byte.
     /// `last` is the number of the field before it.
     fn field_header(&mut self, last: i16) -> Result<Option<(i16, FieldHead)>, Error> {
-        let h = self.u8()?;
+        let h = self.cursor.u8()?;
         if h == 0 {
             return Ok(None);
         }
@@ -1191,13 +1167,13 @@ impl<'a> Reader<'a> {
     /// A list or set's element type and count.
     fn list_header(&mut self) -> Result<(Type, usize), Error> {
         if self.compact {
-            let h = self.u8()?;
+            let h = self.cursor.u8()?;
             let code = h & 0x0f;
             let elem = Type::from_compact_code(code).ok_or(Error::BadType(code))?;
             let n = if h >> 4 == 15 { self.len(MAX_CONTAINER_LEN)? } else { usize::from(h >> 4) };
             Ok((elem, n))
         } else {
-            let code = self.u8()?;
+            let code = self.cursor.u8()?;
             let elem = Type::from_binary_code(code).ok_or(Error::BadType(code))?;
             Ok((elem, self.len(MAX_CONTAINER_LEN)?))
         }
@@ -1210,12 +1186,12 @@ impl<'a> Reader<'a> {
             if n == 0 {
                 return Ok((Type::Byte, Type::Byte, 0));
             }
-            let h = self.u8()?;
+            let h = self.cursor.u8()?;
             let key = Type::from_compact_code(h >> 4).ok_or(Error::BadType(h >> 4))?;
             let value = Type::from_compact_code(h & 0x0f).ok_or(Error::BadType(h & 0x0f))?;
             Ok((key, value, n))
         } else {
-            let [k, v] = self.array()?;
+            let [k, v] = self.cursor.array()?;
             let key = Type::from_binary_code(k).ok_or(Error::BadType(k))?;
             let value = Type::from_binary_code(v).ok_or(Error::BadType(v))?;
             Ok((key, value, self.len(MAX_CONTAINER_LEN)?))
@@ -1225,7 +1201,7 @@ impl<'a> Reader<'a> {
     fn list(&mut self, depth: usize) -> Result<List, Error> {
         let (elem, n) = self.list_header()?;
         // Every element takes at least one byte.
-        if n > self.remaining() {
+        if n > self.cursor.remaining() {
             return Err(Error::Truncated);
         }
         let mut items = Vec::with_capacity(n.min(MAX_PREALLOC));
@@ -1238,7 +1214,7 @@ impl<'a> Reader<'a> {
     fn map(&mut self, depth: usize) -> Result<Map, Error> {
         let (key, value, n) = self.map_header()?;
         // Every key and every value takes at least one byte.
-        if n.saturating_mul(2) > self.remaining() {
+        if n.saturating_mul(2) > self.cursor.remaining() {
             return Err(Error::Truncated);
         }
         let mut entries = Vec::with_capacity(n.min(MAX_PREALLOC));
@@ -1260,7 +1236,7 @@ enum FieldHead {
     Typed(Type),
 }
 
-/// Writes values, checking the same limits a [`Reader`] does.
+/// Writes values, checking the same limits a [`Fields`] does.
 struct Writer<'o> {
     out: &'o mut Vec<u8>,
     compact: bool,
@@ -1465,6 +1441,11 @@ impl<'o> Writer<'o> {
         }
         self.check()
     }
+}
+
+impl From<Truncated> for Error {
+    #[inline]
+    fn from(_: Truncated) -> Self { Error::Truncated }
 }
 
 #[cfg(test)]

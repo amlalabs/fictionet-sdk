@@ -95,6 +95,8 @@
 //! assert!(Packet::parse(&bad, &link).is_err());
 //! ```
 
+use fictionet::stdlib::codec::Reader as ByteReader;
+
 use fictionet::stdlib::codec::Wire;
 
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -964,42 +966,40 @@ fn lsa_data(lsa: &[u8]) -> Option<&[u8]> {
 
 // Reading.
 
-/// A cursor over bytes that gives `err` when they run out.
-struct Rd<'a> {
-    b: &'a [u8],
-    pos: usize,
+/// Reads OSPF fields with the enclosing packet or LSA error.
+struct Fields<'a> {
+    cursor: ByteReader<'a>,
     err: Error,
 }
 
-impl<'a> Rd<'a> {
-    fn new(b: &'a [u8], err: Error) -> Rd<'a> {
-        Rd { b, pos: 0, err }
+impl<'a> Fields<'a> {
+    fn new(b: &'a [u8], err: Error) -> Fields<'a> {
+        Fields { cursor: ByteReader::new(b), err }
     }
 
+    #[inline]
     fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
-        let end = self.pos.checked_add(n).ok_or(self.err)?;
-        let s = self.b.get(self.pos..end).ok_or(self.err)?;
-        self.pos = end;
-        Ok(s)
+        self.cursor.take(n).map_err(|_| self.err)
     }
 
+    #[inline]
     fn u8(&mut self) -> Result<u8, Error> {
-        Ok(self.take(1)?[0])
+        self.cursor.u8().map_err(|_| self.err)
     }
 
+    #[inline]
     fn u16(&mut self) -> Result<u16, Error> {
-        let s = self.take(2)?;
-        Ok(u16::from_be_bytes([s[0], s[1]]))
+        self.cursor.u16_be().map_err(|_| self.err)
     }
 
+    #[inline]
     fn u24(&mut self) -> Result<u32, Error> {
-        let s = self.take(3)?;
-        Ok(u32::from_be_bytes([0, s[0], s[1], s[2]]))
+        self.cursor.u24_be().map_err(|_| self.err)
     }
 
+    #[inline]
     fn u32(&mut self) -> Result<u32, Error> {
-        let s = self.take(4)?;
-        Ok(u32::from_be_bytes([s[0], s[1], s[2], s[3]]))
+        self.cursor.u32_be().map_err(|_| self.err)
     }
 
     fn ip4(&mut self) -> Result<Ipv4Addr, Error> {
@@ -1013,12 +1013,14 @@ impl<'a> Rd<'a> {
         Ok(Ipv6Addr::from(a))
     }
 
+    #[inline]
     fn left(&self) -> usize {
-        self.b.len() - self.pos
+        self.cursor.remaining()
     }
 
+    #[inline]
     fn end(&self) -> Result<(), Error> {
-        if self.left() == 0 { Ok(()) } else { Err(self.err) }
+        self.cursor.finish().map_err(|_| self.err)
     }
 
     /// `n` reserved bytes, which must be zero.
@@ -1071,7 +1073,7 @@ fn check_lsa_header(h: &LsaHeader) -> Result<(), Error> {
     check_age_sequence(h.age, h.sequence)
 }
 
-fn read_lsa_header(r: &mut Rd, v: Version) -> Result<LsaHeader, Error> {
+fn read_lsa_header(r: &mut Fields, v: Version) -> Result<LsaHeader, Error> {
     let age = r.u16()?;
     let (options, ls_type) = match v {
         Version::V2 => (r.u8()?, u16::from(r.u8()?)),
@@ -1094,7 +1096,7 @@ fn prefix_bytes(length: u8) -> usize {
 }
 
 /// A prefix and the 16-bit field between its options and its address.
-fn read_prefix(r: &mut Rd) -> Result<(Prefix, u16), Error> {
+fn read_prefix(r: &mut Fields) -> Result<(Prefix, u16), Error> {
     let length = r.u8()?;
     let options = r.u8()?;
     let middle = r.u16()?;
@@ -1186,7 +1188,7 @@ impl LsaBody {
         if b.len() > MAX_LSA - LSA_HEADER_LEN {
             return Err(Error::TooLong);
         }
-        let r = &mut Rd::new(b, Error::LsaBody);
+        let r = &mut Fields::new(b, Error::LsaBody);
         let body = match kind_for(v, ls_type) {
             Kind::Router => {
                 let flags = r.u8()?;
@@ -1365,7 +1367,7 @@ impl LsaBody {
                 })
             }
             Kind::Other => {
-                r.pos = b.len();
+                r.cursor.rest();
                 LsaBody::Other(b.to_vec())
             }
         };
@@ -1559,7 +1561,7 @@ impl Lsa {
         if !lsa_checksum_ok(b) {
             return Err(Error::LsaChecksum);
         }
-        let h = read_lsa_header(&mut Rd::new(b, Error::Truncated), v)?;
+        let h = read_lsa_header(&mut Fields::new(b, Error::Truncated), v)?;
         check_age_sequence(h.age, h.sequence)?;
         let body = LsaBody::parse(&b[LSA_HEADER_LEN..], v, h.ls_type)?;
         check_designated(&body, h.advertising_router)?;
@@ -1605,7 +1607,7 @@ impl Lsa {
     /// For an LSA read with [`Lsa::parse`] it is the header received.
     pub fn header(&self, v: Version) -> Result<LsaHeader, Error> {
         let bytes = self.frame(v).and_then(|frame| frame.to_bytes())?;
-        read_lsa_header(&mut Rd::new(&bytes, Error::Truncated), v)
+        read_lsa_header(&mut Fields::new(&bytes, Error::Truncated), v)
     }
 
     /// Which LSA this is, as a Link State Request asks for it.
@@ -1865,7 +1867,7 @@ impl Packet {
 }
 
 fn parse_body(b: &[u8], v: Version, t: u8) -> Result<Body, Error> {
-    let r = &mut Rd::new(b, Error::BodyLength);
+    let r = &mut Fields::new(b, Error::BodyLength);
     let body = match (t, v) {
         (packet_type::HELLO, Version::V2) => Body::HelloV2(HelloV2 {
             network_mask: r.ip4()?,
@@ -1926,7 +1928,7 @@ fn parse_body(b: &[u8], v: Version, t: u8) -> Result<Body, Error> {
                 if r.left() < LSA_HEADER_LEN {
                     return Err(Error::BodyLength);
                 }
-                let rest = &b[r.pos..];
+                let rest = &b[r.cursor.position()..];
                 let length = be16(rest, 18);
                 let n = usize::from(length);
                 if !(LSA_HEADER_LEN..=rest.len()).contains(&n) {
@@ -1938,7 +1940,7 @@ fn parse_body(b: &[u8], v: Version, t: u8) -> Result<Body, Error> {
                 if let Ok((lsa, _)) = Lsa::parse(&rest[..n], v) {
                     lsas.push(lsa);
                 }
-                r.pos += n;
+                r.cursor.skip(n).map_err(|_| r.err)?;
                 framed += 1;
             }
             if u64::from(count) != framed {

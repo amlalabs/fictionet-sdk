@@ -69,7 +69,7 @@
 //! );
 //! ```
 
-use fictionet::stdlib::codec::{self, Decode, Step, Stream, Wire};
+use fictionet::stdlib::codec::{self, Decode, Step, Stream, Wire, Reader};
 
 fn exact<T>(parsed: Result<Option<(T, usize)>, Error>, len: usize) -> Result<T, Error> {
     let (value, used) = parsed?.ok_or(Error::Truncated)?;
@@ -1814,40 +1814,40 @@ impl State {
     }
 
     /// Reads the next client message, as this phase expects it.
-    fn client_at(&self, c: &mut Cur<'_>) -> Result<ClientMessage, Stop> {
+    fn client_at(&self, c: &mut Reader<'_>) -> Result<ClientMessage, Stop> {
         Ok(match self.phase {
             Phase::ClientVersion => ClientMessage::Version(version(c)?),
-            Phase::SecurityChoice => ClientMessage::SecurityType(c.u8()?),
-            Phase::VncResponse => ClientMessage::VncResponse(c.array()?),
-            Phase::ClientInit => ClientMessage::ClientInit { shared: c.u8()? != 0 },
+            Phase::SecurityChoice => ClientMessage::SecurityType(take(c, 1)?[0]),
+            Phase::VncResponse => ClientMessage::VncResponse(array(c)?),
+            Phase::ClientInit => ClientMessage::ClientInit { shared: take(c, 1)?[0] != 0 },
             Phase::Normal => client_normal(c)?,
             p => return Err(Stop::Fail(Error::Phase(p))),
         })
     }
 
     /// Reads one complete server message in the current phase.
-    fn server_at(&self, c: &mut Cur<'_>) -> Result<ServerMessage, Stop> {
+    fn server_at(&self, c: &mut Reader<'_>) -> Result<ServerMessage, Stop> {
         Ok(match self.phase {
             Phase::ServerVersion => ServerMessage::Version(version(c)?),
             Phase::SecurityOffer => match self.dialect {
-                Dialect::V3_3 => match c.u32()? {
+                Dialect::V3_3 => match u32::from_be_bytes(array(c)?) {
                     0 => ServerMessage::SecurityFailure(text(c)?),
                     t => ServerMessage::SecurityType(t),
                 },
-                Dialect::V3_7 | Dialect::V3_8 => match c.u8()? {
+                Dialect::V3_7 | Dialect::V3_8 => match take(c, 1)?[0] {
                     0 => ServerMessage::SecurityFailure(text(c)?),
-                    n => ServerMessage::SecurityTypes(c.take(usize::from(n))?.to_vec()),
+                    n => ServerMessage::SecurityTypes(take(c, usize::from(n))?.to_vec()),
                 },
             },
-            Phase::VncChallenge => ServerMessage::VncChallenge(c.array()?),
-            Phase::SecurityResult => match c.u32()? {
+            Phase::VncChallenge => ServerMessage::VncChallenge(array(c)?),
+            Phase::SecurityResult => match u32::from_be_bytes(array(c)?) {
                 0 => ServerMessage::SecurityOk,
                 _ if self.dialect == Dialect::V3_8 => ServerMessage::SecurityFailed(text(c)?),
                 _ => ServerMessage::SecurityFailed(Vec::new()),
             },
             Phase::ServerInit => {
-                let (width, height) = (c.u16()?, c.u16()?);
-                let format = PixelFormat::read(&c.array()?);
+                let (width, height) = (u16::from_be_bytes(array(c)?), u16::from_be_bytes(array(c)?));
+                let format = PixelFormat::read(&array(c)?);
                 if !format.is_valid() {
                     return Err(Stop::Fail(Error::PixelFormat));
                 }
@@ -1870,58 +1870,20 @@ impl From<Error> for Stop {
     }
 }
 
-/// A read position in a byte slice. Every read checks the length, and no
-/// read reaches past [`MAX_MESSAGE`].
-struct Cur<'a> {
-    b: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Cur<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8], Stop> {
-        let end = self.pos.checked_add(n).filter(|&e| e <= MAX_MESSAGE).ok_or(Stop::Fail(Error::TooLong))?;
-        let s = self.b.get(self.pos..end).ok_or(Stop::Need)?;
-        self.pos = end;
-        Ok(s)
-    }
-
-    fn array<const N: usize>(&mut self) -> Result<[u8; N], Stop> {
-        let mut out = [0u8; N];
-        out.copy_from_slice(self.take(N)?);
-        Ok(out)
-    }
-
-    fn u8(&mut self) -> Result<u8, Stop> {
-        Ok(self.take(1)?[0])
-    }
-
-    fn u16(&mut self) -> Result<u16, Stop> {
-        Ok(u16::from_be_bytes(self.array()?))
-    }
-
-    fn u32(&mut self) -> Result<u32, Stop> {
-        Ok(u32::from_be_bytes(self.array()?))
-    }
-
-    fn i32(&mut self) -> Result<i32, Stop> {
-        Ok(i32::from_be_bytes(self.array()?))
-    }
-}
-
 /// Runs a read from the start of `b` and says how far it got.
-fn run<T>(b: &[u8], read: impl FnOnce(&mut Cur<'_>) -> Result<T, Stop>) -> Result<Option<(T, usize)>, Error> {
-    let mut c = Cur { b, pos: 0 };
+fn run<T>(b: &[u8], read: impl FnOnce(&mut Reader<'_>) -> Result<T, Stop>) -> Result<Option<(T, usize)>, Error> {
+    let mut c = Reader::new(b);
     match read(&mut c) {
-        Ok(v) => Ok(Some((v, c.pos))),
+        Ok(v) => Ok(Some((v, c.position()))),
         Err(Stop::Need) => Ok(None),
         Err(Stop::Fail(e)) => Err(e),
     }
 }
 
-fn version(c: &mut Cur<'_>) -> Result<Version, Stop> {
+fn version(c: &mut Reader<'_>) -> Result<Version, Stop> {
     const PATTERN: &[u8; VERSION_LEN] = b"RFB 000.000\n";
     // A wrong byte is known before the rest of the line comes.
-    let have = c.b.get(c.pos..).unwrap_or_default();
+    let have = c.clone().rest();
     for (&x, &p) in have.iter().zip(PATTERN) {
         let fits = if p == b'0' { x.is_ascii_digit() } else { x == p };
         if !fits {
@@ -1933,18 +1895,18 @@ fn version(c: &mut Cur<'_>) -> Result<Version, Stop> {
         // as it comes.
         return Err(Stop::Need);
     }
-    let b = c.take(VERSION_LEN)?;
+    let b = take(c, VERSION_LEN)?;
     let number = |d: &[u8]| d.iter().fold(0u16, |n, &x| n * 10 + u16::from(x - b'0'));
     Ok(Version { major: number(&b[4..7]), minor: number(&b[8..11]) })
 }
 
 /// A four-byte length and that many bytes of text.
-fn text(c: &mut Cur<'_>) -> Result<Vec<u8>, Stop> {
-    let n = usize::try_from(c.u32()?).map_err(|_| Error::TooLong)?;
+fn text(c: &mut Reader<'_>) -> Result<Vec<u8>, Stop> {
+    let n = usize::try_from(u32::from_be_bytes(array(c)?)).map_err(|_| Error::TooLong)?;
     if n > MAX_TEXT {
         return Err(Stop::Fail(Error::TooLong));
     }
-    Ok(c.take(n)?.to_vec())
+    Ok(take(c, n)?.to_vec())
 }
 
 fn pixels_len(width: u16, height: u16, format: &PixelFormat) -> Result<usize, Error> {
@@ -1961,49 +1923,49 @@ fn mask_len(width: u16, height: u16) -> Result<usize, Error> {
     usize::from(width).div_ceil(8).checked_mul(usize::from(height)).ok_or(Error::TooLong)
 }
 
-fn client_normal(c: &mut Cur<'_>) -> Result<ClientMessage, Stop> {
-    Ok(match c.u8()? {
+fn client_normal(c: &mut Reader<'_>) -> Result<ClientMessage, Stop> {
+    Ok(match take(c, 1)?[0] {
         client_type::SET_PIXEL_FORMAT => {
-            c.take(3)?;
-            let format = PixelFormat::read(&c.array()?);
+            take(c, 3)?;
+            let format = PixelFormat::read(&array(c)?);
             if !format.is_valid() {
                 return Err(Stop::Fail(Error::PixelFormat));
             }
             ClientMessage::SetPixelFormat(format)
         }
         client_type::SET_ENCODINGS => {
-            c.take(1)?;
-            let n = usize::from(c.u16()?);
-            let b = c.take(4 * n)?;
+            take(c, 1)?;
+            let n = usize::from(u16::from_be_bytes(array(c)?));
+            let b = take(c, 4 * n)?;
             ClientMessage::SetEncodings(b.as_chunks::<4>().0.iter().map(|e| i32::from_be_bytes([e[0], e[1], e[2], e[3]])).collect())
         }
         client_type::FRAMEBUFFER_UPDATE_REQUEST => {
-            let incremental = c.u8()? != 0;
-            let (x, y, width, height) = (c.u16()?, c.u16()?, c.u16()?, c.u16()?);
+            let incremental = take(c, 1)?[0] != 0;
+            let (x, y, width, height) = (u16::from_be_bytes(array(c)?), u16::from_be_bytes(array(c)?), u16::from_be_bytes(array(c)?), u16::from_be_bytes(array(c)?));
             ClientMessage::FramebufferUpdateRequest { incremental, x, y, width, height }
         }
         client_type::KEY_EVENT => {
-            let down = c.u8()? != 0;
-            c.take(2)?;
-            ClientMessage::KeyEvent { down, key: c.u32()? }
+            let down = take(c, 1)?[0] != 0;
+            take(c, 2)?;
+            ClientMessage::KeyEvent { down, key: u32::from_be_bytes(array(c)?) }
         }
         client_type::POINTER_EVENT => {
-            let buttons = c.u8()?;
-            ClientMessage::PointerEvent { buttons, x: c.u16()?, y: c.u16()? }
+            let buttons = take(c, 1)?[0];
+            ClientMessage::PointerEvent { buttons, x: u16::from_be_bytes(array(c)?), y: u16::from_be_bytes(array(c)?) }
         }
         client_type::CLIENT_CUT_TEXT => {
-            c.take(3)?;
+            take(c, 3)?;
             ClientMessage::ClientCutText(text(c)?)
         }
         t => return Err(Stop::Fail(Error::MessageType(t))),
     })
 }
 
-fn server_normal(c: &mut Cur<'_>, format: &PixelFormat) -> Result<ServerMessage, Stop> {
-    Ok(match c.u8()? {
+fn server_normal(c: &mut Reader<'_>, format: &PixelFormat) -> Result<ServerMessage, Stop> {
+    Ok(match take(c, 1)?[0] {
         server_type::FRAMEBUFFER_UPDATE => {
-            c.take(1)?;
-            let count = usize::from(c.u16()?);
+            take(c, 1)?;
+            let count = usize::from(u16::from_be_bytes(array(c)?));
             let mut rects = Vec::new();
             for i in 0..count {
                 let r = rectangle(c, format)?;
@@ -2015,10 +1977,10 @@ fn server_normal(c: &mut Cur<'_>, format: &PixelFormat) -> Result<ServerMessage,
             ServerMessage::FramebufferUpdate(rects)
         }
         server_type::SET_COLOR_MAP_ENTRIES => {
-            c.take(1)?;
-            let first = c.u16()?;
-            let n = usize::from(c.u16()?);
-            let b = c.take(6 * n)?;
+            take(c, 1)?;
+            let first = u16::from_be_bytes(array(c)?);
+            let n = usize::from(u16::from_be_bytes(array(c)?));
+            let b = take(c, 6 * n)?;
             let colors = b
                 .as_chunks::<6>()
                 .0
@@ -2033,27 +1995,40 @@ fn server_normal(c: &mut Cur<'_>, format: &PixelFormat) -> Result<ServerMessage,
         }
         server_type::BELL => ServerMessage::Bell,
         server_type::SERVER_CUT_TEXT => {
-            c.take(3)?;
+            take(c, 3)?;
             ServerMessage::ServerCutText(text(c)?)
         }
         t => return Err(Stop::Fail(Error::MessageType(t))),
     })
 }
 
-fn rectangle(c: &mut Cur<'_>, format: &PixelFormat) -> Result<Rectangle, Stop> {
-    let (x, y, width, height) = (c.u16()?, c.u16()?, c.u16()?, c.u16()?);
-    let contents = match c.i32()? {
-        encoding::RAW => Contents::Raw(c.take(pixels_len(width, height, format)?)?.to_vec()),
-        encoding::COPY_RECT => Contents::CopyRect { src_x: c.u16()?, src_y: c.u16()? },
+fn rectangle(c: &mut Reader<'_>, format: &PixelFormat) -> Result<Rectangle, Stop> {
+    let (x, y, width, height) = (u16::from_be_bytes(array(c)?), u16::from_be_bytes(array(c)?), u16::from_be_bytes(array(c)?), u16::from_be_bytes(array(c)?));
+    let contents = match i32::from_be_bytes(array(c)?) {
+        encoding::RAW => Contents::Raw(take(c, pixels_len(width, height, format)?)?.to_vec()),
+        encoding::COPY_RECT => Contents::CopyRect { src_x: u16::from_be_bytes(array(c)?), src_y: u16::from_be_bytes(array(c)?) },
         encoding::CURSOR => {
             let (p, m) = (pixels_len(width, height, format)?, mask_len(width, height)?);
-            let b = c.take(p.checked_add(m).ok_or(Error::TooLong)?)?;
+            let b = take(c, p.checked_add(m).ok_or(Error::TooLong)?)?;
             Contents::Cursor { pixels: b[..p].to_vec(), mask: b[p..].to_vec() }
         }
         encoding::DESKTOP_SIZE => Contents::DesktopSize,
         e => return Err(Stop::Fail(Error::Encoding(e))),
     };
     Ok(Rectangle { x, y, width, height, contents })
+}
+
+#[inline]
+fn take<'a>(r: &mut Reader<'a>, n: usize) -> Result<&'a [u8], Stop> {
+    r.position().checked_add(n).filter(|&end| end <= MAX_MESSAGE).ok_or(Stop::Fail(Error::TooLong))?;
+    r.take(n).map_err(|_| Stop::Need)
+}
+
+#[inline]
+fn array<const N: usize>(r: &mut Reader<'_>) -> Result<[u8; N], Stop> {
+    let mut out = [0; N];
+    out.copy_from_slice(take(r, N)?);
+    Ok(out)
 }
 
 #[cfg(test)]

@@ -81,6 +81,8 @@
 //! assert_eq!(back.notify(notify::INVALID_KE_PAYLOAD).unwrap().data, [0, 19]);
 //! ```
 
+use fictionet::stdlib::codec::{Reader, Truncated};
+
 use fictionet::stdlib::codec::Wire;
 
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -1259,37 +1261,6 @@ fn write_selectors(sel: &[TrafficSelector], room: usize, out: &mut Vec<u8>) -> O
     Some(())
 }
 
-/// Reads big-endian fields from a slice, giving `None` past its end.
-struct Reader<'a> {
-    b: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Reader<'a> {
-    fn new(b: &'a [u8]) -> Reader<'a> {
-        Reader { b, pos: 0 }
-    }
-
-    fn take<const N: usize>(&mut self) -> Option<[u8; N]> {
-        let end = self.pos.checked_add(N)?;
-        let s: [u8; N] = self.b.get(self.pos..end)?.try_into().ok()?;
-        self.pos = end;
-        Some(s)
-    }
-
-    fn u8(&mut self) -> Option<u8> {
-        self.take::<1>().map(|[b]| b)
-    }
-
-    fn u32(&mut self) -> Option<u32> {
-        self.take().map(u32::from_be_bytes)
-    }
-
-    fn u64(&mut self) -> Option<u64> {
-        self.take().map(u64::from_be_bytes)
-    }
-}
-
 /// The big-endian u16 at `i`. Callers check that `b` holds it.
 fn be16(b: &[u8], i: usize) -> u16 {
     u16::from_be_bytes([b[i], b[i + 1]])
@@ -1307,19 +1278,16 @@ impl Wire for Header {
         }
 
         let mut r = Reader::new(b);
-        let h = (|| {
-            Some(Header {
-                initiator_spi: r.u64()?,
-                responder_spi: r.u64()?,
-                next_payload: r.u8()?,
-                version: r.u8()?,
-                exchange: r.u8()?,
-                flags: r.u8()?,
-                message_id: r.u32()?,
-                length: r.u32()?,
-            })
-        })();
-        h.ok_or(Error::Short)
+        Ok(Header {
+            initiator_spi: r.u64_be()?,
+            responder_spi: r.u64_be()?,
+            next_payload: r.u8()?,
+            version: r.u8()?,
+            exchange: r.u8()?,
+            flags: r.u8()?,
+            message_id: r.u32_be()?,
+            length: r.u32_be()?,
+        })
     }
 
     /// Appends all header fields unchanged. Refuses no values.
@@ -1483,6 +1451,11 @@ impl<const FIRST: u8> Wire for Payloads<FIRST> {
         out.extend_from_slice(&bytes);
         Ok(())
     }
+}
+
+impl From<Truncated> for Error {
+    #[inline]
+    fn from(_: Truncated) -> Self { Error::Short }
 }
 
 #[cfg(test)]

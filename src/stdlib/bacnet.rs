@@ -76,7 +76,7 @@
 //! );
 //! ```
 
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire, Reader, Truncated, Trailing};
 
 use std::net::{Ipv4Addr, SocketAddrV4};
 
@@ -566,7 +566,7 @@ fn apdu_expects_reply(apdu: &[u8]) -> bool {
 }
 
 fn net_address(r: &mut Reader) -> Result<NetAddress, Error> {
-    let network = r.u16()?;
+    let network = r.u16_be()?;
     let len = r.u8()?;
     Ok(NetAddress { network, mac: r.take(usize::from(len))?.to_vec() })
 }
@@ -824,13 +824,13 @@ impl Tag {
             (Class::Context, 7) => TagContent::Closing,
             (Class::Application, 6 | 7) => return Err(Error::ApplicationOpenClose),
             (_, 5) => TagContent::Length(match r.u8()? {
-                254 => u32::from(r.u16()?),
-                255 => r.u32()?,
+                254 => u32::from(r.u16_be()?),
+                255 => r.u32_be()?,
                 n => u32::from(n),
             }),
             (_, n) => TagContent::Length(u32::from(n)),
         };
-        Ok((Tag { number, class, content }, r.at))
+        Ok((Tag { number, class, content }, r.position()))
     }
 }
 
@@ -1262,49 +1262,6 @@ fn int_bytes(v: i64) -> Vec<u8> {
     v.to_be_bytes()[8 - n..].to_vec()
 }
 
-/// A cursor over bytes that reports running out as [`Error::Truncated`].
-struct Reader<'a> {
-    b: &'a [u8],
-    at: usize,
-}
-
-impl<'a> Reader<'a> {
-    fn new(b: &'a [u8]) -> Reader<'a> {
-        Reader { b, at: 0 }
-    }
-
-    fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
-        let end = self.at.checked_add(n).ok_or(Error::Truncated)?;
-        let s = self.b.get(self.at..end).ok_or(Error::Truncated)?;
-        self.at = end;
-        Ok(s)
-    }
-
-    fn u8(&mut self) -> Result<u8, Error> {
-        Ok(self.take(1)?[0])
-    }
-
-    fn u16(&mut self) -> Result<u16, Error> {
-        let s = self.take(2)?;
-        Ok(u16::from_be_bytes([s[0], s[1]]))
-    }
-
-    fn u32(&mut self) -> Result<u32, Error> {
-        let s = self.take(4)?;
-        Ok(u32::from_be_bytes([s[0], s[1], s[2], s[3]]))
-    }
-
-    fn rest(&mut self) -> &'a [u8] {
-        let s = &self.b[self.at..];
-        self.at = self.b.len();
-        s
-    }
-
-    fn end(&self) -> Result<(), Error> {
-        if self.at == self.b.len() { Ok(()) } else { Err(Error::TrailingBytes) }
-    }
-}
-
 fn be16(b: &[u8], i: usize) -> u16 {
     u16::from_be_bytes([b[i], b[i + 1]])
 }
@@ -1549,7 +1506,7 @@ impl Wire for Npdu {
         };
         let body = if control & 0x80 != 0 {
             let message_type = r.u8()?;
-            let vendor = if message_type >= 0x80 { Some(r.u16()?) } else { None };
+            let vendor = if message_type >= 0x80 { Some(r.u16_be()?) } else { None };
             NpduBody::Network { message_type, vendor, data: r.rest().to_vec() }
         } else {
             NpduBody::Apdu(r.rest().to_vec())
@@ -1675,7 +1632,7 @@ impl Wire for Apdu {
             7 => Apdu::Abort { server: first & 0x01 != 0, invoke_id: r.u8()?, reason: r.u8()? },
             t => return Err(Error::PduType(t)),
         };
-        r.end()?;
+        r.finish()?;
         Ok(apdu)
     }
 
@@ -1997,6 +1954,16 @@ impl Wire for ValueList {
         dst.extend_from_slice(&out);
         Ok(())
     }
+}
+
+impl From<Truncated> for Error {
+    #[inline]
+    fn from(_: Truncated) -> Self { Error::Truncated }
+}
+
+impl From<Trailing> for Error {
+    #[inline]
+    fn from(_: Trailing) -> Self { Error::TrailingBytes }
 }
 
 #[cfg(test)]

@@ -64,7 +64,7 @@
 //! assert_eq!(Packet::new(vec![21]).to_bytes().unwrap().len(), 16);
 //! ```
 
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire, Reader as ByteReader, Truncated};
 
 /// The TCP port SSH servers listen on.
 pub const PORT: u16 = 22;
@@ -815,28 +815,25 @@ fn shortest(mut b: &[u8]) -> &[u8] {
 /// for at least two bytes of input.
 #[derive(Clone, Debug)]
 pub struct Reader<'a> {
-    rest: &'a [u8],
+    cursor: ByteReader<'a>,
 }
 
 impl<'a> Reader<'a> {
     /// A reader over `b`.
     pub fn new(b: &'a [u8]) -> Reader<'a> {
-        Reader { rest: b }
+        Reader { cursor: ByteReader::new(b) }
     }
 
     /// The next `n` bytes.
+    #[inline]
     pub fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
-        if self.rest.len() < n {
-            return Err(Error::Truncated);
-        }
-        let (head, rest) = self.rest.split_at(n);
-        self.rest = rest;
-        Ok(head)
+        self.cursor.take(n).map_err(Error::from)
     }
 
     /// A `byte`.
+    #[inline]
     pub fn byte(&mut self) -> Result<u8, Error> {
-        Ok(self.take(1)?[0])
+        self.cursor.u8().map_err(Error::from)
     }
 
     /// A `boolean`: any byte but 0 is true.
@@ -845,16 +842,15 @@ impl<'a> Reader<'a> {
     }
 
     /// A `uint32`, most significant byte first.
+    #[inline]
     pub fn uint32(&mut self) -> Result<u32, Error> {
-        let b = self.take(4)?;
-        Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+        self.cursor.u32_be().map_err(Error::from)
     }
 
     /// A `uint64`, most significant byte first.
+    #[inline]
     pub fn uint64(&mut self) -> Result<u64, Error> {
-        let mut a = [0u8; 8];
-        a.copy_from_slice(self.take(8)?);
-        Ok(u64::from_be_bytes(a))
+        self.cursor.u64_be().map_err(Error::from)
     }
 
     /// A `string`: a `uint32` length, then that many bytes.
@@ -913,17 +909,15 @@ impl<'a> Reader<'a> {
     }
 
     /// The bytes not yet read.
+    #[inline]
     pub fn remaining(&self) -> &'a [u8] {
-        self.rest
+        self.cursor.clone().rest()
     }
 
     /// Checks that every byte has been read.
+    #[inline]
     pub fn finish(&self) -> Result<(), Error> {
-        if self.rest.is_empty() {
-            Ok(())
-        } else {
-            Err(Error::Trailing)
-        }
+        self.cursor.finish().map_err(|_| Error::Trailing)
     }
 }
 
@@ -1501,6 +1495,11 @@ impl Message {
 /// Whether [`Message::parse`] reads message number `n` as its own variant.
 fn is_known(n: u8) -> bool {
     matches!(n, 1..=6 | 20 | 21)
+}
+
+impl From<Truncated> for Error {
+    #[inline]
+    fn from(_: Truncated) -> Self { Error::Truncated }
 }
 
 #[cfg(test)]

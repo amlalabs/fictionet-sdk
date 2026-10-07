@@ -1,4 +1,5 @@
 //! Bounded byte decoders, wire values, and the driver that runs them.
+//! [`Reader`] checks byte reads and keeps its position on truncation.
 //!
 //! A [`Decode`] reads a slice and returns a [`Step`]. It owns state, but
 //! never keeps unread input. [`Stream`] owns that input in one [`Buffer`].
@@ -141,6 +142,7 @@ mod faults;
 mod interceptor;
 mod lcg;
 mod pipe;
+mod reader;
 mod recorder;
 mod stream;
 pub mod test_support;
@@ -157,6 +159,7 @@ pub use interceptor::{
 };
 pub use lcg::Lcg;
 pub use pipe::{Carry, DEFAULT_SPANS, Layered, Pipe, PipeError, Span, Spans};
+pub use reader::{Reader, Trailing, Truncated};
 pub use recorder::{Direction, Record, RecordKind, Recorder};
 pub use stream::{Fail, PumpError, Stream, StreamEvent, finish, pump, try_pump};
 

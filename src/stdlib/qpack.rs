@@ -49,6 +49,8 @@
 //! encoder.apply_instruction(ack.unwrap()).unwrap();
 //! ```
 
+use fictionet::stdlib::codec::{Reader, Truncated};
+
 use std::collections::VecDeque;
 
 use fictionet::stdlib::codec::{Decode, Step, Wire};
@@ -318,19 +320,15 @@ impl From<Error> for Stop {
     }
 }
 
-struct Cursor<'a> {
-    b: &'a [u8],
-    i: usize,
+trait ReadFields<'a> {
+    fn int(&mut self, prefix: u8) -> Result<u64, Stop>;
+    fn raw_string(&mut self, prefix: u8) -> Result<RawString<'a>, Stop>;
 }
 
-impl<'a> Cursor<'a> {
-    fn peek(&self) -> Result<u8, Stop> {
-        self.b.get(self.i).copied().ok_or(Stop::More)
-    }
-
+impl<'a> ReadFields<'a> for Reader<'a> {
     /// An integer with a `prefix`-bit prefix, 1 to 8 bits.
     fn int(&mut self, prefix: u8) -> Result<u64, Stop> {
-        let bytes = self.b.get(self.i..).ok_or(Stop::More)?;
+        let bytes = self.clone().rest();
         let bounded = &bytes[..bytes.len().min(MAX_INTEGER_BYTES)];
         let (value, used) = prefix_int::read(bounded, prefix).map_err(|error| match error {
             prefix_int::Error::Truncated if bytes.len() < MAX_INTEGER_BYTES => Stop::More,
@@ -339,22 +337,20 @@ impl<'a> Cursor<'a> {
         if value > MAX_INTEGER {
             return Err(Error::IntegerOverflow.into());
         }
-        self.i = self.i.checked_add(used).ok_or(Error::IntegerOverflow)?;
+        self.skip(used)?;
         Ok(value)
     }
 
     /// A string whose Huffman flag is the bit just above a `prefix`-bit
     /// length, still encoded.
     fn raw_string(&mut self, prefix: u8) -> Result<RawString<'a>, Stop> {
-        let huffman = self.peek()? & (1 << prefix) != 0;
+        let huffman = self.peek_u8().ok_or(Stop::More)? & (1 << prefix) != 0;
         let len = self.int(prefix)?;
         if len > MAX_STRING as u64 {
             return Err(Error::StringTooLong.into());
         }
         let len = len as usize;
-        let end = self.i.checked_add(len).ok_or(Stop::More)?;
-        let bytes = self.b.get(self.i..end).ok_or(Stop::More)?;
-        self.i = end;
+        let bytes = self.take(len)?;
         Ok(RawString { huffman, bytes })
     }
 }
@@ -687,9 +683,9 @@ impl EncoderInstruction {
     /// `b` holds only part of one, and otherwise the instruction and how
     /// many bytes it took.
     fn parse_prefix(b: &[u8]) -> Result<Option<(EncoderInstruction, usize)>, Error> {
-        let mut c = Cursor { b, i: 0 };
-        let read = |c: &mut Cursor| -> Result<EncoderInstruction, Stop> {
-            let first = c.peek()?;
+        let mut c = Reader::new(b);
+        let read = |c: &mut Reader| -> Result<EncoderInstruction, Stop> {
+            let first = c.peek_u8().ok_or(Stop::More)?;
             Ok(if first & 0x80 != 0 {
                 let static_table = first & 0x40 != 0;
                 let index = c.int(6)?;
@@ -706,7 +702,7 @@ impl EncoderInstruction {
             })
         };
         match read(&mut c) {
-            Ok(ins) => Ok(Some((ins, c.i))),
+            Ok(ins) => Ok(Some((ins, c.position()))),
             Err(Stop::More) => Ok(None),
             Err(Stop::Bad(e)) => Err(e),
         }
@@ -733,9 +729,9 @@ impl DecoderInstruction {
     /// many bytes it took. An increment of 0 is read; an [`Encoder`]
     /// refuses it.
     fn parse_prefix(b: &[u8]) -> Result<Option<(DecoderInstruction, usize)>, Error> {
-        let mut c = Cursor { b, i: 0 };
-        let read = |c: &mut Cursor| -> Result<DecoderInstruction, Stop> {
-            let first = c.peek()?;
+        let mut c = Reader::new(b);
+        let read = |c: &mut Reader| -> Result<DecoderInstruction, Stop> {
+            let first = c.peek_u8().ok_or(Stop::More)?;
             Ok(if first & 0x80 != 0 {
                 DecoderInstruction::SectionAck(c.int(7)?)
             } else if first & 0x40 != 0 {
@@ -745,7 +741,7 @@ impl DecoderInstruction {
             })
         };
         match read(&mut c) {
-            Ok(ins) => Ok(Some((ins, c.i))),
+            Ok(ins) => Ok(Some((ins, c.position()))),
             Err(Stop::More) => Ok(None),
             Err(Stop::Bad(e)) => Err(e),
         }
@@ -807,11 +803,11 @@ impl SectionPrefix {
     /// Reads the prefix at the start of `b`, given the decoder's maximum
     /// entries and inserts received, and returns it and its length.
     pub fn parse(b: &[u8], max_entries: u64, total_inserts: u64) -> Result<(SectionPrefix, usize), Error> {
-        let mut c = Cursor { b, i: 0 };
+        let mut c = Reader::new(b);
         let mut read = || -> Result<SectionPrefix, Stop> {
             let encoded = c.int(8)?;
             let required = decode_insert_count(encoded, max_entries, total_inserts)?;
-            let negative = c.peek()? & 0x80 != 0;
+            let negative = c.peek_u8().ok_or(Stop::More)? & 0x80 != 0;
             let delta = c.int(7)?;
             let base = if negative {
                 delta.checked_add(1).and_then(|d| required.checked_sub(d)).ok_or(Error::Base)?
@@ -821,7 +817,7 @@ impl SectionPrefix {
             Ok(SectionPrefix { required_insert_count: required, base })
         };
         match read() {
-            Ok(p) => Ok((p, c.i)),
+            Ok(p) => Ok((p, c.position())),
             Err(Stop::More) => Err(Error::Truncated),
             Err(Stop::Bad(e)) => Err(e),
         }
@@ -860,11 +856,11 @@ pub struct EncodedPrefix {
 
 impl EncodedPrefix {
     fn parse_prefix(bytes: &[u8]) -> Result<(Self, usize), Error> {
-        let mut c = Cursor { b: bytes, i: 0 };
+        let mut c = Reader::new(bytes);
         let encoded_insert_count = c.int(8).map_err(parse_stop)?;
-        let negative = c.peek().map_err(parse_stop)? & 0x80 != 0;
+        let negative = c.peek_u8().ok_or(Stop::More).map_err(parse_stop)? & 0x80 != 0;
         let delta_base = c.int(7).map_err(parse_stop)?;
-        Ok((Self { encoded_insert_count, negative, delta_base }, c.i))
+        Ok((Self { encoded_insert_count, negative, delta_base }, c.position()))
     }
 }
 
@@ -998,9 +994,9 @@ impl Representation {
     /// Reads the field line at the start of `b`, and returns it and its
     /// length. A field line cut short is [`Error::Truncated`].
     fn parse_prefix(b: &[u8]) -> Result<(Representation, usize), Error> {
-        let mut c = Cursor { b, i: 0 };
-        let read = |c: &mut Cursor| -> Result<Representation, Stop> {
-            let first = c.peek()?;
+        let mut c = Reader::new(b);
+        let read = |c: &mut Reader| -> Result<Representation, Stop> {
+            let first = c.peek_u8().ok_or(Stop::More)?;
             Ok(if first & 0x80 != 0 {
                 Representation::Indexed { static_table: first & 0x40 != 0, index: c.int(6)? }
             } else if first & 0x40 != 0 {
@@ -1023,7 +1019,7 @@ impl Representation {
             })
         };
         match read(&mut c) {
-            Ok(r) => Ok((r, c.i)),
+            Ok(r) => Ok((r, c.position())),
             Err(Stop::More) => Err(Error::Truncated),
             Err(Stop::Bad(e)) => Err(e),
         }
@@ -1362,9 +1358,9 @@ impl EncoderInstructions {
 // Find the boundary without decoding strings. Even a bad Huffman string
 // has a trusted length, so its error consumes exactly one instruction.
 fn encoder_instruction_len(input: &[u8]) -> Result<Option<usize>, Error> {
-    let mut c = Cursor { b: input, i: 0 };
-    let scan = |c: &mut Cursor<'_>| -> Result<(), Stop> {
-        let first = c.peek()?;
+    let mut c = Reader::new(input);
+    let scan = |c: &mut Reader<'_>| -> Result<(), Stop> {
+        let first = c.peek_u8().ok_or(Stop::More)?;
         if first & 0x80 != 0 {
             c.int(6)?;
             c.raw_string(7)?;
@@ -1377,7 +1373,7 @@ fn encoder_instruction_len(input: &[u8]) -> Result<Option<usize>, Error> {
         Ok(())
     };
     match scan(&mut c) {
-        Ok(()) => Ok(Some(c.i)),
+        Ok(()) => Ok(Some(c.position())),
         Err(Stop::More) => Ok(None),
         Err(Stop::Bad(e)) => Err(e),
     }
@@ -1779,6 +1775,11 @@ impl BlockedSections {
     }
 }
 
+impl From<Truncated> for Stop {
+    #[inline]
+    fn from(_: Truncated) -> Self { Stop::More }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1838,7 +1839,7 @@ mod tests {
                 let unit = Integer::<P> { flags: 0, value };
                 contract::check_wire_value(&unit);
                 let bytes = unit.to_bytes().unwrap();
-                let mut c = Cursor { b: &bytes, i: 0 };
+                let mut c = Reader::new(&bytes);
                 if value > MAX_INTEGER {
                     assert!(matches!(c.int(P), Err(Stop::Bad(Error::IntegerOverflow))));
                     assert_eq!(
@@ -1867,13 +1868,13 @@ mod tests {
         assert_eq!(Integer::<8>::parse(&hex("ff 80feffffffffffff3f")), Ok(Integer { flags: 0, value: MAX_INTEGER }));
         // MAX_INTEGER + 1 with an eight-bit prefix.
         for bytes in [vec![0xff; 30], hex("ff 81feffffffffffff3f")] {
-            let mut c = Cursor { b: &bytes, i: 0 };
+            let mut c = Reader::new(&bytes);
             assert!(matches!(c.int(8), Err(Stop::Bad(Error::IntegerOverflow))));
         }
         let bytes = [
             0x1f, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0,
         ];
-        let mut c = Cursor { b: &bytes, i: 0 };
+        let mut c = Reader::new(&bytes);
         assert!(matches!(c.int(5), Err(Stop::Bad(Error::IntegerOverflow))));
     }
 

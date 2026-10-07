@@ -71,7 +71,7 @@
 //! assert!(reader.is_done());
 //! ```
 
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire, Reader, Truncated};
 
 /// The TCP port MySQL servers listen on.
 pub const PORT: u16 = 3306;
@@ -783,24 +783,24 @@ pub struct Handshake {
 
 impl Handshake {
     fn read(payload: &[u8]) -> Result<Handshake, Error> {
-        let mut r = Reader(payload);
+        let mut r = Reader::new(payload);
         let version = r.u8()?;
         if version != PROTOCOL_VERSION {
             return Err(Error::Version(version));
         }
         let server_version = r.nul()?.to_vec();
-        let connection_id = r.u32()?;
+        let connection_id = r.u32_le()?;
         let mut auth_data = r.take(8)?.to_vec();
         r.u8()?; // filler
-        let mut capabilities = u32::from(r.u16()?);
+        let mut capabilities = u32::from(r.u16_le()?);
         let mut h = Handshake { server_version, connection_id, capabilities, ..Handshake::default() };
-        if r.0.is_empty() {
+        if r.is_empty() {
             h.auth_data = auth_data;
             return Ok(h);
         }
         h.charset = r.u8()?;
-        h.status = r.u16()?;
-        capabilities |= u32::from(r.u16()?) << 16;
+        h.status = r.u16_le()?;
+        capabilities |= u32::from(r.u16_le()?) << 16;
         let data_len = usize::from(r.u8()?);
         r.take(10)?; // reserved
         // Part 2 comes whatever the flags; its length byte counts only with
@@ -813,7 +813,7 @@ impl Handshake {
         }
         h.capabilities = capabilities;
         h.auth_data = auth_data;
-        if !r.0.is_empty() { return Err(Error::Trailing); }
+        if !r.is_empty() { return Err(Error::Trailing); }
         Ok(h)
     }
 
@@ -888,12 +888,12 @@ pub struct HandshakeResponse {
 
 impl HandshakeResponse {
     fn read(payload: &[u8]) -> Result<HandshakeResponse, Error> {
-        let mut r = Reader(payload);
-        let capabilities = r.u32()?;
+        let mut r = Reader::new(payload);
+        let capabilities = r.u32_le()?;
         if capabilities & capability::PROTOCOL_41 == 0 {
             return Err(Error::Unsupported);
         }
-        let max_packet = r.u32()?;
+        let max_packet = r.u32_le()?;
         let charset = r.u8()?;
         r.take(23)?; // filler
         let username = r.nul()?.to_vec();
@@ -911,7 +911,7 @@ impl HandshakeResponse {
         if capabilities & capability::CONNECT_WITH_DB != 0 {
             h.database = r.nul()?.to_vec();
         }
-        if capabilities & capability::PLUGIN_AUTH != 0 && !r.0.is_empty() {
+        if capabilities & capability::PLUGIN_AUTH != 0 && !r.is_empty() {
             h.auth_plugin = r.nul_or_rest().to_vec();
         }
         if capabilities & capability::CONNECT_ATTRS != 0 {
@@ -920,8 +920,8 @@ impl HandshakeResponse {
             if len > MAX_ATTRIBUTE_BYTES {
                 return Err(Error::Length(len));
             }
-            let mut block = Reader(r.take(len)?);
-            while !block.0.is_empty() {
+            let mut block = Reader::new(r.take(len)?);
+            while !block.is_empty() {
                 if h.attributes.len() >= MAX_ATTRIBUTES {
                     return Err(Error::TooMany);
                 }
@@ -936,7 +936,7 @@ impl HandshakeResponse {
                 return Err(Error::Value(u64::from(h.zstd_level)));
             }
         }
-        if !r.0.is_empty() { return Err(Error::Trailing); }
+        if !r.is_empty() { return Err(Error::Trailing); }
         Ok(h)
     }
 
@@ -1030,9 +1030,9 @@ impl SslRequest {
         if payload.len() > SSL_REQUEST_LEN {
             return Err(Error::Trailing);
         }
-        let mut r = Reader(payload);
-        let capabilities = r.u32()?;
-        let max_packet = r.u32()?;
+        let mut r = Reader::new(payload);
+        let capabilities = r.u32_le()?;
+        let max_packet = r.u32_le()?;
         let charset = r.u8()?;
         r.take(23)?;
         let need = capability::SSL | capability::PROTOCOL_41;
@@ -1083,25 +1083,25 @@ impl OkPacket {
     /// Refuses payloads above [`MAX_MESSAGE`].
     pub fn parse(payload: &[u8], capabilities: u32) -> Result<OkPacket, Error> {
         read_size(payload)?;
-        let mut r = Reader(payload);
+        let mut r = Reader::new(payload);
         let header = r.u8()?;
         if header != 0x00 && header != 0xfe {
             return Err(Error::Header(header));
         }
         let mut ok = OkPacket { affected_rows: r.lenenc()?, last_insert_id: r.lenenc()?, ..OkPacket::default() };
         if capabilities & capability::PROTOCOL_41 != 0 {
-            ok.status = r.u16()?;
-            ok.warnings = r.u16()?;
+            ok.status = r.u16_le()?;
+            ok.warnings = r.u16_le()?;
         } else if capabilities & capability::TRANSACTIONS != 0 {
-            ok.status = r.u16()?;
+            ok.status = r.u16_le()?;
         }
         if capabilities & capability::SESSION_TRACK != 0 {
-            if !r.0.is_empty() {
+            if !r.is_empty() {
                 ok.info = r.lenenc_str()?.to_vec();
                 if ok.status & status::SESSION_STATE_CHANGED != 0 {
                     ok.session_state = r.lenenc_str()?.to_vec();
                 }
-                if !r.0.is_empty() {
+                if !r.is_empty() {
                     return Err(Error::Trailing);
                 }
             }
@@ -1180,18 +1180,18 @@ impl ErrPacket {
     /// Refuses payloads above [`MAX_MESSAGE`].
     pub fn parse(payload: &[u8], capabilities: u32) -> Result<ErrPacket, Error> {
         read_size(payload)?;
-        let mut r = Reader(payload);
+        let mut r = Reader::new(payload);
         let header = r.u8()?;
         if header != 0xff {
             return Err(Error::Header(header));
         }
-        let code = r.u16()?;
+        let code = r.u16_le()?;
         let mut sql_state = None;
-        if capabilities & capability::PROTOCOL_41 != 0 && r.0.len() >= 6 && r.0[0] == b'#' {
+        if capabilities & capability::PROTOCOL_41 != 0 && r.remaining() >= 6 && r.clone().rest()[0] == b'#' {
             let mut s = [0u8; 5];
-            s.copy_from_slice(&r.0[1..6]);
+            s.copy_from_slice(&r.clone().rest()[1..6]);
             sql_state = Some(s);
-            r.0 = &r.0[6..];
+            r.skip(6)?;
         }
         Ok(ErrPacket { code, sql_state, message: r.rest().to_vec() })
     }
@@ -1230,16 +1230,16 @@ impl Eof {
     /// Refuses payloads above [`MAX_MESSAGE`].
     pub fn parse(payload: &[u8], capabilities: u32) -> Result<Eof, Error> {
         read_size(payload)?;
-        let mut r = Reader(payload);
+        let mut r = Reader::new(payload);
         let header = r.u8()?;
         if header != 0xfe {
             return Err(Error::Header(header));
         }
         let mut eof = Eof::default();
         if capabilities & capability::PROTOCOL_41 != 0 {
-            eof = Eof { warnings: r.u16()?, status: r.u16()? };
+            eof = Eof { warnings: r.u16_le()?, status: r.u16_le()? };
         }
-        if !r.0.is_empty() {
+        if !r.is_empty() {
             return Err(Error::Trailing);
         }
         Ok(eof)
@@ -1318,7 +1318,7 @@ impl Command {
     /// Refuses payloads above [`MAX_MESSAGE`].
     pub fn parse(payload: &[u8], capabilities: u32) -> Result<Command, Error> {
         read_size(payload)?;
-        let mut r = Reader(payload);
+        let mut r = Reader::new(payload);
         let code = r.u8()?;
         Ok(match code {
             command::QUIT => Command::Quit,
@@ -1345,13 +1345,13 @@ impl Command {
             command::REFRESH => Command::Refresh(r.u8()?),
             command::STATISTICS => Command::Statistics,
             command::PROCESS_INFO => Command::ProcessInfo,
-            command::PROCESS_KILL => Command::ProcessKill(r.u32()?),
+            command::PROCESS_KILL => Command::ProcessKill(r.u32_le()?),
             command::DEBUG => Command::Debug,
             command::PING => Command::Ping,
             command::STMT_PREPARE => Command::StmtPrepare(r.rest().to_vec()),
-            command::STMT_CLOSE => Command::StmtClose(r.u32()?),
-            command::STMT_RESET => Command::StmtReset(r.u32()?),
-            command::SET_OPTION => Command::SetOption(r.u16()?),
+            command::STMT_CLOSE => Command::StmtClose(r.u32_le()?),
+            command::STMT_RESET => Command::StmtReset(r.u32_le()?),
+            command::SET_OPTION => Command::SetOption(r.u16_le()?),
             command::RESET_CONNECTION => Command::ResetConnection,
             _ => Command::Other { command: code, data: r.rest().to_vec() },
         })
@@ -1472,7 +1472,7 @@ impl Column {
     }
 
     fn read(payload: &[u8]) -> Result<Column, Error> {
-        let mut r = Reader(payload);
+        let mut r = Reader::new(payload);
         let mut c = Column {
             catalog: r.lenenc_str()?.to_vec(),
             schema: r.lenenc_str()?.to_vec(),
@@ -1486,13 +1486,13 @@ impl Column {
         if fixed != 0x0c {
             return Err(Error::FixedFields(fixed));
         }
-        c.charset = r.u16()?;
-        c.length = r.u32()?;
+        c.charset = r.u16_le()?;
+        c.length = r.u32_le()?;
         c.column_type = r.u8()?;
-        c.flags = r.u16()?;
+        c.flags = r.u16_le()?;
         c.decimals = r.u8()?;
         r.take(2)?; // filler
-        if !r.0.is_empty() { return Err(Error::Trailing); }
+        if !r.is_empty() { return Err(Error::Trailing); }
         Ok(c)
     }
 
@@ -1530,17 +1530,17 @@ pub fn parse_row(payload: &[u8], columns: usize) -> Result<Row, Error> {
     if columns > MAX_COLUMNS {
         return Err(Error::TooMany);
     }
-    let mut r = Reader(payload);
+    let mut r = Reader::new(payload);
     let mut row = Vec::new();
     for _ in 0..columns {
-        if r.0.first() == Some(&0xfb) {
-            r.0 = &r.0[1..];
+        if r.clone().rest().first() == Some(&0xfb) {
+            r.skip(1)?;
             row.push(None);
         } else {
             row.push(Some(r.lenenc_str()?.to_vec()));
         }
     }
-    if !r.0.is_empty() {
+    if !r.is_empty() {
         return Err(Error::Trailing);
     }
     Ok(Row(row))
@@ -1548,11 +1548,11 @@ pub fn parse_row(payload: &[u8], columns: usize) -> Result<Row, Error> {
 
 impl Row {
     fn read(payload: &[u8]) -> Result<Self, Error> {
-        let mut reader = Reader(payload);
+        let mut reader = Reader::new(payload);
         let mut values = Vec::new();
-        while !reader.0.is_empty() {
+        while !reader.is_empty() {
             if values.len() == MAX_COLUMNS { return Err(Error::TooMany); }
-            if reader.0[0] == 0xfb { reader.0 = &reader.0[1..]; values.push(None); }
+            if reader.clone().rest()[0] == 0xfb { reader.skip(1)?; values.push(None); }
             else { values.push(Some(reader.lenenc_str()?.to_vec())); }
         }
         Ok(Self(values))
@@ -1577,7 +1577,7 @@ pub struct LocalInfile(
 );
 impl LocalInfile {
     fn read(payload: &[u8]) -> Result<Self, Error> {
-        let mut reader = Reader(payload);
+        let mut reader = Reader::new(payload);
         let first = reader.u8()?;
         if first != 0xfb { return Err(Error::Header(first)); }
         Ok(Self(reader.rest().to_vec()))
@@ -1598,9 +1598,9 @@ pub struct LenencInt(
 );
 impl LenencInt {
     fn read(payload: &[u8]) -> Result<Self, Error> {
-        let mut reader = Reader(payload);
+        let mut reader = Reader::new(payload);
         let value = reader.lenenc()?;
-        if !reader.0.is_empty() { return Err(Error::Trailing); }
+        if !reader.is_empty() { return Err(Error::Trailing); }
         Ok(Self(value))
     }
     fn encode(&self) -> Result<Vec<u8>, Error> {
@@ -1618,9 +1618,9 @@ pub struct LenencString(
 );
 impl LenencString {
     fn read(payload: &[u8]) -> Result<Self, Error> {
-        let mut reader = Reader(payload);
+        let mut reader = Reader::new(payload);
         let value = reader.lenenc_str()?;
-        if !reader.0.is_empty() { return Err(Error::Trailing); }
+        if !reader.is_empty() { return Err(Error::Trailing); }
         Ok(Self(value.to_vec()))
     }
     fn encode(&self) -> Result<Vec<u8>, Error> {
@@ -1788,13 +1788,13 @@ impl ResultReader {
                     if caps & capability::PROTOCOL_41 == 0 {
                         return Err(Error::Unsupported);
                     }
-                    let mut r = Reader(payload);
+                    let mut r = Reader::new(payload);
                     let n = r.lenenc()?;
                     // The flag byte comes after the count, as libmysql reads it.
                     if caps & capability::OPTIONAL_RESULTSET_METADATA != 0 && r.u8()? != METADATA_FULL {
                         return Err(Error::Unsupported);
                     }
-                    if !r.0.is_empty() {
+                    if !r.is_empty() {
                         return Err(Error::Trailing);
                     }
                     if n == 0 {
@@ -1876,40 +1876,20 @@ fn put_nul(out: &mut Vec<u8>, s: &[u8]) -> Result<(), Error> {
     Ok(())
 }
 
-/// Reads fields from the front of a payload. Every read checks the
-/// length first.
-struct Reader<'a>(&'a [u8]);
+trait ReadFields<'a> {
+    fn lenenc(&mut self) -> Result<u64, Error>;
+    fn lenenc_str(&mut self) -> Result<&'a [u8], Error>;
+    fn nul(&mut self) -> Result<&'a [u8], Error>;
+    fn nul_or_rest(&mut self) -> &'a [u8];
+}
 
-impl<'a> Reader<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
-        if self.0.len() < n {
-            return Err(Error::Truncated);
-        }
-        let (head, tail) = self.0.split_at(n);
-        self.0 = tail;
-        Ok(head)
-    }
-
-    fn u8(&mut self) -> Result<u8, Error> {
-        Ok(self.take(1)?[0])
-    }
-
-    fn u16(&mut self) -> Result<u16, Error> {
-        let b = self.take(2)?;
-        Ok(u16::from_le_bytes([b[0], b[1]]))
-    }
-
-    fn u32(&mut self) -> Result<u32, Error> {
-        let b = self.take(4)?;
-        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-    }
-
+impl<'a> ReadFields<'a> for Reader<'a> {
     /// A length-encoded integer.
     fn lenenc(&mut self) -> Result<u64, Error> {
-        let first = *self.0.first().ok_or(Error::Truncated)?;
+        let first = self.peek_u8().ok_or(Error::Truncated)?;
         let n = match first {
             0..=0xfa => {
-                self.0 = &self.0[1..];
+                self.skip(1)?;
                 return Ok(u64::from(first));
             }
             0xfc => 2,
@@ -1917,10 +1897,10 @@ impl<'a> Reader<'a> {
             0xfe => 8,
             _ => return Err(Error::LengthPrefix(first)),
         };
-        if self.0.len() < 1 + n {
+        if self.remaining() < 1 + n {
             return Err(Error::Truncated);
         }
-        self.0 = &self.0[1..];
+        self.skip(1)?;
         let mut v = [0u8; 8];
         v[..n].copy_from_slice(self.take(n)?);
         Ok(u64::from_le_bytes(v))
@@ -1929,19 +1909,20 @@ impl<'a> Reader<'a> {
     /// A length-encoded string. Its length is checked against what is
     /// left before anything is taken.
     fn lenenc_str(&mut self) -> Result<&'a [u8], Error> {
-        let mut probe = Reader(self.0);
+        let mut probe = self.clone();
         let n = probe.lenenc()?;
         let n = usize::try_from(n).map_err(|_| Error::Truncated)?;
         let s = probe.take(n)?;
-        self.0 = probe.0;
+        *self = probe;
         Ok(s)
     }
 
     /// A NUL-terminated string, without its NUL.
     fn nul(&mut self) -> Result<&'a [u8], Error> {
-        let i = self.0.iter().position(|&b| b == 0).ok_or(Error::Truncated)?;
-        let s = &self.0[..i];
-        self.0 = &self.0[i + 1..];
+        let rest = self.clone().rest();
+        let i = rest.iter().position(|&b| b == 0).ok_or(Error::Truncated)?;
+        let s = &rest[..i];
+        self.skip(i + 1)?;
         Ok(s)
     }
 
@@ -1952,10 +1933,6 @@ impl<'a> Reader<'a> {
             Ok(s) => s,
             Err(_) => self.rest(),
         }
-    }
-
-    fn rest(&mut self) -> &'a [u8] {
-        std::mem::take(&mut self.0)
     }
 }
 
@@ -2056,6 +2033,11 @@ impl OkPacket {
         if Self::parse(&payload, capabilities).as_ref() != Ok(self) { return Err(Error::Unwritable); }
         Ok(Message { seq, payload })
     }
+}
+
+impl From<Truncated> for Error {
+    #[inline]
+    fn from(_: Truncated) -> Self { Error::Truncated }
 }
 
 #[cfg(test)]

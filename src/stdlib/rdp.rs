@@ -45,6 +45,8 @@
 //! assert_eq!(request.to_packet().unwrap().to_bytes().unwrap(), bytes);
 //! ```
 
+use fictionet::stdlib::codec::{Reader, Truncated, Trailing};
+
 use fictionet::stdlib::{
     codec::{Decode, Step, Wire},
     cotp, tpkt,
@@ -168,73 +170,60 @@ fn u16_len(n: usize) -> Result<u16, Error> {
 
 // Readers borrow slices and never recurse. All owning parsers first bound
 // their input; nested readers cannot acquire bytes outside their parent.
-struct Read<'a> {
-    b: &'a [u8],
-    pos: usize,
+trait ReadFields<'a> {
+    fn field_bytes(&mut self, n: usize) -> Result<&'a [u8], Error>;
+    fn block(&mut self, field: &'static str) -> Result<&'a [u8], Error>;
+    fn expect(&mut self, b: &[u8]) -> Result<(), Error>;
+    fn per_len(&mut self) -> Result<usize, Error>;
+    fn per_uint(&mut self) -> Result<u32, Error>;
+    fn per_signed(&mut self) -> Result<i32, Error>;
+    fn user_id(&mut self) -> Result<u32, Error>;
+    fn mcs_result(&mut self, tag: u8) -> Result<u8, Error>;
+    fn ber_len(&mut self) -> Result<usize, Error>;
+    fn ber(&mut self, tag: &[u8]) -> Result<&'a [u8], Error>;
+    fn ber_uint(&mut self, tag: u8) -> Result<u32, Error>;
 }
-impl<'a> Read<'a> {
-    fn new(b: &'a [u8]) -> Self {
-        Self { b, pos: 0 }
+
+impl<'a> ReadFields<'a> for Reader<'a> {
+    #[inline]
+    fn field_bytes(&mut self, n: usize) -> Result<&'a [u8], Error> {
+        self.position().checked_add(n).ok_or(Error::Limit("length"))?;
+        self.take(n).map_err(Error::from)
     }
-    fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
-        let end = self.pos.checked_add(n).ok_or(Error::Limit("length"))?;
-        let b = self.b.get(self.pos..end).ok_or(Error::Truncated)?;
-        self.pos = end;
-        Ok(b)
-    }
+
     fn block(&mut self, field: &'static str) -> Result<&'a [u8], Error> {
-        let mut header = Read::new(self.rest());
-        header.le16()?;
-        let n = usize::from(header.le16()?);
+        let mut header = Reader::new(self.clone().rest());
+        header.u16_le()?;
+        let n = usize::from(header.u16_le()?);
         check(n >= 4, field)?;
-        self.take(n)
+        self.field_bytes(n)
     }
-    fn array<const N: usize>(&mut self) -> Result<[u8; N], Error> {
-        self.take(N)?.try_into().map_err(|_| Error::Truncated)
-    }
-    fn byte(&mut self) -> Result<u8, Error> {
-        Ok(u8::from_le_bytes(self.array()?))
-    }
-    fn le16(&mut self) -> Result<u16, Error> {
-        Ok(u16::from_le_bytes(self.array()?))
-    }
-    fn be16(&mut self) -> Result<u16, Error> {
-        Ok(u16::from_be_bytes(self.array()?))
-    }
-    fn le32(&mut self) -> Result<u32, Error> {
-        Ok(u32::from_le_bytes(self.array()?))
-    }
-    fn i32(&mut self) -> Result<i32, Error> {
-        Ok(i32::from_le_bytes(self.array()?))
-    }
-    fn rest(&self) -> &'a [u8] {
-        self.b.get(self.pos..).unwrap_or_default()
-    }
-    fn finish(&self) -> Result<(), Error> {
-        check(self.rest().is_empty(), "trailing bytes")
-    }
+
     fn expect(&mut self, b: &[u8]) -> Result<(), Error> {
-        check(self.take(b.len())? == b, "tag or fixed field")
+        check(self.field_bytes(b.len())? == b, "tag or fixed field")
     }
+
     fn per_len(&mut self) -> Result<usize, Error> {
-        let a = self.byte()?;
+        let a = self.u8()?;
         if a & 0x80 == 0 {
             return Ok(usize::from(a));
         }
         if a & 0x40 != 0 {
             return Err(Error::Unsupported("fragmented PER length"));
         }
-        Ok((usize::from(a & 0x3f) << 8) | usize::from(self.byte()?))
+        Ok((usize::from(a & 0x3f) << 8) | usize::from(self.u8()?))
     }
+
     fn per_uint(&mut self) -> Result<u32, Error> {
         let n = self.per_len()?;
         check((1..=4).contains(&n), "PER integer length")?;
-        unsigned(self.take(n)?)
+        unsigned(self.field_bytes(n)?)
     }
+
     fn per_signed(&mut self) -> Result<i32, Error> {
         let n = self.per_len()?;
         check((1..=4).contains(&n), "PER signed integer length")?;
-        let b = self.take(n)?;
+        let b = self.field_bytes(n)?;
         let sign = if b.first().is_some_and(|x| x & 0x80 != 0) {
             0xff
         } else {
@@ -247,18 +236,21 @@ impl<'a> Read<'a> {
             .copy_from_slice(b);
         Ok(i32::from_be_bytes(bytes))
     }
+
     fn user_id(&mut self) -> Result<u32, Error> {
-        Ok(u32::from(self.be16()?) + 1001)
+        Ok(u32::from(self.u16_be()?) + 1001)
     }
+
     fn mcs_result(&mut self, tag: u8) -> Result<u8, Error> {
         // Choice (6 bits), optional-ID bitmap (1 bit), then Result (4 bits).
         // The result straddles two octets; five alignment bits follow it.
-        let tail = self.byte()?;
+        let tail = self.u8()?;
         check(tail & 0x1f == 0, "MCS result padding")?;
         Ok(((tag & 1) << 3) | (tail >> 5))
     }
+
     fn ber_len(&mut self) -> Result<usize, Error> {
-        let a = self.byte()?;
+        let a = self.u8()?;
         if a < 128 {
             return Ok(usize::from(a));
         }
@@ -267,15 +259,17 @@ impl<'a> Read<'a> {
             return Err(Error::Unsupported("indefinite BER length"));
         }
         bound(n, 4, "BER length octets")?;
-        let n = size(unsigned(self.take(n)?)?)?;
+        let n = size(unsigned(self.field_bytes(n)?)?)?;
         bound(n, MAX_PDU, "BER value")?;
         Ok(n)
     }
+
     fn ber(&mut self, tag: &[u8]) -> Result<&'a [u8], Error> {
         self.expect(tag)?;
         let n = self.ber_len()?;
-        self.take(n)
+        self.field_bytes(n)
     }
+
     fn ber_uint(&mut self, tag: u8) -> Result<u32, Error> {
         let b = self.ber(&[tag])?;
         check(!b.is_empty(), "BER integer length")?;
@@ -680,27 +674,27 @@ impl Connection {
             c.credit == 0 && c.class == 0 && c.options == 0 && c.data.is_empty(),
             "connection class or data",
         )?;
-        // Read the original bytes: Variable may recognize a negotiation
+        // Reader the original bytes: Variable may recognize a negotiation
         // structure as ordinary COTP parameters, which would lose its shape.
-        let mut r = Read::new(packet.payload.get(7..).ok_or(Error::Truncated)?);
+        let mut r = Reader::new(packet.payload.get(7..).ok_or(Error::Truncated)?);
         let routing_token = if kind == ConnectionKind::Request
-            && !r.rest().is_empty()
-            && r.rest().first() != Some(&1)
+            && !r.is_empty()
+            && r.clone().rest().first() != Some(&1)
         {
             let end = r
-                .rest()
+                .clone().rest()
                 .windows(2)
                 .position(|x| x == b"\r\n")
                 .ok_or(Error::Invalid("routing token terminator"))?
                 + 2;
-            r.take(end)?.to_vec()
+            r.field_bytes(end)?.to_vec()
         } else {
             Vec::new()
         };
-        let negotiation = if r.rest().is_empty() {
+        let negotiation = if r.is_empty() {
             None
         } else {
-            Some(Negotiation::parse(r.take(8)?)?)
+            Some(Negotiation::parse(r.field_bytes(8)?)?)
         };
         let has_correlation =
             matches!(negotiation, Some(Negotiation::Request { flags, .. }) if flags & 8 != 0);
@@ -1051,8 +1045,8 @@ pub struct DomainParameters {
     pub protocol_version: u32,
 }
 impl DomainParameters {
-    fn read(r: &mut Read<'_>) -> Result<Self, Error> {
-        let mut r = Read::new(r.ber(&[0x30])?);
+    fn read(r: &mut Reader<'_>) -> Result<Self, Error> {
+        let mut r = Reader::new(r.ber(&[0x30])?);
         let out = Self {
             max_channel_ids: r.ber_uint(2)?,
             max_user_ids: r.ber_uint(2)?,
@@ -1458,9 +1452,9 @@ impl Wire for DataBlocks {
     /// Typed block errors are those of [`DataBlock::parse`].
     fn parse(b: &[u8]) -> Result<Self, Error> {
         bound(b.len(), MAX_GCC_DATA, "GCC blocks")?;
-        let mut r = Read::new(b);
+        let mut r = Reader::new(b);
         let mut blocks = Vec::with_capacity(MAX_BLOCKS);
-        while !r.rest().is_empty() {
+        while !r.is_empty() {
             bound(blocks.len() + 1, MAX_BLOCKS, "GCC block count")?;
             blocks.push(DataBlock::parse(r.block("GCC block length")?)?);
         }
@@ -1491,11 +1485,11 @@ impl Wire for Negotiation {
     /// for extra bytes, an unknown type, a length other than eight, nonzero
     /// failure flags, or more than one selected protocol.
     fn parse(b: &[u8]) -> Result<Self, Error> {
-        let mut r = Read::new(b);
-        let kind = r.byte()?;
-        let flags = r.byte()?;
-        check(r.le16()? == 8, "negotiation length")?;
-        let value = r.le32()?;
+        let mut r = Reader::new(b);
+        let kind = r.u8()?;
+        let flags = r.u8()?;
+        check(r.u16_le()? == 8, "negotiation length")?;
+        let value = r.u32_le()?;
         r.finish()?;
         match kind {
             1 => Ok(Self::Request {
@@ -1550,31 +1544,31 @@ impl Wire for DataBlock {
     /// monitor lists, inverted rectangles or invalid typed core/security fields.
     fn parse(b: &[u8]) -> Result<Self, Error> {
         bound(b.len(), MAX_GCC_DATA, "GCC block")?;
-        let mut outer = Read::new(b);
-        let kind = outer.le16()?;
-        let length = usize::from(outer.le16()?);
+        let mut outer = Reader::new(b);
+        let kind = outer.u16_le()?;
+        let length = usize::from(outer.u16_le()?);
         check(length >= 4 && length == b.len(), "GCC block length")?;
-        let mut r = Read::new(outer.rest());
+        let mut r = Reader::new(outer.clone().rest());
         let out = match kind {
             0xc001 => {
                 let core = ClientCore {
-                    version: r.le32()?,
-                    desktop_width: r.le16()?,
-                    desktop_height: r.le16()?,
-                    color_depth: r.le16()?,
-                    sas_sequence: r.le16()?,
-                    keyboard_layout: r.le32()?,
-                    client_build: r.le32()?,
+                    version: r.u32_le()?,
+                    desktop_width: r.u16_le()?,
+                    desktop_height: r.u16_le()?,
+                    color_depth: r.u16_le()?,
+                    sas_sequence: r.u16_le()?,
+                    keyboard_layout: r.u32_le()?,
+                    client_build: r.u32_le()?,
                     client_name: r.array()?,
-                    keyboard_type: r.le32()?,
-                    keyboard_subtype: r.le32()?,
-                    keyboard_function_keys: r.le32()?,
+                    keyboard_type: r.u32_le()?,
+                    keyboard_subtype: r.u32_le()?,
+                    keyboard_function_keys: r.u32_le()?,
                     ime_file_name: r.array()?,
                     optional: {
-                        let n = r.rest().len();
+                        let n = r.remaining();
                         bound(n, MAX_CORE_OPTIONAL, "client core optional fields")?;
                         check(CORE_BOUNDARIES.contains(&n), "client core field boundary")?;
-                        let mut optional = r.take(n)?.to_vec();
+                        let mut optional = r.field_bytes(n)?.to_vec();
                         // An unpaired field is ignored by the receiver.
                         if n == 88 || n == 98 {
                             optional.truncate(n - 4);
@@ -1586,11 +1580,11 @@ impl Wire for DataBlock {
                 Self::ClientCore(core)
             }
             0xc002 => Self::ClientSecurity {
-                encryption_methods: r.le32()?,
-                extended_methods: r.le32()?,
+                encryption_methods: r.u32_le()?,
+                extended_methods: r.u32_le()?,
             },
             0xc003 => {
-                let count = size(r.le32()?)?;
+                let count = size(r.u32_le()?)?;
                 bound(count, MAX_CHANNELS, "channels")?;
                 let mut channels = Vec::with_capacity(count);
                 for _ in 0..count {
@@ -1598,28 +1592,28 @@ impl Wire for DataBlock {
                     check(name.contains(&0), "unterminated channel name")?;
                     channels.push(ChannelDefinition {
                         name,
-                        options: r.le32()?,
+                        options: r.u32_le()?,
                     });
                 }
                 Self::ClientNetwork(channels)
             }
             0xc004 => Self::ClientCluster {
-                flags: r.le32()?,
-                redirected_session_id: r.le32()?,
+                flags: r.u32_le()?,
+                redirected_session_id: r.u32_le()?,
             },
             0xc005 => {
-                check(r.le32()? == 0, "monitor reserved flags")?;
-                let count = size(r.le32()?)?;
+                check(r.u32_le()? == 0, "monitor reserved flags")?;
+                let count = size(r.u32_le()?)?;
                 check(count != 0, "monitor count")?;
                 bound(count, MAX_MONITORS, "monitors")?;
                 let mut monitors = Vec::with_capacity(count);
                 for _ in 0..count {
                     let m = Monitor {
-                        left: r.i32()?,
-                        top: r.i32()?,
-                        right: r.i32()?,
-                        bottom: r.i32()?,
-                        flags: r.le32()?,
+                        left: r.i32_le()?,
+                        top: r.i32_le()?,
+                        right: r.i32_le()?,
+                        bottom: r.i32_le()?,
+                        flags: r.u32_le()?,
                     };
                     check(m.right >= m.left && m.bottom >= m.top, "monitor rectangle")?;
                     monitors.push(m);
@@ -1627,34 +1621,34 @@ impl Wire for DataBlock {
                 Self::ClientMonitor(monitors)
             }
             0xc006 => {
-                check(r.le32()? == 0, "message channel flags")?;
+                check(r.u32_le()? == 0, "message channel flags")?;
                 Self::ClientMessageChannel
             }
-            0xc00a => Self::ClientMultitransport(r.le32()?),
+            0xc00a => Self::ClientMultitransport(r.u32_le()?),
             0x0c01 => Self::ServerCore {
-                version: r.le32()?,
-                requested_protocols: if r.rest().is_empty() {
+                version: r.u32_le()?,
+                requested_protocols: if r.is_empty() {
                     None
                 } else {
-                    Some(Protocols(r.le32()?))
+                    Some(Protocols(r.u32_le()?))
                 },
-                early_capability_flags: if r.rest().is_empty() {
+                early_capability_flags: if r.is_empty() {
                     None
                 } else {
-                    Some(r.le32()?)
+                    Some(r.u32_le()?)
                 },
             },
             0x0c02 => {
-                let encryption_method = r.le32()?;
-                let encryption_level = r.le32()?;
+                let encryption_method = r.u32_le()?;
+                let encryption_level = r.u32_le()?;
                 let (random, certificate) = if encryption_method == 0 && encryption_level == 0 {
                     (Vec::new(), Vec::new())
                 } else {
-                    let random_len = size(r.le32()?)?;
-                    let cert_len = size(r.le32()?)?;
+                    let random_len = size(r.u32_le()?)?;
+                    let cert_len = size(r.u32_le()?)?;
                     check(random_len == SERVER_RANDOM_LEN, "server random length")?;
                     bound(cert_len, MAX_GCC_DATA, "certificate")?;
-                    (r.take(random_len)?.to_vec(), r.take(cert_len)?.to_vec())
+                    (r.field_bytes(random_len)?.to_vec(), r.field_bytes(cert_len)?.to_vec())
                 };
                 Self::ServerSecurity {
                     encryption_method,
@@ -1664,26 +1658,26 @@ impl Wire for DataBlock {
                 }
             }
             0x0c03 => {
-                let io_channel = r.le16()?;
-                let count = usize::from(r.le16()?);
+                let io_channel = r.u16_le()?;
+                let count = usize::from(r.u16_le()?);
                 bound(count, MAX_CHANNELS, "channels")?;
                 let mut channels = Vec::with_capacity(count);
                 for _ in 0..count {
-                    channels.push(r.le16()?);
+                    channels.push(r.u16_le()?);
                 }
                 if count % 2 != 0 {
-                    r.take(2)?;
+                    r.field_bytes(2)?;
                 } // Padding is ignored on read.
                 Self::ServerNetwork {
                     io_channel,
                     channels,
                 }
             }
-            0x0c04 => Self::ServerMessageChannel(r.le16()?),
-            0x0c08 => Self::ServerMultitransport(r.le32()?),
+            0x0c04 => Self::ServerMessageChannel(r.u16_le()?),
+            0x0c08 => Self::ServerMultitransport(r.u32_le()?),
             _ => Self::Other {
                 kind,
-                data: r.take(r.rest().len())?.to_vec(),
+                data: r.field_bytes(r.remaining())?.to_vec(),
             },
         };
         r.finish()?;
@@ -1848,11 +1842,11 @@ impl Wire for GccConference {
     /// Inner block errors are those of [`DataBlock::parse`].
     fn parse(b: &[u8]) -> Result<Self, Error> {
         bound(b.len(), MAX_GCC_RESPONSE, "GCC conference")?;
-        let mut r = Read::new(b);
+        let mut r = Reader::new(b);
         r.expect(&[0, 5, 0, 0x14, 0x7c, 0, 1])?;
         let outer_length = r.per_len()?;
-        let body_length = r.rest().len();
-        let kind = r.byte()?;
+        let body_length = r.remaining();
+        let kind = r.u8()?;
         let (node, tag, result) = match kind {
             0 => {
                 bound(b.len(), MAX_GCC_REQUEST, "GCC request")?;
@@ -1861,10 +1855,10 @@ impl Wire for GccConference {
                 (0, 0, 0)
             }
             0x14 => {
-                let node = u32::from(r.be16()?) + 1001;
+                let node = u32::from(r.u16_be()?) + 1001;
                 check(node <= 65536, "GCC node ID")?;
                 let tag = r.per_signed()?;
-                let result = r.byte()?;
+                let result = r.u8()?;
                 check(result & 0x8f == 0 && result >> 4 <= 4, "GCC result")?;
                 (node, tag, result >> 4)
             }
@@ -1873,7 +1867,7 @@ impl Wire for GccConference {
         r.expect(&[1, 0xc0, 0])?;
         r.expect(if kind == 0 { b"Duca" } else { b"McDn" })?;
         let length = r.per_len()?;
-        let blocks = DataBlocks::parse(r.take(length)?)?;
+        let blocks = DataBlocks::parse(r.field_bytes(length)?)?;
         r.finish()?;
         check_block_direction(&blocks.0, kind == 0)?;
         if kind == 0 {
@@ -1947,12 +1941,12 @@ impl Wire for McsConnect {
     /// GCC errors are those of [`GccConference::parse`].
     fn parse(b: &[u8]) -> Result<Self, Error> {
         bound(b.len(), MAX_PDU, "MCS connect")?;
-        let mut outer = Read::new(b);
+        let mut outer = Reader::new(b);
         outer.expect(&[0x7f])?;
-        let kind = outer.byte()?;
+        let kind = outer.u8()?;
         check(kind == 0x65 || kind == 0x66, "MCS connect tag")?;
         let length = outer.ber_len()?;
-        let mut r = Read::new(outer.take(length)?);
+        let mut r = Reader::new(outer.field_bytes(length)?);
         outer.finish()?;
         let out = if kind == 0x65 {
             let calling = r.ber(&[4])?;
@@ -2051,8 +2045,8 @@ impl Wire for McsPdu {
     /// [`Error::Invalid`].
     fn parse(b: &[u8]) -> Result<Self, Error> {
         bound(b.len(), MAX_PDU, "MCS PDU")?;
-        let mut r = Read::new(b);
-        let tag = r.byte()?;
+        let mut r = Reader::new(b);
+        let tag = r.u8()?;
         let pdu = match tag {
             4 => Self::ErectDomain {
                 sub_height: r.per_uint()?,
@@ -2069,18 +2063,18 @@ impl Wire for McsPdu {
             },
             0x38 => Self::ChannelJoinRequest {
                 initiator: r.user_id()?,
-                channel_id: r.be16()?,
+                channel_id: r.u16_be()?,
             },
             0x3c..=0x3f => Self::ChannelJoinConfirm {
                 result: r.mcs_result(tag)?,
                 initiator: r.user_id()?,
-                requested: r.be16()?,
-                channel_id: if tag & 2 != 0 { Some(r.be16()?) } else { None },
+                requested: r.u16_be()?,
+                channel_id: if tag & 2 != 0 { Some(r.u16_be()?) } else { None },
             },
             0x64 | 0x68 => {
                 let initiator = r.user_id()?;
-                let channel_id = r.be16()?;
-                let bits = r.byte()?;
+                let channel_id = r.u16_be()?;
+                let bits = r.u8()?;
                 check(bits & 15 == 0, "MCS priority padding")?;
                 let n = r.per_len()?;
                 Self::SendData {
@@ -2089,7 +2083,7 @@ impl Wire for McsPdu {
                     channel_id,
                     priority: bits >> 6,
                     segmentation: (bits >> 4) & 3,
-                    data: r.take(n)?.to_vec(),
+                    data: r.field_bytes(n)?.to_vec(),
                 }
             }
             _ => return Err(Error::Unsupported("MCS PER choice")),
@@ -2176,11 +2170,11 @@ impl Wire for SecurityPayload {
     /// above [`MAX_PDU`]. Protected data remains opaque.
     fn parse(b: &[u8]) -> Result<Self, Error> {
         bound(b.len(), MAX_PDU, "security payload")?;
-        let mut r = Read::new(b);
+        let mut r = Reader::new(b);
         Ok(Self {
-            flags: r.le16()?,
-            flags_hi: r.le16()?,
-            data: r.rest().to_vec(),
+            flags: r.u16_le()?,
+            flags_hi: r.u16_le()?,
+            data: r.clone().rest().to_vec(),
         })
     }
 
@@ -2207,19 +2201,19 @@ impl Wire for ClientInfo {
     /// Unicode lengths or missing null terminators return [`Error::Invalid`].
     fn parse(b: &[u8]) -> Result<Self, Error> {
         bound(b.len(), MAX_PDU, "client info")?;
-        let mut r = Read::new(b);
-        let code_page = r.le32()?;
-        let flags = r.le32()?;
+        let mut r = Reader::new(b);
+        let code_page = r.u32_le()?;
+        let flags = r.u32_le()?;
         check(flags & INFO_RESERVED == 0, "reserved info flags")?;
         let unicode = flags & INFO_UNICODE != 0;
-        let lengths = [r.le16()?, r.le16()?, r.le16()?, r.le16()?, r.le16()?];
+        let lengths = [r.u16_le()?, r.u16_le()?, r.u16_le()?, r.u16_le()?, r.u16_le()?];
         let mut strings = lengths.into_iter().map(|n| {
             let n = usize::from(n);
             bound(n + 1 + usize::from(unicode), MAX_INFO_STRING, "info string")?;
             check(!unicode || n % 2 == 0, "Unicode string length")?;
-            let b = r.take(n)?.to_vec();
+            let b = r.field_bytes(n)?.to_vec();
             r.expect(if unicode { &[0, 0] } else { &[0] })?;
-            Ok(b)
+            Ok::<_, Error>(b)
         });
         let mut next = || strings.next().ok_or(Error::Truncated)?;
         let domain = next()?;
@@ -2227,7 +2221,7 @@ impl Wire for ClientInfo {
         let password = next()?;
         let alternate_shell = next()?;
         let working_dir = next()?;
-        bound(r.rest().len(), MAX_EXTRA_INFO, "extended info")?;
+        bound(r.remaining(), MAX_EXTRA_INFO, "extended info")?;
         Ok(Self {
             code_page,
             flags,
@@ -2236,7 +2230,7 @@ impl Wire for ClientInfo {
             password,
             alternate_shell,
             working_dir,
-            extra_info: r.rest().to_vec(),
+            extra_info: r.clone().rest().to_vec(),
         })
     }
 
@@ -2289,17 +2283,17 @@ impl Wire for LicenseError {
     /// or trailing bytes return [`Error::Invalid`].
     fn parse(b: &[u8]) -> Result<Self, Error> {
         bound(b.len(), MAX_PDU, "license error")?;
-        let mut r = Read::new(b);
+        let mut r = Reader::new(b);
         r.expect(&[0xff])?;
-        let flags = r.byte()?;
+        let flags = r.u8()?;
         check(matches!(flags & 0x7f, 2 | 3), "license preamble flags")?;
-        check(usize::from(r.le16()?) == b.len(), "license message length")?;
-        let error_code = r.le32()?;
-        let state_transition = r.le32()?;
-        let blob_type = r.le16()?;
+        check(usize::from(r.u16_le()?) == b.len(), "license message length")?;
+        let error_code = r.u32_le()?;
+        let state_transition = r.u32_le()?;
+        let blob_type = r.u16_le()?;
         check(blob_type == 4, "license error blob type")?;
-        let n = usize::from(r.le16()?);
-        let blob = r.take(n)?.to_vec();
+        let n = usize::from(r.u16_le()?);
+        let blob = r.field_bytes(n)?.to_vec();
         r.finish()?;
         Ok(Self {
             flags,
@@ -2342,13 +2336,13 @@ impl Wire for CapabilitySet {
     /// length below four or one that does not match the input.
     fn parse(b: &[u8]) -> Result<Self, Error> {
         bound(b.len(), MAX_CAPABILITY + 4, "capability")?;
-        let mut r = Read::new(b);
-        let kind = CapabilityType(r.le16()?);
-        let n = usize::from(r.le16()?);
+        let mut r = Reader::new(b);
+        let kind = CapabilityType(r.u16_le()?);
+        let n = usize::from(r.u16_le()?);
         check(n >= 4 && n == b.len(), "capability length")?;
         Ok(Self {
             kind,
-            data: r.rest().to_vec(),
+            data: r.clone().rest().to_vec(),
         })
     }
 
@@ -2375,28 +2369,28 @@ impl Wire for ActivePdu {
     /// other than [`SERVER_CHANNEL_ID`] return [`Error::Invalid`].
     fn parse(b: &[u8]) -> Result<Self, Error> {
         bound(b.len(), MAX_PDU, "active PDU")?;
-        let mut r = Read::new(b);
-        check(usize::from(r.le16()?) == b.len(), "share control length")?;
-        let kind = r.le16()?;
+        let mut r = Reader::new(b);
+        check(usize::from(r.u16_le()?) == b.len(), "share control length")?;
+        let kind = r.u16_le()?;
         check(kind == 0x11 || kind == 0x13, "share control type/version")?;
-        let source = r.le16()?;
-        let share_id = r.le32()?;
+        let source = r.u16_le()?;
+        let share_id = r.u32_le()?;
         let originator = if kind == 0x13 {
-            let id = r.le16()?;
+            let id = r.u16_le()?;
             check(id == SERVER_CHANNEL_ID, "confirm active originator")?;
             id
         } else {
             0
         };
-        let descriptor_len = usize::from(r.le16()?);
-        let combined_len = usize::from(r.le16()?);
+        let descriptor_len = usize::from(r.u16_le()?);
+        let combined_len = usize::from(r.u16_le()?);
         bound(descriptor_len, MAX_DESCRIPTOR, "source descriptor")?;
-        let source_descriptor = r.take(descriptor_len)?.to_vec();
+        let source_descriptor = r.field_bytes(descriptor_len)?.to_vec();
         check(combined_len >= 4, "combined capability length")?;
-        let mut caps = Read::new(r.take(combined_len)?);
-        let count = usize::from(caps.le16()?);
+        let mut caps = Reader::new(r.field_bytes(combined_len)?);
+        let count = usize::from(caps.u16_le()?);
         bound(count, MAX_CAPABILITIES, "capability count")?;
-        let padding = caps.le16()?;
+        let padding = caps.u16_le()?;
         let mut capabilities = Vec::with_capacity(count);
         for _ in 0..count {
             capabilities.push(CapabilitySet::parse(caps.block("capability length")?)?);
@@ -2404,7 +2398,7 @@ impl Wire for ActivePdu {
         caps.finish()?;
         let kind = if kind == 0x11 {
             ActiveKind::Demand {
-                session_id: r.le32()?,
+                session_id: r.u32_le()?,
             }
         } else {
             ActiveKind::Confirm {
@@ -2473,8 +2467,28 @@ impl Wire for ActivePdu {
     }
 }
 
+impl From<Truncated> for Error {
+    #[inline]
+    fn from(_: Truncated) -> Self { Error::Truncated }
+}
+
+impl From<Trailing> for Error {
+    #[inline]
+    fn from(_: Trailing) -> Self { Error::Invalid("trailing bytes") }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn field_length_overflow_keeps_its_error() {
+        let mut r = super::Reader::new(&[1, 2]);
+        r.skip(1).unwrap();
+        assert_eq!(super::ReadFields::field_bytes(&mut r, usize::MAX), Err(super::Error::Limit("length")));
+        assert_eq!(r.position(), 1);
+        assert_eq!(super::ReadFields::field_bytes(&mut r, 2), Err(super::Error::Truncated));
+        assert_eq!(r.position(), 1);
+    }
+
     use super::*;
     use fictionet::stdlib::codec::{
         Fail, Lcg, Stream, contract, pump,
@@ -3140,7 +3154,7 @@ mod tests {
             hex("02 06 00 00 00 00 00 00"),
             hex("02 05 01 00 00 00 00"),
         ] {
-            assert!(Read::new(&bytes).ber_uint(2).is_err());
+            assert!(Reader::new(&bytes).ber_uint(2).is_err());
         }
         for bytes in [
             hex("04 00 01 00"),
@@ -3150,7 +3164,7 @@ mod tests {
         ] {
             assert!(McsPdu::parse(&bytes).is_err());
         }
-        let mut r = Read::new(&[0x84, 0, 1, 0, 0]);
+        let mut r = Reader::new(&[0x84, 0, 1, 0, 0]);
         assert!(r.ber_len().is_err());
         for n in [0, 127, 128, 255, 256, 65535, u32::MAX] {
             let p = McsPdu::ErectDomain {
@@ -3160,7 +3174,7 @@ mod tests {
             assert_eq!(McsPdu::parse(&p.to_bytes().unwrap()), Ok(p));
             let mut w = Write::new(MAX_PDU);
             w.ber_uint(2, n).unwrap();
-            assert_eq!(Read::new(&w.b).ber_uint(2), Ok(n));
+            assert_eq!(Reader::new(&w.b).ber_uint(2), Ok(n));
         }
     }
 
@@ -4089,10 +4103,10 @@ mod tests {
             let mut w = Write::new(MAX_PDU);
             w.per_signed(tag).unwrap();
             assert_eq!(w.b, hex(bytes));
-            assert_eq!(Read::new(&w.b).per_signed(), Ok(tag));
+            assert_eq!(Reader::new(&w.b).per_signed(), Ok(tag));
         }
-        assert!(Read::new(&[0]).per_signed().is_err());
-        assert!(Read::new(&[5, 0, 0, 0, 0, 0]).per_signed().is_err());
+        assert!(Reader::new(&[0]).per_signed().is_err());
+        assert!(Reader::new(&[5, 0, 0, 0, 0, 0]).per_signed().is_err());
     }
 
     #[test]
@@ -4169,12 +4183,12 @@ mod tests {
             McsConnect::parse(&outer.b),
             Err(Error::Invalid("BER Boolean"))
         );
-        assert!(DomainParameters::read(&mut Read::new(&[0x30, 0])).is_err());
+        assert!(DomainParameters::read(&mut Reader::new(&[0x30, 0])).is_err());
         let mut w = Write::new(MAX_PDU);
         params().write(&mut w).unwrap();
         w.b[1] += 1;
         w.b.push(0);
-        assert!(DomainParameters::read(&mut Read::new(&w.b)).is_err());
+        assert!(DomainParameters::read(&mut Reader::new(&w.b)).is_err());
     }
 
     #[test]

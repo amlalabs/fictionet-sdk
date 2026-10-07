@@ -64,7 +64,7 @@
 //! assert_eq!(TokenStream::parse(&message.data), Ok(reply));
 //! ```
 
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire, Reader, Truncated, Trailing};
 
 /// The TCP port SQL Server listens on.
 pub const PORT: u16 = 1433;
@@ -1346,17 +1346,17 @@ fn deobfuscate(bytes: &[u8]) -> Vec<u8> {
 /// Feature options up to the 0xFF that ends them, and how many bytes they
 /// took with it.
 fn parse_features(b: &[u8]) -> Result<(Vec<Feature>, usize), Error> {
-    let mut c = Cur::new(b);
+    let mut c = Reader::new(b);
     let mut features = Vec::new();
     loop {
         let id = c.u8()?;
         if id == 0xff {
-            return Ok((features, c.p));
+            return Ok((features, c.position()));
         }
         if features.len() == MAX_FEATURES {
             return Err(Error::Limit("feature options"));
         }
-        let len = c.u32()? as usize;
+        let len = c.u32_le()? as usize;
         features.push(Feature {
             id,
             data: c.take(len)?.to_vec(),
@@ -1412,9 +1412,9 @@ impl StreamHeader {
             header_type::TRANSACTION_DESCRIPTOR => self.data.len() == 12,
             header_type::TRACE_ACTIVITY => self.data.len() == 20,
             header_type::QUERY_NOTIFICATIONS => {
-                let mut c = Cur::new(&self.data);
+                let mut c = Reader::new(&self.data);
                 let strings = (0..2).all(|_| c.us_varchar().is_ok());
-                strings && matches!(self.data.len() - c.p, 0 | 4)
+                strings && matches!(self.data.len() - c.position(), 0 | 4)
             }
             _ => true,
         }
@@ -1466,23 +1466,23 @@ impl SqlBatch {
     pub fn parse(data: &[u8], all_headers: bool) -> Result<SqlBatch, Error> {
         if data.len() > MAX_MESSAGE { return Err(Error::Limit("SQL batch data")); }
         let (headers, rest) = if all_headers {
-            let mut c = Cur::new(data);
-            let total = c.u32()? as usize;
+            let mut c = Reader::new(data);
+            let total = c.u32_le()? as usize;
             if total < 4 {
                 return Err(Error::Invalid("ALL_HEADERS length"));
             }
             let block = data.get(4..total).ok_or(Error::Truncated)?;
-            let mut c = Cur::new(block);
+            let mut c = Reader::new(block);
             let mut headers = Vec::new();
-            while c.p < block.len() {
+            while c.position() < block.len() {
                 if headers.len() == MAX_HEADERS {
                     return Err(Error::Limit("ALL_HEADERS headers"));
                 }
-                let len = c.u32()? as usize;
+                let len = c.u32_le()? as usize;
                 if len < 6 {
                     return Err(Error::Invalid("header length"));
                 }
-                let kind = c.u16()?;
+                let kind = c.u16_le()?;
                 if headers.iter().any(|h: &StreamHeader| h.kind == kind) {
                     return Err(Error::Invalid("header type repeated"));
                 }
@@ -1961,8 +1961,8 @@ fn byte_len_value_ok(ty: &TypeInfo, data: &[u8]) -> bool {
     };
     let mut framed = vec![n];
     framed.extend_from_slice(data);
-    let mut c = Cur::new(&framed);
-    read_value(&mut c, ty).is_ok_and(|v| v != Value::Null) && c.p == framed.len()
+    let mut c = Reader::new(&framed);
+    read_value(&mut c, ty).is_ok_and(|v| v != Value::Null) && c.position() == framed.len()
 }
 
 /// The partly length-prefixed (PLP) length that means null.
@@ -1972,7 +1972,7 @@ const PLP_UNKNOWN: u64 = u64::MAX - 1;
 /// The most bytes in one PLP chunk a writer writes.
 const PLP_CHUNK: usize = 1 << 20;
 
-fn read_type_info(c: &mut Cur) -> Result<TypeInfo, Error> {
+fn read_type_info(c: &mut Reader) -> Result<TypeInfo, Error> {
     let ty = c.u8()?;
     let mut t = TypeInfo::bare(ty);
     // A NULL-typed column takes no bytes in a row, so one byte of ROW
@@ -2007,7 +2007,7 @@ fn read_type_info(c: &mut Cur) -> Result<TypeInfo, Error> {
             }
         }
         Class::UShort { chars, var } => {
-            t.max_len = u32::from(c.u16()?);
+            t.max_len = u32::from(c.u16_le()?);
             if t.max_len == 0xffff && !var {
                 return Err(Error::Invalid("column length"));
             }
@@ -2017,7 +2017,7 @@ fn read_type_info(c: &mut Cur) -> Result<TypeInfo, Error> {
                 t.collation = Some(col);
             }
         }
-        Class::Variant => t.max_len = c.u32()?,
+        Class::Variant => t.max_len = c.u32_le()?,
     }
     Ok(t)
 }
@@ -2050,7 +2050,7 @@ fn write_type_info(out: &mut Vec<u8>, t: &TypeInfo) -> Result<(), Error> {
 /// than the column's maximum length, a decimal within its precision, and
 /// dates, times and time zone offsets within the ranges MS-TDS 2.2.5.5.1
 /// gives them.
-fn read_value(c: &mut Cur, t: &TypeInfo) -> Result<Value, Error> {
+fn read_value(c: &mut Reader, t: &TypeInfo) -> Result<Value, Error> {
     let chars_text = t.ty == data_type::NVARCHAR || t.ty == data_type::NCHAR;
     match class(t.ty).ok_or(Error::UnsupportedType(t.ty))? {
         Class::Fixed(0) => Ok(Value::Null),
@@ -2135,13 +2135,13 @@ fn read_value(c: &mut Cur, t: &TypeInfo) -> Result<Value, Error> {
             })
         }
         Class::UShort { .. } if t.max_len == 0xffff => {
-            let total = c.u64()?;
+            let total = c.u64_le()?;
             if total == PLP_NULL {
                 return Ok(Value::Null);
             }
             let mut data = Vec::new();
             loop {
-                let n = c.u32()? as usize;
+                let n = c.u32_le()? as usize;
                 if n == 0 {
                     break;
                 }
@@ -2153,7 +2153,7 @@ fn read_value(c: &mut Cur, t: &TypeInfo) -> Result<Value, Error> {
             bytes_value(data, chars_text)
         }
         Class::UShort { .. } => {
-            let n = c.u16()?;
+            let n = c.u16_le()?;
             if n == 0xffff {
                 return Ok(Value::Null);
             }
@@ -2163,7 +2163,7 @@ fn read_value(c: &mut Cur, t: &TypeInfo) -> Result<Value, Error> {
             bytes_value(c.take(usize::from(n))?.to_vec(), chars_text)
         }
         Class::Variant => {
-            let n = c.u32()? as usize;
+            let n = c.u32_le()? as usize;
             if n == 0 {
                 return Ok(Value::Null);
             }
@@ -2489,17 +2489,17 @@ fn other_len(t: u8) -> Option<OtherLen> {
 /// the last COLMETADATA token. It returns the token and how many bytes
 /// it took.
 fn read_token(b: &[u8], columns: Option<&[Column]>) -> Result<(Token, usize), Error> {
-    let mut c = Cur::new(b);
+    let mut c = Reader::new(b);
     let t = c.u8()?;
     let token = match t {
         token::LOGINACK => {
             let body = c.u16_block()?;
-            let mut d = Cur::new(body);
+            let mut d = Reader::new(body);
             let interface = d.u8()?;
             let tds_version = u32::from_be_bytes(d.array()?);
             let prog_name = d.b_varchar()?;
             let prog_version = d.array()?;
-            d.end()?;
+            d.finish()?;
             Token::LoginAck(LoginAck {
                 interface,
                 tds_version,
@@ -2512,7 +2512,7 @@ fn read_token(b: &[u8], columns: Option<&[Column]>) -> Result<(Token, usize), Er
             if body == [env_type::PROMOTE_TRANSACTION] {
                 // The token's length covers only the type; the DTC token
                 // and the old value follow it.
-                let n = c.u32()? as usize;
+                let n = c.u32_le()? as usize;
                 let dtc = c.take(n)?.to_vec();
                 if c.u8()? != 0 {
                     return Err(Error::Invalid("ENVCHANGE old value"));
@@ -2524,17 +2524,17 @@ fn read_token(b: &[u8], columns: Option<&[Column]>) -> Result<(Token, usize), Er
         }
         token::INFO | token::ERROR => {
             let body = c.u16_block()?;
-            let mut d = Cur::new(body);
+            let mut d = Reader::new(body);
             let m = ServerMessage {
-                number: d.u32()? as i32,
+                number: d.u32_le()? as i32,
                 state: d.u8()?,
                 class: d.u8()?,
                 text: d.us_varchar()?,
                 server: d.b_varchar()?,
                 procedure: d.b_varchar()?,
-                line: d.u32()?,
+                line: d.u32_le()?,
             };
-            d.end()?;
+            d.finish()?;
             if t == token::INFO {
                 Token::Info(m)
             } else {
@@ -2543,9 +2543,9 @@ fn read_token(b: &[u8], columns: Option<&[Column]>) -> Result<(Token, usize), Er
         }
         token::DONE | token::DONEPROC | token::DONEINPROC => {
             let d = Done {
-                status: c.u16()?,
-                cur_cmd: c.u16()?,
-                row_count: c.u64()?,
+                status: c.u16_le()?,
+                cur_cmd: c.u16_le()?,
+                row_count: c.u64_le()?,
             };
             match t {
                 token::DONE => Token::Done(d),
@@ -2554,7 +2554,7 @@ fn read_token(b: &[u8], columns: Option<&[Column]>) -> Result<(Token, usize), Er
             }
         }
         token::COLMETADATA => {
-            let count = c.u16()?;
+            let count = c.u16_le()?;
             if count == 0xffff {
                 Token::ColMetadata(None)
             } else {
@@ -2564,8 +2564,8 @@ fn read_token(b: &[u8], columns: Option<&[Column]>) -> Result<(Token, usize), Er
                 }
                 let mut cols = Vec::with_capacity(count);
                 for _ in 0..count {
-                    let user_type = c.u32()?;
-                    let flags = c.u16()?;
+                    let user_type = c.u32_le()?;
+                    let flags = c.u16_le()?;
                     let type_info = read_type_info(&mut c)?;
                     let name = c.b_varchar()?;
                     cols.push(Column {
@@ -2602,16 +2602,16 @@ fn read_token(b: &[u8], columns: Option<&[Column]>) -> Result<(Token, usize), Er
                 Token::NbcRow(values)
             }
         }
-        token::RETURNSTATUS => Token::ReturnStatus(c.u32()? as i32),
+        token::RETURNSTATUS => Token::ReturnStatus(c.u32_le()? as i32),
         token::RETURNVALUE => {
-            let ordinal = c.u16()?;
+            let ordinal = c.u16_le()?;
             let name = c.b_varchar()?;
             let status = c.u8()?;
             if status != return_status::OUTPUT && status != return_status::UDF {
                 return Err(Error::Invalid("RETURNVALUE status"));
             }
-            let user_type = c.u32()?;
-            let flags = c.u16()?;
+            let user_type = c.u32_le()?;
+            let flags = c.u16_le()?;
             if flags & FLAG_ENCRYPTED != 0 {
                 return Err(Error::Limit("encrypted RETURNVALUE"));
             }
@@ -2629,13 +2629,13 @@ fn read_token(b: &[u8], columns: Option<&[Column]>) -> Result<(Token, usize), Er
         }
         token::FEATUREEXTACK => {
             let (features, used) = parse_features(&b[1..])?;
-            c.p += used;
+            c.skip(used)?;
             Token::FeatureExtAck(features)
         }
         _ => {
             let len = match other_len(t).ok_or(Error::UnknownToken(t))? {
-                OtherLen::U16 => usize::from(c.u16()?),
-                OtherLen::U32 => c.u32()? as usize,
+                OtherLen::U16 => usize::from(c.u16_le()?),
+                OtherLen::U32 => c.u32_le()? as usize,
                 OtherLen::Fixed(n) => n,
             };
             Token::Other {
@@ -2644,11 +2644,11 @@ fn read_token(b: &[u8], columns: Option<&[Column]>) -> Result<(Token, usize), Er
             }
         }
     };
-    Ok((token, c.p))
+    Ok((token, c.position()))
 }
 
 fn read_env_change(body: &[u8]) -> Result<EnvChange, Error> {
-    let mut d = Cur::new(body);
+    let mut d = Reader::new(body);
     let kind = d.u8()?;
     let env = match kind {
         1..=6 | 13 | 19 => EnvChange::Text {
@@ -2667,7 +2667,7 @@ fn read_env_change(body: &[u8]) -> Result<EnvChange, Error> {
             }
         }
         15 => {
-            let n = d.u32()? as usize;
+            let n = d.u32_le()? as usize;
             let token = d.take(n)?.to_vec();
             if d.u8()? != 0 {
                 return Err(Error::Invalid("ENVCHANGE old value"));
@@ -2675,19 +2675,19 @@ fn read_env_change(body: &[u8]) -> Result<EnvChange, Error> {
             EnvChange::PromoteTransaction(token)
         }
         20 | 21 => {
-            let n = usize::from(d.u16()?);
-            let mut r = Cur::new(d.take(n)?);
+            let n = usize::from(d.u16_le()?);
+            let mut r = Reader::new(d.take(n)?);
             let protocol = r.u8()?;
             if protocol != 0 {
                 return Err(Error::Invalid("routing protocol"));
             }
-            let port = r.u16()?;
+            let port = r.u16_le()?;
             if port == 0 {
                 return Err(Error::Invalid("routing port"));
             }
             let server = r.us_varchar()?;
             let database = if kind == env_type::ENHANCED_ROUTING {
-                let n = usize::from(r.u16()?);
+                let n = usize::from(r.u16_le()?);
                 if n > MAX_ROUTING_DATABASE {
                     return Err(Error::Limit("routing database"));
                 }
@@ -2695,8 +2695,8 @@ fn read_env_change(body: &[u8]) -> Result<EnvChange, Error> {
             } else {
                 None
             };
-            r.end()?;
-            if d.u16()? != 0 {
+            r.finish()?;
+            if d.u16_le()? != 0 {
                 return Err(Error::Invalid("ENVCHANGE old value"));
             }
             EnvChange::Routing {
@@ -2711,7 +2711,7 @@ fn read_env_change(body: &[u8]) -> Result<EnvChange, Error> {
             EnvChange::Other { kind, data }
         }
     };
-    d.end()?;
+    d.finish()?;
     check_env_change(&env)?;
     Ok(env)
 }
@@ -2930,8 +2930,8 @@ fn check_columns(columns: &[Column]) -> Result<(), Error> {
     for col in columns {
         let mut b = Vec::new();
         write_type_info(&mut b, &col.type_info)?;
-        let mut c = Cur::new(&b);
-        if read_type_info(&mut c)? != col.type_info || c.p != b.len() {
+        let mut c = Reader::new(&b);
+        if read_type_info(&mut c)? != col.type_info || c.position() != b.len() {
             return Err(Error::Invalid("column type parameters"));
         }
     }
@@ -3094,51 +3094,17 @@ payload_wire!(Login7,
 // Helpers.
 // ---------------------------------------------------------------------
 
-/// A cursor over bytes whose reads fail with [`Error::Truncated`] at the
-/// end.
-struct Cur<'a> {
-    b: &'a [u8],
-    p: usize,
+trait ReadFields<'a> {
+    fn u16_block(&mut self) -> Result<&'a [u8], Error>;
+    fn b_varchar(&mut self) -> Result<String, Error>;
+    fn us_varchar(&mut self) -> Result<String, Error>;
 }
 
-impl<'a> Cur<'a> {
-    fn new(b: &'a [u8]) -> Cur<'a> {
-        Cur { b, p: 0 }
-    }
-
-    fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
-        let end = self.p.checked_add(n).ok_or(Error::Truncated)?;
-        let s = self.b.get(self.p..end).ok_or(Error::Truncated)?;
-        self.p = end;
-        Ok(s)
-    }
-
-    fn array<const N: usize>(&mut self) -> Result<[u8; N], Error> {
-        let mut a = [0u8; N];
-        a.copy_from_slice(self.take(N)?);
-        Ok(a)
-    }
-
-    fn u8(&mut self) -> Result<u8, Error> {
-        Ok(self.take(1)?[0])
-    }
-
-    fn u16(&mut self) -> Result<u16, Error> {
-        Ok(u16::from_le_bytes(self.array()?))
-    }
-
-    fn u32(&mut self) -> Result<u32, Error> {
-        Ok(u32::from_le_bytes(self.array()?))
-    }
-
-    fn u64(&mut self) -> Result<u64, Error> {
-        Ok(u64::from_le_bytes(self.array()?))
-    }
-
+impl<'a> ReadFields<'a> for Reader<'a> {
     /// A two-byte length and that many bytes.
     fn u16_block(&mut self) -> Result<&'a [u8], Error> {
-        let n = self.u16()?;
-        self.take(usize::from(n))
+        let n = self.u16_le()?;
+        self.take(usize::from(n)).map_err(Error::from)
     }
 
     /// A one-byte count of UTF-16 units and the units.
@@ -3149,17 +3115,8 @@ impl<'a> Cur<'a> {
 
     /// A two-byte count of UTF-16 units and the units.
     fn us_varchar(&mut self) -> Result<String, Error> {
-        let n = usize::from(self.u16()?);
+        let n = usize::from(self.u16_le()?);
         Ok(utf16_string(self.take(2 * n)?))
-    }
-
-    /// Fails unless every byte has been read.
-    fn end(&self) -> Result<(), Error> {
-        if self.p == self.b.len() {
-            Ok(())
-        } else {
-            Err(Error::Invalid("bytes after the token's fields"))
-        }
     }
 }
 
@@ -3223,6 +3180,16 @@ fn le16(b: &[u8], i: usize) -> u16 {
 
 fn le32(b: &[u8], i: usize) -> u32 {
     u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]])
+}
+
+impl From<Truncated> for Error {
+    #[inline]
+    fn from(_: Truncated) -> Self { Error::Truncated }
+}
+
+impl From<Trailing> for Error {
+    #[inline]
+    fn from(_: Trailing) -> Self { Error::Invalid("bytes after the token's fields") }
 }
 
 #[cfg(test)]

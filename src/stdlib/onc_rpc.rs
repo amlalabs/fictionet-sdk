@@ -64,7 +64,7 @@
 //! );
 //! ```
 
-use fictionet::stdlib::codec::{self, Assemble, AssembleError, Assembled, Decode, Step, Wire};
+use fictionet::stdlib::codec::{self, Assemble, AssembleError, Assembled, Decode, Step, Wire, Reader as ByteReader, Truncated};
 use core::convert::Infallible;
 
 /// The port the portmapper and rpcbind listen on, over TCP and UDP.
@@ -202,52 +202,48 @@ impl std::error::Error for Error {}
 /// a caller stops there.
 #[derive(Clone, Debug)]
 pub struct Reader<'a> {
-    buf: &'a [u8],
-    pos: usize,
+    cursor: ByteReader<'a>,
 }
 
 impl<'a> Reader<'a> {
     /// A reader at the start of `buf`.
     pub fn new(buf: &'a [u8]) -> Reader<'a> {
-        Reader { buf, pos: 0 }
+        Reader { cursor: ByteReader::new(buf) }
     }
 
     /// How many bytes have been read.
+    #[inline]
     pub fn position(&self) -> usize {
-        self.pos
+        self.cursor.position()
     }
 
     /// The bytes not yet read.
+    #[inline]
     pub fn remaining(&self) -> &'a [u8] {
-        self.buf.get(self.pos..).unwrap_or(&[])
+        self.cursor.clone().rest()
     }
 
     /// Takes every byte not yet read, such as a call's arguments.
+    #[inline]
     pub fn rest(&mut self) -> &'a [u8] {
-        let r = self.remaining();
-        self.pos = self.buf.len();
-        r
+        self.cursor.rest()
     }
 
     /// Checks that every byte has been read.
+    #[inline]
     pub fn finish(&self) -> Result<(), Error> {
-        match self.remaining().len() {
-            0 => Ok(()),
-            n => Err(Error::Trailing(n)),
-        }
+        self.cursor.finish().map_err(|e| Error::Trailing(e.0))
     }
 
+    #[inline]
     fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
-        let end = self.pos.checked_add(n).ok_or(Error::Short)?;
-        let b = self.buf.get(self.pos..end).ok_or(Error::Short)?;
-        self.pos = end;
-        Ok(b)
+        self.cursor.take(n).map_err(Error::from)
     }
 
     /// An unsigned integer: 4 bytes.
+    #[inline]
     pub fn uint(&mut self) -> Result<u32, Error> {
-        let b = self.take(4)?;
-        Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+        self.cursor.u32_be().map_err(Error::from)
     }
 
     /// A signed integer: 4 bytes, two's complement.
@@ -1433,6 +1429,11 @@ pub fn silent_on_failure(call: &Call) -> bool {
     call.program == PMAP_PROGRAM
         && (PMAP_VERSION..=RPCB_VERSION_HIGH).contains(&call.version)
         && call.procedure == procedure::CALLIT
+}
+
+impl From<Truncated> for Error {
+    #[inline]
+    fn from(_: Truncated) -> Self { Error::Short }
 }
 
 #[cfg(test)]
