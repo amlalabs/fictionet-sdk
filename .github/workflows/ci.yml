@@ -106,3 +106,40 @@ jobs:
         with:
           name: fuzz-artifacts
           path: fuzz/artifacts
+
+  docker:
+    name: docker (${{ matrix.dockerfile }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Each Dockerfile and the stages to build from it, from the crate
+        # root, as its compose file or script does. "-" is the last stage.
+        include:
+          - dockerfile: deploy/Dockerfile
+            targets: attach web-world agent
+          - dockerfile: tests/docker/web/Dockerfile
+            targets: runtime agent
+          - dockerfile: tests/docker/ping/Dockerfile
+            targets: runtime agent
+          - dockerfile: tests/docker/proxy/Dockerfile
+            targets: runtime agent
+          - dockerfile: tests/docker/tcpudp/Dockerfile
+            targets: "-"
+          - dockerfile: examples/scan/docker/Dockerfile
+            targets: fictionet container scanner
+          - dockerfile: examples/fakewiki/docker/Dockerfile
+            targets: world attach agent
+          - dockerfile: examples/border/docker/Dockerfile
+            targets: world world-home attach agent home
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build
+        run: |
+          for t in ${{ matrix.targets }}; do
+            echo "::group::$t"
+            if [ "$t" = - ]; then target=(); else target=(--target "$t"); fi
+            docker buildx build -f "${{ matrix.dockerfile }}" "${target[@]}" .
+            echo "::endgroup::"
+          done
