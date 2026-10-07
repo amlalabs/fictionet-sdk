@@ -1885,3 +1885,105 @@ fn a_connection_counts_until_its_socket_is_gone() {
         Ok(())
     });
 }
+
+/// A LAN joins Net: a host placed on it, a VM attached to it as a member,
+/// DNS at the LAN's first address, the agent reaching the LAN through the
+/// router, multicast from a host to a member, and LAN drops journaled.
+#[test]
+fn hosts_and_members_share_a_lan_on_the_net() {
+    /// Sends `tick` to a multicast group every 20 ms.
+    struct Feed;
+    impl Service for Feed {
+        type Decode = Lines;
+        type World = SocketAddr;
+        type Error = Infallible;
+        fn decoder(&self) -> Lines {
+            Lines::new(64, Ending::LfOrCrlf)
+        }
+        fn on_open(&mut self, _: &SocketAddr, ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
+            ctx.set_timer("tick", Duration::from_millis(20));
+            Ok(Flow::Continue)
+        }
+        fn on_item(&mut self, _: Result<Vec<u8>, LineError>, _: &SocketAddr, _: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
+            Ok(Flow::Continue)
+        }
+        fn on_timer(&mut self, _: Timer, group: &SocketAddr, ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
+            ctx.send_to(*group, b"tick".to_vec());
+            ctx.set_timer("tick", Duration::from_millis(20));
+            Ok(Flow::Continue)
+        }
+    }
+    world(|cx| async move {
+        let journal = Journal::new();
+        let kept = journal.keep(1000);
+        let (attacher, attachments) = fictionet::attachments();
+        let lan: Prefix = "192.168.56.0/24".parse()?;
+        let dc: Ipv4Addr = "192.168.56.10".parse()?;
+        let ws: Ipv4Addr = "192.168.56.31".parse()?;
+        let group = SocketAddr::new(Ipv4Addr::new(239, 1, 1, 1).into(), 30001);
+        Net::new()
+            .journal(journal)
+            .ipv4_only()
+            .lan("corp", lan)
+            .host("dc01", |h| h.on("corp").at(dc).dns_name("dc01.corp.test").tcp(389, Arc::new(()), || Echo))
+            .host("feed", |h| h.on("corp").dns_name("feed.corp.test").udp(30000, Arc::new(group), || Feed))
+            .member("ws01", "corp", ws.into())
+            .serve(&cx, attachments)?;
+
+        // The VM: its own stack at its LAN address, no DHCP.
+        let vm = sandbox(&cx, attacher.attach("ws01")?, ws);
+        // DNS at the LAN's first address.
+        let mut socket = vm.udp.bind(40001)?;
+        let mut q = Message::query();
+        q.metadata.id = 9;
+        q.add_query(Query::query(Name::from_ascii("dc01.corp.test").unwrap(), RecordType::A));
+        socket.send_to(&q.to_vec().unwrap(), SocketAddr::new(Ipv4Addr::new(192, 168, 56, 1).into(), 53));
+        let (bytes, _) = timeout(&cx, Duration::from_secs(2), socket.recv(&cx)).await.expect("a DNS answer")?;
+        let answer = Message::from_vec(&bytes).unwrap();
+        assert!(answer.answers.iter().any(|a| matches!(&a.data, RData::A(a) if a.0 == dc)));
+        // The VM reaches the host across the LAN.
+        let mut conn = vm.tcp.connect(&cx, SocketAddr::new(dc.into(), 389)).await?;
+        assert_eq!(read_some(&cx, &mut conn, 6).await, b"hello\n");
+        // Multicast from a host on the LAN reaches the member that joined.
+        vm.udp.join(group.ip())?;
+        let mut feed = vm.udp.bind(group.port())?;
+        assert_eq!(timeout(&cx, Duration::from_secs(2), feed.recv(&cx)).await.expect("a tick")?.0, b"tick");
+
+        // The agent, on the sandboxes' subnet, reaches the LAN through the
+        // router.
+        let agent = sandbox(&cx, attacher.attach("agent")?, ME);
+        let mut conn = agent.tcp.connect(&cx, SocketAddr::new(dc.into(), 389)).await?;
+        assert_eq!(read_some(&cx, &mut conn, 6).await, b"hello\n");
+        conn.write_all(&cx, b"hi\n").await?;
+        assert_eq!(read_some(&cx, &mut conn, 3).await, b"hi\n");
+        // An address on the LAN with no member: the LAN drops it, and the
+        // journal says so.
+        let mut u = agent.udp.bind(5000)?;
+        u.send_to(b"anyone?", SocketAddr::new(Ipv4Addr::new(192, 168, 56, 99).into(), 7));
+        let drops = kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("net", "blocked") && e.str("why") == Some("Lan")).await;
+        assert_eq!(drops[0].str("detail"), Some("no member at that address"));
+        assert_eq!(drops[0].conn.sandbox.as_ref().map(|s| s.name.to_string()).as_deref(), Some("agent"));
+        // The VM is named in the journal like any sandbox.
+        let joined = kept.of("net", "attached");
+        assert!(joined.iter().any(|e| e.conn.sandbox.as_ref().is_some_and(|s| &*s.name == "ws01")));
+        let vm_lines: Vec<Entry> = kept.entries().into_iter().filter(|e| e.conn.sandbox.as_ref().is_some_and(|s| &*s.name == "ws01") && e.is("dns", "query")).collect();
+        assert!(!vm_lines.is_empty());
+        Ok(())
+    });
+}
+
+#[test]
+fn net_refuses_lans_that_overlap() {
+    world(|cx| async move {
+        let fail = |net: Net| {
+            let (_attacher, attachments) = fictionet::attachments();
+            net.ipv4_only().serve(&cx, attachments).err().map(|e| e.to_string())
+        };
+        let p = |s: &str| s.parse::<Prefix>().unwrap();
+        assert!(fail(Net::new().lan("a", p("10.0.0.0/16"))).is_some_and(|e| e.contains("sandboxes")));
+        assert!(fail(Net::new().lan("a", p("192.168.0.0/16")).lan("b", p("192.168.56.0/24"))).is_some_and(|e| e.contains("overlaps LAN a")));
+        assert!(fail(Net::new().lan("a", p("192.168.56.0/24")).member("vm", "a", "192.168.56.1".parse().unwrap())).is_some());
+        assert!(fail(Net::new().lan("a", p("192.168.56.0/24")).host("x", |h| h.at(Ipv4Addr::new(192, 168, 56, 5)))).is_some_and(|e| e.contains("Host::on")));
+        Ok(())
+    });
+}

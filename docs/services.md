@@ -180,6 +180,23 @@ small ones. `Net::seed` seeds every service's randomness, mixed with each
 connection's number, so a run whose connections arrive in the same order
 repeats.
 
+`Net::lan(name, prefix)` adds an IP subnet that hosts join with
+`Host::on(name)` and real virtual machines with
+`Net::member(attachment, name, addr)`, as machines on one Ethernet:
+broadcast and multicast reach every member, so a MoldUDP64 feed sent to a
+group reaches every member that joined it (`udp::Endpoint::join`). The
+router sends the prefix to the LAN, its first address answers DNS for the
+members, and the LAN's drops are journaled as `net.blocked` with `why`
+`Lan`:
+
+```rust
+Net::new()
+    .lan("corp", "192.168.56.0/24".parse()?)
+    .host("dc01", |h| h.on("corp").at(dc01).dns_name("dc01.corp.test").tcp(389, directory, || Ldap))
+    .member("ws01", "corp", "192.168.56.31".parse()?)
+    .serve(&cx, attachments)?;
+```
+
 `Net::route(name, prefix)` wires a trusted sandbox, such as a real
 container that plays one of the hosts, straight to the router at a fixed
 prefix. `Net::resolve` makes a host the first time a name is looked up,

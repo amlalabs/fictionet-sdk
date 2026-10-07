@@ -74,7 +74,7 @@ fn main() -> Result {
     }
 
     fictionet::block_on(fictionet::run(move |cx| async move {
-        let lan = route::lan(&cx, subnet);
+        let lan = route::lan(&cx, subnet, None);
         while let Some(sandbox) = attachments.next(&cx).await {
             let name = sandbox.name().to_owned();
             let Some(&addr) = members.get(name.as_str()) else {

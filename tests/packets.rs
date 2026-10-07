@@ -590,7 +590,7 @@ fn router_keeps_running_while_the_handle_can_add_routes() {
 fn lan_forwards_unicast_and_floods_ip_group_traffic() {
     world(|cx| async move {
         let network: Prefix = "192.168.56.0/24".parse()?;
-        let lan = lan(&cx, network);
+        let lan = lan(&cx, network, None);
         let (a_lan, mut a) = pair();
         let (b_lan, mut b) = pair();
         let (c_lan, mut c) = pair();
@@ -635,7 +635,7 @@ fn lan_forwards_unicast_and_floods_ip_group_traffic() {
 #[test]
 fn lan_sends_off_subnet_unicast_to_the_gateway_or_drops_it() {
     world(|cx| async move {
-        let lan = lan(&cx, "192.168.56.0/24".parse()?);
+        let lan = lan(&cx, "192.168.56.0/24".parse()?, None);
         let (a_lan, mut a) = pair();
         let (b_lan, mut b) = pair();
         lan.add("192.168.56.10".parse()?, Box::new(a_lan))?;
@@ -702,7 +702,7 @@ fn lan_carries_one_address_family() {
     world(|cx| async move {
         // IPv6 on an IPv4 LAN is dropped: link-local multicast and unicast
         // alike, gateway or not. IPv4 still flows.
-        let lan4 = lan(&cx, "192.168.56.0/24".parse()?);
+        let lan4 = lan(&cx, "192.168.56.0/24".parse()?, None);
         let (a_lan, mut a) = pair();
         let (b_lan, mut b) = pair();
         let (gw_lan, mut gw) = pair();
@@ -722,7 +722,7 @@ fn lan_carries_one_address_family() {
         // An IPv6 LAN forwards unicast, floods multicast, takes no IPv4
         // member and drops IPv4 packets. Link-local unicast is on the LAN,
         // so it never reaches the gateway.
-        let lan6 = lan(&cx, "fd00::/64".parse()?);
+        let lan6 = lan(&cx, "fd00::/64".parse()?, None);
         let fd = |host: u8| -> [u8; 16] { [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, host] };
         let (c_lan, mut c) = pair();
         let (d_lan, mut d) = pair();
@@ -757,7 +757,7 @@ fn lan_carries_one_address_family() {
 #[test]
 fn lan_forgets_a_member_whose_interface_closed() {
     world(|cx| async move {
-        let lan = lan(&cx, "192.168.56.0/24".parse()?);
+        let lan = lan(&cx, "192.168.56.0/24".parse()?, None);
         let (a_lan, mut a) = pair();
         let (b_lan, b) = pair();
         let (c_lan, mut c) = pair();
@@ -812,7 +812,7 @@ fn lan_fan_out_counts_toward_the_budget() {
     let l = log.clone();
     world(move |cx| async move {
         let done = Arc::new(AtomicBool::new(false));
-        let lan = lan(&cx, "10.0.0.0/24".parse()?);
+        let lan = lan(&cx, "10.0.0.0/24".parse()?, None);
         let (sender_lan, mut sender) = pair();
         lan.add("10.0.0.1".parse()?, Box::new(sender_lan))?;
         let mut members = Vec::new();
@@ -1077,7 +1077,7 @@ fn every_task_stops_when_its_region_is_cancelled() {
             let r = router(&cx, vec![("0.0.0.0/0".parse()?, Box::new(b) as Box<dyn Interface>)]);
             let (a, b) = pair();
             keep.push(a);
-            let l = lan(&cx, "10.0.0.0/24".parse()?);
+            let l = lan(&cx, "10.0.0.0/24".parse()?, None);
             l.add("10.0.0.2".parse()?, Box::new(b))?;
             cx.sleep(ms(20)).await?;
             let _keep = (keep, r, l);

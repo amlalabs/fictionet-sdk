@@ -67,6 +67,11 @@
 //!   (IPv6). Hosts with the same address share one machine.
 //! - **A router** with one route per machine. A packet for any other
 //!   address gets ICMP "host unreachable" (ICMPv6 "address unreachable").
+//! - **LANs.** [`Net::lan`] adds an IP subnet that hosts join with
+//!   [`Host::on`] and attached virtual machines with [`Net::member`], as
+//!   machines on one Ethernet: broadcast and multicast reach every member.
+//!   The router sends the LAN's prefix to its gateway, the LAN's first
+//!   address answers DNS, and every packet the LAN drops is journaled.
 //! - **Machines** answer pings, reset TCP to closed ports and answer UDP to
 //!   closed ports with "port unreachable". A sandbox may have 256
 //!   connections open at once to one machine
@@ -348,12 +353,13 @@ pub struct Host {
     at_v6: Option<Ipv6Addr>,
     family: Family,
     ports: Vec<(u16, PortSpec)>,
+    lan: Option<String>,
 }
 
 impl Host {
     /// A host called `label` (for observers), with no names or services.
     pub fn new(label: &str) -> Host {
-        Host { label: label.to_owned(), names: Vec::new(), at: None, at_v6: None, family: Family::Both, ports: Vec::new() }
+        Host { label: label.to_owned(), names: Vec::new(), at: None, at_v6: None, family: Family::Both, ports: Vec::new(), lan: None }
     }
 
     /// Serves the host at `addr`, IPv4 or IPv6, which sets its address of
@@ -370,6 +376,14 @@ impl Host {
             IpAddr::V4(a) => Host { at: Some(a), ..self },
             IpAddr::V6(a) => Host { at_v6: Some(a), ..self },
         }
+    }
+
+    /// Places the host on the LAN called `lan` ([`Net::lan`]): it has one
+    /// address, of the LAN's family, inside the LAN's prefix (the one given
+    /// with [`at`](Self::at), or a free one), and shares the subnet with
+    /// the LAN's other hosts and members.
+    pub fn on(self, lan: &str) -> Host {
+        Host { lan: Some(lan.to_owned()), ..self }
     }
 
     /// Gives the host only an IPv4 address.
@@ -508,6 +522,8 @@ pub struct Net {
     limits: Limits,
     seed: u64,
     start: Fields,
+    lans: Vec<(String, Prefix)>,
+    members: Vec<(String, String, IpAddr)>,
 }
 
 impl Default for Net {
@@ -533,6 +549,8 @@ impl Net {
             limits: Limits::default(),
             seed: 0,
             start: Fields::new(),
+            lans: Vec::new(),
+            members: Vec::new(),
         }
     }
 
@@ -603,6 +621,34 @@ impl Net {
         self
     }
 
+    /// Adds an IP LAN called `name` on `prefix` ([`route::lan`]). Hosts
+    /// placed on it with [`Host::on`] and sandboxes attached to it with
+    /// [`Net::member`] share the subnet as machines on one Ethernet do,
+    /// broadcast and multicast included. The router sends `prefix` to the
+    /// LAN's gateway, so sandboxes and the other hosts reach its members,
+    /// and members reach everything else through it. The LAN's first
+    /// address (`.1` of a `/24`) answers DNS as the network's gateway does,
+    /// for members to use. Every packet the LAN drops is journaled as
+    /// `net.blocked`, with `why` `Lan` and the reason in `detail`.
+    ///
+    /// [`serve`](Net::serve) fails if `prefix` overlaps the sandboxes'
+    /// subnets or another LAN, or leaves no room for members.
+    pub fn lan(mut self, name: &str, prefix: Prefix) -> Net {
+        self.lans.push((name.to_owned(), prefix.canonical()));
+        self
+    }
+
+    /// Attaches the sandbox called `name` to the LAN `lan` at `addr`, with
+    /// no filter, no address binding and no DHCP: a trusted member, such
+    /// as a GOAD virtual machine attached with `fictionet attach --type
+    /// tap`. Journal entries name it as a sandbox. [`serve`](Net::serve)
+    /// fails if there is no such LAN, `addr` is not a member address of it,
+    /// or another member has it.
+    pub fn member(mut self, name: &str, lan: &str, addr: IpAddr) -> Net {
+        self.members.push((name.to_owned(), lan.to_owned(), addr));
+        self
+    }
+
     /// Installs `registry` for observers when the network starts, so the
     /// dashboard decodes the services' protocols.
     pub fn observe(self, registry: fictionet::observe::Registry) -> Net {
@@ -662,6 +708,7 @@ impl Net {
             conns: AtomicU64::new(0),
             attached: Mutex::default(),
         });
+        let lans = make_lans(cx, &router, &hooks, &subnet, subnet6.as_ref(), self.lans, &self.members)?;
         let routes: Vec<(String, Prefix)> = self.routes;
         let shared = Arc::new(Shared {
             cx: cx.clone(),
@@ -677,8 +724,14 @@ impl Net {
             limits: self.limits,
             seed: self.seed,
             budgets: Mutex::default(),
+            lans,
         });
         start_gateway(&shared)?;
+        for seg in shared.lans.values() {
+            let (lan_side, side) = link();
+            seg.lan.add(seg.dns, Box::new(lan_side))?;
+            start_dns(&shared, &shared.cx.group("lan gateway"), side, seg.dns)?;
+        }
         {
             let mut world = lock(&shared.world);
             for host in self.hosts {
@@ -691,10 +744,15 @@ impl Net {
             }
         }
 
+        let members = self.members;
         caller.spawn(move |cx| async move {
             while let Some(sandbox) = attachments.next(&cx).await {
                 if let Some((_, prefix)) = routes.iter().find(|(n, _)| n == sandbox.name()) {
                     shared.router.add(*prefix, Box::new(sandbox));
+                    continue;
+                }
+                if let Some((name, lan, addr)) = members.iter().find(|(n, _, _)| n == sandbox.name()) {
+                    shared.join_lan(&cx, name, lan, *addr, sandbox);
                     continue;
                 }
                 let shared = shared.clone();
@@ -972,6 +1030,95 @@ struct Shared {
     seed: u64,
     /// Each sandbox's budget, by its address.
     budgets: Mutex<HashMap<IpAddr, Budget>>,
+    /// The LANs, by name.
+    lans: HashMap<String, LanSeg>,
+}
+
+/// One LAN of the network ([`Net::lan`]).
+struct LanSeg {
+    prefix: Prefix,
+    lan: route::Lan,
+    /// Where its DNS answers: its first address.
+    dns: IpAddr,
+    /// Addresses members have, which hosts may not take.
+    members: HashSet<IpAddr>,
+}
+
+/// The address `n` after the network address of `p`, if it is inside `p`.
+fn nth(p: &Prefix, n: u128) -> Option<IpAddr> {
+    match p.addr {
+        IpAddr::V4(a) => {
+            let size = 1u128 << (32 - u32::from(p.len.min(32)));
+            (n < size).then(|| IpAddr::V4(Ipv4Addr::from(u32::from(a) + n as u32)))
+        }
+        IpAddr::V6(a) => {
+            let bits = 128 - u32::from(p.len.min(128));
+            (bits == 128 || n < (1u128 << bits)).then(|| IpAddr::V6(Ipv6Addr::from(u128::from(a) + n)))
+        }
+    }
+}
+
+/// Whether `a` and `b` share any address.
+fn overlap(a: &Prefix, b: &Prefix) -> bool {
+    prefix_contains(a, b.addr) || prefix_contains(b, a.addr)
+}
+
+/// Starts the network's LANs: each wired to the router through its
+/// gateway, with its drops journaled. Checks them and their members.
+fn make_lans(
+    cx: &Cx,
+    router: &Router,
+    hooks: &Arc<Hooks>,
+    subnet: &Subnet,
+    subnet6: Option<&Subnet6>,
+    lans: Vec<(String, Prefix)>,
+    members: &[(String, String, IpAddr)],
+) -> Result<HashMap<String, LanSeg>, Error> {
+    let sandboxes4 = Prefix { addr: IpAddr::V4(Ipv4Addr::from(subnet.net)), len: subnet.mask.count_ones() as u8 };
+    let sandboxes6 = subnet6.map(|s| Prefix { addr: IpAddr::V6(Ipv6Addr::from(s.net)), len: s.mask.count_ones() as u8 });
+    let mut made: HashMap<String, LanSeg> = HashMap::new();
+    for (name, prefix) in lans {
+        let max = if prefix.addr.is_ipv4() { 30 } else { 126 };
+        if prefix.len > max {
+            return Err(format!("LAN {name}: {}/{} leaves no room for members", prefix.addr, prefix.len).into());
+        }
+        if overlap(&prefix, &sandboxes4) || sandboxes6.as_ref().is_some_and(|s| overlap(&prefix, s)) {
+            return Err(format!("LAN {name}: {}/{} overlaps the sandboxes' subnet", prefix.addr, prefix.len).into());
+        }
+        if let Some((other, _)) = made.iter().find(|(n, l)| **n == name || overlap(&prefix, &l.prefix)) {
+            return Err(format!("LAN {name}: {}/{} overlaps LAN {other}", prefix.addr, prefix.len).into());
+        }
+        let journal = hooks.clone();
+        let on_drop: route::OnDrop = Arc::new(move |cx: &Cx, packet: &Packet, why: &'static str| {
+            if journal.on() {
+                let src = Header::parse_truncated(&packet.0).map(|h| h.src);
+                let conn = src.map_or_else(ConnInfo::default, |a| sandbox_only(journal.sandbox_at(a)));
+                journal.record(cx, &conn, blocked(BlockedWhy::Lan, &packet.0).field("detail", why));
+            }
+        });
+        let lan = route::lan(&cx.group(format!("lan {name}")), prefix, Some(on_drop));
+        let (lan_side, router_side) = link();
+        lan.gateway(Box::new(lan_side))?;
+        router.add(prefix, Box::new(router_side));
+        let dns = nth(&prefix, 1).ok_or("a LAN has room for its DNS")?;
+        made.insert(name, LanSeg { prefix, lan, dns, members: HashSet::new() });
+    }
+    for (member, lan, addr) in members {
+        let Some(seg) = made.get_mut(lan) else {
+            return Err(format!("member {member}: there is no LAN called {lan}").into());
+        };
+        let broadcast = match seg.prefix.addr {
+            IpAddr::V4(a) => Some(IpAddr::V4(Ipv4Addr::from(u32::from(a) | (u32::MAX >> seg.prefix.len)))),
+            IpAddr::V6(_) => None,
+        };
+        if !prefix_contains(&seg.prefix, *addr) || *addr == seg.prefix.addr || *addr == seg.dns || Some(*addr) == broadcast {
+            return Err(format!("member {member}: {addr} is not a member address of LAN {lan}").into());
+        }
+        if !seg.members.insert(*addr) {
+            return Err(format!("member {member}: another member of LAN {lan} has {addr}").into());
+        }
+    }
+    Ok(made)
 }
 
 fn prefix_contains(p: &Prefix, a: IpAddr) -> bool {
@@ -1029,6 +1176,14 @@ impl Shared {
     /// Fails if an address given with `at` cannot be served, it ends up
     /// with no address, or a service cannot be added.
     fn place(self: &Arc<Self>, world: &mut World, host: Host) -> Result<Placed, String> {
+        if let Some(name) = &host.lan {
+            return self.place_on_lan(world, name, &host);
+        }
+        for a in host.at.map(IpAddr::V4).into_iter().chain(host.at_v6.map(IpAddr::V6)) {
+            if let Some((name, _)) = self.lans.iter().find(|(_, l)| prefix_contains(&l.prefix, a)) {
+                return Err(format!("{a} is on LAN {name}: place the host there with Host::on"));
+            }
+        }
         let wants_v4 = host.family != Family::V6;
         let subnet6 = self.subnet6.filter(|_| host.family != Family::V4);
         let mut placed = Placed::default();
@@ -1055,7 +1210,7 @@ impl Shared {
             let machine = match world.machines.get(&addr) {
                 Some(m) => m.clone(),
                 None => {
-                    let m = Machine::start(self, addr, &label);
+                    let m = Machine::start(self, addr, &label, None)?;
                     world.machines.insert(addr, m.clone());
                     m
                 }
@@ -1063,6 +1218,64 @@ impl Shared {
             machine.add(&host)?;
         }
         Ok(placed)
+    }
+
+    /// Places `host` on the LAN `name`, at its `at` address of the LAN's
+    /// family or the first free one from the LAN's second address up.
+    fn place_on_lan(self: &Arc<Self>, world: &mut World, name: &str, host: &Host) -> Result<Placed, String> {
+        let seg = self.lans.get(name).ok_or_else(|| format!("there is no LAN called {name}"))?;
+        let v4 = seg.prefix.addr.is_ipv4();
+        let given = if v4 { host.at.map(IpAddr::V4) } else { host.at_v6.map(IpAddr::V6) };
+        let free = |a: IpAddr| a != seg.dns && !seg.members.contains(&a);
+        let addr = match given {
+            Some(a) if prefix_contains(&seg.prefix, a) && a != seg.prefix.addr && free(a) && !a.is_multicast() => a,
+            Some(a) => return Err(format!("{a} is not a free address on LAN {name}")),
+            None => (2..1u128 << 16)
+                .map_while(|n| nth(&seg.prefix, n))
+                .filter(|a| prefix_contains(&seg.prefix, *a))
+                .find(|a| free(*a) && !world.machines.contains_key(a))
+                .ok_or_else(|| format!("LAN {name} has no free address left"))?,
+        };
+        let machine = match world.machines.get(&addr) {
+            Some(m) => m.clone(),
+            None => {
+                let label = host.names.first().cloned().unwrap_or_else(|| host.label.clone());
+                let m = Machine::start(self, addr, &label, Some(&seg.lan))?;
+                world.machines.insert(addr, m.clone());
+                m
+            }
+        };
+        machine.add(host)?;
+        Ok(match addr {
+            IpAddr::V4(a) => Placed { v4: Some(a), v6: None },
+            IpAddr::V6(a) => Placed { v4: None, v6: Some(a) },
+        })
+    }
+
+    /// A member sandbox attached: it joins its LAN at its address, with no
+    /// filter, and the journal knows it by that address.
+    fn join_lan(&self, cx: &Cx, name: &str, lan: &str, addr: IpAddr, sandbox: Attachment) {
+        let Some(seg) = self.lans.get(lan) else { return };
+        let owner = lock(&self.leases).new_owner();
+        let hooks = &self.hooks;
+        let me = Sandbox {
+            id: owner,
+            name: Arc::from(name),
+            addr: if let IpAddr::V4(a) = addr { Some(a) } else { None },
+            addr_v6: if let IpAddr::V6(a) = addr { Some(a) } else { None },
+        };
+        if hooks.on() {
+            lock(&hooks.by_addr).insert(addr, me.clone());
+            lock(&hooks.attached).insert(owner);
+        }
+        let joined = seg.lan.add(addr, Box::new(sandbox));
+        if hooks.on() {
+            let event = match joined {
+                Ok(()) => Event::new("net", "attached").summary(format!("sandbox {name} joined LAN {lan} at {addr}")),
+                Err(e) => Event::new("net", "error").level(Level::Notice).summary(format!("sandbox {name} could not join LAN {lan}: {e}")).field("error", e.to_string()),
+            };
+            hooks.record(cx, &sandbox_only(me), event.field("lan", lan).field("addr", addr.to_string()));
+        }
     }
 
     /// The budget of the sandbox at `peer`.
@@ -1165,15 +1378,18 @@ struct Machine {
 impl Machine {
     /// Starts a machine at `addr`: a route, TCP and UDP with no ports open,
     /// and ping replies, in a group named after `label` and the address.
-    fn start(shared: &Arc<Shared>, addr: IpAddr, label: &str) -> Arc<Machine> {
+    fn start(shared: &Arc<Shared>, addr: IpAddr, label: &str, lan: Option<&route::Lan>) -> Result<Arc<Machine>, String> {
         let cx = &shared.cx.group(format!("{label} ({addr})"));
         let (router_side, side) = link();
-        shared.router.add(host_prefix(addr), Box::new(router_side));
+        match lan {
+            Some(lan) => lan.add(addr, Box::new(router_side)).map_err(|e| e.to_string())?,
+            None => shared.router.add(host_prefix(addr), Box::new(router_side)),
+        }
         let (tcp, udp, icmp, _other) = ip::split_protocols(cx, side);
         let tcp = tcp::endpoint(cx, tcp, addr);
         let udp = udp::endpoint(cx, udp, addr);
         cx.spawn(move |cx| pings(cx, icmp, addr));
-        Arc::new(Machine {
+        Ok(Arc::new(Machine {
             cx: cx.clone(),
             addr,
             tcp,
@@ -1182,7 +1398,7 @@ impl Machine {
             udp_ports: Mutex::new(HashSet::new()),
             peers: Peers::new(shared.limits.connections_per_peer),
             shared: Arc::downgrade(shared),
-        })
+        }))
     }
 
     /// The port `port`, made and listened on if it is new.
@@ -1390,18 +1606,24 @@ fn start_gateway(shared: &Arc<Shared>) -> Result<(), Error> {
     for gateway in gateways {
         let (router_side, side) = link();
         shared.router.add(host_prefix(gateway), Box::new(router_side));
-        let (tcp, udp, icmp, _other) = ip::split_protocols(cx, side);
-        let tcp = tcp::endpoint(cx, tcp, gateway);
-        let udp = udp::endpoint(cx, udp, gateway);
-        let socket = udp.bind(53)?;
-        let listener = tcp.listen(53)?;
-        lock(&shared.gateway_tcp).push(tcp);
-        let s = shared.clone();
-        cx.spawn(move |cx| dns_udp(cx, socket, s));
-        let s = shared.clone();
-        cx.spawn(move |cx| dns_tcp(cx, listener, s));
-        cx.spawn(move |cx| pings(cx, icmp, gateway));
+        start_dns(shared, cx, side, gateway)?;
     }
+    Ok(())
+}
+
+/// DNS over UDP and TCP on port 53, and ping replies, at `addr` on `side`.
+fn start_dns(shared: &Arc<Shared>, cx: &Cx, side: End, addr: IpAddr) -> Result<(), Error> {
+    let (tcp, udp, icmp, _other) = ip::split_protocols(cx, side);
+    let tcp = tcp::endpoint(cx, tcp, addr);
+    let udp = udp::endpoint(cx, udp, addr);
+    let socket = udp.bind(53)?;
+    let listener = tcp.listen(53)?;
+    lock(&shared.gateway_tcp).push(tcp);
+    let s = shared.clone();
+    cx.spawn(move |cx| dns_udp(cx, socket, s));
+    let s = shared.clone();
+    cx.spawn(move |cx| dns_tcp(cx, listener, s));
+    cx.spawn(move |cx| pings(cx, icmp, addr));
     Ok(())
 }
 
@@ -1942,8 +2164,12 @@ pub enum BlockedWhy {
     /// Its destination port is closed: TCP gets a RST, UDP "port
     /// unreachable".
     ClosedPort,
-    /// A new TCP connection past the sandbox's limit per machine. Reset.
+    /// A new TCP connection past the sandbox's limit per machine, or past
+    /// a service's cap. Reset.
     TooManyConnections,
+    /// A LAN dropped it; the event's `detail` says why, such as "no member
+    /// at that address".
+    Lan,
 }
 
 impl BlockedWhy {
@@ -1959,6 +2185,7 @@ impl BlockedWhy {
             BlockedWhy::NoRoute => "NoRoute",
             BlockedWhy::ClosedPort => "ClosedPort",
             BlockedWhy::TooManyConnections => "TooManyConnections",
+            BlockedWhy::Lan => "Lan",
         }
     }
 }
@@ -2148,11 +2375,13 @@ impl Filter {
 }
 
 impl Shared {
+    /// Whether `dst` is the gateway, or a LAN's DNS address.
     fn is_gateway(&self, dst: IpAddr) -> bool {
-        match dst {
+        let gateway = match dst {
             IpAddr::V4(a) => a == self.subnet.gateway,
             IpAddr::V6(a) => self.subnet6.is_some_and(|s| a == s.gateway),
-        }
+        };
+        gateway || self.lans.values().any(|l| l.dns == dst)
     }
 
     /// Whether `p` is for the gateway or a machine.
@@ -2174,14 +2403,14 @@ impl Shared {
         if self.is_gateway(dst) {
             return closed(&|_, p| p == 53).then_some(BlockedWhy::ClosedPort);
         }
-        if self.fixed.iter().any(|p| prefix_contains(p, dst)) {
-            return None;
-        }
         let machine = lock(&self.world).machines.get(&dst).cloned();
         match machine {
-            None => Some(BlockedWhy::NoRoute),
             Some(m) => closed(&|proto, p| if proto == PROTO_TCP { m.serves_tcp(p) } else { m.serves_udp(p) })
                 .then_some(BlockedWhy::ClosedPort),
+            // A trusted sandbox's prefix, or a LAN, which reports its own
+            // drops.
+            None if self.fixed.iter().chain(self.lans.values().map(|l| &l.prefix)).any(|p| prefix_contains(p, dst)) => None,
+            None => Some(BlockedWhy::NoRoute),
         }
     }
 }

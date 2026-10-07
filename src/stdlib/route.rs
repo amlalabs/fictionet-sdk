@@ -64,14 +64,14 @@ impl Prefix {
     /// The same prefix with the bits past its length cleared. A length
     /// longer than the address, in a `Prefix` built by hand, counts as the
     /// whole address.
-    fn canonical(self) -> Prefix {
+    pub fn canonical(self) -> Prefix {
         let len = self.len.min(if self.addr.is_ipv4() { 32 } else { 128 });
         Prefix { addr: mask(self.addr, len), len }
     }
 
     /// Whether `addr` is in this prefix. An address of the other family
     /// never is.
-    fn contains(self, addr: IpAddr) -> bool {
+    pub fn contains(self, addr: IpAddr) -> bool {
         self.addr.is_ipv4() == addr.is_ipv4() && mask(addr, self.len) == self.canonical().addr
     }
 }
@@ -373,7 +373,9 @@ impl Router {
 /// subnet, a packet from the gateway for such an address, a member's own
 /// address, the other address family, or not an IP packet. A member that
 /// is replaced or whose interface closes is noted too. Notes are kept only
-/// while an observer such as the dashboard is connected.
+/// while an observer such as the dashboard is connected. `on_drop`, when
+/// given, hears every drop with its reason as well, observer or not, as
+/// [`net::Net`](crate::stdlib::net::Net) uses to journal them.
 ///
 /// This is how virtual machines attached with `fictionet attach --type tap`
 /// share a subnet. Attach answers each VM's ARP itself and hands the LAN
@@ -391,7 +393,7 @@ impl Router {
 /// # use fictionet::{Cx, End, Interface, Result, pair};
 /// # use fictionet::stdlib::route;
 /// # fn wire(cx: Cx, toward_sandbox: End, dc_side: End, pc_side: End) -> Result {
-/// let lan = route::lan(&cx, "192.168.56.0/24".parse()?);
+/// let lan = route::lan(&cx, "192.168.56.0/24".parse()?, None);
 /// lan.add("192.168.56.10".parse()?, Box::new(dc_side))?;
 /// lan.add("192.168.56.100".parse()?, Box::new(pc_side))?;
 /// let (lan_side, router_side) = pair();
@@ -409,7 +411,7 @@ impl Router {
 /// is cancelled, or when every member and the gateway have closed and the
 /// last [`Lan`] handle has been dropped.
 #[track_caller]
-pub fn lan(cx: &Cx, subnet: Prefix) -> Lan {
+pub fn lan(cx: &Cx, subnet: Prefix, on_drop: Option<OnDrop>) -> Lan {
     let subnet = subnet.canonical();
     let shared = Arc::new(Mutex::new(LanShared { joins: Vec::new(), waker: None, handles_gone: false, stopped: false }));
     let lan = Lan { handle: Arc::new(LanHandle { subnet, shared: shared.clone() }) };
@@ -417,7 +419,7 @@ pub fn lan(cx: &Cx, subnet: Prefix) -> Lan {
         // However the task ends, later members are dropped immediately.
         let _stopped = LanStopped(shared.clone());
         let mut ports = Ports::new(Vec::new());
-        let mut members = Members::default();
+        let mut members = Members { on_drop, ..Members::default() };
         let mut handles_gone = false;
         loop {
             // Take members added since the last turn.
@@ -487,9 +489,15 @@ fn link_local(addr: IpAddr) -> bool {
     }
 }
 
-/// Tells observers that the LAN dropped `packet`, and why. Every drop goes
-/// through here, so the reporting can move as one piece.
-fn dropped(cx: &Cx, packet: &Packet, why: &str) {
+/// Hears every packet a [`lan`] drops, with the reason.
+pub type OnDrop = Arc<dyn Fn(&Cx, &Packet, &'static str) + Send + Sync>;
+
+/// Tells observers and the `on_drop` sink that the LAN dropped `packet`,
+/// and why. Every drop goes through here, so the reporting is one piece.
+fn dropped(cx: &Cx, on_drop: &Option<OnDrop>, packet: &Packet, why: &'static str) {
+    if let Some(f) = on_drop {
+        f(cx, packet, why);
+    }
     if cx.observed() {
         crate::observe::note_dropped(cx, packet, why);
     }
@@ -504,6 +512,8 @@ struct Members {
     by_port: HashMap<usize, IpAddr>,
     /// The gateway's port.
     gateway: Option<usize>,
+    /// Hears every drop.
+    on_drop: Option<OnDrop>,
 }
 
 /// What a [`Lan`] handle adds.
@@ -575,11 +585,11 @@ impl Members {
     /// drops it with a note.
     fn forward(&self, cx: &Cx, ports: &mut Ports, subnet: Prefix, from: usize, packet: Packet) {
         let Some(dst) = wire::destination(&packet.0) else {
-            return dropped(cx, &packet, "not an IP packet");
+            return dropped(cx, &self.on_drop, &packet, "not an IP packet");
         };
         if dst.is_ipv4() != subnet.addr.is_ipv4() {
             let why = if dst.is_ipv4() { "IPv4 on an IPv6 LAN" } else { "IPv6 on an IPv4 LAN" };
-            return dropped(cx, &packet, why);
+            return dropped(cx, &self.on_drop, &packet, why);
         }
         if floods(subnet, dst) {
             // Every member but the sender. The gateway gets none of it.
@@ -593,15 +603,15 @@ impl Members {
             ports.spend(sent);
         } else if subnet.contains(dst) || link_local(dst) {
             match self.by_addr.get(&dst) {
-                Some(&to) if to == from => dropped(cx, &packet, "sent to its own address"),
+                Some(&to) if to == from => dropped(cx, &self.on_drop, &packet, "sent to its own address"),
                 Some(&to) => ports.send(to, packet),
-                None => dropped(cx, &packet, "no member at that address"),
+                None => dropped(cx, &self.on_drop, &packet, "no member at that address"),
             }
         } else {
             match self.gateway {
                 Some(to) if to != from => ports.send(to, packet),
-                Some(_) => dropped(cx, &packet, "from the gateway, for an address outside the subnet"),
-                None => dropped(cx, &packet, "outside the subnet, and the LAN has no gateway"),
+                Some(_) => dropped(cx, &self.on_drop, &packet, "from the gateway, for an address outside the subnet"),
+                None => dropped(cx, &self.on_drop, &packet, "outside the subnet, and the LAN has no gateway"),
             }
         }
     }
@@ -777,7 +787,7 @@ mod tests {
     #[test]
     fn member_addresses_are_unicast_in_the_subnet() {
         crate::block_on(crate::run(|cx| async move {
-            let lan = lan(&cx, "192.168.56.0/24".parse()?);
+            let lan = lan(&cx, "192.168.56.0/24".parse()?, None);
             for bad in ["192.168.57.1", "192.168.56.255", "255.255.255.255", "224.0.0.252", "0.0.0.0", "fd00::1"] {
                 let (end, mut far) = crate::pair();
                 let err = lan.add(bad.parse()?, Box::new(end)).unwrap_err().to_string();
@@ -796,7 +806,7 @@ mod tests {
     #[test]
     fn drops_and_member_changes_are_noted_while_observed() {
         crate::block_on(crate::run(|cx| async move {
-            let lan = lan(&cx, "192.168.56.0/24".parse()?);
+            let lan = lan(&cx, "192.168.56.0/24".parse()?, None);
             let (a_lan, mut a) = crate::pair();
             let (b_lan, _b) = crate::pair();
             lan.add("192.168.56.10".parse()?, Box::new(a_lan))?;
@@ -851,7 +861,7 @@ mod tests {
             let k = kept.clone();
             let r = cx
                 .region(|cx| async move {
-                    *lock(&k) = Some(lan(&cx, "10.0.0.0/24".parse()?));
+                    *lock(&k) = Some(lan(&cx, "10.0.0.0/24".parse()?, None));
                     Err("stop".into())
                 })
                 .await;

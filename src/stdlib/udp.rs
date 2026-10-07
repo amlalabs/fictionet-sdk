@@ -30,9 +30,11 @@ const QUEUE: usize = 1024;
 /// `inner`.
 ///
 /// Starts a background task and returns immediately with an [`Endpoint`].
-/// The task takes UDP packets sent to `addr` and drops the rest. A packet
-/// for a port with no socket gets an ICMP "port unreachable" reply, because
-/// that is part of UDP's job. Everything it sends goes into `inner`.
+/// The task takes UDP packets sent to `addr`, and to the multicast groups
+/// the endpoint [joined](Endpoint::join), and drops the rest. A packet for
+/// `addr` and a port with no socket gets an ICMP "port unreachable" reply,
+/// because that is part of UDP's job. Everything it sends goes into
+/// `inner`.
 ///
 /// The task stops when the caller's [region](crate::Cx#regions) is
 /// cancelled or `inner` closes. The endpoint's sockets then return
@@ -50,7 +52,7 @@ pub fn endpoint(cx: &Cx, inner: impl Interface, addr: IpAddr) -> Endpoint {
     let shared = Arc::new(Shared {
         addr,
         inner: Mutex::new(Box::new(inner)),
-        state: Mutex::new(State { sockets: HashMap::new(), stopped: false, ip_id: cx.random_u64() as u16 }),
+        state: Mutex::new(State { sockets: HashMap::new(), stopped: false, ip_id: cx.random_u64() as u16, groups: Vec::new() }),
     });
     let driver = shared.clone();
     cx.spawn_as(|| "udp::endpoint".into(), move |cx| async move {
@@ -77,6 +79,8 @@ struct Shared {
 
 struct State {
     sockets: HashMap<u16, Queue>,
+    /// Multicast groups joined.
+    groups: Vec<IpAddr>,
     stopped: bool,
     ip_id: u16,
 }
@@ -124,7 +128,11 @@ async fn drive(cx: &Cx, shared: &Shared) {
 /// unreachable.
 fn deliver(shared: &Shared, packet: Packet) {
     let Some(ip) = parse_ip(&packet.0) else { return };
-    if ip.proto != UDP || ip.dst != shared.addr {
+    if ip.proto != UDP {
+        return;
+    }
+    let group = ip.dst != shared.addr;
+    if group && !shared.state.lock().unwrap().groups.contains(&ip.dst) {
         return;
     }
     let udp = &packet.0[ip.payload..ip.end];
@@ -154,6 +162,8 @@ fn deliver(shared: &Shared, packet: Packet) {
                 }
                 None
             }
+            // No one answers a group's datagram with an error.
+            None if group => None,
             None => {
                 st.ip_id = st.ip_id.wrapping_add(1);
                 port_unreachable(&packet.0[..ip.end], ip.src, ip.dst, st.ip_id)
@@ -175,6 +185,29 @@ pub struct Endpoint {
 }
 
 impl Endpoint {
+    /// Joins the multicast group `group`: datagrams sent to it reach this
+    /// endpoint's sockets on their ports, as datagrams to its own address
+    /// do. Delivering them is the network's job: a
+    /// [`route::lan`](crate::stdlib::route::lan) floods multicast to every
+    /// member.
+    ///
+    /// Fails if `group` is not a multicast address of the endpoint's family.
+    pub fn join(&self, group: IpAddr) -> Result<(), Error> {
+        if !group.is_multicast() || group.is_ipv4() != self.shared.addr.is_ipv4() {
+            return Err(format!("{group} is not a multicast group {} can join", self.shared.addr).into());
+        }
+        let mut st = self.shared.state.lock().unwrap();
+        if !st.groups.contains(&group) {
+            st.groups.push(group);
+        }
+        Ok(())
+    }
+
+    /// Leaves the multicast group `group`.
+    pub fn leave(&self, group: IpAddr) {
+        self.shared.state.lock().unwrap().groups.retain(|g| *g != group);
+    }
+
     /// Opens a socket on `port`.
     ///
     /// Fails if `port` is 0 or a socket is already open there. Dropping the
