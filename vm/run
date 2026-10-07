@@ -346,7 +346,8 @@ cmd_ssh() {
 
 # Copies the working tree (tracked files and untracked ones that are not
 # ignored) into /src in the VM. Ignored files, such as target/ and .vm/,
-# stay behind. File times are kept, so cargo rebuilds only what changed.
+# stay behind, and so does fuzz/corpus, which no suite in the VM reads.
+# File times are kept, so cargo rebuilds only what changed.
 cmd_sync() {
     require_running
     local t0
@@ -356,7 +357,7 @@ cmd_sync() {
         # Only git knows what is ignored (.env, target/, .vm/), so a checkout
         # is required.
         git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "vm/run sync needs a git checkout"
-        git ls-files -z --cached --others --exclude-standard |
+        git ls-files -z --cached --others --exclude-standard -- . ':(exclude)fuzz/corpus' |
             while IFS= read -r -d '' f; do
                 if [[ -e $f || -L $f ]]; then printf '%s\0' "$f"; fi
             done | tar --null -T - -czf -
