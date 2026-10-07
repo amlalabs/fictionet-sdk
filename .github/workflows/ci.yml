@@ -90,18 +90,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: fuzz
+      - name: Every target has a [[bin]] and a corpus directory
+        run: fuzz/check-targets.sh
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
       # +nightly overrides the stable toolchain pinned in rust-toolchain.toml.
       - name: Build the targets
         run: cargo +nightly fuzz build -O -a
+      # Runs every target, even after one fails, and fails at the end if any did.
       - name: Run each target for 60 seconds
-        run: |
-          for t in $(cargo +nightly fuzz list); do
-            echo "::group::$t"
-            cargo +nightly fuzz run -O -a "$t" "fuzz/corpus/$t" -- -max_total_time=60 -timeout=20 -rss_limit_mb=4096
-            echo "::endgroup::"
-          done
+        run: fuzz/run-all.sh 60 -timeout=20 -rss_limit_mb=4096
       - name: Keep what a target found
         if: failure()
         uses: actions/upload-artifact@v4
