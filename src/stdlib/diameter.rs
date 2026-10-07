@@ -25,7 +25,7 @@
 //! subscribers and sessions exist is up to world code.
 //!
 //! Every reader checks lengths, because the agent can send any bytes it
-//! likes. Each [`FrameError`] names the Result-Code a real server answers it
+//! likes. Each [`Error`] names the Result-Code a real server answers it
 //! with.
 //!
 //! ```
@@ -351,9 +351,9 @@ pub fn command_name(code: u32) -> Option<&'static str> {
     })
 }
 
-/// Why bytes are not a Diameter message, or an AVP is not what its
-/// dictionary says. It is the [`Decode::Error`] of [`Messages`], and the
-/// reason inside an [`Error`].
+/// Why a message's header cannot frame it: the faults that end a
+/// [`Messages`] stream, its [`Decode::Error`]. [`Message::parse`] reports
+/// them as [`Error::Frame`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FrameError {
     /// The version byte was not 1.
@@ -363,6 +363,38 @@ pub enum FrameError {
     MessageLength(u32),
     /// The message length was above the reader's limit.
     TooBig(u32),
+}
+
+impl FrameError {
+    /// The Result-Code a server answers it with.
+    pub fn result_code(self) -> u32 {
+        match self {
+            FrameError::Version(_) => result::UNSUPPORTED_VERSION,
+            FrameError::MessageLength(_) => result::INVALID_MESSAGE_LENGTH,
+            FrameError::TooBig(_) => result::RESOURCES_EXCEEDED,
+        }
+    }
+}
+
+impl std::fmt::Display for FrameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FrameError::Version(v) => write!(f, "Diameter version {v}, not 1"),
+            FrameError::MessageLength(n) => write!(f, "message length {n}, below 20 or not a multiple of 4"),
+            FrameError::TooBig(n) => write!(f, "message length {n}, above the limit"),
+        }
+    }
+}
+
+impl std::error::Error for FrameError {}
+
+/// Why bytes are not a Diameter message, or an AVP is not what its
+/// dictionary says: the module's error, and the reason inside an
+/// [`AvpFault`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Error {
+    /// The header cannot frame the message.
+    Frame(FrameError),
     /// An AVP's length was shorter than its header, ran past the bytes
     /// that hold it, left out the padding an AVP in a list needs, or did
     /// not match its format's fixed size. Also an AVP too large to fit in
@@ -407,44 +439,47 @@ pub enum FrameError {
     Unwritable,
 }
 
-impl FrameError {
+impl Error {
     /// The Result-Code a server answers a read error with.
-    /// [`FrameError::Unwritable`] is a write-side error and must never produce
+    /// [`Error::Unwritable`] is a write-side error and must never produce
     /// a reply. Its fallback code here is not a response to a peer.
     pub fn result_code(self) -> u32 {
         match self {
-            FrameError::Incomplete | FrameError::Trailing { .. } | FrameError::Unwritable => result::INVALID_MESSAGE_LENGTH,
-            FrameError::HeaderBits(_) => result::INVALID_HDR_BITS,
-            FrameError::AvpBits { .. } => result::INVALID_AVP_BITS,
-            FrameError::Version(_) => result::UNSUPPORTED_VERSION,
-            FrameError::MessageLength(_) => result::INVALID_MESSAGE_LENGTH,
-            FrameError::TooBig(_) | FrameError::TooManyAvps | FrameError::TooDeep(_) => result::RESOURCES_EXCEEDED,
-            FrameError::AvpLength { .. } => result::INVALID_AVP_LENGTH,
-            FrameError::Value { .. } => result::INVALID_AVP_VALUE,
+            Error::Incomplete | Error::Trailing { .. } | Error::Unwritable => result::INVALID_MESSAGE_LENGTH,
+            Error::HeaderBits(_) => result::INVALID_HDR_BITS,
+            Error::AvpBits { .. } => result::INVALID_AVP_BITS,
+            Error::Frame(e) => e.result_code(),
+            Error::TooManyAvps | Error::TooDeep(_) => result::RESOURCES_EXCEEDED,
+            Error::AvpLength { .. } => result::INVALID_AVP_LENGTH,
+            Error::Value { .. } => result::INVALID_AVP_VALUE,
         }
     }
 }
 
-impl std::fmt::Display for FrameError {
+impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            FrameError::Incomplete => f.write_str("incomplete Diameter message"),
-            FrameError::Trailing { remaining } => write!(f, "{remaining} bytes after Diameter value"),
-            FrameError::Unwritable => f.write_str("Diameter value cannot be written without changing it"),
-            FrameError::Version(v) => write!(f, "Diameter version {v}, not 1"),
-            FrameError::MessageLength(n) => write!(f, "message length {n}, below 20 or not a multiple of 4"),
-            FrameError::TooBig(n) => write!(f, "message length {n}, above the limit"),
-            FrameError::AvpLength { code, length } => write!(f, "AVP {code} has length {length}, which does not fit"),
-            FrameError::TooManyAvps => write!(f, "more than {MAX_AVPS} AVPs in one list"),
-            FrameError::TooDeep(code) => write!(f, "grouped AVP {code} nests deeper than {MAX_DEPTH} levels"),
-            FrameError::Value { code, format } => write!(f, "AVP {code} is not a valid {}", format.name()),
-            FrameError::HeaderBits(flags) => write!(f, "header flags {flags:#04x} are a forbidden combination"),
-            FrameError::AvpBits { code } => write!(f, "AVP {code} has the vendor flag with vendor ID 0"),
+            Error::Incomplete => f.write_str("incomplete Diameter message"),
+            Error::Trailing { remaining } => write!(f, "{remaining} bytes after Diameter value"),
+            Error::Unwritable => f.write_str("Diameter value cannot be written without changing it"),
+            Error::Frame(e) => e.fmt(f),
+            Error::AvpLength { code, length } => write!(f, "AVP {code} has length {length}, which does not fit"),
+            Error::TooManyAvps => write!(f, "more than {MAX_AVPS} AVPs in one list"),
+            Error::TooDeep(code) => write!(f, "grouped AVP {code} nests deeper than {MAX_DEPTH} levels"),
+            Error::Value { code, format } => write!(f, "AVP {code} is not a valid {}", format.name()),
+            Error::HeaderBits(flags) => write!(f, "header flags {flags:#04x} are a forbidden combination"),
+            Error::AvpBits { code } => write!(f, "AVP {code} has the vendor flag with vendor ID 0"),
         }
     }
 }
 
-impl std::error::Error for FrameError {}
+impl std::error::Error for Error {}
+
+impl From<FrameError> for Error {
+    fn from(e: FrameError) -> Error {
+        Error::Frame(e)
+    }
+}
 
 /// One Diameter message: the header's fields and the AVPs it carries. The
 /// version is always 1 and the length is worked out from the AVPs, so
@@ -586,25 +621,25 @@ impl Message {
     /// is never set in a request, and the T flag never in an answer.
     /// Readers accept either, since the answer to them is
     /// [`result::INVALID_HDR_BITS`] and the connection stays up.
-    pub fn check_header(&self) -> Result<(), FrameError> {
+    pub fn check_header(&self) -> Result<(), Error> {
         if (self.request && self.error) || (!self.request && self.retransmit) {
-            return Err(FrameError::HeaderBits(self.flags()));
+            return Err(Error::HeaderBits(self.flags()));
         }
         Ok(())
     }
 }
 
 impl Wire for Message {
-    type ParseError = FrameError;
-    type WriteError = FrameError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads one message. Refuses invalid versions or lengths, truncated
     /// messages, malformed AVPs, excessive AVP counts, and trailing bytes.
-    fn parse(bytes: &[u8]) -> Result<Self, FrameError> {
-        let length = Self::frame_length(bytes, MAX_MESSAGE)?.ok_or(FrameError::Incomplete)?;
-        let body = bytes.get(HEADER_LEN..length).ok_or(FrameError::Incomplete)?;
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        let length = Self::frame_length(bytes, MAX_MESSAGE)?.ok_or(Error::Incomplete)?;
+        let body = bytes.get(HEADER_LEN..length).ok_or(Error::Incomplete)?;
         if bytes.len() != length {
-            return Err(FrameError::Trailing { remaining: bytes.len() - length });
+            return Err(Error::Trailing { remaining: bytes.len() - length });
         }
         Ok(Self { avps: Avp::parse_list(body)?, ..Self::header(bytes) })
     }
@@ -614,9 +649,9 @@ impl Wire for Message {
     /// Leaves `out` unchanged on error. Keeps forbidden flag combinations
     /// and vendor ID zero; use [`Message::check_header`] and [`check`] to
     /// validate those semantic rules.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), FrameError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         if self.command > 0x00ff_ffff {
-            return Err(FrameError::Unwritable);
+            return Err(Error::Unwritable);
         }
         let length = HEADER_LEN + list_length(&self.avps, MAX_MESSAGE - HEADER_LEN)?;
         let mut bytes = Vec::with_capacity(length);
@@ -640,20 +675,20 @@ impl Wire for Message {
 /// [`Messages`] consumes the complete message and returns this as an item,
 /// so the caller can answer using the header and then read the next message.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Error {
+pub struct AvpFault {
     /// The command, application, flags and identifiers, with no AVPs.
     pub header: Message,
     /// The AVP error that caused this message to be refused.
-    pub error: FrameError,
+    pub error: Error,
 }
 
-impl core::fmt::Display for Error {
+impl core::fmt::Display for AvpFault {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        self.error.fmt(f)
+        write!(f, "Diameter command {} has an AVP that cannot be read", self.header.command)
     }
 }
 
-impl core::error::Error for Error {
+impl core::error::Error for AvpFault {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         Some(&self.error)
     }
@@ -664,9 +699,9 @@ impl core::error::Error for Error {
 /// Use with [`fictionet::stdlib::codec::Stream`] for bounded buffering. The first four
 /// bytes suffice to refuse a message above [`limit`](Self::limit). Partial
 /// messages return [`Step::Need`], including at EOF. The driver reports
-/// truncation and reports header errors once. Only [`FrameError::Version`],
-/// [`FrameError::MessageLength`] and [`FrameError::TooBig`] end the stream. AVP errors
-/// yield [`Error`] items with the header and no AVPs, then decoding
+/// truncation and reports header errors once. Only a [`FrameError`] ends
+/// the stream. AVP errors
+/// yield [`AvpFault`] items with the header and no AVPs, then decoding
 /// continues at the next message. Use that header to construct an answer.
 ///
 /// ```
@@ -711,7 +746,7 @@ impl Default for Messages {
 }
 
 impl Decode for Messages {
-    type Item = Result<Message, Error>;
+    type Item = Result<Message, AvpFault>;
     type Error = FrameError;
     const NAME: &'static str = "Diameter";
 
@@ -729,22 +764,22 @@ impl Decode for Messages {
         let header = Message::header(input);
         let message = match Avp::parse_list(body) {
             Ok(avps) => Ok(Message { avps, ..header }),
-            Err(error) => Err(Error { header, error }),
+            Err(error) => Err(AvpFault { header, error }),
         };
         Ok(Step::Item(message, used))
     }
 }
 
 /// Checks the count and padded byte length before a list is copied.
-fn list_length(avps: &[Avp], limit: usize) -> Result<usize, FrameError> {
+fn list_length(avps: &[Avp], limit: usize) -> Result<usize, Error> {
     if avps.len() > MAX_AVPS {
-        return Err(FrameError::Unwritable);
+        return Err(Error::Unwritable);
     }
     let mut length = 0usize;
     for avp in avps {
-        let size = avp.header_len().checked_add(avp.data.len()).ok_or(FrameError::Unwritable)?;
-        let size = size.checked_add(3).ok_or(FrameError::Unwritable)? & !3;
-        length = length.checked_add(size).filter(|n| *n <= limit).ok_or(FrameError::Unwritable)?;
+        let size = avp.header_len().checked_add(avp.data.len()).ok_or(Error::Unwritable)?;
+        let size = size.checked_add(3).ok_or(Error::Unwritable)? & !3;
+        length = length.checked_add(size).filter(|n| *n <= limit).ok_or(Error::Unwritable)?;
     }
     Ok(length)
 }
@@ -770,26 +805,26 @@ pub struct Avp {
 }
 
 impl Wire for Avp {
-    type ParseError = FrameError;
-    type WriteError = FrameError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads one AVP. Refuses invalid lengths, incomplete headers or data,
     /// values too large for one message, and trailing bytes. A final AVP
     /// may omit padding; [`Avp::parse_list`] requires it.
-    fn parse(bytes: &[u8]) -> Result<Self, FrameError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         let (avp, used) = Self::read_prefix(bytes)?;
         if used != bytes.len() {
-            return Err(FrameError::Trailing { remaining: bytes.len() - used });
+            return Err(Error::Trailing { remaining: bytes.len() - used });
         }
         Ok(avp)
     }
 
     /// Appends one AVP and its four-byte alignment padding. Refuses data
     /// that cannot fit in one message. Leaves `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), FrameError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         let header = self.header_len();
         if self.data.len() > MAX_MESSAGE - HEADER_LEN - header {
-            return Err(FrameError::Unwritable);
+            return Err(Error::Unwritable);
         }
         let data = &self.data;
         let mut f = 0;
@@ -822,7 +857,7 @@ impl Avp {
     /// Error-Reporting-Host, and set for every other code. Refuses values
     /// that exceed length or AVP count limits, text containing NUL, UDP
     /// Diameter URIs, and [`Address::Other`] with an IPv4 or IPv6 family.
-    pub fn new(code: u32, value: &Value) -> Result<Avp, FrameError> {
+    pub fn new(code: u32, value: &Value) -> Result<Avp, Error> {
         let mandatory = !matches!(
             code,
             avp::PRODUCT_NAME | avp::FIRMWARE_REVISION | avp::ERROR_MESSAGE | avp::ERROR_REPORTING_HOST
@@ -839,10 +874,10 @@ impl Avp {
     /// bytes it took, padding included. An AVP that ends `b` may leave out
     /// its padding, as some peers do; [`Avp::parse_list`] does not allow
     /// that.
-    fn read_prefix(b: &[u8]) -> Result<(Avp, usize), FrameError> {
+    fn read_prefix(b: &[u8]) -> Result<(Avp, usize), Error> {
         if b.len() < AVP_HEADER_LEN {
             let code = if b.len() >= 4 { be32(b, 0) } else { 0 };
-            return Err(FrameError::AvpLength { code, length: b.len() as u32 });
+            return Err(Error::AvpLength { code, length: b.len() as u32 });
         }
         let code = be32(b, 0);
         let f = b[4];
@@ -851,7 +886,7 @@ impl Avp {
         let has_vendor = f & avp_flags::VENDOR != 0;
         let header = if has_vendor { VENDOR_AVP_HEADER_LEN } else { AVP_HEADER_LEN };
         if len < header || len > b.len() || padded(len) > MAX_MESSAGE - HEADER_LEN {
-            return Err(FrameError::AvpLength { code, length });
+            return Err(Error::AvpLength { code, length });
         }
         let avp = Avp {
             code,
@@ -867,20 +902,20 @@ impl Avp {
     /// grouped AVP's data. Refuses more than [`MAX_AVPS`] entries or more
     /// than [`MAX_MESSAGE`] minus [`HEADER_LEN`] bytes. Each AVP, the last included, must have its
     /// padding, since RFC 6733 (section 4.2) counts it in the list.
-    pub fn parse_list(b: &[u8]) -> Result<Vec<Avp>, FrameError> {
+    pub fn parse_list(b: &[u8]) -> Result<Vec<Avp>, Error> {
         if b.len() > MAX_MESSAGE - HEADER_LEN {
-            return Err(FrameError::TooBig(b.len().min(u32::MAX as usize) as u32));
+            return Err(FrameError::TooBig(b.len().min(u32::MAX as usize) as u32).into());
         }
         let mut avps = Vec::new();
         let mut at = 0;
         while let Some(rest) = b.get(at..).filter(|r| !r.is_empty()) {
             if avps.len() == MAX_AVPS {
-                return Err(FrameError::TooManyAvps);
+                return Err(Error::TooManyAvps);
             }
             let (avp, used) = Avp::read_prefix(rest)?;
             let len = avp.header_len() + avp.data.len();
             if used < padded(len) {
-                return Err(FrameError::AvpLength { code: avp.code, length: len as u32 });
+                return Err(Error::AvpLength { code: avp.code, length: len as u32 });
             }
             avps.push(avp);
             at += used;
@@ -890,12 +925,12 @@ impl Avp {
 
     /// Reads the data as `format`. Data of the wrong size for a
     /// fixed-size format, such as 3 bytes for an Unsigned32, is an
-    /// [`FrameError::AvpLength`], as RFC 6733 (section 7.1.5) answers it.
-    pub fn value(&self, format: Format) -> Result<Value, FrameError> {
-        let bad = FrameError::Value { code: self.code, format };
+    /// [`Error::AvpLength`], as RFC 6733 (section 7.1.5) answers it.
+    pub fn value(&self, format: Format) -> Result<Value, Error> {
+        let bad = Error::Value { code: self.code, format };
         let d = &self.data[..];
         let length = (self.header_len() + d.len()).min(u32::MAX as usize) as u32;
-        let size = FrameError::AvpLength { code: self.code, length };
+        let size = Error::AvpLength { code: self.code, length };
         Ok(match format {
             Format::OctetString => Value::OctetString(d.to_vec()),
             Format::Integer32 => Value::Integer32(i32::from_be_bytes(d.try_into().map_err(|_| size)?)),
@@ -1056,22 +1091,22 @@ pub fn base_format(code: u32) -> Option<Format> {
 /// Reads every AVP in `avps` as the format `dictionary` gives for its code
 /// and vendor ID, and reads into grouped AVPs down to [`MAX_DEPTH`]
 /// levels. An AVP with vendor ID 0, which RFC 6733 (section 4.1.1)
-/// forbids, is a [`FrameError::AvpBits`]. AVPs the dictionary does not know
+/// forbids, is a [`Error::AvpBits`]. AVPs the dictionary does not know
 /// are otherwise skipped. Whether one
 /// with the mandatory flag is an error is the caller's call. The data of a
 /// base Failed-AVP is not read at all: it holds the AVP that failed, which
 /// RFC 6733 (section 7.5) lets be malformed. For the base
 /// protocol alone, pass `|code, vendor| vendor.map_or_else(|| base_format(code), |_| None)`.
-pub fn check(avps: &[Avp], dictionary: impl Fn(u32, Option<u32>) -> Option<Format>) -> Result<(), FrameError> {
+pub fn check(avps: &[Avp], dictionary: impl Fn(u32, Option<u32>) -> Option<Format>) -> Result<(), Error> {
     check_at(avps, &dictionary, 0)
 }
 
 /// [`check`] for a list `depth` grouped AVPs down. The depth is at most
 /// [`MAX_DEPTH`], which bounds the recursion.
-fn check_at(avps: &[Avp], dictionary: &dyn Fn(u32, Option<u32>) -> Option<Format>, depth: usize) -> Result<(), FrameError> {
+fn check_at(avps: &[Avp], dictionary: &dyn Fn(u32, Option<u32>) -> Option<Format>, depth: usize) -> Result<(), Error> {
     for a in avps {
         if a.vendor == Some(0) {
-            return Err(FrameError::AvpBits { code: a.code });
+            return Err(Error::AvpBits { code: a.code });
         }
         if a.code == avp::FAILED_AVP && a.vendor.is_none() {
             continue;
@@ -1080,7 +1115,7 @@ fn check_at(avps: &[Avp], dictionary: &dyn Fn(u32, Option<u32>) -> Option<Format
             None => {}
             Some(Format::Grouped) => {
                 if depth >= MAX_DEPTH {
-                    return Err(FrameError::TooDeep(a.code));
+                    return Err(Error::TooDeep(a.code));
                 }
                 check_at(&Avp::parse_list(&a.data)?, dictionary, depth + 1)?;
             }
@@ -1146,12 +1181,12 @@ impl Value {
         }
     }
 
-    fn encode(&self) -> Result<Vec<u8>, FrameError> {
+    fn encode(&self) -> Result<Vec<u8>, Error> {
         let limit = MAX_MESSAGE - HEADER_LEN - AVP_HEADER_LEN;
         Ok(match self {
             Value::OctetString(b) => {
                 if b.len() > limit {
-                    return Err(FrameError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 b.clone()
             }
@@ -1170,14 +1205,14 @@ impl Value {
             Value::Address(a) => a.to_bytes()?,
             Value::Utf8String(s) => {
                 if s.len() > limit || s.contains('\0') {
-                    return Err(FrameError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 s.as_bytes().to_vec()
             }
             Value::DiameterIdentity(id) => id.as_str().as_bytes().to_vec(),
             Value::DiameterUri(uri) => {
                 if uri.udp_diameter() {
-                    return Err(FrameError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 uri.to_string().into_bytes()
             }
@@ -1203,13 +1238,13 @@ pub enum Address {
 }
 
 impl Wire for Address {
-    type ParseError = FrameError;
-    type WriteError = FrameError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads an address family and data. Refuses missing families, incorrect
     /// IPv4 or IPv6 lengths, and values over [`MAX_AVP_DATA`].
-    fn parse(d: &[u8]) -> Result<Self, FrameError> {
-        let bad = FrameError::Value { code: 0, format: Format::Address };
+    fn parse(d: &[u8]) -> Result<Self, Error> {
+        let bad = Error::Value { code: 0, format: Format::Address };
         if d.len() > MAX_AVP_DATA {
             return Err(bad);
         }
@@ -1229,7 +1264,7 @@ impl Wire for Address {
 
     /// Appends the family and address. Refuses `Other` with family 1 or 2
     /// and values over [`MAX_AVP_DATA`]. Leaves `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), FrameError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         match self {
             Address::V4(a) => {
                 out.extend_from_slice(&Address::IPV4.to_be_bytes());
@@ -1241,7 +1276,7 @@ impl Wire for Address {
             }
             Address::Other { family, bytes } => {
                 if matches!(*family, Address::IPV4 | Address::IPV6) || bytes.len() > MAX_AVP_DATA - 2 {
-                    return Err(FrameError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 out.extend_from_slice(&family.to_be_bytes());
                 out.extend_from_slice(bytes);
@@ -1580,7 +1615,7 @@ mod tests {
             // An AVP on its own may leave its padding out, one in a list
             // may not.
             assert_eq!(Avp::parse(&b[..8 + n]), Ok(a.clone()));
-            let listed = if n % 4 == 0 { Ok(vec![a]) } else { Err(FrameError::AvpLength { code: 7, length: 8 + n as u32 }) };
+            let listed = if n % 4 == 0 { Ok(vec![a]) } else { Err(Error::AvpLength { code: 7, length: 8 + n as u32 }) };
             assert_eq!(Avp::parse_list(&b[..8 + n]), listed);
         }
     }
@@ -1631,7 +1666,7 @@ mod tests {
         assert!(Address::parse(&[0]).is_err());
         assert_eq!(Address::parse(&[0, 8, 9]), Ok(Address::Other { family: 8, bytes: vec![9] }));
         let other = Address::Other { family: 1, bytes: vec![10, 0, 0, 1] };
-        assert_eq!(other.to_bytes(), Err(FrameError::Unwritable));
+        assert_eq!(other.to_bytes(), Err(Error::Unwritable));
     }
 
     #[test]
@@ -1708,9 +1743,9 @@ mod tests {
             Avp { code: avp::ORIGIN_HOST, vendor: None, mandatory: true, protected: false, data: b"bad host".to_vec() };
         assert_eq!(
             a.value(Format::DiameterIdentity),
-            Err(FrameError::Value { code: 264, format: Format::DiameterIdentity })
+            Err(Error::Value { code: 264, format: Format::DiameterIdentity })
         );
-        assert_eq!(check(&[a], base), Err(FrameError::Value { code: 264, format: Format::DiameterIdentity }));
+        assert_eq!(check(&[a], base), Err(Error::Value { code: 264, format: Format::DiameterIdentity }));
     }
 
     #[test]
@@ -1728,7 +1763,7 @@ mod tests {
             (Format::Enumerated, &[1]),
         ] {
             let e = raw(bad).value(format).unwrap_err();
-            assert_eq!(e, FrameError::AvpLength { code: 9, length: 8 + bad.len() as u32 });
+            assert_eq!(e, Error::AvpLength { code: 9, length: 8 + bad.len() as u32 });
             assert_eq!(e.result_code(), result::INVALID_AVP_LENGTH);
         }
         for (format, bad) in [
@@ -1740,13 +1775,13 @@ mod tests {
             (Format::DiameterUri, &[0xff]),
         ] {
             let e = raw(bad).value(format).unwrap_err();
-            assert_eq!(e, FrameError::Value { code: 9, format });
+            assert_eq!(e, Error::Value { code: 9, format });
             assert_eq!(e.result_code(), result::INVALID_AVP_VALUE);
             assert!(e.to_string().contains(format.name()));
         }
         // A grouped AVP whose data is not AVPs.
-        assert_eq!(raw(&[0, 0, 0, 5, 0]).value(Format::Grouped), Err(FrameError::AvpLength { code: 5, length: 5 }));
-        assert_eq!(raw(&[0, 0]).value(Format::Grouped), Err(FrameError::AvpLength { code: 0, length: 2 }));
+        assert_eq!(raw(&[0, 0, 0, 5, 0]).value(Format::Grouped), Err(Error::AvpLength { code: 5, length: 5 }));
+        assert_eq!(raw(&[0, 0]).value(Format::Grouped), Err(Error::AvpLength { code: 0, length: 2 }));
         assert_eq!(raw(&[]).value(Format::Grouped), Ok(Value::Grouped(vec![])));
         assert_eq!(raw(&[]).as_u32(), None);
         assert_eq!(raw(&[0, 0, 0, 0, 0, 0, 0, 1]).as_u64(), Some(1));
@@ -1761,33 +1796,33 @@ mod tests {
             b[i] = v;
             b
         };
-        assert_eq!(Message::parse(&[2]), Err(FrameError::Version(2)));
-        assert_eq!(Message::parse(&with(0, 0)), Err(FrameError::Version(0)));
-        assert_eq!(Message::parse(&[1, 0, 0, 16]), Err(FrameError::MessageLength(16)));
-        assert_eq!(Message::parse(&[1, 0, 0, 22]), Err(FrameError::MessageLength(22)));
+        assert_eq!(Message::parse(&[2]), Err(Error::Frame(FrameError::Version(2))));
+        assert_eq!(Message::parse(&with(0, 0)), Err(Error::Frame(FrameError::Version(0))));
+        assert_eq!(Message::parse(&[1, 0, 0, 16]), Err(Error::Frame(FrameError::MessageLength(16))));
+        assert_eq!(Message::parse(&[1, 0, 0, 22]), Err(Error::Frame(FrameError::MessageLength(22))));
         assert_eq!(Messages::with_limit(64).decode(&[1, 0, 0, 0x44], false), Err(FrameError::TooBig(0x44)));
         assert_eq!(Messages::with_limit(64).decode(&ok, false), Ok(Step::Item(Ok(dwr()), 64)));
         // An AVP length shorter than its header.
-        assert_eq!(Message::parse(&with(27, 7)), Err(FrameError::AvpLength { code: 264, length: 7 }));
+        assert_eq!(Message::parse(&with(27, 7)), Err(Error::AvpLength { code: 264, length: 7 }));
         // A vendor flag on an AVP too short to hold the vendor ID.
         let mut b = ok.clone();
         b[24] = 0xc0;
         b[27] = 11;
-        assert_eq!(Message::parse(&b), Err(FrameError::AvpLength { code: 264, length: 11 }));
+        assert_eq!(Message::parse(&b), Err(Error::AvpLength { code: 264, length: 11 }));
         // An AVP that runs past the message.
-        assert_eq!(Message::parse(&with(27, 0x30)), Err(FrameError::AvpLength { code: 264, length: 0x30 }));
+        assert_eq!(Message::parse(&with(27, 0x30)), Err(Error::AvpLength { code: 264, length: 0x30 }));
         // A message length that cuts an AVP header short.
         let mut b = ok[..24].to_vec();
         b[3] = 24;
-        assert_eq!(Message::parse(&b), Err(FrameError::AvpLength { code: 264, length: 4 }));
+        assert_eq!(Message::parse(&b), Err(Error::AvpLength { code: 264, length: 4 }));
         // Result-Codes.
         assert_eq!(FrameError::Version(2).result_code(), result::UNSUPPORTED_VERSION);
         assert_eq!(FrameError::MessageLength(3).result_code(), result::INVALID_MESSAGE_LENGTH);
-        assert_eq!(FrameError::AvpLength { code: 1, length: 1 }.result_code(), result::INVALID_AVP_LENGTH);
+        assert_eq!(Error::AvpLength { code: 1, length: 1 }.result_code(), result::INVALID_AVP_LENGTH);
         assert_eq!(FrameError::TooBig(1).result_code(), result::RESOURCES_EXCEEDED);
-        assert_eq!(FrameError::TooManyAvps.result_code(), result::RESOURCES_EXCEEDED);
-        assert_eq!(FrameError::TooDeep(1).result_code(), result::RESOURCES_EXCEEDED);
-        for e in [FrameError::Version(2), FrameError::MessageLength(3), FrameError::TooBig(1), FrameError::TooManyAvps, FrameError::TooDeep(1)] {
+        assert_eq!(Error::TooManyAvps.result_code(), result::RESOURCES_EXCEEDED);
+        assert_eq!(Error::TooDeep(1).result_code(), result::RESOURCES_EXCEEDED);
+        for e in [Error::Frame(FrameError::Version(2)), Error::Frame(FrameError::MessageLength(3)), Error::Frame(FrameError::TooBig(1)), Error::TooManyAvps, Error::TooDeep(1)] {
             assert!(!e.to_string().is_empty());
         }
     }
@@ -1798,11 +1833,11 @@ mod tests {
         let list: Vec<u8> = one.to_bytes().unwrap().repeat(MAX_AVPS);
         assert_eq!(Avp::parse_list(&list).unwrap().len(), MAX_AVPS);
         let more: Vec<u8> = one.to_bytes().unwrap().repeat(MAX_AVPS + 1);
-        assert_eq!(Avp::parse_list(&more), Err(FrameError::TooManyAvps));
+        assert_eq!(Avp::parse_list(&more), Err(Error::TooManyAvps));
         let mut message = Message::request(1, 0, 0, 0);
         message.avps = vec![one.clone(); MAX_AVPS + 5];
-        assert_eq!(message.to_bytes(), Err(FrameError::Unwritable));
-        assert_eq!(Avp::new(1, &Value::Grouped(vec![one; MAX_AVPS + 5])), Err(FrameError::Unwritable));
+        assert_eq!(message.to_bytes(), Err(Error::Unwritable));
+        assert_eq!(Avp::new(1, &Value::Grouped(vec![one; MAX_AVPS + 5])), Err(Error::Unwritable));
     }
 
     #[test]
@@ -1816,13 +1851,13 @@ mod tests {
         }
         check(std::slice::from_ref(&a), dict).unwrap();
         let deeper = Avp::new(NEST, &Value::Grouped(vec![a.clone()])).unwrap();
-        assert_eq!(check(&[deeper], dict), Err(FrameError::TooDeep(NEST)));
+        assert_eq!(check(&[deeper], dict), Err(Error::TooDeep(NEST)));
         // A bad value deep inside is found.
         let mut b = Avp { data: vec![1], ..leaf };
         for _ in 0..3 {
             b = Avp::new(NEST, &Value::Grouped(vec![b])).unwrap();
         }
-        assert_eq!(check(&[b], dict), Err(FrameError::AvpLength { code: avp::RESULT_CODE, length: 9 }));
+        assert_eq!(check(&[b], dict), Err(Error::AvpLength { code: avp::RESULT_CODE, length: 9 }));
         // Unknown AVPs are skipped, whatever they hold.
         let unknown = Avp { code: 77, vendor: Some(1), mandatory: true, protected: false, data: vec![9] };
         check(&[unknown], dict).unwrap();
@@ -1832,7 +1867,7 @@ mod tests {
     fn every_truncated_prefix() {
         let bytes = dwr_bytes();
         for n in 0..bytes.len() {
-            assert_eq!(Message::parse(&bytes[..n]), Err(FrameError::Incomplete), "{n} bytes");
+            assert_eq!(Message::parse(&bytes[..n]), Err(Error::Incomplete), "{n} bytes");
         }
         // AVPs cut short read as errors, never as a shorter AVP.
         let a = Avp { code: 5, vendor: Some(3), mandatory: true, protected: false, data: vec![1, 2, 3, 4, 5] };
@@ -1897,26 +1932,26 @@ mod tests {
     fn writers_refuse_what_does_not_fit() {
         let huge = Avp { code: 1, vendor: Some(1), mandatory: false, protected: false, data: vec![7; MAX_AVP_DATA + 100] };
         contract::check_wire_value(&huge);
-        assert_eq!(huge.to_bytes(), Err(FrameError::Unwritable));
+        assert_eq!(huge.to_bytes(), Err(Error::Unwritable));
         let mut message = Message::request(1, 2, 3, 4);
         message.avps = vec![huge.clone(), huge];
         contract::check_wire_value(&message);
-        assert_eq!(message.to_bytes(), Err(FrameError::Unwritable));
+        assert_eq!(message.to_bytes(), Err(Error::Unwritable));
         let text = "é".repeat(MAX_AVP_DATA / 2 + 4);
-        assert_eq!(Avp::new(1, &Value::Utf8String(text)), Err(FrameError::Unwritable));
+        assert_eq!(Avp::new(1, &Value::Utf8String(text)), Err(Error::Unwritable));
         let address = Address::Other { family: 9, bytes: vec![0; MAX_AVP_DATA] };
-        assert_eq!(address.to_bytes(), Err(FrameError::Unwritable));
+        assert_eq!(address.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&address);
-        assert_eq!(Message::request(0xff00_0101, 0, 0, 0).to_bytes(), Err(FrameError::Unwritable));
+        assert_eq!(Message::request(0xff00_0101, 0, 0, 0).to_bytes(), Err(Error::Unwritable));
     }
 
     #[test]
     fn utf8_string_refuses_code_point_zero() {
         // RFC 6733, section 4.3.1: code points 0x00000001 and up only.
         let a = Avp { code: avp::USER_NAME, vendor: None, mandatory: true, protected: false, data: b"a\0b".to_vec() };
-        assert_eq!(a.value(Format::Utf8String), Err(FrameError::Value { code: 1, format: Format::Utf8String }));
-        assert_eq!(check(&[a], base), Err(FrameError::Value { code: 1, format: Format::Utf8String }));
-        assert_eq!(Avp::new(avp::USER_NAME, &Value::Utf8String("a\0b\0".into())), Err(FrameError::Unwritable));
+        assert_eq!(a.value(Format::Utf8String), Err(Error::Value { code: 1, format: Format::Utf8String }));
+        assert_eq!(check(&[a], base), Err(Error::Value { code: 1, format: Format::Utf8String }));
+        assert_eq!(Avp::new(avp::USER_NAME, &Value::Utf8String("a\0b\0".into())), Err(Error::Unwritable));
     }
 
     #[test]
@@ -1934,7 +1969,7 @@ mod tests {
         check(&[f], base).unwrap();
         // Another grouped AVP is still read.
         let g = Avp { code: avp::PROXY_INFO, data: vec![0, 0, 1, 8, 0x40, 0, 0, 5], ..rc };
-        assert_eq!(check(&[g], base), Err(FrameError::AvpLength { code: 264, length: 5 }));
+        assert_eq!(check(&[g], base), Err(Error::AvpLength { code: 264, length: 5 }));
     }
 
     #[test]
@@ -1945,10 +1980,10 @@ mod tests {
         assert!(Address::parse(&[0, 2, 0, 0, 0, 0]).is_err());
         let a =
             Avp { code: avp::HOST_IP_ADDRESS, vendor: None, mandatory: true, protected: false, data: vec![0, 1, 9] };
-        assert_eq!(check(&[a], base), Err(FrameError::Value { code: 257, format: Format::Address }));
+        assert_eq!(check(&[a], base), Err(Error::Value { code: 257, format: Format::Address }));
         for address in [Address::Other { family: 1, bytes: vec![10, 0, 0] },
             Address::Other { family: 2, bytes: vec![0xff; 20] }] {
-            assert_eq!(address.to_bytes(), Err(FrameError::Unwritable));
+            assert_eq!(address.to_bytes(), Err(Error::Unwritable));
             contract::check_wire_value(&address);
         }
     }
@@ -2061,7 +2096,7 @@ mod tests {
             protocol: Some(AaaProtocol::Diameter),
         };
         assert_eq!(u.to_string(), "aaa://h.example;transport=udp;protocol=diameter");
-        assert_eq!(Avp::new(avp::REDIRECT_HOST, &Value::DiameterUri(u)), Err(FrameError::Unwritable));
+        assert_eq!(Avp::new(avp::REDIRECT_HOST, &Value::DiameterUri(u)), Err(Error::Unwritable));
     }
 
     #[test]
@@ -2070,7 +2105,7 @@ mod tests {
         // their padding. Proxy-State "x" with its 3 padding bytes left out:
         let short = [0, 0, 0, 0x21, 0x40, 0, 0, 9, b'x'];
         let g = Avp { code: avp::PROXY_INFO, vendor: None, mandatory: true, protected: false, data: short.to_vec() };
-        let e = FrameError::AvpLength { code: avp::PROXY_STATE, length: 9 };
+        let e = Error::AvpLength { code: avp::PROXY_STATE, length: 9 };
         assert_eq!(g.value(Format::Grouped), Err(e));
         assert_eq!(check(&[g], base), Err(e));
         assert_eq!(Avp::parse_list(&short), Err(e));
@@ -2084,10 +2119,10 @@ mod tests {
         // RFC 6733, section 7.1.5: DIAMETER_INVALID_AVP_LENGTH.
         let a = Avp { code: avp::SESSION_TIMEOUT, vendor: None, mandatory: true, protected: false, data: vec![0; 3] };
         let e = check(std::slice::from_ref(&a), base).unwrap_err();
-        assert_eq!(e, FrameError::AvpLength { code: avp::SESSION_TIMEOUT, length: 11 });
+        assert_eq!(e, Error::AvpLength { code: avp::SESSION_TIMEOUT, length: 11 });
         assert_eq!(e.result_code(), result::INVALID_AVP_LENGTH);
         let v = Avp { vendor: Some(10415), ..a };
-        assert_eq!(v.value(Format::Unsigned32), Err(FrameError::AvpLength { code: avp::SESSION_TIMEOUT, length: 15 }));
+        assert_eq!(v.value(Format::Unsigned32), Err(Error::AvpLength { code: avp::SESSION_TIMEOUT, length: 15 }));
     }
 
     #[test]
@@ -2098,14 +2133,14 @@ mod tests {
         b[4] |= flags::ERROR;
         let m = Message::parse(&b).unwrap();
         let e = m.check_header().unwrap_err();
-        assert_eq!(e, FrameError::HeaderBits(flags::REQUEST | flags::ERROR));
+        assert_eq!(e, Error::HeaderBits(flags::REQUEST | flags::ERROR));
         assert_eq!(e.result_code(), result::INVALID_HDR_BITS);
         assert!(!e.to_string().is_empty());
         contract::check_wire_value(&m);
         assert_eq!(m.to_bytes().unwrap(), b);
         let mut a = dwr().answer();
         a.retransmit = true;
-        assert_eq!(a.check_header(), Err(FrameError::HeaderBits(flags::RETRANSMIT)));
+        assert_eq!(a.check_header(), Err(Error::HeaderBits(flags::RETRANSMIT)));
         contract::check_wire_value(&a);
         // An error answer and a retransmitted request are fine.
         let mut a = dwr().answer();
@@ -2125,7 +2160,7 @@ mod tests {
         let a = Avp::parse(&b).unwrap();
         assert_eq!(a.vendor, Some(0));
         let e = check(std::slice::from_ref(&a), base).unwrap_err();
-        assert_eq!(e, FrameError::AvpBits { code: avp::ORIGIN_HOST });
+        assert_eq!(e, Error::AvpBits { code: avp::ORIGIN_HOST });
         assert_eq!(e.result_code(), result::INVALID_AVP_BITS);
         assert!(!e.to_string().is_empty());
         // Inside a grouped AVP too.
@@ -2139,24 +2174,24 @@ mod tests {
     #[test]
     fn checked_writer_refuses_what_it_would_change() {
         assert_eq!(dwr().to_bytes(), Ok(dwr_bytes()));
-        assert_eq!(Message::request(0x0100_0101, 0, 0, 0).to_bytes(), Err(FrameError::Unwritable));
+        assert_eq!(Message::request(0x0100_0101, 0, 0, 0).to_bytes(), Err(Error::Unwritable));
         let one = Avp { code: 1, vendor: None, mandatory: false, protected: false, data: vec![] };
         let mut m = Message::request(1, 0, 0, 0);
         m.avps = vec![one; MAX_AVPS];
         contract::check_wire_value(&m);
         m.avps.push(m.avps[0].clone());
-        assert_eq!(m.to_bytes(), Err(FrameError::Unwritable));
+        assert_eq!(m.to_bytes(), Err(Error::Unwritable));
         // The largest AVP fits on its own, but not with another after it.
         let big = vec![0; MAX_MESSAGE - HEADER_LEN - AVP_HEADER_LEN];
         let mut m = Message::request(1, 0, 0, 0);
         m.avps.push(Avp { code: 1, vendor: None, mandatory: false, protected: false, data: big.clone() });
         assert!(m.to_bytes().is_ok());
         m.avps.push(Avp::new(avp::RESULT_CODE, &Value::Unsigned32(2001)).unwrap());
-        assert_eq!(m.to_bytes(), Err(FrameError::Unwritable));
+        assert_eq!(m.to_bytes(), Err(Error::Unwritable));
         // With a vendor ID the same data is 4 bytes too long.
         let mut m = Message::request(1, 0, 0, 0);
         m.avps.push(Avp { code: 1, vendor: Some(1), mandatory: false, protected: false, data: big });
-        assert_eq!(m.to_bytes(), Err(FrameError::Unwritable));
+        assert_eq!(m.to_bytes(), Err(Error::Unwritable));
     }
 
     #[test]
@@ -2167,7 +2202,7 @@ mod tests {
         let (messages, error) = decode_all(Messages::new, &data);
         assert_eq!(error, None);
         let malformed = messages[0].as_ref().unwrap_err();
-        assert_eq!(malformed.error, FrameError::AvpLength { code: avp::ORIGIN_HOST, length: 7 });
+        assert_eq!(malformed.error, Error::AvpLength { code: avp::ORIGIN_HOST, length: 7 });
         assert_eq!(malformed.header, Message { avps: vec![], ..dwr() });
         let reply = malformed.header.answer();
         assert_eq!((reply.hop_by_hop, reply.end_to_end), (0x1234_5678, 0x9abc_def0));

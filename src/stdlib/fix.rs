@@ -20,8 +20,10 @@
 //!
 //! [`Message`] retains field order. BodyLength and CheckSum are derived, so
 //! they are not stored in its field list. [`Messages`] yields `Result<Message,
-//! Error>` from a [`fictionet::stdlib::codec::Stream`]. Pass each item to
-//! [`Session::receive_frame`]. Only envelope faults are skipped as garbled.
+//! FieldFault>` from a [`fictionet::stdlib::codec::Stream`]. Pass each item to
+//! [`Session::receive_frame`]. A message with a bad field is a [`FieldFault`]
+//! item, which holds what a Reject needs; a bad envelope is skipped as garbled,
+//! so the stream never ends with an error and the module has no `FrameError`.
 //! Group layouts are supplied by
 //! the caller. Application views check message type and expose borrowed values;
 //! they do not impose a venue's required fields or trading rules.
@@ -35,10 +37,11 @@
 //! let bytes = message.to_bytes()?;
 //! let parsed = Message::parse(&bytes)?;
 //! assert_eq!(NewOrderSingle::view(&parsed)?.cl_ord_id(), Some(&b"order-7"[..]));
-//! # Ok::<(), fictionet::stdlib::fix::FrameError>(())
+//! # Ok::<(), fictionet::stdlib::fix::Error>(())
 //! ```
 
 use fictionet::stdlib::codec::{Decode, Step, Wire};
+use std::convert::Infallible;
 use std::fmt;
 
 /// The field delimiter, ASCII SOH.
@@ -106,10 +109,10 @@ pub const LENGTH_DATA_PAIRS: &[(u32, u32)] = &[
     (1403, 1404),
 ];
 
-/// Why a message, layout, or session operation was refused. It is also the
-/// [`Decode::Error`] of [`Messages`], and the reason inside an [`Error`].
+/// Why a message, layout, or session operation was refused: the module's
+/// error, and the reason inside a [`FieldFault`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FrameError {
+pub enum Error {
     /// A named storage or count limit was exceeded.
     Limit,
     /// Input ended inside a message or field.
@@ -145,12 +148,12 @@ pub enum FrameError {
     /// Session configuration or incoming session identity was invalid.
     Session,
 }
-impl fmt::Display for FrameError {
+impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "FIX {self:?}")
     }
 }
-impl std::error::Error for FrameError {}
+impl std::error::Error for Error {}
 
 /// Session BeginString values supported by this module.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -175,13 +178,13 @@ impl Version {
         }
     }
     /// Reads a supported BeginString value.
-    pub fn from_begin_string(value: &[u8]) -> Result<Self, FrameError> {
+    pub fn from_begin_string(value: &[u8]) -> Result<Self, Error> {
         match value {
             b"FIX.4.2" => Ok(Self::Fix42),
             b"FIX.4.3" => Ok(Self::Fix43),
             b"FIX.4.4" => Ok(Self::Fix44),
             b"FIXT.1.1" => Ok(Self::Fixt11),
-            _ => Err(FrameError::Version),
+            _ => Err(Error::Version),
         }
     }
 }
@@ -198,7 +201,7 @@ impl Field {
     /// character data; the caller selects its character set.
     /// Empty data fields are refused too, including `95=0|96=|`. This applies
     /// the no-value rule in FIX 4.4 Vol 2 case 14.d to data as well as text.
-    pub fn new(tag: u32, value: &[u8]) -> Result<Self, FrameError> {
+    pub fn new(tag: u32, value: &[u8]) -> Result<Self, Error> {
         check_field(tag, value)?;
         Ok(Self {
             tag,
@@ -214,22 +217,22 @@ impl Field {
         &self.value
     }
     /// Reads an unsigned decimal integer with checked arithmetic.
-    pub fn unsigned(&self) -> Result<u32, FrameError> {
+    pub fn unsigned(&self) -> Result<u32, Error> {
         decimal(&self.value)
     }
     fn size(&self) -> usize {
         digits(self.tag as usize) + 2 + self.value.len()
     }
 }
-fn check_field(tag: u32, value: &[u8]) -> Result<(), FrameError> {
+fn check_field(tag: u32, value: &[u8]) -> Result<(), Error> {
     if value.len() > MAX_VALUE_LENGTH {
-        return Err(FrameError::Limit);
+        return Err(Error::Limit);
     }
     if tag == 0 {
-        return Err(FrameError::Field);
+        return Err(Error::Field);
     }
     if value.is_empty() || (!is_data(tag) && value.contains(&SOH)) {
-        return Err(FrameError::Field);
+        return Err(Error::Field);
     }
     Ok(())
 }
@@ -239,17 +242,17 @@ fn is_data(tag: u32) -> bool {
 fn data_tag(tag: u32) -> Option<u32> {
     LENGTH_DATA_PAIRS.iter().find(|p| p.0 == tag).map(|p| p.1)
 }
-fn decimal(b: &[u8]) -> Result<u32, FrameError> {
+fn decimal(b: &[u8]) -> Result<u32, Error> {
     if b.is_empty() || b.len() > 10 {
-        return Err(FrameError::Field);
+        return Err(Error::Field);
     }
     b.iter().try_fold(0u32, |n, b| {
         if !b.is_ascii_digit() {
-            return Err(FrameError::Field);
+            return Err(Error::Field);
         }
         n.checked_mul(10)
             .and_then(|n| n.checked_add(u32::from(*b - b'0')))
-            .ok_or(FrameError::Field)
+            .ok_or(Error::Field)
     })
 }
 fn digits(n: usize) -> usize {
@@ -274,7 +277,7 @@ pub struct Message {
 }
 impl Message {
     /// Starts a message. Refuses an empty MsgType or one containing SOH.
-    pub fn new(version: Version, msg_type: &[u8]) -> Result<Self, FrameError> {
+    pub fn new(version: Version, msg_type: &[u8]) -> Result<Self, Error> {
         let begin = Field::new(8, version.begin_string())?;
         let kind = Field::new(35, msg_type)?;
         let stored_size = begin.size() + kind.size();
@@ -292,7 +295,7 @@ impl Message {
         self.fields.iter().find(|f| f.tag == tag).map(Field::value)
     }
     /// Reads a singleton field and refuses duplicate occurrences.
-    pub fn unique(&self, tag: u32) -> Result<Option<&[u8]>, FrameError> {
+    pub fn unique(&self, tag: u32) -> Result<Option<&[u8]>, Error> {
         unique(&self.fields, tag)
     }
     /// Returns MsgType.
@@ -300,35 +303,35 @@ impl Message {
         self.get(35).unwrap_or_default()
     }
     /// Returns the version carried by BeginString.
-    pub fn version(&self) -> Result<Version, FrameError> {
-        Version::from_begin_string(self.get(8).ok_or(FrameError::Header)?)
+    pub fn version(&self) -> Result<Version, Error> {
+        Version::from_begin_string(self.get(8).ok_or(Error::Header)?)
     }
     /// Appends a field. Refuses envelope tags and named size/count limits.
     /// Length/data consistency is checked by `write` or [`Self::validate`].
     /// Failure leaves the message unchanged.
-    pub fn push(&mut self, tag: u32, value: &[u8]) -> Result<&mut Self, FrameError> {
+    pub fn push(&mut self, tag: u32, value: &[u8]) -> Result<&mut Self, Error> {
         if matches!(tag, 8 | 9 | 10 | 35) {
-            return Err(FrameError::Header);
+            return Err(Error::Header);
         }
         check_field(tag, value)?;
         let size = digits(tag as usize) + 2 + value.len();
-        let stored = self.stored_size.checked_add(size).ok_or(FrameError::Limit)?;
+        let stored = self.stored_size.checked_add(size).ok_or(Error::Limit)?;
         if self.fields.len() >= MAX_FIELDS || self.encoded_size(stored)? > MAX_MESSAGE_SIZE {
-            return Err(FrameError::Limit);
+            return Err(Error::Limit);
         }
         self.fields.push(Field::new(tag, value)?);
         self.stored_size = stored;
         Ok(self)
     }
-    fn encoded_size(&self, stored: usize) -> Result<usize, FrameError> {
-        let begin = self.fields.first().ok_or(FrameError::Header)?;
-        let body = stored.checked_sub(begin.size()).ok_or(FrameError::Header)?;
-        stored.checked_add(3 + digits(body) + 7).ok_or(FrameError::Limit)
+    fn encoded_size(&self, stored: usize) -> Result<usize, Error> {
+        let begin = self.fields.first().ok_or(Error::Header)?;
+        let body = stored.checked_sub(begin.size()).ok_or(Error::Header)?;
+        stored.checked_add(3 + digits(body) + 7).ok_or(Error::Limit)
     }
     /// Appends a standard Length/data pair, deriving the Length value.
     /// Refuses empty data, unknown pairs, or size limits without changing the message.
-    pub fn push_data(&mut self, length_tag: u32, value: &[u8]) -> Result<&mut Self, FrameError> {
-        let tag = data_tag(length_tag).ok_or(FrameError::DataLength)?;
+    pub fn push_data(&mut self, length_tag: u32, value: &[u8]) -> Result<&mut Self, Error> {
+        let tag = data_tag(length_tag).ok_or(Error::DataLength)?;
         let count = self.fields.len();
         let size = self.stored_size;
         let result = self
@@ -343,46 +346,46 @@ impl Message {
     }
     /// Checks the envelope, Length/data adjacency and named limits.
     /// Dictionary-specific required fields and groups require caller layouts.
-    pub fn validate(&self) -> Result<(), FrameError> {
+    pub fn validate(&self) -> Result<(), Error> {
         self.version()?;
         if self.fields.first().map(Field::tag) != Some(8)
             || self.fields.get(1).map(Field::tag) != Some(35)
         {
-            return Err(FrameError::Header);
+            return Err(Error::Header);
         }
         if self.fields.len() > MAX_FIELDS || self.encoded_size(self.stored_size)? > MAX_MESSAGE_SIZE
         {
-            return Err(FrameError::Limit);
+            return Err(Error::Limit);
         }
         let mut pending = None;
         for (i, f) in self.fields.iter().enumerate() {
             check_field(f.tag, &f.value)?;
             if matches!(f.tag, 9 | 10) || (i > 1 && matches!(f.tag, 8 | 35)) {
-                return Err(FrameError::Header);
+                return Err(Error::Header);
             }
             if let Some((tag, len)) = pending.take() {
                 if f.tag != tag || f.value.len() != len {
-                    return Err(FrameError::DataLength);
+                    return Err(Error::DataLength);
                 }
             } else if is_data(f.tag) {
-                return Err(FrameError::DataLength);
+                return Err(Error::DataLength);
             }
             if let Some(tag) = data_tag(f.tag) {
-                let len = decimal(&f.value).map_err(|_| FrameError::DataLength)? as usize;
+                let len = decimal(&f.value).map_err(|_| Error::DataLength)? as usize;
                 if len > MAX_VALUE_LENGTH {
-                    return Err(FrameError::Limit);
+                    return Err(Error::Limit);
                 }
                 pending = Some((tag, len));
             }
         }
         if pending.is_some() {
-            return Err(FrameError::DataLength);
+            return Err(Error::DataLength);
         }
         Ok(())
     }
     /// Validates a group whose count field is at `field_index`, returning
     /// borrowed entry slices. Refuses invalid layouts, counts, and member order.
-    pub fn group(&self, field_index: usize, layout: &GroupLayout<'_>) -> Result<Group<'_>, FrameError> {
+    pub fn group(&self, field_index: usize, layout: &GroupLayout<'_>) -> Result<Group<'_>, Error> {
         group(&self.fields, field_index, layout)
     }
 
@@ -390,10 +393,10 @@ impl Message {
     /// Refuses duplicate top-level fields, invalid groups, and layout limits.
     /// Required application fields remain caller policy. Unknown count tags
     /// cannot be recognized as groups without a layout.
-    pub fn validate_groups(&self, layouts: &[GroupLayout<'_>]) -> Result<(), FrameError> {
+    pub fn validate_groups(&self, layouts: &[GroupLayout<'_>]) -> Result<(), Error> {
         self.validate()?;
         if layouts.len() > MAX_GROUP_LAYOUTS {
-            return Err(FrameError::Limit);
+            return Err(Error::Limit);
         }
         let mut total = 0;
         for (i, layout) in layouts.iter().enumerate() {
@@ -402,7 +405,7 @@ impl Message {
                 .take(i)
                 .any(|g| g.count_tag == layout.count_tag)
             {
-                return Err(FrameError::Group);
+                return Err(Error::Group);
             }
             check_layout(layout, 1, &mut total)?;
         }
@@ -410,7 +413,7 @@ impl Message {
         let mut at = 0;
         while let Some(field) = self.fields.get(at) {
             if !seen.insert(field.tag) {
-                return Err(FrameError::Duplicate(field.tag));
+                return Err(Error::Duplicate(field.tag));
             }
             if let Some(layout) = layouts.iter().find(|g| g.count_tag == field.tag) {
                 at = walk_group(&self.fields, at, layout, 1, &mut |_, _| {})?;
@@ -423,7 +426,7 @@ impl Message {
 
     /// Parses one exact message and checks its caller-supplied group layouts.
     /// Refuses everything refused by `Wire::parse` or [`Self::validate_groups`].
-    pub fn parse_with_groups(bytes: &[u8], layouts: &[GroupLayout<'_>]) -> Result<Self, FrameError> {
+    pub fn parse_with_groups(bytes: &[u8], layouts: &[GroupLayout<'_>]) -> Result<Self, Error> {
         let message = Self::parse(bytes)?;
         message.validate_groups(layouts)?;
         Ok(message)
@@ -435,25 +438,25 @@ impl Message {
         &self,
         out: &mut Vec<u8>,
         layouts: &[GroupLayout<'_>],
-    ) -> Result<(), FrameError> {
+    ) -> Result<(), Error> {
         self.validate_groups(layouts)?;
         self.write(out)
     }
 }
-fn unique(fields: &[Field], tag: u32) -> Result<Option<&[u8]>, FrameError> {
+fn unique(fields: &[Field], tag: u32) -> Result<Option<&[u8]>, Error> {
     let mut matches = fields.iter().filter(|f| f.tag == tag);
     let value = matches.next().map(Field::value);
     if matches.next().is_some() {
-        return Err(FrameError::Duplicate(tag));
+        return Err(Error::Duplicate(tag));
     }
     Ok(value)
 }
 
 // Only this fixed-size prefix is rescanned on incremental input.
-fn prefix(input: &[u8]) -> Result<Option<(usize, usize)>, FrameError> {
+fn prefix(input: &[u8]) -> Result<Option<(usize, usize)>, Error> {
     let bounded = input
         .get(..input.len().min(MAX_PREFIX_SIZE))
-        .ok_or(FrameError::Header)?;
+        .ok_or(Error::Header)?;
     let mut ends = bounded
         .iter()
         .enumerate()
@@ -461,7 +464,7 @@ fn prefix(input: &[u8]) -> Result<Option<(usize, usize)>, FrameError> {
         .map(|p| p.0);
     let Some(first) = ends.next() else {
         return if input.len() >= MAX_PREFIX_SIZE {
-            Err(FrameError::Header)
+            Err(Error::Header)
         } else {
             Ok(None)
         };
@@ -469,11 +472,11 @@ fn prefix(input: &[u8]) -> Result<Option<(usize, usize)>, FrameError> {
     let begin = bounded
         .get(..first)
         .and_then(|b| b.strip_prefix(b"8="))
-        .ok_or(FrameError::Header)?;
+        .ok_or(Error::Header)?;
     Version::from_begin_string(begin)?;
     let Some(second) = ends.next() else {
         return if input.len() >= MAX_PREFIX_SIZE {
-            Err(FrameError::Header)
+            Err(Error::Header)
         } else {
             Ok(None)
         };
@@ -481,18 +484,18 @@ fn prefix(input: &[u8]) -> Result<Option<(usize, usize)>, FrameError> {
     let body = bounded
         .get(first + 1..second)
         .and_then(|b| b.strip_prefix(b"9="))
-        .ok_or(FrameError::Header)?;
-    let len = decimal(body).map_err(|_| FrameError::BodyLength)? as usize;
+        .ok_or(Error::Header)?;
+    let len = decimal(body).map_err(|_| Error::BodyLength)? as usize;
     if len < 5 {
-        return Err(FrameError::BodyLength);
+        return Err(Error::BodyLength);
     }
     let start = second + 1;
     let total = start
         .checked_add(len)
         .and_then(|n| n.checked_add(7))
-        .ok_or(FrameError::Limit)?;
+        .ok_or(Error::Limit)?;
     if total > MAX_MESSAGE_SIZE {
-        return Err(FrameError::Limit);
+        return Err(Error::Limit);
     }
     Ok(Some((start, total)))
 }
@@ -500,40 +503,40 @@ fn next_field<'a>(
     input: &'a [u8],
     pos: &mut usize,
     raw: Option<(u32, usize)>,
-) -> Result<(u32, &'a [u8]), FrameError> {
-    let rest = input.get(*pos..).ok_or(FrameError::Incomplete)?;
+) -> Result<(u32, &'a [u8]), Error> {
+    let rest = input.get(*pos..).ok_or(Error::Incomplete)?;
     let eq = rest
         .iter()
         .take(11)
         .position(|b| *b == b'=')
-        .ok_or(FrameError::Field)?;
-    let tag_bytes = rest.get(..eq).ok_or(FrameError::Field)?;
+        .ok_or(Error::Field)?;
+    let tag_bytes = rest.get(..eq).ok_or(Error::Field)?;
     if tag_bytes.first() == Some(&b'0') {
-        return Err(FrameError::Field);
+        return Err(Error::Field);
     }
     let tag = decimal(tag_bytes)?;
-    let start = pos.checked_add(eq + 1).ok_or(FrameError::Limit)?;
-    let value_rest = input.get(start..).ok_or(FrameError::Incomplete)?;
+    let start = pos.checked_add(eq + 1).ok_or(Error::Limit)?;
+    let value_rest = input.get(start..).ok_or(Error::Incomplete)?;
     let len = if let Some((expected, len)) = raw {
         if expected != tag {
-            return Err(FrameError::DataLength);
+            return Err(Error::DataLength);
         }
         len
     } else {
         if is_data(tag) {
-            return Err(FrameError::DataLength);
+            return Err(Error::DataLength);
         }
         value_rest
             .iter()
             .take(MAX_VALUE_LENGTH + 1)
             .position(|b| *b == SOH)
-            .ok_or(FrameError::Field)?
+            .ok_or(Error::Field)?
     };
-    let end = start.checked_add(len).ok_or(FrameError::Limit)?;
+    let end = start.checked_add(len).ok_or(Error::Limit)?;
     if input.get(end) != Some(&SOH) {
-        return Err(FrameError::DataLength);
+        return Err(Error::DataLength);
     }
-    let value = input.get(start..end).ok_or(FrameError::Incomplete)?;
+    let value = input.get(start..end).ok_or(Error::Incomplete)?;
     *pos = end + 1;
     Ok((tag, value))
 }
@@ -543,13 +546,13 @@ fn next_field<'a>(
 /// Parsing stops at an ambiguous data boundary; later bytes are never searched
 /// for session headers inside binary data.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Error {
+pub struct FieldFault {
     message: Message,
     tag: Option<u32>,
     reason: u32,
-    error: FrameError,
+    error: Error,
 }
-impl Error {
+impl FieldFault {
     /// MsgSeqNum when a unique, positive, supported number could be read.
     pub fn sequence(&self) -> Option<u32> {
         number(&self.message, 34).and_then(seq).ok()
@@ -568,7 +571,7 @@ impl Error {
         self.reason
     }
 }
-impl fmt::Display for Error {
+impl fmt::Display for FieldFault {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -577,7 +580,7 @@ impl fmt::Display for Error {
         )
     }
 }
-impl std::error::Error for Error {}
+impl std::error::Error for FieldFault {}
 
 // The tag before the first `=` in the next 11 bytes, if it reads as one.
 fn leading_tag(rest: &[u8]) -> Option<u32> {
@@ -604,32 +607,32 @@ struct Envelope {
 // trailer's shape and position, and MsgType in the first body field. None of
 // them reads more than MAX_PREFIX_SIZE + 18 bytes, so Messages runs them on
 // every candidate before any work that grows with BodyLength.
-fn envelope(input: &[u8]) -> Result<Envelope, FrameError> {
+fn envelope(input: &[u8]) -> Result<Envelope, Error> {
     if input.len() > MAX_MESSAGE_SIZE {
-        return Err(FrameError::Limit);
+        return Err(Error::Limit);
     }
-    let (start, total) = prefix(input)?.ok_or(FrameError::Incomplete)?;
+    let (start, total) = prefix(input)?.ok_or(Error::Incomplete)?;
     if input.len() < total {
-        return Err(FrameError::Incomplete);
+        return Err(Error::Incomplete);
     }
     if input.len() > total {
-        return Err(FrameError::Trailing);
+        return Err(Error::Trailing);
     }
-    let checksum_at = total.checked_sub(7).ok_or(FrameError::BodyLength)?;
-    let trailer = input.get(checksum_at..).ok_or(FrameError::Incomplete)?;
+    let checksum_at = total.checked_sub(7).ok_or(Error::BodyLength)?;
+    let trailer = input.get(checksum_at..).ok_or(Error::Incomplete)?;
     let checksum = match trailer {
         [b'1', b'0', b'=', a, b, c, SOH]
             if a.is_ascii_digit() && b.is_ascii_digit() && c.is_ascii_digit() =>
         {
             u32::from(*a - b'0') * 100 + u32::from(*b - b'0') * 10 + u32::from(*c - b'0')
         }
-        _ => return Err(FrameError::Checksum),
+        _ => return Err(Error::Checksum),
     };
     if checksum_at.checked_sub(1).and_then(|i| input.get(i)) != Some(&SOH) {
-        return Err(FrameError::BodyLength);
+        return Err(Error::BodyLength);
     }
     if leading_tag(input.get(start..checksum_at).unwrap_or_default()) != Some(35) {
-        return Err(FrameError::Header);
+        return Err(Error::Header);
     }
     Ok(Envelope {
         start,
@@ -639,18 +642,18 @@ fn envelope(input: &[u8]) -> Result<Envelope, FrameError> {
 }
 
 // Envelope errors are outer errors. Field failures are per-unit items.
-fn parse_frame(input: &[u8]) -> Result<Result<Message, Error>, FrameError> {
+fn parse_frame(input: &[u8]) -> Result<Result<Message, FieldFault>, Error> {
     let envelope = envelope(input)?;
-    let content = input.get(..envelope.checksum_at).ok_or(FrameError::BodyLength)?;
+    let content = input.get(..envelope.checksum_at).ok_or(Error::BodyLength)?;
     if u32::from(checksum(content)) != envelope.checksum {
-        return Err(FrameError::Checksum);
+        return Err(Error::Checksum);
     }
     fields(content, envelope.start)
 }
 
 // Reads the fields of a candidate whose envelope and checksum were checked.
 // Work and allocation are linear in `content`.
-fn fields(content: &[u8], start: usize) -> Result<Result<Message, Error>, FrameError> {
+fn fields(content: &[u8], start: usize) -> Result<Result<Message, FieldFault>, Error> {
     let checksum_at = content.len();
     let mut pos = 0;
     let (_, begin) = next_field(content, &mut pos, None)?;
@@ -666,22 +669,22 @@ fn fields(content: &[u8], start: usize) -> Result<Result<Message, Error>, FrameE
         let at = pos;
         let raw = pending.take();
         let first = at == start;
-        let rest = content.get(at..).ok_or(FrameError::Incomplete)?;
+        let rest = content.get(at..).ok_or(Error::Incomplete)?;
         let tag_hint = leading_tag(rest);
         if first && tag_hint != Some(35) {
-            return Err(FrameError::Header);
+            return Err(Error::Header);
         }
         if matches!(tag_hint, Some(8..=10)) || (!first && tag_hint == Some(35)) {
-            return Err(FrameError::Header);
+            return Err(Error::Header);
         }
         if message.fields.len() >= MAX_FIELDS {
-            fault.get_or_insert((tag_hint, 5, FrameError::Limit));
+            fault.get_or_insert((tag_hint, 5, Error::Limit));
             break;
         }
         let (tag, value) = match next_field(content, &mut pos, raw) {
             Ok(field) => field,
             Err(error) => {
-                let reason = if matches!(error, FrameError::DataLength | FrameError::Limit) {
+                let reason = if matches!(error, Error::DataLength | Error::Limit) {
                     5
                 } else {
                     0
@@ -695,7 +698,7 @@ fn fields(content: &[u8], start: usize) -> Result<Result<Message, Error>, FrameE
                 let Some(end) = rest.iter().position(|b| *b == SOH) else {
                     break;
                 };
-                pos = at.checked_add(end + 1).ok_or(FrameError::Limit)?;
+                pos = at.checked_add(end + 1).ok_or(Error::Limit)?;
                 continue;
             }
         };
@@ -716,23 +719,23 @@ fn fields(content: &[u8], start: usize) -> Result<Result<Message, Error>, FrameE
         message.stored_size = message
             .stored_size
             .checked_add(field.size())
-            .ok_or(FrameError::Limit)?;
+            .ok_or(Error::Limit)?;
         message.fields.push(field);
         if let Some(data) = data_tag(tag) {
             match decimal(value) {
                 Ok(len) if len as usize <= MAX_VALUE_LENGTH => pending = Some((data, len as usize)),
                 _ => {
-                    fault.get_or_insert((Some(tag), 5, FrameError::DataLength));
+                    fault.get_or_insert((Some(tag), 5, Error::DataLength));
                     break;
                 }
             }
         }
     }
     if let Some((tag, _)) = pending {
-        fault.get_or_insert((Some(tag), 5, FrameError::DataLength));
+        fault.get_or_insert((Some(tag), 5, Error::DataLength));
     }
     Ok(match fault {
-        Some((tag, reason, error)) => Err(Error {
+        Some((tag, reason, error)) => Err(FieldFault {
             message,
             tag,
             reason,
@@ -743,30 +746,30 @@ fn fields(content: &[u8], start: usize) -> Result<Result<Message, Error>, FrameE
 }
 
 impl Wire for Message {
-    type ParseError = FrameError;
-    type WriteError = FrameError;
+    type ParseError = Error;
+    type WriteError = Error;
     /// Reads exactly one message. Refuses truncation, trailing bytes, bad
     /// envelope order, lengths, checksum, fields, data pairs, and named limits.
     /// Leading zeros in BodyLength are accepted and normalized on write.
-    fn parse(input: &[u8]) -> Result<Self, FrameError> {
+    fn parse(input: &[u8]) -> Result<Self, Error> {
         parse_frame(input)?.map_err(|malformed| malformed.error)
     }
     /// Appends one message with computed BodyLength and three-digit CheckSum.
     /// Refuses invalid fields, envelope tags, data pairs, or named limits.
     /// All checks finish before appending; an error leaves `out` unchanged.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), FrameError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         self.validate()?;
-        let begin = self.fields.first().ok_or(FrameError::Header)?;
+        let begin = self.fields.first().ok_or(Error::Header)?;
         let body = self
             .stored_size
             .checked_sub(begin.size())
-            .ok_or(FrameError::Header)?;
+            .ok_or(Error::Header)?;
         let total = self
             .stored_size
             .checked_add(3 + digits(body) + 7)
-            .ok_or(FrameError::Limit)?;
+            .ok_or(Error::Limit)?;
         if total > MAX_MESSAGE_SIZE {
-            return Err(FrameError::Limit);
+            return Err(Error::Limit);
         }
         let offset = out.len();
         append_field(out, 8, begin.value());
@@ -817,7 +820,7 @@ pub const MAX_RESYNC_DEBT: usize = 4 * MAX_MESSAGE_SIZE;
 /// pump(&mut stream, b"8=FIX.4.4\x019=5\x0135=0\x0110=164\x01", |_| unreachable!())?;
 /// assert_eq!(stream.decoder().garbled(), 1);
 /// assert!(stream.failed().is_none());
-/// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::fix::FrameError>>(())
+/// # Ok::<(), fictionet::stdlib::codec::Fail<std::convert::Infallible>>(())
 /// ```
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Messages {
@@ -854,7 +857,7 @@ impl Messages {
     // cursor is relative to the unread start, so a scan is linear across
     // calls. Returns Need, with no state changed, only when there is nothing
     // to skip yet.
-    fn recover(&mut self, input: &[u8], eof: bool) -> Step<Result<Message, Error>> {
+    fn recover(&mut self, input: &[u8], eof: bool) -> Step<Result<Message, FieldFault>> {
         let mut scanned = if self.resync { self.scanned } else { 1 };
         let mut found = false;
         while let Some(window) = input.get(scanned..).and_then(|b| b.get(..5)) {
@@ -885,7 +888,7 @@ impl Messages {
         };
         Step::Skip(used)
     }
-    fn step(&mut self, input: &[u8], eof: bool) -> Step<Result<Message, Error>> {
+    fn step(&mut self, input: &[u8], eof: bool) -> Step<Result<Message, FieldFault>> {
         // A marker kept back by a partial skip may now start the input.
         if self.resync && self.scanned == 0 && input.starts_with(b"8=FIX") {
             self.resync = false;
@@ -898,7 +901,7 @@ impl Messages {
             Ok(None) => return Step::Need,
             Err(error) => {
                 let step = self.recover(input, eof);
-                if error == FrameError::Version && !matches!(step, Step::Need) {
+                if error == Error::Version && !matches!(step, Step::Need) {
                     self.unsupported_versions = self.unsupported_versions.saturating_add(1);
                 }
                 return step;
@@ -940,14 +943,14 @@ impl Messages {
     }
 }
 impl Decode for Messages {
-    type Item = Result<Message, Error>;
-    type Error = FrameError;
+    type Item = Result<Message, FieldFault>;
+    type Error = Infallible;
     const NAME: &'static str = "FIX";
     /// The maximum unread input needed before a message or error is returned.
     fn capacity(&self) -> usize {
         MAX_MESSAGE_SIZE
     }
-    /// Returns a checked message or an [`Error`] field-failure item.
+    /// Returns a checked message or a [`FieldFault`] item.
     /// On an envelope fault, skips to the next `8=FIX` after offset zero,
     /// retaining four bytes for a split marker. Includes bad lengths,
     /// misplaced tags, unsupported versions, and noise (FIX 4.4 Vol 2 cases
@@ -957,7 +960,7 @@ impl Decode for Messages {
     /// At EOF, searches incomplete candidates for a later frame. Otherwise
     /// partial input returns `Need`; the driver reports any final truncation.
     /// Never returns `Err`.
-    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Self::Item>, FrameError> {
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Self::Item>, Infallible> {
         let step = self.step(input, eof);
         if let Step::Item(_, n) | Step::Skip(n) = &step {
             self.debt = self.debt.saturating_sub(*n);
@@ -1011,32 +1014,32 @@ impl<'a> Group<'a> {
         entry: usize,
         count_index: usize,
         layout: &GroupLayout<'_>,
-    ) -> Result<Group<'a>, FrameError> {
+    ) -> Result<Group<'a>, Error> {
         group(
-            self.entries.get(entry).copied().ok_or(FrameError::Group)?,
+            self.entries.get(entry).copied().ok_or(Error::Group)?,
             count_index,
             layout,
         )
     }
 }
-fn check_layout(layout: &GroupLayout<'_>, depth: usize, total: &mut usize) -> Result<(), FrameError> {
-    *total = total.checked_add(1).ok_or(FrameError::Limit)?;
+fn check_layout(layout: &GroupLayout<'_>, depth: usize, total: &mut usize) -> Result<(), Error> {
+    *total = total.checked_add(1).ok_or(Error::Limit)?;
     if depth > MAX_GROUP_DEPTH
         || *total > MAX_GROUP_LAYOUTS
         || layout.members.len() > MAX_GROUP_MEMBERS
         || layout.nested.len() > MAX_GROUP_LAYOUTS
     {
-        return Err(FrameError::Limit);
+        return Err(Error::Limit);
     }
     if layout.count_tag == 0
         || layout.members.first() != Some(&layout.delimiter_tag)
         || layout.members.contains(&layout.count_tag)
     {
-        return Err(FrameError::Group);
+        return Err(Error::Group);
     }
     for (i, tag) in layout.members.iter().enumerate() {
-        if *tag == 0 || layout.members.get(..i).ok_or(FrameError::Group)?.contains(tag) {
-            return Err(FrameError::Group);
+        if *tag == 0 || layout.members.get(..i).ok_or(Error::Group)?.contains(tag) {
+            return Err(Error::Group);
         }
     }
     for (i, child) in layout.nested.iter().enumerate() {
@@ -1047,7 +1050,7 @@ fn check_layout(layout: &GroupLayout<'_>, depth: usize, total: &mut usize) -> Re
                 .take(i)
                 .any(|p| p.count_tag == child.count_tag)
         {
-            return Err(FrameError::Group);
+            return Err(Error::Group);
         }
         check_layout(child, depth + 1, total)?;
     }
@@ -1057,7 +1060,7 @@ fn group<'a>(
     fields: &'a [Field],
     index: usize,
     layout: &GroupLayout<'_>,
-) -> Result<Group<'a>, FrameError> {
+) -> Result<Group<'a>, Error> {
     check_layout(layout, 1, &mut 0)?;
     let mut entries = Vec::new();
     let end = walk_group(fields, index, layout, 1, &mut |start, end| {
@@ -1073,23 +1076,23 @@ fn walk_group(
     layout: &GroupLayout<'_>,
     depth: usize,
     on_entry: &mut dyn FnMut(usize, usize),
-) -> Result<usize, FrameError> {
+) -> Result<usize, Error> {
     if depth > MAX_GROUP_DEPTH {
-        return Err(FrameError::Limit);
+        return Err(Error::Limit);
     }
     let count = fields
         .get(index)
         .filter(|f| f.tag == layout.count_tag)
-        .ok_or(FrameError::Group)?
+        .ok_or(Error::Group)?
         .unsigned()? as usize;
     if count > MAX_GROUP_COUNT {
-        return Err(FrameError::Limit);
+        return Err(Error::Limit);
     }
-    let mut at = index.checked_add(1).ok_or(FrameError::Group)?;
+    let mut at = index.checked_add(1).ok_or(Error::Group)?;
     for _ in 0..count {
         let start = at;
         if fields.get(at).map(Field::tag) != Some(layout.delimiter_tag) {
-            return Err(FrameError::Group);
+            return Err(Error::Group);
         }
         if let Some(child) = layout
             .nested
@@ -1109,7 +1112,7 @@ fn walk_group(
                 break;
             };
             if order <= previous {
-                return Err(FrameError::Group);
+                return Err(Error::Group);
             }
             previous = order;
             if let Some(child) = layout.nested.iter().find(|g| g.count_tag == field.tag) {
@@ -1124,7 +1127,7 @@ fn walk_group(
         .get(at)
         .is_some_and(|f| layout.members.contains(&f.tag))
     {
-        return Err(FrameError::Group);
+        return Err(Error::Group);
     }
     Ok(at)
 }
@@ -1137,13 +1140,13 @@ macro_rules! application_view {
         pub struct $view<'a> { message: &'a Message }
         impl<'a> $view<'a> {
             /// Checks MsgType and borrows the message. Other message types are refused.
-            pub fn view(message: &'a Message) -> Result<Self, FrameError> {
-                if message.msg_type() != $kind { return Err(FrameError::MessageType); }
+            pub fn view(message: &'a Message) -> Result<Self, Error> {
+                if message.msg_type() != $kind { return Err(Error::MessageType); }
                 Ok(Self { message })
             }
             /// Starts a builder backed by one Message. Add session fields through
             /// `field`, or pass the finished body to [`Session::send`].
-            pub fn builder(version: Version) -> Result<$builder, FrameError> {
+            pub fn builder(version: Version) -> Result<$builder, Error> {
                 Ok($builder { message: Message::new(version, $kind)? })
             }
             /// The underlying ordered message.
@@ -1157,18 +1160,18 @@ macro_rules! application_view {
         impl $builder {
             /// Appends an extension or group field. Refuses envelope tags and
             /// field limits. Repeated tags are retained in the supplied order.
-            pub fn field(&mut self, tag: u32, value: &[u8]) -> Result<&mut Self, FrameError> {
+            pub fn field(&mut self, tag: u32, value: &[u8]) -> Result<&mut Self, Error> {
                 self.message.push(tag, value)?; Ok(self)
             }
             $(#[doc = $doc]
             #[doc = " The builder refuses a second occurrence of this singleton."]
-            pub fn $method(&mut self, value: &[u8]) -> Result<&mut Self, FrameError> {
-                if self.message.get($tag).is_some() { return Err(FrameError::Duplicate($tag)); }
+            pub fn $method(&mut self, value: &[u8]) -> Result<&mut Self, Error> {
+                if self.message.get($tag).is_some() { return Err(Error::Duplicate($tag)); }
                 self.field($tag, value)
             })*
             /// Returns the Message after wire validation. Required application
             /// fields, numeric types, and group layouts remain caller policy.
-            pub fn finish(self) -> Result<Message, FrameError> { self.message.validate()?; Ok(self.message) }
+            pub fn finish(self) -> Result<Message, Error> { self.message.validate()?; Ok(self.message) }
         }
     };
 }
@@ -1300,7 +1303,7 @@ impl SessionConfig {
     /// Creates a policy with 30-second heartbeats, one second of transmission
     /// grace, a 10-second Logon timeout, and a two-second Logout timeout.
     /// FIXT defaults to application version 6 (FIX 4.4).
-    pub fn new(version: Version, role: Role, sender: &str, target: &str) -> Result<Self, FrameError> {
+    pub fn new(version: Version, role: Role, sender: &str, target: &str) -> Result<Self, Error> {
         session_id(sender.as_bytes())?;
         session_id(target.as_bytes())?;
         Ok(Self {
@@ -1317,7 +1320,7 @@ impl SessionConfig {
             default_appl_ver_id: (version == Version::Fixt11).then(|| "6".into()),
         })
     }
-    fn validate(&self) -> Result<(), FrameError> {
+    fn validate(&self) -> Result<(), Error> {
         session_id(self.sender_comp_id.as_bytes())?;
         session_id(self.target_comp_id.as_bytes())?;
         if self.heartbeat_seconds > MAX_HEARTBEAT_SECONDS
@@ -1325,18 +1328,18 @@ impl SessionConfig {
             || !(1..=86_400_000).contains(&self.logon_timeout_ms)
             || !(1..=86_400_000).contains(&self.logout_timeout_ms)
         {
-            return Err(FrameError::Limit);
+            return Err(Error::Limit);
         }
         match (&self.default_appl_ver_id, self.version) {
             (Some(id), Version::Fixt11) => session_id(id.as_bytes()),
             (None, v) if v != Version::Fixt11 => Ok(()),
-            _ => Err(FrameError::Session),
+            _ => Err(Error::Session),
         }
     }
 }
-fn session_id(id: &[u8]) -> Result<(), FrameError> {
+fn session_id(id: &[u8]) -> Result<(), Error> {
     if id.len() > MAX_SESSION_ID_LENGTH {
-        return Err(FrameError::Limit);
+        return Err(Error::Limit);
     }
     check_field(49, id)
 }
@@ -1422,9 +1425,9 @@ pub enum Action {
     /// A notification for the caller.
     Event(Event),
 }
-fn action(actions: &mut Vec<Action>, value: Action) -> Result<(), FrameError> {
+fn action(actions: &mut Vec<Action>, value: Action) -> Result<(), Error> {
     if actions.len() >= MAX_ACTIONS {
-        return Err(FrameError::Limit);
+        return Err(Error::Limit);
     }
     actions.push(value);
     Ok(())
@@ -1479,7 +1482,7 @@ impl Session {
         next_inbound: u32,
         next_outbound: u32,
         now_ms: u64,
-    ) -> Result<Self, FrameError> {
+    ) -> Result<Self, Error> {
         config.validate()?;
         seq(next_inbound)?;
         seq(next_outbound)?;
@@ -1529,15 +1532,15 @@ impl Session {
         id: &[u8],
         now_ms: u64,
         sending_time: &[u8],
-    ) -> Result<Vec<Action>, FrameError> {
+    ) -> Result<Vec<Action>, Error> {
         self.transaction(now_ms, sending_time, |s, actions| {
             if s.phase != Phase::Established || s.test.is_some() {
-                return Err(FrameError::State);
+                return Err(Error::State);
             }
             if id.len() > MAX_TEST_REQUEST_ID_LENGTH {
-                return Err(FrameError::Limit);
+                return Err(Error::Limit);
             }
-            let id = std::str::from_utf8(id).map_err(|_| FrameError::Field)?;
+            let id = std::str::from_utf8(id).map_err(|_| Error::Field)?;
             s.emit(b"1", &[(112, id.as_bytes())], now_ms, sending_time, actions)?;
             s.test = Some((id.into(), now_ms));
             Ok(())
@@ -1550,13 +1553,13 @@ impl Session {
         now_ms: u64,
         sending_time: &[u8],
         reset: bool,
-    ) -> Result<Vec<Action>, FrameError> {
+    ) -> Result<Vec<Action>, Error> {
         self.transaction(now_ms, sending_time, |s, actions| {
             if s.config.role != Role::Initiator || s.phase != Phase::AwaitingLogon {
-                return Err(FrameError::State);
+                return Err(Error::State);
             }
             if reset && !s.config.allow_logon_reset {
-                return Err(FrameError::Session);
+                return Err(Error::Session);
             }
             if reset {
                 s.incoming = 1;
@@ -1583,7 +1586,7 @@ impl Session {
         message: &Message,
         now_ms: u64,
         sending_time: &[u8],
-    ) -> Result<Vec<Action>, FrameError> {
+    ) -> Result<Vec<Action>, Error> {
         message.validate()?;
         self.transaction(now_ms, sending_time, |s, actions| {
             s.receive_inner(message, None, now_ms, sending_time, actions)
@@ -1597,10 +1600,10 @@ impl Session {
     /// [`Self::receive`], leaving the session unchanged on `Err`.
     pub fn receive_frame(
         &mut self,
-        frame: &Result<Message, Error>,
+        frame: &Result<Message, FieldFault>,
         now_ms: u64,
         sending_time: &[u8],
-    ) -> Result<Vec<Action>, FrameError> {
+    ) -> Result<Vec<Action>, Error> {
         match frame {
             Ok(message) => self.receive(message, now_ms, sending_time),
             Err(fault) => self.transaction(now_ms, sending_time, |s, actions| {
@@ -1611,7 +1614,7 @@ impl Session {
     /// Advances timers. Sends Heartbeat after outgoing silence, TestRequest
     /// after inbound silence plus grace, and disconnects on expired probes.
     /// Any non-garbled inbound message satisfies a probe (Vol 2 state row 14).
-    pub fn tick(&mut self, now_ms: u64, sending_time: &[u8]) -> Result<Vec<Action>, FrameError> {
+    pub fn tick(&mut self, now_ms: u64, sending_time: &[u8]) -> Result<Vec<Action>, Error> {
         self.transaction(now_ms, sending_time, |s, actions| {
             match s.phase {
                 Phase::Closed => return Ok(()),
@@ -1649,7 +1652,7 @@ impl Session {
                     return Ok(());
                 }
             } else if interval != 0 && now_ms.saturating_sub(s.last_received) >= timeout {
-                s.test_serial = s.test_serial.checked_add(1).ok_or(FrameError::Limit)?;
+                s.test_serial = s.test_serial.checked_add(1).ok_or(Error::Limit)?;
                 let id = s.test_serial.to_string();
                 s.emit(b"1", &[(112, id.as_bytes())], now_ms, sending_time, actions)?;
                 s.test = Some((id, now_ms));
@@ -1667,14 +1670,14 @@ impl Session {
         body: &Message,
         now_ms: u64,
         sending_time: &[u8],
-    ) -> Result<Vec<Action>, FrameError> {
+    ) -> Result<Vec<Action>, Error> {
         body.validate()?;
         self.transaction(now_ms, sending_time, |s, actions| {
             if s.phase != Phase::Established {
-                return Err(FrameError::State);
+                return Err(Error::State);
             }
             if admin(body.msg_type()) || body.version()? != s.config.version {
-                return Err(FrameError::MessageType);
+                return Err(Error::MessageType);
             }
             let mut message = s.application_header(
                 body.msg_type(),
@@ -1687,7 +1690,7 @@ impl Session {
                     continue;
                 }
                 if session_tag(field.tag) {
-                    return Err(FrameError::Duplicate(field.tag));
+                    return Err(Error::Duplicate(field.tag));
                 }
                 message.push(field.tag, field.value())?;
             }
@@ -1702,10 +1705,10 @@ impl Session {
         text: &[u8],
         now_ms: u64,
         sending_time: &[u8],
-    ) -> Result<Vec<Action>, FrameError> {
+    ) -> Result<Vec<Action>, Error> {
         self.transaction(now_ms, sending_time, |s, actions| {
             if s.phase != Phase::Established {
-                return Err(FrameError::State);
+                return Err(Error::State);
             }
             let fields = [(58, text)];
             s.emit(
@@ -1733,10 +1736,10 @@ impl Session {
         reason: u32,
         now_ms: u64,
         sending_time: &[u8],
-    ) -> Result<Vec<Action>, FrameError> {
+    ) -> Result<Vec<Action>, Error> {
         self.transaction(now_ms, sending_time, |s, actions| {
             if s.phase != Phase::Established {
-                return Err(FrameError::State);
+                return Err(Error::State);
             }
             seq(reference)?;
             s.reject_inner(
@@ -1758,30 +1761,30 @@ impl Session {
         original: &Message,
         now_ms: u64,
         sending_time: &[u8],
-    ) -> Result<Vec<Action>, FrameError> {
+    ) -> Result<Vec<Action>, Error> {
         original.validate()?;
         self.transaction(now_ms, sending_time, |s, actions| {
             s.recovery_state()?;
             if admin(original.msg_type()) && original.msg_type() != b"3" {
-                return Err(FrameError::MessageType);
+                return Err(Error::MessageType);
             }
             if original.version()? != s.config.version
                 || required(original, 49)? != s.config.sender_comp_id.as_bytes()
                 || required(original, 56)? != s.config.target_comp_id.as_bytes()
             {
-                return Err(FrameError::Session);
+                return Err(Error::Session);
             }
             let number = number(original, 34)?;
             seq(number)?;
             if number >= s.outgoing {
-                return Err(FrameError::Sequence);
+                return Err(Error::Sequence);
             }
             let original_time = match original.unique(122)? {
                 Some(time) => time,
                 None => required(original, 52)?,
             };
             if timestamp(original_time)? > timestamp(sending_time)? {
-                return Err(FrameError::Time);
+                return Err(Error::Time);
             }
             let mut message = s.application_header(
                 original.msg_type(),
@@ -1812,16 +1815,16 @@ impl Session {
         original_time: &[u8],
         now_ms: u64,
         sending_time: &[u8],
-    ) -> Result<Vec<Action>, FrameError> {
+    ) -> Result<Vec<Action>, Error> {
         self.transaction(now_ms, sending_time, |s, actions| {
             s.recovery_state()?;
             seq(begin)?;
             seq(next)?;
             if next <= begin || next > s.outgoing || next - begin > MAX_RESEND_RANGE {
-                return Err(FrameError::Sequence);
+                return Err(Error::Sequence);
             }
             if timestamp(original_time)? > timestamp(sending_time)? {
-                return Err(FrameError::Time);
+                return Err(Error::Time);
             }
             let mut message = s.header(b"4", begin, sending_time)?;
             message
@@ -1841,14 +1844,14 @@ impl Session {
         next: u32,
         now_ms: u64,
         sending_time: &[u8],
-    ) -> Result<Vec<Action>, FrameError> {
+    ) -> Result<Vec<Action>, Error> {
         self.transaction(now_ms, sending_time, |s, actions| {
             if s.phase != Phase::Established {
-                return Err(FrameError::State);
+                return Err(Error::State);
             }
             seq(next)?;
             if next <= s.outgoing {
-                return Err(FrameError::Sequence);
+                return Err(Error::Sequence);
             }
             s.emit(
                 b"4",
@@ -1865,10 +1868,10 @@ impl Session {
         &mut self,
         now: u64,
         time: &[u8],
-        operation: impl FnOnce(&mut Self, &mut Vec<Action>) -> Result<(), FrameError>,
-    ) -> Result<Vec<Action>, FrameError> {
+        operation: impl FnOnce(&mut Self, &mut Vec<Action>) -> Result<(), Error>,
+    ) -> Result<Vec<Action>, Error> {
         if now < self.last_now {
-            return Err(FrameError::Time);
+            return Err(Error::Time);
         }
         timestamp(time)?;
         let mut staged = self.clone();
@@ -1884,17 +1887,17 @@ impl Session {
             Phase::AwaitingLogon | Phase::LogonSent
         )
     }
-    fn recovery_state(&self) -> Result<(), FrameError> {
+    fn recovery_state(&self) -> Result<(), Error> {
         if matches!(
             self.phase,
             Phase::Established | Phase::LogoutSent | Phase::LogoutReceived
         ) {
             Ok(())
         } else {
-            Err(FrameError::State)
+            Err(Error::State)
         }
     }
-    fn header(&self, kind: &[u8], sequence: u32, time: &[u8]) -> Result<Message, FrameError> {
+    fn header(&self, kind: &[u8], sequence: u32, time: &[u8]) -> Result<Message, Error> {
         self.application_header(kind, sequence, time, None)
     }
     fn application_header(
@@ -1903,7 +1906,7 @@ impl Session {
         sequence: u32,
         time: &[u8],
         appl_version: Option<&[u8]>,
-    ) -> Result<Message, FrameError> {
+    ) -> Result<Message, Error> {
         seq(sequence)?;
         timestamp(time)?;
         let mut message = Message::new(self.config.version, kind)?;
@@ -1912,7 +1915,7 @@ impl Session {
             .push(56, self.config.target_comp_id.as_bytes())?;
         if let Some(version) = appl_version {
             if self.config.version != Version::Fixt11 || admin(kind) {
-                return Err(FrameError::Session);
+                return Err(Error::Session);
             }
             session_id(version)?;
             message.push(1128, version)?;
@@ -1927,9 +1930,9 @@ impl Session {
         message: Message,
         now: u64,
         actions: &mut Vec<Action>,
-    ) -> Result<(), FrameError> {
+    ) -> Result<(), Error> {
         message.validate()?;
-        let next = self.outgoing.checked_add(1).ok_or(FrameError::Sequence)?;
+        let next = self.outgoing.checked_add(1).ok_or(Error::Sequence)?;
         seq(next)?;
         action(actions, Action::Send(message))?;
         self.outgoing = next;
@@ -1943,7 +1946,7 @@ impl Session {
         now: u64,
         time: &[u8],
         actions: &mut Vec<Action>,
-    ) -> Result<(), FrameError> {
+    ) -> Result<(), Error> {
         let mut message = self.header(kind, self.outgoing, time)?;
         for (tag, value) in fields {
             message.push(*tag, value)?;
@@ -1956,7 +1959,7 @@ impl Session {
         time: &[u8],
         reset: bool,
         actions: &mut Vec<Action>,
-    ) -> Result<(), FrameError> {
+    ) -> Result<(), Error> {
         let mut message = self.header(b"A", self.outgoing, time)?;
         message
             .push(98, b"0")?
@@ -1969,7 +1972,7 @@ impl Session {
         }
         self.send_fresh(message, now, actions)
     }
-    fn close(&mut self, reason: CloseReason, actions: &mut Vec<Action>) -> Result<(), FrameError> {
+    fn close(&mut self, reason: CloseReason, actions: &mut Vec<Action>) -> Result<(), Error> {
         self.phase = Phase::Closed;
         self.test = None;
         action(actions, Action::Event(Event::Disconnected(reason)))
@@ -1981,7 +1984,7 @@ impl Session {
         now: u64,
         time: &[u8],
         actions: &mut Vec<Action>,
-    ) -> Result<(), FrameError> {
+    ) -> Result<(), Error> {
         self.emit(b"5", &[(58, text)], now, time, actions)?;
         self.close(reason, actions)
     }
@@ -1993,7 +1996,7 @@ impl Session {
         now: u64,
         time: &[u8],
         actions: &mut Vec<Action>,
-    ) -> Result<(), FrameError> {
+    ) -> Result<(), Error> {
         let (sequence, kind) = reference;
         let mut message = self.header(b"3", self.outgoing, time)?;
         message.push(45, sequence.to_string().as_bytes())?;
@@ -2021,7 +2024,7 @@ impl Session {
         now: u64,
         time: &[u8],
         actions: &mut Vec<Action>,
-    ) -> Result<(), FrameError> {
+    ) -> Result<(), Error> {
         if let Some(high) = self.gap_high {
             if self.incoming > high {
                 self.gap_high = None;
@@ -2066,7 +2069,7 @@ impl Session {
         now: u64,
         time: &[u8],
         actions: &mut Vec<Action>,
-    ) -> Result<(), FrameError> {
+    ) -> Result<(), Error> {
         self.emit(b"5", &[], now, time, actions)?;
         self.pending_logout = None;
         self.phase = Phase::LogoutReceived;
@@ -2082,13 +2085,13 @@ impl Session {
     fn receive_inner(
         &mut self,
         message: &Message,
-        fault: Option<&Error>,
+        fault: Option<&FieldFault>,
         now: u64,
         time: &[u8],
         actions: &mut Vec<Action>,
-    ) -> Result<(), FrameError> {
+    ) -> Result<(), Error> {
         if self.phase == Phase::Closed {
-            return Err(FrameError::State);
+            return Err(Error::State);
         }
         let initial = self.initial();
         let kind = message.msg_type();
@@ -2256,7 +2259,7 @@ impl Session {
         let original = read_input!(message.unique(122), 122, 6);
         if duplicate {
             let original = read_input!(
-                original.ok_or(FrameError::Missing(122)).and_then(timestamp),
+                original.ok_or(Error::Missing(122)).and_then(timestamp),
                 122,
                 6
             );
@@ -2486,7 +2489,7 @@ impl Session {
         now: u64,
         time: &[u8],
         actions: &mut Vec<Action>,
-    ) -> Result<(), FrameError> {
+    ) -> Result<(), Error> {
         let (n, _) = reference;
         if self.initial() {
             return self.fatal(CloseReason::Protocol, b"Invalid Logon", now, time, actions);
@@ -2507,10 +2510,10 @@ impl Session {
         now: u64,
         time: &[u8],
         actions: &mut Vec<Action>,
-    ) -> Result<(), FrameError> {
+    ) -> Result<(), Error> {
         let begin = number(message, 7)?;
         let requested_end = number(message, 16)?;
-        let last = self.outgoing.checked_sub(1).ok_or(FrameError::Sequence)?;
+        let last = self.outgoing.checked_sub(1).ok_or(Error::Sequence)?;
         let end = if requested_end == 0 {
             last
         } else {
@@ -2573,11 +2576,11 @@ fn reject_text(reason: u32) -> &'static [u8] {
         _ => b"Invalid message field",
     }
 }
-fn reject_reason(error: FrameError, fallback: u32) -> u32 {
+fn reject_reason(error: Error, fallback: u32) -> u32 {
     match error {
-        FrameError::Missing(_) => 1,
-        FrameError::Duplicate(_) => 13,
-        FrameError::Sequence | FrameError::Limit => 5,
+        Error::Missing(_) => 1,
+        Error::Duplicate(_) => 13,
+        Error::Sequence | Error::Limit => 5,
         _ => fallback,
     }
 }
@@ -2587,38 +2590,38 @@ fn session_tag(tag: u32) -> bool {
 fn admin(kind: &[u8]) -> bool {
     matches!(kind, b"A" | b"0" | b"1" | b"2" | b"3" | b"4" | b"5")
 }
-fn required(message: &Message, tag: u32) -> Result<&[u8], FrameError> {
-    message.unique(tag)?.ok_or(FrameError::Missing(tag))
+fn required(message: &Message, tag: u32) -> Result<&[u8], Error> {
+    message.unique(tag)?.ok_or(Error::Missing(tag))
 }
-fn number(message: &Message, tag: u32) -> Result<u32, FrameError> {
+fn number(message: &Message, tag: u32) -> Result<u32, Error> {
     decimal(required(message, tag)?)
 }
-fn flag(message: &Message, tag: u32) -> Result<bool, FrameError> {
+fn flag(message: &Message, tag: u32) -> Result<bool, Error> {
     match message.unique(tag)? {
         None | Some(b"N") => Ok(false),
         Some(b"Y") => Ok(true),
-        _ => Err(FrameError::Field),
+        _ => Err(Error::Field),
     }
 }
-fn seq(n: u32) -> Result<u32, FrameError> {
+fn seq(n: u32) -> Result<u32, Error> {
     if n == 0 || n == u32::MAX {
-        Err(FrameError::Sequence)
+        Err(Error::Sequence)
     } else {
         Ok(n)
     }
 }
-fn advance(n: u32) -> Result<u32, FrameError> {
-    seq(n.checked_add(1).ok_or(FrameError::Sequence)?)
+fn advance(n: u32) -> Result<u32, Error> {
+    seq(n.checked_add(1).ok_or(Error::Sequence)?)
 }
-fn timestamp(bytes: &[u8]) -> Result<[u32; 7], FrameError> {
+fn timestamp(bytes: &[u8]) -> Result<[u32; 7], Error> {
     if !matches!(bytes.len(), 17 | 21 | 24 | MAX_TIMESTAMP_LENGTH)
         || bytes.get(8) != Some(&b'-')
         || bytes.get(11) != Some(&b':')
         || bytes.get(14) != Some(&b':')
     {
-        return Err(FrameError::Time);
+        return Err(Error::Time);
     }
-    let part = |a, b| decimal(bytes.get(a..b).ok_or(FrameError::Time)?).map_err(|_| FrameError::Time);
+    let part = |a, b| decimal(bytes.get(a..b).ok_or(Error::Time)?).map_err(|_| Error::Time);
     let (year, month, day, hour, minute, second) = (
         part(0, 4)?,
         part(4, 6)?,
@@ -2633,28 +2636,28 @@ fn timestamp(bytes: &[u8]) -> Result<[u32; 7], FrameError> {
         4 | 6 | 9 | 11 => 30,
         2 if leap => 29,
         2 => 28,
-        _ => return Err(FrameError::Time),
+        _ => return Err(Error::Time),
     };
     if year == 0 || day == 0 || day > days || hour > 23 || minute > 59 || second > 60 {
-        return Err(FrameError::Time);
+        return Err(Error::Time);
     }
     let fraction = if bytes.len() == 17 {
         0
     } else {
         if bytes.get(17) != Some(&b'.') {
-            return Err(FrameError::Time);
+            return Err(Error::Time);
         }
         let fraction = part(18, bytes.len())?;
         fraction
             .checked_mul(10u32.pow((MAX_TIMESTAMP_LENGTH - bytes.len()) as u32))
-            .ok_or(FrameError::Time)?
+            .ok_or(Error::Time)?
     };
     Ok([year, month, day, hour, minute, second, fraction])
 }
 
-fn timestamp_nanos(value: [u32; 7]) -> Result<u128, FrameError> {
+fn timestamp_nanos(value: [u32; 7]) -> Result<u128, Error> {
     let [year, month, day, hour, minute, second, fraction] = value;
-    let previous = u128::from(year).checked_sub(1).ok_or(FrameError::Time)?;
+    let previous = u128::from(year).checked_sub(1).ok_or(Error::Time)?;
     let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
     let mut days = previous * 365 + previous / 4 - previous / 100 + previous / 400;
     for m in 1..month {
@@ -2668,7 +2671,7 @@ fn timestamp_nanos(value: [u32; 7]) -> Result<u128, FrameError> {
     days = days
         .checked_add(u128::from(day))
         .and_then(|n| n.checked_sub(1))
-        .ok_or(FrameError::Time)?;
+        .ok_or(Error::Time)?;
     // Four-digit years bound the day count. Checked conversions retain the
     // full nanosecond fraction and handle changes of day, month, and year.
     days.checked_mul(24)
@@ -2679,7 +2682,7 @@ fn timestamp_nanos(value: [u32; 7]) -> Result<u128, FrameError> {
         .and_then(|n| n.checked_add(u128::from(second)))
         .and_then(|n| n.checked_mul(1_000_000_000))
         .and_then(|n| n.checked_add(u128::from(fraction)))
-        .ok_or(FrameError::Time)
+        .ok_or(Error::Time)
 }
 
 #[cfg(test)]
@@ -2953,7 +2956,7 @@ mod tests {
         // An empty data value is refused transactionally, like other empty fields.
         let mut message = Message::new(Version::Fix44, b"0").unwrap();
         let before = message.clone();
-        assert_eq!(message.push_data(95, b""), Err(FrameError::Field));
+        assert_eq!(message.push_data(95, b""), Err(Error::Field));
         assert_eq!(message, before);
     }
 
@@ -3066,7 +3069,7 @@ mod tests {
         }
         assert_eq!(
             timestamp(b"20261006-12:00:00.123456789012"),
-            Err(FrameError::Time)
+            Err(Error::Time)
         );
         assert!(timestamp(b"20261006-12:00:00.123456789").is_ok());
     }
@@ -3486,7 +3489,7 @@ mod tests {
         check_wire::<Message>(&wire);
         check_wire_value(&message);
         assert_eq!(Message::parse(&wire), Ok(message.clone()));
-        assert_eq!(message.push(58, b"x"), Err(FrameError::Limit));
+        assert_eq!(message.push(58, b"x"), Err(Error::Limit));
         let mut frames = Messages::default();
         assert!(matches!(
             frames.decode(&wire, false),
@@ -3590,7 +3593,7 @@ mod tests {
         // Candidate 0 passes its CheckSum and fails only at the late `9=1`.
         assert_eq!(
             Message::parse(&small[..small.len() - 19 * 7]),
-            Err(FrameError::Header)
+            Err(Error::Header)
         );
         check_decode_with_alloc_limit(Messages::default, &small, 2 * MAX_MESSAGE_SIZE);
         let bytes = build(2000, 4000);
@@ -3680,7 +3683,7 @@ mod tests {
         let (messages, failure) = decode_all(Messages::default, &stream);
         assert_eq!(failure, None);
         assert_eq!(messages.len(), 2);
-        assert_eq!(Message::parse(&stream), Err(FrameError::Trailing));
+        assert_eq!(Message::parse(&stream), Err(Error::Trailing));
         check_decode_with_alloc_limit(Messages::default, &stream, 2 * MAX_MESSAGE_SIZE);
     }
 
@@ -3704,7 +3707,7 @@ mod tests {
         }
         let mut corrupted = LOGON.to_vec();
         *corrupted.last_mut().unwrap() = b'0';
-        assert_eq!(Message::parse(&corrupted), Err(FrameError::Checksum));
+        assert_eq!(Message::parse(&corrupted), Err(Error::Checksum));
         for (from, to) in [
             (b"9=65".as_slice(), b"9=64".as_slice()),
             (b"9=65", b"9=66"),
@@ -3765,7 +3768,7 @@ mod tests {
         message.push(95, b"3").unwrap().push(96, b"xx").unwrap();
         check_wire_value(&message);
         let mut out = b"prefix".to_vec();
-        assert_eq!(message.write(&mut out), Err(FrameError::DataLength));
+        assert_eq!(message.write(&mut out), Err(Error::DataLength));
         assert_eq!(out, b"prefix");
         let before = message.clone();
         assert!(message.push(58, &[b'x'; MAX_VALUE_LENGTH + 1]).is_err());
@@ -3893,7 +3896,7 @@ mod tests {
             members: &[1000],
             nested: &[CYCLE],
         }];
-        assert_eq!(check_layout(&CYCLE, 1, &mut 0), Err(FrameError::Limit));
+        assert_eq!(check_layout(&CYCLE, 1, &mut 0), Err(Error::Limit));
     }
 
     #[test]

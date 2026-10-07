@@ -361,7 +361,7 @@ fn standalone_wire_units_are_exact_and_transactional() {
     assert_eq!(diameter::Avp::parse(&bytes[..9]), Ok(avp.clone()));
     assert!(diameter::Avp::parse_list(&bytes[..9]).is_err());
     bytes.push(0);
-    assert_eq!(diameter::Avp::parse(&bytes), Err(diameter::FrameError::Trailing { remaining: 1 }));
+    assert_eq!(diameter::Avp::parse(&bytes), Err(diameter::Error::Trailing { remaining: 1 }));
     refused(&diameter::Address::Other { family: diameter::Address::IPV4, bytes: vec![0; 4] });
 }
 
@@ -518,9 +518,9 @@ fn diameter_bad_avp_keeps_header_and_next_message() {
     bytes[27] = 4;
     let bad = bytes.clone();
     request.avps.clear();
-    let malformed = diameter::Error {
+    let malformed = diameter::AvpFault {
         header: request,
-        error: diameter::FrameError::AvpLength {
+        error: diameter::Error::AvpLength {
             code: 264,
             length: 4,
         },
@@ -565,9 +565,9 @@ fn diameter_too_many_avps_is_a_message_error() {
     next.write(&mut bytes).unwrap();
     let mut stream = Stream::new(diameter::Messages::new());
     assert_eq!(stream.push(&bytes), bytes.len());
-    let malformed = diameter::Error {
+    let malformed = diameter::AvpFault {
         header,
-        error: diameter::FrameError::TooManyAvps,
+        error: diameter::Error::TooManyAvps,
     };
     assert_eq!(
         stream.next_span(),
