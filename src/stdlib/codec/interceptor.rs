@@ -57,7 +57,14 @@ impl<E: fmt::Display> fmt::Display for RewriteError<E> {
         }
     }
 }
-impl<E: Error> Error for RewriteError<E> {}
+impl<E: Error + 'static> Error for RewriteError<E> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Write(e) => Some(e),
+            Self::TooLong { .. } | Self::Allocation | Self::Capacity { .. } => None,
+        }
+    }
+}
 
 /// A stream failure or a refused replacement.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,7 +82,14 @@ impl<D: fmt::Display, W: fmt::Display> fmt::Display for InterceptError<D, W> {
         }
     }
 }
-impl<D: Error, W: Error> Error for InterceptError<D, W> {}
+impl<D: Error + 'static, W: Error + 'static> Error for InterceptError<D, W> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Decode(e) => Some(e),
+            Self::Rewrite(e) => Some(e),
+        }
+    }
+}
 
 /// How bytes consumed without an item reach the output.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

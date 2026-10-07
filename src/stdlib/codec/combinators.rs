@@ -73,7 +73,14 @@ impl<E: fmt::Display> fmt::Display for CollectError<E> {
         }
     }
 }
-impl<E: Error> Error for CollectError<E> {}
+impl<E: Error + 'static> Error for CollectError<E> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Parse(e) => Some(e),
+            Self::TooLong { .. } => None,
+        }
+    }
+}
 impl<M: Wire> Decode for Collect<M> {
     type Item = M;
     type Error = CollectError<M::ParseError>;
@@ -288,7 +295,14 @@ impl<E: fmt::Display> fmt::Display for AssembleError<E> {
         }
     }
 }
-impl<E: Error> Error for AssembleError<E> {}
+impl<E: Error + 'static> Error for AssembleError<E> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Inner(e) => Some(e),
+            Self::TooLong { .. } | Self::Allocation | Self::Incomplete { .. } => None,
+        }
+    }
+}
 /// Joins fragments under one message limit. Control items pass through.
 pub struct Assemble<D, F> {
     inner: D,

@@ -1636,7 +1636,9 @@ impl Session {
                 Some(Ok((item, bytes))) => self.step(item, &bytes),
                 Some(Err(Fail::Protocol(e))) => Err(e),
                 Some(Err(Fail::Truncated { .. })) => Err(size("truncated frame or preface")),
-                Some(Err(Fail::Stuck { .. })) => Err(budget("frame buffer exhausted")),
+                Some(Err(Fail::Stuck { .. } | Fail::Refused { .. })) => {
+                    Err(budget("frame buffer exhausted"))
+                }
                 None if self.frames.is_done() && self.blocks.pending.is_some() => {
                     Err(protocol("incomplete header block at EOF"))
                 }

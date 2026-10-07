@@ -865,7 +865,10 @@ fn demux_refuses_initial_state_and_delivers_item_before_budget_error() {
     assert_eq!(d.push(&1, b"a"), 1);
     assert_eq!(d.next(), Some((1, Ok(()))));
     assert_eq!(d.total(), 0);
-    assert!(matches!(d.next(), Some((1, Err(Fail::Stuck { .. })))));
+    assert!(matches!(
+        d.next(),
+        Some((1, Err(Fail::Refused { limit: 2, .. })))
+    ));
     assert!(d.next().is_none());
     assert_eq!(d.len(), 1);
     assert_eq!(d.push(&1, b"closed"), 6);
@@ -1221,38 +1224,47 @@ fn contract_alloc_limit_rejects_large_buffer() {
     contract::check_decode_with_alloc_limit(|| Frames, &[7, 1, 2, 3, 4, 5, 6, 7], 4);
 }
 #[test]
-fn errors_support_borrowed_details_and_nested_display() {
+fn wrappers_chain_to_their_source_and_display_it() {
     use alloc::string::ToString;
-    #[derive(Debug, Clone)]
-    struct Borrowed<'a>(&'a str);
-    impl fmt::Display for Borrowed<'_> {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str(self.0)
-        }
+    use core::error::Error as _;
+    fn chained(e: &dyn core::error::Error) -> bool {
+        e.source()
+            .is_some_and(|s| s.is::<TestError>() || chained(s))
     }
-    impl core::error::Error for Borrowed<'_> {}
-    fn is_error(_: &impl core::error::Error) {}
-    let detail = alloc::string::String::from("borrowed detail");
-    let fail = Fail::Protocol(Borrowed(&detail));
-    is_error(&fail);
-    is_error(&CollectError::Parse(Borrowed(&detail)));
-    is_error(&AssembleError::Inner(Borrowed(&detail)));
-    is_error(&PipeError::<_, TestError>::Outer(Borrowed(&detail)));
-    is_error(&PumpError::<_, TestError>::Decode(fail.clone()));
-    assert!(fail.to_string().contains(&detail));
-    assert!(
-        !Fail::<TestError>::Truncated { unread: 2 }
-            .to_string()
-            .is_empty()
-    );
-    assert!(
-        !Fail::<TestError>::Stuck {
+    let fail = Fail::Protocol(TestError);
+    assert!(fail.source().is_some_and(|s| s.is::<TestError>()));
+    assert!(chained(&CollectError::Parse(TestError)));
+    assert!(chained(&AssembleError::Inner(TestError)));
+    assert!(chained(&PipeError::<_, TestError>::Outer(TestError)));
+    assert!(chained(&PipeError::<TestError, _>::Inner(fail.clone())));
+    assert!(chained(&PumpError::<_, TestError>::Decode(fail.clone())));
+    assert!(chained(&PumpError::<TestError, _>::Handler(TestError)));
+    assert!(chained(&RewriteError::Write(TestError)));
+    assert!(chained(&FaultError::Rewrite(RewriteError::Write(
+        TestError
+    ))));
+    assert!(chained(&InterceptError::<_, TestError>::Decode(
+        fail.clone()
+    )));
+    assert!(chained(&InterceptError::<TestError, _>::Rewrite(
+        RewriteError::Write(TestError)
+    )));
+    assert!(fail.to_string().contains(&TestError.to_string()));
+    for verdict in [
+        Fail::<TestError>::Truncated { unread: 2 },
+        Fail::Stuck {
             unread: 3,
-            capacity: 3
-        }
-        .to_string()
-        .is_empty()
-    );
+            capacity: 3,
+        },
+        Fail::Refused {
+            unread: 3,
+            limit: 3,
+        },
+    ] {
+        assert!(verdict.source().is_none());
+        assert!(!verdict.to_string().is_empty());
+    }
+    assert!(LineError::BareLf.source().is_none());
 }
 
 #[test]
@@ -1637,7 +1649,10 @@ fn demux_mutable_access_updates_only_its_stream() {
     assert_eq!(d.push(&2, b"b"), 1);
     assert_eq!(d.get_mut(&2).unwrap().push(b"excess"), 6);
     assert_eq!(d.total(), 8);
-    assert!(matches!(d.next(), Some((2, Err(Fail::Stuck { .. })))));
+    assert!(matches!(
+        d.next(),
+        Some((2, Err(Fail::Refused { limit: 4, .. })))
+    ));
     assert_eq!(d.total(), 1);
     d.end(&1);
     assert_eq!(d.next(), Some((1, Ok(Body(b"a".to_vec())))));

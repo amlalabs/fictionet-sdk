@@ -99,6 +99,23 @@ pages (`README.md`, the crate root in `src/lib.rs`, and the top of
 `src/stdlib/mod.rs`) tell one story about the core and do not gain a paragraph
 per protocol.
 
+## Names
+
+A protocol module follows these rules. The `stdlib::codec` module docs give
+each with examples.
+
+- **E1.** One `pub enum Error` per module, for every `Wire` and `Decode` impl in it.
+- **E2.** `FrameError` only where a decoder yields `Result<Unit, Error>`: it is the fault that ends the stream.
+- **E3.** An error the peer sends keeps the protocol's word (`modbus::Exception`, `grpc::Status`).
+- **E4.** No `DecodeError`, `EncodeError`, `ParseError`, `WireError`, `<Unit>ParseError`, `<Unit>Error`, `<Module>Error`.
+- **E5.** The only wrappers are the codec's (`Fail`, `PipeError`, ...). A wrapper returns its inner error from `source()`.
+- **N1.** A `Decode` type is the plural of its item: `Frames` yields `Frame`, `Packets` yields `Packet`.
+- **N2.** A `Wire` type is the specification's word for its unit, with no module prefix (`rtp::Packet`).
+- **N3.** One decoder per direction: the items carry the side (`ClientMessages` yields `ClientMessage`).
+- **N4.** One side of a protocol is `Client` or `Server`, either side is `Session`, and its progress is `Phase`.
+- **N5.** A `Service` is named for what it serves, with `type Decoder` and `type State`.
+- **N6.** `Present` is implemented on the decoder it presents.
+
 ## Performance
 
 `benches/perf.rs` is a performance suite. Each group builds a small world, pushes

@@ -1865,7 +1865,7 @@ fn wire_failure(failure: Fail<Error>) -> Error {
     match failure {
         Fail::Protocol(error) => error,
         Fail::Truncated { .. } => Error::Incomplete,
-        Fail::Stuck { .. } => Error::State,
+        Fail::Stuck { .. } | Fail::Refused { .. } => Error::State,
     }
 }
 

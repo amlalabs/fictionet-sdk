@@ -2,23 +2,36 @@ use super::{Buffer, Decode, Step};
 use core::{error::Error, fmt, ops::Range};
 
 /// Why a stream stopped.
+///
+/// [`Stuck`](Self::Stuck) is a bug in the decoder. [`Refused`](Self::Refused)
+/// is the owner's limit, reached by a decoder that kept its contract.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Fail<E> {
-    /// A terminal decoder error.
+    /// A terminal decoder error. [`source`](Error::source) returns it.
     Protocol(E),
     /// EOF left a partial unit in the input buffer.
     Truncated {
         /// Unread input bytes.
         unread: usize,
     },
-    /// A decoder broke its progress or accounting contract.
-    /// Also covers refused buffer input, including allocation failure,
-    /// and a [`Demux`](super::Demux) shared budget excess.
+    /// The decoder broke the [`Decode`] contract: it consumed more than its
+    /// input, grew held state across [`Step::Need`], returned `Need` at
+    /// capacity, or did not finish its zero-byte steps.
     Stuck {
         /// Unread input bytes at failure.
         unread: usize,
         /// The decoder's stated capacity.
         capacity: usize,
+    },
+    /// The owner refused more input: a buffer limit, an allocation failure,
+    /// a datagram larger than the buffer, or a [`Demux`](super::Demux)
+    /// shared budget.
+    Refused {
+        /// Unread input bytes at failure.
+        unread: usize,
+        /// The limit that refused the input: the buffer's, or the shared
+        /// budget of a `Demux`.
+        limit: usize,
     },
 }
 impl<E: fmt::Display> fmt::Display for Fail<E> {
@@ -30,10 +43,21 @@ impl<E: fmt::Display> fmt::Display for Fail<E> {
                 f,
                 "decoder stuck with {unread} unread bytes (capacity {capacity})"
             ),
+            Self::Refused { unread, limit } => write!(
+                f,
+                "input refused with {unread} unread bytes (limit {limit})"
+            ),
         }
     }
 }
-impl<E: Error> Error for Fail<E> {}
+impl<E: Error + 'static> Error for Fail<E> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Protocol(e) => Some(e),
+            Self::Truncated { .. } | Self::Stuck { .. } | Self::Refused { .. } => None,
+        }
+    }
+}
 
 /// A borrowed observation made before the driver releases bytes.
 /// Ranges use this stream's offsets and saturate at `u64::MAX`.
@@ -144,6 +168,10 @@ impl<D: Decode> Stream<D> {
     pub fn buffered(&self) -> usize {
         self.buf.len()
     }
+    /// The buffer's limit for new input: at least the decoder's capacity.
+    pub fn limit(&self) -> usize {
+        self.buf.limit()
+    }
     /// Bytes of state retained by the decoder, excluding the input buffer.
     pub fn held(&self) -> usize {
         self.dec.held()
@@ -190,6 +218,12 @@ impl<D: Decode> Stream<D> {
         Fail::Stuck {
             unread: self.buf.len(),
             capacity: self.dec.capacity(),
+        }
+    }
+    pub(super) fn refused(&self) -> Fail<D::Error> {
+        Fail::Refused {
+            unread: self.buf.len(),
+            limit: self.buf.limit(),
         }
     }
 }
@@ -359,7 +393,14 @@ impl<E: fmt::Display, H: fmt::Display> fmt::Display for PumpError<E, H> {
         }
     }
 }
-impl<E: Error, H: Error> Error for PumpError<E, H> {}
+impl<E: Error + 'static, H: Error + 'static> Error for PumpError<E, H> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Decode(e) => Some(e),
+            Self::Handler(e) => Some(e),
+        }
+    }
+}
 
 /// Feeds bytes and returns the number accepted from this slice.
 /// Stops at EOF or completion. After `End`, swap decoders and push
@@ -413,7 +454,9 @@ where
             return Ok(taken);
         }
         if n == 0 && s.offset() == before_offset && s.held() >= before_held {
-            let fail = s.stuck();
+            // A decoder at capacity has already failed as Stuck, so the
+            // buffer refused room it had: the allocation failed.
+            let fail = s.refused();
             s.done = true;
             s.failed = Some(fail.clone());
             return Err(PumpError::Decode(fail));

@@ -17,7 +17,7 @@ struct Entry<D: Decode> {
 /// `max_bytes` through this owner's operations. Decoder growth is checked
 /// after each drain. An over-budget stream is released and its key stays
 /// closed until removed. Its last item or protocol error is delivered.
-/// A successful item is followed by [`Fail::Stuck`] on the next visit.
+/// A successful item is followed by [`Fail::Refused`] on the next visit.
 /// Allocator overhead and provenance have separate component limits.
 pub struct Demux<K: Ord, D: Decode, F = fn(&K) -> D> {
     streams: BTreeMap<K, Entry<D>>,
@@ -213,7 +213,10 @@ where
                 .saturating_add(after);
             self.total.set(total);
             if total > self.max_bytes {
-                let failure = stream.stuck();
+                let failure = Fail::Refused {
+                    unread: stream.buffered(),
+                    limit: self.max_bytes,
+                };
                 self.total.set(total.saturating_sub(after));
                 entry.stream = None;
                 return Some((

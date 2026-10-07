@@ -131,7 +131,14 @@ impl<E: fmt::Display> fmt::Display for FaultError<E> {
         }
     }
 }
-impl<E: Error> Error for FaultError<E> {}
+impl<E: Error + 'static> Error for FaultError<E> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Rewrite(e) => Some(e),
+            Self::HeldLimit { .. } => None,
+        }
+    }
+}
 impl<E> From<RewriteError<E>> for FaultError<E> {
     fn from(error: RewriteError<E>) -> Self {
         Self::Rewrite(error)

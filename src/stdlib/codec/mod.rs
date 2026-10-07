@@ -74,6 +74,52 @@
 //! assert_eq!(items, vec![Layered::Inner(Body(b"hello".to_vec()))]);
 //! # Ok::<(), Box<dyn core::error::Error>>(())
 //! ```
+//!
+//! # Errors and names in a codec module
+//!
+//! Every protocol module in [`stdlib`](super) follows these rules, and a
+//! copy you own reads best if it keeps them.
+//!
+//! - **E1.** A module has one `pub enum Error`. It is the `ParseError` and
+//!   `WriteError` of each [`Wire`] type, the [`Decode::Error`] of each
+//!   decoder, and the `E` in an `Item = Result<T, E>`. Its variants name
+//!   the clause of the specification. A writer that cannot fail uses
+//!   [`Infallible`](core::convert::Infallible).
+//! - **E2.** A decoder that yields `Result<Unit, Error>`, so a bad unit
+//!   does not end the stream, reports the fault that does end it as
+//!   `FrameError`, its `Decode::Error`. A module without that split has
+//!   no `FrameError`.
+//! - **E3.** An error the peer sends is a wire value and keeps the
+//!   protocol's word: `modbus::Exception`, `grpc::Status`,
+//!   `kerberos::KrbError`. E1 does not count it.
+//! - **E4.** No `DecodeError`, `EncodeError`, `ParseError`, `WireError`,
+//!   `<Unit>ParseError`, `<Unit>Error`, `<Module>Error`, `Malformed` or
+//!   `Unwritable`.
+//! - **E5.** The wrappers are this module's: [`Fail`], [`PumpError`],
+//!   [`CollectError`], [`AssembleError`], [`PipeError`], [`LineError`],
+//!   [`InterceptError`], [`RewriteError`] and [`FaultError`]. A protocol
+//!   module adds none. An error that wraps another returns it from
+//!   [`source`](Error::source).
+//! - **N1.** A [`Decode`] type is the plural of its item: `Frames` yields
+//!   `Frame`, `Packets` yields `Packet`, and a `Result<T, E>` item counts
+//!   as `T`. A raw-bytes item takes the protocol's word for its unit. A
+//!   decoder that yields one message head and then ends is `Head`.
+//! - **N2.** A [`Wire`] type takes the specification's word for its unit,
+//!   with no module prefix: `rtp::Packet`, not `rtp::RtpPacket`. Names the
+//!   specification gives (`LdapResult`) stay, and so do prefixed names
+//!   whose bare form clashes with the prelude (`CoapOption`).
+//! - **N3.** With one decoder for each direction, the items carry the side
+//!   and the decoders follow N1 (`ClientMessage`, `ClientMessages`). When
+//!   both directions yield the same item, one decoder has a constructor
+//!   for each side (`Frames::client_side()`).
+//! - **N4.** A state machine for one side of a protocol is `Client` or
+//!   `Server`, one that plays either side is `Session`, and its progress
+//!   enum is `Phase`. `Connection` names only the byte-stream trait.
+//! - **N5.** A [`Service`](super::serve::Service) is named for what it
+//!   serves, with no suffix. Its associated types are `Decoder` and
+//!   `State`.
+//! - **N6.** [`Present`](crate::observe::Present) is implemented on the
+//!   decoder it presents.
 
 extern crate alloc;
 
@@ -125,7 +171,10 @@ pub enum Step<T> {
 ///
 /// Counts must not exceed the input length. `Need` must not grow held
 /// state or change later results. Chunk boundaries must not change items.
-/// At capacity, a call must progress or fail. Zero-byte steps must finish
+/// At capacity, a call must progress or fail. After a call, the capacity
+/// must be at least the length of the input that call read, consumed bytes
+/// included. So a decoder lowers its capacity only on a call whose input
+/// fits the new value. Zero-byte steps must finish
 /// work bounded by held state within each `next` call. Composite steps can
 /// move or expand that state. Each step need not reduce [`held`](Self::held).
 /// EOF must terminate. An error is terminal. Driving a stream requires
@@ -134,12 +183,14 @@ pub enum Step<T> {
 pub trait Decode {
     /// An owned decoded unit. Recoverable unit errors belong here.
     type Item;
-    /// A fault that ends framing of this stream.
-    type Error: Error;
+    /// A fault that ends framing of this stream. It owns its details, so
+    /// a wrapper can return it from [`source`](Error::source).
+    type Error: Error + 'static;
     /// A short name for logs and observation layers.
     const NAME: &'static str;
     /// The most unread bytes needed to make progress or report an error.
-    /// This must fit within [`Buffer::MAX_LIMIT`].
+    /// This must fit within [`Buffer::MAX_LIMIT`]. After each call it must
+    /// be at least the length of the input that call read.
     fn capacity(&self) -> usize;
     /// Reads the stable unread suffix. `eof` means no more bytes will arrive.
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Self::Item>, Self::Error>;
@@ -162,10 +213,12 @@ pub trait Decode {
 /// must parse as the same value. An unsuccessful write must leave the
 /// destination unchanged. Context-dependent formats use ordinary functions.
 pub trait Wire: Sized {
-    /// Why a complete byte slice is not a value.
-    type ParseError: Error;
-    /// Why a value cannot be represented on the wire.
-    type WriteError: Error;
+    /// Why a complete byte slice is not a value. Owned, like
+    /// [`Decode::Error`].
+    type ParseError: Error + 'static;
+    /// Why a value cannot be represented on the wire. Owned, like
+    /// [`Decode::Error`].
+    type WriteError: Error + 'static;
     /// Reads all bytes. Trailing bytes are an error.
     fn parse(b: &[u8]) -> Result<Self, Self::ParseError>;
     /// Appends the value's bytes, leaving `out` unchanged on error.

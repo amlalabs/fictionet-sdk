@@ -91,9 +91,11 @@
 //!   on standard error ([`PanicNote`]).
 //! - **Progress, not stalls.** Bytes the decoder takes count as progress,
 //!   whether or not they make an item, so a decoder that skips a long run
-//!   of bytes is never mistaken for a stuck one. A decoder that can take
-//!   nothing more and yields nothing fails with
-//!   [`Fail::Stuck`], which [`Service::on_fail`] hears.
+//!   of bytes is never mistaken for a stuck one. A decoder that breaks
+//!   the [`Decode`] contract fails with
+//!   [`Fail::Stuck`]. Input the buffer cannot take (a failed allocation,
+//!   a datagram larger than the buffer) fails with [`Fail::Refused`].
+//!   [`Service::on_fail`] hears both.
 //! - **Timers.** [`ServeCtx::set_timer`] arms a named timer; several can
 //!   run at once. Each counts from when the call's reply is written. A due
 //!   timer is handled before more input is read, so a client that never
@@ -870,6 +872,7 @@ impl Transcript {
                     Fail::Protocol(e) => Fail::Protocol(e.to_string()),
                     Fail::Truncated { unread } => Fail::Truncated { unread: *unread },
                     Fail::Stuck { unread, capacity } => Fail::Stuck { unread: *unread, capacity: *capacity },
+                    Fail::Refused { unread, limit } => Fail::Refused { unread: *unread, limit: *limit },
                 };
                 recorder.observe_tagged(tag, direction, StreamEvent::Failed { error: &error, bytes, range });
             }
@@ -1886,8 +1889,10 @@ where
                 return Next::Sleep(d);
             }
             if !self.queue.is_empty() {
-                // The decoder took nothing and yielded nothing.
-                let fail = Fail::Stuck { unread: self.stream.buffered(), capacity: self.stream.decoder().capacity() };
+                // The buffer took nothing and the decoder yielded nothing: a
+                // decoder at capacity has already failed as Stuck, so the
+                // allocation failed.
+                let fail = Fail::Refused { unread: self.stream.buffered(), limit: self.stream.limit() };
                 self.failed(service, state, now, fail);
                 return Next::Again;
             }
@@ -2646,7 +2651,7 @@ where
                 None => {
                     if taken < datagram.len() {
                         // Longer than the decoder could hold at once.
-                        let fail = Fail::Stuck { unread: datagram.len(), capacity: stream.decoder().capacity() };
+                        let fail = Fail::Refused { unread: datagram.len(), limit: stream.limit() };
                         s.unread = datagram.clone();
                         let flow = called(&mut s, &timers, &mut socket, &info, &mut |ctx| service.on_fail(&fail, state, ctx).map(|()| Flow::Close));
                         s.unread = Vec::new();

@@ -159,11 +159,12 @@ impl std::error::Error for FrameError {}
 
 /// The status a server sends when a message stream fails.
 /// Protocol failures use [`FrameError::to_status`]. A truncated message,
-/// including a partial length prefix, or a stalled decoder gives `INTERNAL`.
+/// including a partial length prefix, a stalled decoder, or refused input
+/// gives `INTERNAL`.
 pub fn fail_status(fail: &codec::Fail<FrameError>) -> Status {
     match fail {
         codec::Fail::Protocol(error) => error.to_status(),
-        codec::Fail::Truncated { .. } | codec::Fail::Stuck { .. } => {
+        codec::Fail::Truncated { .. } | codec::Fail::Stuck { .. } | codec::Fail::Refused { .. } => {
             Status::new(Code::Internal, &fail.to_string())
         }
     }

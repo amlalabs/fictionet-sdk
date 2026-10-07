@@ -158,6 +158,10 @@ fn drain<D: Decode>(
             }
             Err(e) => {
                 assert!(!matches!(e, Fail::Stuck { .. }), "driver reported Stuck");
+                assert!(
+                    !matches!(e, Fail::Refused { .. }),
+                    "driver reported Refused"
+                );
                 assert!(out.failure.is_none(), "error reported more than once");
                 out.failure = Some(e);
             }

@@ -228,7 +228,15 @@ impl<OE: fmt::Display, IE: fmt::Display> fmt::Display for PipeError<OE, IE> {
         }
     }
 }
-impl<OE: Error, IE: Error> Error for PipeError<OE, IE> {}
+impl<OE: Error + 'static, IE: Error + 'static> Error for PipeError<OE, IE> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Outer(e) => Some(e),
+            Self::Inner(e) => Some(e),
+            Self::PayloadTooLong { .. } => None,
+        }
+    }
+}
 /// Feeds selected outer payloads into one continuous inner stream.
 /// Inner items can cross payload boundaries. A staged payload is fully
 /// admitted before another outer item is decoded. The inner stream sees
@@ -370,7 +378,7 @@ where
             }
             let after = self.inner.buffered().saturating_add(self.inner.held());
             if n == 0 && self.inner.offset() == offset && after >= before {
-                return Err(PipeError::Inner(self.inner.stuck()));
+                return Err(PipeError::Inner(self.inner.refused()));
             }
         }
         if self.outer_ended {

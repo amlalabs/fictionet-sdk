@@ -51,6 +51,7 @@ fuzz_target!(|data: &[u8]| {
             assert_eq!(EncodedMessage::parse(rest), Err(Error::Truncated));
         }
         Some(Fail::Stuck { .. }) => panic!("message decoder made no progress"),
+        Some(Fail::Refused { .. }) => panic!("stream refused input"),
         None => assert!(rest.is_empty()),
     }
     macro_rules! values {

@@ -365,9 +365,9 @@ where
     }
 
     fn refuse(&mut self, packet: &mut Decoded) {
-        let error = Fail::Stuck {
+        let error = Fail::Refused {
             unread: self.stream.buffered(),
-            capacity: self.stream.decoder().capacity(),
+            limit: self.stream.limit(),
         };
         D::error(&error, packet);
         self.refused = Some(error);
@@ -450,7 +450,7 @@ mod tests {
         // Exercise refusal without depending on an allocator failure.
         observed.refuse(&mut packet);
         assert!(packet.tags.is_empty());
-        assert!(matches!(observed.failed(), Some(Fail::Stuck { .. })));
+        assert!(matches!(observed.failed(), Some(Fail::Refused { .. })));
         assert!(observed.is_done());
         assert!(!observed.waiting());
         observed.data(b"y", Place::default(), &mut packet);
