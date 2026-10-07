@@ -8,7 +8,7 @@ use fictionet::stdlib::codec::{
     test_support::decode_all,
 };
 use fictionet::stdlib::soupbintcp::{
-    Action, Alpha, Client, Frames, Login, MAX_PACKET, Packet, Server, Timers,
+    Action, Alpha, Client, Login, MAX_PACKET, Packet, Packets, Server, Timers,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -42,13 +42,13 @@ fuzz_target!(|input: &[u8]| {
     if let Ok(packet) = Packet::parse_body(data) {
         check_wire_value(&packet);
     }
-    check_decode(Frames::default, data);
+    check_decode(Packets::default, data);
     check_decode_with_alloc_limit(
-        || Frames::with_limit(SMALL_LIMIT),
+        || Packets::with_limit(SMALL_LIMIT),
         data,
         2 * (SMALL_LIMIT + 3),
     );
-    let (frames, _) = decode_all(Frames::default, data);
+    let (frames, _) = decode_all(Packets::default, data);
 
     // A logged-in client and server each read every frame, with time
     // taken from the frame bytes.

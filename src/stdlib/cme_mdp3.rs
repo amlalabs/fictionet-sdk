@@ -24869,33 +24869,10 @@ pub const MAX_PACKET: usize = 65_507;
 /// size field and the eight-byte SBE message header.
 pub const MAX_PACKET_MESSAGES: usize = (MAX_PACKET - PACKET_HEADER) / 10;
 
-/// Why a packet or a size-prefixed message was refused.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PacketError {
-    /// Input ended within the packet header, a size field, or a message.
-    Truncated,
-    /// A `MsgSize` is below two, the size of the field itself.
-    Size,
-    /// A packet exceeds [`MAX_PACKET`] or [`MAX_PACKET_MESSAGES`], or a
-    /// message does not fit a two-byte size.
-    Limit,
-    /// The generated code refused a message.
-    Message(Error),
-}
-impl std::fmt::Display for PacketError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Message(e) => write!(f, "MDP 3.0 message: {e}"),
-            other => write!(f, "MDP 3.0 packet: {other:?}"),
-        }
-    }
-}
-impl std::error::Error for PacketError {}
-impl From<Error> for PacketError {
-    fn from(e: Error) -> Self {
-        Self::Message(e)
-    }
-}
+// Packets and messages share the generated `Error`. A packet or message
+// past a limit is `Error::Limit`, input that ends within a packet header,
+// a size field, or a message is `Error::Truncated`, and a `MsgSize` below
+// two, which cannot hold the field itself, is `Error::Layout`.
 
 /// The binary packet header that starts every MDP 3.0 UDP packet.
 /// Both fields are little-endian.
@@ -24918,38 +24895,38 @@ pub struct Packet {
 }
 
 impl fictionet::stdlib::codec::Wire for Packet {
-    type ParseError = PacketError;
-    type WriteError = PacketError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads one whole datagram. Refuses packets over [`MAX_PACKET`], a
     /// truncated header or message, sizes below two, and every message the
     /// generated [`Message`] refuses.
-    fn parse(bytes: &[u8]) -> Result<Self, PacketError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         use fictionet::stdlib::codec::{Decode, Step};
         if bytes.len() > MAX_PACKET {
-            return Err(PacketError::Limit);
+            return Err(Error::Limit);
         }
-        let header = bytes.get(..PACKET_HEADER).ok_or(PacketError::Truncated)?;
+        let header = bytes.get(..PACKET_HEADER).ok_or(Error::Truncated)?;
         let (sequence, sending_time) = header.split_at(4);
         let header = PacketHeader {
-            sequence: u32::from_le_bytes(sequence.try_into().map_err(|_| PacketError::Truncated)?),
+            sequence: u32::from_le_bytes(sequence.try_into().map_err(|_| Error::Truncated)?),
             sending_time: u64::from_le_bytes(
                 sending_time
                     .try_into()
-                    .map_err(|_| PacketError::Truncated)?,
+                    .map_err(|_| Error::Truncated)?,
             ),
         };
         let mut rest = bytes.get(PACKET_HEADER..).unwrap_or_default();
         let mut messages = Vec::new();
         while !rest.is_empty() {
             if messages.len() >= MAX_PACKET_MESSAGES {
-                return Err(PacketError::Limit);
+                return Err(Error::Limit);
             }
-            let Step::Item(message, used) = Frames.decode(rest, true)? else {
-                return Err(PacketError::Truncated);
+            let Step::Item(message, used) = Messages.decode(rest, true)? else {
+                return Err(Error::Truncated);
             };
             messages.push(message);
-            rest = rest.get(used..).ok_or(PacketError::Truncated)?;
+            rest = rest.get(used..).ok_or(Error::Truncated)?;
         }
         Ok(Self { header, messages })
     }
@@ -24957,21 +24934,21 @@ impl fictionet::stdlib::codec::Wire for Packet {
     /// Appends the packet. Refuses more than [`MAX_PACKET_MESSAGES`]
     /// messages, packets over [`MAX_PACKET`], and every message the
     /// generated [`Message`] refuses. Errors leave `out` unchanged.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), PacketError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         if self.messages.len() > MAX_PACKET_MESSAGES {
-            return Err(PacketError::Limit);
+            return Err(Error::Limit);
         }
         let mut packet = Vec::new();
         packet.extend_from_slice(&self.header.sequence.to_le_bytes());
         packet.extend_from_slice(&self.header.sending_time.to_le_bytes());
         for message in &self.messages {
-            Frames::write(message, &mut packet)?;
+            Messages::write(message, &mut packet)?;
             if packet.len() > MAX_PACKET {
-                return Err(PacketError::Limit);
+                return Err(Error::Limit);
             }
         }
         out.try_reserve(packet.len())
-            .map_err(|_| PacketError::Limit)?;
+            .map_err(|_| Error::Limit)?;
         out.extend_from_slice(&packet);
         Ok(())
     }
@@ -24980,29 +24957,29 @@ impl fictionet::stdlib::codec::Wire for Packet {
 /// Size-prefixed messages, the layout of a packet after its header.
 /// Each `MsgSize` counts its own two bytes.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct Frames;
-impl Frames {
+pub struct Messages;
+impl Messages {
     /// Appends a size and a message. Refuses messages that do not fit a
     /// two-byte size and every message [`Message`] refuses. Errors leave
     /// `out` unchanged.
-    pub fn write(message: &Message, out: &mut Vec<u8>) -> Result<(), PacketError> {
+    pub fn write(message: &Message, out: &mut Vec<u8>) -> Result<(), Error> {
         use fictionet::stdlib::codec::Wire;
         let body = message.to_bytes()?;
         let size = body
             .len()
             .checked_add(MESSAGE_SIZE)
             .and_then(|n| u16::try_from(n).ok())
-            .ok_or(PacketError::Limit)?;
+            .ok_or(Error::Limit)?;
         out.try_reserve(usize::from(size))
-            .map_err(|_| PacketError::Limit)?;
+            .map_err(|_| Error::Limit)?;
         out.extend_from_slice(&size.to_le_bytes());
         out.extend_from_slice(&body);
         Ok(())
     }
 }
-impl fictionet::stdlib::codec::Decode for Frames {
+impl fictionet::stdlib::codec::Decode for Messages {
     type Item = Message;
-    type Error = PacketError;
+    type Error = Error;
     const NAME: &'static str = "CME MDP 3.0";
 
     fn capacity(&self) -> usize {
@@ -25016,14 +24993,14 @@ impl fictionet::stdlib::codec::Decode for Frames {
         &mut self,
         input: &[u8],
         _eof: bool,
-    ) -> Result<fictionet::stdlib::codec::Step<Message>, PacketError> {
+    ) -> Result<fictionet::stdlib::codec::Step<Message>, Error> {
         use fictionet::stdlib::codec::{Step, Wire};
         let Some(&[low, high]) = input.get(..MESSAGE_SIZE) else {
             return Ok(Step::Need);
         };
         let size = usize::from(u16::from_le_bytes([low, high]));
         if size < MESSAGE_SIZE {
-            return Err(PacketError::Size);
+            return Err(Error::Layout);
         }
         let Some(body) = input.get(MESSAGE_SIZE..size) else {
             return Ok(Step::Need);
@@ -25061,15 +25038,15 @@ mod framing_tests {
         );
         assert_eq!(Packet::parse(&bytes).unwrap(), packet);
         for (at, error) in [
-            (12, PacketError::Size),
-            (16, PacketError::Message(Error::Header)),
+            (12, Error::Layout),
+            (16, Error::Header),
         ] {
             let mut bad = bytes.clone();
             bad[at] = if at == 12 { 1 } else { 13 };
             assert_eq!(Packet::parse(&bad), Err(error));
         }
-        assert_eq!(Packet::parse(&bytes[..21]), Err(PacketError::Truncated));
-        assert_eq!(Packet::parse(&bytes[..11]), Err(PacketError::Truncated));
+        assert_eq!(Packet::parse(&bytes[..21]), Err(Error::Truncated));
+        assert_eq!(Packet::parse(&bytes[..11]), Err(Error::Truncated));
     }
 
     #[test]
@@ -25078,12 +25055,12 @@ mod framing_tests {
         let mut messages = Vec::new();
         for seed in 0..64 {
             if let Some(message) = sample(seed) {
-                Frames::write(&message, &mut stream).unwrap();
+                Messages::write(&message, &mut stream).unwrap();
                 messages.push(message);
             }
         }
         assert!(messages.len() > 32);
-        contract::check_decode_with_alloc_limit(|| Frames, &stream, 4 * usize::from(u16::MAX));
+        contract::check_decode_with_alloc_limit(|| Messages, &stream, 4 * usize::from(u16::MAX));
         let packet = Packet {
             header: PacketHeader {
                 sequence: 1,
@@ -25099,13 +25076,13 @@ mod framing_tests {
             let at = rng.index(mutated.len());
             mutated[at] = rng.next() as u8;
             contract::check_wire::<Packet>(&mutated);
-            contract::check_decode(|| Frames, &mutated[PACKET_HEADER..]);
+            contract::check_decode(|| Messages, &mutated[PACKET_HEADER..]);
         }
         let mut too_many = packet.clone();
         too_many.messages =
             vec![Message::AdminHeartbeat12(AdminHeartbeat12 {}); MAX_PACKET_MESSAGES + 1];
         let mut out = vec![3];
-        assert_eq!(too_many.write(&mut out), Err(PacketError::Limit));
+        assert_eq!(too_many.write(&mut out), Err(Error::Limit));
         assert_eq!(out, [3]);
     }
 }

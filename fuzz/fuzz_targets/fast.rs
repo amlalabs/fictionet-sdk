@@ -56,18 +56,18 @@ fuzz_target!(|data: &[u8]| {
         2 * (MAX_MESSAGE_BYTES + MAX_INTEGER_BYTES),
     );
     check_decode_with_alloc_limit(
-        || BlockFrames::new(Frames::new(templates.clone())),
+        || BlockMessages::new(Messages::new(templates.clone())),
         input,
         2 * MAX_MESSAGE_BYTES,
     );
     check_decode_with_alloc_limit(
-        || Frames::new(templates.clone()),
+        || Messages::new(templates.clone()),
         input,
         2 * MAX_MESSAGE_BYTES,
     );
-    let (messages, _) = decode_all(|| Frames::new(templates.clone()), input);
+    let (messages, _) = decode_all(|| Messages::new(templates.clone()), input);
     let mut encoder = Encoder::new(templates.clone());
-    let mut decoder = Frames::new(templates.clone());
+    let mut decoder = Messages::new(templates.clone());
     for message in messages {
         let mut bytes = Vec::new();
         encoder
@@ -105,7 +105,7 @@ fuzz_target!(|data: &[u8]| {
                 UInt32(id).write(&mut bytes).expect("integer");
                 bytes.extend_from_slice(input.get(..input.len().min(128)).unwrap_or_default());
                 check_decode_with_alloc_limit(
-                    || Frames::new(t.clone()),
+                    || Messages::new(t.clone()),
                     &bytes,
                     2 * MAX_MESSAGE_BYTES,
                 );

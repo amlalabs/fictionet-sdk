@@ -12,7 +12,7 @@
 //! Every packet is a two-byte big-endian length, one type byte and a payload
 //! (1.1). The length counts the type byte and the payload. [`Packet`] is one
 //! whole packet, length prefix included, read and written through
-//! [`Wire`]. [`Frames`] reads packets from a byte stream for a
+//! [`Wire`]. [`Packets`] reads packets from a byte stream for a
 //! [`Stream`](fictionet::stdlib::codec::Stream). A packet that frames but
 //! does not parse is an item (`Err`), so a session can close the
 //! connection as it chooses.
@@ -28,7 +28,7 @@
 //! ```
 //! use fictionet::stdlib::codec::{Stream, Wire};
 //! use fictionet::stdlib::soupbintcp::{
-//!     Action, Alpha, Client, Event, Frames, Login, Packet, Server, Timers,
+//!     Action, Alpha, Client, Event, Login, Packet, Packets, Server, Timers,
 //! };
 //!
 //! let login = Login {
@@ -47,7 +47,7 @@
 //!         packet.write(&mut wire)?;
 //!     }
 //! }
-//! let mut frames = Stream::new(Frames::default());
+//! let mut frames = Stream::new(Packets::default());
 //! assert_eq!(frames.push(&wire), wire.len());
 //! let frame = frames.next().unwrap().unwrap();
 //! let actions = server.receive_frame(&frame, 10)?;
@@ -103,7 +103,7 @@ pub enum Error {
     /// The length prefix disagrees with the bytes, or with the fixed size
     /// of the packet's type.
     Length,
-    /// A payload is longer than [`MAX_PAYLOAD`] or a [`Frames`] limit.
+    /// A payload is longer than [`MAX_PAYLOAD`] or a [`Packets`] limit.
     TooLong,
     /// An unknown packet type byte.
     Type(u8),
@@ -458,9 +458,9 @@ impl Wire for Packet {
 ///
 /// ```
 /// use fictionet::stdlib::codec::{finish, pump, Stream};
-/// use fictionet::stdlib::soupbintcp::{Frames, Packet};
+/// use fictionet::stdlib::soupbintcp::{Packet, Packets};
 ///
-/// let mut stream = Stream::new(Frames::default());
+/// let mut stream = Stream::new(Packets::default());
 /// let mut packets = Vec::new();
 /// // A server heartbeat, then sequenced data "hi", split across reads.
 /// pump(&mut stream, &[0, 1, b'H', 0, 3], |p| packets.push(p))?;
@@ -470,10 +470,10 @@ impl Wire for Packet {
 /// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::soupbintcp::Error>>(())
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Frames {
+pub struct Packets {
     limit: usize,
 }
-impl Frames {
+impl Packets {
     /// A framer that accepts payloads up to `limit` bytes, at most
     /// [`MAX_PAYLOAD`].
     pub fn with_limit(limit: usize) -> Self {
@@ -486,13 +486,13 @@ impl Frames {
         self.limit
     }
 }
-impl Default for Frames {
+impl Default for Packets {
     /// Accepts every payload the length field can describe.
     fn default() -> Self {
         Self::with_limit(MAX_PAYLOAD)
     }
 }
-impl Decode for Frames {
+impl Decode for Packets {
     type Item = Result<Packet, Error>;
     type Error = Error;
     const NAME: &'static str = "SoupBinTCP";
@@ -655,7 +655,7 @@ pub enum ClientState {
 /// The client side of one SoupBinTCP connection, without I/O.
 ///
 /// Pass every packet read from the connection to [`receive`](Self::receive)
-/// (or each [`Frames`] item to [`receive_frame`](Self::receive_frame)),
+/// (or each [`Packets`] item to [`receive_frame`](Self::receive_frame)),
 /// call [`tick`](Self::tick) at least every few hundred milliseconds, and
 /// write every [`Action::Send`] packet in order. Packets returned directly
 /// ([`send`](Self::send), [`debug`](Self::debug)) must be written too:
@@ -720,7 +720,7 @@ impl Client {
         *self = s;
         Ok(actions)
     }
-    /// [`receive`](Self::receive) for a [`Frames`] item. A packet that did
+    /// [`receive`](Self::receive) for a [`Packets`] item. A packet that did
     /// not parse closes the session with [`CloseReason::Protocol`].
     pub fn receive_frame(
         &mut self,
@@ -928,7 +928,7 @@ impl Server {
         *self = s;
         Ok(actions)
     }
-    /// [`receive`](Self::receive) for a [`Frames`] item. A packet that did
+    /// [`receive`](Self::receive) for a [`Packets`] item. A packet that did
     /// not parse closes the session with [`CloseReason::Protocol`].
     pub fn receive_frame(
         &mut self,
@@ -1260,9 +1260,9 @@ mod tests {
     #[test]
     fn frames_follow_the_contract() {
         let bytes = stream_of(&every_packet());
-        check_decode(Frames::default, &bytes);
-        check_decode_with_alloc_limit(|| Frames::with_limit(64), &bytes, 2 * (64 + 3));
-        let (items, failure) = decode_all(Frames::default, &bytes);
+        check_decode(Packets::default, &bytes);
+        check_decode_with_alloc_limit(|| Packets::with_limit(64), &bytes, 2 * (64 + 3));
+        let (items, failure) = decode_all(Packets::default, &bytes);
         assert!(failure.is_none());
         assert_eq!(
             items,
@@ -1274,8 +1274,8 @@ mod tests {
     fn frames_pass_unparsed_packets_as_items() {
         let mut bytes = vec![0, 0, 0, 1, b'Q', 0, 2, b'H', 0];
         Packet::ServerHeartbeat.write(&mut bytes).unwrap();
-        check_decode(Frames::default, &bytes);
-        let (items, failure) = decode_all(Frames::default, &bytes);
+        check_decode(Packets::default, &bytes);
+        let (items, failure) = decode_all(Packets::default, &bytes);
         assert!(failure.is_none());
         assert_eq!(
             items,
@@ -1290,16 +1290,16 @@ mod tests {
 
     #[test]
     fn frames_refuse_over_limit_from_the_prefix() {
-        let mut s = Stream::new(Frames::with_limit(4));
+        let mut s = Stream::new(Packets::with_limit(4));
         assert_eq!(s.push(&[0, 6]), 2);
         assert_eq!(s.next(), Some(Err(Fail::Protocol(Error::TooLong))));
-        let mut s = Stream::new(Frames::with_limit(4));
+        let mut s = Stream::new(Packets::with_limit(4));
         assert_eq!(s.push(&[0, 5, b'S', 1, 2, 3, 4]), 7);
         assert_eq!(
             s.next(),
             Some(Ok(Ok(Packet::SequencedData(vec![1, 2, 3, 4]))))
         );
-        let (_, failure) = decode_all(Frames::default, &[0, 3, b'S', 1]);
+        let (_, failure) = decode_all(Packets::default, &[0, 3, b'S', 1]);
         assert_eq!(failure, Some(Fail::Truncated { unread: 4 }));
     }
 
@@ -1313,8 +1313,8 @@ mod tests {
                 mutate(&mut rng, &mut bytes);
             }
             check_wire::<Packet>(&bytes);
-            check_decode_with_alloc_limit(|| Frames::with_limit(256), &bytes, 2 * 259);
-            let (items, _) = decode_all(Frames::default, &bytes);
+            check_decode_with_alloc_limit(|| Packets::with_limit(256), &bytes, 2 * 259);
+            let (items, _) = decode_all(Packets::default, &bytes);
             for item in items.into_iter().flatten() {
                 check_wire_value(&item);
             }
