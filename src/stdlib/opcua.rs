@@ -2067,7 +2067,7 @@ impl Chunk {
     /// `b` holds only part of a chunk, and otherwise the chunk and how many
     /// bytes it took. A bad type is found from the first bytes, and a bad
     /// size from the header, before the rest comes.
-    pub fn parse(b: &[u8], limits: &Limits) -> Result<Option<(Chunk, usize)>, ChunkError> {
+    pub fn parse_prefix(b: &[u8], limits: &Limits) -> Result<Option<(Chunk, usize)>, ChunkError> {
         if b.len() < 3 {
             return Ok(None);
         }
@@ -2114,7 +2114,7 @@ impl Chunk {
 }
 
 /// Why an exact [`Wire`] parse did not read one complete chunk.
-/// [`Chunk::parse`] reads a prefix under caller-supplied limits and returns
+/// [`Chunk::parse_prefix`] reads a prefix under caller-supplied limits and returns
 /// the bytes used.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChunkParseError {
@@ -2162,7 +2162,7 @@ impl Wire for Chunk {
             receive_buffer_size: MAX_BUFFER_SIZE,
             ..Limits::default()
         };
-        match Self::parse(b, &limits).map_err(ChunkParseError::Chunk)? {
+        match Self::parse_prefix(b, &limits).map_err(ChunkParseError::Chunk)? {
             Some((chunk, used)) if used == b.len() => Ok(chunk),
             Some(_) => Err(ChunkParseError::Trailing),
             None => Err(ChunkParseError::Truncated),
@@ -2255,7 +2255,7 @@ impl Decode for Frames {
     /// invalid type bytes, [`ChunkError::TooSmall`] below the header size,
     /// and [`ChunkError::TooLarge`] above the negotiated limit.
     fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Chunk>, ChunkError> {
-        Ok(match Chunk::parse(input, &self.limits)? {
+        Ok(match Chunk::parse_prefix(input, &self.limits)? {
             Some((chunk, used)) => Step::Item(chunk, used),
             None => Step::Need,
         })
@@ -2943,7 +2943,7 @@ impl Decode for Messages {
     /// [`ChunkError::MessageTooLarge`] or [`ChunkError::TooManyChunks`].
     /// EOF during assembly returns [`ChunkError::Incomplete`].
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Message>, ChunkError> {
-        match Chunk::parse(input, &self.limits)? {
+        match Chunk::parse_prefix(input, &self.limits)? {
             Some((chunk, used)) => Ok(match self.take(chunk)? {
                 Some(message) => Step::Item(message, used),
                 None => Step::Skip(used),
@@ -4364,37 +4364,37 @@ mod tests {
     fn chunk_header_errors() {
         let l = Limits::default();
         assert_eq!(
-            Chunk::parse(b"GET", &l),
+            Chunk::parse_prefix(b"GET", &l),
             Err(ChunkError::MessageType(*b"GET"))
         );
-        assert_eq!(Chunk::parse(b"HE", &l), Ok(None));
+        assert_eq!(Chunk::parse_prefix(b"HE", &l), Ok(None));
         // The fourth byte of a HEL, ACK, ERR or RHE is reserved and ignored.
-        assert_eq!(Chunk::parse(b"HELC", &l), Ok(None));
+        assert_eq!(Chunk::parse_prefix(b"HELC", &l), Ok(None));
         assert_eq!(
-            Chunk::parse(b"OPNC", &l),
+            Chunk::parse_prefix(b"OPNC", &l),
             Err(ChunkError::ChunkType(MessageType::Open, b'C'))
         );
         assert_eq!(
-            Chunk::parse(b"CLOA", &l),
+            Chunk::parse_prefix(b"CLOA", &l),
             Err(ChunkError::ChunkType(MessageType::Close, b'A'))
         );
         assert_eq!(
-            Chunk::parse(b"MSGX", &l),
+            Chunk::parse_prefix(b"MSGX", &l),
             Err(ChunkError::ChunkType(MessageType::Message, b'X'))
         );
         assert_eq!(
-            Chunk::parse(b"MSGC\x07\0\0\0", &l),
+            Chunk::parse_prefix(b"MSGC\x07\0\0\0", &l),
             Err(ChunkError::TooSmall(7))
         );
         assert_eq!(
-            Chunk::parse(b"MSGF\x01\x20\0\0", &l),
+            Chunk::parse_prefix(b"MSGF\x01\x20\0\0", &l),
             Err(ChunkError::TooLarge {
                 size: 8193,
                 limit: MIN_BUFFER_SIZE
             })
         );
         assert_eq!(
-            Chunk::parse(b"HELF\xff\xff\0\0", &l),
+            Chunk::parse_prefix(b"HELF\xff\xff\0\0", &l),
             Err(ChunkError::TooLarge {
                 size: 65535,
                 limit: MAX_HANDSHAKE_SIZE
@@ -4404,9 +4404,9 @@ mod tests {
             receive_buffer_size: 65536,
             ..l
         };
-        assert_eq!(Chunk::parse(b"MSGF\x01\x20\0\0", &big), Ok(None));
+        assert_eq!(Chunk::parse_prefix(b"MSGF\x01\x20\0\0", &big), Ok(None));
         assert_eq!(
-            Chunk::parse(
+            Chunk::parse_prefix(
                 b"MSGF\0\0\0\x10",
                 &Limits {
                     receive_buffer_size: u32::MAX,
@@ -4418,7 +4418,7 @@ mod tests {
                 limit: MAX_BUFFER_SIZE
             })
         );
-        let (c, used) = Chunk::parse(b"MSGF\x08\0\0\0rest", &l).unwrap().unwrap();
+        let (c, used) = Chunk::parse_prefix(b"MSGF\x08\0\0\0rest", &l).unwrap().unwrap();
         assert_eq!(
             (c.message_type, c.chunk_type, c.body.len(), used),
             (MessageType::Message, ChunkType::Final, 0, 8)

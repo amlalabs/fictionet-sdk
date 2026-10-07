@@ -175,7 +175,7 @@ impl std::fmt::Display for FrameError {
 impl std::error::Error for FrameError {}
 
 /// Why an exact [`Wire`] parse did not read one complete frame.
-/// [`Frame::parse`] keeps its separate prefix parsing behavior.
+/// [`Frame::parse_prefix`] keeps its separate prefix parsing behavior.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameParseError {
     /// The MBAP header is invalid.
@@ -209,7 +209,7 @@ impl Frame {
     /// Reads the frame at the start of `b`. It returns `Ok(None)` if `b`
     /// holds only part of one, and otherwise the frame and how many bytes
     /// of `b` it took.
-    pub fn parse(b: &[u8]) -> Result<Option<(Frame, usize)>, FrameError> {
+    pub fn parse_prefix(b: &[u8]) -> Result<Option<(Frame, usize)>, FrameError> {
         if b.len() < HEADER_LEN {
             // A bad protocol identifier is known before the rest comes.
             if b.len() >= 4 {
@@ -241,7 +241,7 @@ impl Frame {
     }
 
     /// The function code: the PDU's first byte. A frame read by
-    /// [`Frame::parse`] always has one.
+    /// [`Frame::parse_prefix`] always has one.
     pub fn function(&self) -> Option<u8> {
         self.pdu.first().copied()
     }
@@ -282,7 +282,7 @@ impl Wire for Frame {
     /// A nonzero protocol ID or length outside 2..=254 returns
     /// [`FrameParseError::Frame`] with [`FrameError::Protocol`] or [`FrameError::Length`].
     fn parse(b: &[u8]) -> Result<Self, FrameParseError> {
-        match Self::parse(b).map_err(FrameParseError::Frame)? {
+        match Self::parse_prefix(b).map_err(FrameParseError::Frame)? {
             Some((frame, used)) if used == b.len() => Ok(frame),
             Some(_) => Err(FrameParseError::Trailing),
             None => Err(FrameParseError::Truncated),
@@ -347,7 +347,7 @@ impl Decode for Frames {
     /// A length outside 2..=254 returns [`FrameError::Length`]. Partial input
     /// returns [`Step::Need`], including at EOF.
     fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, FrameError> {
-        Ok(match Frame::parse(input)? {
+        Ok(match Frame::parse_prefix(input)? {
             Some((frame, used)) => Step::Item(frame, used),
             None => Step::Need,
         })
@@ -1104,7 +1104,7 @@ mod tests {
         let bytes = [
             0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x11, 0x03, 0x00, 0x6b, 0x00, 0x03, 0xaa,
         ];
-        let (frame, used) = Frame::parse(&bytes).unwrap().unwrap();
+        let (frame, used) = Frame::parse_prefix(&bytes).unwrap().unwrap();
         assert_eq!(used, 12);
         assert_eq!(
             frame,
@@ -1117,20 +1117,20 @@ mod tests {
         assert_eq!(frame.to_bytes().unwrap(), bytes[..12]);
         // Part of a frame.
         for n in 0..12 {
-            assert_eq!(Frame::parse(&bytes[..n]), Ok(None), "{n} bytes");
+            assert_eq!(Frame::parse_prefix(&bytes[..n]), Ok(None), "{n} bytes");
         }
         // Not Modbus, known from the first four bytes.
-        assert_eq!(Frame::parse(&[0, 1, 0, 5]), Err(FrameError::Protocol(5)));
+        assert_eq!(Frame::parse_prefix(&[0, 1, 0, 5]), Err(FrameError::Protocol(5)));
         // Lengths out of range.
         assert_eq!(
-            Frame::parse(&[0, 1, 0, 0, 0, 1, 1]),
+            Frame::parse_prefix(&[0, 1, 0, 0, 0, 1, 1]),
             Err(FrameError::Length(1))
         );
         assert_eq!(
-            Frame::parse(&[0, 1, 0, 0, 0, 255, 1]),
+            Frame::parse_prefix(&[0, 1, 0, 0, 0, 255, 1]),
             Err(FrameError::Length(255))
         );
-        assert!(matches!(Frame::parse(&[0, 1, 0, 0, 0, 254, 1]), Ok(None)));
+        assert!(matches!(Frame::parse_prefix(&[0, 1, 0, 0, 0, 254, 1]), Ok(None)));
     }
 
     #[test]
@@ -1150,7 +1150,7 @@ mod tests {
                     <Frame as Wire>::parse(prefix),
                     Err(FrameParseError::Truncated)
                 );
-                assert_eq!(Frame::parse(prefix), Ok(None));
+                assert_eq!(Frame::parse_prefix(prefix), Ok(None));
             }
             for suffix in [&[0][..], bytes.as_slice()] {
                 let mut trailing = bytes.clone();
@@ -1160,7 +1160,7 @@ mod tests {
                     Err(FrameParseError::Trailing)
                 );
                 assert_eq!(
-                    Frame::parse(&trailing),
+                    Frame::parse_prefix(&trailing),
                     Ok(Some((frame.clone(), bytes.len())))
                 );
             }
@@ -1638,7 +1638,7 @@ mod tests {
         };
         let bytes = frame.to_bytes().unwrap();
         assert_eq!(bytes.len(), MAX_FRAME);
-        assert_eq!(Frame::parse(&bytes), Ok(Some((frame, MAX_FRAME))));
+        assert_eq!(Frame::parse_prefix(&bytes), Ok(Some((frame, MAX_FRAME))));
     }
 
     #[test]
@@ -1720,7 +1720,7 @@ mod tests {
             unit: 1,
             pdu: vec![0x41],
         };
-        assert_eq!(Frame::parse(&one.to_bytes().unwrap()), Ok(Some((one, 8))));
+        assert_eq!(Frame::parse_prefix(&one.to_bytes().unwrap()), Ok(Some((one, 8))));
     }
 
     #[test]

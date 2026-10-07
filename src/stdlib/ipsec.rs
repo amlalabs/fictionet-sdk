@@ -331,17 +331,17 @@ impl AhHeader {
     }
 
     /// Reads the AH header at the start of `b`, and returns it and its
-    /// length in bytes.
-    pub fn parse_prefix(b: &[u8]) -> Result<(AhHeader, usize), IpsecError> {
+    /// length in bytes, or `None` if `b` holds only part of one.
+    pub fn parse_prefix(b: &[u8]) -> Result<Option<(AhHeader, usize)>, IpsecError> {
         if let Some(e) = ah_prefix_error(b) {
             return Err(e);
         }
         if b.len() < 2 {
-            return Err(IpsecError::Truncated);
+            return Ok(None);
         }
         let len = (usize::from(b[1]) + 2) * 4;
         if b.len() < len {
-            return Err(IpsecError::Truncated);
+            return Ok(None);
         }
         let header = AhHeader {
             next_header: b[0],
@@ -350,7 +350,7 @@ impl AhHeader {
             sequence: be32(b, 8),
             icv: b[AH_FIXED_LEN..len].to_vec(),
         };
-        Ok((header, len))
+        Ok(Some((header, len)))
     }
 
     /// How many bytes the header takes.
@@ -432,7 +432,7 @@ impl AhPacket {
         if b.len() > MAX_PACKET {
             return Err(IpsecError::TooLong);
         }
-        let (header, used) = AhHeader::parse_prefix(b)?;
+        let (header, used) = AhHeader::parse_prefix(b)?.ok_or(IpsecError::Truncated)?;
         Ok((header, &b[used..]))
     }
 }
@@ -631,7 +631,7 @@ impl Wire for AhHeader {
     /// Reads a standalone AH header. Refuses a zero SPI, an invalid length,
     /// truncation, and bytes after the header.
     fn parse(b: &[u8]) -> Result<Self, IpsecError> {
-        let (header, used) = Self::parse_prefix(b)?;
+        let (header, used) = Self::parse_prefix(b)?.ok_or(IpsecError::Truncated)?;
         if used != b.len() {
             return Err(IpsecError::Trailing {
                 remaining: b.len() - used,
@@ -894,7 +894,7 @@ mod tests {
         let bytes = h.to_bytes().unwrap();
         assert_eq!(bytes.len(), MAX_AH_LEN);
         assert_eq!(bytes[1], 255);
-        assert_eq!(AhHeader::parse_prefix(&bytes), Ok((h, MAX_AH_LEN)));
+        assert_eq!(AhHeader::parse_prefix(&bytes), Ok(Some((h, MAX_AH_LEN))));
     }
 
     #[test]

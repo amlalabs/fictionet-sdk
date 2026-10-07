@@ -1469,7 +1469,7 @@ mod tests {
             0x03, 0x00, 0x00, 0x13, 0x0e, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x08,
             0x00, 0x03, 0x00, 0x00, 0x00,
         ];
-        let (packet, used) = Packet::parse(&bytes).unwrap().unwrap();
+        let (packet, used) = Packet::parse_prefix(&bytes).unwrap().unwrap();
         assert_eq!(used, 19);
         assert_eq!(packet.payload.len(), 15);
         let Ok(Tpdu::ConnectionRequest(cr)) = over_tpkt::tpdu(&packet) else {
@@ -1622,7 +1622,7 @@ mod tests {
     }
 
     fn tpdu_from_packet(packet: &[u8]) -> Tpdu {
-        let (tpdu, used) = tpkt::Packet::parse(packet).unwrap().unwrap();
+        let (tpdu, used) = tpkt::Packet::parse_prefix(packet).unwrap().unwrap();
         assert_eq!(used, packet.len());
         Tpdu::parse(&tpdu.payload).unwrap()
     }
@@ -1633,7 +1633,7 @@ mod tests {
     fn tpkt_example() {
         let packet = [3, 0, 0, 7, 2, 0xf0, 0x80];
         assert_eq!(
-            tpkt::Packet::parse(&packet),
+            tpkt::Packet::parse_prefix(&packet),
             Ok(Some((tpkt::Packet::new(packet[4..].to_vec()), 7)))
         );
         assert_eq!(
@@ -1655,32 +1655,32 @@ mod tests {
         );
         // Every prefix is incomplete, not an error.
         for n in 0..packet.len() {
-            assert_eq!(tpkt::Packet::parse(&packet[..n]), Ok(None), "{n} bytes");
+            assert_eq!(tpkt::Packet::parse_prefix(&packet[..n]), Ok(None), "{n} bytes");
         }
         // Extra bytes after the packet are left alone.
         let mut longer = packet.to_vec();
         longer.extend_from_slice(&[3, 0]);
-        assert_eq!(tpkt::Packet::parse(&longer).unwrap().unwrap().1, 7);
+        assert_eq!(tpkt::Packet::parse_prefix(&longer).unwrap().unwrap().1, 7);
     }
 
     #[test]
     fn tpkt_errors() {
         // Known from the first byte.
         assert_eq!(
-            tpkt::Packet::parse(&[0x30]),
+            tpkt::Packet::parse_prefix(&[0x30]),
             Err(tpkt::TpktError::Version(0x30))
         );
         assert_eq!(
-            tpkt::Packet::parse(&[2, 0, 0, 7, 2, 0xf0, 0x80]),
+            tpkt::Packet::parse_prefix(&[2, 0, 0, 7, 2, 0xf0, 0x80]),
             Err(tpkt::TpktError::Version(2))
         );
         for n in 0..tpkt::MIN_PACKET as u16 {
             let b = [3, 0, (n >> 8) as u8, n as u8];
-            assert_eq!(tpkt::Packet::parse(&b), Err(tpkt::TpktError::Length(n)));
+            assert_eq!(tpkt::Packet::parse_prefix(&b), Err(tpkt::TpktError::Length(n)));
         }
         // The reserved byte is not checked.
         assert!(
-            tpkt::Packet::parse(&[3, 9, 0, 7, 2, 0xf0, 0x80])
+            tpkt::Packet::parse_prefix(&[3, 9, 0, 7, 2, 0xf0, 0x80])
                 .unwrap()
                 .is_some()
         );
@@ -2105,7 +2105,7 @@ mod tests {
         ];
         for p in &packets {
             for n in 0..p.len() {
-                assert_eq!(tpkt::Packet::parse(&p[..n]), Ok(None), "{n} of {p:?}");
+                assert_eq!(tpkt::Packet::parse_prefix(&p[..n]), Ok(None), "{n} of {p:?}");
                 let mut d = Stream::new(tpkt::Packets::new());
                 assert_eq!(d.push(&p[..n]), n);
                 assert_eq!(d.next(), None);

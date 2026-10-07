@@ -414,12 +414,12 @@ pub enum Frame {
 impl Frame {
     /// Reads one frame prefix, returning `None` for an incomplete frame.
     /// The returned count excludes bytes belonging to the next frame.
-    pub fn parse(b: &[u8]) -> Result<Option<(Self, usize)>, Error> {
+    pub fn parse_prefix(b: &[u8]) -> Result<Option<(Self, usize)>, Error> {
         let Some(&first) = b.first() else {
             return Ok(None);
         };
         if first == 3 {
-            return tpkt::Packet::parse(b)
+            return tpkt::Packet::parse_prefix(b)
                 .map(|p| p.map(|(p, n)| (Self::SlowPath(p), n)))
                 .map_err(Error::Tpkt);
         }
@@ -456,7 +456,7 @@ impl Wire for Frame {
     /// for trailing bytes, nonzero fast-path action bits or a length shorter
     /// than its header, and [`Error::Tpkt`] for a bad TPKT header.
     fn parse(b: &[u8]) -> Result<Self, Error> {
-        match Self::parse(b)? {
+        match Self::parse_prefix(b)? {
             Some((frame, used)) if used == b.len() => Ok(frame),
             Some(_) => Err(Error::Invalid("trailing bytes")),
             None => Err(Error::Truncated),
@@ -519,7 +519,7 @@ impl Decode for Frames {
     /// Returns [`Error::Invalid`] for bad fast-path action bits or lengths,
     /// and [`Error::Tpkt`] for invalid TPKT headers.
     fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, Error> {
-        Ok(match Frame::parse(input)? {
+        Ok(match Frame::parse_prefix(input)? {
             Some((frame, used)) => Step::Item(frame, used),
             None => Step::Need,
         })
@@ -2756,10 +2756,10 @@ mod tests {
         if let Ok(blocks) = DataBlocks::parse(b) {
             assert_eq!(DataBlocks::parse(&blocks.to_bytes().unwrap()), Ok(blocks));
         }
-        if let Ok(Some((f, n))) = Frame::parse(b) {
+        if let Ok(Some((f, n))) = Frame::parse_prefix(b) {
             assert!(n <= b.len());
             let bytes = f.to_bytes().unwrap();
-            assert_eq!(Frame::parse(&bytes), Ok(Some((f.clone(), bytes.len()))));
+            assert_eq!(Frame::parse_prefix(&bytes), Ok(Some((f.clone(), bytes.len()))));
             if let Frame::SlowPath(p) = f {
                 if let Ok(c) = Connection::from_packet(&p) {
                     assert_eq!(Connection::from_packet(&c.to_packet().unwrap()), Ok(c));
@@ -2775,7 +2775,7 @@ mod tests {
     fn spec_negotiation_exact_bytes() {
         let wire = hex("03 00 00 13 0e e0 00 00 00 00 00 01 00 08 00 03 00 00 00");
         assert_eq!(connection().to_packet().unwrap().to_bytes().unwrap(), wire);
-        let (packet, _) = tpkt::Packet::parse(&wire).unwrap().unwrap();
+        let (packet, _) = tpkt::Packet::parse_prefix(&wire).unwrap().unwrap();
         assert_eq!(Connection::from_packet(&packet), Ok(connection()));
         for (n, b) in [
             (
@@ -2920,7 +2920,7 @@ mod tests {
     fn spec_connect_initial() {
         let wire = initial_example();
         assert_eq!(wire.len(), 416);
-        let (packet, _) = tpkt::Packet::parse(&wire).unwrap().unwrap();
+        let (packet, _) = tpkt::Packet::parse_prefix(&wire).unwrap().unwrap();
         let data = read_data(&packet).unwrap();
         let parsed = McsConnect::parse(&data).unwrap();
         let McsConnect::Initial {
@@ -2958,7 +2958,7 @@ mod tests {
     fn spec_connect_response() {
         let wire = response_example();
         assert_eq!(wire.len(), 337);
-        let (packet, _) = tpkt::Packet::parse(&wire).unwrap().unwrap();
+        let (packet, _) = tpkt::Packet::parse_prefix(&wire).unwrap().unwrap();
         let data = read_data(&packet).unwrap();
         let parsed = McsConnect::parse(&data).unwrap();
         assert_eq!(parsed.to_bytes().unwrap(), data);
@@ -3683,7 +3683,7 @@ mod tests {
         let b = hex("03 00 00 2a 02 f0 80 68 00 01 03 eb 70 1c 88 02
                      02 03 8d 43 9a ab d5 2a 31 39 62 4d c1 ec 0d 99
                      88 e6 da ab 2c 02 72 4d 49 90");
-        let (packet, _) = tpkt::Packet::parse(&b).unwrap().unwrap();
+        let (packet, _) = tpkt::Packet::parse_prefix(&b).unwrap().unwrap();
         let mcs = McsPdu::parse(&read_data(&packet).unwrap()).unwrap();
         assert_eq!(
             write_data(&mcs.to_bytes().unwrap())
@@ -3826,11 +3826,11 @@ mod tests {
                 };
                 let b = f.to_bytes().unwrap();
                 assert_eq!(b.len(), n + if n <= 125 { 2 } else { 3 });
-                assert_eq!(Frame::parse(&b), Ok(Some((f, b.len()))));
+                assert_eq!(Frame::parse_prefix(&b), Ok(Some((f, b.len()))));
             }
         }
         assert_eq!(
-            Frame::parse(&[0, 0x80, 3]),
+            Frame::parse_prefix(&[0, 0x80, 3]),
             Ok(Some((
                 Frame::FastPath {
                     header: 0,
@@ -3839,11 +3839,11 @@ mod tests {
                 3
             )))
         );
-        assert!(Frame::parse(&[1]).is_err());
-        assert!(Frame::parse(&[2]).is_err());
-        assert!(Frame::parse(&[0, 1]).is_err());
-        assert!(Frame::parse(&[0, 0x80, 2]).is_err());
-        assert!(Frame::parse(&[3, 0, 0, 6]).is_err());
+        assert!(Frame::parse_prefix(&[1]).is_err());
+        assert!(Frame::parse_prefix(&[2]).is_err());
+        assert!(Frame::parse_prefix(&[0, 1]).is_err());
+        assert!(Frame::parse_prefix(&[0, 0x80, 2]).is_err());
+        assert!(Frame::parse_prefix(&[3, 0, 0, 6]).is_err());
         assert!(
             Frame::FastPath {
                 header: 3,
@@ -3900,12 +3900,12 @@ mod tests {
         for b in samples {
             contract::check_decode(Frames::new, &b);
             for n in 0..b.len() {
-                assert_eq!(Frame::parse(&b[..n]), Ok(None));
+                assert_eq!(Frame::parse_prefix(&b[..n]), Ok(None));
             }
             let mut stream = Stream::new(Frames);
             let mut frames = Vec::new();
             pump(&mut stream, &b, |frame| frames.push(frame)).unwrap();
-            assert_eq!(frames, [Frame::parse(&b).unwrap().unwrap().0]);
+            assert_eq!(frames, [Frame::parse_prefix(&b).unwrap().unwrap().0]);
         }
     }
 

@@ -27,7 +27,7 @@
 //! assert_eq!(asdu.objects(1).unwrap(), [Object { address: 0, value: vec![20] }]);
 //! let frame = Frame::Information { send: 0, receive: 0, asdu: asdu.to_bytes().unwrap() };
 //! let bytes = frame.to_bytes().unwrap();
-//! assert_eq!(Frame::parse(&bytes).unwrap(), Some((frame, bytes.len())));
+//! assert_eq!(Frame::parse_prefix(&bytes).unwrap(), Some((frame, bytes.len())));
 //! ```
 
 use fictionet::stdlib::codec::{Decode, Step, Wire};
@@ -73,7 +73,7 @@ impl std::fmt::Display for FrameError {
 impl std::error::Error for FrameError {}
 
 /// Why an exact [`Wire`] parse did not read one complete frame.
-/// [`Frame::parse`] reads a prefix and returns the bytes used.
+/// [`Frame::parse_prefix`] reads a prefix and returns the bytes used.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameParseError {
     /// The frame is invalid.
@@ -171,7 +171,7 @@ impl Frame {
     /// Reads one APDU at the start of `b` and returns its consumed length.
     /// `Ok(None)` means it needs more bytes. S and U frames must have
     /// exactly four control bytes and no ASDU.
-    pub fn parse(b: &[u8]) -> Result<Option<(Self, usize)>, FrameError> {
+    pub fn parse_prefix(b: &[u8]) -> Result<Option<(Self, usize)>, FrameError> {
         if b.first().is_some_and(|&x| x != 0x68) {
             return Err(FrameError::Start);
         }
@@ -233,7 +233,7 @@ impl Wire for Frame {
     /// with [`FrameError::Start`], [`FrameError::Length`],
     /// [`FrameError::Control`] or [`FrameError::AsduLength`].
     fn parse(b: &[u8]) -> Result<Self, FrameParseError> {
-        match Self::parse(b).map_err(FrameParseError::Frame)? {
+        match Self::parse_prefix(b).map_err(FrameParseError::Frame)? {
             Some((frame, used)) if used == b.len() => Ok(frame),
             Some(_) => Err(FrameParseError::Trailing),
             None => Err(FrameParseError::Truncated),
@@ -305,7 +305,7 @@ impl Decode for Frames {
     /// [`FrameError::Start`], [`FrameError::Length`], [`FrameError::Control`]
     /// or [`FrameError::AsduLength`].
     fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, FrameError> {
-        Ok(match Frame::parse(input)? {
+        Ok(match Frame::parse_prefix(input)? {
             Some((frame, used)) => Step::Item(frame, used),
             None => Step::Need,
         })
@@ -532,9 +532,9 @@ mod tests {
             &[0x68, 4, 7, 0, 0, 0],
         ] {
             for cut in 0..bytes.len() {
-                assert_eq!(Frame::parse(&bytes[..cut]), Ok(None));
+                assert_eq!(Frame::parse_prefix(&bytes[..cut]), Ok(None));
             }
-            let (frame, used) = Frame::parse(bytes).unwrap().unwrap();
+            let (frame, used) = Frame::parse_prefix(bytes).unwrap().unwrap();
             assert_eq!(used, bytes.len());
             assert_eq!(frame.to_bytes().unwrap(), bytes);
         }
@@ -554,7 +554,7 @@ mod tests {
             assert_eq!(function.code(), code);
             let bytes = [0x68, 4, code, 0, 0, 0];
             assert_eq!(
-                Frame::parse(&bytes),
+                Frame::parse_prefix(&bytes),
                 Ok(Some((Frame::Unnumbered(function), 6)))
             );
         }
@@ -577,11 +577,11 @@ mod tests {
             &[0x68, 5, 1, 0, 0, 0, 0],
             &[0x68, 5, 7, 0, 0, 0, 0],
         ] {
-            assert!(Frame::parse(bytes).is_err(), "{bytes:?}");
+            assert!(Frame::parse_prefix(bytes).is_err(), "{bytes:?}");
         }
         let mut bytes = INTERROGATION.to_vec();
         bytes[4] = 1;
-        assert_eq!(Frame::parse(&bytes), Err(FrameError::Control));
+        assert_eq!(Frame::parse_prefix(&bytes), Err(FrameError::Control));
         assert_eq!(
             Frame::Supervisory { receive: 32768 }.to_bytes(),
             Err(FrameError::Sequence)

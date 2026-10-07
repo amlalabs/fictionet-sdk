@@ -170,7 +170,7 @@ pub fn fail_status(fail: &codec::Fail<FrameError>) -> Status {
 }
 
 /// Why an exact [`Wire`] parse did not contain one complete [`Message`].
-/// The inherent [`Message::parse`] reads a prefix.
+/// The inherent [`Message::parse_prefix`] reads a prefix.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MessageParseError {
     /// Input ended before a complete message.
@@ -213,7 +213,7 @@ impl Message {
     /// [`MAX_MESSAGE`] bytes of body. It returns `Ok(None)` if `b` holds
     /// only part of one, and otherwise the message and how many bytes of
     /// `b` it took.
-    pub fn parse(b: &[u8]) -> Result<Option<(Message, usize)>, FrameError> {
+    pub fn parse_prefix(b: &[u8]) -> Result<Option<(Message, usize)>, FrameError> {
         parse_message(b, MAX_MESSAGE)
     }
 
@@ -247,7 +247,7 @@ impl Wire for Message {
     /// with [`FrameError::Flag`] or [`FrameError::TooLarge`]. Compressed
     /// bodies remain flagged bytes.
     fn parse(b: &[u8]) -> Result<Self, Self::ParseError> {
-        match Message::parse(b).map_err(MessageParseError::Frame)? {
+        match Message::parse_prefix(b).map_err(MessageParseError::Frame)? {
             Some((message, used)) if used == b.len() => Ok(message),
             Some((_, used)) => Err(MessageParseError::Trailing {
                 remaining: b.len().saturating_sub(used),
@@ -1787,7 +1787,7 @@ mod tests {
         for tail in [&[0xff][..], &[0, 0, 0, 0, 0]] {
             let joined = [bytes.as_slice(), tail].concat();
             assert_eq!(
-                Message::parse(&joined),
+                Message::parse_prefix(&joined),
                 Ok(Some((message.clone(), bytes.len())))
             );
             assert_eq!(
@@ -1967,11 +1967,11 @@ mod tests {
         let mut stream = m.to_bytes().unwrap();
         stream.extend(c.to_bytes().unwrap());
         stream.push(0);
-        let (a, used) = Message::parse(&stream).unwrap().unwrap();
+        let (a, used) = Message::parse_prefix(&stream).unwrap().unwrap();
         assert_eq!((a, used), (m.clone(), 8));
-        let (b, used2) = Message::parse(&stream[8..]).unwrap().unwrap();
+        let (b, used2) = Message::parse_prefix(&stream[8..]).unwrap().unwrap();
         assert_eq!((b, used2), (c.clone(), 5));
-        assert_eq!(Message::parse(&stream[13..]), Ok(None));
+        assert_eq!(Message::parse_prefix(&stream[13..]), Ok(None));
         contract::check_decode(|| Messages::with_limit(MAX_MESSAGE), &stream);
     }
 
@@ -2002,19 +2002,19 @@ mod tests {
 
     #[test]
     fn frame_errors() {
-        assert_eq!(Message::parse(&[2]), Err(FrameError::Flag(2)));
-        assert_eq!(Message::parse(&[0xff, 0, 0]), Err(FrameError::Flag(0xff)));
+        assert_eq!(Message::parse_prefix(&[2]), Err(FrameError::Flag(2)));
+        assert_eq!(Message::parse_prefix(&[0xff, 0, 0]), Err(FrameError::Flag(0xff)));
         let big = (MAX_MESSAGE as u32 + 1).to_be_bytes();
         let b = [0, big[0], big[1], big[2], big[3]];
         assert_eq!(
-            Message::parse(&b),
+            Message::parse_prefix(&b),
             Err(FrameError::TooLarge {
                 length: MAX_MESSAGE as u32 + 1,
                 limit: MAX_MESSAGE
             })
         );
         assert_eq!(
-            Message::parse(&[0, 0xff, 0xff, 0xff, 0xff]),
+            Message::parse_prefix(&[0, 0xff, 0xff, 0xff, 0xff]),
             Err(FrameError::TooLarge {
                 length: u32::MAX,
                 limit: MAX_MESSAGE
@@ -2022,7 +2022,7 @@ mod tests {
         );
         // Exactly the limit is allowed, and waits for its bytes.
         let at = (MAX_MESSAGE as u32).to_be_bytes();
-        assert_eq!(Message::parse(&[0, at[0], at[1], at[2], at[3]]), Ok(None));
+        assert_eq!(Message::parse_prefix(&[0, at[0], at[1], at[2], at[3]]), Ok(None));
         assert_eq!(FrameError::Flag(2).code(), Code::Internal);
         assert_eq!(
             FrameError::TooLarge {
@@ -2145,7 +2145,7 @@ mod tests {
         };
         let bytes = m.to_bytes().unwrap();
         assert_eq!(bytes.len(), HEADER_LEN + MAX_MESSAGE);
-        assert_eq!(Message::parse(&bytes), Ok(Some((m, bytes.len()))));
+        assert_eq!(Message::parse_prefix(&bytes), Ok(Some((m, bytes.len()))));
         let long = "é".repeat(MAX_STATUS_MESSAGE);
         let s = Status::new(Code::Internal, &long);
         assert!(s.message.len() <= MAX_STATUS_MESSAGE);

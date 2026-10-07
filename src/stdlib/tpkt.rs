@@ -36,7 +36,7 @@
 //! // A packet holds any payload of 3 to 65531 bytes.
 //! let packet = Packet::new(vec![1, 2, 3]);
 //! assert_eq!(packet.to_bytes().unwrap(), [3, 0, 0, 7, 1, 2, 3]);
-//! assert_eq!(Packet::parse(&[3, 0, 0, 7, 1, 2, 3]), Ok(Some((packet, 7))));
+//! assert_eq!(Packet::parse_prefix(&[3, 0, 0, 7, 1, 2, 3]), Ok(Some((packet, 7))));
 //! ```
 
 use fictionet::stdlib::codec::{Decode, Step, Wire};
@@ -244,11 +244,11 @@ impl Packet {
     /// Reads the packet at the start of `b`. It returns `Ok(None)` if `b`
     /// holds only part of one, and otherwise the packet and how many bytes
     /// of `b` it took. Use [`Wire::parse`] to require exactly one packet.
-    pub fn parse(b: &[u8]) -> Result<Option<(Packet, usize)>, TpktError> {
+    pub fn parse_prefix(b: &[u8]) -> Result<Option<(Packet, usize)>, TpktError> {
         Packet::parse_limited(b, MAX_PACKET)
     }
 
-    /// Reads the packet at the start of `b`, as [`Packet::parse`] does,
+    /// Reads the packet at the start of `b`, as [`Packet::parse_prefix`] does,
     /// but refuses one longer than `limit` bytes. A limit below
     /// [`MIN_PACKET`] is taken as that, and one above [`MAX_PACKET`] as
     /// that.
@@ -296,7 +296,7 @@ impl Wire for Packet {
     /// other than 3 or a length below [`MIN_PACKET`] returns [`ParseError::Header`]
     /// with [`TpktError::Version`] or [`TpktError::Length`].
     fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
-        let (packet, used) = Packet::parse(bytes)
+        let (packet, used) = Packet::parse_prefix(bytes)
             .map_err(ParseError::Header)?
             .ok_or(ParseError::Incomplete)?;
         if used != bytes.len() {
@@ -401,7 +401,7 @@ mod codec_tests {
             <Packet as Wire>::parse(&trailing),
             Err(ParseError::Trailing { remaining: 1 })
         );
-        assert_eq!(Packet::parse(&trailing), Ok(Some((packet, bytes.len()))));
+        assert_eq!(Packet::parse_prefix(&trailing), Ok(Some((packet, bytes.len()))));
         assert_eq!(
             <Packet as Wire>::parse(&[9]),
             Err(ParseError::Header(TpktError::Version(9)))
@@ -495,7 +495,7 @@ mod tests {
     fn rfc1006_example() {
         let bytes = [3, 0, 0, 7, 2, 0xf0, 0x80];
         let packet = Packet::new(vec![2, 0xf0, 0x80]);
-        assert_eq!(Packet::parse(&bytes), Ok(Some((packet.clone(), 7))));
+        assert_eq!(Packet::parse_prefix(&bytes), Ok(Some((packet.clone(), 7))));
         assert_eq!(packet.to_bytes().unwrap(), bytes);
         assert_eq!(
             packet.header(),
@@ -543,7 +543,7 @@ mod tests {
             0
         );
         // The reserved byte is kept, not checked.
-        let (p, _) = Packet::parse(&[3, 0xff, 0, 7, 1, 2, 3]).unwrap().unwrap();
+        let (p, _) = Packet::parse_prefix(&[3, 0xff, 0, 7, 1, 2, 3]).unwrap().unwrap();
         assert_eq!(p.reserved, 0xff);
         assert_eq!(p.to_bytes().unwrap(), [3, 0xff, 0, 7, 1, 2, 3]);
     }
@@ -552,7 +552,7 @@ mod tests {
     fn every_prefix_is_incomplete() {
         let bytes = [3, 0, 0, 10, 2, 0xf0, 0x80, 1, 2, 3];
         for n in 0..bytes.len() {
-            assert_eq!(Packet::parse(&bytes[..n]), Ok(None), "{n} bytes");
+            assert_eq!(Packet::parse_prefix(&bytes[..n]), Ok(None), "{n} bytes");
             if n < HEADER_LEN {
                 assert_eq!(Header::parse(&bytes[..n], MAX_PACKET), Ok(None));
             }
@@ -560,20 +560,20 @@ mod tests {
         // Bytes after the packet are left alone.
         let mut longer = bytes.to_vec();
         longer.extend_from_slice(&[3, 0]);
-        assert_eq!(Packet::parse(&longer).unwrap().unwrap().1, 10);
+        assert_eq!(Packet::parse_prefix(&longer).unwrap().unwrap().1, 10);
     }
 
     #[test]
     fn parse_errors() {
         // A bad version is known from the first byte.
-        assert_eq!(Packet::parse(&[0x30]), Err(TpktError::Version(0x30)));
+        assert_eq!(Packet::parse_prefix(&[0x30]), Err(TpktError::Version(0x30)));
         assert_eq!(
-            Packet::parse(&[2, 0, 0, 7, 1, 2, 3]),
+            Packet::parse_prefix(&[2, 0, 0, 7, 1, 2, 3]),
             Err(TpktError::Version(2))
         );
         for n in 0..MIN_PACKET as u16 {
             let b = [3, 0, (n >> 8) as u8, n as u8];
-            assert_eq!(Packet::parse(&b), Err(TpktError::Length(n)));
+            assert_eq!(Packet::parse_prefix(&b), Err(TpktError::Length(n)));
         }
         // The limit, as given and as clamped.
         assert_eq!(
@@ -622,7 +622,7 @@ mod tests {
         let bytes = max.to_bytes().unwrap();
         assert_eq!(bytes.len(), MAX_PACKET);
         assert_eq!(&bytes[..4], &[3, 0, 0xff, 0xff]);
-        assert_eq!(Packet::parse(&bytes), Ok(Some((max, MAX_PACKET))));
+        assert_eq!(Packet::parse_prefix(&bytes), Ok(Some((max, MAX_PACKET))));
         for e in [EncodeError::TooShort(1), EncodeError::TooLong(1)] {
             assert!(!e.to_string().is_empty());
         }
@@ -712,7 +712,7 @@ mod tests {
             for p in &whole.0 {
                 assert!(p.payload.len() + HEADER_LEN <= limit);
                 let bytes = p.to_bytes().unwrap();
-                assert_eq!(Packet::parse(&bytes), Ok(Some((p.clone(), bytes.len()))));
+                assert_eq!(Packet::parse_prefix(&bytes), Ok(Some((p.clone(), bytes.len()))));
             }
             // Any header a writer takes reads back the same.
             let h = Header {
@@ -728,7 +728,7 @@ mod tests {
             }
             // Raw bytes, never panicking.
             let raw = rng.bytes(19);
-            let _ = Packet::parse(&raw);
+            let _ = Packet::parse_prefix(&raw);
             let _ = Packet::parse_limited(&raw, rng.index(usize::MAX));
             contract::check_decode_with_alloc_limit(Packets::new, &raw, 2 * MAX_PACKET);
             let _ = test_support::decode_all(Packets::new, &raw);

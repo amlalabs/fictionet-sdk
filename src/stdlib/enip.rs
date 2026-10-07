@@ -23,7 +23,7 @@
 //!
 //! Every reader checks lengths and bounds, because the agent can send any
 //! bytes it likes. The encapsulation layer accepts any command code and
-//! any length, so [`Packet::parse`] only ever asks for more bytes and the
+//! any length, so [`Packet::parse_prefix`] only ever asks for more bytes and the
 //! stream never loses its place; the CIP readers return a [`DecodeError`]
 //! when bytes do not form the structure they name. Every writer returns
 //! an [`EncodeError`] instead of writing a value its reader would refuse
@@ -60,7 +60,7 @@
 //! let bytes = packet.to_bytes().unwrap();
 //!
 //! // A world playing the device reads the packet back off the wire.
-//! let (back, used) = Packet::parse(&bytes).unwrap();
+//! let (back, used) = Packet::parse_prefix(&bytes).unwrap();
 //! assert_eq!(used, bytes.len());
 //! assert_eq!(back.check(), Ok(()));
 //! assert_eq!(back.command, Command::SendRRData);
@@ -202,7 +202,7 @@ impl Packet {
     /// it took. Any command code and any length the header names are
     /// taken, so the stream keeps its place; [`Packet::check`] says whether
     /// the packet is one a receiver should act on.
-    pub fn parse(b: &[u8]) -> Option<(Packet, usize)> {
+    pub fn parse_prefix(b: &[u8]) -> Option<(Packet, usize)> {
         if b.len() < HEADER_LEN {
             return None;
         }
@@ -260,13 +260,13 @@ impl Wire for Packet {
     type WriteError = EncodeError;
 
     /// Reads exactly one packet that passes [`Packet::check`].
-    /// [`Packet::parse`] accepts nonzero options and every
+    /// [`Packet::parse_prefix`] accepts nonzero options and every
     /// length the header can name, so a receiver can apply its own policy.
     /// Returns [`DecodeError::Truncated`] for an incomplete packet,
     /// [`DecodeError::Trailing`] for extra bytes, [`DecodeError::Options`]
     /// for nonzero options, and [`DecodeError::TooLong`] above [`MAX_DATA`].
     fn parse(b: &[u8]) -> Result<Self, DecodeError> {
-        let (packet, used) = Self::parse(b).ok_or(DecodeError::Truncated)?;
+        let (packet, used) = Self::parse_prefix(b).ok_or(DecodeError::Truncated)?;
         if used != b.len() {
             return Err(DecodeError::Trailing);
         }
@@ -334,7 +334,7 @@ impl Decode for Frames {
     /// Accepts all header fields and never returns an error. Use
     /// [`Packet::check`] for protocol limits and options.
     fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Packet>, Infallible> {
-        Ok(match Packet::parse(input) {
+        Ok(match Packet::parse_prefix(input) {
             Some((packet, used)) => Step::Item(packet, used),
             None => Step::Need,
         })
@@ -1738,7 +1738,7 @@ mod tests {
         // Command 0x65, length 4, then handle, status, context, options, data.
         assert_eq!(&bytes[..6], &[0x65, 0x00, 0x04, 0x00, 0x00, 0x00]);
         assert_eq!(bytes.len(), HEADER_LEN + 4);
-        let (back, used) = Packet::parse(&bytes).unwrap();
+        let (back, used) = Packet::parse_prefix(&bytes).unwrap();
         assert_eq!(used, bytes.len());
         assert_eq!(back, packet);
     }
@@ -1762,9 +1762,9 @@ mod tests {
         };
         let bytes = packet.to_bytes().unwrap();
         for n in 0..bytes.len() {
-            assert_eq!(Packet::parse(&bytes[..n]), None, "{n} bytes");
+            assert_eq!(Packet::parse_prefix(&bytes[..n]), None, "{n} bytes");
         }
-        assert!(Packet::parse(&bytes).is_some());
+        assert!(Packet::parse_prefix(&bytes).is_some());
     }
 
     #[test]
@@ -2284,7 +2284,7 @@ mod tests {
             },
         ]);
         let p = packet(Command::SendRRData, 0, send.to_bytes().unwrap());
-        let (back, _) = Packet::parse(&p.to_bytes().unwrap()).unwrap();
+        let (back, _) = Packet::parse_prefix(&p.to_bytes().unwrap()).unwrap();
         assert_eq!(back.check(), Ok(()));
         assert_eq!(SendData::parse(&back.data), Ok(send));
         let send = send_data(vec![
@@ -2328,7 +2328,7 @@ mod tests {
         let longest = packet(Command::Nop, 0, vec![0; MAX_DATA]);
         let bytes = longest.to_bytes().unwrap();
         assert_eq!(bytes.len(), 65535);
-        let (back, _) = Packet::parse(&bytes).unwrap();
+        let (back, _) = Packet::parse_prefix(&bytes).unwrap();
         assert_eq!(back.check(), Ok(()));
         // One byte more is read whole, so the stream keeps its place, but
         // fails the check and cannot be written.
@@ -2336,11 +2336,11 @@ mod tests {
         over[2..4].copy_from_slice(&65512u16.to_le_bytes());
         over.push(0);
         over.extend_from_slice(&bytes);
-        let (back, used) = Packet::parse(&over).unwrap();
+        let (back, used) = Packet::parse_prefix(&over).unwrap();
         assert_eq!(used, 65536);
         assert_eq!(back.check(), Err(DecodeError::TooLong));
         assert_eq!(back.to_bytes(), Err(EncodeError::TooLong));
-        assert_eq!(Packet::parse(&over[used..]).unwrap().0, longest);
+        assert_eq!(Packet::parse_prefix(&over[used..]).unwrap().0, longest);
     }
 
     #[test]
@@ -2466,7 +2466,7 @@ mod tests {
             .to_bytes()
             .unwrap();
         bytes[20] = 1;
-        let (back, _) = Packet::parse(&bytes).unwrap();
+        let (back, _) = Packet::parse_prefix(&bytes).unwrap();
         assert_eq!(back, request);
         assert_eq!(back.check(), Err(DecodeError::Options));
         assert_eq!(back.to_bytes(), Err(EncodeError::Options));
@@ -2550,7 +2550,7 @@ mod tests {
             Err(EncodeError::Unwritable)
         );
         let other = packet(Command::Other(0x72), 0, Vec::new());
-        assert_eq!(Packet::parse(&other.to_bytes().unwrap()).unwrap().0, other);
+        assert_eq!(Packet::parse_prefix(&other.to_bytes().unwrap()).unwrap().0, other);
         // A request's service with the reply bit, or a reply's.
         let req = MessageRequest {
             service: 0x8e,
@@ -2663,7 +2663,7 @@ mod tests {
         let samples = samples();
         // The Forward Open and the tag read ride in a send-data envelope.
         for k in [3, 4] {
-            let (p, used) = Packet::parse(&samples[k]).unwrap();
+            let (p, used) = Packet::parse_prefix(&samples[k]).unwrap();
             assert_eq!(used, samples[k].len());
             let send = SendData::parse(&p.data).unwrap();
             let req = MessageRequest::parse(&send.cpf.items[1].data).unwrap();
@@ -2674,7 +2674,7 @@ mod tests {
                 assert_eq!(req.path[0], PathSegment::Symbol(b"Counter".to_vec()));
             }
         }
-        let (p, _) = Packet::parse(&samples[5]).unwrap();
+        let (p, _) = Packet::parse_prefix(&samples[5]).unwrap();
         let cpf = Cpf::parse(&p.data).unwrap();
         let id = Identity::parse(&cpf.items[0].data).unwrap();
         assert_eq!(id.product_name, b"1756-L71");
@@ -3038,7 +3038,7 @@ mod tests {
                 }
                 d
             };
-            if Packet::parse(&data).is_some() {
+            if Packet::parse_prefix(&data).is_some() {
                 read += 1;
             }
             check(&data);

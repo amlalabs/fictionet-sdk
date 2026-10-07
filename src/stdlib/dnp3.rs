@@ -69,7 +69,7 @@ impl std::fmt::Display for FrameError {
 impl std::error::Error for FrameError {}
 
 /// Why an exact [`Wire`] parse did not read one complete frame.
-/// [`Frame::parse`] reads a prefix and returns the bytes used.
+/// [`Frame::parse_prefix`] reads a prefix and returns the bytes used.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameParseError {
     /// The frame is invalid.
@@ -130,7 +130,7 @@ impl Frame {
     /// Reads one frame at the start of `b`, returning its consumed length.
     /// `Ok(None)` means more bytes are needed. Invalid headers and complete
     /// bad CRC blocks are reported as soon as they are available.
-    pub fn parse(b: &[u8]) -> Result<Option<(Self, usize)>, FrameError> {
+    pub fn parse_prefix(b: &[u8]) -> Result<Option<(Self, usize)>, FrameError> {
         let n = b.len().min(2);
         if b[..n] != [5, 0x64][..n] {
             return Err(FrameError::Start);
@@ -205,7 +205,7 @@ impl Wire for Frame {
     /// and CRCs return [`FrameParseError::Frame`] with [`FrameError::Start`],
     /// [`FrameError::Length`] or [`FrameError::Crc`].
     fn parse(b: &[u8]) -> Result<Self, FrameParseError> {
-        match Self::parse(b).map_err(FrameParseError::Frame)? {
+        match Self::parse_prefix(b).map_err(FrameParseError::Frame)? {
             Some((frame, used)) if used == b.len() => Ok(frame),
             Some(_) => Err(FrameParseError::Trailing),
             None => Err(FrameParseError::Truncated),
@@ -260,7 +260,7 @@ impl Decode for Frames {
     /// Returns [`FrameError::Start`], [`FrameError::Length`] or
     /// [`FrameError::Crc`] for invalid start bytes, lengths or CRCs.
     fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, FrameError> {
-        Ok(match Frame::parse(input)? {
+        Ok(match Frame::parse_prefix(input)? {
             Some((frame, used)) => Step::Item(frame, used),
             None => Step::Need,
         })
@@ -509,7 +509,7 @@ mod tests {
     #[test]
     fn known_crc_and_link_frame() {
         assert_eq!(crc(b"123456789"), 0xea82);
-        let (frame, used) = Frame::parse(RESET).unwrap().unwrap();
+        let (frame, used) = Frame::parse_prefix(RESET).unwrap().unwrap();
         assert_eq!(used, 10);
         assert_eq!(
             frame,
@@ -523,7 +523,7 @@ mod tests {
         assert_eq!(frame.to_bytes().unwrap(), RESET);
         assert_eq!(frame.segment(), Err(TransportError::NotData));
         for n in 0..RESET.len() {
-            assert_eq!(Frame::parse(&RESET[..n]), Ok(None));
+            assert_eq!(Frame::parse_prefix(&RESET[..n]), Ok(None));
         }
     }
 
@@ -539,11 +539,11 @@ mod tests {
             let bytes = frame.to_bytes().unwrap();
             assert_eq!(bytes.len(), HEADER_LEN + n + 2 * n.div_ceil(16));
             for cut in 0..bytes.len() {
-                assert_eq!(Frame::parse(&bytes[..cut]), Ok(None));
+                assert_eq!(Frame::parse_prefix(&bytes[..cut]), Ok(None));
             }
             let mut joined = bytes.clone();
             joined.extend_from_slice(RESET);
-            assert_eq!(Frame::parse(&joined), Ok(Some((frame, bytes.len()))));
+            assert_eq!(Frame::parse_prefix(&joined), Ok(Some((frame, bytes.len()))));
         }
         let frame = Frame {
             control: 0xc4,
@@ -567,13 +567,13 @@ mod tests {
             let mut bad = bytes.clone();
             bad[at] ^= 1;
             assert!(
-                matches!(Frame::parse(&bad), Err(FrameError::Crc(_))),
+                matches!(Frame::parse_prefix(&bad), Err(FrameError::Crc(_))),
                 "offset {at}"
             );
         }
-        assert_eq!(Frame::parse(&[4]), Err(FrameError::Start));
-        assert_eq!(Frame::parse(&[5, 0x65]), Err(FrameError::Start));
-        assert_eq!(Frame::parse(&[5, 0x64, 4]), Err(FrameError::Length));
+        assert_eq!(Frame::parse_prefix(&[4]), Err(FrameError::Start));
+        assert_eq!(Frame::parse_prefix(&[5, 0x65]), Err(FrameError::Start));
+        assert_eq!(Frame::parse_prefix(&[5, 0x64, 4]), Err(FrameError::Length));
     }
 
     #[test]
