@@ -246,7 +246,8 @@ impl Link {
     }
 
     /// The Ethernet header for a packet from the world, or `None` to drop
-    /// it: it is not IPv4 or IPv6, or is longer than the MTU.
+    /// it: it is not IPv4 or IPv6, is longer than the MTU, or is unicast
+    /// before the VM's MAC is known.
     pub(crate) fn to_vm(&self, packet: &[u8]) -> Option<[u8; ether::HEADER]> {
         if packet.len() > self.mtu as usize {
             return None;
@@ -739,7 +740,7 @@ struct Stats {
     from_vm: Vec<(Why, u64)>,
     /// Packets for the world that did not fit its connection's buffer.
     to_world_full: u64,
-    /// Packets from the world that were not IP, or were over the MTU.
+    /// Packets from the world rejected by Link::to_vm.
     from_world_bad: u64,
     /// Frames for the VM that did not fit the queue to QEMU.
     to_vm_full: u64,
@@ -776,7 +777,7 @@ impl Stats {
             eprintln!("fictionet attach: {} frames to the VM dropped on a full queue", self.to_vm_full);
         }
         if self.from_world_bad > 0 {
-            eprintln!("fictionet attach: {} packets from the world dropped: not IP, or over the MTU", self.from_world_bad);
+            eprintln!("fictionet attach: {} packets from the world dropped: not IP, over the MTU, or unicast before the VM's MAC is known", self.from_world_bad);
         }
     }
 }
@@ -1425,10 +1426,38 @@ mod tests {
     }
 
     #[test]
+    fn world_unicast_waits_for_the_vm_mac() {
+        let mut link = served();
+        let unicast = ether::ipv6("fd00::1".parse().unwrap(), "fd00::2".parse().unwrap(), 6, 64, &[]);
+        assert!(link.to_vm(&unicast).is_none());
+        for (dst, mac) in [
+            (Ipv4Addr::BROADCAST, ether::BROADCAST),
+            (Ipv4Addr::new(239, 129, 2, 3), [1, 0, 0x5e, 1, 2, 3]),
+        ] {
+            let p = ether::ipv4(Ipv4Addr::new(10, 0, 0, 1), dst, 17, &[]);
+            assert_eq!(link.to_vm(&p).unwrap()[..6], mac);
+        }
+        let ra = link.router_advert().unwrap();
+        assert_eq!(ra[..6], [0x33, 0x33, 0, 0, 0, 1]);
+        let FromVm::Answer(answer) = link.frame_from_vm(&discover()) else { panic!("DHCP answer") };
+        assert_eq!(answer[..6], ether::BROADCAST);
+        let mut renew = dhcp::Message::new(dhcp::BOOTREQUEST, 8);
+        renew.chaddr[..6].copy_from_slice(&VM);
+        renew.ciaddr = Ipv4Addr::new(10, 0, 0, 2);
+        renew.push(dhcp::opt::MESSAGE_TYPE, [dhcp::REQUEST]);
+        let p = ether::udp4(renew.ciaddr, 68, Ipv4Addr::new(10, 0, 0, 1), 67, &renew.to_bytes().unwrap());
+        let FromVm::Answer(answer) = link.frame_from_vm(&eth(VM, ether::GATEWAY_MAC, ether::IPV4, &p)) else {
+            panic!("DHCP renewal answer");
+        };
+        assert_eq!(answer[..6], VM);
+        assert_eq!(link.to_vm(&unicast).unwrap()[..6], VM);
+    }
+
+    #[test]
     fn world_packets_get_the_vm_or_group_mac() {
         let mut link = served();
         let to_vm = ether::ipv4(Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 2), 1, &[]);
-        assert_eq!(link.to_vm(&to_vm).unwrap()[..6], ether::BROADCAST, "before the VM's MAC is known");
+        assert!(link.to_vm(&to_vm).is_none(), "before the VM's MAC is known");
         link.frame_from_vm(&discover());
         let h = link.to_vm(&to_vm).unwrap();
         assert_eq!(h, ether::header(VM, ether::GATEWAY_MAC, ether::IPV4));
