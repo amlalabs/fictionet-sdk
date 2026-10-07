@@ -7,10 +7,10 @@
 //! datagrams with [`recv`](Socket::recv) and sends them with
 //! [`send_to`](Socket::send_to).
 //!
-//! The interface comes from [`ip::split_protocols`](crate::stdlib::ip::split_protocols),
+//! The interface comes from [`ip::split_protocols`],
 //! which splits a machine's packets so that only UDP, and ICMP errors
 //! about it, reach this layer.
-//! The [`ip`](crate::stdlib::ip) page shows a whole machine.
+//! The [`ip`] page shows a whole machine.
 
 use std::collections::{HashMap, VecDeque};
 use std::future::poll_fn;

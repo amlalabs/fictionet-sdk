@@ -6,7 +6,7 @@
 //! with no ICMP loop looks silent to `ping`.
 //!
 //! Answering pings takes a short loop on the ICMP interface that
-//! [`ip::split_protocols`](crate::stdlib::ip::split_protocols) returns. It
+//! [`ip::split_protocols`] returns. It
 //! receives each ICMP packet, builds the reply with [`echo_reply`], and
 //! sends it back:
 //!
