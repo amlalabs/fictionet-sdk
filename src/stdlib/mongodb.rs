@@ -25,7 +25,10 @@
 //! bytes. OP_MSG checksums (CRC-32C) are checked and
 //! written. Compressed messages (OP_COMPRESSED) are reported with their
 //! compressor and bytes, not decompressed. Every writer checks the same
-//! limits, so what it writes always reads back.
+//! limits, so what it writes always reads back. The faults that end a
+//! [`Messages`] stream, [`Error::Length`] and [`Error::SectionKind`], are the
+//! ones [`Message`]'s `parse` reports too, so the module has one [`Error`]
+//! and no `FrameError`.
 //!
 //! ```
 //! use fictionet::stdlib::mongodb::{Body, Bson, Document, Message, Messages, Msg, Reply};

@@ -25,7 +25,9 @@
 //! Every reader checks lengths, because the agent can send any bytes it
 //! likes. A header that cannot be read breaks the stream, since the next
 //! PDU cannot be found. A body that cannot be read is an [`Error`] for
-//! that PDU alone, and the stream goes on. Writers return an
+//! that PDU alone, and the stream goes on. A bad header is the same
+//! [`Error`] that [`Pdu::frame_length`] and [`Pdu`]'s `parse` report, so the
+//! module has no `FrameError`. Writers return an
 //! [`Error`] rather than write bytes a reader would refuse or read
 //! back as something else.
 //!

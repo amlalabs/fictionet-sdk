@@ -15,7 +15,9 @@
 //! [`Wire`]. [`Packets`] reads packets from a byte stream for a
 //! [`Stream`](fictionet::stdlib::codec::Stream). A packet that frames but
 //! does not parse is an item (`Err`), so a session can close the
-//! connection as it chooses.
+//! connection as it chooses. The one fault that ends the stream,
+//! [`Error::TooLong`], is also what writers and sessions report, so the
+//! module has one [`Error`] and no `FrameError`.
 //!
 //! [`Client`] and [`Server`] are the session rules: login (1.2, 2.2.1,
 //! 2.3.1), heartbeats once a side has sent nothing for one second and an
