@@ -19,8 +19,8 @@ The default addresses match GOAD and GOAD-Light:
 | `attacker` | 192.168.56.100 | Kali or another agent VM/container |
 
 GOAD-Light needs `dc01`, `dc02`, `srv02` and `attacker`. The full lab adds
-`dc03` and `srv03`. Members may attach in any order and may reconnect under
-the same name.
+`dc03` and `srv03`. Members may attach in any order. A name is free again
+once the attach that held it has exited.
 
 ## What Fictionet provides
 
@@ -106,12 +106,17 @@ useful for Windows images that do not have virtio-net drivers installed:
 -device e1000,netdev=lab,mac=52:54:00:00:00:10
 ```
 
-`server=off` makes QEMU the client of attach's socket. `reconnect-ms` makes
-QEMU try the socket again every half second if attach is restarted under a
-running VM. It needs QEMU 9.2 or later; older QEMU spells it `reconnect=1`,
-in seconds. QEMU adds its default user-mode network card, which reaches the
-real internet, only when no `-netdev` or `-nic` is given, so this VM has the
-one card.
+`server=off` makes QEMU the client of attach's socket. Attach serves one
+QEMU connection and exits when QEMU closes it. It does not wait for QEMU to
+come back. So after QEMU stops or restarts, start `fictionet attach` again
+with the same name and socket path, then start QEMU.
+
+`reconnect-ms=500` makes a running QEMU retry the socket every half second
+after disconnection. If attach is restarted under that VM, QEMU can find
+the new socket without restarting QEMU. The millisecond option needs QEMU
+9.2 or later; older QEMU spells it `reconnect=1`, in seconds. QEMU adds its
+default user-mode network card, which reaches the real internet, only when
+no `-netdev` or `-nic` is given, so this VM has the one card.
 
 Repeat with the attachment name, socket and final MAC byte for each guest.
 Only the lab NIC should remain connected during an eval. A provisioning or NAT
