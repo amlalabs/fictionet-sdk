@@ -42,12 +42,16 @@ macro_rules! protocols {
         pub mod cotp;
         #[path = "../../src/stdlib/dcerpc.rs"]
         pub mod dcerpc;
+        #[path = "../../src/stdlib/connection.rs"]
+        pub mod connection;
         #[path = "../../src/stdlib/dhcp.rs"]
         pub mod dhcp;
         #[path = "../../src/stdlib/dhcpv6.rs"]
         pub mod dhcpv6;
         #[path = "../../src/stdlib/diameter.rs"]
         pub mod diameter;
+        #[path = "../../src/stdlib/dns.rs"]
+        pub mod dns;
         #[path = "../../src/stdlib/dnp3.rs"]
         pub mod dnp3;
         #[path = "../../src/stdlib/dtls.rs"]
@@ -88,12 +92,16 @@ macro_rules! protocols {
         pub mod iec104;
         #[path = "../../src/stdlib/igmp.rs"]
         pub mod igmp;
+        #[path = "../../src/stdlib/icmp.rs"]
+        pub mod icmp;
         #[path = "../../src/stdlib/ike.rs"]
         pub mod ike;
         #[path = "../../src/stdlib/imap.rs"]
         pub mod imap;
         #[path = "../../src/stdlib/imf.rs"]
         pub mod imf;
+        #[path = "../../src/stdlib/ip.rs"]
+        pub mod ip;
         #[path = "../../src/stdlib/ipp.rs"]
         pub mod ipp;
         #[path = "../../src/stdlib/ipsec.rs"]

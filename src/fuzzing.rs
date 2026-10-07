@@ -5,7 +5,7 @@
 use std::cell::Cell;
 
 use crate::Packet;
-use crate::stdlib::ip::{Intake, Reassembly, protocol};
+use crate::stdlib::ip::{Intake, Reassembly, protocol_end};
 use crate::time::{Duration, Instant};
 
 /// Feeds packets to fragment reassembly, as `split_protocols` takes them in
@@ -37,7 +37,7 @@ pub fn reassemble(packets: impl IntoIterator<Item = (u64, Vec<u8>)>) -> Vec<Pack
 /// Which end of `ip::split_protocols` a whole packet goes to, as a
 /// protocol number.
 pub fn sort(packet: &[u8]) -> u8 {
-    protocol(packet)
+    protocol_end(packet)
 }
 
 thread_local! {

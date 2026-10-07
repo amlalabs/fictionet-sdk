@@ -33,7 +33,7 @@ use std::sync::Arc;
 use std::task::Poll;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use fictionet::stdlib::{tls, web};
+use fictionet::stdlib::{ip, tls, web};
 use fictionet::{Attacher, Cx, End, Interface, Packet};
 
 /// The gateway, where `Sites` runs DNS (its default subnet is 10.0.0.0/24).
@@ -253,8 +253,7 @@ fn dns_query_packet(id: u16, name: &str) -> Vec<u8> {
     p.extend_from_slice(&[0x45, 0, (total >> 8) as u8, total as u8, 0, 0, 0x40, 0, 64, 17, 0, 0]);
     p.extend_from_slice(&LOOKUP_FROM.ip().octets());
     p.extend_from_slice(&GATEWAY.octets());
-    let sum = checksum(&p[..20]);
-    p[10..12].copy_from_slice(&sum.to_be_bytes());
+    ip::set_header_checksum(&mut p[..20]);
     p.extend_from_slice(&LOOKUP_FROM.port().wrapping_add(id).to_be_bytes());
     p.extend_from_slice(&53u16.to_be_bytes());
     p.extend_from_slice(&(udp_len as u16).to_be_bytes());
@@ -263,13 +262,3 @@ fn dns_query_packet(id: u16, name: &str) -> Vec<u8> {
     p
 }
 
-fn checksum(data: &[u8]) -> u16 {
-    let mut sum = 0u32;
-    for chunk in data.chunks(2) {
-        sum += u16::from_be_bytes([chunk[0], *chunk.get(1).unwrap_or(&0)]) as u32;
-    }
-    while sum > 0xffff {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    !(sum as u16)
-}

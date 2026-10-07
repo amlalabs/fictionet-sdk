@@ -144,7 +144,7 @@ fn gre_packets_and_exact_pptp_boundary() {
 
 fn igmp_checksum(bytes: &mut [u8]) {
     bytes.get_mut(2..4).unwrap().fill(0);
-    let checksum = igmp::checksum(bytes);
+    let checksum = fictionet::stdlib::ip::checksum(bytes);
     bytes
         .get_mut(2..4)
         .unwrap()

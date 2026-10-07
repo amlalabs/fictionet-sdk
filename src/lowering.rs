@@ -191,12 +191,12 @@
 //!   The rest go to the world.
 //! - **Anything else,** such as VLAN-tagged frames or LLDP, is dropped.
 //!
-//! `ether::upper` finds the transport with `stdlib::transport`, a hidden
-//! module of the library built on the parser that
+//! `ether::upper` finds the transport with
+//! [`ip::Header::check`](crate::stdlib::ip::Header::check), the parser that
 //! [`ip::split_protocols`](crate::stdlib::ip::split_protocols) uses. So
 //! attach walks the same IPv6 extension headers as the world's stack
-//! (hop-by-hop, routing, destination options, authentication, fragment,
-//! and the rest it knows), with no limit on how many. A packet whose
+//! (hop-by-hop, routing, destination options, authentication and
+//! fragment), with no limit on how many. A packet whose
 //! headers run past its end, whose UDP header is cut short or whose UDP
 //! length does not fit, or whose ICMPv6 header is cut short, is dropped.
 //! Attach does not put fragments back together. The transport header is

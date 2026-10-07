@@ -8,6 +8,7 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use arbitrary::Arbitrary;
 use fictionet::stdlib::dhcp;
+use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::dns::op::{Message, Query};
 use fictionet::stdlib::dns::rr::{Name, RecordType};
 use fictionet::{Interface, Packet};
@@ -76,7 +77,7 @@ fuzz_target!(|steps: Vec<Step>| {
                     }
                     // The extra bytes go before the END option, where the
                     // parser still reads them as options.
-                    let mut b = m.to_bytes();
+                    let mut b = m.to_bytes().unwrap();
                     let end = b.iter().rposition(|&x| x == dhcp::opt::END).unwrap();
                     b.truncate(end);
                     b.extend_from_slice(&extra);

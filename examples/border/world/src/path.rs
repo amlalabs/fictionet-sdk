@@ -359,26 +359,11 @@ fn v4_src(p: &[u8]) -> Option<Ipv4Addr> {
     header_len(p).map(|_| Ipv4Addr::new(p[12], p[13], p[14], p[15]))
 }
 
-/// The Internet checksum of `data`.
-pub fn checksum(data: &[u8]) -> u16 {
-    let mut sum = 0u32;
-    for chunk in data.chunks(2) {
-        sum += u32::from(u16::from_be_bytes([chunk[0], *chunk.get(1).unwrap_or(&0)]));
-    }
-    while sum > 0xffff {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    !(sum as u16)
-}
-
 /// Sets the TTL of the IPv4 packet `p` and its header checksum.
 fn set_ttl(p: &mut [u8], ttl: u8) {
     let Some(ihl) = header_len(p) else { return };
     p[8] = ttl;
-    p[10] = 0;
-    p[11] = 0;
-    let sum = checksum(&p[..ihl]);
-    p[10..12].copy_from_slice(&sum.to_be_bytes());
+    ip::set_header_checksum(&mut p[..ihl]);
 }
 
 /// The most of a packet an ICMP error quotes: RFC 1812 keeps the error
@@ -416,7 +401,7 @@ pub fn icmp_error(p: &[u8], from: Ipv4Addr, ttl: u8, id: u16, kind: u8, code: u8
     }
     let mut icmp = vec![kind, code, 0, 0, 0, 0, 0, 0];
     icmp.extend_from_slice(&quoted);
-    let sum = checksum(&icmp);
+    let sum = ip::checksum(&icmp);
     icmp[2..4].copy_from_slice(&sum.to_be_bytes());
     let total = 20 + icmp.len();
     let mut out = Vec::with_capacity(total);
@@ -425,8 +410,7 @@ pub fn icmp_error(p: &[u8], from: Ipv4Addr, ttl: u8, id: u16, kind: u8, code: u8
     out.extend_from_slice(&[0, 0, ttl, 1, 0, 0]);
     out.extend_from_slice(&from.octets());
     out.extend_from_slice(&src.octets());
-    let sum = checksum(&out[..20]);
-    out[10..12].copy_from_slice(&sum.to_be_bytes());
+    ip::set_header_checksum(&mut out[..20]);
     out.extend_from_slice(&icmp);
     Some(Packet(out))
 }
@@ -434,6 +418,7 @@ pub fn icmp_error(p: &[u8], from: Ipv4Addr, ttl: u8, id: u16, kind: u8, code: u8
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fictionet::stdlib::ip::checksum;
 
     fn packet(proto: u8, ttl: u8, frag: u16, payload: &[u8]) -> Vec<u8> {
         let total = 20 + payload.len();

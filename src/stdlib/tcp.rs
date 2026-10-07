@@ -50,8 +50,8 @@ use smoltcp::socket::tcp::{self as stcp, State as TcpState};
 use smoltcp::wire::{HardwareAddress, IpCidr};
 
 use crate::cx::CancelWait;
-use crate::stdlib::udp::{TCP, ipv4_header_checksum, parse_ip, transport_checksum};
-use crate::stdlib::{ConnError, Connection, wire};
+use crate::stdlib::ip::{Header, protocol::TCP, set_header_checksum, strip_extension_headers, transport_checksum};
+use crate::stdlib::{ConnError, Connection};
 use crate::time::{Duration, Instant};
 use crate::{Cx, Error, Interface, Packet};
 
@@ -77,9 +77,12 @@ const ORPHAN_TIMEOUT: Duration = Duration::from_secs(60);
 /// Idle connections send a keepalive this often, so a peer that is gone is
 /// noticed within `TIMEOUT`.
 const KEEPALIVE: Duration = Duration::from_secs(45);
-/// Connections per port that have arrived but not been accepted yet. More
-/// connection attempts get a RST.
-const BACKLOG: usize = 16 * 1024;
+/// Connections per port that have arrived but not been accepted yet,
+/// unless [`Options::backlog`] says otherwise. More connection attempts get
+/// a RST.
+const BACKLOG: usize = 4096;
+/// The largest backlog [`Options::backlog`] allows.
+const MAX_BACKLOG: usize = 65_536;
 /// Of those, at most this many from one peer address. More attempts from
 /// that address are dropped, so one peer that never finishes its
 /// handshakes (a SYN flood) cannot fill the backlog for the others.
@@ -103,8 +106,9 @@ const ACK_DELAY: Duration = Duration::from_millis(10);
 /// then fail with [`ConnError::Closed`].
 ///
 /// Each connection has 256 KiB buffers each way, a 1,500-byte MTU, no
-/// Nagle delay, and Reno congestion control. [`endpoint_with`] takes
-/// other buffer sizes. Buffer memory is used only
+/// Nagle delay, and Reno congestion control. Each listening port holds up
+/// to 4,096 connections that have not been accepted yet. [`endpoint_with`]
+/// takes other buffer sizes and backlogs. Buffer memory is used only
 /// as data passes through: once a connection's buffers are empty, their
 /// pages go back to the system within about two seconds, though the
 /// connection stays open, and closing frees them. A connection gives up with
@@ -123,11 +127,12 @@ pub fn endpoint(cx: &Cx, inner: impl Interface, addr: IpAddr) -> Endpoint {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Options {
     buffer: usize,
+    backlog: usize,
 }
 
 impl Default for Options {
     fn default() -> Options {
-        Options { buffer: BUFFER }
+        Options { buffer: BUFFER, backlog: BACKLOG }
     }
 }
 
@@ -158,7 +163,25 @@ impl Options {
     /// [`split_protocols`](crate::stdlib::ip::split_protocols), drop what
     /// does not fit, and TCP then sends it again.
     pub fn buffer(self, bytes: usize) -> Options {
-        Options { buffer: bytes.clamp(MIN_BUFFER, MAX_BUFFER) }
+        Options { buffer: bytes.clamp(MIN_BUFFER, MAX_BUFFER), ..self }
+    }
+
+    /// Sets how many connections each listening port holds that have
+    /// arrived but not been accepted yet: handshakes under way, and
+    /// connections waiting for [`Listener::accept`]. The default is 4,096.
+    /// Values below 1 or above 65,536 are raised or lowered to those
+    /// limits. Past the backlog, a connection attempt gets a RST, as from
+    /// a full listen queue. At most 256 of them come from one peer address,
+    /// whatever the backlog, so a single peer cannot fill it.
+    ///
+    /// Each connection in the backlog has its buffers from its first SYN.
+    /// Their pages cost memory only once data arrives, but each connection
+    /// holds one memory mapping, and Linux allows a process 65,530 of them
+    /// by default (`vm.max_map_count`). Spoofed SYNs from many addresses
+    /// fill the backlog of every port they reach, so a world with many
+    /// listening ports may want a smaller one.
+    pub fn backlog(self, connections: usize) -> Options {
+        Options { backlog: connections.clamp(1, MAX_BACKLOG), ..self }
     }
 }
 
@@ -210,6 +233,7 @@ pub fn endpoint_with(cx: &Cx, inner: impl Interface, addr: IpAddr, options: Opti
             stopped: false,
             driver: None,
             buffer: options.buffer,
+            backlog: options.backlog,
         }),
     });
     let driver = shared.clone();
@@ -321,6 +345,8 @@ struct State {
     driver: Option<Waker>,
     /// Each new socket's receive and send buffer, in bytes.
     buffer: usize,
+    /// Connections per listening port not accepted yet: [`Options::backlog`].
+    backlog: usize,
 }
 
 /// One listening port.
@@ -475,9 +501,12 @@ impl Pages {
     /// Gives the pages of both halves back to the system. They read as
     /// zeros after, and cost memory again only once written.
     ///
-    /// Only for a socket whose buffers hold nothing: no bytes to read, none
-    /// to send or resend, and nothing received out of order.
-    fn release(&self) {
+    /// SAFETY: the socket that holds the halves (see [`Pages::halves`])
+    /// must hold nothing in them: no bytes to read, none to send or
+    /// resend, and nothing received out of order. Its buffers are
+    /// `&'static mut` slices of this mapping, and this changes their bytes
+    /// behind them.
+    unsafe fn release(&self) {
         // SAFETY: the range is this mapping. MADV_DONTNEED on a private
         // anonymous mapping only makes its pages read as zeros, and the
         // caller has checked that the socket holds no data in them.
@@ -520,7 +549,8 @@ impl Pages {
         match *self {}
     }
 
-    fn release(&self) {
+    /// SAFETY: as on a host; no `Pages` exists to call it on.
+    unsafe fn release(&self) {
         match *self {}
     }
 }
@@ -587,7 +617,9 @@ impl State {
             let (rq, sq) = (s.recv_queue(), s.send_queue());
             let held = self.conns.get(&h).is_some_and(|c| c.may_hold_more(rq));
             if rq == 0 && sq == 0 && !held {
-                self.pages[&h].release();
+                // SAFETY: the socket holds nothing in its buffers, as just
+                // checked: nothing to read or send, and nothing out of order.
+                unsafe { self.pages[&h].release() };
                 self.dirty.remove(&h);
             }
         }
@@ -678,21 +710,21 @@ impl State {
     /// Feeds one packet from the interface into smoltcp. Returns whether it was
     /// a TCP segment for this endpoint that carried data.
     fn ingress(&mut self, addr: IpAddr, now: smoltcp::time::Instant, packet: Vec<u8>) -> bool {
-        let Some(ip) = parse_ip(&packet) else { return false };
-        if ip.proto != TCP || ip.dst != addr || ip.end - ip.payload < 20 {
+        let Some(ip) = Header::parse_whole(&packet) else { return false };
+        if ip.protocol != TCP || ip.dst != addr || ip.payload.len() < 20 {
             return false;
         }
-        // smoltcp takes TCP only right after the IPv6 header. `parse_ip` has
+        // smoltcp takes TCP only right after the IPv6 header. `parse_whole` has
         // checked the extension headers in between, so they are taken out,
         // as `split_protocols` does before packets get here.
-        if ip.payload != 40 && ip.dst.is_ipv6() {
-            return match wire::strip_ext6(&packet) {
+        if ip.payload.start != 40 && ip.dst.is_ipv6() {
+            return match strip_extension_headers(&packet) {
                 Ok(Some(stripped)) => self.ingress(addr, now, stripped),
                 _ => false,
             };
         }
-        let t = &packet[ip.payload..];
-        let data_len = (ip.end - ip.payload).saturating_sub(((t[12] >> 4) as usize) * 4);
+        let t = &packet[ip.payload.start..];
+        let data_len = ip.payload.len().saturating_sub(((t[12] >> 4) as usize) * 4);
         let data = data_len > 0;
         let src = SocketAddr::new(ip.src, u16::from_be_bytes([t[0], t[1]]));
         let dst = SocketAddr::new(ip.dst, u16::from_be_bytes([t[2], t[3]]));
@@ -706,7 +738,7 @@ impl State {
                 return false;
             }
             listening = true;
-            if l.idle.is_empty() && l.embryonic.len() + l.ready.len() < BACKLOG {
+            if l.idle.is_empty() && l.embryonic.len() + l.ready.len() < self.backlog {
                 let mut s = new_socket(self.buffer);
                 s.0.listen(dst.port()).expect("a new socket can listen");
                 let h = self.add_socket(s);
@@ -876,9 +908,9 @@ impl State {
 ///    (at least one second) instead. A pure ACK with SACK blocks that
 ///    repeats the last acknowledgment is a duplicate (RFC 6675), so its
 ///    window is set back to the last one smoltcp saw.
-fn repair_ack(c: &mut Conn, s: &stcp::Socket<'static>, ip: &crate::stdlib::udp::IpInfo, packet: &mut Vec<u8>) -> Option<Vec<u8>> {
+fn repair_ack(c: &mut Conn, s: &stcp::Socket<'static>, ip: &Header, packet: &mut Vec<u8>) -> Option<Vec<u8>> {
     let irs = c.irs?;
-    let t = &packet[ip.payload..ip.end];
+    let t = &packet[ip.payload.clone()];
     let off = ((t[12] >> 4) as usize) * 4;
     if off < 20 || off > t.len() {
         return None;
@@ -896,21 +928,21 @@ fn repair_ack(c: &mut Conn, s: &stcp::Socket<'static>, ip: &crate::stdlib::udp::
     let last = c.last_fed.replace((ack, win));
     if ahead && last != Some((ack, win)) && intact() {
         // A copy with no data and no FIN, at the expected sequence number.
-        let mut copy = packet[..ip.payload + off].to_vec();
-        let tcp_at = ip.payload;
+        let tcp_at = ip.payload.start;
+        let mut copy = packet[..tcp_at + off].to_vec();
         copy[tcp_at + 4..tcp_at + 8].copy_from_slice(&rcv_nxt.to_be_bytes());
         copy[tcp_at + 13] = 0x10;
-        fix_lengths(&mut copy, ip.payload, ip.src, ip.dst);
+        fix_lengths(&mut copy, tcp_at, ip.src, ip.dst);
         return Some(copy);
     }
     let pure = off == t.len() && !fin;
     if !ahead && pure && let Some((last_ack, last_win)) = last
         && last_ack == ack && last_win != win && has_sack(&t[20..off]) && intact()
     {
-        let tcp_at = ip.payload;
+        let tcp_at = ip.payload.start;
         packet[tcp_at + 14..tcp_at + 16].copy_from_slice(&last_win.to_be_bytes());
-        packet.truncate(ip.end);
-        fix_lengths(packet, ip.payload, ip.src, ip.dst);
+        packet.truncate(ip.payload.end);
+        fix_lengths(packet, tcp_at, ip.src, ip.dst);
         c.last_fed = Some((ack, last_win));
     }
     None
@@ -941,10 +973,8 @@ fn fix_lengths(packet: &mut [u8], tcp_at: usize, src: IpAddr, dst: IpAddr) {
     let len = packet.len();
     if src.is_ipv4() {
         packet[2..4].copy_from_slice(&(len as u16).to_be_bytes());
-        packet[10..12].copy_from_slice(&[0, 0]);
         let ihl = (packet[0] & 15) as usize * 4;
-        let sum = ipv4_header_checksum(&packet[..ihl]);
-        packet[10..12].copy_from_slice(&sum.to_be_bytes());
+        set_header_checksum(&mut packet[..ihl]);
     } else {
         packet[4..6].copy_from_slice(&((len - 40) as u16).to_be_bytes());
     }
@@ -1521,7 +1551,37 @@ mod tests {
         t[14..16].copy_from_slice(&65535u16.to_be_bytes());
         let sum = transport_checksum(src.ip(), dst.ip(), TCP, &t);
         t[16..18].copy_from_slice(&sum.to_be_bytes());
-        crate::stdlib::udp::ip_packet(src.ip(), dst.ip(), TCP, 0, &t)
+        crate::stdlib::ip::packet(src.ip(), dst.ip(), TCP, &t)
+    }
+
+    /// A listening port holds at most its backlog of connections not
+    /// accepted yet. Further SYNs get a RST.
+    #[test]
+    fn syns_past_the_backlog_get_a_rst() {
+        assert_eq!(Options::default().backlog, 4096);
+        assert_eq!((Options::default().backlog(0).backlog, Options::default().backlog(1 << 20).backlog), (1, MAX_BACKLOG));
+        let result = block_on(run(|cx| async move {
+            let (mut raw, side) = pair();
+            let server = endpoint_with(&cx, side, "10.0.0.1".parse().unwrap(), Options::default().backlog(4));
+            let _listener = server.listen(80)?;
+            let to: SocketAddr = "10.0.0.1:80".parse().unwrap();
+            for port in 1000..1010u16 {
+                raw.send(segment(SocketAddr::new("10.0.0.2".parse().unwrap(), port), to, 7, 0, 0x02));
+            }
+            let (mut syn_acks, mut rsts) = (0, 0);
+            while syn_acks + rsts < 10 {
+                let p = raw.recv(&cx).await?;
+                let t = Header::parse_whole(&p.0).unwrap().payload(&p.0).to_vec();
+                match t[13] {
+                    0x12 => syn_acks += 1,
+                    f if f & 0x04 != 0 => rsts += 1,
+                    f => panic!("flags {f:#x}"),
+                }
+            }
+            assert_eq!((syn_acks, rsts), (4, 6));
+            Err::<(), crate::Error>("done".into())
+        }));
+        assert_eq!(result.unwrap_err().to_string(), "done");
     }
 
     /// A burst of handshakes that the peer resets in SYN-RECEIVED leaves
@@ -1539,8 +1599,8 @@ mod tests {
             let mut acks = 0;
             while acks < 250 {
                 let p = raw.recv(&cx).await?;
-                let ip = parse_ip(&p.0).unwrap();
-                let t = &p.0[ip.payload..];
+                let ip = Header::parse_whole(&p.0).unwrap();
+                let t = ip.payload(&p.0);
                 assert_eq!(t[13], 0x12, "a SYN-ACK");
                 let port = u16::from_be_bytes([t[2], t[3]]);
                 let isn = u32::from_be_bytes([t[4], t[5], t[6], t[7]]);

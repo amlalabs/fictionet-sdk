@@ -7,6 +7,7 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use fictionet::prelude::*;
+use fictionet::stdlib::ip::{Fields, checksum, destination, packet_with, source, transport_checksum};
 use fictionet::stdlib::{ConnError, Connection, tcp, udp};
 use fictionet::{Cx, Interface, Packet, RecvError, block_on, pair, run};
 
@@ -649,7 +650,7 @@ fn udp_closed_port_gets_port_unreachable() {
                 assert_eq!(r[6], 58, "ICMPv6");
                 assert_eq!((r[40], r[41]), (1, 4), "port unreachable");
                 assert_eq!(&r[48..], &sent.0[..], "quotes the datagram");
-                assert_eq!(pseudo_checksum(&r[8..24], &r[24..40], 58, &r[40..]), 0);
+                assert_eq!(transport_checksum(source(r).unwrap(), destination(r).unwrap(), 58, &r[40..]), 0);
             }
             // An open port gets no ICMP, and a datagram for another address
             // gets nothing at all.
@@ -681,7 +682,7 @@ fn udp_packets_have_good_checksums_and_bad_ones_are_dropped() {
         sock.send_to(b"answer", from);
         let p = raw.recv(&cx).await?;
         assert_eq!(checksum(&p.0[..20]), 0);
-        assert_eq!(pseudo_checksum(&p.0[12..16], &p.0[16..20], 17, &p.0[20..]), 0);
+        assert_eq!(transport_checksum(source(&p.0).unwrap(), destination(&p.0).unwrap(), 17, &p.0[20..]), 0);
         assert_eq!(&p.0[28..], b"answer");
         Ok(())
     });
@@ -713,64 +714,10 @@ fn udp_recv_ends_on_cancel_and_on_close() {
 
 // Hand-made packets.
 
-fn checksum(data: &[u8]) -> u16 {
-    let mut acc = 0u32;
-    for c in data.chunks(2) {
-        acc += u16::from_be_bytes([c[0], *c.get(1).unwrap_or(&0)]) as u32;
-    }
-    while acc > 0xffff {
-        acc = (acc & 0xffff) + (acc >> 16);
-    }
-    !(acc as u16)
-}
-
-fn pseudo_checksum(src: &[u8], dst: &[u8], proto: u8, data: &[u8]) -> u16 {
-    let mut pseudo = Vec::new();
-    pseudo.extend_from_slice(src);
-    pseudo.extend_from_slice(dst);
-    if src.len() == 4 {
-        pseudo.extend_from_slice(&[0, proto]);
-        pseudo.extend_from_slice(&(data.len() as u16).to_be_bytes());
-    } else {
-        pseudo.extend_from_slice(&(data.len() as u32).to_be_bytes());
-        pseudo.extend_from_slice(&[0, 0, 0, proto]);
-    }
-    pseudo.extend_from_slice(data);
-    if pseudo.len() % 2 == 1 {
-        pseudo.push(0);
-    }
-    checksum(&pseudo)
-}
-
-fn octets(a: IpAddr) -> Vec<u8> {
-    match a {
-        IpAddr::V4(a) => a.octets().to_vec(),
-        IpAddr::V6(a) => a.octets().to_vec(),
-    }
-}
-
 fn ip_packet(src: IpAddr, dst: IpAddr, proto: u8, mut payload: Vec<u8>, sum_at: usize) -> Packet {
-    let (s, d) = (octets(src), octets(dst));
-    let sum = pseudo_checksum(&s, &d, proto, &payload);
+    let sum = transport_checksum(src, dst, proto, &payload);
     payload[sum_at..sum_at + 2].copy_from_slice(&sum.to_be_bytes());
-    let mut p = Vec::new();
-    if src.is_ipv4() {
-        p.extend_from_slice(&[0x45, 0]);
-        p.extend_from_slice(&((20 + payload.len()) as u16).to_be_bytes());
-        p.extend_from_slice(&[0, 1, 0x40, 0, 64, proto, 0, 0]);
-        p.extend_from_slice(&s);
-        p.extend_from_slice(&d);
-        let sum = checksum(&p);
-        p[10..12].copy_from_slice(&sum.to_be_bytes());
-    } else {
-        p.extend_from_slice(&[0x60, 0, 0, 0]);
-        p.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-        p.extend_from_slice(&[proto, 64]);
-        p.extend_from_slice(&s);
-        p.extend_from_slice(&d);
-    }
-    p.extend_from_slice(&payload);
-    Packet(p)
+    packet_with(src, dst, proto, Fields { id: 1, ..Fields::default() }, &payload)
 }
 
 fn udp_packet(src: IpAddr, sport: u16, dst: IpAddr, dport: u16, data: &[u8]) -> Packet {

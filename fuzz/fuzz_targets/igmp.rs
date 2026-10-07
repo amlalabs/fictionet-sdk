@@ -4,7 +4,8 @@
 
 use std::net::Ipv4Addr;
 
-use fictionet::stdlib::igmp::{Message, RecordType, checksum};
+use fictionet::stdlib::igmp::{Message, RecordType};
+use fictionet::stdlib::ip::checksum;
 use fictionet::stdlib::{codec::{Wire, Collect, contract}, igmp};
 use libfuzzer_sys::fuzz_target;
 

@@ -1,4 +1,5 @@
-//! IP: sorting packets by IP version and by the protocol they carry.
+//! IP: sorting packets by IP version and by the protocol they carry, and
+//! reading, checking and building IP headers.
 //!
 //! Use this module to build a [machine](crate::stdlib#what-you-build-with-it),
 //! one IP address on the simulated network. A machine's packets arrive on one
@@ -36,15 +37,46 @@
 //! interface that was split. The task stops when the caller's
 //! [region](crate::Cx#regions) is cancelled, when the interface it splits
 //! closes, or when all of the interfaces it returned have closed.
+//!
+//! # Reading and building packets
+//!
+//! This module is also the stdlib's one IP layer: the TCP, UDP and ICMP
+//! modules, the router and `Net` all read and build packets with it, so
+//! code of your own between two interfaces can too.
+//!
+//! - [`Header`] reads an IPv4 or IPv6 header with every length checked.
+//!   [`Header::check`] also checks IPv6 extension headers as a host must
+//!   (RFC 8200), and [`parameter_problem`] builds the answer to a packet it
+//!   refuses. One walker reads the extension headers for every reader, so
+//!   they all agree on the upper-layer protocol.
+//! - [`checksum`] is the Internet checksum, [`transport_checksum`] adds the
+//!   TCP, UDP or ICMPv6 pseudo-header, and [`set_header_checksum`] redoes an
+//!   IPv4 header's.
+//! - [`packet`] and [`packet_with`] put an IP header in front of a payload.
+//!   [`hop`] lowers the TTL as a router does.
+//!
+//! ```
+//! use fictionet::stdlib::ip::{self, Header, protocol};
+//!
+//! let (src, dst) = ("10.0.0.2".parse().unwrap(), "10.0.0.1".parse().unwrap());
+//! let mut udp = vec![0, 1, 0, 53, 0, 8, 0, 0];
+//! let sum = ip::transport_checksum(src, dst, protocol::UDP, &udp);
+//! udp[6..8].copy_from_slice(&sum.to_be_bytes());
+//! let packet = ip::packet(src, dst, protocol::UDP, &udp);
+//!
+//! let header = Header::parse(&packet.0).unwrap();
+//! assert_eq!((header.src, header.protocol), (src, protocol::UDP));
+//! assert!(ip::udp_checksum_ok(src, dst, header.payload(&packet.0)));
+//! ```
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::ops::Range;
 use std::task::Poll;
 
-use crate::stdlib::wire::{self, V4, V6};
-use crate::stdlib::{Event, Ports};
-use crate::time::{Duration, Instant};
-use crate::{Cx, End, Interface, Packet};
+use fictionet::stdlib::{PortEvent as Event, Ports, icmp};
+use fictionet::time::{Duration, Instant};
+use fictionet::{Cx, End, Interface, Packet};
 
 /// Each interface a split returns holds at most this many bytes of packets
 /// each way, counting 64 bytes more for each packet; past that, packets
@@ -54,7 +86,7 @@ use crate::{Cx, End, Interface, Packet};
 const QUEUE: usize = 4 << 20;
 
 fn capped() -> (End, End) {
-    crate::cable::pair_with_limit(QUEUE)
+    fictionet::pair_with_limit(QUEUE)
 }
 
 /// Splits an interface's packets by IP version.
@@ -79,7 +111,7 @@ pub fn split_versions(cx: &Cx, inner: impl Interface) -> (End, End, End) {
     let (other, other_mine) = capped();
     cx.spawn_as(|| "split_versions".into(), move |cx| async move {
         let ports = Ports::new(vec![Box::new(inner), Box::new(v4_mine), Box::new(v6_mine), Box::new(other_mine)]);
-        split(cx, ports, None, |packet| match wire::version(&packet.0) {
+        split(cx, ports, None, |packet| match version(&packet.0) {
             Some(4) => 1,
             Some(6) => 2,
             _ => 3,
@@ -101,7 +133,7 @@ async fn split(
     mut ports: Ports,
     mut reassembly: Option<Reassembly>,
     sort: impl Fn(&Packet) -> usize,
-) -> crate::Result {
+) -> fictionet::Result {
     loop {
         let deadline = reassembly.as_ref().and_then(|r| r.next_expiry());
         match ports.next(&cx, deadline, |_| Poll::Pending).await {
@@ -217,10 +249,10 @@ pub fn split_protocols(cx: &Cx, inner: impl Interface) -> (End, End, End, End) {
             Box::new(icmp_mine),
             Box::new(other_mine),
         ]);
-        split(cx, ports, Some(Reassembly::default()), |packet| match protocol(&packet.0) {
-            wire::PROTO_TCP => 1,
-            wire::PROTO_UDP => 2,
-            wire::PROTO_ICMP | wire::PROTO_ICMPV6 => 3,
+        split(cx, ports, Some(Reassembly::default()), |packet| match protocol_end(&packet.0) {
+            protocol::TCP => 1,
+            protocol::UDP => 2,
+            protocol::ICMP | protocol::ICMPV6 => 3,
             _ => 4,
         })
         .await
@@ -232,72 +264,37 @@ pub fn split_protocols(cx: &Cx, inner: impl Interface) -> (End, End, End, End) {
 /// to, as a protocol number: TCP, UDP, ICMP (1 for both versions' ICMP), or
 /// anything else for the last end. ICMP errors are sorted by the protocol
 /// of the packet they quote.
-pub(crate) fn protocol(packet: &[u8]) -> u8 {
-    const OTHER: u8 = wire::PROTO_NONE;
-    match wire::version(packet) {
-        Some(4) => {
-            let Some(ip) = V4::parse(packet, false) else { return OTHER };
-            if ip.is_fragment() {
-                return OTHER;
+pub(crate) fn protocol_end(packet: &[u8]) -> u8 {
+    let Some(h) = Header::parse_whole(packet) else { return protocol::NONE };
+    let icmp = h.payload(packet);
+    match h.protocol {
+        // Destination unreachable (including "fragmentation needed"),
+        // source quench, time exceeded, parameter problem.
+        protocol::ICMP if h.src.is_ipv4() => {
+            if icmp.len() >= 8 && matches!(icmp[0], 3 | 4 | 11 | 12) && let Some(p) = quoted_protocol(&icmp[8..]) {
+                return p;
             }
-            match ip.proto() {
-                wire::PROTO_ICMP => {
-                    let icmp = ip.payload();
-                    // Destination unreachable (including "fragmentation
-                    // needed"), source quench, time exceeded, parameter
-                    // problem.
-                    if icmp.len() >= 8 && matches!(icmp[0], 3 | 4 | 11 | 12)
-                        && let Some(proto) = quoted_protocol(&icmp[8..])
-                    {
-                        return proto;
-                    }
-                    wire::PROTO_ICMP
-                }
-                p => p,
-            }
+            protocol::ICMP
         }
-        Some(6) => {
-            let Ok(chain) = wire::ext6_chain(packet) else { return OTHER };
-            if chain.frag.is_some() {
-                return OTHER;
+        // Types below 128 are errors: destination unreachable, packet too
+        // big, time exceeded, parameter problem.
+        protocol::ICMPV6 if h.src.is_ipv6() => {
+            if icmp.len() >= 8 && icmp[0] < 128 && let Some(p) = quoted_protocol(&icmp[8..]) {
+                return p;
             }
-            match chain.proto {
-                wire::PROTO_ICMPV6 => {
-                    let icmp = &packet[chain.upper..chain.end];
-                    // Types below 128 are errors: destination unreachable,
-                    // packet too big, time exceeded, parameter problem.
-                    if icmp.len() >= 8 && icmp[0] < 128 && let Some(proto) = quoted_protocol(&icmp[8..]) {
-                        return proto;
-                    }
-                    wire::PROTO_ICMP
-                }
-                p => p,
-            }
+            protocol::ICMP
         }
-        _ => OTHER,
+        p => p,
     }
 }
 
 /// The protocol of the packet quoted in an ICMP error, if it is TCP or UDP.
 fn quoted_protocol(quoted: &[u8]) -> Option<u8> {
-    let proto = match wire::version(quoted)? {
-        4 => {
-            let ip = V4::parse(quoted, true)?;
-            if ip.frag_offset() != 0 {
-                return None;
-            }
-            ip.proto()
-        }
-        6 => {
-            let ip = V6::parse(quoted, true)?;
-            if let Some((at, _)) = ip.frag && u16::from_be_bytes([quoted[at + 2], quoted[at + 3]]) & 0xfff8 != 0 {
-                return None;
-            }
-            ip.proto
-        }
-        _ => return None,
-    };
-    matches!(proto, wire::PROTO_TCP | wire::PROTO_UDP).then_some(proto)
+    let h = Header::parse_truncated(quoted)?;
+    if h.fragment.is_some_and(|f| f.offset != 0) {
+        return None;
+    }
+    matches!(h.protocol, protocol::TCP | protocol::UDP).then_some(h.protocol)
 }
 
 /// How long an unfinished IPv4 packet waits for its fragments, as Linux's
@@ -379,7 +376,7 @@ pub enum Intake {
 }
 
 /// One fragment, read from a packet.
-struct Fragment<'a> {
+struct Arrived<'a> {
     key: Key,
     offset: usize,
     more: bool,
@@ -393,29 +390,30 @@ struct Fragment<'a> {
 impl Reassembly {
     /// Takes a packet from the agent's side, as a host takes it in.
     ///
-    /// An IPv6 packet's extension headers are checked with
-    /// `wire::ext6_chain` as it arrives, fragment or not. So the headers
+    /// An IPv6 packet's extension headers are checked as
+    /// [`Header::check`] says as it arrives, fragment or not. So the headers
     /// in front of every fragment are checked, not only the first
     /// fragment's (RFC 8200, section 4.5), and a first fragment must hold
     /// the whole chain (RFC 7112). Fragments are then put back together
     /// (`push`). A whole IPv6 packet is checked again
-    /// and its extension headers taken out (`wire::strip_ext6`); that
-    /// also drops a packet whose fragments held another fragment.
+    /// and its extension headers taken out
+    /// ([`strip_extension_headers`]); that also drops a packet whose
+    /// fragments held another fragment.
     pub fn intake(&mut self, packet: Packet, now: Instant) -> Intake {
         let refused = |packet: Packet, reject| {
-            let answer = wire::parameter_problem(&packet.0, reject).map(Packet);
+            let answer = parameter_problem(&packet.0, reject);
             Intake::Refused { packet, answer }
         };
-        if wire::version(&packet.0) == Some(6)
-            && let Err(reject) = wire::ext6_chain(&packet.0)
+        if version(&packet.0) == Some(6)
+            && let Err(reject) = chain6(&packet.0, Walk::Check)
         {
             return refused(packet, reject);
         }
         let Some(whole) = self.push(packet, now) else { return Intake::Waiting };
-        if wire::version(&whole.0) != Some(6) {
+        if version(&whole.0) != Some(6) {
             return Intake::Whole(whole);
         }
-        match wire::strip_ext6(&whole.0) {
+        match strip_extension_headers(&whole.0) {
             Ok(None) => Intake::Whole(whole),
             Ok(Some(stripped)) => Intake::Whole(Packet(stripped)),
             Err(reject) => refused(whole, reject),
@@ -439,7 +437,7 @@ impl Reassembly {
 
     /// [`push`](Reassembly::push), without the cap.
     fn push_fragment(&mut self, packet: Packet, now: Instant) -> Option<Packet> {
-        let Some(frag) = fragment(&packet.0) else { return Some(packet) };
+        let Some(frag) = arrived(&packet.0) else { return Some(packet) };
         // A packet in one fragment needs no waiting (RFC 6946).
         if frag.offset == 0 && !frag.more {
             let header = frag.header?;
@@ -459,7 +457,7 @@ impl Reassembly {
         let by_expiry = &mut self.by_expiry;
         let size = &mut self.size;
         let partial = self.partial.entry(key).or_insert_with(|| {
-            let expires = crate::stdlib::later(now, frag.timeout);
+            let expires = now + frag.timeout;
             by_expiry.insert((expires, key));
             *size += PARTIAL_COST;
             Partial {
@@ -606,39 +604,39 @@ impl Reassembly {
 
 /// Reads a fragment. `None` if the packet is not a fragment, or cannot be
 /// read.
-fn fragment(packet: &[u8]) -> Option<Fragment<'_>> {
-    match wire::version(packet)? {
+fn arrived(packet: &[u8]) -> Option<Arrived<'_>> {
+    match version(packet)? {
         4 => {
-            let ip = V4::parse(packet, false)?;
-            if !ip.is_fragment() {
-                return None;
-            }
-            let header = (ip.frag_offset() == 0).then(|| packet[..ip.ihl].to_vec());
-            Some(Fragment {
-                key: Key::V4 { src: ip.src(), dst: ip.dst(), id: ip.id(), proto: ip.proto() },
-                offset: ip.frag_offset(),
-                more: ip.more_fragments(),
-                data: ip.payload(),
-                header,
+            let h = v4(packet, false)?;
+            let f = h.fragment?;
+            let (IpAddr::V4(src), IpAddr::V4(dst)) = (h.src, h.dst) else { return None };
+            Some(Arrived {
+                key: Key::V4 { src, dst, id: f.id as u16, proto: h.protocol },
+                offset: f.offset,
+                more: f.more,
+                data: h.payload(packet),
+                header: (f.offset == 0).then(|| packet[..h.payload.start].to_vec()),
                 timeout: V4_TIMEOUT,
             })
         }
         6 => {
-            let ip = V6::parse(packet, false)?;
-            let (at, next_at) = wire::ext6_chain(packet).ok()?.frag?;
-            let f = &packet[at..at + 8];
-            let off_m = u16::from_be_bytes([f[2], f[3]]);
-            let offset = (off_m & 0xfff8) as usize;
-            let header = (offset == 0).then(|| {
-                let mut h = packet[..at].to_vec();
-                h[next_at] = f[0];
-                h
+            let chain = chain6(packet, Walk::Check).ok()?;
+            let (at, next_at) = chain.frag?;
+            let h = v6(packet, &chain);
+            let f = h.fragment?;
+            let (IpAddr::V6(src), IpAddr::V6(dst)) = (h.src, h.dst) else { return None };
+            // The headers in front of the fragment header, with the "next
+            // header" byte that named it naming what it named.
+            let header = (f.offset == 0).then(|| {
+                let mut header = packet[..at].to_vec();
+                header[next_at] = packet[at];
+                header
             });
-            Some(Fragment {
-                key: Key::V6 { src: ip.src(), dst: ip.dst(), id: u32::from_be_bytes([f[4], f[5], f[6], f[7]]) },
-                offset,
-                more: off_m & 1 != 0,
-                data: &packet[at + 8..ip.end],
+            Some(Arrived {
+                key: Key::V6 { src, dst, id: f.id },
+                offset: f.offset,
+                more: f.more,
+                data: &packet[at + 8..chain.end],
                 header,
                 timeout: V6_TIMEOUT,
             })
@@ -664,16 +662,660 @@ fn finish(mut header: Vec<u8>, pieces: &[(usize, &[u8])], total: usize) -> Optio
         // No more fragments, offset 0. Keep "don't fragment".
         header[6] &= 0x40;
         header[7] = 0;
-        wire::set_v4_checksum(&mut header[..head]);
+        set_header_checksum(&mut header[..head]);
     } else {
         header[4..6].copy_from_slice(&len.to_be_bytes());
     }
     Some(header)
 }
 
+// ---------------------------------------------------------------------------
+// Reading and building IP headers
+
+/// IP protocol numbers, and the IPv6 extension headers this module walks.
+pub mod protocol {
+    /// IPv6 Hop-by-Hop Options.
+    pub const HOP_BY_HOP: u8 = 0;
+    /// ICMP, over IPv4.
+    pub const ICMP: u8 = 1;
+    /// TCP.
+    pub const TCP: u8 = 6;
+    /// UDP.
+    pub const UDP: u8 = 17;
+    /// IPv6 Routing header.
+    pub const ROUTING: u8 = 43;
+    /// IPv6 Fragment header.
+    pub const FRAGMENT: u8 = 44;
+    /// The Authentication header (IPsec AH).
+    pub const AUTH: u8 = 51;
+    /// ICMPv6.
+    pub const ICMPV6: u8 = 58;
+    /// IPv6 "no next header".
+    pub const NONE: u8 = 59;
+    /// IPv6 Destination Options.
+    pub const DEST_OPTIONS: u8 = 60;
+}
+
+/// The IP version of a packet, from the top four bits of its first byte:
+/// 4 or 6 for an IP packet. `None` for an empty packet.
+#[inline]
+pub fn version(packet: &[u8]) -> Option<u8> {
+    packet.first().map(|b| b >> 4)
+}
+
+/// The source address of an IPv4 or IPv6 packet, if its fixed header is
+/// there.
+#[inline]
+pub fn source(packet: &[u8]) -> Option<IpAddr> {
+    address(packet, 12, 8)
+}
+
+/// The destination address of an IPv4 or IPv6 packet, if its fixed header
+/// is there.
+#[inline]
+pub fn destination(packet: &[u8]) -> Option<IpAddr> {
+    address(packet, 16, 24)
+}
+
+/// The address at byte `v4` of an IPv4 header or `v6` of an IPv6 one.
+#[inline]
+fn address(packet: &[u8], v4: usize, v6: usize) -> Option<IpAddr> {
+    match version(packet)? {
+        4 => Some(IpAddr::V4(<[u8; 4]>::try_from(packet.get(v4..v4 + 4)?).ok()?.into())),
+        6 if packet.len() >= 40 => Some(IpAddr::V6(<[u8; 16]>::try_from(&packet[v6..v6 + 16]).ok()?.into())),
+        _ => None,
+    }
+}
+
+/// A checked view of an IPv4 or IPv6 header: what a filter, a router or a
+/// transport needs to decide where a packet goes.
+///
+/// Every reader checks lengths, since the agent can send any bytes it
+/// likes. For IPv6, one walk over the extension headers finds the
+/// upper-layer protocol, for every reader here: Hop-by-Hop Options,
+/// Routing, Destination Options, Authentication and Fragment are extension
+/// headers, and anything else, such as the mobility header, is the
+/// upper-layer protocol, as it is to the world's stack.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Header {
+    /// The source address.
+    pub src: IpAddr,
+    /// The destination address.
+    pub dst: IpAddr,
+    /// The upper-layer protocol: [`protocol::TCP`], [`protocol::UDP`],
+    /// [`protocol::ICMP`] or [`protocol::ICMPV6`], for example. For IPv6,
+    /// the protocol after the extension headers, or [`protocol::NONE`] when
+    /// [`Header::parse_truncated`] found them cut short. In a fragment after
+    /// the first, what its fragment header names.
+    pub protocol: u8,
+    /// Where the upper-layer header starts and the packet ends, as byte
+    /// offsets into the packet. The end is cut to the bytes present.
+    pub payload: Range<usize>,
+    /// The fragment this packet is, if it is one.
+    pub fragment: Option<Fragment>,
+}
+
+/// One fragment of a larger packet: the fragment fields of an IPv4 header,
+/// or an IPv6 Fragment header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fragment {
+    /// The identification shared by the fragments of one packet: 16 bits
+    /// for IPv4, 32 for IPv6.
+    pub id: u32,
+    /// The fragment's offset in its packet, in bytes. Only the first
+    /// fragment, at offset 0, carries the upper-layer header.
+    pub offset: usize,
+    /// Whether more fragments follow.
+    pub more: bool,
+}
+
+impl Fragment {
+    /// Whether this fragment is the whole packet: offset 0 and no more to
+    /// come (an atomic fragment, RFC 6946).
+    #[inline]
+    pub fn is_atomic(&self) -> bool {
+        self.offset == 0 && !self.more
+    }
+}
+
+/// Why a host must not take in an IPv6 packet, from [`Header::check`], and
+/// what RFC 8200 says to do about it. An IPv4 packet or an IPv6 packet that
+/// cannot be read at all is [`Reject::Discard`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reject {
+    /// Drop the packet without an answer: it is not a whole IP packet, a
+    /// header runs past it, an option's length runs past its header, or an
+    /// option's action bits say to discard it silently.
+    Discard,
+    /// Drop the packet and answer with ICMPv6 Parameter Problem (type 4)
+    /// with this code; [`parameter_problem`] builds the answer. `pointer`
+    /// is the offset, from the start of the IPv6 header, of the byte at
+    /// fault.
+    Problem {
+        /// The Parameter Problem code: 0 for an erroneous header field, 1
+        /// for an unrecognized next header, 2 for an unrecognized option, 3
+        /// for a first fragment that does not hold the whole chain.
+        code: u8,
+        /// The offset of the byte at fault.
+        pointer: u32,
+    },
+}
+
+impl Header {
+    /// Reads the header of a whole packet, whose length fields fit the
+    /// bytes present. `None` if it is not IPv4 or IPv6, or is cut short.
+    /// IPv6 extension headers are walked, not checked: see
+    /// [`Header::check`] for that.
+    #[inline]
+    pub fn parse(packet: &[u8]) -> Option<Header> {
+        Header::read(packet, false)
+    }
+
+    /// Reads a header that may be followed by fewer bytes than its length
+    /// field says, as the copy of a packet inside an ICMP error is, or a
+    /// packet a world logs without trusting.
+    #[inline]
+    pub fn parse_truncated(packet: &[u8]) -> Option<Header> {
+        Header::read(packet, true)
+    }
+
+    /// Reads the header of a whole packet as a host that is its
+    /// destination takes it in, fragment or not. IPv6 extension headers
+    /// are checked as RFC 8200 asks (sections 4.1 to 4.6):
+    ///
+    /// - Hop-by-Hop Options may only come first. Anywhere else, it is
+    ///   answered with Parameter Problem code 1, pointing at the "next
+    ///   header" byte that names it.
+    /// - In Hop-by-Hop and Destination Options, Pad1 and PadN are skipped.
+    ///   Any other option is unknown, and its two high bits decide: 00 skip
+    ///   it, 01 discard the packet, 10 and 11 discard it and answer with
+    ///   Parameter Problem code 2, pointing at the option. (RFC 8200
+    ///   answers 10, but not 11, even to a multicast address.
+    ///   [`parameter_problem`] answers neither, as it has no address of its
+    ///   own to answer from.)
+    /// - A Routing header with Segments Left 0 is skipped. Any other is
+    ///   answered with Parameter Problem code 0, pointing at its Routing
+    ///   Type: a host here forwards no source-routed packets.
+    /// - A Fragment header is noted. In a fragment after the first, the
+    ///   walk stops there. A second Fragment header discards the packet: no
+    ///   stack puts a fragment inside a fragment.
+    /// - The Authentication header is read past and asks nothing more: the
+    ///   world runs no IPsec, so it checks none.
+    /// - Anything else, including ESP and "no next header", is the
+    ///   upper-layer protocol.
+    ///
+    /// A first fragment (offset 0, more to come) must hold the whole chain
+    /// and the upper-layer header: 20 bytes of TCP, 8 of UDP, 4 of ICMPv6
+    /// (RFC 7112). One that does not is answered with Parameter Problem
+    /// code 3, pointer 0. Any other header that runs past the packet
+    /// discards it, and so does a packet that is not a whole IP packet.
+    pub fn check(packet: &[u8]) -> Result<Header, Reject> {
+        match version(packet) {
+            Some(4) => v4(packet, false).ok_or(Reject::Discard),
+            Some(6) => Ok(v6(packet, &chain6(packet, Walk::Check)?)),
+            _ => Err(Reject::Discard),
+        }
+    }
+
+    /// Reads the header of a whole packet that a host would take in, as
+    /// [`Header::check`] does, and that is not a fragment. This is what the
+    /// TCP and UDP endpoints read.
+    #[inline]
+    pub fn parse_whole(packet: &[u8]) -> Option<Header> {
+        Header::check(packet).ok().filter(|h| h.fragment.is_none())
+    }
+
+    /// The upper-layer bytes of `packet`, which this header was read from.
+    #[inline]
+    pub fn payload<'a>(&self, packet: &'a [u8]) -> &'a [u8] {
+        packet.get(self.payload.clone()).unwrap_or_default()
+    }
+
+    /// The destination port of a TCP or UDP packet, which this header was
+    /// read from. `None` for other protocols, for a fragment after the
+    /// first, and when the port's bytes are not there.
+    pub fn dst_port(&self, packet: &[u8]) -> Option<u16> {
+        if self.fragment.is_some_and(|f| f.offset != 0) || !matches!(self.protocol, protocol::TCP | protocol::UDP) {
+            return None;
+        }
+        let t = self.payload(packet);
+        (t.len() >= 4).then(|| u16::from_be_bytes([t[2], t[3]]))
+    }
+
+    #[inline]
+    fn read(packet: &[u8], truncated: bool) -> Option<Header> {
+        match version(packet)? {
+            4 => v4(packet, truncated),
+            6 => Some(v6(packet, &chain6(packet, Walk::Read { truncated }).ok()?)),
+            _ => None,
+        }
+    }
+}
+
+/// Reads an IPv4 header. With `truncated`, the packet may be cut short (as
+/// the copy inside an ICMP error is), and only the header must be whole.
+#[inline]
+fn v4(bytes: &[u8], truncated: bool) -> Option<Header> {
+    if bytes.len() < 20 || bytes[0] >> 4 != 4 {
+        return None;
+    }
+    let ihl = (bytes[0] & 0x0f) as usize * 4;
+    let total = u16::from_be_bytes([bytes[2], bytes[3]]) as usize;
+    if ihl < 20 || bytes.len() < ihl || total < ihl || (!truncated && total > bytes.len()) {
+        return None;
+    }
+    let flags = u16::from_be_bytes([bytes[6], bytes[7]]);
+    let fragment = (flags & 0x3fff != 0).then(|| Fragment {
+        id: u16::from_be_bytes([bytes[4], bytes[5]]).into(),
+        offset: (flags & 0x1fff) as usize * 8,
+        more: flags & 0x2000 != 0,
+    });
+    Some(Header {
+        src: IpAddr::V4(<[u8; 4]>::try_from(&bytes[12..16]).ok()?.into()),
+        dst: IpAddr::V4(<[u8; 4]>::try_from(&bytes[16..20]).ok()?.into()),
+        protocol: bytes[9],
+        payload: ihl..total.min(bytes.len()),
+        fragment,
+    })
+}
+
+/// The header of an IPv6 packet whose chain [`chain6`] walked.
+#[inline]
+fn v6(bytes: &[u8], chain: &Chain) -> Header {
+    let fragment = chain.frag.map(|(at, _)| {
+        let f = &bytes[at..at + 8];
+        let off_m = u16::from_be_bytes([f[2], f[3]]);
+        Fragment { id: u32::from_be_bytes([f[4], f[5], f[6], f[7]]), offset: (off_m & 0xfff8) as usize, more: off_m & 1 != 0 }
+    });
+    let addr = |at: usize| IpAddr::V6(<[u8; 16]>::try_from(&bytes[at..at + 16]).expect("a whole IPv6 header").into());
+    Header { src: addr(8), dst: addr(24), protocol: chain.proto, payload: chain.upper..chain.end, fragment }
+}
+
+// The IPv6 extension-header chain (RFC 8200, section 4)
+
+/// How [`chain6`] walks a chain.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Walk {
+    /// Find the upper-layer protocol and check nothing else. With
+    /// `truncated`, the packet may be shorter than its length field says,
+    /// and a chain that runs past the bytes present gives
+    /// [`protocol::NONE`].
+    Read { truncated: bool },
+    /// As a host takes the packet in: see [`Header::check`].
+    Check,
+}
+
+/// An IPv6 packet's extension-header chain, walked by [`chain6`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Chain {
+    /// The upper-layer protocol. For a fragment after the first, this is
+    /// what its fragment header names, since the headers after it are in
+    /// the first fragment.
+    proto: u8,
+    /// Where the upper-layer header starts.
+    upper: usize,
+    /// Where the "next header" byte that names `proto` is: 6 when there
+    /// are no extension headers.
+    proto_at: usize,
+    /// The first fragment header, if any: where it starts, and where the
+    /// "next header" byte that names it is.
+    frag: Option<(usize, usize)>,
+    /// The packet's length, from its payload length field, cut to the
+    /// bytes present.
+    end: usize,
+}
+
+/// Walks the extension-header chain of an IPv6 packet: the one walker
+/// behind every reader in this module. [`Walk::Check`] checks it as
+/// [`Header::check`] says. [`Walk::Read`] walks the same headers and checks
+/// only that they fit.
+fn chain6(bytes: &[u8], walk: Walk) -> Result<Chain, Reject> {
+    use Reject::{Discard, Problem};
+    use protocol::{AUTH, DEST_OPTIONS, FRAGMENT, HOP_BY_HOP, ROUTING};
+    if bytes.len() < 40 || bytes[0] >> 4 != 6 {
+        return Err(Discard);
+    }
+    let check = walk == Walk::Check;
+    let mut end = 40 + u16::from_be_bytes([bytes[4], bytes[5]]) as usize;
+    if end > bytes.len() {
+        if walk != (Walk::Read { truncated: true }) {
+            return Err(Discard);
+        }
+        end = bytes.len();
+    }
+    // A first fragment: offset 0, more to come.
+    let first = |frag: Option<(usize, usize)>| {
+        frag.is_some_and(|(at, _): (usize, usize)| u16::from_be_bytes([bytes[at + 2], bytes[at + 3]]) & 0xfff9 == 1)
+    };
+    let mut next = bytes[6];
+    let mut next_at = 6;
+    let mut at = 40;
+    let mut frag = None;
+    loop {
+        if check && next == HOP_BY_HOP && next_at != 6 {
+            return Err(Problem { code: 1, pointer: next_at as u32 });
+        }
+        // The header's length, for the headers that say it.
+        let len = match next {
+            HOP_BY_HOP | DEST_OPTIONS | ROUTING => bytes.get(at + 1).map(|l| (*l as usize + 1) * 8),
+            // Its length is in 4-byte units, not counting the first two.
+            AUTH => bytes.get(at + 1).map(|l| (*l as usize + 2) * 4),
+            FRAGMENT => Some(8),
+            _ => break,
+        };
+        let Some(len) = len.filter(|len| at + len <= end) else {
+            // The header runs past the packet.
+            if check {
+                return Err(if first(frag) && next != FRAGMENT { Problem { code: 3, pointer: 0 } } else { Discard });
+            }
+            return Ok(Chain { proto: protocol::NONE, upper: at.min(end), proto_at: next_at, frag, end });
+        };
+        match next {
+            HOP_BY_HOP | DEST_OPTIONS if check => check_options(&bytes[at..at + len], at)?,
+            ROUTING if check && bytes[at + 3] != 0 => return Err(Problem { code: 0, pointer: (at + 2) as u32 }),
+            FRAGMENT => {
+                if frag.is_some() {
+                    if check {
+                        return Err(Discard);
+                    }
+                } else {
+                    frag = Some((at, next_at));
+                }
+            }
+            _ => {}
+        }
+        // Only the first fragment carries the headers after a fragment
+        // header.
+        let later = next == FRAGMENT && u16::from_be_bytes([bytes[at + 2], bytes[at + 3]]) & 0xfff8 != 0;
+        (next, next_at, at) = (bytes[at], at, at + len);
+        if later {
+            break;
+        }
+    }
+    let need = match next {
+        protocol::TCP => 20,
+        protocol::UDP => 8,
+        protocol::ICMPV6 => 4,
+        _ => 0,
+    };
+    if check && first(frag) && end - at < need {
+        return Err(Problem { code: 3, pointer: 0 });
+    }
+    Ok(Chain { proto: next, upper: at, proto_at: next_at, frag, end })
+}
+
+/// Checks the options of one Hop-by-Hop or Destination Options header,
+/// `header`, which starts `base` bytes into the packet.
+fn check_options(header: &[u8], base: usize) -> Result<(), Reject> {
+    let mut i = 2;
+    while i < header.len() {
+        let kind = header[i];
+        // Pad1: one byte, no length.
+        if kind == 0 {
+            i += 1;
+            continue;
+        }
+        if i + 2 > header.len() || i + 2 + header[i + 1] as usize > header.len() {
+            return Err(Reject::Discard);
+        }
+        // PadN is the only other option a host here knows.
+        if kind != 1 {
+            let pointer = (base + i) as u32;
+            match kind >> 6 {
+                0 => {}
+                1 => return Err(Reject::Discard),
+                _ => return Err(Reject::Problem { code: 2, pointer }),
+            }
+        }
+        i += 2 + header[i + 1] as usize;
+    }
+    Ok(())
+}
+
+/// A whole IPv6 packet with its extension headers checked by
+/// [`Header::check`] and taken out, so the upper-layer header follows the
+/// IPv6 header. `Ok(None)` if it has none to take out. A packet with a
+/// Fragment header is not whole, and is discarded.
+///
+/// What a header asks of a host is done once the check passes: skipped
+/// options and a Routing header with no segments left ask for nothing more.
+/// Taking them out lets layers that read only the upper-layer header, such
+/// as smoltcp's TCP, accept the packet.
+pub fn strip_extension_headers(packet: &[u8]) -> Result<Option<Vec<u8>>, Reject> {
+    let chain = chain6(packet, Walk::Check)?;
+    if chain.frag.is_some() {
+        return Err(Reject::Discard);
+    }
+    if chain.upper == 40 {
+        return Ok(None);
+    }
+    let mut out = Vec::with_capacity(40 + chain.end - chain.upper);
+    out.extend_from_slice(&packet[..40]);
+    out.extend_from_slice(&packet[chain.upper..chain.end]);
+    out[6] = chain.proto;
+    out[4..6].copy_from_slice(&((chain.end - chain.upper) as u16).to_be_bytes());
+    Ok(Some(out))
+}
+
+/// The ICMPv6 Parameter Problem answer to `packet`, for `reject`, built by
+/// [`icmp::error`]. It comes from the packet's destination. `None` for
+/// [`Reject::Discard`], and where `icmp::error` sends no answer.
+pub fn parameter_problem(packet: &[u8], reject: Reject) -> Option<Packet> {
+    let Reject::Problem { code, pointer } = reject else { return None };
+    let from = destination(packet)?;
+    icmp::error(packet, from, 4, code, pointer)
+}
+
+// Checksums (RFC 1071)
+
+/// Adds `data` to a one's-complement sum, as 16-bit big-endian words. Four
+/// bytes at a time: since 2^16 is 1 modulo 2^16 - 1, a 32-bit word adds
+/// the same as its two halves once the sum is folded.
+#[inline]
+fn sum(mut acc: u64, data: &[u8]) -> u64 {
+    let (words, rest) = data.as_chunks::<4>();
+    for w in words {
+        acc += u32::from_be_bytes(*w) as u64;
+    }
+    let (pairs, odd) = rest.as_chunks::<2>();
+    for p in pairs {
+        acc += u16::from_be_bytes(*p) as u64;
+    }
+    if let [last] = odd {
+        acc += (*last as u64) << 8;
+    }
+    acc
+}
+
+/// Folds a one's-complement sum to 16 bits and complements it.
+#[inline]
+fn fold(mut acc: u64) -> u16 {
+    while acc >> 16 != 0 {
+        acc = (acc & 0xffff) + (acc >> 16);
+    }
+    !(acc as u16)
+}
+
+/// The Internet checksum of `data` (RFC 1071), as the IPv4 header, ICMP and
+/// IGMP use it. Over data whose checksum field is filled in, a correct
+/// checksum gives 0.
+#[inline]
+pub fn checksum(data: &[u8]) -> u16 {
+    fold(sum(0, data))
+}
+
+/// The TCP, UDP or ICMPv6 checksum of `data` over the pseudo-header for
+/// `src`, `dst` and `protocol` (RFC 9293, RFC 768, RFC 8200 section 8.1).
+/// Over data whose checksum field is filled in, a correct checksum gives 0.
+/// Addresses of two families have no pseudo-header, and give 1, which is
+/// never correct.
+#[inline]
+pub fn transport_checksum(src: IpAddr, dst: IpAddr, protocol: u8, data: &[u8]) -> u16 {
+    let len = data.len() as u64;
+    let acc = match (src, dst) {
+        (IpAddr::V4(s), IpAddr::V4(d)) => sum(sum(0, &s.octets()), &d.octets()),
+        (IpAddr::V6(s), IpAddr::V6(d)) => sum(sum(0, &s.octets()), &d.octets()),
+        _ => return 1,
+    };
+    fold(sum(acc + protocol as u64 + len, data))
+}
+
+/// Whether a UDP datagram from `src` to `dst` has a good checksum. A zero
+/// checksum field means "no checksum" over IPv4. Over IPv6 it is never
+/// valid (RFC 8200, section 8.1): a sender whose sum comes out as zero
+/// sends `0xffff` instead.
+#[inline]
+pub fn udp_checksum_ok(src: IpAddr, dst: IpAddr, udp: &[u8]) -> bool {
+    if udp.len() < 8 {
+        return false;
+    }
+    if udp[6..8] == [0, 0] {
+        return src.is_ipv4();
+    }
+    transport_checksum(src, dst, protocol::UDP, udp) == 0
+}
+
+/// Recomputes the checksum of an IPv4 header, options included, in place.
+///
+/// # Panics
+///
+/// If `header` is shorter than 20 bytes.
+#[inline]
+pub fn set_header_checksum(header: &mut [u8]) {
+    header[10..12].copy_from_slice(&[0, 0]);
+    let c = checksum(header);
+    header[10..12].copy_from_slice(&c.to_be_bytes());
+}
+
+// Building packets
+
+/// The fields of an IP header that [`packet_with`] sets beyond the
+/// addresses, the protocol and the length. The default is what
+/// [`packet`] uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fields {
+    /// The TTL (IPv4) or hop limit (IPv6). 64 by default.
+    pub ttl: u8,
+    /// The IPv4 type of service or the IPv6 traffic class. 0 by default.
+    pub tos: u8,
+    /// The IPv4 identification. Unused for IPv6. 0 by default.
+    pub id: u16,
+    /// The IPv4 "don't fragment" flag. Unused for IPv6. Set by default.
+    pub dont_fragment: bool,
+}
+
+impl Default for Fields {
+    fn default() -> Fields {
+        Fields { ttl: 64, tos: 0, id: 0, dont_fragment: true }
+    }
+}
+
+/// Builds an IP packet from `src` to `dst` around `payload`, with a TTL or
+/// hop limit of 64. The IPv4 header checksum is filled in. The payload's
+/// own checksum must already be done: see [`transport_checksum`].
+///
+/// # Panics
+///
+/// If `src` and `dst` are of two families, or `payload` is too long for one
+/// packet.
+#[inline]
+pub fn packet(src: IpAddr, dst: IpAddr, protocol: u8, payload: &[u8]) -> Packet {
+    packet_with(src, dst, protocol, Fields::default(), payload)
+}
+
+/// [`packet`], with the header's other `fields`.
+///
+/// # Panics
+///
+/// As [`packet`].
+pub fn packet_with(src: IpAddr, dst: IpAddr, protocol: u8, fields: Fields, payload: &[u8]) -> Packet {
+    let mut p;
+    match (src, dst) {
+        (IpAddr::V4(s), IpAddr::V4(d)) => {
+            let total = u16::try_from(20 + payload.len()).expect("a payload that fits one IPv4 packet");
+            p = Vec::with_capacity(20 + payload.len());
+            p.extend_from_slice(&[0x45, fields.tos]);
+            p.extend_from_slice(&total.to_be_bytes());
+            p.extend_from_slice(&fields.id.to_be_bytes());
+            p.extend_from_slice(&[if fields.dont_fragment { 0x40 } else { 0 }, 0, fields.ttl, protocol, 0, 0]);
+            p.extend_from_slice(&s.octets());
+            p.extend_from_slice(&d.octets());
+            set_header_checksum(&mut p);
+        }
+        (IpAddr::V6(s), IpAddr::V6(d)) => {
+            let len = u16::try_from(payload.len()).expect("a payload that fits one IPv6 packet");
+            p = Vec::with_capacity(40 + payload.len());
+            p.extend_from_slice(&[0x60 | fields.tos >> 4, fields.tos << 4, 0, 0]);
+            p.extend_from_slice(&len.to_be_bytes());
+            p.extend_from_slice(&[protocol, fields.ttl]);
+            p.extend_from_slice(&s.octets());
+            p.extend_from_slice(&d.octets());
+        }
+        _ => panic!("an IP packet from {src} to {dst}: the addresses are of two families"),
+    }
+    p.extend_from_slice(payload);
+    Packet(p)
+}
+
+/// What a router hop did to a packet's TTL or hop limit, from [`hop`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hop {
+    /// Lowered by one: forward the packet.
+    Forward,
+    /// It was 0 or 1, so the packet must not be forwarded (RFC 1812
+    /// 5.3.1, RFC 8200 section 3).
+    Expired,
+    /// Neither IPv4 nor IPv6, or too short to hold the field.
+    NotIp,
+}
+
+/// Lowers the TTL (IPv4, updating the header checksum as RFC 1624 does) or
+/// the hop limit (IPv6) of `packet` by one, as a router does for each hop.
+/// An expired packet is left as it was.
+pub fn hop(packet: &mut [u8]) -> Hop {
+    match version(packet) {
+        Some(4) if packet.len() >= 20 => {
+            let ttl = packet[8];
+            if ttl <= 1 {
+                return Hop::Expired;
+            }
+            let old = u16::from_be_bytes([ttl, packet[9]]);
+            let new = u16::from_be_bytes([ttl - 1, packet[9]]);
+            packet[8] = ttl - 1;
+            // HC' = ~(~HC + ~m + m')
+            let hc = u16::from_be_bytes([packet[10], packet[11]]);
+            let c = fold(u64::from(!hc) + u64::from(!old) + u64::from(new));
+            packet[10..12].copy_from_slice(&c.to_be_bytes());
+            Hop::Forward
+        }
+        Some(6) if packet.len() >= 40 => {
+            if packet[7] <= 1 {
+                return Hop::Expired;
+            }
+            packet[7] -= 1;
+            Hop::Forward
+        }
+        _ => Hop::NotIp,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An IPv4 header with a correct checksum, from `src` to `dst`, for
+    /// `payload_len` bytes of `proto` after `options` (a multiple of 4
+    /// bytes).
+    fn v4_header(proto: u8, src: Ipv4Addr, dst: Ipv4Addr, id: u16, options: &[u8], payload_len: usize) -> Vec<u8> {
+        let fields = Fields { id, dont_fragment: false, ..Fields::default() };
+        let mut h = packet_with(src.into(), dst.into(), proto, fields, &[]).0;
+        h.extend_from_slice(options);
+        h[0] = 0x40 | (h.len() / 4) as u8;
+        let total = (h.len() + payload_len) as u16;
+        h[2..4].copy_from_slice(&total.to_be_bytes());
+        set_header_checksum(&mut h);
+        h
+    }
 
     /// IPv4 fragment of a packet with identification `id`: `len` data bytes
     /// at `offset`.
@@ -683,10 +1325,10 @@ mod tests {
 
     /// The same, with `data` as the data.
     fn frag4_of(id: u16, offset: usize, data: &[u8], more: bool) -> Packet {
-        let mut h = wire::v4_header(wire::PROTO_UDP, Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(1, 1, 1, 1), 64, id, 0, &[], data.len());
+        let mut h = v4_header(protocol::UDP, Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(1, 1, 1, 1), id, &[], data.len());
         let flags: u16 = if more { 0x2000 } else { 0 };
         h[6..8].copy_from_slice(&((offset / 8) as u16 | flags).to_be_bytes());
-        wire::set_v4_checksum(&mut h[..20]);
+        set_header_checksum(&mut h[..20]);
         h.extend_from_slice(data);
         Packet(h)
     }
@@ -717,7 +1359,7 @@ mod tests {
         assert!(r.push(frag4(2, 0, 16, true), at(40)).is_none());
         let whole = r.push(frag4(2, 16, 8, false), at(69)).expect("a whole packet");
         assert_eq!(whole.0.len(), 20 + 24);
-        assert_eq!(wire::checksum(0, &whole.0[..20]), 0);
+        assert_eq!(checksum(&whole.0[..20]), 0);
     }
 
     #[test]
@@ -735,7 +1377,7 @@ mod tests {
             src: Ipv4Addr::new(10, 0, 0, 2),
             dst: Ipv4Addr::new(1, 1, 1, 1),
             id: 0,
-            proto: wire::PROTO_UDP
+            proto: protocol::UDP
         }));
     }
 
@@ -748,7 +1390,7 @@ mod tests {
             let t = Instant::from_since_start(Duration::from_micros(i as u64));
             let mut f = frag4((i % 65_536) as u16, 0, 8, true);
             f.0[15] = (i / 65_536) as u8; // another source for each round of ids
-            wire::set_v4_checksum(&mut f.0[..20]);
+            set_header_checksum(&mut f.0[..20]);
             assert!(r.push(f, t).is_none());
             assert!(r.size <= MAX_WAITING);
         }
@@ -791,11 +1433,11 @@ mod tests {
             let more = offset + len < 65_535;
             let options: &[u8] = if offset == 0 { &[1; 40] } else { &[] };
             let src = Ipv4Addr::new(10, 0, 0, 2);
-            let mut h = wire::v4_header(wire::PROTO_UDP, src, Ipv4Addr::new(1, 1, 1, 1), 64, 7, 0, options, len);
+            let mut h = v4_header(protocol::UDP, src, Ipv4Addr::new(1, 1, 1, 1), 7, options, len);
             let flags: u16 = if more { 0x2000 } else { 0 };
             h[6..8].copy_from_slice(&((offset / 8) as u16 | flags).to_be_bytes());
             let ihl = h.len();
-            wire::set_v4_checksum(&mut h[..ihl]);
+            set_header_checksum(&mut h[..ihl]);
             h.extend(std::iter::repeat_n(0xab, len));
             assert_eq!(r.push(Packet(h), at(0)), None, "a packet of {} bytes came out", 40 + 20 + offset + len);
             offset += len;
@@ -820,8 +1462,8 @@ mod tests {
             p.extend_from_slice(&[60, 64]);
             p.extend_from_slice(&[0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
             p.extend_from_slice(&[0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
-            p.extend_from_slice(&[wire::PROTO_IPV6_FRAG, 1, 1, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-            p.push(wire::PROTO_UDP);
+            p.extend_from_slice(&[protocol::FRAGMENT, 1, 1, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            p.push(protocol::UDP);
             p.push(0);
             p.extend_from_slice(&(offset as u16 | more as u16).to_be_bytes());
             p.extend_from_slice(&9u32.to_be_bytes());
@@ -842,7 +1484,7 @@ mod tests {
             let (_tcp, _udp, _icmp, other) = split_protocols(&cx, side);
             // 20 MiB of protocol 99, which goes to `other`.
             for _ in 0..20 * 1024 {
-                let h = wire::v4_header(99, Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(10, 0, 0, 1), 64, 0, 0, &[], 1000);
+                let h = v4_header(99, Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(10, 0, 0, 1), 0, &[], 1000);
                 let mut p = h;
                 p.extend_from_slice(&[0; 1000]);
                 raw.send(Packet(p));
@@ -920,7 +1562,7 @@ mod tests {
         for id in 0..40_000u32 {
             let mut first = frag4_of((id % 65_536) as u16, 0, &[1; 16], true);
             first.0[15] = (id / 65_536) as u8 + 1;
-            wire::set_v4_checksum(&mut first.0[..20]);
+            set_header_checksum(&mut first.0[..20]);
             let mut other = first.clone();
             other.0[28] ^= 1;
             r.push(first, at(0));
@@ -953,130 +1595,235 @@ mod tests {
         assert!(r.push(frag4_of(1, 8, &[2; 8], false), at(0)).is_none());
         assert!(r.push(frag4_of(1, 0, &[1; 8], true), at(0)).is_some());
     }
-}
 
-// ---------------------------------------------------------------------------
-// Reading and building IP headers, for code that sees whole packets
+    // The IPv6 extension-header chain
 
-/// The IP version of a packet, from the top four bits of its first byte:
-/// 4 or 6 for an IP packet. `None` for an empty packet.
-pub fn version(packet: &[u8]) -> Option<u8> {
-    wire::version(packet)
-}
+    const SRC: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2);
+    const DST: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
 
-/// The destination address of an IPv4 or IPv6 packet, if its fixed header
-/// is there.
-pub fn destination(packet: &[u8]) -> Option<std::net::IpAddr> {
-    wire::destination(packet)
-}
-
-/// A checked view of an IPv4 or IPv6 header: what a filter or a router
-/// needs to decide where a packet goes.
-///
-/// Every reader checks lengths, since the agent can send any bytes it
-/// likes. For IPv6, the extension headers are walked to find the
-/// upper-layer protocol.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct Header {
-    /// The source address.
-    pub src: std::net::IpAddr,
-    /// The destination address.
-    pub dst: std::net::IpAddr,
-    /// The upper-layer protocol: 6 for TCP, 17 for UDP, 1 for ICMP, 58 for
-    /// ICMPv6. For IPv6, the protocol after the extension headers, or 59
-    /// ("no next header") when they could not be read.
-    pub protocol: u8,
-    /// Where the upper-layer header starts and the packet ends, as byte
-    /// offsets into the packet. The end is cut to the bytes present.
-    pub payload: std::ops::Range<usize>,
-    /// Whether the packet is a fragment of a larger one.
-    pub fragment: bool,
-    /// The fragment's offset in its packet, in bytes. Zero for the first
-    /// fragment and for a whole packet. Only the first fragment carries
-    /// the upper-layer header.
-    pub fragment_offset: usize,
-}
-
-impl Header {
-    /// Reads the header of a whole packet, whose length fields fit the
-    /// bytes present. `None` if it is not IPv4 or IPv6, or is cut short.
-    pub fn parse(packet: &[u8]) -> Option<Header> {
-        Header::read(packet, false)
+    /// An IPv6 packet from `SRC` to `DST` whose first header is `next`.
+    fn v6(next: u8, payload: &[u8]) -> Vec<u8> {
+        let mut p = vec![0x60, 0, 0, 0];
+        p.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        p.extend_from_slice(&[next, 64]);
+        p.extend_from_slice(&SRC.octets());
+        p.extend_from_slice(&DST.octets());
+        p.extend_from_slice(payload);
+        p
     }
 
-    /// Reads a header that may be followed by fewer bytes than its length
-    /// field says, as the copy of a packet inside an ICMP error is, or a
-    /// packet a world logs without trusting.
-    pub fn parse_truncated(packet: &[u8]) -> Option<Header> {
-        Header::read(packet, true)
+    /// `headers` in front of 8 bytes of UDP.
+    fn chained(next: u8, headers: &[&[u8]]) -> Vec<u8> {
+        let mut payload: Vec<u8> = headers.concat();
+        payload.extend_from_slice(&[0, 1, 0, 2, 0, 8, 0, 0]);
+        v6(next, &payload)
     }
 
-    fn read(packet: &[u8], truncated: bool) -> Option<Header> {
-        if let Some(v4) = V4::parse(packet, truncated) {
-            return Some(Header {
-                src: v4.src().into(),
-                dst: v4.dst().into(),
-                protocol: v4.proto(),
-                payload: v4.ihl..v4.total,
-                fragment: v4.is_fragment(),
-                fragment_offset: v4.frag_offset(),
-            });
+    fn checked(p: &[u8]) -> Result<Chain, Reject> {
+        chain6(p, Walk::Check)
+    }
+
+    fn problem(code: u8, pointer: u32) -> Result<Chain, Reject> {
+        Err(Reject::Problem { code, pointer })
+    }
+
+    #[test]
+    fn headers_that_ask_nothing_are_walked() {
+        let plain = v6(protocol::UDP, &[0; 8]);
+        assert_eq!(checked(&plain), Ok(Chain { proto: protocol::UDP, upper: 40, proto_at: 6, frag: None, end: 48 }));
+        // An Authentication header is read past.
+        let ah = chained(protocol::AUTH, &[&[17, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]]);
+        assert_eq!(checked(&ah).map(|c| (c.proto, c.upper)), Ok((protocol::UDP, 52)));
+        // Hop-by-Hop with PadN, a Routing header with no segments left, and
+        // Destination Options with an unknown option to skip and Pad1.
+        let p = chained(0, &[&[43, 0, 1, 4, 0, 0, 0, 0], &[60, 0, 250, 0, 0, 0, 0, 0], &[17, 0, 0x1e, 3, 9, 9, 9, 0]]);
+        assert_eq!(checked(&p), Ok(Chain { proto: protocol::UDP, upper: 64, proto_at: 56, frag: None, end: 72 }));
+        let stripped = strip_extension_headers(&p).unwrap().unwrap();
+        assert_eq!(stripped, v6(protocol::UDP, &[0, 1, 0, 2, 0, 8, 0, 0]));
+        assert_eq!(strip_extension_headers(&plain), Ok(None));
+    }
+
+    #[test]
+    fn headers_a_host_must_refuse_are_refused() {
+        // Unknown options, by their two high bits.
+        assert_eq!(checked(&chained(60, &[&[17, 0, 0x40, 0, 0, 0, 0, 0]])), Err(Reject::Discard));
+        assert_eq!(checked(&chained(60, &[&[17, 0, 0x80, 0, 0, 0, 0, 0]])), problem(2, 42));
+        assert_eq!(checked(&chained(0, &[&[17, 0, 1, 0, 0xc2, 0, 0, 0]])), problem(2, 44));
+        // A Routing header with segments left, of any type.
+        for kind in [0, 2, 3, 4, 250] {
+            assert_eq!(checked(&chained(43, &[&[17, 0, kind, 1, 0, 0, 0, 0]])), problem(0, 42));
         }
-        let v6 = V6::parse(packet, truncated)?;
-        let offset = v6.frag.map_or(0, |(at, _)| usize::from(u16::from_be_bytes([packet[at + 2], packet[at + 3]]) & 0xfff8));
-        Some(Header {
-            src: v6.src().into(),
-            dst: v6.dst().into(),
-            protocol: v6.proto,
-            payload: v6.upper..v6.end,
-            fragment: v6.frag.is_some(),
-            fragment_offset: offset,
-        })
+        // Hop-by-Hop anywhere but first, even cut short.
+        assert_eq!(checked(&chained(60, &[&[0, 0, 0, 0, 0, 0, 0, 0], &[17, 0, 0, 0, 0, 0, 0, 0]])), problem(1, 40));
+        assert_eq!(checked(&v6(60, &[0, 0, 0, 0, 0, 0, 0, 0, 17])), problem(1, 40));
+        // An option that runs past its header, and headers that run past
+        // the packet.
+        assert_eq!(checked(&chained(60, &[&[17, 0, 1, 5, 0, 0, 0, 0]])), Err(Reject::Discard));
+        assert_eq!(checked(&v6(60, &[17, 1, 0, 0, 0, 0, 0, 0])), Err(Reject::Discard));
+        assert_eq!(checked(&v6(43, &[17, 0, 0, 0])), Err(Reject::Discard));
+        assert_eq!(checked(&v6(protocol::FRAGMENT, &[17, 0, 0, 0])), Err(Reject::Discard));
+        // A length field longer than the bytes present.
+        let mut cut = v6(protocol::UDP, &[0; 8]);
+        cut.truncate(44);
+        assert_eq!(checked(&cut), Err(Reject::Discard));
     }
 
-    /// Reads the header of a whole packet that a host would take in: not a
-    /// fragment, and for IPv6, with extension headers a host accepts.
-    /// This is what the TCP and UDP endpoints read.
-    pub fn parse_whole(packet: &[u8]) -> Option<Header> {
-        let ip = crate::stdlib::udp::parse_ip(packet)?;
-        Some(Header { src: ip.src, dst: ip.dst, protocol: ip.proto, payload: ip.payload..ip.end, fragment: false, fragment_offset: 0 })
+    #[test]
+    fn fragments_are_noted_and_not_stripped() {
+        // A first fragment: the walk goes on past it.
+        let first = chained(protocol::FRAGMENT, &[&[60, 0, 0, 1, 0, 0, 0, 7], &[17, 0, 0, 0, 0, 0, 0, 0]]);
+        let chain = checked(&first).unwrap();
+        assert_eq!((chain.proto, chain.upper, chain.frag), (protocol::UDP, 56, Some((40, 6))));
+        assert_eq!(Header::check(&first).unwrap().fragment, Some(Fragment { id: 7, offset: 0, more: true }));
+        // A later fragment: the walk stops at it.
+        let later = chained(protocol::FRAGMENT, &[&[60, 0, 0, 16, 0, 0, 0, 7]]);
+        let chain = checked(&later).unwrap();
+        assert_eq!((chain.proto, chain.upper), (protocol::DEST_OPTIONS, 48));
+        assert_eq!(Header::check(&later).unwrap().fragment, Some(Fragment { id: 7, offset: 16, more: false }));
+        assert_eq!(strip_extension_headers(&first), Err(Reject::Discard));
+        assert_eq!(Header::parse_whole(&first), None);
+        // A second fragment header: refused by a host, read past otherwise.
+        let twice = chained(protocol::FRAGMENT, &[&[44, 0, 0, 1, 0, 0, 0, 7], &[17, 0, 0, 0, 0, 0, 0, 7]]);
+        assert_eq!(checked(&twice), Err(Reject::Discard));
+        assert_eq!(Header::parse(&twice).map(|h| (h.protocol, h.payload.start)), Some((protocol::UDP, 56)));
     }
 
-    /// The upper-layer bytes of `packet`, which this header was read from.
-    pub fn payload<'a>(&self, packet: &'a [u8]) -> &'a [u8] {
-        packet.get(self.payload.clone()).unwrap_or_default()
-    }
-
-    /// The destination port of a TCP or UDP packet, which this header was
-    /// read from. `None` for other protocols, for a fragment after the
-    /// first, and when the port's bytes are not there.
-    pub fn dst_port(&self, packet: &[u8]) -> Option<u16> {
-        if self.fragment_offset != 0 || !matches!(self.protocol, 6 | 17) {
-            return None;
+    /// Before there was one walker, `Header::parse` and
+    /// `Header::parse_truncated` read mobility (135), HIP (139), shim6 (140)
+    /// and the experimental numbers (253, 254) as extension headers and
+    /// walked past them, while `Header::parse_whole`, the protocol split and
+    /// the attach binary read them as the upper-layer protocol. So the
+    /// sandbox filter took a mobility header in front of UDP for UDP, and
+    /// the world's stack for protocol 135. Every reader now agrees.
+    #[test]
+    fn every_reader_walks_the_same_chain() {
+        for next in [135, 139, 140, 253, 254] {
+            let p = v6(next, &[protocol::UDP, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 2, 0, 8, 0, 0]);
+            let read = |h: Option<Header>| h.map(|h| (h.protocol, h.payload.start));
+            assert_eq!(read(Header::parse(&p)), Some((next, 40)), "parse, next header {next}");
+            assert_eq!(read(Header::parse_truncated(&p)), Some((next, 40)), "parse_truncated, next header {next}");
+            assert_eq!(read(Header::parse_truncated(&p[..44])), Some((next, 40)), "cut short, next header {next}");
+            assert_eq!(read(Header::check(&p).ok()), Some((next, 40)), "check, next header {next}");
+            assert_eq!(read(Header::parse_whole(&p)), Some((next, 40)), "parse_whole, next header {next}");
+            assert_eq!(protocol_end(&p), next, "the split, next header {next}");
         }
-        let t = self.payload(packet);
-        (t.len() >= 4).then(|| u16::from_be_bytes([t[2], t[3]]))
+        // A chain cut short reads as "no next header" only to the reader
+        // that allows it.
+        let cut = chained(60, &[&[17, 1, 0, 0, 0, 0, 0, 0]]);
+        assert_eq!(Header::parse_truncated(&cut[..44]).map(|h| h.protocol), Some(protocol::NONE));
+        assert_eq!(Header::parse(&cut[..44]), None);
     }
-}
 
-/// Builds an IP packet from `src` to `dst` around `payload`, with a TTL or
-/// hop limit of 64. The IPv4 header checksum is filled in. The payload's
-/// own checksum must already be done: see [`transport_checksum`]. `src`
-/// and `dst` must be of the same family.
-pub fn packet(src: std::net::IpAddr, dst: std::net::IpAddr, protocol: u8, payload: &[u8]) -> Packet {
-    crate::stdlib::udp::ip_packet(src, dst, protocol, 0, payload)
-}
+    #[test]
+    fn parameter_problems_follow_rfc_4443() {
+        let bad = chained(43, &[&[17, 0, 250, 1, 0, 0, 0, 0]]);
+        let reject = checked(&bad).unwrap_err();
+        let answer = parameter_problem(&bad, reject).expect("an answer").0;
+        let ip = Header::parse(&answer).unwrap();
+        assert_eq!((ip.src, ip.dst, ip.protocol), (DST.into(), SRC.into(), protocol::ICMPV6));
+        let icmp = ip.payload(&answer);
+        assert_eq!(&icmp[..2], &[4, 0]);
+        assert_eq!(&icmp[4..8], &42u32.to_be_bytes());
+        assert_eq!(&icmp[8..], &bad[..]);
+        assert_eq!(transport_checksum(DST.into(), SRC.into(), protocol::ICMPV6, icmp), 0);
+        // Nothing for a silent discard, to a multicast address, from an
+        // unspecified one, or for an ICMPv6 error.
+        assert_eq!(parameter_problem(&bad, Reject::Discard), None);
+        let mut multicast = bad.clone();
+        multicast[24] = 0xff;
+        assert_eq!(parameter_problem(&multicast, reject), None);
+        let mut unspecified = bad.clone();
+        unspecified[8..24].fill(0);
+        assert_eq!(parameter_problem(&unspecified, reject), None);
+        let error = v6(43, &[protocol::ICMPV6, 0, 250, 1, 0, 0, 0, 0, 1, 4, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(parameter_problem(&error, checked(&error).unwrap_err()), None);
+        // Nor for the first fragment of an ICMPv6 error, cut short (RFC
+        // 7112): its type is there to read.
+        let first = v6(protocol::FRAGMENT, &[protocol::ICMPV6, 0, 0, 1, 0, 0, 0, 9, 1, 4]);
+        let reject = checked(&first).unwrap_err();
+        assert_eq!(reject, Reject::Problem { code: 3, pointer: 0 });
+        assert_eq!(parameter_problem(&first, reject), None);
+        // An echo request cut short the same way is answered.
+        let ping = v6(protocol::FRAGMENT, &[protocol::ICMPV6, 0, 0, 1, 0, 0, 0, 9, 128, 0]);
+        assert!(parameter_problem(&ping, checked(&ping).unwrap_err()).is_some());
+        // A big packet is quoted up to the minimum MTU.
+        let mut big = chained(43, &[&[17, 0, 250, 1, 0, 0, 0, 0]]);
+        big.resize(4000, 0);
+        let len = (big.len() - 40) as u16;
+        big[4..6].copy_from_slice(&len.to_be_bytes());
+        assert_eq!(parameter_problem(&big, reject).unwrap().0.len(), 1280);
+    }
 
-/// The TCP, UDP or ICMPv6 checksum of `data` over the pseudo-header for
-/// `src`, `dst` and `protocol`. Over data whose checksum field is filled
-/// in, a correct checksum gives 0.
-pub fn transport_checksum(src: std::net::IpAddr, dst: std::net::IpAddr, protocol: u8, data: &[u8]) -> u16 {
-    crate::stdlib::udp::transport_checksum(src, dst, protocol, data)
-}
+    // Checksums and building
 
-/// Whether a UDP datagram has a good checksum. A zero checksum field means
-/// "no checksum" over IPv4, and is never valid over IPv6.
-pub fn udp_checksum_ok(src: std::net::IpAddr, dst: std::net::IpAddr, udp: &[u8]) -> bool {
-    crate::stdlib::udp::udp_checksum_ok(src, dst, udp)
+    /// RFC 1071 one 16-bit word at a time, as the copies of it did.
+    fn reference_checksum(data: &[u8]) -> u16 {
+        let mut sum = 0u64;
+        for c in data.chunks(2) {
+            sum += u64::from(u16::from_be_bytes([c[0], c.get(1).copied().unwrap_or(0)]));
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+
+    #[test]
+    fn checksums_match_rfc_1071_at_every_length() {
+        let data: Vec<u8> = (0..2000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        for len in 0..data.len() {
+            assert_eq!(checksum(&data[..len]), reference_checksum(&data[..len]), "{len} bytes");
+        }
+        assert_eq!(checksum(&[0xff; 65_536]), reference_checksum(&[0xff; 65_536]));
+        // A pseudo-header is the addresses, the protocol and the length.
+        let (s, d): (Ipv4Addr, Ipv4Addr) = ("10.0.0.2".parse().unwrap(), "10.0.0.1".parse().unwrap());
+        let udp = [0, 1, 0, 2, 0, 9, 0, 0, 0xab];
+        let pseudo = [&s.octets()[..], &d.octets(), &[0, 17, 0, 9], &udp].concat();
+        assert_eq!(transport_checksum(s.into(), d.into(), protocol::UDP, &udp), reference_checksum(&pseudo));
+        assert_eq!(transport_checksum(s.into(), DST.into(), protocol::UDP, &udp), 1);
+    }
+
+    #[test]
+    fn built_packets_read_back() {
+        let (s, d): (IpAddr, IpAddr) = ("10.0.0.2".parse().unwrap(), "10.0.0.1".parse().unwrap());
+        let p = packet_with(s, d, protocol::UDP, Fields { ttl: 9, tos: 0x10, id: 7, dont_fragment: false }, &[1; 8]).0;
+        assert_eq!(&p[..12], &[0x45, 0x10, 0, 28, 0, 7, 0, 0, 9, 17, p[10], p[11]]);
+        assert_eq!(checksum(&p[..20]), 0);
+        assert_eq!(Header::parse(&p), Some(Header { src: s, dst: d, protocol: protocol::UDP, payload: 20..28, fragment: None }));
+        let p = packet_with(SRC.into(), DST.into(), protocol::UDP, Fields { tos: 0xab, ..Fields::default() }, &[1; 8]).0;
+        assert_eq!(&p[..8], &[0x6a, 0xb0, 0, 0, 0, 8, 17, 64]);
+        assert_eq!((source(&p), destination(&p)), (Some(SRC.into()), Some(DST.into())));
+        // A router hop lowers the TTL and keeps the header checksum right.
+        let mut p = packet(s, d, protocol::UDP, &[]).0;
+        assert_eq!(hop(&mut p), Hop::Forward);
+        assert_eq!((p[8], checksum(&p)), (63, 0));
+        p[8] = 1;
+        assert_eq!(hop(&mut p), Hop::Expired);
+        assert_eq!(hop(&mut [0x45; 10]), Hop::NotIp);
+    }
+
+    #[test]
+    fn a_zero_checksum_means_none_only_over_ipv4() {
+        let (v4a, v4b): (IpAddr, IpAddr) = ("10.0.0.2".parse().unwrap(), "10.0.0.1".parse().unwrap());
+        let (v6a, v6b): (IpAddr, IpAddr) = ("2001:db8::2".parse().unwrap(), "2001:db8::1".parse().unwrap());
+        let mut u = vec![0, 1, 0, 2, 0, 10, 0, 0, 0xab, 0xcd];
+        assert!(udp_checksum_ok(v4a, v4b, &u));
+        assert!(!udp_checksum_ok(v6a, v6b, &u));
+        // Data whose sum, with the field zero, comes out as zero: over
+        // IPv6, the field must say 0xffff.
+        let w = (0..=u16::MAX)
+            .find(|w| {
+                u[8..10].copy_from_slice(&w.to_be_bytes());
+                transport_checksum(v6a, v6b, protocol::UDP, &u) == 0
+            })
+            .expect("some data sums to zero");
+        u[8..10].copy_from_slice(&w.to_be_bytes());
+        assert!(!udp_checksum_ok(v6a, v6b, &u));
+        u[6..8].copy_from_slice(&[0xff, 0xff]);
+        assert!(udp_checksum_ok(v6a, v6b, &u));
+        // A wrong checksum fails over both.
+        u[6..8].copy_from_slice(&[0x12, 0x34]);
+        assert!(!udp_checksum_ok(v6a, v6b, &u));
+        assert!(!udp_checksum_ok(v4a, v4b, &u));
+    }
 }

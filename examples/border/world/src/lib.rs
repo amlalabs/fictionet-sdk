@@ -230,8 +230,7 @@ fn dns_query_packet(from: SocketAddrV4, gateway: Ipv4Addr, id: u16, name: &str) 
     p.extend_from_slice(&[0x45, 0, (total >> 8) as u8, total as u8, 0, 0, 0x40, 0, 64, 17, 0, 0]);
     p.extend_from_slice(&from.ip().octets());
     p.extend_from_slice(&gateway.octets());
-    let sum = path::checksum(&p[..20]);
-    p[10..12].copy_from_slice(&sum.to_be_bytes());
+    fictionet::stdlib::ip::set_header_checksum(&mut p[..20]);
     p.extend_from_slice(&from.port().wrapping_add(id).to_be_bytes());
     p.extend_from_slice(&53u16.to_be_bytes());
     p.extend_from_slice(&(udp_len as u16).to_be_bytes());

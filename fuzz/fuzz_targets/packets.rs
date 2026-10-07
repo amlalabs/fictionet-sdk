@@ -6,6 +6,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use fictionet::Packet;
+use fictionet::stdlib::codec::contract::check_wire;
 use fictionet::stdlib::{dhcp, icmp};
 use libfuzzer_sys::fuzz_target;
 
@@ -27,10 +28,5 @@ fuzz_target!(|data: &[u8]| {
             assert!(icmp::echo_reply(&reply, addr).is_none());
         }
     }
-    if let Some(m) = dhcp::Message::parse(data) {
-        let bytes = m.to_bytes();
-        let again = dhcp::Message::parse(&bytes).expect("what parsed and was written parses");
-        assert_eq!(again.message_type(), m.message_type());
-        assert_eq!(again.options, m.options);
-    }
+    check_wire::<dhcp::Message>(data);
 });

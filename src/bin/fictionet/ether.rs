@@ -6,9 +6,9 @@
 //! run by the agent, so every frame is read as hostile input: no length
 //! is trusted before it is checked.
 
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use fictionet::stdlib::transport::{Transport, transport};
+use fictionet::stdlib::ip::{self, Fields, Header};
 
 /// A MAC address.
 pub(crate) type Mac = [u8; 6];
@@ -139,70 +139,28 @@ pub(crate) fn ip_packet(ethertype: u16, payload: &[u8]) -> Option<&[u8]> {
     }
 }
 
-// Checksums and packet building
+// Packet building, on the stdlib's IP layer
 
-/// The ones' complement sum of `data` as 16-bit words, added to `sum`.
-fn add(mut sum: u32, data: &[u8]) -> u32 {
-    let (chunks, rest) = data.as_chunks::<2>();
-    for c in chunks {
-        sum += u16::from_be_bytes([c[0], c[1]]) as u32;
-        // Fold early, so a long packet cannot overflow.
-        if sum > 0xffff_0000 {
-            sum = (sum & 0xffff) + (sum >> 16);
-        }
-    }
-    if let [last] = rest {
-        sum += (*last as u32) << 8;
-    }
-    sum
-}
-
-/// Folds a sum and complements it: the Internet checksum.
-fn finish(mut sum: u32) -> u16 {
-    while sum > 0xffff {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    !(sum as u16)
-}
-
-/// An IPv4 packet around `payload`, with TTL 64 and a correct header
-/// checksum.
+/// An IPv4 packet around `payload`, with TTL 64, identification 0, no
+/// flags and a correct header checksum.
 pub(crate) fn ipv4(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, payload: &[u8]) -> Vec<u8> {
-    let mut p = Vec::with_capacity(20 + payload.len());
-    p.extend_from_slice(&[0x45, 0]);
-    p.extend_from_slice(&((20 + payload.len()) as u16).to_be_bytes());
-    p.extend_from_slice(&[0, 0, 0, 0, 64, proto, 0, 0]);
-    p.extend_from_slice(&src.octets());
-    p.extend_from_slice(&dst.octets());
-    let sum = finish(add(0, &p));
-    p[10..12].copy_from_slice(&sum.to_be_bytes());
-    p.extend_from_slice(payload);
-    p
+    ip::packet_with(src.into(), dst.into(), proto, Fields { dont_fragment: false, ..Fields::default() }, payload).0
 }
 
 /// A UDP datagram in an IPv4 packet, with a correct checksum.
 pub(crate) fn udp4(src: Ipv4Addr, sport: u16, dst: Ipv4Addr, dport: u16, data: &[u8]) -> Vec<u8> {
-    let u = udp(sport, dport, data, |u| {
-        let mut pseudo = [0u8; 12];
-        pseudo[0..4].copy_from_slice(&src.octets());
-        pseudo[4..8].copy_from_slice(&dst.octets());
-        pseudo[9] = UDP;
-        pseudo[10..12].copy_from_slice(&(u.len() as u16).to_be_bytes());
-        add(add(0, &pseudo), u)
-    });
-    ipv4(src, dst, UDP, &u)
+    ipv4(src, dst, UDP, &udp(src.into(), sport, dst.into(), dport, data))
 }
 
-/// A UDP datagram, its checksum computed by `sum` over the datagram with
-/// the checksum field zero.
-fn udp(sport: u16, dport: u16, data: &[u8], sum: impl Fn(&[u8]) -> u32) -> Vec<u8> {
+/// A UDP datagram from `src` to `dst`, with a correct checksum.
+fn udp(src: IpAddr, sport: u16, dst: IpAddr, dport: u16, data: &[u8]) -> Vec<u8> {
     let mut u = Vec::with_capacity(8 + data.len());
     u.extend_from_slice(&sport.to_be_bytes());
     u.extend_from_slice(&dport.to_be_bytes());
     u.extend_from_slice(&((8 + data.len()) as u16).to_be_bytes());
     u.extend_from_slice(&[0, 0]);
     u.extend_from_slice(data);
-    let mut c = finish(sum(&u));
+    let mut c = ip::transport_checksum(src, dst, UDP, &u);
     if c == 0 {
         c = 0xffff;
     }
@@ -210,38 +168,21 @@ fn udp(sport: u16, dport: u16, data: &[u8], sum: impl Fn(&[u8]) -> u32) -> Vec<u
     u
 }
 
-/// The IPv6 pseudo-header sum for an upper-layer packet of `len` bytes.
-fn pseudo_v6(src: &Ipv6Addr, dst: &Ipv6Addr, next: u8, len: usize) -> u32 {
-    let mut s = add(0, &src.octets());
-    s = add(s, &dst.octets());
-    s = add(s, &(len as u32).to_be_bytes());
-    add(s, &[0, 0, 0, next])
-}
-
 /// An IPv6 packet around `payload`.
 pub(crate) fn ipv6(src: Ipv6Addr, dst: Ipv6Addr, next: u8, hop_limit: u8, payload: &[u8]) -> Vec<u8> {
-    let mut p = Vec::with_capacity(40 + payload.len());
-    p.extend_from_slice(&[0x60, 0, 0, 0]);
-    p.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-    p.push(next);
-    p.push(hop_limit);
-    p.extend_from_slice(&src.octets());
-    p.extend_from_slice(&dst.octets());
-    p.extend_from_slice(payload);
-    p
+    ip::packet_with(src.into(), dst.into(), next, Fields { ttl: hop_limit, ..Fields::default() }, payload).0
 }
 
 /// A UDP datagram in an IPv6 packet, with a correct checksum.
 pub(crate) fn udp6(src: Ipv6Addr, sport: u16, dst: Ipv6Addr, dport: u16, data: &[u8]) -> Vec<u8> {
-    let u = udp(sport, dport, data, |u| add(pseudo_v6(&src, &dst, UDP, u.len()), u));
-    ipv6(src, dst, UDP, 64, &u)
+    ipv6(src, dst, UDP, 64, &udp(src.into(), sport, dst.into(), dport, data))
 }
 
 /// An ICMPv6 message in an IPv6 packet with hop limit 255, as neighbor
 /// discovery requires. `body` is the whole message with its checksum
 /// field (bytes 2 and 3) zero; this fills it in.
 pub(crate) fn icmp6(src: Ipv6Addr, dst: Ipv6Addr, mut body: Vec<u8>) -> Vec<u8> {
-    let sum = finish(add(pseudo_v6(&src, &dst, ICMPV6, body.len()), &body));
+    let sum = ip::transport_checksum(src.into(), dst.into(), ICMPV6, &body);
     body[2..4].copy_from_slice(&sum.to_be_bytes());
     ipv6(src, dst, ICMPV6, 255, &body)
 }
@@ -303,9 +244,9 @@ pub(crate) const NEIGHBOR_ADVERTISEMENT: u8 = 136;
 pub(crate) const REDIRECT: u8 = 137;
 
 /// What attach needs to know about the transport of one IP packet from
-/// the VM. [`transport`](fictionet::stdlib::transport::transport) reads
-/// the extension headers and fragments, with the parser the world's own
-/// stack uses; this adds the UDP port and the ICMPv6 type.
+/// the VM. [`Header::check`] reads the extension headers and fragments,
+/// with the parser the world's own stack uses; this adds the UDP port and
+/// the ICMPv6 type.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Upper<'a> {
     /// A whole UDP datagram: its destination port and payload.
@@ -329,14 +270,15 @@ pub(crate) struct Unreadable;
 
 /// Reads the transport of an IP packet, which [`ip_packet`] has checked.
 pub(crate) fn upper(packet: &[u8]) -> Result<Upper<'_>, Unreadable> {
-    let (proto, bytes, fragment) = match transport(packet).ok_or(Unreadable)? {
-        Transport::Whole { proto, bytes } => (proto, bytes, false),
-        // An atomic fragment is a whole packet, but neighbor discovery may
-        // not carry a fragment header at all (RFC 6980), so it counts as a
-        // fragment here.
-        Transport::First { proto, bytes } | Transport::Atomic { proto, bytes } => (proto, bytes, true),
-        Transport::Later => return Ok(Upper::Other),
+    let h = Header::check(packet).map_err(|_| Unreadable)?;
+    // An atomic fragment is a whole packet, but neighbor discovery may not
+    // carry a fragment header at all (RFC 6980), so it counts as a fragment
+    // here. A fragment after the first holds no transport header.
+    let fragment = match h.fragment {
+        Some(f) if f.offset != 0 => return Ok(Upper::Other),
+        f => f.is_some(),
     };
+    let (proto, bytes) = (h.protocol, h.payload(packet));
     match proto {
         UDP => {
             if bytes.len() < 8 {
@@ -538,15 +480,10 @@ pub(crate) mod tests {
 
     pub(crate) const VM: Mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
 
-    /// Checks the Internet checksum over `data` (it sums to zero).
-    pub(crate) fn sums_to_zero(sum: u32, data: &[u8]) -> bool {
-        finish(add(sum, data)) == 0
-    }
-
     pub(crate) fn v6_checksum_ok(packet: &[u8]) -> bool {
         let src = source_v6(packet);
         let dst = Ipv6Addr::from(<[u8; 16]>::try_from(&packet[24..40]).unwrap());
-        sums_to_zero(pseudo_v6(&src, &dst, packet[6], packet.len() - 40), &packet[40..])
+        ip::transport_checksum(src.into(), dst.into(), packet[6], &packet[40..]) == 0
     }
 
     fn arp_request(spa: [u8; 4], tpa: [u8; 4]) -> Vec<u8> {
@@ -591,10 +528,9 @@ pub(crate) mod tests {
     #[test]
     fn built_packets_have_correct_checksums() {
         let p = udp4(Ipv4Addr::new(10, 0, 0, 1), 67, Ipv4Addr::BROADCAST, 68, b"odd");
-        assert!(sums_to_zero(0, &p[..20]), "IPv4 header");
-        let mut pseudo = vec![10, 0, 0, 1, 255, 255, 255, 255, 0, UDP];
-        pseudo.extend_from_slice(&((p.len() - 20) as u16).to_be_bytes());
-        assert!(sums_to_zero(add(0, &pseudo), &p[20..]), "UDP over IPv4");
+        assert_eq!(ip::checksum(&p[..20]), 0, "IPv4 header");
+        let (src, dst) = (Ipv4Addr::new(10, 0, 0, 1).into(), Ipv4Addr::BROADCAST.into());
+        assert_eq!(ip::transport_checksum(src, dst, UDP, &p[20..]), 0, "UDP over IPv4");
         let p = udp6(link_local(GATEWAY_MAC), 547, link_local(VM), 546, b"odd");
         assert!(v6_checksum_ok(&p));
         assert_eq!(udp_to(&p), Some((546, &b"odd"[..])));

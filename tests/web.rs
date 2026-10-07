@@ -18,6 +18,7 @@ use bytes::Bytes;
 use fictionet::prelude::*;
 use fictionet::stdlib::dns::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use fictionet::stdlib::dns::rr::{Name, RData, RecordType};
+use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::tls;
 use fictionet::events::{Event as Entry, EventLog, Fields, Sandbox};
 use fictionet::stdlib::{ConnError, Connection, dhcp, ip, tcp, udp, web};
@@ -971,23 +972,12 @@ fn an_unknown_tls_name_is_rejected_with_unrecognized_name() {
 // ---------------------------------------------------------------------------
 // Raw packets
 
-fn sum16(data: &[u8]) -> u32 {
-    data.chunks(2).map(|c| u16::from_be_bytes([c[0], *c.get(1).unwrap_or(&0)]) as u32).sum()
-}
-
-fn fold(mut s: u32) -> u16 {
-    while s > 0xffff {
-        s = (s & 0xffff) + (s >> 16);
-    }
-    !(s as u16)
-}
-
 fn ipv4(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, payload: &[u8]) -> Packet {
     let mut p = vec![0x45, 0, 0, 0, 0, 1, 0, 0, 64, proto, 0, 0];
     p[2..4].copy_from_slice(&((20 + payload.len()) as u16).to_be_bytes());
     p.extend_from_slice(&src.octets());
     p.extend_from_slice(&dst.octets());
-    let c = fold(sum16(&p));
+    let c = ip::checksum(&p);
     p[10..12].copy_from_slice(&c.to_be_bytes());
     p.extend_from_slice(payload);
     Packet(p)
@@ -997,7 +987,7 @@ fn ping(src: Ipv4Addr, dst: Ipv4Addr, seq: u16) -> Packet {
     let mut icmp = vec![8, 0, 0, 0, 0x12, 0x34];
     icmp.extend_from_slice(&seq.to_be_bytes());
     icmp.extend_from_slice(b"fictionet");
-    let c = fold(sum16(&icmp));
+    let c = ip::checksum(&icmp);
     icmp[2..4].copy_from_slice(&c.to_be_bytes());
     ipv4(src, dst, 1, &icmp)
 }
@@ -1009,12 +999,7 @@ fn udp(src: Ipv4Addr, sport: u16, dst: Ipv4Addr, dport: u16, data: &[u8]) -> Pac
     u.extend_from_slice(&((8 + data.len()) as u16).to_be_bytes());
     u.extend_from_slice(&[0, 0]);
     u.extend_from_slice(data);
-    let mut pseudo = Vec::new();
-    pseudo.extend_from_slice(&src.octets());
-    pseudo.extend_from_slice(&dst.octets());
-    pseudo.extend_from_slice(&[0, 17]);
-    pseudo.extend_from_slice(&(u.len() as u16).to_be_bytes());
-    let c = fold(sum16(&pseudo) + sum16(&u));
+    let c = ip::transport_checksum(src.into(), dst.into(), 17, &u);
     u[6..8].copy_from_slice(&c.to_be_bytes());
     ipv4(src, dst, 17, &u)
 }
@@ -1023,7 +1008,7 @@ fn udp(src: Ipv4Addr, sport: u16, dst: Ipv4Addr, dport: u16, data: &[u8]) -> Pac
 fn parse(p: &Packet) -> (Ipv4Addr, Ipv4Addr, u8, Vec<u8>) {
     let b = &p.0;
     assert_eq!(b[0] >> 4, 4);
-    assert_eq!(fold(sum16(&b[..20])), 0, "IPv4 header checksum");
+    assert_eq!(ip::checksum(&b[..20]), 0, "IPv4 header checksum");
     let src = Ipv4Addr::new(b[12], b[13], b[14], b[15]);
     let dst = Ipv4Addr::new(b[16], b[17], b[18], b[19]);
     (src, dst, b[9], b[20..].to_vec())
@@ -1052,7 +1037,7 @@ fn unknown_addresses_get_host_unreachable_and_sites_appear_on_lookup() {
         let (src, dst, proto, icmp) = parse(&reply);
         assert_eq!((src, dst, proto), (GATEWAY, me, 1));
         assert_eq!((icmp[0], icmp[1]), (3, 1));
-        assert_eq!(fold(sum16(&icmp)), 0, "ICMP checksum");
+        assert_eq!(ip::checksum(&icmp), 0, "ICMP checksum");
         assert_eq!(&icmp[8..], &sent.0[..]);
 
         // A site's address before its name was looked up: unreachable too.
@@ -1086,7 +1071,7 @@ fn unknown_addresses_get_host_unreachable_and_sites_appear_on_lookup() {
         // address is dropped.
         let mut err = vec![3, 1, 0, 0, 0, 0, 0, 0];
         err.extend_from_slice(&sent.0[..28]);
-        let c = fold(sum16(&err));
+        let c = ip::checksum(&err);
         err[2..4].copy_from_slice(&c.to_be_bytes());
         raw.send(ipv4(me, Ipv4Addr::new(192, 0, 2, 1), 1, &err));
         let mut v6 = vec![0x60, 0, 0, 0, 0, 0, 59, 64];
@@ -1185,7 +1170,7 @@ fn dhcp_msg(kind: u8, xid: u32, mac: u8) -> dhcp::Message {
 /// Sends a DHCP message from `src` to `dst` and returns the reply's IP
 /// destination and message.
 async fn dhcp_ask(cx: &Cx, end: &mut End, src: Ipv4Addr, dst: Ipv4Addr, m: &dhcp::Message) -> Option<(Ipv4Addr, dhcp::Message)> {
-    end.send(udp(src, 68, dst, 67, &m.to_bytes()));
+    end.send(udp(src, 68, dst, 67, &m.to_bytes().unwrap()));
     let p = recv_within(cx, end, SHORT).await?;
     let (from, to, proto, u) = parse(&p);
     assert_eq!((from, proto), (GATEWAY, 17));
@@ -1331,10 +1316,10 @@ fn dhcp_messages_round_trip() {
     m.ciaddr = Ipv4Addr::new(10, 0, 0, 5);
     m.push(dhcp::opt::REQUESTED_IP, [10, 0, 0, 5]);
     m.push(200, vec![1; 300]); // longer than one option entry
-    let bytes = m.to_bytes();
+    let bytes = m.to_bytes().unwrap();
     assert!(bytes.len() >= 300);
-    assert_eq!(dhcp::Message::parse(&bytes), Some(m));
-    assert_eq!(dhcp::Message::parse(&bytes[..239]), None);
+    assert_eq!(dhcp::Message::parse(&bytes), Ok(m));
+    assert_eq!(dhcp::Message::parse(&bytes[..239]), Err(dhcp::ParseError::Short));
 }
 
 #[test]
@@ -1524,7 +1509,7 @@ fn fragment(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, id: u16, offset: usize, mor
     let flags = ((offset / 8) as u16) | if more { 0x2000 } else { 0 };
     p.0[6..8].copy_from_slice(&flags.to_be_bytes());
     p.0[10..12].copy_from_slice(&[0, 0]);
-    let c = fold(sum16(&p.0[..20]));
+    let c = ip::checksum(&p.0[..20]);
     p.0[10..12].copy_from_slice(&c.to_be_bytes());
     p
 }
@@ -1563,12 +1548,7 @@ fn tcp_seg(src: Ipv4Addr, sport: u16, dst: Ipv4Addr, dport: u16, seq: u32, ack: 
     t.extend_from_slice(&ack.to_be_bytes());
     t.extend_from_slice(&[0x50, flags, 0xff, 0xff, 0, 0, 0, 0]);
     t.extend_from_slice(data);
-    let mut pseudo = Vec::new();
-    pseudo.extend_from_slice(&src.octets());
-    pseudo.extend_from_slice(&dst.octets());
-    pseudo.extend_from_slice(&[0, 6]);
-    pseudo.extend_from_slice(&(t.len() as u16).to_be_bytes());
-    let c = fold(sum16(&pseudo) + sum16(&t));
+    let c = ip::transport_checksum(src.into(), dst.into(), 6, &t);
     t[16..18].copy_from_slice(&c.to_be_bytes());
     ipv4(src, dst, 6, &t)
 }
@@ -3204,20 +3184,9 @@ fn ipv6(src: Ipv6Addr, dst: Ipv6Addr, next: u8, payload: &[u8]) -> Packet {
     Packet(p)
 }
 
-/// The checksum of `data` over the IPv6 pseudo-header. Over data whose
-/// checksum is filled in, a correct one gives 0.
-fn sum6(src: Ipv6Addr, dst: Ipv6Addr, next: u8, data: &[u8]) -> u16 {
-    let mut pseudo = Vec::new();
-    pseudo.extend_from_slice(&src.octets());
-    pseudo.extend_from_slice(&dst.octets());
-    pseudo.extend_from_slice(&(data.len() as u32).to_be_bytes());
-    pseudo.extend_from_slice(&[0, 0, 0, next]);
-    fold(sum16(&pseudo) + sum16(data))
-}
-
 /// An IPv6 packet carrying `data`, with its checksum at `at` filled in.
 fn checksummed6(src: Ipv6Addr, dst: Ipv6Addr, next: u8, mut data: Vec<u8>, at: usize) -> Packet {
-    let c = sum6(src, dst, next, &data);
+    let c = ip::transport_checksum(src.into(), dst.into(), next, &data);
     data[at..at + 2].copy_from_slice(&c.to_be_bytes());
     ipv6(src, dst, next, &data)
 }
@@ -3259,7 +3228,7 @@ fn parse6(p: &Packet) -> (Ipv6Addr, Ipv6Addr, u8, Vec<u8>) {
     let src = Ipv6Addr::from(<[u8; 16]>::try_from(&b[8..24]).unwrap());
     let dst = Ipv6Addr::from(<[u8; 16]>::try_from(&b[24..40]).unwrap());
     let payload = b[40..].to_vec();
-    assert_eq!(sum6(src, dst, b[6], &payload), 0, "the checksum");
+    assert_eq!(ip::transport_checksum(src.into(), dst.into(), b[6], &payload), 0, "the checksum");
     (src, dst, b[6], payload)
 }
 
@@ -3825,10 +3794,10 @@ fn dns_drops_a_zero_udp_checksum_over_ipv6() {
         u.extend_from_slice(&bytes);
         // Choose the DNS id so that the sum over the datagram, with the
         // checksum field zero, is right.
-        let id = sum6(ME6, GATEWAY6, 17, &u);
+        let id = ip::transport_checksum(ME6.into(), GATEWAY6.into(), 17, &u);
         bytes[..2].copy_from_slice(&id.to_be_bytes());
         u[8..].copy_from_slice(&bytes);
-        assert_eq!(sum6(ME6, GATEWAY6, 17, &u), 0);
+        assert_eq!(ip::transport_checksum(ME6.into(), GATEWAY6.into(), 17, &u), 0);
         raw.send(ipv6(ME6, GATEWAY6, 17, &u));
         assert!(recv_within(&cx, &mut raw, SHORT).await.is_none(), "a zero UDP checksum was accepted over IPv6");
         // The same datagram as a sender must send it: 0xffff for a sum of
