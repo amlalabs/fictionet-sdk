@@ -13,12 +13,21 @@ const EXAMPLES: &[&str] = &[
     "short_names",
     "long_names",
     "float_nulls",
+    "blocks",
 ];
+/// SBE XML schemas with goldens, read by the `sbe` front end.
+const SBE_EXAMPLES: &[&str] = &["sbe_sample"];
+fn examples() -> impl Iterator<Item = (&'static str, &'static str, &'static str)> {
+    EXAMPLES
+        .iter()
+        .map(|n| (*n, "ir", "json"))
+        .chain(SBE_EXAMPLES.iter().map(|n| (*n, "sbe", "xml")))
+}
 #[test]
 fn goldens_and_determinism() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
-    for name in EXAMPLES {
-        let limits = if *name == "budgets" {
+    for (name, format, extension) in examples() {
+        let limits = if name == "budgets" {
             Limits {
                 max_message: 128,
                 max_collection: 8,
@@ -30,15 +39,15 @@ fn goldens_and_determinism() {
             Limits::default()
         };
         let input = Input {
-            name: format!("/ignored/path/{name}.json"),
-            bytes: std::fs::read(root.join(format!("schemas/{name}.json"))).unwrap(),
+            name: format!("/ignored/path/{name}.{extension}"),
+            bytes: std::fs::read(root.join(format!("schemas/{name}.{extension}"))).unwrap(),
         };
-        let source = generate("ir", std::slice::from_ref(&input), limits)
+        let source = generate(format, std::slice::from_ref(&input), limits)
             .unwrap()
             .source;
         assert_eq!(
             source,
-            generate("ir", std::slice::from_ref(&input), limits)
+            generate(format, std::slice::from_ref(&input), limits)
                 .unwrap()
                 .source
         );
@@ -52,9 +61,9 @@ fn goldens_and_determinism() {
             "golden {name}; set BLESS_CODEGEN=1 to update"
         );
         let mut renamed = input.clone();
-        renamed.name = format!("C:\\other\\{name}.json");
-        assert_eq!(source, generate("ir", &[renamed], limits).unwrap().source);
-        if *name == "recursive" {
+        renamed.name = format!("C:\\other\\{name}.{extension}");
+        assert_eq!(source, generate(format, &[renamed], limits).unwrap().source);
+        if name == "recursive" {
             let checked = validate(IrFrontEnd.parse(&[input], limits).unwrap(), limits).unwrap();
             assert_eq!(checked.recursive_types().collect::<Vec<_>>(), ["Node"]);
             let target = emit_fuzz(
@@ -79,7 +88,7 @@ fn goldens_are_rustfmt_clean_when_available() {
     }
     let mut command = Command::new("rustfmt");
     command.args(["--edition", "2024", "--check"]);
-    for name in EXAMPLES {
+    for (name, _, _) in examples() {
         command.arg(Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/golden/{name}.rs")));
     }
     let output = command.output().unwrap();

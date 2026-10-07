@@ -6,13 +6,15 @@ it. Regenerate only when you choose to replace those edits. The generated
 file has no dependency on the generator at runtime.
 
 The generator has a shared IR, a validator, one Rust emitter, and a
-front end per input format. The built-in `ir` front end reads the IR
-itself as JSON. The IR describes ordered binary layouts. Front ends for
-formats such as SBE, FIX, FAST, XDR, protobuf, ASN.1, OpenAPI/JSON
-Schema, and DCE/RPC parse their schemas into this IR. Tagged fields,
-varints, padding rules, and text formats get their own IR encoding forms
+front end per input format. Two front ends are registered: `ir` reads
+the IR itself as JSON, and `sbe` reads FIX Simple Binary Encoding 1.0 XML
+message schemas. The IR describes ordered binary layouts: structs with
+optional byte offsets, blocks whose wire length comes from a header,
+headers of unsigned fields with roles, and unions selected by a header
+tag. Front ends for formats such as FIX, FAST, XDR, protobuf, ASN.1,
+OpenAPI/JSON Schema, and DCE/RPC parse their schemas into this IR.
+Tagged fields, varints, and text formats get their own IR encoding forms
 when those front ends need them.
-Unions will be added when a front end needs them.
 
 ## Generate and use a module
 
@@ -21,10 +23,11 @@ From the SDK checkout:
 ```sh
 CARGO_BUILD_JOBS=4 cargo run -p fictionet-codegen -- --list
 CARGO_BUILD_JOBS=4 cargo run -p fictionet-codegen -- ir schema.json -o orders.rs
+CARGO_BUILD_JOBS=4 cargo run -p fictionet-codegen -- sbe templates.xml -o market.rs
 ```
 
 The equivalent spelling is `--format ir schema.json -o orders.rs`.
-`ir` accepts exactly one JSON document. The registry API accepts a list
+`ir` accepts exactly one JSON document, and `sbe` exactly one XML schema. The registry API accepts a list
 of inputs so future formats can support imports and multiple files.
 The generator reads local files only. It uses no network, external
 formatter, build script, proc macro, or third-party library.
@@ -39,13 +42,18 @@ value.write(&mut output)?;
 ```
 
 `Wire::parse` reads one exact value. `Wire::write` appends a value without
-changing the destination if it returns an error. A generated stream type
+changing the destination if it returns an error. Each module defines its own
+`Error`: `Truncated`, `Trailing`, `Limit`, `Depth`, `Value` (a scalar,
+range, flag, enum, set, or null), `Utf8`, `Header` (magic, tag, version,
+or a header constant), `Layout` (a block length too short for the
+block's fixed fields), and `Allocation`. A generated stream type
 implements `Decode`; use it with `codec::Stream`, `pump`, and `finish`.
 Its associated `write` method writes the magic, length, and complete body.
 A body's `Wire` implementation excludes this outer framing.
 
 The header records the generator package version and escaped input
-basenames. It never includes input directory paths or timestamps.
+basenames, followed by a `#![doc]` attribute with the schema's
+documentation. It never includes input directory paths or timestamps.
 Declaration order is preserved. Identical validated inputs produce
 identical output bytes, without a formatter installed.
 
@@ -99,6 +107,11 @@ Generator limits are fixed and exported from `fictionet_codegen::ir`:
 | `MAX_NAME` | 128 UTF-8 bytes per source name or input basename |
 | `MAX_DOC` | 4,096 UTF-8 bytes per documentation string |
 | `MAX_OUTPUT` | 32 MiB per emitted file |
+| `MAX_HEADER` | 256 bytes, and 256 fields, per header |
+| `MAX_CONSTANT` | 4,096 bytes per byte constant |
+| `MAX_XML_DEPTH` | 32 nested XML elements |
+| `MAX_XML_ELEMENTS` | 16,384 XML elements per document |
+| `MAX_XML_ATTRIBUTES` | 32 attributes per XML element |
 
 Stream magic is limited to 256 bytes. Explicit collection limits are
 limited to one MiB and must fit their prefix width. Fixed data must fit
@@ -166,8 +179,10 @@ variants, and bits accept an optional `doc` string.
 | Definition kind | Required members | Meaning |
 | --- | --- | --- |
 | `struct` | `fields` | Ordered field array; empty structs are allowed |
+| `block` | `length`, `fields` | A struct whose fixed fields fill a block of `length` bytes; see below |
 | `enum` | `repr`, `variants` | Closed integer enum; variants have `name` and integer `value` |
 | `set` | `repr`, `bits` | Unsigned bit set; bits have `name` and zero-based `bit` |
+| `union` | `header`, `cases` | A header, then the value its tag selects; see below |
 
 Enums require at least one variant. Their representation must be an
 integer scalar. Discriminants must be unique and fit that scalar. Sets
@@ -178,7 +193,10 @@ A field requires `name` and `type`. Optional `byte_order` overrides the
 inherited order for the whole field, including prefixes and referenced
 values. Optional `fixed_size` asserts an exact wire size. Validation
 checks the assertion through references; variable layouts cannot have
-one. Docs do not affect parsing.
+one. Optional `offset` places the field that many bytes after the start
+of its struct. Every earlier field must have a fixed size, and offsets
+may not move backwards. Skipped bytes are ignored when read and written
+as zero. Docs do not affect parsing.
 
 | Type JSON | Wire encoding and Rust value |
 | --- | --- |
@@ -193,6 +211,61 @@ one. Docs do not affect parsing.
 | `{"kind":"optional","flag":"u8","item":"i32"}` | A 0 or 1 flag; 1 is followed by a value, as `Option<T>` |
 | `{"kind":"optional","null":-1,"item":"i32"}` | One scalar; the reserved value means `None` |
 | `{"kind":"ref","name":"Order"}` | Named type, emitted as `Order` unless an inline cycle needs `Box<Order>` |
+| `{"kind":"range","item":"u8","min":1,"max":9}` | One scalar; values outside the inclusive range are refused |
+| `{"kind":"optional","null":0,"item":{"kind":"range",...}}` | A range with a reserved null outside it, as `Option<T>` |
+| `{"kind":"optional","null":0,"item":{"kind":"ref","name":"Side"}}` | An enum whose representation reserves a null value |
+| `{"kind":"constant","item":"i8","value":-9}` | No wire bytes; an associated constant `pub const NAME: i8` |
+| `{"kind":"constant","bytes":[56]}` | No wire bytes; an associated `&[u8]` constant |
+| `{"kind":"constant","enum":"Side","variant":"buy"}` | No wire bytes; an associated enum constant |
+| `{"kind":"block_group","item":"Entry","header":{...},"limit":8}` | A header with a count, then that many entries, as `Vec<Entry>` |
+
+Constants are only allowed as direct struct fields. They have no Rust
+field and take no `offset` or `byte_order`. A null on an enum must fit
+the enum's representation and differ from every variant.
+
+A header is a fixed run of unsigned fields at explicit offsets:
+
+```json
+{
+  "size": 8,
+  "fields": [
+    { "name": "blockLength", "offset": 0, "width": "u16", "role": "length", "max": 65534 },
+    { "name": "templateId", "offset": 2, "width": "u16", "role": "tag" },
+    { "name": "schemaId", "offset": 4, "width": "u16", "role": "constant", "value": 1 },
+    { "name": "version", "offset": 6, "width": "u16", "role": "version", "current": 13, "minimum": 13 }
+  ]
+}
+```
+
+Fields must lie inside `size` and must not overlap. Bytes no field covers
+are ignored when read and written as zero. Optional `max` bounds the
+value; readers refuse larger values. Roles:
+
+| Role | Read | Written |
+| --- | --- | --- |
+| `tag` | Selects a union case; unknown tags are refused | The case's tag |
+| `length` | The wire length of the following block | The block's declared `length` |
+| `count` | The number of group entries, at most the group's limit | The entry count |
+| `version` | Refused below `minimum` | `current` |
+| `constant` | Refused unless equal to `value` | `value` |
+
+A union header has one `tag`, at most one `length` and one `version`,
+and no `count`. A group header has one `count`, at most one `length`, and
+no `tag` or `version`. Each union case has `name`, `tag`, `item`, and an
+optional `doc`; names and tags are unique. A union may not take part in
+a reference cycle. A group's omitted `limit` is the smaller of
+`--max-collection` and the count field's maximum.
+
+A `block` places its fixed-size fields first and its variable fields,
+such as groups and length-prefixed data, after them. When a header with
+a `length` precedes a block, readers accept any length that holds the
+block's fixed fields. They skip the extra bytes of a longer block, the
+way SBE extends a message (section 5.3 of the SBE standard). A group
+header's length is checked against the entry's fixed fields even when
+the count is zero. Writers always emit the declared length, padded with
+zeros. A block read or written through its own `Wire` implementation
+uses the declared length. A `length` role requires a block whose
+declared length fits the length field.
 
 Prefix, count, flag, and set widths are `u8`, `u16`, `u32`, or `u64`.
 Variable data and groups may omit `limit`; validation fills it from the
@@ -224,6 +297,62 @@ input, return `Need` for partial frames, and reject oversized lengths as
 soon as the complete header is available. The driver reports truncation
 at EOF. Invalid complete bodies terminate decoding.
 
+## SBE schemas
+
+The `sbe` front end reads one `messageSchema` document of the
+[SBE 1.0 standard](https://github.com/FIXTradingCommunity/fix-simple-binary-encoding/tree/master/v1-0-STANDARD/doc).
+Its bounded XML reader accepts an XML declaration, comments, namespace
+prefixes, and predefined or numeric character references. It refuses
+DTDs, entities, CDATA, processing instructions, and includes.
+
+| SBE | IR |
+| --- | --- |
+| `byteOrder` | The schema byte order; little-endian when omitted |
+| Required `<type>` scalar | A `range` from the type's `minValue`/`maxValue`, excluding the null value (section 2) |
+| Optional `<type>` scalar | `optional` with the type's null, around that range |
+| `char` scalar | A `u8` range, 0x20 through 0x7e unless the schema says otherwise |
+| `char` or `uint8` array | Fixed `bytes`; padding is kept |
+| Constant `<type>` or `valueRef` | A `constant` field |
+| `<enum>`, `<set>` | Named `enum` and `set`; `char` enums use byte values |
+| Optional enum field | `optional` with the encoding's null around a `ref` |
+| `<composite>` used by a message | A `struct`, with member offsets and constants |
+| `<message>` | A `block` with its `blockLength` |
+| `<group>` | A `block` named `<Owner>_<group>`, and a `block_group` with the dimension composite as its header |
+| `<data>` | Variable `bytes` with the length member's width |
+| `headerType` (default `messageHeader`) | The header of one union, `Message`, with a case per template |
+
+The message header maps `blockLength` to `length`, `templateId` to
+`tag`, `schemaId` to a `constant` of the schema id, and `version` to a
+`version` with `current` and `minimum` both the schema version. Header
+maxima come from the schema; `numInGroup` allows its full width unless
+the schema sets `maxValue` (section 3.4.10). Group and data limits are
+the smaller of the schema's maximum and `--max-collection`. Composites
+that no message uses are left out; every enum and set is emitted.
+
+Generated readers accept acting versions from the schema version up.
+Longer blocks from newer senders are skipped. Senders on older versions
+are refused, so fields need no "absent" form. `sinceVersion` and
+`deprecated` may not exceed the schema version, and `sinceVersion` may
+not decrease within a block or composite (section 5).
+
+The front end refuses, with `Unsupported`, primitive arrays other than
+`char` and `uint8`, optional floats (their null is NaN), optional
+composite fields, and header or dimension composites with `numGroups` or
+`numVarDataFields`. Other schema errors are `SchemaShape`, `InvalidName`,
+`DuplicateName`, `UnknownReference`, or `InvalidSize`, with the input
+name and the element path in the location.
+
+`stdlib::cme_mdp3` is generated this way from CME's public MDP 3.0
+schema, kept at `data/cme/templates_FixBinary.xml`. The generated code is
+followed by hand-written packet framing: the binary packet header and
+the two-byte message size. A test checks that the file still starts with
+the generator's output. To regenerate the generated part and keep the
+hand-written tail:
+
+```sh
+CARGO_BUILD_JOBS=4 BLESS_CODEGEN=1 cargo test --test sbe_codegen module_is
+```
+
 ## Rust identifiers
 
 ASCII letters and digits form words. Punctuation and non-ASCII characters
@@ -247,14 +376,17 @@ cannot produce. No silent renaming or compatibility aliases are added.
 
 The crate exports `Schema`, `NamedType`, `Definition`, `Field`, `Type`,
 `Primitive`, `Length`, `Presence`, `Number`, `Width`, `ByteOrder`, `Stream`,
-and `Limits`. Construct them directly or use `FrontEnd::parse`. Call
+`Header`, `HeaderField`, `Role`, `Case`, `Constant`, and `Limits`, and the
+front ends `IrFrontEnd` and `SbeFrontEnd`. Construct them directly or use `FrontEnd::parse`. Call
 `validate(schema, limits)` to obtain a `ValidatedSchema`, then
 `emit(&validated, &input_names)` to get Rust source. `generate` combines
 registry lookup, parsing, validation, and emission. It returns `Generated`,
 with `source: String` and `schema: ValidatedSchema`. The CLI uses this same
 pipeline and uses the returned schema for an optional fuzz target.
 `Error` carries an `ErrorKind`, a location or schema path, and a short
-explanation.
+explanation. Front ends add three kinds: `XmlSyntax` for malformed XML,
+`SchemaShape` for a missing attribute or a misplaced element, and
+`Unsupported` for valid input the IR cannot express.
 
 Implement `FrontEnd: Sync` with `name()` and
 `parse(&[Input], Limits) -> Result<Schema, Error>`. The parser must bound
@@ -287,6 +419,18 @@ every name length from 1 through `MAX_NAME`, and deterministic random
 schemas when rustfmt is on PATH. Random modules also compile with warnings
 denied and run their generated tests. They use clippy when it is installed.
 
+`tests/sbe_codegen.rs` compares generated SBE code with the runtime
+decoder `stdlib::sbe`, loaded with the same XML, for every template of
+CME MDP 3.0 and of `codegen/tests/schemas/sbe_sample.xml`. A third,
+IR-driven encoder in the test makes random messages. Both decoders read
+each one, and their values are compared field by field: the generated
+value's `Debug` output against the runtime value tree. Both encoders then
+reproduce the input bytes. The runtime also re-encodes each message with
+longer blocks and a newer version, and the generated decoder reads the
+same value. Mutated bytes must be accepted by both, with equal values,
+or refused by both. The one expected difference is a version below the
+schema's, which only the runtime reads.
+
 The XDR example covers big-endian signed and unsigned numbers, enums,
 fixed opaque bytes, counted arrays, and four-byte optional flags.
 Differential tests build its equivalent IR, check the emitted source,
@@ -295,7 +439,9 @@ and compare generated reads and writes with `onc_rpc::Reader` and
 mutations, and arbitrary bytes. Protobuf and ASN.1 use tagged encodings.
 Their front ends add the IR forms and the matching comparisons.
 
-Goldens live in `codegen/tests/golden`. The codegen test target compiles
+Goldens live in `codegen/tests/golden`. The `blocks` example covers
+offsets, blocks, block groups, unions, ranges, constants, and enum nulls;
+`sbe_sample` is the golden for the `sbe` front end. The codegen test target compiles
 them and runs their emitted tests. It also runs the root integration checks
 in `tests/codegen.rs`. Additional
 fixtures check small allocation and work budgets, long identifiers, and

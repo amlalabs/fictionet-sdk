@@ -24,6 +24,8 @@ macro_rules! protocols {
         pub mod cboe_boe;
         #[path = "../../src/stdlib/cboe_pitch.rs"]
         pub mod cboe_pitch;
+        #[path = "../../src/stdlib/cme_mdp3.rs"]
+        pub mod cme_mdp3;
         #[path = "../../src/stdlib/coap.rs"]
         pub mod coap;
         #[path = "../../src/stdlib/cotp.rs"]

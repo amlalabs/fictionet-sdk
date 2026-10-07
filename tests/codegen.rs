@@ -276,6 +276,7 @@ fn differential_fixture_matches_programmatic_ir() {
         ty,
         byte_order: None,
         fixed_size: None,
+        offset: None,
     })
     .collect();
     let schema = Schema {

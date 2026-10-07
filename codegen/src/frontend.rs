@@ -27,7 +27,7 @@ pub trait FrontEnd: Sync {
 #[derive(Clone, Copy, Debug)]
 pub struct IrFrontEnd;
 /// Registered front ends. Add one instance here to expose another format.
-pub static FORMATS: &[&dyn FrontEnd] = &[&IrFrontEnd];
+pub static FORMATS: &[&dyn FrontEnd] = &[&IrFrontEnd, &crate::SbeFrontEnd];
 
 /// Generated source and the validated schema used to emit it.
 #[derive(Clone, Debug)]
@@ -268,13 +268,34 @@ fn named(v: Value, path: &str) -> Result<NamedType, Error> {
     let doc = o.doc()?;
     let kind = o.text("kind")?;
     let definition = match kind.as_str() {
-        "struct" => Definition::Struct(
-            array(o.required("fields")?, path)?
+        "struct" => Definition::Struct(fields(o.required("fields")?, path)?),
+        "block" => Definition::Block {
+            length: size(o.required("length")?, &format!("{path}.length"))?,
+            fields: fields(o.required("fields")?, path)?,
+        },
+        "union" => {
+            let header = header(o.required("header")?, &format!("{path}.header"))?;
+            let cases = array(o.required("cases")?, path)?
                 .into_iter()
                 .enumerate()
-                .map(|(i, v)| field(v, &format!("{path}.fields[{i}]")))
-                .collect::<Result<_, _>>()?,
-        ),
+                .map(|(i, v)| {
+                    let p = format!("{path}.cases[{i}]");
+                    let mut o = Object::new(v, &p)?;
+                    let name = o.text("name")?;
+                    let doc = o.doc()?;
+                    let tag = unsigned(o.required("tag")?, &p)?;
+                    let item = o.text("item")?;
+                    o.finish()?;
+                    Ok(Case {
+                        name,
+                        doc,
+                        tag,
+                        item,
+                    })
+                })
+                .collect::<Result<_, Error>>()?;
+            Definition::Union { header, cases }
+        }
         "enum" => {
             let repr = primitive(&o.text("repr")?, path)?;
             let variants = array(o.required("variants")?, path)?
@@ -310,13 +331,73 @@ fn named(v: Value, path: &str) -> Result<NamedType, Error> {
                 .collect::<Result<_, Error>>()?;
             Definition::Set { repr, bits }
         }
-        _ => return Err(shape(path, "kind must be struct, enum, or set")),
+        _ => {
+            return Err(shape(
+                path,
+                "kind must be struct, block, enum, set, or union",
+            ));
+        }
     };
     o.finish()?;
     Ok(NamedType {
         name,
         doc,
         definition,
+    })
+}
+fn fields(v: Value, path: &str) -> Result<Vec<Field>, Error> {
+    array(v, path)?
+        .into_iter()
+        .enumerate()
+        .map(|(i, v)| field(v, &format!("{path}.fields[{i}]")))
+        .collect()
+}
+fn unsigned(v: Value, path: &str) -> Result<u64, Error> {
+    u64::try_from(integer(v, path)?).map_err(|_| shape(path, "expected u64"))
+}
+fn header(v: Value, path: &str) -> Result<Header, Error> {
+    let mut o = Object::new(v, path)?;
+    let total = size(o.required("size")?, &format!("{path}.size"))?;
+    let fields = array(o.required("fields")?, path)?
+        .into_iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let p = format!("{path}.fields[{i}]");
+            let mut o = Object::new(v, &p)?;
+            let name = o.text("name")?;
+            let offset = size(o.required("offset")?, &p)?;
+            let width = width(o.required("width")?, &p)?;
+            let max = o.take("max").map(|v| unsigned(v, &p)).transpose()?;
+            let role = match o.text("role")?.as_str() {
+                "tag" => Role::Tag,
+                "length" => Role::Length,
+                "count" => Role::Count,
+                "version" => Role::Version {
+                    current: unsigned(o.required("current")?, &p)?,
+                    minimum: unsigned(o.required("minimum")?, &p)?,
+                },
+                "constant" => Role::Constant(unsigned(o.required("value")?, &p)?),
+                _ => {
+                    return Err(shape(
+                        &p,
+                        "role must be tag, length, count, version, or constant",
+                    ));
+                }
+            };
+            o.finish()?;
+            Ok(HeaderField {
+                name,
+                offset,
+                width,
+                role,
+                max,
+            })
+        })
+        .collect::<Result<_, Error>>()?;
+    o.finish()?;
+    Ok(Header {
+        size: total,
+        fields,
     })
 }
 fn field(v: Value, path: &str) -> Result<Field, Error> {
@@ -326,6 +407,7 @@ fn field(v: Value, path: &str) -> Result<Field, Error> {
     let ty = ty(o.required("type")?, &format!("{path}.type"))?;
     let byte_order = o.take("byte_order").map(|v| order(v, path)).transpose()?;
     let fixed_size = o.limit("fixed_size")?;
+    let offset = o.limit("offset")?;
     o.finish()?;
     Ok(Field {
         name,
@@ -333,6 +415,7 @@ fn field(v: Value, path: &str) -> Result<Field, Error> {
         ty,
         byte_order,
         fixed_size,
+        offset,
     })
 }
 fn ty(v: Value, path: &str) -> Result<Type, Error> {
@@ -362,6 +445,44 @@ fn ty(v: Value, path: &str) -> Result<Type, Error> {
             count: width(o.required("count")?, path)?,
             limit: o.limit("limit")?,
         },
+        "range" => {
+            let item = primitive(&o.text("item")?, path)?;
+            Type::Range {
+                item,
+                min: number(o.required("min")?, path, Some(item))?,
+                max: number(o.required("max")?, path, Some(item))?,
+            }
+        }
+        "constant" => {
+            let constant = if let Some(v) = o.take("bytes") {
+                Constant::Bytes(
+                    array(v, path)?
+                        .into_iter()
+                        .map(|v| {
+                            u8::try_from(integer(v, path)?)
+                                .map_err(|_| shape(path, "constant bytes must fit u8"))
+                        })
+                        .collect::<Result<_, _>>()?,
+                )
+            } else if let Some(v) = o.take("enum") {
+                Constant::Variant {
+                    ty: text(v, path)?,
+                    name: o.text("variant")?,
+                }
+            } else {
+                let ty = primitive(&o.text("item")?, path)?;
+                Constant::Number {
+                    ty,
+                    value: number(o.required("value")?, path, Some(ty))?,
+                }
+            };
+            Type::Constant(constant)
+        }
+        "block_group" => Type::BlockGroup {
+            item: o.text("item")?,
+            header: header(o.required("header")?, &format!("{path}.header"))?,
+            limit: o.limit("limit")?,
+        },
         "optional" => {
             let item = Box::new(ty(o.required("item")?, &format!("{path}.item"))?);
             let presence = match o.take("null") {
@@ -369,7 +490,7 @@ fn ty(v: Value, path: &str) -> Result<Type, Error> {
                     v,
                     path,
                     match item.as_ref() {
-                        Type::Scalar(p) => Some(*p),
+                        Type::Scalar(p) | Type::Range { item: p, .. } => Some(*p),
                         _ => None,
                     },
                 )?),
