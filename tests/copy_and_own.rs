@@ -539,9 +539,9 @@ fn copied_generated_cme_module_frames_packets() {
     let mut stream = Stream::new(cme_mdp3::Messages);
     let mut messages = Vec::new();
     for chunk in bytes[cme_mdp3::PACKET_HEADER..].chunks(3) {
-        pump(&mut stream, chunk, |m| messages.push(m)).unwrap();
+        pump(&mut stream, chunk, |m| messages.push(m.unwrap())).unwrap();
     }
-    finish(&mut stream, |m| messages.push(m)).unwrap();
+    finish(&mut stream, |m| messages.push(m.unwrap())).unwrap();
     assert_eq!(messages, packet.messages);
     assert_eq!(cme_mdp3::Price9::EXPONENT, -9);
 }

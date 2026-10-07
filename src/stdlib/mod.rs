@@ -349,7 +349,8 @@ pub mod cboe_pitch;
 /// [`Packet`](cme_mdp3::Packet) is one UDP datagram: the binary packet
 /// header (`MsgSeqNum` and `SendingTime`), then messages, each after a
 /// two-byte `MsgSize` that counts itself. [`Messages`](cme_mdp3::Messages)
-/// reads the same size-prefixed messages from a byte stream.
+/// reads the same size-prefixed messages from a byte stream. It yields a
+/// message it refuses as an `Err` item and reads on from the next size.
 ///
 /// ```
 /// use fictionet::stdlib::cme_mdp3::{AdminHeartbeat12, Message, Packet, PacketHeader};

@@ -24872,7 +24872,24 @@ pub const MAX_PACKET_MESSAGES: usize = (MAX_PACKET - PACKET_HEADER) / 10;
 // Packets and messages share the generated `Error`. A packet or message
 // past a limit is `Error::Limit`, input that ends within a packet header,
 // a size field, or a message is `Error::Truncated`, and a `MsgSize` below
-// two, which cannot hold the field itself, is `Error::Layout`.
+// two, which cannot hold the field itself, is `Error::Layout`. The stream
+// decoder [`Messages`] yields a refused message as an `Error` item and
+// goes on; only a size below two ends it, as [`FrameError::Size`].
+
+/// Why [`Messages`] stopped: the fault that leaves no next message to read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameError {
+    /// A `MsgSize` below two, which cannot hold the field itself.
+    Size,
+}
+impl std::fmt::Display for FrameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Size => f.write_str("MsgSize below two"),
+        }
+    }
+}
+impl std::error::Error for FrameError {}
 
 /// The binary packet header that starts every MDP 3.0 UDP packet.
 /// Both fields are little-endian.
@@ -24922,10 +24939,11 @@ impl fictionet::stdlib::codec::Wire for Packet {
             if messages.len() >= MAX_PACKET_MESSAGES {
                 return Err(Error::Limit);
             }
-            let Step::Item(message, used) = Messages.decode(rest, true)? else {
+            let step = Messages.decode(rest, true).map_err(|FrameError::Size| Error::Layout)?;
+            let Step::Item(message, used) = step else {
                 return Err(Error::Truncated);
             };
-            messages.push(message);
+            messages.push(message?);
             rest = rest.get(used..).ok_or(Error::Truncated)?;
         }
         Ok(Self { header, messages })
@@ -24978,34 +24996,35 @@ impl Messages {
     }
 }
 impl fictionet::stdlib::codec::Decode for Messages {
-    type Item = Message;
-    type Error = Error;
+    type Item = Result<Message, Error>;
+    type Error = FrameError;
     const NAME: &'static str = "CME MDP 3.0";
 
     fn capacity(&self) -> usize {
         usize::from(u16::MAX)
     }
 
-    /// Reads one message. Refuses sizes below two and messages the
-    /// generated [`Message`] refuses. Partial messages return `Need`,
-    /// including at EOF. Holds no input.
+    /// Reads one message. A message the generated [`Message`] refuses is
+    /// an `Err` item, and reading goes on after it, since `MsgSize` frames
+    /// the next one. Only a size below two ends the stream. Partial
+    /// messages return `Need`, including at EOF. Holds no input.
     fn decode(
         &mut self,
         input: &[u8],
         _eof: bool,
-    ) -> Result<fictionet::stdlib::codec::Step<Message>, Error> {
+    ) -> Result<fictionet::stdlib::codec::Step<Self::Item>, FrameError> {
         use fictionet::stdlib::codec::{Step, Wire};
         let Some(&[low, high]) = input.get(..MESSAGE_SIZE) else {
             return Ok(Step::Need);
         };
         let size = usize::from(u16::from_le_bytes([low, high]));
         if size < MESSAGE_SIZE {
-            return Err(Error::Layout);
+            return Err(FrameError::Size);
         }
         let Some(body) = input.get(MESSAGE_SIZE..size) else {
             return Ok(Step::Need);
         };
-        Ok(Step::Item(Message::parse(body)?, size))
+        Ok(Step::Item(Message::parse(body), size))
     }
 }
 
@@ -25047,6 +25066,45 @@ mod framing_tests {
         }
         assert_eq!(Packet::parse(&bytes[..21]), Err(Error::Truncated));
         assert_eq!(Packet::parse(&bytes[..11]), Err(Error::Truncated));
+    }
+
+    #[test]
+    fn a_refused_message_does_not_end_the_stream() {
+        use fictionet::stdlib::codec::{Stream, finish, pump};
+        let heartbeat = Message::AdminHeartbeat12(AdminHeartbeat12 {});
+        let mut good = Vec::new();
+        Messages::write(&heartbeat, &mut good).unwrap();
+        // An unknown templateId, then trailing bytes after a known message,
+        // as a newer schema's extra group would leave. MsgSize frames both.
+        let mut unknown = good.clone();
+        unknown[4] = 0xff;
+        let mut longer = good.clone();
+        longer[0] += 3;
+        longer.extend_from_slice(&[1, 2, 3]);
+        let bytes = [&good[..], &unknown, &good, &longer, &good].concat();
+        let mut stream = Stream::new(Messages);
+        let mut items = Vec::new();
+        assert_eq!(pump(&mut stream, &bytes, |m| items.push(m)), Ok(bytes.len()));
+        finish(&mut stream, |m| items.push(m)).unwrap();
+        assert_eq!(
+            items,
+            [
+                Ok(heartbeat.clone()),
+                Message::parse(&unknown[MESSAGE_SIZE..]),
+                Ok(heartbeat.clone()),
+                Message::parse(&longer[MESSAGE_SIZE..]),
+                Ok(heartbeat),
+            ]
+        );
+        assert!(items[1].is_err() && items[3].is_err());
+        assert!(stream.failed().is_none());
+        // A size below two cannot frame the next message, so it ends the stream.
+        let mut stream = Stream::new(Messages);
+        assert!(pump(&mut stream, &[1, 0, 0, 0], |_| ()).is_err());
+        assert_eq!(
+            stream.failed(),
+            Some(&fictionet::stdlib::codec::Fail::Protocol(FrameError::Size))
+        );
     }
 
     #[test]
