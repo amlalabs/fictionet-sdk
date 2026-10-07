@@ -1,8 +1,0 @@
-EH .Pos
-RPT TO
-MA .Pos>!SI
-RPT TO
-MAIL FROM>!SI
-RPT TO
-MA .Pos>!SI
-RPT 

@@ -83,11 +83,19 @@ milliseconds in all:
 FICTIONET_FUZZ_SLEEP_MS=30 cargo +nightly fuzz run -O -a tcp fuzz/corpus/tcp
 ```
 
-The corpora here are small seeds. Shrink a corpus before you commit it:
+The corpora here are seeds, cut down to the fewest inputs that reach every
+edge the larger corpus reached. Cut a corpus down the same way before you
+commit it: merge it into an empty directory with libFuzzer's set cover,
+counting edges only, and commit the result.
 
 ```sh
-cargo +nightly fuzz cmin -O -a tcp fuzz/corpus/tcp
+mkdir /tmp/tcp
+cargo +nightly fuzz run -O -a tcp /tmp/tcp fuzz/corpus/tcp -- -set_cover_merge=1 -use_counters=0
 ```
+
+`stack`, `tcp`, `web`, `web_http` and `ip_reassembly` run timers and
+threads, so the edges an input reaches vary from run to run, and a cut
+loses some. Their corpora are kept whole.
 
 Each bug a target found has a regression test in the SDK's own tests, so
 `cargo test` keeps it fixed without a fuzzer.
