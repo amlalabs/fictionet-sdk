@@ -1,17 +1,17 @@
 //! SFTP packets and typed payloads through the shared contracts.
 #![no_main]
 use fictionet::stdlib::codec::{Wire, contract, test_support::decode_all};
-use fictionet::stdlib::sftp::{Attrs, Frames, MAX_FRAME, MAX_PACKET, Packet, Request, Response, Status};
+use fictionet::stdlib::sftp::{Attrs, MAX_FRAME, MAX_PACKET, Packet, Packets, Request, Response, Status};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(Frames::new, data, 2 * MAX_FRAME);
-    contract::check_decode_with_alloc_limit(|| Frames::with_limit(64), data, 136);
+    contract::check_decode_with_alloc_limit(Packets::new, data, 2 * MAX_FRAME);
+    contract::check_decode_with_alloc_limit(|| Packets::with_limit(64), data, 136);
     contract::check_wire::<Packet>(data);
     contract::check_wire::<Request>(data);
     contract::check_wire::<Response>(data);
     contract::check_wire::<Attrs>(data);
-    for packet in decode_all(Frames::new, data).0 {
+    for packet in decode_all(Packets::new, data).0 {
         contract::check_wire::<Request>(&packet.to_bytes().unwrap());
         contract::check_wire::<Response>(&packet.to_bytes().unwrap());
     }

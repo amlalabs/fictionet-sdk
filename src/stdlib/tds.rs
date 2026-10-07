@@ -13,14 +13,14 @@
 //! follows the Microsoft [MS-TDS] specification for TDS 7.2 to 7.4.
 //!
 //! Nothing here reads a socket. A world reads packets with
-//! [`Stream<Frames>`](fictionet::stdlib::codec::Stream), or uses [`Messages`] in that
+//! [`Stream<Packets>`](fictionet::stdlib::codec::Stream), or uses [`Messages`] in that
 //! driver to assemble packets through EOM. It reads message data as
 //! [`Prelogin`], [`Login7`], or [`SqlBatch`]. It answers with [`Prelogin`]
 //! or a [`TokenStream`]. World code decides which users, databases, and
 //! tables exist and what queries return. A client can use [`TokenReader`]
 //! to follow tokens and carry column metadata across responses.
 //!
-//! Readers check lengths and return [`Error`] or [`FrameError`] for bad
+//! Readers check lengths and return [`Error`] for bad
 //! input. Buffers have named limits, including [`MAX_MESSAGE`].
 //!
 //! [MS-TDS]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-tds/
@@ -423,92 +423,20 @@ pub struct Packet {
     pub data: Vec<u8>,
 }
 
-/// Why bytes are not a TDS packet stream. Either way, the connection
-/// holds no more messages a reader can find, and a real server closes it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FrameError {
-    /// The length field was below the header's 8 bytes.
-    Length(u16),
-    /// A packet's type differs from the earlier packets of its message.
-    TypeChanged {
-        /// The type of the message's first packet.
-        expected: u8,
-        /// The type of this packet.
-        got: u8,
-    },
-    /// A message or packet exceeds its size limit. For [`Messages`],
-    /// this is the assembled data length, including the packet that broke
-    /// the limit. For [`Frames`], it includes one packet's header.
-    TooLong(usize),
-    /// The last packet did not carry EOM before EOF.
-    Incomplete,
-    /// The value cannot be written without changing it.
-    Unwritable,
-}
-
-impl std::fmt::Display for FrameError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            FrameError::Incomplete => f.write_str("message ended without EOM"),
-            FrameError::Unwritable => f.write_str("value cannot be written without changing it"),
-            FrameError::Length(n) => write!(f, "packet length {n}, below the 8-byte header"),
-            FrameError::TypeChanged { expected, got } => {
-                write!(
-                    f,
-                    "packet type {got:#04x} in the middle of a {expected:#04x} message"
-                )
-            }
-            FrameError::TooLong(n) => write!(f, "message of {n} bytes, over the limit"),
-        }
-    }
-}
-
-impl std::error::Error for FrameError {}
-
-/// Why an exact [`Wire`] parse did not read one complete packet.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PacketParseError {
-    /// The packet header is invalid.
-    Frame(FrameError),
-    /// The input ended before a complete packet, including empty input.
-    Truncated,
-    /// Bytes follow the first complete packet.
-    Trailing,
-}
-
-impl core::fmt::Display for PacketParseError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Frame(e) => e.fmt(f),
-            Self::Truncated => f.write_str("input ended before a complete TDS packet"),
-            Self::Trailing => f.write_str("bytes follow the TDS packet"),
-        }
-    }
-}
-
-impl core::error::Error for PacketParseError {
-    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
-        match self {
-            Self::Frame(e) => Some(e),
-            Self::Truncated | Self::Trailing => None,
-        }
-    }
-}
-
 impl Packet {
     /// Reads the packet at the start of `b`. It returns `Ok(None)` if `b`
     /// holds only part of one, and otherwise the packet and how many bytes
     /// of `b` it took.
-    fn parse_prefix(b: &[u8], limit: usize) -> Result<Option<(Packet, usize)>, FrameError> {
+    fn parse_prefix(b: &[u8], limit: usize) -> Result<Option<(Packet, usize)>, Error> {
         if b.len() < 4 {
             return Ok(None);
         }
         let length = be16(b, 2);
         if usize::from(length) < HEADER_LEN {
-            return Err(FrameError::Length(length));
+            return Err(Error::Length(length));
         }
         let end = usize::from(length);
-        if end > limit.clamp(HEADER_LEN, MAX_PACKET) { return Err(FrameError::TooLong(end)); }
+        if end > limit.clamp(HEADER_LEN, MAX_PACKET) { return Err(Error::TooLong(end)); }
         if b.len() < end {
             return Ok(None);
         }
@@ -526,27 +454,27 @@ impl Packet {
 }
 
 impl Wire for Packet {
-    type ParseError = PacketParseError;
-    type WriteError = FrameError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads exactly one packet. Incomplete input and trailing bytes are errors.
-    fn parse(b: &[u8]) -> Result<Self, PacketParseError> {
-        match Packet::parse_prefix(b, MAX_PACKET).map_err(PacketParseError::Frame)? {
+    fn parse(b: &[u8]) -> Result<Self, Error> {
+        match Packet::parse_prefix(b, MAX_PACKET)? {
             Some((packet, used)) if used == b.len() => Ok(packet),
-            Some(_) => Err(PacketParseError::Trailing),
-            None => Err(PacketParseError::Truncated),
+            Some(_) => Err(Error::Trailing),
+            None => Err(Error::Truncated),
         }
     }
 
     /// Appends at most [`MAX_PACKET`] bytes. Refuses oversized data with
-    /// [`FrameError::Unwritable`]. Leaves `out`
+    /// [`Error::Unwritable`]. Leaves `out`
     /// unchanged on error. All header fields are preserved.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), FrameError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         let length = HEADER_LEN.saturating_add(self.data.len());
         if length > MAX_PACKET {
-            return Err(FrameError::Unwritable);
+            return Err(Error::Unwritable);
         }
-        let length = u16::try_from(length).map_err(|_| FrameError::Unwritable)?;
+        let length = u16::try_from(length).map_err(|_| Error::Unwritable)?;
         out.extend_from_slice(&[self.packet_type, self.status]);
         out.extend_from_slice(&length.to_be_bytes());
         out.extend_from_slice(&self.spid.to_be_bytes());
@@ -564,11 +492,11 @@ impl Wire for Packet {
 /// including at EOF, so the stream reports truncation. Message assembly
 /// and status handling remain in [`Messages`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Frames {
+pub struct Packets {
     limit: usize,
 }
 
-impl Frames {
+impl Packets {
     /// Reads packets up to [`MAX_PACKET`] bytes, header included.
     pub fn new() -> Self {
         Self::with_limit(MAX_PACKET)
@@ -586,22 +514,22 @@ impl Frames {
     }
 }
 
-impl Default for Frames {
+impl Default for Packets {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Decode for Frames {
+impl Decode for Packets {
     type Item = Packet;
-    type Error = FrameError;
+    type Error = Error;
     const NAME: &'static str = "TDS";
 
     fn capacity(&self) -> usize {
         self.limit
     }
 
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Packet>, FrameError> {
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Packet>, Error> {
         Ok(match Packet::parse_prefix(input, self.limit)? {
             Some((packet, used)) => Step::Item(packet, used),
             None => Step::Need,
@@ -644,9 +572,9 @@ impl Message {
     /// [`MIN_PACKET_SIZE`] through [`MAX_PACKET_SIZE`]. Only the first
     /// carries reset bits. Only the last carries EOM and IGNORE. IDs start
     /// at 1 and wrap. Refuses data above [`MAX_MESSAGE`] or missing EOM.
-    pub fn packets(&self, packet_size: usize) -> Result<Vec<Packet>, FrameError> {
+    pub fn packets(&self, packet_size: usize) -> Result<Vec<Packet>, Error> {
         if self.data.len() > MAX_MESSAGE || self.status & status::EOM == 0 {
-            return Err(FrameError::Unwritable);
+            return Err(Error::Unwritable);
         }
         let chunk = packet_size.clamp(MIN_PACKET_SIZE, MAX_PACKET_SIZE) - HEADER_LEN;
         let count = self.data.len().div_ceil(chunk).max(1);
@@ -670,20 +598,20 @@ impl Message {
 }
 
 impl Wire for Message {
-    type ParseError = PacketParseError;
-    type WriteError = FrameError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads one complete message. Refuses invalid packet lengths, a type
     /// change, oversized data, missing EOM, incomplete or trailing packets.
-    fn parse(bytes: &[u8]) -> Result<Self, PacketParseError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         let mut decoder = Messages::new();
         let mut rest = bytes;
         loop {
-            match decoder.decode(rest, true).map_err(PacketParseError::Frame)? {
+            match decoder.decode(rest, true)? {
                 Step::Skip(used) => rest = &rest[used..],
                 Step::Item(value, used) if used == rest.len() => return Ok(value),
-                Step::Item(_, _) => return Err(PacketParseError::Trailing),
-                Step::Need | Step::End => return Err(PacketParseError::Truncated),
+                Step::Item(_, _) => return Err(Error::Trailing),
+                Step::Need | Step::End => return Err(Error::Truncated),
             }
         }
     }
@@ -691,7 +619,7 @@ impl Wire for Message {
     /// Appends packets of at most 4096 bytes. Refuses data above
     /// [`MAX_MESSAGE`] and missing EOM. Leaves the destination unchanged
     /// on error. Use [`Message::packets`] to select another packet size.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), FrameError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         let packets = self.packets(4096)?;
         let start = out.len();
         for packet in packets {
@@ -727,27 +655,27 @@ impl Default for Messages {
 
 impl Decode for Messages {
     type Item = Message;
-    type Error = FrameError;
+    type Error = Error;
     const NAME: &'static str = "TDS messages";
 
     fn capacity(&self) -> usize { (self.limit + HEADER_LEN).min(MAX_PACKET) }
     fn held(&self) -> usize { self.partial.as_ref().map_or(0, |p| p.data.len()) }
 
-    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Message>, FrameError> {
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Message>, Error> {
         let Some(&[kind, bits, hi, lo]) = input.get(..4) else {
-            if eof && input.is_empty() && self.partial.is_some() { return Err(FrameError::Incomplete); }
+            if eof && input.is_empty() && self.partial.is_some() { return Err(Error::Incomplete); }
             return Ok(Step::Need);
         };
         let length = u16::from_be_bytes([hi, lo]);
-        if usize::from(length) < HEADER_LEN { return Err(FrameError::Length(length)); }
+        if usize::from(length) < HEADER_LEN { return Err(Error::Length(length)); }
         if let Some(partial) = &self.partial
             && partial.packet_type != kind
         {
-            return Err(FrameError::TypeChanged { expected: partial.packet_type, got: kind });
+            return Err(Error::TypeChanged { expected: partial.packet_type, got: kind });
         }
         let used = usize::from(length);
-        let total = self.held().checked_add(used - HEADER_LEN).ok_or(FrameError::TooLong(usize::MAX))?;
-        if total > self.limit { return Err(FrameError::TooLong(total)); }
+        let total = self.held().checked_add(used - HEADER_LEN).ok_or(Error::TooLong(usize::MAX))?;
+        if total > self.limit { return Err(Error::TooLong(total)); }
         let Some(packet) = input.get(..used) else { return Ok(Step::Need) };
         let resets = status::RESET_CONNECTION | status::RESET_CONNECTION_SKIP_TRAN;
         let mut message = self.partial.take().unwrap_or_else(|| Message {
@@ -759,7 +687,7 @@ impl Decode for Messages {
         if total > message.data.capacity() {
             let target = total.max(message.data.capacity().saturating_mul(2)).min(self.limit);
             message.data.try_reserve_exact(target.saturating_sub(message.data.len()))
-                .map_err(|_| FrameError::TooLong(total))?;
+                .map_err(|_| Error::TooLong(total))?;
         }
         message.data.extend_from_slice(&packet[HEADER_LEN..]);
         if last { Ok(Step::Item(message, used)) }
@@ -771,11 +699,32 @@ impl Decode for Messages {
 // Errors in message contents.
 // ---------------------------------------------------------------------
 
-/// Why a message's data is not what it should be.
+/// Why bytes are not a TDS packet stream, why a message's data is not
+/// what it should be, or why a value cannot be written. After a packet
+/// stream fault, the connection holds no more messages a reader can find,
+/// and a real server closes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
-    /// The data ended in the middle of a field.
+    /// The input ended before a complete packet or message, including
+    /// empty input, or the data ended in the middle of a field.
     Truncated,
+    /// Bytes follow the first complete packet or message.
+    Trailing,
+    /// The packet length field was below the header's 8 bytes.
+    Length(u16),
+    /// A packet's type differs from the earlier packets of its message.
+    TypeChanged {
+        /// The type of the message's first packet.
+        expected: u8,
+        /// The type of this packet.
+        got: u8,
+    },
+    /// A message or packet exceeds its size limit. For [`Messages`],
+    /// this is the assembled data length, including the packet that broke
+    /// the limit. For [`Packets`], it includes one packet's header.
+    TooLong(usize),
+    /// The last packet did not carry EOM before EOF.
+    Incomplete,
     /// A field breaks the specification. The text says which.
     Invalid(&'static str),
     /// Something is longer or more numerous than this module's limits
@@ -796,7 +745,17 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::Truncated => write!(f, "data ends in the middle of a field"),
+            Error::Truncated => write!(f, "data ends before a complete packet or in the middle of a field"),
+            Error::Trailing => f.write_str("bytes follow the TDS packet"),
+            Error::Length(n) => write!(f, "packet length {n}, below the 8-byte header"),
+            Error::TypeChanged { expected, got } => {
+                write!(
+                    f,
+                    "packet type {got:#04x} in the middle of a {expected:#04x} message"
+                )
+            }
+            Error::TooLong(n) => write!(f, "message of {n} bytes, over the limit"),
+            Error::Incomplete => f.write_str("message ended without EOM"),
             Error::Invalid(what) => write!(f, "invalid {what}"),
             Error::Limit(what) => write!(f, "too long or too many: {what}"),
             Error::UnknownToken(t) => write!(f, "unknown token {t:#04x}"),
@@ -3781,8 +3740,8 @@ mod tests {
         assert_eq!((first.status, first.id), (status::RESET_CONNECTION, 1));
         assert_eq!(first.to_bytes().unwrap(), bytes[..512]);
         for n in 0..512 {
-            assert_eq!(Packet::parse(&bytes[..n]), Err(PacketParseError::Truncated));
-            assert_eq!(Frames::new().decode(&bytes[..n], false), Ok(Step::Need));
+            assert_eq!(Packet::parse(&bytes[..n]), Err(Error::Truncated));
+            assert_eq!(Packets::new().decode(&bytes[..n], false), Ok(Step::Need));
         }
         contract::check_decode_with_alloc_limit(Messages::new, &bytes, 2 * MAX_PACKET);
         assert_eq!(one_message(&bytes), m);
@@ -3801,10 +3760,10 @@ mod tests {
 
     #[test]
     fn frame_errors() {
-        assert_eq!(Packet::parse(&[1, 1, 0, 7]), Err(PacketParseError::Frame(FrameError::Length(7))));
+        assert_eq!(Packet::parse(&[1, 1, 0, 7]), Err(Error::Length(7)));
         let mut stream = Stream::new(Messages::new());
         assert_eq!(stream.push(&[1, 1, 0, 3]), 4);
-        assert_eq!(stream.next(), Some(Err(Fail::Protocol(FrameError::Length(3)))));
+        assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::Length(3)))));
         assert_eq!(stream.next(), None);
         let bytes = Message::new(1, vec![]).to_bytes().unwrap();
         assert_eq!(stream.push(&bytes), bytes.len());
@@ -3812,21 +3771,21 @@ mod tests {
         assert_eq!(stream.unread(), [1, 1, 0, 3]);
         let changed = [1, 0, 0, 9, 0, 0, 1, 0, b'x', 3, 1, 0, 8];
         assert_eq!(decode_all(Messages::new, &changed).1,
-            Some(Fail::Protocol(FrameError::TypeChanged { expected: 1, got: 3 })));
+            Some(Fail::Protocol(Error::TypeChanged { expected: 1, got: 3 })));
         let mut stream = Stream::new(Messages::with_limit(10));
         assert_eq!(stream.push(&[1, 0, 0, 16, 0, 0, 1, 0]), 8);
         assert_eq!(stream.next(), None);
         assert_eq!(stream.push(&[1, 1, 0, 11]), 4);
         assert_eq!(stream.next(), None);
         let oversized = [1, 0, 0, 16, 0, 0, 1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 1, 1, 0, 11];
-        assert_eq!(decode_all(|| Messages::with_limit(10), &oversized).1, Some(Fail::Protocol(FrameError::TooLong(11))));
+        assert_eq!(decode_all(|| Messages::with_limit(10), &oversized).1, Some(Fail::Protocol(Error::TooLong(11))));
         let incomplete = [1, 0, 0, 8, 0, 0, 1, 0];
-        assert_eq!(decode_all(Messages::new, &incomplete).1, Some(Fail::Protocol(FrameError::Incomplete)));
+        assert_eq!(decode_all(Messages::new, &incomplete).1, Some(Fail::Protocol(Error::Incomplete)));
         for bytes in [&changed[..], &oversized, &incomplete] {
             contract::check_decode_with_alloc_limit(|| Messages::with_limit(10), bytes, 36);
         }
-        for error in [FrameError::Length(1), FrameError::TypeChanged { expected: 1, got: 2 },
-            FrameError::TooLong(5), FrameError::Incomplete, FrameError::Unwritable] {
+        for error in [Error::Length(1), Error::TypeChanged { expected: 1, got: 2 },
+            Error::TooLong(5), Error::Incomplete, Error::Unwritable] {
             assert!(!error.to_string().is_empty());
         }
     }
@@ -4638,9 +4597,9 @@ mod tests {
     #[test]
     fn oversized_messages_are_refused_whole() {
         let big = Message::new(packet_type::SQL_BATCH, vec![b' '; MAX_MESSAGE + 1]);
-        assert_eq!(big.packets(4096), Err(FrameError::Unwritable));
+        assert_eq!(big.packets(4096), Err(Error::Unwritable));
         let mut out = vec![7];
-        assert_eq!(big.write(&mut out), Err(FrameError::Unwritable));
+        assert_eq!(big.write(&mut out), Err(Error::Unwritable));
         assert_eq!(out, [7]);
         let at = Message::new(packet_type::SQL_BATCH, vec![b' '; MAX_MESSAGE]);
         assert_eq!(one_message(&at.to_bytes().unwrap()), at);
@@ -4754,7 +4713,7 @@ mod tests {
         let mut bytes = vec![packet_type::SQL_BATCH, status::IGNORE, 0, 9, 0, 0, 1, 0, 5];
         bytes.extend([packet_type::SQL_BATCH, status::RESET_CONNECTION_SKIP_TRAN | status::EOM, 0, 9, 0, 0, 1, 0, 5]);
         assert_eq!(one_message(&bytes).status, status::EOM);
-        assert_eq!(Message { status: 0, ..m }.to_bytes(), Err(FrameError::Unwritable));
+        assert_eq!(Message { status: 0, ..m }.to_bytes(), Err(Error::Unwritable));
     }
 
     /// MS-TDS 2.2.6.5: MARS and FEDAUTHREQUIRED are one byte of 0 or 1,
@@ -5132,7 +5091,7 @@ mod tests {
                 }
             }
             contract::check_decode_with_alloc_limit(|| Messages::with_limit(64), &stream, 2 * (64 + HEADER_LEN));
-            contract::check_decode_with_alloc_limit(|| Frames::with_limit(64), &stream, 128);
+            contract::check_decode_with_alloc_limit(|| Packets::with_limit(64), &stream, 128);
             for message in decode_all(|| Messages::with_limit(64), &stream).0 {
                 assert!(message.to_bytes().is_ok(), "{message:?}");
                 contract::check_wire_value(&message);
