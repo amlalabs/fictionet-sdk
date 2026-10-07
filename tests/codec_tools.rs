@@ -259,7 +259,7 @@ fn byte_faults_run_before_modbus_and_line_decoding() {
         .unwrap();
     assert!(matches!(
         test_support::decode_all(|| modbus::Frames, &damaged).1,
-        Some(Fail::Protocol(modbus::FrameError::Protocol(1)))
+        Some(Fail::Protocol(modbus::Error::Protocol(1)))
     ));
 
     let line = b"{\"result\":true}\n";
@@ -504,7 +504,7 @@ fn failed_write_consumes_only_its_item_and_preserves_prior_output() {
             invalid
         ])),
         Some(Err(fictionet::stdlib::codec::InterceptError::Rewrite(
-            fictionet::stdlib::codec::RewriteError::Write(modbus::EncodeError::EmptyPdu)
+            fictionet::stdlib::codec::RewriteError::Write(modbus::Error::EmptyPdu)
         )))
     ));
     assert_eq!(out, [42]);
@@ -629,7 +629,7 @@ fn recorder_preserves_oversized_failure_ranges_with_truncation() {
         let record = log.iter().next().unwrap();
         assert_eq!(
             record.kind,
-            RecordKind::Failed(Fail::Protocol(modbus::FrameError::Protocol(1)))
+            RecordKind::Failed(Fail::Protocol(modbus::Error::Protocol(1)))
         );
         assert_eq!(record.range, 0..8);
         assert_eq!(record.bytes.len(), max_bytes);
@@ -770,7 +770,7 @@ fn intercept_helper_keeps_prior_items_and_handoff_bytes() {
     assert!(matches!(
         error.1,
         fictionet::stdlib::codec::InterceptError::Rewrite(
-            fictionet::stdlib::codec::RewriteError::Write(modbus::EncodeError::EmptyPdu)
+            fictionet::stdlib::codec::RewriteError::Write(modbus::Error::EmptyPdu)
         )
     ));
     assert_eq!(&out[1..], &input[..12]);
@@ -830,7 +830,7 @@ fn intercept_keeps_good_frame_before_decode_failure() {
     assert!(matches!(
         error,
         fictionet::stdlib::codec::InterceptError::Decode(Fail::Protocol(
-            modbus::FrameError::Protocol(1)
+            modbus::Error::Protocol(1)
         ))
     ));
     assert_eq!(out, first);
