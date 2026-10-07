@@ -31,7 +31,7 @@
 //! Framebuffer updates are read for the Raw and CopyRect encodings and for
 //! the Cursor and DesktopSize pseudo-encodings. Other encodings cannot be
 //! split from the stream without decoding them, so they stop the session
-//! with [`Error::Encoding`].
+//! with [`FrameError::Encoding`].
 //!
 //! Every reader checks lengths against the limits below, because the agent
 //! can send any bytes it likes. Every writer refuses a message it cannot
@@ -71,50 +71,20 @@
 
 use fictionet::stdlib::codec::{self, Decode, Step, Stream, Wire};
 
-/// Why an RFB unit cannot be read or its decoder mode cannot change.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ParseError {
-    /// The value is malformed or exceeds a named limit.
-    Protocol(Error),
-    /// The bytes end inside the value.
-    Truncated,
-    /// Bytes follow the value.
-    Trailing,
-    /// A phase or mode change was attempted inside an incomplete unit.
-    PartialUnit,
-}
-impl core::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Protocol(e) => e.fmt(f),
-            Self::Truncated => f.write_str("incomplete RFB value"),
-            Self::Trailing => f.write_str("bytes after the RFB value"),
-            Self::PartialUnit => f.write_str("mode change inside a partial RFB unit"),
-        }
-    }
-}
-impl core::error::Error for ParseError {}
-
-impl From<Error> for ParseError {
-    fn from(error: Error) -> Self {
-        Self::Protocol(error)
-    }
-}
-
-fn exact<T>(parsed: Result<Option<(T, usize)>, Error>, len: usize) -> Result<T, ParseError> {
-    let (value, used) = parsed.map_err(ParseError::Protocol)?.ok_or(ParseError::Truncated)?;
+fn exact<T>(parsed: Result<Option<(T, usize)>, Error>, len: usize) -> Result<T, Error> {
+    let (value, used) = parsed?.ok_or(Error::Truncated)?;
     if used != len {
-        return Err(ParseError::Trailing);
+        return Err(Error::Trailing);
     }
     Ok(value)
 }
 
 impl Wire for Version {
-    type ParseError = ParseError;
+    type ParseError = Error;
     type WriteError = Error;
     /// Reads one version line. Refuses non-digits, an invalid prefix or ending,
     /// incomplete input and trailing bytes.
-    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         exact(Version::parse_prefix(bytes), bytes.len())
     }
     /// Refuses version parts above 999. Leaves `out` unchanged on error.
@@ -134,17 +104,17 @@ impl Wire for Version {
 }
 
 impl Wire for PixelFormat {
-    type ParseError = ParseError;
+    type ParseError = Error;
     type WriteError = Error;
     /// Reads a pixel format. Nonzero flags mean true; padding is ignored.
     /// Refuses incomplete or trailing bytes and invalid pixel formats.
-    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         let raw: &[u8; PIXEL_FORMAT_LEN] = bytes
             .try_into()
-            .map_err(|_| if bytes.len() < PIXEL_FORMAT_LEN { ParseError::Truncated } else { ParseError::Trailing })?;
+            .map_err(|_| if bytes.len() < PIXEL_FORMAT_LEN { Error::Truncated } else { Error::Trailing })?;
         let format = PixelFormat::read(raw);
         if !format.is_valid() {
-            return Err(ParseError::Protocol(Error::PixelFormat));
+            return Err(Error::PixelFormat);
         }
         Ok(format)
     }
@@ -171,16 +141,16 @@ impl Wire for PixelFormat {
 }
 
 impl Wire for ServerInit {
-    type ParseError = ParseError;
+    type ParseError = Error;
     type WriteError = Error;
     /// Reads one ServerInit. Refuses invalid pixel formats, names longer
     /// than `MAX_TEXT`, incomplete input and trailing bytes.
-    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         let state = State { phase: Phase::ServerInit, ..State::new() };
         let message = exact(run(bytes, |c| state.server_at(c)), bytes.len())?;
         match message {
             ServerMessage::ServerInit(init) => Ok(init),
-            _ => Err(ParseError::Protocol(Error::Unwritable)),
+            _ => Err(Error::Unwritable),
         }
     }
     /// Refuses invalid pixel formats and names longer than `MAX_TEXT`.
@@ -200,14 +170,14 @@ impl Wire for ServerInit {
 }
 
 impl Wire for ClientMessage {
-    type ParseError = ParseError;
+    type ParseError = Error;
     type WriteError = Error;
 
     /// Reads exactly one normal client message. Handshake units require
     /// a phase and use [`ClientMessages`]; they have no shared wire tag.
     /// Refuses unknown tags, invalid pixel formats, oversized text,
     /// incomplete input and trailing bytes.
-    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         exact(ClientMessage::parse_prefix(bytes), bytes.len())
     }
 
@@ -396,12 +366,12 @@ impl<'a> Text<'a> {
     }
 }
 impl Wire for Text<'_> {
-    type ParseError = ParseError;
+    type ParseError = Error;
     type WriteError = Error;
 
     /// Reads one length-prefixed text value. Refuses lengths above
     /// [`MAX_TEXT`], incomplete input and trailing bytes.
-    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         exact(run(bytes, text), bytes.len()).map(|bytes| Self { bytes: std::borrow::Cow::Owned(bytes) })
     }
 
@@ -438,12 +408,12 @@ pub struct ClientInit {
 macro_rules! fixed_wire {
     ($ty:ty, $len:expr, |$b:ident| $read:expr, |$v:ident, $out:ident| $write:block) => {
         impl Wire for $ty {
-            type ParseError = ParseError;
+            type ParseError = Error;
             type WriteError = Error;
             /// Reads the complete fixed unit. Refuses incomplete and trailing bytes.
-            fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
+            fn parse(bytes: &[u8]) -> Result<Self, Error> {
                 let $b: &[u8; $len] = bytes.try_into().map_err(|_| {
-                    if bytes.len() < $len { ParseError::Truncated } else { ParseError::Trailing }
+                    if bytes.len() < $len { Error::Truncated } else { Error::Trailing }
                 })?;
                 Ok($read)
             }
@@ -476,27 +446,37 @@ fn read_u32(b: &[u8], at: usize) -> Option<u32> {
     let &[a, c, d, e] = b.get(at..at.checked_add(4)?)? else { return None };
     Some(u32::from_be_bytes([a, c, d, e]))
 }
-fn sized_end(at: usize, count: usize, width: usize, limit: usize) -> Result<usize, Error> {
-    count.checked_mul(width).and_then(|n| at.checked_add(n)).filter(|&n| n <= limit).ok_or(Error::TooLong)
+// The version line and pixel lengths are read by the body parsers too,
+// which report them as `Error`. Found while framing, they end the stream.
+// These readers fail only with Version, BitsPerPixel or TooLong.
+fn framing(e: Error) -> FrameError {
+    match e {
+        Error::Version => FrameError::Version,
+        Error::BitsPerPixel(b) => FrameError::BitsPerPixel(b),
+        _ => FrameError::TooLong,
+    }
 }
-fn text_end(b: &[u8], at: usize, limit: usize) -> Result<Option<usize>, Error> {
+fn sized_end(at: usize, count: usize, width: usize, limit: usize) -> Result<usize, FrameError> {
+    count.checked_mul(width).and_then(|n| at.checked_add(n)).filter(|&n| n <= limit).ok_or(FrameError::TooLong)
+}
+fn text_end(b: &[u8], at: usize, limit: usize) -> Result<Option<usize>, FrameError> {
     let header = sized_end(at, 4, 1, limit)?;
     let Some(n) = read_u32(b, at) else { return Ok(None) };
-    let n = usize::try_from(n).map_err(|_| Error::TooLong)?;
+    let n = usize::try_from(n).map_err(|_| FrameError::TooLong)?;
     if n > MAX_TEXT {
-        return Err(Error::TooLong);
+        return Err(FrameError::TooLong);
     }
     Ok(Some(sized_end(header, n, 1, limit)?))
 }
-fn counted_end(b: &[u8], at: usize, header: usize, width: usize, limit: usize) -> Result<Option<usize>, Error> {
+fn counted_end(b: &[u8], at: usize, header: usize, width: usize, limit: usize) -> Result<Option<usize>, FrameError> {
     let Some(n) = read_u16(b, at) else { return Ok(None) };
     Ok(Some(sized_end(header, usize::from(n), width, limit)?))
 }
 
-fn client_end(b: &[u8], phase: Phase, limit: usize) -> Result<Option<usize>, Error> {
+fn client_end(b: &[u8], phase: Phase, limit: usize) -> Result<Option<usize>, FrameError> {
     let end = match phase {
         Phase::ClientVersion => {
-            Version::parse_prefix(b)?;
+            Version::parse_prefix(b).map_err(framing)?;
             VERSION_LEN
         }
         Phase::SecurityChoice | Phase::ClientInit => 1,
@@ -509,9 +489,9 @@ fn client_end(b: &[u8], phase: Phase, limit: usize) -> Result<Option<usize>, Err
             Some(&client_type::KEY_EVENT) => 8,
             Some(&client_type::POINTER_EVENT) => 6,
             Some(&client_type::CLIENT_CUT_TEXT) => return text_end(b, 4, limit),
-            Some(&t) => return Err(Error::MessageType(t)),
+            Some(&t) => return Err(FrameError::MessageType(t)),
         },
-        p => return Err(Error::Phase(p)),
+        p => return Err(FrameError::Phase(p)),
     };
     Ok(Some(sized_end(0, end, 1, limit)?))
 }
@@ -524,10 +504,10 @@ impl FrameScan {
         dialect: Dialect,
         format: &PixelFormat,
         limit: usize,
-    ) -> Result<Option<usize>, Error> {
+    ) -> Result<Option<usize>, FrameError> {
         let end = match phase {
             Phase::ServerVersion => {
-                Version::parse_prefix(b)?;
+                Version::parse_prefix(b).map_err(framing)?;
                 VERSION_LEN
             }
             Phase::SecurityOffer => match dialect {
@@ -556,14 +536,14 @@ impl FrameScan {
                 Some(&server_type::SET_COLOR_MAP_ENTRIES) => return counted_end(b, 4, 6, 6, limit),
                 Some(&server_type::BELL) => 1,
                 Some(&server_type::SERVER_CUT_TEXT) => return text_end(b, 4, limit),
-                Some(&t) => return Err(Error::MessageType(t)),
+                Some(&t) => return Err(FrameError::MessageType(t)),
             },
-            p => return Err(Error::Phase(p)),
+            p => return Err(FrameError::Phase(p)),
         };
         Ok(Some(sized_end(0, end, 1, limit)?))
     }
 
-    fn update_end(&mut self, b: &[u8], format: &PixelFormat, limit: usize) -> Result<Option<usize>, Error> {
+    fn update_end(&mut self, b: &[u8], format: &PixelFormat, limit: usize) -> Result<Option<usize>, FrameError> {
         if self.remaining.is_none() {
             let Some(n) = read_u16(b, 2) else { return Ok(None) };
             // Every rectangle needs at least its twelve-byte header.
@@ -577,17 +557,18 @@ impl FrameScan {
             if b.get(..header).is_none() {
                 return Ok(None);
             }
-            let width = read_u16(b, sized_end(at, 4, 1, limit)?).ok_or(Error::TooLong)?;
-            let height = read_u16(b, sized_end(at, 6, 1, limit)?).ok_or(Error::TooLong)?;
-            let encoding = read_u32(b, sized_end(at, 8, 1, limit)?).ok_or(Error::TooLong)? as i32;
+            let width = read_u16(b, sized_end(at, 4, 1, limit)?).ok_or(FrameError::TooLong)?;
+            let height = read_u16(b, sized_end(at, 6, 1, limit)?).ok_or(FrameError::TooLong)?;
+            let encoding = read_u32(b, sized_end(at, 8, 1, limit)?).ok_or(FrameError::TooLong)? as i32;
             let size = match encoding {
-                encoding::RAW => pixels_len(width, height, format)?,
+                encoding::RAW => pixels_len(width, height, format).map_err(framing)?,
                 encoding::COPY_RECT => 4,
                 encoding::CURSOR => {
-                    pixels_len(width, height, format)?.checked_add(mask_len(width, height)?).ok_or(Error::TooLong)?
+                    let pixels = pixels_len(width, height, format).map_err(framing)?;
+                    pixels.checked_add(mask_len(width, height).map_err(framing)?).ok_or(FrameError::TooLong)?
                 }
                 encoding::DESKTOP_SIZE => 0,
-                other => return Err(Error::Encoding(other)),
+                other => return Err(FrameError::Encoding(other)),
             };
             self.next = sized_end(header, size, 1, limit)?;
             self.remaining = Some(left - 1);
@@ -603,8 +584,9 @@ impl FrameScan {
 /// Use with [`Stream`]. Call [`set_phase`](Self::set_phase) between items;
 /// a phase stays selected until changed. `Closed` and `Unsupported` return
 /// `End`, leaving the unread suffix for `swap` or `into_parts`. All other
-/// phases yield one `Result<ClientMessage, ParseError>` per complete unit.
-/// Malformed bodies are items; unknown framing and limits end the stream.
+/// phases yield one `Result<ClientMessage, Error>` per complete unit.
+/// Malformed bodies are items; unknown framing and limits end the stream
+/// with a [`FrameError`].
 /// Partial input returns `Need`, including at EOF. No input is retained.
 #[derive(Clone, Debug)]
 pub struct ClientMessages {
@@ -633,14 +615,14 @@ impl ClientMessages {
     }
     /// Selects a phase before decoding or just after an item. Once decoding
     /// returns `Need` with unread bytes, changes (including `Closed`) return
-    /// [`ParseError::PartialUnit`] until that unit completes. A phase in which
-    /// only the server can speak wraps [`Error::Phase`] in [`ParseError::Protocol`].
-    pub fn set_phase(&mut self, phase: Phase) -> Result<(), ParseError> {
+    /// [`Error::PartialUnit`] until that unit completes. A phase in which
+    /// only the server can speak returns [`Error::Phase`].
+    pub fn set_phase(&mut self, phase: Phase) -> Result<(), Error> {
         if self.partial {
-            return Err(ParseError::PartialUnit);
+            return Err(Error::PartialUnit);
         }
         if !(phase.client_turn() || matches!(phase, Phase::Closed | Phase::Unsupported(_))) {
-            return Err(ParseError::Protocol(Error::Phase(phase)));
+            return Err(Error::Phase(phase));
         }
         self.phase = phase;
         Ok(())
@@ -652,15 +634,15 @@ impl Default for ClientMessages {
     }
 }
 impl Decode for ClientMessages {
-    type Item = Result<ClientMessage, ParseError>;
-    type Error = Error;
+    type Item = Result<ClientMessage, Error>;
+    type Error = FrameError;
     const NAME: &'static str = "RFB client units";
     fn capacity(&self) -> usize {
         self.limit
     }
-    fn decode(&mut self, b: &[u8], _: bool) -> Result<Step<Self::Item>, Error> {
+    fn decode(&mut self, b: &[u8], _: bool) -> Result<Step<Self::Item>, FrameError> {
         if self.out_of_turn {
-            return Err(Error::OutOfTurn);
+            return Err(FrameError::OutOfTurn);
         }
         if matches!(self.phase, Phase::Closed | Phase::Unsupported(_)) {
             return Ok(Step::End);
@@ -683,8 +665,8 @@ impl Decode for ClientMessages {
 /// [`set_mode`](Self::set_mode) supplies the phase, negotiated dialect and
 /// pixel format between items. Mode stays selected until changed. `Closed`
 /// and `Unsupported` return `End` without consuming the unread suffix.
-/// Complete body failures are [`ParseError`] items; unknown message types, encodings and
-/// excessive declared lengths are terminal errors. EOF inside a unit
+/// Complete body failures are [`Error`] items; unknown message types, encodings and
+/// excessive declared lengths are a terminal [`FrameError`]. EOF inside a unit
 /// returns `Need`. A scan cursor makes bytewise framebuffer input linear;
 /// all pixel bytes remain in [`Stream`]'s buffer until an item is complete.
 #[derive(Clone, Debug)]
@@ -720,23 +702,22 @@ impl ServerMessages {
     }
     /// Selects a mode before decoding or just after an item. Once decoding
     /// returns `Need` with unread bytes, changes (including `Closed`) return
-    /// [`ParseError::PartialUnit`] until that unit completes. Invalid pixel formats
-    /// and client-only phases wrap [`Error::PixelFormat`] or [`Error::Phase`]
-    /// in [`ParseError::Protocol`].
+    /// [`Error::PartialUnit`] until that unit completes. Invalid pixel formats
+    /// and client-only phases return [`Error::PixelFormat`] or [`Error::Phase`].
     pub fn set_mode(
         &mut self,
         phase: Phase,
         dialect: Dialect,
         format: PixelFormat,
-    ) -> Result<(), ParseError> {
+    ) -> Result<(), Error> {
         if self.partial {
-            return Err(ParseError::PartialUnit);
+            return Err(Error::PartialUnit);
         }
         if !(phase.server_turn() || matches!(phase, Phase::Closed | Phase::Unsupported(_))) {
-            return Err(ParseError::Protocol(Error::Phase(phase)));
+            return Err(Error::Phase(phase));
         }
         if !format.is_valid() {
-            return Err(ParseError::Protocol(Error::PixelFormat));
+            return Err(Error::PixelFormat);
         }
         self.phase = phase;
         self.dialect = dialect;
@@ -751,15 +732,15 @@ impl Default for ServerMessages {
     }
 }
 impl Decode for ServerMessages {
-    type Item = Result<ServerMessage, ParseError>;
-    type Error = Error;
+    type Item = Result<ServerMessage, Error>;
+    type Error = FrameError;
     const NAME: &'static str = "RFB server units";
     fn capacity(&self) -> usize {
         self.limit
     }
-    fn decode(&mut self, b: &[u8], _: bool) -> Result<Step<Self::Item>, Error> {
+    fn decode(&mut self, b: &[u8], _: bool) -> Result<Step<Self::Item>, FrameError> {
         if self.out_of_turn {
-            return Err(Error::OutOfTurn);
+            return Err(FrameError::OutOfTurn);
         }
         if matches!(self.phase, Phase::Closed | Phase::Unsupported(_)) {
             return Ok(Step::End);
@@ -788,7 +769,7 @@ impl Decode for ServerMessages {
 /// Before the client's turn, input is capped at [`MAX_PENDING`] buffered
 /// bytes or the stream's smaller capacity. Pending bytes are also checked
 /// when a received unit passes the turn to the server. Any excess closes
-/// the session and the next read reports [`Error::OutOfTurn`] once, leaving
+/// the session and the next read reports [`FrameError::OutOfTurn`] once, leaving
 /// accepted bytes available for inspection.
 /// Once `is_done` is true, `push` takes and drops every byte, as [`Stream`]
 /// does. `into_stream` exposes unread bytes for handoff after a refusal or
@@ -819,7 +800,7 @@ impl Server {
     /// Adds what fits. Keep the unaccepted suffix and drain before retrying.
     /// Before the client's turn, exceeding [`MAX_PENDING`] buffered bytes
     /// or the stream's smaller capacity closes the session; `next_message`
-    /// reports [`Error::OutOfTurn`]. After completion, takes and drops all bytes.
+    /// reports [`FrameError::OutOfTurn`]. After completion, takes and drops all bytes.
     #[must_use = "bytes past the returned count were not taken"]
     pub fn push(&mut self, bytes: &[u8]) -> usize {
         if self.input.is_done() {
@@ -849,7 +830,7 @@ impl Server {
     /// the next server handshake unit before calling again.
     pub fn next_message(
         &mut self,
-    ) -> Option<Result<Result<ClientMessage, ParseError>, codec::Fail<Error>>> {
+    ) -> Option<Result<Result<ClientMessage, Error>, codec::Fail<FrameError>>> {
         if !self.state.phase.client_turn()
             && !matches!(self.state.phase, Phase::Closed | Phase::Unsupported(_))
         {
@@ -932,7 +913,7 @@ impl Default for Server {
 /// input is capped at [`MAX_PENDING`] buffered bytes or the stream's smaller
 /// capacity. Pending bytes are also checked when a received unit passes
 /// the turn to the client. Excess input closes the session and reports
-/// [`Error::OutOfTurn`] once. Once `is_done` is true, `push` takes and drops
+/// [`FrameError::OutOfTurn`] once. Once `is_done` is true, `push` takes and drops
 /// every byte, as [`Stream`] does.
 /// Pixel format changes are refused while an update is pending or partial.
 /// Use `into_stream` for an unread suffix after `End` or a terminal error.
@@ -962,7 +943,7 @@ impl Client {
     /// Adds what fits. Keep the unaccepted suffix and drain before retrying.
     /// Before the server's turn, exceeding [`MAX_PENDING`] buffered bytes
     /// or the stream's smaller capacity closes the session; `next_message`
-    /// reports [`Error::OutOfTurn`]. After completion, takes and drops all bytes.
+    /// reports [`FrameError::OutOfTurn`]. After completion, takes and drops all bytes.
     #[must_use = "bytes past the returned count were not taken"]
     pub fn push(&mut self, bytes: &[u8]) -> usize {
         if self.input.is_done() {
@@ -992,7 +973,7 @@ impl Client {
     /// client handshake unit before calling again when the turn changes.
     pub fn next_message(
         &mut self,
-    ) -> Option<Result<Result<ServerMessage, ParseError>, codec::Fail<Error>>> {
+    ) -> Option<Result<Result<ServerMessage, Error>, codec::Fail<FrameError>>> {
         if !self.state.phase.server_turn()
             && !matches!(self.state.phase, Phase::Closed | Phase::Unsupported(_))
         {
@@ -1155,9 +1136,9 @@ pub mod server_type {
     pub const SERVER_CUT_TEXT: u8 = 3;
 }
 
-/// Why protocol bytes cannot be read or a message cannot be sent.
-/// Stream decoders wrap body failures in [`ParseError::Protocol`] items;
-/// framing errors end the stream.
+/// Why an RFB unit cannot be read, a message cannot be sent, or a
+/// decoder mode cannot change. Stream decoders yield body failures as
+/// items; a [`FrameError`] ends the stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     /// The bytes are not a version line, `RFB xxx.yyy\n` with digits.
@@ -1171,11 +1152,14 @@ pub enum Error {
     /// Text longer than [`MAX_TEXT`], or a message longer than
     /// [`MAX_MESSAGE`].
     TooLong,
+    /// The bytes end inside the value.
+    Truncated,
+    /// Bytes follow the value.
+    Trailing,
+    /// A phase or mode change was attempted inside an incomplete unit.
+    PartialUnit,
     /// The client picked a security type the server did not offer.
     NotOffered(u8),
-    /// The peer exceeded [`MAX_PENDING`] or the smaller stream capacity
-    /// before its turn.
-    OutOfTurn,
     /// A pixel format RFC 6143 does not allow: bits per pixel other than
     /// 8, 16 or 32, a depth past bits per pixel, or, for true color, a
     /// maximum that is not one less than a power of two or a color that
@@ -1213,8 +1197,10 @@ impl std::fmt::Display for Error {
             Error::Encoding(e) => write!(f, "rectangle encoding {e} is not read"),
             Error::BitsPerPixel(b) => write!(f, "{b} bits per pixel, not 8, 16 or 32"),
             Error::TooLong => f.write_str("text or message too long"),
+            Error::Truncated => f.write_str("incomplete RFB value"),
+            Error::Trailing => f.write_str("bytes after the RFB value"),
+            Error::PartialUnit => f.write_str("mode change inside a partial RFB unit"),
             Error::NotOffered(t) => write!(f, "security type {t} was not offered"),
-            Error::OutOfTurn => f.write_str("too many bytes sent before the peer's turn"),
             Error::PixelFormat => f.write_str("pixel format not allowed"),
             Error::Rectangle => f.write_str("rectangle outside the framebuffer or out of order"),
             Error::NotRequested => f.write_str("server message the client did not ask for"),
@@ -1226,6 +1212,44 @@ impl std::fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+/// Why [`ClientMessages`] or [`ServerMessages`] cannot find the next
+/// unit. It ends the stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameError {
+    /// The bytes are not a version line, `RFB xxx.yyy\n` with digits.
+    Version,
+    /// A message type this module does not read.
+    MessageType(u8),
+    /// A rectangle encoding this module cannot read.
+    Encoding(i32),
+    /// Pixels in a format whose bits per pixel is not 8, 16 or 32.
+    BitsPerPixel(u8),
+    /// Text longer than [`MAX_TEXT`], or a unit longer than the decoder's
+    /// limit.
+    TooLong,
+    /// The peer exceeded [`MAX_PENDING`] or the smaller stream capacity
+    /// before its turn.
+    OutOfTurn,
+    /// The decoder is in a phase where the peer does not speak.
+    Phase(Phase),
+}
+
+impl std::fmt::Display for FrameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FrameError::Version => f.write_str("not an RFB protocol version line"),
+            FrameError::MessageType(t) => write!(f, "unknown message type {t}"),
+            FrameError::Encoding(e) => write!(f, "rectangle encoding {e} is not read"),
+            FrameError::BitsPerPixel(b) => write!(f, "{b} bits per pixel, not 8, 16 or 32"),
+            FrameError::TooLong => f.write_str("text or message too long"),
+            FrameError::OutOfTurn => f.write_str("too many bytes sent before the peer's turn"),
+            FrameError::Phase(p) => write!(f, "message does not belong in phase {p:?}"),
+        }
+    }
+}
+
+impl std::error::Error for FrameError {}
 
 /// A protocol version, as in `RFB 003.008\n`. Each part has three digits
 /// on the wire, so a message that carries a part past 999 cannot be
@@ -1537,7 +1561,7 @@ impl ServerMessage {
     /// Reads a message a server sends after the handshake from the start
     /// of `b`, with pixels in `format`. Refuses incomplete input, trailing
     /// bytes, unknown tags or encodings and lengths past the named limits.
-    pub fn parse(b: &[u8], format: &PixelFormat) -> Result<ServerMessage, ParseError> {
+    pub fn parse(b: &[u8], format: &PixelFormat) -> Result<ServerMessage, Error> {
         exact(run(b, |c| server_normal(c, format)), b.len())
     }
 
@@ -2135,12 +2159,12 @@ mod tests {
         assert_eq!(Version::V3_7.to_bytes().unwrap(), *b"RFB 003.007\n");
         assert_eq!(Version { major: 3, minor: 889 }.to_bytes().unwrap(), *b"RFB 003.889\n");
         for n in 0..12 {
-            assert_eq!(Version::parse(&b"RFB 003.008\n"[..n]), Err(ParseError::Truncated), "{n} bytes");
+            assert_eq!(Version::parse(&b"RFB 003.008\n"[..n]), Err(Error::Truncated), "{n} bytes");
         }
         // A wrong byte is an error at once.
-        assert_eq!(Version::parse(b"G"), Err(ParseError::Protocol(Error::Version)));
-        assert_eq!(Version::parse(b"RFB 0x"), Err(ParseError::Protocol(Error::Version)));
-        assert_eq!(Version::parse(b"RFB 003.008\r"), Err(ParseError::Protocol(Error::Version)));
+        assert_eq!(Version::parse(b"G"), Err(Error::Version));
+        assert_eq!(Version::parse(b"RFB 0x"), Err(Error::Version));
+        assert_eq!(Version::parse(b"RFB 003.008\r"), Err(Error::Version));
         // The line clamps what three digits cannot hold, and the message
         // writers refuse it.
         let big = Version { major: 1000, minor: 65535 };
@@ -2264,7 +2288,7 @@ mod tests {
         s.next_message().unwrap().unwrap().unwrap();
         s.send(&ServerMessage::SecurityTypes(vec![2])).unwrap();
         let _ = s.push(&[1]);
-        assert_eq!(s.next_message(), Some(Ok(Err(ParseError::Protocol(Error::NotOffered(1))))));
+        assert_eq!(s.next_message(), Some(Ok(Err(Error::NotOffered(1)))));
         assert_eq!(s.next_message(), None);
         // A client world cannot pick one either.
         let mut c = Client::new();
@@ -2350,7 +2374,7 @@ mod tests {
         assert_eq!(s.next_message(), Some(Ok(Ok(ClientMessage::Version(Version::V3_8)))));
         // Too much early is an error.
         let _ = s.push(&vec![0; MAX_PENDING + 1]);
-        assert_eq!(s.next_message(), Some(Err(codec::Fail::Protocol(Error::OutOfTurn))));
+        assert_eq!(s.next_message(), Some(Err(codec::Fail::Protocol(FrameError::OutOfTurn))));
         assert_eq!(s.push(&[1]), 1);
         assert_eq!(s.next_message(), None);
         assert_eq!(s.buffered(), MAX_PENDING);
@@ -2408,10 +2432,10 @@ mod tests {
     }
 
     mod sessions {
-        use super::{Client, ClientMessage, Dialect, Error, ParseError, Phase, PixelFormat, Server, ServerInit, ServerMessage, Version, codec};
+        use super::{Client, ClientMessage, Dialect, Error, FrameError, Phase, PixelFormat, Server, ServerInit, ServerMessage, Version, codec};
 
         /// One session result, preserving both unit and terminal failures.
-        pub type Item<T> = Result<Result<T, ParseError>, codec::Fail<Error>>;
+        pub type Item<T> = Result<Result<T, Error>, codec::Fail<FrameError>>;
 
         fn server_turn(server: &Server, vnc: bool) -> Option<ServerMessage> {
             Some(match server.phase() {
@@ -2635,7 +2659,7 @@ mod tests {
         assert_eq!(p.to_bytes().unwrap(), odd);
         assert_eq!(PixelFormat { bits_per_pixel: 24, ..f }.bytes_per_pixel(), None);
         odd[0] = 24;
-        assert_eq!(PixelFormat::parse(&odd), Err(ParseError::Protocol(Error::PixelFormat)));
+        assert_eq!(PixelFormat::parse(&odd), Err(Error::PixelFormat));
         // RFC 6143, section 7.4.
         assert!(f.is_valid());
         assert!(p.is_valid());
@@ -2682,7 +2706,7 @@ mod tests {
             let bytes = m.to_bytes().unwrap();
             assert_eq!(ClientMessage::parse(&bytes), Ok(m.clone()));
             for n in 0..bytes.len() {
-                assert_eq!(ClientMessage::parse(&bytes[..n]), Err(ParseError::Truncated), "{m:?} cut to {n}");
+                assert_eq!(ClientMessage::parse(&bytes[..n]), Err(Error::Truncated), "{m:?} cut to {n}");
             }
             // And through a session, a byte at a time.
             let (mut s, _) = converse(Version::V3_8, ServerMessage::SecurityTypes(vec![1]), Some(1), Some(ServerMessage::SecurityOk));
@@ -2709,7 +2733,7 @@ mod tests {
             let bytes = server_bytes(&m, Dialect::V3_8, &f).unwrap();
             assert_eq!(ServerMessage::parse(&bytes, &f), Ok(m.clone()));
             for n in 0..bytes.len() {
-                assert_eq!(ServerMessage::parse(&bytes[..n], &f), Err(ParseError::Truncated), "{m:?} cut to {n}");
+                assert_eq!(ServerMessage::parse(&bytes[..n], &f), Err(Error::Truncated), "{m:?} cut to {n}");
             }
             let (_, mut c) = converse(Version::V3_8, ServerMessage::SecurityTypes(vec![1]), Some(1), Some(ServerMessage::SecurityOk));
             for (i, chunk) in chunks(&bytes, &[1]).enumerate() {
@@ -2743,43 +2767,46 @@ mod tests {
     #[test]
     fn read_errors() {
         let f = PixelFormat::TRUE_COLOR_32;
-        assert_eq!(ClientMessage::parse(&[1]), Err(ParseError::Protocol(Error::MessageType(1))));
-        assert_eq!(ClientMessage::parse(&[7, 0, 0]), Err(ParseError::Protocol(Error::MessageType(7))));
-        assert_eq!(ServerMessage::parse(&[4], &f), Err(ParseError::Protocol(Error::MessageType(4))));
+        assert_eq!(ClientMessage::parse(&[1]), Err(Error::MessageType(1)));
+        assert_eq!(ClientMessage::parse(&[7, 0, 0]), Err(Error::MessageType(7)));
+        assert_eq!(ServerMessage::parse(&[4], &f), Err(Error::MessageType(4)));
         // Encodings this module cannot size, known from the header.
         let rect = |enc: i32| {
             let mut b = vec![0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1];
             b.extend_from_slice(&enc.to_be_bytes());
             b
         };
-        assert_eq!(ServerMessage::parse(&rect(encoding::HEXTILE), &f), Err(ParseError::Protocol(Error::Encoding(5))));
-        assert_eq!(ServerMessage::parse(&rect(-224), &f), Err(ParseError::Protocol(Error::Encoding(-224))));
+        assert_eq!(ServerMessage::parse(&rect(encoding::HEXTILE), &f), Err(Error::Encoding(5)));
+        assert_eq!(ServerMessage::parse(&rect(-224), &f), Err(Error::Encoding(-224)));
         // Raw pixels need a valid format.
         let mut bad = f;
         bad.bits_per_pixel = 24;
-        assert_eq!(ServerMessage::parse(&rect(encoding::RAW), &bad), Err(ParseError::Protocol(Error::BitsPerPixel(24))));
-        assert_eq!(ServerMessage::parse(&rect(encoding::CURSOR), &bad), Err(ParseError::Protocol(Error::BitsPerPixel(24))));
-        assert_eq!(ServerMessage::parse(&rect(encoding::COPY_RECT), &bad), Err(ParseError::Truncated));
+        assert_eq!(ServerMessage::parse(&rect(encoding::RAW), &bad), Err(Error::BitsPerPixel(24)));
+        assert_eq!(ServerMessage::parse(&rect(encoding::CURSOR), &bad), Err(Error::BitsPerPixel(24)));
+        assert_eq!(ServerMessage::parse(&rect(encoding::COPY_RECT), &bad), Err(Error::Truncated));
         // Text and messages past the limits.
-        assert_eq!(ClientMessage::parse(&[6, 0, 0, 0, 0, 0x10, 0, 1]), Err(ParseError::Protocol(Error::TooLong)));
-        assert_eq!(ServerMessage::parse(&[3, 0, 0, 0, 0xff, 0xff, 0xff, 0xff], &f), Err(ParseError::Protocol(Error::TooLong)));
-        assert_eq!(ClientMessage::parse(&[6, 0, 0, 0, 0, 0x10, 0, 0]), Err(ParseError::Truncated));
+        assert_eq!(ClientMessage::parse(&[6, 0, 0, 0, 0, 0x10, 0, 1]), Err(Error::TooLong));
+        assert_eq!(ServerMessage::parse(&[3, 0, 0, 0, 0xff, 0xff, 0xff, 0xff], &f), Err(Error::TooLong));
+        assert_eq!(ClientMessage::parse(&[6, 0, 0, 0, 0, 0x10, 0, 0]), Err(Error::Truncated));
         let mut huge = vec![0, 0, 0, 1, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff];
         huge.extend_from_slice(&encoding::RAW.to_be_bytes());
-        assert_eq!(ServerMessage::parse(&huge, &f), Err(ParseError::Protocol(Error::TooLong)));
+        assert_eq!(ServerMessage::parse(&huge, &f), Err(Error::TooLong));
         // Through a session, the error sticks.
         let (mut s, _) = converse(Version::V3_8, ServerMessage::SecurityTypes(vec![1]), Some(1), Some(ServerMessage::SecurityOk));
         let _ = s.push(&[9]);
-        assert_eq!(s.next_message(), Some(Err(codec::Fail::Protocol(Error::MessageType(9)))));
+        assert_eq!(s.next_message(), Some(Err(codec::Fail::Protocol(FrameError::MessageType(9)))));
         assert_eq!(s.push(&[2]), 1);
         assert_eq!(s.next_message(), None);
         assert_eq!(s.buffered(), 1);
         let mut s = Server::new();
         s.send(&ServerMessage::Version(Version::V3_8)).unwrap();
         let _ = s.push(b"RFB 3.8\n");
-        assert_eq!(s.next_message(), Some(Err(codec::Fail::Protocol(Error::Version))));
+        assert_eq!(s.next_message(), Some(Err(codec::Fail::Protocol(FrameError::Version))));
         // Every error has words.
-        for e in [Error::Version, Error::Encoding(5), Error::Phase(Phase::Normal), Error::Unwritable, Error::OutOfTurn] {
+        for e in [Error::Version, Error::Encoding(5), Error::Phase(Phase::Normal), Error::Unwritable, Error::Truncated] {
+            assert!(!e.to_string().is_empty());
+        }
+        for e in [FrameError::Version, FrameError::Encoding(5), FrameError::Phase(Phase::Normal), FrameError::OutOfTurn] {
             assert!(!e.to_string().is_empty());
         }
     }
@@ -2926,13 +2953,13 @@ mod tests {
         let bad = PixelFormat { bits_per_pixel: 8, depth: 24, red_max: 250, red_shift: 255, ..PixelFormat::TRUE_COLOR_32 };
         let mut b = vec![client_type::SET_PIXEL_FORMAT, 0, 0, 0];
         b.extend_from_slice(&[8, 24, 0, 1, 0, 250, 0, 255, 0, 255, 255, 8, 0, 0, 0, 0]);
-        assert_eq!(ClientMessage::parse(&b), Err(ParseError::Protocol(Error::PixelFormat)));
+        assert_eq!(ClientMessage::parse(&b), Err(Error::PixelFormat));
         assert_eq!(ClientMessage::SetPixelFormat(bad).to_bytes(), Err(Error::PixelFormat));
         let (mut s, mut c) = normal_pair();
         assert_eq!(c.send(&ClientMessage::SetPixelFormat(bad)), Err(Error::PixelFormat));
         assert_eq!(c.pixel_format(), PixelFormat::TRUE_COLOR_32);
         let _ = s.push(&b);
-        assert_eq!(s.next_message(), Some(Ok(Err(ParseError::Protocol(Error::PixelFormat)))));
+        assert_eq!(s.next_message(), Some(Ok(Err(Error::PixelFormat))));
         // A ServerInit in 24 bits per pixel is refused before the first
         // update, on both sides.
         let mut c = Client::new();
@@ -2951,7 +2978,7 @@ mod tests {
         bytes.extend_from_slice(&raw);
         bytes.extend_from_slice(&[0, 0, 0, 0]);
         let _ = c.push(&bytes);
-        assert_eq!(c.next_message(), Some(Ok(Err(ParseError::Protocol(Error::PixelFormat)))));
+        assert_eq!(c.next_message(), Some(Ok(Err(Error::PixelFormat))));
     }
 
     #[test]
@@ -2971,7 +2998,7 @@ mod tests {
         ] {
             assert_eq!(s.send(&bad), Err(Error::Rectangle), "{bad:?}");
             let _ = c.push(&server_bytes(&bad, Dialect::V3_8, &f).unwrap());
-            assert_eq!(c.next_message(), Some(Ok(Err(ParseError::Protocol(Error::Rectangle)))), "{bad:?}");
+            assert_eq!(c.next_message(), Some(Ok(Err(Error::Rectangle))), "{bad:?}");
         }
         // The edges are inside, and the cursor's hot spot is not checked.
         let good = update(vec![
@@ -2990,7 +3017,7 @@ mod tests {
         let past = update(vec![rect(640, 0, 1, 1, Contents::Raw(vec![0; 4]))]);
         assert_eq!(s.send(&past), Err(Error::Rectangle));
         let _ = c.push(&server_bytes(&past, Dialect::V3_8, &f).unwrap());
-        assert_eq!(c.next_message(), Some(Ok(Err(ParseError::Protocol(Error::Rectangle)))));
+        assert_eq!(c.next_message(), Some(Ok(Err(Error::Rectangle))));
     }
 
     #[test]
@@ -3009,7 +3036,7 @@ mod tests {
         let mut swapped = b[..4].to_vec();
         swapped.extend_from_slice(&b[4 + 16..]);
         swapped.extend_from_slice(&b[4..4 + 16]);
-        assert_eq!(ServerMessage::parse(&swapped, &f), Err(ParseError::Protocol(Error::Rectangle)));
+        assert_eq!(ServerMessage::parse(&swapped, &f), Err(Error::Rectangle));
     }
 
     #[test]

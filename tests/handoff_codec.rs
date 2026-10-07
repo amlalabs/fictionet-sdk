@@ -221,7 +221,7 @@ fn proxy_bad_complete_body_is_an_item_before_end() {
 struct SocksHandshake(socks::ClientMessages);
 impl Decode for SocksHandshake {
     type Item = Result<socks::ClientMessage, socks::Error>;
-    type Error = socks::DecodeError;
+    type Error = socks::FrameError;
     const NAME: &'static str = "SOCKS test session";
     fn capacity(&self) -> usize {
         self.0.capacity()
@@ -329,8 +329,8 @@ fn socks_reply_bind_and_refusal_handoffs() {
 
 #[test]
 fn socks_limits_truncation_and_framing_errors() {
-    terminal(|| socks::ClientMessages::with_limit(8), &[5, 20], Fail::Protocol(socks::DecodeError::TooLong));
-    terminal(socks::ClientMessages::new, &[3], Fail::Protocol(socks::DecodeError::Protocol(socks::Error::Version(3))));
+    terminal(|| socks::ClientMessages::with_limit(8), &[5, 20], Fail::Protocol(socks::FrameError::TooLong));
+    terminal(socks::ClientMessages::new, &[3], Fail::Protocol(socks::FrameError::Version(3)));
     truncated(socks::ClientMessages::new, &[5, 2, 0]);
     truncated(socks::ClientMessages::new, &[4, 1, 0, 80, 1, 2, 3, 4, b'u']);
     let make = || {
@@ -339,15 +339,15 @@ fn socks_limits_truncation_and_framing_errors() {
         assert!(d.select(socks::Method::NoAuth));
         d
     };
-    terminal(make, &[5, 1, 0, 3, 30], Fail::Protocol(socks::DecodeError::TooLong));
-    terminal(make, &[5, 1, 0, 99], Fail::Protocol(socks::DecodeError::Protocol(socks::Error::AddressType(99))));
+    terminal(make, &[5, 1, 0, 3, 30], Fail::Protocol(socks::FrameError::TooLong));
+    terminal(make, &[5, 1, 0, 99], Fail::Protocol(socks::FrameError::AddressType(99)));
     let make_auth = || {
         let mut d = socks::ClientMessages::with_limit(8);
         d.decode(&[5, 1, 2], false).unwrap();
         assert!(d.select(socks::Method::UsernamePassword));
         d
     };
-    terminal(make_auth, &[1, 20], Fail::Protocol(socks::DecodeError::TooLong));
+    terminal(make_auth, &[1, 20], Fail::Protocol(socks::FrameError::TooLong));
     truncated(make_auth, &[1, 1, b'u', 2, b'p']);
 }
 
@@ -365,7 +365,7 @@ fn socks_modes_and_complete_request_errors() {
     assert!(!stream.decoder().select(socks::Method::UsernamePassword));
     assert!(stream.decoder().select(socks::Method::NoAuth));
     assert_eq!(stream.next(), Some(Ok(Err(socks::Error::Command(99)))));
-    assert_eq!(stream.decoder().stage(), socks::ServerStage::Failed);
+    assert_eq!(stream.decoder().phase(), socks::ServerPhase::Failed);
     assert_eq!(stream.next(), None);
     assert!(stream.is_done());
     assert_eq!(stream.into_parts().0.unread(), PAYLOAD);
@@ -384,7 +384,7 @@ fn socks_client_item_error_is_failed() {
     let bytes = [5, 9, 0, 1, 1, 2, 3, 4, 0, 80, b'x'];
     assert_eq!(stream.push(&bytes), bytes.len());
     assert_eq!(stream.next(), Some(Ok(Err(socks::Error::Command(9)))));
-    assert_eq!(stream.decoder().stage(), socks::ServerStage::Failed);
+    assert_eq!(stream.decoder().phase(), socks::ServerPhase::Failed);
     assert_eq!(stream.next(), None);
     assert_eq!(stream.into_parts().0.unread(), b"x");
 }
@@ -396,11 +396,9 @@ fn socks_client_terminal_error_is_failed() {
     assert_eq!(stream.push(&bytes), bytes.len());
     assert_eq!(
         stream.next(),
-        Some(Err(Fail::Protocol(socks::DecodeError::Protocol(
-            socks::Error::Version(7)
-        ))))
+        Some(Err(Fail::Protocol(socks::FrameError::Version(7))))
     );
-    assert_eq!(stream.decoder().stage(), socks::ServerStage::Failed);
+    assert_eq!(stream.decoder().phase(), socks::ServerPhase::Failed);
     assert_eq!(stream.next(), None);
     assert_eq!(stream.into_parts().0.unread(), bytes);
 }
@@ -416,7 +414,7 @@ fn socks_server_item_error_is_failed() {
     let bytes = [5, 0, 9, 1, 1, 2, 3, 4, 0, 80, b'x'];
     assert_eq!(stream.push(&bytes), bytes.len());
     assert_eq!(stream.next(), Some(Ok(Err(socks::Error::Reserved(9)))));
-    assert_eq!(stream.decoder().stage(), socks::ClientStage::Failed);
+    assert_eq!(stream.decoder().phase(), socks::ClientPhase::Failed);
     assert_eq!(stream.next(), None);
     assert_eq!(stream.into_parts().0.unread(), b"x");
 }
@@ -428,11 +426,9 @@ fn socks_server_terminal_error_is_failed() {
     assert_eq!(stream.push(&bytes), bytes.len());
     assert_eq!(
         stream.next(),
-        Some(Err(Fail::Protocol(socks::DecodeError::Protocol(
-            socks::Error::Version(7)
-        ))))
+        Some(Err(Fail::Protocol(socks::FrameError::Version(7))))
     );
-    assert_eq!(stream.decoder().stage(), socks::ClientStage::Failed);
+    assert_eq!(stream.decoder().phase(), socks::ClientPhase::Failed);
     assert_eq!(stream.next(), None);
     assert_eq!(stream.into_parts().0.unread(), bytes);
 }
@@ -445,7 +441,7 @@ fn socks_pumps_pause_for_world_decisions() {
         codec::pump(&mut stream, &[5, 1, 2], |m| items.push(m)),
         Ok(3)
     );
-    assert_eq!(stream.decoder().stage(), socks::ServerStage::Selecting);
+    assert_eq!(stream.decoder().phase(), socks::ServerPhase::Selecting);
     assert!(!stream.is_done());
     assert!(stream.decoder().select(socks::Method::UsernamePassword));
     assert_eq!(
@@ -455,11 +451,11 @@ fn socks_pumps_pause_for_world_decisions() {
         }),
         Ok(5)
     );
-    assert_eq!(stream.decoder().stage(), socks::ServerStage::Verifying);
+    assert_eq!(stream.decoder().phase(), socks::ServerPhase::Verifying);
     assert!(!stream.is_done());
     assert_eq!(items.len(), 2);
     stream.decoder().verified(true);
-    assert_eq!(stream.decoder().stage(), socks::ServerStage::Request);
+    assert_eq!(stream.decoder().phase(), socks::ServerPhase::Request);
     let request = socks5_request();
     let bytes = Wire::to_bytes(&request).unwrap();
     assert_eq!(
@@ -470,34 +466,32 @@ fn socks_pumps_pause_for_world_decisions() {
         items.last(),
         Some(&Ok(socks::ClientMessage::Request(request)))
     );
-    assert_eq!(stream.decoder().stage(), socks::ServerStage::Done);
+    assert_eq!(stream.decoder().phase(), socks::ServerPhase::Done);
 }
 
 #[test]
 fn socks_decisions_fail_only_at_capacity_without_consuming() {
-    for stage in [socks::ServerStage::Selecting, socks::ServerStage::Verifying] {
+    for phase in [socks::ServerPhase::Selecting, socks::ServerPhase::Verifying] {
         let mut stream = Stream::new(socks::ClientMessages::with_limit(8));
         assert_eq!(stream.push(&[5, 1, 2]), 3);
         stream.next().unwrap().unwrap().unwrap();
-        if stage == socks::ServerStage::Verifying {
+        if phase == socks::ServerPhase::Verifying {
             assert!(stream.decoder().select(socks::Method::UsernamePassword));
             assert_eq!(stream.push(&[1, 1, b'u', 1, b'p']), 5);
             stream.next().unwrap().unwrap().unwrap();
         }
         assert_eq!(stream.next(), None);
-        assert_eq!(stream.decoder().stage(), stage);
+        assert_eq!(stream.decoder().phase(), phase);
         assert_eq!(stream.push(&[0; 9]), 9);
         assert_eq!(stream.next(), None);
-        assert_eq!(stream.decoder().stage(), stage);
+        assert_eq!(stream.decoder().phase(), phase);
         assert_eq!(stream.unread(), [0; 9]);
         assert_eq!(stream.push(&[0]), 1);
         assert_eq!(
             stream.next(),
-            Some(Err(Fail::Protocol(socks::DecodeError::DecisionRequired(
-                stage
-            ))))
+            Some(Err(Fail::Protocol(socks::FrameError::DecisionRequired(phase))))
         );
-        assert_eq!(stream.decoder().stage(), socks::ServerStage::Failed);
+        assert_eq!(stream.decoder().phase(), socks::ServerPhase::Failed);
         assert_eq!(stream.next(), None);
         assert_eq!(stream.into_parts().0.unread(), [0; 10]);
     }
@@ -519,9 +513,9 @@ fn socks4_limit_is_independent_of_chunking_with_a_larger_buffer() {
         }
         assert_eq!(
             result,
-            Some(Err(Fail::Protocol(socks::DecodeError::TooLong)))
+            Some(Err(Fail::Protocol(socks::FrameError::TooLong)))
         );
-        assert_eq!(stream.decoder().stage(), socks::ServerStage::Failed);
+        assert_eq!(stream.decoder().phase(), socks::ServerPhase::Failed);
         assert_eq!(stream.offset(), 0);
         assert_eq!(stream.unread(), &bytes[..stream.buffered()]);
     }
@@ -536,9 +530,9 @@ fn socks_reply_limit_and_unoffered_method_leave_failed() {
     assert_eq!(stream.push(&[5, 0, 0, 3, 30]), 5);
     assert_eq!(
         stream.next(),
-        Some(Err(Fail::Protocol(socks::DecodeError::TooLong)))
+        Some(Err(Fail::Protocol(socks::FrameError::TooLong)))
     );
-    assert_eq!(stream.decoder().stage(), socks::ClientStage::Failed);
+    assert_eq!(stream.decoder().phase(), socks::ClientPhase::Failed);
 
     let mut stream = Stream::new(socks::ServerMessages::socks5_offering(
         socks::Command::Connect,
@@ -546,7 +540,7 @@ fn socks_reply_limit_and_unoffered_method_leave_failed() {
     ));
     assert_eq!(stream.push(&[5, 2]), 2);
     assert_eq!(stream.next(), Some(Ok(Err(socks::Error::Method(2)))));
-    assert_eq!(stream.decoder().stage(), socks::ClientStage::Failed);
+    assert_eq!(stream.decoder().phase(), socks::ClientPhase::Failed);
 }
 
 #[test]
@@ -619,8 +613,8 @@ fn client_decoder(phase: rfb::Phase, limit: usize) -> rfb::ClientMessages {
 
 struct RfbServerHandshake(rfb::ServerMessages);
 impl Decode for RfbServerHandshake {
-    type Item = Result<rfb::ServerMessage, rfb::ParseError>;
-    type Error = rfb::Error;
+    type Item = Result<rfb::ServerMessage, rfb::Error>;
+    type Error = rfb::FrameError;
     const NAME: &'static str = "RFB server transcript";
     fn capacity(&self) -> usize {
         self.0.capacity()
@@ -645,8 +639,8 @@ impl Decode for RfbServerHandshake {
 }
 struct RfbClientHandshake(rfb::ClientMessages);
 impl Decode for RfbClientHandshake {
-    type Item = Result<rfb::ClientMessage, rfb::ParseError>;
-    type Error = rfb::Error;
+    type Item = Result<rfb::ClientMessage, rfb::Error>;
+    type Error = rfb::FrameError;
     const NAME: &'static str = "RFB client transcript";
     fn capacity(&self) -> usize {
         self.0.capacity()
@@ -735,22 +729,22 @@ fn rfb_limits_truncation_and_framing_errors() {
     let bytes = Wire::to_bytes(&init()).unwrap();
     let mut over = bytes[..24].to_vec();
     over[20..24].copy_from_slice(&100u32.to_be_bytes());
-    terminal(make, &over, Fail::Protocol(rfb::Error::TooLong));
+    terminal(make, &over, Fail::Protocol(rfb::FrameError::TooLong));
     truncated(make, &bytes[..25]);
     truncated(rfb::ClientMessages::new, b"RFB 003.");
     truncated(|| server_decoder(rfb::Phase::SecurityResult, LIMIT), &[0, 0, 0]);
-    terminal(rfb::ServerMessages::new, b"BAD", Fail::Protocol(rfb::Error::Version));
-    terminal(|| server_decoder(rfb::Phase::Normal, LIMIT), &[99], Fail::Protocol(rfb::Error::MessageType(99)));
+    terminal(rfb::ServerMessages::new, b"BAD", Fail::Protocol(rfb::FrameError::Version));
+    terminal(|| server_decoder(rfb::Phase::Normal, LIMIT), &[99], Fail::Protocol(rfb::FrameError::MessageType(99)));
     terminal(
         || client_decoder(rfb::Phase::Normal, 32),
         &[6, 0, 0, 0, 0, 0, 0, 100],
-        Fail::Protocol(rfb::Error::TooLong),
+        Fail::Protocol(rfb::FrameError::TooLong),
     );
     let rectangle = [0, 0, 0, 1, 0, 0, 0, 0, 0, 8, 0, 8, 0, 0, 0, 0];
-    terminal(|| server_decoder(rfb::Phase::Normal, 32), &rectangle, Fail::Protocol(rfb::Error::TooLong));
+    terminal(|| server_decoder(rfb::Phase::Normal, 32), &rectangle, Fail::Protocol(rfb::FrameError::TooLong));
     let mut unknown = rectangle;
     unknown[12..].copy_from_slice(&42i32.to_be_bytes());
-    terminal(|| server_decoder(rfb::Phase::Normal, LIMIT), &unknown, Fail::Protocol(rfb::Error::Encoding(42)));
+    terminal(|| server_decoder(rfb::Phase::Normal, LIMIT), &unknown, Fail::Protocol(rfb::FrameError::Encoding(42)));
     truncated(|| server_decoder(rfb::Phase::Normal, LIMIT), &rectangle);
 }
 
@@ -765,12 +759,12 @@ fn rfb_body_errors_are_items_and_mode_changes_require_boundaries() {
     assert_eq!(stream.next(), None);
     assert_eq!(
         stream.decoder().set_phase(rfb::Phase::Closed),
-        Err(rfb::ParseError::PartialUnit)
+        Err(rfb::Error::PartialUnit)
     );
     assert_eq!(stream.push(&bytes[2..]), bytes.len() - 2);
     assert_eq!(
         stream.next(),
-        Some(Ok(Err(rfb::ParseError::Protocol(rfb::Error::PixelFormat))))
+        Some(Ok(Err(rfb::Error::PixelFormat)))
     );
     assert_eq!(stream.next(), Some(Ok(Ok(good))));
     assert!(stream.decoder().set_phase(rfb::Phase::Closed).is_ok());
@@ -805,9 +799,9 @@ fn strict_wire_writers_refuse_changes_transactionally() {
         let mut trailing = bytes;
         trailing.push(0);
         if trailing.len() == rfb::VERSION_LEN + 1 {
-            assert_eq!(<rfb::Version as Wire>::parse(&trailing), Err(rfb::ParseError::Trailing));
+            assert_eq!(<rfb::Version as Wire>::parse(&trailing), Err(rfb::Error::Trailing));
         } else {
-            assert_eq!(<rfb::ServerInit as Wire>::parse(&trailing), Err(rfb::ParseError::Trailing));
+            assert_eq!(<rfb::ServerInit as Wire>::parse(&trailing), Err(rfb::Error::Trailing));
         }
     }
     let mut out = vec![1, 2, 3];
@@ -882,7 +876,7 @@ fn rfb_stream_sessions_negotiate_all_existing_dialects() {
                 assert_eq!(server.push(&bytes), bytes.len());
                 assert_eq!(
                     server.next_message(),
-                    Some(Ok(Err(rfb::ParseError::Protocol(rfb::Error::PixelFormat))))
+                    Some(Ok(Err(rfb::Error::PixelFormat)))
                 );
                 assert_eq!(server.phase(), rfb::Phase::Normal);
                 assert_eq!(server.next_message(), Some(Ok(Ok(good))));
@@ -900,7 +894,7 @@ fn rfb_stream_sessions_negotiate_all_existing_dialects() {
                 assert_eq!(client.push(&bytes), bytes.len());
                 assert_eq!(
                     client.next_message(),
-                    Some(Ok(Err(rfb::ParseError::Protocol(rfb::Error::Rectangle))))
+                    Some(Ok(Err(rfb::Error::Rectangle)))
                 );
                 assert_eq!(client.phase(), rfb::Phase::Normal);
                 assert_eq!(
@@ -987,9 +981,7 @@ fn rfb_unoffered_security_closes_without_reading_another_choice() {
         assert_eq!(server.push(&[choice, 1]), 2);
         assert_eq!(
             server.next_message(),
-            Some(Ok(Err(rfb::ParseError::Protocol(rfb::Error::NotOffered(
-                choice
-            )))))
+            Some(Ok(Err(rfb::Error::NotOffered(choice))))
         );
         assert_eq!(server.phase(), rfb::Phase::Closed);
         assert_eq!(server.next_message(), None);
@@ -1013,14 +1005,14 @@ fn rfb_pending_input_is_bounded_and_error_survives_handoff() {
         assert_eq!(server.push(&[1]), 0);
         assert_eq!(
             server.next_message(),
-            Some(Err(Fail::Protocol(rfb::Error::OutOfTurn)))
+            Some(Err(Fail::Protocol(rfb::FrameError::OutOfTurn)))
         );
         assert_eq!(server.next_message(), None);
         assert!(server.is_done());
         let stream = server.into_stream();
         assert_eq!(
             stream.failed(),
-            Some(&Fail::Protocol(rfb::Error::OutOfTurn))
+            Some(&Fail::Protocol(rfb::FrameError::OutOfTurn))
         );
         assert_eq!(stream.unread(), &bytes[..accepted]);
     }
@@ -1035,7 +1027,7 @@ fn rfb_pending_input_is_bounded_and_error_survives_handoff() {
     let mut stream = client.into_stream();
     assert_eq!(
         stream.next(),
-        Some(Err(Fail::Protocol(rfb::Error::OutOfTurn)))
+        Some(Err(Fail::Protocol(rfb::FrameError::OutOfTurn)))
     );
     assert_eq!(stream.next(), None);
     assert_eq!(stream.unread(), &bytes[..rfb::MAX_PENDING]);
@@ -1064,15 +1056,13 @@ fn rfb_mode_errors_name_the_refused_phase_or_partial_unit() {
     let mut client = rfb::ClientMessages::new();
     assert_eq!(
         client.set_phase(rfb::Phase::ServerInit),
-        Err(rfb::ParseError::Protocol(rfb::Error::Phase(
-            rfb::Phase::ServerInit
-        )))
+        Err(rfb::Error::Phase(rfb::Phase::ServerInit))
     );
     assert_eq!(client.phase(), rfb::Phase::ClientVersion);
     assert_eq!(client.decode(b"RFB 003.", false), Ok(Step::Need));
     assert_eq!(
         client.set_phase(rfb::Phase::Closed),
-        Err(rfb::ParseError::PartialUnit)
+        Err(rfb::Error::PartialUnit)
     );
     assert!(matches!(
         client.decode(b"RFB 003.008\n", false),
@@ -1083,15 +1073,13 @@ fn rfb_mode_errors_name_the_refused_phase_or_partial_unit() {
     let mut server = rfb::ServerMessages::new();
     assert_eq!(
         server.set_mode(rfb::Phase::ClientInit, rfb::Dialect::V3_8, format()),
-        Err(rfb::ParseError::Protocol(rfb::Error::Phase(
-            rfb::Phase::ClientInit
-        )))
+        Err(rfb::Error::Phase(rfb::Phase::ClientInit))
     );
     assert_eq!(server.phase(), rfb::Phase::ServerVersion);
     assert_eq!(server.decode(b"RFB 003.", false), Ok(Step::Need));
     assert_eq!(
         server.set_mode(rfb::Phase::Closed, rfb::Dialect::V3_8, format()),
-        Err(rfb::ParseError::PartialUnit)
+        Err(rfb::Error::PartialUnit)
     );
     assert!(matches!(
         server.decode(b"RFB 003.008\n", false),
@@ -1194,7 +1182,7 @@ fn socks_pipelined_greeting_and_request_pause_in_pump() {
                 methods: vec![method]
             }))]
         );
-        assert_eq!(stream.decoder().stage(), socks::ServerStage::Selecting);
+        assert_eq!(stream.decoder().phase(), socks::ServerPhase::Selecting);
         assert_eq!(stream.unread(), &bytes[3..]);
         assert!(stream.decoder().select(method));
         if auth {
@@ -1210,7 +1198,7 @@ fn socks_pipelined_greeting_and_request_pause_in_pump() {
                     password: b"p".to_vec(),
                 }))]
             );
-            assert_eq!(stream.decoder().stage(), socks::ServerStage::Verifying);
+            assert_eq!(stream.decoder().phase(), socks::ServerPhase::Verifying);
             assert_eq!(stream.unread(), request);
             stream.decoder().verified(true);
         }
@@ -1251,7 +1239,7 @@ fn rfb_client_refused_server_init_closes_before_retry() {
     assert_eq!(client.push(&bytes), bytes.len());
     assert_eq!(
         client.next_message(),
-        Some(Ok(Err(rfb::ParseError::Protocol(rfb::Error::PixelFormat))))
+        Some(Ok(Err(rfb::Error::PixelFormat)))
     );
     assert_eq!(client.phase(), rfb::Phase::Closed);
     assert_eq!(client.next_message(), None);
@@ -1272,7 +1260,7 @@ fn rfb_server_push_then_drain_finishes_after_out_of_turn() {
             }
             rest = &rest[server.push(rest)..];
             while let Some(item) = server.next_message() {
-                assert_eq!(item, Err(Fail::Protocol(rfb::Error::OutOfTurn)));
+                assert_eq!(item, Err(Fail::Protocol(rfb::FrameError::OutOfTurn)));
                 errors += 1;
             }
         }
@@ -1303,7 +1291,7 @@ fn rfb_client_push_then_drain_finishes_after_out_of_turn() {
             }
             rest = &rest[client.push(rest)..];
             while let Some(item) = client.next_message() {
-                assert_eq!(item, Err(Fail::Protocol(rfb::Error::OutOfTurn)));
+                assert_eq!(item, Err(Fail::Protocol(rfb::FrameError::OutOfTurn)));
                 errors += 1;
             }
         }
@@ -1334,7 +1322,7 @@ fn rfb_server_limits_pending_input_after_turn_change() {
     );
     assert_eq!(
         server.next_message(),
-        Some(Err(Fail::Protocol(rfb::Error::OutOfTurn)))
+        Some(Err(Fail::Protocol(rfb::FrameError::OutOfTurn)))
     );
     assert_eq!(server.phase(), rfb::Phase::Closed);
     assert_eq!(server.next_message(), None);
@@ -1355,7 +1343,7 @@ fn rfb_client_limits_pending_input_after_turn_change() {
     );
     assert_eq!(
         client.next_message(),
-        Some(Err(Fail::Protocol(rfb::Error::OutOfTurn)))
+        Some(Err(Fail::Protocol(rfb::FrameError::OutOfTurn)))
     );
     assert_eq!(client.phase(), rfb::Phase::Closed);
     assert_eq!(client.next_message(), None);

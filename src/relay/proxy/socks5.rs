@@ -15,7 +15,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::stdlib::codec::{Fail, Stream, Wire};
 use crate::stdlib::socks::{
-    self, Address, AuthReply, ClientMessage, ClientMessages, Command, DecodeError, Method, Reply, ReplyCode, Selection,
+    self, Address, AuthReply, ClientMessage, ClientMessages, Command, FrameError, Method, Reply, ReplyCode, Selection,
 };
 
 use super::Host;
@@ -54,7 +54,7 @@ where
 {
     let mut stream = Stream::new(ClientMessages::new());
     loop {
-        let stage = stream.decoder().stage();
+        let phase = stream.decoder().phase();
         let message = match stream.next() {
             Some(Ok(Ok(message))) => message,
             Some(Ok(Err(e))) => {
@@ -65,11 +65,11 @@ where
                 };
                 return Err(refuse(s, e.reply_code(), why).await);
             }
-            Some(Err(Fail::Protocol(DecodeError::Protocol(socks::Error::AddressType(_))))) => {
+            Some(Err(Fail::Protocol(FrameError::AddressType(_)))) => {
                 return Err(refuse(s, ReplyCode::AddressTypeNotSupported, "unknown address type").await);
             }
-            Some(Err(Fail::Protocol(DecodeError::Protocol(socks::Error::Version(_))))) => {
-                return Err(Refusal::Malformed(if stage == socks::ServerStage::Auth {
+            Some(Err(Fail::Protocol(FrameError::Version(_)))) => {
+                return Err(Refusal::Malformed(if phase == socks::ServerPhase::Auth {
                     "not version 1 of the username/password method"
                 } else {
                     "not SOCKS version 5"
