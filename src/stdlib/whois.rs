@@ -23,7 +23,7 @@
 //! A world that plays a WHOIS server pushes query lines into
 //! [`Stream<Queries>`](fictionet::stdlib::codec::Stream), writes a [`Response`], and
 //! closes the connection. Query lines accept CRLF and bare LF. A client
-//! collects replies with [`Stream<Responses>`](fictionet::stdlib::codec::Stream) and
+//! collects replies with [`Stream<CollectedResponses>`](fictionet::stdlib::codec::Stream) and
 //! calls `end` at connection close. The resulting [`CollectedResponse`]
 //! preserves the truncation flag. Names, owners, and referrals belong to
 //! world code.
@@ -32,12 +32,12 @@
 //! likes. A query line longer than [`MAX_QUERY`] is an error, and the
 //! decoder skips it and goes on to the next line. A response is held to
 //! [`MAX_RESPONSE`] bytes, and bytes past that are dropped. Writers return
-//! an [`EncodeError`] or a [`QueryError`] rather than write bytes a reader
+//! an [`Error`] rather than write bytes a reader
 //! would refuse or read back as something else.
 //!
 //! ```
 //! use fictionet::stdlib::codec::{Stream, Wire, pump};
-//! use fictionet::stdlib::whois::{Field, Query, Queries, ReferralKind, Response, Responses};
+//! use fictionet::stdlib::whois::{CollectedResponses, Field, Query, Queries, ReferralKind, Response};
 //!
 //! // A client asks the RIPE database about an address, with two flags.
 //! let query = Query::new("-B -T inetnum 193.0.0.1").unwrap();
@@ -63,7 +63,7 @@
 //! );
 //!
 //! // The client reads until the close, then finds where to ask next.
-//! let mut reader = Stream::new(Responses::new());
+//! let mut reader = Stream::new(CollectedResponses::new());
 //! pump(&mut reader, response.as_bytes(), |_| unreachable!()).unwrap();
 //! reader.end();
 //! let collected = reader.next().unwrap().unwrap();
@@ -83,9 +83,9 @@ use std::borrow::Cow;
 pub const PORT: u16 = 43;
 /// The longest query line, in bytes, not counting its CR LF.
 pub const MAX_QUERY: usize = 1024;
-/// The longest response retained by [`Responses`] or held by [`Response`].
+/// The longest response retained by [`CollectedResponses`] or held by [`Response`].
 pub const MAX_RESPONSE: usize = 1 << 20;
-/// Input buffer capacity for [`Responses`], independent of its retained byte limit.
+/// Input buffer capacity for [`CollectedResponses`], independent of its retained byte limit.
 pub const RESPONSE_WINDOW: usize = 4096;
 /// The most fields [`parse_fields`] reads and [`Response::from_fields`] writes.
 pub const MAX_FIELDS: usize = 10_000;
@@ -156,40 +156,25 @@ fn takes_next_word(w: &str, next: &str) -> bool {
     false
 }
 
-/// Why a query line was refused, by a reader or a writer.
+/// Why a query line or a response could not be read or written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum QueryError {
-    /// The line was longer than [`MAX_QUERY`] bytes.
-    TooLong,
-    /// The line was not UTF-8.
+pub enum Error {
+    /// The query line was longer than [`MAX_QUERY`] bytes.
+    QueryTooLong,
+    /// The query line was not UTF-8.
     NotUtf8,
-    /// The line held a control character other than a tab, such as a CR
-    /// on its own. The value is the character.
+    /// The query line held a control character other than a tab, such as
+    /// a CR on its own. The value is the character.
     Control(char),
     /// [`Query::build`] was given flags and terms that would not read back
     /// as given: a flag that is empty or holds a space or tab, a word that
     /// does not start with a dash where a flag should be, a flag that wants
     /// an argument and has none, or terms whose first word reads as a flag.
     Flags,
-}
-
-impl std::fmt::Display for QueryError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            QueryError::TooLong => write!(f, "a query line longer than {MAX_QUERY} bytes"),
-            QueryError::NotUtf8 => f.write_str("a query line that is not UTF-8"),
-            QueryError::Control(c) => write!(f, "control character {:#x} in a query line", u32::from(*c)),
-            QueryError::Flags => f.write_str("query flags and terms that would not read back as given"),
-        }
-    }
-}
-
-impl std::error::Error for QueryError {}
-
-/// Why a writer refused a value: its bytes would be too long, or a reader
-/// would read them back as something else.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum EncodeError {
+    /// The query line was not terminated.
+    Incomplete,
+    /// Bytes followed the query line.
+    Trailing,
     /// A key, value, block order, or referral would change when read back.
     /// Keys must be nonempty, at most [`MAX_KEY`] bytes, and have no colon,
     /// control character, outer whitespace, or leading `%`, `#`, `>` or `+`.
@@ -198,32 +183,30 @@ pub enum EncodeError {
     /// start at zero and advance by at most one. Referral hosts must follow
     /// [`Referral::to_field`]'s rules, and ports must be nonzero.
     Unwritable,
-    /// More than [`MAX_FIELDS`] fields, or more than [`MAX_RESPONSE`] bytes.
-    TooLong,
+    /// More than [`MAX_FIELDS`] fields to write, or more than
+    /// [`MAX_RESPONSE`] bytes in a response.
+    ResponseTooLong,
+    /// A response held more than [`MAX_FIELDS`] fields.
+    TooManyFields,
 }
 
-impl std::fmt::Display for EncodeError {
+impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            EncodeError::Unwritable => f.write_str("value cannot be written without changing it"),
-            EncodeError::TooLong => f.write_str("more than one WHOIS response may hold"),
+            Error::QueryTooLong => write!(f, "a query line longer than {MAX_QUERY} bytes"),
+            Error::NotUtf8 => f.write_str("a query line that is not UTF-8"),
+            Error::Control(c) => write!(f, "control character {:#x} in a query line", u32::from(*c)),
+            Error::Flags => f.write_str("query flags and terms that would not read back as given"),
+            Error::Incomplete => f.write_str("incomplete WHOIS query"),
+            Error::Trailing => f.write_str("bytes after WHOIS query"),
+            Error::Unwritable => f.write_str("value cannot be written without changing it"),
+            Error::ResponseTooLong => f.write_str("more than one WHOIS response may hold"),
+            Error::TooManyFields => write!(f, "more than {MAX_FIELDS} fields"),
         }
     }
 }
 
-impl std::error::Error for EncodeError {}
-
-/// A response held more than [`MAX_FIELDS`] fields.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct TooManyFields;
-
-impl std::fmt::Display for TooManyFields {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "more than {MAX_FIELDS} fields")
-    }
-}
-
-impl std::error::Error for TooManyFields {}
+impl std::error::Error for Error {}
 
 /// One query: the text of the line a client sends, without its CR LF. It
 /// is at most [`MAX_QUERY`] bytes and holds no control characters but
@@ -247,7 +230,7 @@ pub struct Flag<'a> {
 impl Query {
     /// A query with this text. It is an error if the text is longer than
     /// [`MAX_QUERY`] bytes or holds a control character other than a tab.
-    pub fn new(text: &str) -> Result<Query, QueryError> {
+    pub fn new(text: &str) -> Result<Query, Error> {
         check_query(text)?;
         Ok(Query { text: text.to_string() })
     }
@@ -255,41 +238,41 @@ impl Query {
     /// A query of `flags` and then `terms`, each word with one space
     /// between. A flag's argument is its own word in `flags`, as in
     /// `["-T", "inetnum"]`. The same checks as [`Query::new`] apply. It is
-    /// also an error, [`QueryError::Flags`], if [`Query::flags`] and
+    /// also an error, [`Error::Flags`], if [`Query::flags`] and
     /// [`Query::terms`] would not read the query back as these flags and
     /// these terms without space at either end.
-    pub fn build(flags: &[&str], terms: &str) -> Result<Query, QueryError> {
+    pub fn build(flags: &[&str], terms: &str) -> Result<Query, Error> {
         let mut text = String::new();
         for f in flags {
             if f.is_empty() || f.contains([' ', '\t']) {
-                return Err(QueryError::Flags);
+                return Err(Error::Flags);
             }
             if text.len().saturating_add(f.len()) > MAX_QUERY {
-                return Err(QueryError::TooLong);
+                return Err(Error::QueryTooLong);
             }
             text.push_str(f);
             text.push(' ');
         }
         if text.len().saturating_add(terms.len()) > MAX_QUERY {
-            return Err(QueryError::TooLong);
+            return Err(Error::QueryTooLong);
         }
         text.push_str(terms);
         let query = Query::new(&text)?;
         let (read, read_terms) = query.split();
         let words = read.iter().flat_map(|f| std::iter::once(f.name).chain(f.argument));
         if !words.eq(flags.iter().copied()) || read_terms != trim(terms) {
-            return Err(QueryError::Flags);
+            return Err(Error::Flags);
         }
         Ok(query)
     }
 
     /// Reads a query line: the bytes before its line ending, with no CR
     /// or LF at the end.
-    fn parse_line(line: &[u8]) -> Result<Query, QueryError> {
+    fn parse_line(line: &[u8]) -> Result<Query, Error> {
         if line.len() > MAX_QUERY {
-            return Err(QueryError::TooLong);
+            return Err(Error::QueryTooLong);
         }
-        let text = std::str::from_utf8(line).map_err(|_| QueryError::NotUtf8)?;
+        let text = std::str::from_utf8(line).map_err(|_| Error::NotUtf8)?;
         Query::new(text)
     }
 
@@ -360,12 +343,12 @@ fn words(s: &str) -> Vec<(usize, &str)> {
     out
 }
 
-fn check_query(text: &str) -> Result<(), QueryError> {
+fn check_query(text: &str) -> Result<(), Error> {
     if text.len() > MAX_QUERY {
-        return Err(QueryError::TooLong);
+        return Err(Error::QueryTooLong);
     }
     match text.chars().find(|&c| c.is_control() && c != '\t') {
-        Some(c) => Err(QueryError::Control(c)),
+        Some(c) => Err(Error::Control(c)),
         None => Ok(()),
     }
 }
@@ -380,9 +363,9 @@ pub struct Response {
 impl Response {
     /// A response of these bytes, sent as they are. It is an error if
     /// there are more than [`MAX_RESPONSE`].
-    pub fn new(bytes: &[u8]) -> Result<Response, EncodeError> {
+    pub fn new(bytes: &[u8]) -> Result<Response, Error> {
         if bytes.len() > MAX_RESPONSE {
-            return Err(EncodeError::TooLong);
+            return Err(Error::ResponseTooLong);
         }
         Ok(Response { bytes: bytes.to_vec() })
     }
@@ -397,26 +380,26 @@ impl Response {
     /// whitespace or controls other than tabs. An empty first value line
     /// cannot precede continuation lines. Blocks start at zero and advance
     /// by at most one.
-    pub fn from_fields(fields: &[Field]) -> Result<Response, EncodeError> {
+    pub fn from_fields(fields: &[Field]) -> Result<Response, Error> {
         if fields.len() > MAX_FIELDS {
-            return Err(EncodeError::TooLong);
+            return Err(Error::ResponseTooLong);
         }
         let mut out = String::new();
         let mut block = 0usize;
         for (i, f) in fields.iter().enumerate() {
-            let next_block = block.checked_add(1).ok_or(EncodeError::Unwritable)?;
+            let next_block = block.checked_add(1).ok_or(Error::Unwritable)?;
             if (i == 0 && f.block != 0) || (f.block != block && f.block != next_block) {
-                return Err(EncodeError::Unwritable);
+                return Err(Error::Unwritable);
             }
             check_key(&f.key)?;
             // Bound the work before splitting the value into lines.
             if f.value.len() > MAX_RESPONSE {
-                return Err(EncodeError::TooLong);
+                return Err(Error::ResponseTooLong);
             }
             let mut lines = f.value.split('\n');
             let first = lines.next().unwrap_or("");
             if first.is_empty() && f.value.contains('\n') {
-                return Err(EncodeError::Unwritable);
+                return Err(Error::Unwritable);
             }
             // The exact bytes this field adds: a blank line before a new
             // block, the key line, and each further line.
@@ -429,15 +412,15 @@ impl Response {
             }
             for (i, line) in f.value.split('\n').enumerate() {
                 if trim(line) != line || line.chars().any(|c| c.is_control() && c != '\t') {
-                    return Err(EncodeError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 if i > 0 {
                     let extra = if line.is_empty() { 3 } else { CONTINUATION_INDENT.len() + line.len() + 2 };
-                    need = need.checked_add(extra).ok_or(EncodeError::TooLong)?;
+                    need = need.checked_add(extra).ok_or(Error::ResponseTooLong)?;
                 }
             }
             if out.len().saturating_add(need) > MAX_RESPONSE {
-                return Err(EncodeError::TooLong);
+                return Err(Error::ResponseTooLong);
             }
             if f.block != block {
                 out.push_str("\r\n");
@@ -475,7 +458,7 @@ impl Response {
     }
 
     /// The fields of the response, read by [`parse_fields`].
-    pub fn fields(&self) -> Result<Vec<Field>, TooManyFields> {
+    pub fn fields(&self) -> Result<Vec<Field>, Error> {
         parse_fields(&self.text())
     }
 
@@ -640,25 +623,25 @@ fn trim(s: &str) -> &str {
 
 /// The fields of `text`, read by a [`FieldReader`]. It is an error if
 /// there are more than [`MAX_FIELDS`].
-pub fn parse_fields(text: &str) -> Result<Vec<Field>, TooManyFields> {
+pub fn parse_fields(text: &str) -> Result<Vec<Field>, Error> {
     let mut out = Vec::new();
     for f in FieldReader::new(text) {
         if out.len() >= MAX_FIELDS {
-            return Err(TooManyFields);
+            return Err(Error::TooManyFields);
         }
         out.push(f);
     }
     Ok(out)
 }
 
-fn check_key(key: &str) -> Result<(), EncodeError> {
+fn check_key(key: &str) -> Result<(), Error> {
     let ok = !key.is_empty()
         && key.len() <= MAX_KEY
         && trim(key) == key
         && !key.contains(':')
         && !key.chars().any(char::is_control)
         && !key.starts_with(['%', '#', '>', '+']);
-    if ok { Ok(()) } else { Err(EncodeError::Unwritable) }
+    if ok { Ok(()) } else { Err(Error::Unwritable) }
 }
 
 /// Which field a referral came from.
@@ -760,10 +743,10 @@ impl Referral {
     /// canonical lowercase IPv6 addresses or ASCII names. Name labels
     /// must have 1 to 63 letters, digits, hyphens, or underscores, with
     /// no leading hyphen. A final dot is allowed.
-    pub fn to_field(&self, block: usize) -> Result<Field, EncodeError> {
+    pub fn to_field(&self, block: usize) -> Result<Field, Error> {
         check_host(&self.host)?;
         if self.port == 0 {
-            return Err(EncodeError::Unwritable);
+            return Err(Error::Unwritable);
         }
         let mut value = String::new();
         if self.kind == ReferralKind::ReferralServer {
@@ -797,14 +780,14 @@ fn parse_port(p: &str) -> Option<u16> {
     p.parse::<u16>().ok().filter(|&n| n != 0)
 }
 
-fn check_host(host: &str) -> Result<(), EncodeError> {
+fn check_host(host: &str) -> Result<(), Error> {
     if host.is_empty() || host.len() > MAX_HOST || host.bytes().any(|b| b.is_ascii_uppercase()) {
-        return Err(EncodeError::Unwritable);
+        return Err(Error::Unwritable);
     }
     if host.contains(':') {
         return match host.parse::<std::net::Ipv6Addr>() {
             Ok(_) => Ok(()),
-            Err(_) => Err(EncodeError::Unwritable),
+            Err(_) => Err(Error::Unwritable),
         };
     }
     // Labels of 1 to 63 bytes (RFC 1035, section 2.3.4), and a dot at the
@@ -813,48 +796,12 @@ fn check_host(host: &str) -> Result<(), EncodeError> {
     let ok = !host.starts_with('-')
         && name.split('.').all(|l| !l.is_empty() && l.len() <= 63)
         && host.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'-' | b'_'));
-    if ok { Ok(()) } else { Err(EncodeError::Unwritable) }
+    if ok { Ok(()) } else { Err(Error::Unwritable) }
 }
-
-/// Why an exact query wire value could not be read.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum QueryParseError {
-    /// A complete query line was refused.
-    Query(QueryError),
-    /// The query line was not terminated.
-    Incomplete,
-    /// Bytes followed the query line.
-    Trailing,
-}
-
-impl core::fmt::Display for QueryParseError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Query(e) => e.fmt(f),
-            Self::Incomplete => f.write_str("incomplete WHOIS query"),
-            Self::Trailing => f.write_str("bytes after WHOIS query"),
-        }
-    }
-}
-impl core::error::Error for QueryParseError {}
-
-/// Why bytes cannot be read as one WHOIS response.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ResponseParseError {
-    /// The response exceeds [`MAX_RESPONSE`].
-    TooLong,
-}
-
-impl core::fmt::Display for ResponseParseError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("WHOIS response exceeds its byte limit")
-    }
-}
-impl core::error::Error for ResponseParseError {}
 
 impl Wire for Query {
-    type ParseError = QueryParseError;
-    type WriteError = QueryError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads one UTF-8 query with CRLF or bare LF. Refuses invalid UTF-8,
     /// control characters other than tabs, more than [`MAX_QUERY`] content
@@ -863,18 +810,18 @@ impl Wire for Query {
         let mut decoder = Queries::new();
         match decoder
             .decode(bytes, true)
-            .map_err(|_| QueryParseError::Incomplete)?
+            .map_err(|_| Error::Incomplete)?
         {
-            Step::Item(query, used) if used == bytes.len() => query.map_err(QueryParseError::Query),
-            Step::Item(Err(e), _) => Err(QueryParseError::Query(e)),
-            Step::Item(_, _) => Err(QueryParseError::Trailing),
-            _ => Err(QueryParseError::Incomplete),
+            Step::Item(query, used) if used == bytes.len() => query,
+            Step::Item(Err(e), _) => Err(e),
+            Step::Item(_, _) => Err(Error::Trailing),
+            _ => Err(Error::Incomplete),
         }
     }
 
     /// Appends a query with CRLF. Refuses text over [`MAX_QUERY`] bytes
     /// or control characters other than tabs. Leaves `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), QueryError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         check_query(&self.text)?;
         out.extend_from_slice(self.text.as_bytes());
         out.extend_from_slice(b"\r\n");
@@ -883,20 +830,20 @@ impl Wire for Query {
 }
 
 impl Wire for Response {
-    type ParseError = ResponseParseError;
-    type WriteError = EncodeError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads a complete response, refusing more than [`MAX_RESPONSE`]
     /// bytes. All byte values are accepted; no line terminator is stripped.
-    fn parse(bytes: &[u8]) -> Result<Self, ResponseParseError> {
-        Self::new(bytes).map_err(|_| ResponseParseError::TooLong)
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        Self::new(bytes)
     }
 
     /// Appends response bytes unchanged, refusing an oversized response
     /// before changing `out`.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         if self.bytes.len() > MAX_RESPONSE {
-            return Err(EncodeError::TooLong);
+            return Err(Error::ResponseTooLong);
         }
         out.extend_from_slice(&self.bytes);
         Ok(())
@@ -932,7 +879,7 @@ impl Default for Queries {
     }
 }
 impl Decode for Queries {
-    type Item = Result<Query, QueryError>;
+    type Item = Result<Query, Error>;
     type Error = codec::LineError;
     const NAME: &'static str = "WHOIS queries";
 
@@ -948,7 +895,7 @@ impl Decode for Queries {
         Ok(match step {
             Step::Item(Ok(line), n) => Step::Item(Query::parse_line(&line), n),
             Step::Item(Err(codec::LineError::TooLong { .. }), n) => {
-                Step::Item(Err(QueryError::TooLong), n)
+                Step::Item(Err(Error::QueryTooLong), n)
             }
             Step::Item(Err(e), _) => return Err(e),
             Step::Skip(n) => Step::Skip(n),
@@ -974,14 +921,14 @@ pub struct CollectedResponse {
 /// at exactly the limit.
 /// Input capacity is [`RESPONSE_WINDOW`]; retained state is bounded by the byte limit.
 #[derive(Clone, Debug)]
-pub struct Responses {
+pub struct CollectedResponses {
     limit: usize,
     bytes: Vec<u8>,
     truncated: bool,
     taken: bool,
 }
 
-impl Responses {
+impl CollectedResponses {
     /// Creates a collector that keeps at most [`MAX_RESPONSE`] bytes.
     pub fn new() -> Self {
         Self::with_limit(MAX_RESPONSE)
@@ -1003,12 +950,12 @@ impl Responses {
         self.limit
     }
 }
-impl Default for Responses {
+impl Default for CollectedResponses {
     fn default() -> Self {
         Self::new()
     }
 }
-impl Decode for Responses {
+impl Decode for CollectedResponses {
     type Item = CollectedResponse;
     type Error = core::convert::Infallible;
     const NAME: &'static str = "WHOIS response";
@@ -1191,14 +1138,14 @@ mod tests {
     #[test]
     fn build_reads_back_as_given() {
         // Terms that start like a flag would be read as one.
-        assert_eq!(Query::build(&["-B"], "-r 193.0.0.1"), Err(QueryError::Flags));
+        assert_eq!(Query::build(&["-B"], "-r 193.0.0.1"), Err(Error::Flags));
         // A flag word that is not a flag would be read as a term.
-        assert_eq!(Query::build(&["inetnum"], "193.0.0.1"), Err(QueryError::Flags));
+        assert_eq!(Query::build(&["inetnum"], "193.0.0.1"), Err(Error::Flags));
         // Flags must be one word each.
-        assert_eq!(Query::build(&["-B -r"], "x"), Err(QueryError::Flags));
-        assert_eq!(Query::build(&[""], "x"), Err(QueryError::Flags));
+        assert_eq!(Query::build(&["-B -r"], "x"), Err(Error::Flags));
+        assert_eq!(Query::build(&[""], "x"), Err(Error::Flags));
         // A flag that takes an argument and has none eats the terms.
-        assert_eq!(Query::build(&["-T"], "inetnum"), Err(QueryError::Flags));
+        assert_eq!(Query::build(&["-T"], "inetnum"), Err(Error::Flags));
         // These read back as given.
         let q = Query::build(&["-T", "dn,ace", "-C", "UTF-8"], " example.de ").unwrap();
         assert_eq!(q.terms(), "example.de");
@@ -1209,17 +1156,17 @@ mod tests {
 
     #[test]
     fn query_errors() {
-        assert_eq!(Query::new("a\rb"), Err(QueryError::Control('\r')));
-        assert_eq!(Query::new("a\nb"), Err(QueryError::Control('\n')));
-        assert_eq!(Query::new("a\u{85}"), Err(QueryError::Control('\u{85}')));
+        assert_eq!(Query::new("a\rb"), Err(Error::Control('\r')));
+        assert_eq!(Query::new("a\nb"), Err(Error::Control('\n')));
+        assert_eq!(Query::new("a\u{85}"), Err(Error::Control('\u{85}')));
         assert!(Query::new("a\tb").is_ok());
-        assert_eq!(Query::parse(b"\xffabc\r\n"), Err(QueryParseError::Query(QueryError::NotUtf8)));
-        assert_eq!(Query::parse(&[vec![b'a'; MAX_QUERY + 1], b"\r\n".to_vec()].concat()), Err(QueryParseError::Query(QueryError::TooLong)));
+        assert_eq!(Query::parse(b"\xffabc\r\n"), Err(Error::NotUtf8));
+        assert_eq!(Query::parse(&[vec![b'a'; MAX_QUERY + 1], b"\r\n".to_vec()].concat()), Err(Error::QueryTooLong));
         assert!(Query::parse(&[vec![b'a'; MAX_QUERY], b"\r\n".to_vec()].concat()).is_ok());
-        assert_eq!(Query::new(&"a".repeat(MAX_QUERY + 1)), Err(QueryError::TooLong));
-        assert_eq!(Query::build(&["x"; 2000], ""), Err(QueryError::TooLong));
-        assert_eq!(Query::build(&[&"a".repeat(MAX_QUERY)], "b"), Err(QueryError::TooLong));
-        for e in [QueryError::TooLong, QueryError::NotUtf8, QueryError::Control('\0'), QueryError::Flags] {
+        assert_eq!(Query::new(&"a".repeat(MAX_QUERY + 1)), Err(Error::QueryTooLong));
+        assert_eq!(Query::build(&["x"; 2000], ""), Err(Error::QueryTooLong));
+        assert_eq!(Query::build(&[&"a".repeat(MAX_QUERY)], "b"), Err(Error::QueryTooLong));
+        for e in [Error::QueryTooLong, Error::NotUtf8, Error::Control('\0'), Error::Flags] {
             assert!(!e.to_string().is_empty());
         }
     }
@@ -1230,13 +1177,13 @@ mod tests {
         bytes.extend_from_slice(b"\r\nok\r\n");
         let got = decode_all(Queries::new, &bytes).0;
         contract::check_decode_with_alloc_limit(Queries::new, &bytes, 2 * (MAX_QUERY + 2));
-        assert_eq!(got, [Err(QueryError::TooLong), Ok(Query::new("ok").unwrap())]);
+        assert_eq!(got, [Err(Error::QueryTooLong), Ok(Query::new("ok").unwrap())]);
         // A line one byte too long, ended by a bare LF, is an error too.
         let mut d = Stream::new(Queries::new());
         let mut line = vec![b'a'; MAX_QUERY + 1];
         line.push(b'\n');
         assert_eq!(d.push(&line), line.len());
-        assert_eq!(d.next(), Some(Ok(Err(QueryError::TooLong))));
+        assert_eq!(d.next(), Some(Ok(Err(Error::QueryTooLong))));
         // The longest line is read.
         let mut line = vec![b'a'; MAX_QUERY];
         line.extend_from_slice(b"\r\n");
@@ -1331,11 +1278,11 @@ mod tests {
         let r = Referral { kind: ReferralKind::ReferralServer, host: "h".into(), port: 4343 };
         assert_eq!(r.to_field(0).unwrap().value, "whois://h:4343");
         let bad = |host: &str, port| Referral { kind: ReferralKind::Refer, host: host.into(), port }.to_field(0);
-        assert_eq!(bad("Upper.example", 43), Err(EncodeError::Unwritable));
-        assert_eq!(bad("", 43), Err(EncodeError::Unwritable));
-        assert_eq!(bad(".x", 43), Err(EncodeError::Unwritable));
-        assert_eq!(bad("a:b", 43), Err(EncodeError::Unwritable));
-        assert_eq!(bad("x", 0), Err(EncodeError::Unwritable));
+        assert_eq!(bad("Upper.example", 43), Err(Error::Unwritable));
+        assert_eq!(bad("", 43), Err(Error::Unwritable));
+        assert_eq!(bad(".x", 43), Err(Error::Unwritable));
+        assert_eq!(bad("a:b", 43), Err(Error::Unwritable));
+        assert_eq!(bad("x", 0), Err(Error::Unwritable));
     }
 
     #[test]
@@ -1372,11 +1319,11 @@ mod tests {
         let text = "k: v\n".repeat(MAX_FIELDS);
         assert_eq!(parse_fields(&text).unwrap().len(), MAX_FIELDS);
         let text = "k: v\n".repeat(MAX_FIELDS + 1);
-        assert_eq!(parse_fields(&text), Err(TooManyFields));
-        assert_eq!(Response::new(text.as_bytes()).unwrap().fields(), Err(TooManyFields));
-        assert!(!TooManyFields.to_string().is_empty());
+        assert_eq!(parse_fields(&text), Err(Error::TooManyFields));
+        assert_eq!(Response::new(text.as_bytes()).unwrap().fields(), Err(Error::TooManyFields));
+        assert!(!Error::TooManyFields.to_string().is_empty());
         let fields = vec![Field::new(0, "k", "v"); MAX_FIELDS + 1];
-        assert_eq!(Response::from_fields(&fields), Err(EncodeError::TooLong));
+        assert_eq!(Response::from_fields(&fields), Err(Error::ResponseTooLong));
         assert!(Response::from_fields(&fields[..MAX_FIELDS]).is_ok());
     }
 
@@ -1384,19 +1331,19 @@ mod tests {
     fn writer_errors() {
         let one = |k: &str, v: &str| Response::from_fields(&[Field::new(0, k, v)]);
         for key in ["", " k", "k ", "a:b", "%k", "#k", ">k", "+k", "k\tx", "k\u{7f}"] {
-            assert_eq!(one(key, "v"), Err(EncodeError::Unwritable), "{key:?}");
+            assert_eq!(one(key, "v"), Err(Error::Unwritable), "{key:?}");
         }
-        assert_eq!(one(&"k".repeat(MAX_KEY + 1), "v"), Err(EncodeError::Unwritable));
+        assert_eq!(one(&"k".repeat(MAX_KEY + 1), "v"), Err(Error::Unwritable));
         for value in [" v", "v ", "v\r", "a\n b", "\nb", "a\u{1}"] {
-            assert_eq!(one("k", value), Err(EncodeError::Unwritable), "{value:?}");
+            assert_eq!(one("k", value), Err(Error::Unwritable), "{value:?}");
         }
         assert_eq!(
             Response::from_fields(&[Field::new(1, "k", "v")]),
-            Err(EncodeError::Unwritable)
+            Err(Error::Unwritable)
         );
         assert_eq!(
             Response::from_fields(&[Field::new(0, "k", "v"), Field::new(2, "k", "v")]),
-            Err(EncodeError::Unwritable)
+            Err(Error::Unwritable)
         );
         assert_eq!(
             Response::from_fields(&[
@@ -1404,17 +1351,17 @@ mod tests {
                 Field::new(1, "k", "v"),
                 Field::new(0, "k", "v")
             ]),
-            Err(EncodeError::Unwritable)
+            Err(Error::Unwritable)
         );
         let big = "v".repeat(MAX_RESPONSE);
-        assert_eq!(one("k", &big), Err(EncodeError::TooLong));
-        assert_eq!(Response::from_fields(&[Field::new(0, "k", &big)]), Err(EncodeError::TooLong));
+        assert_eq!(one("k", &big), Err(Error::ResponseTooLong));
+        assert_eq!(Response::from_fields(&[Field::new(0, "k", &big)]), Err(Error::ResponseTooLong));
         // A value with more lines than one response holds is refused
         // before it is split.
-        assert_eq!(one("k", &"a\n".repeat(MAX_RESPONSE)), Err(EncodeError::TooLong));
-        assert_eq!(Response::new(&vec![0; MAX_RESPONSE + 1]), Err(EncodeError::TooLong));
+        assert_eq!(one("k", &"a\n".repeat(MAX_RESPONSE)), Err(Error::ResponseTooLong));
+        assert_eq!(Response::new(&vec![0; MAX_RESPONSE + 1]), Err(Error::ResponseTooLong));
         assert!(Response::new(&vec![0; MAX_RESPONSE]).is_ok());
-        for e in [EncodeError::Unwritable, EncodeError::TooLong] {
+        for e in [Error::Unwritable, Error::ResponseTooLong] {
             assert!(!e.to_string().is_empty());
         }
     }
@@ -1442,14 +1389,14 @@ mod tests {
     #[test]
     fn response_collection_keeps_the_first_bytes() {
         let bytes = [vec![b'x'; MAX_RESPONSE - 1], b"yzmore".to_vec()].concat();
-        let (items, failure) = decode_all(Responses::new, &bytes);
+        let (items, failure) = decode_all(CollectedResponses::new, &bytes);
         assert_eq!(failure, None);
         assert_eq!(items.len(), 1);
         assert!(items[0].truncated);
         let r = &items[0].response;
         assert_eq!(r.as_bytes().len(), MAX_RESPONSE);
         assert_eq!(r.as_bytes().last(), Some(&b'y'));
-        contract::check_decode_with_alloc_limit(Responses::new, &bytes, 2 * RESPONSE_WINDOW);
+        contract::check_decode_with_alloc_limit(CollectedResponses::new, &bytes, 2 * RESPONSE_WINDOW);
         let r = Response::new(b"owner: M\xfcller\n").unwrap();
         assert_eq!(r.fields().unwrap()[0].value, "M\u{fffd}ller");
     }
@@ -1465,7 +1412,7 @@ mod tests {
         for text in [VERISIGN, RIPE, IANA, ARIN] {
             let full = parse_fields(text).unwrap();
             for n in 0..=text.len() {
-                let (items, failure) = decode_all(Responses::new, &text.as_bytes()[..n]);
+                let (items, failure) = decode_all(CollectedResponses::new, &text.as_bytes()[..n]);
                 assert_eq!(failure, None);
                 let r = &items[0].response;
                 let fields = r.fields().unwrap();
@@ -1491,7 +1438,7 @@ mod tests {
             }
             mutate(&mut rng, &mut data);
             contract::check_decode_with_alloc_limit(Queries::new, &data, 2 * (MAX_QUERY + 2));
-            contract::check_decode_with_alloc_limit(Responses::new, &data, 2 * RESPONSE_WINDOW);
+            contract::check_decode_with_alloc_limit(CollectedResponses::new, &data, 2 * RESPONSE_WINDOW);
             contract::check_wire::<Query>(&data);
             contract::check_wire::<Response>(&data);
             for q in decode_all(Queries::new, &data).0.iter().flatten() {
@@ -1509,7 +1456,7 @@ mod tests {
                 assert_eq!(query.terms(), trim(terms));
                 contract::check_wire_value(&query);
             }
-            let response = &decode_all(Responses::new, &data).0[0].response;
+            let response = &decode_all(CollectedResponses::new, &data).0[0].response;
             let fields = response.fields().unwrap();
             if let Ok(response) = Response::from_fields(&fields) {
                 assert_eq!(response.fields().unwrap(), fields);
@@ -1558,7 +1505,7 @@ mod tests {
         for length in [0, 1, MAX_QUERY - 1, MAX_QUERY, MAX_QUERY + 1, 3 * MAX_QUERY] {
             for ending in [b"\r\n".as_slice(), b"\n"] {
                 let data = [vec![b'a'; length], ending.to_vec(), b"next\r\n".to_vec()].concat();
-                let expected = if length > MAX_QUERY { Err(QueryError::TooLong) } else { Query::new(&"a".repeat(length)) };
+                let expected = if length > MAX_QUERY { Err(Error::QueryTooLong) } else { Query::new(&"a".repeat(length)) };
                 assert_eq!(decode_all(Queries::new, &data), (vec![expected, Query::new("next")], None));
                 contract::check_decode_with_alloc_limit(Queries::new, &data, 2 * (MAX_QUERY + 2));
             }
@@ -1591,7 +1538,7 @@ mod tests {
         assert_eq!(q.terms(), "AS-FOO");
         assert_eq!(Query::new("-rB AS3333").unwrap().terms(), "AS3333");
         assert_eq!(Query::build(&["-Bi", "origin"], "AS3333").unwrap().terms(), "AS3333");
-        assert_eq!(Query::build(&["-Bi"], "origin AS3333"), Err(QueryError::Flags));
+        assert_eq!(Query::build(&["-Bi"], "origin AS3333"), Err(Error::Flags));
     }
 
     #[test]
@@ -1629,7 +1576,7 @@ mod tests {
         let r = Referral { kind: ReferralKind::Refer, host: "2001:db8::1".into(), port: 4343 };
         assert_eq!(r.to_field(0).unwrap().value, "[2001:db8::1]:4343");
         let bad = Referral { kind: ReferralKind::Refer, host: "2001:DB8::1".into(), port: 43 };
-        assert_eq!(bad.to_field(0), Err(EncodeError::Unwritable));
+        assert_eq!(bad.to_field(0), Err(Error::Unwritable));
     }
 
     #[test]
@@ -1646,7 +1593,7 @@ mod tests {
         assert!(read(&longest).is_some());
         assert_eq!(read(&format!("{longest}e")), None);
         let bad = Referral { kind: ReferralKind::Refer, host: "a..b".into(), port: 43 };
-        assert_eq!(bad.to_field(0), Err(EncodeError::Unwritable));
+        assert_eq!(bad.to_field(0), Err(Error::Unwritable));
     }
 
     #[test]
@@ -1657,7 +1604,7 @@ mod tests {
         assert_eq!(response.as_bytes().len(), MAX_RESPONSE);
         assert_eq!(
             Response::from_fields(&[Field::new(0, "k", &"a".repeat(MAX_RESPONSE - 4))]),
-            Err(EncodeError::TooLong)
+            Err(Error::ResponseTooLong)
         );
         // Empty further lines are written as "+" and CR LF.
         let value = format!("a{}", "\n".repeat(100_000));
@@ -1675,7 +1622,7 @@ mod tests {
             MAX_RESPONSE
         );
         let fields = [Field::new(0, "k", ""), Field::new(1, "k", &"a".repeat(MAX_RESPONSE - 10))];
-        assert_eq!(Response::from_fields(&fields), Err(EncodeError::TooLong));
+        assert_eq!(Response::from_fields(&fields), Err(Error::ResponseTooLong));
     }
 
     #[test]
@@ -1722,8 +1669,8 @@ mod tests {
             }
             let resp = Response::from_fields(&fields).unwrap();
             assert_eq!(resp.fields().unwrap(), fields);
-            contract::check_decode_with_alloc_limit(Responses::new, resp.as_bytes(), 2 * RESPONSE_WINDOW);
-            assert_eq!(decode_all(Responses::new, resp.as_bytes()).0[0].response.fields().unwrap(), fields);
+            contract::check_decode_with_alloc_limit(CollectedResponses::new, resp.as_bytes(), 2 * RESPONSE_WINDOW);
+            assert_eq!(decode_all(CollectedResponses::new, resp.as_bytes()).0[0].response.fields().unwrap(), fields);
         }
     }
 }

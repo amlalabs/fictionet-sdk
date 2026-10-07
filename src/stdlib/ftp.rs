@@ -20,13 +20,14 @@
 //! Every reader checks lengths, because the agent can send any bytes it
 //! likes. A line longer than [`MAX_LINE`] is an error, and a server's
 //! decoder skips it and goes on to the next line, as real servers do. The
-//! error says which reply a server sends: a bad line ([`CommandError`]) is
-//! answered with [`code::SYNTAX_ERROR`] (500), and a bad argument
-//! ([`ArgumentError`]) with [`code::ARGUMENT_ERROR`] (501). Each input
+//! error says which reply a server sends: a bad line (an error item from
+//! [`Commands`]) is answered with [`code::SYNTAX_ERROR`] (500), and a bad
+//! argument (an error from [`Request::from_command`]) with
+//! [`code::ARGUMENT_ERROR`] (501). Each input
 //! buffer holds at most [`MAX_LINE`] bytes. Replies retain at most
 //! [`MAX_REPLY_BYTES`] of text while assembling their lines.
 //!
-//! A command writer refuses ([`WriteError`]) rather than send a line that
+//! A command writer refuses ([`Error`]) rather than send a line that
 //! would read back as a different command. A pathname may hold a carriage
 //! return: RFC 2640 sends it as CR NUL, and a reader turns CR NUL back into
 //! CR. A command reader also drops Telnet commands, such as the interrupt
@@ -113,72 +114,53 @@ pub struct Command {
     pub arg: Option<String>,
 }
 
-/// Why a line is not a command. A server answers each of these with
-/// [`code::SYNTAX_ERROR`] and reads the next line.
+/// Why bytes are not an FTP command or reply, why a command does not
+/// say what a request needs, or why a value cannot be written. A server
+/// answers an error item from [`Commands`] with [`code::SYNTAX_ERROR`],
+/// and an error from [`Request::from_command`] with
+/// [`code::ARGUMENT_ERROR`], except [`Error::Family`] in `EPRT`, which
+/// RFC 2428 answers with [`code::UNKNOWN_NETWORK_PROTOCOL`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CommandError {
-    /// The line was longer than [`MAX_LINE`]. The decoder dropped all of it.
+pub enum Error {
+    /// A command or reply line was longer than [`MAX_LINE`], or would be
+    /// with its prefix, escaping and CRLF. The decoder dropped all of it.
     LineTooLong,
-    /// The line was empty.
+    /// The command line was empty.
     Empty,
-    /// The line did not start with one to four letters followed by a space
-    /// or the end of the line.
+    /// The command line did not start with one to four letters followed
+    /// by a space or the end of the line.
     Verb,
-    /// The line was not UTF-8 once Telnet commands were dropped, held a NUL
-    /// or a carriage return other than as CR NUL, or ended inside a Telnet
-    /// command.
+    /// A command line was not UTF-8 once Telnet commands were dropped,
+    /// held a NUL or a carriage return other than as CR NUL, or ended
+    /// inside a Telnet command. Or a reply line was not UTF-8, or held a
+    /// carriage return or a NUL byte.
     Text,
-}
-
-impl std::fmt::Display for CommandError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            CommandError::LineTooLong => "command line too long",
-            CommandError::Empty => "empty command line",
-            CommandError::Verb => "command verb is not one to four letters",
-            CommandError::Text => "command line is not UTF-8 text without a bare CR or NUL",
-        })
-    }
-}
-
-impl std::error::Error for CommandError {}
-
-impl Command {
-    /// A command with `verb` and `arg`.
-    pub fn new(verb: &str, arg: Option<&str>) -> Command {
-        Command { verb: verb.to_string(), arg: arg.map(str::to_string) }
-    }
-
-    /// Reads one command line, without its line ending. Telnet commands in
-    /// it, such as `IAC IP` and `IAC DM`, are dropped, and CR NUL is read
-    /// as CR.
-    fn parse_line(line: &[u8]) -> Result<Command, CommandError> {
-        if line.len() > MAX_CONTENT {
-            return Err(CommandError::LineTooLong);
-        }
-        let line = command_text(line).ok_or(CommandError::Text)?;
-        let line = line.as_str();
-        if line.is_empty() {
-            return Err(CommandError::Empty);
-        }
-        let (verb, arg) = match line.split_once(' ') {
-            Some((verb, arg)) => (verb, Some(arg)),
-            None => (line, None),
-        };
-        if verb.is_empty() || verb.len() > MAX_VERB || !verb.bytes().all(|b| b.is_ascii_alphabetic()) {
-            return Err(CommandError::Verb);
-        }
-        Ok(Command { verb: verb.to_ascii_uppercase(), arg: arg.map(str::to_string) })
-    }
-}
-
-/// Why a command, request, reply or address token could not be written.
-/// A writer refuses a value that would read back as something else.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WriteError {
-    /// A command or reply line, including a feature line, would exceed
-    /// [`MAX_LINE`] bytes with its prefix, escaping and CRLF.
-    LineTooLong,
+    /// A reply did not start with a code from 100 to 599 followed by a
+    /// space, a hyphen or the end of the line.
+    Syntax,
+    /// A reply ran to more than [`MAX_REPLY_LINES`] lines. A
+    /// [`Replies`] drops the reply's lines up to its last one, as RFC
+    /// 1123 (section 4.1.2.11) asks, and goes on to the next reply.
+    TooManyLines,
+    /// The verb needs an argument and the command had none.
+    MissingArgument,
+    /// The verb takes no argument and the command had one.
+    UnexpectedArgument,
+    /// The argument was not one the verb accepts.
+    InvalidArgument,
+    /// An address in `PORT`, `EPRT` or a passive reply did not have the
+    /// form the command or reply needs.
+    Address,
+    /// `EPRT` named an address family other than 1 (IPv4) or 2 (IPv6).
+    Family,
+    /// The reply's code does not carry what was asked of it: 211 for a
+    /// list of features, 227 for a passive address, 229 for an extended
+    /// passive port.
+    Code(ReplyCode),
+    /// A feature line did not start with a space and a name of printable
+    /// ASCII characters, or its parameters held other characters than
+    /// printable ASCII, spaces and tabs.
+    Feature,
     /// The value would be refused or change when read back: a verb other
     /// than one to four uppercase ASCII letters, a command argument with
     /// NUL or LF without a preceding CR, a request whose argument does
@@ -189,18 +171,65 @@ pub enum WriteError {
     /// [`Reply::feature_list`] returns this for invalid names or parameters,
     /// empty parameter values, or more than [`MAX_FEATURES`] features.
     Unwritable,
+    /// The command or reply ended early.
+    Incomplete,
+    /// Bytes followed the command or reply.
+    Trailing,
 }
 
-impl std::fmt::Display for WriteError {
+impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            WriteError::LineTooLong => f.write_str("line too long"),
-            WriteError::Unwritable => f.write_str("value cannot be written without changing it"),
+            Error::LineTooLong => f.write_str("line too long"),
+            Error::Empty => f.write_str("empty command line"),
+            Error::Verb => f.write_str("command verb is not one to four letters"),
+            Error::Text => f.write_str("line is not UTF-8 text without a bare CR or NUL"),
+            Error::Syntax => f.write_str("reply does not start with a code from 100 to 599"),
+            Error::TooManyLines => f.write_str("reply has too many lines"),
+            Error::MissingArgument => f.write_str("missing argument"),
+            Error::UnexpectedArgument => f.write_str("unexpected argument"),
+            Error::InvalidArgument => f.write_str("invalid argument"),
+            Error::Address => f.write_str("malformed address"),
+            Error::Family => f.write_str("address family is not 1 (IPv4) or 2 (IPv6)"),
+            Error::Code(c) => write!(f, "reply code {c} does not carry what was asked of it"),
+            Error::Feature => f.write_str("malformed feature line"),
+            Error::Unwritable => f.write_str("value cannot be written without changing it"),
+            Error::Incomplete => f.write_str("incomplete FTP command or reply"),
+            Error::Trailing => f.write_str("bytes after FTP command or reply"),
         }
     }
 }
 
-impl std::error::Error for WriteError {}
+impl std::error::Error for Error {}
+
+impl Command {
+    /// A command with `verb` and `arg`.
+    pub fn new(verb: &str, arg: Option<&str>) -> Command {
+        Command { verb: verb.to_string(), arg: arg.map(str::to_string) }
+    }
+
+    /// Reads one command line, without its line ending. Telnet commands in
+    /// it, such as `IAC IP` and `IAC DM`, are dropped, and CR NUL is read
+    /// as CR.
+    fn parse_line(line: &[u8]) -> Result<Command, Error> {
+        if line.len() > MAX_CONTENT {
+            return Err(Error::LineTooLong);
+        }
+        let line = command_text(line).ok_or(Error::Text)?;
+        let line = line.as_str();
+        if line.is_empty() {
+            return Err(Error::Empty);
+        }
+        let (verb, arg) = match line.split_once(' ') {
+            Some((verb, arg)) => (verb, Some(arg)),
+            None => (line, None),
+        };
+        if verb.is_empty() || verb.len() > MAX_VERB || !verb.bytes().all(|b| b.is_ascii_alphabetic()) {
+            return Err(Error::Verb);
+        }
+        Ok(Command { verb: verb.to_ascii_uppercase(), arg: arg.map(str::to_string) })
+    }
+}
 
 /// The representation type that `TYPE` sets (RFC 959, section 3.1.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -355,45 +384,16 @@ pub enum Request {
     Other(Command),
 }
 
-/// Why a command's argument does not fit its verb. A server answers each
-/// of these with [`code::ARGUMENT_ERROR`], except an [`AddressError::Family`]
-/// in `EPRT`, which RFC 2428 answers with
-/// [`code::UNKNOWN_NETWORK_PROTOCOL`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ArgumentError {
-    /// The verb needs an argument and the command had none.
-    Missing,
-    /// The verb takes no argument and the command had one.
-    Unexpected,
-    /// The argument was not one the verb accepts.
-    Invalid,
-    /// The address in `PORT` or `EPRT` could not be read.
-    Address(AddressError),
-}
-
-impl std::fmt::Display for ArgumentError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ArgumentError::Missing => f.write_str("missing argument"),
-            ArgumentError::Unexpected => f.write_str("unexpected argument"),
-            ArgumentError::Invalid => f.write_str("invalid argument"),
-            ArgumentError::Address(e) => write!(f, "bad address: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for ArgumentError {}
-
 impl Request {
     /// Reads what `command` asks for. Verbs are known in upper case, as
     /// [`Wire::parse`] leaves them.
-    pub fn from_command(command: &Command) -> Result<Request, ArgumentError> {
-        use ArgumentError as E;
+    pub fn from_command(command: &Command) -> Result<Request, Error> {
+        use Error as E;
         let arg = command.arg.as_deref();
-        let need = || arg.map(str::to_string).ok_or(E::Missing);
-        let none = |r: Request| if arg.is_some() { Err(E::Unexpected) } else { Ok(r) };
+        let need = || arg.map(str::to_string).ok_or(E::MissingArgument);
+        let none = |r: Request| if arg.is_some() { Err(E::UnexpectedArgument) } else { Ok(r) };
         let maybe = || arg.map(str::to_string);
-        let upper = || arg.map(str::to_ascii_uppercase).ok_or(E::Missing);
+        let upper = || arg.map(str::to_ascii_uppercase).ok_or(E::MissingArgument);
         Ok(match command.verb.as_str() {
             "USER" => Request::User(need()?),
             "PASS" => Request::Pass(need()?),
@@ -403,27 +403,27 @@ impl Request {
             "SMNT" => Request::Smnt(need()?),
             "REIN" => none(Request::Rein)?,
             "QUIT" => none(Request::Quit)?,
-            "PORT" => Request::Port(parse_port(arg.ok_or(E::Missing)?).map_err(E::Address)?),
+            "PORT" => Request::Port(parse_port(arg.ok_or(E::MissingArgument)?)?),
             "PASV" => none(Request::Pasv)?,
-            "TYPE" => Request::Type(parse_type(&upper()?).ok_or(E::Invalid)?),
+            "TYPE" => Request::Type(parse_type(&upper()?).ok_or(E::InvalidArgument)?),
             "STRU" => Request::Stru(match upper()?.as_str() {
                 "F" => Structure::File,
                 "R" => Structure::Record,
                 "P" => Structure::Page,
-                _ => return Err(E::Invalid),
+                _ => return Err(E::InvalidArgument),
             }),
             "MODE" => Request::Mode(match upper()?.as_str() {
                 "S" => TransferMode::Stream,
                 "B" => TransferMode::Block,
                 "C" => TransferMode::Compressed,
-                _ => return Err(E::Invalid),
+                _ => return Err(E::InvalidArgument),
             }),
             "RETR" => Request::Retr(need()?),
             "STOR" => Request::Stor(need()?),
             "STOU" => none(Request::Stou)?,
             "APPE" => Request::Appe(need()?),
-            "ALLO" => Request::Allo(need().and_then(|a| if allo_ok(&a) { Ok(a) } else { Err(E::Invalid) })?),
-            "REST" => Request::Rest(need().and_then(|a| if rest_ok(&a) { Ok(a) } else { Err(E::Invalid) })?),
+            "ALLO" => Request::Allo(need().and_then(|a| if allo_ok(&a) { Ok(a) } else { Err(E::InvalidArgument) })?),
+            "REST" => Request::Rest(need().and_then(|a| if rest_ok(&a) { Ok(a) } else { Err(E::InvalidArgument) })?),
             "RNFR" => Request::Rnfr(need()?),
             "RNTO" => Request::Rnto(need()?),
             "ABOR" => none(Request::Abor)?,
@@ -438,16 +438,16 @@ impl Request {
             "STAT" => Request::Stat(maybe()),
             "HELP" => Request::Help(maybe()),
             "NOOP" => none(Request::Noop)?,
-            "EPRT" => Request::Eprt(parse_eprt(arg.ok_or(E::Missing)?).map_err(E::Address)?),
+            "EPRT" => Request::Eprt(parse_eprt(arg.ok_or(E::MissingArgument)?)?),
             "EPSV" => Request::Epsv(match arg {
                 None => None,
                 Some(a) if a.eq_ignore_ascii_case("ALL") => Some(EpsvArg::All),
                 Some(a) => {
-                    Some(EpsvArg::Protocol(decimal(a, 5).and_then(|n| u16::try_from(n).ok()).ok_or(E::Invalid)?))
+                    Some(EpsvArg::Protocol(decimal(a, 5).and_then(|n| u16::try_from(n).ok()).ok_or(E::InvalidArgument)?))
                 }
             }),
             "FEAT" => none(Request::Feat)?,
-            "OPTS" => Request::Opts(need().and_then(|a| if opts_ok(&a) { Ok(a) } else { Err(E::Invalid) })?),
+            "OPTS" => Request::Opts(need().and_then(|a| if opts_ok(&a) { Ok(a) } else { Err(E::InvalidArgument) })?),
             "MDTM" => Request::Mdtm(need()?),
             "SIZE" => Request::Size(need()?),
             "MLST" => Request::Mlst(maybe()),
@@ -596,29 +596,6 @@ fn write_type(t: DataType) -> String {
     }
 }
 
-/// Why an address in `PORT`, `EPRT` or a passive reply could not be read.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AddressError {
-    /// The text did not have the form the command or reply needs.
-    Syntax,
-    /// `EPRT` named an address family other than 1 (IPv4) or 2 (IPv6).
-    Family,
-    /// The reply had the wrong code for the address asked of it.
-    Code,
-}
-
-impl std::fmt::Display for AddressError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            AddressError::Syntax => "malformed address",
-            AddressError::Family => "address family is not 1 (IPv4) or 2 (IPv6)",
-            AddressError::Code => "reply code does not carry this address",
-        })
-    }
-}
-
-impl std::error::Error for AddressError {}
-
 /// The six-number IPv4 address token in `PORT` and `PASV`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PortAddress {
@@ -626,15 +603,15 @@ pub struct PortAddress {
     pub address: SocketAddrV4,
 }
 impl Wire for PortAddress {
-    type ParseError = AddressError;
+    type ParseError = Error;
     type WriteError = core::convert::Infallible;
 
     /// Reads six decimal bytes separated by commas: four IPv4 octets,
     /// then the port's high and low bytes (RFC 959, section 4.1.2).
     /// Refuses missing or extra numbers, signs, spaces, invalid UTF-8,
     /// values above 255, and numbers longer than three digits.
-    fn parse(bytes: &[u8]) -> Result<Self, AddressError> {
-        let text = std::str::from_utf8(bytes).map_err(|_| AddressError::Syntax)?;
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        let text = std::str::from_utf8(bytes).map_err(|_| Error::Address)?;
         parse_port(text).map(|address| Self { address })
     }
 
@@ -653,24 +630,24 @@ pub struct EprtAddress {
     pub address: SocketAddr,
 }
 impl Wire for EprtAddress {
-    type ParseError = AddressError;
-    type WriteError = WriteError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads an RFC 2428 token with a printable ASCII delimiter. Refuses
     /// invalid addresses, ports, trailing fields, and families other than
-    /// 1 or 2. An unknown numeric family returns [`AddressError::Family`].
-    fn parse(bytes: &[u8]) -> Result<Self, AddressError> {
-        let text = std::str::from_utf8(bytes).map_err(|_| AddressError::Syntax)?;
+    /// 1 or 2. An unknown numeric family returns [`Error::Family`].
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        let text = std::str::from_utf8(bytes).map_err(|_| Error::Address)?;
         parse_eprt(text).map(|address| Self { address })
     }
 
     /// Appends an RFC 2428 token with `|` delimiters. Refuses nonzero IPv6
     /// scope or flow values because the token has no fields for them.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         if let SocketAddr::V6(address) = self.address
             && (address.flowinfo() != 0 || address.scope_id() != 0)
         {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         out.extend_from_slice(eprt_text(self.address).as_bytes());
         Ok(())
@@ -680,10 +657,10 @@ impl Wire for EprtAddress {
 /// Reads the argument of `PORT`: six decimal numbers from 0 to 255 joined
 /// by commas, `h1,h2,h3,h4,p1,p2`. The first four are the IPv4 address and
 /// the last two the port, high byte first (RFC 959, section 4.1.2).
-fn parse_port(arg: &str) -> Result<SocketAddrV4, AddressError> {
+fn parse_port(arg: &str) -> Result<SocketAddrV4, Error> {
     match scan_host_port(arg) {
         Some((addr, used)) if used == arg.len() => Ok(addr),
-        _ => Err(AddressError::Syntax),
+        _ => Err(Error::Address),
     }
 }
 
@@ -698,29 +675,29 @@ fn port_text(addr: SocketAddrV4) -> String {
 /// Reads the argument of `EPRT`, such as `|1|132.235.1.2|6275|` or
 /// `|2|1080::8:800:200C:417A|5282|` (RFC 2428, section 2). The first
 /// character is the delimiter, which may be any printable ASCII character.
-/// A family given as digits but not 1 or 2 is [`AddressError::Family`],
+/// A family given as digits but not 1 or 2 is [`Error::Family`],
 /// whatever the address and port after it look like.
-fn parse_eprt(arg: &str) -> Result<SocketAddr, AddressError> {
-    let d = arg.chars().next().ok_or(AddressError::Syntax)?;
+fn parse_eprt(arg: &str) -> Result<SocketAddr, Error> {
+    let d = arg.chars().next().ok_or(Error::Address)?;
     if !d.is_ascii_graphic() {
-        return Err(AddressError::Syntax);
+        return Err(Error::Address);
     }
     let mut fields = arg[1..].split(d);
     let (Some(family), Some(host), Some(port), Some(""), None) =
         (fields.next(), fields.next(), fields.next(), fields.next(), fields.next())
     else {
-        return Err(AddressError::Syntax);
+        return Err(Error::Address);
     };
     if family.is_empty() || !family.bytes().all(|c| c.is_ascii_digit()) {
-        return Err(AddressError::Syntax);
+        return Err(Error::Address);
     }
     // Leading zeros aside, the family must be 1 or 2.
     let ip = match family.trim_start_matches('0') {
-        "1" => IpAddr::V4(host.parse::<Ipv4Addr>().map_err(|_| AddressError::Syntax)?),
-        "2" => IpAddr::V6(host.parse::<Ipv6Addr>().map_err(|_| AddressError::Syntax)?),
-        _ => return Err(AddressError::Family),
+        "1" => IpAddr::V4(host.parse::<Ipv4Addr>().map_err(|_| Error::Address)?),
+        "2" => IpAddr::V6(host.parse::<Ipv6Addr>().map_err(|_| Error::Address)?),
+        _ => return Err(Error::Family),
     };
-    let port = decimal(port, 5).and_then(|n| u16::try_from(n).ok()).ok_or(AddressError::Syntax)?;
+    let port = decimal(port, 5).and_then(|n| u16::try_from(n).ok()).ok_or(Error::Address)?;
     Ok(SocketAddr::new(ip, port))
 }
 
@@ -928,36 +905,6 @@ pub struct Reply {
     pub lines: Vec<String>,
 }
 
-/// Why bytes are not an FTP reply. See [`Replies`] for recovery from
-/// malformed first lines and terminal framing errors.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReplyError {
-    /// A line was longer than [`MAX_LINE`].
-    LineTooLong,
-    /// A line was not UTF-8, or held a carriage return or a NUL byte.
-    Text,
-    /// A reply did not start with a code from 100 to 599 followed by a
-    /// space, a hyphen or the end of the line.
-    Syntax,
-    /// A reply ran to more than [`MAX_REPLY_LINES`] lines. A
-    /// [`Replies`] drops the reply's lines up to its last one, as RFC
-    /// 1123 (section 4.1.2.11) asks, and goes on to the next reply.
-    TooManyLines,
-}
-
-impl std::fmt::Display for ReplyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            ReplyError::LineTooLong => "reply line too long",
-            ReplyError::Text => "reply line is not UTF-8 text without CR or NUL",
-            ReplyError::Syntax => "reply does not start with a code from 100 to 599",
-            ReplyError::TooManyLines => "reply has too many lines",
-        })
-    }
-}
-
-impl std::error::Error for ReplyError {}
-
 /// One feature line of a reply to `FEAT` (RFC 2389, section 3.2), such as
 /// ` MLST size*;modify*;`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -971,28 +918,6 @@ pub struct Feature {
     pub params: Option<String>,
 }
 
-/// Why a reply is not a list of features.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FeatureError {
-    /// The reply's code was not 211.
-    Code(ReplyCode),
-    /// A feature line did not start with a space and a name of printable
-    /// ASCII characters, or its parameters held other characters than
-    /// printable ASCII, spaces and tabs.
-    Line,
-}
-
-impl std::fmt::Display for FeatureError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            FeatureError::Code(c) => write!(f, "reply code {c}, not 211"),
-            FeatureError::Line => f.write_str("malformed feature line"),
-        }
-    }
-}
-
-impl std::error::Error for FeatureError {}
-
 impl Reply {
     /// A reply of one line. Writing refuses text longer than `MAX_REPLY_TEXT`
     /// bytes, so the line with its code, separator and CRLF fits in [`MAX_LINE`].
@@ -1005,10 +930,10 @@ impl Reply {
     /// are unchanged. The returned value includes the padding.
     /// Refuses empty or oversized line lists, CR, LF or NUL in text, and
     /// lines that exceed [`MAX_LINE`] after padding and code prefixes.
-    pub fn from_lines(code: ReplyCode, mut lines: Vec<String>) -> Result<Reply, WriteError> {
+    pub fn from_lines(code: ReplyCode, mut lines: Vec<String>) -> Result<Reply, Error> {
         let count = lines.len();
         if count == 0 || count > MAX_REPLY_LINES {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         for line in lines.iter_mut().take(count - 1).skip(1) {
             if line
@@ -1017,7 +942,7 @@ impl Reply {
                 .is_some_and(|start| start.iter().all(u8::is_ascii_digit))
             {
                 if line.len() >= MAX_CONTENT {
-                    return Err(WriteError::LineTooLong);
+                    return Err(Error::LineTooLong);
                 }
                 line.insert(0, ' ');
             }
@@ -1028,21 +953,21 @@ impl Reply {
     }
 
     /// Checks line limits and text without producing wire bytes.
-    fn validate(&self) -> Result<(), WriteError> {
+    fn validate(&self) -> Result<(), Error> {
         let count = self.lines.len();
         if count == 0 || count > MAX_REPLY_LINES {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         for (i, line) in self.lines.iter().enumerate() {
             let middle = i != 0 && i != count - 1;
             let limit = if middle { MAX_CONTENT } else { MAX_REPLY_TEXT };
             if line.len() > limit {
-                return Err(WriteError::LineTooLong);
+                return Err(Error::LineTooLong);
             }
             if line.bytes().any(|b| matches!(b, b'\r' | b'\n' | 0))
                 || (middle && ends(line, self.code))
             {
-                return Err(WriteError::Unwritable);
+                return Err(Error::Unwritable);
             }
         }
         Ok(())
@@ -1058,9 +983,9 @@ impl Reply {
     /// different ways, so this reads the six numbers from the first digit
     /// of a line on, as RFC 1123 (section 4.1.2.6) advises. In a reply of
     /// several lines it takes the first line that holds them.
-    pub fn passive_address(&self) -> Result<SocketAddrV4, AddressError> {
+    pub fn passive_address(&self) -> Result<SocketAddrV4, Error> {
         if self.code != code::PASSIVE {
-            return Err(AddressError::Code);
+            return Err(Error::Code(self.code));
         }
         self.lines
             .iter()
@@ -1068,7 +993,7 @@ impl Reply {
                 let start = line.find(|c: char| c.is_ascii_digit())?;
                 scan_host_port(&line[start..]).map(|(addr, _)| addr)
             })
-            .ok_or(AddressError::Syntax)
+            .ok_or(Error::Address)
     }
 
     /// The reply to `EPSV`: code 229 and the port in the form RFC 2428
@@ -1080,20 +1005,20 @@ impl Reply {
     /// The port in a reply to `EPSV`: the number in `(|||port|)`, where `|`
     /// may be any printable ASCII character, `)` included. In a reply of
     /// several lines it takes the first line that holds one.
-    pub fn extended_passive_port(&self) -> Result<u16, AddressError> {
+    pub fn extended_passive_port(&self) -> Result<u16, Error> {
         if self.code != code::EXTENDED_PASSIVE {
-            return Err(AddressError::Code);
+            return Err(Error::Code(self.code));
         }
-        self.lines.iter().find_map(|line| epsv_port(line)).ok_or(AddressError::Syntax)
+        self.lines.iter().find_map(|line| epsv_port(line)).ok_or(Error::Address)
     }
 
     /// Builds a `FEAT` reply (RFC 2389, section 3.2). With no features,
     /// returns `211 No features.`. Refuses invalid names or parameters,
     /// empty parameter values, and lists or lines beyond the named limits.
     /// Every accepted feature is preserved, including its case.
-    pub fn feature_list(features: &[Feature]) -> Result<Reply, WriteError> {
+    pub fn feature_list(features: &[Feature]) -> Result<Reply, Error> {
         if features.len() > MAX_FEATURES {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         if features.is_empty() {
             return Ok(Reply::new(code::SYSTEM_STATUS, "No features."));
@@ -1102,15 +1027,15 @@ impl Reply {
         for feature in features {
             let size = feature.name.len().checked_add(1)
                 .and_then(|n| feature.params.as_ref().map_or(Some(n), |p| n.checked_add(1)?.checked_add(p.len())))
-                .ok_or(WriteError::LineTooLong)?;
+                .ok_or(Error::LineTooLong)?;
             if size > MAX_CONTENT {
-                return Err(WriteError::LineTooLong);
+                return Err(Error::LineTooLong);
             }
             if feature.name.is_empty()
                 || !feature.name.bytes().all(|b| b.is_ascii_graphic())
                 || feature.params.as_ref().is_some_and(|p| p.is_empty() || !p.chars().all(feature_char))
             {
-                return Err(WriteError::Unwritable);
+                return Err(Error::Unwritable);
             }
             let mut line = format!(" {}", feature.name);
             if let Some(params) = &feature.params {
@@ -1125,15 +1050,15 @@ impl Reply {
 
     /// The features a reply to `FEAT` lists. A reply of one line lists
     /// none.
-    pub fn features(&self) -> Result<Vec<Feature>, FeatureError> {
+    pub fn features(&self) -> Result<Vec<Feature>, Error> {
         if self.code != code::SYSTEM_STATUS {
-            return Err(FeatureError::Code(self.code));
+            return Err(Error::Code(self.code));
         }
         let middle = if self.lines.len() > 2 { &self.lines[1..self.lines.len() - 1] } else { &[] };
         middle
             .iter()
             .map(|line| {
-                let rest = line.strip_prefix(' ').ok_or(FeatureError::Line)?;
+                let rest = line.strip_prefix(' ').ok_or(Error::Feature)?;
                 let (name, params) = match rest.split_once(' ') {
                     // A space with nothing after it is read as no parameters.
                     Some((name, "")) => (name, None),
@@ -1141,10 +1066,10 @@ impl Reply {
                     None => (rest, None),
                 };
                 if name.is_empty() || !name.bytes().all(|b| b.is_ascii_graphic()) {
-                    return Err(FeatureError::Line);
+                    return Err(Error::Feature);
                 }
                 if params.is_some_and(|p| !p.chars().all(feature_char)) {
-                    return Err(FeatureError::Line);
+                    return Err(Error::Feature);
                 }
                 Ok(Feature { name: name.to_string(), params: params.map(str::to_string) })
             })
@@ -1187,8 +1112,8 @@ impl Builder {
     /// Takes one line's content. It returns the reply that line finishes,
     /// if it finishes one. A reply with too many lines is an error once
     /// its last line comes, and the builder is then ready for the next.
-    fn take(&mut self, line: &[u8]) -> Result<Option<Reply>, ReplyError> {
-        let line = text(line).ok_or(ReplyError::Text)?;
+    fn take(&mut self, line: &[u8]) -> Result<Option<Reply>, Error> {
+        let line = text(line).ok_or(Error::Text)?;
         if let Some((code, lines, over)) = &mut self.open {
             if ends(line, *code) {
                 let code = *code;
@@ -1196,7 +1121,7 @@ impl Builder {
                 let mut lines = std::mem::take(lines);
                 self.open = None;
                 if over {
-                    return Err(ReplyError::TooManyLines);
+                    return Err(Error::TooManyLines);
                 }
                 lines.push(line.get(4..).unwrap_or("").to_string());
                 return Ok(Some(Reply { code, lines }));
@@ -1214,9 +1139,9 @@ impl Builder {
         let code = match b.get(..3) {
             Some(&[a, x, y]) if (b'1'..=b'5').contains(&a) && x.is_ascii_digit() && y.is_ascii_digit() => {
                 let n = u16::from(a - b'0') * 100 + u16::from(x - b'0') * 10 + u16::from(y - b'0');
-                ReplyCode::new(n).ok_or(ReplyError::Syntax)?
+                ReplyCode::new(n).ok_or(Error::Syntax)?
             }
-            _ => return Err(ReplyError::Syntax),
+            _ => return Err(Error::Syntax),
         };
         let rest = line.get(4..).unwrap_or("").to_string();
         match b.get(3) {
@@ -1225,7 +1150,7 @@ impl Builder {
                 self.open = Some((code, vec![rest], false));
                 Ok(None)
             }
-            Some(_) => Err(ReplyError::Syntax),
+            Some(_) => Err(Error::Syntax),
         }
     }
 }
@@ -1338,13 +1263,13 @@ pub const MAX_REPLY_BYTES: usize = MAX_REPLY_LINES * MAX_CONTENT;
 
 /// A terminal fault in [`Commands`] or [`Replies`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DecodeError {
+pub enum FrameError {
     /// EOF interrupted a line or a multi-line reply.
     Incomplete,
     /// A reply's framing can no longer be followed.
-    Reply(ReplyError),
+    Reply(Error),
 }
-impl core::fmt::Display for DecodeError {
+impl core::fmt::Display for FrameError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Incomplete => f.write_str("incomplete FTP control unit"),
@@ -1352,49 +1277,14 @@ impl core::fmt::Display for DecodeError {
         }
     }
 }
-impl core::error::Error for DecodeError {}
-
-/// Why bytes do not contain exactly one complete FTP command.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CommandParseError {
-    /// The command was refused.
-    Command(CommandError),
-    /// The command ended early.
-    Incomplete,
-    /// Bytes followed the command.
-    Trailing,
-}
-impl core::fmt::Display for CommandParseError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+impl core::error::Error for FrameError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
-            Self::Command(e) => e.fmt(f),
-            Self::Incomplete => f.write_str("incomplete FTP command"),
-            Self::Trailing => f.write_str("bytes after FTP command"),
+            Self::Incomplete => None,
+            Self::Reply(e) => Some(e),
         }
     }
 }
-impl core::error::Error for CommandParseError {}
-
-/// Why bytes do not contain exactly one complete FTP reply.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReplyParseError {
-    /// The reply was refused.
-    Reply(ReplyError),
-    /// The reply ended early.
-    Incomplete,
-    /// Bytes followed the reply.
-    Trailing,
-}
-impl core::fmt::Display for ReplyParseError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Reply(e) => e.fmt(f),
-            Self::Incomplete => f.write_str("incomplete FTP reply"),
-            Self::Trailing => f.write_str("bytes after FTP reply"),
-        }
-    }
-}
-impl core::error::Error for ReplyParseError {}
 
 // Lines frames physical lines. RFC 2640's CR NUL LF is joined here into
 // one logical line. Only consumed pieces are retained, under MAX_CONTENT.
@@ -1434,7 +1324,7 @@ impl ControlLines {
         &mut self,
         input: &[u8],
         eof: bool,
-    ) -> Result<Step<Result<Vec<u8>, CommandError>>, DecodeError> {
+    ) -> Result<Step<Result<Vec<u8>, Error>>, FrameError> {
         if self.dropping {
             let n = next_end(self.prev, input).map_or(input.len(), |i| i.saturating_add(1));
             if n == 0 {
@@ -1459,7 +1349,7 @@ impl ControlLines {
                         self.dropping = true;
                         self.prev = last_two(LINE_START, raw);
                         self.reset_line();
-                        return Ok(Step::Item(Err(CommandError::LineTooLong), n));
+                        return Ok(Step::Item(Err(Error::LineTooLong), n));
                     }
                     self.partial.extend_from_slice(raw);
                     self.reset_line();
@@ -1477,10 +1367,10 @@ impl ControlLines {
                 self.dropping = next_end(LINE_START, raw).is_none();
                 self.prev = last_two(LINE_START, raw);
                 self.reset_line();
-                Ok(Step::Item(Err(CommandError::LineTooLong), n))
+                Ok(Step::Item(Err(Error::LineTooLong), n))
             }
-            Step::Item(Err(_), _) => Err(DecodeError::Incomplete),
-            Step::Need if eof && !self.partial.is_empty() => Err(DecodeError::Incomplete),
+            Step::Item(Err(_), _) => Err(FrameError::Incomplete),
+            Step::Need if eof && !self.partial.is_empty() => Err(FrameError::Incomplete),
             Step::Need => Ok(Step::Need),
             Step::Skip(n) => Ok(Step::Skip(n)),
             Step::End => Ok(Step::End),
@@ -1516,8 +1406,8 @@ impl Default for Commands {
     }
 }
 impl Decode for Commands {
-    type Item = Result<Command, CommandError>;
-    type Error = DecodeError;
+    type Item = Result<Command, Error>;
+    type Error = FrameError;
     const NAME: &'static str = "FTP commands";
 
     fn capacity(&self) -> usize {
@@ -1526,7 +1416,7 @@ impl Decode for Commands {
     fn held(&self) -> usize {
         self.lines.partial.len()
     }
-    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Self::Item>, DecodeError> {
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Self::Item>, FrameError> {
         Ok(match self.lines.decode(input, eof)? {
             Step::Item(line, n) => Step::Item(line.and_then(|line| Command::parse_line(&line)), n),
             Step::Skip(n) => Step::Skip(n),
@@ -1543,7 +1433,7 @@ impl Decode for Commands {
 /// A malformed first line is an error item. Invalid text inside an open
 /// reply or an overlong line ends framing. Too many reply lines produce
 /// one error item at the matching final line. EOF in an assembly is
-/// [`DecodeError::Incomplete`].
+/// [`FrameError::Incomplete`].
 pub struct Replies {
     lines: ControlLines,
     builder: Builder,
@@ -1573,8 +1463,8 @@ impl Default for Replies {
     }
 }
 impl Decode for Replies {
-    type Item = Result<Reply, ReplyError>;
-    type Error = DecodeError;
+    type Item = Result<Reply, Error>;
+    type Error = FrameError;
     const NAME: &'static str = "FTP replies";
 
     fn capacity(&self) -> usize {
@@ -1583,7 +1473,7 @@ impl Decode for Replies {
     fn held(&self) -> usize {
         self.held.saturating_add(self.lines.partial.len())
     }
-    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Self::Item>, DecodeError> {
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Self::Item>, FrameError> {
         match self.lines.decode(input, eof)? {
             Step::Item(Ok(line), n) => {
                 let open = self.builder.open.is_some();
@@ -1596,12 +1486,12 @@ impl Decode for Replies {
                 match result {
                     Ok(Some(reply)) => Ok(Step::Item(Ok(reply), n)),
                     Ok(None) => Ok(Step::Skip(n)),
-                    Err(e) if !open || e == ReplyError::TooManyLines => Ok(Step::Item(Err(e), n)),
-                    Err(e) => Err(DecodeError::Reply(e)),
+                    Err(e) if !open || e == Error::TooManyLines => Ok(Step::Item(Err(e), n)),
+                    Err(e) => Err(FrameError::Reply(e)),
                 }
             }
-            Step::Item(Err(_), _) => Err(DecodeError::Reply(ReplyError::LineTooLong)),
-            Step::Need if eof && self.builder.open.is_some() => Err(DecodeError::Incomplete),
+            Step::Item(Err(_), _) => Err(FrameError::Reply(Error::LineTooLong)),
+            Step::Need if eof && self.builder.open.is_some() => Err(FrameError::Incomplete),
             Step::Need => Ok(Step::Need),
             Step::Skip(n) => Ok(Step::Skip(n)),
             Step::End => Ok(Step::End),
@@ -1636,43 +1526,43 @@ where
 }
 
 impl Wire for Command {
-    type ParseError = CommandParseError;
-    type WriteError = WriteError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads one command with CRLF or bare LF. Drops Telnet commands,
     /// decodes CR NUL as CR, and makes the verb uppercase. Refuses invalid
     /// verbs, UTF-8, Telnet sequences, or argument text, incomplete lines,
     /// and trailing bytes. Checks [`MAX_LINE`] before trailing bytes.
-    fn parse(bytes: &[u8]) -> Result<Self, CommandParseError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         exact(
             Commands::new(),
             bytes,
-            CommandParseError::Command,
-            |_| CommandParseError::Incomplete,
-            CommandParseError::Incomplete,
-            CommandParseError::Trailing,
+            |e| e,
+            |_| Error::Incomplete,
+            Error::Incomplete,
+            Error::Trailing,
         )
     }
     /// Appends a command with CRLF, leaving `out` unchanged on error.
     /// Refuses verbs other than one to four uppercase ASCII letters,
     /// NUL, LF without a preceding CR, and lines over [`MAX_LINE`].
     /// Each argument CR is sent as CR NUL (RFC 2640).
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         let (verb, arg) = (self.verb.as_str(), self.arg.as_deref());
         if verb.is_empty() || verb.len() > MAX_VERB || !verb.bytes().all(|b| b.is_ascii_uppercase())
         {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         let mut len = verb.len() + 2;
         if let Some(arg) = arg {
             let b = arg.as_bytes();
             if b.len() > MAX_LINE {
-                return Err(WriteError::LineTooLong);
+                return Err(Error::LineTooLong);
             }
             for (i, &c) in b.iter().enumerate() {
                 match c {
-                    0 => return Err(WriteError::Unwritable),
-                    b'\n' if i == 0 || b[i - 1] != b'\r' => return Err(WriteError::Unwritable),
+                    0 => return Err(Error::Unwritable),
+                    b'\n' if i == 0 || b[i - 1] != b'\r' => return Err(Error::Unwritable),
                     b'\r' => len += 1,
                     _ => {}
                 }
@@ -1680,7 +1570,7 @@ impl Wire for Command {
             len += 1 + b.len();
         }
         if len > MAX_LINE {
-            return Err(WriteError::LineTooLong);
+            return Err(Error::LineTooLong);
         }
         out.extend_from_slice(verb.as_bytes());
         if let Some(arg) = arg {
@@ -1697,53 +1587,35 @@ impl Wire for Command {
     }
 }
 
-/// Why a complete command cannot be read as a request.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RequestParseError {
-    /// The command line was refused.
-    Command(CommandParseError),
-    /// The argument does not fit the verb.
-    Argument(ArgumentError),
-}
-impl core::fmt::Display for RequestParseError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Command(e) => e.fmt(f),
-            Self::Argument(e) => e.fmt(f),
-        }
-    }
-}
-impl core::error::Error for RequestParseError {}
-
 impl Wire for Request {
-    type ParseError = RequestParseError;
-    type WriteError = WriteError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads one terminated command and its meaning. Refuses incomplete
     /// or trailing bytes and arguments that do not fit the verb.
-    fn parse(bytes: &[u8]) -> Result<Self, RequestParseError> {
-        let command = Command::parse(bytes).map_err(RequestParseError::Command)?;
-        Self::from_command(&command).map_err(RequestParseError::Argument)
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        let command = Command::parse(bytes)?;
+        Self::from_command(&command)
     }
 
     /// Appends one command with CRLF. Refuses invalid command text,
     /// oversized lines, and requests that would read back differently,
     /// including known verbs in `Other` and IPv6 EPRT flow labels or scope.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         if let Request::Eprt(SocketAddr::V6(address)) = self
             && (address.flowinfo() != 0 || address.scope_id() != 0)
         {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         let (verb, arg) = self.parts();
         // Check lengths before copying a caller's argument.
         if arg.as_ref().is_some_and(|a| a.len() > MAX_LINE) {
-            return Err(WriteError::LineTooLong);
+            return Err(Error::LineTooLong);
         }
         let command = Command { verb: verb.to_string(), arg: arg.map(Cow::into_owned) };
         let bytes = command.to_bytes()?;
         if Self::parse(&bytes).as_ref() != Ok(self) {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         out.extend_from_slice(&bytes);
         Ok(())
@@ -1751,24 +1623,24 @@ impl Wire for Request {
 }
 
 impl Wire for Reply {
-    type ParseError = ReplyParseError;
-    type WriteError = WriteError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads one reply with CRLF or bare LF. A multiline reply ends at
     /// its matching code followed by a space, or the code alone. Refuses
     /// invalid codes or UTF-8, CR or NUL in text, lines above [`MAX_LINE`],
     /// more than [`MAX_REPLY_LINES`], incomplete input, and trailing bytes.
-    fn parse(bytes: &[u8]) -> Result<Self, ReplyParseError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         exact(
             Replies::new(),
             bytes,
-            ReplyParseError::Reply,
+            |e| e,
             |e| match e {
-                DecodeError::Incomplete => ReplyParseError::Incomplete,
-                DecodeError::Reply(e) => ReplyParseError::Reply(e),
+                FrameError::Incomplete => Error::Incomplete,
+                FrameError::Reply(e) => e,
             },
-            ReplyParseError::Incomplete,
-            ReplyParseError::Trailing,
+            Error::Incomplete,
+            Error::Trailing,
         )
     }
 
@@ -1776,7 +1648,7 @@ impl Wire for Reply {
     /// Refuses text that would not read back unchanged before touching
     /// `out`: empty or oversized line lists, CR, LF, NUL, oversized text,
     /// and middle lines that would end the reply.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         self.validate()?;
         let count = self.lines.len();
         let code = self.code.get().to_string();
@@ -1801,15 +1673,15 @@ mod tests {
         test_support::{decode_all, mutate},
     };
 
-    fn commands(bytes: &[u8]) -> Vec<Result<Command, CommandError>> {
+    fn commands(bytes: &[u8]) -> Vec<Result<Command, Error>> {
         decode_all(Commands::new, bytes).0
     }
 
-    fn replies(bytes: &[u8]) -> Vec<Result<Reply, ReplyError>> {
+    fn replies(bytes: &[u8]) -> Vec<Result<Reply, Error>> {
         decode_all(Replies::new, bytes).0
     }
 
-    fn request(line: &str) -> Result<Request, ArgumentError> {
+    fn request(line: &str) -> Result<Request, Error> {
         Request::from_command(&Command::parse(format!("{line}\r\n").as_bytes()).unwrap())
     }
 
@@ -1882,9 +1754,9 @@ mod tests {
         // Other wordings, as RFC 1123 warns.
         assert_eq!(reply_of(b"227 =192,168,1,2,19,137\n").passive_address(), Ok(addr));
         assert_eq!(reply_of(b"227 Passive 192,168,1,2,19,137 ok\r\n").passive_address(), Ok(addr));
-        assert_eq!(reply_of(b"227 Passive\r\n").passive_address(), Err(AddressError::Syntax));
-        assert_eq!(reply_of(b"227 (1,2,3)\r\n").passive_address(), Err(AddressError::Syntax));
-        assert_eq!(reply_of(b"200 (1,2,3,4,5,6)\r\n").passive_address(), Err(AddressError::Code));
+        assert_eq!(reply_of(b"227 Passive\r\n").passive_address(), Err(Error::Address));
+        assert_eq!(reply_of(b"227 (1,2,3)\r\n").passive_address(), Err(Error::Address));
+        assert_eq!(reply_of(b"200 (1,2,3,4,5,6)\r\n").passive_address(), Err(Error::Code(code::OK)));
     }
 
     #[test]
@@ -1917,10 +1789,10 @@ mod tests {
         assert_eq!(reply_of(b"211 no-features\r\n").features(), Ok(vec![]));
         assert_eq!(Reply::feature_list(&[]).unwrap().to_bytes().unwrap(), b"211 No features.\r\n");
         // Errors.
-        assert_eq!(reply_of(b"500 no\r\n").features(), Err(FeatureError::Code(code::SYNTAX_ERROR)));
-        assert_eq!(reply_of(b"211-x\r\nSIZE\r\n211 e\r\n").features(), Err(FeatureError::Line));
-        assert_eq!(reply_of(b"211-x\r\n  SIZE\r\n211 e\r\n").features(), Err(FeatureError::Line));
-        assert_eq!(reply_of(b"211-x\r\n \x01\r\n211 e\r\n").features(), Err(FeatureError::Line));
+        assert_eq!(reply_of(b"500 no\r\n").features(), Err(Error::Code(code::SYNTAX_ERROR)));
+        assert_eq!(reply_of(b"211-x\r\nSIZE\r\n211 e\r\n").features(), Err(Error::Feature));
+        assert_eq!(reply_of(b"211-x\r\n  SIZE\r\n211 e\r\n").features(), Err(Error::Feature));
+        assert_eq!(reply_of(b"211-x\r\n \x01\r\n211 e\r\n").features(), Err(Error::Feature));
         // Names keep their case, and a space with nothing after it is no
         // parameters.
         let f = reply_of(b"211-x\r\n mdtm \r\n211 e\r\n").features().unwrap();
@@ -1999,68 +1871,68 @@ mod tests {
     #[test]
     fn command_errors() {
         for (line, error) in [
-            (b"\r\n".as_slice(), CommandError::Empty),
-            (b" USER x\r\n", CommandError::Verb),
-            (b"USERS x\r\n", CommandError::Verb),
-            (b"US3R x\r\n", CommandError::Verb),
-            (b"\xffABOR\r\n", CommandError::Text),
-            (b"ABOR\xff\r\n", CommandError::Text),
-            (b"ABOR\xff\xfb\r\n", CommandError::Text),
-            (b"RETR \xff\xff\r\n", CommandError::Text),
-            (b"RETR a\rb\r\n", CommandError::Text),
-            (b"RETR a\r\r\n", CommandError::Text),
-            (b"RETR a\0b\r\n", CommandError::Text),
-            (b"RETR \r\0\0\r\n", CommandError::Text),
+            (b"\r\n".as_slice(), Error::Empty),
+            (b" USER x\r\n", Error::Verb),
+            (b"USERS x\r\n", Error::Verb),
+            (b"US3R x\r\n", Error::Verb),
+            (b"\xffABOR\r\n", Error::Text),
+            (b"ABOR\xff\r\n", Error::Text),
+            (b"ABOR\xff\xfb\r\n", Error::Text),
+            (b"RETR \xff\xff\r\n", Error::Text),
+            (b"RETR a\rb\r\n", Error::Text),
+            (b"RETR a\r\r\n", Error::Text),
+            (b"RETR a\0b\r\n", Error::Text),
+            (b"RETR \r\0\0\r\n", Error::Text),
         ] {
-            assert_eq!(Command::parse(line), Err(CommandParseError::Command(error)));
+            assert_eq!(Command::parse(line), Err(error));
             contract::check_decode_with_alloc_limit(Commands::new, line, 2 * MAX_LINE);
         }
-        assert_eq!(Command::parse(b"RETR a\nb\r\n"), Err(CommandParseError::Trailing));
-        assert_eq!(Command::parse(&[b'A'; MAX_LINE]), Err(CommandParseError::Command(CommandError::LineTooLong)));
+        assert_eq!(Command::parse(b"RETR a\nb\r\n"), Err(Error::Trailing));
+        assert_eq!(Command::parse(&[b'A'; MAX_LINE]), Err(Error::LineTooLong));
         assert_eq!(Command::parse(b"retr \r\n"), Ok(Command::new("RETR", Some(""))));
     }
 
     #[test]
     fn argument_errors() {
-        use ArgumentError as E;
-        assert_eq!(request("USER"), Err(E::Missing));
-        assert_eq!(request("RETR"), Err(E::Missing));
-        assert_eq!(request("PORT"), Err(E::Missing));
-        assert_eq!(request("EPRT"), Err(E::Missing));
-        assert_eq!(request("TYPE"), Err(E::Missing));
-        assert_eq!(request("PASV x"), Err(E::Unexpected));
-        assert_eq!(request("QUIT "), Err(E::Unexpected));
-        assert_eq!(request("TYPE X"), Err(E::Invalid));
-        assert_eq!(request("TYPE A X"), Err(E::Invalid));
-        assert_eq!(request("TYPE I N"), Err(E::Invalid));
-        assert_eq!(request("TYPE L"), Err(E::Invalid));
-        assert_eq!(request("TYPE L 256"), Err(E::Invalid));
+        use Error as E;
+        assert_eq!(request("USER"), Err(E::MissingArgument));
+        assert_eq!(request("RETR"), Err(E::MissingArgument));
+        assert_eq!(request("PORT"), Err(E::MissingArgument));
+        assert_eq!(request("EPRT"), Err(E::MissingArgument));
+        assert_eq!(request("TYPE"), Err(E::MissingArgument));
+        assert_eq!(request("PASV x"), Err(E::UnexpectedArgument));
+        assert_eq!(request("QUIT "), Err(E::UnexpectedArgument));
+        assert_eq!(request("TYPE X"), Err(E::InvalidArgument));
+        assert_eq!(request("TYPE A X"), Err(E::InvalidArgument));
+        assert_eq!(request("TYPE I N"), Err(E::InvalidArgument));
+        assert_eq!(request("TYPE L"), Err(E::InvalidArgument));
+        assert_eq!(request("TYPE L 256"), Err(E::InvalidArgument));
         // RFC 959, section 5.3.2: a byte size is from 1 to 255.
-        assert_eq!(request("TYPE L 0"), Err(E::Invalid));
-        assert_eq!(request("TYPE A N X"), Err(E::Invalid));
-        assert_eq!(request("STRU X"), Err(E::Invalid));
-        assert_eq!(request("MODE X"), Err(E::Invalid));
-        assert_eq!(request("EPSV 3x"), Err(E::Invalid));
-        assert_eq!(request("EPSV 65536"), Err(E::Invalid));
-        assert_eq!(request("PORT 1,2,3,4,5"), Err(E::Address(AddressError::Syntax)));
+        assert_eq!(request("TYPE L 0"), Err(E::InvalidArgument));
+        assert_eq!(request("TYPE A N X"), Err(E::InvalidArgument));
+        assert_eq!(request("STRU X"), Err(E::InvalidArgument));
+        assert_eq!(request("MODE X"), Err(E::InvalidArgument));
+        assert_eq!(request("EPSV 3x"), Err(E::InvalidArgument));
+        assert_eq!(request("EPSV 65536"), Err(E::InvalidArgument));
+        assert_eq!(request("PORT 1,2,3,4,5"), Err(Error::Address));
         // RFC 959, section 5.3.2, and RFC 2389, section 4.
         for bad in
             ["ALLO xyz", "ALLO ", "ALLO 1 R", "ALLO 1 X 2", "ALLO 1  R 2", "REST a b", "REST ", "OPTS ", "OPTS  x"]
         {
-            assert_eq!(request(bad), Err(E::Invalid), "{bad:?}");
+            assert_eq!(request(bad), Err(E::InvalidArgument), "{bad:?}");
         }
         assert_eq!(request("ALLO 10 r 2"), Ok(Request::Allo("10 r 2".into())));
         assert_eq!(request("REST !x~"), Ok(Request::Rest("!x~".into())));
         assert_eq!(request("OPTS UTF8"), Ok(Request::Opts("UTF8".into())));
-        assert_eq!(request("EPRT |3|1.2.3.4|5|"), Err(E::Address(AddressError::Family)));
+        assert_eq!(request("EPRT |3|1.2.3.4|5|"), Err(Error::Family));
     }
 
     #[test]
     fn address_errors() {
-        use AddressError::*;
+        use Error::*;
         for bad in ["", "1,2,3,4,5", "1,2,3,4,5,6,", "256,0,0,0,0,0", "1,2,3,4,5,0006", "1, 2,3,4,5,6", "+1,2,3,4,5,6"]
         {
-            assert_eq!(PortAddress::parse(bad.as_bytes()).map(|token| token.address), Err(Syntax), "{bad:?}");
+            assert_eq!(PortAddress::parse(bad.as_bytes()).map(|token| token.address), Err(Address), "{bad:?}");
         }
         assert_eq!(PortAddress::parse("001,2,3,4,5,6".as_bytes()).map(|token| token.address), Ok(SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), 0x0506)));
         for bad in [
@@ -2076,7 +1948,7 @@ mod tests {
             "|x|1.2.3.4|5|",
             "|1|01.2.3.4|5|",
         ] {
-            assert_eq!(EprtAddress::parse(bad.as_bytes()).map(|token| token.address), Err(Syntax), "{bad:?}");
+            assert_eq!(EprtAddress::parse(bad.as_bytes()).map(|token| token.address), Err(Address), "{bad:?}");
         }
         assert_eq!(EprtAddress::parse("|0|1.2.3.4|5|".as_bytes()).map(|token| token.address), Err(Family));
         assert_eq!(EprtAddress::parse("|99999|1.2.3.4|5|".as_bytes()).map(|token| token.address), Err(Family));
@@ -2086,21 +1958,21 @@ mod tests {
         assert_eq!(EprtAddress::parse("|3|zone:4|x|".as_bytes()).map(|token| token.address), Err(Family));
         for bad in ["229 none", "229 ()", "229 (|||x|)", "229 (||1|5|)", "229 (|||5|", "229 (|||5)", "229 ( || 5|)"] {
             let r = reply_of(format!("{bad}\r\n").as_bytes());
-            assert_eq!(r.extended_passive_port(), Err(Syntax), "{bad:?}");
+            assert_eq!(r.extended_passive_port(), Err(Address), "{bad:?}");
         }
-        assert_eq!(Reply::new(code::OK, "(|||5|)").extended_passive_port(), Err(Code));
+        assert_eq!(Reply::new(code::OK, "(|||5|)").extended_passive_port(), Err(Code(code::OK)));
         // A reply built by hand with no lines.
         let empty = Reply { code: code::PASSIVE, lines: vec![] };
-        assert_eq!(empty.passive_address(), Err(Syntax));
+        assert_eq!(empty.passive_address(), Err(Address));
         let empty = Reply { code: code::EXTENDED_PASSIVE, lines: vec![] };
-        assert_eq!(empty.extended_passive_port(), Err(Syntax));
+        assert_eq!(empty.extended_passive_port(), Err(Address));
         // `)` as the delimiter (RFC 2428, section 3).
         let r = reply_of(b"229 Entering Extended Passive Mode ()))6446))\r\n");
         assert_eq!(r.extended_passive_port(), Ok(6446));
         for (flow, scope) in [(7, 0), (0, 9), (7, 9)] {
             let address = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 5, flow, scope));
-            assert_eq!(EprtAddress { address }.to_bytes(), Err(WriteError::Unwritable));
-            assert_eq!(Request::Eprt(address).to_bytes(), Err(WriteError::Unwritable));
+            assert_eq!(EprtAddress { address }.to_bytes(), Err(Error::Unwritable));
+            assert_eq!(Request::Eprt(address).to_bytes(), Err(Error::Unwritable));
         }
     }
 
@@ -2110,7 +1982,7 @@ mod tests {
             let address = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 5, flow, scope));
             let request = Request::Eprt(address);
             let mut out = b"prefix".to_vec();
-            assert_eq!(request.write(&mut out), Err(WriteError::Unwritable));
+            assert_eq!(request.write(&mut out), Err(Error::Unwritable));
             assert_eq!(out, b"prefix");
         }
     }
@@ -2119,29 +1991,29 @@ mod tests {
     fn request_write_refuses_known_verb_in_other() {
         let request = Request::Other(Command::new("RETR", Some("x")));
         let mut out = b"prefix".to_vec();
-        assert_eq!(request.write(&mut out), Err(WriteError::Unwritable));
+        assert_eq!(request.write(&mut out), Err(Error::Unwritable));
         assert_eq!(out, b"prefix");
     }
 
     #[test]
     fn reply_errors() {
-        assert_eq!(Reply::parse(b"600 x\r\n"), Err(ReplyParseError::Reply(ReplyError::Syntax)));
-        assert_eq!(Reply::parse(b"099 x\r\n"), Err(ReplyParseError::Reply(ReplyError::Syntax)));
-        assert_eq!(Reply::parse(b"20 x\r\n"), Err(ReplyParseError::Reply(ReplyError::Syntax)));
-        assert_eq!(Reply::parse(b"200x\r\n"), Err(ReplyParseError::Reply(ReplyError::Syntax)));
-        assert_eq!(Reply::parse(b"\r\n"), Err(ReplyParseError::Reply(ReplyError::Syntax)));
-        assert_eq!(Reply::parse(b"200 \xff\r\n"), Err(ReplyParseError::Reply(ReplyError::Text)));
-        assert_eq!(Reply::parse(b"200 a\rb\r\n"), Err(ReplyParseError::Reply(ReplyError::Text)));
-        assert_eq!(Reply::parse(b"200-a\r\nb\0\r\n"), Err(ReplyParseError::Reply(ReplyError::Text)));
+        assert_eq!(Reply::parse(b"600 x\r\n"), Err(Error::Syntax));
+        assert_eq!(Reply::parse(b"099 x\r\n"), Err(Error::Syntax));
+        assert_eq!(Reply::parse(b"20 x\r\n"), Err(Error::Syntax));
+        assert_eq!(Reply::parse(b"200x\r\n"), Err(Error::Syntax));
+        assert_eq!(Reply::parse(b"\r\n"), Err(Error::Syntax));
+        assert_eq!(Reply::parse(b"200 \xff\r\n"), Err(Error::Text));
+        assert_eq!(Reply::parse(b"200 a\rb\r\n"), Err(Error::Text));
+        assert_eq!(Reply::parse(b"200-a\r\nb\0\r\n"), Err(Error::Text));
         let long = [vec![b'2', b'0', b'0', b' '], vec![b'x'; MAX_LINE], b"\r\n".to_vec()].concat();
-        assert_eq!(Reply::parse(&long), Err(ReplyParseError::Reply(ReplyError::LineTooLong)));
+        assert_eq!(Reply::parse(&long), Err(Error::LineTooLong));
         // Too many lines.
         let mut many = b"200-first\r\n".to_vec();
         for _ in 0..MAX_REPLY_LINES {
             many.extend_from_slice(b"x\r\n");
         }
         many.extend_from_slice(b"200 last\r\n");
-        assert_eq!(Reply::parse(&many), Err(ReplyParseError::Reply(ReplyError::TooManyLines)));
+        assert_eq!(Reply::parse(&many), Err(Error::TooManyLines));
         // The most lines allowed.
         let mut most = b"200-first\r\n".to_vec();
         for _ in 0..MAX_REPLY_LINES - 2 {
@@ -2151,13 +2023,13 @@ mod tests {
         assert_eq!(reply_of(&most).lines.len(), MAX_REPLY_LINES);
         // A malformed first line is recoverable; invalid text in an open reply is terminal.
         assert_eq!(replies(b"200 ok\r\nhello\r\n200 ok\r\n"), [
-            Ok(Reply::new(code::OK, "ok")), Err(ReplyError::Syntax), Ok(Reply::new(code::OK, "ok"))
+            Ok(Reply::new(code::OK, "ok")), Err(Error::Syntax), Ok(Reply::new(code::OK, "ok"))
         ]);
         let mut stream = Stream::new(Replies::new());
         assert_eq!(stream.push(b"200-a\r\nb\0\r\n"), 11);
-        assert_eq!(stream.next(), Some(Err(Fail::Protocol(DecodeError::Reply(ReplyError::Text)))));
+        assert_eq!(stream.next(), Some(Err(Fail::Protocol(FrameError::Reply(Error::Text)))));
         assert!(stream.next().is_none());
-        assert_eq!(stream.failed(), Some(&Fail::Protocol(DecodeError::Reply(ReplyError::Text))));
+        assert_eq!(stream.failed(), Some(&Fail::Protocol(FrameError::Reply(Error::Text))));
     }
 
     #[test]
@@ -2177,7 +2049,7 @@ mod tests {
             assert_eq!(got.len(), 2);
             assert_eq!(got[0].is_ok(), ok);
             if !ok {
-                assert_eq!(got[0], Err(CommandError::LineTooLong));
+                assert_eq!(got[0], Err(Error::LineTooLong));
             }
             assert_eq!(got[1], Ok(Command::new("NOOP", None)));
             contract::check_decode_with_alloc_limit(Commands::new, &stream, 2 * MAX_LINE);
@@ -2198,7 +2070,7 @@ mod tests {
         let reply: &[u8] = b"211-Extensions supported:\r\n SIZE\r\n MDTM\r\n211 End\r\n";
         reply_of(reply);
         for n in 0..reply.len() {
-            assert_eq!(Reply::parse(&reply[..n]), Err(ReplyParseError::Incomplete), "{n} bytes");
+            assert_eq!(Reply::parse(&reply[..n]), Err(Error::Incomplete), "{n} bytes");
             assert_eq!(replies(&reply[..n]), vec![], "{n} bytes");
         }
     }
@@ -2245,7 +2117,7 @@ mod tests {
         ] {
             assert_eq!(
                 Reply::from_lines(code::READY, lines),
-                Err(WriteError::Unwritable)
+                Err(Error::Unwritable)
             );
         }
         for (size, fits) in [(MAX_CONTENT - 1, true), (MAX_CONTENT, false)] {
@@ -2256,7 +2128,7 @@ mod tests {
                 assert_eq!(reply.lines[1].len(), MAX_CONTENT);
                 contract::check_wire_value(&reply);
             } else {
-                assert_eq!(reply, Err(WriteError::LineTooLong));
+                assert_eq!(reply, Err(Error::LineTooLong));
             }
         }
     }
@@ -2266,15 +2138,15 @@ mod tests {
         let c = Request::Retr("a\r\nDELE b".into());
         assert_eq!(commands(&c.to_bytes().unwrap()), [Ok(Command::new("RETR", Some("a\r\nDELE b")))]);
         for (request, error) in [
-            (Request::Dele("a\nb".into()), WriteError::Unwritable),
-            (Request::Dele("a\0b".into()), WriteError::Unwritable),
-            (Request::Allo("xyz".into()), WriteError::Unwritable),
-            (Request::Other(Command::new("RETR", None)), WriteError::Unwritable),
-            (Request::Other(Command::new("NOOP", None)), WriteError::Unwritable),
-            (Request::Other(Command::new("noop", None)), WriteError::Unwritable),
-            (Request::Other(Command::new("abcd", None)), WriteError::Unwritable),
-            (Request::Stor("é".repeat(MAX_LINE)), WriteError::LineTooLong),
-            (Request::Stor("x".repeat(64 << 20)), WriteError::LineTooLong),
+            (Request::Dele("a\nb".into()), Error::Unwritable),
+            (Request::Dele("a\0b".into()), Error::Unwritable),
+            (Request::Allo("xyz".into()), Error::Unwritable),
+            (Request::Other(Command::new("RETR", None)), Error::Unwritable),
+            (Request::Other(Command::new("NOOP", None)), Error::Unwritable),
+            (Request::Other(Command::new("noop", None)), Error::Unwritable),
+            (Request::Other(Command::new("abcd", None)), Error::Unwritable),
+            (Request::Stor("é".repeat(MAX_LINE)), Error::LineTooLong),
+            (Request::Stor("x".repeat(64 << 20)), Error::LineTooLong),
         ] {
             let mut out = b"prefix".to_vec();
             assert_eq!(request.write(&mut out), Err(error));
@@ -2283,15 +2155,15 @@ mod tests {
         for verb in ["x-y z", "12", "", "abcdef"] {
             assert_eq!(
                 Command::new(verb, None).to_bytes(),
-                Err(WriteError::Unwritable)
+                Err(Error::Unwritable)
             );
         }
-        assert_eq!(Command::new("retr", Some("x")).to_bytes(), Err(WriteError::Unwritable));
+        assert_eq!(Command::new("retr", Some("x")).to_bytes(), Err(Error::Unwritable));
         let fits = "x".repeat(MAX_LINE - 7);
         let request = Request::Stor(fits.clone());
         assert_eq!(request.to_bytes().unwrap().len(), MAX_LINE);
         contract::check_wire_value(&request);
-        assert_eq!(Request::Stor(format!("{}\r", &fits[1..])).to_bytes(), Err(WriteError::LineTooLong));
+        assert_eq!(Request::Stor(format!("{}\r", &fits[1..])).to_bytes(), Err(Error::LineTooLong));
         for lines in [
             vec!["a\r\n214 x".into(), "214 end".into(), "214".into(), "é".repeat(MAX_LINE), "z".into()],
             vec!["a".into(), "214 end".into(), "z".into()],
@@ -2302,23 +2174,23 @@ mod tests {
         ] {
             let reply = Reply { code: code::HELP, lines };
             let mut out = b"prefix".to_vec();
-            assert_eq!(reply.write(&mut out), Err(WriteError::Unwritable));
+            assert_eq!(reply.write(&mut out), Err(Error::Unwritable));
             assert_eq!(out, b"prefix");
         }
         let reply = Reply { code: code::READY, lines: vec!["a".into(), "230 Logged in".into(), "999-x".into(), "end".into()] };
         assert_eq!(reply.to_bytes().unwrap(), b"220-a\r\n230 Logged in\r\n999-x\r\n220 end\r\n");
         let one = Reply::new(code::OK, &"x".repeat(2 * MAX_LINE));
-        assert_eq!(one.to_bytes(), Err(WriteError::LineTooLong));
+        assert_eq!(one.to_bytes(), Err(Error::LineTooLong));
         for feature in [
             Feature { name: "a b".into(), params: Some("p\r\nq\x01\té".into()) },
             Feature { name: " ".into(), params: None },
             Feature { name: "X".into(), params: Some(String::new()) },
             Feature { name: "Y".into(), params: Some("\x01".into()) },
         ] {
-            assert_eq!(Reply::feature_list(&[feature]), Err(WriteError::Unwritable));
+            assert_eq!(Reply::feature_list(&[feature]), Err(Error::Unwritable));
         }
         let many: Vec<_> = (0..MAX_REPLY_LINES).map(|i| Feature { name: format!("F{i}"), params: None }).collect();
-        assert_eq!(Reply::feature_list(&many), Err(WriteError::Unwritable));
+        assert_eq!(Reply::feature_list(&many), Err(Error::Unwritable));
         let reply = Reply::feature_list(&many[..MAX_FEATURES]).unwrap();
         assert_eq!(reply.features().unwrap().len(), MAX_FEATURES);
         contract::check_wire_value(&reply);
@@ -2334,7 +2206,7 @@ mod tests {
             assert_eq!(Reply::parse(&bytes), Ok(reply.clone()));
             reply.lines[at].push('x');
             let mut out = b"prefix".to_vec();
-            assert_eq!(reply.write(&mut out), Err(WriteError::LineTooLong));
+            assert_eq!(reply.write(&mut out), Err(Error::LineTooLong));
             assert_eq!(out, b"prefix");
         }
         for mut feature in [
@@ -2348,13 +2220,13 @@ mod tests {
             } else {
                 feature.name.push('x');
             }
-            assert_eq!(Reply::feature_list(&[feature]), Err(WriteError::LineTooLong));
+            assert_eq!(Reply::feature_list(&[feature]), Err(Error::LineTooLong));
         }
         let reply = Reply::new(code::OK, &"x".repeat(MAX_REPLY_TEXT));
         assert_eq!(reply.to_bytes().unwrap().len(), MAX_LINE);
         let reply = Reply::new(code::OK, &"x".repeat(MAX_REPLY_TEXT + 1));
         assert_eq!(reply.lines[0].len(), MAX_REPLY_TEXT + 1);
-        assert_eq!(reply.to_bytes(), Err(WriteError::LineTooLong));
+        assert_eq!(reply.to_bytes(), Err(Error::LineTooLong));
     }
 
     #[test]
@@ -2375,9 +2247,9 @@ mod tests {
         let stream = b"USER a\r\n\r\nPASV\nbad1\r\nQUIT\r\n";
         let want = vec![
             Ok(Command::new("USER", Some("a"))),
-            Err(CommandError::Empty),
+            Err(Error::Empty),
             Ok(Command::new("PASV", None)),
-            Err(CommandError::Verb),
+            Err(Error::Verb),
             Ok(Command::new("QUIT", None)),
         ];
         assert_eq!(commands(stream), want);
@@ -2409,7 +2281,7 @@ mod tests {
         // skipped, pushed whole or in pieces.
         let long = [b"NOOP\r\n".repeat(10), vec![b'x'; 2 * MAX_LINE], b"\r\nQUIT\r\n".to_vec()].concat();
         let mut want = vec![Ok(Command::new("NOOP", None)); 10];
-        want.push(Err(CommandError::LineTooLong));
+        want.push(Err(Error::LineTooLong));
         want.push(Ok(Command::new("QUIT", None)));
         assert_eq!(commands(&long), want);
         contract::check_decode_with_alloc_limit(Commands::new, &long, 2 * MAX_LINE);
@@ -2420,7 +2292,7 @@ mod tests {
     #[test]
     fn streams_bound_input_allocation() {
         let big = [vec![b'x'; 1 << 20], b"yy\r\nNOOP\r\n".to_vec()].concat();
-        assert_eq!(commands(&big), [Err(CommandError::LineTooLong), Ok(Command::new("NOOP", None))]);
+        assert_eq!(commands(&big), [Err(Error::LineTooLong), Ok(Command::new("NOOP", None))]);
         contract::check_decode_with_alloc_limit(Commands::new, &big, 2 * MAX_LINE);
         let mut stream = Stream::new(Commands::new());
         let many = b"NOOP\r\n".repeat(MAX_LINE);
@@ -2430,7 +2302,7 @@ mod tests {
         let big = [b"200 a\r\n".as_slice(), &vec![b'x'; 1 << 20], b"\r\n"].concat();
         let (items, failure) = decode_all(Replies::new, &big);
         assert_eq!(items, [Ok(Reply::new(code::OK, "a"))]);
-        assert_eq!(failure, Some(Fail::Protocol(DecodeError::Reply(ReplyError::LineTooLong))));
+        assert_eq!(failure, Some(Fail::Protocol(FrameError::Reply(Error::LineTooLong))));
         contract::check_decode_with_alloc_limit(Replies::new, &big, 2 * MAX_LINE);
     }
 
@@ -2469,7 +2341,7 @@ mod tests {
             s.extend_from_slice(b"x\r\n");
         }
         s.extend_from_slice(b"200 last\r\n220 next\r\n");
-        let want = vec![Err(ReplyError::TooManyLines), Ok(Reply::new(code::READY, "next"))];
+        let want = vec![Err(Error::TooManyLines), Ok(Reply::new(code::READY, "next"))];
         assert_eq!(replies(&s), want);
         contract::check_decode_with_alloc_limit(Replies::new, &s, 2 * MAX_LINE);
     }
@@ -2481,8 +2353,8 @@ mod tests {
         assert_eq!(f, [Feature { name: "x-Custom".into(), params: Some("a\tb".into()) }]);
         assert_eq!(Reply::feature_list(&f).unwrap().features(), Ok(f));
         // RFC 2389, section 2.1: parameters are TCHAR.
-        assert_eq!(reply_of(b"211-x\r\n X \x01\r\n211 End\r\n").features(), Err(FeatureError::Line));
-        assert_eq!(reply_of("211-x\r\n X é\r\n211 End\r\n".as_bytes()).features(), Err(FeatureError::Line));
+        assert_eq!(reply_of(b"211-x\r\n X \x01\r\n211 End\r\n").features(), Err(Error::Feature));
+        assert_eq!(reply_of("211-x\r\n X é\r\n211 End\r\n".as_bytes()).features(), Err(Error::Feature));
     }
 
     #[test]

@@ -8,28 +8,28 @@ use fictionet::stdlib::codec::{
     test_support::decode_all,
 };
 use fictionet::stdlib::memcache::{
-    BINARY_HEADER_LEN, Command, Commands, CounterExtras, Frames, MAX_BINARY_BUFFERED, MAX_LINE,
+    BINARY_HEADER_LEN, Command, Commands, CounterExtras, Packets, MAX_BINARY_BUFFERED, MAX_LINE,
     MAX_TEXT_HELD, MetaFlag, MetaStatus, Packet, Response, Responses, Status, StoreExtras,
-    UDP_HEADER_LEN, UDP_MAX_DATAGRAM, UdpError, UdpFrame,
+    UDP_HEADER_LEN, UDP_MAX_DATAGRAM, Error, UdpFrame,
 };
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     check_decode_with_alloc_limit(Commands::new, data, 2 * MAX_LINE);
     check_decode_with_alloc_limit(Responses::new, data, 2 * MAX_LINE);
-    check_decode_with_alloc_limit(Frames::new, data, 2 * MAX_BINARY_BUFFERED);
+    check_decode_with_alloc_limit(Packets::new, data, 2 * MAX_BINARY_BUFFERED);
     check_decode_with_held_limit(Commands::new, data, MAX_TEXT_HELD);
     check_decode_with_held_limit(Responses::new, data, MAX_TEXT_HELD);
     check_decode_with_alloc_limit(|| Commands::with_limit(17), data, 2 * MAX_LINE);
     check_decode_with_alloc_limit(|| Responses::with_limit(17), data, 2 * MAX_LINE);
     check_decode_with_alloc_limit(
-        || Frames::with_limit(17),
+        || Packets::with_limit(17),
         data,
         2 * (BINARY_HEADER_LEN + 17),
     );
     check_decode_with_held_limit(|| Commands::with_limit(17), data, MAX_TEXT_HELD);
     check_decode_with_held_limit(|| Responses::with_limit(17), data, MAX_TEXT_HELD);
-    check_decode_with_held_limit(Frames::new, data, 0);
+    check_decode_with_held_limit(Packets::new, data, 0);
     check_wire::<Command>(data);
     check_wire::<Response>(data);
     check_wire::<Packet>(data);
@@ -61,7 +61,7 @@ fuzz_target!(|data: &[u8]| {
     check_wire_value(&Response::Stat { name: first.clone(), value: data.to_vec() });
     check_wire_value(&Response::Meta { status: MetaStatus::Header, flags });
 
-    for packet in decode_all(Frames::new, data).0 {
+    for packet in decode_all(Packets::new, data).0 {
         check_wire_value(&packet);
         assert_eq!(Packet::parse(&packet.to_bytes().unwrap()), Ok(packet.clone()));
         assert_eq!(Status::from_code(packet.status).code(), packet.status);
@@ -77,7 +77,7 @@ fuzz_target!(|data: &[u8]| {
     let split = UdpFrame::split(7, data);
     // Even an unusually large corpus entry must not panic at the count limit.
     if data.len().div_ceil(UDP_MAX_DATAGRAM - UDP_HEADER_LEN) > usize::from(u16::MAX) {
-        assert_eq!(split, Err(UdpError::TooLong(data.len())));
+        assert_eq!(split, Err(Error::PayloadTooLong(data.len())));
         return;
     }
     let frames = split.unwrap();

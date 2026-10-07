@@ -11,7 +11,7 @@ use fictionet::stdlib::codec::{
 };
 use fictionet::stdlib::whois::{
     Field, MAX_QUERY, MAX_RESPONSE, RESPONSE_WINDOW, Queries, Query, Referral,
-    ReferralKind, Response, Responses, find_referral, parse_fields,
+    ReferralKind, Response, CollectedResponses, find_referral, parse_fields,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -68,10 +68,10 @@ fn built(data: &[u8]) -> Result<()> {
 
 fuzz_target!(|data: &[u8]| {
     check_decode_with_alloc_limit(Queries::new, data, 2 * (MAX_QUERY + 2));
-    check_decode_with_alloc_limit(Responses::new, data, 2 * RESPONSE_WINDOW);
-    check_decode_with_held_limit(Responses::new, data, MAX_RESPONSE);
-    check_decode_with_alloc_limit(|| Responses::with_limit(17), data, 2 * RESPONSE_WINDOW);
-    check_decode_with_held_limit(|| Responses::with_limit(17), data, 17);
+    check_decode_with_alloc_limit(CollectedResponses::new, data, 2 * RESPONSE_WINDOW);
+    check_decode_with_held_limit(CollectedResponses::new, data, MAX_RESPONSE);
+    check_decode_with_alloc_limit(|| CollectedResponses::with_limit(17), data, 2 * RESPONSE_WINDOW);
+    check_decode_with_held_limit(|| CollectedResponses::with_limit(17), data, 17);
     check_wire::<Query>(data);
     check_wire::<Response>(data);
 
@@ -81,7 +81,7 @@ fuzz_target!(|data: &[u8]| {
         let _ = (query.flags(), query.terms());
     }
 
-    let (responses, failure) = decode_all(Responses::new, data);
+    let (responses, failure) = decode_all(CollectedResponses::new, data);
     assert_eq!(failure, None);
     assert_eq!(responses.len(), 1);
     let collected = &responses[0];
