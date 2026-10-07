@@ -672,8 +672,8 @@ impl Wire for Tpdu {
 
     /// Reads one TPDU. Input over [`MAX_TPDU`] returns [`Error::TpduTooLong`].
     /// Invalid length indicators, short headers, unsupported codes, or an
-    /// unexpected header or data length return [`Error::Tpdu`] with
-    /// the corresponding [`Error`].
+    /// unexpected header or data length return the corresponding
+    /// [`Error`].
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         if bytes.len() > MAX_TPDU {
             return Err(Error::TpduTooLong {

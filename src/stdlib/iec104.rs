@@ -216,8 +216,8 @@ impl Wire for Frame {
     /// Reads exactly one frame. Incomplete input and trailing bytes are errors.
     /// Returns [`Error::Truncated`] for an incomplete APDU and
     /// [`Error::Trailing`] for extra bytes. Invalid start bytes,
-    /// lengths, control fields or ASDU lengths return [`Error::Frame`]
-    /// with [`Error::Start`], [`Error::ApduLength`],
+    /// lengths, control fields or ASDU lengths return
+    /// [`Error::Start`], [`Error::ApduLength`],
     /// [`Error::Control`] or [`Error::AsduLength`].
     fn parse(b: &[u8]) -> Result<Self, Error> {
         match Self::parse_prefix(b)? {

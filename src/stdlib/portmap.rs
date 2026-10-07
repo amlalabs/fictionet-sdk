@@ -14,7 +14,7 @@
 //! addresses.
 //!
 //! Nothing here reads a socket, and nothing here frames a message. The
-//! [`onc_rpc`](fictionet::stdlib::onc_rpc) module reads and writes calls,
+//! [`onc_rpc`] module reads and writes calls,
 //! replies and TCP records. A world that plays a portmapper reads each
 //! [`Call`] there, reads its [`Request`] here with
 //! [`Request::from_call`], works out the answer, and writes it with
@@ -24,7 +24,7 @@
 //! fails; [`silent_on_failure`](fictionet::stdlib::onc_rpc::silent_on_failure)
 //! says which calls those are.
 //!
-//! Over TCP, map [`onc_rpc::messages`](fictionet::stdlib::onc_rpc::messages) with a
+//! Over TCP, map [`onc_rpc::messages`] with a
 //! closure. [`Request::read`] also accepts version, procedure, and arguments
 //! directly when the caller has already checked the RPC header.
 //!

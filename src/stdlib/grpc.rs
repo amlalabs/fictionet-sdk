@@ -265,8 +265,8 @@ impl Wire for Message {
     /// Reads exactly one message with at most [`MAX_MESSAGE`] body bytes.
     /// Returns [`Error::Truncated`] for incomplete input and
     /// [`Error::Trailing`] for extra bytes. A flag other than
-    /// 0 or 1 or a body above the limit returns [`Error::Frame`]
-    /// with [`Error::Flag`] or [`Error::TooLarge`]. Compressed
+    /// 0 or 1 or a body above the limit returns [`Error::Flag`] or
+    /// [`Error::TooLarge`]. Compressed
     /// bodies remain flagged bytes.
     fn parse(b: &[u8]) -> Result<Self, Self::ParseError> {
         match Message::parse_prefix(b)? {

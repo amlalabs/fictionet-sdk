@@ -246,7 +246,7 @@ impl Wire for Frame {
     /// Reads exactly one frame. Returns [`Error::Truncated`] for
     /// incomplete input and [`Error::Trailing`] for trailing bytes.
     /// A nonzero protocol ID or length outside 2..=254 returns
-    /// [`Error::Frame`] with [`Error::Protocol`] or [`Error::Length`].
+    /// [`Error::Protocol`] or [`Error::Length`].
     fn parse(b: &[u8]) -> Result<Self, Error> {
         match Self::parse_prefix(b)? {
             Some((frame, used)) if used == b.len() => Ok(frame),

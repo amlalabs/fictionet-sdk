@@ -200,7 +200,7 @@ impl Wire for Frame {
     /// Reads exactly one frame. Incomplete input and trailing bytes are errors.
     /// Returns [`Error::Truncated`] for an incomplete frame and
     /// [`Error::Trailing`] for extra bytes. Bad start bytes, lengths
-    /// and CRCs return [`Error::Frame`] with [`Error::Start`],
+    /// and CRCs return [`Error::Start`],
     /// [`Error::FrameLength`] or [`Error::Crc`].
     fn parse(b: &[u8]) -> Result<Self, Error> {
         match Self::parse_prefix(b)? {
