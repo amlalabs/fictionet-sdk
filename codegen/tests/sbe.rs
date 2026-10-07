@@ -375,3 +375,37 @@ fn mutated_schemas_never_panic() {
     }
     assert!(generated > 50, "{generated}");
 }
+
+/// Schemas whose IR would grow with the product of two counts are refused
+/// by the front end itself, before that IR exists.
+#[test]
+fn refuses_amplifying_schemas_early() {
+    // A dimension composite repeating a role would be copied into every
+    // group that uses it.
+    let repeated: String = (0..64)
+        .map(|_| r#"<type name="blockLength" primitiveType="uint16"/>"#)
+        .collect();
+    let groups: String = (0..64)
+        .map(|i| format!(r#"<group name="g{i}" id="{i}" dimensionType="Dim"/>"#))
+        .collect();
+    let schema = xml(
+        &format!(
+            r#"<composite name="Dim"><type name="numInGroup" primitiveType="uint8"/>{repeated}</composite>"#
+        ),
+        &groups,
+    );
+    assert_eq!(parse(&schema).unwrap_err().kind, ErrorKind::DuplicateName);
+    // Fields, members, and choices count against MAX_FIELDS as they are
+    // read, so a large enum cannot be referenced by many fields.
+    let choices: String = (0..3000)
+        .map(|i| format!(r#"<validValue name="v{i}">{i}</validValue>"#))
+        .collect();
+    let fields: String = (0..3000)
+        .map(|i| format!(r#"<field name="f{i}" id="{i}" type="E"/>"#))
+        .collect();
+    let schema = xml(
+        &format!(r#"<enum name="E" encodingType="uint16">{choices}</enum>"#),
+        &fields,
+    );
+    assert_eq!(parse(&schema).unwrap_err().kind, ErrorKind::IrLimit);
+}

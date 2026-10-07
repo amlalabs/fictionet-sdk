@@ -25,6 +25,7 @@ use crate::{
     xml::{self, Document, Node},
 };
 use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
 
 /// The SBE 1.0 XML schema front end, registered as `sbe`.
 #[derive(Clone, Copy, Debug)]
@@ -350,7 +351,8 @@ impl Simple {
     }
 }
 
-/// What a field or member needs to know about an enum.
+/// What a field or member needs to know about an enum. Shared through an
+/// `Rc`, so each reference does not copy the choices.
 #[derive(Clone, Debug)]
 struct EnumInfo {
     ir: String,
@@ -362,7 +364,7 @@ struct EnumInfo {
 #[derive(Clone, Debug)]
 enum Encoding {
     Simple(Simple),
-    Enum(EnumInfo),
+    Enum(Rc<EnumInfo>),
     Set { ir: String, size: usize },
     Composite { ir: String, length: usize },
 }
@@ -377,6 +379,9 @@ struct Compiler<'a> {
     active: BTreeSet<usize>,
     /// Named IR types, keyed by XML node for document order.
     types: BTreeMap<usize, NamedType>,
+    /// Fields, members, and choices so far. The validator counts at least
+    /// these against [`MAX_FIELDS`]; refusing early bounds the work.
+    fields: usize,
 }
 
 impl<'a> Compiler<'a> {
@@ -397,6 +402,7 @@ impl<'a> Compiler<'a> {
             compiled: BTreeMap::new(),
             active: BTreeSet::new(),
             types: BTreeMap::new(),
+            fields: 0,
         })
     }
     fn node(&self, id: usize) -> Result<&'a Node, Error> {
@@ -404,6 +410,14 @@ impl<'a> Compiler<'a> {
             .nodes
             .get(id)
             .ok_or_else(|| shape("schema", "missing XML node"))
+    }
+    /// Counts one IR field, variant, or bit against [`MAX_FIELDS`].
+    fn count(&mut self, path: &str) -> Result<(), Error> {
+        self.fields += 1;
+        if self.fields > MAX_FIELDS {
+            return Err(Error::new(ErrorKind::IrLimit, path, "MAX_FIELDS exceeded"));
+        }
+        Ok(())
     }
     fn since(&self, n: &Node, path: &str) -> Result<(), Error> {
         if number(n, "sinceVersion", 0, path)? > self.version
@@ -706,7 +720,7 @@ impl<'a> Compiler<'a> {
             .find(|(n, _)| n == choice)
             .map(|(_, v)| *v)
             .ok_or_else(|| shape(path, "valueRef names no valid value"))?;
-        Ok((info.ir, value))
+        Ok((info.ir.clone(), value))
     }
 
     fn choices(
@@ -762,6 +776,7 @@ impl<'a> Compiler<'a> {
             }
             let choice = symbol(c, path)?;
             let choice_path = format!("{path}.{choice}");
+            self.count(&choice_path)?;
             self.since(c, &choice_path)?;
             let value = if is_set {
                 let bit = c
@@ -840,11 +855,11 @@ impl<'a> Compiler<'a> {
                 size: s.prim.size(),
             }
         } else {
-            Encoding::Enum(EnumInfo {
+            Encoding::Enum(Rc::new(EnumInfo {
                 ir: name.into(),
                 encoding: s,
                 choices,
-            })
+            }))
         })
     }
 
@@ -868,6 +883,7 @@ impl<'a> Compiler<'a> {
             let c = self.node(child)?;
             let member = symbol(c, path)?;
             let member_path = format!("{path}.{member}");
+            self.count(&member_path)?;
             if !names.insert(member.clone()) {
                 return Err(Error::new(
                     ErrorKind::DuplicateName,
@@ -1078,12 +1094,21 @@ impl<'a> Compiler<'a> {
         if number(n, "sinceVersion", 0, &path)? != 0 {
             return Err(shape(&path, "headers cannot be versioned"));
         }
-        let mut fields = Vec::new();
+        let mut fields: Vec<HeaderField> = Vec::new();
         let mut end = 0usize;
         for &child in &n.children {
             let c = self.node(child)?;
             let member = symbol(c, &path)?;
             let member_path = format!("{path}.{member}");
+            // Each role appears once, so a header has at most four fields,
+            // however many groups reuse it.
+            if fields.iter().any(|f| f.name == member) {
+                return Err(Error::new(
+                    ErrorKind::DuplicateName,
+                    member_path,
+                    "duplicate header field",
+                ));
+            }
             let s = match c.tag.as_str() {
                 "type" => self.simple(c, &member_path, 1)?,
                 "ref" => match self.named(
@@ -1194,6 +1219,7 @@ impl<'a> Compiler<'a> {
             let c = self.node(child)?;
             let member = symbol(c, path)?;
             let member_path = format!("{path}/{member}");
+            self.count(&member_path)?;
             let field_id = c
                 .attr("id")
                 .ok_or_else(|| shape(&member_path, "missing id"))?
