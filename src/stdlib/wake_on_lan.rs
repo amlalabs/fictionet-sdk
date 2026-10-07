@@ -160,7 +160,7 @@ fn packet_at(bytes: &[u8]) -> Option<Mac> {
         return None;
     }
     let mac: Mac = repeats.get(..MAC_LEN)?.try_into().ok()?;
-    if repeats.chunks_exact(MAC_LEN).all(|c| c == mac) {
+    if repeats.as_chunks::<MAC_LEN>().0.iter().all(|c| *c == mac) {
         Some(mac)
     } else {
         None

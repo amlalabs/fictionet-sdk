@@ -1239,7 +1239,7 @@ fn ends(line: &str, code: ReplyCode) -> bool {
 
 /// The two bytes taken to come before the bytes a reader holds: the end
 /// of a line, or of nothing.
-const LINE_START: [u8; 2] = [b'\n', b'\n'];
+const LINE_START: [u8; 2] = *b"\n\n";
 
 /// Where the first line end in `b` is: the first LF that does not follow
 /// CR NUL. A LF after CR NUL is part of a pathname (RFC 2640, section

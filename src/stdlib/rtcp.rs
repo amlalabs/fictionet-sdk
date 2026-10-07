@@ -646,7 +646,9 @@ impl XrBlock {
         }
         Some(
             self.data
-                .chunks_exact(12)
+                .as_chunks::<12>()
+                .0
+                .iter()
                 .map(|c| DlrrItem { ssrc: be32(c, 0), last_rr: be32(c, 4), delay_since_last_rr: be32(c, 8) })
                 .collect(),
         )
@@ -839,7 +841,7 @@ impl Body {
                             return Err(bad);
                         }
                         TransportMessage::Nack(
-                            fci.chunks_exact(4).map(|e| Nack { pid: be16(e, 0), blp: be16(e, 2) }).collect(),
+                            fci.as_chunks::<4>().0.iter().map(|e| Nack { pid: be16(e, 0), blp: be16(e, 2) }).collect(),
                         )
                     }
                     rtpfb::TMMBR | rtpfb::TMMBN => {
@@ -847,7 +849,9 @@ impl Body {
                             return Err(bad);
                         }
                         let items = fci
-                            .chunks_exact(8)
+                            .as_chunks::<8>()
+                            .0
+                            .iter()
                             .map(|e| {
                                 let v = be32(e, 4);
                                 Tmmb {
@@ -888,7 +892,7 @@ impl Body {
                             return Err(bad);
                         }
                         PayloadMessage::Sli(
-                            fci.chunks_exact(4)
+                            fci.as_chunks::<4>().0.iter()
                                 .map(|e| {
                                     let v = be32(e, 0);
                                     Sli {
@@ -915,7 +919,7 @@ impl Body {
                         // The media SSRC is unused, and ignored on reading.
                         media_ssrc = 0;
                         PayloadMessage::Fir(
-                            fci.chunks_exact(8).map(|e| Fir { ssrc: be32(e, 0), sequence: e[4] }).collect(),
+                            fci.as_chunks::<8>().0.iter().map(|e| Fir { ssrc: be32(e, 0), sequence: e[4] }).collect(),
                         )
                     }
                     psfb::AFB if fci.starts_with(REMB_ID) => {
@@ -1625,7 +1629,7 @@ impl Decode for Frames {
 
 /// Reads `n` report blocks from the start of `b`, which holds them all.
 fn report_blocks(b: &[u8], n: usize) -> Vec<ReportBlock> {
-    b.chunks_exact(REPORT_BLOCK_LEN)
+    b.as_chunks::<REPORT_BLOCK_LEN>().0.iter()
         .take(n)
         .map(|r| {
             let raw = be32(r, 4) & 0xff_ffff;
@@ -1726,7 +1730,7 @@ fn parse_remb(fci: &[u8]) -> Option<Remb> {
     Some(Remb {
         exponent: (v >> 18 & 0x3f) as u8,
         mantissa: v & 0x3_ffff,
-        ssrcs: rest.chunks_exact(4).map(|s| be32(s, 0)).collect(),
+        ssrcs: rest.as_chunks::<4>().0.iter().map(|s| be32(s, 0)).collect(),
     })
 }
 

@@ -1,0 +1,4 @@
+# cargo-fuzz needs nightly. This keeps the pinned stable toolchain in the
+# crate root's rust-toolchain.toml from applying here.
+[toolchain]
+channel = "nightly"

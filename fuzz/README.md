@@ -190,6 +190,18 @@ On a system whose default target is not `x86_64-unknown-linux-gnu`, add
 `--target x86_64-unknown-linux-gnu`: the sanitizer does not work with
 musl's static libc.
 
+To run every target in turn, as CI does, for some seconds each:
+
+```sh
+cargo +nightly fuzz build -O -a
+fuzz/run-all.sh 60 -timeout=20 -rss_limit_mb=4096
+```
+
+It goes on past a target that fails and lists the failures at the end.
+Every target needs a `[[bin]]` in `fuzz/Cargo.toml` and a directory in
+`fuzz/corpus/`, even an empty one; `fuzz/check-targets.sh` checks both,
+and CI runs it.
+
 The `tcp` target never sleeps by default, which keeps it fast. To reach
 the timers too (delayed ACKs, TIME-WAIT), let each input sleep up to some
 milliseconds in all:

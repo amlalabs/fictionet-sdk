@@ -952,7 +952,9 @@ fn parse_capabilities(mut r: &[u8]) -> Result<Vec<Capability>, Error> {
             }
             capability::GRACEFUL_RESTART if v.len() >= 2 && (v.len() - 2).is_multiple_of(4) => {
                 let families = v[2..]
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .map(|c| RestartFamily { afi: u16::from_be_bytes([c[0], c[1]]), safi: c[2], flags: c[3] })
                     .collect();
                 Capability::GracefulRestart(GracefulRestart {
@@ -1385,7 +1387,7 @@ impl Attribute {
             }
             // RFC 7606 section 7.8: a nonzero multiple of 4 bytes.
             attr::COMMUNITIES if !v.is_empty() && v.len().is_multiple_of(4) => Attribute::Communities {
-                values: v.chunks_exact(4).map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]])).collect(),
+                values: v.as_chunks::<4>().0.iter().map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]])).collect(),
                 partial,
             },
             attr::COMMUNITIES => return Err(length()),

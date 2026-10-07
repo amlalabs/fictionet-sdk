@@ -328,7 +328,7 @@ impl Attribute {
                     return Err(bad());
                 }
                 Ok(Attribute::UnknownAttributes(
-                    value.chunks_exact(2).filter_map(|c| be16(c, 0)).collect(),
+                    value.as_chunks::<2>().0.iter().filter_map(|c| be16(c, 0)).collect(),
                 ))
             }
             attr::FINGERPRINT => Err(ParseError::FingerprintNotLast),

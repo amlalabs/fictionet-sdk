@@ -592,11 +592,11 @@ fn full_mask(a: IpAddr) -> u8 {
 /// Adds `b` to a ones' complement sum, as 16-bit words with a zero byte
 /// added to an odd length.
 fn sum_words(mut sum: u64, b: &[u8]) -> u64 {
-    let mut words = b.chunks_exact(2);
-    for w in &mut words {
+    let (words, rest) = b.as_chunks::<2>();
+    for w in words {
         sum += u64::from(u16::from_be_bytes([w[0], w[1]]));
     }
-    if let [last] = words.remainder() {
+    if let [last] = rest {
         sum += u64::from(*last) << 8;
     }
     sum

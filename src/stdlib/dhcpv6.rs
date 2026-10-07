@@ -1041,7 +1041,7 @@ fn parse_option(code: u16, b: &[u8], depth: usize) -> Result<DhcpOption, ParseEr
             if !b.len().is_multiple_of(2) {
                 return Err(bad);
             }
-            DhcpOption::Oro(b.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect())
+            DhcpOption::Oro(b.as_chunks::<2>().0.iter().map(|c| u16::from_be_bytes([c[0], c[1]])).collect())
         }
         opt::PREFERENCE => {
             fixed(1)?;
@@ -1113,7 +1113,7 @@ fn parse_option(code: u16, b: &[u8], depth: usize) -> Result<DhcpOption, ParseEr
             if b.is_empty() || !b.len().is_multiple_of(16) {
                 return Err(bad);
             }
-            DhcpOption::DnsServers(b.chunks_exact(16).map(|c| addr(c, 0)).collect())
+            DhcpOption::DnsServers(b.as_chunks::<16>().0.iter().map(|c| addr(c, 0)).collect())
         }
         opt::DOMAIN_LIST => match parse_names(b).ok_or(bad)? {
             Names::Hosts(names) => DhcpOption::DomainList(names),

@@ -493,7 +493,7 @@ impl Wire for Frame {
             }),
             4 => {
                 let mut entries = Vec::new();
-                for b in b.chunks_exact(6) {
+                for b in b.as_chunks::<6>().0 {
                     let id = u16::from_be_bytes([
                         *b.first().ok_or_else(|| size("setting"))?,
                         *b.get(1).ok_or_else(|| size("setting"))?,
@@ -2438,7 +2438,9 @@ impl Decode for Capture {
                     FrameItem::Frame(Frame::Settings(settings)) => &settings.entries,
                     _ => {
                         partial = body
-                            .chunks_exact(6)
+                            .as_chunks::<6>()
+                            .0
+                            .iter()
                             .map(|b| {
                                 Ok(Setting {
                                     id: u16::from_be_bytes([

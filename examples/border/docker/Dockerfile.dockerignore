@@ -4,6 +4,9 @@
 !src
 !docs
 !dashboard
+!benches
+!codegen
+!tests/copy_and_own
 !examples/*.rs
 !examples/border/world/Cargo.toml
 !examples/border/world/Cargo.lock

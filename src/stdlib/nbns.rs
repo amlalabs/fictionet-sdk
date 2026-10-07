@@ -175,7 +175,7 @@ pub fn decode_first_level(label: &[u8]) -> Option<[u8; NAME_LEN]> {
     }
     let half = |c: u8| if (b'A'..=b'P').contains(&c) { Some(c - b'A') } else { None };
     let mut out = [0u8; NAME_LEN];
-    for (i, pair) in label.chunks_exact(2).enumerate() {
+    for (i, pair) in label.as_chunks::<2>().0.iter().enumerate() {
         out[i] = half(pair[0])? << 4 | half(pair[1])?;
     }
     Some(out)
@@ -589,14 +589,16 @@ impl RData {
 
     fn parse(rr: u16, data: &[u8]) -> RData {
         if rr == rr_type::NB && data.len().is_multiple_of(NB_ENTRY_LEN) {
-            return RData::Nb(data.chunks_exact(NB_ENTRY_LEN).map(NbEntry::parse).collect());
+            return RData::Nb(data.as_chunks::<NB_ENTRY_LEN>().0.iter().map(|e| NbEntry::parse(e)).collect());
         }
         if rr == rr_type::NBSTAT
             && let Some((&n, rest)) = data.split_first()
             && let Some(names) = rest.get(..usize::from(n) * NODE_NAME_LEN)
         {
             let names = names
-                .chunks_exact(NODE_NAME_LEN)
+                .as_chunks::<NODE_NAME_LEN>()
+                .0
+                .iter()
                 .map(|c| {
                     let mut bytes = [0u8; NAME_LEN];
                     bytes.copy_from_slice(&c[..NAME_LEN]);

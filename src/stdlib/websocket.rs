@@ -1440,11 +1440,11 @@ fn sha1(parts: &[&[u8]]) -> [u8; 20] {
     tail[used] = 0x80;
     let n = if used < 56 { 64 } else { 128 };
     tail[n - 8..n].copy_from_slice(&bits.to_be_bytes());
-    for block in tail[..n].chunks_exact(64) {
+    for block in tail[..n].as_chunks::<64>().0 {
         sha1_block(&mut h, block);
     }
     let mut out = [0u8; 20];
-    for (o, word) in out.chunks_exact_mut(4).zip(h) {
+    for (o, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(h) {
         o.copy_from_slice(&word.to_be_bytes());
     }
     out
@@ -1452,7 +1452,7 @@ fn sha1(parts: &[&[u8]]) -> [u8; 20] {
 
 fn sha1_block(h: &mut [u32; 5], block: &[u8]) {
     let mut w = [0u32; 80];
-    for (wi, b) in w.iter_mut().zip(block.chunks_exact(4)) {
+    for (wi, b) in w.iter_mut().zip(block.as_chunks::<4>().0) {
         *wi = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
     }
     for i in 16..80 {
@@ -1506,7 +1506,7 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
     }
     let count = b.len() / 4;
     let mut out = Vec::with_capacity(count * 3);
-    for (i, c) in b.chunks_exact(4).enumerate() {
+    for (i, c) in b.as_chunks::<4>().0.iter().enumerate() {
         let pad = match (c[2], c[3]) {
             (b'=', b'=') => 2,
             (_, b'=') => 1,

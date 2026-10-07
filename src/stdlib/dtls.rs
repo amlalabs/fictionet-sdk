@@ -762,7 +762,7 @@ impl ClientHello {
         if n < 2 || usize::from(n) != list.len() || !n.is_multiple_of(2) {
             return None;
         }
-        Some(list.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect())
+        Some(list.as_chunks::<2>().0.iter().map(|c| u16::from_be_bytes([c[0], c[1]])).collect())
     }
 }
 
@@ -1361,7 +1361,7 @@ impl Wire for ClientHello {
         if suites.is_empty() || !suites.len().is_multiple_of(2) {
             return Err(HandshakeError::CipherSuites);
         }
-        let cipher_suites = suites.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+        let cipher_suites = suites.as_chunks::<2>().0.iter().map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
         let compression_methods = r.vec8()?.to_vec();
         if compression_methods.is_empty() {
             return Err(HandshakeError::CompressionMethods);

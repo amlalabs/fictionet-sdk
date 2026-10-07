@@ -726,7 +726,7 @@ mod tests {
         assert_eq!(kept(EncodeSet::Form), "*-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz");
         assert_eq!(kept(EncodeSet::Component), "!'()*-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz~");
         assert_eq!(kept(EncodeSet::C0Control).len(), printable.len());
-        for b in [b' ', b'"', b'#', b'<', b'>'] {
+        for b in *b" \"#<>" {
             assert!(EncodeSet::Query.contains(b));
             assert!(!EncodeSet::C0Control.contains(b));
         }

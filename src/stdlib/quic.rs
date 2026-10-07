@@ -660,7 +660,7 @@ impl Packet {
             if rest.is_empty() || !rest.len().is_multiple_of(4) {
                 return Err(Error::VersionList(rest.len()));
             }
-            let versions = rest.chunks_exact(4).map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]])).collect();
+            let versions = rest.as_chunks::<4>().0.iter().map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]])).collect();
             let p = Packet::VersionNegotiation { unused: first & 0x7f, dcid, scid, versions };
             return Ok((p, b.len()));
         }

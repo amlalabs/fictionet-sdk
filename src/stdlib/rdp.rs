@@ -818,7 +818,7 @@ pub struct ClientCore {
 const CORE_BOUNDARIES: [usize; 16] = [0, 2, 4, 8, 10, 12, 14, 78, 79, 80, 84, 88, 92, 94, 98, 102];
 
 fn utf16_terminated(b: &[u8]) -> bool {
-    b.chunks_exact(2).any(|c| c == [0, 0])
+    b.as_chunks::<2>().0.contains(&[0, 0])
 }
 
 impl ClientCore {
@@ -3195,7 +3195,7 @@ mod tests {
             );
             let mut wire = hex("01 c0 00 00");
             let mut full = c.clone();
-            full.optional.truncate(0);
+            full.optional.clear();
             let fixed = DataBlock::ClientCore(full).to_bytes().unwrap();
             wire.extend_from_slice(&fixed[4..]);
             wire.extend_from_slice(&c.optional);

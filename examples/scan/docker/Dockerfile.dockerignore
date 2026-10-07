@@ -4,5 +4,8 @@
 !src
 !docs
 !dashboard
+!benches
+!codegen
+!tests/copy_and_own
 !examples/*.rs
 !examples/scan/main.rs

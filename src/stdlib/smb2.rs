@@ -2754,7 +2754,7 @@ fn string(b: &[u8]) -> Result<Vec<u16>, Error> {
     if !b.len().is_multiple_of(2) {
         return Err(Error::OddString);
     }
-    Ok(b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect())
+    Ok(b.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes([c[0], c[1]])).collect())
 }
 
 /// Code units as UTF-16LE bytes for a 16-bit length field, checked

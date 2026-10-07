@@ -497,7 +497,7 @@ impl Message {
                     if b.len() % 4 != 0 {
                         return Err(Error::Truncated);
                     }
-                    out.extend(b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])));
+                    out.extend(b.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])));
                 }
                 _ => {}
             }
@@ -515,7 +515,7 @@ impl Message {
                     if b.len() % 8 != 0 {
                         return Err(Error::Truncated);
                     }
-                    out.extend(b.chunks_exact(8).map(|c| {
+                    out.extend(b.as_chunks::<8>().0.iter().map(|c| {
                         let mut a = [0u8; 8];
                         a.copy_from_slice(c);
                         u64::from_le_bytes(a)

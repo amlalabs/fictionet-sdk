@@ -21,11 +21,11 @@ pub(crate) fn version(packet: &[u8]) -> Option<u8> {
 /// The Internet checksum (RFC 1071) of `data`, starting from `sum`.
 pub(crate) fn checksum(sum: u32, data: &[u8]) -> u16 {
     let mut sum = sum as u64;
-    let mut chunks = data.chunks_exact(2);
-    for c in &mut chunks {
+    let (chunks, rest) = data.as_chunks::<2>();
+    for c in chunks {
         sum += u16::from_be_bytes([c[0], c[1]]) as u64;
     }
-    if let [last] = chunks.remainder() {
+    if let [last] = rest {
         sum += (*last as u64) << 8;
     }
     while sum >> 16 != 0 {
@@ -38,7 +38,7 @@ pub(crate) fn checksum(sum: u32, data: &[u8]) -> u16 {
 pub(crate) fn pseudo_v6(src: &Ipv6Addr, dst: &Ipv6Addr, next: u8, len: u32) -> u32 {
     let mut sum = 0u32;
     for a in [src.octets(), dst.octets()] {
-        for c in a.chunks_exact(2) {
+        for c in a.as_chunks::<2>().0 {
             sum += u16::from_be_bytes([c[0], c[1]]) as u32;
         }
     }

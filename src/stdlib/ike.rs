@@ -1109,7 +1109,7 @@ fn write_body(body: &Body, room: usize) -> Option<Vec<u8>> {
         Body::Delete(d) => {
             fixed(4)?;
             let size = usize::from(d.spi_size);
-            let fits = if size == 0 { MAX_DELETE_SPIS } else { (room - 4) / size };
+            let fits = (room - 4).checked_div(size).unwrap_or(MAX_DELETE_SPIS);
             if d.spis.len() > MAX_DELETE_SPIS.min(fits) || d.spis.iter().any(|s| s.len() != size) {
                 return None;
             }
