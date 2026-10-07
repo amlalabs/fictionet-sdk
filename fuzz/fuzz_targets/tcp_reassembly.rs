@@ -40,9 +40,9 @@ fn key(flow: u8) -> FlowKey {
 
 fuzz_target!(|input: Input| {
     let mut tcp = Reassembler::new(Limits {
-        max_buffered: usize::from(input.byte_limit),
-        max_segments: usize::from(input.segment_limit),
-        max_flows: usize::from(input.flow_limit % 9),
+        buffered: usize::from(input.byte_limit),
+        segments: usize::from(input.segment_limit),
+        flows: usize::from(input.flow_limit % 9),
     });
     let limits = tcp.limits();
     let mut positions = HashMap::<FlowKey, u64>::new();
@@ -147,14 +147,14 @@ fuzz_target!(|input: Input| {
         }
         delivered = delivered.checked_add(released).unwrap();
         assert!(delivered <= fed);
-        assert!(tcp.buffered() <= limits.max_buffered);
-        assert!(tcp.flows() <= limits.max_flows);
+        assert!(tcp.buffered() <= limits.buffered);
+        assert!(tcp.flows() <= limits.flows);
         assert!(
             tcp.buffered().checked_add(released).unwrap()
                 <= previous_buffered.checked_add(payload.len()).unwrap()
         );
         for flow in 0..8 {
-            assert!(tcp.buffered_segments(key(flow)) <= limits.max_segments);
+            assert!(tcp.buffered_segments(key(flow)) <= limits.segments);
         }
     }
 });

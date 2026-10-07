@@ -886,31 +886,31 @@ impl Decode for Frames {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
     /// Local payload ceiling, independent of the peer's negotiated limit.
-    pub max_frame_size: usize,
+    pub frame: usize,
     /// Maximum encoded bytes in one assembled header block.
-    pub max_header_block: usize,
+    pub header_block: usize,
     /// Maximum retained decoded name and value bytes in a block.
     /// Indexed references can expand a few encoded bytes up to this limit.
-    pub max_header_list: usize,
+    pub header_list: usize,
     /// Maximum tracked stream states, including ended streams until retired.
-    pub max_streams: usize,
+    pub streams: usize,
 }
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            max_frame_size: MAX_FRAME_SIZE,
-            max_header_block: 64 << 10,
-            max_header_list: hpack::MAX_DECODED,
-            max_streams: 256,
+            frame: MAX_FRAME_SIZE,
+            header_block: 64 << 10,
+            header_list: hpack::MAX_DECODED,
+            streams: 256,
         }
     }
 }
 impl Limits {
     fn bounded(mut self) -> Self {
-        self.max_frame_size = self.max_frame_size.min(MAX_FRAME_SIZE);
-        self.max_header_block = self.max_header_block.min(hpack::MAX_BLOCK);
-        self.max_header_list = self.max_header_list.min(hpack::MAX_DECODED);
-        self.max_streams = self.max_streams.min(65_536);
+        self.frame = self.frame.min(MAX_FRAME_SIZE);
+        self.header_block = self.header_block.min(hpack::MAX_BLOCK);
+        self.header_list = self.header_list.min(hpack::MAX_DECODED);
+        self.streams = self.streams.min(65_536);
         self
     }
 }
@@ -1089,8 +1089,8 @@ impl HeaderBlocks {
                 hpack::Table::new(4096)
             },
             pending: None,
-            limit: limits.max_header_block,
-            decoded: limits.max_header_list,
+            limit: limits.header_block,
+            decoded: limits.header_list,
             capture,
         }
     }
@@ -1329,7 +1329,7 @@ impl Session {
     }
     fn new(limits: Limits, client: bool) -> Self {
         let limits = limits.bounded();
-        let limit = limits.max_frame_size.min(DEFAULT_FRAME_SIZE);
+        let limit = limits.frame.min(DEFAULT_FRAME_SIZE);
         Self {
             frames: Stream::new(if client {
                 Frames::client_side(limit)
@@ -1373,7 +1373,7 @@ impl Session {
     /// Construct a new direction only at a known new connection boundary.
     pub fn lost(&mut self) {
         self.frames = Stream::new(Frames::with_limit(
-            self.limits.max_frame_size.min(DEFAULT_FRAME_SIZE),
+            self.limits.frame.min(DEFAULT_FRAME_SIZE),
         ));
         self.blocks.forget();
         self.streams.clear();
@@ -1401,7 +1401,7 @@ impl Session {
     }
     /// Encoded header bytes and HPACK table bytes retained between frames.
     /// Stream metadata and recent peer-reset IDs are each separately bounded
-    /// by `limits.max_streams`.
+    /// by `limits.streams`.
     pub fn held(&self) -> usize {
         self.blocks.held()
     }
@@ -1439,7 +1439,7 @@ impl Session {
     /// Headers still update HPACK, then are dropped. The caller validates
     /// idle-stream rules, including resets before this direction's headers.
     ///
-    /// Keeps at most `limits.max_streams` recent reset IDs. Older IDs fall
+    /// Keeps at most `limits.streams` recent reset IDs. Older IDs fall
     /// below a per-parity watermark. Untracked streams at or below that
     /// watermark are also dropped. Tracked streams keep their own state.
     pub fn peer_reset(&mut self, stream: u32) {
@@ -1454,7 +1454,7 @@ impl Session {
         if stream > self.reset_before[parity] {
             self.peer_resets.insert(stream);
         }
-        if self.peer_resets.len() > self.limits.max_streams
+        if self.peer_resets.len() > self.limits.streams
             && let Some(oldest) = self.peer_resets.pop_first()
         {
             let before = &mut self.reset_before[(oldest % 2) as usize];
@@ -1551,7 +1551,7 @@ impl Session {
         self.frame_size = value;
         self.frames
             .decoder()
-            .set_limit(self.limits.max_frame_size.min(value as usize));
+            .set_limit(self.limits.frame.min(value as usize));
     }
     fn acknowledge_settings(&mut self) -> Result<(), Error> {
         let Some(update) = self.settings_updates.pop_front() else {
@@ -1610,7 +1610,7 @@ impl Session {
         result
     }
     fn stream_state(&mut self, id: u32) -> Result<&mut StreamState, Error> {
-        if !self.streams.contains_key(&id) && self.streams.len() >= self.limits.max_streams {
+        if !self.streams.contains_key(&id) && self.streams.len() >= self.limits.streams {
             return Err(budget("stream state limit"));
         }
         Ok(self.streams.entry(id).or_insert(StreamState {
@@ -2034,7 +2034,7 @@ mod tests {
             );
         }
         let mut c = Session::server_side(Limits {
-            max_header_block: 1,
+            header_block: 1,
             ..Limits::default()
         });
         accept(&mut c, &settings());
@@ -2112,7 +2112,7 @@ mod tests {
     #[test]
     fn peer_reset_records_stay_bounded_and_preserve_other_streams() {
         let mut c = Session::server_side(Limits {
-            max_streams: 2,
+            streams: 2,
             ..Limits::default()
         });
         accept(&mut c, &settings());
@@ -2166,7 +2166,7 @@ mod tests {
     #[test]
     fn caller_can_retire_streams_abandoned_by_goaway() {
         let mut c = Session::server_side(Limits {
-            max_streams: 4,
+            streams: 4,
             ..Limits::default()
         });
         accept(&mut c, &settings());
@@ -2222,7 +2222,7 @@ mod tests {
     #[test]
     fn frame_size_reductions_accept_in_flight_frames_until_ack() {
         let mut c = Session::server_side(Limits {
-            max_frame_size: 32_768,
+            frame: 32_768,
             ..Limits::default()
         });
         accept(&mut c, &settings());

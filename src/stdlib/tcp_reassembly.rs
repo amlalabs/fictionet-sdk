@@ -28,23 +28,23 @@ pub fn conversation_key(key: FlowKey) -> (FlowKey, bool) {
 pub struct Limits {
     /// Payload bytes held across all directions. The default is 8 MiB.
     /// Zero disables out-of-order buffering.
-    pub max_buffered: usize,
+    pub buffered: usize,
     /// Segments held per direction. The default is 256.
     /// Zero disables out-of-order buffering.
-    pub max_segments: usize,
+    pub segments: usize,
     /// Directions tracked at once. The default is 512.
     /// Zero is raised to one. Adding a direction past this bound clears
     /// all state and sets [`Reassembled::cleared`].
-    pub max_flows: usize,
+    pub flows: usize,
 }
 
 impl Default for Limits {
     /// Uses 8 MiB, 256 segments per direction, and 512 directions.
     fn default() -> Self {
         Self {
-            max_buffered: 8 << 20,
-            max_segments: 256,
-            max_flows: 512,
+            buffered: 8 << 20,
+            segments: 256,
+            flows: 512,
         }
     }
 }
@@ -200,8 +200,8 @@ impl Flow {
 /// emits [`Chunk::Gap`], and drains its contiguous successors. With no
 /// buffered segment it reports a gap and keeps waiting. The limits are
 /// checked before replacement, including for retransmits of held data.
-/// A retransmit counts against `max_segments` even if it replaces a segment.
-/// One stalled direction can hold the entire shared `max_buffered` budget
+/// A retransmit counts against `segments` even if it replaces a segment.
+/// One stalled direction can hold the entire shared `buffered` budget
 /// indefinitely. Other directions then drop out-of-order payloads until
 /// that state is drained, reset by SYN, or cleared by the flow limit.
 /// Returned events own their bytes and are outside the retained budget.
@@ -257,9 +257,9 @@ fn release(held: &mut usize, bytes: usize) {
 }
 
 impl Reassembler {
-    /// Creates empty state with the given bounds. Raises `max_flows` to one.
+    /// Creates empty state with the given bounds. Raises `flows` to one.
     pub fn new(mut limits: Limits) -> Self {
-        limits.max_flows = limits.max_flows.max(1);
+        limits.flows = limits.flows.max(1);
         Self {
             limits,
             flows: HashMap::new(),
@@ -310,7 +310,7 @@ impl Reassembler {
             cleared: false,
             events: Vec::new(),
         };
-        if self.flows.len() >= self.limits.max_flows && !self.flows.contains_key(&key) {
+        if self.flows.len() >= self.limits.flows && !self.flows.contains_key(&key) {
             self.flows.clear();
             self.held = 0;
             result.cleared = true;
@@ -359,8 +359,8 @@ impl Reassembler {
                 self.held.checked_add(payload.len()),
                 flow.held_bytes.checked_add(payload.len()),
                 flow.position.checked_add(u64::from(seq.wrapping_sub(next))),
-            ) && total <= self.limits.max_buffered
-                && flow.held.len() < self.limits.max_segments
+            ) && total <= self.limits.buffered
+                && flow.held.len() < self.limits.segments
             {
                 self.held = total;
                 flow.held_bytes = local;
@@ -650,18 +650,18 @@ mod tests {
     #[test]
     fn held_segments_stay_ordered_after_large_gap_resumes() {
         let mut tcp = Reassembler::new(Limits {
-            max_buffered: 1,
+            buffered: 1,
             ..Limits::default()
         });
         let next = resume_two_large_gaps(&mut tcp, b"x");
-        tcp.limits.max_buffered = 4;
+        tcp.limits.buffered = 4;
         drain_near_bytes_before_distant_bytes(&mut tcp, next);
     }
 
     #[test]
     fn public_pushes_keep_held_segments_ordered_after_large_gap_resumes() {
         let mut tcp = Reassembler::new(Limits {
-            max_buffered: 4,
+            buffered: 4,
             ..Limits::default()
         });
         let next = resume_two_large_gaps(&mut tcp, b"drop");
@@ -671,7 +671,7 @@ mod tests {
     #[test]
     fn byte_bound_drops_incoming_and_resumes_at_first_held_segment() {
         let mut tcp = Reassembler::new(Limits {
-            max_buffered: 4,
+            buffered: 4,
             ..Limits::default()
         });
         tcp.push(segment(100, 2, b""));
@@ -692,7 +692,7 @@ mod tests {
     #[test]
     fn segment_bound_skips_only_one_gap() {
         let mut tcp = Reassembler::new(Limits {
-            max_segments: 2,
+            segments: 2,
             ..Limits::default()
         });
         tcp.push(segment(100, 2, b""));
@@ -712,7 +712,7 @@ mod tests {
     #[test]
     fn replacement_checks_the_bound_before_removing_old_bytes() {
         let mut tcp = Reassembler::new(Limits {
-            max_buffered: 2,
+            buffered: 2,
             ..Limits::default()
         });
         tcp.push(segment(100, 2, b""));
@@ -727,11 +727,11 @@ mod tests {
     fn gap_without_held_bytes_waits_for_the_missing_segment() {
         for limits in [
             Limits {
-                max_buffered: 0,
+                buffered: 0,
                 ..Limits::default()
             },
             Limits {
-                max_segments: 0,
+                segments: 0,
                 ..Limits::default()
             },
         ] {
@@ -783,7 +783,7 @@ mod tests {
     #[test]
     fn both_directions_share_the_byte_budget_but_not_offsets() {
         let mut tcp = Reassembler::new(Limits {
-            max_buffered: 2,
+            buffered: 2,
             ..Limits::default()
         });
         let key = key();
@@ -869,10 +869,10 @@ mod tests {
             assert_eq!(tcp.flows(), 1);
         }
         let mut tcp = Reassembler::new(Limits {
-            max_flows: 0,
+            flows: 0,
             ..Limits::default()
         });
-        assert_eq!(tcp.limits().max_flows, 1);
+        assert_eq!(tcp.limits().flows, 1);
         tcp.push(segment(100, 2, b""));
         tcp.push(segment(103, 0x18, b"cd"));
         let mut other = segment(200, 2, b"");

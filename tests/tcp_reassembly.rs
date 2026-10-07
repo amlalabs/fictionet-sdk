@@ -33,7 +33,7 @@ fn key() -> FlowKey {
 #[test]
 fn public_events_drive_a_user_decoder_with_gap_and_end_hooks() {
     let mut tcp = Reassembler::new(Limits {
-        max_buffered: 2,
+        buffered: 2,
         ..Limits::default()
     });
     let mut decoder = Stream::new(UserDecoder);
@@ -73,7 +73,7 @@ fn public_events_drive_a_user_decoder_with_gap_and_end_hooks() {
                 }
             }
         }
-        assert!(tcp.buffered() <= tcp.limits().max_buffered);
+        assert!(tcp.buffered() <= tcp.limits().buffered);
     }
     assert_eq!(pairs, [*b"de", *b"fg"]);
     assert_eq!((gaps, ends), (1, 1));

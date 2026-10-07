@@ -46,13 +46,13 @@ fuzz_target!(|input: &[u8]| {
             FormatPolicy::Assert
         },
         limits: Limits {
-            max_schema_nodes: 512,
-            max_instance_nodes: 512,
-            max_bytes: 8192,
-            max_depth: 16,
-            max_validation_depth: 24,
-            max_work: 50_000,
-            max_errors: 8,
+            schema_nodes: 512,
+            instance_nodes: 512,
+            bytes: 8192,
+            depth: 16,
+            validation_depth: 24,
+            work: 50_000,
+            errors: 8,
             ..Limits::default()
         },
     };

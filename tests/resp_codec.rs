@@ -10,7 +10,7 @@ const RESP_LIMIT: usize = 128;
 
 fn resp_limits() -> resp::Limits {
     resp::Limits {
-        max_frame_len: RESP_LIMIT,
+        frame: RESP_LIMIT,
         ..resp::Limits::DEFAULT
     }
 }
@@ -65,19 +65,19 @@ fn resp_limits_and_terminal_errors() {
     assert_eq!(resp::Values::new().capacity(), resp::MAX_FRAME_LEN);
     assert_eq!(resp::Commands::new().capacity(), resp::MAX_FRAME_LEN);
     let limits = resp::Limits {
-        max_frame_len: 16,
+        frame: 16,
         ..resp::Limits::DEFAULT
     };
-    let bytes = vec![b'+'; limits.max_frame_len + 1];
+    let bytes = vec![b'+'; limits.frame + 1];
     let mut commands = Stream::new(resp::Commands::with_limits(limits));
-    assert_eq!(commands.push(&bytes), limits.max_frame_len);
+    assert_eq!(commands.push(&bytes), limits.frame);
     assert_eq!(
         commands.next(),
         Some(Err(Fail::Protocol(resp::ParseError::FrameTooLarge)))
     );
     assert!(commands.next().is_none());
     let mut values = Stream::new(resp::Values::with_limits(limits));
-    assert_eq!(values.push(&bytes), limits.max_frame_len);
+    assert_eq!(values.push(&bytes), limits.frame);
     assert_eq!(
         values.next(),
         Some(Err(Fail::Protocol(resp::ParseError::FrameTooLarge)))
@@ -115,7 +115,7 @@ fn resp_limits_and_terminal_errors() {
     );
     for limit in [0, 1, 2, 3, 4, 16, usize::MAX] {
         let limits = resp::Limits {
-            max_frame_len: limit,
+            frame: limit,
             ..resp::Limits::DEFAULT
         };
         let make = || resp::Values::with_limits(limits);
@@ -241,7 +241,7 @@ fn resp_scan_resumes_across_lines_and_aggregates() {
 #[test]
 fn small_resp_capacity_drains_a_long_pipeline() {
     let limits = resp::Limits {
-        max_frame_len: 4,
+        frame: 4,
         ..resp::Limits::DEFAULT
     };
     let bytes = b"_\r\n".repeat(100);

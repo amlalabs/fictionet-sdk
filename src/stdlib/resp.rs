@@ -127,7 +127,7 @@ pub mod marker {
     pub const END: u8 = b'.';
 }
 
-/// The deepest nesting the readers take, whatever [`Limits::max_depth`]
+/// The deepest nesting the readers take, whatever [`Limits::depth`]
 /// says, since they recurse once per level.
 const DEPTH_CEILING: usize = 256;
 
@@ -141,27 +141,27 @@ const PREALLOC: usize = 4096;
 pub struct Limits {
     /// The longest bulk string, bulk error or verbatim string, and the
     /// longest argument of a command, in bytes.
-    pub max_bulk_len: usize,
+    pub bulk: usize,
     /// The most elements of one aggregate, or entries of one map.
-    pub max_elements: usize,
+    pub elements: usize,
     /// How many aggregates may nest inside each other. The readers
     /// recurse once per level, so they take no more than 256 levels
     /// whatever this says.
-    pub max_depth: usize,
+    pub depth: usize,
     /// The longest line, without its type byte and line end.
-    pub max_line_len: usize,
+    pub line: usize,
     /// The most bytes one whole value or command may take.
-    pub max_frame_len: usize,
+    pub frame: usize,
 }
 
 impl Limits {
     /// The limits named by this module's constants.
     pub const DEFAULT: Limits = Limits {
-        max_bulk_len: MAX_BULK_LEN,
-        max_elements: MAX_ELEMENTS,
-        max_depth: MAX_DEPTH,
-        max_line_len: MAX_LINE_LEN,
-        max_frame_len: MAX_FRAME_LEN,
+        bulk: MAX_BULK_LEN,
+        elements: MAX_ELEMENTS,
+        depth: MAX_DEPTH,
+        line: MAX_LINE_LEN,
+        frame: MAX_FRAME_LEN,
     };
 }
 
@@ -307,17 +307,17 @@ pub enum ParseError {
     UnknownType(u8),
     /// A line held a CR not followed by LF, or an LF with no CR before it.
     BadLineEnd,
-    /// A line ran past [`Limits::max_line_len`] without ending.
+    /// A line ran past [`Limits::line`] without ending.
     LineTooLong,
     /// A length or count was not a number this type allows.
     BadLength,
     /// A bulk string, or a command's argument, was longer than
-    /// [`Limits::max_bulk_len`].
+    /// [`Limits::bulk`].
     BulkTooLong,
-    /// An aggregate or a command had more than [`Limits::max_elements`]
+    /// An aggregate or a command had more than [`Limits::elements`]
     /// elements.
     TooManyElements,
-    /// Aggregates nested deeper than [`Limits::max_depth`].
+    /// Aggregates nested deeper than [`Limits::depth`].
     TooDeep,
     /// A bulk string's data was not followed by CR LF.
     MissingCrlf,
@@ -330,7 +330,7 @@ pub enum ParseError {
     /// An inline command had a quote that does not close, or a closing
     /// quote followed by something other than a space.
     UnbalancedQuotes,
-    /// A value or command took more than [`Limits::max_frame_len`] bytes.
+    /// A value or command took more than [`Limits::frame`] bytes.
     FrameTooLarge,
 }
 
@@ -506,7 +506,7 @@ impl Values {
     /// The frame limit is clamped to [`MAX_FRAME_LEN`]. Zero refuses all
     /// nonempty input and uses one byte of input capacity.
     pub fn with_limits(mut limits: Limits) -> Self {
-        limits.max_frame_len = limits.max_frame_len.min(MAX_FRAME_LEN);
+        limits.frame = limits.frame.min(MAX_FRAME_LEN);
         // Fixed room for nesting counters, including a streamed string
         // inside the deepest aggregate. No input bytes are stored here.
         let scan = Scan { open: Vec::with_capacity(depth_limit(&limits) + 1), ..Scan::default() };
@@ -532,7 +532,7 @@ impl Values {
             return Ok(codec::Step::Need);
         }
         if let Some(need) = scan(&mut self.scan, bytes, &self.limits)
-            && need <= self.limits.max_frame_len
+            && need <= self.limits.frame
         {
             self.need = need;
             return Ok(codec::Step::Need);
@@ -560,7 +560,7 @@ impl Decode for Values {
     const NAME: &'static str = "RESP values";
 
     fn capacity(&self) -> usize {
-        self.limits.max_frame_len.max(1)
+        self.limits.frame.max(1)
     }
 
     /// Reserved nesting counters, bounded by the 256-level depth ceiling
@@ -744,14 +744,14 @@ impl Scan {
 fn scan_value(s: &mut Scan, b: &[u8], lim: &Limits) -> Option<usize> {
     loop {
         let start = s.pos.saturating_add(1);
-        if s.line_waits(b, start, lim.max_line_len) {
+        if s.line_waits(b, start, lim.line) {
             return Some(b.len().saturating_add(1));
         }
         match scan_step(s, b, lim) {
             Ok(Scanned::More) => {}
             Ok(Scanned::Whole) | Err(Fail::Bad(_)) => return None,
             Err(Fail::Need(n)) => {
-                s.note_line(b, start, n, lim.max_line_len);
+                s.note_line(b, start, n, lim.line);
                 return Some(n);
             }
         }
@@ -776,7 +776,7 @@ fn scan_step(s: &mut Scan, b: &[u8], lim: &Limits) -> Result<Scanned, Fail> {
                 s.open.pop();
                 return Ok(s.ended(e));
             }
-            if n > lim.max_bulk_len.saturating_sub(len) {
+            if n > lim.bulk.saturating_sub(len) {
                 return Err(ParseError::BulkTooLong.into());
             }
             let (_, e) = data(b, e, n, lim)?;
@@ -792,7 +792,7 @@ fn scan_step(s: &mut Scan, b: &[u8], lim: &Limits) -> Result<Scanned, Fail> {
                 s.open.pop();
                 return Ok(s.ended(e));
             }
-            if (if pairs { seen / 2 } else { seen }) >= lim.max_elements {
+            if (if pairs { seen / 2 } else { seen }) >= lim.elements {
                 return Err(ParseError::TooManyElements.into());
             }
         }
@@ -822,7 +822,7 @@ fn scan_step(s: &mut Scan, b: &[u8], lim: &Limits) -> Result<Scanned, Fail> {
             }
             let pairs = matches!(t, marker::MAP | marker::ATTRIBUTE);
             let open = match len {
-                Len::N(n) if n > lim.max_elements => return Err(ParseError::TooManyElements.into()),
+                Len::N(n) if n > lim.elements => return Err(ParseError::TooManyElements.into()),
                 // An attribute's entries, then the value they describe.
                 Len::N(n) if t == marker::ATTRIBUTE => Open::Attr(n.saturating_mul(2).saturating_add(1)),
                 Len::N(n) if pairs => Open::Left(n.saturating_mul(2)),
@@ -869,14 +869,14 @@ fn scan_command(s: &mut Scan, b: &[u8], lim: &Limits) -> Option<usize> {
     }
     loop {
         let start = s.pos.saturating_add(1);
-        if s.line_waits(b, start, lim.max_line_len) {
+        if s.line_waits(b, start, lim.line) {
             return Some(b.len().saturating_add(1));
         }
         match command_step(s, b, lim) {
             Ok(true) => {}
             Ok(false) | Err(Fail::Bad(_)) => return None,
             Err(Fail::Need(n)) => {
-                s.note_line(b, start, n, lim.max_line_len);
+                s.note_line(b, start, n, lim.line);
                 return Some(n);
             }
         }
@@ -891,7 +891,7 @@ fn command_step(s: &mut Scan, b: &[u8], lim: &Limits) -> Result<bool, Fail> {
         // The count, as multibulk reads it.
         let (l, e) = line(b, 1, lim)?;
         return match redis_ll(l).and_then(|n| usize::try_from(n).ok()) {
-            Some(n) if n > 0 && n <= lim.max_elements => {
+            Some(n) if n > 0 && n <= lim.elements => {
                 s.open.push(Open::Left(n));
                 s.pos = e;
                 Ok(true)
@@ -925,7 +925,7 @@ fn scan_inline(s: &mut Scan, b: &[u8], lim: &Limits) -> Option<usize> {
     if let Some(q) = s.quiet
         && q.start == 0
         && q.to <= b.len()
-        && b.len() <= lim.max_line_len
+        && b.len() <= lim.line
     {
         let first = b[q.to..].iter().find(|&&c| c == b'\n' || c == 0);
         let stuck = q.stuck || first == Some(&0);
@@ -938,7 +938,7 @@ fn scan_inline(s: &mut Scan, b: &[u8], lim: &Limits) -> Option<usize> {
         Err(Fail::Need(n)) => {
             // Needing more, a line no longer than the limit holds no LF,
             // or a NUL before it.
-            if b.len() <= lim.max_line_len {
+            if b.len() <= lim.line {
                 s.quiet = Some(Quiet { start: 0, to: b.len(), stuck: b.contains(&0) });
             }
             Some(n)
@@ -948,19 +948,19 @@ fn scan_inline(s: &mut Scan, b: &[u8], lim: &Limits) -> Option<usize> {
 }
 
 /// The bytes a value or command may take: no more than
-/// [`Limits::max_frame_len`]. The readers see only these, so what they
+/// [`Limits::frame`]. The readers see only these, so what they
 /// find does not depend on how many bytes past the limit have come, and
 /// exact parsing agrees with a stream receiving chunks.
 fn frame<'a>(b: &'a [u8], lim: &Limits) -> &'a [u8] {
-    &b[..b.len().min(lim.max_frame_len)]
+    &b[..b.len().min(lim.frame)]
 }
 
-/// Holds a whole value or command to [`Limits::max_frame_len`]. A reader
+/// Holds a whole value or command to [`Limits::frame`]. A reader
 /// that needs bytes past it has found a frame too large.
 fn bounded<T>(r: Step<T>, lim: &Limits) -> Step<T> {
     match r {
-        Ok((_, end)) if end > lim.max_frame_len => Err(Fail::Bad(ParseError::FrameTooLarge)),
-        Err(Fail::Need(n)) if n > lim.max_frame_len => Err(Fail::Bad(ParseError::FrameTooLarge)),
+        Ok((_, end)) if end > lim.frame => Err(Fail::Bad(ParseError::FrameTooLarge)),
+        Err(Fail::Need(n)) if n > lim.frame => Err(Fail::Bad(ParseError::FrameTooLarge)),
         r => r,
     }
 }
@@ -977,7 +977,7 @@ fn command_top(b: &[u8], lim: &Limits) -> Step<Command> {
 /// starts.
 fn line<'a>(b: &'a [u8], pos: usize, lim: &Limits) -> Step<&'a [u8]> {
     let rest = b.get(pos..).unwrap_or(&[]);
-    let window = &rest[..rest.len().min(lim.max_line_len.saturating_add(1))];
+    let window = &rest[..rest.len().min(lim.line.saturating_add(1))];
     match window.iter().position(|&c| c == b'\r' || c == b'\n') {
         Some(i) => {
             if window[i] == b'\n' {
@@ -989,14 +989,14 @@ fn line<'a>(b: &'a [u8], pos: usize, lim: &Limits) -> Step<&'a [u8]> {
                 Some(_) => Err(ParseError::BadLineEnd.into()),
             }
         }
-        None if window.len() > lim.max_line_len => Err(ParseError::LineTooLong.into()),
+        None if window.len() > lim.line => Err(ParseError::LineTooLong.into()),
         None => Err(Fail::Need(b.len().saturating_add(1))),
     }
 }
 
 /// `n` bytes of data from `pos`, then CR LF.
 fn data<'a>(b: &'a [u8], pos: usize, n: usize, lim: &Limits) -> Step<&'a [u8]> {
-    if n > lim.max_bulk_len {
+    if n > lim.bulk {
         return Err(ParseError::BulkTooLong.into());
     }
     let end = pos.checked_add(n).ok_or(ParseError::BulkTooLong)?;
@@ -1285,12 +1285,12 @@ fn capacity(b: &[u8], pos: usize, n: usize, min: usize) -> usize {
 
 /// How deep the readers let aggregates nest under `lim`.
 fn depth_limit(lim: &Limits) -> usize {
-    lim.max_depth.min(DEPTH_CEILING)
+    lim.depth.min(DEPTH_CEILING)
 }
 
 /// `n` elements from `pos`. With `push`, the first must be a string.
 fn list(b: &[u8], mut pos: usize, n: usize, depth: usize, push: bool, lim: &Limits) -> Step<Vec<Value>> {
-    if n > lim.max_elements {
+    if n > lim.elements {
         return Err(ParseError::TooManyElements.into());
     }
     let mut items = Vec::with_capacity(capacity(b, pos, n, 3));
@@ -1316,7 +1316,7 @@ fn list(b: &[u8], mut pos: usize, n: usize, depth: usize, push: bool, lim: &Limi
 }
 
 fn pairs(b: &[u8], mut pos: usize, n: usize, depth: usize, lim: &Limits) -> Step<Vec<(Value, Value)>> {
-    if n > lim.max_elements {
+    if n > lim.elements {
         return Err(ParseError::TooManyElements.into());
     }
     let mut entries = Vec::with_capacity(capacity(b, pos, n, 6));
@@ -1351,7 +1351,7 @@ fn streamed_list(b: &[u8], mut pos: usize, depth: usize, lim: &Limits) -> Step<V
         if let Some(e) = stream_end(b, pos, lim)? {
             return Ok((items, e));
         }
-        if items.len() >= lim.max_elements {
+        if items.len() >= lim.elements {
             return Err(ParseError::TooManyElements.into());
         }
         let (v, e) = value(b, pos, depth + 1, false, lim)?;
@@ -1366,7 +1366,7 @@ fn streamed_pairs(b: &[u8], mut pos: usize, depth: usize, lim: &Limits) -> Step<
         if let Some(e) = stream_end(b, pos, lim)? {
             return Ok((entries, e));
         }
-        if entries.len() >= lim.max_elements {
+        if entries.len() >= lim.elements {
             return Err(ParseError::TooManyElements.into());
         }
         let (k, e) = value(b, pos, depth + 1, false, lim)?;
@@ -1389,7 +1389,7 @@ fn streamed_string(b: &[u8], mut pos: usize, lim: &Limits) -> Step<Value> {
         if n == 0 {
             return Ok((Value::Bulk(out), e));
         }
-        if n > lim.max_bulk_len.saturating_sub(out.len()) {
+        if n > lim.bulk.saturating_sub(out.len()) {
             return Err(ParseError::BulkTooLong.into());
         }
         let (d, e) = data(b, e, n, lim)?;
@@ -1413,7 +1413,7 @@ fn multibulk(b: &[u8], lim: &Limits) -> Step<Command> {
     let Ok(n) = usize::try_from(n) else {
         return Ok((Command::default(), pos));
     };
-    if n > lim.max_elements {
+    if n > lim.elements {
         return Err(ParseError::TooManyElements.into());
     }
     let mut args = Vec::with_capacity(capacity(b, pos, n, 6));
@@ -1433,29 +1433,29 @@ fn multibulk(b: &[u8], lim: &Limits) -> Step<Command> {
 }
 
 fn inline(b: &[u8], lim: &Limits) -> Step<Command> {
-    // The text may be max_line_len bytes, then CR LF.
-    let window = &b[..b.len().min(lim.max_line_len.saturating_add(2))];
+    // The text may be line bytes, then CR LF.
+    let window = &b[..b.len().min(lim.line.saturating_add(2))];
     // Redis finds the LF with strchr, which stops at a NUL, so after a
     // NUL the line never ends, and the bytes run into the limit.
     let end = window.iter().position(|&c| c == b'\n' || c == 0);
     let Some(i) = end.filter(|&i| window[i] == b'\n') else {
         // Without an LF, the bytes past the longest text can only be a CR,
         // and only before a LF that can still come.
-        let over = window.len().saturating_sub(lim.max_line_len);
+        let over = window.len().saturating_sub(lim.line);
         if over > 1 || (over == 1 && (end.is_some() || window.last() != Some(&b'\r'))) {
             return Err(ParseError::LineTooLong.into());
         }
         return Err(Fail::Need(b.len().saturating_add(1)));
     };
     let text = b[..i].strip_suffix(b"\r").unwrap_or(&b[..i]);
-    if text.len() > lim.max_line_len {
+    if text.len() > lim.line {
         return Err(ParseError::LineTooLong.into());
     }
     let args = split_args(text)?;
-    if args.len() > lim.max_elements {
+    if args.len() > lim.elements {
         return Err(ParseError::TooManyElements.into());
     }
-    if args.iter().any(|a| a.len() > lim.max_bulk_len) {
+    if args.iter().any(|a| a.len() > lim.bulk) {
         return Err(ParseError::BulkTooLong.into());
     }
     Ok((Command { args }, i + 1))
@@ -1889,14 +1889,14 @@ mod tests {
         // NaN compares through its canonical encoding.
         contract::check_decode_with_alloc_limit(
             || Values::with_limits(limits).map(|value| value.to_bytes()),
-            b, 2 * limits.max_frame_len.clamp(1, MAX_FRAME_LEN),
+            b, 2 * limits.frame.clamp(1, MAX_FRAME_LEN),
         );
     }
 
     fn check_commands(b: &[u8], limits: Limits) {
         contract::check_decode_with_alloc_limit(
             || Commands::with_limits(limits), b,
-            2 * limits.max_frame_len.clamp(1, MAX_FRAME_LEN),
+            2 * limits.frame.clamp(1, MAX_FRAME_LEN),
         );
     }
 
@@ -2310,7 +2310,7 @@ mod tests {
 
     #[test]
     fn value_errors() {
-        let lim = Limits { max_bulk_len: 8, max_elements: 3, max_depth: 2, max_line_len: 10, max_frame_len: 40 };
+        let lim = Limits { bulk: 8, elements: 3, depth: 2, line: 10, frame: 40 };
         let bad = |b: &[u8]| value_step(b, lim).err().unwrap_or_else(|| panic!("{} parsed", b.escape_ascii()));
         assert_eq!(bad(b"x\r\n"), ParseError::UnknownType(b'x'));
         assert_eq!(bad(b".\r\n"), ParseError::UnknownType(b'.'));
@@ -2361,7 +2361,7 @@ mod tests {
         // One past the largest 64-bit integer.
         assert_eq!(Value::parse(b":9223372036854775808\r\n"), Err(WireError::Parse(ParseError::Malformed(b':'))));
         assert_eq!(Value::parse(b":-9223372036854775809\r\n"), Err(WireError::Parse(ParseError::Malformed(b':'))));
-        let frame = Limits { max_frame_len: 10, ..Limits::DEFAULT };
+        let frame = Limits { frame: 10, ..Limits::DEFAULT };
         assert_eq!(value_step(b"$8\r\n", frame), Err(ParseError::FrameTooLarge));
         assert_eq!(value_step(b"+0123456789\r\n", frame), Err(ParseError::FrameTooLarge));
         assert_eq!(value_step(b"+0123456789", frame), Err(ParseError::FrameTooLarge));
@@ -2371,7 +2371,7 @@ mod tests {
 
     #[test]
     fn command_errors() {
-        let lim = Limits { max_bulk_len: 8, max_elements: 3, max_depth: 2, max_line_len: 10, max_frame_len: 40 };
+        let lim = Limits { bulk: 8, elements: 3, depth: 2, line: 10, frame: 40 };
         let bad =
             |b: &[u8]| command_step(b, lim).err().unwrap_or_else(|| panic!("{} parsed", b.escape_ascii()));
         assert_eq!(bad(b"*1\r\n:1\r\n"), ParseError::ExpectedBulk(b':'));
@@ -2388,7 +2388,7 @@ mod tests {
         assert_eq!(bad(b"\"a\"b\n"), ParseError::UnbalancedQuotes);
         assert_eq!(bad(b"'a'b\n"), ParseError::UnbalancedQuotes);
         assert_eq!(bad(b"\"a\\\n"), ParseError::UnbalancedQuotes);
-        let frame = Limits { max_frame_len: 12, ..Limits::DEFAULT };
+        let frame = Limits { frame: 12, ..Limits::DEFAULT };
         assert_eq!(command_step(b"*1\r\n$20\r\n", frame), Err(ParseError::FrameTooLarge));
         assert_eq!(
             ParseError::UnbalancedQuotes.reply(),
@@ -2446,7 +2446,7 @@ mod tests {
         assert_eq!(stream.push(b"+OK\r\n"), 5);
         assert_eq!(stream.next(), None);
         assert_eq!(stream.failed(), Some(&error));
-        let limits = Limits { max_frame_len: 100, ..Limits::DEFAULT };
+        let limits = Limits { frame: 100, ..Limits::DEFAULT };
         for bytes in [&b"$1000\r\n"[..], &[b'+'; 100]] {
             check_values(bytes, limits);
             assert_eq!(value_step(bytes, limits), Err(ParseError::FrameTooLarge));
@@ -2650,7 +2650,7 @@ mod tests {
     #[test]
     fn fuzz_loop() {
         let mut r = Lcg::new(0x5eed);
-        let small = Limits { max_bulk_len: 6, max_elements: 3, max_depth: 2, max_line_len: 6, max_frame_len: 30 };
+        let small = Limits { bulk: 6, elements: 3, depth: 2, line: 6, frame: 30 };
         let rounds = codec::test_support::rounds(1250);
         for _ in 0..rounds {
             let mut b = Vec::new();
@@ -2707,7 +2707,7 @@ mod tests {
     /// line ends with LF or CR LF.
     #[test]
     fn inline_line_limit_counts_text_only() {
-        let lim = Limits { max_line_len: 10, ..Limits::DEFAULT };
+        let lim = Limits { line: 10, ..Limits::DEFAULT };
         assert_eq!(command_step(b"0123456789\n", lim), Ok(Decoded::Item(Command::new(["0123456789"]), 11)));
         assert_eq!(command_step(b"0123456789\r\n", lim), Ok(Decoded::Item(Command::new(["0123456789"]), 12)));
         assert_eq!(command_step(b"0123456789\r", lim), Ok(Decoded::Need));
@@ -2721,7 +2721,7 @@ mod tests {
     /// an array.
     #[test]
     fn inline_arguments_keep_the_bulk_limit() {
-        let lim = Limits { max_bulk_len: 8, ..Limits::DEFAULT };
+        let lim = Limits { bulk: 8, ..Limits::DEFAULT };
         for bytes in [&b"GET 12345678\r\n"[..], b"GET \"123\\x41\\x42678\"\r\n"] {
             let expected = Command::parse(bytes).unwrap();
             assert_eq!(command_step(bytes, lim), Ok(Decoded::Item(expected, bytes.len())));
@@ -2746,13 +2746,13 @@ mod tests {
     /// chunks gives, also when a frame runs over the limit.
     #[test]
     fn frame_limit_gives_one_answer() {
-        let limits = Limits { max_frame_len: 10, ..Limits::DEFAULT };
+        let limits = Limits { frame: 10, ..Limits::DEFAULT };
         for b in [&b"*2\r\n+0123456789\r\nX"[..], b"*1\r\n$7\r\nabcdefgXY", b"*2\r\n:1\r\n:22\r\n:3\r\n"] {
             check_values(b, limits);
             assert_eq!(decode_all(|| Values::with_limits(limits), b),
                 (vec![], Some(codec::Fail::Protocol(ParseError::FrameTooLarge))));
         }
-        let limits = Limits { max_frame_len: 12, ..Limits::DEFAULT };
+        let limits = Limits { frame: 12, ..Limits::DEFAULT };
         let b = b"*1\r\n$4\r\nabcdXY";
         check_commands(b, limits);
         assert_eq!(decode_all(|| Commands::with_limits(limits), b),
@@ -2762,7 +2762,7 @@ mod tests {
     /// Malformed and truncated inputs keep their results across chunk schedules.
     #[test]
     fn contracts_cover_malformed_prefixes() {
-        let lim = Limits { max_bulk_len: 6, max_elements: 3, max_depth: 2, max_line_len: 6, max_frame_len: 40 };
+        let lim = Limits { bulk: 6, elements: 3, depth: 2, line: 6, frame: 40 };
         let inputs: &[&[u8]] = &[
             b"%?\r\n+a\r\n.\r\n",
             b"%?\r\n+a\r\n:1\r\n+b\r\n:2\r\n+c\r\n:3\r\n+d\r\n:4\r\n.\r\n",
@@ -2907,7 +2907,7 @@ mod tests {
     /// A depth limit set very high still cannot overflow the stack.
     #[test]
     fn depth_has_a_ceiling() {
-        let limits = Limits { max_depth: 100_000, ..Limits::DEFAULT };
+        let limits = Limits { depth: 100_000, ..Limits::DEFAULT };
         let mut b = b"*1\r\n".repeat(100_000);
         b.extend_from_slice(b"_\r\n");
         check_values(&b, limits);
@@ -3019,7 +3019,7 @@ mod tests {
     #[test]
     fn inline_nul_hides_the_line_end() {
         assert_eq!(Command::parse(b"GET a\0b\nPING\n"), Err(WireError::Incomplete));
-        let limits = Limits { max_line_len: 12, ..Limits::DEFAULT };
+        let limits = Limits { line: 12, ..Limits::DEFAULT };
         assert_eq!(command_step(b"GET a\0b\nPING\n", limits), Err(ParseError::LineTooLong));
         assert_eq!(command_step(b"GET a\0b\nPIN\n", limits), Ok(Decoded::Need));
         check_commands(b"GET a\0b\nPING\n", limits);

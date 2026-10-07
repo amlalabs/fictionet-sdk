@@ -909,7 +909,7 @@ mod tests {
     #[test]
     fn reassembly_gap_resets_the_http2_header_table() {
         use fictionet::stdlib::tcp_reassembly::Limits;
-        let mut dis = Dissector { tcp: Reassembler::new(Limits { max_segments: 1, ..Limits::default() }), ..Dissector::default() };
+        let mut dis = Dissector { tcp: Reassembler::new(Limits { segments: 1, ..Limits::default() }), ..Dissector::default() };
         dis.decode(&tcp(40000, 80, 100, 0x02, b""), &[]);
         let mut first = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
         first.extend(h2_frame(1, 0x4, 1, b"\x40\x01x\x01y"));
@@ -932,7 +932,7 @@ mod tests {
     #[test]
     fn reassembly_gap_before_the_first_bytes_also_stops_http2() {
         use fictionet::stdlib::tcp_reassembly::Limits;
-        let mut dis = Dissector { tcp: Reassembler::new(Limits { max_segments: 1, ..Limits::default() }), ..Dissector::default() };
+        let mut dis = Dissector { tcp: Reassembler::new(Limits { segments: 1, ..Limits::default() }), ..Dissector::default() };
         dis.decode(&tcp(40000, 80, 100, 0x02, b""), &[]);
         let mut first = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
         first.extend(h2_frame(1, 0x4, 1, &[0x82]));
@@ -946,7 +946,7 @@ mod tests {
     #[test]
     fn reassembly_gap_without_held_data_keeps_the_packet_tag() {
         use fictionet::stdlib::tcp_reassembly::Limits;
-        let mut dis = Dissector { tcp: Reassembler::new(Limits { max_buffered: 0, ..Limits::default() }), ..Dissector::default() };
+        let mut dis = Dissector { tcp: Reassembler::new(Limits { buffered: 0, ..Limits::default() }), ..Dissector::default() };
         dis.decode(&tcp(40000, 80, 100, 0x02, b""), &[]);
         let gap = dis.decode(&tcp(40000, 80, 110, 0x18, b"dropped"), &[]);
         assert!(gap.tags.contains(&"gap"));

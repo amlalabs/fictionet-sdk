@@ -40,19 +40,19 @@ fuzz_target!(|data: &[u8]| {
     let mut rng = Lcg::new(data.iter().fold(0x9e37_79b9_7f4a_7c15, |h, &b| {
         (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
     }));
-    let small = Limits { max_bulk_len: 6, max_elements: 3, max_depth: 2, max_line_len: 6, max_frame_len: 40 };
+    let small = Limits { bulk: 6, elements: 3, depth: 2, line: 6, frame: 40 };
     let drawn = Limits {
-        max_bulk_len: rng.index(64),
-        max_elements: rng.index(16),
-        max_depth: if rng.index(4) == 0 { usize::MAX } else { rng.index(8) },
-        max_line_len: rng.index(64),
-        max_frame_len: rng.index(data.len().saturating_add(2)),
+        bulk: rng.index(64),
+        elements: rng.index(16),
+        depth: if rng.index(4) == 0 { usize::MAX } else { rng.index(8) },
+        line: rng.index(64),
+        frame: rng.index(data.len().saturating_add(2)),
     };
     for (index, limits) in [Limits::DEFAULT, small, drawn].into_iter().enumerate() {
         // Default and small limits keep all chunk and prefix checks. Drawn limits
         // exercise whole input without repeating those expensive schedules.
         if index < 2 {
-            let allocation = 2 * limits.max_frame_len.clamp(1, MAX_FRAME_LEN);
+            let allocation = 2 * limits.frame.clamp(1, MAX_FRAME_LEN);
             contract::check_decode_with_alloc_limit(|| Values::with_limits(limits).map(WireValue), data, allocation);
             contract::check_decode_with_alloc_limit(|| Commands::with_limits(limits), data, allocation);
         }

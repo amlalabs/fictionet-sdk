@@ -69,7 +69,7 @@ impl Stack {
     fn new() -> Self {
         Self {
             tcp: tcp_reassembly::Reassembler::new(tcp_reassembly::Limits {
-                max_buffered: 128,
+                buffered: 128,
                 ..Default::default()
             }),
             h2: [

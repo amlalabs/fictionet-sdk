@@ -784,7 +784,7 @@ pub struct Limits {
     /// what came, as a body that ends in an error, and closes the
     /// connection after the answer; HTTP/2 answers the stream `413`.
     /// Default 64 MiB.
-    pub max_body: usize,
+    pub body: usize,
     /// HTTP/1: how long a request's head may take to arrive, counted from
     /// when the service starts waiting for it, which includes the wait
     /// between requests. Default 30 seconds.
@@ -800,18 +800,18 @@ pub struct Limits {
     /// HTTP/2: the most streams open at once on one connection, which
     /// the server announces in its settings. Default 100, the least RFC
     /// 9113 recommends.
-    pub max_streams: u32,
+    pub streams: u32,
 }
 
 impl Default for Limits {
     fn default() -> Limits {
         Limits {
             head: http1::Limits::default(),
-            max_body: 64 << 20,
+            body: 64 << 20,
             header_timeout: Duration::from_secs(30),
             body_timeout: Duration::from_secs(30),
             write_timeout: Duration::from_secs(30),
-            max_streams: 100,
+            streams: 100,
         }
     }
 }
@@ -1119,7 +1119,7 @@ impl serve::Service for Http1 {
                 self.too_big = false;
             }
             H1::Body(bytes) => {
-                if self.body.len() + bytes.len() > self.opts.max_body {
+                if self.body.len() + bytes.len() > self.opts.body {
                     self.too_big = true;
                 } else {
                     self.body.extend_from_slice(&bytes);
@@ -1143,7 +1143,7 @@ impl serve::Service for Http1 {
             // The body was cut off: the handler still sees what came, as a
             // body that ends in an error.
             let mut got = std::mem::take(&mut self.body);
-            let room = self.opts.max_body.saturating_sub(got.len());
+            let room = self.opts.body.saturating_sub(got.len());
             got.extend_from_slice(&ctx.unread()[..ctx.unread().len().min(room)]);
             let body = partial(Bytes::from(got), "the request body was cut off");
             self.dispatch(ctx, body, true);
@@ -1661,7 +1661,7 @@ mod h2 {
         let browser = cfg!(target_arch = "wasm32");
         let mut builder = hyper::server::conn::http2::Builder::new(Executor { cx: cx.clone() });
         builder.auto_date_header(false);
-        builder.max_concurrent_streams(opts.limits.max_streams);
+        builder.max_concurrent_streams(opts.limits.streams);
         if !browser {
             builder.timer(CxTimer { cx: cx.clone() });
         }
@@ -1784,7 +1784,7 @@ mod h2 {
                     };
                     let Ok(data) = frame.into_data() else { continue };
                     let len = got.len() + data.len();
-                    if len > self.limits.max_body {
+                    if len > self.limits.body {
                         return Err(Box::new(answered(text(StatusCode::PAYLOAD_TOO_LARGE, "The request body is too large.\n"), "too_large")));
                     }
                     if !charge.as_mut().is_none_or(|c| c.set(len)) {

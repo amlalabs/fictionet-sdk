@@ -22,7 +22,7 @@
 //!
 //! Numbers use their decimal text, including for equality and `multipleOf`.
 //! No floating point rounding or tolerance is used by validation. Precision
-//! is limited only by [`fictionet::stdlib::json::MAX_NUMBER_LEN`] and [`Limits::max_number_exponent`].
+//! is limited only by [`fictionet::stdlib::json::MAX_NUMBER_LEN`] and [`Limits::number_exponent`].
 //! Out-of-range exponents are errors, including in enum values and instances.
 //! Object order does not affect equality. Duplicate object keys are refused.
 //!
@@ -99,67 +99,67 @@ pub enum FormatPolicy {
 ///
 /// ```
 /// use fictionet::stdlib::json_schema::{Limits, Options};
-/// let limits = Limits { max_work: 10_000, ..Limits::default() };
+/// let limits = Limits { work: 10_000, ..Limits::default() };
 /// let options = Options { limits, ..Options::default() };
-/// assert_eq!(options.limits.max_work, 10_000);
+/// assert_eq!(options.limits.work, 10_000);
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
     /// Distinct reached source values, including keyword data. Default 16,384.
     /// Unused definitions and document siblings are excluded.
-    pub max_schema_nodes: usize,
+    pub schema_nodes: usize,
     /// Values in an instance. Object names are not nodes. Default 100,000.
-    pub max_instance_nodes: usize,
+    pub instance_nodes: usize,
     /// Sum of string, name, and number bytes plus one per reached source value,
     /// or per instance value, separately. Default 1 MiB.
-    pub max_bytes: usize,
+    pub bytes: usize,
     /// Source or instance nesting before copying. Default 128; ceiling 256.
     /// Each entry or reference target starts at zero. Document ancestors do
     /// not count. The ceiling bounds recursive value cloning and comparison.
-    pub max_depth: usize,
+    pub depth: usize,
     /// Simultaneous evaluations on the explicit stack, including applicators.
     /// Default 512. Recursive lists fit JSON depth 128.
-    pub max_validation_depth: usize,
+    pub validation_depth: usize,
     /// Reference hops at one instance location. Default 32. The count resets
-    /// on instance descent; `max_validation_depth` also bounds the stack.
-    pub max_ref_depth: usize,
+    /// on instance descent; `validation_depth` also bounds the stack.
+    pub ref_depth: usize,
     /// Bytes in a JSON Pointer diagnostic or resolved schema path. Default 4,096.
-    pub max_pointer_bytes: usize,
+    pub pointer_bytes: usize,
     /// Collected validation errors. Default 64. Zero still returns one error.
-    pub max_errors: usize,
+    pub errors: usize,
     /// Work units per compilation or validation. Default 1,000,000.
     /// Units charge visits, searches, comparisons, and decimal digit operations.
-    pub max_work: usize,
+    pub work: usize,
     /// Additional validation work ceiling per schema/instance size pair.
-    /// Default 32. The effective budget is the smaller of `max_work` and
+    /// Default 32. The effective budget is the smaller of `work` and
     /// this field times `(schema_size + 1) * (instance_size + 1)`.
     pub work_per_pair: usize,
     /// Absolute decimal exponent before normalization. Default 10,000;
     /// ceiling 1,000,000 keeps decimal index arithmetic bounded.
-    pub max_number_exponent: usize,
+    pub number_exponent: usize,
 }
 impl Default for Limits {
     /// Returns the documented resource defaults.
     fn default() -> Self {
         Self {
-            max_schema_nodes: 16_384,
-            max_instance_nodes: 100_000,
-            max_bytes: 1 << 20,
-            max_depth: 128,
-            max_validation_depth: 512,
-            max_ref_depth: 32,
-            max_pointer_bytes: 4096,
-            max_errors: 64,
-            max_work: 1_000_000,
+            schema_nodes: 16_384,
+            instance_nodes: 100_000,
+            bytes: 1 << 20,
+            depth: 128,
+            validation_depth: 512,
+            ref_depth: 32,
+            pointer_bytes: 4096,
+            errors: 64,
+            work: 1_000_000,
             work_per_pair: 32,
-            max_number_exponent: 10_000,
+            number_exponent: 10_000,
         }
     }
 }
 impl Limits {
     fn bounded(mut self) -> Self {
-        self.max_depth = self.max_depth.min(256);
-        self.max_number_exponent = self.max_number_exponent.min(1_000_000);
+        self.depth = self.depth.min(256);
+        self.number_exponent = self.number_exponent.min(1_000_000);
 
         self
     }
@@ -196,7 +196,7 @@ pub enum ErrorMode {
     /// Stop at the first failed assertion. Branch probes remain isolated.
     #[default]
     First,
-    /// Collect failed assertions up to [`Limits::max_errors`].
+    /// Collect failed assertions up to [`Limits::errors`].
     All,
 }
 
@@ -387,7 +387,7 @@ impl std::error::Error for GenerationError {}
 ///
 /// Validation preflights input in bounded depth, then evaluates under a shared
 /// work cap. For schema size S and instance size I (nodes plus text bytes),
-/// evaluation performs at most `min(max_work, work_per_pair*(S+1)*(I+1))`
+/// evaluation performs at most `min(work, work_per_pair*(S+1)*(I+1))`
 /// charged operations. Text comparisons and decimal parsing charge bytes read.
 /// Preflight uses ordered sets for duplicate names: O((S+I) log(S+I)) in the
 /// worst case. `uniqueItems` sorts normalized values in O(n log n) comparisons.
@@ -476,14 +476,14 @@ impl Node {
 }
 
 fn pointer(base: &str, token: &str, max: usize) -> Result<String, &'static str> {
-    let mut size = base.len().checked_add(1).ok_or("max_pointer_bytes")?;
+    let mut size = base.len().checked_add(1).ok_or("pointer_bytes")?;
     for b in token.bytes() {
         size = size
             .checked_add(if b == b'~' || b == b'/' { 2 } else { 1 })
-            .ok_or("max_pointer_bytes")?;
+            .ok_or("pointer_bytes")?;
     }
     if size > max {
-        return Err("max_pointer_bytes");
+        return Err("pointer_bytes");
     }
     let mut out = String::with_capacity(size);
     out.push_str(base);
@@ -524,14 +524,14 @@ impl<'v> InstancePath<'v> {
                 .try_fold(0usize, |n, b| {
                     n.checked_add(if matches!(b, b'~' | b'/') { 2 } else { 1 })
                 })
-                .ok_or("max_pointer_bytes")?,
+                .ok_or("pointer_bytes")?,
         };
         let bytes = self
             .bytes
             .checked_add(1)
             .and_then(|n| n.checked_add(size))
             .filter(|&n| n <= max)
-            .ok_or("max_pointer_bytes")?;
+            .ok_or("pointer_bytes")?;
         Ok(Self {
             last: Some(std::rc::Rc::new(Step {
                 parent: self.clone(),
@@ -586,8 +586,8 @@ fn inspect(value: &Value, limits: &Limits, max_nodes: usize) -> Result<usize, In
             path: path.render(),
             limit,
         };
-        if depth > l.max_depth {
-            return Err(err(Some("max_depth")));
+        if depth > l.depth {
+            return Err(err(Some("depth")));
         }
         *nodes = nodes.saturating_add(1);
         if *nodes > cap {
@@ -606,7 +606,7 @@ fn inspect(value: &Value, limits: &Limits, max_nodes: usize) -> Result<usize, In
                 }
                 for (i, child) in a.iter().enumerate() {
                     let p = path
-                        .child(Token::Index(i), l.max_pointer_bytes)
+                        .child(Token::Index(i), l.pointer_bytes)
                         .map_err(|s| err(Some(s)))?;
                     visit(child, &p, depth + 1, nodes, bytes, l, cap)?;
                 }
@@ -618,11 +618,11 @@ fn inspect(value: &Value, limits: &Limits, max_nodes: usize) -> Result<usize, In
                 let mut names = BTreeSet::new();
                 for (key, child) in o {
                     *bytes = bytes.saturating_add(key.len());
-                    if *bytes > l.max_bytes {
-                        return Err(err(Some("max_bytes")));
+                    if *bytes > l.bytes {
+                        return Err(err(Some("bytes")));
                     }
                     let p = path
-                        .child(Token::Name(key), l.max_pointer_bytes)
+                        .child(Token::Name(key), l.pointer_bytes)
                         .map_err(|s| err(Some(s)))?;
                     if !names.insert(key) {
                         return Err(InputError {
@@ -635,8 +635,8 @@ fn inspect(value: &Value, limits: &Limits, max_nodes: usize) -> Result<usize, In
             }
             _ => {}
         }
-        if *bytes > l.max_bytes {
-            return Err(err(Some("max_bytes")));
+        if *bytes > l.bytes {
+            return Err(err(Some("bytes")));
         }
         Ok(())
     }
@@ -657,9 +657,9 @@ impl Decimal {
     fn new(number: &Number, limits: &Limits) -> Result<Self, &'static str> {
         let text = number.text();
         let (mantissa, exp) = text.split_once(['e', 'E']).unwrap_or((text, "0"));
-        let exponent: i64 = exp.parse().map_err(|_| "max_number_exponent")?;
-        if exponent.unsigned_abs() > limits.max_number_exponent as u64 {
-            return Err("max_number_exponent");
+        let exponent: i64 = exp.parse().map_err(|_| "number_exponent")?;
+        if exponent.unsigned_abs() > limits.number_exponent as u64 {
+            return Err("number_exponent");
         }
         let fraction = mantissa.split_once('.').map_or(0, |(_, s)| s.len());
         let mut digits: Vec<u8> = mantissa
@@ -839,7 +839,7 @@ struct Work {
 }
 impl Work {
     fn spend(&mut self, n: usize) -> Result<(), &'static str> {
-        self.left = self.left.checked_sub(n).ok_or("max_work")?;
+        self.left = self.left.checked_sub(n).ok_or("work")?;
         Ok(())
     }
 }
@@ -889,14 +889,14 @@ impl Paths {
             self.0[parent]
                 .bytes
                 .checked_add(1)
-                .ok_or("max_pointer_bytes")?,
+                .ok_or("pointer_bytes")?,
             |n, b| {
                 n.checked_add(if matches!(b, b'~' | b'/') { 2 } else { 1 })
-                    .ok_or("max_pointer_bytes")
+                    .ok_or("pointer_bytes")
             },
         )?;
         if bytes > max {
-            return Err("max_pointer_bytes");
+            return Err("pointer_bytes");
         }
         let id = self.0.len();
         self.0.push(Location {
@@ -992,7 +992,7 @@ impl<'a> Compiler<'a> {
         }
         let id = self
             .paths
-            .child(parent, token, self.options.limits.max_pointer_bytes)
+            .child(parent, token, self.options.limits.pointer_bytes)
             .map_err(|s| self.error(parent, CompileErrorKind::Limit(s)))?;
         self.locations.insert(value, id);
         Ok(id)
@@ -1015,11 +1015,11 @@ impl<'a> Compiler<'a> {
                 continue;
             }
             let l = self.options.limits;
-            if depth > l.max_depth {
-                return Err(self.error(p, CompileErrorKind::Limit("max_depth")));
+            if depth > l.depth {
+                return Err(self.error(p, CompileErrorKind::Limit("depth")));
             }
-            if self.checked.len() > l.max_schema_nodes {
-                return Err(self.error(p, CompileErrorKind::Limit("max_schema_nodes")));
+            if self.checked.len() > l.schema_nodes {
+                return Err(self.error(p, CompileErrorKind::Limit("schema_nodes")));
             }
             let text_bytes = match v {
                 Value::String(s) => s.len(),
@@ -1028,12 +1028,12 @@ impl<'a> Compiler<'a> {
             };
             let bytes = text_bytes
                 .checked_add(1)
-                .ok_or_else(|| self.error(p, CompileErrorKind::Limit("max_bytes")))?;
+                .ok_or_else(|| self.error(p, CompileErrorKind::Limit("bytes")))?;
             self.size = self
                 .size
                 .checked_add(bytes)
-                .filter(|&n| n <= l.max_bytes)
-                .ok_or_else(|| self.error(p, CompileErrorKind::Limit("max_bytes")))?;
+                .filter(|&n| n <= l.bytes)
+                .ok_or_else(|| self.error(p, CompileErrorKind::Limit("bytes")))?;
             self.spend(bytes, p)?;
             if let Value::Number(n) = v {
                 Decimal::new(n, &l).map_err(|s| self.error(p, CompileErrorKind::Limit(s)))?;
@@ -1054,11 +1054,11 @@ impl<'a> Compiler<'a> {
                 _ => 0,
             };
             if children
-                > l.max_schema_nodes
+                > l.schema_nodes
                     .saturating_sub(self.checked.len())
                     .saturating_sub(stack.len())
             {
-                return Err(self.error(p, CompileErrorKind::Limit("max_schema_nodes")));
+                return Err(self.error(p, CompileErrorKind::Limit("schema_nodes")));
             }
             match v {
                 Value::Array(a) => {
@@ -1079,8 +1079,8 @@ impl<'a> Compiler<'a> {
                         self.size = self
                             .size
                             .checked_add(key.len())
-                            .filter(|&n| n <= l.max_bytes)
-                            .ok_or_else(|| self.error(p, CompileErrorKind::Limit("max_bytes")))?;
+                            .filter(|&n| n <= l.bytes)
+                            .ok_or_else(|| self.error(p, CompileErrorKind::Limit("bytes")))?;
                         self.spend(key.len().saturating_add(1), p)?;
                         let at = self.location(child, p, key)?;
                         if !names.insert(key) {
@@ -1110,8 +1110,8 @@ impl<'a> Compiler<'a> {
     }
     fn resolve(&mut self, pointer: &str) -> Result<(&'a Value, usize), CompileErrorKind> {
         use CompileErrorKind::{InvalidReference, Limit};
-        if pointer.len() > self.options.limits.max_pointer_bytes {
-            return Err(Limit("max_pointer_bytes"));
+        if pointer.len() > self.options.limits.pointer_bytes {
+            return Err(Limit("pointer_bytes"));
         }
         let mut value = self.root;
         let mut path = 0;
@@ -1177,7 +1177,7 @@ impl<'a> Compiler<'a> {
     // `const`, or extensions is never a target.
     fn anchor_pointer(&mut self, anchor: &str) -> Result<String, CompileErrorKind> {
         use CompileErrorKind::{InvalidAnchor, InvalidReference, Limit};
-        let max = self.options.limits.max_pointer_bytes;
+        let max = self.options.limits.pointer_bytes;
         let mut found: Option<(*const Value, String)> = None;
         let mut starts = vec![(self.root, String::new())];
         if let Some((value, pointer)) = &self.entry {
@@ -1497,7 +1497,7 @@ impl<'a> Compiler<'a> {
     fn finish(mut self, entry: &str) -> Result<Schema, CompileError> {
         let (value, path) = self.resolve(entry).map_err(|kind| CompileError {
             schema_path: {
-                let mut end = entry.len().min(self.options.limits.max_pointer_bytes);
+                let mut end = entry.len().min(self.options.limits.pointer_bytes);
                 while !entry.is_char_boundary(end) {
                     end -= 1;
                 }
@@ -1610,7 +1610,7 @@ impl Schema {
             nodes: Vec::new(),
             annotations: Vec::new(),
             work: Work {
-                left: options.limits.max_work,
+                left: options.limits.work,
             },
         }
         .finish(entry)
@@ -1644,14 +1644,14 @@ impl Schema {
             truncated: false,
         };
         let l = &self.options.limits;
-        let size = match inspect(instance, l, l.max_instance_nodes) {
+        let size = match inspect(instance, l, l.instance_nodes) {
             Ok(size) => size,
             Err(e) => {
                 report.errors.push(ValidationError {
                     instance_path: e.path,
                     schema_path: String::new(),
                     kind: match e.limit {
-                        Some("max_nodes") => ValidationKind::Limit("max_instance_nodes"),
+                        Some("max_nodes") => ValidationKind::Limit("instance_nodes"),
                         Some(l) => ValidationKind::Limit(l),
                         None => ValidationKind::DuplicateKey,
                     },
@@ -1671,7 +1671,7 @@ impl Schema {
             cap: if mode == ErrorMode::First {
                 1
             } else {
-                l.max_errors.max(1)
+                l.errors.max(1)
             },
             truncated: false,
         };
@@ -1687,7 +1687,7 @@ impl Schema {
         report
     }
     fn budget(&self, size: usize) -> usize {
-        self.options.limits.max_work.min(
+        self.options.limits.work.min(
             self.size
                 .saturating_add(1)
                 .saturating_mul(size.saturating_add(1))
@@ -2340,7 +2340,7 @@ impl<'s> Eval<'s, '_> {
             schema_path: if keyword.is_empty() {
                 base.clone()
             } else {
-                pointer(&base, keyword, self.schema.options.limits.max_pointer_bytes)
+                pointer(&base, keyword, self.schema.options.limits.pointer_bytes)
                     .unwrap_or_else(|_| base.clone())
             },
             kind,
@@ -2363,7 +2363,7 @@ impl<'s> Eval<'s, '_> {
         p: &InstancePath<'v>,
         token: Token<'v>,
     ) -> Result<InstancePath<'v>, ValidationError> {
-        p.child(token, self.schema.options.limits.max_pointer_bytes)
+        p.child(token, self.schema.options.limits.pointer_bytes)
             .map_err(|s| self.error(id, p, "", ValidationKind::Limit(s)))
     }
     fn assertion(
@@ -2471,20 +2471,20 @@ impl<'s> Eval<'s, '_> {
             match check {
                 Check::Enter => {
                     self.spend(1, c.id, &c.path, "")?;
-                    if c.depth > self.schema.options.limits.max_validation_depth {
+                    if c.depth > self.schema.options.limits.validation_depth {
                         return Err(self.error(
                             c.id,
                             &c.path,
                             "",
-                            ValidationKind::Limit("max_validation_depth"),
+                            ValidationKind::Limit("validation_depth"),
                         ));
                     }
-                    if c.refs > self.schema.options.limits.max_ref_depth {
+                    if c.refs > self.schema.options.limits.ref_depth {
                         return Err(self.error(
                             c.id,
                             &c.path,
                             "$ref",
-                            ValidationKind::Limit("max_ref_depth"),
+                            ValidationKind::Limit("ref_depth"),
                         ));
                     }
                     if !self.active.insert((c.id, c.value.get())) {
@@ -2973,7 +2973,7 @@ impl Schema {
             let size = match inspect(
                 &value,
                 &self.options.limits,
-                self.options.limits.max_instance_nodes,
+                self.options.limits.instance_nodes,
             ) {
                 Ok(size) => size,
                 Err(_) => {
@@ -2999,7 +2999,7 @@ impl Schema {
             match result {
                 Ok(true) => return Ok(value),
                 Ok(false) => last = GenerationError::NoCandidate,
-                Err(e) if e.kind == ValidationKind::Limit("max_work") => {
+                Err(e) if e.kind == ValidationKind::Limit("work") => {
                     return Err(GenerationError::Limit("work"));
                 }
                 Err(e) => return Err(GenerationError::Validation(e)),
@@ -3942,7 +3942,7 @@ mod tests {
                 &source,
                 Options {
                     limits: Limits {
-                        max_errors: cap,
+                        errors: cap,
                         ..Limits::default()
                     },
                     ..Options::default()
@@ -3962,11 +3962,11 @@ mod tests {
             Schema::compile(&Value::Object(vec![("minimum".into(), huge.clone())]))
                 .unwrap_err()
                 .kind,
-            CompileErrorKind::Limit("max_number_exponent")
+            CompileErrorKind::Limit("number_exponent")
         ));
         assert_eq!(
             schema("true").validate(&huge).errors[0].kind,
-            ValidationKind::Limit("max_number_exponent")
+            ValidationKind::Limit("number_exponent")
         );
         let source = Value::Object(vec![(
             "enum".into(),
@@ -3974,7 +3974,7 @@ mod tests {
         )]);
         assert_eq!(
             Schema::compile(&source).unwrap_err().kind,
-            CompileErrorKind::Limit("max_schema_nodes")
+            CompileErrorKind::Limit("schema_nodes")
         );
         let mut deep = Value::Null;
         for _ in 0..200 {
@@ -3982,15 +3982,15 @@ mod tests {
         }
         assert!(matches!(
             Schema::compile(&deep).unwrap_err().kind,
-            CompileErrorKind::Limit("max_depth")
+            CompileErrorKind::Limit("depth")
         ));
         assert_eq!(
             schema("true").validate(&deep).errors[0].kind,
-            ValidationKind::Limit("max_depth")
+            ValidationKind::Limit("depth")
         );
         let options = Options {
             limits: Limits {
-                max_ref_depth: 1,
+                ref_depth: 1,
                 ..Limits::default()
             },
             ..Options::default()
@@ -4002,11 +4002,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             s.validate(&Value::Null).errors[0].kind,
-            ValidationKind::Limit("max_ref_depth")
+            ValidationKind::Limit("ref_depth")
         );
         let options = Options {
             limits: Limits {
-                max_validation_depth: 0,
+                validation_depth: 0,
                 ..Limits::default()
             },
             ..Options::default()
@@ -4014,7 +4014,7 @@ mod tests {
         let s = Schema::compile_with(&value(r#"{"allOf":[true]}"#), options).unwrap();
         assert_eq!(
             s.validate(&Value::Null).errors[0].kind,
-            ValidationKind::Limit("max_validation_depth")
+            ValidationKind::Limit("validation_depth")
         );
         // A small DAG expands exponentially without a shared budget.
         let mut defs = Vec::new();
@@ -4035,7 +4035,7 @@ mod tests {
         ]);
         let options = Options {
             limits: Limits {
-                max_work: 5000,
+                work: 5000,
                 ..Limits::default()
             },
             ..Options::default()
@@ -4043,11 +4043,11 @@ mod tests {
         let s = Schema::compile_with(&source, options).unwrap();
         assert_eq!(
             s.validate(&Value::Null).errors[0].kind,
-            ValidationKind::Limit("max_work")
+            ValidationKind::Limit("work")
         );
         let options = Options {
             limits: Limits {
-                max_pointer_bytes: 3,
+                pointer_bytes: 3,
                 ..Limits::default()
             },
             ..Options::default()
@@ -4055,7 +4055,7 @@ mod tests {
         assert!(Schema::compile_with(&value(r#"{"properties":{"long":true}}"#), options).is_err());
         let options = Options {
             limits: Limits {
-                max_work: 0,
+                work: 0,
                 ..Limits::default()
             },
             ..Options::default()
@@ -4176,11 +4176,11 @@ mod tests {
         let source = value(r#"{"type":"integer"}"#);
         for limits in [
             Limits {
-                max_schema_nodes: 0,
+                schema_nodes: 0,
                 ..Limits::default()
             },
             Limits {
-                max_bytes: 0,
+                bytes: 0,
                 ..Limits::default()
             },
         ] {
@@ -4199,7 +4199,7 @@ mod tests {
             &Value::Bool(true),
             Options {
                 limits: Limits {
-                    max_instance_nodes: 1,
+                    instance_nodes: 1,
                     ..Limits::default()
                 },
                 ..Options::default()
@@ -4208,13 +4208,13 @@ mod tests {
         .unwrap();
         assert_eq!(
             s.validate(&value("[1]")).errors[0].kind,
-            ValidationKind::Limit("max_instance_nodes")
+            ValidationKind::Limit("instance_nodes")
         );
         let s = Schema::compile_with(
             &Value::Bool(true),
             Options {
                 limits: Limits {
-                    max_bytes: 4,
+                    bytes: 4,
                     ..Limits::default()
                 },
                 ..Options::default()
@@ -4223,24 +4223,24 @@ mod tests {
         .unwrap();
         assert_eq!(
             s.validate(&Value::from("1234")).errors[0].kind,
-            ValidationKind::Limit("max_bytes")
+            ValidationKind::Limit("bytes")
         );
         let s = Schema::compile_with(
             &Value::Bool(true),
             Options {
                 limits: Limits {
-                    max_depth: usize::MAX,
-                    max_number_exponent: usize::MAX,
-                    max_work: usize::MAX,
+                    depth: usize::MAX,
+                    number_exponent: usize::MAX,
+                    work: usize::MAX,
                     ..Limits::default()
                 },
                 ..Options::default()
             },
         )
         .unwrap();
-        assert_eq!(s.options().limits.max_work, usize::MAX);
-        assert_eq!(s.options().limits.max_depth, 256);
-        assert_eq!(s.options().limits.max_number_exponent, 1_000_000);
+        assert_eq!(s.options().limits.work, usize::MAX);
+        assert_eq!(s.options().limits.depth, 256);
+        assert_eq!(s.options().limits.number_exponent, 1_000_000);
         let s = Schema::compile_with(
             &value(r#"{"not":false}"#),
             Options {
@@ -4254,7 +4254,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             s.validate(&Value::Null).errors[0].kind,
-            ValidationKind::Limit("max_work")
+            ValidationKind::Limit("work")
         );
         let source = value(r##"{"a/b~c":{"type":"integer"},"$ref":"#%2Fa~1b~0c"}"##);
         assert!(
@@ -4281,14 +4281,14 @@ mod tests {
             &source,
             Options {
                 limits: Limits {
-                    max_work: 2500,
+                    work: 2500,
                     ..Limits::default()
                 },
                 ..Options::default()
             },
         )
         .unwrap_err();
-        assert_eq!(e.kind, CompileErrorKind::Limit("max_work"));
+        assert_eq!(e.kind, CompileErrorKind::Limit("work"));
     }
     #[test]
     fn review_unique_items_scales_and_normalizes() {
@@ -4414,7 +4414,7 @@ mod tests {
         )]);
         let options = Options {
             limits: Limits {
-                max_schema_nodes: 20_000,
+                schema_nodes: 20_000,
                 ..Limits::default()
             },
             ..Options::default()
@@ -4426,8 +4426,8 @@ mod tests {
         )]);
         let options = Options {
             limits: Limits {
-                max_bytes: 2 << 20,
-                max_work: 4_000_000,
+                bytes: 2 << 20,
+                work: 4_000_000,
                 ..Limits::default()
             },
             ..Options::default()
@@ -4546,8 +4546,8 @@ mod tests {
                 &unused,
                 Options {
                     limits: Limits {
-                        max_schema_nodes: 1,
-                        max_depth: 0,
+                        schema_nodes: 1,
+                        depth: 0,
                         ..Limits::default()
                     },
                     ..Options::default()
@@ -4560,9 +4560,9 @@ mod tests {
         );
         let options = Options {
             limits: Limits {
-                max_schema_nodes: 8,
-                max_bytes: 100,
-                max_depth: 1,
+                schema_nodes: 8,
+                bytes: 100,
+                depth: 1,
                 ..Limits::default()
             },
             ..Options::default()
@@ -4616,9 +4616,9 @@ mod tests {
             &source,
             Options {
                 limits: Limits {
-                    max_validation_depth: 1024,
-                    max_ref_depth: usize::MAX,
-                    max_work: 100_000_000,
+                    validation_depth: 1024,
+                    ref_depth: usize::MAX,
+                    work: 100_000_000,
                     ..Limits::default()
                 },
                 ..Options::default()
@@ -4627,7 +4627,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             s.validate(&Value::Null).errors[0].kind,
-            ValidationKind::Limit("max_validation_depth")
+            ValidationKind::Limit("validation_depth")
         );
     }
 

@@ -321,7 +321,7 @@ fn http2_has_the_limits_budget_and_seed_of_http1() {
             .get("/dice", |ex, _| http::Response::new(Bytes::from(ex.random_u64().to_string())))
             .post("/echo", |_, request: http::Request<Bytes>| http::Response::new(request.into_body()));
         let opts = HttpOptions {
-            limits: Limits { max_body: 3000, ..Limits::default() },
+            limits: Limits { body: 3000, ..Limits::default() },
             budget: Some(Budget::new(2000)),
             seed: 7,
             ..HttpOptions::default()
