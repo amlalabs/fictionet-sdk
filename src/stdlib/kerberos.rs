@@ -304,8 +304,8 @@ pub mod error_code {
     pub const KRB_ERR_FIELD_TOOLONG: i32 = 61;
 }
 
-/// Why bytes are not a Kerberos message, or why a value cannot be
-/// written as one.
+/// Why bytes are not a Kerberos message or TCP record, or why a value
+/// cannot be written as one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     /// Encoding would change the value when parsed.
@@ -349,6 +349,19 @@ pub enum Error {
     /// forbids (unspecified, loopback, link-local, or IPv4-mapped, which
     /// must be type 2). Other types hold any bytes.
     Address,
+    /// A TCP length prefix has its high bit, reserved for extensions, set.
+    /// It holds the prefix. RFC 4120 section 7.2.2 says a KDC must answer
+    /// with [`error_code::KRB_ERR_FIELD_TOOLONG`] and close the
+    /// connection. The stream holds no more messages a reader can find.
+    ReservedLength(u32),
+    /// A TCP length prefix is above [`MAX_MESSAGE`] or the decoder's
+    /// limit. It holds the prefix. The RFC sets no rule for this; the
+    /// answer for [`Error::ReservedLength`] suits it.
+    LengthTooLong(u32),
+    /// The input ended inside a TCP record's prefix or payload.
+    Truncated,
+    /// Bytes followed the complete TCP record.
+    Trailing,
 }
 
 impl fmt::Display for Error {
@@ -368,11 +381,22 @@ impl fmt::Display for Error {
             Error::Time => f.write_str("KerberosTime not YYYYMMDDhhmmssZ"),
             Error::TooLong => write!(f, "message longer than {MAX_MESSAGE} bytes"),
             Error::Address => f.write_str("host address not of its type's form"),
+            Error::ReservedLength(n) => write!(f, "length {n:#010x} has the reserved high bit set"),
+            Error::LengthTooLong(n) => write!(f, "length {n} is above {MAX_MESSAGE}"),
+            Error::Truncated => f.write_str("Kerberos TCP record ended early"),
+            Error::Trailing => f.write_str("bytes after the Kerberos TCP record"),
         }
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Asn1(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 impl From<asn1::Error> for Error {
     fn from(e: asn1::Error) -> Error {
@@ -1165,31 +1189,6 @@ impl Message {
     }
 }
 
-/// Why a TCP stream cannot be split into messages. Either way the stream
-/// holds no more messages a reader can find. For a set reserved bit, RFC
-/// 4120 section 7.2.2 says a KDC must answer with
-/// [`error_code::KRB_ERR_FIELD_TOOLONG`] and close the connection. The
-/// RFC sets no rule for a length over [`MAX_MESSAGE`]; the same answer
-/// suits it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FrameError {
-    /// The length's high bit, reserved for extensions, is set.
-    Reserved(u32),
-    /// The length is above [`MAX_MESSAGE`].
-    TooLong(u32),
-}
-
-impl fmt::Display for FrameError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            FrameError::Reserved(n) => write!(f, "length {n:#010x} has the reserved high bit set"),
-            FrameError::TooLong(n) => write!(f, "length {n} is above {MAX_MESSAGE}"),
-        }
-    }
-}
-
-impl std::error::Error for FrameError {}
-
 impl Wire for Message {
     type ParseError = Error;
     type WriteError = Error;
@@ -1226,49 +1225,26 @@ pub struct Frame(
     pub Vec<u8>,
 );
 
-/// Why bytes do not contain exactly one complete TCP record.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FrameParseError {
-    /// The record's length was refused.
-    Frame(FrameError),
-    /// The input ended inside the prefix or payload.
-    Truncated,
-    /// Bytes followed the complete record.
-    Trailing,
-}
-
-impl core::fmt::Display for FrameParseError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Frame(e) => e.fmt(f),
-            Self::Truncated => f.write_str("Kerberos TCP record ended early"),
-            Self::Trailing => f.write_str("bytes after the Kerberos TCP record"),
-        }
-    }
-}
-
-impl core::error::Error for FrameParseError {}
-
 impl Wire for Frame {
-    type ParseError = FrameParseError;
-    type WriteError = FrameError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads one TCP record. Refuses a reserved length bit, payloads over
     /// [`MAX_MESSAGE`], incomplete records, and trailing bytes.
-    fn parse(bytes: &[u8]) -> Result<Self, FrameParseError> {
-        match Frames::new().decode(bytes, true).map_err(FrameParseError::Frame)? {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        match Frames::new().decode(bytes, true)? {
             Step::Item(data, n) if n == bytes.len() => Ok(Self(data)),
-            Step::Item(_, _) => Err(FrameParseError::Trailing),
-            _ => Err(FrameParseError::Truncated),
+            Step::Item(_, _) => Err(Error::Trailing),
+            _ => Err(Error::Truncated),
         }
     }
 
     /// Appends the four-byte length and payload. Refuses payloads over
     /// [`MAX_MESSAGE`], leaving `out` unchanged.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), FrameError> {
-        let length = u32::try_from(self.0.len()).map_err(|_| FrameError::TooLong(u32::MAX))?;
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        let length = u32::try_from(self.0.len()).map_err(|_| Error::LengthTooLong(u32::MAX))?;
         if self.0.len() > MAX_MESSAGE {
-            return Err(FrameError::TooLong(length));
+            return Err(Error::LengthTooLong(length));
         }
         out.extend_from_slice(&length.to_be_bytes());
         out.extend_from_slice(&self.0);
@@ -1315,23 +1291,23 @@ impl Default for Frames {
 
 impl Decode for Frames {
     type Item = Vec<u8>;
-    type Error = FrameError;
+    type Error = Error;
     const NAME: &'static str = "Kerberos TCP";
 
     fn capacity(&self) -> usize {
         TCP_HEADER_LEN.saturating_add(self.limit)
     }
 
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Vec<u8>>, FrameError> {
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Vec<u8>>, Error> {
         let Some(&[a, b, c, d]) = input.get(..TCP_HEADER_LEN) else {
             return Ok(Step::Need);
         };
         let length = u32::from_be_bytes([a, b, c, d]);
         let n = frame_len(length)?;
         if n > self.limit {
-            return Err(FrameError::TooLong(length));
+            return Err(Error::LengthTooLong(length));
         }
-        let total = TCP_HEADER_LEN.checked_add(n).ok_or(FrameError::TooLong(length))?;
+        let total = TCP_HEADER_LEN.checked_add(n).ok_or(Error::LengthTooLong(length))?;
         Ok(match input.get(TCP_HEADER_LEN..total) {
             Some(bytes) => Step::Item(bytes.to_vec(), total),
             None => Step::Need,
@@ -1340,11 +1316,11 @@ impl Decode for Frames {
 }
 
 /// The body length a TCP length prefix gives, if it is allowed.
-fn frame_len(len: u32) -> Result<usize, FrameError> {
+fn frame_len(len: u32) -> Result<usize, Error> {
     if len & 0x8000_0000 != 0 {
-        return Err(FrameError::Reserved(len));
+        return Err(Error::ReservedLength(len));
     }
-    usize::try_from(len).ok().filter(|&n| n <= MAX_MESSAGE).ok_or(FrameError::TooLong(len))
+    usize::try_from(len).ok().filter(|&n| n <= MAX_MESSAGE).ok_or(Error::LengthTooLong(len))
 }
 
 // Reading helpers. Each reads one value from `r` and leaves the rest.
@@ -1927,7 +1903,7 @@ mod tests {
         // A message over the size limit.
         let big = Message::ApRep(ApRep { enc_part: enc(18, None, &vec![0; MAX_MESSAGE]) });
         assert_eq!(big.to_bytes(), Err(Error::TooLong));
-        assert_eq!(Frame(vec![0; MAX_MESSAGE + 1]).to_bytes(), Err(FrameError::TooLong(MAX_MESSAGE as u32 + 1)));
+        assert_eq!(Frame(vec![0; MAX_MESSAGE + 1]).to_bytes(), Err(Error::LengthTooLong(MAX_MESSAGE as u32 + 1)));
         assert!(Frame(vec![0; MAX_MESSAGE]).to_bytes().is_ok());
     }
 
@@ -2137,16 +2113,16 @@ mod tests {
         assert_eq!(d.next(), Some(Ok(Vec::new())));
         // The reserved bit breaks the stream for good.
         assert_eq!(d.push(&[0x80, 0, 0, 1, 0]), 5);
-        assert_eq!(d.next(), Some(Err(Fail::Protocol(FrameError::Reserved(0x8000_0001)))));
+        assert_eq!(d.next(), Some(Err(Fail::Protocol(Error::ReservedLength(0x8000_0001)))));
         assert_eq!(d.push(&stream), stream.len());
         assert_eq!(d.next(), None);
-        assert_eq!(d.failed(), Some(&Fail::Protocol(FrameError::Reserved(0x8000_0001))));
+        assert_eq!(d.failed(), Some(&Fail::Protocol(Error::ReservedLength(0x8000_0001))));
         // So does a length over the limit, known before the body comes.
         let mut d = Stream::new(Frames::new());
         let over = (MAX_MESSAGE as u32 + 1).to_be_bytes();
         assert_eq!(d.push(&over), over.len());
-        assert_eq!(d.next(), Some(Err(Fail::Protocol(FrameError::TooLong(MAX_MESSAGE as u32 + 1)))));
-        assert!(!FrameError::TooLong(1).to_string().is_empty());
+        assert_eq!(d.next(), Some(Err(Fail::Protocol(Error::LengthTooLong(MAX_MESSAGE as u32 + 1)))));
+        assert!(!Error::LengthTooLong(1).to_string().is_empty());
     }
 
     #[test]
@@ -2172,7 +2148,7 @@ mod tests {
         let mut got = Vec::new();
         assert_eq!(
             pump(&mut stream, &bytes, |m| got.push(m)),
-            Err(Fail::Protocol(FrameError::TooLong(MAX_MESSAGE as u32 + 1)))
+            Err(Fail::Protocol(Error::LengthTooLong(MAX_MESSAGE as u32 + 1)))
         );
         assert_eq!(got, [one[4..].to_vec(), one[4..].to_vec()]);
         let held = stream.buffered();
@@ -2183,7 +2159,7 @@ mod tests {
         assert_eq!(stream.push(&[0x80, 0]), 2);
         assert_eq!(stream.next(), None);
         assert_eq!(stream.push(&[0, 5]), 2);
-        assert_eq!(stream.next(), Some(Err(Fail::Protocol(FrameError::Reserved(0x8000_0005)))));
+        assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::ReservedLength(0x8000_0005)))));
     }
 
     #[test]
@@ -2403,7 +2379,7 @@ mod tests {
         assert_eq!(stream.next(), Some(Ok(frame.0)));
         contract::check_decode_with_alloc_limit(Frames::new, &[0, 0, 0, 0, 0x80, 0, 0, 0], 2 * (TCP_HEADER_LEN + MAX_MESSAGE));
         assert_eq!(stream.push(&[0x80, 0, 0, 0]), 4);
-        assert_eq!(stream.next(), Some(Err(Fail::Protocol(FrameError::Reserved(0x8000_0000)))));
+        assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::ReservedLength(0x8000_0000)))));
         assert_eq!(stream.next(), None);
         contract::check_wire_value(&Frame(Vec::new()));
     }
@@ -2419,8 +2395,8 @@ mod tests {
         let oversized = Frame(vec![0; MAX_MESSAGE + 1]);
         assert!(oversized.write(&mut out).is_err());
         assert_eq!(out, [42]);
-        assert_eq!(<Frame as Wire>::parse(&[0, 0, 0, 0, 0]), Err(FrameParseError::Trailing));
-        assert_eq!(<Frame as Wire>::parse(&[0, 0, 0, 1]), Err(FrameParseError::Truncated));
+        assert_eq!(<Frame as Wire>::parse(&[0, 0, 0, 0, 0]), Err(Error::Trailing));
+        assert_eq!(<Frame as Wire>::parse(&[0, 0, 0, 1]), Err(Error::Truncated));
         let mut request = as_req();
         request.padata = Some(Vec::new());
         // Optional empty lists are refused without changing the destination.

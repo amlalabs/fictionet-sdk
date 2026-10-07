@@ -6,8 +6,8 @@
 use fictionet::stdlib::codec::{Stream, Wire, contract, finish, pump};
 use fictionet::stdlib::ocsp::{
     AlgorithmIdentifier, BasicResponse, CertId, CertStatus, CrlReason, Extension, Frames,
-    MAX_NONCE, OcspRequest, OcspResponse, Request, ResponderId, ResponseBytes, ResponseData,
-    ResponseStatus, SingleResponse, decode_get_path, encode_get_path, find_nonce,
+    MAX_NONCE, Request, ResponderId, Response, ResponseBytes, ResponseData, ResponseStatus,
+    SingleRequest, SingleResponse, decode_get_path, encode_get_path, find_nonce,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -48,12 +48,12 @@ fn written(mut data: &[u8]) {
         serial_number: some(d, 4),
     };
     let requests = (0..byte(d) % 3)
-        .map(|_| Request {
+        .map(|_| SingleRequest {
             cert_id: cert_id.clone(),
             extensions: vec![],
         })
         .collect();
-    let mut req = OcspRequest::new(requests);
+    let mut req = Request::new(requests);
     let name = some(d, 12);
     if !name.is_empty() {
         req.requestor_name = Some(name);
@@ -69,9 +69,9 @@ fn written(mut data: &[u8]) {
     }
     contract::check_wire_value(&req);
     if let Ok(der) = req.to_bytes() {
-        assert_eq!(OcspRequest::parse(&der).unwrap(), req);
+        assert_eq!(Request::parse(&der).unwrap(), req);
         // Unsigned, the request is a SEQUENCE header and the TBSRequest.
-        let tbs = OcspRequest::tbs_request(&der).unwrap();
+        let tbs = Request::tbs_request(&der).unwrap();
         assert!(der.ends_with(&tbs) && der.len() - tbs.len() <= 4);
     }
 
@@ -112,18 +112,18 @@ fn written(mut data: &[u8]) {
         }),
     };
     if let Some(status) = ResponseStatus::from_code(code) {
-        let resp = OcspResponse { status, bytes };
+        let resp = Response { status, bytes };
         contract::check_wire_value(&resp);
         if let Ok(der) = resp.to_bytes() {
-            assert_eq!(OcspResponse::parse(&der).unwrap(), resp);
+            assert_eq!(Response::parse(&der).unwrap(), resp);
         }
     }
 }
 
 fuzz_target!(|data: &[u8]| {
     contract::check_decode(Frames::new, data);
-    contract::check_wire::<OcspRequest>(data);
-    contract::check_wire::<OcspResponse>(data);
+    contract::check_wire::<Request>(data);
+    contract::check_wire::<Response>(data);
     contract::check_wire::<BasicResponse>(data);
 
     let mut stream = Stream::new(Frames::new());
@@ -135,18 +135,18 @@ fuzz_target!(|data: &[u8]| {
     // Any bytes as each message on its own. What reads can be written,
     // and reads back the same.
     for m in messages.iter().map(Vec::as_slice).chain([data]) {
-        if let Ok(req) = OcspRequest::parse(m) {
+        if let Ok(req) = Request::parse(m) {
             let der = req.to_bytes().unwrap();
-            assert_eq!(OcspRequest::parse(&der).unwrap(), req);
+            assert_eq!(Request::parse(&der).unwrap(), req);
             let path = encode_get_path(&req.to_bytes().unwrap()).unwrap();
-            assert_eq!(OcspRequest::from_get_path(&path).unwrap(), req);
+            assert_eq!(Request::from_get_path(&path).unwrap(), req);
             if let Some(nonce) = req.nonce() {
                 assert!((1..=MAX_NONCE).contains(&nonce.len()));
             }
         }
-        if let Ok(resp) = OcspResponse::parse(m) {
+        if let Ok(resp) = Response::parse(m) {
             let der = resp.to_bytes().unwrap();
-            assert_eq!(OcspResponse::parse(&der).unwrap(), resp);
+            assert_eq!(Response::parse(&der).unwrap(), resp);
         }
         if let Ok(basic) = BasicResponse::parse(m) {
             let der = basic.to_bytes().unwrap();
@@ -155,7 +155,7 @@ fuzz_target!(|data: &[u8]| {
     }
     // Any text as a GET path.
     if let Ok(der) = decode_get_path(&String::from_utf8_lossy(data)) {
-        let _ = OcspRequest::parse(&der);
+        let _ = Request::parse(&der);
     }
     written(data);
 });
