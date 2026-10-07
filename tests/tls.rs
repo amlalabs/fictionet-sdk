@@ -347,7 +347,7 @@ fn handshake_with_sni_and_alpn() {
                 got += client.read(&cx, &mut buf[got..]).await.unwrap();
             }
             assert_eq!(&buf, b"pong");
-            server.join(&cx).await
+            Ok(server.join(&cx).await?)
         }))
     })
     .unwrap();
@@ -396,7 +396,7 @@ fn the_world_picks_a_config_per_handshake() {
             });
             let err = Client::connect(&cx, client_side, client_config, "b.test").await.err().unwrap();
             assert!(matches!(err, ClientError::Tls(rustls::Error::InvalidCertificate(_))), "{err:?}");
-            server.join(&cx).await
+            Ok(server.join(&cx).await?)
         }))
     })
     .unwrap();
@@ -420,7 +420,7 @@ fn reject_sends_unrecognized_name() {
                 matches!(err, ClientError::Tls(rustls::Error::AlertReceived(AlertDescription::UnrecognisedName))),
                 "{err:?}"
             );
-            server.join(&cx).await
+            Ok(server.join(&cx).await?)
         }))
     })
     .unwrap();
@@ -440,7 +440,7 @@ fn a_dropped_hello_closes_with_no_alert() {
             let err = Client::connect(&cx, client_side, client_config, "x.test").await.err().unwrap();
             // The client reads the end of the stream, not an alert.
             assert!(matches!(err, ClientError::Truncated), "{err:?}");
-            server.join(&cx).await
+            Ok(server.join(&cx).await?)
         }))
     })
     .unwrap();
@@ -469,7 +469,7 @@ fn a_first_message_that_is_not_a_hello_is_broken() {
             });
             client_side.write_all(&cx, &[22, 3, 1, 0, 200, 1]).await?;
             client_side.shutdown(&cx).await?;
-            server.join(&cx).await
+            Ok(server.join(&cx).await?)
         }))
     })
     .unwrap();
@@ -603,7 +603,7 @@ fn close_notify_both_ways() {
             assert_eq!(got, b"bye");
             client.write_all(&cx, b"last words").await.unwrap();
             client.close(&cx).await.unwrap();
-            server.join(&cx).await
+            Ok(server.join(&cx).await?)
         }))
     })
     .unwrap();
@@ -661,7 +661,7 @@ fn five_megabytes_each_way() {
             client.close(&cx).await.unwrap();
             let n = client.read(&cx, &mut buf).await.unwrap();
             assert_eq!(n, 0);
-            server.join(&cx).await
+            Ok(server.join(&cx).await?)
         }))
     })
     .unwrap();
@@ -701,7 +701,63 @@ fn tls12_clients_work_too() {
                 got.extend_from_slice(&buf[..n]);
             }
             assert_eq!(got, b"twelve");
-            server.join(&cx).await
+            Ok(server.join(&cx).await?)
+        }))
+    })
+    .unwrap();
+}
+
+/// A cancel comes before plaintext the TLS connection already decrypted,
+/// and a handshake cut by a cancel says `Cancelled`, not a broken
+/// connection.
+#[test]
+fn a_cancel_comes_first_and_is_never_a_broken_handshake() {
+    within(Duration::from_secs(20), || {
+        block_on(run(|cx| async move {
+            let ca = Ca::new();
+            let config = server_config(&cx, &ca, "example.test", &[]);
+            let client_config = client_config(&ca, &[]);
+            let (server_side, client_side) = mem_pair();
+            let (tx, rx) = mpsc::channel();
+            let server = cx.spawn(move |cx| async move {
+                let _ = cx
+                    .region(|rcx| async move {
+                        let mut conn = tls::server(&rcx, server_side).await?.finish(&rcx, config).await?;
+                        // One byte now: rustls holds the rest, decrypted.
+                        let mut one = [0; 1];
+                        assert_eq!(conn.read(&rcx, &mut one).await?, 1);
+                        rcx.cancel();
+                        let _ = tx.send(conn.read(&rcx, &mut one).await);
+                        Ok(())
+                    })
+                    .await;
+                Ok(())
+            });
+            let mut client = Client::connect(&cx, client_side, client_config, "example.test").await.unwrap();
+            client.write_all(&cx, b"hello").await.unwrap();
+            server.join(&cx).await?;
+            assert_eq!(rx.recv().unwrap(), Err(ConnError::Cancelled));
+            Ok(())
+        }))
+    })
+    .unwrap();
+
+    within(Duration::from_secs(20), || {
+        block_on(run(|cx| async move {
+            let (server_side, _client_side) = mem_pair();
+            cx.region(|rcx| async move {
+                let stopper = rcx.clone();
+                rcx.spawn(move |cx| async move {
+                    cx.sleep(Duration::from_millis(20)).await?;
+                    stopper.cancel();
+                    Ok(())
+                });
+                // The client never says hello.
+                let res = tls::server_detailed(&rcx, server_side).await;
+                assert!(matches!(res, Err(tls::HandshakeError::Cancelled)), "{:?}", res.err());
+                Ok(())
+            })
+            .await
         }))
     })
     .unwrap();

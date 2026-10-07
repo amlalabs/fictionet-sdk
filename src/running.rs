@@ -76,12 +76,16 @@
 //! # use fictionet::{Attachment, Attachments, Cx, Result};
 //! # async fn serve(_cx: Cx, _sandbox: Attachment) -> Result { Ok(()) }
 //! # async fn world(cx: Cx, mut attachments: Attachments) -> Result {
-//! while let Some(sandbox) = attachments.next(&cx).await {
+//! loop {
+//!     let sandbox = attachments.next(&cx).await?;
 //!     cx.spawn(move |cx| serve(cx, sandbox));
 //! }
-//! # Ok(())
 //! # }
 //! ```
+//!
+//! When the world stops, `next` returns [`Cancelled`](crate::Cancelled),
+//! and `?` ends the loop with it. That is not a failure: see
+//! [What ends what](#what-ends-what).
 //!
 //! # How long it runs, and how it stops
 //!
@@ -108,20 +112,25 @@
 //! |---|---|---|
 //! | The world function returns `Ok` | Nothing stops. The tasks it started keep running, and `run` finishes once the last of them has ended. | Returning `Ok` does not cancel a region. This is how a world wires its network and leaves it running. |
 //! | The world function returns `Err` | The world's region is cancelled. Every task stops at its next wait, and `run` returns the error once they have all ended. | An error fails the region of the task that returned it. The world function is the first task in the world's region. |
-//! | A spawned task returns `Err` | The same: the whole world stops, and `run` returns that error. [`Task::join`](crate::Task::join) on that task returns a copy of its message. | The task shares the world's region, so a failure deep inside a world reaches the harness. Work that is allowed to fail handles its own errors and returns `Ok(())`. Stdlib code does this for work such as one HTTP connection, which runs in a region of its own inside the world's. |
+//! | A spawned task returns `Err` | The same: the whole world stops, and `run` returns that error. [`Task::join`](crate::Task::join) on that task returns the same error, shared, as [`JoinError::Failed`](crate::JoinError::Failed). | The task shares the world's region, so a failure deep inside a world reaches the harness. Work that is allowed to fail handles its own errors and returns `Ok(())`. Stdlib code does this for work such as one HTTP connection, which runs in a region of its own inside the world's. |
+//! | A task returns [`Cancelled`](crate::Cancelled), or an error whose `Cancelled` variant says a wait was cancelled | Nothing else stops. The region keeps no error and is not cancelled. `Task::join` on that task returns [`JoinError::Cancelled`](crate::JoinError::Cancelled). | The task ended because a region was cancelled, its own or that of a `Cx` it waited on. A cancel is not a failure. |
+//! | A task panics | The panic is not caught. It unwinds out of the future from `run`, and the run ends there, as when the future is dropped. | A panic is a bug in the world, and the world's author handles it. Nothing in Fictionet catches it to keep the world running. |
 //! | A [`Task`](crate::Task) handle is dropped | Nothing. The task is detached and keeps running. | The region owns the task, not the handle. |
 //! | A sandbox detaches | Its [`Attachment`](crate::Attachment) hands over the packets that already arrived, and then `recv` returns [`RecvError::Closed`](crate::RecvError::Closed). Packets sent to it are dropped. Stdlib tasks that read it each stop by their own rule, listed under [Three kinds of functions](crate::stdlib#three-kinds-of-functions). A [`delay`](crate::stdlib::delay), [`bottleneck`](crate::stdlib::bottleneck) or [`filter`](crate::stdlib::filter) stops as soon as either of its interfaces closes. A `filter` has passed on every packet by then, but packets that a `delay` or `bottleneck` still holds are lost, so a detach can cut off the packets in flight in a pipeline. The sandbox's name is free to attach again. | A detach closes an interface. It is not an error, so the region is not cancelled. A task of your own that passes `Closed` up with `?` does fail the world, so a world that should outlive one sandbox ends that loop on `Closed` instead. |
 //! | The future from `run` is dropped | Everything stops immediately. The tasks are dropped without being polled again, so their own code gets no chance to clean up. A wait outside the run, such as in a tokio task, returns [`Cancelled`](crate::Cancelled) if it waited on a clone of one of the run's `Cx`s, or [`RecvError::Closed`](crate::RecvError::Closed) if it waited on an interface whose other end was inside the run. `Task::join` on a task that had not ended returns `Cancelled`. | Dropping a future is how Rust abandons work, for example when a timeout around it fires. |
-//! | A region is cancelled, by [`Cx::cancel`](crate::Cx::cancel) or by an error | Every Fictionet wait in the region returns `Cancelled`, and each task ends through its own code. Regions inside it are cancelled too. The region ends when its last task ends. After an error, `run` returns that error. After `Cx::cancel`, it returns `Ok(())`, unless a task failed before the cancel. | Cancellation is cooperative, as the next section explains. |
+//! | A region is cancelled, by [`Cx::cancel`](crate::Cx::cancel) or by an error | Every Fictionet wait in the region returns `Cancelled`, and each task ends through its own code. Regions inside it are cancelled too. The region ends when its last task ends. After an error, `run` returns that error. After `Cx::cancel`, it returns `Ok(())`, unless a task failed before the cancel. A region made with [`Cx::region`](crate::Cx::region) that was cancelled because the region around it was returns `Cancelled`. | Cancellation is cooperative, as the next section explains. |
 //!
 //! ## Cancellation is cooperative
 //!
 //! A cancel does not drop a task. It wakes the task, and the task stops at
 //! its next await on a Fictionet future: [`recv`](crate::InterfaceExt::recv),
-//! [`Cx::sleep`](crate::Cx::sleep), [`Attachments::get`](crate::Attachments::get),
-//! a stdlib connection's read, and the rest. Each of these returns
-//! `Cancelled` (or `None`, for [`Attachments::next`](crate::Attachments::next)),
-//! and the task usually passes it up with `?`.
+//! [`Cx::sleep`](crate::Cx::sleep), [`Attachments::next`](crate::Attachments::next),
+//! a stdlib connection's read, and the rest. Each of these returns `Err`,
+//! with [`Cancelled`](crate::Cancelled) itself or with its own error type's
+//! `Cancelled` variant, such as [`RecvError::Cancelled`](crate::RecvError::Cancelled).
+//! A cancel is never `None`, `Ok`, or another error such as a broken
+//! connection, and it comes before anything the wait already holds, such
+//! as queued packets. The task usually passes it up with `?`.
 //!
 //! An await on anything outside Fictionet is not interrupted. A task that
 //! waits on a tokio socket, a database query or a channel keeps waiting
@@ -258,11 +267,11 @@
 //! stay apart:
 //!
 //! - **The checks pass.** `cx.cancel()` stops the world cleanly. Each task
-//!   ends through its own code, and `run` returns `Ok(())`. Errors that
-//!   tasks return after the cancel are not reported. Most are the
-//!   `Cancelled` that a task passes up with `?`. A task whose cleanup can
-//!   fail in a way the test must see reports it before the test cancels,
-//!   or through a channel the test reads.
+//!   ends through its own code, and `run` returns `Ok(())`. The `Cancelled`
+//!   that a task passes up with `?` is never a failure, and other errors
+//!   that tasks return after the cancel are not reported either. A task
+//!   whose cleanup can fail in a way the test must see reports it before
+//!   the test cancels, or through a channel the test reads.
 //! - **The world fails.** A task's error cancels the world's region, and
 //!   `run` returns that error, so the test fails with the world's own
 //!   message. A failed `assert!` in the test's code panics, and the panic

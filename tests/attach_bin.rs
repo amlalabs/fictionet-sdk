@@ -136,8 +136,8 @@ fn packets_cross_both_ways_and_refuse_and_world_close_end_attach() {
                     match next {
                         Some(Ok(Packet(p))) if p.len() >= 28 && p[9] == 1 && p[20] == 0 => reply = Some(p),
                         Some(Ok(_)) => continue,
-                        Some(Err(RecvError::Closed)) => return Err("attach closed".into()),
-                        Some(Err(RecvError::Cancelled)) => return Err("cancelled".into()),
+                        Some(Err(RecvError::Closed)) => return Err(fictionet::Error::msg("attach closed")),
+                        Some(Err(RecvError::Cancelled)) => return Err(fictionet::Error::msg("cancelled")),
                         None => break,
                     }
                 }
@@ -145,7 +145,7 @@ fn packets_cross_both_ways_and_refuse_and_world_close_end_attach() {
                     break;
                 }
             }
-            let reply = reply.ok_or("the sandbox never answered the echo request")?;
+            let reply = reply.ok_or_else(|| fictionet::Error::msg("the sandbox never answered the echo request"))?;
 
             // A second attach under the same name is refused. Waiting for it
             // blocks this thread, which is fine: the listen helper thread

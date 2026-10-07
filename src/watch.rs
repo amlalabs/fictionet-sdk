@@ -596,7 +596,7 @@ mod tests {
             }
             *s.lock().unwrap() = Some(snapshot(&g));
             drop(a);
-            echo.join(&cx).await
+            Ok(echo.join(&cx).await?)
         }));
         out.unwrap();
         let (tasks, links) = seen.lock().unwrap().take().unwrap();

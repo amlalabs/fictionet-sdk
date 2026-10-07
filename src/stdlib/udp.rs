@@ -200,7 +200,7 @@ impl Endpoint {
     /// Fails if `group` is not a multicast address of the endpoint's family.
     pub fn join(&self, group: IpAddr) -> Result<(), Error> {
         if !group.is_multicast() || group.is_ipv4() != self.shared.addr.is_ipv4() {
-            return Err(format!("{group} is not a multicast group {} can join", self.shared.addr).into());
+            return Err(fictionet::Error::msg(format!("{group} is not a multicast group {} can join", self.shared.addr)));
         }
         let mut st = self.shared.state.lock().unwrap();
         if !st.groups.contains(&group) {
@@ -220,11 +220,11 @@ impl Endpoint {
     /// socket frees the port.
     pub fn bind(&self, port: u16) -> Result<Socket, Error> {
         if port == 0 {
-            return Err("UDP port 0 cannot be bound".into());
+            return Err(fictionet::Error::msg("UDP port 0 cannot be bound"));
         }
         let mut st = self.shared.state.lock().unwrap();
         if st.sockets.contains_key(&port) {
-            return Err(format!("UDP port {port} is already bound on {}", self.shared.addr).into());
+            return Err(fictionet::Error::msg(format!("UDP port {port} is already bound on {}", self.shared.addr)));
         }
         st.sockets.insert(port, Queue::default());
         Ok(Socket { shared: self.shared.clone(), port, wait: CancelWait::default() })
@@ -365,7 +365,7 @@ mod tests {
             // The rest were dropped, and the room is there again.
             raw.send(datagram(b"after"));
             assert_eq!(socket.recv(&cx).await?.0, b"after");
-            Err::<(), crate::Error>("done".into())
+            Err::<(), crate::Error>(fictionet::Error::msg("done"))
         }));
         assert_eq!(result.unwrap_err().to_string(), "done");
     }

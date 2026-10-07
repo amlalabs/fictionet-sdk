@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use fictionet::prelude::*;
 use fictionet::time::ms;
-use fictionet::{AttachError, Cancelled, Interface, Packet, RecvError, attachments, block_on, pair, run};
+use fictionet::{AttachError, Cancelled, Interface, JoinError, Packet, RecvError, attachments, block_on, pair, run};
 
 /// Runs `f` on its own thread and fails the test if it takes longer than
 /// `limit`, instead of hanging.
@@ -159,8 +159,7 @@ fn cancellation_ends_every_wait() {
             cx.spawn(move |cx| async move {
                 let res = forever.join(&cx).await;
                 joined.store(true, Ordering::SeqCst);
-                let cancelled = res.as_ref().is_err_and(|e| e.is::<Cancelled>());
-                r4.lock().unwrap().push(format!("join cancelled={cancelled}"));
+                r4.lock().unwrap().push(format!("join {res:?}"));
                 Ok(())
             });
             let (_attacher, mut attachments) = attachments();
@@ -169,7 +168,27 @@ fn cancellation_ends_every_wait() {
                 let res = attachments.get(&cx, "nope").await;
                 r5.lock().unwrap().push(format!("get {:?}", res.err()));
                 let res = attachments.next(&cx).await;
-                r5.lock().unwrap().push(format!("next {:?}", res.is_none()));
+                r5.lock().unwrap().push(format!("next {:?}", res.err()));
+                Ok(())
+            });
+            let r7 = r.clone();
+            cx.spawn(move |cx| async move {
+                let res = cx.race(None, std::future::pending::<()>()).await;
+                r7.lock().unwrap().push(format!("race {res:?}"));
+                Ok(())
+            });
+            let (port, _other) = pair();
+            let r8 = r.clone();
+            cx.spawn(move |cx| async move {
+                let mut ports = fictionet::stdlib::Ports::new(vec![Box::new(port)]);
+                let res = ports.next(&cx, None, |_| std::task::Poll::Pending).await;
+                r8.lock().unwrap().push(format!("ports {:?}", res.err()));
+                Ok(())
+            });
+            let r9 = r.clone();
+            cx.spawn(move |cx| async move {
+                let res = cx.events().wait(&cx, 1, Duration::from_secs(60), |_| false).await;
+                r9.lock().unwrap().push(format!("events {:?}", res.err()));
                 Ok(())
             });
             let r6 = r.clone();
@@ -194,9 +213,12 @@ fn cancellation_ends_every_wait() {
         results,
         [
             "cancelled",
+            "events Some(Cancelled)",
             "get Some(Cancelled)",
-            "join cancelled=true",
-            "next true",
+            "join Err(Cancelled)",
+            "next Some(Cancelled)",
+            "ports Some(Cancelled)",
+            "race Err(Cancelled)",
             "recv Err(Cancelled)",
             "sleep Err(Cancelled)",
             "yield Cancelled",
@@ -249,24 +271,28 @@ fn join_returns_what_the_work_returned() {
     })
     .unwrap();
 
-    let joined = within(Duration::from_secs(5), || {
-        let joined = Arc::new(Mutex::new(String::new()));
+    let (out, joined) = within(Duration::from_secs(5), || {
+        let joined = Arc::new(Mutex::new(None));
         let j = joined.clone();
         let out = block_on(run(move |cx| async move {
             let bad = cx.spawn(|_cx| async { Err(Boom("bad").into()) });
-            // The join gets the message, though the failure also cancels
-            // the region the joiner waits in.
-            let res = bad.join(&cx).await;
-            *j.lock().unwrap() = match res {
-                Err(e) => e.to_string(),
-                Ok(()) => "ok".into(),
-            };
+            // The join gets the error, though the failure also cancels the
+            // region the joiner waits in.
+            *j.lock().unwrap() = Some(bad.join(&cx).await);
             Ok(())
         }));
-        assert_eq!(out.unwrap_err().to_string(), "bad");
-        joined.lock().unwrap().clone()
+        let joined = joined.lock().unwrap().take();
+        (out, joined)
     });
-    assert_eq!(joined, "bad");
+    // The joiner holds the task's own error, the one `run` returns: the
+    // same value, not a copy of its message.
+    let out = out.unwrap_err();
+    let Some(Err(JoinError::Failed(e))) = joined else { panic!("{joined:?}") };
+    assert_eq!(e.downcast_ref::<Boom>().map(|b| b.0), Some("bad"));
+    assert!(std::ptr::addr_eq(&*e, &*out));
+    let joined = JoinError::Failed(e);
+    assert_eq!(joined.to_string(), "the task failed: bad");
+    assert!(std::error::Error::source(&joined).is_some_and(|s| s.is::<Boom>()));
 }
 
 /// A task that is always ready but yields every 64 packets cannot starve
@@ -819,7 +845,7 @@ fn a_joiner_outside_the_run_gets_the_message_of_a_failed_task() {
     use std::future::Future;
     use std::pin::Pin;
     use std::task::{Context, Poll, Waker};
-    type JoinFuture = Pin<Box<dyn Future<Output = fictionet::Result> + Send>>;
+    type JoinFuture = Pin<Box<dyn Future<Output = Result<(), JoinError>> + Send>>;
     /// Polls the join again, right inside `wake`.
     struct RePoll {
         job: Mutex<Option<JoinFuture>>,
@@ -830,7 +856,11 @@ fn a_joiner_outside_the_run_gets_the_message_of_a_failed_task() {
             let Some(mut job) = self.job.lock().unwrap().take() else { return };
             match job.as_mut().poll(&mut Context::from_waker(wake)) {
                 Poll::Ready(value) => {
-                    *self.result.lock().unwrap() = Some(value.map_or_else(|e| e.to_string(), |()| "ok".into()))
+                    *self.result.lock().unwrap() = Some(match value {
+                        Ok(()) => "ok".into(),
+                        Err(JoinError::Failed(e)) => e.to_string(),
+                        Err(JoinError::Cancelled) => "cancelled".into(),
+                    })
                 }
                 Poll::Pending => *self.job.lock().unwrap() = Some(job),
             }

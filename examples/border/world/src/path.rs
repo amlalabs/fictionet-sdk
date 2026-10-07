@@ -177,13 +177,13 @@ pub async fn run(cx: Cx, mut sandbox: impl Interface, mut inner: End, shared: Ar
                         _ => &mut foreign,
                     };
                     if let Poll::Ready(r) = end.poll_recv(&cx, task) {
-                        return Poll::Ready(Some((i, r)));
+                        return Poll::Ready(r.map(|p| Some((i, p))));
                     }
                 }
-                if let Some(sleep) = sleep.as_mut().as_pin_mut() {
-                    if let Poll::Ready(r) = sleep.poll(task) {
-                        return Poll::Ready(r.is_ok().then_some((4, Err(RecvError::Cancelled))));
-                    }
+                if let Some(sleep) = sleep.as_mut().as_pin_mut()
+                    && let Poll::Ready(r) = sleep.poll(task)
+                {
+                    return Poll::Ready(r.map(|()| None).map_err(RecvError::from));
                 }
                 Poll::Pending
             })
@@ -191,7 +191,7 @@ pub async fn run(cx: Cx, mut sandbox: impl Interface, mut inner: End, shared: Ar
         };
         let (from, packet) = match got {
             // The time of the first packet on its way has come.
-            Some((4, _)) => {
+            Ok(None) => {
                 let now = cx.now();
                 let mut sent = 0;
                 while sent < 64 {
@@ -207,16 +207,16 @@ pub async fn run(cx: Cx, mut sandbox: impl Interface, mut inner: End, shared: Ar
                 run += sent;
                 if run >= 64 {
                     run = 0;
-                    if cx.yield_now().await.is_err() {
-                        return Ok(());
-                    }
+                    cx.yield_now().await?;
                 }
                 continue;
             }
-            Some((i, Ok(p))) => (i, p),
-            // The sandbox detached, `Sites` stopped, or the world is
-            // stopping. A router's end closes only with this task.
-            Some((_, Err(RecvError::Closed | RecvError::Cancelled))) | None => return Ok(()),
+            Ok(Some((i, p))) => (i, p),
+            // The sandbox detached, or `Sites` stopped. A router's end
+            // closes only with this task.
+            Err(RecvError::Closed) => return Ok(()),
+            // The world is stopping: a cancel, which is not a failure.
+            Err(e @ RecvError::Cancelled) => return Err(e.into()),
         };
         first = (from + 1) % 4;
         let now = cx.now();

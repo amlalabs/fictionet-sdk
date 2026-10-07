@@ -99,6 +99,14 @@ it: it ends the run, wherever in the world it happens. As it unwinds,
 the driver names the service and the connection on standard error after
 the panic's own message, so the failed run says where to look.
 
+When the world stops, `on_end` hears `Ended::Cancelled`, and `serve`
+returns `Err(ServeError::Cancelled)`, also when the stop comes during the
+TLS handshake, before the service started. `serve_datagram` returns
+`Err(Cancelled)`. A stop is never reported as a closed or broken
+connection. `listen` and `Net` serve each connection in a task of its
+own; a connection's failure is that connection's, recorded as
+`conn.error`, and does not end the world.
+
 A write that takes no bytes for `ServeOptions::write_timeout` (10
 seconds) ends the connection: a client that stops reading cannot hold a
 reply, or a service's timers, for ever. A client that resets the

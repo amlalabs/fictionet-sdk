@@ -48,13 +48,13 @@ impl FromStr for Prefix {
             Some((a, l)) => (a, Some(l)),
             None => (s, None),
         };
-        let addr: IpAddr = addr.parse().map_err(|_| format!("{s:?} is not an address prefix"))?;
+        let addr: IpAddr = addr.parse().map_err(|_| fictionet::Error::msg(format!("{s:?} is not an address prefix")))?;
         let max = if addr.is_ipv4() { 32 } else { 128 };
         let len = match len {
             None => max,
             Some(l) => match l.parse::<u8>() {
                 Ok(n) if n <= max && !l.starts_with('+') => n,
-                _ => return Err(format!("{s:?}: the length must be 0 to {max}").into()),
+                _ => return Err(fictionet::Error::msg(format!("{s:?}: the length must be 0 to {max}"))),
             },
         };
         Ok(Prefix { addr: mask(addr, len), len })
@@ -214,7 +214,7 @@ pub fn router(cx: &Cx, routes: Vec<(Prefix, Box<dyn Interface>)>) -> Router {
                     }
                     Poll::Pending
                 })
-                .await;
+                .await?;
             match event {
                 Event::Packet(_, mut packet) => {
                     let Some(dst) = ip::destination(&packet.0) else { continue };
@@ -239,7 +239,6 @@ pub fn router(cx: &Cx, routes: Vec<(Prefix, Box<dyn Interface>)>) -> Router {
                     table.remove_port(i)
                 }
                 Event::Extra | Event::Timer => {}
-                Event::Cancelled => return Ok(()),
             }
         }
     });
@@ -550,12 +549,11 @@ pub fn lan(cx: &Cx, subnet: Prefix, on_drop: Option<OnDrop>) -> Lan {
                     }
                     Poll::Pending
                 })
-                .await;
+                .await?;
             match event {
                 Event::Packet(from, packet) => members.forward(&cx, &mut ports, subnet, from, packet),
                 Event::Closed(i) => members.remove_port(&cx, i),
                 Event::Extra | Event::Timer => {}
-                Event::Cancelled => return Ok(()),
             }
         }
     });
@@ -770,7 +768,7 @@ impl LanHandle {
             if s.stopped {
                 drop(s);
                 drop(join);
-                return Err("the LAN has stopped".into());
+                return Err(fictionet::Error::msg("the LAN has stopped"));
             }
             s.joins.push(join);
             s.waker.take()
@@ -807,10 +805,10 @@ impl Lan {
     pub fn add(&self, addr: IpAddr, interface: Box<dyn Interface>) -> Result<(), Error> {
         let subnet = self.handle.subnet;
         if !subnet.contains(addr) {
-            return Err(format!("{addr} is outside the LAN's subnet {}/{}", subnet.addr, subnet.len).into());
+            return Err(fictionet::Error::msg(format!("{addr} is outside the LAN's subnet {}/{}", subnet.addr, subnet.len)));
         }
         if addr.is_unspecified() || floods(subnet, addr) {
-            return Err(format!("{addr} is not a unicast address, so no member can have it").into());
+            return Err(fictionet::Error::msg(format!("{addr} is not a unicast address, so no member can have it")));
         }
         self.handle.join(Join::Member(addr, interface))
     }
@@ -1061,7 +1059,7 @@ mod tests {
             let r = cx
                 .region(|cx| async move {
                     *lock(&k) = Some(lan(&cx, "10.0.0.0/24".parse()?, None));
-                    Err("stop".into())
+                    Err(fictionet::Error::msg("stop"))
                 })
                 .await;
             assert_eq!(r.unwrap_err().to_string(), "stop");

@@ -1137,10 +1137,10 @@ impl Endpoint {
     pub fn listen(&self, port: u16) -> Result<Listener, Error> {
         let mut st = self.shared.state.lock().unwrap();
         if port == 0 {
-            return Err("TCP port 0 cannot be listened on".into());
+            return Err(fictionet::Error::msg("TCP port 0 cannot be listened on"));
         }
         if st.listeners.contains_key(&port) || st.ports.contains_key(&port) {
-            return Err(format!("TCP port {port} is already in use on {}", self.shared.addr).into());
+            return Err(fictionet::Error::msg(format!("TCP port {port} is already in use on {}", self.shared.addr)));
         }
         st.listeners.insert(port, Listen::default());
         st.take_port(port);
@@ -1501,10 +1501,8 @@ impl Connection for TcpConnection {
     }
 
     /// Sends a FIN, after every byte already written. Returns immediately.
-    fn poll_shutdown(&mut self, cx: &Cx, _task: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
-        if cx.is_cancelled() {
-            return Poll::Ready(Err(ConnError::Cancelled));
-        }
+    /// It never waits, so a cancel does not stop it.
+    fn poll_shutdown(&mut self, _cx: &Cx, _task: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
         let mut st = self.shared.state.lock().unwrap();
         if st.stopped {
             return Poll::Ready(Err(ConnError::Closed));
@@ -1579,7 +1577,7 @@ mod tests {
                 }
             }
             assert_eq!((syn_acks, rsts), (4, 6));
-            Err::<(), crate::Error>("done".into())
+            Err::<(), crate::Error>(fictionet::Error::msg("done"))
         }));
         assert_eq!(result.unwrap_err().to_string(), "done");
     }
@@ -1615,7 +1613,7 @@ mod tests {
             assert!(l.idle.len() <= 1, "{} spare listening sockets", l.idle.len());
             assert!(st.sockets.iter().count() <= 1);
             drop(st);
-            Err::<(), crate::Error>("done".into())
+            Err::<(), crate::Error>(fictionet::Error::msg("done"))
         }));
         assert_eq!(result.unwrap_err().to_string(), "done");
     }
@@ -1664,7 +1662,7 @@ mod tests {
             }
             writer.join(&cx).await?;
             assert!(got == data, "the connection that stayed open still works");
-            Err::<(), crate::Error>("done".into())
+            Err::<(), crate::Error>(fictionet::Error::msg("done"))
         }));
         assert_eq!(result.unwrap_err().to_string(), "done");
     }
@@ -1688,7 +1686,7 @@ mod tests {
             assert_eq!(st.get(h).state(), TcpState::FinWait2, "the client never closes its side");
             assert_eq!(st.get(h).timeout(), Some(ORPHAN_TIMEOUT.into()));
             drop(st);
-            Err::<(), crate::Error>("done".into())
+            Err::<(), crate::Error>(fictionet::Error::msg("done"))
         }));
         assert_eq!(result.unwrap_err().to_string(), "done");
     }
@@ -1723,7 +1721,7 @@ mod tests {
                 }
                 assert!(got == data, "the data came through unchanged with {size}-byte buffers");
                 writer.join(&cx).await?;
-                Err::<(), crate::Error>("done".into())
+                Err::<(), crate::Error>(fictionet::Error::msg("done"))
             }));
             assert_eq!(result.unwrap_err().to_string(), "done");
         }
@@ -1780,7 +1778,7 @@ mod tests {
             }
             drop((c, s));
             // Err ends the run, and with it the endpoints' drivers.
-            Err::<(), crate::Error>("done".into())
+            Err::<(), crate::Error>(fictionet::Error::msg("done"))
         }));
         assert_eq!(result.unwrap_err().to_string(), "done");
     }

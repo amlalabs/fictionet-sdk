@@ -329,7 +329,7 @@ fn one_sandbox_flooding_everything_stays_bounded_and_others_are_served() {
             // get SERVFAIL. Fragments and sockets are capped too. Measured:
             // names +31 MiB, fragments +7 MiB, connections +136 MiB.
             assert!(grew < 200 << 20, "the world grew by {:.1} MiB", mib(grew));
-            Err::<(), fictionet::Error>("done".into())
+            Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
         }));
         let _ = tx.send(result.map_err(|e| e.to_string()));
     });
@@ -420,7 +420,7 @@ fn sandboxes_sending_as_fast_as_they_can_do_not_grow_the_world() {
             // Joined outside the world: a sender may wait on its socket
             // until the world reads it.
             drop(senders);
-            Err::<(), fictionet::Error>("done".into())
+            Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
         }));
         let _ = tx.send(result.map_err(|e| e.to_string()));
     });

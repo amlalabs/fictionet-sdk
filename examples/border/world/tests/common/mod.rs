@@ -113,7 +113,7 @@ where
             let lookups = border_world::start(&cx, scenario.clone(), ids, log, attachments)?;
             border_world::look_up_all(&cx, &lookups, &scenario).await?;
             f(cx, attacher, Env { roots: Arc::new(roots), log: buf, scenario }).await?;
-            Err(Box::new(Done) as fictionet::Error)
+            Err(fictionet::Error::from(Done))
         }));
         let _ = tx.send(result);
     });

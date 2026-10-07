@@ -119,16 +119,16 @@ pub async fn fetch(https: bool, version: Version) -> Result<Fetched> {
         let body = String::from_utf8(body.to_vec())?;
         *out.lock().unwrap() = Some(Fetched { address, status, version, body });
         // Ending with an error cancels the sites, which would serve forever.
-        Err(Box::new(Done) as fictionet::Error)
+        Err(fictionet::Error::from(Done))
     })
     .await;
     match ended {
         Err(e) if e.downcast_ref::<Done>().is_some() => {}
         Err(e) => return Err(e),
-        Ok(()) => return Err("the world ended before the request".into()),
+        Ok(()) => return Err(fictionet::Error::msg("the world ended before the request")),
     }
     let fetched = fetched.lock().unwrap().take();
-    fetched.ok_or_else(|| "no response".into())
+    fetched.ok_or_else(|| fictionet::Error::msg("no response"))
 }
 
 /// The page's entry point: [`fetch`] as a JavaScript promise of the
@@ -185,7 +185,7 @@ async fn lookup(cx: &Cx, udp: &udp::Endpoint, name: &str) -> Result<Ipv4Addr> {
     let (bytes, _from) = socket.recv(cx).await?;
     let answer = Message::from_vec(&bytes)?;
     if answer.metadata.response_code != ResponseCode::NoError {
-        return Err(format!("DNS answered {} for {name}", answer.metadata.response_code).into());
+        return Err(fictionet::Error::msg(format!("DNS answered {} for {name}", answer.metadata.response_code)));
     }
     answer
         .answers
@@ -194,7 +194,7 @@ async fn lookup(cx: &Cx, udp: &udp::Endpoint, name: &str) -> Result<Ipv4Addr> {
             RData::A(a) => Some(a.0),
             _ => None,
         })
-        .ok_or_else(|| format!("no A record for {name}").into())
+        .ok_or_else(|| fictionet::Error::msg(format!("no A record for {name}")))
 }
 
 /// The run's CA, and a certificate for [`NAME`] that it signed.

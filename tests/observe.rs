@@ -27,7 +27,7 @@ fn start_world(path: &str) -> fictionet::Listening {
     let listening = fictionet::listen(fictionet::WorldSocket::UnixSocket(path.into()), attacher).unwrap();
     std::thread::spawn(move || {
         let _ = fictionet::block_on(fictionet::run(move |cx| async move {
-            while let Some(mut sandbox) = attachments.next(&cx).await {
+            while let Ok(mut sandbox) = attachments.next(&cx).await {
                 cx.spawn(move |cx| async move {
                     let (mut mine, mut theirs) = fictionet::pair();
                     cx.spawn(move |cx| async move {

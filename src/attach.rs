@@ -355,13 +355,17 @@ impl std::error::Error for AttachError {}
 /// A world that serves every sandbox the same way loops over `next`:
 ///
 /// ```
-/// # async fn world(cx: fictionet::Cx, mut attachments: fictionet::Attachments) {
-/// while let Some(sandbox) = attachments.next(&cx).await {
+/// # async fn world(cx: fictionet::Cx, mut attachments: fictionet::Attachments) -> fictionet::Result {
+/// loop {
+///     let sandbox = attachments.next(&cx).await?;
 ///     // wire `sandbox` into the world
 /// #   drop(sandbox);
 /// }
 /// # }
 /// ```
+///
+/// The loop ends when the world stops: `next` returns [`Cancelled`], and
+/// `?` passes it up, which ends the task without failing it.
 pub struct Attachments {
     hub: Arc<Hub>,
 }
@@ -380,15 +384,15 @@ impl Attachments {
     pub async fn get(&mut self, cx: &Cx, name: &str) -> Result<Attachment, Cancelled> {
         let mut wait = CancelWait::default();
         let found = poll_fn(|task| self.poll_take(cx, task, &mut wait, |a| a.name == name)).await;
-        found.map(Attachment::unwrap_pending).ok_or(Cancelled)
+        found.map(Attachment::unwrap_pending)
     }
 
     /// Waits for the next sandbox that has not been handed out yet, in the
     /// order they attached.
     ///
-    /// Returns `None` if `cx`'s [region](Cx#regions) is cancelled, so a
-    /// `while let` loop over it ends cleanly.
-    pub async fn next(&mut self, cx: &Cx) -> Option<Attachment> {
+    /// Returns early with [`Cancelled`] if `cx`'s [region](Cx#regions) is
+    /// cancelled.
+    pub async fn next(&mut self, cx: &Cx) -> Result<Attachment, Cancelled> {
         let mut wait = CancelWait::default();
         let found = poll_fn(|task| self.poll_take(cx, task, &mut wait, |_| true)).await;
         found.map(Attachment::unwrap_pending)
@@ -464,12 +468,13 @@ impl Attachments {
                     if out.poll_closed(task).is_ready() {
                         return Poll::Ready(None);
                     }
-                    self.poll_take(&cx, task, &mut wait, |_| true)
+                    self.poll_take(&cx, task, &mut wait, |_| true).map(Some)
                 })
                 .await;
-                // `None`: the region was cancelled, or the new
-                // `Attachments` was dropped.
-                let Some(mut sandbox) = next else { return Ok(()) };
+                // `None`: the new `Attachments` was dropped. A cancel ends
+                // the task with `Cancelled`.
+                let Some(next) = next else { return Ok(()) };
+                let mut sandbox = next?;
                 // `wrap` runs only when the world takes the sandbox. What it
                 // returns may read the sandbox's packets at once, as a
                 // `filter` does, and before the world takes the sandbox
@@ -492,17 +497,16 @@ impl Attachments {
         Attachments { hub }
     }
 
-    /// Takes the first pending attachment that `wanted` picks. `None` means
-    /// the region was cancelled.
+    /// Takes the first pending attachment that `wanted` picks.
     fn poll_take(
         &mut self,
         cx: &Cx,
         task: &mut Context<'_>,
         wait: &mut CancelWait,
         wanted: impl Fn(&Attachment) -> bool,
-    ) -> Poll<Option<Attachment>> {
+    ) -> Poll<Result<Attachment, Cancelled>> {
         if cx.is_cancelled() {
-            return Poll::Ready(None);
+            return Poll::Ready(Err(Cancelled));
         }
         let mut gone = VecDeque::new();
         {
@@ -515,11 +519,10 @@ impl Attachments {
                 state.pending = live;
                 gone = dead;
             }
-            if let Some(i) = state.pending.iter().position(&wanted) {
-                let found = state.pending.remove(i);
+            if let Some(found) = state.pending.iter().position(&wanted).and_then(|i| state.pending.remove(i)) {
                 drop(state);
                 drop(gone);
-                return Poll::Ready(found);
+                return Poll::Ready(Ok(found));
             }
             match &state.waker {
                 Some(w) if w.will_wake(task.waker()) => {}
@@ -530,7 +533,7 @@ impl Attachments {
         // takes the lock.
         drop(gone);
         if cx.register_cancel(task.waker(), wait) {
-            return Poll::Ready(None);
+            return Poll::Ready(Err(Cancelled));
         }
         Poll::Pending
     }

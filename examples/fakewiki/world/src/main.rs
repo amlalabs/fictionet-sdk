@@ -26,7 +26,7 @@ fn main() {
 }
 
 fn real_main() -> fictionet::Result {
-    let args = args()?;
+    let args = args().map_err(fictionet::Error::msg)?;
     let _ = std::fs::remove_file(&args.ready);
 
     // 1. The content server. Its first line says it is listening, and
@@ -36,8 +36,8 @@ fn real_main() -> fictionet::Result {
     watch_backend(child);
     let variant = backend["variant"].as_str().unwrap_or_default().to_owned();
     let mut hosts = HashMap::new();
-    for (name, ip) in backend["hosts"].as_object().ok_or("backend sent no hosts")? {
-        let ip: Ipv4Addr = ip.as_str().ok_or("bad host address")?.parse()?;
+    for (name, ip) in backend["hosts"].as_object().ok_or_else(|| fictionet::Error::msg("backend sent no hosts"))? {
+        let ip: Ipv4Addr = ip.as_str().ok_or_else(|| fictionet::Error::msg("bad host address"))?.parse()?;
         hosts.insert(name.clone(), ip);
     }
 

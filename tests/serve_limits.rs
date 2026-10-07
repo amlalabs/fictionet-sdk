@@ -44,7 +44,7 @@ where
     std::thread::spawn(move || {
         let r = block_on(run(move |cx| async move {
             f(cx).await?;
-            Err(Box::new(Done) as fictionet::Error)
+            Err(fictionet::Error::from(Done))
         }));
         let _ = tx.send(r);
     });
@@ -79,8 +79,7 @@ fn serve_http(cx: &Cx, server: &tcp::Endpoint, port: u16, handler: Arc<dyn Handl
             let info = ConnInfo::new(id, conn.local_addr(), conn.peer_addr());
             let (handler, opts) = (handler.clone(), opts.clone());
             cx.spawn(move |cx| async move {
-                httpd::serve_connection(&cx, conn, info, handler, &opts).await;
-                Ok(())
+                Ok(httpd::serve_connection(&cx, conn, info, handler, &opts).await?)
             });
         }
     });
@@ -174,7 +173,7 @@ fn a_client_that_stops_reading_times_out() {
         serve::listen(&cx, server.listen(7)?, Arc::new(()), || Loud { size: 16 << 20 }, opts);
         let mut conn = client.connect(&cx, SocketAddr::new(SERVER.into(), 7)).await?;
         conn.write_all(&cx, b"go\n").await?;
-        let closed = kept.wait(&cx, 1, Duration::from_secs(10), |e| e.is("conn", "close")).await;
+        let closed = kept.wait(&cx, 1, Duration::from_secs(10), |e| e.is("conn", "close")).await?;
         assert_eq!(closed.first().and_then(|e| e.str("end")), Some("timed_out"));
         drop(conn);
         Ok(())
@@ -256,7 +255,7 @@ fn a_response_cut_off_by_a_reset_is_logged_incomplete() {
         let head = read_some(&cx, &mut conn, 64).await;
         assert!(head.starts_with(b"HTTP/1.1 200 OK\r\n"));
         conn.reset();
-        let request = kept.wait(&cx, 1, Duration::from_secs(10), |e| e.is("http", "request")).await;
+        let request = kept.wait(&cx, 1, Duration::from_secs(10), |e| e.is("http", "request")).await?;
         let request = request.first().expect("an http.request event");
         assert_eq!(field_bool(request, "complete"), Some(false));
         assert!(field_u64(request, "sent").unwrap() < size as u64);
@@ -273,7 +272,7 @@ fn a_response_cut_off_by_a_reset_is_logged_incomplete() {
             }
         }
         assert!(all.len() > size);
-        let done = kept.wait(&cx, 2, Duration::from_secs(10), |e| e.is("http", "request")).await;
+        let done = kept.wait(&cx, 2, Duration::from_secs(10), |e| e.is("http", "request")).await?;
         assert_eq!(field_bool(&done[1], "complete"), Some(true));
         assert_eq!(field_u64(&done[1], "sent"), Some(size as u64));
         Ok(())
@@ -356,7 +355,7 @@ fn http2_has_the_limits_budget_and_seed_of_http1() {
         let (status, _) = ask(http::Method::POST, "/echo", vec![b'c'; 3500]).await?;
         assert_eq!(status, 413);
 
-        let events = kept.wait(&cx, 4, Duration::from_secs(5), |e| e.is("http", "request")).await;
+        let events = kept.wait(&cx, 4, Duration::from_secs(5), |e| e.is("http", "request")).await?;
         let answers: Vec<_> = events.iter().map(|e| e.str("answer").unwrap_or("").to_owned()).collect();
         assert_eq!(answers, ["handler", "handler", "budget", "too_large"]);
         Ok(())

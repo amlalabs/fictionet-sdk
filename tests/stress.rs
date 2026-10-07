@@ -94,7 +94,7 @@ fn many_attachments_lose_nothing_and_idle_costs_nothing() {
                     Ok(())
                 });
                 for _ in 0..CLIENTS {
-                    let mut a = attachments.next(&cx).await.ok_or("cancelled")?;
+                    let mut a = attachments.next(&cx).await?;
                     cx.spawn(move |cx| async move {
                         loop {
                             match a.recv(&cx).await {
@@ -109,7 +109,7 @@ fn many_attachments_lose_nothing_and_idle_costs_nothing() {
                 // Wait for the test to say stop, then fail the region to
                 // cancel the timer.
                 let _ = stopped.recv(&cx).await;
-                Err("stop".into())
+                Err(fictionet::Error::msg("stop"))
             }))
             .map_err(|e| e.to_string())
         })

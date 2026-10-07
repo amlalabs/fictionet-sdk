@@ -8,7 +8,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll, Wake, Waker};
 
-use crate::cx::{Cancelled, JoinState, Region, TaskFailed};
+use crate::cx::{JoinState, Region, is_cancel};
+use crate::JoinError;
 use crate::watch::{Graph, Polling};
 use crate::{Cx, Result};
 
@@ -37,7 +38,14 @@ use crate::{Cx, Result};
 ///
 /// When `world`, or any task in its region, returns an error, the region
 /// is cancelled. The future returns the first error once all of the
-/// region's tasks have ended.
+/// region's tasks have ended. A task that ends with
+/// [`Cancelled`](crate::Cancelled) has not failed (see
+/// [`Cx::spawn`](crate::Cx::spawn)). After
+/// [`Cx::cancel`](crate::Cx::cancel), the future returns `Ok(())`, unless a
+/// task failed before the cancel.
+///
+/// A panic in the world or in any of its tasks is not caught. It unwinds
+/// out of the future, and the run ends there, as if it were dropped.
 ///
 /// Dropping the future stops everything immediately: the world and all of
 /// its tasks are dropped, without waiting for them. Its regions count as
@@ -323,17 +331,16 @@ impl RunState {
                 // The order matters, because each step can wake code that
                 // calls `Cx::cancel`, and a cancel discards later errors.
                 // 1. The region takes the error before anything else runs.
-                let failed = result.is_err();
-                let joined = match result {
-                    Ok(()) => Ok(()),
+                //    A cancel is not a failure: it is noted, not kept.
+                let (joined, failed) = match result {
+                    Ok(()) => (Ok(()), false),
+                    Err(e) if is_cancel(&*e) => {
+                        region.ended_by_cancel();
+                        (Err(JoinError::Cancelled), false)
+                    }
                     Err(e) => {
-                        let copy: crate::Error = if e.is::<Cancelled>() {
-                            Box::new(Cancelled)
-                        } else {
-                            Box::new(TaskFailed(e.to_string()))
-                        };
-                        region.record_error(e);
-                        Err(copy)
+                        region.record_error(e.clone());
+                        (Err(JoinError::Failed(e)), true)
                     }
                 };
                 // 2. Drop the work, so its interfaces close before a joiner
@@ -388,7 +395,7 @@ impl Drop for RunState {
         // Waits outside the run end too: joins of the dropped work, and
         // every wait on a `Cx` of the run, which reads `Cancelled`.
         for join in joins {
-            join.finish(Err(Box::new(Cancelled)));
+            join.finish(Err(JoinError::Cancelled));
         }
         self.root.cancel();
         self.shared.graph.run_ended();

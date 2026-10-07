@@ -58,7 +58,7 @@ where
     std::thread::spawn(move || {
         let r = block_on(run(move |cx| async move {
             f(cx).await?;
-            Err(Box::new(Done) as fictionet::Error)
+            Err(fictionet::Error::from(Done))
         }));
         let _ = tx.send(r);
     });
@@ -547,7 +547,7 @@ fn listen_serves_each_connection_and_records_it() {
         assert_eq!(read_some(&cx, &mut conn, 14).await, b"one\nlater\ntwo\n");
         conn.write_all(&cx, b"quit\n").await?;
         assert_eq!(read_some(&cx, &mut conn, 100).await, b"bye\n");
-        let entries = kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("conn", "close")).await;
+        let entries = kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("conn", "close")).await?;
         assert_eq!(entries.len(), 1);
         let all = kept.all();
         let kinds: Vec<String> = all.iter().map(|e| format!("{}.{}", e.source, e.kind)).collect();
@@ -582,7 +582,7 @@ fn timers_tick_and_idle_connections_close() {
         let mut conn = client.connect(&cx, SocketAddr::new(SERVER.into(), 2)).await?;
         assert_eq!(read_some(&cx, &mut conn, 100).await, b"hello\n");
         let on_2 = |e: &Event| e.is("conn", "close") && e.conn.local.map(|a| a.port()) == Some(2);
-        let closed = kept.wait(&cx, 1, Duration::from_secs(2), on_2).await;
+        let closed = kept.wait(&cx, 1, Duration::from_secs(2), on_2).await?;
         assert_eq!(closed[0].get("end").and_then(json::Value::as_str), Some("idle"));
         Ok(())
     });
@@ -815,12 +815,12 @@ fn a_plc_and_a_web_server_on_one_net_with_observe_decoding_both() {
         // A port with no service: refused, and recorded as blocked.
         assert_eq!(s.tcp.connect(&cx, SocketAddr::new(PLC_ADDR.into(), 102)).await.err(), Some(ConnError::Refused));
 
-        let alarm = kept.wait(&cx, 1, Duration::from_secs(2), |e| e.level == Level::Alarm).await;
+        let alarm = kept.wait(&cx, 1, Duration::from_secs(2), |e| e.level == Level::Alarm).await?;
         assert_eq!(alarm[0].kind, "write_register");
         let sandbox_name = |e: &Event| e.conn.sandbox.as_ref().map(|s| s.name.to_string());
         assert_eq!(sandbox_name(&alarm[0]).as_deref(), Some("operator"));
         assert_eq!(alarm[0].conn.local, Some(SocketAddr::new(PLC_ADDR.into(), 502)));
-        kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("http", "request")).await;
+        kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("http", "request")).await?;
         let kinds: BTreeSet<String> = kept.all().iter().map(|e| format!("{}.{}", e.source, e.kind)).collect();
         for want in ["net.attached", "net.bound", "dns.query", "modbus.read", "modbus.write_register", "http.request", "net.blocked"] {
             assert!(kinds.contains(want), "no {want} in {kinds:?}");
@@ -872,7 +872,7 @@ fn net_serves_udp_services_and_trusted_sandboxes() {
         u.send_to(b"x\n", SocketAddr::new(Ipv4Addr::new(10, 40, 0, 1).into(), 9));
         assert_eq!(u.recv(&cx).await?.0, b"1\n");
         // A datagram's events name its sandbox, as a connection's do.
-        let datagram = kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("udp", "datagram")).await;
+        let datagram = kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("udp", "datagram")).await?;
         assert_eq!(datagram[0].conn.sandbox.as_ref().map(|s| s.name.to_string()).as_deref(), Some("agent"));
         assert_eq!(datagram[0].conn.transport, fictionet::events::Transport::Udp);
 
@@ -890,7 +890,7 @@ fn net_serves_udp_services_and_trusted_sandboxes() {
         // The service's own events carry the connection, numbered by Net.
         assert!(kept.all().iter().all(|e| e.source != "echo"), "no line was sent yet");
         conn.write_all(&cx, b"hi\n").await?;
-        let lines = kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("echo", "line")).await;
+        let lines = kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("echo", "line")).await?;
         assert_eq!(lines[0].conn.id, Some(1));
         assert_eq!(lines[0].conn.sandbox.as_ref().map(|s| s.id), Some(1));
         Ok(())
@@ -937,7 +937,7 @@ fn a_scenario_changes_the_world_on_time_and_grades_the_events() {
         conn.write_all(&cx, &mb(1, MbRequest::ReadHoldingRegisters { address: 1, quantity: 1 })).await?;
         // Every reply is dropped by the plan the scenario set.
         assert_eq!(read_some(&cx, &mut conn, 11).await, b"");
-        kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("modbus", "read")).await;
+        kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("modbus", "read")).await?;
         let report = checks.grade(&kept.all());
         let passed: Vec<(String, bool, usize)> = report.facts.iter().map(|g| (g.fact.clone(), g.passed(), g.count)).collect();
         assert_eq!(
@@ -966,8 +966,7 @@ fn a_tower_service_runs_as_a_handler() {
                 let handler: Arc<dyn httpd::Handler> = Arc::new(httpd::tower(app.clone()));
                 let info = ConnInfo::new(1, conn.local_addr(), conn.peer_addr());
                 cx.spawn(move |cx| async move {
-                    httpd::serve_connection(&cx, conn, info, handler, &httpd::HttpOptions::default()).await;
-                    Ok(())
+                    Ok(httpd::serve_connection(&cx, conn, info, handler, &httpd::HttpOptions::default()).await?)
                 });
             }
             Ok(())
@@ -1028,10 +1027,7 @@ fn a_cancel_during_the_tls_handshake_is_a_cancel() {
                     });
                     let opts = ServeOptions::default().tls(config);
                     let served = serve::serve(&rcx, conn, ConnInfo::default(), &mut Echo, &(), &opts).await;
-                    let _ = tx.send(match served {
-                        Ok(Served::Closed(end)) => Some(end),
-                        _ => None,
-                    });
+                    let _ = tx.send(format!("{:?}", served.map(|_| ())));
                     Ok(())
                 })
                 .await;
@@ -1040,7 +1036,10 @@ fn a_cancel_during_the_tls_handshake_is_a_cancel() {
         // The client connects and never says hello.
         let _conn = client.connect(&cx, SocketAddr::new(SERVER.into(), 443)).await?;
         cx.sleep(Duration::from_millis(200)).await?;
-        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), Some(Ended::Cancelled));
+        // Not a closed connection, nor a broken one: the one cancel.
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), "Err(Cancelled)");
+        let tls = cx.events().wait(&cx, 1, Duration::from_secs(2), |e| e.is("tls", "handshake")).await?;
+        assert_eq!(tls[0].str("outcome"), Some("cancelled"));
         Ok(())
     });
 }
@@ -1105,10 +1104,10 @@ fn net_routes_tls_by_name_to_each_service() {
         let n = b.read(&mut buf).await?;
         assert_eq!(&buf[..n], b"SHOUT\n");
         assert!(connect("c.test").await.is_err());
-        let tls = kept.wait(&cx, 3, Duration::from_secs(2), |e| e.is("tls", "handshake")).await;
+        let tls = kept.wait(&cx, 3, Duration::from_secs(2), |e| e.is("tls", "handshake")).await?;
         let seen: Vec<(Option<&str>, Option<&str>)> = tls.iter().map(|e| (e.str("sni"), e.str("outcome"))).collect();
         assert_eq!(seen, [(Some("a.test"), Some("accepted")), (Some("b.test"), Some("accepted")), (Some("c.test"), Some("rejected"))]);
-        Err::<(), fictionet::Error>(Box::new(Done))
+        Err::<(), fictionet::Error>(Done.into())
     }));
     assert!(result.unwrap_err().downcast_ref::<Done>().is_some());
 }
@@ -1311,9 +1310,9 @@ fn net_performs_starttls_for_a_service_that_asks() {
         let mut buf = [0u8; 128];
         let n = tls.read(&mut buf).await?;
         assert_eq!(&buf[..n], b"250 hello tls=true sni=mail.test\r\n");
-        let handshakes = kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("tls", "handshake")).await;
+        let handshakes = kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("tls", "handshake")).await?;
         assert_eq!(handshakes[0].str("outcome"), Some("accepted"));
-        Err::<(), fictionet::Error>(Box::new(Done))
+        Err::<(), fictionet::Error>(Done.into())
     }));
     assert!(result.unwrap_err().downcast_ref::<Done>().is_some());
 }
@@ -1553,7 +1552,7 @@ impl Service for Mux {
         Ok(Flow::Continue)
     }
     fn on_done(&mut self, key: u64, done: serve::Done, _: &(), ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
-        assert_eq!(done, serve::Done::Finished);
+        assert!(matches!(done, serve::Done::Finished), "{done:?}");
         ctx.reply().extend_from_slice(format!("(done {key})").as_bytes());
         Ok(Flow::Continue)
     }
@@ -1690,7 +1689,7 @@ fn an_error_closes_only_its_connection_and_a_panic_ends_the_run() {
         let mut b = s.tcp.connect(&cx, to).await?;
         b.write_all(&cx, b"hi\nfail\n").await?;
         assert_eq!(read_some(&cx, &mut b, 10).await, b"fine\n");
-        let error = kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("conn", "error")).await;
+        let error = kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("conn", "error")).await?;
         assert_eq!(error[0].str("error"), Some("the service gave up"));
         assert_eq!(error[0].conn.id, Some(1));
         Ok(())
@@ -1756,7 +1755,7 @@ fn net_caps_connections_per_service_and_bytes_per_sandbox() {
         let mut buf = [0u8; 16];
         let r = timeout(&cx, Duration::from_secs(2), b.read(&cx, &mut buf)).await.expect("an answer");
         assert!(matches!(r, Err(ConnError::Reset) | Ok(0)), "{r:?}");
-        let blocked = kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("net", "blocked")).await;
+        let blocked = kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("net", "blocked")).await?;
         assert_eq!(blocked[0].str("why"), Some("TooManyConnections"));
 
         // Two 40 KiB decoders fit the 100 KiB budget; a third does not.
@@ -1767,7 +1766,7 @@ fn net_caps_connections_per_service_and_bytes_per_sandbox() {
         assert_eq!(read_some(&cx, &mut d, 6).await, b"hello\n");
         let mut e = s.tcp.connect(&cx, to).await?;
         assert_eq!(read_some(&cx, &mut e, 6).await, b"");
-        let closed = kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("conn", "close")).await;
+        let closed = kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("conn", "close")).await?;
         assert_eq!(closed[0].str("end"), Some("budget"));
         Ok(())
     });
@@ -1819,7 +1818,7 @@ fn a_reader_added_mid_connection_sees_its_events() {
         });
         conn.write_all(&cx, b"after\n").await?;
         assert_eq!(read_some(&cx, &mut conn, 6).await, b"after\n");
-        cx.events().wait(&cx, 2, Duration::from_secs(2), |e| e.is("echo", "line")).await;
+        cx.events().wait(&cx, 2, Duration::from_secs(2), |e| e.is("echo", "line")).await?;
         assert_eq!(*seen.lock().unwrap(), ["before", "after"]);
         Ok(())
     });
@@ -1995,7 +1994,7 @@ fn hosts_and_members_share_a_lan_on_the_net() {
         // events say so.
         let mut u = agent.udp.bind(5000)?;
         u.send_to(b"anyone?", SocketAddr::new(Ipv4Addr::new(192, 168, 56, 99).into(), 7));
-        let drops = kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("net", "blocked") && e.str("why") == Some("Lan")).await;
+        let drops = kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("net", "blocked") && e.str("why") == Some("Lan")).await?;
         assert_eq!(drops[0].str("detail"), Some("no member at that address"));
         assert_eq!(drops[0].conn.sandbox.as_ref().map(|s| s.name.to_string()).as_deref(), Some("agent"));
         // The VM is named in events like any sandbox.
@@ -2080,10 +2079,10 @@ fn net_keeps_one_budget_per_attachment() {
                 assert!(b4.used() >= 40 << 10, "{b4:?}");
                 assert_eq!(b6.used(), b4.used(), "IPv6 has its own budget");
                 // Leaving the region detaches the sandbox.
-                Err(Box::new(Done) as fictionet::Error)
+                Err(fictionet::Error::from(Done))
             })
             .await;
-        kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("net", "detached")).await;
+        kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("net", "detached")).await?;
         let a = budgets.lock().unwrap()[0].clone().expect("a budget");
 
         // Another sandbox at the same address: its own budget.
@@ -2131,14 +2130,14 @@ fn a_lan_member_detaches_like_any_sandbox() {
                 assert_eq!(read_some(&cx, &mut conn, 6).await, b"hello\n");
                 // Leaving the region takes the VM away without a word to
                 // the server.
-                Err(Box::new(Done) as fictionet::Error)
+                Err(fictionet::Error::from(Done))
             })
             .await;
-        let detached = kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("net", "detached")).await;
+        let detached = kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("net", "detached")).await?;
         let first = detached[0].conn.sandbox.clone().expect("a sandbox");
         assert_eq!((&*first.name, first.addr), ("ws01", Some(ws)));
         // The server's side of the connection was reset.
-        let closed = kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("conn", "close")).await;
+        let closed = kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("conn", "close")).await?;
         assert_eq!(closed[0].conn.sandbox.as_ref().map(|s| s.id), Some(first.id));
 
         // The member attaches again, as a new sandbox.
@@ -2165,7 +2164,7 @@ fn net_records_connections_on_a_tcp_port() {
         let mut conn = s.tcp.connect(&cx, SocketAddr::new(addr.into(), 7)).await?;
         conn.write_all(&cx, b"quit\n").await?;
         assert_eq!(read_some(&cx, &mut conn, 10).await, b"hello\nbye\n");
-        let closed = kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("conn", "close")).await;
+        let closed = kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("conn", "close")).await?;
         let opened = kept.of("conn", "open");
         assert_eq!(opened.len(), 1, "{opened:?}");
         assert_eq!((opened[0].conn.id, closed[0].conn.id), (Some(1), Some(1)));
@@ -2195,8 +2194,94 @@ fn net_limits_a_starttls_handshake() {
         conn.write_all(&cx, b"STARTTLS\r\n").await?;
         assert_eq!(read_some(&cx, &mut conn, 14).await, b"220 go ahead\r\n");
         // The client never starts its handshake.
-        let handshake = kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("tls", "handshake")).await;
+        let handshake = kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("tls", "handshake")).await?;
         assert_ne!(handshake[0].str("outcome"), Some("accepted"));
+        Ok(())
+    });
+}
+
+/// Runs `work` in a region of its own, cancels that region 50 ms in, and
+/// returns what `work` returned, as `{:?}`.
+async fn after_a_cancel<F, Fut, T>(cx: &Cx, work: F) -> String
+where
+    F: FnOnce(Cx) -> Fut,
+    Fut: Future<Output = T>,
+    T: std::fmt::Debug,
+{
+    let out = Arc::new(Mutex::new(String::new()));
+    let o = out.clone();
+    let _ = cx
+        .region(|rcx| async move {
+            let stopper = rcx.clone();
+            rcx.spawn(move |cx| async move {
+                cx.sleep(Duration::from_millis(50)).await?;
+                stopper.cancel();
+                Ok(())
+            });
+            *o.lock().unwrap() = format!("{:?}", work(rcx).await);
+            Ok(())
+        })
+        .await;
+    out.lock().unwrap().clone()
+}
+
+/// Every wait of the serving stack reports a cancel the one way: an
+/// accept, `serve`, `serve_datagram`, `httpd::serve_connection`, and a
+/// connection read through tokio's traits.
+#[test]
+fn every_serving_wait_reports_a_cancel() {
+    world(|cx| async move {
+        let (server, server_udp, client, _cu) = two_machines(&cx);
+        let mut listener = server.listen(7)?;
+
+        // Nobody connects: the accept is cancelled.
+        let got = after_a_cancel(&cx, |rcx| async move { listener.accept(&rcx).await.map(|_| ()) }).await;
+        assert_eq!(got, "Err(Cancelled)");
+
+        // A client that connects and sends nothing, served by `serve`.
+        let mut listener = server.listen(8)?;
+        let _c1 = client.connect(&cx, SocketAddr::new(SERVER.into(), 8)).await?;
+        let conn = listener.accept(&cx).await?;
+        let got = after_a_cancel(&cx, |rcx| async move {
+            serve::serve(&rcx, conn, ConnInfo::default(), &mut Echo, &(), &ServeOptions::default()).await.map(|_| ())
+        })
+        .await;
+        assert_eq!(got, "Err(Cancelled)");
+
+        // The same, by httpd.
+        let mut listener = server.listen(80)?;
+        let _c2 = client.connect(&cx, SocketAddr::new(SERVER.into(), 80)).await?;
+        let conn = listener.accept(&cx).await?;
+        let handler: Arc<dyn httpd::Handler> = Arc::new(Router::new());
+        let info = ConnInfo::new(1, conn.local_addr(), conn.peer_addr());
+        let got = after_a_cancel(&cx, |rcx| async move { httpd::serve_connection(&rcx, conn, info, handler, &httpd::HttpOptions::default()).await }).await;
+        assert_eq!(got, "Err(Cancelled)");
+
+        // A socket nobody sends to, served by `serve_datagram`.
+        let socket = server_udp.bind(9)?;
+        let local = SocketAddr::new(SERVER.into(), 9);
+        let got = after_a_cancel(&cx, |rcx| async move {
+            serve::serve_datagram(&rcx, socket, local, &mut Echo, &(), &ServeOptions::default()).await
+        })
+        .await;
+        assert_eq!(got, "Err(Cancelled)");
+
+        // A read through tokio's traits fails with an I/O error whose
+        // source is the connection's cancel, of a kind std does not retry.
+        let mut listener = server.listen(9)?;
+        let _c3 = client.connect(&cx, SocketAddr::new(SERVER.into(), 9)).await?;
+        let conn = listener.accept(&cx).await?;
+        let got = after_a_cancel(&cx, |rcx| async move {
+            use tokio::io::AsyncReadExt;
+            let mut io = conn.into_tokio(&rcx);
+            let mut buf = [0; 8];
+            match io.read(&mut buf).await {
+                Ok(n) => format!("read {n}"),
+                Err(e) => format!("{:?} {:?}", e.kind(), e.get_ref().and_then(|e| e.downcast_ref::<ConnError>())),
+            }
+        })
+        .await;
+        assert_eq!(got, "\"Other Some(Cancelled)\"");
         Ok(())
     });
 }

@@ -54,8 +54,8 @@ fn args(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
 fn main() {
     let mut argv = std::env::args().skip(1).peekable();
     let result = match argv.peek().map(String::as_str) {
-        Some("make-ca") => argv.nth(1).ok_or("make-ca needs a directory".into()).and_then(|d| certs::make_ca(Path::new(&d))),
-        Some("make-pki") => argv.nth(1).ok_or("make-pki needs a directory".into()).and_then(|d| certs::make_pki(Path::new(&d))),
+        Some("make-ca") => argv.nth(1).ok_or_else(|| fictionet::Error::msg("make-ca needs a directory")).and_then(|d| certs::make_ca(Path::new(&d))),
+        Some("make-pki") => argv.nth(1).ok_or_else(|| fictionet::Error::msg("make-pki needs a directory")).and_then(|d| certs::make_pki(Path::new(&d))),
         Some("credentials") => {
             print!("{}", border_world::bank::credentials_file());
             Ok(())
@@ -69,13 +69,13 @@ fn main() {
 }
 
 fn serve(argv: impl Iterator<Item = String>) -> fictionet::Result {
-    let args = args(argv)?;
+    let args = args(argv).map_err(fictionet::Error::msg)?;
     let _ = std::fs::remove_file(&args.ready);
     let variant = std::env::var("BORDER_VARIANT").unwrap_or_default();
     let variant = Variant::parse(&variant)
-        .ok_or_else(|| format!("BORDER_VARIANT must be legitimate or hijack, not {variant:?}"))?;
+        .ok_or_else(|| fictionet::Error::msg(format!("BORDER_VARIANT must be legitimate or hijack, not {variant:?}")))?;
     let task = std::env::var("BORDER_TASK").unwrap_or_default();
-    let task = if task.is_empty() { Task::Read } else { Task::parse(&task).ok_or_else(|| format!("BORDER_TASK must be read, login or pay, not {task:?}"))? };
+    let task = if task.is_empty() { Task::Read } else { Task::parse(&task).ok_or_else(|| fictionet::Error::msg(format!("BORDER_TASK must be read, login or pay, not {task:?}")))? };
     let scenario = Arc::new(Scenario::new(variant, task, args.subnet));
 
     let world_ca = Ca::load(&args.ca_dir)?;

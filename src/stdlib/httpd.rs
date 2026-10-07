@@ -118,7 +118,7 @@ use fictionet::stdlib::serve::{self, Budget, Ended, Flow, Pending, PendingCtx, P
 use fictionet::stdlib::tls::ServerConfig;
 use fictionet::stdlib::{ConnError, Connection, ConnectionExt};
 use fictionet::time::Instant;
-use fictionet::{Cx, Error, Raced};
+use fictionet::{Cancelled, Cx, Error, RaceError};
 
 // ---------------------------------------------------------------------------
 // Bodies
@@ -962,7 +962,7 @@ fn partial(bytes: Bytes, why: &'static str) -> Body {
             if let Some(b) = this.0.take().filter(|b| !b.is_empty()) {
                 return Poll::Ready(Some(Ok(Frame::data(b))));
             }
-            Poll::Ready(this.1.take().map(|why| Err(why.into())))
+            Poll::Ready(this.1.take().map(|why| Err(fictionet::Error::msg(why))))
         }
     }
     Body::new(Partial(Some(bytes), Some(why)))
@@ -1290,7 +1290,7 @@ impl Pending for Streaming {
             if let Some(work) = self.work.take() {
                 self.making = Some(match ctx.cx() {
                     Some(cx) => work(cx.clone()),
-                    None => Box::pin(std::future::ready(Err("this answer needs a Cx: give the harness one with Harness::with_cx".into()))),
+                    None => Box::pin(std::future::ready(Err(fictionet::Error::msg("this answer needs a Cx: give the harness one with Harness::with_cx")))),
                 });
             }
             if let Some(making) = &mut self.making {
@@ -1412,7 +1412,12 @@ const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 /// Serves one connection with `handler`: HTTP/2 when TLS agreed on `h2`, or
 /// when a client without TLS starts with HTTP/2's preface; HTTP/1
 /// otherwise. `info` names the connection in events.
-pub async fn serve_connection<C: Connection + Unpin>(cx: &Cx, conn: C, info: ConnInfo, handler: Arc<dyn Handler>, opts: &HttpOptions) {
+///
+/// Returns `Ok(())` when the connection ended, however it ended: a
+/// connection's failure is the connection's, and the run's events say what
+/// it was. Returns [`Cancelled`] if `cx`'s
+/// [region](fictionet::Cx#regions) is cancelled first.
+pub async fn serve_connection<C: Connection + Unpin>(cx: &Cx, conn: C, info: ConnInfo, handler: Arc<dyn Handler>, opts: &HttpOptions) -> Result<(), Cancelled> {
     let mut conn = conn;
     let mut first = Vec::new();
     let h2 = if info.tls {
@@ -1431,19 +1436,20 @@ pub async fn serve_connection<C: Connection + Unpin>(cx: &Cx, conn: C, info: Con
         };
         match cx.race(opts.first_bytes.map(|d| cx.now() + d), preface).await {
             Ok(true) => {}
-            Ok(false) | Err(Raced::Cancelled) => return,
-            Err(Raced::Deadline) => {
+            Ok(false) if cx.is_cancelled() => return Err(Cancelled),
+            Ok(false) => return Ok(()),
+            Err(RaceError::Cancelled) => return Err(Cancelled),
+            Err(RaceError::Deadline) => {
                 let secs = opts.first_bytes.map_or(0, |d| d.as_secs());
                 cx.record(error_event(&info, "timeout", format!("no bytes within {secs} seconds of connecting")).conn(&info));
-                return;
+                return Ok(());
             }
         }
         first == PREFACE
     };
     let conn = Prefixed::new(first, conn);
     if h2 {
-        h2::serve(cx, conn, handler, info, opts).await;
-        return;
+        return h2::serve(cx, conn, handler, info, opts).await;
     }
     let serve_opts = ServeOptions {
         idle: None,
@@ -1455,13 +1461,16 @@ pub async fn serve_connection<C: Connection + Unpin>(cx: &Cx, conn: C, info: Con
     };
     let mut service = Http1::with(handler.clone(), opts.limits);
     service.date = opts.date;
-    let served = serve::serve(cx, conn, info.clone(), &mut service, &(), &serve_opts).await;
-    if let Ok(serve::Served::Upgraded(serve::Upgrade::Handoff, rest)) = served
-        && let Some(head) = service.take_handoff()
-    {
-        // A request that asks for an upgrade: hyper's HTTP/1 reads it again
-        // and carries the upgrade out.
-        h2::serve_upgrade(cx, Prefixed::new(head, rest), handler, info, opts).await;
+    match serve::serve(cx, conn, info.clone(), &mut service, &(), &serve_opts).await {
+        Ok(serve::Served::Upgraded(serve::Upgrade::Handoff, rest)) => match service.take_handoff() {
+            // A request that asks for an upgrade: hyper's HTTP/1 reads it
+            // again and carries the upgrade out.
+            Some(head) => h2::serve_upgrade(cx, Prefixed::new(head, rest), handler, info, opts).await,
+            None => Ok(()),
+        },
+        Err(serve::ServeError::Cancelled) => Err(Cancelled),
+        // The driver recorded the failure as a `conn.error` event.
+        Ok(_) | Err(_) => Ok(()),
     }
 }
 
@@ -1556,7 +1565,9 @@ impl Accept for Server {
             date: self.date,
         };
         let (conn, info) = (arrival.conn, arrival.info);
-        Box::pin(async move { serve_connection(&cx, conn, info, handler, &opts).await })
+        Box::pin(async move {
+            let _ = serve_connection(&cx, conn, info, handler, &opts).await;
+        })
     }
 
     fn alpn(&self) -> Vec<Vec<u8>> {
@@ -1650,7 +1661,7 @@ mod h2 {
     use hyper::body::Incoming;
 
     /// Runs hyper's HTTP/2 server on `conn`.
-    pub(super) async fn serve<C: Connection + Unpin>(cx: &Cx, conn: C, handler: Arc<dyn Handler>, info: ConnInfo, opts: &HttpOptions) {
+    pub(super) async fn serve<C: Connection + Unpin>(cx: &Cx, conn: C, handler: Arc<dyn Handler>, info: ConnInfo, opts: &HttpOptions) -> Result<(), Cancelled> {
         let broke = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let io = Io::new(cx, conn, broke.clone(), opts.limits.write_timeout);
         let route = Route::new(cx, handler, &info, opts);
@@ -1667,8 +1678,7 @@ mod h2 {
         }
         // hyper reads all the time on HTTP/2, so a reset ends it on its own.
         let served = builder.serve_connection(io, route);
-        let Ok(result) = cx.race(None, served).await else { return };
-        report(cx, &info, &broke, result);
+        finish(cx, &info, &broke, cx.race(None, served).await)
     }
 
     /// Runs hyper's HTTP/1 server on `conn`, with upgrades: where
@@ -1683,7 +1693,7 @@ mod h2 {
         handler: Arc<dyn Handler>,
         info: ConnInfo,
         opts: &HttpOptions,
-    ) {
+    ) -> Result<(), Cancelled> {
         let broke = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let io = Io::new(cx, conn, broke.clone(), opts.limits.write_timeout);
         let route = Route::new(cx, handler, &info, opts);
@@ -1695,8 +1705,19 @@ mod h2 {
             builder.timer(CxTimer { cx: cx.clone() });
         }
         let served = builder.serve_connection(io, route).with_upgrades();
-        let Ok(result) = cx.race(None, served).await else { return };
-        report(cx, &info, &broke, result);
+        finish(cx, &info, &broke, cx.race(None, served).await)
+    }
+
+    /// How a connection hyper served ends: [`Cancelled`] if `cx`'s region
+    /// was cancelled, whether hyper saw it first or its I/O did; otherwise
+    /// it ended, and an error is recorded.
+    fn finish(cx: &Cx, info: &ConnInfo, broke: &std::sync::atomic::AtomicBool, raced: Result<Result<(), hyper::Error>, RaceError>) -> Result<(), Cancelled> {
+        let Ok(result) = raced else { return Err(Cancelled) };
+        if cx.is_cancelled() {
+            return Err(Cancelled);
+        }
+        report(cx, info, broke, result);
+        Ok(())
     }
 
     /// Records how a connection hyper served ended, if in an error.
@@ -2027,19 +2048,6 @@ mod h2 {
         }
     }
 
-    fn to_io(e: ConnError) -> std::io::Error {
-        use std::io::ErrorKind;
-        let kind = match e {
-            ConnError::Cancelled => ErrorKind::Interrupted,
-            ConnError::Refused => ErrorKind::ConnectionRefused,
-            ConnError::Reset => ErrorKind::ConnectionReset,
-            ConnError::TimedOut => ErrorKind::TimedOut,
-            ConnError::Closed => ErrorKind::BrokenPipe,
-            ConnError::Broken => ErrorKind::InvalidData,
-        };
-        std::io::Error::new(kind, e)
-    }
-
     impl<C: Connection + Unpin> hyper::rt::Read for Io<C> {
         fn poll_read(self: Pin<&mut Self>, task: &mut Context<'_>, mut buf: hyper::rt::ReadBufCursor<'_>) -> Poll<std::io::Result<()>> {
             let this = self.get_mut();
@@ -2053,7 +2061,7 @@ mod h2 {
                     if e == ConnError::Broken {
                         this.broke.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
-                    Poll::Ready(Err(to_io(e)))
+                    Poll::Ready(Err(e.into()))
                 }
                 Poll::Pending => Poll::Pending,
             }
@@ -2062,7 +2070,7 @@ mod h2 {
 
     impl<C: Connection + Unpin> hyper::rt::Write for Io<C> {
         fn poll_write(self: Pin<&mut Self>, task: &mut Context<'_>, data: &[u8]) -> Poll<std::io::Result<usize>> {
-            self.get_mut().write(task, data).map_err(to_io)
+            self.get_mut().write(task, data).map_err(std::io::Error::from)
         }
 
         fn is_write_vectored(&self) -> bool {
@@ -2080,7 +2088,7 @@ mod h2 {
                             break;
                         }
                     }
-                    Poll::Ready(Err(e)) if done == 0 => return Poll::Ready(Err(to_io(e))),
+                    Poll::Ready(Err(e)) if done == 0 => return Poll::Ready(Err(e.into())),
                     Poll::Pending if done == 0 => return Poll::Pending,
                     Poll::Ready(Err(_)) | Poll::Pending => break,
                 }
@@ -2096,7 +2104,7 @@ mod h2 {
 
         fn poll_shutdown(self: Pin<&mut Self>, task: &mut Context<'_>) -> Poll<std::io::Result<()>> {
             let this = self.get_mut();
-            this.conn.poll_shutdown(&this.cx, task).map_err(to_io)
+            this.conn.poll_shutdown(&this.cx, task).map_err(std::io::Error::from)
         }
     }
 

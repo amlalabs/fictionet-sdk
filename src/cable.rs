@@ -250,7 +250,7 @@ mod tests {
             a.send(Packet(vec![99; 36]));
             assert_eq!(b.recv(&cx).await?, Packet(vec![99; 36]));
             assert_eq!(b.cable.dirs[b.side].lock().unwrap().queued, 0);
-            Err::<(), crate::Error>("done".into())
+            Err::<(), crate::Error>(crate::Error::msg("done"))
         }));
         assert_eq!(result.unwrap_err().to_string(), "done");
     }

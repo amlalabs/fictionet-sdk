@@ -112,7 +112,7 @@ impl World {
                     cx.sleep(fictionet::time::ms(20)).await?;
                 }
                 // Ends the run: every attachment closes.
-                Err::<(), fictionet::Error>("stopped".into())
+                Err::<(), fictionet::Error>(fictionet::Error::msg("stopped"))
             }));
             drop(listening);
         });
@@ -137,7 +137,7 @@ impl World {
             ready_tx.send(()).unwrap();
             let _ = fictionet::block_on(fictionet::run(move |cx| async move {
                 cx.spawn(move |cx| async move {
-                    while let Some(mut sandbox) = attachments.next(&cx).await {
+                    while let Ok(mut sandbox) = attachments.next(&cx).await {
                         let seen = seen2.clone();
                         cx.spawn(move |cx| async move {
                             while let Ok(p) = sandbox.recv(&cx).await {
@@ -154,7 +154,7 @@ impl World {
                     cx.sleep(fictionet::time::ms(20)).await?;
                 }
                 // Ends the run: every attachment closes.
-                Err::<(), fictionet::Error>("stopped".into())
+                Err::<(), fictionet::Error>(fictionet::Error::msg("stopped"))
             }));
             drop(listening);
         });

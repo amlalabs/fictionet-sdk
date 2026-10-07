@@ -26,10 +26,12 @@ fn main() -> Result {
     let _listening = fictionet::listen(fictionet::WorldSocket::UnixSocket(path.clone().into()), attacher)?;
     println!("listening on {path}");
     fictionet::block_on(fictionet::run(move |cx| async move {
-        while let Some(sandbox) = attachments.next(&cx).await {
+        // `next` returns `Cancelled` when the world stops, and `?` ends
+        // the loop with it.
+        loop {
+            let sandbox = attachments.next(&cx).await?;
             cx.spawn(move |cx| serve(cx, sandbox));
         }
-        Ok(())
     }))
 }
 
