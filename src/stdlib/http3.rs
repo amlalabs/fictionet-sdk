@@ -6,7 +6,7 @@
 //! Extended CONNECT follows RFC 9220 and RFC 8441. Priority dictionaries
 //! use the RFC 8941 grammar, including values and parameters we ignore.
 //!
-//! [`Connection`] routes ordered stream bytes under a shared input budget.
+//! [`Session`] routes ordered stream bytes under a shared input budget.
 //! For a single stream, use [`Stream<Frames>`](fictionet::stdlib::codec::Stream),
 //! [`ControlFrames`], or [`StreamHeaders`]. [`RequestState`] validates decoded
 //! request and push frames. QPACK tables and blocked sections belong to the
@@ -1265,22 +1265,22 @@ pub enum RequestResult {
         /// Send this value on the decoder stream before taking an insert increment.
         ack: Option<qpack::DecoderInstruction>,
     },
-    /// Call [`Connection::pause`] until the section can be retried, then
-    /// [`RequestState::resume`] and [`Connection::unpause`] before reading more frames.
+    /// Call [`Session::pause`] until the section can be retried, then
+    /// [`RequestState::resume`] and [`Session::unpause`] before reading more frames.
     Blocked(qpack::BlockedSection),
 }
 
 /// Request or push message state over decoded [`Frame`] values.
 ///
-/// Drive [`Frames`] with [`codec::Stream`] or route [`Connection`] frame items
+/// Drive [`Frames`] with [`codec::Stream`] or route [`Session`] frame items
 /// here. This state checks message order: HEADERS and
 /// DATA ordering, trailers, interim responses, CONNECT, and Content-Length.
 /// Received duplicate identical Content-Length values are normalized.
 /// No input, blocked field bytes, or acknowledgment queue is retained here.
 /// Hold returned blocked sections in [`qpack::BlockedSections`] and call
-/// [`Connection::pause`] for this stream (or stop driving its standalone
+/// [`Session::pause`] for this stream (or stop driving its standalone
 /// [`codec::Stream`]). Pass its retried result to [`Self::resume`], then call
-/// [`Connection::unpause`] once it is no longer blocked. Send every returned
+/// [`Session::unpause`] once it is no longer blocked. Send every returned
 /// acknowledgment in order, even on reset, before [`qpack::Table::take_increment`].
 /// Use [`Self::with_field_limit`] to enforce the advertised
 /// SETTINGS_MAX_FIELD_SECTION_SIZE on immediate and retried sections.
@@ -1506,8 +1506,8 @@ impl RequestState {
     }
     /// Validates one decoded frame against the receiving QPACK table.
     /// A blocked or finished session returns State without consuming the frame.
-    /// On Blocked, call [`Connection::pause`], retain the returned section, and
-    /// resume it before [`Connection::unpause`] allows the next frame.
+    /// On Blocked, call [`Session::pause`], retain the returned section, and
+    /// resume it before [`Session::unpause`] allows the next frame.
     /// Field-validation errors are carried beside their acknowledgment in
     /// [`RequestResult::Event`]; send that acknowledgment even for invalid HTTP
     /// fields. Placement and QPACK decoding failures return `Err`.
@@ -1960,7 +1960,7 @@ enum StreamKind {
 
 /// The selected byte decoder for a single HTTP/3 stream.
 ///
-/// [`Connection`] drives these with [`codec::Demux`]. Tables, blocked
+/// [`Session`] drives these with [`codec::Demux`]. Tables, blocked
 /// sections, acknowledgment values, and HTTP request semantics belong to
 /// the caller. Use [`RequestState::step`] between frame items, or
 /// [`qpack::decode_section`] and [`HeaderList::from_fields`] for standalone
@@ -2096,13 +2096,13 @@ type StreamFactory = Box<dyn FnMut(&u64) -> StreamItems + Send>;
 /// in the input budget. Retry the section and call [`RequestState::resume`],
 /// then [`Self::unpause`] when it is no longer blocked.
 /// Acknowledgments and insert increments come back as values to send.
-pub struct Connection {
+pub struct Session {
     streams: codec::Demux<u64, StreamItems, StreamFactory>,
     paused: std::collections::BTreeMap<u64, codec::Stream<StreamItems>>,
     sender: Endpoint,
 }
 
-impl Connection {
+impl Session {
     /// Creates input routing for bytes sent by one peer endpoint.
     /// `max_streams` bounds open and closed keys; `max_bytes` is shared by
     /// every input stream, including control and both QPACK streams.
@@ -3016,13 +3016,13 @@ mod tests {
         let wire = join(&[Frame::headers(&section).unwrap(), Frame::Data(vec![42])]);
         let mut table = qpack::Table::new(4096);
         let mut state = RequestState::new(0, MessageSide::Request, false).unwrap();
-        let mut connection = Connection::new(Endpoint::Client, 4, MAX_FRAME);
-        assert_eq!(connection.push(0, &wire), wire.len());
-        let (_, Ok(Ok(StreamItem::Frame(frame)))) = connection.next().unwrap() else { panic!() };
+        let mut session = Session::new(Endpoint::Client, 4, MAX_FRAME);
+        assert_eq!(session.push(0, &wire), wire.len());
+        let (_, Ok(Ok(StreamItem::Frame(frame)))) = session.next().unwrap() else { panic!() };
         let RequestResult::Blocked(blocked) = state.step(&frame, &table).unwrap() else { panic!() };
-        connection.pause(0);
-        assert_eq!(connection.push(0, &[0]), 0);
-        assert_eq!(connection.next(), None);
+        session.pause(0);
+        assert_eq!(session.push(0, &[0]), 0);
+        assert_eq!(session.next(), None);
         assert_eq!(state.finish(), Err(Error::State));
         assert_eq!(state.resume(4, blocked.clone().retry(&table)), Err(Error::State));
         assert!(state.is_blocked());
@@ -3033,8 +3033,8 @@ mod tests {
         };
         assert_eq!(result, Ok(Event::Headers(headers)));
         encoder.apply_instruction(ack.unwrap()).unwrap();
-        connection.unpause(0);
-        let (_, Ok(Ok(StreamItem::Frame(frame)))) = connection.next().unwrap() else { panic!() };
+        session.unpause(0);
+        let (_, Ok(Ok(StreamItem::Frame(frame)))) = session.next().unwrap() else { panic!() };
         assert_eq!(event(&mut state, frame, &table), Ok(Event::Data(vec![42])));
         assert_eq!(state.finish(), Ok(()));
     }
@@ -3302,17 +3302,17 @@ mod tests {
             contract::check_wire::<Priority>(&bytes);
             contract::check_wire::<StreamHeader>(&bytes);
             let budget = MAX_FRAME + MAX_TEST_BYTES;
-            let mut connection = Connection::new(Endpoint::Client, 5, budget);
+            let mut session = Session::new(Endpoint::Client, 5, budget);
             for (index, chunk) in bytes.chunks(17).enumerate() {
-                let _ = connection.push([0, 2, 4, 6, 10][index % 5], chunk);
-                while connection.next().is_some() {}
-                assert!(connection.buffered() <= budget);
+                let _ = session.push([0, 2, 4, 6, 10][index % 5], chunk);
+                while session.next().is_some() {}
+                assert!(session.buffered() <= budget);
             }
             for id in [0, 2, 4, 6, 10] {
-                connection.end(id);
+                session.end(id);
             }
-            while connection.next().is_some() {}
-            assert!(connection.buffered() <= budget);
+            while session.next().is_some() {}
+            assert!(session.buffered() <= budget);
             let (items, _) = decode_all(Frames::new, &bytes);
             for frame in items.iter().flatten() {
                 contract::check_wire_value(frame);

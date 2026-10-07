@@ -2,7 +2,7 @@
 
 use fictionet::stdlib::{
     codec::{self, Decode, Fail, Stream, Wire, contract, finish, pump, test_support::chunks},
-    http3::{self, Connection, Endpoint, Frame, StreamHeader, StreamItem},
+    http3::{self, Endpoint, Frame, Session, StreamHeader, StreamItem},
     qpack::{
         self, DecoderInstruction as DI, EncoderInstruction as EI, Field, Representation as Rep, SectionResult, Table,
     },
@@ -37,80 +37,80 @@ fn blocked_stream_keeps_frames_in_connection_budget_until_unpaused() {
     let mut table = Table::new(4096);
     table.apply(EI::SetCapacity(4096)).unwrap();
     let mut state = http3::RequestState::new(0, http3::MessageSide::Response, false).unwrap();
-    let mut connection = Connection::new(Endpoint::Server, 4, http3::MAX_FRAME);
+    let mut session = Session::new(Endpoint::Server, 4, http3::MAX_FRAME);
     let data = Frame::Data(vec![7; 10]);
     let mut bytes = wire(&Frame::Headers(vec![2, 0, 0x80]));
     for _ in 0..50 {
         Wire::write(&data, &mut bytes).unwrap();
     }
-    assert_eq!(connection.push(0, &bytes), bytes.len());
-    let Some((0, Ok(Ok(StreamItem::Frame(frame))))) = connection.next() else { panic!("expected HEADERS") };
+    assert_eq!(session.push(0, &bytes), bytes.len());
+    let Some((0, Ok(Ok(StreamItem::Frame(frame))))) = session.next() else { panic!("expected HEADERS") };
     let http3::RequestResult::Blocked(blocked) = state.step(&frame, &table).unwrap() else {
         panic!("expected a blocked section")
     };
-    connection.pause(0);
-    let buffered = connection.buffered();
+    session.pause(0);
+    let buffered = session.buffered();
     assert_eq!(buffered, 50 * wire(&data).len());
-    assert_eq!(connection.push(4, &wire(&data)), wire(&data).len());
+    assert_eq!(session.push(4, &wire(&data)), wire(&data).len());
     let mut other_frames = 0;
-    while let Some((id, result)) = connection.next() {
+    while let Some((id, result)) = session.next() {
         assert_eq!(id, 4, "blocked stream released buffered frames");
         assert_eq!(result, Ok(Ok(StreamItem::Frame(data.clone()))));
         other_frames += 1;
     }
     assert_eq!(other_frames, 1);
-    assert_eq!(connection.buffered(), buffered);
-    assert_eq!(connection.push(0, &wire(&data)), 0);
+    assert_eq!(session.buffered(), buffered);
+    assert_eq!(session.push(0, &wire(&data)), 0);
     table.apply(EI::InsertWithLiteralName { name: b":status".to_vec(), value: b"200".to_vec() }).unwrap();
     assert!(matches!(
         state.resume(0, blocked.retry(&table)),
         Ok(http3::RequestResult::Event { event: Ok(http3::Event::Headers(_)), ack: Some(DI::SectionAck(0)) })
     ));
-    connection.unpause(0);
+    session.unpause(0);
     for _ in 0..50 {
-        assert_eq!(connection.next(), Some((0, Ok(Ok(StreamItem::Frame(data.clone()))))));
+        assert_eq!(session.next(), Some((0, Ok(Ok(StreamItem::Frame(data.clone()))))));
     }
-    assert!(connection.next().is_none());
-    assert_eq!(connection.buffered(), 0);
-    assert_eq!(connection.push(0, &wire(&data)), wire(&data).len());
+    assert!(session.next().is_none());
+    assert_eq!(session.buffered(), 0);
+    assert_eq!(session.push(0, &wire(&data)), wire(&data).len());
 }
 
 #[test]
 fn paused_stream_defers_eof_and_preserves_offsets() {
     for end_before_pause in [false, true] {
         for partial in [false, true] {
-            let mut connection = Connection::new(Endpoint::Client, 1, http3::MAX_FRAME);
+            let mut session = Session::new(Endpoint::Client, 1, http3::MAX_FRAME);
             let frame = Frame::Data(vec![7; 10]);
             let mut bytes = wire(&frame);
             if partial {
                 bytes.extend_from_slice(&[0, 2, 7]);
             }
-            assert_eq!(connection.push(0, &bytes), bytes.len());
+            assert_eq!(session.push(0, &bytes), bytes.len());
             if end_before_pause {
-                connection.end(0);
+                session.end(0);
             }
-            connection.pause(0);
-            connection.pause(0);
+            session.pause(0);
+            session.pause(0);
             if !end_before_pause {
-                connection.end(0);
-                connection.end(0);
+                session.end(0);
+                session.end(0);
             }
-            assert!(connection.next().is_none());
-            assert!(connection.next().is_none());
-            assert_eq!(connection.buffered(), bytes.len());
-            assert_eq!(connection.push(0, &[7]), 0);
-            connection.unpause(0);
-            connection.unpause(0);
-            assert_eq!(connection.next(), Some((0, Ok(Ok(StreamItem::Frame(frame.clone()))))));
+            assert!(session.next().is_none());
+            assert!(session.next().is_none());
+            assert_eq!(session.buffered(), bytes.len());
+            assert_eq!(session.push(0, &[7]), 0);
+            session.unpause(0);
+            session.unpause(0);
+            assert_eq!(session.next(), Some((0, Ok(Ok(StreamItem::Frame(frame.clone()))))));
             if partial {
-                assert_eq!(connection.next(), Some((0, Err(Fail::Truncated { unread: 3 }))));
+                assert_eq!(session.next(), Some((0, Err(Fail::Truncated { unread: 3 }))));
             }
-            assert!(connection.next().is_none());
+            assert!(session.next().is_none());
             // A terminal stream cannot be restarted by pause/unpause.
-            connection.pause(0);
-            connection.unpause(0);
-            assert!(connection.next().is_none());
-            let stream = connection.remove(0).unwrap();
+            session.pause(0);
+            session.unpause(0);
+            assert!(session.next().is_none());
+            let stream = session.remove(0).unwrap();
             assert!(stream.is_done());
             assert_eq!(stream.offset(), wire(&frame).len() as u64);
             assert_eq!(stream.buffered(), if partial { 3 } else { 0 });
@@ -121,22 +121,22 @@ fn paused_stream_defers_eof_and_preserves_offsets() {
 
 #[test]
 fn paused_stream_at_capacity_resumes_without_stuck() {
-    let mut connection = Connection::new(Endpoint::Client, 1, http3::MAX_FRAME);
-    connection.pause(4);
-    connection.unpause(4);
-    assert!(connection.is_empty());
+    let mut session = Session::new(Endpoint::Client, 1, http3::MAX_FRAME);
+    session.pause(4);
+    session.unpause(4);
+    assert!(session.is_empty());
     // Empty DATA frames exactly fill the stream buffer.
     let bytes = vec![0; http3::MAX_FRAME];
-    assert_eq!(connection.push(0, &bytes), bytes.len());
+    assert_eq!(session.push(0, &bytes), bytes.len());
     for _ in 0..2 {
-        connection.pause(0);
-        assert!(connection.next().is_none());
-        assert_eq!(connection.buffered(), bytes.len());
-        assert_eq!(connection.push(0, &[0, 0]), 0);
-        connection.unpause(0);
+        session.pause(0);
+        assert!(session.next().is_none());
+        assert_eq!(session.buffered(), bytes.len());
+        assert_eq!(session.push(0, &[0, 0]), 0);
+        session.unpause(0);
     }
-    assert_eq!(connection.next(), Some((0, Ok(Ok(StreamItem::Frame(Frame::Data(vec![])))))));
-    assert_eq!(connection.buffered(), bytes.len() - 2);
+    assert_eq!(session.next(), Some((0, Ok(Ok(StreamItem::Frame(Frame::Data(vec![])))))));
+    assert_eq!(session.buffered(), bytes.len() - 2);
 }
 
 #[test]
@@ -290,7 +290,7 @@ fn two_request_states_resume_in_qpack_release_order() {
         RequestState::new(0, MessageSide::Request, false).unwrap(),
         RequestState::new(4, MessageSide::Request, false).unwrap(),
     ];
-    let mut connection = Connection::new(Endpoint::Client, 2, 2 * http3::MAX_FRAME);
+    let mut session = Session::new(Endpoint::Client, 2, 2 * http3::MAX_FRAME);
     for (id, required) in [(0, 2), (4, 1)] {
         let mut reps: Vec<_> = received_request(&[])
             .into_iter()
@@ -299,18 +299,18 @@ fn two_request_states_resume_in_qpack_release_order() {
         reps.push(Rep::Indexed { static_table: false, index: 0 });
         let mut bytes = wire(&Frame::Headers(section(required, required, table.max_entries(), &reps)));
         Frame::Data(vec![id as u8]).write(&mut bytes).unwrap();
-        assert_eq!(connection.push(id, &bytes), bytes.len());
-        connection.end(id);
+        assert_eq!(session.push(id, &bytes), bytes.len());
+        session.end(id);
     }
     for _ in 0..2 {
-        let (id, item) = connection.next().unwrap();
+        let (id, item) = session.next().unwrap();
         let StreamItem::Frame(frame) = item.unwrap().unwrap() else { panic!("expected HEADERS") };
         let state = states.iter_mut().find(|state| state.stream_id() == id).unwrap();
         let RequestResult::Blocked(section) = state.step(&frame, &table).unwrap() else { panic!("must block") };
         held.push(section).unwrap();
-        connection.pause(id);
+        session.pause(id);
     }
-    assert!(connection.next().is_none());
+    assert!(session.next().is_none());
     for (expected_id, value) in [(4, "first"), (0, "second")] {
         table.apply(EI::InsertWithLiteralName { name: b"x-order".to_vec(), value: value.as_bytes().to_vec() }).unwrap();
         let (id, result) = held.next_ready(&table).unwrap();
@@ -326,9 +326,9 @@ fn two_request_states_resume_in_qpack_release_order() {
                 ack: Some(DI::SectionAck(id))
             })
         );
-        connection.unpause(id);
-        assert_eq!(connection.next(), Some((id, Ok(Ok(StreamItem::Frame(Frame::Data(vec![id as u8])))))));
-        assert!(connection.next().is_none());
+        session.unpause(id);
+        assert_eq!(session.next(), Some((id, Ok(Ok(StreamItem::Frame(Frame::Data(vec![id as u8])))))));
+        assert!(session.next().is_none());
         assert!(held.next_ready(&table).is_none());
         assert!(held.buffered() <= qpack::MAX_BLOCKED_BYTES);
         assert_eq!(state.finish(), Ok(()));
@@ -627,15 +627,15 @@ fn partial_critical_fin_is_closed_critical_stream() {
 #[test]
 fn connection_partial_critical_fin_survives_handoff() {
     for bytes in [&[0, 0x04, 0x02, 0x01][..], &[2, 0x3f], &[3, 0xff]] {
-        let mut connection = Connection::new(Endpoint::Client, 4, http3::MAX_FRAME);
-        assert_eq!(connection.push(2, bytes), bytes.len());
-        connection.end(2);
-        assert!(matches!(connection.next(), Some((2, Ok(Ok(StreamItem::Header(_)))))));
+        let mut session = Session::new(Endpoint::Client, 4, http3::MAX_FRAME);
+        assert_eq!(session.push(2, bytes), bytes.len());
+        session.end(2);
+        assert!(matches!(session.next(), Some((2, Ok(Ok(StreamItem::Header(_)))))));
         assert_eq!(
-            connection.next(),
+            session.next(),
             Some((2, Err(Fail::Protocol(http3::StreamError::Http3(http3::Error::ClosedCriticalStream)))))
         );
-        assert!(connection.next().is_none());
+        assert!(session.next().is_none());
     }
 }
 
@@ -1066,10 +1066,10 @@ fn http3_stream_header_end_swap_and_parts_preserve_bytes_and_eof() {
     assert_eq!(buffer.unread(), [0x20, 0x41, b'x', 0]);
 }
 
-type ConnectionItems = BTreeMap<u64, Vec<StreamItem>>;
+type SessionItems = BTreeMap<u64, Vec<StreamItem>>;
 
-fn drain(connection: &mut Connection, items: &mut ConnectionItems, table: &mut Table) {
-    while let Some((stream, item)) = connection.next() {
+fn drain(session: &mut Session, items: &mut SessionItems, table: &mut Table) {
+    while let Some((stream, item)) = session.next() {
         let item = item.unwrap().unwrap();
         if let StreamItem::EncoderInstruction(ins) = &item {
             table.apply(ins.clone()).unwrap();
@@ -1080,9 +1080,9 @@ fn drain(connection: &mut Connection, items: &mut ConnectionItems, table: &mut T
 
 fn interleaved_connection(chunk_size: usize) {
     const BUDGET: usize = 512;
-    let mut connection = Connection::new(Endpoint::Client, 5, BUDGET);
+    let mut session = Session::new(Endpoint::Client, 5, BUDGET);
     let mut table = Table::new(4096);
-    let mut items = ConnectionItems::new();
+    let mut items = SessionItems::new();
     let mut control = wire(&StreamHeader::Control);
     Wire::write(&settings(), &mut control).unwrap();
     Wire::write(&Frame::Goaway(128), &mut control).unwrap();
@@ -1105,11 +1105,11 @@ fn interleaved_connection(chunk_size: usize) {
             if let Some(mut chunk) = input.next() {
                 progressed = true;
                 while !chunk.is_empty() {
-                    let used = connection.push(*id, chunk);
+                    let used = session.push(*id, chunk);
                     assert!(used > 0);
                     chunk = chunk.get(used..).unwrap();
-                    assert!(connection.buffered() <= BUDGET);
-                    drain(&mut connection, &mut items, &mut table);
+                    assert!(session.buffered() <= BUDGET);
+                    drain(&mut session, &mut items, &mut table);
                 }
             }
         }
@@ -1117,8 +1117,8 @@ fn interleaved_connection(chunk_size: usize) {
             break;
         }
     }
-    assert_eq!(connection.buffered(), 0);
-    assert_eq!(connection.len(), 5);
+    assert_eq!(session.buffered(), 0);
+    assert_eq!(session.len(), 5);
     assert_eq!(
         items.get(&2),
         Some(&vec![
@@ -1154,15 +1154,15 @@ fn interleaved_connection(chunk_size: usize) {
         Ok(SectionResult::Fields { fields: vec![Field::new(":method", "GET")], ack: Some(DI::SectionAck(0)) })
     );
     for id in [0, 4] {
-        connection.end(id);
+        session.end(id);
     }
-    assert!(connection.next().is_none());
+    assert!(session.next().is_none());
     for (id, bytes) in inputs {
-        let stream = connection.remove(id).unwrap();
+        let stream = session.remove(id).unwrap();
         assert_eq!(stream.offset(), bytes.len() as u64);
         assert_eq!(stream.buffered(), 0);
     }
-    assert!(connection.is_empty());
+    assert!(session.is_empty());
 }
 
 #[test]
@@ -1174,38 +1174,38 @@ fn http3_connection_interleaves_control_qpack_and_two_requests() {
 
 #[test]
 fn http3_aggregate_demux_budget_refuses_across_streams() {
-    // Every stream's frame limit exceeds this total connection budget.
-    let mut connection = Connection::new(Endpoint::Client, 4, 9);
-    assert_eq!(connection.push(0, &[0, 100, 1]), 3);
-    assert_eq!(connection.push(4, &[0, 100, 2]), 3);
-    assert_eq!(connection.push(2, &[0, 4, 100, 3, 4]), 3);
-    assert_eq!(connection.buffered(), 9);
-    assert_eq!(connection.push(6, &[2]), 0);
+    // Every stream's frame limit exceeds this total session budget.
+    let mut session = Session::new(Endpoint::Client, 4, 9);
+    assert_eq!(session.push(0, &[0, 100, 1]), 3);
+    assert_eq!(session.push(4, &[0, 100, 2]), 3);
+    assert_eq!(session.push(2, &[0, 4, 100, 3, 4]), 3);
+    assert_eq!(session.buffered(), 9);
+    assert_eq!(session.push(6, &[2]), 0);
     // Type handoff consumes only the control type and releases one byte.
-    assert_eq!(connection.next(), Some((2, Ok(Ok(StreamItem::Header(StreamHeader::Control))))));
-    assert_eq!(connection.buffered(), 8);
-    assert_eq!(connection.push(6, &[2, 0x20]), 1);
-    assert_eq!(connection.buffered(), 9);
-    assert_eq!(connection.push(0, &[9]), 0);
-    assert!(connection.remove(4).is_some());
-    assert_eq!(connection.buffered(), 6);
-    assert_eq!(connection.push(0, &[9, 9, 9, 9]), 3);
-    assert_eq!(connection.buffered(), 9);
+    assert_eq!(session.next(), Some((2, Ok(Ok(StreamItem::Header(StreamHeader::Control))))));
+    assert_eq!(session.buffered(), 8);
+    assert_eq!(session.push(6, &[2, 0x20]), 1);
+    assert_eq!(session.buffered(), 9);
+    assert_eq!(session.push(0, &[9]), 0);
+    assert!(session.remove(4).is_some());
+    assert_eq!(session.buffered(), 6);
+    assert_eq!(session.push(0, &[9, 9, 9, 9]), 3);
+    assert_eq!(session.buffered(), 9);
 }
 
 #[test]
 fn http3_many_small_streams_allocate_in_proportion_to_input() {
     const COUNT: usize = 512;
     const FIRST: &[u8] = &[0, 100, 7];
-    let mut connection = Connection::new(Endpoint::Client, COUNT, COUNT * FIRST.len());
+    let mut session = Session::new(Endpoint::Client, COUNT, COUNT * FIRST.len());
     for index in 0..COUNT {
         let id = index as u64 * 4;
-        assert_eq!(connection.push(id, FIRST), FIRST.len());
+        assert_eq!(session.push(id, FIRST), FIRST.len());
     }
-    assert_eq!(connection.buffered(), COUNT * FIRST.len());
+    assert_eq!(session.buffered(), COUNT * FIRST.len());
     let mut allocated = 0;
     for index in 0..COUNT {
-        let (buffer, _) = connection.remove(index as u64 * 4).unwrap().into_parts();
+        let (buffer, _) = session.remove(index as u64 * 4).unwrap().into_parts();
         allocated += buffer.allocated();
     }
     assert!(allocated <= COUNT * FIRST.len() * 2);
@@ -1292,28 +1292,28 @@ fn http3_control_and_selected_stream_contracts() {
 
 #[test]
 fn http3_connection_eof_survives_handoff_and_unknown_streams_are_skipped() {
-    let mut connection = Connection::new(Endpoint::Server, 3, 64);
+    let mut session = Session::new(Endpoint::Server, 3, 64);
     // Push ID is part of the header; the entire DATA frame is already buffered.
     let mut bytes = wire(&StreamHeader::Push(65));
     Wire::write(&Frame::Data(b"hello".to_vec()), &mut bytes).unwrap();
-    assert_eq!(connection.push(3, &bytes), bytes.len());
-    connection.end(3);
-    assert_eq!(connection.next(), Some((3, Ok(Ok(StreamItem::Header(StreamHeader::Push(65)))))));
-    assert_eq!(connection.next(), Some((3, Ok(Ok(StreamItem::Frame(Frame::Data(b"hello".to_vec())))))));
-    assert!(connection.next().is_none());
-    assert!(connection.remove(3).unwrap().is_done());
-    assert_eq!(connection.push(7, &[0x40, 64, 0xff, 0xff]), 4);
-    assert_eq!(connection.next(), Some((7, Ok(Ok(StreamItem::Header(StreamHeader::Unknown(64)))))));
-    assert!(connection.next().is_none());
-    assert_eq!(connection.buffered(), 0);
-    assert_eq!(connection.push(11, &[2, 0x3f]), 2);
-    connection.end(11);
-    assert_eq!(connection.next(), Some((11, Ok(Ok(StreamItem::Header(StreamHeader::QpackEncoder))))));
+    assert_eq!(session.push(3, &bytes), bytes.len());
+    session.end(3);
+    assert_eq!(session.next(), Some((3, Ok(Ok(StreamItem::Header(StreamHeader::Push(65)))))));
+    assert_eq!(session.next(), Some((3, Ok(Ok(StreamItem::Frame(Frame::Data(b"hello".to_vec())))))));
+    assert!(session.next().is_none());
+    assert!(session.remove(3).unwrap().is_done());
+    assert_eq!(session.push(7, &[0x40, 64, 0xff, 0xff]), 4);
+    assert_eq!(session.next(), Some((7, Ok(Ok(StreamItem::Header(StreamHeader::Unknown(64)))))));
+    assert!(session.next().is_none());
+    assert_eq!(session.buffered(), 0);
+    assert_eq!(session.push(11, &[2, 0x3f]), 2);
+    session.end(11);
+    assert_eq!(session.next(), Some((11, Ok(Ok(StreamItem::Header(StreamHeader::QpackEncoder))))));
     assert_eq!(
-        connection.next(),
+        session.next(),
         Some((11, Err(Fail::Protocol(http3::StreamError::Http3(http3::Error::ClosedCriticalStream)))))
     );
-    assert!(connection.next().is_none());
+    assert!(session.next().is_none());
 }
 
 #[test]

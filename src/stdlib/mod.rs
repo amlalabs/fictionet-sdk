@@ -220,7 +220,7 @@
 //! | [`hpack`] | HPACK header compression for HTTP/2: fields, blocks, the dynamic table and an encoder. | yes |  |  |  |  | yes | yes |
 //! | [`http1`] | HTTP/1.0 and 1.1 request and response heads and bodies, with RFC 9112 framing. | yes | yes |  |  | built in | yes | yes |
 //! | [`http2`] | HTTP/2 frames, per-direction connection state, and the header block reader the dashboard's capture decoder uses. | yes | yes | `Session` |  | built in | yes | yes |
-//! | [`http3`] | HTTP/3 frames, stream headers, field sections and connection state. | yes | yes | `Connection` |  |  | yes | yes |
+//! | [`http3`] | HTTP/3 frames, stream headers, field sections and connection state. | yes | yes | `Session` |  |  | yes | yes |
 //! | [`httpd`] | HTTP as a service: a router with byte-body handlers, an adapter for any tower service, virtual hosts, and the `Site` a `Net` host serves. |  |  |  | `Http1` |  |  | yes |
 //! | [`huffman`] | The RFC 7541 Huffman code that HPACK and QPACK share. | yes |  |  |  |  | yes | yes |
 //! | [`icmp`] | ICMP echo replies and error messages, for machines built by hand. |  |  |  |  |  |  | yes |

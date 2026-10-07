@@ -4,8 +4,8 @@
 use fictionet::stdlib::{
     codec::{Decode, Wire, contract, test_support::decode_all},
     http3::{
-        self, Connection, Endpoint, Event, Frame, Frames, HeaderKind, HeaderList, MessageSide, Priority,
-        PriorityElement, RequestResult, RequestState, Settings, StreamHeader, StreamHeaders, StreamItem, StreamItems,
+        self, Endpoint, Event, Frame, Frames, HeaderKind, HeaderList, MessageSide, Priority,
+        PriorityElement, RequestResult, RequestState, Session, Settings, StreamHeader, StreamHeaders, StreamItem, StreamItems,
     },
     qpack::{self, SectionResult, Table},
 };
@@ -52,14 +52,14 @@ fn request_result(
     result: Result<RequestResult, http3::Error>,
     id: u64,
     side: MessageSide,
-    connection: &mut Connection,
+    session: &mut Session,
     table: &Table,
     held: &mut qpack::BlockedSections,
 ) -> bool {
     match result {
         Ok(RequestResult::Blocked(section)) => {
             held.push(section).unwrap();
-            connection.pause(id);
+            session.pause(id);
             return true;
         }
         Ok(RequestResult::Event { event, ack }) => {
@@ -77,7 +77,7 @@ fn request_result(
     if let Some(cancel) = held.cancel(table, id) {
         contract::check_wire_value(&cancel);
     }
-    let _ = connection.remove(id);
+    let _ = session.remove(id);
     false
 }
 
@@ -88,8 +88,8 @@ fn shared_qpack(bytes: &[u8], side: MessageSide) {
     let (encoder, requests) = rest.split_at(rest.len() * usize::from(*split) / 256);
     let (first, second) = requests.split_at(requests.len() / 2);
     let (sender, encoder_id) = if side == MessageSide::Request { (Endpoint::Client, 2) } else { (Endpoint::Server, 3) };
-    let mut connection = Connection::new(sender, 3, http3::MAX_FRAME * 2);
-    assert_eq!(connection.push(encoder_id, &StreamHeader::QpackEncoder.to_bytes().unwrap()), 1);
+    let mut session = Session::new(sender, 3, http3::MAX_FRAME * 2);
+    assert_eq!(session.push(encoder_id, &StreamHeader::QpackEncoder.to_bytes().unwrap()), 1);
     let mut table = Table::new(4096);
     let mut states = [RequestState::new(0, side, true).unwrap(), RequestState::new(4, side, true).unwrap()];
     let mut held = qpack::BlockedSections::new(2);
@@ -101,14 +101,14 @@ fn shared_qpack(bytes: &[u8], side: MessageSide) {
             if k < 2 && !active[k] {
                 continue;
             }
-            let used = connection.push(id, &inputs[k][..inputs[k].len().min(chunk)]);
+            let used = session.push(id, &inputs[k][..inputs[k].len().min(chunk)]);
             inputs[k] = &inputs[k][used..];
             progress |= used > 0;
             if k < 2 && inputs[k].is_empty() {
-                connection.end(id);
+                session.end(id);
             }
         }
-        while let Some((stream, item)) = connection.next() {
+        while let Some((stream, item)) = session.next() {
             progress = true;
             match item {
                 Ok(Ok(StreamItem::EncoderInstruction(instruction))) => {
@@ -120,27 +120,27 @@ fn shared_qpack(bytes: &[u8], side: MessageSide) {
                         let state = &mut states[k];
                         assert!(state.is_blocked());
                         let result = state.resume(id, result);
-                        active[k] = request_result(result, id, side, &mut connection, &table, &mut held);
+                        active[k] = request_result(result, id, side, &mut session, &table, &mut held);
                         if active[k] {
                             assert!(!state.is_blocked());
-                            connection.unpause(id);
+                            session.unpause(id);
                         }
                     }
                 }
                 Ok(Ok(StreamItem::Frame(frame))) => {
                     let k = states.iter().position(|state| state.stream_id() == stream).expect("unknown stream");
                     let result = states[k].step(&frame, &table);
-                    active[k] = request_result(result, stream, side, &mut connection, &table, &mut held);
+                    active[k] = request_result(result, stream, side, &mut session, &table, &mut held);
                 }
                 Ok(Ok(_)) => {}
                 _ if stream == encoder_id => break 'drive,
                 _ => {
                     let k = states.iter().position(|state| state.stream_id() == stream).expect("unknown stream");
                     active[k] =
-                        request_result(Err(http3::Error::State), stream, side, &mut connection, &table, &mut held);
+                        request_result(Err(http3::Error::State), stream, side, &mut session, &table, &mut held);
                 }
             }
-            assert!(connection.buffered() <= http3::MAX_FRAME * 2);
+            assert!(session.buffered() <= http3::MAX_FRAME * 2);
             assert!(held.buffered() <= qpack::MAX_BLOCKED_BYTES);
         }
         if !progress {
@@ -150,7 +150,7 @@ fn shared_qpack(bytes: &[u8], side: MessageSide) {
     for state in &mut states {
         let _ = state.finish();
         contract::check_wire_value(&held.cancel(&table, state.stream_id()).unwrap());
-        let _ = connection.remove(state.stream_id());
+        let _ = session.remove(state.stream_id());
     }
 }
 
@@ -178,17 +178,17 @@ fuzz_target!(|input: &[u8]| {
         }
     }
     let budget = http3::MAX_FRAME + MAX_FUZZ_INPUT;
-    let mut connection = Connection::new(Endpoint::Client, 5, budget);
+    let mut session = Session::new(Endpoint::Client, 5, budget);
     for (index, chunk) in bytes.chunks(17).enumerate() {
-        let _ = connection.push([0, 2, 4, 6, 10][index % 5], chunk);
-        while connection.next().is_some() {}
-        assert!(connection.buffered() <= budget);
+        let _ = session.push([0, 2, 4, 6, 10][index % 5], chunk);
+        while session.next().is_some() {}
+        assert!(session.buffered() <= budget);
     }
     for id in [0, 2, 4, 6, 10] {
-        connection.end(id);
+        session.end(id);
     }
-    while connection.next().is_some() {}
-    assert!(connection.buffered() <= budget);
+    while session.next().is_some() {}
+    assert!(session.buffered() <= budget);
     let table = Table::new(0);
     let (items, _) = decode_all(Frames::new, bytes);
     for frame in items.iter().flatten() {
