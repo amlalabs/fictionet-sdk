@@ -151,7 +151,7 @@ fn mask(addr: IpAddr, len: u8) -> IpAddr {
 /// packet that arrives with a TTL or hop limit of 0 or 1 is dropped, so a
 /// loop of routes, such as two routers whose default routes point at each
 /// other, cannot carry a packet forever. The drop is recorded as a
-/// `router.drop` [event](crate::events). Once the router has an [address](Router::address) of the
+/// `router.drop` [event](crate::events), a [repeat](crate::events#repeats). Once the router has an [address](Router::address) of the
 /// packet's family, it also answers the sender with an ICMP "time
 /// exceeded" ([`icmp::time_exceeded`](crate::stdlib::icmp::time_exceeded)),
 /// which is what `traceroute` reads. Packets to or from the router's own
@@ -252,7 +252,7 @@ pub fn router(cx: &Cx, routes: Vec<(Prefix, Box<dyn Interface>)>) -> Router {
 fn expired(cx: &Cx, addrs: Addrs, table: &Table, ports: &mut Ports, packet: Packet) {
     let v4 = ip::version(&packet.0) == Some(4);
     let why = if v4 { "its TTL ran out" } else { "its hop limit ran out" };
-    crate::observe::record_drop(cx, "router", &packet, why);
+    crate::observe::record_drop(cx, "router", &packet, why, events::Fields::new());
     let (a4, a6) = addrs;
     let from = if v4 { a4.map(IpAddr::V4) } else { a6.map(IpAddr::V6) };
     let answer = from.and_then(|from| crate::stdlib::icmp::time_exceeded(&packet.0, from));
@@ -472,7 +472,7 @@ impl Router {
 /// that address, or is dropped. It never goes to the gateway.
 ///
 /// Every packet the LAN drops is recorded as a `lan.drop`
-/// [event](crate::events) with the reason: no member at the destination,
+/// [repeat](crate::events#repeats) with the reason: no member at the destination,
 /// no gateway for an address outside the subnet, a packet from the gateway
 /// for such an address, a member's own address, the other address family,
 /// or not an IP packet. A member that is replaced or whose interface closes
@@ -603,7 +603,7 @@ fn dropped(cx: &Cx, on_drop: &Option<OnDrop>, packet: &Packet, why: &'static str
     if let Some(f) = on_drop {
         f(cx, packet, why);
     }
-    crate::observe::record_drop(cx, "lan", packet, why);
+    crate::observe::record_drop(cx, "lan", packet, why, events::Fields::new());
 }
 
 /// Records a change to a LAN's members.
@@ -917,7 +917,7 @@ mod tests {
 
             let drops: Vec<String> = cx.events().of("router", "drop").into_iter().map(|e| e.summary).collect();
             assert_eq!(drops.len(), 2, "{drops:?}");
-            assert!(drops.iter().any(|d| d.starts_with("10.0.0.2:0 → 192.0.2.1:0") && d.ends_with("its TTL ran out")), "{drops:?}");
+            assert!(drops.iter().any(|d| d == "10.0.0.2 → 192.0.2.1: its TTL ran out"), "{drops:?}");
             assert!(drops.iter().any(|d| d.ends_with("its hop limit ran out")), "{drops:?}");
             cx.cancel();
             Ok(())

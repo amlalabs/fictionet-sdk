@@ -74,7 +74,8 @@
 //!   [`Host::on`] and attached virtual machines with [`Net::member`], as
 //!   machines on one Ethernet: broadcast and multicast reach every member.
 //!   The router sends the LAN's prefix to its gateway, the LAN's first
-//!   address answers DNS, and every packet the LAN drops is recorded.
+//!   address answers DNS, and the packets the LAN drops are recorded
+//!   (as [repeats](crate::events#repeats)).
 //! - **Machines** answer pings, reset TCP to closed ports and answer UDP to
 //!   closed ports with "port unreachable". A sandbox may have 256
 //!   connections open at once to one machine
@@ -91,7 +92,8 @@
 //! - **Events.** The network records every fact in the run's
 //!   [events](crate::events): a `run.start` event first, `net` events for
 //!   sandboxes attaching,
-//!   binding, detaching and packets dropped (`net.blocked`), `dns.query`
+//!   binding, detaching and packets dropped (`net.blocked`, counted as
+//!   [repeats](crate::events#repeats)), `dns.query`
 //!   for every DNS message, `tls.handshake` for every handshake on a TLS
 //!   port, and each service's own events. Every event names its sandbox
 //!   and, for a connection, its number (from 1, on every port of every
@@ -294,8 +296,9 @@ where
     fn serve(&self, cx: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         let Some(guard) = Counted::enter(&self.open, self.opts.max_conns) else {
             let (src, dst) = (arrival.info.peer, arrival.info.local);
-            let event = blocked_event(BlockedWhy::TooManyConnections, Some(PROTO_TCP), src.map(|a| a.ip()), dst.map(|a| a.ip()), dst.map(|a| a.port()));
-            cx.record(event.conn(&arrival.info));
+            let event = blocked_event(BlockedWhy::TooManyConnections, Some(PROTO_TCP), src.map(|a| a.ip()), dst.map(|a| a.ip()));
+            let conn = ConnInfo { sandbox: arrival.info.sandbox.clone(), ..ConnInfo::default() };
+            cx.record_repeat(event.conn(&conn), port_detail(dst.map(|a| a.port())));
             arrival.socket.reset();
             return Box::pin(async {});
         };
@@ -626,8 +629,9 @@ impl Net {
     /// LAN's gateway, so sandboxes and the other hosts reach its members,
     /// and members reach everything else through it. The LAN's first
     /// address (`.1` of a `/24`) answers DNS as the network's gateway does,
-    /// for members to use. Every packet the LAN drops is recorded as
-    /// `net.blocked`, with `why` `Lan` and the reason in `detail`.
+    /// for members to use. The packets the LAN drops are recorded as
+    /// `net.blocked` [repeats](fictionet::events#repeats), with `why` `Lan`
+    /// and the reason in `detail`.
     ///
     /// [`serve`](Net::serve) fails if `prefix` overlaps the sandboxes'
     /// subnets or another LAN, or leaves no room for members.
@@ -778,6 +782,12 @@ struct Hooks {
 impl Hooks {
     fn record(&self, cx: &Cx, conn: &ConnInfo, event: Event) {
         cx.record(event.conn(conn));
+    }
+
+    /// Records a `net.blocked` event, with its detail, as a repeat: a
+    /// flood of them is counted, not kept one by one.
+    fn blocked(&self, cx: &Cx, conn: &ConnInfo, (event, detail): (Event, Fields)) {
+        cx.record_repeat(event.conn(conn), detail);
     }
 
     fn sandbox_at(&self, addr: IpAddr) -> Sandbox {
@@ -1083,7 +1093,8 @@ fn make_lans(
         let on_drop: route::OnDrop = Arc::new(move |cx: &Cx, packet: &Packet, why: &'static str| {
             let src = Header::parse_truncated(&packet.0).map(|h| h.src);
             let conn = src.map_or_else(ConnInfo::default, |a| sandbox_only(names.sandbox_at(a)));
-            names.record(cx, &conn, blocked(BlockedWhy::Lan, &packet.0).field("detail", why));
+            let (event, detail) = blocked(BlockedWhy::Lan, &packet.0);
+            names.blocked(cx, &conn, (event.field("detail", why), detail));
         });
         let lan = route::lan(&cx.group(format!("lan {name}")), prefix, Some(on_drop));
         let (lan_side, router_side) = link();
@@ -1489,8 +1500,8 @@ fn host_prefix(addr: IpAddr) -> Prefix {
 /// limit.
 fn too_many(cx: &Cx, hooks: &Hooks, conn: &tcp::TcpConnection) {
     let (peer, local) = (conn.peer_addr(), conn.local_addr());
-    let event = blocked_event(BlockedWhy::TooManyConnections, Some(PROTO_TCP), Some(peer.ip()), Some(local.ip()), Some(local.port()));
-    hooks.record(cx, &sandbox_only(hooks.sandbox_at(peer.ip())), event);
+    let event = blocked_event(BlockedWhy::TooManyConnections, Some(PROTO_TCP), Some(peer.ip()), Some(local.ip()));
+    hooks.blocked(cx, &sandbox_only(hooks.sandbox_at(peer.ip())), (event, port_detail(Some(local.port()))));
 }
 
 /// Accepts connections on one port of a machine. Each is served in its own
@@ -2204,7 +2215,9 @@ impl BlockedWhy {
     }
 }
 
-fn blocked_event(why: BlockedWhy, protocol: Option<u8>, src: Option<IpAddr>, dst: Option<IpAddr>, dst_port: Option<u16>) -> Event {
+/// A `net.blocked` event. The destination port goes in its detail
+/// ([`port_detail`]), since a scan changes it with every packet.
+fn blocked_event(why: BlockedWhy, protocol: Option<u8>, src: Option<IpAddr>, dst: Option<IpAddr>) -> Event {
     Event::new("net", "blocked")
         .level(Level::Notice)
         .summary(format!("blocked {}: {} -> {}", why.as_str(), src.map_or("-".into(), |a| a.to_string()), dst.map_or("-".into(), |a| a.to_string())))
@@ -2212,20 +2225,18 @@ fn blocked_event(why: BlockedWhy, protocol: Option<u8>, src: Option<IpAddr>, dst
         .field("protocol", jopt(protocol.map(u32::from)))
         .field("src", jopt(src.map(|a| a.to_string())))
         .field("dst", jopt(dst.map(|a| a.to_string())))
-        .field("dst_port", jopt(dst_port.map(u32::from)))
 }
 
-/// The event for a blocked packet.
-fn blocked(why: BlockedWhy, p: &[u8]) -> Event {
+/// The detail of a `net.blocked` event: its destination port.
+fn port_detail(port: Option<u16>) -> Fields {
+    Fields::new().with("dst_port", jopt(port.map(u32::from)))
+}
+
+/// The event for a blocked packet, and its detail.
+fn blocked(why: BlockedWhy, p: &[u8]) -> (Event, Fields) {
     match Header::parse_truncated(p) {
-        Some(h) => {
-            let port = (h.fragment.is_none_or(|f| f.offset == 0) && matches!(h.protocol, PROTO_TCP | PROTO_UDP))
-                .then(|| h.payload(p))
-                .filter(|t| t.len() >= 4)
-                .map(|t| u16::from_be_bytes([t[2], t[3]]));
-            blocked_event(why, Some(h.protocol), Some(h.src), Some(h.dst), port)
-        }
-        None => blocked_event(why, None, None, None, None),
+        Some(h) => (blocked_event(why, Some(h.protocol), Some(h.src), Some(h.dst)), port_detail(h.dst_port(p))),
+        None => (blocked_event(why, None, None, None), port_detail(None)),
     }
 }
 
@@ -2247,7 +2258,7 @@ impl Filter {
     }
 
     fn block(&self, cx: &Cx, why: BlockedWhy, packet: &[u8]) {
-        self.shared.hooks.record(cx, &sandbox_only(self.me()), blocked(why, packet));
+        self.shared.hooks.blocked(cx, &sandbox_only(self.me()), blocked(why, packet));
     }
 
     fn bound_now(&mut self, cx: &Cx, addr: IpAddr, by_dhcp: bool) {

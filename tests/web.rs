@@ -8,7 +8,7 @@ use std::future::{Future, poll_fn};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::{Pin, pin};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime};
@@ -20,7 +20,7 @@ use fictionet::stdlib::dns::op::{Message, MessageType, OpCode, Query, ResponseCo
 use fictionet::stdlib::dns::rr::{Name, RData, RecordType};
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::tls;
-use fictionet::events::{Event as Entry, Fields};
+use fictionet::events::{Event as Entry, EventLog, Fields, Sandbox};
 use fictionet::stdlib::{ConnError, Connection, dhcp, ip, tcp, udp, web};
 use fictionet::{Attacher, Cx, End, Interface, Packet, block_on, run};
 use http::{HeaderMap, Request, Response, StatusCode, Version};
@@ -889,14 +889,11 @@ fn a_tls_site_with_plain_http_answers_port_80_itself() {
 
         // Each plain request is a Handler event on port 80, with no SNI.
         let seen = wait_for(&cx, &log, 3, http_seen).await;
-        let plain: Vec<_> = seen.iter().filter(|h| h.local.port() == 80).collect();
+        let plain: Vec<_> = seen.iter().filter(|h| local(h).port() == 80).collect();
         assert_eq!(plain.len(), 2);
         for h in plain {
-            assert_eq!(h.answer, HttpAnswer::Handler);
-            assert_eq!(h.scheme, http::uri::Scheme::HTTP);
-            assert_eq!(h.sni, None);
-            assert_eq!(h.status, Some(StatusCode::OK));
-            assert_eq!(h.uri.path(), "/a");
+            assert_eq!((h.str("answer"), h.str("scheme"), h.str("sni")), (Some("handler"), Some("http"), None));
+            assert_eq!((h.u64("status"), h.str("path")), (Some(200), Some("/a")));
         }
 
         // A TLS site without it still redirects, at the same time.
@@ -2291,278 +2288,37 @@ fn a_client_that_half_closes_after_its_request_gets_the_response() {
 // ---------------------------------------------------------------------------
 // Tests: events
 
-/// The log of events a test world keeps.
-type Log = Arc<std::sync::Mutex<Vec<Ev>>>;
-
-// The run's events, read back into the shape the old `web::Event`
-// had, so each test states what it checks the same way.
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Sandbox {
-    id: u64,
-    name: Arc<str>,
-    addr: Option<Ipv4Addr>,
-    addr_v6: Option<Ipv6Addr>,
+/// A test world's event log, read from a mark the test moves past the
+/// events it has checked.
+#[derive(Clone)]
+struct Log {
+    events: EventLog,
+    from: Arc<AtomicU64>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum DnsAnswer {
-    Addr(IpAddr),
-    NoData,
-    NxDomain,
-    Error(u16),
-    None,
+impl Log {
+    fn new(cx: &Cx) -> Log {
+        Log { events: cx.events(), from: Arc::default() }
+    }
+
+    /// Moves the mark past every event so far.
+    fn clear(&self) {
+        self.from.store(self.events.recorded(), Ordering::SeqCst);
+    }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Dns {
-    sandbox: Sandbox,
-    tcp: bool,
-    name: Option<String>,
-    qtype: Option<u16>,
-    answer: DnsAnswer,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum TlsOutcome {
-    Accepted { alpn: Option<Vec<u8>> },
-    Rejected,
-    Alert(u8),
-    Failed(String),
-    Closed,
-    TimedOut,
-    Aborted,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Tls {
-    sandbox: Sandbox,
-    conn: u64,
-    addr: IpAddr,
-    sni: Option<String>,
-    outcome: TlsOutcome,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HttpAnswer {
-    Handler,
-    Error,
-    Redirect,
-    Misdirected,
-    NoHost,
-    Cancelled,
-}
-
-#[derive(Clone, Debug)]
-struct Http {
-    sandbox: Sandbox,
-    conn: u64,
-    local: SocketAddr,
-    scheme: http::uri::Scheme,
-    sni: Option<String>,
-    host: Option<String>,
-    started: f64,
-    method: http::Method,
-    uri: http::Uri,
-    version: Version,
-    headers: HeaderMap,
-    answer: HttpAnswer,
-    status: Option<StatusCode>,
-    sent: u64,
-    complete: bool,
-    /// The `page` field a handler added.
-    page: Option<String>,
-    /// How many fields the handler added.
-    extra: usize,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HttpErrorCause {
-    Protocol,
-    Timeout,
-    Transport,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct HttpError {
-    sandbox: Sandbox,
-    conn: u64,
-    local: SocketAddr,
-    cause: HttpErrorCause,
-    detail: String,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BlockedWhy {
-    NotItsAddress,
-    OtherSandbox,
-    Broadcast,
-    Ipv6,
-    Malformed,
-    NoRoute,
-    ClosedPort,
-    TooManyConnections,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Blocked {
-    sandbox: Sandbox,
-    why: BlockedWhy,
-    protocol: Option<u8>,
-    src: Option<IpAddr>,
-    dst: Option<IpAddr>,
-    dst_port: Option<u16>,
-}
-
-#[allow(clippy::large_enum_variant)]
-#[derive(Clone, Debug)]
-enum Ev {
-    Attached { sandbox: Sandbox },
-    Bound { sandbox: Sandbox, by_dhcp: bool },
-    Detached { sandbox: Sandbox },
-    Dns(Dns),
-    Tls(Tls),
-    Http(Http),
-    HttpError(HttpError),
-    Blocked(Blocked),
-}
-
-/// Keeps every event of `cx`'s run in `log`, as an [`Ev`].
-fn keeping(cx: &Cx, log: Log) {
-    cx.events().subscribe(move |e| {
-        if let Some(ev) = ev(e) {
-            log.lock().unwrap_or_else(|p| p.into_inner()).push(ev);
-        }
-    });
-}
-
-fn ev(e: &Entry) -> Option<Ev> {
-    let s = e.conn.sandbox.as_ref()?;
-    let sandbox = Sandbox { id: s.id, name: s.name.clone(), addr: s.addr, addr_v6: s.addr_v6 };
-    let text = |n: &str| e.str(n).map(str::to_owned);
-    let num = |n: &str| e.u64(n);
-    let conn = e.conn.id.unwrap_or(0);
-    let local = e.conn.local.unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
-    Some(match (e.source, e.kind) {
-        ("net", "attached") => Ev::Attached { sandbox },
-        ("net", "bound") => Ev::Bound { sandbox, by_dhcp: e.get("by_dhcp").and_then(|v| v.as_bool()) == Some(true) },
-        ("net", "detached") => Ev::Detached { sandbox },
-        ("dns", "query") => Ev::Dns(Dns {
-            sandbox,
-            tcp: e.get("tcp").and_then(|v| v.as_bool()) == Some(true),
-            name: text("name"),
-            qtype: num("qtype").map(|q| q as u16),
-            answer: match e.str("answer")? {
-                "addr" => DnsAnswer::Addr(e.str("addr")?.parse().ok()?),
-                "nodata" => DnsAnswer::NoData,
-                "nxdomain" => DnsAnswer::NxDomain,
-                "error" => DnsAnswer::Error(num("rcode")? as u16),
-                _ => DnsAnswer::None,
-            },
-        }),
-        ("tls", "handshake") => Ev::Tls(Tls {
-            sandbox,
-            conn,
-            addr: e.str("addr")?.parse().ok()?,
-            sni: text("sni"),
-            outcome: match e.str("outcome")? {
-                "accepted" => TlsOutcome::Accepted { alpn: text("alpn").map(String::into_bytes) },
-                "rejected" => TlsOutcome::Rejected,
-                "alert" => TlsOutcome::Alert(num("alert")? as u8),
-                "failed" => TlsOutcome::Failed(text("detail").unwrap_or_default()),
-                "closed" => TlsOutcome::Closed,
-                "timed_out" => TlsOutcome::TimedOut,
-                _ => TlsOutcome::Aborted,
-            },
-        }),
-        ("http", "request") => {
-            let mut headers = HeaderMap::new();
-            for pair in e.get("headers")?.as_array()? {
-                let pair = pair.as_array()?;
-                let name = http::HeaderName::from_bytes(pair[0].as_str()?.as_bytes()).ok()?;
-                headers.append(name, pair[1].as_str()?.parse().ok()?);
-            }
-            let standard = [
-                "scheme", "sni", "host", "method", "uri", "path", "query", "version", "headers", "started", "answer", "status",
-                "sent", "complete",
-            ];
-            Ev::Http(Http {
-                sandbox,
-                conn,
-                local,
-                scheme: e.str("scheme")?.parse().ok()?,
-                sni: text("sni"),
-                host: text("host"),
-                started: e.get("started")?.as_f64()?,
-                method: e.str("method")?.parse().ok()?,
-                uri: e.str("uri")?.parse().ok()?,
-                version: match e.str("version")? {
-                    "HTTP/2.0" => Version::HTTP_2,
-                    "HTTP/1.0" => Version::HTTP_10,
-                    _ => Version::HTTP_11,
-                },
-                headers,
-                answer: match e.str("answer")? {
-                    "handler" => HttpAnswer::Handler,
-                    "error" => HttpAnswer::Error,
-                    "redirect" => HttpAnswer::Redirect,
-                    "misdirected" => HttpAnswer::Misdirected,
-                    "no_host" => HttpAnswer::NoHost,
-                    _ => HttpAnswer::Cancelled,
-                },
-                status: num("status").and_then(|s| StatusCode::from_u16(s as u16).ok()),
-                sent: num("sent")?,
-                complete: e.get("complete").and_then(|v| v.as_bool()) == Some(true),
-                page: text("page"),
-                extra: e.fields.iter().filter(|(n, _)| !standard.contains(n)).count(),
-            })
-        }
-        ("http", "error") => Ev::HttpError(HttpError {
-            sandbox,
-            conn,
-            local,
-            cause: match e.str("cause")? {
-                "protocol" => HttpErrorCause::Protocol,
-                "timeout" => HttpErrorCause::Timeout,
-                _ => HttpErrorCause::Transport,
-            },
-            detail: text("detail").unwrap_or_default(),
-        }),
-        ("net", "blocked") => Ev::Blocked(Blocked {
-            sandbox,
-            why: match e.str("why")? {
-                "NotItsAddress" => BlockedWhy::NotItsAddress,
-                "OtherSandbox" => BlockedWhy::OtherSandbox,
-                "Broadcast" => BlockedWhy::Broadcast,
-                "Ipv6" => BlockedWhy::Ipv6,
-                "Malformed" => BlockedWhy::Malformed,
-                "NoRoute" => BlockedWhy::NoRoute,
-                "ClosedPort" => BlockedWhy::ClosedPort,
-                _ => BlockedWhy::TooManyConnections,
-            },
-            protocol: num("protocol").map(|p| p as u8),
-            src: text("src").and_then(|a| a.parse().ok()),
-            dst: text("dst").and_then(|a| a.parse().ok()),
-            dst_port: num("dst_port").map(|p| p as u16),
-        }),
-        _ => return None,
-    })
-}
-
-/// [`world`], with an event callback that keeps every event in a [`Log`].
+/// [`world`], with the run's event log.
 fn world_events<F, Fut>(f: F)
 where
     F: FnOnce(Cx, Attacher, Env, Log) -> Fut + Send + 'static,
     Fut: Future<Output = fictionet::Result> + Send + 'static,
 {
-    let log: Log = Arc::default();
     let result = within(Duration::from_secs(60), move || {
         block_on(run(move |cx| async move {
             let (attacher, attachments) = fictionet::attachments();
             let t = sites(&cx);
-            let keep = log.clone();
-            keeping(&cx, keep);
             let env = t.serve_with(&cx, attachments)?;
+            let log = Log::new(&cx);
             f(cx, attacher, env, log).await?;
             Err(Box::new(Done) as fictionet::Error)
         }))
@@ -2574,71 +2330,108 @@ where
     }
 }
 
-/// The events so far that `pick` keeps.
-fn picked<T>(log: &Log, pick: impl FnMut(&Ev) -> Option<T>) -> Vec<T> {
-    log.lock().unwrap_or_else(|p| p.into_inner()).iter().filter_map(pick).collect()
+/// The events after the log's mark that `pick` keeps.
+fn picked<T>(log: &Log, pick: impl FnMut(&Entry) -> Option<T>) -> Vec<T> {
+    log.events.after(log.from.load(Ordering::SeqCst), usize::MAX).iter().filter_map(pick).collect()
 }
 
-/// Waits up to 5 s until `pick` keeps `n` events, and returns them.
-async fn wait_for<T>(cx: &Cx, log: &Log, n: usize, mut pick: impl FnMut(&Ev) -> Option<T>) -> Vec<T> {
-    for _ in 0..500 {
-        let got = picked(log, &mut pick);
-        if got.len() >= n {
-            return got;
-        }
-        let _ = cx.sleep(Duration::from_millis(10)).await;
+/// Waits up to 5 s until `pick` keeps `n` events after the log's mark,
+/// and returns them.
+async fn wait_for<T>(cx: &Cx, log: &Log, n: usize, mut pick: impl FnMut(&Entry) -> Option<T>) -> Vec<T> {
+    let from = log.from.load(Ordering::SeqCst);
+    let got = log.events.wait(cx, n, Duration::from_secs(5), |e| e.seq > from && pick(e).is_some()).await;
+    if got.len() < n {
+        panic!("fewer than {n} such events: {:#?}", log.events.all());
     }
-    panic!("fewer than {n} such events: {:#?}", log.lock().unwrap());
+    got.iter().filter_map(pick).collect()
 }
 
 fn is(s: &Sandbox, name: &str, addr: Option<Ipv4Addr>) -> bool {
     &*s.name == name && s.addr == addr
 }
 
-fn sandbox_of(e: &Ev) -> Option<&Sandbox> {
-    Some(match e {
-        Ev::Attached { sandbox, .. } | Ev::Bound { sandbox, .. } | Ev::Detached { sandbox, .. } => sandbox,
-        Ev::Dns(d) => &d.sandbox,
-        Ev::Tls(t) => &t.sandbox,
-        Ev::Http(h) => &h.sandbox,
-        Ev::HttpError(b) => &b.sandbox,
-        Ev::Blocked(b) => &b.sandbox,
-    })
+/// The sandbox an event names.
+fn sandbox_of(e: &Entry) -> Option<&Sandbox> {
+    e.conn.sandbox.as_ref()
 }
 
-fn dns_seen(e: &Ev) -> Option<Dns> {
-    match e {
-        Ev::Dns(d) => Some(d.clone()),
-        _ => None,
+/// Picks the events of `source`'s `kind`.
+fn seen(source: &'static str, kind: &'static str) -> impl FnMut(&Entry) -> Option<Entry> {
+    move |e| e.is(source, kind).then(|| e.clone())
+}
+
+fn dns_seen(e: &Entry) -> Option<Entry> {
+    seen("dns", "query")(e)
+}
+
+fn tls_seen(e: &Entry) -> Option<Entry> {
+    seen("tls", "handshake")(e)
+}
+
+fn http_seen(e: &Entry) -> Option<Entry> {
+    seen("http", "request")(e)
+}
+
+fn error_seen(e: &Entry) -> Option<Entry> {
+    seen("http", "error")(e)
+}
+
+fn blocked_seen(e: &Entry) -> Option<Entry> {
+    seen("net", "blocked")(e)
+}
+
+/// The field `name` as an address.
+fn addr(e: &Entry, name: &str) -> Option<IpAddr> {
+    e.str(name)?.parse().ok()
+}
+
+/// Whether the field `name` is true.
+fn flag(e: &Entry, name: &str) -> bool {
+    e.get(name).and_then(|v| v.as_bool()) == Some(true)
+}
+
+/// The address and port an event's connection arrived on.
+fn local(e: &Entry) -> SocketAddr {
+    e.conn.local.expect("a connection's event names its address")
+}
+
+/// A DNS event's answer, as `addr 192.0.2.1`, `nodata`, `nxdomain`,
+/// `error 1` or `none`.
+fn answer(e: &Entry) -> String {
+    match e.str("answer") {
+        Some("addr") => format!("addr {}", e.str("addr").unwrap_or_default()),
+        Some("error") => format!("error {}", e.u64("rcode").unwrap_or_default()),
+        Some(other) => other.to_owned(),
+        None => "none".to_owned(),
     }
 }
 
-fn tls_seen(e: &Ev) -> Option<Tls> {
-    match e {
-        Ev::Tls(t) => Some(t.clone()),
-        _ => None,
+/// A TLS event's outcome, with its `alpn`, `alert` or nothing after a
+/// space: `accepted h2`, `alert 48`, `rejected`.
+fn outcome(e: &Entry) -> String {
+    match e.str("outcome") {
+        Some("accepted") => format!("accepted {}", e.str("alpn").unwrap_or("-")),
+        Some("alert") => format!("alert {}", e.u64("alert").unwrap_or_default()),
+        Some(other) => other.to_owned(),
+        None => "none".to_owned(),
     }
 }
 
-fn http_seen(e: &Ev) -> Option<Http> {
-    match e {
-        Ev::Http(h) => Some(h.clone()),
-        _ => None,
-    }
+/// How many fields a handler added to an HTTP event.
+fn extra(e: &Entry) -> usize {
+    let standard = [
+        "scheme", "sni", "host", "method", "uri", "path", "query", "version", "headers", "started", "answer", "status", "sent",
+        "complete",
+    ];
+    e.fields.iter().filter(|(n, _)| !standard.contains(n)).count()
 }
 
-fn error_seen(e: &Ev) -> Option<HttpError> {
-    match e {
-        Ev::HttpError(b) => Some(b.clone()),
-        _ => None,
-    }
-}
+/// A `net.blocked` event's `why`, sandbox address, protocol, source,
+/// destination and destination port.
+type BlockedRow<'a> = (&'a str, Option<Ipv4Addr>, Option<u64>, Option<IpAddr>, Option<IpAddr>, Option<u64>);
 
-fn blocked_seen(e: &Ev) -> Option<Blocked> {
-    match e {
-        Ev::Blocked(b) => Some(b.clone()),
-        _ => None,
-    }
+fn blocked_row(e: &Entry) -> BlockedRow<'_> {
+    (e.str("why").unwrap_or_default(), sandbox_of(e).and_then(|s| s.addr), e.u64("protocol"), addr(e, "src"), addr(e, "dst"), e.u64("dst_port"))
 }
 
 #[test]
@@ -2666,20 +2459,22 @@ fn events_attach_bind_and_detach() {
         assert_eq!(ack.message_type(), Some(dhcp::ACK));
 
         drop(a);
-        wait_for(&cx, &log, 1, |e| matches!(e, Ev::Detached { .. }).then_some(())).await;
+        wait_for(&cx, &log, 1, seen("net", "detached")).await;
 
-        let of = |name: &str| picked(&log, |e| (&*sandbox_of(e)?.name == name).then(|| e.clone()));
+        let of = |name: &str| picked(&log, |e| (e.source == "net" && &*sandbox_of(e)?.name == name).then(|| e.clone()));
         let a_events = of("a");
-        assert_eq!(a_events.len(), 3, "{a_events:#?}");
-        assert!(matches!(&a_events[0], Ev::Attached { sandbox, .. } if is(sandbox, "a", None) && sandbox.id == 1));
-        assert!(matches!(&a_events[1], Ev::Bound { sandbox, by_dhcp: false, .. } if is(sandbox, "a", Some(me))));
-        assert!(matches!(&a_events[2], Ev::Detached { sandbox, .. } if is(sandbox, "a", Some(me)) && sandbox.id == 1));
+        let kinds: Vec<_> = a_events.iter().map(|e| e.kind).collect();
+        assert_eq!(kinds, ["attached", "bound", "detached"], "{a_events:#?}");
+        let sandbox = |e: &Entry| sandbox_of(e).unwrap().clone();
+        assert!(is(&sandbox(&a_events[0]), "a", None) && sandbox(&a_events[0]).id == 1);
+        assert!(is(&sandbox(&a_events[1]), "a", Some(me)) && !flag(&a_events[1], "by_dhcp"));
+        assert!(is(&sandbox(&a_events[2]), "a", Some(me)) && sandbox(&a_events[2]).id == 1);
 
         let d_events = of("d");
-        assert!(matches!(&d_events[0], Ev::Attached { sandbox, .. } if is(sandbox, "d", None) && sandbox.id == 2));
-        let bound: Vec<_> = d_events.iter().filter(|e| matches!(e, Ev::Bound { .. })).collect();
+        assert!(d_events[0].is("net", "attached") && is(&sandbox(&d_events[0]), "d", None) && sandbox(&d_events[0]).id == 2);
+        let bound: Vec<_> = d_events.iter().filter(|e| e.kind == "bound").collect();
         assert_eq!(bound.len(), 1, "{d_events:#?}");
-        assert!(matches!(bound[0], Ev::Bound { sandbox, by_dhcp: true, .. } if is(sandbox, "d", Some(got))));
+        assert!(is(&sandbox(bound[0]), "d", Some(got)) && flag(bound[0], "by_dhcp"));
         Ok(())
     });
 }
@@ -2718,26 +2513,23 @@ fn events_name_each_attachment_by_id() {
         raw_connect(&cx, &mut a, me, SocketAddr::new(SECURE_ADDR.into(), 443), 30_001, &[]).await;
         let _ = cx.sleep(Duration::from_millis(100)).await;
         drop(a);
-        wait_for(&cx, &log, 1, |e| matches!(e, Ev::Detached { .. }).then_some(())).await;
+        wait_for(&cx, &log, 1, seen("net", "detached")).await;
 
         // The same name and address again: a new id.
         let mut a = attacher.attach("a").unwrap();
         let _ = raw_dns(&cx, &mut a, me, GATEWAY, "secure.test", 3).await.unwrap();
 
         let http = wait_for(&cx, &log, 1, http_seen).await;
-        assert_eq!((http[0].answer, http[0].status, http[0].complete), (HttpAnswer::Cancelled, None, false));
-        assert_eq!((http[0].sandbox.id, http[0].host.as_deref(), http[0].uri.path()), (1, Some("slow.test"), "/wait"));
-        assert_eq!(http[0].local, SocketAddr::from((slow, 80)));
+        assert_eq!((http[0].str("answer"), http[0].u64("status"), flag(&http[0], "complete")), (Some("cancelled"), None, false));
+        assert_eq!((sandbox_of(&http[0]).unwrap().id, http[0].str("host"), http[0].str("path")), (1, Some("slow.test"), Some("/wait")));
+        assert_eq!(local(&http[0]), SocketAddr::from((slow, 80)));
         let tls = wait_for(&cx, &log, 1, tls_seen).await;
-        assert_eq!((tls[0].sandbox.id, tls[0].outcome.clone()), (1, TlsOutcome::Aborted));
+        assert_eq!((sandbox_of(&tls[0]).unwrap().id, outcome(&tls[0])), (1, "aborted".to_owned()));
         let dns = wait_for(&cx, &log, 3, dns_seen).await;
-        let ids: Vec<u64> = dns.iter().map(|d| d.sandbox.id).collect();
+        let ids: Vec<u64> = dns.iter().map(|d| sandbox_of(d).unwrap().id).collect();
         assert_eq!(ids, vec![1, 1, 2]);
-        assert!(dns.iter().all(|d| is(&d.sandbox, "a", Some(me))));
-        let attached = picked(&log, |e| match e {
-            Ev::Attached { sandbox, .. } => Some(sandbox.id),
-            _ => None,
-        });
+        assert!(dns.iter().all(|d| is(sandbox_of(d).unwrap(), "a", Some(me))));
+        let attached = picked(&log, |e| e.is("net", "attached").then(|| sandbox_of(e).unwrap().id));
         assert_eq!(attached, vec![1, 2]);
         Ok(())
     });
@@ -2783,20 +2575,21 @@ fn events_for_dns_queries() {
         socket.send_to(b"xx", gw);
 
         let got = wait_for(&cx, &log, 8, dns_seen).await;
-        assert!(got.iter().all(|d| is(&d.sandbox, "a", Some(me))), "{got:#?}");
-        let summary: Vec<_> = got.iter().map(|d| (d.tcp, d.name.as_deref(), d.qtype, d.answer.clone())).collect();
+        assert!(got.iter().all(|d| is(sandbox_of(d).unwrap(), "a", Some(me))), "{got:#?}");
+        let summary: Vec<_> = got.iter().map(|d| (flag(d, "tcp"), d.str("name"), d.u64("qtype"), answer(d))).collect();
+        let a = |s: &str| s.to_owned();
         assert_eq!(
             summary,
             vec![
-                (false, Some("secure.test"), Some(1), DnsAnswer::Addr(SECURE_ADDR.into())),
+                (false, Some("secure.test"), Some(1), format!("addr {SECURE_ADDR}")),
                 // Seen before: the callback does not run, the query is still an event.
-                (false, Some("secure.test"), Some(1), DnsAnswer::Addr(SECURE_ADDR.into())),
-                (false, Some("secure.test"), Some(28), DnsAnswer::Addr("2001:2::1".parse().unwrap())),
-                (false, Some("nope.test"), Some(1), DnsAnswer::NxDomain),
-                (true, Some("nope.test"), Some(1), DnsAnswer::NxDomain),
-                (false, None, None, DnsAnswer::Error(1)),
-                (false, None, None, DnsAnswer::Error(1)),
-                (false, None, None, DnsAnswer::None),
+                (false, Some("secure.test"), Some(1), format!("addr {SECURE_ADDR}")),
+                (false, Some("secure.test"), Some(28), a("addr 2001:2::1")),
+                (false, Some("nope.test"), Some(1), a("nxdomain")),
+                (true, Some("nope.test"), Some(1), a("nxdomain")),
+                (false, None, None, a("error 1")),
+                (false, None, None, a("error 1")),
+                (false, None, None, a("none")),
             ]
         );
         assert_eq!(env.calls.load(Ordering::SeqCst), 2);
@@ -2870,17 +2663,19 @@ fn events_for_tls_handshakes() {
         tcp.write_all(&cx, b"GET / HTTP/1.1\r\nHost: secure.test\r\n\r\n").await.unwrap();
 
         let got = wait_for(&cx, &log, 7, tls_seen).await;
-        assert!(got.iter().all(|t| is(&t.sandbox, "a", Some(me))), "{got:#?}");
-        let summary: Vec<_> = got.iter().map(|t| (t.addr, t.sni.as_deref(), t.outcome.clone())).collect();
-        assert_eq!(summary[0], (IpAddr::V4(SECURE_ADDR), Some("secure.test"), TlsOutcome::Accepted { alpn: Some(b"h2".to_vec()) }));
-        assert_eq!(summary[1], (IpAddr::V4(SECURE_ADDR), None, TlsOutcome::Rejected));
-        assert_eq!(summary[2], (IpAddr::V4(SECURE_ADDR), Some("shared.test"), TlsOutcome::Rejected));
-        assert_eq!(summary[3], (IpAddr::V4(SECURE_ADDR), Some("secure.test"), TlsOutcome::Alert(48)));
-        assert_eq!(summary[4], (IpAddr::V4(EVENTS_ADDR), Some("events.test"), TlsOutcome::Accepted { alpn: Some(b"http/1.1".to_vec()) }));
-        assert_eq!(summary[5], (IpAddr::V4(SECURE_ADDR), None, TlsOutcome::Closed));
-        assert!(matches!(&summary[6], (_, None, TlsOutcome::Failed(_))), "{:?}", summary[6]);
+        assert!(got.iter().all(|t| is(sandbox_of(t).unwrap(), "a", Some(me))), "{got:#?}");
+        let summary: Vec<_> = got.iter().map(|t| (addr(t, "addr"), t.str("sni"), outcome(t))).collect();
+        let (secure, events) = (Some(IpAddr::V4(SECURE_ADDR)), Some(IpAddr::V4(EVENTS_ADDR)));
+        assert_eq!(summary[0], (secure, Some("secure.test"), "accepted h2".to_owned()));
+        assert_eq!(summary[1], (secure, None, "rejected".to_owned()));
+        assert_eq!(summary[2], (secure, Some("shared.test"), "rejected".to_owned()));
+        assert_eq!(summary[3], (secure, Some("secure.test"), "alert 48".to_owned()));
+        assert_eq!(summary[4], (events, Some("events.test"), "accepted http/1.1".to_owned()));
+        assert_eq!(summary[5], (secure, None, "closed".to_owned()));
+        assert_eq!((summary[6].1, summary[6].2.as_str()), (None, "failed"), "{:?}", summary[6]);
+        assert!(!got[6].str("detail").unwrap_or_default().is_empty());
         // Connections are numbered in order, from 1.
-        let conns: Vec<u64> = got.iter().map(|t| t.conn).collect();
+        let conns: Vec<u64> = got.iter().map(|t| t.conn.id.unwrap()).collect();
         assert_eq!(conns, (1..=7).collect::<Vec<u64>>());
         Ok(())
     });
@@ -2917,26 +2712,28 @@ fn events_for_http_requests() {
         let pages = wait_for(&cx, &log, 3, http_seen).await;
         let mut last = before.since_start().as_secs_f64();
         for (h, path) in pages.iter().zip(["/page", "/page?x=1", "/page"]) {
-            assert!(is(&h.sandbox, "a", Some(me)));
-            assert_eq!(h.conn, tls.conn, "one connection");
-            assert_eq!((h.answer, h.status, h.version), (HttpAnswer::Handler, Some(StatusCode::OK), Version::HTTP_2));
-            assert_eq!((h.method.clone(), h.uri.path_and_query().unwrap().as_str()), (http::Method::GET, path));
-            assert_eq!(h.page.as_deref(), Some("article"));
-            assert_eq!(h.extra, 1);
-            assert_eq!((h.sent, h.complete), ("page sni=Some(\"events.test\")".len() as u64, true));
-            assert_eq!((h.scheme.as_str(), h.host.as_deref(), h.sni.as_deref()), ("https", Some("events.test"), Some("events.test")));
-            assert_eq!(h.local, SocketAddr::from((EVENTS_ADDR, 443)));
-            assert!(h.started >= last, "requests started in order");
-            last = h.started;
+            assert!(is(sandbox_of(h).unwrap(), "a", Some(me)));
+            assert_eq!(h.conn.id, tls.conn.id, "one connection");
+            assert_eq!((h.str("answer"), h.u64("status"), h.str("version")), (Some("handler"), Some(200), Some("HTTP/2.0")));
+            let uri: http::Uri = h.str("uri").unwrap().parse().unwrap();
+            assert_eq!((h.str("method"), uri.path_and_query().unwrap().as_str()), (Some("GET"), path));
+            assert_eq!(h.str("page"), Some("article"));
+            assert_eq!(extra(h), 1);
+            assert_eq!((h.u64("sent"), flag(h, "complete")), (Some("page sni=Some(\"events.test\")".len() as u64), true));
+            assert_eq!((h.str("scheme"), h.str("host"), h.str("sni")), (Some("https"), Some("events.test"), Some("events.test")));
+            assert_eq!(local(h), SocketAddr::from((EVENTS_ADDR, 443)));
+            let started = h.get("started").and_then(|v| v.as_f64()).unwrap();
+            assert!(started >= last, "requests started in order");
+            last = started;
         }
-        // The connection's Tls event came first.
-        let order = picked(&log, |e| match e {
-            Ev::Tls(_) => Some("tls"),
-            Ev::Http(_) => Some("http"),
+        // The connection's TLS event came first.
+        let order = picked(&log, |e| match (e.source, e.kind) {
+            ("tls", "handshake") => Some("tls"),
+            ("http", "request") => Some("http"),
             _ => None,
         });
         assert_eq!(order, vec!["tls", "http", "http", "http"]);
-        log.lock().unwrap().clear();
+        log.clear();
 
         // Answers from Sites itself, on port 80.
         let tcp = m.tcp.connect(&cx, SocketAddr::new(SECURE_ADDR.into(), 80)).await.unwrap();
@@ -2949,24 +2746,24 @@ fn events_for_http_requests() {
         let reply = raw_http(&cx, &m, SECURE_ADDR, b"GET / HTTP/1.0\r\n\r\n").await;
         assert!(reply.starts_with(b"HTTP/1.0 400"), "{}", String::from_utf8_lossy(&reply));
         let got = wait_for(&cx, &log, 4, http_seen).await;
-        let summary: Vec<_> = got
-            .iter()
-            .map(|h| (h.answer, h.status.map(|s| s.as_u16()), h.host.clone(), h.local.port(), h.sni.clone(), h.extra, h.complete))
-            .collect();
+        let summary: Vec<_> =
+            got.iter().map(|h| (h.str("answer"), h.u64("status"), h.str("host"), local(h).port(), h.str("sni"), extra(h), flag(h, "complete"))).collect();
         assert_eq!(
             summary,
             vec![
-                (HttpAnswer::Redirect, Some(301), Some("secure.test".into()), 80, None, 0, true),
-                (HttpAnswer::Misdirected, Some(421), Some("unknown.test".into()), 80, None, 0, true),
-                (HttpAnswer::Error, Some(500), Some("broken.test".into()), 80, None, 0, true),
-                (HttpAnswer::NoHost, Some(400), None, 80, None, 0, true),
+                (Some("redirect"), Some(301), Some("secure.test"), 80, None, 0, true),
+                (Some("misdirected"), Some(421), Some("unknown.test"), 80, None, 0, true),
+                (Some("error"), Some(500), Some("broken.test"), 80, None, 0, true),
+                (Some("no_host"), Some(400), None, 80, None, 0, true),
             ]
         );
-        assert_eq!(got[0].uri, "/x?y=1");
-        assert_eq!(got[0].headers.get("host").unwrap(), "secure.test");
-        assert_eq!(got[0].conn, got[1].conn);
-        assert_ne!(got[1].conn, got[2].conn);
-        log.lock().unwrap().clear();
+        assert_eq!(got[0].str("uri"), Some("/x?y=1"));
+        let headers = got[0].get("headers").and_then(|v| v.as_array()).unwrap();
+        let host = headers.iter().filter_map(|p| p.as_array()).find(|p| p[0].as_str() == Some("host")).unwrap();
+        assert_eq!(host[1].as_str(), Some("secure.test"));
+        assert_eq!(got[0].conn.id, got[1].conn.id);
+        assert_ne!(got[1].conn.id, got[2].conn.id);
+        log.clear();
 
         // HEAD: no body, complete once sent.
         let conn = tls_connect(&cx, &m, &env, EVENTS_ADDR, "events.test", &[b"http/1.1"]).await.unwrap();
@@ -2976,8 +2773,8 @@ fn events_for_http_requests() {
         assert_eq!(r.status(), StatusCode::OK);
         drop(r);
         let got = wait_for(&cx, &log, 1, http_seen).await;
-        assert_eq!((got[0].method.clone(), got[0].sent, got[0].complete), (http::Method::HEAD, 0, true));
-        log.lock().unwrap().clear();
+        assert_eq!((got[0].str("method"), got[0].u64("sent"), flag(&got[0], "complete")), (Some("HEAD"), Some(0), true));
+        log.clear();
 
         // A whole download, then one the client cuts short.
         let conn = tls_connect(&cx, &m, &env, EVENTS_ADDR, "events.test", &[b"h2"]).await.unwrap();
@@ -2992,12 +2789,13 @@ fn events_for_http_requests() {
         // Dropping the body resets the stream.
         drop(body);
         let got = wait_for(&cx, &log, 2, http_seen).await;
-        assert_eq!((got[0].sent, got[0].complete), (BIG as u64, true));
-        assert!(!got[1].complete, "{:?}", got[1]);
-        assert!(got[1].sent < BIG as u64, "{}", got[1].sent);
-        assert_eq!(got[1].status, Some(StatusCode::OK));
-        eprintln!("cut short after {} of {BIG} bytes", got[1].sent);
-        log.lock().unwrap().clear();
+        assert_eq!((got[0].u64("sent"), flag(&got[0], "complete")), (Some(BIG as u64), true));
+        assert!(!flag(&got[1], "complete"), "{:?}", got[1]);
+        let sent = got[1].u64("sent").unwrap();
+        assert!(sent < BIG as u64, "{sent}");
+        assert_eq!(got[1].u64("status"), Some(200));
+        eprintln!("cut short after {sent} of {BIG} bytes");
+        log.clear();
 
         // A request the client cancels while the handler waits: the stream
         // is reset, and the connection goes on.
@@ -3005,8 +2803,9 @@ fn events_for_http_requests() {
         let waiting = send.send_request(Request::get("https://events.test/wait").body(Empty::new()).unwrap());
         assert!(timeout(&cx, Duration::from_millis(200), waiting).await.is_none(), "no answer to /wait");
         let got = wait_for(&cx, &log, 1, http_seen).await;
-        assert_eq!((got[0].answer, got[0].status, got[0].sent, got[0].complete), (HttpAnswer::Cancelled, None, 0, false));
-        assert_eq!(got[0].uri.path(), "/wait");
+        let g = &got[0];
+        assert_eq!((g.str("answer"), g.u64("status"), g.u64("sent"), flag(g, "complete")), (Some("cancelled"), None, Some(0), false));
+        assert_eq!(g.str("path"), Some("/wait"));
         assert_eq!(client.get("https", "events.test", "/page").await.status, StatusCode::OK);
         assert_eq!(wait_for(&cx, &log, 2, http_seen).await.len(), 2);
         Ok(())
@@ -3027,8 +2826,8 @@ fn events_for_a_client_that_resets_mid_request() {
         assert!(picked(&log, http_seen).is_empty());
         raw.send(tcp_seg(me, 30_000, slow, 80, seq, ack, RST, &[]));
         let got = wait_for(&cx, &log, 1, http_seen).await;
-        assert_eq!((got[0].answer, got[0].status, got[0].complete), (HttpAnswer::Cancelled, None, false));
-        assert_eq!((got[0].version, got[0].host.as_deref()), (Version::HTTP_11, Some("slow.test")));
+        assert_eq!((got[0].str("answer"), got[0].u64("status"), flag(&got[0], "complete")), (Some("cancelled"), None, false));
+        assert_eq!((got[0].str("version"), got[0].str("host")), (Some("HTTP/1.1"), Some("slow.test")));
         // A reset is the client going away, not an HTTP error.
         let _ = cx.sleep(Duration::from_millis(100)).await;
         assert!(picked(&log, error_seen).is_empty());
@@ -3167,17 +2966,18 @@ fn events_for_bytes_that_are_not_http() {
         let got = wait_for(&cx, &log, 3, error_seen).await;
         let _ = cx.sleep(Duration::from_millis(200)).await;
         assert_eq!(picked(&log, error_seen).len(), 3, "{:#?}", picked(&log, error_seen));
-        let summary: Vec<_> = got.iter().map(|b| (b.local, b.cause)).collect();
+        let summary: Vec<_> = got.iter().map(|b| (local(b), b.str("cause"))).collect();
         assert_eq!(
             summary,
             vec![
-                (SocketAddr::from((plain, 80)), HttpErrorCause::Protocol),
-                (SocketAddr::from((plain, 80)), HttpErrorCause::Protocol),
-                (SocketAddr::from((EVENTS_ADDR, 443)), HttpErrorCause::Transport),
+                (SocketAddr::from((plain, 80)), Some("protocol")),
+                (SocketAddr::from((plain, 80)), Some("protocol")),
+                (SocketAddr::from((EVENTS_ADDR, 443)), Some("transport")),
             ]
         );
-        assert!(got.iter().all(|b| is(&b.sandbox, "a", Some(Ipv4Addr::new(10, 0, 0, 2))) && !b.detail.is_empty()));
-        assert_ne!(got[0].conn, got[1].conn);
+        let me = Some(Ipv4Addr::new(10, 0, 0, 2));
+        assert!(got.iter().all(|b| is(sandbox_of(b).unwrap(), "a", me) && !b.str("detail").unwrap_or_default().is_empty()));
+        assert_ne!(got[0].conn.id, got[1].conn.id);
         Ok(())
     });
 }
@@ -3194,28 +2994,27 @@ fn events_for_clients_that_send_nothing() {
         let tls = wait_for_long(&cx, &log, tls_seen).await;
         let took = started.elapsed();
         assert!(took >= Duration::from_secs(10) && took < Duration::from_millis(10_500), "{took:?}");
-        assert_eq!((tls.sni.clone(), tls.outcome.clone()), (None, TlsOutcome::TimedOut));
+        assert_eq!((tls.str("sni"), outcome(&tls)), (None, "timed_out".to_owned()));
         let bad = wait_for(&cx, &log, 1, error_seen).await;
-        assert_eq!((bad[0].local.port(), bad[0].cause), (80, HttpErrorCause::Timeout));
+        assert_eq!((local(&bad[0]).port(), bad[0].str("cause")), (80, Some("timeout")));
         Ok(())
     });
 }
 
 /// Waits up to 12 s for the first event `pick` keeps.
-async fn wait_for_long<T>(cx: &Cx, log: &Log, mut pick: impl FnMut(&Ev) -> Option<T>) -> T {
+async fn wait_for_long<T>(cx: &Cx, log: &Log, mut pick: impl FnMut(&Entry) -> Option<T>) -> T {
     for _ in 0..1200 {
         if let Some(t) = picked(log, &mut pick).into_iter().next() {
             return t;
         }
         let _ = cx.sleep(Duration::from_millis(10)).await;
     }
-    panic!("no such event: {:#?}", log.lock().unwrap());
+    panic!("no such event: {:#?}", log.events.all());
 }
 
 #[test]
 fn events_for_blocked_packets() {
     world_events(|cx, attacher, _env, log| async move {
-        use BlockedWhy::*;
         let me = Ipv4Addr::new(10, 0, 0, 2);
         let mut raw = attacher.attach("a").unwrap();
 
@@ -3262,41 +3061,109 @@ fn events_for_blocked_packets() {
         raw.send(tcp_seg(me, 30_001, plain, 80, 1, 0, SYN, &[]));
         assert!(recv_within(&cx, &mut raw, Duration::from_secs(2)).await.is_some());
 
+        // Each is recorded as it comes, except a repeat within a second:
+        // the second closed TCP port at the same machine is counted, and
+        // its count recorded a second later.
         let got = wait_for(&cx, &log, 12, blocked_seen).await;
-        let summary: Vec<_> =
-            got.iter().map(|b| (b.why, b.sandbox.addr, b.protocol, b.src, b.dst, b.dst_port)).collect();
+        let summary: Vec<_> = got.iter().map(blocked_row).collect();
         let v4 = |a: Ipv4Addr| Some(IpAddr::V4(a));
         assert_eq!(
             summary,
             vec![
-                (Malformed, None, None, None, None, None),
-                (Broadcast, None, Some(17), Some(IpAddr::V6(Ipv6Addr::UNSPECIFIED)), Some(IpAddr::V6(Ipv6Addr::UNSPECIFIED)), Some(53)),
-                (NotItsAddress, None, Some(1), v4(Ipv4Addr::new(192, 168, 1, 5)), v4(GATEWAY), None),
-                (NotItsAddress, Some(me), Some(1), v4(Ipv4Addr::new(10, 0, 0, 9)), v4(GATEWAY), None),
-                (OtherSandbox, Some(me), Some(1), v4(me), v4(Ipv4Addr::new(10, 0, 0, 3)), None),
-                (Broadcast, Some(me), Some(17), v4(me), v4(Ipv4Addr::BROADCAST), Some(2000)),
-                (NoRoute, Some(me), Some(1), v4(me), v4(Ipv4Addr::new(192, 0, 2, 1)), None),
-                (ClosedPort, Some(me), Some(6), v4(me), v4(plain), Some(22)),
-                (ClosedPort, Some(me), Some(6), v4(me), v4(plain), Some(443)),
-                (ClosedPort, Some(me), Some(6), v4(me), v4(GATEWAY), Some(80)),
-                (ClosedPort, Some(me), Some(17), v4(me), v4(plain), Some(9999)),
-                (ClosedPort, Some(me), Some(17), v4(me), v4(GATEWAY), Some(5000)),
+                ("Malformed", None, None, None, None, None),
+                ("Broadcast", None, Some(17), Some(IpAddr::V6(Ipv6Addr::UNSPECIFIED)), Some(IpAddr::V6(Ipv6Addr::UNSPECIFIED)), Some(53)),
+                ("NotItsAddress", None, Some(1), v4(Ipv4Addr::new(192, 168, 1, 5)), v4(GATEWAY), None),
+                ("NotItsAddress", Some(me), Some(1), v4(Ipv4Addr::new(10, 0, 0, 9)), v4(GATEWAY), None),
+                ("OtherSandbox", Some(me), Some(1), v4(me), v4(Ipv4Addr::new(10, 0, 0, 3)), None),
+                ("Broadcast", Some(me), Some(17), v4(me), v4(Ipv4Addr::BROADCAST), Some(2000)),
+                ("NoRoute", Some(me), Some(1), v4(me), v4(Ipv4Addr::new(192, 0, 2, 1)), None),
+                ("ClosedPort", Some(me), Some(6), v4(me), v4(plain), Some(22)),
+                ("ClosedPort", Some(me), Some(6), v4(me), v4(GATEWAY), Some(80)),
+                ("ClosedPort", Some(me), Some(17), v4(me), v4(plain), Some(9999)),
+                ("ClosedPort", Some(me), Some(17), v4(me), v4(GATEWAY), Some(5000)),
+                // The count: the port's lowest and highest.
+                ("ClosedPort", Some(me), Some(6), v4(me), v4(plain), None),
             ]
         );
-        assert!(got.iter().all(|b| &*b.sandbox.name == "a" && b.sandbox.id == 1));
-        log.lock().unwrap().clear();
+        let counts: Vec<_> = got.iter().map(|b| b.u64("count")).collect();
+        assert_eq!(counts, [Some(1); 11].into_iter().chain([Some(1)]).collect::<Vec<_>>());
+        assert_eq!(got[11].get("dst_port"), Some(&fictionet::stdlib::json::Value::Array(vec![443u64.into(), 443u64.into()])));
+        assert!(got.iter().all(|b| sandbox_of(b).is_some_and(|s| &*s.name == "a" && s.id == 1)));
+        log.clear();
 
-        // Past the limit of connections to one machine.
+        // Past the limit of connections to one machine: the first refused
+        // is recorded, and the rest counted.
         let (_, addrs) = raw_dns(&cx, &mut raw, me, GATEWAY, "secure.test", 6).await.unwrap();
         assert_eq!(addrs, vec![SECURE_ADDR]);
         let (open, _) = open_idle(&cx, &mut raw, me, SocketAddr::new(SECURE_ADDR.into(), 443), 300).await;
         assert_eq!(open, 300);
-        let got = wait_for(&cx, &log, 44, blocked_seen).await;
-        assert_eq!(got.len(), 44);
-        assert!(got.iter().all(|b| b.why == TooManyConnections && b.dst == v4(SECURE_ADDR) && b.dst_port == Some(443)));
-        assert!(got.iter().all(|b| is(&b.sandbox, "a", Some(me))));
+        let got = wait_for(&cx, &log, 2, blocked_seen).await;
+        assert_eq!(got.len(), 2);
+        assert_eq!((got[0].u64("count"), got[0].u64("dst_port")), (Some(1), Some(443)));
+        assert_eq!(got[1].u64("count"), Some(43));
+        assert!(got.iter().all(|b| b.str("why") == Some("TooManyConnections") && addr(b, "dst") == v4(SECURE_ADDR)));
+        assert!(got.iter().all(|b| is(sandbox_of(b).unwrap(), "a", Some(me))));
         Ok(())
     });
+}
+
+/// A sandbox scans more closed ports than the log holds events. The
+/// refusals are counted, not kept one by one, so the events a grader reads
+/// all stay in the log, and a file sink loses nothing.
+#[test]
+fn a_port_scan_cannot_push_out_the_events_a_grader_reads() {
+    const SCAN: u16 = 55_000;
+    let path = std::env::temp_dir().join(format!("fictionet-scan-{}.jsonl", std::process::id()));
+    let kept: Arc<std::sync::Mutex<Option<EventLog>>> = Arc::default();
+    let (keep, file) = (kept.clone(), path.clone());
+    world_events(move |cx, attacher, env, log| async move {
+        log.events.to_file(&file)?;
+        // What a grader reads: a lookup, a TLS handshake and a request.
+        let m = machine(&cx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+        assert_eq!(lookup(&cx, &m, "secure.test").await, SECURE_ADDR);
+        let conn = tls_connect(&cx, &m, &env, SECURE_ADDR, "secure.test", &[b"http/1.1"]).await.unwrap();
+        let mut client = Client::new(&cx, conn, false).await;
+        assert_eq!(client.get("https", "secure.test", "/").await.status, StatusCode::OK);
+
+        // The scan, from another sandbox: every port but the open ones.
+        let me = Ipv4Addr::new(10, 0, 0, 3);
+        let mut raw = attacher.attach("b").unwrap();
+        raw.send(ping(me, GATEWAY, 1));
+        assert!(recv_within(&cx, &mut raw, Duration::from_secs(2)).await.is_some());
+        let (_, addrs) = raw_dns(&cx, &mut raw, me, GATEWAY, "plain.test", 2).await.unwrap();
+        let plain = addrs[0];
+        let ports: Vec<u16> = (1..).filter(|p| ![80, 443].contains(p)).take(usize::from(SCAN)).collect();
+        for batch in ports.chunks(500) {
+            for &port in batch {
+                raw.send(tcp_seg(me, 40_000, plain, port, 1, 0, SYN, &[]));
+            }
+            for _ in batch {
+                let (_, _, _, t) = parse(&recv_within(&cx, &mut raw, Duration::from_secs(2)).await.expect("a RST"));
+                assert_eq!(t[13] & RST, RST);
+            }
+        }
+        *keep.lock().unwrap() = Some(log.events.clone());
+        Ok(())
+    });
+    // The run is over: every count is recorded, and the file is written.
+    let events = kept.lock().unwrap().take().unwrap();
+    fn from(e: &Entry, name: &str) -> bool {
+        sandbox_of(e).is_some_and(|s| &*s.name == name)
+    }
+    let all = events.all();
+    let graders: Vec<_> = all.iter().filter(|e| from(e, "a") && e.source != "net").map(|e| format!("{}.{}", e.source, e.kind)).collect();
+    for want in ["dns.query", "tls.handshake", "http.request"] {
+        assert!(graders.iter().any(|g| g == want), "{want} is gone: {graders:?}");
+    }
+    assert_eq!(events.dropped(), 0);
+    let blocked: Vec<_> = all.iter().filter(|e| e.is("net", "blocked") && from(e, "b")).collect();
+    assert_eq!(blocked.iter().map(|e| e.u64("count").unwrap()).sum::<u64>(), u64::from(SCAN));
+    assert!(blocked.len() < 100, "{} events for the scan", blocked.len());
+    assert_eq!(events.lost(), 0);
+    let text = std::fs::read_to_string(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(text.lines().count() as u64, events.recorded());
+    assert!(text.lines().any(|l| l.contains(r#""source":"http","kind":"request""#)));
 }
 
 // ---------------------------------------------------------------------------
@@ -3519,17 +3386,17 @@ fn https_http2_and_plain_http_over_ipv6() {
 
         // The events name the IPv6 addresses.
         let tls = wait_for(&cx, &log, 5, tls_seen).await;
-        assert_eq!(tls[0].addr, IpAddr::V6(DUAL_ADDR6));
-        assert_eq!(tls[0].sandbox.addr_v6, Some(ME6));
-        assert_eq!(tls[0].sandbox.addr, None);
-        assert_eq!((tls[4].addr, &tls[4].outcome), (IpAddr::V6(DUAL_ADDR6), &TlsOutcome::Rejected));
+        assert_eq!(addr(&tls[0], "addr"), Some(IpAddr::V6(DUAL_ADDR6)));
+        assert_eq!(sandbox_of(&tls[0]).unwrap().addr_v6, Some(ME6));
+        assert_eq!(sandbox_of(&tls[0]).unwrap().addr, None);
+        assert_eq!((addr(&tls[4], "addr"), outcome(&tls[4])), (Some(IpAddr::V6(DUAL_ADDR6)), "rejected".to_owned()));
         let http = wait_for(&cx, &log, 7, http_seen).await;
-        assert_eq!(http[0].local, SocketAddr::new(DUAL_ADDR6.into(), 443));
-        assert_eq!(http[2].local, SocketAddr::new(DUAL_ADDR.into(), 443));
-        assert_eq!(http[2].sandbox.addr, Some(Ipv4Addr::new(10, 0, 0, 2)));
+        assert_eq!(local(&http[0]), SocketAddr::new(DUAL_ADDR6.into(), 443));
+        assert_eq!(local(&http[2]), SocketAddr::new(DUAL_ADDR.into(), 443));
+        assert_eq!(sandbox_of(&http[2]).unwrap().addr, Some(Ipv4Addr::new(10, 0, 0, 2)));
         let dns = wait_for(&cx, &log, 3, dns_seen).await;
-        assert_eq!(dns[0].answer, DnsAnswer::Addr(DUAL_ADDR6.into()));
-        assert_eq!(dns[0].qtype, Some(28));
+        assert_eq!(answer(&dns[0]), format!("addr {DUAL_ADDR6}"));
+        assert_eq!(dns[0].u64("qtype"), Some(28));
         Ok(())
     });
 }
@@ -3589,7 +3456,6 @@ fn ipv6_pings_closed_ports_and_unknown_addresses() {
 #[test]
 fn ipv6_addresses_are_bound_to_one_sandbox() {
     world_events(|cx, attacher, _env, log| async move {
-        use BlockedWhy::*;
         let me4 = Ipv4Addr::new(10, 0, 0, 2);
         let mut a = attacher.attach("a").unwrap();
         // What a Linux sandbox sends first: a router solicitation from its
@@ -3617,34 +3483,35 @@ fn ipv6_addresses_are_bound_to_one_sandbox() {
         assert!(recv_within(&cx, &mut b, SHORT).await.is_none());
 
         let got = wait_for(&cx, &log, 9, blocked_seen).await;
-        let summary: Vec<_> = got.iter().map(|b| (&*b.sandbox.name, b.why, b.sandbox.addr_v6, b.src, b.dst)).collect();
+        let summary: Vec<_> =
+            got.iter().map(|b| (&*sandbox_of(b).unwrap().name, b.str("why").unwrap(), sandbox_of(b).unwrap().addr_v6, addr(b, "src"), addr(b, "dst"))).collect();
         let v6 = |a: Ipv6Addr| Some(IpAddr::V6(a));
         assert_eq!(
             summary,
             vec![
-                ("a", Broadcast, None, v6(link_local), v6("ff02::2".parse().unwrap())),
-                ("a", NotItsAddress, Some(ME6), v6("2001:db8::9".parse().unwrap()), v6(GATEWAY6)),
-                ("a", OtherSandbox, Some(ME6), v6(ME6), v6("2001:db8::3".parse().unwrap())),
-                ("a", NotItsAddress, Some(ME6), v6(link_local), v6(GATEWAY6)),
-                ("a", NoRoute, Some(ME6), v6(ME6), v6(NOWHERE6)),
-                ("b", NotItsAddress, None, v6(ME6), v6(GATEWAY6)),
-                ("b", NotItsAddress, None, v6(GATEWAY6), v6(GATEWAY6)),
-                ("b", NotItsAddress, None, v6("2001:db8::".parse().unwrap()), v6(GATEWAY6)),
-                ("b", NotItsAddress, None, v6("2001:db8:1::5".parse().unwrap()), v6(GATEWAY6)),
+                ("a", "Broadcast", None, v6(link_local), v6("ff02::2".parse().unwrap())),
+                ("a", "NotItsAddress", Some(ME6), v6("2001:db8::9".parse().unwrap()), v6(GATEWAY6)),
+                ("a", "OtherSandbox", Some(ME6), v6(ME6), v6("2001:db8::3".parse().unwrap())),
+                ("a", "NotItsAddress", Some(ME6), v6(link_local), v6(GATEWAY6)),
+                ("a", "NoRoute", Some(ME6), v6(ME6), v6(NOWHERE6)),
+                ("b", "NotItsAddress", None, v6(ME6), v6(GATEWAY6)),
+                ("b", "NotItsAddress", None, v6(GATEWAY6), v6(GATEWAY6)),
+                ("b", "NotItsAddress", None, v6("2001:db8::".parse().unwrap()), v6(GATEWAY6)),
+                ("b", "NotItsAddress", None, v6("2001:db8:1::5".parse().unwrap()), v6(GATEWAY6)),
             ]
         );
         assert_eq!(got.len(), 9, "{got:#?}");
 
-        // One Bound for each family, and a Detached that names both.
+        // One `bound` for each family, and a `detached` that names both.
         drop(a);
-        wait_for(&cx, &log, 1, |e| matches!(e, Ev::Detached { .. }).then_some(())).await;
-        let a_events = picked(&log, |e| (&*sandbox_of(e)?.name == "a" && !matches!(e, Ev::Blocked(_))).then(|| e.clone()));
-        assert_eq!(a_events.len(), 4, "{a_events:#?}");
-        let at = |e: &Ev| sandbox_of(e).map(|s| (s.addr, s.addr_v6));
-        assert!(matches!(&a_events[1], Ev::Bound { by_dhcp: false, .. }));
+        wait_for(&cx, &log, 1, seen("net", "detached")).await;
+        let a_events = picked(&log, |e| (e.source == "net" && e.kind != "blocked" && &*sandbox_of(e)?.name == "a").then(|| e.clone()));
+        let kinds: Vec<_> = a_events.iter().map(|e| e.kind).collect();
+        assert_eq!(kinds, ["attached", "bound", "bound", "detached"], "{a_events:#?}");
+        let at = |e: &Entry| sandbox_of(e).map(|s| (s.addr, s.addr_v6));
+        assert!(!flag(&a_events[1], "by_dhcp"));
         assert_eq!(at(&a_events[1]), Some((None, Some(ME6))));
         assert_eq!(at(&a_events[2]), Some((Some(me4), Some(ME6))));
-        assert!(matches!(&a_events[3], Ev::Detached { .. }));
         assert_eq!(at(&a_events[3]), Some((Some(me4), Some(ME6))));
 
         // Now the address is free, and the second sandbox can take it.
@@ -3661,13 +3528,11 @@ where
     F: FnOnce(Cx, Attacher, Log) -> Fut + Send + 'static,
     Fut: Future<Output = fictionet::Result> + Send + 'static,
 {
-    let log: Log = Arc::default();
     let result = within(Duration::from_secs(60), move || {
         block_on(run(move |cx| async move {
             let (attacher, attachments) = fictionet::attachments();
-            let keep = log.clone();
-            keeping(&cx, keep);
             make().serve(&cx, attachments)?;
+            let log = Log::new(&cx);
             f(cx, attacher, log).await?;
             Err(Box::new(Done) as fictionet::Error)
         }))
@@ -3701,7 +3566,7 @@ fn an_ipv4_only_network_drops_ipv6_and_answers_aaaa_with_nodata() {
         raw.send(ping6(ME6, GATEWAY6, 1));
         assert!(recv_within(&cx, &mut raw, SHORT).await.is_none());
         let got = wait_for(&cx, &log, 1, blocked_seen).await;
-        assert_eq!((got[0].why, got[0].dst), (BlockedWhy::Ipv6, Some(IpAddr::V6(GATEWAY6))));
+        assert_eq!((got[0].str("why"), addr(&got[0], "dst")), (Some("Ipv6"), Some(IpAddr::V6(GATEWAY6))));
         Ok(())
     });
 }
@@ -3965,7 +3830,7 @@ fn dns_makes_no_more_sites_than_the_limit() {
             let answer = raw_dns6(&cx, &mut raw, ME6, GATEWAY6, name, RecordType::AAAA).await.unwrap();
             assert_eq!(answer, (ResponseCode::ServFail, vec![]), "{name}");
         }
-        assert_eq!(picked(&log, dns_seen).iter().filter(|d| d.answer == DnsAnswer::Error(2)).count(), 3);
+        assert_eq!(picked(&log, dns_seen).iter().filter(|d| answer(d) == "error 2").count(), 3);
         // The first eight still answer, and have machines.
         let site0 = Ipv6Addr::from(u128::from("2001:2::".parse::<Ipv6Addr>().unwrap()) + 1);
         let answer = raw_dns6(&cx, &mut raw, ME6, GATEWAY6, "n0.test", RecordType::AAAA).await.unwrap();

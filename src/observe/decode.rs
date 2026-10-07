@@ -232,15 +232,12 @@ pub struct Dissector {
     tcp: Reassembler,
     conversations: HashMap<FlowKey, super::Conversation>,
     registry: super::Registry,
-    /// Stop at the transport layer.
-    headers_only: bool,
 }
 
 impl std::fmt::Debug for Dissector {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Dissector")
             .field("registry", &self.registry)
-            .field("headers_only", &self.headers_only)
             .finish_non_exhaustive()
     }
 }
@@ -268,11 +265,6 @@ impl Dissector {
     /// Creates a dissector with built-in or user protocol registrations.
     pub fn with_registry(registry: super::Registry) -> Self {
         Self { registry, ..Self::default() }
-    }
-
-    /// A dissector that decodes IP, TCP, UDP and ICMP, and nothing past.
-    pub(crate) fn headers_only() -> Dissector {
-        Dissector { headers_only: true, ..Dissector::default() }
     }
 
     /// Decodes one raw IPv4 or IPv6 packet. Pass TLS key log entries when
@@ -404,7 +396,7 @@ impl Dissector {
         let body = &p[at..end];
         match proto {
             6 => self.tcp(p, at, end, src, dst, d, keys),
-            17 => udp(p, at, end, d, !self.headers_only, &self.registry),
+            17 => udp(p, at, end, d, &self.registry),
             1 => icmp(p, at, end, d, false),
             58 => icmp(p, at, end, d, true),
             other => {
@@ -485,9 +477,6 @@ impl Dissector {
             d.tag("reset");
         }
         d.info = info;
-        if self.headers_only {
-            return;
-        }
         let mut gap = false;
         let layers = d.layers.len().checked_add(d.cut);
         let mut delivered = false;
@@ -563,7 +552,7 @@ fn tcp_options(o: &[u8]) -> Vec<String> {
     out
 }
 
-fn udp(p: &[u8], at: usize, end: usize, d: &mut Decoded, apps: bool, registry: &super::Registry) {
+fn udp(p: &[u8], at: usize, end: usize, d: &mut Decoded, registry: &super::Registry) {
     let u = &p[at..end];
     if u.len() < 8 {
         return truncated(d, "UDP", u.len());
@@ -592,7 +581,7 @@ fn udp(p: &[u8], at: usize, end: usize, d: &mut Decoded, apps: bool, registry: &
         return;
     }
     let body = (at + 8, end);
-    if !apps || body.0 >= body.1 {
+    if body.0 >= body.1 {
         return;
     }
     let bytes = &p[body.0..body.1];
@@ -792,11 +781,10 @@ mod tests {
     }
 
     #[test]
-    fn headers_only_keeps_fast_open_and_retransmission_state() {
+    fn fast_open_and_retransmission_state_are_kept() {
         for ack in [101u32, 103] {
-            let mut dis = Dissector::headers_only();
-            let syn = dis.decode(&tcp(40000, 80, 100, 0x02, b"ab"), &[]);
-            assert_eq!(syn.layers.len(), 2);
+            let mut dis = Dissector::default();
+            dis.decode(&tcp(40000, 80, 100, 0x02, b"ab"), &[]);
             let mut syn_ack = tcp_back(500, 0x12, b"");
             syn_ack[28..32].copy_from_slice(&ack.to_be_bytes());
             dis.decode(&syn_ack, &[]);
@@ -806,8 +794,6 @@ mod tests {
             let next = dis.decode(&tcp(40000, 80, 103, 0x18, b"cd"), &[]);
             assert!(next.info.contains("Seq=3 "));
             assert!(!next.tags.contains(&"retransmission"));
-            assert_eq!(next.layers.len(), 2);
-            assert!(dis.conversations.is_empty());
         }
     }
 

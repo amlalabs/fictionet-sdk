@@ -871,6 +871,17 @@ impl Header {
         packet.get(self.payload.clone()).unwrap_or_default()
     }
 
+    /// The destination port of a TCP or UDP packet, which this header was
+    /// read from. `None` for other protocols, for a fragment after the
+    /// first, and when the port's bytes are not there.
+    pub fn dst_port(&self, packet: &[u8]) -> Option<u16> {
+        if self.fragment.is_some_and(|f| f.offset != 0) || !matches!(self.protocol, protocol::TCP | protocol::UDP) {
+            return None;
+        }
+        let t = self.payload(packet);
+        (t.len() >= 4).then(|| u16::from_be_bytes([t[2], t[3]]))
+    }
+
     #[inline]
     fn read(packet: &[u8], truncated: bool) -> Option<Header> {
         match version(packet)? {

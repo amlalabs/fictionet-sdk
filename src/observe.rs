@@ -181,16 +181,18 @@
 //! }
 //! ```
 //!
-//! The core records events of its own:
+//! The core records events of its own. Packet drops are
+//! [repeats](crate::events#repeats): the first of a run is recorded, the
+//! rest counted in its `count` field.
 //!
-//! - [`bottleneck`](crate::stdlib::bottleneck) records each packet its full
-//!   queue drops (`bottleneck.drop`), and the dashboard counts them on its
-//!   node.
+//! - [`bottleneck`](crate::stdlib::bottleneck) records the packets its
+//!   full queue drops (`bottleneck.drop`), and the dashboard counts them on
+//!   its node.
 //! - A [router](crate::stdlib::route::router) records a route it removes
 //!   because the route's interface closed (`router.route_removed`), and
-//!   each packet it drops because its TTL or hop limit ran out
+//!   the packets it drops because their TTL or hop limit ran out
 //!   (`router.drop`).
-//! - A [LAN](crate::stdlib::route::lan) records each packet it drops
+//! - A [LAN](crate::stdlib::route::lan) records the packets it drops
 //!   (`lan.drop`) and each member replaced or gone (`lan.member_replaced`,
 //!   `lan.member_removed`).
 //! - The [TLS](crate::stdlib::tls) server records each session whose keys
@@ -401,17 +403,22 @@
 //! {"seq":527,"at":123.32,"source":"dns","kind":"query","level":"info",
 //!  "summary":"example.test A: 203.0.113.10","sandbox":{"id":1,"name":"agent",
 //!  "addr":"10.0.0.2","addr_v6":null},"conn":null,"local":null,"peer":"10.0.0.2:47583",
-//!  "transport":"tcp","sni":null,"fields":{"name":"example.test","qtype":1,...},
+//!  "transport":"tcp","tls":false,"sni":null,"alpn":null,
+//!  "fields":{"name":"example.test","qtype":1,...},
 //!  "node":"t7","task":"net::serve_dns","file":"src/stdlib/net.rs","line":1750,"parent":"t1"}
 //! ```
 //!
 //! `seq` numbers the run's events from 1, with no gaps, and `at` is when it
-//! happened, in seconds on the world's clock. `node` is the task that
+//! happened, in seconds on the world's clock. `tls` says whether the
+//! connection was TLS, and `sni` and `alpn` are what its handshake named
+//! and agreed. `node` is the task that
 //! recorded it, and `task`, `file`, `line` and `parent` describe that task,
 //! since a short task may have ended before anyone reads the event. The
-//! world keeps its latest 50,000 events, up to 16 MiB of them. A reader that asks
-//! for events the log no longer holds gets one `events.dropped` event
-//! first, whose `count` field says how many it missed.
+//! world keeps its latest 50,000 events, up to 16 MiB of them, and apart
+//! from them its latest 5,000 [repeats](crate::events#repeats). Where a
+//! reader asks for events the log no longer holds, an `events.dropped`
+//! event stands in their place, whose `count` field says how many it
+//! missed.
 //!
 //! ## Packets
 //!
@@ -585,21 +592,28 @@ pub(crate) fn existing_watch(graph: &Graph, id: u64) -> Option<Arc<LinkWatch>> {
     lock(&graph.watches).get(&id).cloned()
 }
 
-/// Records that `source` dropped `packet`, and `why`: a `drop` event with
-/// the packet's addresses, protocol and length.
-pub(crate) fn record_drop(cx: &Cx, source: &'static str, packet: &crate::Packet, why: &str) {
-    // Only the headers: this runs on the world's own thread.
-    let d = decode::Dissector::headers_only().decode(&packet.0, &[]);
-    let summary = format!("{} → {} {} ({} bytes): {why}", d.src, d.dst, d.proto, packet.0.len());
-    let event = crate::events::Event::new(source, "drop")
-        .level(crate::events::Level::Notice)
-        .summary(summary)
-        .field("src", d.src)
-        .field("dst", d.dst)
-        .field("protocol", d.proto)
-        .field("len", packet.0.len() as u64)
+/// Records that `source` dropped `packet`, and `why`, as a `drop` event
+/// with the packet's addresses and protocol (a
+/// [repeat](crate::events#repeats)). Its length, its destination port and
+/// `detail` change with each packet, so they are its detail.
+pub(crate) fn record_drop(cx: &Cx, source: &'static str, packet: &crate::Packet, why: &'static str, detail: crate::events::Fields) {
+    use crate::events::{Event, Level, opt};
+    let h = crate::stdlib::ip::Header::parse_truncated(&packet.0);
+    let port = h.as_ref().and_then(|h| h.dst_port(&packet.0));
+    let (src, dst) = match &h {
+        Some(h) => (h.src.to_string(), h.dst.to_string()),
+        None => ("?".to_owned(), "?".to_owned()),
+    };
+    let event = Event::new(source, "drop")
+        .level(Level::Notice)
+        .summary(format!("{src} → {dst}: {why}"))
+        .field("src", opt(h.as_ref().map(|_| src)))
+        .field("dst", opt(h.as_ref().map(|_| dst)))
+        .field("protocol", opt(h.as_ref().map(|h| u32::from(h.protocol))))
         .field("why", why);
-    cx.record(event);
+    let mut all = crate::events::Fields::new().with("len", packet.0.len() as u64).with("dst_port", opt(port.map(u32::from)));
+    all.extend(detail);
+    cx.record_repeat(event, all);
 }
 
 /// A link an [`Interface`](crate::Interface) belongs to, so the stdlib can

@@ -31,8 +31,40 @@
 //! host's, so two runs that do the same things record the same sequence.
 //! The log is bounded: it holds the latest [`MAX_EVENTS`] events, and at
 //! most [`MAX_EVENT_BYTES`] of them ([`Event::size`]). Past either limit the oldest go first,
-//! and every reader that missed some is told how many, with one
+//! and every reader that missed some is told how many, with an
 //! `events.dropped` event in their place ([`EventLog::after`]).
+//!
+//! # Repeats
+//!
+//! Some events come once per packet: a packet the network refuses
+//! (`net.blocked`), or one a LAN, a router or a [bottleneck] drops
+//! (`drop`). The sandbox decides how many of those there are, so an agent
+//! that scans every port or floods a link would otherwise fill the log
+//! and push out the events a grader reads. Such events are recorded with
+//! [`Cx::record_repeat`], which counts them instead:
+//!
+//! - Repeats are alike when their source, kind, connection and fields
+//!   match. Fields that change with every packet, such as a destination
+//!   port or a length, go in the `detail` given beside the event, and do
+//!   not tell repeats apart.
+//! - The first of a run of alike repeats is recorded as it comes, with its
+//!   detail and the field `count` set to 1. For the next
+//!   [`REPEAT_WINDOW`] on the run's clock, repeats of it are only counted.
+//!   When the window has passed, the first event recorded after it, or the
+//!   run's end, records one more event for them: the same source, kind,
+//!   connection and fields, `count` repeats, and for each detail field
+//!   that is a number, its lowest and highest values as `[low, high]`.
+//!   The sum of `count` over alike events is how many repeats there were.
+//! - Repeats are kept apart from every other event, within their own
+//!   bounds: the latest [`MAX_REPEATS`] of them, and at most
+//!   [`MAX_REPEAT_BYTES`]. Past either, the oldest repeat goes first. A
+//!   flood of repeats never pushes out another event, and other events
+//!   never push out repeats. A reader that missed some is told as for any
+//!   other event: an `events.dropped` event stands where they were.
+//!
+//! So a flood costs at most two events per second for each distinct kind
+//! of repeat, and never costs the run a service's event, an HTTP request,
+//! a DNS query, a TLS handshake or a connection's open and close.
 //!
 //! Everything that reads events reads this log:
 //!
@@ -77,14 +109,15 @@
 //! [bottleneck]: crate::stdlib::bottleneck
 //! [router]: crate::stdlib::route::router
 //! [`Cx::now`]: crate::Cx::now
+//! [`Cx::record_repeat`]: crate::Cx::record_repeat
 //! [`Layer::note`]: crate::observe::Layer::note
 
 use std::borrow::Cow;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, sync_channel};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -98,6 +131,18 @@ pub const MAX_EVENTS: usize = 50_000;
 /// How many bytes of events a run's log holds, as [`Event::size`] counts
 /// them. Past this, the oldest are dropped.
 pub const MAX_EVENT_BYTES: usize = 16 << 20;
+/// How many [repeats](self#repeats) a run's log holds, beside its other
+/// events. Past this, the oldest repeats are dropped.
+pub const MAX_REPEATS: usize = 5_000;
+/// How many bytes of [repeats](self#repeats) a run's log holds, beside its
+/// other events. Past this, the oldest repeats are dropped.
+pub const MAX_REPEAT_BYTES: usize = 2 << 20;
+/// How long, on the run's clock, repeats of an event are counted before
+/// the log records their count. See [Repeats](self#repeats).
+pub const REPEAT_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
+/// How many runs of repeats are counted at once. Past this, the oldest
+/// count is recorded early.
+const OPEN_WINDOWS: usize = 1024;
 
 /// How much an event matters to the people and graders reading the log.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -133,7 +178,7 @@ impl Level {
 ///
 /// An HTTP handler adds fields to its request's event by putting `Fields`
 /// in its response's extensions (see [`httpd`](crate::stdlib::httpd)).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Fields(Vec<(&'static str, Value)>);
 
 impl Fields {
@@ -265,7 +310,7 @@ impl Transport {
 
 /// Where an event came from: the connection and the sandbox behind it.
 /// Every field is optional, since some events belong to no connection.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ConnInfo {
     /// The connection's number, from whoever accepted it. [`Net`]
     /// numbers its connections from 1, on every port.
@@ -428,7 +473,8 @@ impl Event {
 
     /// The event as one JSON object: `seq`, `at` (seconds since the run
     /// started), `source`, `kind`, `level`, `summary`, then the connection
-    /// (`sandbox`, `conn`, `local`, `peer`, `transport`, `sni`), then
+    /// (`sandbox`, `conn`, `local`, `peer`, `transport`, `tls`, `sni`,
+    /// `alpn`), then
     /// `fields`, then the task that recorded it, if known: `node` (its id
     /// in the observe graph, such as `"t7"`), `task` (its name), `file`,
     /// `line` and `parent` (the id of the task that started it).
@@ -446,7 +492,9 @@ impl Event {
             ("local".into(), opt(c.local.map(|a| a.to_string()))),
             ("peer".into(), opt(c.peer.map(|a| a.to_string()))),
             ("transport".into(), c.transport.as_str().into()),
+            ("tls".into(), c.tls.into()),
             ("sni".into(), opt(c.sni.as_deref())),
+            ("alpn".into(), opt(c.alpn.as_deref().map(|a| String::from_utf8_lossy(a).into_owned()))),
             ("fields".into(), self.fields.to_json()),
         ];
         if let Some(o) = &self.origin {
@@ -487,7 +535,7 @@ impl Event {
     fn dropped(seq: u64, at: Instant, count: u64) -> Event {
         let mut event = Event::new("events", "dropped")
             .level(Level::Notice)
-            .summary(format!("{count} earlier events were dropped: the log keeps the latest {MAX_EVENTS}, up to {} MiB of them", MAX_EVENT_BYTES >> 20))
+            .summary(format!("{count} earlier events were dropped for the log's limits"))
             .field("count", count);
         event.seq = seq;
         event.at = at;
@@ -522,6 +570,8 @@ type Subscriber = Arc<dyn Fn(&Event) + Send + Sync>;
 
 /// How many lines may wait for a file's writer thread.
 const FILE_QUEUE: usize = 100_000;
+/// How many bytes of lines may wait for a file's writer thread.
+const FILE_QUEUE_BYTES: usize = MAX_EVENT_BYTES;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -530,50 +580,214 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// What a run's log holds.
 pub(crate) struct Store {
     state: Mutex<State>,
-    /// Lines file sinks could not keep up with.
+    /// Lines file sinks could not keep up with, or could not write.
     lost: Arc<AtomicU64>,
 }
 
-struct State {
+/// One bounded part of the log: its events, oldest first.
+struct Part {
     events: VecDeque<Arc<Event>>,
     bytes: usize,
+    max: usize,
+    max_bytes: usize,
+}
+
+impl Part {
+    fn new(max: usize, max_bytes: usize) -> Part {
+        Part { events: VecDeque::new(), bytes: 0, max, max_bytes }
+    }
+
+    /// Keeps `event`, of `size` bytes, and drops the oldest past the
+    /// bounds. Returns how many it dropped.
+    fn push(&mut self, event: Arc<Event>, size: usize) -> u64 {
+        self.events.push_back(event);
+        self.bytes += size;
+        let mut dropped = 0;
+        while self.events.len() > self.max || (self.bytes > self.max_bytes && self.events.len() > 1) {
+            let Some(old) = self.events.pop_front() else { break };
+            self.bytes -= old.size();
+            dropped += 1;
+        }
+        dropped
+    }
+}
+
+/// What makes repeats alike.
+#[derive(PartialEq, Eq, Hash)]
+struct RepeatKey {
+    source: &'static str,
+    kind: &'static str,
+    conn: ConnInfo,
+    fields: Fields,
+}
+
+/// A run of alike repeats, counted after the first.
+struct Window {
+    /// The first of them, without its detail.
+    first: Event,
+    count: u64,
+    /// When the latest was recorded.
+    last: Instant,
+    /// Each detail field that is a number, with its lowest and highest.
+    ranges: Vec<(&'static str, u64, u64)>,
+}
+
+impl Window {
+    fn add(&mut self, at: Instant, detail: &Fields) {
+        self.count += 1;
+        self.last = self.last.max(at);
+        for (name, value) in detail.iter() {
+            let Some(n) = value.as_u64() else { continue };
+            match self.ranges.iter_mut().find(|r| r.0 == name) {
+                Some(r) => (r.1, r.2) = (r.1.min(n), r.2.max(n)),
+                None => self.ranges.push((name, n, n)),
+            }
+        }
+    }
+
+    /// The event that counts the repeats after the first, if there were
+    /// any.
+    fn summary(self) -> Option<Event> {
+        if self.count == 0 {
+            return None;
+        }
+        let mut event = self.first;
+        event.summary = format!("{} more: {}", self.count, event.summary);
+        event.at = self.last;
+        event.fields.set("count", self.count);
+        for (name, low, high) in self.ranges {
+            event.fields.set(name, Value::Array(vec![low.into(), high.into()]));
+        }
+        Some(event)
+    }
+}
+
+struct State {
+    /// Every event but repeats.
+    events: Part,
+    repeats: Part,
     /// The number of the last event recorded.
     last: u64,
     /// How many events were dropped for the limits.
     dropped: u64,
+    /// The latest time an event was recorded at.
+    clock: Instant,
+    /// The runs of repeats being counted.
+    open: HashMap<Arc<RepeatKey>, Window>,
+    /// The same, oldest first, each with when its count is due.
+    due: VecDeque<(Instant, Arc<RepeatKey>)>,
     /// Shared, so recording takes a reference count, not a copy.
     subscribers: Arc<[Subscriber]>,
+    /// Whether the run is over.
+    closed: bool,
+    /// The file writers' threads, joined when the run is over.
+    writers: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl State {
+    /// Numbers `event` and keeps it, in `out` too.
+    fn keep(&mut self, mut event: Event, repeat: bool, out: &mut Vec<Arc<Event>>) {
+        self.last += 1;
+        event.seq = self.last;
+        let size = event.size();
+        let event = Arc::new(event);
+        let part = if repeat { &mut self.repeats } else { &mut self.events };
+        self.dropped += part.push(event.clone(), size);
+        out.push(event);
+    }
+
+    /// Moves the clock to `at`, recording the counts that are due by then.
+    fn advance(&mut self, at: Instant, out: &mut Vec<Arc<Event>>) {
+        self.clock = self.clock.max(at);
+        while self.due.front().is_some_and(|(due, _)| *due <= self.clock) {
+            self.close_oldest(out);
+        }
+    }
+
+    /// Records the count of the oldest run of repeats, and forgets it.
+    fn close_oldest(&mut self, out: &mut Vec<Arc<Event>>) {
+        let Some((_, key)) = self.due.pop_front() else { return };
+        if let Some(event) = self.open.remove(&key).and_then(Window::summary) {
+            self.keep(event, true, out);
+        }
+    }
 }
 
 impl Store {
     pub(crate) fn new() -> Arc<Store> {
         Arc::new(Store {
-            state: Mutex::new(State { events: VecDeque::new(), bytes: 0, last: 0, dropped: 0, subscribers: Arc::new([]) }),
+            state: Mutex::new(State {
+                events: Part::new(MAX_EVENTS, MAX_EVENT_BYTES),
+                repeats: Part::new(MAX_REPEATS, MAX_REPEAT_BYTES),
+                last: 0,
+                dropped: 0,
+                clock: Instant::ZERO,
+                open: HashMap::new(),
+                due: VecDeque::new(),
+                subscribers: Arc::new([]),
+                closed: false,
+                writers: Vec::new(),
+            }),
             lost: Arc::new(AtomicU64::new(0)),
         })
     }
 
     /// Numbers `event`, keeps it, and calls the subscribers.
-    pub(crate) fn push(&self, mut event: Event) {
-        let size = event.size();
+    pub(crate) fn push(&self, event: Event) {
+        let mut out = Vec::with_capacity(1);
         let mut s = lock(&self.state);
-        s.last += 1;
-        event.seq = s.last;
-        let event = Arc::new(event);
-        s.events.push_back(event.clone());
-        s.bytes += size;
-        while s.events.len() > MAX_EVENTS || (s.bytes > MAX_EVENT_BYTES && s.events.len() > 1) {
-            let Some(old) = s.events.pop_front() else { break };
-            s.bytes -= old.size();
-            s.dropped += 1;
+        s.advance(event.at, &mut out);
+        s.keep(event, false, &mut out);
+        Store::tell(s, &out);
+    }
+
+    /// Keeps `event` as a repeat, or counts it. See
+    /// [Repeats](self#repeats).
+    pub(crate) fn push_repeat(&self, mut event: Event, detail: Fields) {
+        let key = RepeatKey { source: event.source, kind: event.kind, conn: std::mem::take(&mut event.conn), fields: std::mem::take(&mut event.fields) };
+        let mut out = Vec::new();
+        let mut s = lock(&self.state);
+        s.advance(event.at, &mut out);
+        if let Some(window) = s.open.get_mut(&key) {
+            window.add(event.at, &detail);
+        } else {
+            if s.open.len() >= OPEN_WINDOWS {
+                s.close_oldest(&mut out);
+            }
+            event.conn = key.conn.clone();
+            event.fields = key.fields.clone();
+            let first = Window { first: event.clone(), count: 0, last: event.at, ranges: Vec::new() };
+            let key = Arc::new(key);
+            let due = s.clock + REPEAT_WINDOW;
+            s.open.insert(key.clone(), first);
+            s.due.push_back((due, key));
+            event.fields.extend(detail);
+            event.fields.set("count", 1u64);
+            s.keep(event, true, &mut out);
         }
-        if s.subscribers.is_empty() {
+        Store::tell(s, &out);
+    }
+
+    /// Moves the log's clock to `at`, recording the counts of repeats due
+    /// by then.
+    pub(crate) fn advance(&self, at: Instant) {
+        let mut out = Vec::new();
+        let mut s = lock(&self.state);
+        s.advance(at, &mut out);
+        Store::tell(s, &out);
+    }
+
+    /// Calls the subscribers with `events`, once `s` is unlocked.
+    fn tell(s: MutexGuard<'_, State>, events: &[Arc<Event>]) {
+        if s.subscribers.is_empty() || events.is_empty() {
             return;
         }
         let subscribers = s.subscribers.clone();
         drop(s);
-        for f in subscribers.iter() {
-            f(&event);
+        for event in events {
+            for f in subscribers.iter() {
+                f(event);
+            }
         }
     }
 
@@ -582,32 +796,71 @@ impl Store {
         lock(&self.state).last
     }
 
-    /// Forgets the subscribers, so a file's writer finishes once the run
-    /// is over.
+    /// Ends the log with the run: records every count of repeats still
+    /// open, forgets the subscribers, and waits for the file writers to
+    /// write everything.
     pub(crate) fn close(&self) {
-        lock(&self.state).subscribers = Arc::new([]);
+        let mut out = Vec::new();
+        let (subscribers, writers) = {
+            let mut s = lock(&self.state);
+            while !s.due.is_empty() {
+                s.close_oldest(&mut out);
+            }
+            s.closed = true;
+            (std::mem::replace(&mut s.subscribers, Arc::new([])), std::mem::take(&mut s.writers))
+        };
+        for event in &out {
+            for f in subscribers.iter() {
+                f(event);
+            }
+        }
+        // The writers end once their senders, in the subscribers, are gone.
+        drop(subscribers);
+        for writer in writers {
+            let _ = writer.join();
+        }
     }
 
     /// The events after number `after`, at most `max`, oldest first, with
-    /// an `events.dropped` event first if some of them are gone.
+    /// an `events.dropped` event wherever some of them are gone.
     pub(crate) fn after(&self, after: u64, max: usize) -> Vec<Arc<Event>> {
         let s = lock(&self.state);
         after_locked(&s, after, max)
     }
 }
 
+/// The events held after number `after`, in order: the two parts merged.
+fn held(s: &State, after: u64) -> impl Iterator<Item = &Arc<Event>> {
+    let a = s.events.events.partition_point(|e| e.seq <= after);
+    let b = s.repeats.events.partition_point(|e| e.seq <= after);
+    let mut a = s.events.events.range(a..).peekable();
+    let mut b = s.repeats.events.range(b..).peekable();
+    std::iter::from_fn(move || match (a.peek(), b.peek()) {
+        (Some(x), Some(y)) if y.seq < x.seq => b.next(),
+        (Some(_), _) => a.next(),
+        (None, _) => b.next(),
+    })
+}
+
 fn after_locked(s: &State, after: u64, max: usize) -> Vec<Arc<Event>> {
     let mut out = Vec::new();
-    if max == 0 {
-        return out;
+    let mut next = after + 1;
+    for e in held(s, after) {
+        if e.seq > next {
+            if out.len() >= max {
+                return out;
+            }
+            out.push(Arc::new(Event::dropped(e.seq - 1, e.at, e.seq - next)));
+        }
+        if out.len() >= max {
+            return out;
+        }
+        out.push(e.clone());
+        next = e.seq + 1;
     }
-    let first = s.events.front().map_or(s.last + 1, |e| e.seq);
-    if after + 1 < first {
-        let at = s.events.front().map_or(Instant::ZERO, |e| e.at);
-        out.push(Arc::new(Event::dropped(first - 1, at, first - 1 - after)));
+    if next <= s.last && out.len() < max {
+        out.push(Arc::new(Event::dropped(s.last, s.clock, s.last + 1 - next)));
     }
-    let skip = (after + 1).saturating_sub(first) as usize;
-    out.extend(s.events.iter().skip(skip).take(max - out.len()).cloned());
     out
 }
 
@@ -622,7 +875,8 @@ pub struct EventLog {
 impl std::fmt::Debug for EventLog {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = lock(&self.store.state);
-        f.debug_struct("EventLog").field("recorded", &s.last).field("held", &s.events.len()).field("dropped", &s.dropped).finish()
+        let held = s.events.events.len() + s.repeats.events.len();
+        f.debug_struct("EventLog").field("recorded", &s.last).field("held", &held).field("dropped", &s.dropped).finish()
     }
 }
 
@@ -632,16 +886,16 @@ impl EventLog {
     }
 
     /// The events recorded after number `after`, at most `max`, oldest
-    /// first. If the log no longer holds some of them, the first event is
-    /// an `events.dropped` one that counts them (field `count`), numbered
-    /// as the last one missed, so the next call can go on from the last
-    /// event returned.
+    /// first. Where the log no longer holds some of them, an
+    /// `events.dropped` event stands in their place and counts them (field
+    /// `count`), numbered as the last one missed, so the next call can go
+    /// on from the last event returned.
     pub fn after(&self, after: u64, max: usize) -> Vec<Event> {
         self.store.after(after, max).into_iter().map(|e| (*e).clone()).collect()
     }
 
-    /// Every event the log holds, oldest first, after an `events.dropped`
-    /// event if some were dropped.
+    /// Every event the log holds, oldest first, with an `events.dropped`
+    /// event wherever some were dropped.
     pub fn all(&self) -> Vec<Event> {
         self.after(0, usize::MAX)
     }
@@ -649,7 +903,7 @@ impl EventLog {
     /// The events of `source`'s `kind` the log holds.
     pub fn of(&self, source: &str, kind: &str) -> Vec<Event> {
         let s = lock(&self.store.state);
-        s.events.iter().filter(|e| e.is(source, kind)).map(|e| (**e).clone()).collect()
+        held(&s, 0).filter(|e| e.is(source, kind)).map(|e| (**e).clone()).collect()
     }
 
     /// The number of the last event recorded: how many there have been.
@@ -662,19 +916,22 @@ impl EventLog {
         lock(&self.store.state).dropped
     }
 
-    /// Calls `f` with every event the log holds now, oldest first (after
-    /// an `events.dropped` event if some were dropped), then with every
-    /// event recorded from now on, in the task that records it, until the
-    /// run is over. `f` must return quickly and never block: hand the
-    /// event to a channel that never waits.
+    /// Calls `f` with every event the log holds now, oldest first (with
+    /// an `events.dropped` event wherever some were dropped), then with
+    /// every event recorded from now on, in the task that records it,
+    /// until the run is over. `f` must return quickly and never block:
+    /// hand the event to a channel that never waits. Once the run is over,
+    /// `f` gets only what the log holds.
     pub fn subscribe(&self, f: impl Fn(&Event) + Send + Sync + 'static) {
         let f: Subscriber = Arc::new(f);
         let held = {
             let mut s = lock(&self.store.state);
             let held = after_locked(&s, 0, usize::MAX);
-            let mut all: Vec<Subscriber> = s.subscribers.iter().cloned().collect();
-            all.push(f.clone());
-            s.subscribers = all.into();
+            if !s.closed {
+                let mut all: Vec<Subscriber> = s.subscribers.iter().cloned().collect();
+                all.push(f.clone());
+                s.subscribers = all.into();
+            }
             held
         };
         for e in held {
@@ -692,30 +949,48 @@ impl EventLog {
     }
 
     /// Writes every event to `out` as JSON Lines, from a thread of its own
-    /// that flushes whenever it has caught up. A line that does not fit in
-    /// the thread's queue is lost and counted ([`EventLog::lost`]), and the
-    /// file gets an `events.lost` line with the count. A grader throws such
-    /// a sample away. The thread ends once the run is over and it has
-    /// written everything.
+    /// that flushes whenever it has caught up. The run's end waits for the
+    /// thread to write and flush every line.
+    ///
+    /// A line is lost, and counted ([`EventLog::lost`]), when it does not
+    /// fit in the thread's queue (100,000 lines or 16 MiB), or when `out`
+    /// fails. After a queue overflow the file gets an `events.lost` line
+    /// with the count so far. After a failed write or flush the thread
+    /// writes nothing more, and counts every line after it, and each line
+    /// written since the last flush that worked, as lost. A grader throws
+    /// away a sample with any line lost.
     pub fn to_writer(&self, out: Box<dyn Write + Send>) {
         let (tx, rx) = sync_channel::<Vec<u8>>(FILE_QUEUE);
+        let queued = Arc::new(AtomicUsize::new(0));
         let lost = self.store.lost.clone();
-        let reported = Arc::new(AtomicU64::new(0));
-        std::thread::Builder::new()
-            .name("fictionet-events".into())
-            .spawn(move || write_lines(rx, out, &lost, &reported))
-            .expect("the event writer's thread starts");
-        let lost = self.store.lost.clone();
+        let writer = {
+            let (lost, queued) = (lost.clone(), queued.clone());
+            std::thread::Builder::new()
+                .name("fictionet-events".into())
+                .spawn(move || write_lines(rx, out, &lost, &queued))
+                .expect("the event writer's thread starts")
+        };
         self.subscribe(move |event| {
             let Ok(mut line) = event.to_json().to_bytes() else { return };
             line.push(b'\n');
-            if tx.try_send(line).is_err() {
+            let len = line.len();
+            if queued.fetch_add(len, Ordering::Relaxed) + len > FILE_QUEUE_BYTES || tx.try_send(line).is_err() {
+                queued.fetch_sub(len, Ordering::Relaxed);
                 lost.fetch_add(1, Ordering::Relaxed);
             }
         });
+        let mut s = lock(&self.store.state);
+        if s.closed {
+            // The run is over: the thread has all it will get.
+            drop(s);
+            let _ = writer.join();
+        } else {
+            s.writers.push(writer);
+        }
     }
 
-    /// How many lines file writers could not keep up with.
+    /// How many lines file writers lost: lines that did not fit in a
+    /// writer's queue, or that a writer could not write.
     pub fn lost(&self) -> u64 {
         self.store.lost.load(Ordering::Relaxed)
     }
@@ -741,13 +1016,15 @@ impl EventLog {
 
     /// Waits until `n` held events match `pick`, checking every 10 ms on
     /// the run's clock, for at most `limit`. Returns those events, or every
-    /// match so far if the time ran out.
+    /// match so far if the time ran out. Each check first records the
+    /// counts of [repeats](self#repeats) that are due.
     pub async fn wait(&self, cx: &Cx, n: usize, limit: std::time::Duration, mut pick: impl FnMut(&Event) -> bool) -> Vec<Event> {
         let deadline = cx.now() + limit;
         loop {
+            self.store.advance(cx.now());
             let got: Vec<Event> = {
                 let s = lock(&self.store.state);
-                s.events.iter().filter(|e| pick(e)).map(|e| (**e).clone()).collect()
+                held(&s, 0).filter(|e| pick(e)).map(|e| (**e).clone()).collect()
             };
             if got.len() >= n || cx.now() >= deadline {
                 return got;
@@ -759,24 +1036,51 @@ impl EventLog {
     }
 }
 
-fn write_lines(rx: Receiver<Vec<u8>>, mut out: Box<dyn Write + Send>, lost: &AtomicU64, reported: &AtomicU64) {
-    let report = |out: &mut Box<dyn Write + Send>| {
-        let n = lost.load(Ordering::Relaxed);
-        if n != reported.swap(n, Ordering::Relaxed) {
-            let line = format!("{{\"source\":\"events\",\"kind\":\"lost\",\"fields\":{{\"count\":{n}}}}}\n");
-            let _ = out.write_all(line.as_bytes());
-        }
-    };
+/// Writes the lines from `rx` to `out` until the run is over. After a
+/// failed write or flush, only counts them as lost.
+fn write_lines(rx: Receiver<Vec<u8>>, mut out: Box<dyn Write + Send>, lost: &AtomicU64, queued: &AtomicUsize) {
+    let mut reported = 0;
+    // Lines written since the last flush that worked.
+    let mut unflushed = 0u64;
+    let mut failed = false;
+    let mut batch = Vec::new();
     while let Ok(line) = rx.recv() {
-        let _ = out.write_all(&line);
-        while let Ok(more) = rx.try_recv() {
-            let _ = out.write_all(&more);
+        batch.push(line);
+        batch.extend(rx.try_iter());
+        for line in batch.drain(..) {
+            queued.fetch_sub(line.len(), Ordering::Relaxed);
+            if failed {
+                lost.fetch_add(1, Ordering::Relaxed);
+            } else if out.write_all(&line).is_ok() {
+                unflushed += 1;
+            } else {
+                lost.fetch_add(unflushed + 1, Ordering::Relaxed);
+                failed = true;
+            }
         }
-        report(&mut out);
-        let _ = out.flush();
+        if !failed {
+            failed = finish_batch(&mut out, lost, &mut reported, &mut unflushed);
+        }
     }
-    report(&mut out);
-    let _ = out.flush();
+    if !failed {
+        finish_batch(&mut out, lost, &mut reported, &mut unflushed);
+    }
+}
+
+/// Writes an `events.lost` line if more were lost since the last, then
+/// flushes. Returns whether that failed, counting the unflushed lines as
+/// lost if so.
+fn finish_batch(out: &mut Box<dyn Write + Send>, lost: &AtomicU64, reported: &mut u64, unflushed: &mut u64) -> bool {
+    let n = lost.load(Ordering::Relaxed);
+    let report = format!("{{\"source\":\"events\",\"kind\":\"lost\",\"fields\":{{\"count\":{n}}}}}\n");
+    let ok = (n == *reported || out.write_all(report.as_bytes()).is_ok()) && out.flush().is_ok();
+    *reported = n;
+    if ok {
+        *unflushed = 0;
+    } else {
+        lost.fetch_add(*unflushed, Ordering::Relaxed);
+    }
+    !ok
 }
 
 #[cfg(test)]
@@ -797,8 +1101,8 @@ mod tests {
         let total = MAX_EVENTS as u64 + 10;
         numbered(&store, total);
         let log = EventLog::new(store.clone());
-        let held = lock(&store.state).events.len() as u64;
-        assert!(held <= MAX_EVENTS as u64 && lock(&store.state).bytes <= MAX_EVENT_BYTES);
+        let held = lock(&store.state).events.events.len() as u64;
+        assert!(held <= MAX_EVENTS as u64 && lock(&store.state).events.bytes <= MAX_EVENT_BYTES);
         let gone = total - held;
         assert!(gone >= 10);
         assert_eq!((log.dropped(), log.recorded()), (gone, total));
@@ -824,8 +1128,8 @@ mod tests {
             store.push(Event::new("test", "big").summary(big.clone()));
         }
         let s = lock(&store.state);
-        assert!(s.bytes <= MAX_EVENT_BYTES, "{}", s.bytes);
-        assert!(s.events.len() < 40 && s.dropped > 0);
+        assert!(s.events.bytes <= MAX_EVENT_BYTES, "{}", s.events.bytes);
+        assert!(s.events.events.len() < 40 && s.dropped > 0);
     }
 
     /// A subscriber set late gets what the log holds, then what follows.
@@ -842,6 +1146,183 @@ mod tests {
         store.close();
         numbered(&store, 1);
         assert_eq!(seen.lock().unwrap().len(), 5, "a closed log calls no one");
+    }
+
+    fn at(ms: u64) -> Instant {
+        Instant::ZERO + std::time::Duration::from_millis(ms)
+    }
+
+    fn timed(mut event: Event, ms: u64) -> Event {
+        event.at = at(ms);
+        event
+    }
+
+    /// A refused packet, as the network records one: the port is detail.
+    fn refused(store: &Store, ms: u64, dst: &str, port: u16) {
+        let mut event = Event::new("net", "blocked").summary(format!("to {dst}")).field("why", "ClosedPort").field("dst", dst);
+        event.at = at(ms);
+        store.push_repeat(event, Fields::new().with("dst_port", u32::from(port)));
+    }
+
+    /// The first of a run of alike repeats is recorded at once; the rest
+    /// of its window are counted, and the count recorded when the window
+    /// has passed.
+    #[test]
+    fn repeats_are_counted_once_a_window() {
+        let store = Store::new();
+        let log = EventLog::new(store.clone());
+        for port in 1..=1000 {
+            refused(&store, u64::from(port / 10), "192.0.2.1", port);
+        }
+        refused(&store, 50, "192.0.2.2", 22);
+        assert_eq!(log.recorded(), 2, "one event for each destination");
+        // Within the window, nothing more.
+        store.push(timed(Event::new("http", "request"), 500));
+        assert_eq!(log.recorded(), 3);
+        // Past it, the counts come first, then the event that came after.
+        store.push(timed(Event::new("http", "request"), 1200));
+        let all = log.all();
+        let shown: Vec<_> = all.iter().map(|e| (e.kind, e.str("dst"), e.u64("count"), e.get("dst_port").cloned())).collect();
+        let ports = |lo: u64, hi: u64| Some(Value::Array(vec![lo.into(), hi.into()]));
+        assert_eq!(
+            shown,
+            [
+                ("blocked", Some("192.0.2.1"), Some(1), Some(Value::from(1u32))),
+                ("blocked", Some("192.0.2.2"), Some(1), Some(Value::from(22u32))),
+                ("request", None, None, None),
+                ("blocked", Some("192.0.2.1"), Some(999), ports(2, 1000)),
+                ("request", None, None, None),
+            ]
+        );
+        assert_eq!((all[3].at, all[3].summary.as_str()), (at(100), "999 more: to 192.0.2.1"));
+        // A new window after the old one closed starts with a recorded one.
+        refused(&store, 1300, "192.0.2.1", 7);
+        assert_eq!(log.of("net", "blocked").last().and_then(|e| e.u64("count")), Some(1));
+        // The run's end records every count still open.
+        refused(&store, 1301, "192.0.2.1", 8);
+        store.close();
+        assert_eq!(log.of("net", "blocked").last().and_then(|e| e.u64("count")), Some(1));
+        assert_eq!(log.of("net", "blocked").len(), 5);
+    }
+
+    /// Repeats have bounds of their own: a flood of them, more than the
+    /// log holds, never pushes out another event, and a reader is told
+    /// where repeats are gone.
+    #[test]
+    fn a_flood_of_repeats_never_pushes_out_other_events() {
+        let store = Store::new();
+        let log = EventLog::new(store.clone());
+        for i in 0..10u32 {
+            store.push(Event::new("http", "request").field("i", i));
+        }
+        // Every packet to a new address: a new run each time.
+        let flood = MAX_EVENTS as u64 + 10;
+        for i in 0..flood {
+            refused(&store, i, &format!("10.{}.{}.{}", i >> 16, (i >> 8) & 255, i & 255), 1);
+            if i == flood / 2 {
+                store.push(Event::new("dns", "query"));
+            }
+        }
+        assert_eq!(log.of("http", "request").len(), 10);
+        assert_eq!(log.of("dns", "query").len(), 1);
+        let s = lock(&store.state);
+        assert!(s.repeats.events.len() <= MAX_REPEATS && s.repeats.bytes <= MAX_REPEAT_BYTES);
+        assert!(s.open.len() <= OPEN_WINDOWS && s.due.len() == s.open.len());
+        drop(s);
+        // Every number is either an event or counted in an
+        // `events.dropped` event, in order.
+        let mut next = 1;
+        for e in log.all() {
+            let first = if e.is("events", "dropped") { e.seq + 1 - e.u64("count").unwrap() } else { e.seq };
+            assert_eq!(first, next, "{e:?}");
+            next = e.seq + 1;
+        }
+        assert_eq!(next, log.recorded() + 1);
+        assert_eq!(log.dropped() + (log.all().iter().filter(|e| !e.is("events", "dropped")).count() as u64), log.recorded());
+    }
+
+    /// An event's JSON says whether its connection was TLS, and its ALPN.
+    #[test]
+    fn json_names_tls_and_alpn() {
+        let addr = SocketAddr::from(([10, 0, 0, 2], 443));
+        let plain = Event::new("http", "request").conn(&ConnInfo::new(1, addr, addr));
+        let line = plain.to_line();
+        assert!(line.contains(r#""tls":false,"sni":null,"alpn":null"#), "{line}");
+        let tls = Event::new("http", "request").conn(&ConnInfo::new(1, addr, addr).over_tls(Some("a.test"), Some(b"h2")));
+        let line = tls.to_line();
+        assert!(line.contains(r#""tls":true,"sni":"a.test","alpn":"h2""#), "{line}");
+    }
+
+    /// A shared buffer a test writes events into, slowly, or failing after
+    /// some lines.
+    #[derive(Clone, Default)]
+    struct Sink {
+        bytes: Arc<Mutex<Vec<u8>>>,
+        fail_after: Option<usize>,
+        slow: bool,
+    }
+
+    impl Write for Sink {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            let mut bytes = self.bytes.lock().unwrap();
+            if self.fail_after.is_some_and(|n| bytes.iter().filter(|b| **b == b'\n').count() >= n) {
+                return Err(std::io::Error::other("the disk is full"));
+            }
+            if self.slow {
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
+            bytes.extend_from_slice(data);
+            Ok(data.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The run's end waits for a file writer to write every line.
+    #[test]
+    fn the_run_waits_for_its_file_writer() {
+        let sink = Sink { slow: true, ..Sink::default() };
+        let out = sink.clone();
+        let kept = Arc::new(Mutex::new(None));
+        let keep = kept.clone();
+        crate::block_on(crate::run(|cx| async move {
+            cx.events().to_writer(Box::new(out));
+            for i in 0..500u32 {
+                cx.record(Event::new("test", "tick").field("i", i));
+            }
+            *keep.lock().unwrap() = Some(cx.events());
+            Ok(())
+        }))
+        .unwrap();
+        let log = kept.lock().unwrap().take().unwrap();
+        let lines = sink.bytes.lock().unwrap().iter().filter(|b| **b == b'\n').count();
+        assert_eq!((lines, log.lost()), (500, 0));
+    }
+
+    /// A write that fails is counted as lost, with every line after it.
+    #[test]
+    fn a_failed_write_is_counted_as_lost() {
+        let sink = Sink { fail_after: Some(100), ..Sink::default() };
+        let out = sink.clone();
+        let kept = Arc::new(Mutex::new(None));
+        let keep = kept.clone();
+        crate::block_on(crate::run(|cx| async move {
+            cx.events().to_writer(Box::new(out));
+            for i in 0..300u32 {
+                cx.record(Event::new("test", "tick").field("i", i));
+            }
+            *keep.lock().unwrap() = Some(cx.events());
+            Ok(())
+        }))
+        .unwrap();
+        let log = kept.lock().unwrap().take().unwrap();
+        let lines = sink.bytes.lock().unwrap().iter().filter(|b| **b == b'\n').count() as u64;
+        // Lines written but not yet flushed when the write failed count as
+        // lost too: they may not have reached the file.
+        assert_eq!(lines, 100);
+        assert!(log.lost() >= 200 && lines + log.lost() >= 300, "{}", log.lost());
     }
 
     /// Events are recorded with no reader at all, numbered and dated on

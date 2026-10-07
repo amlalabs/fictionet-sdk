@@ -1,5 +1,5 @@
 //! What the core records about a running world, for the
-//! [dashboard](crate::dashboard).
+//! [dashboard](crate::observe#the-dashboard).
 //!
 //! Every [`pair`](crate::pair) and every [`Attachment`](crate::Attachment)
 //! carries a [`Meter`]: packet and byte counts for each direction, and a

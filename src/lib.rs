@@ -445,7 +445,7 @@ pub trait Interface: Send + 'static {
     fn send(&mut self, packet: Packet);
 
     /// The link this interface is one end of, for the
-    /// [dashboard](crate::dashboard). Only [`End`] and [`Attachment`] have
+    /// [dashboard](crate::observe#the-dashboard). Only [`End`] and [`Attachment`] have
     /// one.
     #[doc(hidden)]
     fn observe_link(&self) -> Option<observe::LinkHandle> {

@@ -572,7 +572,9 @@ pub fn delay(cx: &Cx, by: Duration, inner: impl Interface) -> End {
 /// being sent. A packet leaves when its last bit has been sent: a 1,000-byte
 /// packet on a 1 Mbit/s link leaves 8 ms after the link started sending it.
 /// So with `queue` 10, a burst of 11 packets loses the 11th. A rate of 0
-/// sends nothing: the queue fills and every later packet is dropped.
+/// sends nothing: the queue fills and every later packet is dropped. The
+/// drops are recorded as `bottleneck.drop` [repeats](crate::events#repeats),
+/// with how many packets were waiting (`waiting`).
 #[track_caller]
 pub fn bottleneck(cx: &Cx, bits_per_second: u64, queue: usize, inner: impl Interface) -> End {
     shape(cx, "bottleneck", inner, move |waiting: &Queue, now: Instant, len: usize| {
@@ -728,7 +730,7 @@ where
                         queues[i].packets.push_back((leaves, packet));
                     } else {
                         let waiting = queues[i].packets.len();
-                        crate::observe::record_drop(&cx, name, &packet, &format!("the queue was full, {waiting} packets waiting"));
+                        crate::observe::record_drop(&cx, name, &packet, "the queue was full", crate::events::Fields::new().with("waiting", waiting as u64));
                     }
                 }
                 Event::Timer => {
@@ -1065,6 +1067,34 @@ mod tests {
             // Room again, once the queue has emptied.
             sandbox.send(Packet(vec![1; 100]));
             assert_eq!(far.recv(&cx).await?, Packet(vec![1; 100]));
+            Ok(())
+        }))
+        .unwrap();
+    }
+
+    /// A flooded bottleneck counts its drops: a few events, not one per
+    /// packet, so the flood pushes nothing else out of the log.
+    #[test]
+    fn a_flooded_bottleneck_counts_its_drops() {
+        block_on(run(|cx| async move {
+            let (mut sandbox, inner) = pair();
+            let _far = bottleneck(&cx, 0, 10, inner);
+            cx.record(crate::events::Event::new("http", "request"));
+            let flood = crate::events::MAX_EVENTS + 10_000;
+            for i in 0..flood {
+                sandbox.send(Packet(vec![0x45; 20]));
+                if i % 32 == 31 {
+                    cx.yield_now().await?;
+                }
+            }
+            cx.sleep(Duration::from_millis(1500)).await?;
+            cx.record(crate::events::Event::new("http", "request"));
+            let events = cx.events();
+            assert_eq!(events.of("http", "request").len(), 2);
+            let drops = events.of("bottleneck", "drop");
+            assert!(drops.len() <= 4, "{drops:?}");
+            assert_eq!(drops.iter().map(|e| e.u64("count").unwrap()).sum::<u64>(), flood as u64 - 10);
+            assert_eq!(drops[0].str("why"), Some("the queue was full"));
             Ok(())
         }))
         .unwrap();

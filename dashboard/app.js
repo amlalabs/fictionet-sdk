@@ -265,7 +265,8 @@ function addEvent(n) {
   if (n.kind === 'drop' && n.node) {
     const node = state.nodes.get(n.node);
     if (node) {
-      node.drops++;
+      // A drop event counts its repeats (see the events module's Repeats).
+      node.drops += n.fields?.count ?? 1;
       if (node.g) {
         node.g.remove();
         node.g = null;

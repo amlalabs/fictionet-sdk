@@ -205,8 +205,8 @@ repeats.
 broadcast and multicast reach every member, so a MoldUDP64 feed sent to a
 group reaches every member that joined it (`udp::Endpoint::join`). The
 router sends the prefix to the LAN, its first address answers DNS for the
-members, and the LAN's drops are recorded as `net.blocked` events with
-`why` `Lan`:
+members, and the LAN's drops are recorded as `net.blocked` repeats with
+`why` `Lan` (see Events below):
 
 ```rust
 Net::new()
@@ -291,20 +291,37 @@ let logins = events.of("prompt", "login");
 
 The file has one JSON object per line: `seq`, `at`, `source`, `kind`,
 `level`, `summary`, `sandbox`, `conn`, `local`, `peer`, `transport`,
-`sni`, `fields`, then the task that recorded it (`node`, `task`, `file`,
-`line`, `parent`). The network's first event is `run.start`, whose `wall`
-field puts the run's clock on a calendar. Field names are fixed by the
-code that records; names that come from the wire, such as LDAP
-attributes, go under one field as an object.
+`tls`, `sni`, `alpn`, `fields`, then the task that recorded it (`node`,
+`task`, `file`, `line`, `parent`). The network's first event is
+`run.start`, whose `wall` field puts the run's clock on a calendar. Field
+names are fixed by the code that records; names that come from the wire,
+such as LDAP attributes, go under one field as an object.
+
+Events that come once per packet, such as `net.blocked` for a packet the
+network refused and `drop` from a LAN, a router or a bottleneck, are
+repeats (`cx.record_repeat`). An agent decides how many of them there
+are, so the log counts them: the first of a run of alike repeats is
+recorded with `count` 1, and the rest of the next second are counted
+into one more event with their `count`, and with `[low, high]` for each
+number that changed, such as `dst_port`. The sum of `count` is how many
+packets there were. A port scan of 65,535 ports to one machine costs a
+couple of events a second.
 
 The log holds the latest 50,000 events, up to 16 MiB of them
 (`events::MAX_EVENTS`, `events::MAX_EVENT_BYTES`), and drops the oldest
-past that. A file or a callback set halfway through a run first gets
-what the log still holds, then every event that follows, so it misses
-nothing unless the log had already dropped some. A reader that missed
-events gets one `events.dropped` event that counts them. A line the
-file's writer could not keep up with is counted in `events.lost()`; a
-grader throws such a sample away.
+past that. Repeats have bounds of their own beside those: the latest
+5,000, up to 2 MiB (`events::MAX_REPEATS`, `events::MAX_REPEAT_BYTES`).
+A flood of repeats pushes out only older repeats, never a service's
+event, an HTTP request, a DNS query, a TLS handshake or a connection's
+open and close.
+
+A file or a callback set halfway through a run first gets what the log
+still holds, then every event that follows, so it misses nothing unless
+the log had already dropped some. Where a reader missed events, an
+`events.dropped` event counts them. The run's end records the counts
+still open and waits for file writers to write every line. A line a
+file's writer could not keep up with, or could not write, is counted in
+`events.lost()`; a grader throws such a sample away.
 
 ## 6. A scenario
 
@@ -341,14 +358,3 @@ The dashboard lists the events under **Events**, from what the log held
 when it connected. To decode a service's packets there, register its decoder as a `Present`
 in an `observe::Registry`, and give the registry to `Net::observe`. The
 built-in registry already decodes DNS, HTTP, TLS, Modbus and many more.
-
-## Moving a world from `Sites::on_event`
-
-- `Sites::on_event(f)` is `cx.events().subscribe(f)`.
-- `web::Event::Dns` is an event with source `dns`, kind `query`; `Tls` is
-  `tls.handshake`; `Http` is `http.request`; `HttpError` is `http.error`;
-  `Attached`, `Bound`, `Detached` and `Blocked` are `net.*`. The sandbox and
-  connection number are in `event.conn`.
-- Handlers take `http::Request<web::Body>` instead of hyper's `Incoming`.
-- A response extension a handler used for the log becomes
-  `events::Fields`, which arrive as the event's fields.
