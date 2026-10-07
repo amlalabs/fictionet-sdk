@@ -792,7 +792,7 @@ fn a_plc_and_a_web_server_on_one_net_with_observe_decoding_both() {
         Net::new()
             .ipv4_only()
             .host("plc", |h| h.at(PLC_ADDR).dns_name("plc1.plant.test").tcp(modbus::PORT, plant.clone(), || Plc))
-            .host("hmi", |h| h.dns_name("hmi.plant.test").accept(80, httpd::Site::new(hmi)))
+            .host("hmi", |h| h.dns_name("hmi.plant.test").accept(80, httpd::Server::new(hmi)))
             .serve(&cx, attachments)?;
 
         let s = sandbox(&cx, attacher.attach("operator")?, ME);

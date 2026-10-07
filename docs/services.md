@@ -125,7 +125,7 @@ a reader can place every event. The `run.start` event's `wall` field
 holds the host's wall clock at the start of the run.
 
 HTTP follows the same rule. `httpd` sends a `Date` header only when the
-world gave its date at the start of the run (`Sites::date`, `Site::date`,
+world gave its date at the start of the run (`Sites::date`, `Server::date`,
 `Website::date`, `Http1::date` or `HttpOptions::date`), and the header is
 that date plus `ctx.now()`. With no world date, responses carry no `Date`
 header at all, as RFC 9110 allows for a server without a clock: a world
@@ -189,7 +189,7 @@ Other kinds of port:
   client sends (`Sni::Any`, `Sni::Names` for the host's DNS names, or one
   name); several calls on one port route by SNI.
 - `accept(port, accept)` and `tls_accept(port, sni, config, accept)`: an
-  `Accept` of the world's own. HTTP is one: `httpd::Site`, below.
+  `Accept` of the world's own. HTTP is one: `httpd::Server`, below.
 
 Each sandbox may hold 256 connections at once to one machine, and the
 bytes its connections hold together, read or waiting to be written, are
@@ -239,21 +239,21 @@ An axum `Router`, or any tower service over `http::Request<web::Body>`,
 runs with `httpd::tower(service)`. A handler adds facts to its request's
 event by putting `events::Fields` in its response's extensions.
 
-On a network, `httpd::Site` is the `Accept` that serves a handler on a
+On a network, `httpd::Server` is the `Accept` that serves a handler on a
 port, and `httpd::Website` puts one on ports 80 and 443 as `web::Sites`
 does:
 
 ```rust
-use fictionet::stdlib::httpd::{Site, Website};
+use fictionet::stdlib::httpd::{Server, Website};
 
 Net::new()
-    .host("intranet", |h| h.dns_name("intranet.corp.test").accept(80, Site::new(api.clone())))
-    .add_host(Website::new(api).tls(move |_| config.clone()).on(Host::new("www").dns_name("www.corp.test")))
+    .host("intranet", |h| h.dns_name("intranet.corp.test").accept(80, Server::new(api.clone())))
+    .add_host(Website::new(api).tls(move |_| config.clone()).served_by(Host::new("www").dns_name("www.corp.test")))
     /* ... */;
 ```
 
 Sites of several hosts at one address share the port as virtual hosts:
-the first host's `Site` takes in the others through `Accept::share`. `Net`
+the first host's `Server` takes in the others through `Accept::share`. `Net`
 itself knows nothing of HTTP, so a copy of `httpd` with its own handlers
 plugs in the same way.
 

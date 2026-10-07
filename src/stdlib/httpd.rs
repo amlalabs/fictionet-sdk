@@ -16,7 +16,7 @@
 //!   with several sites at one address does, with the redirect to https and
 //!   the `421 Misdirected Request` of [`web::Sites`](crate::stdlib::web::Sites).
 //!
-//! On a [`Net`](crate::stdlib::net::Net), a [`Site`] is the
+//! On a [`Net`](crate::stdlib::net::Net), a [`Server`] is the
 //! [`Accept`] that serves HTTP on a host's
 //! port: sites of several hosts at one address share the port as virtual
 //! hosts. [`Website`] puts a site on ports 80 and 443 the way websites
@@ -36,7 +36,7 @@
 //! and [`serve_connection`] serves the rest of it on hyper's HTTP/1, which
 //! carries out upgrades. The handler sees hyper's `OnUpgrade` in the
 //! request's extensions, so an axum `WebSocketUpgrade` handler, or one that
-//! calls `hyper::upgrade::on`, works on a [`Site`] as it does on hyper.
+//! calls `hyper::upgrade::on`, works on a [`Server`] as it does on hyper.
 //! axum runs the socket in a tokio task, so that world needs a tokio
 //! runtime.
 //!
@@ -44,7 +44,7 @@
 //!
 //! The world owns its dates. A response carries a `Date` header only when
 //! the world gave the date it was at the start of the run, with
-//! [`Http1::date`], [`HttpOptions::date`], [`Site::date`] or
+//! [`Http1::date`], [`HttpOptions::date`], [`Server::date`] or
 //! [`Website::date`]: the header is then that date plus the run's clock.
 //! Without one, responses have no `Date` header (RFC 9110 lets a server
 //! with no clock leave it out). The host's clock is never used, so a world
@@ -1472,18 +1472,18 @@ pub async fn serve_connection<C: Connection + Unpin>(cx: &Cx, conn: C, info: Con
 /// [`Accept`] that serves the host's site for each of its DNS names.
 ///
 /// Every host at one address that serves HTTP on a port shares that port:
-/// the first host's `Site` takes in the others' sites as
+/// the first host's `Server` takes in the others' sites as
 /// [`VirtualHosts`], and each request goes to the site its host names.
 /// Over TLS, ALPN offers `h2` and `http/1.1`.
 ///
 /// ```
 /// # use fictionet::stdlib::{httpd, net::Host};
 /// let page = httpd::Router::new().get("/", |_, _| http::Response::new("hello\n".into()));
-/// let host = Host::new("www").dns_name("www.corp.test").accept(80, httpd::Site::new(page));
+/// let host = Host::new("www").dns_name("www.corp.test").accept(80, httpd::Server::new(page));
 /// # drop(host);
 /// ```
 #[derive(Clone)]
-pub struct Site {
+pub struct Server {
     vhost: VHost,
     default_host: bool,
     limits: Limits,
@@ -1491,15 +1491,15 @@ pub struct Site {
     vhosts: VirtualHosts,
 }
 
-impl Site {
+impl Server {
     /// A site served by `handler`, over plain HTTP.
-    pub fn new(handler: impl Handler) -> Site {
-        Site::shared(Arc::new(handler))
+    pub fn new(handler: impl Handler) -> Server {
+        Server::shared(Arc::new(handler))
     }
 
     /// The same, from a shared handler.
-    pub fn shared(handler: Arc<dyn Handler>) -> Site {
-        Site {
+    pub fn shared(handler: Arc<dyn Handler>) -> Server {
+        Server {
             vhost: VHost { handler, https: false, plain_http: false },
             default_host: false,
             limits: Limits::default(),
@@ -1511,27 +1511,27 @@ impl Site {
     /// The site is served over HTTPS: on a TLS port it answers, and on a
     /// plain port its requests get a `301` to https, unless
     /// [`plain_http`](Self::plain_http).
-    pub fn https(mut self) -> Site {
+    pub fn https(mut self) -> Server {
         self.vhost.https = true;
         self
     }
 
     /// With [`https`](Self::https), answers plain HTTP too, with no
     /// redirect.
-    pub fn plain_http(mut self) -> Site {
+    pub fn plain_http(mut self) -> Server {
         self.vhost.plain_http = true;
         self
     }
 
     /// Answers requests at its address whose host names no site there.
     /// The first default site at an address keeps the role.
-    pub fn default_host(mut self) -> Site {
+    pub fn default_host(mut self) -> Server {
         self.default_host = true;
         self
     }
 
     /// Sets the limits and timers.
-    pub fn limits(mut self, limits: Limits) -> Site {
+    pub fn limits(mut self, limits: Limits) -> Server {
         self.limits = limits;
         self
     }
@@ -1539,13 +1539,13 @@ impl Site {
     /// Sends `Date` headers: `start` is the world's date and time at the
     /// start of the run. See [Dates](self#dates). Sites that share a port
     /// use the first one's.
-    pub fn date(mut self, start: SystemTime) -> Site {
+    pub fn date(mut self, start: SystemTime) -> Server {
         self.date = Some(start);
         self
     }
 }
 
-impl Accept for Site {
+impl Accept for Server {
     fn serve(&self, cx: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         let handler: Arc<dyn Handler> = Arc::new(self.vhosts.clone());
         let opts = HttpOptions {
@@ -1565,7 +1565,7 @@ impl Accept for Site {
 
     fn share(&self, names: &[String], other: &Arc<dyn Accept>) -> bool {
         let other: &dyn Any = &**other;
-        let Some(site) = other.downcast_ref::<Site>() else { return false };
+        let Some(site) = other.downcast_ref::<Server>() else { return false };
         for name in names {
             self.vhosts.insert(name, site.vhost.clone());
         }
@@ -1579,7 +1579,7 @@ impl Accept for Site {
 /// A website on ports 80 and 443, as [`web::Sites`](crate::stdlib::web::Sites)
 /// serves one: with TLS, HTTPS on 443 for each of the host's names and a
 /// redirect to it on 80 (unless [`plain_http`](Self::plain_http));
-/// without, plain HTTP on 80. [`on`](Self::on) puts it on a host.
+/// without, plain HTTP on 80. [`served_by`](Self::served_by) puts it on a host.
 #[derive(Clone)]
 pub struct Website {
     handler: Arc<dyn Handler>,
@@ -1623,8 +1623,8 @@ impl Website {
     }
 
     /// `host`, serving this website.
-    pub fn on(self, host: Host) -> Host {
-        let mut plain = Site::shared(self.handler.clone());
+    pub fn served_by(self, host: Host) -> Host {
+        let mut plain = Server::shared(self.handler.clone());
         plain.vhost.https = self.tls.is_some();
         plain.vhost.plain_http = self.plain_http;
         plain.default_host = self.default_host;
@@ -1633,7 +1633,7 @@ impl Website {
         match self.tls {
             None => host,
             Some(config) => {
-                let mut secure = Site::shared(self.handler).https();
+                let mut secure = Server::shared(self.handler).https();
                 secure.default_host = self.default_host;
                 secure.date = self.date;
                 host.tls_accept(443, Sni::Names, move |cx| config(cx), secure)

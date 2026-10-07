@@ -171,7 +171,7 @@
 //! use std::sync::Arc;
 //! use fictionet::{Attachments, Cx, Result};
 //! use fictionet::stdlib::codec::{Ending, LineError, Lines};
-//! use fictionet::stdlib::httpd::{Router, Site};
+//! use fictionet::stdlib::httpd::{Router, Server};
 //! use fictionet::events::Event;
 //! use fictionet::stdlib::net::Net;
 //! use fictionet::stdlib::serve::{Flow, ServeCtx, Service};
@@ -199,7 +199,7 @@
 //!     let site = Router::new().get("/", |_, _| http::Response::new("hello\n".into()));
 //!     cx.events().to_file(std::env::temp_dir().join("events.jsonl"))?;
 //!     Net::new()
-//!         .host("www", |h| h.dns_name("www.example.test").accept(80, Site::new(site)))
+//!         .host("www", |h| h.dns_name("www.example.test").accept(80, Server::new(site)))
 //!         .host("echo", |h| h.dns_name("echo.example.test").tcp(7, Arc::new(()), || Echo))
 //!         .serve(cx, attachments)
 //! }

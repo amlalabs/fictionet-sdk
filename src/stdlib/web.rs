@@ -782,7 +782,7 @@ impl Site {
 
     /// The site as a host of a [`Net`], named `name`.
     pub fn into_host(self, name: &str) -> Host {
-        let mut host = self.website.on(Host::new(name).dns_name(name));
+        let mut host = self.website.served_by(Host::new(name).dns_name(name));
         if let Some(a) = self.at {
             host = host.at(a);
         }

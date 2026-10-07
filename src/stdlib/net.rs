@@ -5,7 +5,7 @@
 //! [`Net`] builds the whole network around the [`Host`]s a world declares.
 //! Each host has addresses, DNS names, and services on its ports: any
 //! [`Service`] over TCP or UDP, the same over TLS chosen by SNI, and any
-//! [`Accept`] of the world's own, such as [`httpd::Site`] for HTTP with
+//! [`Accept`] of the world's own, such as [`httpd::Server`] for HTTP with
 //! name-based virtual hosting. Every sandbox that attaches is put on the
 //! sandboxes' subnet, given an address by DHCP or by its first packet, and
 //! kept from reaching the other sandboxes. A world then writes only its
@@ -33,7 +33,7 @@
 //! cx.events().to_file("/tmp/office-events.jsonl")?;
 //! Net::new()
 //!     .host("dc01", |h| h.at("10.20.0.10".parse::<std::net::Ipv4Addr>().unwrap()).dns_name("dc01.corp.test").tcp(389, directory.clone(), || Ldap))
-//!     .host("www", |h| h.dns_name("intranet.corp.test").accept(80, httpd::Site::new(intranet)))
+//!     .host("www", |h| h.dns_name("intranet.corp.test").accept(80, httpd::Server::new(intranet)))
 //!     .host("plc1", |h| h.at("10.30.0.5".parse::<std::net::Ipv4Addr>().unwrap()).tcp(502, plant, || Plc))
 //!     .serve(&cx, attachments)?;
 //! # Ok(())
@@ -248,7 +248,7 @@ pub struct Arrival {
 }
 
 /// Serves connections on one port of a host. [`Host::tcp`] and
-/// [`Host::tls`] make one for a [`Service`]; [`httpd::Site`] is HTTP's.
+/// [`Host::tls`] make one for a [`Service`]; [`httpd::Server`] is HTTP's.
 /// A world writes its own for anything else.
 pub trait Accept: Any + Send + Sync {
     /// Serves one connection.
