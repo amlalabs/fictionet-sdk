@@ -200,7 +200,7 @@
 //! | [`codec`] | The tools every protocol is built on, none of them doing I/O: `Decode`, `Wire`, `Stream`, combinators, a recorder and fault injection. | yes | yes |  |  |  | yes | yes |
 //! | [`cotp`] | ISO transport on TCP: TPKT and COTP packets, with segment reassembly. | yes |  |  |  |  | yes | yes |
 //! | [`dcerpc`] | DCE/RPC over connections: bind, request and response PDUs, with fragment reassembly. | yes | yes |  |  |  | yes | yes |
-//! | `dhcp` | DHCP messages, used by `Net` and by the DHCP server attach runs for a VM. Hidden from the docs while its API settles. |  |  |  |  | built in | yes | yes |
+//! | `dhcp` | DHCP messages, used by `Net` and by the DHCP server attach runs for a VM. Hidden from the docs while its API settles. | yes |  |  |  | built in | yes | yes |
 //! | [`dhcpv6`] | DHCPv6 client, server and relay messages and their options. | yes | yes |  |  |  | yes | yes |
 //! | [`diameter`] | Diameter messages and AVPs. | yes | yes |  |  |  | yes | yes |
 //! | [`dnp3`] | DNP3 link frames, transport segments and application headers. | yes | yes |  |  |  | yes | yes |

@@ -12,6 +12,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use fictionet::stdlib::dhcp;
+use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::ip::checksum;
 use fictionet::{Interface, Packet, RecvError};
 
@@ -132,7 +133,7 @@ fn a_fake_qemu_gets_dhcp_arp_and_the_world() {
         let mut m = dhcp::Message::new(dhcp::BOOTREQUEST, 42);
         m.chaddr[..6].copy_from_slice(&VM);
         m.push(dhcp::opt::MESSAGE_TYPE, [dhcp::DISCOVER]);
-        send(&mut qemu, &frame([0xff; 6], 0x0800, &udp4([0; 4], 68, [255; 4], 67, &m.to_bytes())));
+        send(&mut qemu, &frame([0xff; 6], 0x0800, &udp4([0; 4], 68, [255; 4], 67, &m.to_bytes().unwrap())));
         let offer = recv(&mut qemu);
         assert_eq!(&offer[0..12], &[[0xff; 6], GATEWAY].concat()[..]);
         let ip = &offer[14..];

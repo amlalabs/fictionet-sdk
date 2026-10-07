@@ -731,7 +731,7 @@ fn dns_display(msg: &[u8]) -> Display {
 
 fn dhcp_display(bytes: &[u8]) -> Display {
     let mut packet = Decoded::default();
-    let Some(m) = fictionet::stdlib::dhcp::Message::parse(bytes) else {
+    let Ok(m) = <fictionet::stdlib::dhcp::Message as fictionet::stdlib::codec::Wire>::parse(bytes) else {
         return Display::from_packet(packet, "DHCP message");
     };
     let d = &mut packet;

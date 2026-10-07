@@ -18,6 +18,7 @@ use bytes::Bytes;
 use fictionet::prelude::*;
 use fictionet::stdlib::dns::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use fictionet::stdlib::dns::rr::{Name, RData, RecordType};
+use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::tls;
 use fictionet::events::{Event as Entry, Fields};
 use fictionet::stdlib::{ConnError, Connection, dhcp, ip, tcp, udp, web};
@@ -1172,7 +1173,7 @@ fn dhcp_msg(kind: u8, xid: u32, mac: u8) -> dhcp::Message {
 /// Sends a DHCP message from `src` to `dst` and returns the reply's IP
 /// destination and message.
 async fn dhcp_ask(cx: &Cx, end: &mut End, src: Ipv4Addr, dst: Ipv4Addr, m: &dhcp::Message) -> Option<(Ipv4Addr, dhcp::Message)> {
-    end.send(udp(src, 68, dst, 67, &m.to_bytes()));
+    end.send(udp(src, 68, dst, 67, &m.to_bytes().unwrap()));
     let p = recv_within(cx, end, SHORT).await?;
     let (from, to, proto, u) = parse(&p);
     assert_eq!((from, proto), (GATEWAY, 17));
@@ -1318,10 +1319,10 @@ fn dhcp_messages_round_trip() {
     m.ciaddr = Ipv4Addr::new(10, 0, 0, 5);
     m.push(dhcp::opt::REQUESTED_IP, [10, 0, 0, 5]);
     m.push(200, vec![1; 300]); // longer than one option entry
-    let bytes = m.to_bytes();
+    let bytes = m.to_bytes().unwrap();
     assert!(bytes.len() >= 300);
-    assert_eq!(dhcp::Message::parse(&bytes), Some(m));
-    assert_eq!(dhcp::Message::parse(&bytes[..239]), None);
+    assert_eq!(dhcp::Message::parse(&bytes), Ok(m));
+    assert_eq!(dhcp::Message::parse(&bytes[..239]), Err(dhcp::ParseError::Short));
 }
 
 #[test]

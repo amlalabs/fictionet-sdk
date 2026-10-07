@@ -114,7 +114,7 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::task::Poll;
 use std::time::Duration;
 
-use fictionet::stdlib::codec::Decode;
+use fictionet::stdlib::codec::{Decode, Wire};
 use fictionet::stdlib::dhcp::{self, opt};
 use fictionet::stdlib::dns::op::{Edns, Message, MessageType, OpCode, ResponseCode};
 use fictionet::stdlib::dns::rr::{DNSClass, RData, Record, RecordType, rdata::A, rdata::AAAA};
@@ -2008,7 +2008,7 @@ impl Shared {
             m.push(opt::DNS, gateway.octets());
         }
         let to = if kind != dhcp::NAK && !request.ciaddr.is_unspecified() { request.ciaddr } else { Ipv4Addr::BROADCAST };
-        udp_packet(gateway, dhcp::SERVER_PORT, to, dhcp::CLIENT_PORT, &m.to_bytes())
+        udp_packet(gateway, dhcp::SERVER_PORT, to, dhcp::CLIENT_PORT, &m.to_bytes().expect("a reply with distinct options writes"))
     }
 }
 
@@ -2044,7 +2044,7 @@ fn to_dhcp_server(packet: &[u8], h: &Header, gateway: Ipv4Addr) -> Option<Option
         return None;
     }
     let len = (u16::from_be_bytes([u[4], u[5]]) as usize).clamp(8, u.len());
-    Some(dhcp::Message::parse(&u[8..len]))
+    Some(dhcp::Message::parse(&u[8..len]).ok())
 }
 
 /// One attachment's time on the network, the same for a sandbox behind a

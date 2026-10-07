@@ -1072,6 +1072,7 @@ fn flush(vm: RawFd, outbox: &mut Outbox) -> Result<bool, Failure> {
 mod tests {
     use super::*;
     use crate::args::{Cidr, Lease};
+    use fictionet::stdlib::codec::Wire;
     use crate::ether::tests::{VM, solicitation};
 
     fn served() -> Link {
@@ -1098,7 +1099,7 @@ mod tests {
         let mut m = dhcp::Message::new(dhcp::BOOTREQUEST, 7);
         m.chaddr[..6].copy_from_slice(&VM);
         m.push(dhcp::opt::MESSAGE_TYPE, [dhcp::DISCOVER]);
-        let p = ether::udp4(Ipv4Addr::UNSPECIFIED, 68, Ipv4Addr::BROADCAST, 67, &m.to_bytes());
+        let p = ether::udp4(Ipv4Addr::UNSPECIFIED, 68, Ipv4Addr::BROADCAST, 67, &m.to_bytes().unwrap());
         eth(VM, ether::BROADCAST, ether::IPV4, &p)
     }
 
@@ -1354,7 +1355,7 @@ mod tests {
         let mut m = dhcp::Message::new(dhcp::BOOTREQUEST, 7);
         m.chaddr[..6].copy_from_slice(&VM);
         m.push(dhcp::opt::MESSAGE_TYPE, [dhcp::DISCOVER]);
-        let whole = ether::udp4(Ipv4Addr::new(10, 0, 0, 2), 68, Ipv4Addr::BROADCAST, 67, &m.to_bytes());
+        let whole = ether::udp4(Ipv4Addr::new(10, 0, 0, 2), 68, Ipv4Addr::BROADCAST, 67, &m.to_bytes().unwrap());
         let (first, second) = fragments4(&whole, 64);
         let frame = |p: &[u8]| eth(VM, ether::BROADCAST, ether::IPV4, p);
         let mut off = Link::new(Family::Off, Family::Off, 1500);

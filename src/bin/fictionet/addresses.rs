@@ -7,6 +7,7 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
+use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::dhcp::{self, opt};
 
 use crate::args::Lease;
@@ -43,7 +44,7 @@ pub(crate) fn server_id(lease: &Lease<Ipv4Addr>) -> Ipv4Addr {
 /// release, a decline, a request meant for another server, or a message
 /// that is not a request.
 pub(crate) fn dhcp4(lease: &Lease<Ipv4Addr>, mtu: u16, request: &[u8]) -> Option<(Vec<u8>, bool)> {
-    let m = dhcp::Message::parse(request)?;
+    let m = dhcp::Message::parse(request).ok()?;
     if m.op != dhcp::BOOTREQUEST || m.htype != 1 || m.hlen != 6 {
         return None;
     }
@@ -94,7 +95,7 @@ pub(crate) fn dhcp4(lease: &Lease<Ipv4Addr>, mtu: u16, request: &[u8]) -> Option
     // client with no address yet always receives.
     let unicast = kind != dhcp::NAK && !m.ciaddr.is_unspecified();
     let to = if unicast { m.ciaddr } else { Ipv4Addr::BROADCAST };
-    Some((ether::udp4(server, dhcp::SERVER_PORT, to, dhcp::CLIENT_PORT, &r.to_bytes()), !unicast))
+    Some((ether::udp4(server, dhcp::SERVER_PORT, to, dhcp::CLIENT_PORT, &r.to_bytes().ok()?), !unicast))
 }
 
 /// DHCP option 26: the interface MTU.
@@ -367,7 +368,7 @@ mod tests {
 
     #[test]
     fn discover_request_ack() {
-        let (offer, broadcast) = dhcp4(&lease4(), 1500, &client(dhcp::DISCOVER).to_bytes()).unwrap();
+        let (offer, broadcast) = dhcp4(&lease4(), 1500, &client(dhcp::DISCOVER).to_bytes().unwrap()).unwrap();
         assert!(broadcast);
         let (m, to) = answer(&offer);
         assert_eq!(to, Ipv4Addr::BROADCAST);
@@ -386,13 +387,13 @@ mod tests {
         let mut req = client(dhcp::REQUEST);
         req.push(opt::REQUESTED_IP, [10, 0, 0, 2]);
         req.push(opt::SERVER_ID, [10, 0, 0, 1]);
-        let (ack, _) = dhcp4(&lease4(), 1500, &req.to_bytes()).unwrap();
+        let (ack, _) = dhcp4(&lease4(), 1500, &req.to_bytes().unwrap()).unwrap();
         assert_eq!(answer(&ack).0.message_type(), Some(dhcp::ACK));
 
         // A renewal comes from the address, and the answer goes back to it.
         let mut renew = client(dhcp::REQUEST);
         renew.ciaddr = Ipv4Addr::new(10, 0, 0, 2);
-        let (ack, broadcast) = dhcp4(&lease4(), 1500, &renew.to_bytes()).unwrap();
+        let (ack, broadcast) = dhcp4(&lease4(), 1500, &renew.to_bytes().unwrap()).unwrap();
         assert!(!broadcast);
         let (m, to) = answer(&ack);
         assert_eq!((m.message_type(), to), (Some(dhcp::ACK), Ipv4Addr::new(10, 0, 0, 2)));
@@ -402,7 +403,7 @@ mod tests {
     fn wrong_address_is_nakked_and_other_servers_are_left_alone() {
         let mut req = client(dhcp::REQUEST);
         req.push(opt::REQUESTED_IP, [10, 0, 0, 9]);
-        let (nak, broadcast) = dhcp4(&lease4(), 1500, &req.to_bytes()).unwrap();
+        let (nak, broadcast) = dhcp4(&lease4(), 1500, &req.to_bytes().unwrap()).unwrap();
         assert!(broadcast);
         let (m, _) = answer(&nak);
         assert_eq!(m.message_type(), Some(dhcp::NAK));
@@ -412,22 +413,22 @@ mod tests {
         let mut other = client(dhcp::REQUEST);
         other.push(opt::REQUESTED_IP, [10, 0, 0, 2]);
         other.push(opt::SERVER_ID, [10, 0, 0, 254]);
-        assert!(dhcp4(&lease4(), 1500, &other.to_bytes()).is_none());
+        assert!(dhcp4(&lease4(), 1500, &other.to_bytes().unwrap()).is_none());
         for kind in [dhcp::RELEASE, dhcp::DECLINE, dhcp::OFFER] {
-            assert!(dhcp4(&lease4(), 1500, &client(kind).to_bytes()).is_none(), "{kind}");
+            assert!(dhcp4(&lease4(), 1500, &client(kind).to_bytes().unwrap()).is_none(), "{kind}");
         }
         let mut reply = client(dhcp::DISCOVER);
         reply.op = dhcp::BOOTREPLY;
-        assert!(dhcp4(&lease4(), 1500, &reply.to_bytes()).is_none());
+        assert!(dhcp4(&lease4(), 1500, &reply.to_bytes().unwrap()).is_none());
         assert!(dhcp4(&lease4(), 1500, &[0; 100]).is_none());
-        assert!(dhcp4(&lease4(), 1500, &client(dhcp::DISCOVER).to_bytes()[..239]).is_none());
+        assert!(dhcp4(&lease4(), 1500, &client(dhcp::DISCOVER).to_bytes().unwrap()[..239]).is_none());
     }
 
     #[test]
     fn inform_and_turned_off_settings() {
         let mut inform = client(dhcp::INFORM);
         inform.ciaddr = Ipv4Addr::new(10, 0, 0, 2);
-        let (ack, _) = dhcp4(&lease4(), 9000, &inform.to_bytes()).unwrap();
+        let (ack, _) = dhcp4(&lease4(), 9000, &inform.to_bytes().unwrap()).unwrap();
         let (m, _) = answer(&ack);
         assert_eq!(m.message_type(), Some(dhcp::ACK));
         assert_eq!(m.yiaddr, Ipv4Addr::UNSPECIFIED);
@@ -436,7 +437,7 @@ mod tests {
 
         let bare = Lease { gateway: None, dns: None, ..lease4() };
         assert_eq!(server_id(&bare), Ipv4Addr::new(10, 0, 0, 1));
-        let (offer, _) = dhcp4(&bare, 1500, &client(dhcp::DISCOVER).to_bytes()).unwrap();
+        let (offer, _) = dhcp4(&bare, 1500, &client(dhcp::DISCOVER).to_bytes().unwrap()).unwrap();
         let (_, payload) = ether::udp_to(&offer).unwrap();
         let m = dhcp::Message::parse(payload).unwrap();
         assert_eq!(m.option(opt::ROUTER), None);
