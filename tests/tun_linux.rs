@@ -1,7 +1,7 @@
 //! TCP and UDP endpoints against a real Linux network stack, through a tun
-//! device. Needs root and /dev/net/tun, so it only runs when
-//! `FICTIONET_TUN_TEST=1`; `tests/docker/tcpudp/run.sh` runs it in a
-//! container. Elsewhere it passes without doing anything.
+//! device. Needs root and /dev/net/tun, so it is ignored by default and
+//! runs with `--ignored`. `tests/docker/tcpudp/run.sh` runs it that way in
+//! a container.
 //!
 //! The container's kernel is the client: it has 10.9.0.1/24 and fd09::1/64
 //! on the tun device, and the endpoints are 10.9.0.2 and fd09::2.
@@ -357,10 +357,8 @@ fn client(log: &Mutex<Vec<String>>) {
 }
 
 #[test]
+#[ignore = "needs root and /dev/net/tun; tests/docker/tcpudp/run.sh runs it"]
 fn a_linux_client_through_tun() {
-    if std::env::var("FICTIONET_TUN_TEST").is_err() {
-        return;
-    }
     let tun = open_tun("fn0");
     sh("ip link set fn0 up mtu 1500 && ip addr add 10.9.0.1/24 dev fn0 && ip -6 addr add fd09::1/64 dev fn0 nodad");
     let log = Arc::new(Mutex::new(Vec::new()));
