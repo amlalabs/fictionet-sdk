@@ -408,3 +408,40 @@ def test_k8s_tiny_cpu_limit(tmp_path):
     spec = fictionet_sandbox(WEB_WORLD_IMAGE, backend="k8s", cache_dir=tmp_path, agent_limits=Limits(cpus=0.0014))
     res = yaml.safe_load(spec.config.values.read_text())["services"]["default"]["resources"]
     assert res == {"requests": {"cpu": "1m"}, "limits": {"cpu": "1m"}}
+
+
+@pytest.mark.skipif(
+    os.environ.get("INSPECT_FICTIONET_DOCKER") != "1",
+    reason="builds images with Docker; set INSPECT_FICTIONET_DOCKER=1",
+)
+def test_edited_source_is_rebuilt(tmp_path):
+    """The image tag follows the build's configuration, not the source, so
+    an edit leaves the compose file and the tag as they were. Inspect's
+    docker sandbox runs `docker compose build` for each task anyway, and
+    BuildKit's cache sees the changed file. This builds the way Inspect
+    does, edits the source, builds again, and checks that the image changed."""
+    import subprocess
+
+    (tmp_path / "Dockerfile").write_text("FROM busybox:1.36\nCOPY msg.txt /msg.txt\n")
+    (tmp_path / "msg.txt").write_text("one\n")
+    spec = fictionet_sandbox(WEB_WORLD_IMAGE, agent_image=Build(tmp_path / "Dockerfile"), cache_dir=tmp_path / "cache")
+    image = yaml.safe_load(Path(spec.config).read_text())["services"]["default"]["image"]
+
+    def build_and_read() -> str:
+        subprocess.run(
+            ["docker", "compose", "-p", "inspect-fictionet-rebuild-test", "-f", spec.config, "build", "default"],
+            check=True,
+            capture_output=True,
+        )
+        out = subprocess.run(["docker", "run", "--rm", image, "cat", "/msg.txt"], check=True, capture_output=True)
+        return out.stdout.decode()
+
+    try:
+        assert build_and_read() == "one\n"
+        (tmp_path / "msg.txt").write_text("two\n")
+        assert fictionet_sandbox(
+            WEB_WORLD_IMAGE, agent_image=Build(tmp_path / "Dockerfile"), cache_dir=tmp_path / "cache"
+        ) == spec
+        assert build_and_read() == "two\n"
+    finally:
+        subprocess.run(["docker", "rmi", "-f", image], capture_output=True)
