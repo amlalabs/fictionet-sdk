@@ -30,6 +30,16 @@
 //! request's head and on its body. [`serve_connection`] picks the version for a
 //! connection: HTTP/2 by ALPN or by the client's preface, else HTTP/1.
 //!
+//! A request that asks to switch protocols (`Connection: upgrade` with an
+//! `Upgrade` field, as a WebSocket handshake does) makes [`Http1`] hand
+//! the connection back ([`Upgrade::Handoff`](serve::Upgrade::Handoff)),
+//! and [`serve_connection`] serves the rest of it on hyper's HTTP/1, which
+//! carries out upgrades. The handler sees hyper's `OnUpgrade` in the
+//! request's extensions, so an axum `WebSocketUpgrade` handler, or one that
+//! calls `hyper::upgrade::on`, works on a [`Site`] as it does on hyper.
+//! axum runs the socket in a tokio task, so that world needs a tokio
+//! runtime.
+//!
 //! # Dates
 //!
 //! The world owns its dates. A response carries a `Date` header only when
@@ -791,6 +801,9 @@ pub struct Http1 {
     opts: Http1Options,
     /// The world's date at the start of the run, for `Date` headers.
     date: Option<SystemTime>,
+    /// The head of a request that asked for a protocol upgrade, as bytes,
+    /// once the connection is handed over for it.
+    handoff: Option<Vec<u8>>,
     head: Option<RequestHead>,
     body: Vec<u8>,
     too_big: bool,
@@ -805,7 +818,17 @@ impl Http1 {
 
     /// Answers with `handler` and `opts`.
     pub fn with(handler: Arc<dyn Handler>, opts: Http1Options) -> Http1 {
-        Http1 { handler, opts, date: None, head: None, body: Vec::new(), too_big: false, started: Instant::ZERO }
+        Http1 { handler, opts, date: None, handoff: None, head: None, body: Vec::new(), too_big: false, started: Instant::ZERO }
+    }
+
+    /// The head of the request that asked for a protocol upgrade, such as
+    /// a WebSocket handshake, after the service handed the connection back
+    /// for it ([`Upgrade::Handoff`](serve::Upgrade::Handoff)): its bytes,
+    /// to be read again in front of the connection's unread ones.
+    /// [`serve_connection`] serves such a connection on hyper's HTTP/1,
+    /// which carries out the upgrade.
+    pub fn take_handoff(&mut self) -> Option<Vec<u8>> {
+        self.handoff.take()
     }
 
     /// Sends a `Date` header with each response: `start`, the world's date
@@ -887,6 +910,16 @@ impl Http1 {
         ctx.set_timer(HEAD, self.opts.header_timeout);
         Flow::Continue
     }
+}
+
+/// Whether an HTTP/1.1 request asks to switch protocols (RFC 9110 section
+/// 7.8): it has an `Upgrade` field and names `upgrade` in `Connection`.
+fn asks_upgrade(head: &RequestHead) -> bool {
+    let has = |name: &str| head.headers.iter().any(|h| h.name.eq_ignore_ascii_case(name));
+    let connection_upgrade = head.headers.iter().any(|h| {
+        h.name.eq_ignore_ascii_case("connection") && h.value.split(|b| *b == b',').any(|t| t.trim_ascii().eq_ignore_ascii_case(b"upgrade"))
+    });
+    head.version == http1::Version::Http11 && head.method != "CONNECT" && has("upgrade") && connection_upgrade
 }
 
 /// The head at the start of `unread`, read with an empty Host field added
@@ -1061,6 +1094,13 @@ impl serve::Service for Http1 {
         match item {
             H1::Head(head) => {
                 ctx.cancel_timer(HEAD);
+                if asks_upgrade(&head) {
+                    let mut bytes = Vec::new();
+                    if fictionet::stdlib::codec::Wire::write(&head, &mut bytes).is_ok() {
+                        self.handoff = Some(bytes);
+                        return Ok(Flow::Upgrade(serve::Upgrade::Handoff));
+                    }
+                }
                 ctx.set_timer(BODY, self.opts.body_timeout);
                 if head.expects_continue() {
                     ctx.reply().extend_from_slice(b"HTTP/1.1 100 Continue\r\n\r\n");
@@ -1369,9 +1409,16 @@ pub async fn serve_connection<C: Connection + Unpin>(cx: &Cx, conn: C, info: Con
         seed: opts.seed,
         ..ServeOptions::default()
     };
-    let mut service = Http1::with(handler, opts.h1);
+    let mut service = Http1::with(handler.clone(), opts.h1);
     service.date = opts.date;
-    let _ = serve::serve(cx, conn, info, &mut service, &(), &serve_opts).await;
+    let served = serve::serve(cx, conn, info.clone(), &mut service, &(), &serve_opts).await;
+    if let Ok(serve::Served::Upgraded(serve::Upgrade::Handoff, rest)) = served
+        && let Some(head) = service.take_handoff()
+    {
+        // A request that asks for an upgrade: hyper's HTTP/1 reads it again
+        // and carries the upgrade out.
+        h2::serve_upgrade(cx, Prefixed::new(head, rest), handler, info, opts.journal.clone(), opts.date).await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1583,6 +1630,40 @@ mod h2 {
         // hyper reads all the time on HTTP/2, so a reset ends it on its own.
         let served = builder.serve_connection(io, route);
         let Ok(result) = cx.race(None, served).await else { return };
+        report(cx, &info, journal, &broke, result);
+    }
+
+    /// Runs hyper's HTTP/1 server on `conn`, with upgrades: where
+    /// [`Http1`] hands over a connection whose request asks for a protocol
+    /// upgrade, such as a WebSocket handshake. The request carries hyper's
+    /// `OnUpgrade`, so `hyper::upgrade::on` and axum's `WebSocketUpgrade`
+    /// work, and the connection goes to whatever awaits it once the `101`
+    /// is sent. Other requests on the connection are answered as usual.
+    pub(super) async fn serve_upgrade<C: Connection + Unpin + Send + 'static>(
+        cx: &Cx,
+        conn: C,
+        handler: Arc<dyn Handler>,
+        info: ConnInfo,
+        journal: Option<Journal>,
+        date: Option<SystemTime>,
+    ) {
+        let broke = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let io = Io { cx: cx.clone(), conn, broke: broke.clone(), buf: vec![0; 16 * 1024].into_boxed_slice() };
+        let route = Route { cx: cx.clone(), handler, info: Arc::new(info.clone()), journal: journal.clone(), date };
+        let mut builder = hyper::server::conn::http1::Builder::new();
+        builder.auto_date_header(false);
+        if cfg!(target_arch = "wasm32") {
+            builder.header_read_timeout(None);
+        } else {
+            builder.timer(CxTimer { cx: cx.clone() });
+        }
+        let served = builder.serve_connection(io, route).with_upgrades();
+        let Ok(result) = cx.race(None, served).await else { return };
+        report(cx, &info, journal, &broke, result);
+    }
+
+    /// Records how a connection hyper served ended, if in an error.
+    fn report(cx: &Cx, info: &ConnInfo, journal: Option<Journal>, broke: &std::sync::atomic::AtomicBool, result: Result<(), hyper::Error>) {
         let Some(j) = journal else { return };
         let broke = broke.load(std::sync::atomic::Ordering::Relaxed);
         let cause = match &result {
@@ -1595,7 +1676,7 @@ mod h2 {
             Ok(()) => None,
         };
         if let Some((cause, detail)) = cause {
-            j.record(cx, &info, error_event(&info, cause, detail));
+            j.record(cx, info, error_event(info, cause, detail));
         }
     }
 

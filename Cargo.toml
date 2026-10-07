@@ -71,7 +71,7 @@ web-time = "1"
 [dev-dependencies]
 fictionet-codegen = { path = "codegen" }
 fictionet-copy-modules = { path = "tests/copy_and_own" }
-axum = { version = "0.8", default-features = false }
+axum = { version = "0.8", default-features = false, features = ["ws"] }
 hyper = { version = "1.11.1", features = ["client"] }
 etherparse = "0.21"
 rcgen = "0.13"

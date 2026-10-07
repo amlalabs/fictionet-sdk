@@ -822,7 +822,10 @@ impl Site {
 ///
 /// The world checks the real site's certificate against the Mozilla root
 /// store (`webpki-roots`). Hop-by-hop headers (`Connection`, `Keep-Alive`,
-/// `Transfer-Encoding` and the like) are not passed on in either direction.
+/// `Transfer-Encoding` and the like) are not passed on in either direction,
+/// so it carries no protocol upgrades: a WebSocket handshake reaches the
+/// real site as a plain `GET`. A world that wants WebSockets serves them
+/// itself, with a handler on the site (see [`httpd`'s upgrades](crate::stdlib::httpd)).
 /// If the real site cannot be reached, the agent gets `502 Bad Gateway`.
 #[cfg(feature = "tokio")]
 #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]

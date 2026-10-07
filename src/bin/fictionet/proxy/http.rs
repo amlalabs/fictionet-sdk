@@ -9,7 +9,10 @@
 //!   the request in origin form (`GET /path`) without the proxy's own
 //!   headers, and passes the answer back. Each such request gets its own
 //!   connection to the world and ends with `Connection: close`, so the
-//!   client opens a new connection for its next one.
+//!   client opens a new connection for its next one. A request that asks
+//!   to switch protocols (`Connection: upgrade` with `Upgrade`, as a
+//!   WebSocket handshake does) keeps both fields, and so does a `101`
+//!   answer; after it, bytes go both ways until either side closes.
 //!
 //! Every request must carry the token in `Proxy-Authorization`, or gets
 //! `407`. A connection that cannot be made gets `502`, `503` or `504`,
@@ -170,9 +173,21 @@ fn absolute_uri(uri: &str) -> Result<Target, Reject> {
     Ok(Target::Forward { host, port, authority: authority_part.to_owned(), path })
 }
 
+/// Whether a head asks to switch protocols, or agrees to: an `Upgrade`
+/// field, and `upgrade` among the `Connection` options.
+fn upgrades(headers: &[(String, Vec<u8>)]) -> bool {
+    let has_upgrade = headers.iter().any(|(n, _)| n.eq_ignore_ascii_case("upgrade"));
+    has_upgrade
+        && headers.iter().any(|(n, v)| {
+            n.eq_ignore_ascii_case("connection") && String::from_utf8_lossy(v).split(',').any(|t| t.trim().eq_ignore_ascii_case("upgrade"))
+        })
+}
+
 /// Header fields that belong to one hop, never passed on: the standard
-/// ones, the proxy's own, and any that `Connection` names.
+/// ones, the proxy's own, and any that `Connection` names. The `Upgrade`
+/// field of a head that [`upgrades`] is kept: the upgrade goes end to end.
 fn hop_by_hop(headers: &[(String, Vec<u8>)]) -> Vec<String> {
+    let keep_upgrade = upgrades(headers);
     let mut names: Vec<String> =
         ["connection", "keep-alive", "proxy-connection", "proxy-authorization", "proxy-authenticate", "te", "trailer", "upgrade"]
             .iter()
@@ -188,7 +203,15 @@ fn hop_by_hop(headers: &[(String, Vec<u8>)]) -> Vec<String> {
             }
         }
     }
+    if keep_upgrade {
+        names.retain(|n| n != "upgrade");
+    }
     names
+}
+
+/// The `Connection` field that ends a forwarded head.
+fn connection(headers: &[(String, Vec<u8>)]) -> &'static [u8] {
+    if upgrades(headers) { b"Connection: upgrade\r\n\r\n" } else { b"Connection: close\r\n\r\n" }
 }
 
 fn push_headers(out: &mut Vec<u8>, headers: &[(String, Vec<u8>)], skip: &[String]) {
@@ -205,7 +228,8 @@ fn push_headers(out: &mut Vec<u8>, headers: &[(String, Vec<u8>)], skip: &[String
 
 /// The request head as the world's site gets it: origin form, no
 /// hop-by-hop fields, a `Host` if the client sent none, and
-/// `Connection: close`.
+/// `Connection: close`, or `Connection: upgrade` with its `Upgrade` field
+/// for a request that asks to switch protocols.
 pub(crate) fn forward_head(req: &Request) -> Vec<u8> {
     let Target::Forward { authority, path, .. } = &req.target else { unreachable!("only absolute-URI requests are forwarded") };
     let mut out = format!("{} {} HTTP/1.{}\r\n", req.method, path, req.version).into_bytes();
@@ -213,7 +237,7 @@ pub(crate) fn forward_head(req: &Request) -> Vec<u8> {
         out.extend_from_slice(format!("Host: {authority}\r\n").as_bytes());
     }
     push_headers(&mut out, &req.headers, &hop_by_hop(&req.headers));
-    out.extend_from_slice(b"Connection: close\r\n\r\n");
+    out.extend_from_slice(connection(&req.headers));
     out
 }
 
@@ -230,7 +254,8 @@ pub(crate) struct Answer {
 }
 
 /// An answer's head from the site, as the client gets it: no hop-by-hop
-/// fields, and `Connection: close`. Interim answers (`1xx` but `101`) are
+/// fields, and `Connection: close`; a `101` keeps its `Upgrade` field and
+/// says `Connection: upgrade`. Interim answers (`1xx` but `101`) are
 /// passed on as they are. `Ok(None)`: not all of it yet.
 pub(crate) fn rewrite_response(head: &[u8]) -> Result<Option<Answer>, String> {
     let mut fields = [httparse::EMPTY_HEADER; MAX_HEADERS];
@@ -247,8 +272,9 @@ pub(crate) fn rewrite_response(head: &[u8]) -> Result<Option<Answer>, String> {
     let line_end = head.windows(2).position(|w| w == b"\r\n").unwrap_or(0);
     let mut out = head[..line_end + 2].to_vec();
     let headers: Vec<(String, Vec<u8>)> = res.headers.iter().map(|h| (h.name.to_owned(), h.value.to_vec())).collect();
+    let headers = if status == 101 { headers } else { headers.into_iter().filter(|(n, _)| !n.eq_ignore_ascii_case("upgrade")).collect() };
     push_headers(&mut out, &headers, &hop_by_hop(&headers));
-    out.extend_from_slice(b"Connection: close\r\n\r\n");
+    out.extend_from_slice(if status == 101 { connection(&headers) } else { b"Connection: close\r\n\r\n" });
     Ok(Some(Answer { head: out, status, interim: false, len }))
 }
 
@@ -550,6 +576,23 @@ mod tests {
         // No Host: one is added from the URL. HTTP/1.0 stays 1.0.
         let r = parse("GET http://plain.test:81/ HTTP/1.0\r\n\r\n").unwrap();
         assert_eq!(String::from_utf8(forward_head(&r)).unwrap(), "GET / HTTP/1.0\r\nHost: plain.test:81\r\nConnection: close\r\n\r\n");
+        // A WebSocket handshake keeps its upgrade, both ways.
+        let r = parse(
+            "GET http://ws.test/echo HTTP/1.1\r\nHost: ws.test\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\n\
+             Sec-WebSocket-Key: k\r\nProxy-Authorization: x\r\n\r\n",
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(forward_head(&r)).unwrap(),
+            "GET /echo HTTP/1.1\r\nHost: ws.test\r\nUpgrade: websocket\r\nSec-WebSocket-Key: k\r\nConnection: upgrade\r\n\r\n"
+        );
+        let a = rewrite_response(b"HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: upgrade\r\nsec-websocket-accept: a\r\n\r\n")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(a.head).unwrap(),
+            "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nsec-websocket-accept: a\r\nConnection: upgrade\r\n\r\n"
+        );
     }
 
     #[test]
