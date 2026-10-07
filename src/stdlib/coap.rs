@@ -84,7 +84,7 @@ pub const MAX_FRAME_HEADER: usize = 6;
 /// The most bytes a [`Stream<Frames>`](fictionet::stdlib::codec::Stream) holds: one whole frame of the largest
 /// size.
 pub const MAX_BUFFERED: usize = MAX_FRAME_HEADER + MAX_TOKEN + MAX_FRAME_BODY;
-/// The longest body an [`Assembler`] collects.
+/// The longest body a [`Reassembler`] collects.
 pub const MAX_BODY: usize = 1 << 24;
 /// The byte that ends the options and starts the payload.
 pub const PAYLOAD_MARKER: u8 = 0xff;
@@ -833,10 +833,12 @@ impl<'a> IntoIterator for &'a Options {
     }
 }
 
-/// Why bytes are not a CoAP message or frame.
+/// Why bytes are not a CoAP message or frame, why a value cannot be
+/// written, or why a [`Reassembler`] refused a block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Error {
-    /// The bytes end before the header, token or an option does.
+    /// The bytes end before the header, token or an option does, or
+    /// before a complete frame arrived.
     Truncated,
     /// The UDP version field was not 1.
     Version(u8),
@@ -862,6 +864,40 @@ pub enum Error {
     /// A datagram over [`MAX_DATAGRAM`] bytes, or a frame body over
     /// [`MAX_FRAME_BODY`].
     TooLong(u64),
+    /// Bytes followed the frame.
+    Trailing,
+    /// The value cannot be written without changing it: a field exceeds
+    /// its limit, options are out of order, or the message type does not
+    /// allow its contents.
+    Unwritable,
+    /// The block does not start where the body so far ends.
+    OutOfOrder {
+        /// Where the next block should start.
+        expected: usize,
+        /// Where this one starts.
+        got: usize,
+    },
+    /// A block with more after it was not the full block size, or a BERT
+    /// block came to a reassembler that does not take them.
+    BlockSize,
+    /// The body would grow past the reassembler's limit.
+    BodyTooLarge,
+    /// The last block has already come.
+    AfterLastBlock,
+}
+
+impl Error {
+    /// The response code a server answers a request with when it refuses
+    /// it: 4.08 Request Entity Incomplete for a block out of order, 4.13
+    /// Request Entity Too Large for a body over the limit, and 4.00 Bad
+    /// Request for the rest.
+    pub fn code(self) -> Code {
+        match self {
+            Error::OutOfOrder { .. } => Code::REQUEST_ENTITY_INCOMPLETE,
+            Error::BodyTooLarge => Code::REQUEST_ENTITY_TOO_LARGE,
+            _ => Code::BAD_REQUEST,
+        }
+    }
 }
 
 impl std::fmt::Display for Error {
@@ -878,6 +914,12 @@ impl std::fmt::Display for Error {
             Error::TooManyOptions => write!(f, "more than {MAX_OPTIONS} options"),
             Error::EmptyPayload => f.write_str("payload marker with no payload"),
             Error::TooLong(n) => write!(f, "{n} bytes, over the limit"),
+            Error::Trailing => f.write_str("bytes after the CoAP frame"),
+            Error::Unwritable => f.write_str("CoAP value cannot be written without changing it"),
+            Error::OutOfOrder { expected, got } => write!(f, "block at offset {got}, expected {expected}"),
+            Error::BlockSize => f.write_str("block payload is the wrong size"),
+            Error::BodyTooLarge => f.write_str("body too large"),
+            Error::AfterLastBlock => f.write_str("the last block has already come"),
         }
     }
 }
@@ -1066,50 +1108,9 @@ impl Frame {
     }
 }
 
-/// Why bytes do not contain exactly one CoAP TCP frame.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FrameParseError {
-    /// The frame's header or body was refused.
-    Frame(Error),
-    /// The input ended before a complete frame arrived.
-    Truncated,
-    /// Bytes followed the frame.
-    Trailing,
-}
-
-impl core::fmt::Display for FrameParseError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Frame(e) => e.fmt(f),
-            Self::Truncated => f.write_str("CoAP frame ended early"),
-            Self::Trailing => f.write_str("bytes after the CoAP frame"),
-        }
-    }
-}
-
-impl core::error::Error for FrameParseError {}
-
-/// A CoAP value cannot be written without changing it.
-///
-/// A field exceeds its limit, options are out of order, or the message
-/// type does not allow its contents.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WriteError {
-    /// The value cannot be written without changing it.
-    Unwritable,
-}
-
-impl core::fmt::Display for WriteError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("CoAP value cannot be written without changing it")
-    }
-}
-
-impl core::error::Error for WriteError {}
-
 impl Wire for Message {
     type ParseError = Error;
-    type WriteError = WriteError;
+    type WriteError = Error;
 
     /// Reads one UDP datagram. Refuses bad versions, token lengths, type/code pairs, empty content, malformed options, and size limits.
     fn parse(b: &[u8]) -> Result<Message, Error> {
@@ -1143,13 +1144,13 @@ impl Wire for Message {
     /// Appends a datagram. Refuses invalid type/code pairs, empty content,
     /// long tokens, unsorted options, and size limits. Leaves `out` unchanged
     /// on error. [`Message::bad_block`] remains a separate UDP check.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         if !valid_type_code(self.kind, self.code)
             || self.token.len() > MAX_TOKEN
             || (self.code.is_empty()
                 && (!self.token.is_empty() || !self.options.is_empty() || !self.payload.is_empty()))
         {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         let mut bytes = vec![VERSION << 6 | self.kind.bits() << 4 | self.token.len() as u8, self.code.0];
         bytes.extend_from_slice(&self.message_id.to_be_bytes());
@@ -1161,24 +1162,24 @@ impl Wire for Message {
 }
 
 impl Wire for Frame {
-    type ParseError = FrameParseError;
-    type WriteError = WriteError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads exactly one TCP frame, with at most [`MAX_FRAME_BODY`] body bytes.
     /// Refuses long tokens, malformed options, incomplete frames, and trailing bytes.
-    fn parse(bytes: &[u8]) -> Result<Self, FrameParseError> {
-        match Self::parse_prefix(bytes).map_err(FrameParseError::Frame)? {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        match Self::parse_prefix(bytes)? {
             Some((frame, used)) if used == bytes.len() => Ok(frame),
-            Some(_) => Err(FrameParseError::Trailing),
-            None => Err(FrameParseError::Truncated),
+            Some(_) => Err(Error::Trailing),
+            None => Err(Error::Truncated),
         }
     }
 
     /// Appends a TCP frame. Refuses long tokens, unsorted options, and size
     /// limits. Leaves `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         if self.token.len() > MAX_TOKEN {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         let mut body = Vec::new();
         write_body(&mut body, &self.options, &self.payload, MAX_FRAME_BODY)?;
@@ -1220,7 +1221,7 @@ impl Wire for Frame {
 /// assert_eq!(stream.next(), Some(Ok(frame)));
 /// stream.end();
 /// assert_eq!(stream.next(), None);
-/// # Ok::<(), fictionet::stdlib::coap::WriteError>(())
+/// # Ok::<(), fictionet::stdlib::coap::Error>(())
 /// ```
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Frames;
@@ -1323,88 +1324,44 @@ impl Block {
     }
 }
 
-/// Why an [`Assembler`] refused a block.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum BlockError {
-    /// The block does not start where the body so far ends.
-    OutOfOrder {
-        /// Where the next block should start.
-        expected: usize,
-        /// Where this one starts.
-        got: usize,
-    },
-    /// A block with more after it was not the full block size, or a BERT
-    /// block came to an assembler that does not take them.
-    Size,
-    /// The body would grow past the assembler's limit.
-    TooLarge,
-    /// The last block has already come.
-    Done,
-}
-
-impl BlockError {
-    /// The response code a server answers a Block1 request with when it
-    /// refuses the block.
-    pub fn code(self) -> Code {
-        match self {
-            BlockError::OutOfOrder { .. } => Code::REQUEST_ENTITY_INCOMPLETE,
-            BlockError::TooLarge => Code::REQUEST_ENTITY_TOO_LARGE,
-            BlockError::Size | BlockError::Done => Code::BAD_REQUEST,
-        }
-    }
-}
-
-impl std::fmt::Display for BlockError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            BlockError::OutOfOrder { expected, got } => write!(f, "block at offset {got}, expected {expected}"),
-            BlockError::Size => f.write_str("block payload is the wrong size"),
-            BlockError::TooLarge => f.write_str("body too large"),
-            BlockError::Done => f.write_str("the last block has already come"),
-        }
-    }
-}
-
-impl std::error::Error for BlockError {}
-
 /// Puts a body back together from its blocks, as they come in order. A
 /// server uses it for a Block1 request body, a client for a Block2
 /// response. The block size may shrink partway, as RFC 7959 allows.
 /// There is no default: the largest body is always chosen with
-/// [`Assembler::new`] or [`Assembler::with_bert`].
+/// [`Reassembler::new`] or [`Reassembler::with_bert`].
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Assembler {
+pub struct Reassembler {
     body: Vec<u8>,
     max: usize,
     done: bool,
     bert: bool,
 }
 
-impl Assembler {
-    /// An assembler that takes bodies of up to `max` bytes, and never more
+impl Reassembler {
+    /// A reassembler that takes bodies of up to `max` bytes, and never more
     /// than [`MAX_BODY`]. It refuses BERT blocks (SZX 7) with
-    /// [`BlockError::Size`], whose code is 4.00 Bad Request, as RFC 7959
+    /// [`Error::BlockSize`], whose code is 4.00 Bad Request, as RFC 7959
     /// section 2.2 asks over UDP.
-    pub fn new(max: usize) -> Assembler {
-        Assembler { body: Vec::new(), max: max.min(MAX_BODY), done: false, bert: false }
+    pub fn new(max: usize) -> Reassembler {
+        Reassembler { body: Vec::new(), max: max.min(MAX_BODY), done: false, bert: false }
     }
 
-    /// Like [`Assembler::new`], but it also takes BERT blocks, for CoAP
+    /// Like [`Reassembler::new`], but it also takes BERT blocks, for CoAP
     /// over TCP once the peer's CSM offered Block-Wise-Transfer (RFC 8323
     /// section 6).
-    pub fn with_bert(max: usize) -> Assembler {
-        Assembler { bert: true, ..Assembler::new(max) }
+    pub fn with_bert(max: usize) -> Reassembler {
+        Reassembler { bert: true, ..Reassembler::new(max) }
     }
 
     /// Adds the next block and its payload. It returns whether the body
     /// is now whole. A refused block changes nothing.
-    pub fn push(&mut self, block: Block, payload: &[u8]) -> Result<bool, BlockError> {
+    pub fn push(&mut self, block: Block, payload: &[u8]) -> Result<bool, Error> {
         if self.done {
-            return Err(BlockError::Done);
+            return Err(Error::AfterLastBlock);
         }
         let got = block.offset();
         if got != self.body.len() {
-            return Err(BlockError::OutOfOrder { expected: self.body.len(), got });
+            return Err(Error::OutOfOrder { expected: self.body.len(), got });
         }
         // RFC 7959 section 2.3: SZX does not govern the payload size of
         // the last block.
@@ -1415,10 +1372,10 @@ impl Assembler {
             (_, false) => true,
         };
         if !size_ok {
-            return Err(BlockError::Size);
+            return Err(Error::BlockSize);
         }
         if payload.len() > self.max - self.body.len() {
-            return Err(BlockError::TooLarge);
+            return Err(Error::BodyTooLarge);
         }
         self.body.extend_from_slice(payload);
         self.done = !block.more;
@@ -1560,21 +1517,21 @@ fn ext(v: usize) -> (u8, Vec<u8>) {
     }
 }
 
-fn write_body(out: &mut Vec<u8>, options: &Options, payload: &[u8], budget: usize) -> Result<(), WriteError> {
+fn write_body(out: &mut Vec<u8>, options: &Options, payload: &[u8], budget: usize) -> Result<(), Error> {
     if options.0.len() > MAX_OPTIONS {
-        return Err(WriteError::Unwritable);
+        return Err(Error::Unwritable);
     }
     let mut used = 0usize;
     let mut prev = 0u16;
     for o in &options.0 {
         if o.value.len() > MAX_OPTION_VALUE {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
-        let delta = o.number.checked_sub(prev).ok_or(WriteError::Unwritable)?;
+        let delta = o.number.checked_sub(prev).ok_or(Error::Unwritable)?;
         let (dn, dx) = ext(usize::from(delta));
         let (ln, lx) = ext(o.value.len());
         let size = 1 + dx.len() + lx.len() + o.value.len();
-        used = used.checked_add(size).filter(|&n| n <= budget).ok_or(WriteError::Unwritable)?;
+        used = used.checked_add(size).filter(|&n| n <= budget).ok_or(Error::Unwritable)?;
         out.push(dn << 4 | ln);
         out.extend_from_slice(&dx);
         out.extend_from_slice(&lx);
@@ -1583,7 +1540,7 @@ fn write_body(out: &mut Vec<u8>, options: &Options, payload: &[u8], budget: usiz
     }
     if !payload.is_empty() {
         if payload.len().checked_add(1).filter(|&n| n <= budget - used).is_none() {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         out.push(PAYLOAD_MARKER);
         out.extend_from_slice(payload);
@@ -1736,7 +1693,7 @@ mod tests {
         let f = Frame { code: Code::POST, token: vec![9; 8], options: m_options(), payload: vec![7; 400] };
         let bytes = f.to_bytes().unwrap();
         for n in 0..bytes.len() {
-            assert_eq!(Frame::parse(&bytes[..n]), Err(FrameParseError::Truncated), "{n}");
+            assert_eq!(Frame::parse(&bytes[..n]), Err(Error::Truncated), "{n}");
         }
         assert_eq!(Frame::parse(&bytes), Ok(f));
     }
@@ -2131,10 +2088,10 @@ mod tests {
         assert_eq!(m.bad_block(), Some(option::BLOCK1));
         contract::check_wire_value(&m);
         assert!(m.to_bytes().is_ok());
-        let err = Assembler::new(100).push(block, &m.payload).unwrap_err();
-        assert_eq!((err, err.code()), (BlockError::Size, Code::BAD_REQUEST));
+        let err = Reassembler::new(100).push(block, &m.payload).unwrap_err();
+        assert_eq!((err, err.code()), (Error::BlockSize, Code::BAD_REQUEST));
         // Over TCP, after a CSM offering it, BERT is fine.
-        assert_eq!(Assembler::with_bert(100).push(block, &m.payload), Ok(true));
+        assert_eq!(Reassembler::with_bert(100).push(block, &m.payload), Ok(true));
         assert_eq!(get("/x", 1, &[]).bad_block(), None);
         let mut b2 = get("/x", 1, &[]);
         b2.options.set_block2(Block { num: 1, more: false, szx: 7 });
@@ -2145,15 +2102,15 @@ mod tests {
     fn last_block_may_be_any_size() {
         // RFC 7959 section 2.3: SZX does not govern the payload size of a
         // block whose M bit is unset.
-        let mut a = Assembler::new(100);
+        let mut a = Reassembler::new(100);
         assert_eq!(a.push(Block { num: 0, more: false, szx: 0 }, &[0; 17]), Ok(true));
-        let mut a = Assembler::new(100);
+        let mut a = Reassembler::new(100);
         assert_eq!(a.push(Block { num: 0, more: true, szx: 0 }, &[0; 16]), Ok(false));
         assert_eq!(a.push(Block { num: 1, more: false, szx: 0 }, &[1; 40]), Ok(true));
         assert_eq!(a.body().len(), 56);
         // The body limit still holds.
-        let mut a = Assembler::new(10);
-        assert_eq!(a.push(Block { num: 0, more: false, szx: 0 }, &[0; 11]), Err(BlockError::TooLarge));
+        let mut a = Reassembler::new(10);
+        assert_eq!(a.push(Block { num: 0, more: false, szx: 0 }, &[0; 11]), Err(Error::BodyTooLarge));
     }
 
     // RFC 7959: Block options and transfers.
@@ -2187,7 +2144,7 @@ mod tests {
     fn block_transfer_round_trip() {
         let body: Vec<u8> = (0..1000u32).map(|i| i as u8).collect();
         for szx in 0..=6 {
-            let mut a = Assembler::new(4096);
+            let mut a = Reassembler::new(4096);
             let mut num = 0;
             loop {
                 let (block, chunk) = Block::take(&body, num, szx).unwrap();
@@ -2205,7 +2162,7 @@ mod tests {
             }
             assert!(a.is_done());
             assert_eq!(a.body(), &body[..]);
-            assert_eq!(a.push(Block { num: 99, more: false, szx }, &[]), Err(BlockError::Done));
+            assert_eq!(a.push(Block { num: 99, more: false, szx }, &[]), Err(Error::AfterLastBlock));
         }
         assert_eq!(Block::take(&body, 1, 6), None);
         assert_eq!(Block::take(&body, 0, 7), None);
@@ -2217,25 +2174,25 @@ mod tests {
 
     #[test]
     fn assembler_errors() {
-        let mut a = Assembler::new(100);
+        let mut a = Reassembler::new(100);
         assert_eq!(
             a.push(Block { num: 1, more: true, szx: 0 }, &[0; 16]),
-            Err(BlockError::OutOfOrder { expected: 0, got: 16 })
+            Err(Error::OutOfOrder { expected: 0, got: 16 })
         );
-        assert_eq!(a.push(Block { num: 0, more: true, szx: 0 }, &[0; 15]), Err(BlockError::Size));
+        assert_eq!(a.push(Block { num: 0, more: true, szx: 0 }, &[0; 15]), Err(Error::BlockSize));
         // A smaller block size partway: 64 bytes, then 32-byte block 2.
         assert_eq!(a.push(Block { num: 0, more: true, szx: 2 }, &[1; 64]), Ok(false));
         assert_eq!(a.push(Block { num: 2, more: true, szx: 1 }, &[2; 32]), Ok(false));
-        assert_eq!(a.push(Block { num: 6, more: true, szx: 0 }, &[3; 16]), Err(BlockError::TooLarge));
+        assert_eq!(a.push(Block { num: 6, more: true, szx: 0 }, &[3; 16]), Err(Error::BodyTooLarge));
         assert_eq!(a.push(Block { num: 6, more: false, szx: 0 }, &[3; 4]), Ok(true));
         assert_eq!(a.clone().into_body().len(), 100);
-        assert_eq!(BlockError::OutOfOrder { expected: 0, got: 1 }.code(), Code::REQUEST_ENTITY_INCOMPLETE);
-        assert_eq!(BlockError::TooLarge.code(), Code::REQUEST_ENTITY_TOO_LARGE);
-        assert_eq!(BlockError::Size.code(), Code::BAD_REQUEST);
+        assert_eq!(Error::OutOfOrder { expected: 0, got: 1 }.code(), Code::REQUEST_ENTITY_INCOMPLETE);
+        assert_eq!(Error::BodyTooLarge.code(), Code::REQUEST_ENTITY_TOO_LARGE);
+        assert_eq!(Error::BlockSize.code(), Code::BAD_REQUEST);
         // BERT: whole 1024-byte units while more follow.
-        let mut a = Assembler::with_bert(MAX_BODY + 1);
-        assert_eq!(a.push(Block { num: 0, more: true, szx: 7 }, &[0; 1000]), Err(BlockError::Size));
-        assert_eq!(a.push(Block { num: 0, more: true, szx: 7 }, &[]), Err(BlockError::Size));
+        let mut a = Reassembler::with_bert(MAX_BODY + 1);
+        assert_eq!(a.push(Block { num: 0, more: true, szx: 7 }, &[0; 1000]), Err(Error::BlockSize));
+        assert_eq!(a.push(Block { num: 0, more: true, szx: 7 }, &[]), Err(Error::BlockSize));
         assert_eq!(a.push(Block { num: 0, more: true, szx: 7 }, &[0; 2048]), Ok(false));
         assert_eq!(a.push(Block { num: 2, more: false, szx: 7 }, &[0; 3000]), Ok(true));
         assert_eq!(a.body().len(), 5048);
@@ -2287,19 +2244,19 @@ mod tests {
 
     #[test]
     fn tcp_errors() {
-        assert_eq!(Frame::parse(&[0x09]), Err(FrameParseError::Frame(Error::TokenLength(9))));
-        assert_eq!(Frame::parse(&[0xf0, 0, 0x10]), Err(FrameParseError::Truncated));
+        assert_eq!(Frame::parse(&[0x09]), Err(Error::TokenLength(9)));
+        assert_eq!(Frame::parse(&[0xf0, 0, 0x10]), Err(Error::Truncated));
         assert_eq!(
             Frame::parse(&[0xf0, 0, 0x10, 0, 0]),
-            Err(FrameParseError::Frame(Error::TooLong(65_805 + 0x10_0000)))
+            Err(Error::TooLong(65_805 + 0x10_0000))
         );
         assert_eq!(
             Frame::parse(&[0xf0, 0xff, 0xff, 0xff, 0xff]),
-            Err(FrameParseError::Frame(Error::TooLong(65_805 + 0xffff_ffff)))
+            Err(Error::TooLong(65_805 + 0xffff_ffff))
         );
-        assert_eq!(Frame::parse(&[0x10, 0x45, 0xff]), Err(FrameParseError::Frame(Error::EmptyPayload)));
-        assert_eq!(Frame::parse(&[0x10, 0x45, 0xf1]), Err(FrameParseError::Frame(Error::ReservedNibble)));
-        assert_eq!(Frame::parse(&[0x10, 0x45, 0x01]), Err(FrameParseError::Frame(Error::Truncated)));
+        assert_eq!(Frame::parse(&[0x10, 0x45, 0xff]), Err(Error::EmptyPayload));
+        assert_eq!(Frame::parse(&[0x10, 0x45, 0xf1]), Err(Error::ReservedNibble));
+        assert_eq!(Frame::parse(&[0x10, 0x45, 0x01]), Err(Error::Truncated));
         // An empty frame is allowed over TCP.
         assert_eq!(Frame::parse(&[0x00, 0x00]), Ok(Frame::new(Code::EMPTY)));
         let mut largest = Frame {
@@ -2383,7 +2340,7 @@ mod tests {
         ] {
             assert!(!e.to_string().is_empty());
         }
-        for e in [BlockError::OutOfOrder { expected: 0, got: 1 }, BlockError::Size, BlockError::TooLarge, BlockError::Done] {
+        for e in [Error::OutOfOrder { expected: 0, got: 1 }, Error::BlockSize, Error::BodyTooLarge, Error::AfterLastBlock] {
             assert!(!e.to_string().is_empty());
         }
     }

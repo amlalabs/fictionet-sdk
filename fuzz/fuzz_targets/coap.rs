@@ -3,7 +3,7 @@
 #![no_main]
 
 use fictionet::stdlib::coap::{
-    Assembler, Block, BlockError, Code, Frame, Frames, MAX_BUFFERED, MAX_DATAGRAM, Message, Options, Type, option,
+    Reassembler, Block, Error, Code, Frame, Frames, MAX_BUFFERED, MAX_DATAGRAM, Message, Options, Type, option,
     peek_header,
 };
 use libfuzzer_sys::fuzz_target;
@@ -86,12 +86,12 @@ fuzz_target!(|data: &[u8]| {
         // over UDP, any last block within the limit is taken, and the
         // body stays in bounds.
         if let Some(block) = o.block1() {
-            let mut a = Assembler::new(1 << 16);
+            let mut a = Reassembler::new(1 << 16);
             let r = a.push(block, &m.payload);
             if block.is_bert() {
                 assert_eq!(m.bad_block(), Some(option::BLOCK1));
                 if block.num == 0 {
-                    assert_eq!(r, Err(BlockError::Size));
+                    assert_eq!(r, Err(Error::BlockSize));
                 }
             } else if block.num == 0 && !block.more {
                 assert_eq!(r, Ok(true));
@@ -108,13 +108,13 @@ fuzz_target!(|data: &[u8]| {
     // order or the wrong size is refused without changing the body.
     if let [szx, rest @ ..] = data {
         let szx = szx % 7;
-        let mut a = Assembler::new(rest.len());
+        let mut a = Reassembler::new(rest.len());
         let mut num = 0;
         while let Some((block, chunk)) = Block::take(rest, num, szx) {
             let before = a.body().len();
             if num > 0 {
                 let skipped = Block { num: num + 1, ..block };
-                assert!(matches!(a.push(skipped, chunk), Err(BlockError::OutOfOrder { .. })));
+                assert!(matches!(a.push(skipped, chunk), Err(Error::OutOfOrder { .. })));
                 assert_eq!(a.body().len(), before);
             }
             if a.push(block, chunk).unwrap() {

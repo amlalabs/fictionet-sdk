@@ -3,7 +3,7 @@
 #![no_main]
 
 use fictionet::stdlib::mqtt::{
-    ConnAck, ConnectReturnCode, Frames, MAX_PACKET, Packet, Publish, QoS, check_topic_filter, check_topic_name,
+    ConnAck, ConnectReturnCode, Packets, MAX_PACKET, Packet, Publish, QoS, check_topic_filter, check_topic_name,
     topic_matches,
 };
 use libfuzzer_sys::fuzz_target;
@@ -14,16 +14,16 @@ fuzz_target!(|data: &[u8]| {
     contract::check_wire::<fictionet::stdlib::mqtt::RemainingLength>(data);
     let small = usize::from(data.first().copied().unwrap_or(0) & 0x3f);
     for limit in [fictionet::stdlib::mqtt::DEFAULT_MAX_PACKET, MAX_PACKET, small] {
-        let make = || Frames::with_limit(limit);
+        let make = || Packets::with_limit(limit);
         contract::check_decode_with_alloc_limit(make, data, 2 * make().capacity());
     }
-    let packets = decode_all(Frames::new, data).0;
+    let packets = decode_all(Packets::new, data).0;
     if let Ok(packet) = Packet::parse(data) {
         if data.len() <= fictionet::stdlib::mqtt::DEFAULT_MAX_PACKET {
             assert_eq!(packets.first(), Some(&packet));
         } else {
             // Exact parsing allows packets above the default stream limit.
-            assert_eq!(decode_all(|| Frames::with_limit(MAX_PACKET), data).0.first(), Some(&packet));
+            assert_eq!(decode_all(|| Packets::with_limit(MAX_PACKET), data).0.first(), Some(&packet));
         }
     }
     for packet in packets {

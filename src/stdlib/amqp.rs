@@ -20,9 +20,9 @@
 //!
 //! Every reader checks lengths, because the agent can send any bytes it
 //! likes. A frame the stream cannot hold breaks the stream with a
-//! [`FrameError`]. A payload that breaks the specification gives a
-//! [`DecodeError`], whose [`DecodeError::reply_code`] is the code a broker
-//! closes the connection with. Writers return an [`EncodeError`] rather
+//! [`Error`]. A payload that breaks the specification gives a
+//! [`Error`], whose [`Error::reply_code`] is the code a broker
+//! closes the connection with. Writers return an [`Error`] rather
 //! than write bytes a reader would refuse.
 //!
 //! ```
@@ -203,12 +203,14 @@ pub struct Frame {
     pub payload: Vec<u8>,
 }
 
-/// Why bytes are not an AMQP frame stream. The stream holds no more frames
-/// a reader can find, and a broker closes the connection. Whether it sends
-/// `connection.close` first is [`FrameError::sends_close`], and the code it
-/// sends is [`FrameError::reply_code`].
+/// Why bytes are not an AMQP frame stream, or a payload is not a method,
+/// a content header or a field table this module can read, or why a value
+/// cannot be written. After an error from [`Frames`] the stream holds no
+/// more frames a reader can find, and a broker closes the connection.
+/// Whether it sends `connection.close` first is [`Error::sends_close`],
+/// and the code it sends is [`Error::reply_code`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FrameError {
+pub enum Error {
     /// The client's first 8 bytes were not [`PROTOCOL_HEADER`]. A broker
     /// writes its own header back and closes the connection.
     ProtocolHeader([u8; 8]),
@@ -222,7 +224,7 @@ pub enum FrameError {
         size: u32,
     },
     /// The frame, with its header and end byte, is larger than the limit.
-    TooLarge {
+    FrameTooLarge {
         /// The payload size the frame named.
         size: u32,
         /// The limit it broke.
@@ -240,54 +242,127 @@ pub enum FrameError {
         /// The channel it named.
         channel: u16,
     },
+    /// The input ended before a complete frame arrived, or the payload
+    /// ended before the last field, or a length inside it ran past its end.
+    Truncated,
+    /// Bytes were left after the frame or after the last field.
+    Trailing,
+    /// The class and method are not ones this module knows.
+    UnknownMethod {
+        /// The class identifier read.
+        class_id: u16,
+        /// The method identifier read.
+        method_id: u16,
+    },
+    /// A short string was not UTF-8.
+    Utf8,
+    /// A field value had a type tag this module does not know.
+    FieldType(u8),
+    /// Field tables and arrays nested deeper than [`MAX_DEPTH`].
+    TooDeep,
+    /// A content header named a class other than basic (60).
+    ContentClass(u16),
+    /// A content header set property flags basic does not define, or the
+    /// flag that says more flags follow.
+    PropertyFlags(u16),
+    /// The payload was longer than [`MAX_PAYLOAD`] bytes, more than any
+    /// frame holds. It holds the length.
+    PayloadTooLarge(usize),
+    /// A short string held a zero byte, which section 4.2.5.3 forbids.
+    ZeroByte,
+    /// A field table named the same field twice, which section 4.2.5.5
+    /// forbids.
+    DuplicateField,
+    /// A content header's weight was not 0, which section 4.2.6.1
+    /// requires. It holds the weight.
+    Weight(u16),
+    /// The value cannot be written without changing it. A reader would
+    /// refuse what it would have written, so nothing is written.
+    Unwritable,
 }
 
-impl FrameError {
-    /// The reply code for the error, as section 4.2.3 and 4.2.6.1 give
-    /// them: 503 (command invalid) for a connection method or a heartbeat
-    /// off channel 0, and for another class's method on it; 504 (channel
-    /// error) for content on channel 0; and 501 (frame error) otherwise.
+impl Error {
+    /// The reply code a broker closes the connection with, as sections
+    /// 4.2.3, 4.2.6 and 4.2.6.1 give them: 503 (command invalid) for a
+    /// connection method or a heartbeat off channel 0, and for another
+    /// class's method on it; 504 (channel error) for content on channel 0;
+    /// 540 (not implemented) for an unknown method; 505 (unexpected frame)
+    /// for a badly formed content header other than one of the wrong
+    /// class; 502 (syntax error) for another bad payload; and 501 (frame
+    /// error) otherwise, a payload too large for a frame and a content
+    /// header of the wrong class included.
     pub fn reply_code(self) -> u16 {
         match self {
-            FrameError::Heartbeat { channel, .. } if channel != 0 => reply::COMMAND_INVALID,
-            FrameError::NotChannelZero { .. } | FrameError::ChannelZero(FrameKind::Method) => reply::COMMAND_INVALID,
-            FrameError::ChannelZero(_) => reply::CHANNEL_ERROR,
-            _ => reply::FRAME_ERROR,
+            Error::Heartbeat { channel, .. } if channel != 0 => reply::COMMAND_INVALID,
+            Error::NotChannelZero { .. } | Error::ChannelZero(FrameKind::Method) => reply::COMMAND_INVALID,
+            Error::ChannelZero(_) => reply::CHANNEL_ERROR,
+            Error::UnknownMethod { .. } => reply::NOT_IMPLEMENTED,
+            Error::PropertyFlags(_) | Error::Weight(_) => reply::UNEXPECTED_FRAME,
+            Error::Truncated
+            | Error::Trailing
+            | Error::Utf8
+            | Error::FieldType(_)
+            | Error::TooDeep
+            | Error::ZeroByte
+            | Error::DuplicateField
+            | Error::Unwritable => reply::SYNTAX_ERROR,
+            Error::ProtocolHeader(_)
+            | Error::Type(_)
+            | Error::Heartbeat { .. }
+            | Error::FrameTooLarge { .. }
+            | Error::FrameEnd(_)
+            | Error::PayloadTooLarge(_)
+            | Error::ContentClass(_) => reply::FRAME_ERROR,
         }
     }
 
     /// Whether a broker sends `connection.close` with
-    /// [`FrameError::reply_code`] before it closes the socket. A bad
+    /// [`Error::reply_code`] before it closes the socket. A bad
     /// protocol header is answered with the broker's own header instead,
     /// and a bad frame type or end byte with nothing at all: the
     /// specification says to close the connection without sending any
     /// further data (sections 4.2.2 and 4.2.3).
     pub fn sends_close(self) -> bool {
-        !matches!(self, FrameError::ProtocolHeader(_) | FrameError::Type(_) | FrameError::FrameEnd(_))
+        !matches!(self, Error::ProtocolHeader(_) | Error::Type(_) | Error::FrameEnd(_))
     }
 }
 
-impl std::fmt::Display for FrameError {
+impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            FrameError::ProtocolHeader(b) => write!(f, "protocol header {b:02x?}, not AMQP 0-9-1"),
-            FrameError::Type(t) => write!(f, "frame type {t}, not one AMQP 0-9-1 defines"),
-            FrameError::Heartbeat { channel, size } => {
+            Error::ProtocolHeader(b) => write!(f, "protocol header {b:02x?}, not AMQP 0-9-1"),
+            Error::Type(t) => write!(f, "frame type {t}, not one AMQP 0-9-1 defines"),
+            Error::Heartbeat { channel, size } => {
                 write!(f, "heartbeat frame on channel {channel} with {size} bytes; it must be on 0 and empty")
             }
-            FrameError::TooLarge { size, frame_max } => {
+            Error::FrameTooLarge { size, frame_max } => {
                 write!(f, "frame payload of {size} bytes is over the frame-max of {frame_max}")
             }
-            FrameError::FrameEnd(b) => write!(f, "frame ends with 0x{b:02x}, not 0xce"),
-            FrameError::ChannelZero(k) => write!(f, "{k:?} frame on channel 0, which is for the connection alone"),
-            FrameError::NotChannelZero { channel } => {
+            Error::FrameEnd(b) => write!(f, "frame ends with 0x{b:02x}, not 0xce"),
+            Error::ChannelZero(k) => write!(f, "{k:?} frame on channel 0, which is for the connection alone"),
+            Error::NotChannelZero { channel } => {
                 write!(f, "connection method on channel {channel}; it must be on 0")
             }
+            Error::Truncated => f.write_str("AMQP frame or payload ends early"),
+            Error::Trailing => f.write_str("bytes left after the AMQP frame or the last field"),
+            Error::UnknownMethod { class_id, method_id } => {
+                write!(f, "unknown method {class_id}.{method_id}")
+            }
+            Error::Utf8 => f.write_str("short string is not UTF-8"),
+            Error::FieldType(t) => write!(f, "unknown field value type 0x{t:02x}"),
+            Error::TooDeep => write!(f, "field tables nested deeper than {MAX_DEPTH}"),
+            Error::ContentClass(c) => write!(f, "content header for class {c}, not basic (60)"),
+            Error::PropertyFlags(p) => write!(f, "property flags 0x{p:04x} set bits basic does not define"),
+            Error::PayloadTooLarge(n) => write!(f, "payload of {n} bytes is more than a frame holds"),
+            Error::ZeroByte => f.write_str("short string holds a zero byte"),
+            Error::DuplicateField => f.write_str("field table names a field twice"),
+            Error::Weight(w) => write!(f, "content header weight {w}, not 0"),
+            Error::Unwritable => f.write_str("AMQP value cannot be written without changing it"),
         }
     }
 }
 
-impl std::error::Error for FrameError {}
+impl std::error::Error for Error {}
 
 impl Frame {
     /// Reads the frame at the start of `b`, allowing frames up to
@@ -296,26 +371,26 @@ impl Frame {
     /// of `b` it took. A bad type is known from the first byte, and a bad
     /// size from the first 7. A frame on a channel its kind or class may
     /// not use is refused once its end byte is in.
-    fn parse_prefix(b: &[u8], frame_max: u32) -> Result<Option<(Frame, usize)>, FrameError> {
+    fn parse_prefix(b: &[u8], frame_max: u32) -> Result<Option<(Frame, usize)>, Error> {
         let Some(&code) = b.first() else { return Ok(None) };
-        let kind = FrameKind::from_code(code).ok_or(FrameError::Type(code))?;
+        let kind = FrameKind::from_code(code).ok_or(Error::Type(code))?;
         if b.len() < FRAME_HEADER_LEN {
             return Ok(None);
         }
         let channel = u16::from_be_bytes([b[1], b[2]]);
         let size = u32::from_be_bytes([b[3], b[4], b[5], b[6]]);
         if kind == FrameKind::Heartbeat && (channel != 0 || size != 0) {
-            return Err(FrameError::Heartbeat { channel, size });
+            return Err(Error::Heartbeat { channel, size });
         }
         let limit = frame_limit(frame_max);
         if u64::from(size) + u64::from(FRAME_OVERHEAD) > u64::from(limit) {
-            return Err(FrameError::TooLarge { size, frame_max: limit });
+            return Err(Error::FrameTooLarge { size, frame_max: limit });
         }
         // The size is at most MAX_PAYLOAD here, so this cannot overflow.
         let end = FRAME_HEADER_LEN + size as usize;
         let Some(&last) = b.get(end) else { return Ok(None) };
         if last != FRAME_END {
-            return Err(FrameError::FrameEnd(last));
+            return Err(Error::FrameEnd(last));
         }
         let payload = &b[FRAME_HEADER_LEN..end];
         channel_rules(kind, channel, payload)?;
@@ -324,16 +399,16 @@ impl Frame {
 
     /// A method frame carrying `method` on `channel`. Connection methods
     /// go on channel 0 and every other method on another channel.
-    pub fn method(channel: u16, method: &Method) -> Result<Frame, EncodeError> {
+    pub fn method(channel: u16, method: &Method) -> Result<Frame, Error> {
         let payload = method.to_bytes()?;
-        channel_rules(FrameKind::Method, channel, &payload).map_err(|_| EncodeError::Unwritable)?;
+        channel_rules(FrameKind::Method, channel, &payload).map_err(|_| Error::Unwritable)?;
         Ok(Frame { kind: FrameKind::Method, channel, payload })
     }
 
     /// A content header frame carrying `header` on `channel`, which may
     /// not be 0.
-    pub fn header(channel: u16, header: &ContentHeader) -> Result<Frame, EncodeError> {
-        channel_rules(FrameKind::Header, channel, &[]).map_err(|_| EncodeError::Unwritable)?;
+    pub fn header(channel: u16, header: &ContentHeader) -> Result<Frame, Error> {
+        channel_rules(FrameKind::Header, channel, &[]).map_err(|_| Error::Unwritable)?;
         Ok(Frame { kind: FrameKind::Header, channel, payload: header.to_bytes()? })
     }
 
@@ -350,40 +425,17 @@ impl Frame {
     }
 }
 
-/// Why bytes do not contain exactly one AMQP frame.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FrameParseError {
-    /// The frame was refused.
-    Frame(FrameError),
-    /// The input ended before a complete frame arrived.
-    Truncated,
-    /// Bytes followed the frame.
-    Trailing,
-}
-
-impl core::fmt::Display for FrameParseError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Frame(e) => e.fmt(f),
-            Self::Truncated => f.write_str("AMQP frame ended early"),
-            Self::Trailing => f.write_str("bytes after the AMQP frame"),
-        }
-    }
-}
-
-impl core::error::Error for FrameParseError {}
-
 impl Wire for Frame {
-    type ParseError = FrameParseError;
-    type WriteError = EncodeError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads exactly one frame, bounded by [`MAX_FRAME_SIZE`].
     /// Refuses bad types, channels, heartbeat fields, end bytes, and incomplete or trailing input.
-    fn parse(bytes: &[u8]) -> Result<Self, FrameParseError> {
-        match Self::parse_prefix(bytes, MAX_FRAME_SIZE).map_err(FrameParseError::Frame)? {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        match Self::parse_prefix(bytes, MAX_FRAME_SIZE)? {
             Some((frame, used)) if used == bytes.len() => Ok(frame),
-            Some(_) => Err(FrameParseError::Trailing),
-            None => Err(FrameParseError::Truncated),
+            Some(_) => Err(Error::Trailing),
+            None => Err(Error::Truncated),
         }
     }
 
@@ -391,15 +443,15 @@ impl Wire for Frame {
     /// heartbeats, and channels forbidden by the frame kind or method class.
     /// Leaves `out` unchanged on error. The caller enforces the negotiated
     /// frame limit; [`content_frames`] splits bodies to fit it.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         let size = u32::try_from(self.payload.len()).unwrap_or(u32::MAX);
         if self.payload.len() > MAX_PAYLOAD {
-            return Err(EncodeError::Unwritable);
+            return Err(Error::Unwritable);
         }
         if self.kind == FrameKind::Heartbeat && (self.channel != 0 || size != 0) {
-            return Err(EncodeError::Unwritable);
+            return Err(Error::Unwritable);
         }
-        channel_rules(self.kind, self.channel, &self.payload).map_err(|_| EncodeError::Unwritable)?;
+        channel_rules(self.kind, self.channel, &self.payload).map_err(|_| Error::Unwritable)?;
         let mut bytes = Vec::with_capacity(FRAME_HEADER_LEN + self.payload.len() + 1);
         bytes.push(self.kind.code());
         bytes.extend_from_slice(&self.channel.to_be_bytes());
@@ -416,7 +468,7 @@ impl Wire for Frame {
 /// Use with [`fictionet::stdlib::codec::Stream`] for bounded input and one-time errors.
 /// Partial frames return [`Step::Need`], including at EOF. Frame faults
 /// end the stream. Parse method and content payloads separately to receive
-/// their [`DecodeError`] values as items with [`Decode::map`].
+/// their [`Error`] values as items with [`Decode::map`].
 ///
 /// ```
 /// use fictionet::stdlib::{amqp::{Frame, Frames}, codec::{Stream, Wire}};
@@ -428,7 +480,7 @@ impl Wire for Frame {
 /// assert_eq!(stream.next(), Some(Ok(frame)));
 /// stream.end();
 /// assert_eq!(stream.next(), None);
-/// # Ok::<(), fictionet::stdlib::amqp::EncodeError>(())
+/// # Ok::<(), fictionet::stdlib::amqp::Error>(())
 /// ```
 #[derive(Clone, Copy, Debug)]
 pub struct Frames {
@@ -480,20 +532,20 @@ impl Default for Frames {
 
 impl Decode for Frames {
     type Item = Frame;
-    type Error = FrameError;
+    type Error = Error;
     const NAME: &'static str = "AMQP 0-9-1";
 
     fn capacity(&self) -> usize {
         self.frame_max as usize
     }
 
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, FrameError> {
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, Error> {
         if self.expect_header && !self.header_received {
             let Some(header) = input.get(..PROTOCOL_HEADER.len()) else { return Ok(Step::Need) };
             if header != PROTOCOL_HEADER {
                 let mut got = [0; 8];
                 got.copy_from_slice(header);
-                return Err(FrameError::ProtocolHeader(got));
+                return Err(Error::ProtocolHeader(got));
             }
             self.header_received = true;
             return Ok(Step::Skip(PROTOCOL_HEADER.len()));
@@ -509,15 +561,15 @@ impl Decode for Frames {
 /// content goes on a channel other than 0, connection methods on 0, and
 /// other methods off it. A method payload too short to name its class is
 /// left for [`Method::parse`] to refuse.
-fn channel_rules(kind: FrameKind, channel: u16, payload: &[u8]) -> Result<(), FrameError> {
+fn channel_rules(kind: FrameKind, channel: u16, payload: &[u8]) -> Result<(), Error> {
     match kind {
-        FrameKind::Header | FrameKind::Body if channel == 0 => Err(FrameError::ChannelZero(kind)),
+        FrameKind::Header | FrameKind::Body if channel == 0 => Err(Error::ChannelZero(kind)),
         FrameKind::Method => match payload {
             [a, b, ..] => {
                 let connection = u16::from_be_bytes([*a, *b]) == class::CONNECTION;
                 match (connection, channel == 0) {
-                    (true, false) => Err(FrameError::NotChannelZero { channel }),
-                    (false, true) => Err(FrameError::ChannelZero(kind)),
+                    (true, false) => Err(Error::NotChannelZero { channel }),
+                    (false, true) => Err(Error::ChannelZero(kind)),
                     _ => Ok(()),
                 }
             }
@@ -540,118 +592,23 @@ pub fn content_frames(
     properties: &BasicProperties,
     body: &[u8],
     frame_max: u32,
-) -> Result<Vec<Frame>, EncodeError> {
+) -> Result<Vec<Frame>, Error> {
     if !method.has_content() {
-        return Err(EncodeError::Unwritable);
+        return Err(Error::Unwritable);
     }
     let room = (frame_limit(frame_max) - FRAME_OVERHEAD) as usize;
     let method = Frame::method(channel, method)?;
-    channel_rules(FrameKind::Header, channel, &[]).map_err(|_| EncodeError::Unwritable)?;
+    channel_rules(FrameKind::Header, channel, &[]).map_err(|_| Error::Unwritable)?;
     let header = Frame { kind: FrameKind::Header, channel, payload: header_payload(body.len() as u64, properties)? };
     for f in [&method, &header] {
         if f.payload.len() > room {
-            return Err(EncodeError::Unwritable);
+            return Err(Error::Unwritable);
         }
     }
     let mut frames = vec![method, header];
     frames.extend(body.chunks(room).map(|c| Frame::body(channel, c.to_vec())));
     Ok(frames)
 }
-
-/// Why a payload is not a method, a content header or a field table this
-/// module can read.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DecodeError {
-    /// The payload ended before the last field, or a length inside it ran
-    /// past its end.
-    Truncated,
-    /// Bytes were left after the last field.
-    TrailingBytes,
-    /// The class and method are not ones this module knows.
-    UnknownMethod {
-        /// The class identifier read.
-        class_id: u16,
-        /// The method identifier read.
-        method_id: u16,
-    },
-    /// A short string was not UTF-8.
-    Utf8,
-    /// A field value had a type tag this module does not know.
-    FieldType(u8),
-    /// Field tables and arrays nested deeper than [`MAX_DEPTH`].
-    TooDeep,
-    /// A content header named a class other than basic (60).
-    ContentClass(u16),
-    /// A content header set property flags basic does not define, or the
-    /// flag that says more flags follow.
-    PropertyFlags(u16),
-    /// The payload was longer than [`MAX_PAYLOAD`] bytes, more than any
-    /// frame holds. It holds the length.
-    TooLarge(usize),
-    /// A short string held a zero byte, which section 4.2.5.3 forbids.
-    ZeroByte,
-    /// A field table named the same field twice, which section 4.2.5.5
-    /// forbids.
-    DuplicateField,
-    /// A content header's weight was not 0, which section 4.2.6.1
-    /// requires. It holds the weight.
-    Weight(u16),
-}
-
-impl DecodeError {
-    /// The reply code a broker closes the connection with: 540 (not
-    /// implemented) for an unknown method, 501 (frame error) for a payload
-    /// too large for a frame or a content header of the wrong class
-    /// (section 4.2.6.1), 505 (unexpected frame) for another badly formed
-    /// content header (section 4.2.6), and 502 (syntax error) otherwise.
-    pub fn reply_code(self) -> u16 {
-        match self {
-            DecodeError::UnknownMethod { .. } => reply::NOT_IMPLEMENTED,
-            DecodeError::TooLarge(_) | DecodeError::ContentClass(_) => reply::FRAME_ERROR,
-            DecodeError::PropertyFlags(_) | DecodeError::Weight(_) => reply::UNEXPECTED_FRAME,
-            _ => reply::SYNTAX_ERROR,
-        }
-    }
-}
-
-impl std::fmt::Display for DecodeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            DecodeError::Truncated => f.write_str("payload ends before its last field"),
-            DecodeError::TrailingBytes => f.write_str("bytes left after the last field"),
-            DecodeError::UnknownMethod { class_id, method_id } => {
-                write!(f, "unknown method {class_id}.{method_id}")
-            }
-            DecodeError::Utf8 => f.write_str("short string is not UTF-8"),
-            DecodeError::FieldType(t) => write!(f, "unknown field value type 0x{t:02x}"),
-            DecodeError::TooDeep => write!(f, "field tables nested deeper than {MAX_DEPTH}"),
-            DecodeError::ContentClass(c) => write!(f, "content header for class {c}, not basic (60)"),
-            DecodeError::PropertyFlags(p) => write!(f, "property flags 0x{p:04x} set bits basic does not define"),
-            DecodeError::TooLarge(n) => write!(f, "payload of {n} bytes is more than a frame holds"),
-            DecodeError::ZeroByte => f.write_str("short string holds a zero byte"),
-            DecodeError::DuplicateField => f.write_str("field table names a field twice"),
-            DecodeError::Weight(w) => write!(f, "content header weight {w}, not 0"),
-        }
-    }
-}
-
-impl std::error::Error for DecodeError {}
-
-/// Why a value cannot be written. A reader would refuse what it would
-/// have written, so nothing is written.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EncodeError {
-    /// The value cannot be written without changing it.
-    Unwritable,
-}
-
-impl std::fmt::Display for EncodeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("AMQP value cannot be written without changing it")
-    }
-}
-
-impl std::error::Error for EncodeError {}
 
 /// A field table: names and values, in the order they were sent. Each name
 /// appears once: section 4.2.5.5 makes duplicate fields illegal, so readers
@@ -685,13 +642,13 @@ impl Table {
 }
 
 impl Wire for Table {
-    type ParseError = DecodeError;
-    type WriteError = EncodeError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads one field table, including its four-byte length. Refuses
     /// malformed fields, duplicate names, excess nesting, more than
     /// [`MAX_PAYLOAD`] bytes, and trailing bytes.
-    fn parse(b: &[u8]) -> Result<Table, DecodeError> {
+    fn parse(b: &[u8]) -> Result<Table, Error> {
         let mut r = Reader::payload(b)?;
         let t = r.table(1)?;
         r.finish()?;
@@ -700,7 +657,7 @@ impl Wire for Table {
 
     /// Appends the complete value. Refuses invalid fields, excess nesting,
     /// or size limits. Leaves `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         let mut w = Writer::new();
         w.table(self, 1)?;
         let bytes = w.out;
@@ -930,27 +887,27 @@ pub struct BasicProperties {
 }
 
 impl Wire for ContentHeader {
-    type ParseError = DecodeError;
-    type WriteError = EncodeError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads one basic content header payload. Refuses other classes,
     /// nonzero weight, reserved property flags, malformed fields, excess
     /// nesting, more than [`MAX_PAYLOAD`] bytes, and trailing bytes.
-    fn parse(payload: &[u8]) -> Result<ContentHeader, DecodeError> {
+    fn parse(payload: &[u8]) -> Result<ContentHeader, Error> {
         use property_flag as p;
         let mut r = Reader::payload(payload)?;
         let class_id = r.u16()?;
         if class_id != class::BASIC {
-            return Err(DecodeError::ContentClass(class_id));
+            return Err(Error::ContentClass(class_id));
         }
         let weight = r.u16()?;
         if weight != 0 {
-            return Err(DecodeError::Weight(weight));
+            return Err(Error::Weight(weight));
         }
         let body_size = r.u64()?;
         let flags = r.u16()?;
         if flags & 0b11 != 0 {
-            return Err(DecodeError::PropertyFlags(flags));
+            return Err(Error::PropertyFlags(flags));
         }
         let on = |bit: u16| flags & bit != 0;
         let s = |r: &mut Reader, bit: u16| if on(bit) { r.shortstr().map(Some) } else { Ok(None) };
@@ -992,7 +949,7 @@ impl Wire for ContentHeader {
 
     /// Appends the complete value. Refuses invalid fields, excess nesting,
     /// or size limits. Leaves `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         let bytes = header_payload(self.body_size, &self.properties)?;
         out.extend_from_slice(&bytes);
         Ok(())
@@ -1002,7 +959,7 @@ impl Wire for ContentHeader {
 /// A content header payload for a body of `body_size` bytes with
 /// properties `pr`, written from borrowed properties so nothing is copied
 /// before the writer's limits are checked.
-fn header_payload(body_size: u64, pr: &BasicProperties) -> Result<Vec<u8>, EncodeError> {
+fn header_payload(body_size: u64, pr: &BasicProperties) -> Result<Vec<u8>, Error> {
     use property_flag as p;
     let mut flags = 0u16;
     let mut set = |present: bool, bit: u16| {
@@ -1340,11 +1297,11 @@ impl Method {
 }
 
 impl Wire for Method {
-    type ParseError = DecodeError;
-    type WriteError = EncodeError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads exactly one payload. Refuses malformed fields, excess nesting, oversized input, and trailing bytes.
-    fn parse(payload: &[u8]) -> Result<Method, DecodeError> {
+    fn parse(payload: &[u8]) -> Result<Method, Error> {
         use Method::*;
         let mut r = Reader::payload(payload)?;
         let class_id = r.u16()?;
@@ -1548,7 +1505,7 @@ impl Wire for Method {
             (90, 21) => TxCommitOk,
             (90, 30) => TxRollback,
             (90, 31) => TxRollbackOk,
-            _ => return Err(DecodeError::UnknownMethod { class_id, method_id }),
+            _ => return Err(Error::UnknownMethod { class_id, method_id }),
         };
         r.finish()?;
         Ok(m)
@@ -1556,7 +1513,7 @@ impl Wire for Method {
 
     /// Appends the complete value. Refuses invalid fields, excess nesting,
     /// or size limits. Leaves `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         use Method::*;
         let mut w = Writer::new();
         let (class_id, method_id) = self.ids();
@@ -1774,44 +1731,44 @@ impl<'a> Reader<'a> {
 
     /// A reader for a whole payload. A payload no frame can hold is
     /// refused, since what it holds could not be written back.
-    fn payload(b: &'a [u8]) -> Result<Reader<'a>, DecodeError> {
+    fn payload(b: &'a [u8]) -> Result<Reader<'a>, Error> {
         if b.len() > MAX_PAYLOAD {
-            return Err(DecodeError::TooLarge(b.len()));
+            return Err(Error::PayloadTooLarge(b.len()));
         }
         Ok(Reader::new(b))
     }
 
-    fn take(&mut self, n: usize) -> Result<&'a [u8], DecodeError> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
         self.bit_next = 0;
-        let end = self.pos.checked_add(n).ok_or(DecodeError::Truncated)?;
-        let s = self.b.get(self.pos..end).ok_or(DecodeError::Truncated)?;
+        let end = self.pos.checked_add(n).ok_or(Error::Truncated)?;
+        let s = self.b.get(self.pos..end).ok_or(Error::Truncated)?;
         self.pos = end;
         Ok(s)
     }
 
-    fn array<const N: usize>(&mut self) -> Result<[u8; N], DecodeError> {
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], Error> {
         let mut a = [0u8; N];
         a.copy_from_slice(self.take(N)?);
         Ok(a)
     }
 
-    fn u8(&mut self) -> Result<u8, DecodeError> {
+    fn u8(&mut self) -> Result<u8, Error> {
         Ok(self.array::<1>()?[0])
     }
 
-    fn u16(&mut self) -> Result<u16, DecodeError> {
+    fn u16(&mut self) -> Result<u16, Error> {
         self.array().map(u16::from_be_bytes)
     }
 
-    fn u32(&mut self) -> Result<u32, DecodeError> {
+    fn u32(&mut self) -> Result<u32, Error> {
         self.array().map(u32::from_be_bytes)
     }
 
-    fn u64(&mut self) -> Result<u64, DecodeError> {
+    fn u64(&mut self) -> Result<u64, Error> {
         self.array().map(u64::from_be_bytes)
     }
 
-    fn bit(&mut self) -> Result<bool, DecodeError> {
+    fn bit(&mut self) -> Result<bool, Error> {
         if self.bit_next == 0 || self.bit_next >= 8 {
             self.bit_byte = self.u8()?;
         }
@@ -1820,31 +1777,31 @@ impl<'a> Reader<'a> {
         Ok(v)
     }
 
-    fn skip_shortstr(&mut self) -> Result<&'a [u8], DecodeError> {
+    fn skip_shortstr(&mut self) -> Result<&'a [u8], Error> {
         let n = self.u8()?;
         self.take(usize::from(n))
     }
 
-    fn shortstr(&mut self) -> Result<String, DecodeError> {
+    fn shortstr(&mut self) -> Result<String, Error> {
         let b = self.skip_shortstr()?;
         if b.contains(&0) {
-            return Err(DecodeError::ZeroByte);
+            return Err(Error::ZeroByte);
         }
-        std::str::from_utf8(b).map(str::to_owned).map_err(|_| DecodeError::Utf8)
+        std::str::from_utf8(b).map(str::to_owned).map_err(|_| Error::Utf8)
     }
 
-    fn long_bytes(&mut self) -> Result<&'a [u8], DecodeError> {
+    fn long_bytes(&mut self) -> Result<&'a [u8], Error> {
         let n = self.u32()?;
         self.take(usize::try_from(n).unwrap_or(usize::MAX))
     }
 
-    fn longstr(&mut self) -> Result<Vec<u8>, DecodeError> {
+    fn longstr(&mut self) -> Result<Vec<u8>, Error> {
         self.long_bytes().map(<[u8]>::to_vec)
     }
 
-    fn table(&mut self, depth: usize) -> Result<Table, DecodeError> {
+    fn table(&mut self, depth: usize) -> Result<Table, Error> {
         if depth > MAX_DEPTH {
-            return Err(DecodeError::TooDeep);
+            return Err(Error::TooDeep);
         }
         let mut inner = Reader::new(self.long_bytes()?);
         let mut entries = Vec::new();
@@ -1854,12 +1811,12 @@ impl<'a> Reader<'a> {
             entries.push((name, value));
         }
         if has_duplicates(&entries) {
-            return Err(DecodeError::DuplicateField);
+            return Err(Error::DuplicateField);
         }
         Ok(Table { entries })
     }
 
-    fn value(&mut self, depth: usize) -> Result<FieldValue, DecodeError> {
+    fn value(&mut self, depth: usize) -> Result<FieldValue, Error> {
         Ok(match self.u8()? {
             b't' => FieldValue::Bool(self.u8()? != 0),
             b'b' => FieldValue::I8(i8::from_be_bytes(self.array()?)),
@@ -1875,7 +1832,7 @@ impl<'a> Reader<'a> {
             b'S' => FieldValue::LongString(self.longstr()?),
             b'A' => {
                 if depth + 1 > MAX_DEPTH {
-                    return Err(DecodeError::TooDeep);
+                    return Err(Error::TooDeep);
                 }
                 let mut inner = Reader::new(self.long_bytes()?);
                 let mut values = Vec::new();
@@ -1888,12 +1845,12 @@ impl<'a> Reader<'a> {
             b'F' => FieldValue::Table(self.table(depth + 1)?),
             b'V' => FieldValue::Void,
             b'x' => FieldValue::Bytes(self.longstr()?),
-            t => return Err(DecodeError::FieldType(t)),
+            t => return Err(Error::FieldType(t)),
         })
     }
 
-    fn finish(&self) -> Result<(), DecodeError> {
-        if self.pos == self.b.len() { Ok(()) } else { Err(DecodeError::TrailingBytes) }
+    fn finish(&self) -> Result<(), Error> {
+        if self.pos == self.b.len() { Ok(()) } else { Err(Error::Trailing) }
     }
 }
 
@@ -1953,19 +1910,19 @@ impl Writer {
         }
     }
 
-    fn shortstr(&mut self, s: &str) -> Result<(), EncodeError> {
-        let n = u8::try_from(s.len()).map_err(|_| EncodeError::Unwritable)?;
+    fn shortstr(&mut self, s: &str) -> Result<(), Error> {
+        let n = u8::try_from(s.len()).map_err(|_| Error::Unwritable)?;
         if s.as_bytes().contains(&0) {
-            return Err(EncodeError::Unwritable);
+            return Err(Error::Unwritable);
         }
         self.u8(n);
         self.bytes(s.as_bytes());
         Ok(())
     }
 
-    fn longstr(&mut self, b: &[u8]) -> Result<(), EncodeError> {
+    fn longstr(&mut self, b: &[u8]) -> Result<(), Error> {
         if b.len() > MAX_PAYLOAD {
-            return Err(EncodeError::Unwritable);
+            return Err(Error::Unwritable);
         }
         self.u32(b.len() as u32);
         self.bytes(b);
@@ -1974,25 +1931,25 @@ impl Writer {
 
     /// Writes a 4-byte length, then whatever `body` writes, then fills in
     /// the length.
-    fn counted(&mut self, body: impl FnOnce(&mut Writer) -> Result<(), EncodeError>) -> Result<(), EncodeError> {
+    fn counted(&mut self, body: impl FnOnce(&mut Writer) -> Result<(), Error>) -> Result<(), Error> {
         let at = self.out.len();
         self.u32(0);
         body(self)?;
         let len = self.out.len() - at - 4;
         if len > MAX_PAYLOAD {
-            return Err(EncodeError::Unwritable);
+            return Err(Error::Unwritable);
         }
         self.out[at..at + 4].copy_from_slice(&(len as u32).to_be_bytes());
         self.bits = None;
         Ok(())
     }
 
-    fn table(&mut self, t: &Table, depth: usize) -> Result<(), EncodeError> {
+    fn table(&mut self, t: &Table, depth: usize) -> Result<(), Error> {
         if depth > MAX_DEPTH {
-            return Err(EncodeError::Unwritable);
+            return Err(Error::Unwritable);
         }
         if t.entries.len() > MAX_PAYLOAD / 2 || has_duplicates(&t.entries) {
-            return Err(EncodeError::Unwritable);
+            return Err(Error::Unwritable);
         }
         self.counted(|w| {
             for (name, value) in &t.entries {
@@ -2004,7 +1961,7 @@ impl Writer {
         })
     }
 
-    fn value(&mut self, v: &FieldValue, depth: usize) -> Result<(), EncodeError> {
+    fn value(&mut self, v: &FieldValue, depth: usize) -> Result<(), Error> {
         match v {
             FieldValue::Bool(b) => self.bytes(&[b't', u8::from(*b)]),
             FieldValue::I8(n) => self.bytes(&[b'b', n.to_be_bytes()[0]]),
@@ -2048,7 +2005,7 @@ impl Writer {
             }
             FieldValue::Array(values) => {
                 if depth + 1 > MAX_DEPTH {
-                    return Err(EncodeError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 self.u8(b'A');
                 self.counted(|w| {
@@ -2078,11 +2035,11 @@ impl Writer {
 
     /// Stops a writer whose output has grown past what any frame holds, so
     /// a huge table costs no more than one frame's memory to refuse.
-    fn check(&self) -> Result<(), EncodeError> {
-        if self.out.len() > MAX_PAYLOAD { Err(EncodeError::Unwritable) } else { Ok(()) }
+    fn check(&self) -> Result<(), Error> {
+        if self.out.len() > MAX_PAYLOAD { Err(Error::Unwritable) } else { Ok(()) }
     }
 
-    fn finish(self) -> Result<Vec<u8>, EncodeError> {
+    fn finish(self) -> Result<Vec<u8>, Error> {
         self.check()?;
         Ok(self.out)
     }
@@ -2291,9 +2248,9 @@ mod tests {
         assert_eq!(stream.push(&bytes), bytes.len());
         assert_eq!(stream.next(), Some(Ok(Frame::heartbeat())));
         for header in [b"AMQP\x00\x01\x00\x00", b"GET / HT"] {
-            assert_eq!(decode_all(Frames::server, header).1, Some(Fail::Protocol(FrameError::ProtocolHeader(*header))));
+            assert_eq!(decode_all(Frames::server, header).1, Some(Fail::Protocol(Error::ProtocolHeader(*header))));
         }
-        assert_eq!(decode_all(Frames::new, &PROTOCOL_HEADER).1, Some(Fail::Protocol(FrameError::Type(b'A'))));
+        assert_eq!(decode_all(Frames::new, &PROTOCOL_HEADER).1, Some(Fail::Protocol(Error::Type(b'A'))));
     }
 
     #[test]
@@ -2314,11 +2271,11 @@ mod tests {
         // A heartbeat off channel 0, or with a payload, is refused rather
         // than written as something else.
         let odd = Frame { kind: FrameKind::Heartbeat, channel: 3, payload: vec![1] };
-        assert_eq!(odd.to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(odd.to_bytes(), Err(Error::Unwritable));
         let odd = Frame { kind: FrameKind::Heartbeat, channel: 0, payload: vec![1] };
-        assert_eq!(odd.to_bytes(), Err(EncodeError::Unwritable));
-        assert_eq!(FrameError::Heartbeat { channel: 3, size: 0 }.reply_code(), 503);
-        assert_eq!(FrameError::Heartbeat { channel: 0, size: 1 }.reply_code(), 501);
+        assert_eq!(odd.to_bytes(), Err(Error::Unwritable));
+        assert_eq!(Error::Heartbeat { channel: 3, size: 0 }.reply_code(), 503);
+        assert_eq!(Error::Heartbeat { channel: 0, size: 1 }.reply_code(), 501);
     }
 
     #[test]
@@ -2391,8 +2348,8 @@ mod tests {
         }
         // The 0-9 tag 'U' stays unknown, as in RabbitMQ, and so does a tag
         // no table uses.
-        assert_eq!(Table::parse(&[0, 0, 0, 5, 1, b'a', b'U', 0, 1]), Err(DecodeError::FieldType(b'U')));
-        assert_eq!(Table::parse(&[0, 0, 0, 4, 1, b'a', b'z', 0]), Err(DecodeError::FieldType(b'z')));
+        assert_eq!(Table::parse(&[0, 0, 0, 5, 1, b'a', b'U', 0, 1]), Err(Error::FieldType(b'U')));
+        assert_eq!(Table::parse(&[0, 0, 0, 4, 1, b'a', b'z', 0]), Err(Error::FieldType(b'z')));
     }
 
     #[test]
@@ -2414,11 +2371,11 @@ mod tests {
             assert_eq!(back, f);
             // Every strict prefix is cut short, and one more byte is extra.
             for n in 0..p.len() {
-                assert_eq!(Method::parse(&p[..n]), Err(DecodeError::Truncated), "{m:?} cut to {n}");
+                assert_eq!(Method::parse(&p[..n]), Err(Error::Truncated), "{m:?} cut to {n}");
             }
             let mut longer = p.clone();
             longer.push(0);
-            assert_eq!(Method::parse(&longer), Err(DecodeError::TrailingBytes), "{m:?}");
+            assert_eq!(Method::parse(&longer), Err(Error::Trailing), "{m:?}");
         }
         let content: Vec<_> = all.iter().filter(|m| m.has_content()).map(Method::ids).collect();
         assert_eq!(content, [(60, 40), (60, 50), (60, 60), (60, 71)]);
@@ -2438,21 +2395,21 @@ mod tests {
 
     #[test]
     fn method_errors() {
-        assert_eq!(Method::parse(&[0, 10, 0, 99]), Err(DecodeError::UnknownMethod { class_id: 10, method_id: 99 }));
-        assert_eq!(Method::parse(&[0, 30, 0, 10]), Err(DecodeError::UnknownMethod { class_id: 30, method_id: 10 }));
-        assert_eq!(DecodeError::UnknownMethod { class_id: 1, method_id: 1 }.reply_code(), 540);
+        assert_eq!(Method::parse(&[0, 10, 0, 99]), Err(Error::UnknownMethod { class_id: 10, method_id: 99 }));
+        assert_eq!(Method::parse(&[0, 30, 0, 10]), Err(Error::UnknownMethod { class_id: 30, method_id: 10 }));
+        assert_eq!(Error::UnknownMethod { class_id: 1, method_id: 1 }.reply_code(), 540);
         // A queue name that is not UTF-8.
-        assert_eq!(Method::parse(&[0, 60, 0, 21, 2, 0xc3, 0x28]), Err(DecodeError::Utf8));
-        assert_eq!(DecodeError::Utf8.reply_code(), 502);
+        assert_eq!(Method::parse(&[0, 60, 0, 21, 2, 0xc3, 0x28]), Err(Error::Utf8));
+        assert_eq!(Error::Utf8.reply_code(), 502);
         // An unknown field type in queue.declare's arguments.
         let p = [0, 50, 0, 10, 0, 0, 1, b'q', 0, 0, 0, 0, 3, 1, b'a', b'?'];
-        assert_eq!(Method::parse(&p), Err(DecodeError::FieldType(b'?')));
+        assert_eq!(Method::parse(&p), Err(Error::FieldType(b'?')));
         // A table length past the payload's end.
         let p = [0, 50, 0, 10, 0, 0, 1, b'q', 0, 0xff, 0xff, 0xff, 0xff];
-        assert_eq!(Method::parse(&p), Err(DecodeError::Truncated));
+        assert_eq!(Method::parse(&p), Err(Error::Truncated));
         // A table whose entry runs past its own length.
-        assert_eq!(Table::parse(&[0, 0, 0, 3, 1, b'a', b'I', 0, 0, 0, 1]), Err(DecodeError::Truncated));
-        assert_eq!(Table::parse(&[0, 0, 0, 0, 9]), Err(DecodeError::TrailingBytes));
+        assert_eq!(Table::parse(&[0, 0, 0, 3, 1, b'a', b'I', 0, 0, 0, 1]), Err(Error::Truncated));
+        assert_eq!(Table::parse(&[0, 0, 0, 0, 9]), Err(Error::Trailing));
     }
 
     #[test]
@@ -2470,7 +2427,7 @@ mod tests {
         let ok = nest(MAX_DEPTH);
         let bytes = ok.to_bytes().unwrap();
         assert_eq!(Table::parse(&bytes), Ok(ok));
-        assert_eq!(nest(MAX_DEPTH + 1).to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(nest(MAX_DEPTH + 1).to_bytes(), Err(Error::Unwritable));
         let mut deep = Vec::new();
         for _ in 0..MAX_DEPTH {
             deep.extend_from_slice(&[0, 0, 0, 0, 1, b't', b'F']);
@@ -2484,7 +2441,7 @@ mod tests {
             deep[at..at + 4].copy_from_slice(&len.to_be_bytes());
             end = deep.len();
         }
-        assert_eq!(Table::parse(&deep), Err(DecodeError::TooDeep));
+        assert_eq!(Table::parse(&deep), Err(Error::TooDeep));
         // Arrays count too.
         let mut v = FieldValue::Void;
         for _ in 0..MAX_DEPTH {
@@ -2492,7 +2449,7 @@ mod tests {
         }
         let mut t = Table::new();
         t.insert("a", v);
-        assert_eq!(t.to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(t.to_bytes(), Err(Error::Unwritable));
         let FieldValue::Array(inner) = &t.entries[0].1 else { panic!() };
         let mut t = Table::new();
         t.insert("a", inner[0].clone());
@@ -2514,19 +2471,19 @@ mod tests {
         let mut b = ((arrays.len() + 2) as u32).to_be_bytes().to_vec();
         b.extend_from_slice(&[1, b'a']);
         b.extend_from_slice(&arrays);
-        assert_eq!(Table::parse(&b), Err(DecodeError::TooDeep));
+        assert_eq!(Table::parse(&b), Err(Error::TooDeep));
     }
 
     #[test]
     fn encode_errors() {
         let long = "x".repeat(256);
         let m = Method::BasicConsumeOk { consumer_tag: long.clone() };
-        assert_eq!(m.to_bytes(), Err(EncodeError::Unwritable));
-        assert_eq!(Frame::method(1, &m), Err(EncodeError::Unwritable));
+        assert_eq!(m.to_bytes(), Err(Error::Unwritable));
+        assert_eq!(Frame::method(1, &m), Err(Error::Unwritable));
         let m = Method::BasicConsumeOk { consumer_tag: "x".repeat(255) };
         assert!(Method::parse(&m.to_bytes().unwrap()).is_ok());
         let big = Method::ConnectionSecure { challenge: vec![0; MAX_PAYLOAD] };
-        assert!(matches!(big.to_bytes(), Err(EncodeError::Unwritable)));
+        assert!(matches!(big.to_bytes(), Err(Error::Unwritable)));
         let fits = Method::ConnectionSecure { challenge: vec![0; MAX_PAYLOAD - 8] };
         let f = Frame::method(0, &fits).unwrap();
         assert_eq!(f.to_bytes().unwrap().len(), MAX_FRAME_SIZE as usize);
@@ -2535,10 +2492,10 @@ mod tests {
         for i in 0..20 {
             t.insert(format!("k{i}"), FieldValue::Bytes(vec![0; MAX_PAYLOAD / 16]));
         }
-        assert!(matches!(t.to_bytes(), Err(EncodeError::Unwritable)));
+        assert!(matches!(t.to_bytes(), Err(Error::Unwritable)));
         let mut h = ContentHeader::default();
         h.properties.app_id = Some(long);
-        assert_eq!(h.to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(h.to_bytes(), Err(Error::Unwritable));
     }
 
     #[test]
@@ -2548,17 +2505,17 @@ mod tests {
         let mut p = vec![0, 10, 0, 20];
         p.extend_from_slice(&(MAX_PAYLOAD as u32).to_be_bytes());
         p.resize(p.len() + MAX_PAYLOAD, 0);
-        assert_eq!(Method::parse(&p), Err(DecodeError::TooLarge(MAX_PAYLOAD + 8)));
-        assert_eq!(DecodeError::TooLarge(1).reply_code(), 501);
+        assert_eq!(Method::parse(&p), Err(Error::PayloadTooLarge(MAX_PAYLOAD + 8)));
+        assert_eq!(Error::PayloadTooLarge(1).reply_code(), 501);
         // A table that size, and a content header.
         let mut t = vec![0; 4];
         t[..4].copy_from_slice(&(MAX_PAYLOAD as u32 - 3).to_be_bytes());
         t.extend_from_slice(&[1, b'a', b'x']);
         t.extend_from_slice(&(MAX_PAYLOAD as u32 - 10).to_be_bytes());
         t.resize(MAX_PAYLOAD + 1, 0);
-        assert_eq!(Table::parse(&t), Err(DecodeError::TooLarge(MAX_PAYLOAD + 1)));
+        assert_eq!(Table::parse(&t), Err(Error::PayloadTooLarge(MAX_PAYLOAD + 1)));
         let h = vec![0; MAX_PAYLOAD + 1];
-        assert_eq!(ContentHeader::parse(&h), Err(DecodeError::TooLarge(MAX_PAYLOAD + 1)));
+        assert_eq!(ContentHeader::parse(&h), Err(Error::PayloadTooLarge(MAX_PAYLOAD + 1)));
         // At exactly MAX_PAYLOAD bytes a payload reads and writes back.
         p.truncate(MAX_PAYLOAD);
         p[4..8].copy_from_slice(&(MAX_PAYLOAD as u32 - 8).to_be_bytes());
@@ -2628,34 +2585,34 @@ mod tests {
         let bytes = h.to_bytes().unwrap();
         assert_eq!(ContentHeader::parse(&bytes), Ok(h));
         for n in 0..bytes.len() {
-            assert_eq!(ContentHeader::parse(&bytes[..n]), Err(DecodeError::Truncated), "cut to {n}");
+            assert_eq!(ContentHeader::parse(&bytes[..n]), Err(Error::Truncated), "cut to {n}");
         }
         let mut longer = bytes.clone();
         longer.push(0);
-        assert_eq!(ContentHeader::parse(&longer), Err(DecodeError::TrailingBytes));
+        assert_eq!(ContentHeader::parse(&longer), Err(Error::Trailing));
     }
 
     #[test]
     fn content_header_errors() {
         assert_eq!(
             ContentHeader::parse(&[0, 50, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
-            Err(DecodeError::ContentClass(50))
+            Err(Error::ContentClass(50))
         );
         // The continuation flag and the unused bit are refused.
         assert_eq!(
             ContentHeader::parse(&[0, 60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
-            Err(DecodeError::PropertyFlags(1))
+            Err(Error::PropertyFlags(1))
         );
         assert_eq!(
             ContentHeader::parse(&[0, 60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]),
-            Err(DecodeError::PropertyFlags(2))
+            Err(Error::PropertyFlags(2))
         );
         // A nonzero weight is refused (section 4.2.6.1).
-        assert_eq!(ContentHeader::parse(&[0, 60, 0, 9, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0]), Err(DecodeError::Weight(9)));
-        assert_eq!(ContentHeader::parse(&[0, 60, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), Err(DecodeError::Weight(1)));
-        assert_eq!(DecodeError::Weight(1).reply_code(), 505);
+        assert_eq!(ContentHeader::parse(&[0, 60, 0, 9, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0]), Err(Error::Weight(9)));
+        assert_eq!(ContentHeader::parse(&[0, 60, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), Err(Error::Weight(1)));
+        assert_eq!(Error::Weight(1).reply_code(), 505);
         // A wrong class is a frame error (section 4.2.6.1).
-        assert_eq!(DecodeError::ContentClass(50).reply_code(), 501);
+        assert_eq!(Error::ContentClass(50).reply_code(), 501);
     }
 
     #[test]
@@ -2667,38 +2624,38 @@ mod tests {
             assert_eq!(Frames::with_limit(0).decode(&bytes[..n], false), Ok(Step::Need), "{n} bytes");
         }
         // Unknown type, known from the first byte.
-        assert_eq!(Frames::with_limit(0).decode(&[4], false), Err(FrameError::Type(4)));
-        assert_eq!(Frames::with_limit(0).decode(&[0], false), Err(FrameError::Type(0)));
+        assert_eq!(Frames::with_limit(0).decode(&[4], false), Err(Error::Type(4)));
+        assert_eq!(Frames::with_limit(0).decode(&[0], false), Err(Error::Type(0)));
         // A heartbeat off channel 0, or with a payload.
         assert_eq!(
             Frames::with_limit(0).decode(&[8, 0, 1, 0, 0, 0, 0], false),
-            Err(FrameError::Heartbeat { channel: 1, size: 0 })
+            Err(Error::Heartbeat { channel: 1, size: 0 })
         );
         assert_eq!(
             Frames::with_limit(0).decode(&[8, 0, 0, 0, 0, 0, 1], false),
-            Err(FrameError::Heartbeat { channel: 0, size: 1 })
+            Err(Error::Heartbeat { channel: 0, size: 1 })
         );
         // Too large, known from the header.
         assert_eq!(
             Frames::with_limit(4096).decode(&[3, 0, 1, 0, 0, 0x10, 0x00], false),
-            Err(FrameError::TooLarge { size: 4096, frame_max: 4096 })
+            Err(Error::FrameTooLarge { size: 4096, frame_max: 4096 })
         );
         assert_eq!(Frames::with_limit(4096).decode(&[3, 0, 1, 0, 0, 0x0f, 0xf8], false), Ok(Step::Need));
         assert_eq!(
             Frames::with_limit(0).decode(&[3, 0, 1, 0xff, 0xff, 0xff, 0xff], false),
-            Err(FrameError::TooLarge { size: u32::MAX, frame_max: MAX_FRAME_SIZE })
+            Err(Error::FrameTooLarge { size: u32::MAX, frame_max: MAX_FRAME_SIZE })
         );
         // A wrong end byte.
         assert_eq!(
             Frames::with_limit(0).decode(&[3, 0, 1, 0, 0, 0, 1, b'x', 0xcd], false),
-            Err(FrameError::FrameEnd(0xcd))
+            Err(Error::FrameEnd(0xcd))
         );
-        assert_eq!(FrameError::FrameEnd(0).reply_code(), 501);
+        assert_eq!(Error::FrameEnd(0).reply_code(), 501);
         // A bad type or end byte closes the socket with nothing sent.
-        assert!(!FrameError::FrameEnd(0).sends_close());
-        assert!(!FrameError::Type(0).sends_close());
-        assert!(!FrameError::ProtocolHeader([0; 8]).sends_close());
-        assert!(FrameError::TooLarge { size: 1, frame_max: 2 }.sends_close());
+        assert!(!Error::FrameEnd(0).sends_close());
+        assert!(!Error::Type(0).sends_close());
+        assert!(!Error::ProtocolHeader([0; 8]).sends_close());
+        assert!(Error::FrameTooLarge { size: 1, frame_max: 2 }.sends_close());
         // Frame limits.
         assert_eq!(frame_limit(0), MAX_FRAME_SIZE);
         assert_eq!(frame_limit(1), FRAME_MIN_SIZE);
@@ -2706,7 +2663,7 @@ mod tests {
         assert_eq!(frame_limit(131072), 131072);
         // A payload longer than a frame holds is refused, not cut short.
         let f = Frame::body(1, vec![0; MAX_PAYLOAD + 1]);
-        assert_eq!(f.to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(f.to_bytes(), Err(Error::Unwritable));
         let f = Frame::body(1, vec![0; MAX_PAYLOAD]);
         let bytes = f.to_bytes().unwrap();
         assert_eq!(Frames::with_limit(0).decode(&bytes, false), Ok(Step::Item(f, MAX_FRAME_SIZE as usize)));
@@ -2724,7 +2681,7 @@ mod tests {
         assert_eq!(decode_all(Frames::new, &bytes), (frames.to_vec(), None));
         let mut stream = Stream::new(Frames::new());
         assert_eq!(stream.push(&[3, 0, 1, 0, 0, 0, 0, 0]), 8);
-        assert_eq!(stream.next(), Some(Err(Fail::Protocol(FrameError::FrameEnd(0)))));
+        assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::FrameEnd(0)))));
         assert_eq!(stream.push(&bytes), bytes.len());
         assert_eq!(stream.next(), None);
     }
@@ -2736,7 +2693,7 @@ mod tests {
         assert_eq!(frames.frame_max(), DEFAULT_FRAME_MAX);
         frames.set_frame_max(4096);
         assert_eq!(frames.frame_max(), 4096);
-        assert_eq!(frames.decode(&big[..7], false), Err(FrameError::TooLarge { size: 10_000, frame_max: 4096 }));
+        assert_eq!(frames.decode(&big[..7], false), Err(Error::FrameTooLarge { size: 10_000, frame_max: 4096 }));
         assert_eq!(decode_all(Frames::default, &big).0[0].payload.len(), 10_000);
     }
 
@@ -2768,7 +2725,7 @@ mod tests {
         let mut t = Table::new();
         t.insert("big", FieldValue::LongString(vec![0; 5000]));
         props.headers = Some(t);
-        assert!(matches!(content_frames(1, &publish, &props, &[], 4096), Err(EncodeError::Unwritable)));
+        assert!(matches!(content_frames(1, &publish, &props, &[], 4096), Err(Error::Unwritable)));
     }
 
     #[test]
@@ -2786,33 +2743,33 @@ mod tests {
     #[test]
     fn errors_display() {
         for e in [
-            FrameError::ProtocolHeader([0; 8]),
-            FrameError::Type(9),
-            FrameError::Heartbeat { channel: 1, size: 0 },
-            FrameError::TooLarge { size: 1, frame_max: 2 },
-            FrameError::FrameEnd(0),
-            FrameError::ChannelZero(FrameKind::Body),
-            FrameError::NotChannelZero { channel: 1 },
+            Error::ProtocolHeader([0; 8]),
+            Error::Type(9),
+            Error::Heartbeat { channel: 1, size: 0 },
+            Error::FrameTooLarge { size: 1, frame_max: 2 },
+            Error::FrameEnd(0),
+            Error::ChannelZero(FrameKind::Body),
+            Error::NotChannelZero { channel: 1 },
         ] {
             assert!(!e.to_string().is_empty());
         }
         for e in [
-            DecodeError::Truncated,
-            DecodeError::TrailingBytes,
-            DecodeError::UnknownMethod { class_id: 1, method_id: 2 },
-            DecodeError::Utf8,
-            DecodeError::FieldType(0),
-            DecodeError::TooDeep,
-            DecodeError::ContentClass(1),
-            DecodeError::PropertyFlags(1),
-            DecodeError::TooLarge(1),
-            DecodeError::ZeroByte,
-            DecodeError::DuplicateField,
-            DecodeError::Weight(1),
+            Error::Truncated,
+            Error::Trailing,
+            Error::UnknownMethod { class_id: 1, method_id: 2 },
+            Error::Utf8,
+            Error::FieldType(0),
+            Error::TooDeep,
+            Error::ContentClass(1),
+            Error::PropertyFlags(1),
+            Error::PayloadTooLarge(1),
+            Error::ZeroByte,
+            Error::DuplicateField,
+            Error::Weight(1),
         ] {
             assert!(!e.to_string().is_empty());
         }
-        assert_eq!(EncodeError::Unwritable.to_string(), "AMQP value cannot be written without changing it");
+        assert_eq!(Error::Unwritable.to_string(), "AMQP value cannot be written without changing it");
     }
 
     fn publish() -> Method {
@@ -2831,7 +2788,7 @@ mod tests {
         let mut t = Table::new();
         t.entries.push((s("a"), v));
         let mut props = BasicProperties { headers: Some(t), ..Default::default() };
-        assert_eq!(content_frames(1, &publish(), &props, b"", 0), Err(EncodeError::Unwritable));
+        assert_eq!(content_frames(1, &publish(), &props, b"", 0), Err(Error::Unwritable));
         // Take the value apart a level at a time, so dropping it does not
         // recurse either.
         let Some(mut t) = props.headers.take() else { panic!() };
@@ -2845,7 +2802,7 @@ mod tests {
     fn stream_buffer_is_bounded() {
         let chunk = vec![3u8; 100_000];
         contract::check_decode_with_alloc_limit(Frames::new, &chunk, 2 * DEFAULT_FRAME_MAX as usize);
-        assert!(matches!(decode_all(Frames::new, &chunk).1, Some(Fail::Protocol(FrameError::TooLarge { .. }))));
+        assert!(matches!(decode_all(Frames::new, &chunk).1, Some(Fail::Protocol(Error::FrameTooLarge { .. }))));
         let one = Frame::method(1, &Method::BasicAck { delivery_tag: 1, multiple: false }).unwrap();
         let mut bytes = PROTOCOL_HEADER.to_vec();
         bytes.extend(one.to_bytes().unwrap().repeat(1000));
@@ -2862,39 +2819,39 @@ mod tests {
     fn content_needs_a_content_method_and_a_channel() {
         assert_eq!(
             content_frames(1, &Method::TxSelect, &BasicProperties::default(), b"x", 4096),
-            Err(EncodeError::Unwritable)
+            Err(Error::Unwritable)
         );
         assert_eq!(
             content_frames(0, &publish(), &BasicProperties::default(), b"x", 4096),
-            Err(EncodeError::Unwritable)
+            Err(Error::Unwritable)
         );
-        assert_eq!(Frame::header(0, &ContentHeader::default()), Err(EncodeError::Unwritable));
+        assert_eq!(Frame::header(0, &ContentHeader::default()), Err(Error::Unwritable));
     }
 
     #[test]
     fn channel_rules() {
         // Connection methods go on channel 0 and the rest off it (section
         // 4.2.3), in writers and readers alike.
-        assert_eq!(Frame::method(1, &Method::ConnectionCloseOk), Err(EncodeError::Unwritable));
-        assert_eq!(Frame::method(0, &Method::ChannelOpen), Err(EncodeError::Unwritable));
+        assert_eq!(Frame::method(1, &Method::ConnectionCloseOk), Err(Error::Unwritable));
+        assert_eq!(Frame::method(0, &Method::ChannelOpen), Err(Error::Unwritable));
         let close_ok = [1, 0, 1, 0, 0, 0, 4, 0, 10, 0, 51, 0xce];
-        assert_eq!(Frames::with_limit(0).decode(&close_ok, false), Err(FrameError::NotChannelZero { channel: 1 }));
-        assert_eq!(FrameError::NotChannelZero { channel: 1 }.reply_code(), 503);
+        assert_eq!(Frames::with_limit(0).decode(&close_ok, false), Err(Error::NotChannelZero { channel: 1 }));
+        assert_eq!(Error::NotChannelZero { channel: 1 }.reply_code(), 503);
         let open = [1, 0, 0, 0, 0, 0, 5, 0, 20, 0, 10, 0, 0xce];
-        assert_eq!(Frames::with_limit(0).decode(&open, false), Err(FrameError::ChannelZero(FrameKind::Method)));
-        assert_eq!(FrameError::ChannelZero(FrameKind::Method).reply_code(), 503);
+        assert_eq!(Frames::with_limit(0).decode(&open, false), Err(Error::ChannelZero(FrameKind::Method)));
+        assert_eq!(Error::ChannelZero(FrameKind::Method).reply_code(), 503);
         // Content on channel 0 is a channel error (section 4.2.6.1).
         let body = Frame::body(0, vec![1]);
-        assert_eq!(body.to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(body.to_bytes(), Err(Error::Unwritable));
         assert_eq!(
             Frames::with_limit(0).decode(&[3, 0, 0, 0, 0, 0, 1, 1, 0xce], false),
-            Err(FrameError::ChannelZero(FrameKind::Body))
+            Err(Error::ChannelZero(FrameKind::Body))
         );
         assert_eq!(
             Frames::with_limit(0).decode(&[2, 0, 0, 0, 0, 0, 0, 0xce], false),
-            Err(FrameError::ChannelZero(FrameKind::Header))
+            Err(Error::ChannelZero(FrameKind::Header))
         );
-        assert_eq!(FrameError::ChannelZero(FrameKind::Body).reply_code(), 504);
+        assert_eq!(Error::ChannelZero(FrameKind::Body).reply_code(), 504);
         // A method frame too short to name its class is left to Method::parse.
         assert!(matches!(Frames::with_limit(0).decode(&[1, 0, 0, 0, 0, 0, 1, 0, 0xce], false), Ok(Step::Item(_, _))));
     }
@@ -2903,12 +2860,12 @@ mod tests {
     fn short_strings_hold_no_zero_byte() {
         // Section 4.2.5.3.
         let m = Method::BasicConsumeOk { consumer_tag: s("a\0b") };
-        assert_eq!(m.to_bytes(), Err(EncodeError::Unwritable));
-        assert_eq!(Method::parse(&[0, 60, 0, 21, 3, b'a', 0, b'b']), Err(DecodeError::ZeroByte));
+        assert_eq!(m.to_bytes(), Err(Error::Unwritable));
+        assert_eq!(Method::parse(&[0, 60, 0, 21, 3, b'a', 0, b'b']), Err(Error::ZeroByte));
         // Field names are short strings too.
         let t = Table { entries: vec![(s("a\0"), FieldValue::Void)] };
-        assert_eq!(t.to_bytes(), Err(EncodeError::Unwritable));
-        assert_eq!(Table::parse(&[0, 0, 0, 4, 2, b'a', 0, b'V']), Err(DecodeError::ZeroByte));
+        assert_eq!(t.to_bytes(), Err(Error::Unwritable));
+        assert_eq!(Table::parse(&[0, 0, 0, 4, 2, b'a', 0, b'V']), Err(Error::ZeroByte));
         // Long strings may hold any bytes.
         let t = Table { entries: vec![(s("a"), FieldValue::LongString(vec![0]))] };
         assert_eq!(Table::parse(&t.to_bytes().unwrap()), Ok(t));
@@ -2918,10 +2875,10 @@ mod tests {
     fn duplicate_fields_are_refused() {
         // Section 4.2.5.5: duplicate fields are illegal.
         let t = Table { entries: vec![(s("a"), FieldValue::I32(1)), (s("a"), FieldValue::I32(2))] };
-        assert_eq!(t.to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(t.to_bytes(), Err(Error::Unwritable));
         let b = [0, 0, 0, 8, 1, b'a', b'V', 1, b'b', b'V', 1, b'a', b'V'];
         let b = [&[0, 0, 0, 9][..], &b[4..]].concat();
-        assert_eq!(Table::parse(&b), Err(DecodeError::DuplicateField));
+        assert_eq!(Table::parse(&b), Err(Error::DuplicateField));
         // The same name in different tables is fine.
         let mut inner = Table::new();
         inner.insert("a", FieldValue::Void);
