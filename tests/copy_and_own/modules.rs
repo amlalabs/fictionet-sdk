@@ -20,6 +20,10 @@ macro_rules! protocols {
         pub mod bacnet;
         #[path = "../../src/stdlib/bgp.rs"]
         pub mod bgp;
+        #[path = "../../src/stdlib/cboe_boe.rs"]
+        pub mod cboe_boe;
+        #[path = "../../src/stdlib/cboe_pitch.rs"]
+        pub mod cboe_pitch;
         #[path = "../../src/stdlib/coap.rs"]
         pub mod coap;
         #[path = "../../src/stdlib/cotp.rs"]
@@ -78,6 +82,8 @@ macro_rules! protocols {
         pub mod ipp;
         #[path = "../../src/stdlib/ipsec.rs"]
         pub mod ipsec;
+        #[path = "../../src/stdlib/itch.rs"]
+        pub mod itch;
         #[path = "../../src/stdlib/json.rs"]
         pub mod json;
         #[path = "../../src/stdlib/json_schema.rs"]
@@ -128,6 +134,8 @@ macro_rules! protocols {
         pub mod openvpn;
         #[path = "../../src/stdlib/ospf.rs"]
         pub mod ospf;
+        #[path = "../../src/stdlib/ouch.rs"]
+        pub mod ouch;
         #[path = "../../src/stdlib/pcp.rs"]
         pub mod pcp;
         #[path = "../../src/stdlib/pim.rs"]

@@ -203,6 +203,12 @@ impl<const N: usize> Alpha<N> {
     pub fn matches(&self, other: &Self) -> bool {
         self.trimmed().eq_ignore_ascii_case(other.trimmed())
     }
+    /// Whether two fields hold the same text, ignoring padding only.
+    /// Session IDs compare this way: the specification makes only
+    /// usernames and passwords case-insensitive.
+    pub fn same_text(&self, other: &Self) -> bool {
+        self.trimmed() == other.trimmed()
+    }
     fn read(b: &[u8]) -> Result<Self, Error> {
         Self::new(b.try_into().map_err(|_| Error::Length)?)
     }
@@ -743,7 +749,10 @@ impl Client {
         match (self.state, packet) {
             (_, Packet::Debug(_)) => Ok(Vec::new()),
             (ClientState::LoginSent, Packet::LoginAccepted { session, sequence }) => {
-                if !self.login.session.is_blank() && !self.login.session.matches(session) {
+                // Sequence numbers start at 1 in every session (1.2).
+                if *sequence == 0
+                    || (!self.login.session.is_blank() && !self.login.session.same_text(session))
+                {
                     return Ok(self.close(CloseReason::Protocol));
                 }
                 self.state = ClientState::LoggedIn;
@@ -1543,6 +1552,44 @@ mod tests {
             client.receive(&other, 1).unwrap(),
             [Action::Event(Event::Disconnected(CloseReason::Protocol))]
         );
+    }
+
+    #[test]
+    fn login_accepted_needs_the_exact_session_and_a_real_sequence() {
+        let closed = [Action::Event(Event::Disconnected(CloseReason::Protocol))];
+        let asking = Login {
+            session: Alpha::left_padded("Sess1").unwrap(),
+            ..login()
+        };
+        // Session IDs are case-sensitive; only usernames and passwords
+        // are not (2.3.1).
+        let mut client = Client::new(asking, Timers::default(), 0).unwrap();
+        let _ = client.start(0).unwrap();
+        let upper = Packet::LoginAccepted {
+            session: Alpha::left_padded("SESS1").unwrap(),
+            sequence: 1,
+        };
+        assert_eq!(client.receive(&upper, 1).unwrap(), closed);
+        // Padding does not matter.
+        let mut client = Client::new(asking, Timers::default(), 0).unwrap();
+        let _ = client.start(0).unwrap();
+        let padded = Packet::LoginAccepted {
+            session: Alpha::new(*b"Sess1     ").unwrap(),
+            sequence: 1,
+        };
+        assert!(matches!(
+            client.receive(&padded, 1).unwrap()[..],
+            [Action::Event(Event::LoggedIn { .. })]
+        ));
+        // Sequence numbers start at 1 (1.2): 0 is never the next one.
+        let mut client = Client::new(login(), Timers::default(), 0).unwrap();
+        let _ = client.start(0).unwrap();
+        let zero = Packet::LoginAccepted {
+            session: session(),
+            sequence: 0,
+        };
+        assert_eq!(client.receive(&zero, 1).unwrap(), closed);
+        assert_eq!(client.state(), ClientState::Closed);
     }
 
     #[test]
