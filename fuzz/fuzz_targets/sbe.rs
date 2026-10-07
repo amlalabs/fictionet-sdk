@@ -3,7 +3,7 @@
 
 use fictionet::stdlib::codec::{Wire, contract};
 use fictionet::stdlib::sbe::{
-    Error, Frames, MAX_MESSAGE_BYTES, MessageWire, Scalar, Schema, SchemaSource, Value,
+    Error, Messages, MAX_MESSAGE_BYTES, MessageWire, Scalar, Schema, SchemaSource, Value,
 };
 use libfuzzer_sys::fuzz_target;
 use std::sync::OnceLock;
@@ -93,7 +93,7 @@ fuzz_target!(|input: &[u8]| {
             if let Ok(xml) = std::str::from_utf8(xml) {
                 if let Ok(schema) = Schema::parse(xml) {
                     contract::check_decode_with_alloc_limit(
-                        || Frames::new(&schema),
+                        || Messages::new(&schema),
                         bytes,
                         2 * MAX_MESSAGE_BYTES,
                     );
@@ -107,7 +107,7 @@ fuzz_target!(|input: &[u8]| {
         }
     }
     let schema = Car::schema().unwrap();
-    contract::check_decode_with_alloc_limit(|| Frames::new(schema), data, 2 * MAX_MESSAGE_BYTES);
+    contract::check_decode_with_alloc_limit(|| Messages::new(schema), data, 2 * MAX_MESSAGE_BYTES);
     contract::check_wire::<MessageWire<Car>>(data);
     // Mutate valid framing so fuzzing reaches values and nested groups.
     let mut bytes = CAR_BYTES.to_vec();
@@ -120,7 +120,7 @@ fuzz_target!(|input: &[u8]| {
         }
     }
     contract::check_wire::<MessageWire<Car>>(&bytes);
-    contract::check_decode_with_alloc_limit(|| Frames::new(schema), &bytes, 2 * MAX_MESSAGE_BYTES);
+    contract::check_decode_with_alloc_limit(|| Messages::new(schema), &bytes, 2 * MAX_MESSAGE_BYTES);
     let mut value = MessageWire::<Car>::parse(CAR_BYTES).unwrap();
     if let Some(first) = data.first() {
         value.message.header.version = u64::from(*first);

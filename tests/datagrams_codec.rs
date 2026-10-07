@@ -496,12 +496,12 @@ fn wake_on_lan_payload_and_exact_packet() {
         let mut payload = b"prefix".to_vec();
         payload.extend_from_slice(&bytes);
         contract::check_decode_with_alloc_limit(
-            wol::Packets::new,
+            wol::MagicPackets::new,
             &payload,
-            2 * wol::Packets::new().capacity(),
+            2 * wol::MagicPackets::new().capacity(),
         );
         assert!(<wol::MagicPacket as Wire>::parse(&payload).is_err());
-        let mut stream = Stream::new(wol::Packets::new());
+        let mut stream = Stream::new(wol::MagicPackets::new());
         pump(&mut stream, &payload, |_| panic!("packet before EOF")).unwrap();
         let mut got = Vec::new();
         finish(&mut stream, |p| got.push(p)).unwrap();
@@ -517,18 +517,18 @@ fn wake_on_lan_payload_and_exact_packet() {
         payload.extend(vec![7; tail]);
         assert!(<wol::MagicPacket as Wire>::parse(&payload).is_err());
         assert_eq!(
-            decode_all(wol::Packets::new, &payload),
+            decode_all(wol::MagicPackets::new, &payload),
             (vec![(0, wol::MagicPacket::new(MAC))], None)
         );
     }
     contract::check_decode_with_alloc_limit(
-        wol::Packets::new,
+        wol::MagicPackets::new,
         b"no packet",
-        2 * wol::Packets::new().capacity(),
+        2 * wol::MagicPackets::new().capacity(),
     );
     assert_eq!(
-        decode_all(wol::Packets::new, b"no packet"),
-        (vec![], Some(Fail::Protocol(wol::ParseError::NotFound)))
+        decode_all(wol::MagicPackets::new, b"no packet"),
+        (vec![], Some(Fail::Protocol(wol::Error::NotFound)))
     );
 }
 
@@ -537,7 +537,7 @@ fn wake_on_lan_rejects_oversize_payload() {
     let mut payload = vec![0; wol::MAX_PAYLOAD - wol::PACKET_LEN];
     payload.extend(wol::MagicPacket::new(MAC).to_bytes().unwrap());
     assert_eq!(
-        decode_all(wol::Packets::new, &payload),
+        decode_all(wol::MagicPackets::new, &payload),
         (
             vec![(
                 wol::MAX_PAYLOAD - wol::PACKET_LEN,
@@ -547,18 +547,18 @@ fn wake_on_lan_rejects_oversize_payload() {
         )
     );
     payload.push(0);
-    let mut stream = Stream::new(wol::Packets::new());
+    let mut stream = Stream::new(wol::MagicPackets::new());
     assert_eq!(stream.decoder().capacity(), wol::MAX_PAYLOAD + 1);
     assert_eq!(stream.push(&payload), wol::MAX_PAYLOAD + 1);
     assert_eq!(
         stream.next(),
-        Some(Err(Fail::Protocol(wol::ParseError::TooLong)))
+        Some(Err(Fail::Protocol(wol::Error::TooLong)))
     );
     assert!(stream.next().is_none());
     contract::check_decode_with_alloc_limit(
-        wol::Packets::new,
+        wol::MagicPackets::new,
         &payload,
-        2 * wol::Packets::new().capacity(),
+        2 * wol::MagicPackets::new().capacity(),
     );
 }
 
@@ -576,15 +576,15 @@ fn wake_on_lan_contracts_on_mutated_payloads() {
         let end = rng.index(bytes.len() + 1);
         bytes.truncate(end);
         contract::check_decode_with_alloc_limit(
-            wol::Packets::new,
+            wol::MagicPackets::new,
             &bytes,
-            2 * wol::Packets::new().capacity(),
+            2 * wol::MagicPackets::new().capacity(),
         );
         // Adapter consistency: the decoder finds the packet as `find` does.
         let expected = match wol::MagicPacket::find(&bytes) {
             Ok(packet) => (vec![packet], None),
             Err(e) => (vec![], Some(Fail::Protocol(e))),
         };
-        assert_eq!(decode_all(wol::Packets::new, &bytes), expected);
+        assert_eq!(decode_all(wol::MagicPackets::new, &bytes), expected);
     }
 }

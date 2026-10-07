@@ -175,30 +175,30 @@ fn proxy_v1_v2_round_trip_and_handoff() {
 fn proxy_header_limits_truncation_and_terminal_errors() {
     let mut over = proxy::V2_SIGNATURE.to_vec();
     over.extend_from_slice(&[0x21, 0, 0, 17]);
-    terminal(|| proxy::Headers::with_limit(32), &over, Fail::Protocol(proxy::HeaderError::TooLong));
+    terminal(|| proxy::Headers::with_limit(32), &over, Fail::Protocol(proxy::FrameError::TooLong));
     let mut invalid = proxy::V2_SIGNATURE.to_vec();
     invalid.push(0x31);
-    terminal(proxy::Headers::new, &invalid, Fail::Protocol(proxy::HeaderError::Protocol(proxy::Error::Version(3))));
+    terminal(proxy::Headers::new, &invalid, Fail::Protocol(proxy::FrameError::Protocol(proxy::Error::Version(3))));
     truncated(proxy::Headers::new, b"PROXY TCP4 192.");
     truncated(proxy::Headers::new, &over);
     let overline = [b"PROXY ".as_slice(), &[b'x'; proxy::V1_MAX_LEN - 6]].concat();
     terminal(
         proxy::Headers::new,
         &overline,
-        Fail::Protocol(proxy::HeaderError::Protocol(proxy::Error::V1TooLong)),
+        Fail::Protocol(proxy::FrameError::Protocol(proxy::Error::V1TooLong)),
     );
 }
 
 #[test]
 fn proxy_not_proxy_retains_all_bytes_and_can_swap() {
     let bytes = b"GET / HTTP/1.1\r\n\x00\xff";
-    terminal(proxy::Headers::new, bytes, Fail::Protocol(proxy::HeaderError::Protocol(proxy::Error::NotProxy)));
+    terminal(proxy::Headers::new, bytes, Fail::Protocol(proxy::FrameError::Protocol(proxy::Error::NotProxy)));
     for prefix in 1..=bytes.len() {
         let mut stream = Stream::new(proxy::Headers::new());
         assert_eq!(stream.push(&bytes[..prefix]), prefix);
         assert!(matches!(
             stream.next(),
-            Some(Err(Fail::Protocol(proxy::HeaderError::Protocol(proxy::Error::NotProxy))))
+            Some(Err(Fail::Protocol(proxy::FrameError::Protocol(proxy::Error::NotProxy))))
         ));
         let mut stream = stream.swap(Bytes);
         let mut got = Vec::new();

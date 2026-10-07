@@ -21,11 +21,11 @@ fuzz_target!(|data: &[u8]| {
     contract::check_wire::<Npdu>(data);
     contract::check_wire::<Apdu>(data);
     contract::check_decode_with_alloc_limit(|| Tags, data, 2 * Tags.capacity());
-    contract::check_decode_with_alloc_limit(|| Primitives, data, 2 * Primitives.capacity());
+    contract::check_decode_with_alloc_limit(|| Values, data, 2 * Values.capacity());
     let _ = ContextValue::<9>::read(data, data.first().copied().unwrap_or(0));
     contract::check_wire::<Tag>(data);
     contract::check_wire::<Value>(data);
-    contract::check_wire::<Values>(data);
+    contract::check_wire::<ValueList>(data);
     contract::check_wire::<WhoIs>(data);
     contract::check_wire::<IAm>(data);
     contract::check_wire::<ContextValue<0>>(data);

@@ -14,7 +14,7 @@
 //! Character arrays and variable data remain bytes; character encoding and
 //! FIX business semantics belong to the caller.
 //!
-//! [`Schema::decode`] reads one exact message. [`Frames`] reads a sequence
+//! [`Schema::decode`] reads one exact message. [`Messages`] reads a sequence
 //! of header-prefixed messages (section 3.1). It caches a schema walk rather
 //! than reparsing an incomplete tree. Larger fixed blocks are skipped
 //! (section 5.3). Unknown templates and enum values are refused. Undeclared
@@ -2442,7 +2442,7 @@ impl Schema {
         if input.len() > MAX_MESSAGE_BYTES {
             return Err(Error::Limit("MAX_MESSAGE_BYTES"));
         }
-        match Frames::new(self).decode(input, true)? {
+        match Messages::new(self).decode(input, true)? {
             Step::Item(message, used) if used == input.len() => Ok(message),
             Step::Item(_, _) => Err(Error::Trailing),
             _ => Err(Error::Truncated),
@@ -2595,7 +2595,7 @@ struct ScanFrame {
 /// [`codec::Demux`](fictionet::stdlib::codec::Demux), needs a
 /// `&'static Schema`, for example one kept in a `OnceLock`.
 #[derive(Clone, Debug)]
-pub struct Frames<'s> {
+pub struct Messages<'s> {
     schema: &'s Schema,
     limit: usize,
     header: Option<Header>,
@@ -2605,7 +2605,7 @@ pub struct Frames<'s> {
     pos: usize,
     work: usize,
 }
-impl<'s> Frames<'s> {
+impl<'s> Messages<'s> {
     /// Creates a decoder with a [`MAX_MESSAGE_BYTES`] input bound.
     pub fn new(schema: &'s Schema) -> Self {
         Self::with_limit(schema, MAX_MESSAGE_BYTES)
@@ -2634,7 +2634,7 @@ impl<'s> Frames<'s> {
     fn end(&self, a: usize, b: usize) -> Result<usize, Error> {
         let n = add(a, b)?;
         if n > self.limit {
-            return Err(Error::Limit("Frames::limit"));
+            return Err(Error::Limit("Messages::limit"));
         }
         Ok(n)
     }
@@ -2769,7 +2769,7 @@ impl<'s> Frames<'s> {
         Ok(Some(self.pos))
     }
 }
-impl Decode for Frames<'_> {
+impl Decode for Messages<'_> {
     type Item = Message;
     type Error = Error;
     const NAME: &'static str = "SBE 1.0";
@@ -2785,7 +2785,7 @@ impl Decode for Frames<'_> {
             // Every position the scan needs is checked against the limit,
             // so this is only a guard for rule 5 (progress at capacity).
             if !eof && input.len() >= self.limit {
-                return Err(Error::Limit("Frames::limit"));
+                return Err(Error::Limit("Messages::limit"));
             }
             return Ok(Step::Need);
         };
@@ -2960,7 +2960,7 @@ mod tests {
         );
         assert_eq!(wire.to_bytes().unwrap(), bytes);
         contract::check_wire::<MessageWire<MarketNulls>>(&bytes);
-        contract::check_decode_with_alloc_limit(|| Frames::new(s), &bytes, 2 * MAX_MESSAGE_BYTES);
+        contract::check_decode_with_alloc_limit(|| Messages::new(s), &bytes, 2 * MAX_MESSAGE_BYTES);
         wire.message.fields[0].value = int(i64::from(i32::MAX));
         let mut out = vec![1, 2, 3];
         assert_eq!(wire.write(&mut out), Err(Error::Value));
@@ -2996,7 +2996,7 @@ mod tests {
             s.write(&m, &mut out).unwrap();
             assert_eq!(out, bytes);
             contract::check_decode_with_alloc_limit(
-                || Frames::new(&s),
+                || Messages::new(&s),
                 &bytes,
                 2 * MAX_MESSAGE_BYTES,
             );
@@ -3027,7 +3027,7 @@ mod tests {
             s.write(&m, &mut out).unwrap();
             assert_eq!(out, bytes);
             contract::check_decode_with_alloc_limit(
-                || Frames::new(&s),
+                || Messages::new(&s),
                 &bytes,
                 2 * MAX_MESSAGE_BYTES,
             );
@@ -3085,7 +3085,7 @@ mod tests {
             // walk whatever its composites hold, and work stays below two
             // units per input byte.
             let bytes = empty_groups(10_000, block_length);
-            let mut frames = Frames::new(&s);
+            let mut frames = Messages::new(&s);
             assert_eq!(frames.scan(&bytes), Ok(Some(bytes.len())));
             assert!(frames.work <= 2 * bytes.len(), "{}", frames.work);
             let m = s.decode(&bytes).unwrap();
@@ -3096,7 +3096,7 @@ mod tests {
             // limit, not decoded in quadratic time.
             let bytes = empty_groups(20_000, block_length);
             assert_eq!(s.decode(&bytes), Err(Error::Limit("MAX_VALUES")));
-            let mut stream = Stream::new(Frames::new(&s));
+            let mut stream = Stream::new(Messages::new(&s));
             for b in &bytes {
                 assert_eq!(stream.push(core::slice::from_ref(b)), 1);
                 if let Some(r) = stream.next() {
@@ -3144,7 +3144,7 @@ mod tests {
             s.write(&m, &mut out).unwrap();
             assert_eq!(out, bytes);
             contract::check_decode_with_alloc_limit(
-                || Frames::new(&s),
+                || Messages::new(&s),
                 &bytes,
                 2 * MAX_MESSAGE_BYTES,
             );
@@ -3257,7 +3257,7 @@ mod tests {
         let mut out = Vec::new();
         s.write(&m, &mut out).unwrap();
         assert_eq!(out, bytes);
-        contract::check_decode(|| Frames::new(&s), &bytes);
+        contract::check_decode(|| Messages::new(&s), &bytes);
         let mut bad = m.clone();
         bad.fields[0].value =
             Value::Composite(vec![named("time", uint(1)), named("unit", uint(3))]);
@@ -3314,37 +3314,37 @@ mod tests {
             r#"<data name="first" id="1" type="Var"/><data name="second" id="2" type="Var"/>"#,
         ))
         .unwrap();
-        assert_eq!(Frames::with_limit(&s, 0).limit(), s.header_length());
+        assert_eq!(Messages::with_limit(&s, 0).limit(), s.header_length());
         assert_eq!(
-            Frames::with_limit(&s, usize::MAX).limit(),
+            Messages::with_limit(&s, usize::MAX).limit(),
             MAX_MESSAGE_BYTES
         );
         let mut small = packet(0, &[3, 0, 0, 0]);
         small.extend_from_slice(b"abc");
         small.extend_from_slice(&[0; 4]);
-        let frames = Frames::with_limit(&s, small.len());
+        let frames = Messages::with_limit(&s, small.len());
         assert_eq!(frames.capacity(), small.len());
-        contract::check_decode(|| Frames::with_limit(&s, small.len()), &small);
+        contract::check_decode(|| Messages::with_limit(&s, small.len()), &small);
         // Truncated below the limit: Need at EOF, so the driver reports it.
         let cut = &small[..small.len() - 1];
-        assert_eq!(Frames::with_limit(&s, 64).decode(cut, true), Ok(Step::Need));
+        assert_eq!(Messages::with_limit(&s, 64).decode(cut, true), Ok(Step::Need));
         // A length past the limit is refused as soon as it is read.
         let long = packet(0, &[100, 0, 0, 0]);
         assert_eq!(
-            Frames::with_limit(&s, 64).decode(&long, false),
-            Err(Error::Limit("Frames::limit"))
+            Messages::with_limit(&s, 64).decode(&long, false),
+            Err(Error::Limit("Messages::limit"))
         );
         // At the default limit, a length past it is refused the same way.
         let huge = packet(0, &((MAX_MESSAGE_BYTES - 11) as u32).to_le_bytes());
         assert_eq!(
-            Frames::new(&s).decode(&huge, true),
+            Messages::new(&s).decode(&huge, true),
             Err(Error::Limit("MAX_MESSAGE_BYTES"))
         );
     }
 
     #[test]
     fn scanner_holds_no_input() {
-        let mut frames = Frames::new(Car::schema().unwrap());
+        let mut frames = Messages::new(Car::schema().unwrap());
         assert_eq!(frames.held(), 0);
         assert_eq!(frames.decode(&CAR_BYTES[..20], false), Ok(Step::Need));
         assert_eq!(frames.held(), 0);
@@ -3487,13 +3487,13 @@ mod tests {
         contract::check_wire::<MessageWire<Car>>(CAR_BYTES);
         contract::check_wire_value(&wire);
         contract::check_decode_with_alloc_limit(
-            || Frames::new(s),
+            || Messages::new(s),
             CAR_BYTES,
             2 * MAX_MESSAGE_BYTES,
         );
         let mut twice = CAR_BYTES.to_vec();
         twice.extend_from_slice(CAR_BYTES);
-        let (messages, failure) = test_support::decode_all(|| Frames::new(s), &twice);
+        let (messages, failure) = test_support::decode_all(|| Messages::new(s), &twice);
         assert_eq!(messages, vec![m.clone(), m.clone()]);
         assert_eq!(failure, None);
         assert_eq!(s.decode(&twice), Err(Error::Trailing));
@@ -3522,7 +3522,7 @@ mod tests {
         assert_eq!(&encoded[36..38], &[0, 0]);
         contract::check_wire::<MessageWire<Car>>(&bytes);
         contract::check_decode_with_alloc_limit(
-            || Frames::new(Car::schema().unwrap()),
+            || Messages::new(Car::schema().unwrap()),
             &bytes,
             2 * MAX_MESSAGE_BYTES,
         );
@@ -3544,7 +3544,7 @@ mod tests {
         assert_eq!(s.block_length(1, 0), Ok(19));
         assert_eq!(wire.to_bytes().unwrap(), old);
         contract::check_wire::<MessageWire<Car>>(&old);
-        contract::check_decode_with_alloc_limit(|| Frames::new(s), &old, 2 * MAX_MESSAGE_BYTES);
+        contract::check_decode_with_alloc_limit(|| Messages::new(s), &old, 2 * MAX_MESSAGE_BYTES);
         let mut future = CAR_BYTES.to_vec();
         future[6] = 3;
         future[0] = 21;
@@ -3730,7 +3730,7 @@ mod tests {
         let oversized = packet(0, &[1, 0, 1, 0, 0x10, 0]); // 1 MiB + 1 data bytes, declared only
         assert_eq!(s.decode(&oversized), Err(Error::Limit("MAX_MESSAGE_BYTES")));
         contract::check_decode_with_alloc_limit(
-            || Frames::new(&s),
+            || Messages::new(&s),
             &oversized,
             2 * MAX_MESSAGE_BYTES,
         );
@@ -3762,7 +3762,7 @@ mod tests {
             bytes[at] = byte;
             assert_eq!(s.decode(&bytes), Err(error));
             contract::check_decode_with_alloc_limit(
-                || Frames::new(s),
+                || Messages::new(s),
                 &bytes,
                 2 * MAX_MESSAGE_BYTES,
             );
@@ -3894,7 +3894,7 @@ mod tests {
             s.decode(&bytes),
             Err(Error::Limit("MAX_ARRAY_LENGTH"))
         ));
-        contract::check_decode_with_alloc_limit(|| Frames::new(&s), &bytes, 2 * MAX_MESSAGE_BYTES);
+        contract::check_decode_with_alloc_limit(|| Messages::new(&s), &bytes, 2 * MAX_MESSAGE_BYTES);
         let bytes = packet(0, &[0, 0, 0, 0, 1, 0]);
         assert!(matches!(s.decode(&bytes), Err(Error::Limit("MAX_VALUES"))));
     }
@@ -3902,7 +3902,7 @@ mod tests {
     #[test]
     fn one_byte_stream_and_map() {
         let schema = Car::schema().unwrap();
-        let mut stream = Stream::new(Frames::new(schema).map(|m| m.header.template_id));
+        let mut stream = Stream::new(Messages::new(schema).map(|m| m.header.template_id));
         for chunk in test_support::chunks(CAR_BYTES, &[1]) {
             assert_eq!(stream.push(chunk), chunk.len());
             if stream.buffered() < CAR_BYTES.len() {
@@ -3928,7 +3928,7 @@ mod tests {
         let mut out = Vec::new();
         s.write(&message, &mut out).unwrap();
         assert_eq!(out, bytes);
-        contract::check_decode_with_alloc_limit(|| Frames::new(&s), &bytes, 2 * MAX_MESSAGE_BYTES);
+        contract::check_decode_with_alloc_limit(|| Messages::new(&s), &bytes, 2 * MAX_MESSAGE_BYTES);
     }
 
     #[test]
@@ -4008,7 +4008,7 @@ mod tests {
         let payload_start = bytes.len();
         bytes.extend(60_000u16.to_le_bytes());
         bytes.extend([42; 60_000]);
-        let mut frames = Frames::new(&s);
+        let mut frames = Messages::new(&s);
         for cut in 0..bytes.len() {
             assert_eq!(frames.decode(&bytes[..cut], false), Ok(Step::Need));
             if cut >= payload_start {

@@ -88,7 +88,8 @@ pub const DEFAULT_MAX_STOCKS: usize = 16_384;
 /// The most stocks a [`Book`] can track: one per locate code.
 pub const MAX_STOCKS: usize = 1 << 16;
 
-/// Why bytes or a value were refused.
+/// Why bytes or a value were refused, or why a [`Book`] refused a
+/// message. A refused message leaves the book unchanged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     /// The bytes are not the length the message type fixes, or are empty.
@@ -107,6 +108,24 @@ pub enum Error {
     Price,
     /// A frame length prefix over the [`Messages`] limit.
     TooLong,
+    /// A configuration value outside its named limits.
+    Config,
+    /// An execute, cancel, delete or replace names an order not on the
+    /// book.
+    UnknownOrder(u64),
+    /// An add or replace reuses a reference number already on the book.
+    DuplicateOrder(u64),
+    /// An add or replace with zero shares, or an execute or cancel of
+    /// more shares than the order has.
+    Shares(u64),
+    /// The message's locate differs from the order's.
+    Locate(u64),
+    /// The book holds [`BookConfig::max_orders`] orders.
+    TooManyOrders,
+    /// The book holds [`BookConfig::max_levels`] price levels.
+    TooManyLevels,
+    /// The book tracks [`BookConfig::max_stocks`] stocks.
+    TooManyStocks,
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -118,6 +137,14 @@ impl fmt::Display for Error {
             Error::Timestamp => f.write_str("ITCH timestamp does not fit six bytes"),
             Error::Price => f.write_str("ITCH price is invalid"),
             Error::TooLong => f.write_str("ITCH frame is too long"),
+            Error::Config => f.write_str("ITCH book configuration is out of range"),
+            Error::UnknownOrder(r) => write!(f, "ITCH order {r} is not on the book"),
+            Error::DuplicateOrder(r) => write!(f, "ITCH order {r} is already on the book"),
+            Error::Shares(r) => write!(f, "ITCH order {r} share count is invalid"),
+            Error::Locate(r) => write!(f, "ITCH order {r} belongs to another locate"),
+            Error::TooManyOrders => f.write_str("ITCH book order limit reached"),
+            Error::TooManyLevels => f.write_str("ITCH book price level limit reached"),
+            Error::TooManyStocks => f.write_str("ITCH book stock limit reached"),
         }
     }
 }
@@ -991,44 +1018,6 @@ impl Default for BookConfig {
     }
 }
 
-/// Why a [`Book`] refused a message. The book is unchanged.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BookError {
-    /// A configuration value outside its named limits.
-    Config,
-    /// An execute, cancel, delete or replace names an order not on the
-    /// book.
-    UnknownOrder(u64),
-    /// An add or replace reuses a reference number already on the book.
-    DuplicateOrder(u64),
-    /// An add or replace with zero shares, or an execute or cancel of
-    /// more shares than the order has.
-    Shares(u64),
-    /// The message's locate differs from the order's.
-    Locate(u64),
-    /// The book holds [`BookConfig::max_orders`] orders.
-    TooManyOrders,
-    /// The book holds [`BookConfig::max_levels`] price levels.
-    TooManyLevels,
-    /// The book tracks [`BookConfig::max_stocks`] stocks.
-    TooManyStocks,
-}
-impl fmt::Display for BookError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            BookError::Config => f.write_str("ITCH book configuration is out of range"),
-            BookError::UnknownOrder(r) => write!(f, "ITCH order {r} is not on the book"),
-            BookError::DuplicateOrder(r) => write!(f, "ITCH order {r} is already on the book"),
-            BookError::Shares(r) => write!(f, "ITCH order {r} share count is invalid"),
-            BookError::Locate(r) => write!(f, "ITCH order {r} belongs to another locate"),
-            BookError::TooManyOrders => f.write_str("ITCH book order limit reached"),
-            BookError::TooManyLevels => f.write_str("ITCH book price level limit reached"),
-            BookError::TooManyStocks => f.write_str("ITCH book stock limit reached"),
-        }
-    }
-}
-impl std::error::Error for BookError {}
-
 /// A live order on a [`Book`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Order {
@@ -1123,12 +1112,12 @@ pub struct Book {
 }
 impl Book {
     /// An empty book. Refuses limits outside their named ranges.
-    pub fn new(config: BookConfig) -> Result<Self, BookError> {
+    pub fn new(config: BookConfig) -> Result<Self, Error> {
         if !(1..=MAX_ORDERS).contains(&config.max_orders)
             || !(1..=MAX_LEVELS).contains(&config.max_levels)
             || !(1..=MAX_STOCKS).contains(&config.max_stocks)
         {
-            return Err(BookError::Config);
+            return Err(Error::Config);
         }
         Ok(Self {
             config,
@@ -1181,7 +1170,7 @@ impl Book {
     }
 
     /// Applies one message. See [`Book`] for which messages change it.
-    pub fn apply(&mut self, message: &Message) -> Result<Applied, BookError> {
+    pub fn apply(&mut self, message: &Message) -> Result<Applied, Error> {
         let locate = message.header().locate;
         match message {
             Message::AddOrder(m) => self.add(m.order_ref, locate, m.side, m.price, m.shares),
@@ -1201,7 +1190,7 @@ impl Book {
             Message::StockDirectory(m) => {
                 if !self.stocks.contains_key(&locate) && self.stocks.len() >= self.config.max_stocks
                 {
-                    return Err(BookError::TooManyStocks);
+                    return Err(Error::TooManyStocks);
                 }
                 self.stocks.entry(locate).or_default().symbol = Some(m.stock);
                 Ok(Applied::Directory { locate })
@@ -1210,13 +1199,13 @@ impl Book {
         }
     }
 
-    fn live(&self, order_ref: u64, locate: u16) -> Result<Order, BookError> {
+    fn live(&self, order_ref: u64, locate: u16) -> Result<Order, Error> {
         let order = *self
             .orders
             .get(&order_ref)
-            .ok_or(BookError::UnknownOrder(order_ref))?;
+            .ok_or(Error::UnknownOrder(order_ref))?;
         if order.locate != locate {
-            return Err(BookError::Locate(order_ref));
+            return Err(Error::Locate(order_ref));
         }
         Ok(order)
     }
@@ -1232,20 +1221,20 @@ impl Book {
         order_ref: u64,
         order: Order,
         freed: Option<(u64, Order)>,
-    ) -> Result<(), BookError> {
+    ) -> Result<(), Error> {
         if order.shares == 0 {
-            return Err(BookError::Shares(order_ref));
+            return Err(Error::Shares(order_ref));
         }
         let reused = freed.is_some_and(|(r, _)| r == order_ref);
         if self.orders.contains_key(&order_ref) && !reused {
-            return Err(BookError::DuplicateOrder(order_ref));
+            return Err(Error::DuplicateOrder(order_ref));
         }
         let orders = self.orders.len() - usize::from(freed.is_some());
         if orders >= self.config.max_orders {
-            return Err(BookError::TooManyOrders);
+            return Err(Error::TooManyOrders);
         }
         if !self.stocks.contains_key(&order.locate) && self.stocks.len() >= self.config.max_stocks {
-            return Err(BookError::TooManyStocks);
+            return Err(Error::TooManyStocks);
         }
         let mut levels = self.levels;
         let mut joins = self.has_level(order.locate, order.side, order.price);
@@ -1263,7 +1252,7 @@ impl Book {
             }
         }
         if !joins && levels >= self.config.max_levels {
-            return Err(BookError::TooManyLevels);
+            return Err(Error::TooManyLevels);
         }
         Ok(())
     }
@@ -1314,7 +1303,7 @@ impl Book {
         side: Side,
         price: Price4,
         shares: u32,
-    ) -> Result<Applied, BookError> {
+    ) -> Result<Applied, Error> {
         let order = Order {
             locate,
             side,
@@ -1325,10 +1314,10 @@ impl Book {
         self.insert(order_ref, order);
         Ok(Applied::Changed { locate, side })
     }
-    fn reduce(&mut self, order_ref: u64, locate: u16, shares: u32) -> Result<Applied, BookError> {
+    fn reduce(&mut self, order_ref: u64, locate: u16, shares: u32) -> Result<Applied, Error> {
         let order = self.live(order_ref, locate)?;
         if shares > order.shares {
-            return Err(BookError::Shares(order_ref));
+            return Err(Error::Shares(order_ref));
         }
         if shares == 0 {
             return Ok(Applied::Ignored);
@@ -1339,7 +1328,7 @@ impl Book {
             side: order.side,
         })
     }
-    fn replace(&mut self, m: &OrderReplace, locate: u16) -> Result<Applied, BookError> {
+    fn replace(&mut self, m: &OrderReplace, locate: u16) -> Result<Applied, Error> {
         let old = self.live(m.original_ref, locate)?;
         let new = Order {
             locate,
@@ -2150,7 +2139,7 @@ mod tests {
                 }
                 .into()
             ),
-            Err(BookError::UnknownOrder(9))
+            Err(Error::UnknownOrder(9))
         );
         // Once its last order goes, a stock without a directory entry is
         // forgotten and its slot is free for another.
@@ -2192,16 +2181,16 @@ mod tests {
         book.apply(&add(1, 1, Side::Buy, 100, 10)).unwrap();
         let h = header(1);
         let before = format!("{book:?}");
-        let refused: [(Message, BookError); 8] = [
-            (add(1, 1, Side::Buy, 100, 10), BookError::DuplicateOrder(1)),
-            (add(2, 1, Side::Buy, 100, 0), BookError::Shares(2)),
+        let refused: [(Message, Error); 8] = [
+            (add(1, 1, Side::Buy, 100, 10), Error::DuplicateOrder(1)),
+            (add(2, 1, Side::Buy, 100, 0), Error::Shares(2)),
             (
                 OrderDelete {
                     header: h,
                     order_ref: 9,
                 }
                 .into(),
-                BookError::UnknownOrder(9),
+                Error::UnknownOrder(9),
             ),
             (
                 OrderCancel {
@@ -2210,7 +2199,7 @@ mod tests {
                     cancelled_shares: 11,
                 }
                 .into(),
-                BookError::Shares(1),
+                Error::Shares(1),
             ),
             (
                 OrderDelete {
@@ -2218,7 +2207,7 @@ mod tests {
                     order_ref: 1,
                 }
                 .into(),
-                BookError::Locate(1),
+                Error::Locate(1),
             ),
             (
                 OrderReplace {
@@ -2229,7 +2218,7 @@ mod tests {
                     price: Price4(1),
                 }
                 .into(),
-                BookError::Shares(1),
+                Error::Shares(1),
             ),
             (
                 OrderReplace {
@@ -2240,7 +2229,7 @@ mod tests {
                     price: Price4(1),
                 }
                 .into(),
-                BookError::UnknownOrder(9),
+                Error::UnknownOrder(9),
             ),
             (
                 OrderExecuted {
@@ -2250,7 +2239,7 @@ mod tests {
                     match_number: 0,
                 }
                 .into(),
-                BookError::Shares(1),
+                Error::Shares(1),
             ),
         ];
         for (m, e) in refused {
@@ -2261,13 +2250,13 @@ mod tests {
         book.apply(&add(2, 1, Side::Sell, 100, 10)).unwrap();
         assert_eq!(
             book.apply(&add(3, 1, Side::Sell, 101, 10)),
-            Err(BookError::TooManyLevels)
+            Err(Error::TooManyLevels)
         );
         // Joining an existing level needs no new one.
         book.apply(&add(3, 1, Side::Sell, 100, 10)).unwrap();
         assert_eq!(
             book.apply(&add(4, 1, Side::Sell, 100, 10)),
-            Err(BookError::TooManyOrders)
+            Err(Error::TooManyOrders)
         );
         // A replace that empties its level may open another.
         book.apply(
@@ -2305,7 +2294,7 @@ mod tests {
                 }
                 .into()
             ),
-            Err(BookError::TooManyLevels)
+            Err(Error::TooManyLevels)
         );
         // Stocks: one allowed, directory entries included.
         let mut book = Book::new(BookConfig {
@@ -2324,9 +2313,9 @@ mod tests {
         book.apply(&add(1, 1, Side::Buy, 1, 1)).unwrap();
         assert_eq!(
             book.apply(&add(2, 2, Side::Buy, 1, 1)),
-            Err(BookError::TooManyStocks)
+            Err(Error::TooManyStocks)
         );
-        assert_eq!(book.apply(&samples()[1]), Err(BookError::TooManyStocks));
+        assert_eq!(book.apply(&samples()[1]), Err(Error::TooManyStocks));
         assert_eq!(book.stock_count(), 1);
         assert_eq!(
             Book::new(BookConfig {
@@ -2334,7 +2323,7 @@ mod tests {
                 ..BookConfig::default()
             })
             .err(),
-            Some(BookError::Config)
+            Some(Error::Config)
         );
         assert_eq!(
             Book::new(BookConfig {
@@ -2342,7 +2331,7 @@ mod tests {
                 ..BookConfig::default()
             })
             .err(),
-            Some(BookError::Config)
+            Some(Error::Config)
         );
     }
 

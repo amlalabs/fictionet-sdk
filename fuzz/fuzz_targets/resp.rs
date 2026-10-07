@@ -3,8 +3,7 @@
 
 use fictionet::stdlib::codec::{Decode, Fail, Lcg, Wire, contract, test_support::decode_all};
 use fictionet::stdlib::resp::{
-    Command, Commands, Limits, MAX_FRAME_LEN, MAX_LINE_LEN, ParseError, Resp2, Value, Values,
-    WireError,
+    Command, Commands, Error, Limits, MAX_FRAME_LEN, MAX_LINE_LEN, Resp2, Value, Values,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -17,14 +16,14 @@ impl PartialEq for WireValue {
     }
 }
 impl Wire for WireValue {
-    type ParseError = WireError;
-    type WriteError = WireError;
+    type ParseError = Error;
+    type WriteError = Error;
     /// Reads one value. Refuses malformed, incomplete, trailing, or unwritable input.
-    fn parse(bytes: &[u8]) -> Result<Self, WireError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         Value::parse(bytes).map(Self)
     }
     /// Appends a value. Refuses fields or sizes the strict RESP writer cannot preserve.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WireError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         self.0.write(out)
     }
 }
@@ -76,20 +75,20 @@ fuzz_target!(|data: &[u8]| {
     }
 });
 
-fn partial_oracle<T: Wire<ParseError = WireError, WriteError = WireError>>(
+fn partial_oracle<T: Wire<ParseError = Error, WriteError = Error>>(
     data: &[u8],
-    parsed: Result<T, WireError>,
-    decoded: &(Vec<T>, Option<Fail<ParseError>>),
+    parsed: Result<T, Error>,
+    decoded: &(Vec<T>, Option<Fail<Error>>),
     empty: impl Fn(&T) -> bool,
 ) {
     let expected = match parsed {
         Ok(value) => (if empty(&value) { vec![] } else { vec![value.to_bytes().unwrap()] }, None),
         // An empty stream has no incomplete frame.
-        Err(WireError::Incomplete) => (vec![], (!data.is_empty()).then_some(Fail::Truncated { unread: data.len() })),
-        Err(WireError::Parse(error)) if error != ParseError::FrameTooLarge => (vec![], Some(Fail::Protocol(error))),
+        Err(Error::Incomplete) => (vec![], (!data.is_empty()).then_some(Fail::Truncated { unread: data.len() })),
         // Trailing frames need prefix parsing. Size expansion can be refused by
         // Wire::parse after a stream has successfully read the value.
-        _ => return,
+        Err(Error::Trailing | Error::Unwritable | Error::FrameTooLarge) => return,
+        Err(error) => (vec![], Some(Fail::Protocol(error))),
     };
     let actual: Vec<_> = decoded.0.iter().map(|value| value.to_bytes().unwrap()).collect();
     assert_eq!((actual, decoded.1.clone()), expected);

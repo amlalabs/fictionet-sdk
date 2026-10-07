@@ -9,9 +9,9 @@ use std::net::Ipv4Addr;
 
 #[test]
 fn complete_units_refuse_a_second_unit() {
-    let values = bacnet::Values(vec![bacnet::Value::Real(72.3), bacnet::Value::Unsigned(85)]);
+    let values = bacnet::ValueList(vec![bacnet::Value::Real(72.3), bacnet::Value::Unsigned(85)]);
     let bytes = values.to_bytes().unwrap();
-    assert_eq!(bacnet::Values::parse(&bytes), Ok(values));
+    assert_eq!(bacnet::ValueList::parse(&bytes), Ok(values));
     assert_eq!(
         bacnet::Value::parse(&bytes),
         Err(bacnet::Error::TrailingBytes)

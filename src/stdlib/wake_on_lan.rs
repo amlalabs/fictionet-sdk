@@ -21,7 +21,7 @@
 //! password, and wakes the host when that returns true. A world that plays
 //! a tool or a router reads exact packets with [`MagicPacket::parse`],
 //! searches payloads with [`MagicPacket::find`], or uses
-//! [`Stream<Packets>`](fictionet::stdlib::codec::Stream) for a payload ending at EOF,
+//! [`Stream<MagicPackets>`](fictionet::stdlib::codec::Stream) for a payload ending at EOF,
 //! and writes packets with [`MagicPacket::write`].
 //!
 //! Every reader checks lengths, because the agent can send any bytes it
@@ -130,26 +130,33 @@ pub struct MagicPacket {
     pub password: Option<Password>,
 }
 
-/// Why a payload holds no magic packet a reader could take.
+/// Why a payload holds no magic packet a reader could take, or why bytes
+/// are not exactly one magic packet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum ParseError {
+pub enum Error {
     /// The payload is longer than [`MAX_PAYLOAD`].
     TooLong,
     /// No sync stream followed by sixteen repeats of one address appears
     /// anywhere in the payload.
     NotFound,
+    /// The length of an exact packet is not 102, 106, or 108 bytes.
+    Length,
+    /// The sync bytes or repeated addresses of an exact packet do not match.
+    Malformed,
 }
 
-impl core::fmt::Display for ParseError {
+impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            ParseError::TooLong => write!(f, "payload longer than {MAX_PAYLOAD} bytes"),
-            ParseError::NotFound => write!(f, "no magic packet in the payload"),
+            Error::TooLong => write!(f, "payload longer than {MAX_PAYLOAD} bytes"),
+            Error::NotFound => write!(f, "no magic packet in the payload"),
+            Error::Length => f.write_str("magic packet length must be 102, 106, or 108 bytes"),
+            Error::Malformed => f.write_str("invalid magic packet sync or address repeats"),
         }
     }
 }
 
-impl core::error::Error for ParseError {}
+impl core::error::Error for Error {}
 
 /// The address of the magic packet that starts at `bytes[0]`, if one does.
 /// The packet must be whole: `bytes` holds at least [`PACKET_LEN`] bytes.
@@ -168,7 +175,7 @@ fn packet_at(bytes: &[u8]) -> Option<Mac> {
 }
 
 /// The offset and address of each magic packet in `payload`, first to
-/// last. Packets may overlap, as in a run of 0xFF bytes.
+/// last. MagicPackets may overlap, as in a run of 0xFF bytes.
 fn packets(payload: &[u8]) -> impl Iterator<Item = (usize, Mac)> + '_ {
     let last = payload.len().checked_sub(PACKET_LEN);
     (0..last.map_or(0, |l| l.saturating_add(1)))
@@ -212,11 +219,11 @@ impl MagicPacket {
     /// or the Ethernet data without the frame check sequence. A host that
     /// knows its own password should call [`wakes`] instead, which checks
     /// the bytes after the packet whatever follows them.
-    pub fn find(payload: &[u8]) -> Result<(usize, MagicPacket), ParseError> {
+    pub fn find(payload: &[u8]) -> Result<(usize, MagicPacket), Error> {
         if payload.len() > MAX_PAYLOAD {
-            return Err(ParseError::TooLong);
+            return Err(Error::TooLong);
         }
-        let (offset, mac) = packets(payload).next().ok_or(ParseError::NotFound)?;
+        let (offset, mac) = packets(payload).next().ok_or(Error::NotFound)?;
         let rest = offset
             .checked_add(PACKET_LEN)
             .and_then(|end| payload.get(end..))
@@ -231,40 +238,20 @@ impl MagicPacket {
     }
 }
 
-/// Why bytes are not exactly one magic packet.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PacketError {
-    /// The length is not 102, 106, or 108 bytes.
-    Length,
-    /// The sync bytes or repeated addresses do not match.
-    Malformed,
-}
-
-impl core::fmt::Display for PacketError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(match self {
-            Self::Length => "magic packet length must be 102, 106, or 108 bytes",
-            Self::Malformed => "invalid magic packet sync or address repeats",
-        })
-    }
-}
-
-impl core::error::Error for PacketError {}
-
 impl Wire for MagicPacket {
-    type ParseError = PacketError;
+    type ParseError = Error;
     type WriteError = core::convert::Infallible;
 
     /// Reads one packet at offset zero, with an optional 4 or 6 byte password.
     /// Refuses any other length, invalid sync bytes, or unequal address repeats.
-    fn parse(bytes: &[u8]) -> Result<Self, PacketError> {
-        let tail = bytes.get(PACKET_LEN..).ok_or(PacketError::Length)?;
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        let tail = bytes.get(PACKET_LEN..).ok_or(Error::Length)?;
         let password = if tail.is_empty() {
             None
         } else {
-            Some(Password::from_bytes(tail).ok_or(PacketError::Length)?)
+            Some(Password::from_bytes(tail).ok_or(Error::Length)?)
         };
-        let mac = packet_at(bytes).ok_or(PacketError::Malformed)?;
+        let mac = packet_at(bytes).ok_or(Error::Malformed)?;
         Ok(Self { mac, password })
     }
 
@@ -287,35 +274,35 @@ impl Wire for MagicPacket {
 /// Use a fresh [`codec::Stream`] for each datagram. The item contains its
 /// offset and packet, as [`MagicPacket::find`] returns them. Passwords are
 /// determined at EOF. Missing packets and oversized payloads are terminal
-/// [`ParseError`]s. No input is retained outside the stream's buffer.
+/// [`Error`]s. No input is retained outside the stream's buffer.
 /// Capacity is [`MAX_PAYLOAD`] plus one byte to detect an oversized payload.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct Packets {
+pub struct MagicPackets {
     done: bool,
 }
 
-impl Packets {
+impl MagicPackets {
     /// Creates a decoder for one datagram payload.
     pub fn new() -> Self {
         Self::default()
     }
 }
 
-impl Decode for Packets {
+impl Decode for MagicPackets {
     type Item = (usize, MagicPacket);
-    type Error = ParseError;
+    type Error = Error;
     const NAME: &'static str = "Wake-on-LAN";
 
     fn capacity(&self) -> usize {
         MAX_PAYLOAD + 1
     }
 
-    fn decode(&mut self, input: &[u8], eof: bool) -> Result<codec::Step<Self::Item>, ParseError> {
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<codec::Step<Self::Item>, Error> {
         if self.done {
             return Ok(codec::Step::End);
         }
         if input.len() > MAX_PAYLOAD {
-            return Err(ParseError::TooLong);
+            return Err(Error::TooLong);
         }
         if !eof {
             return Ok(codec::Step::Need);
@@ -364,15 +351,15 @@ mod tests {
 
     const MAC: Mac = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
 
-    fn check_payload(payload: &[u8]) -> Result<(usize, MagicPacket), ParseError> {
-        // Adapter consistency only: Packets delegates to find at EOF.
+    fn check_payload(payload: &[u8]) -> Result<(usize, MagicPacket), Error> {
+        // Adapter consistency only: MagicPackets delegates to find at EOF.
         let whole = MagicPacket::find(payload);
         let expected = match whole {
             Ok(packet) => (vec![packet], None),
             Err(error) => (vec![], Some(codec::Fail::Protocol(error))),
         };
-        assert_eq!(decode_all(Packets::new, payload), expected);
-        contract::check_decode_with_alloc_limit(Packets::new, payload, 2 * (MAX_PAYLOAD + 1));
+        assert_eq!(decode_all(MagicPackets::new, payload), expected);
+        contract::check_decode_with_alloc_limit(MagicPackets::new, payload, 2 * (MAX_PAYLOAD + 1));
         contract::check_wire::<MagicPacket>(payload);
         whole
     }
@@ -469,22 +456,22 @@ mod tests {
 
     #[test]
     fn error_not_found() {
-        assert_eq!(check_payload(&[]), Err(ParseError::NotFound));
-        assert_eq!(check_payload(&[0xff; 6]), Err(ParseError::NotFound));
+        assert_eq!(check_payload(&[]), Err(Error::NotFound));
+        assert_eq!(check_payload(&[0xff; 6]), Err(Error::NotFound));
         // One repeat wrong.
         let mut p = MagicPacket::new(MAC).to_bytes().unwrap();
         p[50] ^= 1;
-        assert_eq!(check_payload(&p), Err(ParseError::NotFound));
+        assert_eq!(check_payload(&p), Err(Error::NotFound));
         // A sync byte wrong.
         let mut p = MagicPacket::new(MAC).to_bytes().unwrap();
         p[3] = 0xfe;
-        assert_eq!(check_payload(&p), Err(ParseError::NotFound));
+        assert_eq!(check_payload(&p), Err(Error::NotFound));
         // Only fifteen repeats.
         let p = &MagicPacket::new(MAC).to_bytes().unwrap()[..96];
-        assert_eq!(check_payload(p), Err(ParseError::NotFound));
+        assert_eq!(check_payload(p), Err(Error::NotFound));
         assert!(!wakes(p, MAC, None));
         assert_eq!(
-            ParseError::NotFound.to_string(),
+            Error::NotFound.to_string(),
             "no magic packet in the payload"
         );
     }
@@ -500,21 +487,21 @@ mod tests {
         );
         assert!(wakes(&p, MAC, None));
         p.push(0);
-        assert_eq!(check_payload(&p), Err(ParseError::TooLong));
+        assert_eq!(check_payload(&p), Err(Error::TooLong));
         assert!(!wakes(&p, MAC, None));
-        let mut s = Stream::new(Packets::new());
+        let mut s = Stream::new(MagicPackets::new());
         assert_eq!(s.push(&p), MAX_PAYLOAD + 1);
         assert_eq!(
             s.next(),
-            Some(Err(codec::Fail::Protocol(ParseError::TooLong)))
+            Some(Err(codec::Fail::Protocol(Error::TooLong)))
         );
         assert_eq!(s.push(&p), p.len());
         assert_eq!(s.next(), None);
         assert_eq!(
             s.failed(),
-            Some(&codec::Fail::Protocol(ParseError::TooLong))
+            Some(&codec::Fail::Protocol(Error::TooLong))
         );
-        assert!(ParseError::TooLong.to_string().contains("65535"));
+        assert!(Error::TooLong.to_string().contains("65535"));
     }
 
     #[test]
@@ -529,7 +516,7 @@ mod tests {
                 let prefix = &bytes[..n];
                 let got = check_payload(prefix);
                 if n < PACKET_LEN {
-                    assert_eq!(got, Err(ParseError::NotFound), "prefix {n}");
+                    assert_eq!(got, Err(Error::NotFound), "prefix {n}");
                     assert!(!wakes(prefix, MAC, None));
                 } else {
                     let password = Password::from_bytes(&bytes[PACKET_LEN..n]);
@@ -604,7 +591,7 @@ mod tests {
     fn packet_waits_for_password_at_eof() {
         let packet = MagicPacket::with_password(MAC, Password::Six([1; 6]));
         let bytes = packet.to_bytes().unwrap();
-        let mut s = Stream::new(Packets::new());
+        let mut s = Stream::new(MagicPackets::new());
         assert_eq!(s.push(&bytes[..PACKET_LEN]), PACKET_LEN);
         assert_eq!(s.next(), None);
         assert_eq!(s.push(&bytes[PACKET_LEN..]), MAX_PASSWORD);
@@ -625,7 +612,7 @@ mod tests {
         assert!(!wakes(&p, MAC, None));
         let mut over = p;
         over.push(0xff);
-        assert_eq!(check_payload(&over), Err(ParseError::TooLong));
+        assert_eq!(check_payload(&over), Err(Error::TooLong));
     }
 
     #[test]
@@ -665,7 +652,7 @@ mod tests {
                 // No packet starts before it.
                 assert!((0..offset).all(|i| packet_at(&buf[i..]).is_none()));
             } else {
-                assert_eq!(got, Err(ParseError::NotFound));
+                assert_eq!(got, Err(Error::NotFound));
                 assert!(!wakes(&buf, MAC, None));
                 assert!(!wakes(&buf, [0xff; 6], None));
             }

@@ -5,7 +5,7 @@
 use arbitrary::{Result, Unstructured};
 use fictionet::stdlib::codec::{Fail, Wire, contract, test_support::decode_all};
 use fictionet::stdlib::wake_on_lan::{
-    MAX_PACKET_LEN, MAX_PAYLOAD, Mac, MagicPacket, PACKET_LEN, Packets, ParseError, Password, wakes,
+    Error, MAX_PACKET_LEN, MAX_PAYLOAD, Mac, MagicPacket, MagicPackets, PACKET_LEN, Password, wakes,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -66,15 +66,15 @@ fn built(data: &[u8]) -> Result<()> {
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(Packets::new, data, 2 * (MAX_PAYLOAD + 1));
+    contract::check_decode_with_alloc_limit(MagicPackets::new, data, 2 * (MAX_PAYLOAD + 1));
     contract::check_wire::<MagicPacket>(data);
-    // Adapter consistency only: Packets delegates to find at EOF.
+    // Adapter consistency only: MagicPackets delegates to find at EOF.
     let found = MagicPacket::find(data);
     let expected = match found {
         Ok(packet) => (vec![packet], None),
         Err(error) => (vec![], Some(Fail::Protocol(error))),
     };
-    assert_eq!(decode_all(Packets::new, data), expected);
+    assert_eq!(decode_all(MagicPackets::new, data), expected);
 
     match found {
         Ok((offset, p)) => {
@@ -98,8 +98,9 @@ fuzz_target!(|data: &[u8]| {
             // Written alone, it reads back the same.
             assert_eq!(MagicPacket::find(&p.to_bytes().unwrap()), Ok((0, p)));
         }
-        Err(ParseError::TooLong) => assert!(data.len() > MAX_PAYLOAD),
-        Err(ParseError::NotFound) => {}
+        Err(Error::TooLong) => assert!(data.len() > MAX_PAYLOAD),
+        Err(Error::NotFound) => {}
+        Err(error @ (Error::Length | Error::Malformed)) => panic!("find returned {error}"),
     }
     let _ = built(data);
     // A card set from the first bytes, reading the whole payload.

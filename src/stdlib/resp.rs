@@ -23,8 +23,8 @@
 //!
 //! Every reader checks lengths, counts and nesting against [`Limits`].
 //! A partial value waits for more input. At EOF it is truncated. A
-//! [`ParseError`] ends the stream. A server can answer it with
-//! [`ParseError::reply`] and close the connection.
+//! [`Error`] ends the stream. A server can answer it with
+//! [`Error::reply`] and close the connection.
 //!
 //! ```
 //! use std::collections::HashMap;
@@ -135,7 +135,7 @@ const DEPTH_CEILING: usize = 256;
 const PREALLOC: usize = 4096;
 
 /// How much the readers accept. Anything over a limit is a
-/// [`ParseError`]. The writers keep to [`Limits::DEFAULT`], so what they
+/// [`Error`]. The writers keep to [`Limits::DEFAULT`], so what they
 /// write is always read back under the default limits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
@@ -298,11 +298,12 @@ fn map_resp2(mut value: Value, depth: usize) -> Value {
     }
 }
 
-/// Why bytes are not RESP. Either way, the stream holds no more values a
-/// reader can find, and a server answers with [`ParseError::reply`] and
-/// closes the connection.
+/// Why bytes are not RESP, or why an exact value or command cannot be read
+/// or written. After an error from [`Values`] or [`Commands`] the stream
+/// holds no more values a reader can find, and a server answers with
+/// [`Error::reply`] and closes the connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ParseError {
+pub enum Error {
     /// A value started with a type marker this reader does not accept.
     UnknownType(u8),
     /// A line held a CR not followed by LF, or an LF with no CR before it.
@@ -332,30 +333,39 @@ pub enum ParseError {
     UnbalancedQuotes,
     /// A value or command took more than [`Limits::frame`] bytes.
     FrameTooLarge,
+    /// The input ended inside a frame.
+    Incomplete,
+    /// Bytes follow the first complete frame.
+    Trailing,
+    /// The value cannot be written unchanged under [`Limits::DEFAULT`].
+    Unwritable,
 }
 
-impl core::fmt::Display for ParseError {
+impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            ParseError::UnknownType(c) => write!(f, "unknown type byte '{}'", c.escape_ascii()),
-            ParseError::BadLineEnd => f.write_str("a line ends with a lone CR or LF"),
-            ParseError::LineTooLong => f.write_str("too big inline request"),
-            ParseError::BadLength => f.write_str("invalid length"),
-            ParseError::BulkTooLong => f.write_str("invalid bulk length"),
-            ParseError::TooManyElements => f.write_str("invalid multibulk length"),
-            ParseError::TooDeep => f.write_str("values nested too deep"),
-            ParseError::MissingCrlf => f.write_str("bulk data not followed by CRLF"),
-            ParseError::Malformed(c) => write!(f, "malformed value of type '{}'", c.escape_ascii()),
-            ParseError::ExpectedBulk(c) => write!(f, "expected '$', got '{}'", c.escape_ascii()),
-            ParseError::UnbalancedQuotes => f.write_str("unbalanced quotes in request"),
-            ParseError::FrameTooLarge => f.write_str("value too large"),
+            Error::UnknownType(c) => write!(f, "unknown type byte '{}'", c.escape_ascii()),
+            Error::BadLineEnd => f.write_str("a line ends with a lone CR or LF"),
+            Error::LineTooLong => f.write_str("too big inline request"),
+            Error::BadLength => f.write_str("invalid length"),
+            Error::BulkTooLong => f.write_str("invalid bulk length"),
+            Error::TooManyElements => f.write_str("invalid multibulk length"),
+            Error::TooDeep => f.write_str("values nested too deep"),
+            Error::MissingCrlf => f.write_str("bulk data not followed by CRLF"),
+            Error::Malformed(c) => write!(f, "malformed value of type '{}'", c.escape_ascii()),
+            Error::ExpectedBulk(c) => write!(f, "expected '$', got '{}'", c.escape_ascii()),
+            Error::UnbalancedQuotes => f.write_str("unbalanced quotes in request"),
+            Error::FrameTooLarge => f.write_str("value too large"),
+            Error::Incomplete => f.write_str("incomplete RESP frame"),
+            Error::Trailing => f.write_str("bytes follow the RESP frame"),
+            Error::Unwritable => f.write_str("value cannot be written without changing it"),
         }
     }
 }
 
-impl core::error::Error for ParseError {}
+impl core::error::Error for Error {}
 
-impl ParseError {
+impl Error {
     /// The error reply a Redis server sends before it closes the
     /// connection, such as `-ERR Protocol error: invalid bulk length`.
     pub fn reply(self) -> Value {
@@ -367,11 +377,11 @@ impl ParseError {
 /// bytes are bad.
 enum Fail {
     Need(usize),
-    Bad(ParseError),
+    Bad(Error),
 }
 
-impl From<ParseError> for Fail {
-    fn from(e: ParseError) -> Fail {
+impl From<Error> for Fail {
+    fn from(e: Error) -> Fail {
         Fail::Bad(e)
     }
 }
@@ -523,7 +533,7 @@ impl Values {
         input: &[u8],
         scan: fn(&mut Scan, &[u8], &Limits) -> Option<usize>,
         parse: fn(&[u8], &Limits) -> Step<T>,
-    ) -> Result<codec::Step<T>, ParseError> {
+    ) -> Result<codec::Step<T>, Error> {
         if input.is_empty() {
             return Ok(codec::Step::Need);
         }
@@ -556,7 +566,7 @@ impl Values {
 
 impl Decode for Values {
     type Item = Value;
-    type Error = ParseError;
+    type Error = Error;
     const NAME: &'static str = "RESP values";
 
     fn capacity(&self) -> usize {
@@ -569,7 +579,7 @@ impl Decode for Values {
         self.scan.open.capacity().saturating_mul(core::mem::size_of::<Open>())
     }
 
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<codec::Step<Value>, ParseError> {
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<codec::Step<Value>, Error> {
         self.read(input, scan_value, value_top)
     }
 }
@@ -602,7 +612,7 @@ impl Commands {
 
 impl Decode for Commands {
     type Item = Command;
-    type Error = ParseError;
+    type Error = Error;
     const NAME: &'static str = "RESP commands";
 
     fn capacity(&self) -> usize {
@@ -613,7 +623,7 @@ impl Decode for Commands {
         self.values.held()
     }
 
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<codec::Step<Command>, ParseError> {
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<codec::Step<Command>, Error> {
         Ok(match self.values.read(input, scan_command, command_top)? {
             codec::Step::Item(command, used) if command.args.is_empty() => codec::Step::Skip(used),
             step => step,
@@ -768,16 +778,16 @@ fn scan_step(s: &mut Scan, b: &[u8], lim: &Limits) -> Result<Scanned, Fail> {
             match b.get(pos) {
                 None => return Err(Fail::Need(pos.saturating_add(1))),
                 Some(&marker::CHUNK) => {}
-                Some(_) => return Err(ParseError::Malformed(marker::BULK).into()),
+                Some(_) => return Err(Error::Malformed(marker::BULK).into()),
             }
             let (l, e) = line(b, pos + 1, lim)?;
-            let n = digits(l).ok_or(ParseError::BadLength)?;
+            let n = digits(l).ok_or(Error::BadLength)?;
             if n == 0 {
                 s.open.pop();
                 return Ok(s.ended(e));
             }
             if n > lim.bulk.saturating_sub(len) {
-                return Err(ParseError::BulkTooLong.into());
+                return Err(Error::BulkTooLong.into());
             }
             let (_, e) = data(b, e, n, lim)?;
             s.open.pop();
@@ -793,7 +803,7 @@ fn scan_step(s: &mut Scan, b: &[u8], lim: &Limits) -> Result<Scanned, Fail> {
                 return Ok(s.ended(e));
             }
             if (if pairs { seen / 2 } else { seen }) >= lim.elements {
-                return Err(ParseError::TooManyElements.into());
+                return Err(Error::TooManyElements.into());
             }
         }
         _ => {}
@@ -805,7 +815,7 @@ fn scan_step(s: &mut Scan, b: &[u8], lim: &Limits) -> Result<Scanned, Fail> {
     // As list checks a push's first element.
     let push_first = matches!(s.open.last(), Some(Open::Push(_)));
     if push_first && !is_string_marker(t) {
-        return Err(ParseError::Malformed(marker::PUSH).into());
+        return Err(Error::Malformed(marker::PUSH).into());
     }
     match t {
         marker::ARRAY | marker::SET | marker::PUSH | marker::MAP | marker::ATTRIBUTE => {
@@ -815,21 +825,21 @@ fn scan_step(s: &mut Scan, b: &[u8], lim: &Limits) -> Result<Scanned, Fail> {
                 return Ok(s.ended(e));
             }
             if t == marker::PUSH && (!s.top() || matches!(len, Len::N(0))) {
-                return Err(ParseError::Malformed(marker::PUSH).into());
+                return Err(Error::Malformed(marker::PUSH).into());
             }
             if depth >= depth_limit(lim) {
-                return Err(ParseError::TooDeep.into());
+                return Err(Error::TooDeep.into());
             }
             let pairs = matches!(t, marker::MAP | marker::ATTRIBUTE);
             let open = match len {
-                Len::N(n) if n > lim.elements => return Err(ParseError::TooManyElements.into()),
+                Len::N(n) if n > lim.elements => return Err(Error::TooManyElements.into()),
                 // An attribute's entries, then the value they describe.
                 Len::N(n) if t == marker::ATTRIBUTE => Open::Attr(n.saturating_mul(2).saturating_add(1)),
                 Len::N(n) if pairs => Open::Left(n.saturating_mul(2)),
                 Len::N(n) if t == marker::PUSH => Open::Push(n),
                 Len::N(n) => Open::Left(n),
                 Len::Streamed if t != marker::PUSH && t != marker::ATTRIBUTE => Open::Streamed { pairs, seen: 0 },
-                _ => return Err(ParseError::BadLength.into()),
+                _ => return Err(Error::BadLength.into()),
             };
             if matches!(open, Open::Left(0)) {
                 return Ok(s.ended(e));
@@ -841,7 +851,7 @@ fn scan_step(s: &mut Scan, b: &[u8], lim: &Limits) -> Result<Scanned, Fail> {
         marker::BULK if b.get(pos + 1) == Some(&b'?') => {
             let (l, e) = line(b, pos + 1, lim)?;
             if l != b"?" {
-                return Err(ParseError::BadLength.into());
+                return Err(Error::BadLength.into());
             }
             s.open.push(Open::Chunks(0));
             s.pos = e;
@@ -851,7 +861,7 @@ fn scan_step(s: &mut Scan, b: &[u8], lim: &Limits) -> Result<Scanned, Fail> {
         _ => {
             let (v, e) = value(b, pos, depth, false, lim)?;
             if push_first && v == Value::Null {
-                return Err(ParseError::Malformed(marker::PUSH).into());
+                return Err(Error::Malformed(marker::PUSH).into());
             }
             Ok(s.ended(e))
         }
@@ -910,7 +920,7 @@ fn command_step(s: &mut Scan, b: &[u8], lim: &Limits) -> Result<bool, Fail> {
         Some(_) => return Ok(false),
     }
     let (l, e) = line(b, pos + 1, lim)?;
-    let n = bulk_len(l).ok_or(ParseError::BulkTooLong)?;
+    let n = bulk_len(l).ok_or(Error::BulkTooLong)?;
     let (_, e) = data(b, e, n, lim)?;
     if let Some(slot) = s.open.last_mut() {
         *slot = Open::Left(left - 1);
@@ -959,8 +969,8 @@ fn frame<'a>(b: &'a [u8], lim: &Limits) -> &'a [u8] {
 /// that needs bytes past it has found a frame too large.
 fn bounded<T>(r: Step<T>, lim: &Limits) -> Step<T> {
     match r {
-        Ok((_, end)) if end > lim.frame => Err(Fail::Bad(ParseError::FrameTooLarge)),
-        Err(Fail::Need(n)) if n > lim.frame => Err(Fail::Bad(ParseError::FrameTooLarge)),
+        Ok((_, end)) if end > lim.frame => Err(Fail::Bad(Error::FrameTooLarge)),
+        Err(Fail::Need(n)) if n > lim.frame => Err(Fail::Bad(Error::FrameTooLarge)),
         r => r,
     }
 }
@@ -981,15 +991,15 @@ fn line<'a>(b: &'a [u8], pos: usize, lim: &Limits) -> Step<&'a [u8]> {
     match window.iter().position(|&c| c == b'\r' || c == b'\n') {
         Some(i) => {
             if window[i] == b'\n' {
-                return Err(ParseError::BadLineEnd.into());
+                return Err(Error::BadLineEnd.into());
             }
             match rest.get(i + 1) {
                 None => Err(Fail::Need(pos.saturating_add(i).saturating_add(2))),
                 Some(b'\n') => Ok((&rest[..i], pos + i + 2)),
-                Some(_) => Err(ParseError::BadLineEnd.into()),
+                Some(_) => Err(Error::BadLineEnd.into()),
             }
         }
-        None if window.len() > lim.line => Err(ParseError::LineTooLong.into()),
+        None if window.len() > lim.line => Err(Error::LineTooLong.into()),
         None => Err(Fail::Need(b.len().saturating_add(1))),
     }
 }
@@ -997,15 +1007,15 @@ fn line<'a>(b: &'a [u8], pos: usize, lim: &Limits) -> Step<&'a [u8]> {
 /// `n` bytes of data from `pos`, then CR LF.
 fn data<'a>(b: &'a [u8], pos: usize, n: usize, lim: &Limits) -> Step<&'a [u8]> {
     if n > lim.bulk {
-        return Err(ParseError::BulkTooLong.into());
+        return Err(Error::BulkTooLong.into());
     }
-    let end = pos.checked_add(n).ok_or(ParseError::BulkTooLong)?;
-    let fin = end.checked_add(2).ok_or(ParseError::BulkTooLong)?;
+    let end = pos.checked_add(n).ok_or(Error::BulkTooLong)?;
+    let fin = end.checked_add(2).ok_or(Error::BulkTooLong)?;
     if b.len() < fin {
         return Err(Fail::Need(fin));
     }
     if &b[end..fin] != b"\r\n" {
-        return Err(ParseError::MissingCrlf.into());
+        return Err(Error::MissingCrlf.into());
     }
     Ok((&b[pos..end], fin))
 }
@@ -1016,11 +1026,11 @@ enum Len {
     N(usize),
 }
 
-fn length(l: &[u8]) -> Result<Len, ParseError> {
+fn length(l: &[u8]) -> Result<Len, Error> {
     match l {
         b"-1" => Ok(Len::Null),
         b"?" => Ok(Len::Streamed),
-        _ => digits(l).map(Len::N).ok_or(ParseError::BadLength),
+        _ => digits(l).map(Len::N).ok_or(Error::BadLength),
     }
 }
 
@@ -1175,12 +1185,12 @@ fn value(b: &[u8], pos: usize, depth: usize, top: bool, lim: &Limits) -> Step<Va
         }
         marker::INTEGER => {
             let (l, e) = line(b, p, lim)?;
-            Ok((Value::Integer(int(l).ok_or(ParseError::Malformed(t))?), e))
+            Ok((Value::Integer(int(l).ok_or(Error::Malformed(t))?), e))
         }
         marker::NULL => {
             let (l, e) = line(b, p, lim)?;
             if !l.is_empty() {
-                return Err(ParseError::Malformed(t).into());
+                return Err(Error::Malformed(t).into());
             }
             Ok((Value::Null, e))
         }
@@ -1189,18 +1199,18 @@ fn value(b: &[u8], pos: usize, depth: usize, top: bool, lim: &Limits) -> Step<Va
             let v = match l {
                 b"t" => true,
                 b"f" => false,
-                _ => return Err(ParseError::Malformed(t).into()),
+                _ => return Err(Error::Malformed(t).into()),
             };
             Ok((Value::Boolean(v), e))
         }
         marker::DOUBLE => {
             let (l, e) = line(b, p, lim)?;
-            Ok((Value::Double(double(l).ok_or(ParseError::Malformed(t))?), e))
+            Ok((Value::Double(double(l).ok_or(Error::Malformed(t))?), e))
         }
         marker::BIG_NUMBER => {
             let (l, e) = line(b, p, lim)?;
             if !big_ok(l) {
-                return Err(ParseError::Malformed(t).into());
+                return Err(Error::Malformed(t).into());
             }
             Ok((Value::BigNumber(l.iter().map(|&c| char::from(c)).collect()), e))
         }
@@ -1218,14 +1228,14 @@ fn value(b: &[u8], pos: usize, depth: usize, top: bool, lim: &Limits) -> Step<Va
         marker::BULK_ERROR | marker::VERBATIM => {
             let (l, e) = line(b, p, lim)?;
             let Len::N(n) = length(l)? else {
-                return Err(ParseError::BadLength.into());
+                return Err(Error::BadLength.into());
             };
             let (d, e) = data(b, e, n, lim)?;
             if t == marker::BULK_ERROR {
                 return Ok((Value::BulkError(d.to_vec()), e));
             }
             if d.len() < 4 || d[3] != b':' {
-                return Err(ParseError::Malformed(t).into());
+                return Err(Error::Malformed(t).into());
             }
             Ok((Value::Verbatim { format: [d[0], d[1], d[2]], text: d[4..].to_vec() }, e))
         }
@@ -1233,19 +1243,19 @@ fn value(b: &[u8], pos: usize, depth: usize, top: bool, lim: &Limits) -> Step<Va
             let (l, e) = line(b, p, lim)?;
             let len = length(l)?;
             if matches!(len, Len::Null) {
-                return if t == marker::ARRAY { Ok((Value::NullArray, e)) } else { Err(ParseError::BadLength.into()) };
+                return if t == marker::ARRAY { Ok((Value::NullArray, e)) } else { Err(Error::BadLength.into()) };
             }
             // A push comes only at the top level, and starts with a string.
             if t == marker::PUSH && (!top || matches!(len, Len::N(0))) {
-                return Err(ParseError::Malformed(t).into());
+                return Err(Error::Malformed(t).into());
             }
             if depth >= depth_limit(lim) {
-                return Err(ParseError::TooDeep.into());
+                return Err(Error::TooDeep.into());
             }
             let (items, e) = match len {
                 Len::N(n) => list(b, e, n, depth, t == marker::PUSH, lim)?,
                 Len::Streamed if t != marker::PUSH => streamed_list(b, e, depth, lim)?,
-                _ => return Err(ParseError::BadLength.into()),
+                _ => return Err(Error::BadLength.into()),
             };
             let v = match t {
                 marker::ARRAY => Value::Array(items),
@@ -1258,12 +1268,12 @@ fn value(b: &[u8], pos: usize, depth: usize, top: bool, lim: &Limits) -> Step<Va
             let (l, e) = line(b, p, lim)?;
             let len = length(l)?;
             if depth >= depth_limit(lim) {
-                return Err(ParseError::TooDeep.into());
+                return Err(Error::TooDeep.into());
             }
             let (entries, e) = match len {
                 Len::N(n) => pairs(b, e, n, depth, lim)?,
                 Len::Streamed if t == marker::MAP => streamed_pairs(b, e, depth, lim)?,
-                _ => return Err(ParseError::BadLength.into()),
+                _ => return Err(Error::BadLength.into()),
             };
             if t == marker::MAP {
                 return Ok((Value::Map(entries), e));
@@ -1271,7 +1281,7 @@ fn value(b: &[u8], pos: usize, depth: usize, top: bool, lim: &Limits) -> Step<Va
             let (v, e) = value(b, e, depth + 1, top, lim)?;
             Ok((Value::Attribute { attributes: entries, value: Box::new(v) }, e))
         }
-        _ => Err(ParseError::UnknownType(t).into()),
+        _ => Err(Error::UnknownType(t).into()),
     }
 }
 
@@ -1291,7 +1301,7 @@ fn depth_limit(lim: &Limits) -> usize {
 /// `n` elements from `pos`. With `push`, the first must be a string.
 fn list(b: &[u8], mut pos: usize, n: usize, depth: usize, push: bool, lim: &Limits) -> Step<Vec<Value>> {
     if n > lim.elements {
-        return Err(ParseError::TooManyElements.into());
+        return Err(Error::TooManyElements.into());
     }
     let mut items = Vec::with_capacity(capacity(b, pos, n, 3));
     for i in 0..n {
@@ -1300,14 +1310,14 @@ fn list(b: &[u8], mut pos: usize, n: usize, depth: usize, push: bool, lim: &Limi
             match b.get(pos) {
                 None => return Err(Fail::Need(pos.saturating_add(1))),
                 Some(&t) if !is_string_marker(t) => {
-                    return Err(ParseError::Malformed(marker::PUSH).into());
+                    return Err(Error::Malformed(marker::PUSH).into());
                 }
                 Some(_) => {}
             }
         }
         let (v, e) = value(b, pos, depth + 1, false, lim)?;
         if first && v == Value::Null {
-            return Err(ParseError::Malformed(marker::PUSH).into());
+            return Err(Error::Malformed(marker::PUSH).into());
         }
         items.push(v);
         pos = e;
@@ -1317,7 +1327,7 @@ fn list(b: &[u8], mut pos: usize, n: usize, depth: usize, push: bool, lim: &Limi
 
 fn pairs(b: &[u8], mut pos: usize, n: usize, depth: usize, lim: &Limits) -> Step<Vec<(Value, Value)>> {
     if n > lim.elements {
-        return Err(ParseError::TooManyElements.into());
+        return Err(Error::TooManyElements.into());
     }
     let mut entries = Vec::with_capacity(capacity(b, pos, n, 6));
     for _ in 0..n {
@@ -1337,7 +1347,7 @@ fn stream_end(b: &[u8], pos: usize, lim: &Limits) -> Result<Option<usize>, Fail>
         Some(&marker::END) => {
             let (l, e) = line(b, pos + 1, lim)?;
             if !l.is_empty() {
-                return Err(ParseError::Malformed(marker::END).into());
+                return Err(Error::Malformed(marker::END).into());
             }
             Ok(Some(e))
         }
@@ -1352,7 +1362,7 @@ fn streamed_list(b: &[u8], mut pos: usize, depth: usize, lim: &Limits) -> Step<V
             return Ok((items, e));
         }
         if items.len() >= lim.elements {
-            return Err(ParseError::TooManyElements.into());
+            return Err(Error::TooManyElements.into());
         }
         let (v, e) = value(b, pos, depth + 1, false, lim)?;
         items.push(v);
@@ -1367,7 +1377,7 @@ fn streamed_pairs(b: &[u8], mut pos: usize, depth: usize, lim: &Limits) -> Step<
             return Ok((entries, e));
         }
         if entries.len() >= lim.elements {
-            return Err(ParseError::TooManyElements.into());
+            return Err(Error::TooManyElements.into());
         }
         let (k, e) = value(b, pos, depth + 1, false, lim)?;
         let (v, e) = value(b, e, depth + 1, false, lim)?;
@@ -1382,15 +1392,15 @@ fn streamed_string(b: &[u8], mut pos: usize, lim: &Limits) -> Step<Value> {
         match b.get(pos) {
             None => return Err(Fail::Need(pos.saturating_add(1))),
             Some(&marker::CHUNK) => {}
-            Some(_) => return Err(ParseError::Malformed(marker::BULK).into()),
+            Some(_) => return Err(Error::Malformed(marker::BULK).into()),
         }
         let (l, e) = line(b, pos + 1, lim)?;
-        let n = digits(l).ok_or(ParseError::BadLength)?;
+        let n = digits(l).ok_or(Error::BadLength)?;
         if n == 0 {
             return Ok((Value::Bulk(out), e));
         }
         if n > lim.bulk.saturating_sub(out.len()) {
-            return Err(ParseError::BulkTooLong.into());
+            return Err(Error::BulkTooLong.into());
         }
         let (d, e) = data(b, e, n, lim)?;
         out.extend_from_slice(d);
@@ -1408,23 +1418,23 @@ fn command(b: &[u8], lim: &Limits) -> Step<Command> {
 
 fn multibulk(b: &[u8], lim: &Limits) -> Step<Command> {
     let (l, mut pos) = line(b, 1, lim)?;
-    let n = redis_ll(l).ok_or(ParseError::TooManyElements)?;
+    let n = redis_ll(l).ok_or(Error::TooManyElements)?;
     // Redis ignores an array of zero or fewer elements.
     let Ok(n) = usize::try_from(n) else {
         return Ok((Command::default(), pos));
     };
     if n > lim.elements {
-        return Err(ParseError::TooManyElements.into());
+        return Err(Error::TooManyElements.into());
     }
     let mut args = Vec::with_capacity(capacity(b, pos, n, 6));
     for _ in 0..n {
         match b.get(pos) {
             None => return Err(Fail::Need(pos.saturating_add(1))),
             Some(&marker::BULK) => {}
-            Some(&c) => return Err(ParseError::ExpectedBulk(c).into()),
+            Some(&c) => return Err(Error::ExpectedBulk(c).into()),
         }
         let (l, e) = line(b, pos + 1, lim)?;
-        let n = bulk_len(l).ok_or(ParseError::BulkTooLong)?;
+        let n = bulk_len(l).ok_or(Error::BulkTooLong)?;
         let (d, e) = data(b, e, n, lim)?;
         args.push(d.to_vec());
         pos = e;
@@ -1443,20 +1453,20 @@ fn inline(b: &[u8], lim: &Limits) -> Step<Command> {
         // and only before a LF that can still come.
         let over = window.len().saturating_sub(lim.line);
         if over > 1 || (over == 1 && (end.is_some() || window.last() != Some(&b'\r'))) {
-            return Err(ParseError::LineTooLong.into());
+            return Err(Error::LineTooLong.into());
         }
         return Err(Fail::Need(b.len().saturating_add(1)));
     };
     let text = b[..i].strip_suffix(b"\r").unwrap_or(&b[..i]);
     if text.len() > lim.line {
-        return Err(ParseError::LineTooLong.into());
+        return Err(Error::LineTooLong.into());
     }
     let args = split_args(text)?;
     if args.len() > lim.elements {
-        return Err(ParseError::TooManyElements.into());
+        return Err(Error::TooManyElements.into());
     }
     if args.iter().any(|a| a.len() > lim.bulk) {
-        return Err(ParseError::BulkTooLong.into());
+        return Err(Error::BulkTooLong.into());
     }
     Ok((Command { args }, i + 1))
 }
@@ -1479,7 +1489,7 @@ fn hex(c: Option<&u8>) -> Option<u8> {
 /// Splits an inline command's line into arguments, as Redis's
 /// `sdssplitargs` does. The line holds no NUL: [`inline`] ends no line
 /// after one.
-fn split_args(text: &[u8]) -> Result<Vec<Vec<u8>>, ParseError> {
+fn split_args(text: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
     let after_quote_ok = |i: usize| text.get(i + 1).is_none_or(|&c| is_space(c));
     let mut args = Vec::new();
     let mut i = 0;
@@ -1496,7 +1506,7 @@ fn split_args(text: &[u8]) -> Result<Vec<Vec<u8>>, ParseError> {
             let c = text.get(i).copied();
             if double {
                 match c {
-                    None => return Err(ParseError::UnbalancedQuotes),
+                    None => return Err(Error::UnbalancedQuotes),
                     Some(b'\\') if text.get(i + 1) == Some(&b'x') => {
                         if let (Some(h), Some(l)) = (hex(text.get(i + 2)), hex(text.get(i + 3))) {
                             arg.push(h << 4 | l);
@@ -1519,7 +1529,7 @@ fn split_args(text: &[u8]) -> Result<Vec<Vec<u8>>, ParseError> {
                     }
                     Some(b'"') => {
                         if !after_quote_ok(i) {
-                            return Err(ParseError::UnbalancedQuotes);
+                            return Err(Error::UnbalancedQuotes);
                         }
                         i += 1;
                         break;
@@ -1531,14 +1541,14 @@ fn split_args(text: &[u8]) -> Result<Vec<Vec<u8>>, ParseError> {
                 }
             } else if single {
                 match c {
-                    None => return Err(ParseError::UnbalancedQuotes),
+                    None => return Err(Error::UnbalancedQuotes),
                     Some(b'\\') if text.get(i + 1) == Some(&b'\'') => {
                         arg.push(b'\'');
                         i += 2;
                     }
                     Some(b'\'') => {
                         if !after_quote_ok(i) {
-                            return Err(ParseError::UnbalancedQuotes);
+                            return Err(Error::UnbalancedQuotes);
                         }
                         i += 1;
                         break;
@@ -1562,57 +1572,31 @@ fn split_args(text: &[u8]) -> Result<Vec<Vec<u8>>, ParseError> {
     }
 }
 
-/// Why an exact RESP value or command cannot be read or written.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WireError {
-    /// The protocol parser rejected the frame.
-    Parse(ParseError),
-    /// The input ended inside a frame.
-    Incomplete,
-    /// Bytes follow the first complete frame.
-    Trailing,
-    /// The value cannot be written unchanged under [`Limits::DEFAULT`].
-    Unwritable,
-}
-
-impl core::fmt::Display for WireError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Parse(e) => e.fmt(f),
-            Self::Incomplete => f.write_str("incomplete RESP frame"),
-            Self::Trailing => f.write_str("bytes follow the RESP frame"),
-            Self::Unwritable => f.write_str("value cannot be written without changing it"),
-        }
-    }
-}
-
-impl core::error::Error for WireError {}
-
-fn exact<T>(parsed: Step<T>, len: usize) -> Result<T, WireError> {
+fn exact<T>(parsed: Step<T>, len: usize) -> Result<T, Error> {
     match parsed {
         Ok((item, used)) if used == len => Ok(item),
-        Ok(_) => Err(WireError::Trailing),
-        Err(Fail::Need(_)) => Err(WireError::Incomplete),
-        Err(Fail::Bad(error)) => Err(WireError::Parse(error)),
+        Ok(_) => Err(Error::Trailing),
+        Err(Fail::Need(_)) => Err(Error::Incomplete),
+        Err(Fail::Bad(error)) => Err(error),
     }
 }
 
 impl Wire for Value {
-    type ParseError = WireError;
-    type WriteError = WireError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads one complete RESP2 or RESP3 value under [`Limits::DEFAULT`].
     /// Streamed strings and aggregates become their plain forms. Refuses
     /// malformed, incomplete, oversized, or trailing input and values whose
     /// strict encoding would exceed the default limits. Exponential doubles
     /// can expand when written.
-    fn parse(bytes: &[u8]) -> Result<Self, WireError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         let value = exact(value_top(bytes, &Limits::DEFAULT), bytes.len())?;
         // Parsing validates every field. Only size expansion can make writing fail:
         // doubles expand, and streamed bulk chunks can exceed the plain bulk limit.
         value
             .write(&mut Vec::new())
-            .map_err(|_| WireError::Parse(ParseError::FrameTooLarge))?;
+            .map_err(|_| Error::FrameTooLarge)?;
         Ok(value)
     }
 
@@ -1622,19 +1606,19 @@ impl Wire for Value {
     /// Refuses invalid fields, pushes outside the top level or without a
     /// first string, and values exceeding size, count, or nesting limits.
     /// An error leaves `out` unchanged.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WireError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         transactional(out, |out, limit| strict_value(out, self, 0, true, limit))
     }
 }
 
 impl Wire for Resp2 {
-    type ParseError = WireError;
-    type WriteError = WireError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads one complete RESP2 value under [`Limits::DEFAULT`].
     /// Refuses RESP3 markers and streamed forms, including inside arrays,
     /// and malformed, incomplete, oversized, or trailing input.
-    fn parse(bytes: &[u8]) -> Result<Self, WireError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         let limits = &Limits::DEFAULT;
         exact(
             bounded(resp2_value(frame(bytes, limits), 0, 0), limits),
@@ -1648,7 +1632,7 @@ impl Wire for Resp2 {
     /// Push, and Attribute variants at any depth. Also refuses CR or LF
     /// in simple strings or errors and size, count, or nesting violations.
     /// An error leaves `out` unchanged.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WireError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         transactional(out, |out, limit| strict_resp2(out, &self.0, 0, limit))
     }
 }
@@ -1664,7 +1648,7 @@ fn resp2_value(bytes: &[u8], pos: usize, depth: usize) -> Step<Value> {
         marker::BULK | marker::ARRAY => {
             let (text, mut end) = line(bytes, pos + 1, limits)?;
             let count = match length(text)? {
-                Len::Streamed => return Err(ParseError::BadLength.into()),
+                Len::Streamed => return Err(Error::BadLength.into()),
                 Len::Null => {
                     return Ok((
                         if kind == marker::BULK {
@@ -1682,10 +1666,10 @@ fn resp2_value(bytes: &[u8], pos: usize, depth: usize) -> Step<Value> {
                 return Ok((Value::Bulk(body.to_vec()), end));
             }
             if depth >= MAX_DEPTH {
-                return Err(ParseError::TooDeep.into());
+                return Err(Error::TooDeep.into());
             }
             if count > MAX_ELEMENTS {
-                return Err(ParseError::TooManyElements.into());
+                return Err(Error::TooManyElements.into());
             }
             let mut items = Vec::with_capacity(capacity(bytes, end, count, 3));
             for _ in 0..count {
@@ -1695,11 +1679,11 @@ fn resp2_value(bytes: &[u8], pos: usize, depth: usize) -> Step<Value> {
             }
             Ok((Value::Array(items), end))
         }
-        _ => Err(ParseError::UnknownType(kind).into()),
+        _ => Err(Error::UnknownType(kind).into()),
     }
 }
 
-fn strict_resp2(out: &mut Vec<u8>, value: &Value, depth: usize, limit: usize) -> Result<(), WireError> {
+fn strict_resp2(out: &mut Vec<u8>, value: &Value, depth: usize, limit: usize) -> Result<(), Error> {
     match value {
         Value::Null => strict_bytes(out, b"$-1\r\n", limit),
         Value::Array(items) => {
@@ -1720,13 +1704,13 @@ fn strict_resp2(out: &mut Vec<u8>, value: &Value, depth: usize, limit: usize) ->
         | Value::Map(_)
         | Value::Set(_)
         | Value::Push(_)
-        | Value::Attribute { .. } => Err(WireError::Unwritable),
+        | Value::Attribute { .. } => Err(Error::Unwritable),
     }
 }
 
 impl Wire for Command {
-    type ParseError = WireError;
-    type WriteError = WireError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads one complete command under [`Limits::DEFAULT`], as Redis does.
     /// An initial `*` selects an array of bulk strings. Otherwise, a line
@@ -1737,20 +1721,20 @@ impl Wire for Command {
     /// Blank lines and arrays with zero or negative counts have no arguments.
     /// Refuses malformed, incomplete, oversized, or trailing input and
     /// commands whose array encoding exceeds the default limits.
-    fn parse(bytes: &[u8]) -> Result<Self, WireError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         let command = exact(command_top(bytes, &Limits::DEFAULT), bytes.len())?;
         // Parsed arguments already meet field limits. Only expansion from an
         // inline command to an array of bulk strings can exceed the frame limit.
         command
             .write(&mut Vec::new())
-            .map_err(|_| WireError::Parse(ParseError::FrameTooLarge))?;
+            .map_err(|_| Error::FrameTooLarge)?;
         Ok(command)
     }
 
     /// Appends an array of bulk strings under [`Limits::DEFAULT`].
     /// Refuses oversized arguments, argument counts, or total frame sizes.
     /// An error leaves `out` unchanged.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WireError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         transactional(out, |out, limit| {
             strict_header(out, marker::ARRAY, self.args.len(), 0, limit)?;
             for arg in &self.args {
@@ -1763,47 +1747,47 @@ impl Wire for Command {
 
 fn transactional(
     out: &mut Vec<u8>,
-    write: impl FnOnce(&mut Vec<u8>, usize) -> Result<(), WireError>,
-) -> Result<(), WireError> {
+    write: impl FnOnce(&mut Vec<u8>, usize) -> Result<(), Error>,
+) -> Result<(), Error> {
     let start = out.len();
-    let limit = start.checked_add(MAX_FRAME_LEN).ok_or(WireError::Unwritable)?;
+    let limit = start.checked_add(MAX_FRAME_LEN).ok_or(Error::Unwritable)?;
     write(out, limit).inspect_err(|_| out.truncate(start))
 }
 
-fn strict_bytes(out: &mut Vec<u8>, bytes: &[u8], limit: usize) -> Result<(), WireError> {
+fn strict_bytes(out: &mut Vec<u8>, bytes: &[u8], limit: usize) -> Result<(), Error> {
     if out.len().checked_add(bytes.len()).is_none_or(|n| n > limit) {
-        return Err(WireError::Unwritable);
+        return Err(Error::Unwritable);
     }
     out.extend_from_slice(bytes);
     Ok(())
 }
 
-fn strict_line(out: &mut Vec<u8>, marker: u8, text: &[u8], limit: usize) -> Result<(), WireError> {
+fn strict_line(out: &mut Vec<u8>, marker: u8, text: &[u8], limit: usize) -> Result<(), Error> {
     if text.len() > MAX_LINE_LEN || text.iter().any(|b| matches!(b, b'\r' | b'\n')) {
-        return Err(WireError::Unwritable);
+        return Err(Error::Unwritable);
     }
     strict_bytes(out, &[marker], limit)?;
     strict_bytes(out, text, limit)?;
     strict_bytes(out, b"\r\n", limit)
 }
 
-fn strict_bulk(out: &mut Vec<u8>, marker: u8, prefix: &[u8], bytes: &[u8], limit: usize) -> Result<(), WireError> {
-    let len = prefix.len().checked_add(bytes.len()).filter(|&n| n <= MAX_BULK_LEN).ok_or(WireError::Unwritable)?;
+fn strict_bulk(out: &mut Vec<u8>, marker: u8, prefix: &[u8], bytes: &[u8], limit: usize) -> Result<(), Error> {
+    let len = prefix.len().checked_add(bytes.len()).filter(|&n| n <= MAX_BULK_LEN).ok_or(Error::Unwritable)?;
     strict_line(out, marker, len.to_string().as_bytes(), limit)?;
     strict_bytes(out, prefix, limit)?;
     strict_bytes(out, bytes, limit)?;
     strict_bytes(out, b"\r\n", limit)
 }
 
-fn strict_header(out: &mut Vec<u8>, marker: u8, count: usize, depth: usize, limit: usize) -> Result<(), WireError> {
+fn strict_header(out: &mut Vec<u8>, marker: u8, count: usize, depth: usize, limit: usize) -> Result<(), Error> {
     if count > MAX_ELEMENTS || depth >= MAX_DEPTH {
-        return Err(WireError::Unwritable);
+        return Err(Error::Unwritable);
     }
     strict_line(out, marker, count.to_string().as_bytes(), limit)
 }
 
 // Recursion stops at MAX_DEPTH before inspecting deeper children.
-fn strict_value(out: &mut Vec<u8>, value: &Value, depth: usize, top: bool, limit: usize) -> Result<(), WireError> {
+fn strict_value(out: &mut Vec<u8>, value: &Value, depth: usize, top: bool, limit: usize) -> Result<(), Error> {
     match value {
         Value::Simple(bytes) => strict_line(out, marker::SIMPLE, bytes, limit),
         Value::Error(bytes) => strict_line(out, marker::ERROR, bytes, limit),
@@ -1815,7 +1799,7 @@ fn strict_value(out: &mut Vec<u8>, value: &Value, depth: usize, top: bool, limit
         Value::Double(n) => strict_line(out, marker::DOUBLE, fmt_double(*n).as_bytes(), limit),
         Value::BigNumber(text) => {
             if text.len() > MAX_LINE_LEN || !big_ok(text.as_bytes()) {
-                return Err(WireError::Unwritable);
+                return Err(Error::Unwritable);
             }
             strict_line(out, marker::BIG_NUMBER, text.as_bytes(), limit)
         }
@@ -1831,7 +1815,7 @@ fn strict_value(out: &mut Vec<u8>, value: &Value, depth: usize, top: bool, limit
                 Value::Set(_) => marker::SET,
                 _ => {
                     if !top || items.first().and_then(Value::as_bytes).is_none() {
-                        return Err(WireError::Unwritable);
+                        return Err(Error::Unwritable);
                     }
                     marker::PUSH
                 }
@@ -1877,11 +1861,11 @@ mod tests {
         test_support::{decode_all, mutate},
     };
 
-    fn value_step(b: &[u8], limits: Limits) -> Result<Decoded<Value>, ParseError> {
+    fn value_step(b: &[u8], limits: Limits) -> Result<Decoded<Value>, Error> {
         Values::with_limits(limits).decode(b, false)
     }
 
-    fn command_step(b: &[u8], limits: Limits) -> Result<Decoded<Command>, ParseError> {
+    fn command_step(b: &[u8], limits: Limits) -> Result<Decoded<Command>, Error> {
         Commands::with_limits(limits).decode(b, false)
     }
 
@@ -1901,7 +1885,7 @@ mod tests {
     }
 
     // One-shot parsing bypasses the scan gate used by Values and Commands.
-    fn one_shot<T>(mut bytes: &[u8], parse: impl Fn(&[u8]) -> Step<T>) -> (Vec<T>, Option<codec::Fail<ParseError>>) {
+    fn one_shot<T>(mut bytes: &[u8], parse: impl Fn(&[u8]) -> Step<T>) -> (Vec<T>, Option<codec::Fail<Error>>) {
         let mut items = Vec::new();
         while !bytes.is_empty() {
             match parse(bytes) {
@@ -2019,7 +2003,7 @@ mod tests {
     #[test]
     fn unwritable_display_is_uniform() {
         assert_eq!(
-            WireError::Unwritable.to_string(),
+            Error::Unwritable.to_string(),
             "value cannot be written without changing it"
         );
     }
@@ -2032,7 +2016,7 @@ mod tests {
         bytes.extend_from_slice(&b",1e300\r\n".repeat(count));
         assert_eq!(
             Value::parse(&bytes),
-            Err(WireError::Parse(ParseError::FrameTooLarge))
+            Err(Error::FrameTooLarge)
         );
     }
 
@@ -2153,16 +2137,16 @@ mod tests {
         let binary = Resp2(Value::bulk(b"_\r\n$?\r\n*?\r\n\0\xff"));
         contract::check_wire_value(&binary);
         for bytes in [&b""[..], b"$3\r\nab", b"*1\r\n"] {
-            assert_eq!(Resp2::parse(bytes), Err(WireError::Incomplete));
+            assert_eq!(Resp2::parse(bytes), Err(Error::Incomplete));
         }
-        assert_eq!(Resp2::parse(b"$-1\r\n+OK\r\n"), Err(WireError::Trailing));
+        assert_eq!(Resp2::parse(b"$-1\r\n+OK\r\n"), Err(Error::Trailing));
         assert_eq!(
             Resp2::parse(b"+a\n"),
-            Err(WireError::Parse(ParseError::BadLineEnd))
+            Err(Error::BadLineEnd)
         );
         assert_eq!(
             Resp2::parse(b":x\r\n"),
-            Err(WireError::Parse(ParseError::Malformed(b':')))
+            Err(Error::Malformed(b':'))
         );
         let mut deep = b"*1\r\n".repeat(MAX_DEPTH);
         deep.extend_from_slice(b"$-1\r\n");
@@ -2171,21 +2155,21 @@ mod tests {
         deep.splice(..0, b"*1\r\n".iter().copied());
         assert_eq!(
             Resp2::parse(&deep),
-            Err(WireError::Parse(ParseError::TooDeep))
+            Err(Error::TooDeep)
         );
         for (header, error) in [
             (
                 format!("*{}\r\n", MAX_ELEMENTS + 1),
-                ParseError::TooManyElements,
+                Error::TooManyElements,
             ),
             (
                 format!("${}\r\n", MAX_BULK_LEN + 1),
-                ParseError::BulkTooLong,
+                Error::BulkTooLong,
             ),
         ] {
             assert_eq!(
                 Resp2::parse(header.as_bytes()),
-                Err(WireError::Parse(error))
+                Err(error)
             );
         }
     }
@@ -2211,7 +2195,7 @@ mod tests {
                 let reply = Resp2(nested);
                 contract::check_wire_value(&reply);
                 let mut out = b"prefix".to_vec();
-                assert_eq!(reply.write(&mut out), Err(WireError::Unwritable));
+                assert_eq!(reply.write(&mut out), Err(Error::Unwritable));
                 assert_eq!(out, b"prefix");
             }
         }
@@ -2248,7 +2232,7 @@ mod tests {
             let reply = Resp2::mapped(value);
             contract::check_wire_value(&reply);
             let mut out = b"prefix".to_vec();
-            assert_eq!(reply.write(&mut out), Err(WireError::Unwritable));
+            assert_eq!(reply.write(&mut out), Err(Error::Unwritable));
             assert_eq!(out, b"prefix");
         }
         // RESP2 drops attributes and maps every push to an array.
@@ -2305,41 +2289,41 @@ mod tests {
             assert_eq!(Command::parse(bytes), Ok(Command::default()));
             assert_eq!(decode_all(Commands::new, bytes), (vec![], None));
         }
-        assert_eq!(Command::parse(b"GET a\0b\n"), Err(WireError::Incomplete));
+        assert_eq!(Command::parse(b"GET a\0b\n"), Err(Error::Incomplete));
     }
 
     #[test]
     fn value_errors() {
         let lim = Limits { bulk: 8, elements: 3, depth: 2, line: 10, frame: 40 };
         let bad = |b: &[u8]| value_step(b, lim).err().unwrap_or_else(|| panic!("{} parsed", b.escape_ascii()));
-        assert_eq!(bad(b"x\r\n"), ParseError::UnknownType(b'x'));
-        assert_eq!(bad(b".\r\n"), ParseError::UnknownType(b'.'));
-        assert_eq!(bad(b"+OK\rX"), ParseError::BadLineEnd);
-        assert_eq!(bad(b"+OK\n"), ParseError::BadLineEnd);
-        assert_eq!(bad(b"+01234567890"), ParseError::LineTooLong);
+        assert_eq!(bad(b"x\r\n"), Error::UnknownType(b'x'));
+        assert_eq!(bad(b".\r\n"), Error::UnknownType(b'.'));
+        assert_eq!(bad(b"+OK\rX"), Error::BadLineEnd);
+        assert_eq!(bad(b"+OK\n"), Error::BadLineEnd);
+        assert_eq!(bad(b"+01234567890"), Error::LineTooLong);
         assert_eq!(value_step(b"+0123456789", lim), Ok(Decoded::Need));
-        assert_eq!(bad(b"$-2\r\n"), ParseError::BadLength);
-        assert_eq!(bad(b"$x\r\n"), ParseError::BadLength);
-        assert_eq!(bad(b"$\r\n"), ParseError::BadLength);
-        assert_eq!(bad(b"!-1\r\n"), ParseError::BadLength);
-        assert_eq!(bad(b"=?\r\n"), ParseError::BadLength);
-        assert_eq!(bad(b"~-1\r\n"), ParseError::BadLength);
-        assert_eq!(bad(b">?\r\n"), ParseError::BadLength);
-        assert_eq!(bad(b"|?\r\n"), ParseError::BadLength);
-        assert_eq!(Value::parse(b"$99999999999999999999999\r\n"), Err(WireError::Parse(ParseError::BadLength)));
-        assert_eq!(bad(b"$9\r\n"), ParseError::BulkTooLong);
-        assert_eq!(bad(b"$?\r\n;5\r\nabcde\r\n;5\r\n"), ParseError::BulkTooLong);
-        assert_eq!(bad(b"$?\r\n;x\r\n"), ParseError::BadLength);
-        assert_eq!(bad(b"$?\r\n+"), ParseError::Malformed(b'$'));
-        assert_eq!(bad(b"*4\r\n"), ParseError::TooManyElements);
-        assert_eq!(bad(b"%4\r\n"), ParseError::TooManyElements);
-        assert_eq!(bad(b"*?\r\n_\r\n_\r\n_\r\n_\r\n"), ParseError::TooManyElements);
-        assert_eq!(bad(b"%?\r\n_\r\n_\r\n_\r\n_\r\n_\r\n_\r\n_\r\n"), ParseError::TooManyElements);
-        assert_eq!(bad(b"*1\r\n*1\r\n*1\r\n"), ParseError::TooDeep);
-        assert_eq!(bad(b"|1\r\n_\r\n_\r\n|1\r\n_\r\n_\r\n|1\r\n"), ParseError::TooDeep);
-        assert_eq!(bad(b"$2\r\nabXY"), ParseError::MissingCrlf);
-        assert_eq!(Value::parse(b"$2\r\nabX"), Err(WireError::Incomplete));
-        assert_eq!(bad(b"$2\r\nab\rX"), ParseError::MissingCrlf);
+        assert_eq!(bad(b"$-2\r\n"), Error::BadLength);
+        assert_eq!(bad(b"$x\r\n"), Error::BadLength);
+        assert_eq!(bad(b"$\r\n"), Error::BadLength);
+        assert_eq!(bad(b"!-1\r\n"), Error::BadLength);
+        assert_eq!(bad(b"=?\r\n"), Error::BadLength);
+        assert_eq!(bad(b"~-1\r\n"), Error::BadLength);
+        assert_eq!(bad(b">?\r\n"), Error::BadLength);
+        assert_eq!(bad(b"|?\r\n"), Error::BadLength);
+        assert_eq!(Value::parse(b"$99999999999999999999999\r\n"), Err(Error::BadLength));
+        assert_eq!(bad(b"$9\r\n"), Error::BulkTooLong);
+        assert_eq!(bad(b"$?\r\n;5\r\nabcde\r\n;5\r\n"), Error::BulkTooLong);
+        assert_eq!(bad(b"$?\r\n;x\r\n"), Error::BadLength);
+        assert_eq!(bad(b"$?\r\n+"), Error::Malformed(b'$'));
+        assert_eq!(bad(b"*4\r\n"), Error::TooManyElements);
+        assert_eq!(bad(b"%4\r\n"), Error::TooManyElements);
+        assert_eq!(bad(b"*?\r\n_\r\n_\r\n_\r\n_\r\n"), Error::TooManyElements);
+        assert_eq!(bad(b"%?\r\n_\r\n_\r\n_\r\n_\r\n_\r\n_\r\n_\r\n"), Error::TooManyElements);
+        assert_eq!(bad(b"*1\r\n*1\r\n*1\r\n"), Error::TooDeep);
+        assert_eq!(bad(b"|1\r\n_\r\n_\r\n|1\r\n_\r\n_\r\n|1\r\n"), Error::TooDeep);
+        assert_eq!(bad(b"$2\r\nabXY"), Error::MissingCrlf);
+        assert_eq!(Value::parse(b"$2\r\nabX"), Err(Error::Incomplete));
+        assert_eq!(bad(b"$2\r\nab\rX"), Error::MissingCrlf);
         for (b, t) in [
             (&b":12a\r\n"[..], b':'),
             (b":\r\n", b':'),
@@ -2356,17 +2340,17 @@ mod tests {
             (b"=4\r\ntxt;\r\n", b'='),
             (b"*?\r\n.x\r\n", b'.'),
         ] {
-            assert_eq!(bad(b), ParseError::Malformed(t), "{}", b.escape_ascii());
+            assert_eq!(bad(b), Error::Malformed(t), "{}", b.escape_ascii());
         }
         // One past the largest 64-bit integer.
-        assert_eq!(Value::parse(b":9223372036854775808\r\n"), Err(WireError::Parse(ParseError::Malformed(b':'))));
-        assert_eq!(Value::parse(b":-9223372036854775809\r\n"), Err(WireError::Parse(ParseError::Malformed(b':'))));
+        assert_eq!(Value::parse(b":9223372036854775808\r\n"), Err(Error::Malformed(b':')));
+        assert_eq!(Value::parse(b":-9223372036854775809\r\n"), Err(Error::Malformed(b':')));
         let frame = Limits { frame: 10, ..Limits::DEFAULT };
-        assert_eq!(value_step(b"$8\r\n", frame), Err(ParseError::FrameTooLarge));
-        assert_eq!(value_step(b"+0123456789\r\n", frame), Err(ParseError::FrameTooLarge));
-        assert_eq!(value_step(b"+0123456789", frame), Err(ParseError::FrameTooLarge));
+        assert_eq!(value_step(b"$8\r\n", frame), Err(Error::FrameTooLarge));
+        assert_eq!(value_step(b"+0123456789\r\n", frame), Err(Error::FrameTooLarge));
+        assert_eq!(value_step(b"+0123456789", frame), Err(Error::FrameTooLarge));
         assert_eq!(value_step(b"+0123456\r\n", frame), Ok(Decoded::Item(s("0123456"), 10)));
-        assert!(ParseError::BulkTooLong.reply() == Value::error("ERR Protocol error: invalid bulk length"));
+        assert!(Error::BulkTooLong.reply() == Value::error("ERR Protocol error: invalid bulk length"));
     }
 
     #[test]
@@ -2374,27 +2358,27 @@ mod tests {
         let lim = Limits { bulk: 8, elements: 3, depth: 2, line: 10, frame: 40 };
         let bad =
             |b: &[u8]| command_step(b, lim).err().unwrap_or_else(|| panic!("{} parsed", b.escape_ascii()));
-        assert_eq!(bad(b"*1\r\n:1\r\n"), ParseError::ExpectedBulk(b':'));
-        assert_eq!(bad(b"*x\r\n"), ParseError::TooManyElements);
-        assert_eq!(bad(b"*4\r\n"), ParseError::TooManyElements);
-        assert_eq!(bad(b"*1\r\n$-1\r\n"), ParseError::BulkTooLong);
-        assert_eq!(bad(b"*1\r\n$9\r\n"), ParseError::BulkTooLong);
-        assert_eq!(bad(b"*1\r\n$1\r\naXY"), ParseError::MissingCrlf);
-        assert_eq!(bad(b"*1\n"), ParseError::BadLineEnd);
-        assert_eq!(bad(b"a b c d e\n"), ParseError::TooManyElements);
-        assert_eq!(bad(b"01234567890"), ParseError::LineTooLong);
-        assert_eq!(bad(b"\"abc\n"), ParseError::UnbalancedQuotes);
-        assert_eq!(bad(b"'abc\n"), ParseError::UnbalancedQuotes);
-        assert_eq!(bad(b"\"a\"b\n"), ParseError::UnbalancedQuotes);
-        assert_eq!(bad(b"'a'b\n"), ParseError::UnbalancedQuotes);
-        assert_eq!(bad(b"\"a\\\n"), ParseError::UnbalancedQuotes);
+        assert_eq!(bad(b"*1\r\n:1\r\n"), Error::ExpectedBulk(b':'));
+        assert_eq!(bad(b"*x\r\n"), Error::TooManyElements);
+        assert_eq!(bad(b"*4\r\n"), Error::TooManyElements);
+        assert_eq!(bad(b"*1\r\n$-1\r\n"), Error::BulkTooLong);
+        assert_eq!(bad(b"*1\r\n$9\r\n"), Error::BulkTooLong);
+        assert_eq!(bad(b"*1\r\n$1\r\naXY"), Error::MissingCrlf);
+        assert_eq!(bad(b"*1\n"), Error::BadLineEnd);
+        assert_eq!(bad(b"a b c d e\n"), Error::TooManyElements);
+        assert_eq!(bad(b"01234567890"), Error::LineTooLong);
+        assert_eq!(bad(b"\"abc\n"), Error::UnbalancedQuotes);
+        assert_eq!(bad(b"'abc\n"), Error::UnbalancedQuotes);
+        assert_eq!(bad(b"\"a\"b\n"), Error::UnbalancedQuotes);
+        assert_eq!(bad(b"'a'b\n"), Error::UnbalancedQuotes);
+        assert_eq!(bad(b"\"a\\\n"), Error::UnbalancedQuotes);
         let frame = Limits { frame: 12, ..Limits::DEFAULT };
-        assert_eq!(command_step(b"*1\r\n$20\r\n", frame), Err(ParseError::FrameTooLarge));
+        assert_eq!(command_step(b"*1\r\n$20\r\n", frame), Err(Error::FrameTooLarge));
         assert_eq!(
-            ParseError::UnbalancedQuotes.reply(),
+            Error::UnbalancedQuotes.reply(),
             Value::error("ERR Protocol error: unbalanced quotes in request")
         );
-        assert_eq!(ParseError::ExpectedBulk(b':').to_string(), "expected '$', got ':'");
+        assert_eq!(Error::ExpectedBulk(b':').to_string(), "expected '$', got ':'");
     }
 
     /// The lower bound on bytes needed that a truncated input reports.
@@ -2412,7 +2396,7 @@ mod tests {
             check_values(full, Limits::DEFAULT);
             for n in 0..full.len() {
                 assert_eq!(value_step(&full[..n], Limits::DEFAULT), Ok(Decoded::Need));
-                assert_eq!(Value::parse(&full[..n]), Err(WireError::Incomplete));
+                assert_eq!(Value::parse(&full[..n]), Err(Error::Incomplete));
                 let hint = need(value_top(&full[..n], &Limits::DEFAULT)).unwrap();
                 assert!(hint > n && hint <= full.len(), "{} at {n}: {hint}", full.escape_ascii());
             }
@@ -2421,7 +2405,7 @@ mod tests {
             check_commands(full, Limits::DEFAULT);
             for n in 0..full.len() {
                 assert_eq!(command_step(&full[..n], Limits::DEFAULT), Ok(Decoded::Need));
-                assert_eq!(Command::parse(&full[..n]), Err(WireError::Incomplete));
+                assert_eq!(Command::parse(&full[..n]), Err(Error::Incomplete));
                 let hint = need(command_top(&full[..n], &Limits::DEFAULT)).unwrap();
                 assert!(hint > n && hint <= full.len());
             }
@@ -2441,7 +2425,7 @@ mod tests {
         }
         let mut stream = Stream::new(Values::new());
         assert_eq!(stream.push(b"+OK\n"), 4);
-        let error = codec::Fail::Protocol(ParseError::BadLineEnd);
+        let error = codec::Fail::Protocol(Error::BadLineEnd);
         assert_eq!(stream.next(), Some(Err(error.clone())));
         assert_eq!(stream.push(b"+OK\r\n"), 5);
         assert_eq!(stream.next(), None);
@@ -2449,7 +2433,7 @@ mod tests {
         let limits = Limits { frame: 100, ..Limits::DEFAULT };
         for bytes in [&b"$1000\r\n"[..], &[b'+'; 100]] {
             check_values(bytes, limits);
-            assert_eq!(value_step(bytes, limits), Err(ParseError::FrameTooLarge));
+            assert_eq!(value_step(bytes, limits), Err(Error::FrameTooLarge));
         }
         assert_eq!(value_step(&[b'+'; 99], limits), Ok(Decoded::Need));
     }
@@ -2466,7 +2450,7 @@ mod tests {
         assert_eq!(stream.push(b"56789\r\n"), 7);
         assert_eq!(stream.next(), Some(Ok(Command::new(["0123456789"]))));
         assert_eq!(stream.push(b"*1\r\n+PING\r\n"), 11);
-        let error = codec::Fail::Protocol(ParseError::ExpectedBulk(b'+'));
+        let error = codec::Fail::Protocol(Error::ExpectedBulk(b'+'));
         assert_eq!(stream.next(), Some(Err(error.clone())));
         assert_eq!(stream.next(), None);
         assert_eq!(stream.failed(), Some(&error));
@@ -2489,7 +2473,7 @@ mod tests {
             Value::Map(vec![(Value::Null, Value::Null); MAX_ELEMENTS + 1]),
         ] {
             contract::check_wire_value(&value);
-            assert_eq!(value.to_bytes(), Err(WireError::Unwritable));
+            assert_eq!(value.to_bytes(), Err(Error::Unwritable));
             if let Value::Verbatim { text, .. } = &value {
                 // Its format prefix is omitted in RESP2, so this text fits.
                 let bytes = Resp2::mapped(value.clone()).to_bytes().unwrap();
@@ -2497,7 +2481,7 @@ mod tests {
             } else {
                 let reply = Resp2(value);
                 contract::check_wire_value(&reply);
-                assert_eq!(reply.to_bytes(), Err(WireError::Unwritable));
+                assert_eq!(reply.to_bytes(), Err(Error::Unwritable));
             }
         }
         for command in [
@@ -2505,7 +2489,7 @@ mod tests {
             Command { args: vec![vec![]; MAX_ELEMENTS + 1] },
         ] {
             contract::check_wire_value(&command);
-            assert_eq!(command.to_bytes(), Err(WireError::Unwritable));
+            assert_eq!(command.to_bytes(), Err(Error::Unwritable));
         }
         // Bulk errors retain line breaks in their length-delimited form.
         let value = Value::BulkError(b"x\ny".to_vec());
@@ -2699,7 +2683,7 @@ mod tests {
             assert!(f.is_nan());
         }
         for b in [&b",nan(\r\n"[..], b",nan(1\r\n", b",nanx\r\n", b",-NaN)\r\n"] {
-            assert_eq!(Value::parse(b), Err(WireError::Parse(ParseError::Malformed(b','))), "{}", b.escape_ascii());
+            assert_eq!(Value::parse(b), Err(Error::Malformed(b',')), "{}", b.escape_ascii());
         }
     }
 
@@ -2711,10 +2695,10 @@ mod tests {
         assert_eq!(command_step(b"0123456789\n", lim), Ok(Decoded::Item(Command::new(["0123456789"]), 11)));
         assert_eq!(command_step(b"0123456789\r\n", lim), Ok(Decoded::Item(Command::new(["0123456789"]), 12)));
         assert_eq!(command_step(b"0123456789\r", lim), Ok(Decoded::Need));
-        assert_eq!(command_step(b"01234567890", lim), Err(ParseError::LineTooLong));
-        assert_eq!(command_step(b"0123456789x", lim), Err(ParseError::LineTooLong));
-        assert_eq!(command_step(b"01234567890\n", lim), Err(ParseError::LineTooLong));
-        assert_eq!(command_step(b"01234567890\r\n", lim), Err(ParseError::LineTooLong));
+        assert_eq!(command_step(b"01234567890", lim), Err(Error::LineTooLong));
+        assert_eq!(command_step(b"0123456789x", lim), Err(Error::LineTooLong));
+        assert_eq!(command_step(b"01234567890\n", lim), Err(Error::LineTooLong));
+        assert_eq!(command_step(b"01234567890\r\n", lim), Err(Error::LineTooLong));
     }
 
     /// An inline argument is held to the bulk limit, like an argument in
@@ -2728,7 +2712,7 @@ mod tests {
             check_commands(bytes, lim);
         }
         for bytes in [&b"GET 123456789\r\n"[..], b"GET \"123\\x41\\x426789\"\r\n"] {
-            assert_eq!(command_step(bytes, lim), Err(ParseError::BulkTooLong));
+            assert_eq!(command_step(bytes, lim), Err(Error::BulkTooLong));
             check_commands(bytes, lim);
         }
     }
@@ -2737,8 +2721,8 @@ mod tests {
     /// no `+`, as the value reader also refuses.
     #[test]
     fn command_count_has_no_plus() {
-        assert_eq!(Value::parse(b"*+1\r\n$1\r\na\r\n"), Err(WireError::Parse(ParseError::BadLength)));
-        assert_eq!(Command::parse(b"*+1\r\n$1\r\na\r\n"), Err(WireError::Parse(ParseError::TooManyElements)));
+        assert_eq!(Value::parse(b"*+1\r\n$1\r\na\r\n"), Err(Error::BadLength));
+        assert_eq!(Command::parse(b"*+1\r\n$1\r\na\r\n"), Err(Error::TooManyElements));
         assert_eq!(Command::parse(b"*-1\r\n"), Ok(Command::default()));
     }
 
@@ -2750,13 +2734,13 @@ mod tests {
         for b in [&b"*2\r\n+0123456789\r\nX"[..], b"*1\r\n$7\r\nabcdefgXY", b"*2\r\n:1\r\n:22\r\n:3\r\n"] {
             check_values(b, limits);
             assert_eq!(decode_all(|| Values::with_limits(limits), b),
-                (vec![], Some(codec::Fail::Protocol(ParseError::FrameTooLarge))));
+                (vec![], Some(codec::Fail::Protocol(Error::FrameTooLarge))));
         }
         let limits = Limits { frame: 12, ..Limits::DEFAULT };
         let b = b"*1\r\n$4\r\nabcdXY";
         check_commands(b, limits);
         assert_eq!(decode_all(|| Commands::with_limits(limits), b),
-            (vec![], Some(codec::Fail::Protocol(ParseError::FrameTooLarge))));
+            (vec![], Some(codec::Fail::Protocol(Error::FrameTooLarge))));
     }
 
     /// Malformed and truncated inputs keep their results across chunk schedules.
@@ -2842,7 +2826,7 @@ mod tests {
 
     /// Feeds a stream one byte at a time, draining it after each byte, until
     /// it takes no more input.
-    fn byte_at_a_time<D: codec::Decode<Error = ParseError>>(mut stream: Stream<D>, bytes: &[u8]) {
+    fn byte_at_a_time<D: codec::Decode<Error = Error>>(mut stream: Stream<D>, bytes: &[u8]) {
         for byte in bytes {
             if stream.push(core::slice::from_ref(byte)) == 0 {
                 break;
@@ -2894,7 +2878,7 @@ mod tests {
             attributes: (0..3).map(|_| (Value::Bulk(vec![0; MAX_BULK_LEN]), Value::Null)).collect(),
             value: Box::new(Value::Bulk(vec![1; MAX_BULK_LEN])),
         };
-        assert_eq!(big.to_bytes(), Err(WireError::Unwritable));
+        assert_eq!(big.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&big);
         let attr = Value::Attribute {
             attributes: vec![(s("k"), s("v"))],
@@ -2911,7 +2895,7 @@ mod tests {
         let mut b = b"*1\r\n".repeat(100_000);
         b.extend_from_slice(b"_\r\n");
         check_values(&b, limits);
-        assert_eq!(value_step(&b, limits), Err(ParseError::TooDeep));
+        assert_eq!(value_step(&b, limits), Err(Error::TooDeep));
         let mut ok = b"*1\r\n".repeat(DEPTH_CEILING);
         ok.extend_from_slice(b"_\r\n");
         assert!(matches!(value_step(&ok, limits), Ok(Decoded::Item(_, _))));
@@ -2925,7 +2909,7 @@ mod tests {
         assert!(capacity(&rest, 0, MAX_ELEMENTS, 3) <= PREALLOC);
         let mut b = b"*1048576\r\n".repeat(32);
         b.extend_from_slice(&rest);
-        assert_eq!(Value::parse(&b), Err(WireError::Parse(ParseError::UnknownType(b'x'))));
+        assert_eq!(Value::parse(&b), Err(Error::UnknownType(b'x')));
     }
 
     /// What exactly fills the frame limit is written whole.
@@ -2948,13 +2932,13 @@ mod tests {
         contract::check_wire_value(&command.to_value());
         contract::check_wire_value(&Resp2(command.to_value()));
         command.args[4].push(3);
-        assert_eq!(command.to_bytes(), Err(WireError::Unwritable));
+        assert_eq!(command.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&command);
         let value = command.to_value();
         contract::check_wire_value(&value);
-        assert_eq!(value.to_bytes(), Err(WireError::Unwritable));
+        assert_eq!(value.to_bytes(), Err(Error::Unwritable));
         let mut out = b"prefix".to_vec();
-        assert_eq!(Resp2(value).write(&mut out), Err(WireError::Unwritable));
+        assert_eq!(Resp2(value).write(&mut out), Err(Error::Unwritable));
         assert_eq!(out, b"prefix");
     }
 
@@ -2993,9 +2977,9 @@ mod tests {
             b"%1\r\n+k\r\n>1\r\n+a\r\n",
             b"|1\r\n+k\r\n>1\r\n+a\r\n+v\r\n",
         ] {
-            assert_eq!(Value::parse(b), Err(WireError::Parse(ParseError::Malformed(b'>'))), "{}", b.escape_ascii());
+            assert_eq!(Value::parse(b), Err(Error::Malformed(b'>')), "{}", b.escape_ascii());
             check_values(b, Limits::DEFAULT);
-            assert_eq!(decode_all(Values::new, b), (vec![], Some(codec::Fail::Protocol(ParseError::Malformed(b'>')))));
+            assert_eq!(decode_all(Values::new, b), (vec![], Some(codec::Fail::Protocol(Error::Malformed(b'>')))));
         }
         for b in [
             &b">1\r\n+a\r\n"[..],
@@ -3006,10 +2990,10 @@ mod tests {
             one(b);
         }
         // Invalid pushes are refused without changing their type.
-        assert_eq!(Value::Push(vec![Value::Integer(1)]).to_bytes(), Err(WireError::Unwritable));
-        assert_eq!(Value::Push(vec![]).to_bytes(), Err(WireError::Unwritable));
+        assert_eq!(Value::Push(vec![Value::Integer(1)]).to_bytes(), Err(Error::Unwritable));
+        assert_eq!(Value::Push(vec![]).to_bytes(), Err(Error::Unwritable));
         let nested = Value::Array(vec![Value::Push(vec![s("a")])]);
-        assert_eq!(nested.to_bytes(), Err(WireError::Unwritable));
+        assert_eq!(nested.to_bytes(), Err(Error::Unwritable));
         let attr = Value::Attribute { attributes: vec![], value: Box::new(Value::Push(vec![bulk("a")])) };
         assert_eq!(attr.to_bytes().unwrap(), b"|0\r\n>1\r\n$1\r\na\r\n");
     }
@@ -3018,24 +3002,24 @@ mod tests {
     /// a NUL: after a NUL the line never ends, and runs into the limit.
     #[test]
     fn inline_nul_hides_the_line_end() {
-        assert_eq!(Command::parse(b"GET a\0b\nPING\n"), Err(WireError::Incomplete));
+        assert_eq!(Command::parse(b"GET a\0b\nPING\n"), Err(Error::Incomplete));
         let limits = Limits { line: 12, ..Limits::DEFAULT };
-        assert_eq!(command_step(b"GET a\0b\nPING\n", limits), Err(ParseError::LineTooLong));
+        assert_eq!(command_step(b"GET a\0b\nPING\n", limits), Err(Error::LineTooLong));
         assert_eq!(command_step(b"GET a\0b\nPIN\n", limits), Ok(Decoded::Need));
         check_commands(b"GET a\0b\nPING\n", limits);
         assert_eq!(decode_all(|| Commands::with_limits(limits), b"GET a\0b\nPING\n"),
-            (vec![], Some(codec::Fail::Protocol(ParseError::LineTooLong))));
+            (vec![], Some(codec::Fail::Protocol(Error::LineTooLong))));
     }
 
     /// A command's counts and lengths are numbers as Redis's string2ll
     /// reads them: no leading zero and no `-0`.
     #[test]
     fn command_numbers_follow_string2ll() {
-        assert_eq!(Command::parse(b"*01\r\n$4\r\nPING\r\n"), Err(WireError::Parse(ParseError::TooManyElements)));
-        assert_eq!(Command::parse(b"*-0\r\n"), Err(WireError::Parse(ParseError::TooManyElements)));
-        assert_eq!(Command::parse(b"*00\r\n"), Err(WireError::Parse(ParseError::TooManyElements)));
-        assert_eq!(Command::parse(b"*1\r\n$04\r\nPING\r\n"), Err(WireError::Parse(ParseError::BulkTooLong)));
-        assert_eq!(Command::parse(b"*1\r\n$-0\r\n"), Err(WireError::Parse(ParseError::BulkTooLong)));
+        assert_eq!(Command::parse(b"*01\r\n$4\r\nPING\r\n"), Err(Error::TooManyElements));
+        assert_eq!(Command::parse(b"*-0\r\n"), Err(Error::TooManyElements));
+        assert_eq!(Command::parse(b"*00\r\n"), Err(Error::TooManyElements));
+        assert_eq!(Command::parse(b"*1\r\n$04\r\nPING\r\n"), Err(Error::BulkTooLong));
+        assert_eq!(Command::parse(b"*1\r\n$-0\r\n"), Err(Error::BulkTooLong));
         assert_eq!(Command::parse(b"*1\r\n$0\r\n\r\n"), Ok(Command::new([""])));
         assert_eq!(Command::parse(b"*0\r\n"), Ok(Command::default()));
         assert_eq!(Command::parse(b"*-12\r\n"), Ok(Command::default()));
