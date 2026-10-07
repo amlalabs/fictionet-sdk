@@ -13,6 +13,8 @@
 
 mod auth;
 mod dns;
+#[cfg(test)]
+mod differential;
 mod http;
 mod link;
 mod pump;

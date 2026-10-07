@@ -55,8 +55,9 @@ that name is registered. Other cases use the registry matchers, including
 across split plaintext prefixes. Eight unmatched bytes permanently reject
 plaintext selection in both directions, as in the outer conversation.
 Selection is not retried at each record. User replacements apply inside TLS
-too. HTTP/1 capture parsing remains in observe until a stdlib HTTP/1 module
-is available. Framing for DNS, DHCP, Modbus, HTTP/1, HTTP/2, and TLS uses `Stream`
+too. HTTP/1 capture reads each head with `stdlib::http1`'s lenient reader
+(`RequestHead::parse_lenient`), which checks syntax but not the framing
+rules an endpoint applies, and frames bodies itself. Framing for DNS, DHCP, Modbus, HTTP/1, HTTP/2, and TLS uses `Stream`
 and `Present`.
 
 These files can be copied into another crate and edited:
@@ -64,7 +65,7 @@ These files can be copied into another crate and edited:
 - `src/observe/protocols.rs`: capture decoders and presenters, including
   `ModbusSession`. Register that session through `register_protocol` to stop
   both directions after a framing error, as the built-in does. The file uses
-  public observe and stdlib APIs, plus `hickory-proto` and `httparse`.
+  public observe and stdlib APIs, plus `hickory-proto`.
 - `src/observe/tls.rs`: `TlsSession`, its key schedule, handshake parsing,
   and record presentation. It uses public observe APIs and `ring`. Register
   it through `register_protocol`, passing the supplied registry to `new`.

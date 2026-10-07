@@ -238,6 +238,21 @@ pub struct RequestHead {
 }
 
 impl RequestHead {
+    /// Reads the head at the start of `bytes` by its syntax alone: the
+    /// request line and the fields, without the framing, `Host` and target
+    /// rules that [`Requests`] and `Wire` apply. For a passive observer or a
+    /// relay, which must not refuse a head its endpoints accept. Lines may
+    /// end in a bare LF, and empty lines before the request line are
+    /// skipped. Returns the head and its length through its empty line, or
+    /// `None` until a whole head is there. The lines already there are
+    /// checked before then, so bytes that are not HTTP fail at once. No
+    /// limits apply: bound `bytes`.
+    pub fn parse_lenient(bytes: &[u8]) -> Result<Option<(Self, usize)>, Error> {
+        let Some((start, end)) = lenient_bounds(bytes, true)? else {
+            return Ok(None);
+        };
+        Ok(Some((request_syntax(&bytes[start..end], true)?, end)))
+    }
     /// Whether an HTTP/1.1 Expect field contains `100-continue`.
     /// HTTP/1.0 expectations are ignored (RFC 9110 section 10.1.1).
     pub fn expects_continue(&self) -> bool {
@@ -286,6 +301,16 @@ impl ResponseHead {
             reason: b"Continue".to_vec(),
             headers: Vec::new(),
         }
+    }
+    /// Reads the head at the start of `bytes` by its syntax alone, as
+    /// [`RequestHead::parse_lenient`] does: the status line and the fields,
+    /// without the framing rules. Returns the head and its length, or
+    /// `None` until a whole head is there.
+    pub fn parse_lenient(bytes: &[u8]) -> Result<Option<(Self, usize)>, Error> {
+        let Some((start, end)) = lenient_bounds(bytes, false)? else {
+            return Ok(None);
+        };
+        Ok(Some((response_syntax(&bytes[start..end], true)?, end)))
     }
     /// Whether connection options permit reuse. A close-delimited body still
     /// ends the connection even when this method returns true.
@@ -1409,27 +1434,81 @@ fn response_framing(head: &ResponseHead, info: Fields, method: Method) -> Result
     })
 }
 
-fn split_head(b: &[u8]) -> Result<(&[u8], Vec<Header>), Error> {
+// A line without its CR, which only a lenient reader may leave out.
+fn line_end(line: &[u8], lenient: bool) -> Option<&[u8]> {
+    match line.strip_suffix(b"\r") {
+        Some(line) => Some(line),
+        None if lenient => Some(line),
+        None => None,
+    }
+}
+fn header_line(line: &[u8], lenient: bool) -> Result<Header, Error> {
+    let colon = line.iter().position(|b| *b == b':').ok_or(Error::Header)?;
+    let name = &line[..colon];
+    let value = trim(&line[colon.saturating_add(1)..]);
+    if lenient && (!token(name) || !value.iter().copied().all(field_byte)) {
+        return Err(Error::Header);
+    }
+    Ok(Header {
+        name: String::from_utf8(name.to_vec()).map_err(|_| Error::Header)?,
+        value: value.to_vec(),
+    })
+}
+fn split_head(b: &[u8], lenient: bool) -> Result<(&[u8], Vec<Header>), Error> {
     let mut lines = b.split(|b| *b == b'\n');
-    let first = lines
-        .next()
-        .and_then(|b| b.strip_suffix(b"\r"))
-        .ok_or(Error::LineEnding)?;
+    let first = lines.next().and_then(|l| line_end(l, lenient)).ok_or(Error::LineEnding)?;
     let mut headers = Vec::new();
     for line in lines {
-        let line = line.strip_suffix(b"\r").ok_or(Error::LineEnding)?;
+        let line = line_end(line, lenient).ok_or(Error::LineEnding)?;
         if line.is_empty() {
             return Ok((first, headers));
         }
-        let colon = line.iter().position(|b| *b == b':').ok_or(Error::Header)?;
-        let name = &line[..colon];
-        let value = trim(&line[colon.saturating_add(1)..]);
-        headers.push(Header {
-            name: String::from_utf8(name.to_vec()).map_err(|_| Error::Header)?,
-            value: value.to_vec(),
-        });
+        headers.push(header_line(line, lenient)?);
     }
     Err(Error::Incomplete)
+}
+/// Reads a head with [`RequestHead::parse_lenient`] or
+/// [`ResponseHead::parse_lenient`]: where it starts, after any empty
+/// lines, and where it ends, after its own empty line. Lines may end in a
+/// bare LF. Before the head is whole, the lines that are there are checked,
+/// and so is the start of the first, so a stream that is not HTTP fails at
+/// once instead of at its end.
+fn lenient_bounds(b: &[u8], request: bool) -> Result<Option<(usize, usize)>, Error> {
+    let mut start = 0usize;
+    let mut at = 0usize;
+    for line in b.split_inclusive(|b| *b == b'\n') {
+        let first = start == at;
+        at = at.saturating_add(line.len());
+        let Some(content) = line.strip_suffix(b"\n") else {
+            // The first line so far must start like one.
+            let ok = if !first || line == b"\r" {
+                true
+            } else if request {
+                line.first() != Some(&b' ')
+                    && line.iter().take_while(|b| **b != b' ').all(|b| token(std::slice::from_ref(b)))
+            } else {
+                let n = line.len().min(7);
+                line[..n] == b"HTTP/1."[..n]
+            };
+            return if ok { Ok(None) } else { Err(Error::StartLine) };
+        };
+        let content = line_end(content, true).unwrap_or(content);
+        if content.is_empty() {
+            if first {
+                start = at;
+                continue;
+            }
+            return Ok(Some((start, at)));
+        }
+        if !first {
+            header_line(content, true)?;
+        } else if request {
+            request_line(content, true)?;
+        } else {
+            status_line(content)?;
+        }
+    }
+    Ok(None)
 }
 fn valid_authority(value: &[u8], require_port: bool) -> bool {
     if value.is_empty()
@@ -1503,8 +1582,7 @@ fn validate_host(head: &RequestHead) -> Result<(), Error> {
         _ => Err(Error::Host),
     }
 }
-fn request_head(b: &[u8]) -> Result<(RequestHead, Fields, Framing), Error> {
-    let (line, headers) = split_head(b)?;
+fn request_line(line: &[u8], lenient: bool) -> Result<(String, String, Version), Error> {
     let mut parts = line.split(|b| *b == b' ');
     let method = parts.next().ok_or(Error::StartLine)?;
     let target = parts.next().ok_or(Error::StartLine)?;
@@ -1512,17 +1590,31 @@ fn request_head(b: &[u8]) -> Result<(RequestHead, Fields, Framing), Error> {
     if parts.next().is_some() {
         return Err(Error::StartLine);
     }
-    let head = RequestHead {
-        method: String::from_utf8(method.to_vec()).map_err(|_| Error::StartLine)?,
-        target: String::from_utf8(target.to_vec()).map_err(|_| Error::StartLine)?,
+    if lenient && (!token(method) || target.is_empty() || !target.iter().all(|b| *b > b' ' && *b != 127)) {
+        return Err(Error::StartLine);
+    }
+    Ok((
+        String::from_utf8(method.to_vec()).map_err(|_| Error::StartLine)?,
+        String::from_utf8(target.to_vec()).map_err(|_| Error::StartLine)?,
+        version,
+    ))
+}
+fn request_syntax(b: &[u8], lenient: bool) -> Result<RequestHead, Error> {
+    let (line, headers) = split_head(b, lenient)?;
+    let (method, target, version) = request_line(line, lenient)?;
+    Ok(RequestHead {
+        method,
+        target,
         version,
         headers,
-    };
+    })
+}
+fn request_head(b: &[u8]) -> Result<(RequestHead, Fields, Framing), Error> {
+    let head = request_syntax(b, false)?;
     let (info, framing) = request_info(&head)?;
     Ok((head, info, framing))
 }
-fn response_head(b: &[u8]) -> Result<(ResponseHead, Fields), Error> {
-    let (line, headers) = split_head(b)?;
+fn status_line(line: &[u8]) -> Result<(Version, u16, &[u8]), Error> {
     let mut parts = line.splitn(3, |b| *b == b' ');
     let version = version(parts.next().ok_or(Error::StartLine)?)?;
     let status = parts.next().ok_or(Error::StartLine)?;
@@ -1535,12 +1627,20 @@ fn response_head(b: &[u8]) -> Result<(ResponseHead, Fields), Error> {
     if !(100..=599).contains(&status) || !reason.iter().copied().all(field_byte) {
         return Err(Error::StartLine);
     }
-    let head = ResponseHead {
+    Ok((version, status, reason))
+}
+fn response_syntax(b: &[u8], lenient: bool) -> Result<ResponseHead, Error> {
+    let (line, headers) = split_head(b, lenient)?;
+    let (version, status, reason) = status_line(line)?;
+    Ok(ResponseHead {
         version,
         status,
         reason: reason.to_vec(),
         headers,
-    };
+    })
+}
+fn response_head(b: &[u8]) -> Result<(ResponseHead, Fields), Error> {
+    let head = response_syntax(b, false)?;
     let info = fields(&head.headers, head.version)?;
     Ok((head, info))
 }
@@ -1879,6 +1979,45 @@ mod tests {
         b"POST /tools HTTP/1.1\r\nHost: example.test\r\nContent-Length: 5\r\n\r\nhello";
     const CHUNKED: &[u8] = b"POST /tools HTTP/1.1\r\nHost: example.test\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhe\r\n3\r\nllo\r\n0\r\n\r\n";
     const OK: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+
+    #[test]
+    fn lenient_heads_skip_the_semantic_rules_but_not_the_syntax() {
+        // No Host, two lengths that disagree, and chunked with a length:
+        // Wire refuses each, the lenient reader takes them as written.
+        let bytes = b"\r\nPOST http://u@a/x#f HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2\nTransfer-Encoding: chunked\r\n\r\nbody";
+        assert!(RequestHead::parse(&bytes[2..bytes.len() - 4]).is_err());
+        let (head, n) = RequestHead::parse_lenient(bytes).unwrap().unwrap();
+        assert_eq!(n, bytes.len() - 4);
+        assert_eq!((head.method.as_str(), head.target.as_str()), ("POST", "http://u@a/x#f"));
+        assert_eq!(head.headers.len(), 3);
+        assert_eq!(head.headers[2].value, b"chunked");
+        assert_eq!(RequestHead::parse_lenient(b"GET / HTTP/1.1\r\nHost: a\r\n").unwrap(), None);
+        let (head, n) = ResponseHead::parse_lenient(b"HTTP/1.0 200 Fine\nTransfer-Encoding: gzip\n\nrest").unwrap().unwrap();
+        assert_eq!((head.status, head.reason.as_slice(), n), (200, &b"Fine"[..], 43));
+        // The syntax still holds.
+        for bad in [
+            &b"GET / HTTP/2.0\r\n\r\n"[..],
+            b"G(T / HTTP/1.1\r\n\r\n",
+            b"GET  HTTP/1.1\r\n\r\n",
+            b"GET / HTTP/1.1\r\nno colon\r\n\r\n",
+            b"GET / HTTP/1.1\r\nBad Name: x\r\n\r\n",
+            b"GET / HTTP/1.1\r\nX: a\x01b\r\n\r\n",
+        ] {
+            assert!(RequestHead::parse_lenient(bad).is_err(), "{:?}", String::from_utf8_lossy(bad));
+        }
+        for bad in [&b"HTTP/1.1 20 OK\r\n\r\n"[..], b"HTTP/1.1 600 OK\r\n\r\n", b"HTTP/1.1 200 \x7f\r\n\r\n"] {
+            assert!(ResponseHead::parse_lenient(bad).is_err(), "{:?}", String::from_utf8_lossy(bad));
+        }
+        // Bytes that are not HTTP fail before the head would end.
+        assert!(RequestHead::parse_lenient(b"\x05\x01\x00").is_err());
+        assert!(RequestHead::parse_lenient(b"GET / HTTP/1.1\r\nno colon\r\n").is_err());
+        assert!(ResponseHead::parse_lenient(b"SSH-2.0-OpenSSH\r\n").is_err());
+        assert!(ResponseHead::parse_lenient(b"SSH").is_err());
+        for partial in [&b""[..], b"\r", b"\r\n", b"HTT", b"HTTP/1.1 200 OK\r\nX: y", b"GET / HT"] {
+            assert_eq!(ResponseHead::parse_lenient(partial).ok().flatten(), None);
+            assert!(partial.starts_with(b"HTTP") || RequestHead::parse_lenient(partial).is_ok_and(|h| h.is_none()));
+        }
+    }
 
     fn small() -> Limits {
         Limits {
