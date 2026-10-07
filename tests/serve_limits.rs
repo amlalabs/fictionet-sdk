@@ -114,8 +114,8 @@ struct Loud {
 }
 
 impl Service for Loud {
-    type Decode = Lines;
-    type World = ();
+    type Decoder = Lines;
+    type State = ();
     type Error = Infallible;
     fn decoder(&self) -> Lines {
         Lines::new(64, Ending::LfOrCrlf)

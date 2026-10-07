@@ -1085,8 +1085,8 @@ pub fn http_date(secs: u64) -> String {
 }
 
 impl serve::Service for Http1 {
-    type Decode = http1::Requests;
-    type World = ();
+    type Decoder = http1::Requests;
+    type State = ();
     type Error = Infallible;
 
     fn decoder(&self) -> http1::Requests {

@@ -21,8 +21,8 @@
 //! # struct Ldap; struct Plc; struct Directory; struct Plant;
 //! # macro_rules! svc { ($t:ty, $w:ty) => {
 //! # impl serve::Service for $t {
-//! #     type Decode = fictionet::stdlib::codec::Lines; type World = $w; type Error = std::convert::Infallible;
-//! #     fn decoder(&self) -> Self::Decode { fictionet::stdlib::codec::Lines::new(64, fictionet::stdlib::codec::Ending::LfOrCrlf) }
+//! #     type Decoder = fictionet::stdlib::codec::Lines; type State = $w; type Error = std::convert::Infallible;
+//! #     fn decoder(&self) -> Self::Decoder { fictionet::stdlib::codec::Lines::new(64, fictionet::stdlib::codec::Ending::LfOrCrlf) }
 //! #     fn on_item(&mut self, _: Result<Vec<u8>, fictionet::stdlib::codec::LineError>, _: &$w, _: &mut serve::ServeCtx<'_>) -> std::result::Result<serve::Flow, Self::Error> { Ok(serve::Flow::Continue) }
 //! # } } }
 //! # svc!(Ldap, Directory); svc!(Plc, Plant);
@@ -275,15 +275,15 @@ pub trait Accept: Any + Send + Sync {
 
 /// Serves a [`Service`] made fresh for each connection.
 struct ServiceAccept<S: Service, M> {
-    world: Arc<S::World>,
+    state: Arc<S::State>,
     make: M,
     opts: ServeOptions,
     open: Arc<AtomicUsize>,
 }
 
 impl<S: Service, M> ServiceAccept<S, M> {
-    fn new(world: Arc<S::World>, make: M, opts: ServeOptions) -> ServiceAccept<S, M> {
-        ServiceAccept { world, make, opts, open: Arc::default() }
+    fn new(state: Arc<S::State>, make: M, opts: ServeOptions) -> ServiceAccept<S, M> {
+        ServiceAccept { state, make, opts, open: Arc::default() }
     }
 }
 
@@ -291,7 +291,7 @@ impl<S, M> Accept for ServiceAccept<S, M>
 where
     S: Service,
     M: Fn() -> S + Send + Sync + 'static,
-    <S::Decode as Decode>::Error: Clone + Send,
+    <S::Decoder as Decode>::Error: Clone + Send,
 {
     fn serve(&self, cx: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         let Some(guard) = Counted::enter(&self.open, self.opts.max_conns) else {
@@ -304,7 +304,7 @@ where
         };
         arrival.socket.hold_until_gone(Box::new(guard));
         let mut service = (self.make)();
-        let world = self.world.clone();
+        let state = self.state.clone();
         let mut opts = self.opts.clone();
         if opts.budget.is_none() {
             opts.budget = arrival.budget;
@@ -313,7 +313,7 @@ where
         opts.seed ^= arrival.seed;
         let (conn, info) = (arrival.conn, arrival.info);
         Box::pin(async move {
-            let _ = serve::serve(&cx, conn, info, &mut service, &world, &opts).await;
+            let _ = serve::serve(&cx, conn, info, &mut service, &state, &opts).await;
         })
     }
 }
@@ -413,26 +413,26 @@ impl Host {
     /// connection, sharing `world`, with the default [`ServeOptions`].
     /// Connections are numbered, `conn.open` and `conn.close` events record
     /// each, and the service's events name the sandbox each came from.
-    pub fn tcp<S, M>(self, port: u16, world: Arc<S::World>, make: M) -> Host
+    pub fn tcp<S, M>(self, port: u16, state: Arc<S::State>, make: M) -> Host
     where
         S: Service,
         M: Fn() -> S + Send + Sync + 'static,
-        <S::Decode as Decode>::Error: Clone + Send,
+        <S::Decoder as Decode>::Error: Clone + Send,
     {
-        self.tcp_with(port, world, make, ServeOptions::default())
+        self.tcp_with(port, state, make, ServeOptions::default())
     }
 
     /// The same with these options: a transcript, a fault plan, an idle
     /// limit, a connection cap, a STARTTLS config. The sandbox's budget
     /// applies when `opts` has none. A STARTTLS handshake has
     /// [`Limits::handshake`], whatever `opts` says.
-    pub fn tcp_with<S, M>(self, port: u16, world: Arc<S::World>, make: M, opts: ServeOptions) -> Host
+    pub fn tcp_with<S, M>(self, port: u16, state: Arc<S::State>, make: M, opts: ServeOptions) -> Host
     where
         S: Service,
         M: Fn() -> S + Send + Sync + 'static,
-        <S::Decode as Decode>::Error: Clone + Send,
+        <S::Decoder as Decode>::Error: Clone + Send,
     {
-        self.accept(port, ServiceAccept::new(world, make, opts))
+        self.accept(port, ServiceAccept::new(state, make, opts))
     }
 
     /// Serves TCP `port` with TLS for the names `sni` gives, then a
@@ -444,15 +444,15 @@ impl Host {
         port: u16,
         sni: impl Into<Sni>,
         config_for: impl Fn(&Cx) -> Arc<ServerConfig> + Send + Sync + 'static,
-        world: Arc<S::World>,
+        state: Arc<S::State>,
         make: M,
     ) -> Host
     where
         S: Service,
         M: Fn() -> S + Send + Sync + 'static,
-        <S::Decode as Decode>::Error: Clone + Send,
+        <S::Decoder as Decode>::Error: Clone + Send,
     {
-        let accept = ServiceAccept::new(world, make, ServeOptions::default());
+        let accept = ServiceAccept::new(state, make, ServeOptions::default());
         self.tls_accept(port, sni, config_for, accept)
     }
 
@@ -472,33 +472,33 @@ impl Host {
 
     /// Serves UDP `port` with one [`Service`] made by `make`, which gets
     /// every datagram ([`serve::serve_datagram`]).
-    pub fn udp<S, M>(self, port: u16, world: Arc<S::World>, make: M) -> Host
+    pub fn udp<S, M>(self, port: u16, state: Arc<S::State>, make: M) -> Host
     where
         S: Service,
         M: Fn() -> S + Send + Sync + 'static,
-        <S::Decode as Decode>::Error: Clone + Send,
+        <S::Decoder as Decode>::Error: Clone + Send,
     {
-        self.udp_with(port, world, make, ServeOptions::default())
+        self.udp_with(port, state, make, ServeOptions::default())
     }
 
     /// The same with these options. The network names each datagram's
     /// sandbox ([`ServeOptions::sandbox`]).
-    pub fn udp_with<S, M>(mut self, port: u16, world: Arc<S::World>, make: M, opts: ServeOptions) -> Host
+    pub fn udp_with<S, M>(mut self, port: u16, state: Arc<S::State>, make: M, opts: ServeOptions) -> Host
     where
         S: Service,
         M: Fn() -> S + Send + Sync + 'static,
-        <S::Decode as Decode>::Error: Clone + Send,
+        <S::Decoder as Decode>::Error: Clone + Send,
     {
         let start: UdpStart = Arc::new(move |cx, socket, local, seed, sandbox| {
             let mut service = make();
-            let world = world.clone();
+            let state = state.clone();
             let mut opts = opts.clone();
             if sandbox.is_some() {
                 opts.sandbox = sandbox;
             }
             opts.seed ^= seed;
             cx.spawn(move |cx| async move {
-                serve::serve_datagram(&cx, socket, local, &mut service, &world, &opts).await;
+                serve::serve_datagram(&cx, socket, local, &mut service, &state, &opts).await;
                 Ok(())
             });
         });

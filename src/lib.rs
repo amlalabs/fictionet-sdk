@@ -180,8 +180,8 @@
 //! struct Echo;
 //!
 //! impl Service for Echo {
-//!     type Decode = Lines;
-//!     type World = ();
+//!     type Decoder = Lines;
+//!     type State = ();
 //!     type Error = std::convert::Infallible;
 //!     fn decoder(&self) -> Lines {
 //!         Lines::new(1024, Ending::LfOrCrlf)

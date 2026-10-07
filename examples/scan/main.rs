@@ -170,8 +170,8 @@ impl Decode for Head {
 }
 
 impl Service for Port {
-    type Decode = Head;
-    type World = ();
+    type Decoder = Head;
+    type State = ();
     type Error = Infallible;
 
     fn decoder(&self) -> Head {

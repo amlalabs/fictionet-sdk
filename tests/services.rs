@@ -107,8 +107,8 @@ async fn read_some<C: Connection>(cx: &Cx, conn: &mut C, want: usize) -> Vec<u8>
 struct Echo;
 
 impl Service for Echo {
-    type Decode = Lines;
-    type World = ();
+    type Decoder = Lines;
+    type State = ();
     type Error = Infallible;
 
     fn decoder(&self) -> Lines {
@@ -183,8 +183,8 @@ struct Ticker {
 }
 
 impl Service for Ticker {
-    type Decode = Lines;
-    type World = ();
+    type Decoder = Lines;
+    type State = ();
     type Error = Infallible;
 
     fn decoder(&self) -> Lines {
@@ -223,8 +223,8 @@ struct Plant {
 struct Plc;
 
 impl Service for Plc {
-    type Decode = modbus::Frames;
-    type World = Plant;
+    type Decoder = modbus::Frames;
+    type State = Plant;
     type Error = Infallible;
 
     fn decoder(&self) -> modbus::Frames {
@@ -318,8 +318,8 @@ fn a_decoder_failure_is_handed_to_the_service_with_what_it_could_not_read() {
         unread: Vec<u8>,
     }
     impl Service for Strict {
-        type Decode = modbus::Frames;
-        type World = ();
+        type Decoder = modbus::Frames;
+        type State = ();
         type Error = Infallible;
         fn decoder(&self) -> modbus::Frames {
             modbus::Frames
@@ -668,8 +668,8 @@ fn serve_datagram_answers_each_datagram() {
     /// Answers a datagram of lines with their count.
     struct Count;
     impl Service for Count {
-        type Decode = Lines;
-        type World = AtomicUsize;
+        type Decoder = Lines;
+        type State = AtomicUsize;
         type Error = Infallible;
         fn decoder(&self) -> Lines {
             Lines::new(64, Ending::LfOrCrlf)
@@ -847,8 +847,8 @@ fn net_serves_udp_services_and_trusted_sandboxes() {
         /// Counts datagrams.
         struct Udp;
         impl Service for Udp {
-            type Decode = Lines;
-            type World = AtomicUsize;
+            type Decoder = Lines;
+            type State = AtomicUsize;
             type Error = Infallible;
             fn decoder(&self) -> Lines {
                 Lines::new(64, Ending::LfOrCrlf)
@@ -1050,8 +1050,8 @@ fn net_routes_tls_by_name_to_each_service() {
     /// Answers each line in upper case.
     struct Upper;
     impl Service for Upper {
-        type Decode = Lines;
-        type World = ();
+        type Decoder = Lines;
+        type State = ();
         type Error = Infallible;
         fn decoder(&self) -> Lines {
             Lines::new(64, Ending::LfOrCrlf)
@@ -1178,8 +1178,8 @@ fn a_decoder_that_skips_a_long_line_keeps_the_connection_open() {
     /// Echo on 16-byte lines.
     struct Short;
     impl Service for Short {
-        type Decode = Lines;
-        type World = ();
+        type Decoder = Lines;
+        type State = ();
         type Error = Infallible;
         fn decoder(&self) -> Lines {
             Lines::new(16, Ending::LfOrCrlf)
@@ -1229,8 +1229,8 @@ struct Mail {
 }
 
 impl Service for Mail {
-    type Decode = Lines;
-    type World = ();
+    type Decoder = Lines;
+    type State = ();
     type Error = Infallible;
     fn decoder(&self) -> Lines {
         Lines::new(512, Ending::LfOrCrlf)
@@ -1335,8 +1335,8 @@ struct Trader {
 }
 
 impl Service for Trader {
-    type Decode = Lines;
-    type World = Book;
+    type Decoder = Lines;
+    type State = Book;
     type Error = Infallible;
     fn decoder(&self) -> Lines {
         Lines::new(64, Ending::LfOrCrlf)
@@ -1369,7 +1369,7 @@ impl Service for Trader {
 fn another_connection_wakes_a_service_to_push_a_fill() {
     let mut h = Harness::new(Trader { inbox: Arc::default() }, Book::default());
     assert_eq!(h.push(b"sub\n").unwrap(), b"subscribed\n");
-    let inbox = h.world().subscribers.lock().unwrap()[0].1.clone();
+    let inbox = h.state().subscribers.lock().unwrap()[0].1.clone();
     inbox.lock().unwrap().push("7@100".into());
     h.wake_handle().wake();
     assert_eq!(h.poll().unwrap(), b"execution 7@100\n");
@@ -1398,8 +1398,8 @@ struct Session {
 }
 
 impl Service for Session {
-    type Decode = Lines;
-    type World = ();
+    type Decoder = Lines;
+    type State = ();
     type Error = Infallible;
     fn decoder(&self) -> Lines {
         Lines::new(64, Ending::LfOrCrlf)
@@ -1534,8 +1534,8 @@ struct Mux {
 }
 
 impl Service for Mux {
-    type Decode = Lines;
-    type World = ();
+    type Decoder = Lines;
+    type State = ();
     type Error = Infallible;
     fn decoder(&self) -> Lines {
         Lines::new(64, Ending::LfOrCrlf)
@@ -1603,8 +1603,8 @@ fn datagram_services_send_several_datagrams_and_tick() {
     /// heartbeat goes to the world's subscriber every 20 ms.
     struct Mold;
     impl Service for Mold {
-        type Decode = Lines;
-        type World = SocketAddr;
+        type Decoder = Lines;
+        type State = SocketAddr;
         type Error = Infallible;
         fn decoder(&self) -> Lines {
             Lines::new(64, Ending::LfOrCrlf)
@@ -1653,8 +1653,8 @@ fn datagram_services_send_several_datagrams_and_tick() {
 struct Fragile;
 
 impl Service for Fragile {
-    type Decode = Lines;
-    type World = ();
+    type Decoder = Lines;
+    type State = ();
     type Error = std::io::Error;
     fn decoder(&self) -> Lines {
         Lines::new(64, Ending::LfOrCrlf)
@@ -1717,8 +1717,8 @@ fn an_error_closes_only_its_connection_and_a_panic_ends_the_run() {
 struct Wide;
 
 impl Service for Wide {
-    type Decode = Lines;
-    type World = ();
+    type Decoder = Lines;
+    type State = ();
     type Error = Infallible;
     fn decoder(&self) -> Lines {
         Lines::new(40 << 10, Ending::LfOrCrlf)
@@ -1829,8 +1829,8 @@ fn a_reader_added_mid_connection_sees_its_events() {
 struct Dice;
 
 impl Service for Dice {
-    type Decode = Lines;
-    type World = ();
+    type Decoder = Lines;
+    type State = ();
     type Error = Infallible;
     fn decoder(&self) -> Lines {
         Lines::new(64, Ending::LfOrCrlf)
@@ -1931,8 +1931,8 @@ fn hosts_and_members_share_a_lan_on_the_net() {
     /// Sends `tick` to a multicast group every 20 ms.
     struct Feed;
     impl Service for Feed {
-        type Decode = Lines;
-        type World = SocketAddr;
+        type Decoder = Lines;
+        type State = SocketAddr;
         type Error = Infallible;
         fn decoder(&self) -> Lines {
             Lines::new(64, Ending::LfOrCrlf)

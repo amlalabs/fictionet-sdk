@@ -32,8 +32,8 @@ use fictionet::stdlib::serve::{Flow, ServeCtx, Service};
 struct Prompt;
 
 impl Service for Prompt {
-    type Decode = Lines;
-    type World = String; // the right password, shared by every connection
+    type Decoder = Lines;
+    type State = String; // the right password, shared by every connection
     type Error = std::convert::Infallible;
 
     fn decoder(&self) -> Lines {
@@ -60,7 +60,7 @@ impl Service for Prompt {
 }
 ```
 
-`World` is the state every connection shares: here a password, in a real
+`State` is what every connection shares: here a password, in a real
 world a directory, a process model or an order book. The service itself
 is made fresh for each connection.
 
@@ -107,18 +107,18 @@ connection ends it at once, also while a write waits.
 ### One protocol, two framings
 
 Kerberos frames a message with a four-byte length over TCP, and sends one
-message per datagram over UDP. `Service::Decode` is one type, so write
+message per datagram over UDP. `Service::Decoder` is one type, so write
 two thin services over one core of your own: each picks its decoder and
 hands the message to the shared code. `ctx.conn().transport` says which
 one the call came over, so the KDC can answer `KRB_ERR_RESPONSE_TOO_BIG`
 on UDP. Serve them with `Host::tcp(88, ..)` and `Host::udp(88, ..)` and
-the same `World`.
+the same `State`.
 
 ### Dates belong to the world
 
 `ctx.now()` is the run's clock: time since the run started, with no
 date. A service that needs a date, such as for ticket lifetimes,
-certificate validity or a FIX `SendingTime`, takes it from its `World`,
+certificate validity or a FIX `SendingTime`, takes it from its `State`,
 which decides what day it is in the world. Record the world's date in the
 network's first event (`Net::start_fields` with a `world_date` field), so
 a reader can place every event. The `run.start` event's `wall` field
