@@ -27,9 +27,9 @@
 //!
 //! Every reader checks lengths, limits and nesting, because the agent can
 //! send any bytes it likes. A stream that breaks the specification gives a
-//! [`ChunkError`], whose [`ChunkError::status`] is the code a real server
+//! [`Error`], whose [`Error::status`] is the code a real server
 //! sends back in an ERR message before it closes the connection. Every
-//! message writer checks the same limits and returns an [`EncodeError`]
+//! message writer checks the same limits and returns an [`Error`]
 //! rather than write bytes a reader would refuse.
 //!
 //! ```
@@ -258,10 +258,14 @@ impl StatusCode {
     }
 }
 
-/// Why bytes are not a value in the OPC UA binary encoding.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DecodeError {
-    /// The bytes ended before the value did.
+/// Why bytes are not a value in the OPC UA binary encoding or a byte
+/// stream of OPC UA chunks, or why a value cannot be written. Every error
+/// from [`Chunks`] or [`Messages`] is fatal: the stream holds no more
+/// messages a reader can find, and a real server sends an ERR with
+/// [`Error::status`] and closes the connection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Error {
+    /// The bytes ended before the value or the chunk did.
     End,
     /// A length was below -1, above its limit, or longer than the bytes
     /// left.
@@ -278,68 +282,29 @@ pub enum DecodeError {
     /// A Variant's array dimensions were fewer than 2, more than
     /// [`MAX_DIMENSIONS`], not all above 0, or did not match its length.
     Dimensions,
-    /// Values nested more than [`MAX_DEPTH`] deep.
+    /// Values nest more than [`MAX_DEPTH`] deep.
     Depth,
-    /// The bytes held more than [`MAX_VALUES`] values.
+    /// There are more than [`MAX_VALUES`] values.
     TooManyValues,
     /// An enumeration held a value it does not define.
     Enum(i32),
-    /// Bytes were left over after the value.
+    /// This many bytes were left over after the value or the chunk.
     Trailing(usize),
     /// A NodeId's String identifier or a QualifiedName's name held a C0
     /// or C1 control character, which Part 3 forbids.
     ControlChar,
-}
-
-impl std::fmt::Display for DecodeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            DecodeError::End => f.write_str("the bytes ended inside a value"),
-            DecodeError::Length(n) => write!(f, "length {n} is out of range"),
-            DecodeError::Utf8 => f.write_str("a string is not UTF-8"),
-            DecodeError::NodeIdForm(b) => {
-                write!(f, "NodeId encoding byte {b:#04x} is not valid here")
-            }
-            DecodeError::Mask(b) => write!(f, "encoding mask {b:#04x} sets unknown bits"),
-            DecodeError::VariantType(t) => write!(f, "Variant type {t} is not allowed here"),
-            DecodeError::Dimensions => f.write_str("array dimensions do not match the array"),
-            DecodeError::Depth => write!(f, "values nest more than {MAX_DEPTH} deep"),
-            DecodeError::TooManyValues => write!(f, "more than {MAX_VALUES} values"),
-            DecodeError::Enum(n) => write!(f, "enumeration value {n} is not defined"),
-            DecodeError::Trailing(n) => write!(f, "{n} bytes left over after the value"),
-            DecodeError::ControlChar => f.write_str("a name holds a control character"),
-        }
-    }
-}
-
-impl std::error::Error for DecodeError {}
-
-/// Why a value cannot be written: the bytes would break a limit or a rule
-/// that a reader checks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EncodeError {
-    /// A string, array, chunk or message is longer than its limit allows.
+    /// A string, array, chunk or message to write is longer than its
+    /// limit allows.
     TooLong,
-    /// Values nest more than [`MAX_DEPTH`] deep.
-    TooDeep,
-    /// There are more than [`MAX_VALUES`] values.
-    TooManyValues,
-    /// A Variant holds a value of the wrong type: an array element that
-    /// does not match the array's type, a Variant directly inside a
-    /// Variant, a DiagnosticInfo, a DataValue inside a DataValue, or a
-    /// type id that does not exist or is reserved (26 to 31), which only
-    /// readers take.
-    VariantType,
-    /// A Variant's array dimensions are fewer than 2, more than
-    /// [`MAX_DIMENSIONS`], not all above 0, or do not multiply out to its
-    /// length.
-    Dimensions,
+    /// A Variant to write holds a value of the wrong type: an array
+    /// element that does not match the array's type, a Variant directly
+    /// inside a Variant, a DiagnosticInfo, a DataValue inside a DataValue,
+    /// or a type id that does not exist or is reserved (26 to 31), which
+    /// only readers take.
+    VariantValue,
     /// A Hello or Acknowledge names a buffer smaller than
     /// [`MIN_BUFFER_SIZE`].
     BufferSize(u32),
-    /// A NodeId's String identifier or a QualifiedName's name holds a C0
-    /// or C1 control character.
-    ControlChar,
     /// An OPN's security header breaks its policy: a sender certificate or
     /// receiver thumbprint under policy None, or a thumbprint that is not
     /// 20 bytes.
@@ -347,25 +312,115 @@ pub enum EncodeError {
     /// A field would read back as a different value, or [`Service::Other`]
     /// carries a known service type ID.
     Unwritable,
+    /// The first three bytes named no message type.
+    MessageType([u8; 3]),
+    /// The chunk type byte is not one this message type may have.
+    ChunkType(MessageType, u8),
+    /// The size in the header is smaller than the header.
+    TooSmall(u32),
+    /// The size in the header is larger than the receiver takes.
+    TooLarge {
+        /// The size in the header.
+        size: u32,
+        /// The largest size taken.
+        limit: u32,
+    },
+    /// The fields of a chunk of this message type did not read.
+    Decode(MessageType, Box<Error>),
+    /// A chunk of another message came before the last chunk of a MSG.
+    Interleaved,
+    /// A MSG chunk named a different channel or token from the chunks
+    /// before it.
+    Mismatch,
+    /// An OPN, CLO or MSG chunk's sequence number did not follow the one
+    /// before it on the connection.
+    Sequence {
+        /// The number that would have followed.
+        expected: u32,
+        /// The number that came.
+        got: u32,
+    },
+    /// A message's body grew past the negotiated limit.
+    MessageTooLarge(u32),
+    /// A message took more chunks than the negotiated limit.
+    TooManyChunks(u32),
+    /// Input ended before the final chunk of a message.
+    Incomplete,
 }
 
-impl std::fmt::Display for EncodeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Error {
+    /// The status code a server sends in an ERR message for this error.
+    /// An error in a value outside a chunk is a decoding error.
+    pub fn status(&self) -> StatusCode {
         match self {
-            EncodeError::TooLong => f.write_str("a value is longer than its limit"),
-            EncodeError::TooDeep => write!(f, "values nest more than {MAX_DEPTH} deep"),
-            EncodeError::TooManyValues => write!(f, "more than {MAX_VALUES} values"),
-            EncodeError::VariantType => f.write_str("a Variant holds a value of the wrong type"),
-            EncodeError::Dimensions => f.write_str("array dimensions do not match the array"),
-            EncodeError::BufferSize(n) => write!(f, "buffer size {n} is below {MIN_BUFFER_SIZE}"),
-            EncodeError::ControlChar => f.write_str("a name holds a control character"),
-            EncodeError::SecurityHeader => f.write_str("the security header breaks its policy"),
-            EncodeError::Unwritable => f.write_str("value cannot be written without changing it"),
+            Error::MessageType(_) | Error::ChunkType(..) => StatusCode::BAD_TCP_MESSAGE_TYPE_INVALID,
+            // The endpoint URL is the only length a Hello holds.
+            Error::Decode(MessageType::Hello, e) if matches!(**e, Error::Length(_)) => {
+                StatusCode::BAD_TCP_ENDPOINT_URL_INVALID
+            }
+            Error::TooLarge { .. } => StatusCode::BAD_TCP_MESSAGE_TOO_LARGE,
+            Error::BufferSize(_) => StatusCode::BAD_TCP_NOT_ENOUGH_RESOURCES,
+            Error::Mismatch => StatusCode::BAD_TCP_SECURE_CHANNEL_UNKNOWN,
+            Error::Sequence { .. } => StatusCode::BAD_SEQUENCE_NUMBER_INVALID,
+            Error::MessageTooLarge(_) | Error::TooManyChunks(_) => StatusCode::BAD_REQUEST_TOO_LARGE,
+            _ => StatusCode::BAD_DECODING_ERROR,
         }
     }
 }
 
-impl std::error::Error for EncodeError {}
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::End => f.write_str("the bytes ended inside a value or chunk"),
+            Error::Length(n) => write!(f, "length {n} is out of range"),
+            Error::Utf8 => f.write_str("a string is not UTF-8"),
+            Error::NodeIdForm(b) => {
+                write!(f, "NodeId encoding byte {b:#04x} is not valid here")
+            }
+            Error::Mask(b) => write!(f, "encoding mask {b:#04x} sets unknown bits"),
+            Error::VariantType(t) => write!(f, "Variant type {t} is not allowed here"),
+            Error::Dimensions => f.write_str("array dimensions do not match the array"),
+            Error::Depth => write!(f, "values nest more than {MAX_DEPTH} deep"),
+            Error::TooManyValues => write!(f, "more than {MAX_VALUES} values"),
+            Error::Enum(n) => write!(f, "enumeration value {n} is not defined"),
+            Error::Trailing(n) => write!(f, "{n} bytes left over after the value or chunk"),
+            Error::ControlChar => f.write_str("a name holds a control character"),
+            Error::TooLong => f.write_str("a value is longer than its limit"),
+            Error::VariantValue => f.write_str("a Variant holds a value of the wrong type"),
+            Error::BufferSize(n) => write!(f, "buffer size {n} is below {MIN_BUFFER_SIZE}"),
+            Error::SecurityHeader => f.write_str("the security header breaks its policy"),
+            Error::Unwritable => f.write_str("value cannot be written without changing it"),
+            Error::MessageType(c) => write!(
+                f,
+                "message type {:?} is not OPC UA",
+                String::from_utf8_lossy(c)
+            ),
+            Error::ChunkType(t, b) => write!(f, "chunk type {b:#04x} is not valid for {t:?}"),
+            Error::TooSmall(n) => write!(f, "chunk size {n} is smaller than its header"),
+            Error::TooLarge { size, limit } => {
+                write!(f, "chunk size {size} is over the limit of {limit}")
+            }
+            Error::Decode(t, e) => write!(f, "{t:?} chunk: {e}"),
+            Error::Interleaved => f.write_str("chunks of two messages were interleaved"),
+            Error::Mismatch => f.write_str("a chunk named another channel or token"),
+            Error::Sequence { expected, got } => {
+                write!(f, "sequence number {got}, expected {expected}")
+            }
+            Error::MessageTooLarge(n) => write!(f, "message body over the limit of {n} bytes"),
+            Error::TooManyChunks(n) => write!(f, "message over the limit of {n} chunks"),
+            Error::Incomplete => f.write_str("incomplete OPC UA message"),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Decode(_, e) => Some(&**e),
+            _ => None,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------
 // Reading and writing the binary encoding
@@ -405,9 +460,9 @@ impl<'a> Reader<'a> {
     }
 
     /// The next `n` bytes.
-    pub fn take(&mut self, n: usize) -> Result<&'a [u8], DecodeError> {
+    pub fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
         if n > self.remaining() {
-            return Err(DecodeError::End);
+            return Err(Error::End);
         }
         let out = &self.bytes[self.pos..self.pos + n];
         self.pos += n;
@@ -421,88 +476,88 @@ impl<'a> Reader<'a> {
         out
     }
 
-    /// Fails with [`DecodeError::Trailing`] if any bytes are left.
-    pub fn finish(&self) -> Result<(), DecodeError> {
+    /// Fails with [`Error::Trailing`] if any bytes are left.
+    pub fn finish(&self) -> Result<(), Error> {
         match self.remaining() {
             0 => Ok(()),
-            n => Err(DecodeError::Trailing(n)),
+            n => Err(Error::Trailing(n)),
         }
     }
 
-    fn array<const N: usize>(&mut self) -> Result<[u8; N], DecodeError> {
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], Error> {
         let mut out = [0u8; N];
         out.copy_from_slice(self.take(N)?);
         Ok(out)
     }
 
     /// A Byte.
-    pub fn u8(&mut self) -> Result<u8, DecodeError> {
+    pub fn u8(&mut self) -> Result<u8, Error> {
         Ok(self.array::<1>()?[0])
     }
     /// An SByte.
-    pub fn i8(&mut self) -> Result<i8, DecodeError> {
+    pub fn i8(&mut self) -> Result<i8, Error> {
         Ok(i8::from_le_bytes(self.array()?))
     }
     /// A Boolean: any byte but 0 is true.
-    pub fn bool(&mut self) -> Result<bool, DecodeError> {
+    pub fn bool(&mut self) -> Result<bool, Error> {
         Ok(self.u8()? != 0)
     }
     /// A UInt16.
-    pub fn u16(&mut self) -> Result<u16, DecodeError> {
+    pub fn u16(&mut self) -> Result<u16, Error> {
         Ok(u16::from_le_bytes(self.array()?))
     }
     /// An Int16.
-    pub fn i16(&mut self) -> Result<i16, DecodeError> {
+    pub fn i16(&mut self) -> Result<i16, Error> {
         Ok(i16::from_le_bytes(self.array()?))
     }
     /// A UInt32.
-    pub fn u32(&mut self) -> Result<u32, DecodeError> {
+    pub fn u32(&mut self) -> Result<u32, Error> {
         Ok(u32::from_le_bytes(self.array()?))
     }
     /// An Int32.
-    pub fn i32(&mut self) -> Result<i32, DecodeError> {
+    pub fn i32(&mut self) -> Result<i32, Error> {
         Ok(i32::from_le_bytes(self.array()?))
     }
     /// A UInt64.
-    pub fn u64(&mut self) -> Result<u64, DecodeError> {
+    pub fn u64(&mut self) -> Result<u64, Error> {
         Ok(u64::from_le_bytes(self.array()?))
     }
     /// An Int64, read as it is. A DateTime goes through
     /// [`Reader::date_time`].
-    pub fn i64(&mut self) -> Result<i64, DecodeError> {
+    pub fn i64(&mut self) -> Result<i64, Error> {
         Ok(i64::from_le_bytes(self.array()?))
     }
     /// A DateTime: 100-nanosecond intervals since January 1, 1601 (UTC).
     /// Anything at or before the
     /// epoch as 0, and anything at or after [`MAX_DATE_TIME`] as
     /// `i64::MAX`. Writers require these canonical values.
-    pub fn date_time(&mut self) -> Result<i64, DecodeError> {
+    pub fn date_time(&mut self) -> Result<i64, Error> {
         Ok(clamp_date_time(self.i64()?))
     }
     /// A Float.
-    pub fn f32(&mut self) -> Result<f32, DecodeError> {
+    pub fn f32(&mut self) -> Result<f32, Error> {
         Ok(f32::from_le_bytes(self.array()?))
     }
     /// A Double.
-    pub fn f64(&mut self) -> Result<f64, DecodeError> {
+    pub fn f64(&mut self) -> Result<f64, Error> {
         Ok(f64::from_le_bytes(self.array()?))
     }
 
     /// A length prefix: `None` for -1 (null), and otherwise a length no
     /// larger than `max` or the bytes left.
-    fn length(&mut self, max: usize) -> Result<Option<usize>, DecodeError> {
+    fn length(&mut self, max: usize) -> Result<Option<usize>, Error> {
         let n = self.i32()?;
         if n == -1 {
             return Ok(None);
         }
         match usize::try_from(n) {
             Ok(len) if len <= max && len <= self.remaining() => Ok(Some(len)),
-            _ => Err(DecodeError::Length(n)),
+            _ => Err(Error::Length(n)),
         }
     }
 
     /// A ByteString of at most `max` bytes. Null is `None`.
-    pub fn byte_string_max(&mut self, max: usize) -> Result<Option<Vec<u8>>, DecodeError> {
+    pub fn byte_string_max(&mut self, max: usize) -> Result<Option<Vec<u8>>, Error> {
         match self.length(max)? {
             None => Ok(None),
             Some(n) => Ok(Some(self.take(n)?.to_vec())),
@@ -510,22 +565,22 @@ impl<'a> Reader<'a> {
     }
 
     /// A ByteString of at most [`MAX_STRING_LEN`] bytes. Null is `None`.
-    pub fn byte_string(&mut self) -> Result<Option<Vec<u8>>, DecodeError> {
+    pub fn byte_string(&mut self) -> Result<Option<Vec<u8>>, Error> {
         self.byte_string_max(MAX_STRING_LEN)
     }
 
     /// A UTF-8 String of at most `max` bytes. Null is `None`.
-    pub fn string_max(&mut self, max: usize) -> Result<Option<String>, DecodeError> {
+    pub fn string_max(&mut self, max: usize) -> Result<Option<String>, Error> {
         match self.byte_string_max(max)? {
             None => Ok(None),
             Some(b) => String::from_utf8(b)
                 .map(Some)
-                .map_err(|_| DecodeError::Utf8),
+                .map_err(|_| Error::Utf8),
         }
     }
 
     /// A UTF-8 String of at most [`MAX_STRING_LEN`] bytes. Null is `None`.
-    pub fn string(&mut self) -> Result<Option<String>, DecodeError> {
+    pub fn string(&mut self) -> Result<Option<String>, Error> {
         self.string_max(MAX_STRING_LEN)
     }
 
@@ -533,29 +588,29 @@ impl<'a> Reader<'a> {
     /// of every array takes at least one byte, so a length past the bytes
     /// left is refused, as is one past [`MAX_ARRAY_LEN`]. Elements count
     /// toward [`MAX_VALUES`], and one that takes this reader past it fails
-    /// with [`DecodeError::TooManyValues`].
-    pub fn array_len(&mut self) -> Result<usize, DecodeError> {
+    /// with [`Error::TooManyValues`].
+    pub fn array_len(&mut self) -> Result<usize, Error> {
         let n = self.length(MAX_ARRAY_LEN)?.unwrap_or(0);
         self.count(n)?;
         Ok(n)
     }
 
     /// Counts `n` more values toward [`MAX_VALUES`].
-    fn count(&mut self, n: usize) -> Result<(), DecodeError> {
+    fn count(&mut self, n: usize) -> Result<(), Error> {
         match self.values.checked_add(n) {
             Some(total) if total <= MAX_VALUES => self.values = total,
-            _ => return Err(DecodeError::TooManyValues),
+            _ => return Err(Error::TooManyValues),
         }
         Ok(())
     }
 
     /// A value of type `T`.
-    pub fn read<T: Binary>(&mut self) -> Result<T, DecodeError> {
+    pub fn read<T: Binary>(&mut self) -> Result<T, Error> {
         T::decode(self)
     }
 
     /// An array of `T`: a length, then the elements.
-    pub fn read_array<T: Binary>(&mut self) -> Result<Vec<T>, DecodeError> {
+    pub fn read_array<T: Binary>(&mut self) -> Result<Vec<T>, Error> {
         let n = self.array_len()?;
         let mut out = Vec::with_capacity(n);
         for _ in 0..n {
@@ -569,10 +624,10 @@ impl<'a> Reader<'a> {
     /// succeeds or not.
     fn nested<T>(
         &mut self,
-        f: impl FnOnce(&mut Self) -> Result<T, DecodeError>,
-    ) -> Result<T, DecodeError> {
+        f: impl FnOnce(&mut Self) -> Result<T, Error>,
+    ) -> Result<T, Error> {
         if self.depth >= MAX_DEPTH {
-            return Err(DecodeError::Depth);
+            return Err(Error::Depth);
         }
         self.count(1)?;
         self.depth += 1;
@@ -587,7 +642,7 @@ impl<'a> Reader<'a> {
 #[derive(Debug, Default)]
 struct Writer {
     out: Vec<u8>,
-    error: Option<EncodeError>,
+    error: Option<Error>,
     depth: usize,
     values: usize,
     /// How many DataValues the value being written is inside.
@@ -601,7 +656,7 @@ impl Writer {
     }
 
     /// The bytes written.
-    fn into_bytes(self) -> Result<Vec<u8>, EncodeError> {
+    fn into_bytes(self) -> Result<Vec<u8>, Error> {
         match self.error {
             Some(error) => Err(error),
             None => Ok(self.out),
@@ -619,7 +674,7 @@ impl Writer {
             .checked_add(b.len())
             .is_none_or(|n| n > MAX_MESSAGE_SIZE as usize)
         {
-            self.error = Some(EncodeError::TooLong);
+            self.error = Some(Error::TooLong);
         } else {
             self.out.extend_from_slice(b);
         }
@@ -664,7 +719,7 @@ impl Writer {
     /// A canonical DateTime. Values changed by the reader are refused.
     fn date_time(&mut self, v: i64) {
         if v != clamp_date_time(v) {
-            self.error = Some(EncodeError::Unwritable);
+            self.error = Some(Error::Unwritable);
         }
         self.i64(v);
     }
@@ -688,13 +743,13 @@ impl Writer {
     }
 
     /// A ByteString of at most `max` bytes. `None` is written as null.
-    fn byte_string_max(&mut self, b: Option<&[u8]>, max: usize) -> Result<(), EncodeError> {
+    fn byte_string_max(&mut self, b: Option<&[u8]>, max: usize) -> Result<(), Error> {
         match b {
             None => self.i32(-1),
             Some(b) => {
-                let n = i32::try_from(b.len()).map_err(|_| EncodeError::TooLong)?;
+                let n = i32::try_from(b.len()).map_err(|_| Error::TooLong)?;
                 if b.len() > max {
-                    return Err(EncodeError::TooLong);
+                    return Err(Error::TooLong);
                 }
                 self.i32(n);
                 self.bytes(b);
@@ -704,25 +759,25 @@ impl Writer {
     }
 
     /// A ByteString of at most [`MAX_STRING_LEN`] bytes.
-    fn byte_string(&mut self, b: Option<&[u8]>) -> Result<(), EncodeError> {
+    fn byte_string(&mut self, b: Option<&[u8]>) -> Result<(), Error> {
         self.byte_string_max(b, MAX_STRING_LEN)
     }
 
     /// A String of at most `max` bytes. `None` is written as null.
-    fn string_max(&mut self, s: Option<&str>, max: usize) -> Result<(), EncodeError> {
+    fn string_max(&mut self, s: Option<&str>, max: usize) -> Result<(), Error> {
         self.byte_string_max(s.map(str::as_bytes), max)
     }
 
     /// A String of at most [`MAX_STRING_LEN`] bytes.
-    fn string(&mut self, s: Option<&str>) -> Result<(), EncodeError> {
+    fn string(&mut self, s: Option<&str>) -> Result<(), Error> {
         self.string_max(s, MAX_STRING_LEN)
     }
 
     /// An array's length, at most [`MAX_ARRAY_LEN`]. Its elements count
     /// toward [`MAX_VALUES`], as a [`Reader`] counts them.
-    fn array_len(&mut self, n: usize) -> Result<(), EncodeError> {
+    fn array_len(&mut self, n: usize) -> Result<(), Error> {
         if n > MAX_ARRAY_LEN {
-            return Err(EncodeError::TooLong);
+            return Err(Error::TooLong);
         }
         self.count(n)?;
         self.i32(n as i32);
@@ -730,16 +785,16 @@ impl Writer {
     }
 
     /// Counts `n` more values toward [`MAX_VALUES`].
-    fn count(&mut self, n: usize) -> Result<(), EncodeError> {
+    fn count(&mut self, n: usize) -> Result<(), Error> {
         match self.values.checked_add(n) {
             Some(total) if total <= MAX_VALUES => self.values = total,
-            _ => return Err(EncodeError::TooManyValues),
+            _ => return Err(Error::TooManyValues),
         }
         Ok(())
     }
 
     /// An array of `T`: a length, then the elements.
-    fn write_array<T: BinaryWrite>(&mut self, values: &[T]) -> Result<(), EncodeError> {
+    fn write_array<T: BinaryWrite>(&mut self, values: &[T]) -> Result<(), Error> {
         self.array_len(values.len())?;
         for v in values {
             v.encode(self)?;
@@ -752,10 +807,10 @@ impl Writer {
     /// restored whether `f` succeeds or not.
     fn nested(
         &mut self,
-        f: impl FnOnce(&mut Self) -> Result<(), EncodeError>,
-    ) -> Result<(), EncodeError> {
+        f: impl FnOnce(&mut Self) -> Result<(), Error>,
+    ) -> Result<(), Error> {
         if self.depth >= MAX_DEPTH {
-            return Err(EncodeError::TooDeep);
+            return Err(Error::Depth);
         }
         self.count(1)?;
         self.depth += 1;
@@ -780,17 +835,17 @@ fn clamp_date_time(v: i64) -> i64 {
 /// A type with an OPC UA binary encoding.
 pub trait Binary: Sized {
     /// Reads one value from `r`.
-    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError>;
+    fn decode(r: &mut Reader<'_>) -> Result<Self, Error>;
 }
 
 /// A type that writes an OPC UA binary encoding.
 trait BinaryWrite {
     /// Writes one value to `w`.
-    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError>;
+    fn encode(&self, w: &mut Writer) -> Result<(), Error>;
 }
 
 impl Binary for StatusCode {
-    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, Error> {
         Ok(StatusCode(r.u32()?))
     }
 }
@@ -874,7 +929,7 @@ pub struct Guid {
 }
 
 impl Binary for Guid {
-    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, Error> {
         Ok(Guid {
             data1: r.u32()?,
             data2: r.u16()?,
@@ -957,7 +1012,7 @@ impl NodeId {
 
     /// Reads the rest of a NodeId after its encoding byte, whose low six
     /// bits name the form.
-    fn decode_form(r: &mut Reader<'_>, form: u8) -> Result<NodeId, DecodeError> {
+    fn decode_form(r: &mut Reader<'_>, form: u8) -> Result<NodeId, Error> {
         Ok(match form & 0x3f {
             0 => NodeId::numeric(0, u32::from(r.u8()?)),
             1 => {
@@ -991,12 +1046,12 @@ impl NodeId {
                     ),
                 }
             }
-            _ => return Err(DecodeError::NodeIdForm(form)),
+            _ => return Err(Error::NodeIdForm(form)),
         })
     }
 
     /// Writes the NodeId with `flags` set in its encoding byte.
-    fn encode_flags(&self, w: &mut Writer, flags: u8) -> Result<(), EncodeError> {
+    fn encode_flags(&self, w: &mut Writer, flags: u8) -> Result<(), Error> {
         let ns = self.namespace;
         match &self.identifier {
             Identifier::Numeric(id) => {
@@ -1026,7 +1081,7 @@ impl NodeId {
             }
             Identifier::Opaque(b) => {
                 if b.len() > MAX_NODE_ID_LEN {
-                    return Err(EncodeError::TooLong);
+                    return Err(Error::TooLong);
                 }
                 w.u8(flags | 5);
                 w.u16(ns);
@@ -1044,36 +1099,36 @@ fn is_c0_c1(c: char) -> bool {
 
 /// Reads a NodeId String identifier or a QualifiedName's name: at most
 /// `max` characters, none a control character. A null one reads as empty.
-fn read_name(r: &mut Reader<'_>, max: usize) -> Result<String, DecodeError> {
+fn read_name(r: &mut Reader<'_>, max: usize) -> Result<String, Error> {
     let s = r.string_max(max * 4)?.unwrap_or_default();
     let chars = s.chars().count();
     if chars > max {
-        return Err(DecodeError::Length(
+        return Err(Error::Length(
             i32::try_from(chars).unwrap_or(i32::MAX),
         ));
     }
     if s.chars().any(is_c0_c1) {
-        return Err(DecodeError::ControlChar);
+        return Err(Error::ControlChar);
     }
     Ok(s)
 }
 
 /// Checks what [`read_name`] checks, before writing.
-fn check_name(s: &str, max: usize) -> Result<(), EncodeError> {
+fn check_name(s: &str, max: usize) -> Result<(), Error> {
     if s.chars().count() > max {
-        return Err(EncodeError::TooLong);
+        return Err(Error::TooLong);
     }
     if s.chars().any(is_c0_c1) {
-        return Err(EncodeError::ControlChar);
+        return Err(Error::ControlChar);
     }
     Ok(())
 }
 
 impl Binary for NodeId {
-    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, Error> {
         let form = r.u8()?;
         if form & 0xc0 != 0 {
-            return Err(DecodeError::NodeIdForm(form));
+            return Err(Error::NodeIdForm(form));
         }
         NodeId::decode_form(r, form)
     }
@@ -1106,7 +1161,7 @@ impl From<NodeId> for ExpandedNodeId {
 }
 
 impl Binary for ExpandedNodeId {
-    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, Error> {
         let form = r.u8()?;
         let mut node_id = NodeId::decode_form(r, form)?;
         let namespace_uri = if form & 0x80 != 0 {
@@ -1137,7 +1192,7 @@ pub struct QualifiedName {
 }
 
 impl Binary for QualifiedName {
-    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, Error> {
         Ok(QualifiedName {
             namespace: r.u16()?,
             name: read_name(r, MAX_QUALIFIED_NAME_LEN)?,
@@ -1155,10 +1210,10 @@ pub struct LocalizedText {
 }
 
 impl Binary for LocalizedText {
-    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, Error> {
         let mask = r.u8()?;
         if mask & !0x03 != 0 {
-            return Err(DecodeError::Mask(mask));
+            return Err(Error::Mask(mask));
         }
         let locale = if mask & 0x01 != 0 { r.string()? } else { None };
         let text = if mask & 0x02 != 0 { r.string()? } else { None };
@@ -1189,14 +1244,14 @@ pub struct ExtensionObject {
 }
 
 impl Binary for ExtensionObject {
-    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, Error> {
         let type_id = r.read()?;
         let encoding = r.u8()?;
         let body = match encoding {
             0 => ExtensionBody::None,
             1 => ExtensionBody::Binary(r.byte_string()?.unwrap_or_default()),
             2 => ExtensionBody::Xml(r.byte_string()?.unwrap_or_default()),
-            m => return Err(DecodeError::Mask(m)),
+            m => return Err(Error::Mask(m)),
         };
         Ok(ExtensionObject { type_id, body })
     }
@@ -1223,16 +1278,16 @@ pub struct DiagnosticInfo {
 }
 
 impl Binary for DiagnosticInfo {
-    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, Error> {
         r.nested(DiagnosticInfo::decode_inner)
     }
 }
 
 impl DiagnosticInfo {
-    fn decode_inner(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+    fn decode_inner(r: &mut Reader<'_>) -> Result<Self, Error> {
         let mask = r.u8()?;
         if mask & 0x80 != 0 {
-            return Err(DecodeError::Mask(mask));
+            return Err(Error::Mask(mask));
         }
         let mut d = DiagnosticInfo::default();
         if mask & 0x01 != 0 {
@@ -1258,7 +1313,7 @@ impl DiagnosticInfo {
         }
         Ok(d)
     }
-    fn encode_inner(&self, w: &mut Writer) -> Result<(), EncodeError> {
+    fn encode_inner(&self, w: &mut Writer) -> Result<(), Error> {
         let mut mask = 0;
         let bits = [
             (self.symbolic_id.is_some(), 0x01),
@@ -1461,11 +1516,11 @@ impl Value {
     }
 
     /// Reads a value of built-in type `t`, which [`Value::readable`] takes.
-    fn decode(r: &mut Reader<'_>, t: u8) -> Result<Value, DecodeError> {
+    fn decode(r: &mut Reader<'_>, t: u8) -> Result<Value, Error> {
         use type_id as id;
         if !Value::readable(t, r.data_values) || (r.writable && !Value::writable(t, r.data_values))
         {
-            return Err(DecodeError::VariantType(t));
+            return Err(Error::VariantType(t));
         }
         Ok(match t {
             id::BOOLEAN => Value::Boolean(r.bool()?),
@@ -1496,13 +1551,13 @@ impl Value {
                 type_id: t,
                 bytes: r.byte_string()?,
             },
-            _ => return Err(DecodeError::VariantType(t)),
+            _ => return Err(Error::VariantType(t)),
         })
     }
 
-    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+    fn encode(&self, w: &mut Writer) -> Result<(), Error> {
         if !Value::writable(self.type_id(), w.data_values) {
-            return Err(EncodeError::VariantType);
+            return Err(Error::VariantValue);
         }
         match self {
             Value::Boolean(v) => w.bool(*v),
@@ -1529,7 +1584,7 @@ impl Value {
             Value::DataValue(d) => d.encode(w)?,
             Value::Variant(v) => v.encode(w)?,
             Value::DiagnosticInfo(_) | Value::Reserved { .. } => {
-                return Err(EncodeError::VariantType);
+                return Err(Error::VariantValue);
             }
         }
         Ok(())
@@ -1570,28 +1625,28 @@ impl From<Value> for Variant {
 }
 
 impl Binary for Variant {
-    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, Error> {
         r.nested(Variant::decode_inner)
     }
 }
 
 impl Variant {
-    fn decode_inner(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+    fn decode_inner(r: &mut Reader<'_>) -> Result<Self, Error> {
         let mask = r.u8()?;
         let t = mask & 0x3f;
         let is_array = mask & 0x80 != 0;
         let has_dims = mask & 0x40 != 0;
         let v = if t == type_id::NULL {
             if mask != 0 {
-                return Err(DecodeError::VariantType(t));
+                return Err(Error::VariantType(t));
             }
             Variant::Null
         } else if !is_array {
             if has_dims {
-                return Err(DecodeError::Dimensions);
+                return Err(Error::Dimensions);
             }
             if t == type_id::VARIANT {
-                return Err(DecodeError::VariantType(t));
+                return Err(Error::VariantType(t));
             }
             Variant::Scalar(Value::decode(r, t)?)
         } else {
@@ -1600,7 +1655,7 @@ impl Variant {
             if !Value::readable(t, r.data_values)
                 || (r.writable && !Value::writable(t, r.data_values))
             {
-                return Err(DecodeError::VariantType(t));
+                return Err(Error::VariantType(t));
             }
             let n = r.array_len()?;
             let mut values = Vec::with_capacity(n);
@@ -1611,14 +1666,14 @@ impl Variant {
                 let count = r.i32()?;
                 let count = match usize::try_from(count) {
                     Ok(c) if (2..=MAX_DIMENSIONS).contains(&c) => c,
-                    _ => return Err(DecodeError::Dimensions),
+                    _ => return Err(Error::Dimensions),
                 };
                 let mut dims = Vec::with_capacity(count);
                 for _ in 0..count {
                     dims.push(r.i32()?);
                 }
                 if !dims_match(&dims, n) {
-                    return Err(DecodeError::Dimensions);
+                    return Err(Error::Dimensions);
                 }
                 Some(dims)
             } else {
@@ -1633,13 +1688,13 @@ impl Variant {
         Ok(v)
     }
 
-    fn encode_inner(&self, w: &mut Writer) -> Result<(), EncodeError> {
+    fn encode_inner(&self, w: &mut Writer) -> Result<(), Error> {
         match self {
             Variant::Null => w.u8(0),
             Variant::Scalar(v) => {
                 let t = v.type_id();
                 if t == type_id::VARIANT {
-                    return Err(EncodeError::VariantType);
+                    return Err(Error::VariantValue);
                 }
                 w.u8(t);
                 v.encode(w)?;
@@ -1650,15 +1705,15 @@ impl Variant {
                 dimensions,
             } => {
                 if !Value::writable(*t, w.data_values) {
-                    return Err(EncodeError::VariantType);
+                    return Err(Error::VariantValue);
                 }
                 if values.iter().any(|v| v.type_id() != *t) {
-                    return Err(EncodeError::VariantType);
+                    return Err(Error::VariantValue);
                 }
                 if let Some(d) = dimensions
                     && (d.len() < 2 || d.len() > MAX_DIMENSIONS || !dims_match(d, values.len()))
                 {
-                    return Err(EncodeError::Dimensions);
+                    return Err(Error::Dimensions);
                 }
                 w.u8(t | 0x80 | if dimensions.is_some() { 0x40 } else { 0 });
                 w.array_len(values.len())?;
@@ -1718,7 +1773,7 @@ pub struct DataValue {
 }
 
 impl Binary for DataValue {
-    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, Error> {
         // The Variant in a DataValue may not hold another DataValue, at
         // any depth.
         r.nested(|r| {
@@ -1731,10 +1786,10 @@ impl Binary for DataValue {
 }
 
 impl DataValue {
-    fn decode_inner(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+    fn decode_inner(r: &mut Reader<'_>) -> Result<Self, Error> {
         let mask = r.u8()?;
         if mask & 0xc0 != 0 {
-            return Err(DecodeError::Mask(mask));
+            return Err(Error::Mask(mask));
         }
         let mut d = DataValue::default();
         if mask & 0x01 != 0 {
@@ -1758,7 +1813,7 @@ impl DataValue {
         Ok(d)
     }
 
-    fn encode_inner(&self, w: &mut Writer) -> Result<(), EncodeError> {
+    fn encode_inner(&self, w: &mut Writer) -> Result<(), Error> {
         let mut mask = 0;
         let bits = [
             (self.value.is_some(), 0x01),
@@ -1785,7 +1840,7 @@ impl DataValue {
         }
         if let Some(p) = self.source_picoseconds {
             if p > MAX_PICOSECONDS {
-                return Err(EncodeError::Unwritable);
+                return Err(Error::Unwritable);
             }
             w.u16(p);
         }
@@ -1794,7 +1849,7 @@ impl DataValue {
         }
         if let Some(p) = self.server_picoseconds {
             if p > MAX_PICOSECONDS {
-                return Err(EncodeError::Unwritable);
+                return Err(Error::Unwritable);
             }
             w.u16(p);
         }
@@ -1910,105 +1965,6 @@ pub struct Chunk {
     pub body: Vec<u8>,
 }
 
-/// Why a byte stream is not OPC UA. Every one is fatal: the stream holds
-/// no more messages a reader can find, and a real server sends an ERR
-/// with [`ChunkError::status`] and closes the connection.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ChunkError {
-    /// The first three bytes named no message type.
-    MessageType([u8; 3]),
-    /// The chunk type byte is not one this message type may have.
-    ChunkType(MessageType, u8),
-    /// The size in the header is smaller than the header.
-    TooSmall(u32),
-    /// The size in the header is larger than the receiver takes.
-    TooLarge {
-        /// The size in the header.
-        size: u32,
-        /// The largest size taken.
-        limit: u32,
-    },
-    /// The chunk's fields did not read.
-    Decode(MessageType, DecodeError),
-    /// A Hello or Acknowledge named a buffer smaller than
-    /// [`MIN_BUFFER_SIZE`].
-    BufferSize(u32),
-    /// A chunk of another message came before the last chunk of a MSG.
-    Interleaved,
-    /// A MSG chunk named a different channel or token from the chunks
-    /// before it.
-    Mismatch,
-    /// An OPN, CLO or MSG chunk's sequence number did not follow the one
-    /// before it on the connection.
-    Sequence {
-        /// The number that would have followed.
-        expected: u32,
-        /// The number that came.
-        got: u32,
-    },
-    /// A message's body grew past the negotiated limit.
-    MessageTooLarge(u32),
-    /// A message took more chunks than the negotiated limit.
-    TooManyChunks(u32),
-    /// Input ended before the final chunk of a message.
-    Incomplete,
-}
-
-impl ChunkError {
-    /// The status code a server sends in an ERR message for this error.
-    pub fn status(&self) -> StatusCode {
-        match self {
-            ChunkError::MessageType(_) | ChunkError::ChunkType(..) => {
-                StatusCode::BAD_TCP_MESSAGE_TYPE_INVALID
-            }
-            // The endpoint URL is the only length a Hello holds.
-            ChunkError::Decode(MessageType::Hello, DecodeError::Length(_)) => {
-                StatusCode::BAD_TCP_ENDPOINT_URL_INVALID
-            }
-            ChunkError::TooSmall(_)
-            | ChunkError::Decode(..)
-            | ChunkError::Interleaved
-            | ChunkError::Incomplete => StatusCode::BAD_DECODING_ERROR,
-            ChunkError::TooLarge { .. } => StatusCode::BAD_TCP_MESSAGE_TOO_LARGE,
-            ChunkError::BufferSize(_) => StatusCode::BAD_TCP_NOT_ENOUGH_RESOURCES,
-            ChunkError::Mismatch => StatusCode::BAD_TCP_SECURE_CHANNEL_UNKNOWN,
-            ChunkError::Sequence { .. } => StatusCode::BAD_SEQUENCE_NUMBER_INVALID,
-            ChunkError::MessageTooLarge(_) | ChunkError::TooManyChunks(_) => {
-                StatusCode::BAD_REQUEST_TOO_LARGE
-            }
-        }
-    }
-}
-
-impl std::fmt::Display for ChunkError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ChunkError::MessageType(c) => write!(
-                f,
-                "message type {:?} is not OPC UA",
-                String::from_utf8_lossy(c)
-            ),
-            ChunkError::ChunkType(t, b) => write!(f, "chunk type {b:#04x} is not valid for {t:?}"),
-            ChunkError::TooSmall(n) => write!(f, "chunk size {n} is smaller than its header"),
-            ChunkError::TooLarge { size, limit } => {
-                write!(f, "chunk size {size} is over the limit of {limit}")
-            }
-            ChunkError::Decode(t, e) => write!(f, "{t:?} chunk: {e}"),
-            ChunkError::BufferSize(n) => write!(f, "buffer size {n} is below {MIN_BUFFER_SIZE}"),
-            ChunkError::Interleaved => f.write_str("chunks of two messages were interleaved"),
-            ChunkError::Mismatch => f.write_str("a chunk named another channel or token"),
-            ChunkError::Sequence { expected, got } => {
-                write!(f, "sequence number {got}, expected {expected}")
-            }
-            ChunkError::MessageTooLarge(n) => write!(f, "message body over the limit of {n} bytes"),
-            ChunkError::TooManyChunks(n) => write!(f, "message over the limit of {n} chunks"),
-            ChunkError::Incomplete => f.write_str("incomplete OPC UA message"),
-        }
-    }
-}
-
-impl std::error::Error for ChunkError {}
-
 /// What one side of a connection takes in: the largest chunk, the largest
 /// message body and the most chunks in one message. A limit of 0 means
 /// none was set; the module's own caps apply either way.
@@ -2067,12 +2023,12 @@ impl Chunk {
     /// `b` holds only part of a chunk, and otherwise the chunk and how many
     /// bytes it took. A bad type is found from the first bytes, and a bad
     /// size from the header, before the rest comes.
-    pub fn parse_prefix(b: &[u8], limits: &Limits) -> Result<Option<(Chunk, usize)>, ChunkError> {
+    pub fn parse_prefix(b: &[u8], limits: &Limits) -> Result<Option<(Chunk, usize)>, Error> {
         if b.len() < 3 {
             return Ok(None);
         }
         let code = [b[0], b[1], b[2]];
-        let message_type = MessageType::from_code(code).ok_or(ChunkError::MessageType(code))?;
+        let message_type = MessageType::from_code(code).ok_or(Error::MessageType(code))?;
         let Some(&ct) = b.get(3) else { return Ok(None) };
         let chunk_type = match (ct, message_type) {
             // For HEL, ACK, ERR and RHE the byte is reserved: senders write
@@ -2081,7 +2037,7 @@ impl Chunk {
             (b'F', _) => ChunkType::Final,
             (b'C', MessageType::Message) => ChunkType::Intermediate,
             (b'A', MessageType::Message) => ChunkType::Abort,
-            _ => return Err(ChunkError::ChunkType(message_type, ct)),
+            _ => return Err(Error::ChunkType(message_type, ct)),
         };
         if b.len() < HEADER_LEN {
             return Ok(None);
@@ -2093,10 +2049,10 @@ impl Chunk {
             limits.chunk_limit()
         };
         if (size as usize) < HEADER_LEN {
-            return Err(ChunkError::TooSmall(size));
+            return Err(Error::TooSmall(size));
         }
         if size > limit {
-            return Err(ChunkError::TooLarge { size, limit });
+            return Err(Error::TooLarge { size, limit });
         }
         let end = size as usize;
         if b.len() < end {
@@ -2113,69 +2069,37 @@ impl Chunk {
     }
 }
 
-/// Why an exact [`Wire`] parse did not read one complete chunk.
-/// [`Chunk::parse_prefix`] reads a prefix under caller-supplied limits and returns
-/// the bytes used.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ChunkParseError {
-    /// The chunk header is invalid or exceeds [`MAX_BUFFER_SIZE`].
-    Chunk(ChunkError),
-    /// The input ended before a complete chunk, including empty input.
-    Truncated,
-    /// Bytes follow the first complete chunk.
-    Trailing,
-}
-
-impl core::fmt::Display for ChunkParseError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Chunk(e) => e.fmt(f),
-            Self::Truncated => f.write_str("incomplete OPC UA chunk"),
-            Self::Trailing => f.write_str("bytes follow the OPC UA chunk"),
-        }
-    }
-}
-
-impl core::error::Error for ChunkParseError {
-    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
-        match self {
-            Self::Chunk(e) => Some(e),
-            Self::Truncated | Self::Trailing => None,
-        }
-    }
-}
-
 impl Wire for Chunk {
-    type ParseError = ChunkParseError;
-    type WriteError = ChunkError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads exactly one chunk bounded by [`MAX_BUFFER_SIZE`].
-    /// The body stays opaque. Negotiated limits belong to [`Frames`].
+    /// The body stays opaque. Negotiated limits belong to [`Chunks`].
     /// Handshake chunk type bytes read as [`ChunkType::Final`].
-    /// Returns [`ChunkParseError::Truncated`] for incomplete input and
-    /// [`ChunkParseError::Trailing`] for extra bytes. Invalid message types,
-    /// chunk types or sizes return [`ChunkParseError::Chunk`] containing
-    /// [`ChunkError::MessageType`], [`ChunkError::ChunkType`],
-    /// [`ChunkError::TooSmall`] or [`ChunkError::TooLarge`].
-    fn parse(b: &[u8]) -> Result<Self, ChunkParseError> {
+    /// Returns [`Error::End`] for incomplete input and
+    /// [`Error::Trailing`] for extra bytes. Invalid message types,
+    /// chunk types or sizes return
+    /// [`Error::MessageType`], [`Error::ChunkType`],
+    /// [`Error::TooSmall`] or [`Error::TooLarge`].
+    fn parse(b: &[u8]) -> Result<Self, Error> {
         let limits = Limits {
             receive_buffer_size: MAX_BUFFER_SIZE,
             ..Limits::default()
         };
-        match Self::parse_prefix(b, &limits).map_err(ChunkParseError::Chunk)? {
+        match Self::parse_prefix(b, &limits)? {
             Some((chunk, used)) if used == b.len() => Ok(chunk),
-            Some(_) => Err(ChunkParseError::Trailing),
-            None => Err(ChunkParseError::Truncated),
+            Some((_, used)) => Err(Error::Trailing(b.len() - used)),
+            None => Err(Error::End),
         }
     }
 
     /// Appends at most [`MAX_BUFFER_SIZE`] bytes, leaving `out` unchanged
     /// on error. Only MSG chunks may be intermediate or abort chunks.
-    /// Returns [`ChunkError::ChunkType`] for an intermediate or abort chunk
-    /// outside MSG, and [`ChunkError::TooLarge`] above [`MAX_BUFFER_SIZE`].
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), ChunkError> {
+    /// Returns [`Error::ChunkType`] for an intermediate or abort chunk
+    /// outside MSG, and [`Error::TooLarge`] above [`MAX_BUFFER_SIZE`].
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         if self.message_type != MessageType::Message && self.chunk_type != ChunkType::Final {
-            return Err(ChunkError::ChunkType(
+            return Err(Error::ChunkType(
                 self.message_type,
                 self.chunk_type.byte(),
             ));
@@ -2185,12 +2109,12 @@ impl Wire for Chunk {
             .len()
             .checked_add(HEADER_LEN)
             .and_then(|n| u32::try_from(n).ok())
-            .ok_or(ChunkError::TooLarge {
+            .ok_or(Error::TooLarge {
                 size: u32::MAX,
                 limit: MAX_BUFFER_SIZE,
             })?;
         if size > MAX_BUFFER_SIZE {
-            return Err(ChunkError::TooLarge {
+            return Err(Error::TooLarge {
                 size,
                 limit: MAX_BUFFER_SIZE,
             });
@@ -2212,11 +2136,11 @@ impl Wire for Chunk {
 /// Message bodies, chunk counts, and sequence numbers are not checked here.
 /// Use [`Messages`] for message assembly and connection checks.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct Frames {
+pub struct Chunks {
     limits: Limits,
 }
 
-impl Frames {
+impl Chunks {
     /// Creates a chunk decoder with [`Limits::default`].
     pub fn new() -> Self {
         Self::default()
@@ -2241,9 +2165,9 @@ impl Frames {
     }
 }
 
-impl Decode for Frames {
+impl Decode for Chunks {
     type Item = Chunk;
-    type Error = ChunkError;
+    type Error = Error;
     const NAME: &'static str = "OPC UA TCP";
 
     fn capacity(&self) -> usize {
@@ -2251,10 +2175,10 @@ impl Decode for Frames {
     }
 
     /// Reads a chunk prefix, returning [`Step::Need`] while incomplete.
-    /// Returns [`ChunkError::MessageType`] or [`ChunkError::ChunkType`] for
-    /// invalid type bytes, [`ChunkError::TooSmall`] below the header size,
-    /// and [`ChunkError::TooLarge`] above the negotiated limit.
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Chunk>, ChunkError> {
+    /// Returns [`Error::MessageType`] or [`Error::ChunkType`] for
+    /// invalid type bytes, [`Error::TooSmall`] below the header size,
+    /// and [`Error::TooLarge`] above the negotiated limit.
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Chunk>, Error> {
         Ok(match Chunk::parse_prefix(input, &self.limits)? {
             Some((chunk, used)) => Step::Item(chunk, used),
             None => Step::Need,
@@ -2265,9 +2189,9 @@ impl Decode for Frames {
 /// Reads the reason of an Error message or abort chunk. One longer than
 /// [`MAX_REASON_LEN`] is dropped unread and comes back empty, as Part 6
 /// asks of receivers. A null one reads as empty.
-fn read_reason(r: &mut Reader<'_>) -> Result<String, DecodeError> {
+fn read_reason(r: &mut Reader<'_>) -> Result<String, Error> {
     match r.byte_string()? {
-        Some(b) if b.len() <= MAX_REASON_LEN => String::from_utf8(b).map_err(|_| DecodeError::Utf8),
+        Some(b) if b.len() <= MAX_REASON_LEN => String::from_utf8(b).map_err(|_| Error::Utf8),
         _ => Ok(String::new()),
     }
 }
@@ -2328,7 +2252,7 @@ impl Hello {
         }
     }
 
-    fn decode(r: &mut Reader<'_>) -> Result<Hello, DecodeError> {
+    fn decode(r: &mut Reader<'_>) -> Result<Hello, Error> {
         Ok(Hello {
             protocol_version: r.u32()?,
             receive_buffer_size: r.u32()?,
@@ -2339,7 +2263,7 @@ impl Hello {
         })
     }
 
-    fn body(&self) -> Result<Vec<u8>, EncodeError> {
+    fn body(&self) -> Result<Vec<u8>, Error> {
         check_buffers(self.receive_buffer_size, self.send_buffer_size)?;
         let mut w = Writer::new();
         for v in [
@@ -2384,7 +2308,7 @@ impl Acknowledge {
         }
     }
 
-    fn decode(r: &mut Reader<'_>) -> Result<Acknowledge, DecodeError> {
+    fn decode(r: &mut Reader<'_>) -> Result<Acknowledge, Error> {
         Ok(Acknowledge {
             protocol_version: r.u32()?,
             receive_buffer_size: r.u32()?,
@@ -2394,7 +2318,7 @@ impl Acknowledge {
         })
     }
 
-    fn body(&self) -> Result<Vec<u8>, EncodeError> {
+    fn body(&self) -> Result<Vec<u8>, Error> {
         check_buffers(self.receive_buffer_size, self.send_buffer_size)?;
         let mut w = Writer::new();
         for v in [
@@ -2410,10 +2334,10 @@ impl Acknowledge {
     }
 }
 
-fn check_buffers(receive: u32, send: u32) -> Result<(), EncodeError> {
+fn check_buffers(receive: u32, send: u32) -> Result<(), Error> {
     for n in [receive, send] {
         if n < MIN_BUFFER_SIZE {
-            return Err(EncodeError::BufferSize(n));
+            return Err(Error::BufferSize(n));
         }
     }
     Ok(())
@@ -2567,7 +2491,7 @@ impl Message {
     /// an OPN or CLO too large for one chunk, a MSG with too large a body or
     /// needing too many chunks, a buffer size below [`MIN_BUFFER_SIZE`], or a
     /// string past its limit.
-    pub fn chunks(&self, peer: &Limits) -> Result<Vec<Chunk>, EncodeError> {
+    pub fn chunks(&self, peer: &Limits) -> Result<Vec<Chunk>, Error> {
         Ok(vec![match self {
             Message::Hello(h) => chunk(MessageType::Hello, ChunkType::Final, h.body()?),
             Message::Acknowledge(a) => chunk(MessageType::Acknowledge, ChunkType::Final, a.body()?),
@@ -2601,17 +2525,17 @@ impl Message {
 impl SecureMessage {
     /// Splits the message into chunks, each as large as a peer that takes `peer`
     /// allows. See [`Message::chunks`] for when it fails.
-    pub fn chunks(&self, peer: &Limits) -> Result<Vec<Chunk>, EncodeError> {
+    pub fn chunks(&self, peer: &Limits) -> Result<Vec<Chunk>, Error> {
         let chunk_limit = peer.chunk_limit() as usize;
         if self.body.len() > peer.message_limit() as usize {
-            return Err(EncodeError::TooLong);
+            return Err(Error::TooLong);
         }
         let mut w = Writer::new();
         w.u32(self.channel_id);
         match &self.kind {
             SecureKind::Open(h) => {
                 if h.bad_length().is_some() {
-                    return Err(EncodeError::SecurityHeader);
+                    return Err(Error::SecurityHeader);
                 }
                 w.string_max(Some(&h.policy_uri), MAX_POLICY_URI_LEN)?;
                 w.byte_string(h.sender_certificate.as_deref())?;
@@ -2624,7 +2548,7 @@ impl SecureMessage {
         // The header, the security header and the sequence header.
         let overhead = HEADER_LEN + security.len() + 8;
         if overhead > chunk_limit || (overhead == chunk_limit && !self.body.is_empty()) {
-            return Err(EncodeError::TooLong);
+            return Err(Error::TooLong);
         }
         let per_chunk = chunk_limit - overhead;
         let single = !matches!(self.kind, SecureKind::Message { .. });
@@ -2636,7 +2560,7 @@ impl SecureMessage {
             self.body.len().div_ceil(per_chunk)
         };
         if (single && count > 1) || count > peer.chunk_count_limit() as usize {
-            return Err(EncodeError::TooLong);
+            return Err(Error::TooLong);
         }
         let pieces: Box<dyn Iterator<Item = &[u8]>> = if self.body.is_empty() {
             Box::new(std::iter::once(&[][..]))
@@ -2682,7 +2606,7 @@ struct SecureChunk {
     rest: Vec<u8>,
 }
 
-fn decode_secure(message_type: MessageType, body: &[u8]) -> Result<SecureChunk, DecodeError> {
+fn decode_secure(message_type: MessageType, body: &[u8]) -> Result<SecureChunk, Error> {
     let mut r = Reader::new(body);
     let channel_id = r.u32()?;
     let kind = match message_type {
@@ -2693,7 +2617,7 @@ fn decode_secure(message_type: MessageType, body: &[u8]) -> Result<SecureChunk, 
                 receiver_thumbprint: r.byte_string()?,
             };
             if let Some(n) = h.bad_length() {
-                return Err(DecodeError::Length(i32::try_from(n).unwrap_or(i32::MAX)));
+                return Err(Error::Length(i32::try_from(n).unwrap_or(i32::MAX)));
             }
             SecureKind::Open(h)
         }
@@ -2722,7 +2646,7 @@ fn follows(prev: u32, got: u32) -> bool {
 /// Use with [`Stream<Messages>`](fictionet::stdlib::codec::Stream). Each secure chunk must follow
 /// the previous sequence number, including across message boundaries.
 /// Input stays in the stream. Only an unfinished message body is held here.
-/// EOF during an assembly returns [`ChunkError::Incomplete`], including when
+/// EOF during an assembly returns [`Error::Incomplete`], including when
 /// its body is empty. [`Decode::held`] counts body bytes, so zero held bytes
 /// does not imply a complete message. Use [`Messages::is_between_messages`]
 /// to check for an unfinished assembly. Set receive limits between messages
@@ -2769,16 +2693,16 @@ impl Messages {
     }
 
     /// Handles one chunk: a whole message, or `None` for part of a MSG.
-    fn take(&mut self, chunk: Chunk) -> Result<Option<Message>, ChunkError> {
+    fn take(&mut self, chunk: Chunk) -> Result<Option<Message>, Error> {
         let t = chunk.message_type;
-        let de = |e| ChunkError::Decode(t, e);
+        let de = |e| Error::Decode(t, Box::new(e));
         // An ERR may come at any time: the peer is closing the connection,
         // and any MSG it was sending is dropped.
         if t == MessageType::Error {
             self.partial = None;
         }
         if t != MessageType::Message && self.partial.is_some() {
-            return Err(ChunkError::Interleaved);
+            return Err(Error::Interleaved);
         }
         let mut r = Reader::new(&chunk.body);
         let message = match t {
@@ -2787,7 +2711,7 @@ impl Messages {
                 r.finish().map_err(de)?;
                 for n in [h.receive_buffer_size, h.send_buffer_size] {
                     if n < MIN_BUFFER_SIZE {
-                        return Err(ChunkError::BufferSize(n));
+                        return Err(Error::BufferSize(n));
                     }
                 }
                 Message::Hello(h)
@@ -2797,7 +2721,7 @@ impl Messages {
                 r.finish().map_err(de)?;
                 for n in [a.receive_buffer_size, a.send_buffer_size] {
                     if n < MIN_BUFFER_SIZE {
-                        return Err(ChunkError::BufferSize(n));
+                        return Err(Error::BufferSize(n));
                     }
                 }
                 Message::Acknowledge(a)
@@ -2829,11 +2753,11 @@ impl Messages {
         &mut self,
         chunk_type: ChunkType,
         s: SecureChunk,
-    ) -> Result<Option<Message>, ChunkError> {
+    ) -> Result<Option<Message>, Error> {
         if let Some(prev) = self.last_sequence
             && !follows(prev, s.sequence_number)
         {
-            return Err(ChunkError::Sequence {
+            return Err(Error::Sequence {
                 expected: prev.wrapping_add(1),
                 got: s.sequence_number,
             });
@@ -2846,7 +2770,7 @@ impl Messages {
             _ => {
                 // OPN and CLO are one chunk, and come between messages.
                 if s.rest.len() > message_limit as usize {
-                    return Err(ChunkError::MessageTooLarge(message_limit));
+                    return Err(Error::MessageTooLarge(message_limit));
                 }
                 return Ok(Some(Message::Secure(SecureMessage {
                     kind: s.kind,
@@ -2860,10 +2784,10 @@ impl Messages {
         let mut partial = match self.partial.take() {
             Some(p) => {
                 if p.request_id != s.request_id {
-                    return Err(ChunkError::Interleaved);
+                    return Err(Error::Interleaved);
                 }
                 if p.channel_id != s.channel_id || p.token_id != token_id {
-                    return Err(ChunkError::Mismatch);
+                    return Err(Error::Mismatch);
                 }
                 p
             }
@@ -2878,7 +2802,7 @@ impl Messages {
         };
         if chunk_type == ChunkType::Abort {
             let mut r = Reader::new(&s.rest);
-            let de = |e| ChunkError::Decode(MessageType::Message, e);
+            let de = |e| Error::Decode(MessageType::Message, Box::new(e));
             let error = r.read().map_err(de)?;
             let reason = read_reason(&mut r).map_err(de)?;
             r.finish().map_err(de)?;
@@ -2894,9 +2818,9 @@ impl Messages {
         partial.chunks = partial
             .chunks
             .checked_add(1)
-            .ok_or(ChunkError::TooManyChunks(count_limit))?;
+            .ok_or(Error::TooManyChunks(count_limit))?;
         if partial.chunks > count_limit {
-            return Err(ChunkError::TooManyChunks(count_limit));
+            return Err(Error::TooManyChunks(count_limit));
         }
         if partial
             .body
@@ -2904,7 +2828,7 @@ impl Messages {
             .checked_add(s.rest.len())
             .is_none_or(|n| n > message_limit as usize)
         {
-            return Err(ChunkError::MessageTooLarge(message_limit));
+            return Err(Error::MessageTooLarge(message_limit));
         }
         partial.body.extend_from_slice(&s.rest);
         if chunk_type == ChunkType::Intermediate {
@@ -2923,7 +2847,7 @@ impl Messages {
 
 impl Decode for Messages {
     type Item = Message;
-    type Error = ChunkError;
+    type Error = Error;
     const NAME: &'static str = "OPC UA messages";
 
     fn capacity(&self) -> usize {
@@ -2935,20 +2859,20 @@ impl Decode for Messages {
     }
 
     /// Reads chunks and joins secure messages. Chunk header errors are those
-    /// of [`Frames::decode`]. Invalid bodies return [`ChunkError::Decode`];
-    /// undersized handshake buffers return [`ChunkError::BufferSize`].
-    /// Broken order or changed secure headers return [`ChunkError::Sequence`]
-    /// or [`ChunkError::Interleaved`]. Changed channel or token IDs return
-    /// [`ChunkError::Mismatch`]. Excess assembly bytes or chunks return
-    /// [`ChunkError::MessageTooLarge`] or [`ChunkError::TooManyChunks`].
-    /// EOF during assembly returns [`ChunkError::Incomplete`].
-    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Message>, ChunkError> {
+    /// of [`Chunks::decode`]. Invalid bodies return [`Error::Decode`];
+    /// undersized handshake buffers return [`Error::BufferSize`].
+    /// Broken order or changed secure headers return [`Error::Sequence`]
+    /// or [`Error::Interleaved`]. Changed channel or token IDs return
+    /// [`Error::Mismatch`]. Excess assembly bytes or chunks return
+    /// [`Error::MessageTooLarge`] or [`Error::TooManyChunks`].
+    /// EOF during assembly returns [`Error::Incomplete`].
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Message>, Error> {
         match Chunk::parse_prefix(input, &self.limits)? {
             Some((chunk, used)) => Ok(match self.take(chunk)? {
                 Some(message) => Step::Item(message, used),
                 None => Step::Skip(used),
             }),
-            None if eof && self.partial.is_some() => Err(ChunkError::Incomplete),
+            None if eof && self.partial.is_some() => Err(Error::Incomplete),
             None => Ok(Step::Need),
         }
     }
@@ -2993,7 +2917,7 @@ pub struct RequestHeader {
 }
 
 impl Binary for RequestHeader {
-    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, Error> {
         Ok(RequestHeader {
             authentication_token: r.read()?,
             timestamp: r.date_time()?,
@@ -3025,13 +2949,13 @@ pub struct ResponseHeader {
 }
 
 impl Binary for Option<String> {
-    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, Error> {
         r.string()
     }
 }
 
 impl Binary for ResponseHeader {
-    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, Error> {
         Ok(ResponseHeader {
             timestamp: r.date_time()?,
             request_handle: r.u32()?,
@@ -3066,23 +2990,23 @@ pub enum SecurityMode {
 }
 
 impl Binary for RequestType {
-    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, Error> {
         match r.i32()? {
             0 => Ok(RequestType::Issue),
             1 => Ok(RequestType::Renew),
-            n => Err(DecodeError::Enum(n)),
+            n => Err(Error::Enum(n)),
         }
     }
 }
 
 impl Binary for SecurityMode {
-    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, Error> {
         match r.i32()? {
             0 => Ok(SecurityMode::Invalid),
             1 => Ok(SecurityMode::None),
             2 => Ok(SecurityMode::Sign),
             3 => Ok(SecurityMode::SignAndEncrypt),
-            n => Err(DecodeError::Enum(n)),
+            n => Err(Error::Enum(n)),
         }
     }
 }
@@ -3105,7 +3029,7 @@ pub struct OpenSecureChannelRequest {
 }
 
 impl Binary for OpenSecureChannelRequest {
-    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, Error> {
         Ok(OpenSecureChannelRequest {
             header: r.read()?,
             client_protocol_version: r.u32()?,
@@ -3131,7 +3055,7 @@ pub struct ChannelSecurityToken {
 }
 
 impl Binary for ChannelSecurityToken {
-    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, Error> {
         Ok(ChannelSecurityToken {
             channel_id: r.u32()?,
             token_id: r.u32()?,
@@ -3155,7 +3079,7 @@ pub struct OpenSecureChannelResponse {
 }
 
 impl Binary for OpenSecureChannelResponse {
-    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, Error> {
         Ok(OpenSecureChannelResponse {
             header: r.read()?,
             server_protocol_version: r.u32()?,
@@ -3205,14 +3129,14 @@ impl Service {
 }
 
 impl BinaryWrite for StatusCode {
-    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+    fn encode(&self, w: &mut Writer) -> Result<(), Error> {
         w.u32(self.0);
         Ok(())
     }
 }
 
 impl BinaryWrite for Guid {
-    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+    fn encode(&self, w: &mut Writer) -> Result<(), Error> {
         w.u32(self.data1);
         w.u16(self.data2);
         w.u16(self.data3);
@@ -3222,13 +3146,13 @@ impl BinaryWrite for Guid {
 }
 
 impl BinaryWrite for NodeId {
-    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+    fn encode(&self, w: &mut Writer) -> Result<(), Error> {
         self.encode_flags(w, 0)
     }
 }
 
 impl BinaryWrite for ExpandedNodeId {
-    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+    fn encode(&self, w: &mut Writer) -> Result<(), Error> {
         let uri = self.namespace_uri.as_deref().filter(|u| !u.is_empty());
         let mut flags = 0;
         if uri.is_some() {
@@ -3240,7 +3164,7 @@ impl BinaryWrite for ExpandedNodeId {
         if (uri.is_some() && self.node_id.namespace != 0)
             || self.namespace_uri.as_deref() == Some("")
         {
-            return Err(EncodeError::Unwritable);
+            return Err(Error::Unwritable);
         }
         self.node_id.encode_flags(w, flags)?;
         if let Some(uri) = uri {
@@ -3254,7 +3178,7 @@ impl BinaryWrite for ExpandedNodeId {
 }
 
 impl BinaryWrite for QualifiedName {
-    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+    fn encode(&self, w: &mut Writer) -> Result<(), Error> {
         check_name(&self.name, MAX_QUALIFIED_NAME_LEN)?;
         w.u16(self.namespace);
         w.string(Some(&self.name))
@@ -3262,7 +3186,7 @@ impl BinaryWrite for QualifiedName {
 }
 
 impl BinaryWrite for LocalizedText {
-    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+    fn encode(&self, w: &mut Writer) -> Result<(), Error> {
         w.u8(u8::from(self.locale.is_some()) | u8::from(self.text.is_some()) << 1);
         if let Some(l) = &self.locale {
             w.string(Some(l))?;
@@ -3275,7 +3199,7 @@ impl BinaryWrite for LocalizedText {
 }
 
 impl BinaryWrite for ExtensionObject {
-    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+    fn encode(&self, w: &mut Writer) -> Result<(), Error> {
         self.type_id.encode(w)?;
         match &self.body {
             ExtensionBody::None => w.u8(0),
@@ -3293,19 +3217,19 @@ impl BinaryWrite for ExtensionObject {
 }
 
 impl BinaryWrite for DiagnosticInfo {
-    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+    fn encode(&self, w: &mut Writer) -> Result<(), Error> {
         w.nested(|w| self.encode_inner(w))
     }
 }
 
 impl BinaryWrite for Variant {
-    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+    fn encode(&self, w: &mut Writer) -> Result<(), Error> {
         w.nested(|w| self.encode_inner(w))
     }
 }
 
 impl BinaryWrite for DataValue {
-    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+    fn encode(&self, w: &mut Writer) -> Result<(), Error> {
         w.nested(|w| {
             w.data_values += 1;
             let out = self.encode_inner(w);
@@ -3316,7 +3240,7 @@ impl BinaryWrite for DataValue {
 }
 
 impl BinaryWrite for RequestHeader {
-    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+    fn encode(&self, w: &mut Writer) -> Result<(), Error> {
         self.authentication_token.encode(w)?;
         w.date_time(self.timestamp);
         w.u32(self.request_handle);
@@ -3328,13 +3252,13 @@ impl BinaryWrite for RequestHeader {
 }
 
 impl BinaryWrite for Option<String> {
-    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+    fn encode(&self, w: &mut Writer) -> Result<(), Error> {
         w.string(self.as_deref())
     }
 }
 
 impl BinaryWrite for ResponseHeader {
-    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+    fn encode(&self, w: &mut Writer) -> Result<(), Error> {
         w.date_time(self.timestamp);
         w.u32(self.request_handle);
         self.service_result.encode(w)?;
@@ -3345,21 +3269,21 @@ impl BinaryWrite for ResponseHeader {
 }
 
 impl BinaryWrite for RequestType {
-    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+    fn encode(&self, w: &mut Writer) -> Result<(), Error> {
         w.i32(*self as i32);
         Ok(())
     }
 }
 
 impl BinaryWrite for SecurityMode {
-    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+    fn encode(&self, w: &mut Writer) -> Result<(), Error> {
         w.i32(*self as i32);
         Ok(())
     }
 }
 
 impl BinaryWrite for OpenSecureChannelRequest {
-    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+    fn encode(&self, w: &mut Writer) -> Result<(), Error> {
         self.header.encode(w)?;
         w.u32(self.client_protocol_version);
         self.request_type.encode(w)?;
@@ -3371,7 +3295,7 @@ impl BinaryWrite for OpenSecureChannelRequest {
 }
 
 impl BinaryWrite for ChannelSecurityToken {
-    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+    fn encode(&self, w: &mut Writer) -> Result<(), Error> {
         w.u32(self.channel_id);
         w.u32(self.token_id);
         w.date_time(self.created_at);
@@ -3381,7 +3305,7 @@ impl BinaryWrite for ChannelSecurityToken {
 }
 
 impl BinaryWrite for OpenSecureChannelResponse {
-    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+    fn encode(&self, w: &mut Writer) -> Result<(), Error> {
         self.header.encode(w)?;
         w.u32(self.server_protocol_version);
         self.security_token.encode(w)?;
@@ -3392,16 +3316,16 @@ impl BinaryWrite for OpenSecureChannelResponse {
 macro_rules! binary_wire {
     ($($ty:ty => ($read:literal, $write:literal)),+ $(,)?) => { $(
         impl Wire for $ty {
-            type ParseError = DecodeError;
-            type WriteError = EncodeError;
+            type ParseError = Error;
+            type WriteError = Error;
 
-            /// Reads one complete binary value. Returns [`DecodeError::End`]
-            /// for short fields, [`DecodeError::Trailing`] for extra bytes,
-            /// and [`DecodeError::Length`] above [`MAX_MESSAGE_SIZE`].
+            /// Reads one complete binary value. Returns [`Error::End`]
+            /// for short fields, [`Error::Trailing`] for extra bytes,
+            /// and [`Error::Length`] above [`MAX_MESSAGE_SIZE`].
             #[doc = $read]
-            fn parse(bytes: &[u8]) -> Result<Self, DecodeError> {
+            fn parse(bytes: &[u8]) -> Result<Self, Error> {
                 if bytes.len() > MAX_MESSAGE_SIZE as usize {
-                    return Err(DecodeError::Length(i32::try_from(bytes.len()).unwrap_or(i32::MAX)));
+                    return Err(Error::Length(i32::try_from(bytes.len()).unwrap_or(i32::MAX)));
                 }
                 let mut reader = Reader::new(bytes);
                 reader.writable = true;
@@ -3412,7 +3336,7 @@ macro_rules! binary_wire {
 
             /// Appends the binary value. Leaves `out` unchanged on error.
             #[doc = $write]
-            fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+            fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
                 let mut writer = Writer::new();
                 self.encode(&mut writer)?;
                 out.extend_from_slice(&writer.into_bytes()?);
@@ -3432,152 +3356,152 @@ binary_wire!(
         "Every GUID is writable; this method never returns an error."
     ),
     NodeId => (
-        "Invalid identifier forms return [`DecodeError::NodeIdForm`]. Invalid lengths, UTF-8 or
-control characters in names return [`DecodeError::Length`], [`DecodeError::Utf8`] or
-[`DecodeError::ControlChar`].",
-        "Returns [`EncodeError::TooLong`] for excess name or identifier lengths and
-[`EncodeError::ControlChar`] for control characters in names."
+        "Invalid identifier forms return [`Error::NodeIdForm`]. Invalid lengths, UTF-8 or
+control characters in names return [`Error::Length`], [`Error::Utf8`] or
+[`Error::ControlChar`].",
+        "Returns [`Error::TooLong`] for excess name or identifier lengths and
+[`Error::ControlChar`] for control characters in names."
     ),
     ExpandedNodeId => (
-        "Invalid identifier forms return [`DecodeError::NodeIdForm`]. Invalid lengths, UTF-8 or
-control characters in names return [`DecodeError::Length`], [`DecodeError::Utf8`] or
-[`DecodeError::ControlChar`]. Namespace URI lengths and UTF-8 use the same string
+        "Invalid identifier forms return [`Error::NodeIdForm`]. Invalid lengths, UTF-8 or
+control characters in names return [`Error::Length`], [`Error::Utf8`] or
+[`Error::ControlChar`]. Namespace URI lengths and UTF-8 use the same string
 errors.",
-        "Returns [`EncodeError::TooLong`] for excess name or identifier lengths and
-[`EncodeError::ControlChar`] for control characters in names. Returns
-[`EncodeError::Unwritable`] for an empty namespace URI or a nonzero namespace index with
-a URI. Excess total or URI sizes return [`EncodeError::TooLong`]."
+        "Returns [`Error::TooLong`] for excess name or identifier lengths and
+[`Error::ControlChar`] for control characters in names. Returns
+[`Error::Unwritable`] for an empty namespace URI or a nonzero namespace index with
+a URI. Excess total or URI sizes return [`Error::TooLong`]."
     ),
     QualifiedName => (
-        "Invalid string lengths or UTF-8 return [`DecodeError::Length`] or [`DecodeError::Utf8`].
-Excess name characters or control characters return [`DecodeError::Length`] or
-[`DecodeError::ControlChar`].",
-        "Returns [`EncodeError::TooLong`] above [`MAX_QUALIFIED_NAME_LEN`] characters and
-[`EncodeError::ControlChar`] for control characters."
+        "Invalid string lengths or UTF-8 return [`Error::Length`] or [`Error::Utf8`].
+Excess name characters or control characters return [`Error::Length`] or
+[`Error::ControlChar`].",
+        "Returns [`Error::TooLong`] above [`MAX_QUALIFIED_NAME_LEN`] characters and
+[`Error::ControlChar`] for control characters."
     ),
     LocalizedText => (
-        "Invalid string lengths or UTF-8 return [`DecodeError::Length`] or [`DecodeError::Utf8`].
-Unknown mask bits return [`DecodeError::Mask`].",
-        "Returns [`EncodeError::TooLong`] for strings above [`MAX_STRING_LEN`] or total bytes
+        "Invalid string lengths or UTF-8 return [`Error::Length`] or [`Error::Utf8`].
+Unknown mask bits return [`Error::Mask`].",
+        "Returns [`Error::TooLong`] for strings above [`MAX_STRING_LEN`] or total bytes
 above [`MAX_MESSAGE_SIZE`]."
     ),
     ExtensionObject => (
-        "Invalid identifier forms return [`DecodeError::NodeIdForm`]. Invalid lengths, UTF-8 or
-control characters in names return [`DecodeError::Length`], [`DecodeError::Utf8`] or
-[`DecodeError::ControlChar`]. Unknown body encodings return [`DecodeError::Mask`];
-invalid body lengths return [`DecodeError::Length`].",
-        "Returns [`EncodeError::TooLong`] for excess name or identifier lengths and
-[`EncodeError::ControlChar`] for control characters in names. Excess body or total sizes
-return [`EncodeError::TooLong`]."
+        "Invalid identifier forms return [`Error::NodeIdForm`]. Invalid lengths, UTF-8 or
+control characters in names return [`Error::Length`], [`Error::Utf8`] or
+[`Error::ControlChar`]. Unknown body encodings return [`Error::Mask`];
+invalid body lengths return [`Error::Length`].",
+        "Returns [`Error::TooLong`] for excess name or identifier lengths and
+[`Error::ControlChar`] for control characters in names. Excess body or total sizes
+return [`Error::TooLong`]."
     ),
     DiagnosticInfo => (
-        "Unknown mask bits return [`DecodeError::Mask`]. Invalid string lengths or UTF-8 return
-[`DecodeError::Length`] or [`DecodeError::Utf8`]. Excess nesting or value counts return
-[`DecodeError::Depth`] or [`DecodeError::TooManyValues`].",
-        "Returns [`EncodeError::TooLong`] for excess field or total sizes,
-[`EncodeError::TooDeep`] for nesting above [`MAX_DEPTH`], and
-[`EncodeError::TooManyValues`] above [`MAX_VALUES`]."
+        "Unknown mask bits return [`Error::Mask`]. Invalid string lengths or UTF-8 return
+[`Error::Length`] or [`Error::Utf8`]. Excess nesting or value counts return
+[`Error::Depth`] or [`Error::TooManyValues`].",
+        "Returns [`Error::TooLong`] for excess field or total sizes,
+[`Error::Depth`] for nesting above [`MAX_DEPTH`], and
+[`Error::TooManyValues`] above [`MAX_VALUES`]."
     ),
     Variant => (
         "Invalid or reserved type IDs, including reserved types inside arrays, return
-[`DecodeError::VariantType`]. Invalid array dimensions return
-[`DecodeError::Dimensions`]. Nested fields may also return [`DecodeError::Length`],
-[`DecodeError::Utf8`], [`DecodeError::NodeIdForm`], [`DecodeError::ControlChar`],
-[`DecodeError::Mask`], [`DecodeError::Depth`] or [`DecodeError::TooManyValues`] for
+[`Error::VariantType`]. Invalid array dimensions return
+[`Error::Dimensions`]. Nested fields may also return [`Error::Length`],
+[`Error::Utf8`], [`Error::NodeIdForm`], [`Error::ControlChar`],
+[`Error::Mask`], [`Error::Depth`] or [`Error::TooManyValues`] for
 invalid encodings or limits. Use [`Reader`] for reserved types.",
-        "Returns [`EncodeError::TooLong`] for excess field or total sizes,
-[`EncodeError::TooDeep`] for nesting above [`MAX_DEPTH`], and
-[`EncodeError::TooManyValues`] above [`MAX_VALUES`]. Returns
-[`EncodeError::VariantType`] for reserved types, mismatched array elements, scalar
+        "Returns [`Error::TooLong`] for excess field or total sizes,
+[`Error::Depth`] for nesting above [`MAX_DEPTH`], and
+[`Error::TooManyValues`] above [`MAX_VALUES`]. Returns
+[`Error::VariantValue`] for reserved types, mismatched array elements, scalar
 Variants, DiagnosticInfo or a DataValue inside another DataValue. Invalid dimensions
-return [`EncodeError::Dimensions`]. Control characters in names return
-[`EncodeError::ControlChar`]. Noncanonical dates or namespaces, empty namespace URIs or
-picoseconds above [`MAX_PICOSECONDS`] return [`EncodeError::Unwritable`]. NaNs are
+return [`Error::Dimensions`]. Control characters in names return
+[`Error::ControlChar`]. Noncanonical dates or namespaces, empty namespace URIs or
+picoseconds above [`MAX_PICOSECONDS`] return [`Error::Unwritable`]. NaNs are
 written in canonical form."
     ),
     DataValue => (
-        "Unknown mask bits return [`DecodeError::Mask`]. Invalid or reserved type IDs, including
-reserved types inside arrays, return [`DecodeError::VariantType`]. Invalid array
-dimensions return [`DecodeError::Dimensions`]. Nested fields may also return
-[`DecodeError::Length`], [`DecodeError::Utf8`], [`DecodeError::NodeIdForm`],
-[`DecodeError::ControlChar`], [`DecodeError::Mask`], [`DecodeError::Depth`] or
-[`DecodeError::TooManyValues`] for invalid encodings or limits. Use [`Reader`] for
+        "Unknown mask bits return [`Error::Mask`]. Invalid or reserved type IDs, including
+reserved types inside arrays, return [`Error::VariantType`]. Invalid array
+dimensions return [`Error::Dimensions`]. Nested fields may also return
+[`Error::Length`], [`Error::Utf8`], [`Error::NodeIdForm`],
+[`Error::ControlChar`], [`Error::Mask`], [`Error::Depth`] or
+[`Error::TooManyValues`] for invalid encodings or limits. Use [`Reader`] for
 reserved types.",
-        "Returns [`EncodeError::TooLong`] for excess field or total sizes,
-[`EncodeError::TooDeep`] for nesting above [`MAX_DEPTH`], and
-[`EncodeError::TooManyValues`] above [`MAX_VALUES`]. Returns
-[`EncodeError::VariantType`] for reserved types, mismatched array elements, scalar
+        "Returns [`Error::TooLong`] for excess field or total sizes,
+[`Error::Depth`] for nesting above [`MAX_DEPTH`], and
+[`Error::TooManyValues`] above [`MAX_VALUES`]. Returns
+[`Error::VariantValue`] for reserved types, mismatched array elements, scalar
 Variants, DiagnosticInfo or a DataValue inside another DataValue. Invalid dimensions
-return [`EncodeError::Dimensions`]. Control characters in names return
-[`EncodeError::ControlChar`]. Noncanonical dates or namespaces, empty namespace URIs or
-picoseconds above [`MAX_PICOSECONDS`] return [`EncodeError::Unwritable`]. NaNs are
+return [`Error::Dimensions`]. Control characters in names return
+[`Error::ControlChar`]. Noncanonical dates or namespaces, empty namespace URIs or
+picoseconds above [`MAX_PICOSECONDS`] return [`Error::Unwritable`]. NaNs are
 written in canonical form."
     ),
     RequestHeader => (
-        "Invalid nested fields return [`DecodeError::Length`], [`DecodeError::Utf8`],
-[`DecodeError::NodeIdForm`], [`DecodeError::ControlChar`] or [`DecodeError::Mask`].",
-        "Returns [`EncodeError::TooLong`] for excess field or total sizes,
-[`EncodeError::ControlChar`] for control characters in names, and
-[`EncodeError::Unwritable`] for noncanonical timestamps."
+        "Invalid nested fields return [`Error::Length`], [`Error::Utf8`],
+[`Error::NodeIdForm`], [`Error::ControlChar`] or [`Error::Mask`].",
+        "Returns [`Error::TooLong`] for excess field or total sizes,
+[`Error::ControlChar`] for control characters in names, and
+[`Error::Unwritable`] for noncanonical timestamps."
     ),
     ResponseHeader => (
-        "Invalid nested fields return [`DecodeError::Length`], [`DecodeError::Utf8`],
-[`DecodeError::NodeIdForm`], [`DecodeError::ControlChar`] or [`DecodeError::Mask`].
-Excess diagnostic nesting or array value counts return [`DecodeError::Depth`] or
-[`DecodeError::TooManyValues`].",
-        "Returns [`EncodeError::TooLong`] for excess field or total sizes,
-[`EncodeError::ControlChar`] for control characters in names, and
-[`EncodeError::Unwritable`] for noncanonical timestamps. Excess diagnostic nesting or
-array value counts return [`EncodeError::TooDeep`] or [`EncodeError::TooManyValues`]."
+        "Invalid nested fields return [`Error::Length`], [`Error::Utf8`],
+[`Error::NodeIdForm`], [`Error::ControlChar`] or [`Error::Mask`].
+Excess diagnostic nesting or array value counts return [`Error::Depth`] or
+[`Error::TooManyValues`].",
+        "Returns [`Error::TooLong`] for excess field or total sizes,
+[`Error::ControlChar`] for control characters in names, and
+[`Error::Unwritable`] for noncanonical timestamps. Excess diagnostic nesting or
+array value counts return [`Error::Depth`] or [`Error::TooManyValues`]."
     ),
     RequestType => (
-        "An integer other than zero or one returns [`DecodeError::Enum`].",
+        "An integer other than zero or one returns [`Error::Enum`].",
         "Both request types are writable; this method never returns an error."
     ),
     SecurityMode => (
-        "An integer outside zero through three returns [`DecodeError::Enum`].",
+        "An integer outside zero through three returns [`Error::Enum`].",
         "All four modes are writable, including Invalid; this method never returns an error."
     ),
     OpenSecureChannelRequest => (
-        "Invalid nested fields return [`DecodeError::Length`], [`DecodeError::Utf8`],
-[`DecodeError::NodeIdForm`], [`DecodeError::ControlChar`] or [`DecodeError::Mask`].
-Unknown request types or security modes return [`DecodeError::Enum`]. Invalid nonce
-lengths return [`DecodeError::Length`].",
-        "Returns [`EncodeError::TooLong`] for excess field or total sizes,
-[`EncodeError::ControlChar`] for control characters in names, and
-[`EncodeError::Unwritable`] for noncanonical timestamps."
+        "Invalid nested fields return [`Error::Length`], [`Error::Utf8`],
+[`Error::NodeIdForm`], [`Error::ControlChar`] or [`Error::Mask`].
+Unknown request types or security modes return [`Error::Enum`]. Invalid nonce
+lengths return [`Error::Length`].",
+        "Returns [`Error::TooLong`] for excess field or total sizes,
+[`Error::ControlChar`] for control characters in names, and
+[`Error::Unwritable`] for noncanonical timestamps."
     ),
     ChannelSecurityToken => (
         "All fields are accepted; the creation time is clamped as in [`Reader::date_time`].",
-        "Returns [`EncodeError::Unwritable`] if the creation time is negative or is at least
+        "Returns [`Error::Unwritable`] if the creation time is negative or is at least
 [`MAX_DATE_TIME`] without being `i64::MAX`."
     ),
     OpenSecureChannelResponse => (
-        "Invalid nested fields return [`DecodeError::Length`], [`DecodeError::Utf8`],
-[`DecodeError::NodeIdForm`], [`DecodeError::ControlChar`] or [`DecodeError::Mask`].
-Excess diagnostic nesting or array value counts return [`DecodeError::Depth`] or
-[`DecodeError::TooManyValues`]. Invalid nonce lengths return [`DecodeError::Length`].",
-        "Returns [`EncodeError::TooLong`] for excess field or total sizes,
-[`EncodeError::ControlChar`] for control characters in names, and
-[`EncodeError::Unwritable`] for noncanonical timestamps. Excess diagnostic nesting or
-array value counts return [`EncodeError::TooDeep`] or [`EncodeError::TooManyValues`]."
+        "Invalid nested fields return [`Error::Length`], [`Error::Utf8`],
+[`Error::NodeIdForm`], [`Error::ControlChar`] or [`Error::Mask`].
+Excess diagnostic nesting or array value counts return [`Error::Depth`] or
+[`Error::TooManyValues`]. Invalid nonce lengths return [`Error::Length`].",
+        "Returns [`Error::TooLong`] for excess field or total sizes,
+[`Error::ControlChar`] for control characters in names, and
+[`Error::Unwritable`] for noncanonical timestamps. Excess diagnostic nesting or
+array value counts return [`Error::Depth`] or [`Error::TooManyValues`]."
     )
 );
 
 impl Wire for Service {
-    type ParseError = DecodeError;
-    type WriteError = EncodeError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads a message body. A known service must fill the body exactly.
-    /// Returns [`DecodeError::Length`] above [`MAX_MESSAGE_SIZE`] or for
-    /// invalid field lengths, [`DecodeError::End`] for short fields, and
-    /// [`DecodeError::Trailing`] after a known service. Nested fields can return
-    /// [`DecodeError::Utf8`], [`DecodeError::NodeIdForm`], [`DecodeError::ControlChar`],
-    /// [`DecodeError::Mask`], [`DecodeError::Enum`], [`DecodeError::Depth`] or
-    /// [`DecodeError::TooManyValues`] for their invalid encodings or limits.
-    fn parse(body: &[u8]) -> Result<Service, DecodeError> {
+    /// Returns [`Error::Length`] above [`MAX_MESSAGE_SIZE`] or for
+    /// invalid field lengths, [`Error::End`] for short fields, and
+    /// [`Error::Trailing`] after a known service. Nested fields can return
+    /// [`Error::Utf8`], [`Error::NodeIdForm`], [`Error::ControlChar`],
+    /// [`Error::Mask`], [`Error::Enum`], [`Error::Depth`] or
+    /// [`Error::TooManyValues`] for their invalid encodings or limits.
+    fn parse(body: &[u8]) -> Result<Service, Error> {
         if body.len() > MAX_MESSAGE_SIZE as usize {
-            return Err(DecodeError::Length(
+            return Err(Error::Length(
                 i32::try_from(body.len()).unwrap_or(i32::MAX),
             ));
         }
@@ -3609,12 +3533,12 @@ impl Wire for Service {
     }
 
     /// Writes the encoding NodeId and service fields. Returns
-    /// [`EncodeError::Unwritable`] for `Other` with a known service ID or a
-    /// noncanonical timestamp. Returns [`EncodeError::TooLong`] for excess
-    /// field or message sizes, [`EncodeError::TooDeep`] or
-    /// [`EncodeError::TooManyValues`] for nested diagnostics, and
-    /// [`EncodeError::ControlChar`] for control characters in names.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+    /// [`Error::Unwritable`] for `Other` with a known service ID or a
+    /// noncanonical timestamp. Returns [`Error::TooLong`] for excess
+    /// field or message sizes, [`Error::Depth`] or
+    /// [`Error::TooManyValues`] for nested diagnostics, and
+    /// [`Error::ControlChar`] for control characters in names.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         let mut w = Writer::new();
         self.type_id().encode(&mut w)?;
         match self {
@@ -3633,7 +3557,7 @@ impl Wire for Service {
                     encoding_id::CLOSE_SECURE_CHANNEL_RESPONSE,
                 ];
                 if type_id.ns0().is_some_and(|id| known.contains(&id)) {
-                    return Err(EncodeError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 w.bytes(body);
             }
@@ -3700,7 +3624,7 @@ mod tests {
     }
 
     // Drain staged chunks without marking EOF; later pushes remain valid.
-    fn drain(d: &mut Stream<Messages>) -> Vec<Result<Message, Fail<ChunkError>>> {
+    fn drain(d: &mut Stream<Messages>) -> Vec<Result<Message, Fail<Error>>> {
         std::iter::from_fn(|| d.next()).collect()
     }
 
@@ -3723,15 +3647,15 @@ mod tests {
         assert_eq!(r.string(), Ok(Some(String::new())));
         assert_eq!(
             Reader::new(&[0xfe, 0xff, 0xff, 0xff]).string(),
-            Err(DecodeError::Length(-2))
+            Err(Error::Length(-2))
         );
         assert_eq!(
             Reader::new(&[5, 0, 0, 0, b'a']).string(),
-            Err(DecodeError::Length(5))
+            Err(Error::Length(5))
         );
         assert_eq!(
             Reader::new(&[1, 0, 0, 0, 0xff]).string(),
-            Err(DecodeError::Utf8)
+            Err(Error::Utf8)
         );
     }
 
@@ -3806,17 +3730,17 @@ mod tests {
         // Bad forms.
         assert_eq!(
             <NodeId as Wire>::parse(&[0x06, 0]),
-            Err(DecodeError::NodeIdForm(6))
+            Err(Error::NodeIdForm(6))
         );
         assert_eq!(
             <NodeId as Wire>::parse(&[0x80, 0]),
-            Err(DecodeError::NodeIdForm(0x80))
+            Err(Error::NodeIdForm(0x80))
         );
         assert_eq!(
             <NodeId as Wire>::parse(&[0x00, 1, 2]),
-            Err(DecodeError::Trailing(1))
+            Err(Error::Trailing(1))
         );
-        assert_eq!(<NodeId as Wire>::parse(&[0x01, 1]), Err(DecodeError::End));
+        assert_eq!(<NodeId as Wire>::parse(&[0x01, 1]), Err(Error::End));
         assert!(NodeId::default().is_null());
     }
 
@@ -3842,7 +3766,7 @@ mod tests {
         );
         assert_eq!(
             <ExpandedNodeId as Wire>::parse(&[0x87, 85]),
-            Err(DecodeError::NodeIdForm(0x87))
+            Err(Error::NodeIdForm(0x87))
         );
     }
 
@@ -3875,7 +3799,7 @@ mod tests {
         assert_eq!(Wire::to_bytes(&LocalizedText::default()).unwrap(), [0]);
         assert_eq!(
             <LocalizedText as Wire>::parse(&[4]),
-            Err(DecodeError::Mask(4))
+            Err(Error::Mask(4))
         );
     }
 
@@ -3902,7 +3826,7 @@ mod tests {
         );
         assert_eq!(
             <ExtensionObject as Wire>::parse(&[0, 0, 3]),
-            Err(DecodeError::Mask(3))
+            Err(Error::Mask(3))
         );
     }
 
@@ -3990,10 +3914,10 @@ mod tests {
                 assert_eq!(value, expected);
                 assert_eq!(
                     <Variant as Wire>::parse(&bytes),
-                    Err(DecodeError::VariantType(type_id))
+                    Err(Error::VariantType(type_id))
                 );
                 let mut out = vec![0xa5];
-                assert_eq!(value.write(&mut out), Err(EncodeError::VariantType));
+                assert_eq!(value.write(&mut out), Err(Error::VariantValue));
                 assert_eq!(out, [0xa5]);
                 check_reader::<Variant>(&bytes);
 
@@ -4005,9 +3929,9 @@ mod tests {
                 assert_eq!(value.value, Some(expected));
                 assert_eq!(
                     <DataValue as Wire>::parse(&data_value_bytes),
-                    Err(DecodeError::VariantType(type_id))
+                    Err(Error::VariantType(type_id))
                 );
-                assert_eq!(value.write(&mut out), Err(EncodeError::VariantType));
+                assert_eq!(value.write(&mut out), Err(Error::VariantValue));
                 assert_eq!(out, [0xa5]);
                 check_reader::<DataValue>(&data_value_bytes);
             }
@@ -4018,19 +3942,19 @@ mod tests {
     fn variant_errors() {
         assert_eq!(
             <Variant as Wire>::parse(&[32]),
-            Err(DecodeError::VariantType(32))
+            Err(Error::VariantType(32))
         );
         assert_eq!(
             <Variant as Wire>::parse(&[0x80]),
-            Err(DecodeError::VariantType(0))
+            Err(Error::VariantType(0))
         );
         assert_eq!(
             <Variant as Wire>::parse(&[24, 0]),
-            Err(DecodeError::VariantType(24))
+            Err(Error::VariantType(24))
         );
         assert_eq!(
             <Variant as Wire>::parse(&[0x46, 0, 0, 0, 0]),
-            Err(DecodeError::Dimensions)
+            Err(Error::Dimensions)
         );
         // Dimensions that do not multiply out, a zero dimension, none, or too many.
         let base = [0xc3u8, 2, 0, 0, 0, 1, 2];
@@ -4042,51 +3966,51 @@ mod tests {
             }
             assert_eq!(
                 <Variant as Wire>::parse(&b),
-                Err(DecodeError::Dimensions),
+                Err(Error::Dimensions),
                 "{dims:?}"
             );
         }
         // An array length past the bytes left.
         assert_eq!(
             <Variant as Wire>::parse(&[0x83, 9, 0, 0, 0, 1]),
-            Err(DecodeError::Length(9))
+            Err(Error::Length(9))
         );
         assert_eq!(
             <Variant as Wire>::parse(&[0x83, 0xfe, 0xff, 0xff, 0xff]),
-            Err(DecodeError::Length(-2))
+            Err(Error::Length(-2))
         );
         // Writers refuse what readers refuse.
         let nested = Variant::Scalar(Value::Variant(Box::new(Variant::Null)));
-        assert_eq!(Wire::to_bytes(&nested), Err(EncodeError::VariantType));
+        assert_eq!(Wire::to_bytes(&nested), Err(Error::VariantValue));
         let mixed = Variant::Array {
             type_id: 3,
             values: vec![Value::Byte(1), Value::SByte(1)],
             dimensions: None,
         };
-        assert_eq!(Wire::to_bytes(&mixed), Err(EncodeError::VariantType));
+        assert_eq!(Wire::to_bytes(&mixed), Err(Error::VariantValue));
         let null = Variant::Array {
             type_id: 0,
             values: vec![],
             dimensions: None,
         };
-        assert_eq!(Wire::to_bytes(&null), Err(EncodeError::VariantType));
+        assert_eq!(Wire::to_bytes(&null), Err(Error::VariantValue));
         let dims = Variant::Array {
             type_id: 3,
             values: vec![Value::Byte(1)],
             dimensions: Some(vec![2]),
         };
-        assert_eq!(Wire::to_bytes(&dims), Err(EncodeError::Dimensions));
+        assert_eq!(Wire::to_bytes(&dims), Err(Error::Dimensions));
         let reserved = Variant::Scalar(Value::Reserved {
             type_id: 5,
             bytes: None,
         });
-        assert_eq!(Wire::to_bytes(&reserved), Err(EncodeError::VariantType));
+        assert_eq!(Wire::to_bytes(&reserved), Err(Error::VariantValue));
         let long = Variant::Array {
             type_id: 3,
             values: vec![Value::Byte(0); MAX_ARRAY_LEN + 1],
             dimensions: None,
         };
-        assert_eq!(Wire::to_bytes(&long), Err(EncodeError::TooLong));
+        assert_eq!(Wire::to_bytes(&long), Err(Error::TooLong));
     }
 
     /// `levels` Variants, each an array holding the next, around an Int32.
@@ -4108,7 +4032,7 @@ mod tests {
         assert_eq!(<Variant as Wire>::parse(&bytes), Ok(nest(MAX_DEPTH)));
         assert_eq!(
             Wire::to_bytes(&nest(MAX_DEPTH + 1)),
-            Err(EncodeError::TooDeep)
+            Err(Error::Depth)
         );
         // One level more, written by hand, does not read.
         let mut deep = Vec::new();
@@ -4116,12 +4040,12 @@ mod tests {
             deep.extend_from_slice(&[0x98, 1, 0, 0, 0]);
         }
         deep.extend_from_slice(&[6, 1, 0, 0, 0]);
-        assert_eq!(<Variant as Wire>::parse(&deep), Err(DecodeError::Depth));
+        assert_eq!(<Variant as Wire>::parse(&deep), Err(Error::Depth));
         let mut diag = vec![0x40u8; MAX_DEPTH];
         diag.push(0);
         assert_eq!(
             <DiagnosticInfo as Wire>::parse(&diag),
-            Err(DecodeError::Depth)
+            Err(Error::Depth)
         );
         assert!(<DiagnosticInfo as Wire>::parse(&diag[1..]).is_ok());
         // A failed read leaves the reader's depth where it was.
@@ -4150,7 +4074,7 @@ mod tests {
         assert_eq!(Wire::to_bytes(&DataValue::default()).unwrap(), [0]);
         assert_eq!(
             <DataValue as Wire>::parse(&[0x40]),
-            Err(DecodeError::Mask(0x40))
+            Err(Error::Mask(0x40))
         );
     }
 
@@ -4177,7 +4101,7 @@ mod tests {
         assert_eq!(<DiagnosticInfo as Wire>::parse(&bytes), Ok(d));
         assert_eq!(
             <DiagnosticInfo as Wire>::parse(&[0x80]),
-            Err(DecodeError::Mask(0x80))
+            Err(Error::Mask(0x80))
         );
     }
 
@@ -4233,7 +4157,7 @@ mod tests {
         assert_eq!(d.push(input), input.len());
         assert_eq!(
             d.next(),
-            Some(Err(Fail::Protocol(ChunkError::BufferSize(1024))))
+            Some(Err(Fail::Protocol(Error::BufferSize(1024))))
         );
         let Some(Fail::Protocol(error)) = d.failed() else {
             panic!("expected protocol error")
@@ -4247,7 +4171,7 @@ mod tests {
             Message::Hello(low)
                 .chunks(&Limits::default())
                 .map(wire_chunks),
-            Err(EncodeError::BufferSize(100))
+            Err(Error::BufferSize(100))
         );
         let low = Acknowledge {
             send_buffer_size: 100,
@@ -4257,7 +4181,7 @@ mod tests {
             Message::Acknowledge(low)
                 .chunks(&Limits::default())
                 .map(wire_chunks),
-            Err(EncodeError::BufferSize(100))
+            Err(Error::BufferSize(100))
         );
         let mut c = Stream::new(Messages::new());
         let mut low_ack = ack_bytes.clone();
@@ -4265,7 +4189,7 @@ mod tests {
         assert_eq!(c.push(&low_ack), low_ack.len());
         assert_eq!(
             c.next(),
-            Some(Err(Fail::Protocol(ChunkError::BufferSize(10))))
+            Some(Err(Fail::Protocol(Error::BufferSize(10))))
         );
         // A URL past the limit.
         let long = Hello {
@@ -4276,7 +4200,7 @@ mod tests {
             Message::Hello(long)
                 .chunks(&Limits::default())
                 .map(wire_chunks),
-            Err(EncodeError::TooLong)
+            Err(Error::TooLong)
         );
         let longest = Hello {
             endpoint_url: "a".repeat(MAX_URL_LEN),
@@ -4294,9 +4218,9 @@ mod tests {
         assert_eq!(d.push(&bad), bad.len());
         assert_eq!(
             d.next(),
-            Some(Err(Fail::Protocol(ChunkError::Decode(
+            Some(Err(Fail::Protocol(Error::Decode(
                 MessageType::Hello,
-                DecodeError::Length(MAX_URL_LEN as i32 + 1)
+                Box::new(Error::Length(MAX_URL_LEN as i32 + 1))
             ))))
         );
         // Bytes after the Hello's fields.
@@ -4307,9 +4231,9 @@ mod tests {
         assert_eq!(d.push(&trailing), trailing.len());
         assert_eq!(
             d.next(),
-            Some(Err(Fail::Protocol(ChunkError::Decode(
+            Some(Err(Fail::Protocol(Error::Decode(
                 MessageType::Hello,
-                DecodeError::Trailing(1)
+                Box::new(Error::Trailing(1))
             ))))
         );
     }
@@ -4345,7 +4269,7 @@ mod tests {
             Message::Error(long)
                 .chunks(&Limits::default())
                 .map(wire_chunks),
-            Err(EncodeError::TooLong)
+            Err(Error::TooLong)
         );
         // An ERR missing its reason.
         let mut d = Stream::new(Messages::new());
@@ -4353,9 +4277,9 @@ mod tests {
         assert_eq!(d.push(input), input.len());
         assert_eq!(
             d.next(),
-            Some(Err(Fail::Protocol(ChunkError::Decode(
+            Some(Err(Fail::Protocol(Error::Decode(
                 MessageType::Error,
-                DecodeError::End
+                Box::new(Error::End)
             ))))
         );
     }
@@ -4365,37 +4289,37 @@ mod tests {
         let l = Limits::default();
         assert_eq!(
             Chunk::parse_prefix(b"GET", &l),
-            Err(ChunkError::MessageType(*b"GET"))
+            Err(Error::MessageType(*b"GET"))
         );
         assert_eq!(Chunk::parse_prefix(b"HE", &l), Ok(None));
         // The fourth byte of a HEL, ACK, ERR or RHE is reserved and ignored.
         assert_eq!(Chunk::parse_prefix(b"HELC", &l), Ok(None));
         assert_eq!(
             Chunk::parse_prefix(b"OPNC", &l),
-            Err(ChunkError::ChunkType(MessageType::Open, b'C'))
+            Err(Error::ChunkType(MessageType::Open, b'C'))
         );
         assert_eq!(
             Chunk::parse_prefix(b"CLOA", &l),
-            Err(ChunkError::ChunkType(MessageType::Close, b'A'))
+            Err(Error::ChunkType(MessageType::Close, b'A'))
         );
         assert_eq!(
             Chunk::parse_prefix(b"MSGX", &l),
-            Err(ChunkError::ChunkType(MessageType::Message, b'X'))
+            Err(Error::ChunkType(MessageType::Message, b'X'))
         );
         assert_eq!(
             Chunk::parse_prefix(b"MSGC\x07\0\0\0", &l),
-            Err(ChunkError::TooSmall(7))
+            Err(Error::TooSmall(7))
         );
         assert_eq!(
             Chunk::parse_prefix(b"MSGF\x01\x20\0\0", &l),
-            Err(ChunkError::TooLarge {
+            Err(Error::TooLarge {
                 size: 8193,
                 limit: MIN_BUFFER_SIZE
             })
         );
         assert_eq!(
             Chunk::parse_prefix(b"HELF\xff\xff\0\0", &l),
-            Err(ChunkError::TooLarge {
+            Err(Error::TooLarge {
                 size: 65535,
                 limit: MAX_HANDSHAKE_SIZE
             })
@@ -4413,7 +4337,7 @@ mod tests {
                     ..l
                 }
             ),
-            Err(ChunkError::TooLarge {
+            Err(Error::TooLarge {
                 size: 1 << 28,
                 limit: MAX_BUFFER_SIZE
             })
@@ -4424,11 +4348,11 @@ mod tests {
             (MessageType::Message, ChunkType::Final, 0, 8)
         );
         assert_eq!(
-            ChunkError::MessageType(*b"GET").status(),
+            Error::MessageType(*b"GET").status(),
             StatusCode::BAD_TCP_MESSAGE_TYPE_INVALID
         );
         assert_eq!(
-            ChunkError::TooLarge { size: 0, limit: 0 }.status(),
+            Error::TooLarge { size: 0, limit: 0 }.status(),
             StatusCode::BAD_TCP_MESSAGE_TOO_LARGE
         );
     }
@@ -4500,14 +4424,14 @@ mod tests {
         let mut bad = open_request().to_bytes().unwrap();
         let at = bad.len() - 4 - 4 - 4 - 4;
         bad[at..at + 4].copy_from_slice(&le32(2));
-        assert_eq!(Service::parse(&bad), Err(DecodeError::Enum(2)));
+        assert_eq!(Service::parse(&bad), Err(Error::Enum(2)));
         let mut bad = open_request().to_bytes().unwrap();
         let at = bad.len() - 4 - 4 - 4;
         bad[at..at + 4].copy_from_slice(&le32(4));
-        assert_eq!(Service::parse(&bad), Err(DecodeError::Enum(4)));
+        assert_eq!(Service::parse(&bad), Err(Error::Enum(4)));
         let mut trailing = open_request().to_bytes().unwrap();
         trailing.push(0);
-        assert_eq!(Service::parse(&trailing), Err(DecodeError::Trailing(1)));
+        assert_eq!(Service::parse(&trailing), Err(Error::Trailing(1)));
     }
 
     #[test]
@@ -4530,8 +4454,8 @@ mod tests {
             type_id: NodeId::numeric(0, 446),
             body: vec![],
         };
-        assert_eq!(fake.to_bytes(), Err(EncodeError::Unwritable));
-        assert_eq!(Service::parse(&[]), Err(DecodeError::End));
+        assert_eq!(fake.to_bytes(), Err(Error::Unwritable));
+        assert_eq!(Service::parse(&[]), Err(Error::End));
     }
 
     #[test]
@@ -4560,7 +4484,7 @@ mod tests {
         });
         assert_eq!(
             big.chunks(&Limits::default()).map(wire_chunks),
-            Err(EncodeError::TooLong)
+            Err(Error::TooLong)
         );
         let opn = Message::Secure(SecureMessage {
             kind: SecureKind::Open(AsymmetricHeader {
@@ -4574,7 +4498,7 @@ mod tests {
         });
         assert_eq!(
             opn.chunks(&Limits::default()).map(wire_chunks),
-            Err(EncodeError::TooLong)
+            Err(Error::TooLong)
         );
     }
 
@@ -4659,28 +4583,28 @@ mod tests {
         assert_eq!(d.push(input), input.len());
         assert_eq!(
             d.next(),
-            Some(Err(Fail::Protocol(ChunkError::Decode(
+            Some(Err(Fail::Protocol(Error::Decode(
                 MessageType::Message,
-                DecodeError::End
+                Box::new(Error::End)
             ))))
         );
     }
 
     #[test]
     fn stream_errors() {
-        let cases: Vec<(Vec<Vec<u8>>, Limits, ChunkError)> = vec![
+        let cases: Vec<(Vec<Vec<u8>>, Limits, Error)> = vec![
             (
                 vec![
                     msg_chunk(b'C', 7, 1, 1, 5, b""),
                     msg_chunk(b'F', 7, 1, 2, 6, b""),
                 ],
                 Limits::default(),
-                ChunkError::Interleaved,
+                Error::Interleaved,
             ),
             (
                 vec![msg_chunk(b'C', 7, 1, 1, 5, b""), hel_bytes(8192, 8192, b"")],
                 Limits::default(),
-                ChunkError::Interleaved,
+                Error::Interleaved,
             ),
             (
                 vec![
@@ -4688,7 +4612,7 @@ mod tests {
                     msg_chunk(b'F', 8, 1, 2, 5, b""),
                 ],
                 Limits::default(),
-                ChunkError::Mismatch,
+                Error::Mismatch,
             ),
             (
                 vec![
@@ -4696,7 +4620,7 @@ mod tests {
                     msg_chunk(b'F', 7, 2, 2, 5, b""),
                 ],
                 Limits::default(),
-                ChunkError::Mismatch,
+                Error::Mismatch,
             ),
             (
                 vec![
@@ -4704,7 +4628,7 @@ mod tests {
                     msg_chunk(b'F', 7, 1, 3, 5, b""),
                 ],
                 Limits::default(),
-                ChunkError::Sequence {
+                Error::Sequence {
                     expected: 2,
                     got: 3,
                 },
@@ -4718,7 +4642,7 @@ mod tests {
                     max_chunk_count: 1,
                     ..Limits::default()
                 },
-                ChunkError::TooManyChunks(1),
+                Error::TooManyChunks(1),
             ),
             (
                 vec![
@@ -4729,12 +4653,12 @@ mod tests {
                     max_message_size: 5,
                     ..Limits::default()
                 },
-                ChunkError::MessageTooLarge(5),
+                Error::MessageTooLarge(5),
             ),
             (
                 vec![b"MSGF\x0c\0\0\0\0\0\0\0".to_vec()],
                 Limits::default(),
-                ChunkError::Decode(MessageType::Message, DecodeError::End),
+                Error::Decode(MessageType::Message, Box::new(Error::End)),
             ),
         ];
         for (chunks, limits, want) in cases {
@@ -4769,14 +4693,14 @@ mod tests {
         };
         assert_eq!(
             opn.chunks(&small).map(wire_chunks),
-            Err(EncodeError::TooLong)
+            Err(Error::TooLong)
         );
         let mut d = Stream::new(Messages::with_limits(small));
         let input = &opn.chunks(&Limits::default()).map(wire_chunks).unwrap();
         assert_eq!(d.push(input), input.len());
         assert_eq!(
             d.next(),
-            Some(Err(Fail::Protocol(ChunkError::MessageTooLarge(5))))
+            Some(Err(Fail::Protocol(Error::MessageTooLarge(5))))
         );
     }
 
@@ -4789,12 +4713,12 @@ mod tests {
         };
         assert_eq!(
             msg(1, 0, 0, vec![0; 20_001]).chunks(&peer).map(wire_chunks),
-            Err(EncodeError::TooLong)
+            Err(Error::TooLong)
         );
         // 20000 bytes need 3 chunks of 8192.
         assert_eq!(
             msg(1, 0, 0, vec![0; 20_000]).chunks(&peer).map(wire_chunks),
-            Err(EncodeError::TooLong)
+            Err(Error::TooLong)
         );
         let ok = msg(1, 0, 0, vec![0; 16_000]);
         let bytes = ok.chunks(&peer).map(wire_chunks).unwrap();
@@ -4817,8 +4741,8 @@ mod tests {
         };
         assert_eq!(tiny.chunk_limit(), MIN_BUFFER_SIZE);
         let mut w = Writer::new();
-        assert_eq!(w.array_len(MAX_ARRAY_LEN + 1), Err(EncodeError::TooLong));
-        assert_eq!(w.string_max(Some("abc"), 2), Err(EncodeError::TooLong));
+        assert_eq!(w.array_len(MAX_ARRAY_LEN + 1), Err(Error::TooLong));
+        assert_eq!(w.string_max(Some("abc"), 2), Err(Error::TooLong));
     }
 
     #[test]
@@ -4859,7 +4783,7 @@ mod tests {
         assert_eq!(d.push(input), input.len());
         assert_eq!(
             d.next(),
-            Some(Err(Fail::Protocol(ChunkError::Sequence {
+            Some(Err(Fail::Protocol(Error::Sequence {
                 expected: LEGACY_WRAP + 1,
                 got: 2
             })))
@@ -4880,7 +4804,7 @@ mod tests {
         assert_eq!(d.push(input), input.len());
         assert!(matches!(
             d.next(),
-            Some(Err(Fail::Protocol(ChunkError::Sequence { .. })))
+            Some(Err(Fail::Protocol(Error::Sequence { .. })))
         ));
     }
 
@@ -4937,7 +4861,7 @@ mod tests {
         };
         assert_eq!(
             e,
-            ChunkError::Decode(MessageType::Hello, DecodeError::Length(4096))
+            Error::Decode(MessageType::Hello, Box::new(Error::Length(4096)))
         );
         assert_eq!(e.status(), StatusCode::BAD_TCP_ENDPOINT_URL_INVALID);
         let rh = ReverseHello {
@@ -4948,7 +4872,7 @@ mod tests {
             Message::ReverseHello(rh)
                 .chunks(&Limits::default())
                 .map(wire_chunks),
-            Err(EncodeError::TooLong)
+            Err(Error::TooLong)
         );
     }
 
@@ -4960,11 +4884,11 @@ mod tests {
             values: vec![Value::Byte(1), Value::Byte(2)],
             dimensions: Some(vec![2]),
         };
-        assert_eq!(Wire::to_bytes(&one), Err(EncodeError::Dimensions));
+        assert_eq!(Wire::to_bytes(&one), Err(Error::Dimensions));
         let bytes = [0xc3u8, 2, 0, 0, 0, 1, 2, 1, 0, 0, 0, 2, 0, 0, 0];
         assert_eq!(
             <Variant as Wire>::parse(&bytes),
-            Err(DecodeError::Dimensions)
+            Err(Error::Dimensions)
         );
     }
 
@@ -4986,7 +4910,7 @@ mod tests {
         let n = MAX_VALUES / MAX_ARRAY_LEN;
         let fits = Wire::to_bytes(&outer(n - 1)).unwrap();
         assert!(<Variant as Wire>::parse(&fits).is_ok());
-        assert_eq!(Wire::to_bytes(&outer(n)), Err(EncodeError::TooManyValues));
+        assert_eq!(Wire::to_bytes(&outer(n)), Err(Error::TooManyValues));
         let mut bytes = vec![0x98];
         bytes.extend_from_slice(&le32(n as u32));
         for _ in 0..n {
@@ -4996,7 +4920,7 @@ mod tests {
         }
         assert_eq!(
             <Variant as Wire>::parse(&bytes),
-            Err(DecodeError::TooManyValues)
+            Err(Error::TooManyValues)
         );
     }
 
@@ -5015,7 +4939,7 @@ mod tests {
         }
         assert_eq!(
             Reader::new(&bytes).read_array::<DiagnosticInfo>(),
-            Err(DecodeError::TooManyValues)
+            Err(Error::TooManyValues)
         );
         // The writer stops at the same count as the reader.
         let mut deep = DiagnosticInfo::default();
@@ -5034,7 +4958,7 @@ mod tests {
         let most = MAX_VALUES / (1 + per);
         let ok = fill(most).unwrap();
         assert!(Reader::new(&ok).read_array::<DiagnosticInfo>().is_ok());
-        assert_eq!(fill(most + 1), Err(EncodeError::TooManyValues));
+        assert_eq!(fill(most + 1), Err(Error::TooManyValues));
         // A chain of Variant arrays counts each Variant and each element.
         let mut r = Reader::new(&[0x98, 1, 0, 0, 0, 0x98, 1, 0, 0, 0, 0]);
         assert!(r.read::<Variant>().is_ok());
@@ -5054,11 +4978,11 @@ mod tests {
             Variant::Scalar(Value::Int32(-2))
         );
         assert_eq!(
-            DecodeError::TooManyValues.to_string(),
+            Error::TooManyValues.to_string(),
             format!("more than {MAX_VALUES} values")
         );
         assert_eq!(
-            EncodeError::TooManyValues.to_string(),
+            Error::TooManyValues.to_string(),
             format!("more than {MAX_VALUES} values")
         );
     }
@@ -5208,7 +5132,7 @@ mod tests {
         // As values, prefixes end too soon.
         let req = open_request().to_bytes().unwrap();
         for n in 0..req.len() {
-            assert_eq!(Service::parse(&req[..n]), Err(DecodeError::End), "{n}");
+            assert_eq!(Service::parse(&req[..n]), Err(Error::End), "{n}");
         }
         let full = DataValue {
             value: Some(Variant::Scalar(Value::Int32(1))),
@@ -5222,7 +5146,7 @@ mod tests {
         for n in 0..dv.len() {
             assert_eq!(
                 <DataValue as Wire>::parse(&dv[..n]),
-                Err(DecodeError::End),
+                Err(Error::End),
                 "{n}"
             );
         }
@@ -5232,7 +5156,7 @@ mod tests {
             assert!(
                 matches!(
                     <Variant as Wire>::parse(&v[..n]),
-                    Err(DecodeError::End | DecodeError::Length(_))
+                    Err(Error::End | Error::Length(_))
                 ),
                 "{n}"
             );
@@ -5387,7 +5311,7 @@ mod tests {
             body: vec![0; MAX_MESSAGE_SIZE as usize],
         };
         let started = std::time::Instant::now();
-        assert_eq!(opn.chunks(&Limits::default()), Err(EncodeError::TooLong));
+        assert_eq!(opn.chunks(&Limits::default()), Err(Error::TooLong));
         assert!(
             started.elapsed().as_millis() < 500,
             "took {:?}",
@@ -5406,7 +5330,7 @@ mod tests {
             drain(&mut d),
             [
                 Ok(msg(1, 10, 1, b"a".to_vec())),
-                Err(Fail::Protocol(ChunkError::Sequence {
+                Err(Fail::Protocol(Error::Sequence {
                     expected: 11,
                     got: 10
                 }))
@@ -5445,7 +5369,7 @@ mod tests {
         assert_eq!(d.push(input), input.len());
         assert_eq!(
             drain(&mut d).last(),
-            Some(&Err(Fail::Protocol(ChunkError::Sequence {
+            Some(&Err(Fail::Protocol(Error::Sequence {
                 expected: 6,
                 got: 8
             })))
@@ -5497,7 +5421,7 @@ mod tests {
                     assert_eq!(d.next(), None);
                     assert!(d.failed().is_none());
                 } else {
-                    let error = Fail::Protocol(ChunkError::Incomplete);
+                    let error = Fail::Protocol(Error::Incomplete);
                     assert_eq!(d.next(), Some(Err(error.clone())));
                     assert_eq!(d.failed(), Some(&error));
                 }
@@ -5549,25 +5473,25 @@ mod tests {
         // Part 6, 5.1.9.
         assert_eq!(
             <Variant as Wire>::parse(&[0x19, 0]),
-            Err(DecodeError::VariantType(25))
+            Err(Error::VariantType(25))
         );
         assert_eq!(
             <Variant as Wire>::parse(&[0x99, 0, 0, 0, 0]),
-            Err(DecodeError::VariantType(25))
+            Err(Error::VariantType(25))
         );
         assert_eq!(
             <Variant as Wire>::parse(&[0x17, 0x01, 0x17, 0]),
-            Err(DecodeError::VariantType(23))
+            Err(Error::VariantType(23))
         );
         // Indirectly too: through an array of Variants.
         assert_eq!(
             <DataValue as Wire>::parse(&[0x01, 0x98, 1, 0, 0, 0, 0x17, 0]),
-            Err(DecodeError::VariantType(23))
+            Err(Error::VariantType(23))
         );
         // A DataValue in a Variant that is not inside one is fine.
         assert!(<Variant as Wire>::parse(&[0x17, 0x01, 0x06, 1, 0, 0, 0]).is_ok());
         let diag = Variant::Scalar(Value::DiagnosticInfo(Box::default()));
-        assert_eq!(Wire::to_bytes(&diag), Err(EncodeError::VariantType));
+        assert_eq!(Wire::to_bytes(&diag), Err(Error::VariantValue));
         let inner = DataValue {
             value: Some(Variant::Null),
             ..Default::default()
@@ -5582,7 +5506,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert_eq!(Wire::to_bytes(&outer), Err(EncodeError::VariantType));
+        assert_eq!(Wire::to_bytes(&outer), Err(Error::VariantValue));
         assert!(Wire::to_bytes(&Variant::Scalar(Value::DataValue(Box::new(inner)))).is_ok());
     }
 
@@ -5591,7 +5515,7 @@ mod tests {
         // Part 6, 5.2.2.16: type 32 does not exist, even for an empty array.
         assert_eq!(
             <Variant as Wire>::parse(&[0xa0, 0, 0, 0, 0]),
-            Err(DecodeError::VariantType(32))
+            Err(Error::VariantType(32))
         );
         // Encoders shall not use the reserved ids 26 to 31.
         assert_eq!(
@@ -5599,19 +5523,19 @@ mod tests {
                 type_id: 26,
                 bytes: None
             })),
-            Err(EncodeError::VariantType)
+            Err(Error::VariantValue)
         );
         let empty = Variant::Array {
             type_id: 27,
             values: vec![],
             dimensions: None,
         };
-        assert_eq!(Wire::to_bytes(&empty), Err(EncodeError::VariantType));
+        assert_eq!(Wire::to_bytes(&empty), Err(Error::VariantValue));
         // Binary readers accept reserved type ids.
         assert!(Reader::new(&[0x9b, 0, 0, 0, 0]).read::<Variant>().is_ok());
         assert_eq!(
             <Variant as Wire>::parse(&[0x9b, 0, 0, 0, 0]),
-            Err(DecodeError::VariantType(27))
+            Err(Error::VariantType(27))
         );
     }
 
@@ -5638,48 +5562,48 @@ mod tests {
         );
         assert_eq!(
             Wire::to_bytes(&NodeId::string(1, &"a".repeat(MAX_NODE_ID_LEN + 1))),
-            Err(EncodeError::TooLong)
+            Err(Error::TooLong)
         );
         let mut long = vec![0x03, 1, 0];
         long.extend_from_slice(&le32(MAX_NODE_ID_LEN as u32 + 1));
         long.extend_from_slice(&vec![b'a'; MAX_NODE_ID_LEN + 1]);
         assert_eq!(
             <NodeId as Wire>::parse(&long),
-            Err(DecodeError::Length(MAX_NODE_ID_LEN as i32 + 1))
+            Err(Error::Length(MAX_NODE_ID_LEN as i32 + 1))
         );
         long[0] = 0x05;
         assert_eq!(
             <NodeId as Wire>::parse(&long),
-            Err(DecodeError::Length(MAX_NODE_ID_LEN as i32 + 1))
+            Err(Error::Length(MAX_NODE_ID_LEN as i32 + 1))
         );
         let opaque = NodeId {
             namespace: 1,
             identifier: Identifier::Opaque(vec![0; MAX_NODE_ID_LEN + 1]),
         };
-        assert_eq!(Wire::to_bytes(&opaque), Err(EncodeError::TooLong));
+        assert_eq!(Wire::to_bytes(&opaque), Err(Error::TooLong));
         assert_eq!(
             Wire::to_bytes(&NodeId::string(1, "a\nb")),
-            Err(EncodeError::ControlChar)
+            Err(Error::ControlChar)
         );
         assert_eq!(
             Wire::to_bytes(&NodeId::string(1, "a\u{85}b")),
-            Err(EncodeError::ControlChar)
+            Err(Error::ControlChar)
         );
         assert_eq!(
             <NodeId as Wire>::parse(&[0x03, 1, 0, 3, 0, 0, 0, b'a', b'\n', b'b']),
-            Err(DecodeError::ControlChar)
+            Err(Error::ControlChar)
         );
         let q = QualifiedName {
             namespace: 0,
             name: "q".repeat(MAX_QUALIFIED_NAME_LEN + 1),
         };
-        assert_eq!(Wire::to_bytes(&q), Err(EncodeError::TooLong));
+        assert_eq!(Wire::to_bytes(&q), Err(Error::TooLong));
         let mut qb = vec![0, 0];
         qb.extend_from_slice(&le32(MAX_QUALIFIED_NAME_LEN as u32 + 1));
         qb.extend_from_slice(&vec![b'q'; MAX_QUALIFIED_NAME_LEN + 1]);
         assert_eq!(
             <QualifiedName as Wire>::parse(&qb),
-            Err(DecodeError::Length(MAX_QUALIFIED_NAME_LEN as i32 + 1))
+            Err(Error::Length(MAX_QUALIFIED_NAME_LEN as i32 + 1))
         );
         let ok = QualifiedName {
             namespace: 0,
@@ -5694,7 +5618,7 @@ mod tests {
                 namespace: 0,
                 name: "\t".into()
             }),
-            Err(EncodeError::ControlChar)
+            Err(Error::ControlChar)
         );
     }
 
@@ -5728,7 +5652,7 @@ mod tests {
             namespace_uri: Some("urn:x".into()),
             server_index: 0,
         };
-        assert_eq!(e.to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(e.to_bytes(), Err(Error::Unwritable));
         let e = ExpandedNodeId {
             node_id: NodeId::numeric(0, 42),
             ..e
@@ -5750,7 +5674,7 @@ mod tests {
             namespace_uri: Some(String::new()),
             server_index: 0,
         };
-        assert_eq!(empty.to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(empty.to_bytes(), Err(Error::Unwritable));
         assert_eq!(
             <ExpandedNodeId as Wire>::parse(&[0x80, 42, 0, 0, 0, 0])
                 .unwrap()
@@ -5774,7 +5698,7 @@ mod tests {
             server_picoseconds: Some(10_000),
             ..Default::default()
         };
-        assert_eq!(d.to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(d.to_bytes(), Err(Error::Unwritable));
         let d = DataValue {
             server_picoseconds: Some(MAX_PICOSECONDS),
             ..d
@@ -5812,7 +5736,7 @@ mod tests {
         ] {
             assert_eq!(
                 opn(h.clone()).chunks(&Limits::default()).map(wire_chunks),
-                Err(EncodeError::SecurityHeader)
+                Err(Error::SecurityHeader)
             );
             // The same header, written by hand, does not read.
             let good = opn(AsymmetricHeader {
@@ -5833,9 +5757,9 @@ mod tests {
             assert_eq!(d.push(&bytes), bytes.len());
             assert_eq!(
                 d.next(),
-                Some(Err(Fail::Protocol(ChunkError::Decode(
+                Some(Err(Fail::Protocol(Error::Decode(
                     MessageType::Open,
-                    DecodeError::Length(1)
+                    Box::new(Error::Length(1))
                 ))))
             );
         }
@@ -5902,11 +5826,11 @@ mod tests {
         // Part 6, 5.2.2.5.
         assert_eq!(
             Wire::to_bytes(&Variant::Scalar(Value::DateTime(-1))),
-            Err(EncodeError::Unwritable)
+            Err(Error::Unwritable)
         );
         assert_eq!(
             Wire::to_bytes(&Variant::Scalar(Value::DateTime(MAX_DATE_TIME))),
-            Err(EncodeError::Unwritable)
+            Err(Error::Unwritable)
         );
         assert_eq!(
             Wire::to_bytes(&Variant::Scalar(Value::DateTime(MAX_DATE_TIME - 1))).unwrap()[1..],
@@ -5927,11 +5851,11 @@ mod tests {
             timestamp: -9,
             ..Default::default()
         };
-        assert_eq!(Wire::to_bytes(&h), Err(EncodeError::Unwritable));
+        assert_eq!(Wire::to_bytes(&h), Err(Error::Unwritable));
     }
 
     /// Checks permissive reads, including reserved Variant types that cannot be written.
-    fn check_reader<T: Binary + Wire<WriteError = EncodeError> + PartialEq + core::fmt::Debug>(
+    fn check_reader<T: Binary + Wire<WriteError = Error> + PartialEq + core::fmt::Debug>(
         bytes: &[u8],
     ) {
         let mut reader = Reader::new(bytes);
@@ -5940,7 +5864,7 @@ mod tests {
         {
             match value.to_bytes() {
                 Ok(bytes) => assert_eq!(<T as Wire>::parse(&bytes).unwrap(), value),
-                Err(EncodeError::VariantType) => {}
+                Err(Error::VariantValue) => {}
                 Err(error) => panic!("{error}"),
             }
         }
