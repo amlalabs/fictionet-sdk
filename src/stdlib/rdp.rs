@@ -117,9 +117,9 @@ pub enum Error {
     /// A value would read back as a different value.
     Unwritable,
     /// The sibling TPKT parser rejected the header.
-    Tpkt(tpkt::TpktError),
+    Tpkt(tpkt::Error),
     /// The sibling COTP parser rejected the TPDU.
-    Cotp(cotp::TpduError),
+    Cotp(cotp::Error),
 }
 
 impl std::fmt::Display for Error {
@@ -135,7 +135,15 @@ impl std::fmt::Display for Error {
         }
     }
 }
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Tpkt(e) => Some(e),
+            Self::Cotp(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 fn check(ok: bool, field: &'static str) -> Result<(), Error> {
     if ok {
