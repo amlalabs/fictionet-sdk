@@ -4,5 +4,8 @@
 !src
 !docs
 !dashboard
+!benches
+!codegen
+!tests/copy_and_own
 !examples
 !tests/docker/proxy/goclient

@@ -4,6 +4,9 @@
 !src
 !docs
 !dashboard
+!benches
+!codegen
+!tests/copy_and_own
 !examples/*.rs
 !examples/fakewiki/world/Cargo.toml
 !examples/fakewiki/world/Cargo.lock

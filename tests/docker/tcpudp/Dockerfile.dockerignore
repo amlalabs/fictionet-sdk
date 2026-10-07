@@ -4,5 +4,8 @@
 !src
 !docs
 !dashboard
+!benches
+!codegen
+!tests/copy_and_own
 !tests/tun_linux.rs
 !examples
