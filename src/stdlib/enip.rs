@@ -24,7 +24,7 @@
 //! Every reader checks lengths and bounds, because the agent can send any
 //! bytes it likes. The encapsulation layer accepts any command code and
 //! any length, so [`Packet::parse_prefix`] only ever asks for more bytes and the
-//! stream never loses its place; the CIP readers return a [`Error`]
+//! stream never loses its place; the CIP readers return an [`Error`]
 //! when bytes do not form the structure they name. Every writer returns
 //! an [`Error`] instead of writing a value its reader would refuse
 //! or read back as something else, so nothing is cut short in silence.
@@ -1182,7 +1182,7 @@ impl Wire for Cpf {
     type WriteError = Error;
 
     /// Reads a common packet format that fills `b`. Extra bytes after the
-    /// last item are a [`Error::Trailing`], and more than
+    /// last item are an [`Error::Trailing`], and more than
     /// [`MAX_DATA`] bytes, which no packet can carry, are a
     /// [`Error::TooLong`].
     /// Short headers or item bodies return [`Error::Truncated`].
@@ -1257,7 +1257,7 @@ impl Wire for Identity {
 
     /// Reads an identity that fills `b`. The eight zero bytes that end the
     /// socket address are not checked. A product name longer than
-    /// [`MAX_PRODUCT_NAME`] is a [`Error::TooLong`].
+    /// [`MAX_PRODUCT_NAME`] is an [`Error::TooLong`].
     /// Short fields return [`Error::Truncated`]. Bytes after the
     /// state byte return [`Error::Trailing`].
     fn parse(b: &[u8]) -> Result<Identity, Error> {
@@ -1326,7 +1326,7 @@ impl Wire for SendData {
     type WriteError = Error;
 
     /// Reads a send-data envelope that fills `b`. Items that do not start
-    /// with an address item and a data item are a [`Error::Items`].
+    /// with an address item and a data item are an [`Error::Items`].
     /// Short fields return [`Error::Truncated`], excess bytes return
     /// [`Error::Trailing`], and excess items or input above [`MAX_DATA`]
     /// return [`Error::TooLong`]. Known address items must have their

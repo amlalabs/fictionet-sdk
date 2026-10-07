@@ -32,10 +32,10 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
-//! use fictionet::stdlib::gre::{protocol, GreHeader, Header, Packet};
+//! use fictionet::stdlib::gre::{protocol, Header, Packet, PlainHeader};
 //!
 //! let packet = Packet {
-//!     header: Header::Gre(GreHeader { protocol: protocol::IPV4, checksum: true, key: Some(7), sequence: None }),
+//!     header: Header::Gre(PlainHeader { protocol: protocol::IPV4, checksum: true, key: Some(7), sequence: None }),
 //!     payload: vec![0x45, 0x00],
 //! };
 //! let bytes = packet.to_bytes().unwrap();
@@ -105,7 +105,7 @@ const PPTP_MUST_BE_ZERO: u16 = CHECKSUM_BIT | ROUTING_BIT | STRICT_ROUTE_BIT | R
 /// A plain GRE header, version 0. The flag bits are worked out from which
 /// fields are present, so none of them is kept.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct GreHeader {
+pub struct PlainHeader {
     /// The EtherType of the payload, such as [`protocol::IPV4`].
     pub protocol: u16,
     /// Whether the packet carries a checksum. Its value is not kept: a
@@ -141,20 +141,20 @@ pub struct PptpHeader {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Header {
     /// Plain GRE, version 0.
-    Gre(GreHeader),
+    Gre(PlainHeader),
     /// PPTP's enhanced GRE, version 1.
     Pptp(PptpHeader),
 }
 
 impl Default for Header {
     fn default() -> Header {
-        Header::Gre(GreHeader::default())
+        Header::Gre(PlainHeader::default())
     }
 }
 
 /// Why bytes are not a GRE packet, or why a packet cannot be written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum GreError {
+pub enum Error {
     /// The bytes end before the header does, or, in PPTP, before the
     /// payload length says the payload does.
     Truncated,
@@ -185,23 +185,23 @@ pub enum GreError {
     },
 }
 
-impl std::fmt::Display for GreError {
+impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            GreError::Trailing { remaining } => write!(f, "{remaining} bytes after the GRE packet"),
-            GreError::Truncated => f.write_str("bytes end inside the GRE packet"),
-            GreError::Version(v) => write!(f, "GRE version {v}, not 0 or 1"),
-            GreError::Reserved(bits) => write!(f, "GRE flag bits {bits:#06x} must be zero"),
-            GreError::MissingKey => f.write_str("PPTP GRE header without the K bit"),
-            GreError::PptpProtocol(p) => write!(f, "PPTP GRE protocol type {p:#06x}, not 0x880b"),
-            GreError::PptpSequence => f.write_str("PPTP GRE sequence number without a payload, or payload without one"),
-            GreError::Checksum => f.write_str("GRE checksum does not match"),
-            GreError::TooLong => write!(f, "GRE packet longer than {MAX_PACKET} bytes"),
+            Error::Trailing { remaining } => write!(f, "{remaining} bytes after the GRE packet"),
+            Error::Truncated => f.write_str("bytes end inside the GRE packet"),
+            Error::Version(v) => write!(f, "GRE version {v}, not 0 or 1"),
+            Error::Reserved(bits) => write!(f, "GRE flag bits {bits:#06x} must be zero"),
+            Error::MissingKey => f.write_str("PPTP GRE header without the K bit"),
+            Error::PptpProtocol(p) => write!(f, "PPTP GRE protocol type {p:#06x}, not 0x880b"),
+            Error::PptpSequence => f.write_str("PPTP GRE sequence number without a payload, or payload without one"),
+            Error::Checksum => f.write_str("GRE checksum does not match"),
+            Error::TooLong => write!(f, "GRE packet longer than {MAX_PACKET} bytes"),
         }
     }
 }
 
-impl std::error::Error for GreError {}
+impl std::error::Error for Error {}
 
 fn be16(b: &[u8], at: usize) -> u16 {
     u16::from_be_bytes([b[at], b[at + 1]])
@@ -268,7 +268,7 @@ impl Header {
     /// it took. It fails as soon as the bytes it has show a bad header, so
     /// a longer `b` never turns an error into success. It does not check
     /// the checksum, which needs the whole packet; [`Header::split`] does.
-    pub fn parse_prefix(b: &[u8]) -> Result<Option<(Header, usize)>, GreError> {
+    pub fn parse_prefix(b: &[u8]) -> Result<Option<(Header, usize)>, Error> {
         if b.len() < 2 {
             return Ok(None);
         }
@@ -278,30 +278,30 @@ impl Header {
             VERSION_GRE => {
                 let bad = flags & GRE_MUST_BE_ZERO;
                 if bad != 0 {
-                    return Err(GreError::Reserved(bad));
+                    return Err(Error::Reserved(bad));
                 }
             }
             VERSION_PPTP => {
                 let bad = flags & PPTP_MUST_BE_ZERO;
                 if bad != 0 {
-                    return Err(GreError::Reserved(bad));
+                    return Err(Error::Reserved(bad));
                 }
                 if flags & KEY_BIT == 0 {
-                    return Err(GreError::MissingKey);
+                    return Err(Error::MissingKey);
                 }
             }
-            v => return Err(GreError::Version(v)),
+            v => return Err(Error::Version(v)),
         }
         if b.len() < BASE_HEADER_LEN {
             return Ok(None);
         }
         let proto = be16(b, 2);
         if version == VERSION_PPTP && proto != protocol::PPP {
-            return Err(GreError::PptpProtocol(proto));
+            return Err(Error::PptpProtocol(proto));
         }
         let has = |bit: u16| flags & bit != 0;
         let header = if version == VERSION_GRE {
-            Header::Gre(GreHeader {
+            Header::Gre(PlainHeader {
                 protocol: proto,
                 checksum: has(CHECKSUM_BIT),
                 key: has(KEY_BIT).then_some(0),
@@ -340,7 +340,7 @@ impl Header {
                 // The payload length is the high half of the key field.
                 let has_payload = be16(b, BASE_HEADER_LEN) != 0;
                 if h.sequence.is_some() != has_payload {
-                    return Err(GreError::PptpSequence);
+                    return Err(Error::PptpSequence);
                 }
                 h.call_id = next() as u16;
                 h.sequence = h.sequence.map(|_| next());
@@ -355,24 +355,24 @@ impl Header {
     /// from `b`. It checks the checksum if there is one. For PPTP the
     /// payload is as long as the header's payload length field says, and
     /// bytes after it are refused.
-    pub fn split(b: &[u8]) -> Result<(Header, &[u8]), GreError> {
-        let (header, used) = Header::parse_prefix(b)?.ok_or(GreError::Truncated)?;
+    pub fn split(b: &[u8]) -> Result<(Header, &[u8]), Error> {
+        let (header, used) = Header::parse_prefix(b)?.ok_or(Error::Truncated)?;
         if b.len() > MAX_PACKET {
-            return Err(GreError::TooLong);
+            return Err(Error::TooLong);
         }
         match header {
             Header::Gre(h) => {
                 if h.checksum && checksum(b) != 0 {
-                    return Err(GreError::Checksum);
+                    return Err(Error::Checksum);
                 }
                 Ok((header, &b[used..]))
             }
             Header::Pptp(_) => {
                 let end = used.checked_add(usize::from(be16(b, BASE_HEADER_LEN)))
-                    .ok_or(GreError::TooLong)?;
-                let payload = b.get(used..end).ok_or(GreError::Truncated)?;
+                    .ok_or(Error::TooLong)?;
+                let payload = b.get(used..end).ok_or(Error::Truncated)?;
                 if end != b.len() {
-                    return Err(GreError::Trailing { remaining: b.len() - end });
+                    return Err(Error::Trailing { remaining: b.len() - end });
                 }
                 Ok((header, payload))
             }
@@ -381,19 +381,19 @@ impl Header {
 
     /// Appends the header's bytes to `out`, for a payload of
     /// `payload_len` bytes, with the checksum field zero. It fails with
-    /// [`GreError::TooLong`] if the header and the payload together would
-    /// be longer than [`MAX_PACKET`], and with [`GreError::PptpSequence`] if
+    /// [`Error::TooLong`] if the header and the payload together would
+    /// be longer than [`MAX_PACKET`], and with [`Error::PptpSequence`] if
     /// a PPTP header's sequence number does not match the payload; then
     /// `out` is left as it was.
-    fn write(&self, payload_len: usize, out: &mut Vec<u8>) -> Result<(), GreError> {
+    fn write(&self, payload_len: usize, out: &mut Vec<u8>) -> Result<(), Error> {
         let total = self.len().saturating_add(payload_len);
         if total > MAX_PACKET {
-            return Err(GreError::TooLong);
+            return Err(Error::TooLong);
         }
         if let Header::Pptp(h) = self
             && h.sequence.is_some() != (payload_len > 0)
         {
-            return Err(GreError::PptpSequence);
+            return Err(Error::PptpSequence);
         }
         let bit = |present: bool, bit: u16| if present { bit } else { 0 };
         match self {
@@ -417,7 +417,7 @@ impl Header {
                     | bit(h.ack.is_some(), ACK_BIT)
                     | u16::from(VERSION_PPTP);
                 // The header is at least 8 bytes, so the payload fits in 16 bits.
-                let len = u16::try_from(payload_len).map_err(|_| GreError::TooLong)?;
+                let len = u16::try_from(payload_len).map_err(|_| Error::TooLong)?;
                 out.extend_from_slice(&flags.to_be_bytes());
                 out.extend_from_slice(&protocol::PPP.to_be_bytes());
                 out.extend_from_slice(&len.to_be_bytes());
@@ -442,12 +442,12 @@ pub struct Packet {
 }
 
 impl Wire for Packet {
-    type ParseError = GreError;
-    type WriteError = GreError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads exactly one packet and copies its payload.
     /// Refuses invalid flags, lengths, checksums, and trailing PPTP bytes.
-    fn parse(b: &[u8]) -> Result<Self, GreError> {
+    fn parse(b: &[u8]) -> Result<Self, Error> {
         let (header, payload) = Header::split(b)?;
         Ok(Packet { header, payload: payload.to_vec() })
     }
@@ -455,12 +455,12 @@ impl Wire for Packet {
     /// Appends a packet with its checksum and PPTP payload length. Refuses
     /// a packet above [`MAX_PACKET`] or a PPTP sequence number whose presence
     /// does not match the payload. Leaves `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), GreError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         let start = out.len();
         out.reserve(self.header.len().saturating_add(self.payload.len()).min(MAX_PACKET));
         self.header.write(self.payload.len(), out)?;
         out.extend_from_slice(&self.payload);
-        if let Header::Gre(GreHeader { checksum: true, .. }) = self.header {
+        if let Header::Gre(PlainHeader { checksum: true, .. }) = self.header {
             let sum = checksum(&out[start..]);
             let at = start + BASE_HEADER_LEN;
             out[at..at + 2].copy_from_slice(&sum.to_be_bytes());
@@ -477,7 +477,7 @@ mod tests {
         test_support::{decode_all, mutate},
     };
 
-    fn collect(b: &[u8]) -> Result<Packet, GreError> {
+    fn collect(b: &[u8]) -> Result<Packet, Error> {
         let make = || Collect::<Packet>::new(MAX_PACKET);
         contract::check_decode_with_alloc_limit(make, b, 2 * (MAX_PACKET + 1));
         contract::check_wire::<Packet>(b);
@@ -493,7 +493,7 @@ mod tests {
     }
 
     fn gre(protocol: u16, checksum: bool, key: Option<u32>, sequence: Option<u32>) -> Header {
-        Header::Gre(GreHeader { protocol, checksum, key, sequence })
+        Header::Gre(PlainHeader { protocol, checksum, key, sequence })
     }
 
     fn pptp(call_id: u16, sequence: Option<u32>, ack: Option<u32>) -> Header {
@@ -502,7 +502,7 @@ mod tests {
 
     /// Parses `b` directly and through Collect and checks they agree. A packet read
     /// writes back to bytes that read the same.
-    fn check(b: &[u8]) -> Result<Packet, GreError> {
+    fn check(b: &[u8]) -> Result<Packet, Error> {
         let parsed = Packet::parse(b);
         assert_eq!(collect(b), parsed);
         if let Ok(p) = &parsed {
@@ -624,8 +624,8 @@ mod tests {
         // RFC 2637 section 4.1: the Flags field, bits 9 to 12, must be zero.
         for bit in [0x40u8, 0x20, 0x10, 0x08] {
             let b = [0x30, 0x01 | bit, 0x88, 0x0b, 0, 1, 0, 1, 0, 0, 0, 1, 0x42];
-            assert_eq!(check(&b), Err(GreError::Reserved(u16::from(bit))), "{bit:#04x}");
-            assert_eq!(Header::parse_prefix(&b[..2]), Err(GreError::Reserved(u16::from(bit))));
+            assert_eq!(check(&b), Err(Error::Reserved(u16::from(bit))), "{bit:#04x}");
+            assert_eq!(Header::parse_prefix(&b[..2]), Err(Error::Reserved(u16::from(bit))));
         }
     }
 
@@ -634,21 +634,21 @@ mod tests {
         // RFC 2637 section 4.1: S is set when a payload is present and
         // clear when none is. Data without a sequence number:
         let b = [0x20, 0x01, 0x88, 0x0b, 0, 1, 0, 1, 0x42];
-        assert_eq!(check(&b), Err(GreError::PptpSequence));
+        assert_eq!(check(&b), Err(Error::PptpSequence));
         // A sequence number without data:
         let b = [0x30, 0x01, 0x88, 0x0b, 0, 0, 0, 1, 0, 0, 0, 1];
-        assert_eq!(check(&b), Err(GreError::PptpSequence));
+        assert_eq!(check(&b), Err(Error::PptpSequence));
         assert_eq!(Header::parse_prefix(&[0x20, 0x01, 0x88, 0x0b, 0, 1, 0]), Ok(None));
-        assert_eq!(Header::parse_prefix(&[0x20, 0x01, 0x88, 0x0b, 0, 1, 0, 1]), Err(GreError::PptpSequence));
-        assert!(!GreError::PptpSequence.to_string().is_empty());
+        assert_eq!(Header::parse_prefix(&[0x20, 0x01, 0x88, 0x0b, 0, 1, 0, 1]), Err(Error::PptpSequence));
+        assert!(!Error::PptpSequence.to_string().is_empty());
 
         // Writers refuse both, and leave `out` as it was.
         for (sequence, payload) in [(None, vec![0x42]), (Some(1), vec![])] {
             let p = Packet { header: pptp(1, sequence, Some(2)), payload };
             let mut out = vec![9];
-            assert_eq!(p.write(&mut out), Err(GreError::PptpSequence));
+            assert_eq!(p.write(&mut out), Err(Error::PptpSequence));
             assert_eq!(out, [9]);
-            assert_eq!(p.to_bytes(), Err(GreError::PptpSequence));
+            assert_eq!(p.to_bytes(), Err(Error::PptpSequence));
         }
     }
 
@@ -680,8 +680,8 @@ mod tests {
     #[test]
     fn pptp_refuses_trailing_bytes() {
         let b = [0x30, 0x01, 0x88, 0x0b, 0x00, 0x01, 0, 7, 0, 0, 0, 1, 0x42, 0xee, 0xee];
-        assert_eq!(check(&b), Err(GreError::Trailing { remaining: 2 }));
-        assert_eq!(Header::split(&b), Err(GreError::Trailing { remaining: 2 }));
+        assert_eq!(check(&b), Err(Error::Trailing { remaining: 2 }));
+        assert_eq!(Header::split(&b), Err(Error::Trailing { remaining: 2 }));
         let p = check(&b[..13]).unwrap();
         assert_eq!(p.header, pptp(7, Some(1), None));
         assert_eq!(p.payload, [0x42]);
@@ -690,38 +690,38 @@ mod tests {
 
     #[test]
     fn errors() {
-        let cases: &[(&[u8], GreError)] = &[
-            (&[], GreError::Truncated),
-            (&[0x00], GreError::Truncated),
-            (&[0x00, 0x00, 0x08], GreError::Truncated),
+        let cases: &[(&[u8], Error)] = &[
+            (&[], Error::Truncated),
+            (&[0x00], Error::Truncated),
+            (&[0x00, 0x00, 0x08], Error::Truncated),
             // C and K set, but the bytes stop inside the key.
-            (&[0xa0, 0x00, 0x08, 0x00, 0, 0, 0, 0, 0, 0], GreError::Truncated),
+            (&[0xa0, 0x00, 0x08, 0x00, 0, 0, 0, 0, 0, 0], Error::Truncated),
             // Versions 2 to 7.
-            (&[0x00, 0x02], GreError::Version(2)),
-            (&[0x00, 0x07, 0x08, 0x00], GreError::Version(7)),
+            (&[0x00, 0x02], Error::Version(2)),
+            (&[0x00, 0x07, 0x08, 0x00], Error::Version(7)),
             // The routing bit, the strict source route bit, the top
             // recursion bit.
-            (&[0x40, 0x00, 0x08, 0x00], GreError::Reserved(0x4000)),
-            (&[0x08, 0x00, 0x08, 0x00], GreError::Reserved(0x0800)),
-            (&[0x04, 0x00], GreError::Reserved(0x0400)),
-            (&[0x4c, 0x00], GreError::Reserved(0x4c00)),
+            (&[0x40, 0x00, 0x08, 0x00], Error::Reserved(0x4000)),
+            (&[0x08, 0x00, 0x08, 0x00], Error::Reserved(0x0800)),
+            (&[0x04, 0x00], Error::Reserved(0x0400)),
+            (&[0x4c, 0x00], Error::Reserved(0x4c00)),
             // PPTP with a checksum bit, with recursion, without a key.
-            (&[0xa0, 0x01, 0x88, 0x0b, 0, 0, 0, 0], GreError::Reserved(0x8000)),
-            (&[0x21, 0x01], GreError::Reserved(0x0100)),
-            (&[0x00, 0x01, 0x88, 0x0b], GreError::MissingKey),
+            (&[0xa0, 0x01, 0x88, 0x0b, 0, 0, 0, 0], Error::Reserved(0x8000)),
+            (&[0x21, 0x01], Error::Reserved(0x0100)),
+            (&[0x00, 0x01, 0x88, 0x0b], Error::MissingKey),
             // PPTP carrying something other than PPP.
-            (&[0x20, 0x01, 0x08, 0x00, 0, 0, 0, 0], GreError::PptpProtocol(0x0800)),
+            (&[0x20, 0x01, 0x08, 0x00, 0, 0, 0, 0], Error::PptpProtocol(0x0800)),
             // PPTP whose payload length runs past the bytes.
-            (&[0x30, 0x01, 0x88, 0x0b, 0, 2, 0, 0, 0, 0, 0, 1, 0xff], GreError::Truncated),
+            (&[0x30, 0x01, 0x88, 0x0b, 0, 2, 0, 0, 0, 0, 0, 1, 0xff], Error::Truncated),
             // PPTP data without a sequence number, and a sequence number
             // without data.
-            (&[0x20, 0x01, 0x88, 0x0b, 0, 2, 0, 0, 0xff], GreError::PptpSequence),
-            (&[0x30, 0x01, 0x88, 0x0b, 0, 0, 0, 0, 0, 0, 0, 1], GreError::PptpSequence),
+            (&[0x20, 0x01, 0x88, 0x0b, 0, 2, 0, 0, 0xff], Error::PptpSequence),
+            (&[0x30, 0x01, 0x88, 0x0b, 0, 0, 0, 0, 0, 0, 0, 1], Error::PptpSequence),
             // PPTP with a flags bit set.
-            (&[0x20, 0x09, 0x88, 0x0b], GreError::Reserved(0x0008)),
+            (&[0x20, 0x09, 0x88, 0x0b], Error::Reserved(0x0008)),
             // A checksum off by one.
-            (&[0x80, 0x00, 0x08, 0x00, 0x32, 0xfe, 0x00, 0x00, 0x45, 0x00], GreError::Checksum),
-            (&[0x80, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00], GreError::Checksum),
+            (&[0x80, 0x00, 0x08, 0x00, 0x32, 0xfe, 0x00, 0x00, 0x45, 0x00], Error::Checksum),
+            (&[0x80, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00], Error::Checksum),
         ];
         for (b, e) in cases {
             assert_eq!(check(b), Err(*e), "{b:02x?}");
@@ -732,26 +732,26 @@ mod tests {
     #[test]
     fn header_prefix_errors_and_checksum() {
         assert_eq!(Header::parse_prefix(&[0]), Ok(None));
-        assert_eq!(Header::parse_prefix(&[0, 3]), Err(GreError::Version(3)));
+        assert_eq!(Header::parse_prefix(&[0, 3]), Err(Error::Version(3)));
         assert_eq!(Header::parse_prefix(&[0x20, 1, 0x86]), Ok(None));
-        assert_eq!(Header::parse_prefix(&[0x20, 1, 0x86, 0xdd]), Err(GreError::PptpProtocol(0x86dd)));
+        assert_eq!(Header::parse_prefix(&[0x20, 1, 0x86, 0xdd]), Err(Error::PptpProtocol(0x86dd)));
         assert_eq!(Header::parse_prefix(&[0x20, 0, 8, 0, 0, 0, 0]), Ok(None));
         assert_eq!(Header::parse_prefix(&[0x20, 0, 8, 0, 0, 0, 0, 3]), Ok(Some((gre(protocol::IPV4, false, Some(3), None), 8))));
-        assert_eq!(collect(&[0x80, 0, 8, 0, 0x32, 0xfe, 0, 0, 0x45, 0]), Err(GreError::Checksum));
+        assert_eq!(collect(&[0x80, 0, 8, 0, 0x32, 0xfe, 0, 0, 0x45, 0]), Err(Error::Checksum));
     }
 
     #[test]
     fn too_long() {
         let mut b = vec![0x00, 0x00, 0x08, 0x00];
         b.resize(MAX_PACKET + 1, 0);
-        assert_eq!(Packet::parse(&b), Err(GreError::TooLong));
-        assert_eq!(collect(&b), Err(GreError::TooLong));
+        assert_eq!(Packet::parse(&b), Err(Error::TooLong));
+        assert_eq!(collect(&b), Err(Error::TooLong));
         b.pop();
         assert!(Packet::parse(&b).is_ok());
         // A bad header is reported before the length.
         let mut b = vec![0x00, 0x05];
         b.resize(MAX_PACKET + 10, 0);
-        assert_eq!(check(&b), Err(GreError::Version(5)));
+        assert_eq!(check(&b), Err(Error::Version(5)));
 
         // Writers refuse the same.
         let fits = Packet { header: gre(1, true, Some(1), None), payload: vec![0xab; MAX_PACKET - 12] };
@@ -761,7 +761,7 @@ mod tests {
         let mut over = fits;
         over.payload.push(0);
         let mut out = vec![9];
-        assert_eq!(over.write(&mut out), Err(GreError::TooLong));
+        assert_eq!(over.write(&mut out), Err(Error::TooLong));
         assert_eq!(out, [9]);
 
         let fits = Packet { header: pptp(1, Some(1), Some(2)), payload: vec![0xab; MAX_PACKET - 16] };
@@ -769,8 +769,8 @@ mod tests {
         assert_eq!(Packet::parse(&bytes), Ok(fits.clone()));
         let mut over = fits;
         over.payload.push(0);
-        assert_eq!(over.to_bytes(), Err(GreError::TooLong));
-        assert!(!GreError::TooLong.to_string().is_empty());
+        assert_eq!(over.to_bytes(), Err(Error::TooLong));
+        assert!(!Error::TooLong.to_string().is_empty());
     }
 
     #[test]
@@ -812,13 +812,13 @@ mod tests {
             for n in 0..b.len() {
                 let got = check(&b[..n]);
                 if n < header_len {
-                    assert_eq!(got, Err(GreError::Truncated), "{p:?} cut at {n}");
+                    assert_eq!(got, Err(Error::Truncated), "{p:?} cut at {n}");
                     continue;
                 }
                 match p.header {
-                    Header::Pptp(_) => assert_eq!(got, Err(GreError::Truncated), "{p:?} cut at {n}"),
-                    Header::Gre(GreHeader { checksum: true, .. }) => {
-                        assert_eq!(got, Err(GreError::Checksum), "{p:?} cut at {n}")
+                    Header::Pptp(_) => assert_eq!(got, Err(Error::Truncated), "{p:?} cut at {n}"),
+                    Header::Gre(PlainHeader { checksum: true, .. }) => {
+                        assert_eq!(got, Err(Error::Checksum), "{p:?} cut at {n}")
                     }
                     Header::Gre(_) => {
                         let got = got.unwrap();

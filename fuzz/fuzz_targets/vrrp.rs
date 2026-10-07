@@ -11,7 +11,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use fictionet::stdlib::vrrp::{
     Addresses, Advertisement, AdvertisementV2, AdvertisementV3, Endpoints, GROUP_V4, GROUP_V6, MAX_ADDRESSES,
-    VrrpError, checksum, checksum_rfc5798,
+    Error, checksum, checksum_rfc5798,
 };
 use fictionet::stdlib::{codec::{Wire, Collect, Decode, contract}, vrrp};
 use libfuzzer_sys::fuzz_target;
@@ -89,17 +89,17 @@ fn known_packets() {
     assert!(Advertisement::parse(&rfc5798, &v4).is_ok());
     // Version 2 with no addresses.
     let empty = [0x21, 1, 100, 0, 0, 1, 0x7a, 0xfd, 0, 0, 0, 0, 0, 0, 0, 0];
-    assert_eq!(Advertisement::parse(&empty, &v4), Err(VrrpError::NoAddresses));
+    assert_eq!(Advertisement::parse(&empty, &v4), Err(Error::NoAddresses));
     // Version 2 with authentication type 255.
     let auth = [0x21, 1, 100, 1, 0xff, 1, 0xba, 0x51, 192, 168, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0];
-    assert_eq!(Advertisement::parse(&auth, &v4), Err(VrrpError::AuthType(255)));
+    assert_eq!(Advertisement::parse(&auth, &v4), Err(Error::AuthType(255)));
     // Version 3 over IPv6 from a global source.
     let global = Endpoints::V6 { source: Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2), destination: GROUP_V6 };
     let mut v6 = vec![0x31, 1, 100, 1, 0, 100, 0, 0];
     v6.extend_from_slice(&Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1).octets());
     let c = oracle(&v6, &global, false).unwrap();
     v6[6..8].copy_from_slice(&c.to_be_bytes());
-    assert_eq!(Advertisement::parse(&v6, &global), Err(VrrpError::LinkLocal));
+    assert_eq!(Advertisement::parse(&v6, &global), Err(Error::LinkLocal));
 }
 
 /// Endpoints taken from the first bytes: IPv4 or IPv6, any source.

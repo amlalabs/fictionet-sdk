@@ -5,7 +5,7 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use fictionet::stdlib::pim::{
-    ALL_PIM_ROUTERS_V4, ALL_PIM_ROUTERS_V6, CandidateRp, Endpoints, Message, PimError, checksum,
+    ALL_PIM_ROUTERS_V4, ALL_PIM_ROUTERS_V6, CandidateRp, Endpoints, Message, Error, checksum,
 };
 use fictionet::stdlib::{codec::{Wire, Collect, Decode, contract}, pim};
 use libfuzzer_sys::fuzz_target;
@@ -54,7 +54,7 @@ fn check(data: &[u8], e: &Endpoints) {
         if let Message::CandidateRp(CandidateRp { groups, .. }) = m
             && groups.is_empty()
         {
-            assert_eq!(m.frame(e).and_then(|frame| frame.to_bytes()), Err(PimError::Count));
+            assert_eq!(m.frame(e).and_then(|frame| frame.to_bytes()), Err(Error::Count));
             return;
         }
         // Any other message read can be written, and reads back the same.
