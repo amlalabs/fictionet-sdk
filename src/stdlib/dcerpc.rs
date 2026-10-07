@@ -15,7 +15,7 @@
 //! chapter 12, and Microsoft's extensions in MS-RPCE, section 2.2.2.
 //!
 //! A world that plays an RPC server pushes bytes from a connection or pipe
-//! into a [`Stream<Frames>`](fictionet::stdlib::codec::Stream), gets
+//! into a [`Stream<Pdus>`](fictionet::stdlib::codec::Stream), gets
 //! [`Pdu`]s back, and writes the bytes of its answers. A large call comes
 //! in several fragments, which a [`Reassembler`] joins, and
 //! [`Pdu::fragments`] splits an answer the same way. Which interfaces
@@ -31,7 +31,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::dcerpc::{
-//!     Bind, BindAck, Body, Context, ContextResult, Frames, EPMAPPER, NDR, Pdu, reason,
+//!     Bind, BindAck, Body, Context, ContextResult, EPMAPPER, NDR, Pdu, Pdus, reason,
 //! };
 //!
 //! use fictionet::stdlib::codec::{Stream, Wire};
@@ -76,7 +76,7 @@
 //! assert_eq!(bytes.len(), 72);
 //! assert_eq!(bytes[..4], [5, 0, 11, 3]);
 //!
-//! let mut decoder = Stream::new(Frames::new());
+//! let mut decoder = Stream::new(Pdus::new());
 //! // The bind arrives in two pieces.
 //! assert_eq!(decoder.push(&bytes[..30]), 30);
 //! assert!(decoder.next().is_none());
@@ -690,7 +690,8 @@ pub struct Pdu {
     pub auth: Option<Auth>,
 }
 
-/// Why a PDU or fragment could not be read or written.
+/// Why a PDU or fragment could not be read or written, or why a
+/// [`Reassembler`] dropped a call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     /// The version was not 5.0 or 5.1.
@@ -735,6 +736,27 @@ pub enum Error {
     },
     /// The value cannot be written without changing it.
     Unwritable,
+    /// A [`Reassembler`] got a first fragment while another call was
+    /// still being joined. Both are dropped, since this module does not
+    /// multiplex calls.
+    Interleaved {
+        /// The call ID of the new first fragment.
+        call_id: u32,
+    },
+    /// A [`Reassembler`] got a later fragment with no call being joined,
+    /// or for another call ID, type, context or operation, or with another
+    /// auth type, level or context ID than the first fragment, or with a
+    /// verifier when the first had none or the other way round (MS-RPCE
+    /// 2.2.2.11).
+    UnexpectedFragment {
+        /// The fragment's call ID.
+        call_id: u32,
+    },
+    /// The call's stub data grew past the [`Reassembler`]'s limit.
+    StubTooLong {
+        /// The call's ID.
+        call_id: u32,
+    },
 }
 
 impl std::fmt::Display for Error {
@@ -752,6 +774,9 @@ impl std::fmt::Display for Error {
             Error::AuthPad(n) => write!(f, "auth padding of {n} bytes runs into the header or misaligns the trailer"),
             Error::Truncated => f.write_str("the PDU body is shorter than its fields"),
             Error::Address => f.write_str("the secondary address does not end with a zero byte"),
+            Error::Interleaved { call_id } => write!(f, "call {call_id} started inside another call"),
+            Error::UnexpectedFragment { call_id } => write!(f, "a fragment of call {call_id} came out of order"),
+            Error::StubTooLong { call_id } => write!(f, "call {call_id} has more stub data than allowed"),
         }
     }
 }
@@ -877,7 +902,7 @@ impl Wire for Pdu {
 
     /// Reads exactly one PDU. Refuses invalid headers or bodies, incomplete
     /// fragments, trailing bytes, and values whose canonical padding or
-    /// reserved fields would exceed [`MAX_FRAG`]. [`Frames`] accepts those
+    /// reserved fields would exceed [`MAX_FRAG`]. [`Pdus`] accepts those
     /// last values for forwarding through the driver's original bytes.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         let used = Self::frame_length(bytes)?.ok_or(Error::Incomplete)?;
@@ -1033,20 +1058,20 @@ impl Wire for Pdu {
 /// canonical padding or reserved fields would make [`Wire::write`] refuse it.
 ///
 /// ```
-/// use fictionet::stdlib::{codec::{Stream, Wire}, dcerpc::{Body, Frames, Pdu}};
+/// use fictionet::stdlib::{codec::{Stream, Wire}, dcerpc::{Body, Pdu, Pdus}};
 /// let pdu = Pdu::new(7, Body::Shutdown);
 /// let bytes = Wire::to_bytes(&pdu)?;
-/// let mut stream = Stream::new(Frames::new());
+/// let mut stream = Stream::new(Pdus::new());
 /// assert_eq!(stream.push(&bytes), bytes.len());
 /// assert_eq!(stream.next(), Some(Ok(Ok(pdu))));
 /// # Ok::<(), fictionet::stdlib::dcerpc::Error>(())
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Frames {
+pub struct Pdus {
     limit: usize,
 }
 
-impl Frames {
+impl Pdus {
     /// Creates a decoder accepting fragments up to [`MAX_FRAG`] bytes.
     pub fn new() -> Self {
         Self::with_limit(MAX_FRAG)
@@ -1063,13 +1088,13 @@ impl Frames {
     }
 }
 
-impl Default for Frames {
+impl Default for Pdus {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Decode for Frames {
+impl Decode for Pdus {
     type Item = Result<Pdu, Error>;
     type Error = Error;
     const NAME: &'static str = "DCE/RPC";
@@ -1329,42 +1354,6 @@ fn rd32(le: bool, b: &[u8], i: usize) -> u32 {
     if le { u32::from_le_bytes(v) } else { u32::from_be_bytes(v) }
 }
 
-/// Why a [`Reassembler`] dropped a call.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReassemblyError {
-    /// A first fragment came while another call was still being joined.
-    /// Both are dropped, since this module does not multiplex calls.
-    Interleaved {
-        /// The call ID of the new first fragment.
-        call_id: u32,
-    },
-    /// A later fragment came with no call being joined, or for another
-    /// call ID, type, context or operation, or with another auth type,
-    /// level or context ID than the first fragment, or with a verifier
-    /// when the first had none or the other way round (MS-RPCE 2.2.2.11).
-    Unexpected {
-        /// The fragment's call ID.
-        call_id: u32,
-    },
-    /// The call's stub data grew past the reassembler's limit.
-    TooLong {
-        /// The call's ID.
-        call_id: u32,
-    },
-}
-
-impl std::fmt::Display for ReassemblyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ReassemblyError::Interleaved { call_id } => write!(f, "call {call_id} started inside another call"),
-            ReassemblyError::Unexpected { call_id } => write!(f, "a fragment of call {call_id} came out of order"),
-            ReassemblyError::TooLong { call_id } => write!(f, "call {call_id} has more stub data than allowed"),
-        }
-    }
-}
-
-impl std::error::Error for ReassemblyError {}
-
 /// Joins the fragments of requests and responses into whole calls. Push
 /// each PDU a stream gives; a whole call comes back once its last
 /// fragment has come. Other PDUs come back as they are. A fault or
@@ -1407,7 +1396,7 @@ impl Reassembler {
     /// Takes one PDU. It returns a whole call or another PDU when one is
     /// ready, `None` while a call still needs fragments, and an error when
     /// fragments break the rules, after which the call is dropped.
-    pub fn push(&mut self, pdu: Pdu) -> Result<Option<Pdu>, ReassemblyError> {
+    pub fn push(&mut self, pdu: Pdu) -> Result<Option<Pdu>, Error> {
         let call_id = pdu.call_id;
         match &pdu.body {
             Body::Request { .. } | Body::Response { .. } => {}
@@ -1424,10 +1413,10 @@ impl Reassembler {
         let last = pdu.flags & flags::LAST_FRAG != 0;
         if first {
             if self.partial.take().is_some() {
-                return Err(ReassemblyError::Interleaved { call_id });
+                return Err(Error::Interleaved { call_id });
             }
             if len > self.limit {
-                return Err(ReassemblyError::TooLong { call_id });
+                return Err(Error::StubTooLong { call_id });
             }
             if last {
                 return Ok(Some(pdu));
@@ -1436,7 +1425,7 @@ impl Reassembler {
             self.partial = Some(Pdu { auth: None, ..pdu });
             return Ok(None);
         }
-        let Some(mut p) = self.partial.take() else { return Err(ReassemblyError::Unexpected { call_id }) };
+        let Some(mut p) = self.partial.take() else { return Err(Error::UnexpectedFragment { call_id }) };
         let same = p.call_id == call_id
             && self.security == security(&pdu)
             && match (&p.body, &pdu.body) {
@@ -1448,11 +1437,11 @@ impl Reassembler {
                 _ => false,
             };
         if !same {
-            return Err(ReassemblyError::Unexpected { call_id });
+            return Err(Error::UnexpectedFragment { call_id });
         }
-        let Some(stub) = p.body.stub_mut() else { return Err(ReassemblyError::Unexpected { call_id }) };
+        let Some(stub) = p.body.stub_mut() else { return Err(Error::UnexpectedFragment { call_id }) };
         if stub.len().saturating_add(len) > self.limit {
-            return Err(ReassemblyError::TooLong { call_id });
+            return Err(Error::StubTooLong { call_id });
         }
         stub.extend_from_slice(pdu.body.stub().unwrap_or(&[]));
         p.flags |= pdu.flags & flags::PENDING_CANCEL;
@@ -1935,36 +1924,36 @@ mod tests {
         assert_eq!(parts.len(), 3);
         // A middle fragment with nothing started.
         let mut r = Reassembler::default();
-        assert_eq!(r.push(parts[1].clone()), Err(ReassemblyError::Unexpected { call_id: 7 }));
+        assert_eq!(r.push(parts[1].clone()), Err(Error::UnexpectedFragment { call_id: 7 }));
         // Two first fragments.
         assert_eq!(r.push(parts[0].clone()), Ok(None));
-        assert_eq!(r.push(parts[0].clone()), Err(ReassemblyError::Interleaved { call_id: 7 }));
+        assert_eq!(r.push(parts[0].clone()), Err(Error::Interleaved { call_id: 7 }));
         assert_eq!(r.pending(), 0);
         // A fragment of another call.
         assert_eq!(r.push(parts[0].clone()), Ok(None));
         let mut other = parts[1].clone();
         other.call_id = 8;
-        assert_eq!(r.push(other), Err(ReassemblyError::Unexpected { call_id: 8 }));
+        assert_eq!(r.push(other), Err(Error::UnexpectedFragment { call_id: 8 }));
         // A fragment for another operation.
         assert_eq!(r.push(parts[0].clone()), Ok(None));
         let mut other = parts[1].clone();
         if let Body::Request { opnum, .. } = &mut other.body {
             *opnum = 4;
         }
-        assert_eq!(r.push(other), Err(ReassemblyError::Unexpected { call_id: 7 }));
+        assert_eq!(r.push(other), Err(Error::UnexpectedFragment { call_id: 7 }));
         // A response fragment inside a request.
         assert_eq!(r.push(parts[0].clone()), Ok(None));
         let resp = Pdu {
             flags: 0,
             ..Pdu::new(7, Body::Response { alloc_hint: 0, context_id: 0, cancel_count: 0, stub: vec![] })
         };
-        assert_eq!(r.push(resp), Err(ReassemblyError::Unexpected { call_id: 7 }));
+        assert_eq!(r.push(resp), Err(Error::UnexpectedFragment { call_id: 7 }));
         // Over the limit, at the first fragment and later.
         let mut r = Reassembler::new(15);
         assert_eq!(r.push(parts[0].clone()), Ok(None));
-        assert_eq!(r.push(parts[1].clone()), Err(ReassemblyError::TooLong { call_id: 7 }));
+        assert_eq!(r.push(parts[1].clone()), Err(Error::StubTooLong { call_id: 7 }));
         let mut r = Reassembler::new(5);
-        assert_eq!(r.push(parts[0].clone()), Err(ReassemblyError::TooLong { call_id: 7 }));
+        assert_eq!(r.push(parts[0].clone()), Err(Error::StubTooLong { call_id: 7 }));
         // A fault or orphaned PDU ends the call; other PDUs pass by.
         let mut r = Reassembler::default();
         assert_eq!(r.push(parts[0].clone()), Ok(None));
@@ -1975,9 +1964,9 @@ mod tests {
         assert_eq!(r.push(Pdu::new(7, Body::Orphaned)), Ok(Some(Pdu::new(7, Body::Orphaned))));
         assert_eq!(r.pending(), 0);
         for e in [
-            ReassemblyError::Interleaved { call_id: 1 },
-            ReassemblyError::Unexpected { call_id: 1 },
-            ReassemblyError::TooLong { call_id: 1 },
+            Error::Interleaved { call_id: 1 },
+            Error::UnexpectedFragment { call_id: 1 },
+            Error::StubTooLong { call_id: 1 },
         ] {
             assert!(!e.to_string().is_empty());
         }
@@ -2049,14 +2038,14 @@ mod tests {
         let with = |i: usize, a: Option<Auth>| Pdu { auth: a, ..parts[i].clone() };
         let mut r = Reassembler::default();
         assert_eq!(r.push(with(0, Some(auth(1)))), Ok(None));
-        assert_eq!(r.push(with(1, Some(auth(2)))), Err(ReassemblyError::Unexpected { call_id: 7 }));
+        assert_eq!(r.push(with(1, Some(auth(2)))), Err(Error::UnexpectedFragment { call_id: 7 }));
         assert_eq!(r.push(with(0, Some(auth(1)))), Ok(None));
         let other = Auth { level: auth_level::PKT_PRIVACY, ..auth(1) };
-        assert_eq!(r.push(with(1, Some(other))), Err(ReassemblyError::Unexpected { call_id: 7 }));
+        assert_eq!(r.push(with(1, Some(other))), Err(Error::UnexpectedFragment { call_id: 7 }));
         assert_eq!(r.push(with(0, Some(auth(1)))), Ok(None));
-        assert_eq!(r.push(with(1, None)), Err(ReassemblyError::Unexpected { call_id: 7 }));
+        assert_eq!(r.push(with(1, None)), Err(Error::UnexpectedFragment { call_id: 7 }));
         assert_eq!(r.push(with(0, None)), Ok(None));
-        assert_eq!(r.push(with(1, Some(auth(1)))), Err(ReassemblyError::Unexpected { call_id: 7 }));
+        assert_eq!(r.push(with(1, Some(auth(1)))), Err(Error::UnexpectedFragment { call_id: 7 }));
         // The same context throughout joins, with a different token each.
         assert_eq!(r.push(with(0, Some(auth(1)))), Ok(None));
         assert_eq!(r.push(with(1, Some(Auth { value: vec![9; 16], ..auth(1) }))), Ok(None));
@@ -2196,7 +2185,7 @@ mod tests {
         b[10] = 16;
         let mut stream = b.clone();
         stream.extend(BIND);
-        let mut d = Stream::new(Frames::new());
+        let mut d = Stream::new(Pdus::new());
         assert_eq!(d.push(&stream), stream.len());
         let (p, frame) = d.with_next(|p, raw, _| (p, raw.to_vec())).unwrap().unwrap();
         assert_eq!(frame, &b[..]);
@@ -2221,13 +2210,13 @@ mod tests {
         // A PDU with a bad body, then a good one: the stream goes on.
         stream.extend_from_slice(&[5, 0, 9, 3, 0x10, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0]);
         stream.extend(BIND);
-        contract::check_decode_with_alloc_limit(Frames::new, &stream, 2 * MAX_FRAG);
-        let (whole, error) = decode_all(Frames::new, &stream);
+        contract::check_decode_with_alloc_limit(Pdus::new, &stream, 2 * MAX_FRAG);
+        let (whole, error) = decode_all(Pdus::new, &stream);
         assert_eq!(error, None);
         assert_eq!(whole.len(), all_bodies().len() + 2);
         assert_eq!(whole[whole.len() - 2], Err(Error::Type(9)));
         assert_eq!(whole[whole.len() - 1], Ok(bind()));
-        assert_eq!(decode_all(Frames::new, &[6, 0, 0, 0]).1,
+        assert_eq!(decode_all(Pdus::new, &[6, 0, 0, 0]).1,
             Some(Fail::Protocol(Error::Version { major: 6, minor: 0 })));
     }
 
@@ -2236,12 +2225,12 @@ mod tests {
         let p = request(vec![3; MAX_FRAG - 24]);
         let one = p.to_bytes().unwrap();
         let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * 3).collect();
-        let mut d = Stream::new(Frames::new());
+        let mut d = Stream::new(Pdus::new());
         assert_eq!(d.push(&stream), MAX_FRAG);
         assert_eq!(d.push(&stream[MAX_FRAG..]), 0);
         assert_eq!(d.next(), Some(Ok(Ok(p.clone()))));
         assert_eq!(d.push(&stream[MAX_FRAG..]), MAX_FRAG);
-        let (got, error) = decode_all(Frames::new, &stream);
+        let (got, error) = decode_all(Pdus::new, &stream);
         assert_eq!(error, None);
         assert_eq!(got.len(), 3);
         assert!(got.iter().all(|r| r.as_ref() == Ok(&p)));
@@ -2251,7 +2240,7 @@ mod tests {
     fn stream_takes_many_small_pdus_in_linear_time() {
         let bytes = Pdu::new(1, Body::Shutdown).to_bytes().unwrap().repeat(200_000);
         let started = std::time::Instant::now();
-        let (pdus, error) = decode_all(Frames::new, &bytes);
+        let (pdus, error) = decode_all(Pdus::new, &bytes);
         assert_eq!(pdus.len(), 200_000);
         assert!(pdus.iter().all(Result::is_ok));
         assert_eq!(error, None);
@@ -2303,9 +2292,9 @@ mod tests {
                 bytes
             };
             mutate(&mut rng, &mut data);
-            contract::check_decode_with_alloc_limit(Frames::new, &data, 2 * MAX_FRAG);
+            contract::check_decode_with_alloc_limit(Pdus::new, &data, 2 * MAX_FRAG);
             contract::check_wire::<Pdu>(&data);
-            let (whole, _) = decode_all(Frames::new, &data);
+            let (whole, _) = decode_all(Pdus::new, &data);
             let mut r = Reassembler::new(64);
             for p in whole.into_iter().flatten() {
                 // Whatever reads writes back and reads the same, unless the

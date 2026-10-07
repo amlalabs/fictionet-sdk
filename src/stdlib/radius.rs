@@ -17,7 +17,7 @@
 //! extended vendor-specific attributes. Its dictionary holds every
 //! standard attribute from 1 to 101, and it reads the data types of RFC
 //! 6572 and RFC 8044. RFC 6613 and RFC 6614 carry the same packets
-//! over TCP and TLS. [`Stream<Frames>`](fictionet::stdlib::codec::Stream) reads those streams.
+//! over TCP and TLS. [`Stream<Packets>`](fictionet::stdlib::codec::Stream) reads those streams.
 //!
 //! Nothing here reads a socket, and nothing here does cryptography. A
 //! world that plays a RADIUS server gives each datagram's bytes to
@@ -299,7 +299,7 @@ impl Attribute {
     /// User-Password is 16 to 128 bytes in steps of 16, CHAP-Password 17
     /// bytes, CHAP-Challenge 5 bytes or more, Message-Authenticator 16
     /// bytes, and Login-TCP-Port at most 65535.
-    pub fn decode(&self) -> Result<Value, ValueError> {
+    pub fn decode(&self) -> Result<Value, Error> {
         let data_type = self.info().map_or(DataType::String, |i| i.data_type);
         let value = Value::decode(data_type, &self.value)?;
         let n = self.value.len();
@@ -313,10 +313,10 @@ impl Attribute {
             _ => n > 0 || self.info().is_none() || !matches!(data_type, DataType::Text | DataType::String),
         };
         if !length_ok {
-            return Err(ValueError::Length(n));
+            return Err(Error::ValueLength(n));
         }
         if self.kind == attr::LOGIN_TCP_PORT && matches!(value, Value::Integer(p) if p > 65535) {
-            return Err(ValueError::Range);
+            return Err(Error::Range);
         }
         Ok(value)
     }
@@ -339,8 +339,11 @@ pub struct Packet {
     pub attributes: Vec<Attribute>,
 }
 
-/// Why bytes are not a RADIUS packet. RFC 2865 asks a server to drop such
-/// a packet without an answer.
+/// Why bytes are not a RADIUS packet, or an attribute's value cannot be
+/// read as its data type. RFC 2865 asks a server to drop a packet that
+/// cannot be read, without an answer. RFC 6929 calls an attribute whose
+/// value cannot be read invalid: a server treats it as unknown, and does
+/// not drop the packet for it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     /// Fewer bytes than the 20-byte header. The value is how many came.
@@ -369,6 +372,26 @@ pub enum Error {
     },
     /// The value cannot be written without changing it.
     Unwritable,
+    /// An attribute value had this many bytes, which its type does not
+    /// allow.
+    ValueLength(usize),
+    /// An attribute value of type text that is not UTF-8.
+    Text,
+    /// A prefix length past the address's bits, too few prefix bytes for
+    /// the length, bits set past the length, or an IPv4 prefix of
+    /// 0.0.0.0 whose length is not 32.
+    Prefix,
+    /// A TLV whose length is below 3, a vendor sub-attribute whose length
+    /// is below 2, or either running past the value.
+    Nested,
+    /// A long extended attribute's fragments do not join: a fragment with
+    /// the More flag is not full length, or the next attribute does not
+    /// continue the value, or none does. Also attributes of a concat
+    /// value that are not consecutive.
+    Fragment,
+    /// A number outside the range its attribute allows, such as a
+    /// Login-TCP-Port above 65535.
+    Range,
 }
 
 impl std::fmt::Display for Error {
@@ -380,6 +403,12 @@ impl std::fmt::Display for Error {
             Error::Unwritable => f.write_str("RADIUS value cannot be written without changing it"),
             Error::Truncated { length, got } => write!(f, "length field {length}, but only {got} bytes came"),
             Error::Attribute(at) => write!(f, "the attribute at offset {at} does not fit the packet"),
+            Error::ValueLength(n) => write!(f, "a value of {n} bytes, a length its type does not allow"),
+            Error::Text => f.write_str("text that is not UTF-8"),
+            Error::Prefix => f.write_str("a malformed address prefix"),
+            Error::Nested => f.write_str("a TLV or vendor sub-attribute that does not fit its value"),
+            Error::Fragment => f.write_str("long extended attribute fragments that do not join"),
+            Error::Range => f.write_str("a number outside the range its attribute allows"),
         }
     }
 }
@@ -477,14 +506,14 @@ impl Packet {
     /// The values of the attributes of type `kind`, joined in order, as
     /// EAP-Message carries an EAP packet longer than one attribute holds.
     /// RFC 3579 (section 3.1) and RFC 8044 (section 3.6) ask for such
-    /// attributes to be consecutive, so it gives [`ValueError::Fragment`]
+    /// attributes to be consecutive, so it gives [`Error::Fragment`]
     /// if another attribute sits between two of them. It returns `None`
     /// if the packet has no attribute of type `kind`.
-    pub fn concat_consecutive(&self, kind: u8) -> Option<Result<Vec<u8>, ValueError>> {
+    pub fn concat_consecutive(&self, kind: u8) -> Option<Result<Vec<u8>, Error>> {
         let first = self.attributes.iter().position(|a| a.kind == kind)?;
         let run = self.attributes[first..].iter().take_while(|a| a.kind == kind).count();
         if self.attributes[first + run..].iter().any(|a| a.kind == kind) {
-            return Some(Err(ValueError::Fragment));
+            return Some(Err(Error::Fragment));
         }
         Some(Ok(self.attributes[first..first + run].iter().flat_map(|a| a.value.iter().copied()).collect()))
     }
@@ -529,13 +558,13 @@ impl Packet {
     /// and the same Extended-Type. An extended attribute is an error if
     /// it has no Extended-Type byte or no bytes after it. A long one is
     /// an error if it has no flags byte or no bytes after that. A long
-    /// value is [`ValueError::Fragment`] if a fragment with the More flag
+    /// value is [`Error::Fragment`] if a fragment with the More flag
     /// is not full length, the next attribute does not continue it, or
     /// no attribute follows. That error sits where the value's first
     /// fragment was, and the attribute that broke the value is read on
     /// its own.
-    pub fn extended(&self) -> Vec<Result<Extended, ValueError>> {
-        let mut out: Vec<Result<Extended, ValueError>> = Vec::new();
+    pub fn extended(&self) -> Vec<Result<Extended, Error>> {
+        let mut out: Vec<Result<Extended, Error>> = Vec::new();
         // The index in `out` of a long value whose last fragment had the
         // More flag, and that value's attribute type.
         let mut open: Option<(usize, u8)> = None;
@@ -553,7 +582,7 @@ impl Packet {
                     }
                     // The value was cut short; this attribute is read on
                     // its own below.
-                    _ => out[i] = Err(ValueError::Fragment),
+                    _ => out[i] = Err(Error::Fragment),
                 }
             }
             match a.kind {
@@ -561,7 +590,7 @@ impl Packet {
                     [ext_type, data @ ..] if !data.is_empty() => {
                         Ok(Extended { kind: a.kind, ext_type: *ext_type, data: data.to_vec() })
                     }
-                    v => Err(ValueError::Length(v.len())),
+                    v => Err(Error::ValueLength(v.len())),
                 }),
                 attr::LONG_EXTENDED_TYPE_1 | attr::LONG_EXTENDED_TYPE_2 => match long_fragment(&a.value) {
                     Ok((ext_type, more, data)) => {
@@ -576,7 +605,7 @@ impl Packet {
             }
         }
         if let Some((i, _)) = open {
-            out[i] = Err(ValueError::Fragment);
+            out[i] = Err(Error::Fragment);
         }
         out
     }
@@ -655,10 +684,10 @@ impl Wire for Packet {
 /// [RFC 6613 §2.6.4]: https://www.rfc-editor.org/rfc/rfc6613.html#section-2.6.4
 ///
 /// ```
-/// use fictionet::stdlib::{codec::{Stream, Wire, finish, pump}, radius::{Code, Frames, Packet}};
+/// use fictionet::stdlib::{codec::{Stream, Wire, finish, pump}, radius::{Code, Packet, Packets}};
 /// let packet = Packet::new(Code::AccessRequest, 7, [0; 16]);
 /// let bytes = Wire::to_bytes(&packet)?;
-/// let mut stream = Stream::new(Frames::with_limit(1024));
+/// let mut stream = Stream::new(Packets::with_limit(1024));
 /// let mut packets = Vec::new();
 /// for chunk in bytes.chunks(3) {
 ///     pump(&mut stream, chunk, |item| packets.push(item))?;
@@ -668,11 +697,11 @@ impl Wire for Packet {
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Frames {
+pub struct Packets {
     limit: usize,
 }
 
-impl Frames {
+impl Packets {
     /// Creates a decoder accepting packets up to [`MAX_PACKET`] bytes.
     pub fn new() -> Self {
         Self::with_limit(MAX_PACKET)
@@ -691,13 +720,13 @@ impl Frames {
     }
 }
 
-impl Default for Frames {
+impl Default for Packets {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Decode for Frames {
+impl Decode for Packets {
     type Item = Packet;
     type Error = Error;
     const NAME: &'static str = "RADIUS";
@@ -744,14 +773,14 @@ fn parse_attributes(b: &[u8], min: usize) -> Result<Vec<Attribute>, usize> {
 /// the More flag is set, and this fragment's bytes. RFC 6929 asks for at
 /// least one byte after the flags, and a full-length attribute when the
 /// More flag is set. The reserved flag bits are ignored.
-fn long_fragment(b: &[u8]) -> Result<(u8, bool, &[u8]), ValueError> {
-    let [ext_type, flags, data @ ..] = b else { return Err(ValueError::Length(b.len())) };
+fn long_fragment(b: &[u8]) -> Result<(u8, bool, &[u8]), Error> {
+    let [ext_type, flags, data @ ..] = b else { return Err(Error::ValueLength(b.len())) };
     if data.is_empty() {
-        return Err(ValueError::Length(b.len()));
+        return Err(Error::ValueLength(b.len()));
     }
     let more = flags & MORE_FLAG != 0;
     if more && b.len() != MAX_VALUE {
-        return Err(ValueError::Fragment);
+        return Err(Error::Fragment);
     }
     Ok((*ext_type, more, data))
 }
@@ -883,47 +912,6 @@ pub enum Value {
     Tlv(Vec<Attribute>),
 }
 
-/// Why an attribute's value cannot be read as its data type. RFC 6929
-/// calls such an attribute invalid: a server treats it as unknown, and
-/// does not drop the packet for it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ValueError {
-    /// The value had this many bytes, which its type does not allow.
-    Length(usize),
-    /// Text that is not UTF-8.
-    Text,
-    /// A prefix length past the address's bits, too few prefix bytes for
-    /// the length, bits set past the length, or an IPv4 prefix of
-    /// 0.0.0.0 whose length is not 32.
-    Prefix,
-    /// A TLV whose length is below 3, a vendor sub-attribute whose length
-    /// is below 2, or either running past the value.
-    Nested,
-    /// A long extended attribute's fragments do not join: a fragment with
-    /// the More flag is not full length, or the next attribute does not
-    /// continue the value, or none does. Also attributes of a concat
-    /// value that are not consecutive.
-    Fragment,
-    /// A number outside the range its attribute allows, such as a
-    /// Login-TCP-Port above 65535.
-    Range,
-}
-
-impl std::fmt::Display for ValueError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ValueError::Length(n) => write!(f, "a value of {n} bytes, a length its type does not allow"),
-            ValueError::Text => f.write_str("text that is not UTF-8"),
-            ValueError::Prefix => f.write_str("a malformed address prefix"),
-            ValueError::Nested => f.write_str("a TLV or vendor sub-attribute that does not fit its value"),
-            ValueError::Fragment => f.write_str("long extended attribute fragments that do not join"),
-            ValueError::Range => f.write_str("a number outside the range its attribute allows"),
-        }
-    }
-}
-
-impl std::error::Error for ValueError {}
-
 impl Value {
     /// Reads `b` as `data_type`. As RFC 6929 asks, an extended, long
     /// extended, extended vendor-specific or TLV value needs at least one
@@ -932,10 +920,10 @@ impl Value {
     /// length. A Vendor-Specific value needs at least one byte after the
     /// vendor number (RFC 2865). An IPv4 prefix of 0.0.0.0 must have
     /// length 32 (RFC 8044).
-    pub fn decode(data_type: DataType, b: &[u8]) -> Result<Value, ValueError> {
-        let fixed = |n: usize| if b.len() == n { Ok(()) } else { Err(ValueError::Length(b.len())) };
+    pub fn decode(data_type: DataType, b: &[u8]) -> Result<Value, Error> {
+        let fixed = |n: usize| if b.len() == n { Ok(()) } else { Err(Error::ValueLength(b.len())) };
         Ok(match data_type {
-            DataType::Text => Value::Text(std::str::from_utf8(b).map_err(|_| ValueError::Text)?.to_string()),
+            DataType::Text => Value::Text(std::str::from_utf8(b).map_err(|_| Error::Text)?.to_string()),
             DataType::String | DataType::Concat => Value::String(b.to_vec()),
             DataType::Address => {
                 fixed(4)?;
@@ -966,17 +954,17 @@ impl Value {
                 // Reserved, length, then up to 16 bytes of prefix. The
                 // reserved byte is ignored on receipt.
                 if b.len() < 2 || b.len() > 18 {
-                    return Err(ValueError::Length(b.len()));
+                    return Err(Error::ValueLength(b.len()));
                 }
                 let length = b[1];
                 let bytes = &b[2..];
                 if length > 128 || bytes.len() < usize::from(length).div_ceil(8) {
-                    return Err(ValueError::Prefix);
+                    return Err(Error::Prefix);
                 }
                 let mut a = [0u8; 16];
                 a[..bytes.len()].copy_from_slice(bytes);
                 if mask(&a, length) != a {
-                    return Err(ValueError::Prefix);
+                    return Err(Error::Prefix);
                 }
                 Value::Ipv6Prefix { length, prefix: Ipv6Addr::from(a) }
             }
@@ -985,7 +973,7 @@ impl Value {
                 let length = b[1];
                 let a = [b[2], b[3], b[4], b[5]];
                 if length > 32 || mask(&a, length) != a || (a == [0; 4] && length != 32) {
-                    return Err(ValueError::Prefix);
+                    return Err(Error::Prefix);
                 }
                 Value::Ipv4Prefix { length, prefix: Ipv4Addr::from(a) }
             }
@@ -1001,7 +989,7 @@ impl Value {
                 [ext_type, data @ ..] if !data.is_empty() => {
                     Value::Extended { ext_type: *ext_type, data: data.to_vec() }
                 }
-                _ => return Err(ValueError::Length(b.len())),
+                _ => return Err(Error::ValueLength(b.len())),
             },
             DataType::LongExtended => {
                 let (ext_type, more, data) = long_fragment(b)?;
@@ -1009,9 +997,9 @@ impl Value {
             }
             DataType::Tlv => {
                 if b.is_empty() {
-                    return Err(ValueError::Length(0));
+                    return Err(Error::ValueLength(0));
                 }
-                Value::Tlv(parse_attributes(b, 3).map_err(|_| ValueError::Nested)?)
+                Value::Tlv(parse_attributes(b, 3).map_err(|_| Error::Nested)?)
             }
         })
     }
@@ -1153,14 +1141,14 @@ pub struct Vsa {
 }
 
 impl Wire for Vsa {
-    type ParseError = ValueError;
+    type ParseError = Error;
     type WriteError = Error;
 
     /// Reads a vendor value. Refuses fewer than 5 bytes or more than
     /// [`MAX_VALUE`] bytes. Keeps the vendor number and opaque data.
-    fn parse(b: &[u8]) -> Result<Vsa, ValueError> {
+    fn parse(b: &[u8]) -> Result<Vsa, Error> {
         if !(5..=MAX_VALUE).contains(&b.len()) {
-            return Err(ValueError::Length(b.len()));
+            return Err(Error::ValueLength(b.len()));
         }
         Ok(Vsa { vendor: u32::from_be_bytes([b[0], b[1], b[2], b[3]]), data: b[4..].to_vec() })
     }
@@ -1182,9 +1170,9 @@ impl Vsa {
     /// The vendor's bytes read as sub-attributes, each a 1-byte type, a
     /// 1-byte length (2 or more, counting both) and a value, as RFC 2865
     /// suggests. Vendors that lay their bytes out another way give
-    /// [`ValueError::Nested`] or a wrong reading.
-    pub fn sub_attributes(&self) -> Result<Vec<Attribute>, ValueError> {
-        parse_attributes(&self.data, 2).map_err(|_| ValueError::Nested)
+    /// [`Error::Nested`] or a wrong reading.
+    pub fn sub_attributes(&self) -> Result<Vec<Attribute>, Error> {
+        parse_attributes(&self.data, 2).map_err(|_| Error::Nested)
     }
 
     /// A Vendor-Specific value for `vendor` holding these sub-attributes.
@@ -1215,14 +1203,14 @@ pub struct Evs {
 }
 
 impl Wire for Evs {
-    type ParseError = ValueError;
+    type ParseError = Error;
     type WriteError = Error;
 
     /// Reads a vendor value. Refuses fewer than 6 bytes or more than
     /// [`MAX_LONG_EXTENDED_VALUE`] bytes. Keeps the vendor number and opaque data.
-    fn parse(b: &[u8]) -> Result<Evs, ValueError> {
+    fn parse(b: &[u8]) -> Result<Evs, Error> {
         if !(6..=MAX_LONG_EXTENDED_VALUE).contains(&b.len()) {
-            return Err(ValueError::Length(b.len()));
+            return Err(Error::ValueLength(b.len()));
         }
         Ok(Evs { vendor: u32::from_be_bytes([b[0], b[1], b[2], b[3]]), evs_type: b[4], data: b[5..].to_vec() })
     }
@@ -1273,7 +1261,7 @@ impl Extended {
 
     /// The value read as an extended vendor-specific value, if the
     /// Extended-Type is [`EXTENDED_VENDOR_SPECIFIC`].
-    pub fn evs(&self) -> Option<Result<Evs, ValueError>> {
+    pub fn evs(&self) -> Option<Result<Evs, Error>> {
         (self.ext_type == EXTENDED_VENDOR_SPECIFIC).then(|| Evs::parse(&self.data))
     }
 
@@ -1912,8 +1900,8 @@ mod tests {
                 }
                 assert_eq!(Packet::parse_datagram(&bytes[..n]), Err(e));
             }
-            contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_PACKET);
-            assert_eq!(decode_all(Frames::new, &bytes), (vec![Packet::parse(&bytes).unwrap()], None));
+            contract::check_decode_with_alloc_limit(Packets::new, &bytes, 2 * MAX_PACKET);
+            assert_eq!(decode_all(Packets::new, &bytes), (vec![Packet::parse(&bytes).unwrap()], None));
         }
     }
 
@@ -2081,31 +2069,31 @@ mod tests {
     #[test]
     fn value_errors() {
         use DataType as T;
-        assert_eq!(Value::decode(T::Text, &[0xff]), Err(ValueError::Text));
+        assert_eq!(Value::decode(T::Text, &[0xff]), Err(Error::Text));
         for (t, n) in [(T::Address, 4), (T::Integer, 4), (T::Enum, 4), (T::Time, 4), (T::Integer64, 8)] {
-            assert_eq!(Value::decode(t, &vec![0; n + 1]), Err(ValueError::Length(n + 1)));
-            assert_eq!(Value::decode(t, &vec![0; n - 1]), Err(ValueError::Length(n - 1)));
+            assert_eq!(Value::decode(t, &vec![0; n + 1]), Err(Error::ValueLength(n + 1)));
+            assert_eq!(Value::decode(t, &vec![0; n - 1]), Err(Error::ValueLength(n - 1)));
         }
-        assert_eq!(Value::decode(T::Ipv6Address, &[0; 15]), Err(ValueError::Length(15)));
-        assert_eq!(Value::decode(T::InterfaceId, &[0; 7]), Err(ValueError::Length(7)));
-        assert_eq!(Value::decode(T::Ipv4Prefix, &[0; 5]), Err(ValueError::Length(5)));
-        assert_eq!(Value::decode(T::Ipv6Prefix, &[0]), Err(ValueError::Length(1)));
-        assert_eq!(Value::decode(T::Ipv6Prefix, &[0; 19]), Err(ValueError::Length(19)));
+        assert_eq!(Value::decode(T::Ipv6Address, &[0; 15]), Err(Error::ValueLength(15)));
+        assert_eq!(Value::decode(T::InterfaceId, &[0; 7]), Err(Error::ValueLength(7)));
+        assert_eq!(Value::decode(T::Ipv4Prefix, &[0; 5]), Err(Error::ValueLength(5)));
+        assert_eq!(Value::decode(T::Ipv6Prefix, &[0]), Err(Error::ValueLength(1)));
+        assert_eq!(Value::decode(T::Ipv6Prefix, &[0; 19]), Err(Error::ValueLength(19)));
         // Prefix length past the address, too few bytes, bits past the
         // length.
-        assert_eq!(Value::decode(T::Ipv6Prefix, &[0, 129]), Err(ValueError::Prefix));
-        assert_eq!(Value::decode(T::Ipv6Prefix, &[0, 17, 1, 2]), Err(ValueError::Prefix));
-        assert_eq!(Value::decode(T::Ipv6Prefix, &[0, 4, 0xf8]), Err(ValueError::Prefix));
-        assert_eq!(Value::decode(T::Ipv4Prefix, &[0, 33, 0, 0, 0, 0]), Err(ValueError::Prefix));
-        assert_eq!(Value::decode(T::Ipv4Prefix, &[0, 8, 1, 1, 0, 0]), Err(ValueError::Prefix));
-        assert_eq!(Value::decode(T::Vsa, &[0, 0, 1]), Err(ValueError::Length(3)));
-        assert_eq!(Value::decode(T::Evs, &[0, 0, 0, 1]), Err(ValueError::Length(4)));
-        assert_eq!(Value::decode(T::Extended, &[]), Err(ValueError::Length(0)));
-        assert_eq!(Value::decode(T::LongExtended, &[1]), Err(ValueError::Length(1)));
-        assert_eq!(Value::decode(T::Tlv, &[1, 1]), Err(ValueError::Nested));
-        assert_eq!(Value::decode(T::Tlv, &[1, 4, 0]), Err(ValueError::Nested));
-        assert_eq!(Value::decode(T::Tlv, &[1]), Err(ValueError::Nested));
-        for e in [ValueError::Length(1), ValueError::Text, ValueError::Prefix, ValueError::Nested, ValueError::Fragment]
+        assert_eq!(Value::decode(T::Ipv6Prefix, &[0, 129]), Err(Error::Prefix));
+        assert_eq!(Value::decode(T::Ipv6Prefix, &[0, 17, 1, 2]), Err(Error::Prefix));
+        assert_eq!(Value::decode(T::Ipv6Prefix, &[0, 4, 0xf8]), Err(Error::Prefix));
+        assert_eq!(Value::decode(T::Ipv4Prefix, &[0, 33, 0, 0, 0, 0]), Err(Error::Prefix));
+        assert_eq!(Value::decode(T::Ipv4Prefix, &[0, 8, 1, 1, 0, 0]), Err(Error::Prefix));
+        assert_eq!(Value::decode(T::Vsa, &[0, 0, 1]), Err(Error::ValueLength(3)));
+        assert_eq!(Value::decode(T::Evs, &[0, 0, 0, 1]), Err(Error::ValueLength(4)));
+        assert_eq!(Value::decode(T::Extended, &[]), Err(Error::ValueLength(0)));
+        assert_eq!(Value::decode(T::LongExtended, &[1]), Err(Error::ValueLength(1)));
+        assert_eq!(Value::decode(T::Tlv, &[1, 1]), Err(Error::Nested));
+        assert_eq!(Value::decode(T::Tlv, &[1, 4, 0]), Err(Error::Nested));
+        assert_eq!(Value::decode(T::Tlv, &[1]), Err(Error::Nested));
+        for e in [Error::ValueLength(1), Error::Text, Error::Prefix, Error::Nested, Error::Fragment]
         {
             assert!(!e.to_string().is_empty());
         }
@@ -2125,7 +2113,7 @@ mod tests {
         assert_eq!(back.sub_attributes().unwrap(), [Attribute { kind: 1, value: b"ab".to_vec() }]);
         // Bytes that are not sub-attributes.
         let odd = Vsa { vendor: 1, data: vec![1, 9] };
-        assert_eq!(odd.sub_attributes(), Err(ValueError::Nested));
+        assert_eq!(odd.sub_attributes(), Err(Error::Nested));
         // Sub-attributes that do not fit in one attribute, or none at all,
         // are refused rather than cut.
         assert_eq!(Vsa::from_sub_attributes(1, &[Attribute { kind: 1, value: vec![0; 300] }]), None);
@@ -2187,25 +2175,25 @@ mod tests {
         other.kind = attr::LONG_EXTENDED_TYPE_1;
         let one = |kind, ext_type, data: Vec<u8>| Ok(Extended { kind, ext_type, data });
         q.attributes = vec![f(1, true, 251), other, f(1, false, 2)];
-        assert_eq!(q.extended(), [Err(ValueError::Fragment), one(245, 2, vec![2]), one(246, 1, vec![1, 1])]);
+        assert_eq!(q.extended(), [Err(Error::Fragment), one(245, 2, vec![2]), one(246, 1, vec![1, 1])]);
         q.attributes = vec![f(1, true, 251), Attribute { kind: 1, value: b"u".to_vec() }, f(1, false, 2)];
-        assert_eq!(q.extended(), [Err(ValueError::Fragment), one(246, 1, vec![1, 1])]);
+        assert_eq!(q.extended(), [Err(Error::Fragment), one(246, 1, vec![1, 1])]);
         q.attributes = vec![f(1, true, 251), f(1, false, 2)];
         assert_eq!(q.extended(), [one(246, 1, vec![1; 253])]);
 
         // Errors: More on a short fragment, More on the last, no header,
         // no bytes after the header.
         q.attributes = vec![f(1, true, 10), f(1, false, 1)];
-        assert_eq!(q.extended(), [Err(ValueError::Fragment), Ok(Extended { kind: 246, ext_type: 1, data: vec![1] })]);
+        assert_eq!(q.extended(), [Err(Error::Fragment), Ok(Extended { kind: 246, ext_type: 1, data: vec![1] })]);
         q.attributes = vec![f(1, true, 251)];
-        assert_eq!(q.extended(), [Err(ValueError::Fragment)]);
+        assert_eq!(q.extended(), [Err(Error::Fragment)]);
         q.attributes = vec![Attribute { kind: 246, value: vec![1] }];
-        assert_eq!(q.extended(), [Err(ValueError::Length(1))]);
+        assert_eq!(q.extended(), [Err(Error::ValueLength(1))]);
         q.attributes = vec![f(1, false, 0)];
-        assert_eq!(q.extended(), [Err(ValueError::Length(2))]);
+        assert_eq!(q.extended(), [Err(Error::ValueLength(2))]);
         q.attributes = vec![Attribute { kind: 241, value: vec![] }, Attribute { kind: 242, value: vec![7] }];
-        assert_eq!(q.extended(), [Err(ValueError::Length(0)), Err(ValueError::Length(1))]);
-        assert_eq!(Extended { kind: 241, ext_type: 26, data: vec![1] }.evs(), Some(Err(ValueError::Length(1))));
+        assert_eq!(q.extended(), [Err(Error::ValueLength(0)), Err(Error::ValueLength(1))]);
+        assert_eq!(Extended { kind: 241, ext_type: 26, data: vec![1] }.evs(), Some(Err(Error::ValueLength(1))));
 
         // Values that cannot be written: wrong type, empty, too long.
         assert_eq!(Extended { kind: 1, ext_type: 1, data: vec![1] }.to_attributes(), None);
@@ -2232,21 +2220,21 @@ mod tests {
     fn rfc_6929_minimum_lengths() {
         use DataType as T;
         // Extended: Length 4 or more, so a byte after the Extended-Type.
-        assert_eq!(Value::decode(T::Extended, &[1]), Err(ValueError::Length(1)));
+        assert_eq!(Value::decode(T::Extended, &[1]), Err(Error::ValueLength(1)));
         assert_eq!(Value::decode(T::Extended, &[1, 0]), Ok(Value::Extended { ext_type: 1, data: vec![0] }));
         // Long extended: Length 5 or more.
-        assert_eq!(Value::decode(T::LongExtended, &[1, 0]), Err(ValueError::Length(2)));
+        assert_eq!(Value::decode(T::LongExtended, &[1, 0]), Err(Error::ValueLength(2)));
         assert!(Value::decode(T::LongExtended, &[1, 0x7f, 0]).is_ok());
         // The More flag only on a full-length fragment.
-        assert_eq!(Value::decode(T::LongExtended, &[1, MORE_FLAG, 9]), Err(ValueError::Fragment));
+        assert_eq!(Value::decode(T::LongExtended, &[1, MORE_FLAG, 9]), Err(Error::Fragment));
         // TLV: each TLV-Length 3 or more, and the value one or more bytes.
-        assert_eq!(Value::decode(T::Tlv, &[1, 2]), Err(ValueError::Nested));
-        assert_eq!(Value::decode(T::Tlv, &[1, 3, 0, 2, 2]), Err(ValueError::Nested));
-        assert_eq!(Value::decode(T::Tlv, &[]), Err(ValueError::Length(0)));
+        assert_eq!(Value::decode(T::Tlv, &[1, 2]), Err(Error::Nested));
+        assert_eq!(Value::decode(T::Tlv, &[1, 3, 0, 2, 2]), Err(Error::Nested));
+        assert_eq!(Value::decode(T::Tlv, &[]), Err(Error::ValueLength(0)));
         // EVS: one or more bytes of EVS-Value.
-        assert_eq!(Value::decode(T::Evs, &[0, 0, 0, 9, 1]), Err(ValueError::Length(5)));
+        assert_eq!(Value::decode(T::Evs, &[0, 0, 0, 9, 1]), Err(Error::ValueLength(5)));
         // Vendor-Specific: Length 7 or more (RFC 2865).
-        assert_eq!(Value::decode(T::Vsa, &[0, 0, 0, 9]), Err(ValueError::Length(4)));
+        assert_eq!(Value::decode(T::Vsa, &[0, 0, 0, 9]), Err(Error::ValueLength(4)));
         assert!(Value::decode(T::Vsa, &[0, 0, 0, 9, 1]).is_ok());
         // Writers refuse what readers refuse.
         let empty_tlv = Value::Tlv(vec![Attribute { kind: 1, value: vec![] }]);
@@ -2273,10 +2261,10 @@ mod tests {
         let mut q = Packet::new(Code::AccessAccept, 1, [0; 16]);
         q.attributes = vec![f(1, true, 251), f(2, false, 1), f(1, false, 2)];
         let one = |data: Vec<u8>, ext_type| Ok(Extended { kind: 246, ext_type, data });
-        assert_eq!(q.extended(), [Err(ValueError::Fragment), one(vec![2], 2), one(vec![1, 1], 1)]);
+        assert_eq!(q.extended(), [Err(Error::Fragment), one(vec![2], 2), one(vec![1, 1], 1)]);
         // A broken fragment ends the value it would continue.
         q.attributes = vec![f(1, true, 251), Attribute { kind: 246, value: vec![1] }];
-        assert_eq!(q.extended(), [Err(ValueError::Fragment), Err(ValueError::Length(1))]);
+        assert_eq!(q.extended(), [Err(Error::Fragment), Err(Error::ValueLength(1))]);
         // Two values one after the other.
         q.attributes = vec![f(1, true, 251), f(1, false, 1), f(1, false, 1)];
         assert_eq!(q.extended(), [one(vec![1; 252], 1), one(vec![1], 1)]);
@@ -2296,8 +2284,8 @@ mod tests {
             q.extended(),
             [
                 Ok(Extended { kind: 241, ext_type: 5, data: vec![1] }),
-                Err(ValueError::Length(0)),
-                Err(ValueError::Fragment),
+                Err(Error::ValueLength(0)),
+                Err(Error::Fragment),
                 Ok(Extended { kind: 242, ext_type: 6, data: vec![2] }),
             ]
         );
@@ -2306,8 +2294,8 @@ mod tests {
     #[test]
     fn ipv4_prefix_of_zeros_requires_length_32() {
         // RFC 8044, section 3.11.
-        assert_eq!(Value::decode(DataType::Ipv4Prefix, &[0, 8, 0, 0, 0, 0]), Err(ValueError::Prefix));
-        assert_eq!(Value::decode(DataType::Ipv4Prefix, &[0, 0, 0, 0, 0, 0]), Err(ValueError::Prefix));
+        assert_eq!(Value::decode(DataType::Ipv4Prefix, &[0, 8, 0, 0, 0, 0]), Err(Error::Prefix));
+        assert_eq!(Value::decode(DataType::Ipv4Prefix, &[0, 0, 0, 0, 0, 0]), Err(Error::Prefix));
         let zero = Value::Ipv4Prefix { length: 0, prefix: Ipv4Addr::new(10, 0, 0, 0) };
         assert_eq!(zero.to_attribute(1), None);
     }
@@ -2437,15 +2425,15 @@ mod tests {
     fn stream_splits_packets() {
         let a = hex(ACCESS_REQUEST);
         let data = [a.clone(), hex(ACCESS_ACCEPT)].concat();
-        contract::check_decode_with_alloc_limit(Frames::new, &data, 2 * MAX_PACKET);
-        let (packets, error) = decode_all(Frames::new, &data);
+        contract::check_decode_with_alloc_limit(Packets::new, &data, 2 * MAX_PACKET);
+        let (packets, error) = decode_all(Packets::new, &data);
         assert_eq!(error, None);
         assert_eq!(packets.iter().map(|p| p.code).collect::<Vec<_>>(), [Code::AccessRequest, Code::AccessAccept]);
-        assert_eq!(decode_all(Frames::new, &[1, 0, 0, 5]).1,
+        assert_eq!(decode_all(Packets::new, &[1, 0, 0, 5]).1,
             Some(Fail::Protocol(Error::Length { length: 5, limit: MAX_PACKET })));
         let mut bad = a;
         bad[21] = 1;
-        assert_eq!(decode_all(Frames::new, &bad).1, Some(Fail::Protocol(Error::Attribute(20))));
+        assert_eq!(decode_all(Packets::new, &bad).1, Some(Fail::Protocol(Error::Attribute(20))));
     }
 
     #[test]
@@ -2453,11 +2441,11 @@ mod tests {
         // A stream pushed in one call is taken a packet's worth at a time.
         let one = Packet::new(Code::StatusServer, 1, [0; 16]).to_bytes().unwrap();
         let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * 1000).collect();
-        let mut d = Stream::new(Frames::new());
+        let mut d = Stream::new(Packets::new());
         assert_eq!(d.push(&stream), MAX_PACKET);
         assert_eq!(d.push(&stream[MAX_PACKET..]), 0);
         assert_eq!(d.buffered(), MAX_PACKET);
-        let (packets, error) = decode_all(Frames::new, &stream);
+        let (packets, error) = decode_all(Packets::new, &stream);
         assert_eq!((packets.len(), error), (1000, None));
         // A packet of the longest length fills the decoder, and is read.
         let mut big = Packet::new(Code::AccessAccept, 2, [0; 16]);
@@ -2466,7 +2454,7 @@ mod tests {
         big.push(Attribute { kind: attr::CLASS, value: vec![2; room] }).unwrap();
         let bytes = big.to_bytes().unwrap();
         assert_eq!(bytes.len(), MAX_PACKET);
-        let mut d = Stream::new(Frames::new());
+        let mut d = Stream::new(Packets::new());
         assert_eq!(d.push(&[bytes.clone(), bytes.clone()].concat()), MAX_PACKET);
         assert_eq!(d.next(), Some(Ok(big)));
         assert_eq!(d.buffered(), 0);
@@ -2477,7 +2465,7 @@ mod tests {
         let one = Packet::new(Code::StatusServer, 1, [0; 16]).to_bytes().unwrap();
         let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * 100_000).collect();
         let started = std::time::Instant::now();
-        let (packets, error) = decode_all(Frames::new, &stream);
+        let (packets, error) = decode_all(Packets::new, &stream);
         assert_eq!((packets.len(), error), (100_000, None));
         assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
     }
@@ -2530,8 +2518,8 @@ mod tests {
     fn attribute_lengths_and_ranges() {
         // RFC 2865, section 5: text and strings are never empty.
         let empty = |kind| Attribute { kind, value: vec![] }.decode();
-        assert_eq!(empty(attr::USER_NAME), Err(ValueError::Length(0)));
-        assert_eq!(empty(attr::STATE), Err(ValueError::Length(0)));
+        assert_eq!(empty(attr::USER_NAME), Err(Error::ValueLength(0)));
+        assert_eq!(empty(attr::STATE), Err(Error::ValueLength(0)));
         assert_eq!(Attribute::from_value(attr::USER_NAME, &Value::Text(String::new())), None);
         // EAP-Start is an empty EAP-Message (RFC 3579, section 3.1), and
         // a type the dictionary does not know may be empty.
@@ -2548,9 +2536,9 @@ mod tests {
         // RFC 2865, section 5.16: a TCP port.
         let port = |p: u32| Attribute { kind: attr::LOGIN_TCP_PORT, value: p.to_be_bytes().to_vec() }.decode();
         assert_eq!(port(65535), Ok(Value::Integer(65535)));
-        assert_eq!(port(65536), Err(ValueError::Range));
+        assert_eq!(port(65536), Err(Error::Range));
         assert_eq!(Attribute::from_value(attr::LOGIN_TCP_PORT, &Value::Integer(65536)), None);
-        assert!(!ValueError::Range.to_string().is_empty());
+        assert!(!Error::Range.to_string().is_empty());
     }
 
     #[test]
@@ -2562,7 +2550,7 @@ mod tests {
         p.attributes = vec![user.clone(), eap(1), eap(2), user.clone()];
         assert_eq!(p.concat_consecutive(attr::EAP_MESSAGE), Some(Ok(vec![1, 2])));
         p.attributes = vec![eap(1), user.clone(), eap(2)];
-        assert_eq!(p.concat_consecutive(attr::EAP_MESSAGE), Some(Err(ValueError::Fragment)));
+        assert_eq!(p.concat_consecutive(attr::EAP_MESSAGE), Some(Err(Error::Fragment)));
         p.attributes = vec![user];
         assert_eq!(p.concat_consecutive(attr::EAP_MESSAGE), None);
         // EAP-Start.
@@ -2658,7 +2646,7 @@ mod tests {
             let again: Vec<Extended> = q.extended().into_iter().map(Result::unwrap).collect();
             assert_eq!(again, ext);
         }
-        contract::check_decode_with_alloc_limit(Frames::new, data, 2 * MAX_PACKET);
+        contract::check_decode_with_alloc_limit(Packets::new, data, 2 * MAX_PACKET);
         contract::check_wire::<Packet>(data);
     }
 

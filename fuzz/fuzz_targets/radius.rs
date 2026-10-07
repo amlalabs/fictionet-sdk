@@ -7,8 +7,8 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use fictionet::stdlib::codec::{Decode, Wire, contract};
 use fictionet::stdlib::radius::{
-    Attribute, Code, DataType, Evs, Extended, Frames, MAX_PACKET, MAX_VALUE, Packet,
-    Error, RESERVED_EXTENDED_TYPES, Value, Vsa,
+    Attribute, Code, DataType, Error, Evs, Extended, MAX_PACKET, MAX_VALUE, Packet, Packets,
+    RESERVED_EXTENDED_TYPES, Value, Vsa,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -141,9 +141,9 @@ fn construct(data: &[u8]) -> Option<()> {
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(Frames::new, data, 2 * Frames::new().capacity());
-    contract::check_decode_with_alloc_limit(|| Frames::with_limit(0), data, 2 * Frames::with_limit(0).capacity());
-    contract::check_decode_with_alloc_limit(|| Frames::with_limit(64), data, 2 * Frames::with_limit(64).capacity());
+    contract::check_decode_with_alloc_limit(Packets::new, data, 2 * Packets::new().capacity());
+    contract::check_decode_with_alloc_limit(|| Packets::with_limit(0), data, 2 * Packets::with_limit(0).capacity());
+    contract::check_decode_with_alloc_limit(|| Packets::with_limit(64), data, 2 * Packets::with_limit(64).capacity());
     contract::check_wire::<Packet>(data);
 
     // The bytes as one datagram.

@@ -6,8 +6,7 @@ use arbitrary::{Result, Unstructured};
 use fictionet::stdlib::codec::{Decode, Step, Wire, contract, test_support::decode_all};
 use fictionet::stdlib::dcerpc::{
     AUTH_PAD_ALIGN, Auth, Bind, BindAck, BindNak, Body, Context, ContextResult, DataRep, Error,
-    Frames, MAX_FRAG, MAX_FRAGMENTS, Pdu, Reassembler, ReassemblyError, SEC_TRAILER_LEN, SyntaxId,
-    Uuid, flags,
+    MAX_FRAG, MAX_FRAGMENTS, Pdu, Pdus, Reassembler, SEC_TRAILER_LEN, SyntaxId, Uuid, flags,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -217,7 +216,7 @@ fn related(u: &mut Unstructured, mut parts: Vec<Pdu>, mut want: Pdu) -> Result<(
         let got = r.push(f);
         match fail {
             Some(at) if i == at => {
-                assert_eq!(got, Err(ReassemblyError::Unexpected { call_id: want.call_id }));
+                assert_eq!(got, Err(Error::UnexpectedFragment { call_id: want.call_id }));
                 return Ok(());
             }
             _ if i + 1 == n => assert_eq!(got, Ok(Some(want.clone()))),
@@ -228,18 +227,18 @@ fn related(u: &mut Unstructured, mut parts: Vec<Pdu>, mut want: Pdu) -> Result<(
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(Frames::new, data, 2 * Frames::new().capacity());
+    contract::check_decode_with_alloc_limit(Pdus::new, data, 2 * Pdus::new().capacity());
     contract::check_wire::<Pdu>(data);
-    contract::check_decode_with_alloc_limit(|| Frames::with_limit(0), data, 2 * Frames::with_limit(0).capacity());
-    contract::check_decode_with_alloc_limit(|| Frames::with_limit(64), data, 2 * Frames::with_limit(64).capacity());
+    contract::check_decode_with_alloc_limit(|| Pdus::with_limit(0), data, 2 * Pdus::with_limit(0).capacity());
+    contract::check_decode_with_alloc_limit(|| Pdus::with_limit(64), data, 2 * Pdus::with_limit(64).capacity());
 
-    let (results, _) = decode_all(Frames::new, data);
+    let (results, _) = decode_all(Pdus::new, data);
     let mut rest = data;
     for result in &results {
         let length = Pdu::frame_length(rest).unwrap().unwrap();
         let (raw, tail) = rest.split_at(length);
         assert_eq!(
-            Frames::new().decode(raw, false),
+            Pdus::new().decode(raw, false),
             Ok(Step::Item(result.clone(), length))
         );
         // Exact parsing also checks that the canonical rewrite fits.

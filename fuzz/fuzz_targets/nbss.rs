@@ -4,22 +4,22 @@
 
 use fictionet::stdlib::codec::{Decode, Fail, Wire, contract, test_support::decode_all};
 use fictionet::stdlib::nbss::{
-    Error, Frames, HEADER_LEN, MAX_LABEL, MAX_LENGTH, MAX_NAME_LEN, NAME_LEN, Name, NegativeCode,
-    Packet, decode_first_level,
+    Error, HEADER_LEN, MAX_LABEL, MAX_LENGTH, MAX_NAME_LEN, NAME_LEN, Name, NegativeCode, Packet,
+    Packets, decode_first_level,
 };
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(Frames::new, data, 2 * Frames::new().capacity());
+    contract::check_decode_with_alloc_limit(Packets::new, data, 2 * Packets::new().capacity());
     contract::check_wire::<Packet>(data);
-    contract::check_decode_with_alloc_limit(|| Frames::with_limit(0), data, 2 * Frames::with_limit(0).capacity());
-    contract::check_decode_with_alloc_limit(|| Frames::with_limit(64), data, 2 * Frames::with_limit(64).capacity());
+    contract::check_decode_with_alloc_limit(|| Packets::with_limit(0), data, 2 * Packets::with_limit(0).capacity());
+    contract::check_decode_with_alloc_limit(|| Packets::with_limit(64), data, 2 * Packets::with_limit(64).capacity());
 
-    let (packets, _) = decode_all(Frames::new, data);
+    let (packets, _) = decode_all(Packets::new, data);
 
     // A small limit reads the same packets, up to the first one too long,
     // and stops there with Error::TooLong.
-    let (limited, small_end) = decode_all(|| Frames::with_limit(64), data);
+    let (limited, small_end) = decode_all(|| Packets::with_limit(64), data);
     let fit = packets.iter().take_while(|p| p.to_bytes().unwrap().len() - HEADER_LEN <= 64).count();
     assert_eq!(&limited[..], &packets[..fit]);
     if fit < packets.len() {
