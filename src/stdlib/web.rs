@@ -517,9 +517,9 @@ use std::sync::Arc;
 use http::{Request, Response};
 
 pub use crate::stdlib::httpd::{Body, Target};
-use crate::stdlib::httpd::{self, Handler};
+use crate::stdlib::httpd::{self, Handler, Website};
 use crate::stdlib::journal::Journal;
-use crate::stdlib::net::{Host, Net, Website};
+use crate::stdlib::net::{Host, Net};
 use crate::stdlib::route::Prefix;
 use crate::stdlib::tls::ServerConfig;
 use crate::{Attachments, Cx, Error};
@@ -767,7 +767,7 @@ impl Site {
 
     /// The site as a host of a [`Net`], named `name`.
     pub fn into_host(self, name: &str) -> Host {
-        let mut host = Host::new(name).dns_name(name).web(self.website);
+        let mut host = self.website.on(Host::new(name).dns_name(name));
         if let Some(a) = self.at {
             host = host.at(a);
         }

@@ -16,11 +16,18 @@
 //!   with several sites at one address does, with the redirect to https and
 //!   the `421 Misdirected Request` of [`web::Sites`](crate::stdlib::web::Sites).
 //!
+//! On a [`Net`](crate::stdlib::net::Net), a [`Site`] is the
+//! [`Accept`](crate::stdlib::net::Accept) that serves HTTP on a host's
+//! port: sites of several hosts at one address share the port as virtual
+//! hosts. [`Website`] puts a site on ports 80 and 443 the way websites
+//! are served. `Net` knows nothing of HTTP, so a copy of this file with
+//! its own handlers plugs in the same way.
+//!
 //! [`Http1`] is the [`Service`](crate::stdlib::serve::Service) that speaks
 //! HTTP/1.0 and 1.1 to a client, on [`http1`]'s
 //! decoder: keep-alive, pipelining, `Expect: 100-continue`, `HEAD`, chunked
-//! responses for bodies of unknown length, and a 30-second limit on each
-//! request's head. [`serve_connection`] picks the version for a
+//! responses for bodies of unknown length, and 30-second limits on each
+//! request's head and on its body. [`serve_connection`] picks the version for a
 //! connection: HTTP/2 by ALPN or by the client's preface, else HTTP/1.
 //!
 //! HTTP/2 runs on hyper for now, behind the same [`Handler`] trait and the
@@ -65,6 +72,7 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::future::{Future, poll_fn};
+use std::any::Any;
 use std::pin::{Pin, pin};
 use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context, Poll};
@@ -79,11 +87,12 @@ use http_body::{Body as _, Frame, SizeHint};
 use fictionet::stdlib::http1::{self, Event as H1, RequestHead};
 use fictionet::stdlib::journal::{ConnInfo, Event, Fields, Journal, Level, float, opt};
 use fictionet::stdlib::json::Value;
-use fictionet::stdlib::serve::{self, End, Flow, Pending, PendingCtx, Prefixed, ServeCtx, ServeOptions};
-use fictionet::stdlib::tcp::GoneWatch;
+use fictionet::stdlib::net::{Accept, Arrival, ConfigFor, Host, Sni};
+use fictionet::stdlib::serve::{self, Budget, End, Flow, Pending, PendingCtx, Prefixed, ServeCtx, ServeOptions, Timer};
+use fictionet::stdlib::tls::ServerConfig;
 use fictionet::stdlib::{ConnError, Connection, ConnectionExt};
 use fictionet::time::Instant;
-use fictionet::{Cx, Error};
+use fictionet::{Cx, Error, Raced};
 
 // ---------------------------------------------------------------------------
 // Bodies
@@ -743,13 +752,27 @@ pub struct Http1Options {
     /// service starts waiting for it, which includes the wait between
     /// requests. Default 30 seconds.
     pub header_timeout: Duration,
+    /// How long a request's body may take to arrive, counted from its
+    /// head, so a client that trickles a body cannot hold the connection
+    /// for ever. Default 30 seconds.
+    pub body_timeout: Duration,
 }
 
 impl Default for Http1Options {
     fn default() -> Http1Options {
-        Http1Options { limits: http1::Limits::default(), max_body: 64 << 20, header_timeout: Duration::from_secs(30) }
+        Http1Options {
+            limits: http1::Limits::default(),
+            max_body: 64 << 20,
+            header_timeout: Duration::from_secs(30),
+            body_timeout: Duration::from_secs(30),
+        }
     }
 }
+
+/// [`Http1`]'s timer for a request's head.
+const HEAD: Timer = "head";
+/// [`Http1`]'s timer for a request's body.
+const BODY: Timer = "body";
 
 /// HTTP/1.0 and 1.1 for one connection, answering with a [`Handler`].
 pub struct Http1 {
@@ -834,10 +857,11 @@ impl Http1 {
     }
 
     fn after(&mut self, ctx: &mut ServeCtx<'_>, close: bool) -> Flow {
+        ctx.cancel_timer(BODY);
         if close {
             return Flow::Close;
         }
-        ctx.wake_in(self.opts.header_timeout);
+        ctx.set_timer(HEAD, self.opts.header_timeout);
         Flow::Continue
     }
 }
@@ -950,14 +974,15 @@ impl serve::Service for Http1 {
     }
 
     fn on_open(&mut self, _: &(), ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
-        ctx.wake_in(self.opts.header_timeout);
+        ctx.set_timer(HEAD, self.opts.header_timeout);
         Ok(Flow::Continue)
     }
 
     fn on_item(&mut self, item: H1<RequestHead>, _: &(), ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
         match item {
             H1::Head(head) => {
-                ctx.cancel_wake();
+                ctx.cancel_timer(HEAD);
+                ctx.set_timer(BODY, self.opts.body_timeout);
                 if head.expects_continue() {
                     ctx.reply().extend_from_slice(b"HTTP/1.1 100 Continue\r\n\r\n");
                 }
@@ -978,8 +1003,12 @@ impl serve::Service for Http1 {
         Ok(Flow::Continue)
     }
 
-    fn on_tick(&mut self, _: &(), _ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
+    fn on_timer(&mut self, _: Timer, _: &(), _ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
         Ok(Flow::Close)
+    }
+
+    fn held(&self) -> usize {
+        self.body.len()
     }
 
     fn on_fail(&mut self, error: &serve_fail::Fail, _: &(), ctx: &mut ServeCtx<'_>) -> Result<(), Infallible> {
@@ -1098,7 +1127,10 @@ impl Pending for Streaming {
     fn poll_next(&mut self, ctx: &mut PendingCtx<'_>, task: &mut Context<'_>) -> Poll<Option<Result<Vec<u8>, Error>>> {
         loop {
             if let Some(work) = self.work.take() {
-                self.making = Some(work(ctx.cx().clone()));
+                self.making = Some(match ctx.cx() {
+                    Some(cx) => work(cx.clone()),
+                    None => Box::pin(std::future::ready(Err("this answer needs a Cx: give the harness one with Harness::with_cx".into()))),
+                });
             }
             if let Some(making) = &mut self.making {
                 let response = match making.as_mut().poll(task) {
@@ -1186,6 +1218,10 @@ pub struct HttpOptions {
     pub first_bytes: Option<Duration>,
     /// Where events go.
     pub journal: Option<Journal>,
+    /// What HTTP/1 connections are charged to ([`ServeOptions::budget`]).
+    pub budget: Option<Budget>,
+    /// The seed of HTTP/1 connections' randomness ([`ServeOptions::seed`]).
+    pub seed: u64,
 }
 
 /// What an HTTP/2 client sends first, with no TLS ("prior knowledge").
@@ -1193,16 +1229,8 @@ const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 /// Serves one connection with `handler`: HTTP/2 when TLS agreed on `h2`, or
 /// when a client without TLS starts with HTTP/2's preface; HTTP/1
-/// otherwise. `info` names the connection in events; `gone` ends it as
-/// soon as the client resets it.
-pub async fn serve_connection<C: Connection + Unpin>(
-    cx: &Cx,
-    conn: C,
-    info: ConnInfo,
-    gone: Option<GoneWatch>,
-    handler: Arc<dyn Handler>,
-    opts: &HttpOptions,
-) {
+/// otherwise. `info` names the connection in events.
+pub async fn serve_connection<C: Connection + Unpin>(cx: &Cx, conn: C, info: ConnInfo, handler: Arc<dyn Handler>, opts: &HttpOptions) {
     let mut conn = conn;
     let mut first = Vec::new();
     let h2 = if info.tls {
@@ -1219,10 +1247,10 @@ pub async fn serve_connection<C: Connection + Unpin>(
             }
             true
         };
-        match serve::until(cx, opts.first_bytes.map(|d| cx.now() + d), preface).await {
+        match cx.race(opts.first_bytes.map(|d| cx.now() + d), preface).await {
             Ok(true) => {}
-            Ok(false) | Err(true) => return,
-            Err(false) => {
+            Ok(false) | Err(Raced::Cancelled) => return,
+            Err(Raced::Deadline) => {
                 if let Some(j) = &opts.journal {
                     let secs = opts.first_bytes.map_or(0, |d| d.as_secs());
                     j.record(cx, &info, error_event(&info, "timeout", format!("no bytes within {secs} seconds of connecting")));
@@ -1234,12 +1262,172 @@ pub async fn serve_connection<C: Connection + Unpin>(
     };
     let conn = Prefixed::new(first, conn);
     if h2 {
-        h2::serve(cx, conn, handler, info, gone, opts.journal.clone()).await;
+        h2::serve(cx, conn, handler, info, opts.journal.clone()).await;
         return;
     }
-    let serve_opts = ServeOptions { journal: opts.journal.clone(), idle: None, connection_events: false, ..ServeOptions::default() };
+    let serve_opts = ServeOptions {
+        journal: opts.journal.clone(),
+        idle: None,
+        connection_events: false,
+        budget: opts.budget.clone(),
+        seed: opts.seed,
+        ..ServeOptions::default()
+    };
     let mut service = Http1::with(handler, opts.h1);
-    let _ = serve::serve(cx, conn, info, gone, &mut service, &(), &serve_opts).await;
+    let _ = serve::serve(cx, conn, info, &mut service, &(), &serve_opts).await;
+}
+
+// ---------------------------------------------------------------------------
+// HTTP on a network
+
+/// HTTP on one port of a [`Net`](crate::stdlib::net::Net) host: an
+/// [`Accept`] that serves the host's site for each of its DNS names.
+///
+/// Every host at one address that serves HTTP on a port shares that port:
+/// the first host's `Site` takes in the others' sites as
+/// [`VirtualHosts`], and each request goes to the site its host names.
+/// Over TLS, ALPN offers `h2` and `http/1.1`.
+///
+/// ```
+/// # use fictionet::stdlib::{httpd, net::Host};
+/// let page = httpd::Router::new().get("/", |_, _| http::Response::new("hello\n".into()));
+/// let host = Host::new("www").dns_name("www.corp.test").accept(80, httpd::Site::new(page));
+/// # drop(host);
+/// ```
+#[derive(Clone)]
+pub struct Site {
+    vhost: VHost,
+    default_host: bool,
+    h1: Http1Options,
+    vhosts: VirtualHosts,
+}
+
+impl Site {
+    /// A site served by `handler`, over plain HTTP.
+    pub fn new(handler: impl Handler) -> Site {
+        Site::shared(Arc::new(handler))
+    }
+
+    /// The same, from a shared handler.
+    pub fn shared(handler: Arc<dyn Handler>) -> Site {
+        Site { vhost: VHost { handler, https: false, plain_http: false }, default_host: false, h1: Http1Options::default(), vhosts: VirtualHosts::new() }
+    }
+
+    /// The site is served over HTTPS: on a TLS port it answers, and on a
+    /// plain port its requests get a `301` to https, unless
+    /// [`plain_http`](Self::plain_http).
+    pub fn https(mut self) -> Site {
+        self.vhost.https = true;
+        self
+    }
+
+    /// With [`https`](Self::https), answers plain HTTP too, with no
+    /// redirect.
+    pub fn plain_http(mut self) -> Site {
+        self.vhost.plain_http = true;
+        self
+    }
+
+    /// Answers requests at its address whose host names no site there.
+    /// The first default site at an address keeps the role.
+    pub fn default_host(mut self) -> Site {
+        self.default_host = true;
+        self
+    }
+
+    /// Sets HTTP/1's limits and timers.
+    pub fn options(mut self, h1: Http1Options) -> Site {
+        self.h1 = h1;
+        self
+    }
+}
+
+impl Accept for Site {
+    fn serve(&self, cx: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        let handler: Arc<dyn Handler> = Arc::new(self.vhosts.clone());
+        let opts = HttpOptions {
+            h1: self.h1,
+            first_bytes: (!arrival.info.tls).then_some(arrival.handshake),
+            journal: arrival.journal,
+            budget: arrival.budget,
+            seed: arrival.seed,
+        };
+        let (conn, info) = (arrival.conn, arrival.info);
+        Box::pin(async move { serve_connection(&cx, conn, info, handler, &opts).await })
+    }
+
+    fn alpn(&self) -> Vec<Vec<u8>> {
+        vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+    }
+
+    fn share(&self, names: &[String], other: &Arc<dyn Accept>) -> bool {
+        let other: &dyn Any = &**other;
+        let Some(site) = other.downcast_ref::<Site>() else { return false };
+        for name in names {
+            self.vhosts.insert(name, site.vhost.clone());
+        }
+        if site.default_host {
+            self.vhosts.set_default(site.vhost.clone());
+        }
+        true
+    }
+}
+
+/// A website on ports 80 and 443, as [`web::Sites`](crate::stdlib::web::Sites)
+/// serves one: with TLS, HTTPS on 443 for each of the host's names and a
+/// redirect to it on 80 (unless [`plain_http`](Self::plain_http));
+/// without, plain HTTP on 80. [`on`](Self::on) puts it on a host.
+#[derive(Clone)]
+pub struct Website {
+    handler: Arc<dyn Handler>,
+    tls: Option<ConfigFor>,
+    plain_http: bool,
+    default_host: bool,
+}
+
+impl Website {
+    /// A website served by `handler`, over plain HTTP only.
+    pub fn new(handler: impl Handler) -> Website {
+        Website::shared(Arc::new(handler))
+    }
+
+    /// The same, from a shared handler.
+    pub fn shared(handler: Arc<dyn Handler>) -> Website {
+        Website { handler, tls: None, plain_http: false, default_host: false }
+    }
+
+    /// Serves it over HTTPS on port 443, with the config `config_for`
+    /// returns for each handshake. Port 80 then redirects to https.
+    pub fn tls(self, config_for: impl Fn(&Cx) -> Arc<ServerConfig> + Send + Sync + 'static) -> Website {
+        Website { tls: Some(Arc::new(config_for)), ..self }
+    }
+
+    /// With TLS, answers plain HTTP on port 80 too, with no redirect.
+    pub fn plain_http(self) -> Website {
+        Website { plain_http: true, ..self }
+    }
+
+    /// Answers requests at its address whose host names no site there.
+    pub fn default_host(self) -> Website {
+        Website { default_host: true, ..self }
+    }
+
+    /// `host`, serving this website.
+    pub fn on(self, host: Host) -> Host {
+        let mut plain = Site::shared(self.handler.clone());
+        plain.vhost.https = self.tls.is_some();
+        plain.vhost.plain_http = self.plain_http;
+        plain.default_host = self.default_host;
+        let host = host.accept(80, plain);
+        match self.tls {
+            None => host,
+            Some(config) => {
+                let mut secure = Site::shared(self.handler).https();
+                secure.default_host = self.default_host;
+                host.tls_accept(443, Sni::Names, move |cx| config(cx), secure)
+            }
+        }
+    }
 }
 
 /// HTTP/2 on hyper, until the stdlib's own HTTP/2 lands.
@@ -1249,14 +1437,7 @@ mod h2 {
     use hyper::body::Incoming;
 
     /// Runs hyper's HTTP/2 server on `conn`.
-    pub(super) async fn serve<C: Connection + Unpin>(
-        cx: &Cx,
-        conn: C,
-        handler: Arc<dyn Handler>,
-        info: ConnInfo,
-        gone: Option<GoneWatch>,
-        journal: Option<Journal>,
-    ) {
+    pub(super) async fn serve<C: Connection + Unpin>(cx: &Cx, conn: C, handler: Arc<dyn Handler>, info: ConnInfo, journal: Option<Journal>) {
         let broke = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let io = Io { cx: cx.clone(), conn, broke: broke.clone(), buf: vec![0; 16 * 1024].into_boxed_slice() };
         let route = Route { cx: cx.clone(), handler, info: Arc::new(info.clone()), journal: journal.clone() };
@@ -1270,25 +1451,9 @@ mod h2 {
         if !browser {
             builder.timer(CxTimer { cx: cx.clone() });
         }
+        // hyper reads all the time on HTTP/2, so a reset ends it on its own.
         let served = builder.serve_connection(io, route);
-        let mut served = pin!(served);
-        let mut stopping = pin!(cx.cancelled());
-        let result = poll_fn(|task| {
-            if let Poll::Ready(r) = served.as_mut().poll(task) {
-                return Poll::Ready(Some(r));
-            }
-            if let Some(g) = &gone
-                && g.poll_gone(task).is_ready()
-            {
-                return Poll::Ready(None);
-            }
-            if stopping.as_mut().poll(task).is_ready() {
-                return Poll::Ready(None);
-            }
-            Poll::Pending
-        })
-        .await;
-        let Some(result) = result else { return };
+        let Ok(result) = cx.race(None, served).await else { return };
         let Some(j) = journal else { return };
         let broke = broke.load(std::sync::atomic::Ordering::Relaxed);
         let cause = match &result {

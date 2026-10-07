@@ -94,6 +94,10 @@ impl Level {
 /// Named values, in the order they were set. Setting a name again
 /// replaces its value in place.
 ///
+/// Names are `&'static str`, chosen by the code that records. Facts whose
+/// names come from the wire, such as LDAP attributes or OpenAPI paths, go
+/// under one name as a JSON object or array of pairs.
+///
 /// An HTTP handler adds fields to its request's event by putting `Fields`
 /// in its response's extensions (see [`httpd`](crate::stdlib::httpd)).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -253,6 +257,26 @@ impl Sandbox {
     }
 }
 
+/// How a connection's bytes travel.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Transport {
+    /// A byte stream: TCP, or TLS over it.
+    #[default]
+    Tcp,
+    /// Datagrams: UDP.
+    Udp,
+}
+
+impl Transport {
+    /// `tcp` or `udp`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Transport::Tcp => "tcp",
+            Transport::Udp => "udp",
+        }
+    }
+}
+
 /// Where an event came from: the connection and the sandbox behind it.
 /// Every field is optional, since some events belong to no connection.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -274,6 +298,10 @@ pub struct ConnInfo {
     pub sni: Option<Arc<str>>,
     /// The protocol the TLS handshake agreed on, such as `h2`.
     pub alpn: Option<Arc<[u8]>>,
+    /// TCP or UDP. A service served both ways, such as a Kerberos KDC,
+    /// answers by it: a reply too big for a datagram asks the client to
+    /// use TCP.
+    pub transport: Transport,
 }
 
 impl ConnInfo {
@@ -333,7 +361,8 @@ impl Entry {
 
     /// The entry as one JSON object: `seq`, `at` (seconds since the run
     /// started), `service`, `kind`, `level`, `summary`, then the envelope
-    /// (`sandbox`, `conn`, `local`, `peer`, `sni`), then `fields`.
+    /// (`sandbox`, `conn`, `local`, `peer`, `transport`, `sni`), then
+    /// `fields`.
     pub fn to_json(&self) -> Value {
         let c = &self.conn;
         Value::Object(vec![
@@ -347,6 +376,7 @@ impl Entry {
             ("conn".into(), opt(c.id)),
             ("local".into(), opt(c.local.map(|a| a.to_string()))),
             ("peer".into(), opt(c.peer.map(|a| a.to_string()))),
+            ("transport".into(), c.transport.as_str().into()),
             ("sni".into(), opt(c.sni.as_deref())),
             ("fields".into(), self.event.fields.to_json()),
         ])
@@ -488,6 +518,27 @@ impl Journal {
     /// an observer watching `cx`'s world.
     pub fn wants(&self, cx: &Cx) -> bool {
         self.inner.any.load(Ordering::Relaxed) || (self.inner.dashboard.load(Ordering::Relaxed) && cx.observed())
+    }
+
+    /// Records the `journal.start` entry that anchors the run's clock. It
+    /// is dated at the start of the run (`at` 0), and its `wall` field is
+    /// the wall-clock time then, in seconds since the Unix epoch (`null`
+    /// where there is no wall clock, as in a browser), so a reader can put
+    /// every entry's `at` on a calendar. `fields` add the
+    /// world's own facts, such as the date the world says it is
+    /// (`world_date`): the world owns its dates, and services take them
+    /// from it, never from the host's clock. Call it once, before
+    /// anything else is recorded; [`Net`](crate::stdlib::net::Net) does.
+    pub fn start(&self, cx: &Cx, fields: Fields) {
+        let wall = if cfg!(target_arch = "wasm32") {
+            Value::Null
+        } else {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(Value::Null, |d| float(d.as_secs_f64() - cx.now().since_start().as_secs_f64()))
+        };
+        let event = Event::new("journal", "start").summary("the run started").fields(fields).field("wall", wall);
+        self.record_at(cx, Instant::ZERO, &ConnInfo::default(), event);
     }
 
     /// Records `event`, from `conn`, at `cx`'s time.

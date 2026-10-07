@@ -14,8 +14,11 @@
 //! service, writes its reply, honors its timers, and closes. [`listen`]
 //! runs `serve` for every connection a [`Listener`] accepts, with a
 //! cap on how many are open, and TLS first when the options ask for it.
-//! [`serve_datagram`] does the same for a UDP socket, one datagram at a
-//! time. The driver carries the codec tools without the service knowing:
+//! [`serve_datagram`] does the same for a UDP socket. The driver and the
+//! [`Harness`] share one state machine, so a service that passes its
+//! harness tests behaves the same over a real connection.
+//!
+//! The driver carries the codec tools without the service knowing:
 //! a [`Transcript`] records both directions with a
 //! [`Recorder`], and a [`FaultPlan`] runs
 //! [`Faults`] on the bytes and items in, and
@@ -81,46 +84,69 @@
 //!
 //! - **One call at a time.** The service's methods are called in order, in
 //!   the connection's task. Each call's reply is written before the next
-//!   item is decoded. A service may hand the driver async work with
-//!   [`ServeCtx::defer`], for adapters such as tower; the driver writes its
-//!   bytes, in order, before it reads on.
-//! - **Timers.** [`ServeCtx::wake_in`] asks for one [`Service::on_tick`]
-//!   after a time. The time counts from when the driver next waits for
-//!   input, after the call's reply and deferred work are written, so a slow
-//!   write never eats into it. A later `wake_in` replaces it.
+//!   call. A panic in a call closes the connection, records `conn.panic`,
+//!   and is not seen by the rest of the world.
+//! - **Progress, not stalls.** Bytes the decoder takes count as progress,
+//!   whether or not they make an item, so a decoder that skips a long run
+//!   of bytes is never mistaken for a stuck one. A decoder that can take
+//!   nothing more and yields nothing fails with
+//!   [`Fail::Stuck`], which [`Service::on_fail`] hears.
+//! - **Timers.** [`ServeCtx::set_timer`] arms a named timer; several can
+//!   run at once. Each counts from when the call's reply is written. A due
+//!   timer is handled before more input is read, so a client that never
+//!   stops sending cannot starve a heartbeat.
+//! - **Wakes.** [`ServeCtx::wake_handle`] gives a handle the world or
+//!   another connection keeps; [`WakeHandle::wake`] calls
+//!   [`Service::on_wake`] in this connection's task, for a fill pushed to
+//!   a trader or a notification pushed to a client.
+//! - **Deferred work.** [`ServeCtx::defer`] hands the driver async work
+//!   whose bytes it writes, in order, before it reads on (an HTTP/1
+//!   response from a tower service). [`ServeCtx::defer_keyed`] starts work
+//!   that runs beside the reads and the other keyed work, each writing
+//!   whole frames as they come, and [`Service::on_done`] hears when one
+//!   ends: concurrent responses, as HTTP/2 streams need.
 //! - **Idle.** With [`ServeOptions::idle`], a connection that sends nothing
 //!   for that long while the driver waits for it is closed, after
 //!   [`Service::on_end`] with [`End::Idle`].
+//! - **Budget.** With [`ServeOptions::budget`], the bytes the connection
+//!   holds (the decoder's capacity and held state, the bytes waiting for
+//!   it, and [`Service::held`]) are charged to a [`Budget`] shared with
+//!   other connections; past it the connection closes with
+//!   [`End::Budget`].
 //! - **Ends.** [`Service::on_end`] is called once, with why the connection
 //!   ended. Its reply is written when the connection can still take it: the
 //!   client half-closed ([`End::Eof`]), the service closed, the service's
-//!   decoder failed, or the connection sat idle.
-//! - **Handoff.** A decoder that ends ([`Step::End`](crate::stdlib::codec::Step::End)),
-//!   or a call that returns [`Flow::Upgrade`], hands the connection back
-//!   with its unread bytes in [`Served::Upgraded`], for STARTTLS or a
-//!   CONNECT tunnel.
+//!   decoder failed, the connection sat idle or went over its budget.
+//! - **Upgrades.** A call that returns [`Flow::Upgrade`] says what comes
+//!   next: [`Upgrade::Tls`] shakes hands as a TLS server with
+//!   [`ServeOptions::starttls`] and calls [`Service::on_open`] again over
+//!   TLS (STARTTLS in SMTP, LDAP and Postgres); [`Upgrade::Decoder`] goes
+//!   on with a fresh decoder; [`Upgrade::Handoff`] hands the connection
+//!   and its unread bytes back in [`Served::Upgraded`], for a CONNECT
+//!   tunnel. A decoder that ends ([`Step::End`](crate::stdlib::codec::Step::End))
+//!   asks [`Service::on_decoder_end`] which.
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::future::{Future, poll_fn};
 use std::net::SocketAddr;
 use std::pin::pin;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
 use fictionet::stdlib::codec::{
     Buffer, ByteFault, Decode, Direction, Fail, FaultDelay, Faults, ItemFault, Lcg, Record, Recorder, RewriteError,
     Rule, Stream, StreamEvent,
 };
-use fictionet::stdlib::journal::{ConnInfo, Event, Journal, Level};
-use fictionet::stdlib::tcp::{GoneWatch, Listener};
+use fictionet::stdlib::journal::{ConnInfo, Event, Journal, Level, Transport};
+use fictionet::stdlib::tcp::Listener;
 use fictionet::stdlib::tls::{self, HandshakeError, ServerConfig, TlsConnection};
 use fictionet::stdlib::udp::Socket;
 use fictionet::stdlib::{ConnError, Connection, ConnectionExt};
 use fictionet::time::Instant;
-use fictionet::{Cx, Task};
+use fictionet::{Cx, Raced, Task};
 
 // ---------------------------------------------------------------------------
 // The service
@@ -131,20 +157,29 @@ use fictionet::{Cx, Task};
 /// Make one per connection ([`listen`] takes a function that does). State
 /// shared with the rest of the world, such as a directory, a process model
 /// or an order book, is the `World`, passed to every call.
+///
+/// A protocol that frames the same messages two ways, such as Kerberos
+/// (a length prefix over TCP, one message per datagram over UDP), is two
+/// thin services over one core of its own: each picks its decoder and
+/// hands the message to the shared code. [`ConnInfo::transport`] says
+/// which one a call came over.
 pub trait Service: Send + 'static {
     /// How this service's bytes become items.
     type Decode: Decode + Send + 'static;
     /// State shared with the world, read by every connection.
     type World: Send + Sync + 'static;
-    /// Why the service gives up on a connection. The driver closes it and
-    /// returns the error.
+    /// Why the service gives up on a connection. The driver closes it,
+    /// records `conn.error`, and returns the error.
     type Error: core::error::Error + Send + Sync + 'static;
 
-    /// A fresh decoder for a new connection.
+    /// A fresh decoder for a new connection, and after
+    /// [`Upgrade::Decoder`] or a TLS upgrade.
     fn decoder(&self) -> Self::Decode;
 
     /// The connection is open and nothing is read yet. A protocol whose
-    /// server speaks first (SSH, SMTP, FTP banners) writes here.
+    /// server speaks first (SSH, SMTP, FTP banners) writes here. Called
+    /// again after [`Upgrade::Tls`], once the handshake is done:
+    /// `ctx.conn().tls` is then true.
     fn on_open(&mut self, _world: &Self::World, _ctx: &mut ServeCtx<'_>) -> Result<Flow, Self::Error> {
         Ok(Flow::Continue)
     }
@@ -157,8 +192,20 @@ pub trait Service: Send + 'static {
         ctx: &mut ServeCtx<'_>,
     ) -> Result<Flow, Self::Error>;
 
-    /// The timer asked for with [`ServeCtx::wake_in`] went off.
-    fn on_tick(&mut self, _world: &Self::World, _ctx: &mut ServeCtx<'_>) -> Result<Flow, Self::Error> {
+    /// The timer named `timer`, set with [`ServeCtx::set_timer`], went off.
+    fn on_timer(&mut self, _timer: Timer, _world: &Self::World, _ctx: &mut ServeCtx<'_>) -> Result<Flow, Self::Error> {
+        Ok(Flow::Continue)
+    }
+
+    /// The connection's [`WakeHandle`] was woken. Several wakes before the
+    /// driver gets to it are one call.
+    fn on_wake(&mut self, _world: &Self::World, _ctx: &mut ServeCtx<'_>) -> Result<Flow, Self::Error> {
+        Ok(Flow::Continue)
+    }
+
+    /// Work started with [`ServeCtx::defer_keyed`] under `key` ended, as
+    /// `done` says. Not called for work the service cancelled or replaced.
+    fn on_done(&mut self, _key: u64, _done: Done, _world: &Self::World, _ctx: &mut ServeCtx<'_>) -> Result<Flow, Self::Error> {
         Ok(Flow::Continue)
     }
 
@@ -173,11 +220,31 @@ pub trait Service: Send + 'static {
         Ok(())
     }
 
+    /// The decoder ended ([`Step::End`](crate::stdlib::codec::Step::End)):
+    /// the bytes after it belong to something else. [`Flow::Continue`]
+    /// goes on with a fresh decoder, as [`Upgrade::Decoder`] does. The
+    /// default hands the connection back ([`Upgrade::Handoff`]).
+    fn on_decoder_end(&mut self, _world: &Self::World, _ctx: &mut ServeCtx<'_>) -> Result<Flow, Self::Error> {
+        Ok(Flow::Upgrade(Upgrade::Handoff))
+    }
+
     /// The connection ended, for the reason in `end`. Called once, last.
+    /// Not called after a panic.
     fn on_end(&mut self, _end: End, _world: &Self::World, _ctx: &mut ServeCtx<'_>) -> Result<(), Self::Error> {
         Ok(())
     }
+
+    /// Bytes the service itself holds for this connection, such as a
+    /// request body it collects. Charged to the connection's [`Budget`]
+    /// with the decoder's. Default 0.
+    fn held(&self) -> usize {
+        0
+    }
 }
+
+/// A timer's name. A service names its timers, such as `"heartbeat"` and
+/// `"logon"`, and [`Service::on_timer`] hears which one went off.
+pub type Timer = &'static str;
 
 /// What a call hands back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -186,9 +253,37 @@ pub enum Flow {
     Continue,
     /// Write the reply, then close.
     Close,
-    /// Write the reply, then hand the connection and its unread bytes back
-    /// to the caller of [`serve`] ([`Served::Upgraded`]).
-    Upgrade,
+    /// Write the reply, then change what runs on the connection.
+    Upgrade(Upgrade),
+}
+
+/// What comes after [`Flow::Upgrade`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Upgrade {
+    /// Shake hands as a TLS server on the connection, with the config
+    /// [`ServeOptions::starttls`] picks, then go on with the same service
+    /// over TLS: a fresh decoder, and [`Service::on_open`] again. STARTTLS
+    /// in SMTP, IMAP and LDAP, and Postgres's `SSLRequest`.
+    Tls,
+    /// Go on with the same service and a fresh decoder from
+    /// [`Service::decoder`], which reads the bytes not yet decoded. For a
+    /// protocol whose framing changes after a handshake.
+    Decoder,
+    /// Hand the connection and its unread bytes back to whoever called
+    /// [`serve`] ([`Served::Upgraded`]): a CONNECT tunnel, or a protocol
+    /// served by other code.
+    Handoff,
+}
+
+impl Upgrade {
+    /// `tls`, `decoder` or `handoff`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Upgrade::Tls => "tls",
+            Upgrade::Decoder => "decoder",
+            Upgrade::Handoff => "handoff",
+        }
+    }
 }
 
 /// Why a connection ended, as [`Service::on_end`] hears it.
@@ -197,34 +292,78 @@ pub enum End {
     /// The client sent everything it will send, and every item was handled.
     /// The reply is still written.
     Eof,
-    /// The service returned [`Flow::Close`].
+    /// The service returned [`Flow::Close`], or an error.
     Closed,
     /// The decoder failed, after [`Service::on_fail`].
     Failed,
     /// Nothing arrived for [`ServeOptions::idle`].
     Idle,
+    /// The connection held more than its [`Budget`] allows.
+    Budget,
     /// Reading or writing failed: the client reset the connection, or TLS
     /// broke ([`ConnError::Broken`]).
     Conn(ConnError),
     /// The world is stopping.
     Cancelled,
+    /// A call into the service panicked. [`Service::on_end`] is not
+    /// called.
+    Panicked,
 }
 
-/// Async work a service hands the driver with [`ServeCtx::defer`]: bytes
-/// to write as they come, such as a response from a tower service.
+impl End {
+    /// Whether the connection can still take a last reply.
+    pub fn writable(self) -> bool {
+        matches!(self, End::Eof | End::Closed | End::Failed | End::Idle | End::Budget)
+    }
+
+    /// The name in a `conn.close` event: `eof`, `closed`, `failed`,
+    /// `idle`, `budget`, `reset`, `broken`, `error`, `cancelled` or
+    /// `panicked`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            End::Eof => "eof",
+            End::Closed => "closed",
+            End::Failed => "failed",
+            End::Idle => "idle",
+            End::Budget => "budget",
+            End::Conn(ConnError::Reset) => "reset",
+            End::Conn(ConnError::Broken) => "broken",
+            End::Conn(_) => "error",
+            End::Cancelled => "cancelled",
+            End::Panicked => "panicked",
+        }
+    }
+}
+
+/// How keyed work ended, as [`Service::on_done`] hears it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Done {
+    /// It wrote everything it had.
+    Finished,
+    /// It failed with this message. Its bytes so far were written.
+    Failed(String),
+}
+
+/// Async work a service hands the driver with [`ServeCtx::defer`] or
+/// [`ServeCtx::defer_keyed`]: bytes to write as they come, such as a
+/// response from a tower service.
 pub trait Pending: Send + 'static {
-    /// The next bytes to write, or `None` when done. An error closes the
-    /// connection: the bytes so far may have broken the protocol's framing.
+    /// The next bytes to write, or `None` when done. Keyed work yields
+    /// whole frames: the driver never splits one, and writes other work's
+    /// frames between them. An error on ordered work closes the
+    /// connection, since the bytes so far may have broken the protocol's
+    /// framing; on keyed work it ends that work ([`Done::Failed`]).
     fn poll_next(&mut self, ctx: &mut PendingCtx<'_>, task: &mut Context<'_>) -> Poll<Option<Result<Vec<u8>, fictionet::Error>>>;
 
-    /// The connection went away, or the world is stopping, before the work
-    /// finished. The work is dropped after this.
+    /// The connection went away, the world is stopping, or the service
+    /// cancelled the work, before it finished. The work is dropped after
+    /// this.
     fn cancel(&mut self, _ctx: &mut PendingCtx<'_>) {}
 }
 
 /// What deferred work sees while it runs.
 pub struct PendingCtx<'a> {
-    cx: &'a Cx,
+    cx: Option<&'a Cx>,
     events: &'a mut Vec<Event>,
     written: u64,
     conn: &'a ConnInfo,
@@ -232,8 +371,9 @@ pub struct PendingCtx<'a> {
 }
 
 impl PendingCtx<'_> {
-    /// The connection's context, for async work.
-    pub fn cx(&self) -> &Cx {
+    /// The connection's context, for async work. `None` in a [`Harness`]
+    /// made without one ([`Harness::with_cx`]).
+    pub fn cx(&self) -> Option<&Cx> {
         self.cx
     }
 
@@ -260,33 +400,166 @@ impl PendingCtx<'_> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum TimerRequest {
-    #[default]
-    Unchanged,
-    Set(Duration),
-    Cancel,
+/// Wakes one connection's service from anywhere: the world, another
+/// connection, a scenario step. Cheap to clone. Get one with
+/// [`ServeCtx::wake_handle`] and keep it where the event happens, such as
+/// in an order book next to the order it belongs to.
+///
+/// Each [`wake`](Self::wake) asks for one [`Service::on_wake`]; wakes
+/// before the driver gets to it are one call. Once the connection has
+/// ended, [`is_closed`](Self::is_closed) says so and waking does nothing,
+/// so the world can drop handles of connections that are gone.
+#[derive(Clone)]
+pub struct WakeHandle {
+    inner: Arc<WakeInner>,
+}
+
+struct WakeInner {
+    woken: AtomicBool,
+    closed: AtomicBool,
+    waker: Mutex<Option<Waker>>,
+}
+
+impl std::fmt::Debug for WakeHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WakeHandle").field("closed", &self.is_closed()).finish()
+    }
+}
+
+impl WakeHandle {
+    fn new() -> WakeHandle {
+        WakeHandle { inner: Arc::new(WakeInner { woken: AtomicBool::new(false), closed: AtomicBool::new(false), waker: Mutex::new(None) }) }
+    }
+
+    /// Asks for a [`Service::on_wake`] call.
+    pub fn wake(&self) {
+        if self.is_closed() {
+            return;
+        }
+        self.inner.woken.store(true, Ordering::Release);
+        let waker = self.inner.waker.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(w) = waker {
+            w.wake();
+        }
+    }
+
+    /// Whether the connection has ended.
+    pub fn is_closed(&self) -> bool {
+        self.inner.closed.load(Ordering::Acquire)
+    }
+
+    fn poll(&self, task: &mut Context<'_>) -> Poll<()> {
+        *self.inner.waker.lock().unwrap_or_else(|e| e.into_inner()) = Some(task.waker().clone());
+        if self.inner.woken.load(Ordering::Acquire) { Poll::Ready(()) } else { Poll::Pending }
+    }
+
+    fn take(&self) -> bool {
+        self.inner.woken.swap(false, Ordering::AcqRel)
+    }
+
+    fn close(&self) {
+        self.inner.closed.store(true, Ordering::Release);
+        self.inner.waker.lock().unwrap_or_else(|e| e.into_inner()).take();
+    }
+}
+
+/// Bytes connections may hold, shared by every connection charged to it:
+/// one sandbox's connections in [`Net`](crate::stdlib::net::Net). Cheap to
+/// clone; clones share the count.
+///
+/// Each connection charges what it holds: its decoder's capacity and
+/// held state ([`Decode::capacity`], [`Decode::held`]), the bytes read but
+/// not yet decoded, and [`Service::held`]. A connection that would take
+/// the total past the limit closes with [`End::Budget`]; one that cannot
+/// get its first charge is closed before the service sees it.
+#[derive(Clone)]
+pub struct Budget {
+    inner: Arc<BudgetInner>,
+}
+
+struct BudgetInner {
+    used: AtomicUsize,
+    limit: usize,
+}
+
+impl std::fmt::Debug for Budget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Budget").field("used", &self.used()).field("limit", &self.limit()).finish()
+    }
+}
+
+impl Budget {
+    /// At most `limit` bytes.
+    pub fn new(limit: usize) -> Budget {
+        Budget { inner: Arc::new(BudgetInner { used: AtomicUsize::new(0), limit }) }
+    }
+
+    /// Bytes charged now.
+    pub fn used(&self) -> usize {
+        self.inner.used.load(Ordering::Relaxed)
+    }
+
+    /// The limit.
+    pub fn limit(&self) -> usize {
+        self.inner.limit
+    }
+
+    /// Moves a charge from `from` bytes to `to`. Refuses, changing
+    /// nothing, if that would pass the limit.
+    fn recharge(&self, from: usize, to: usize) -> bool {
+        if to <= from {
+            self.inner.used.fetch_sub(from - to, Ordering::Relaxed);
+            return true;
+        }
+        let more = to - from;
+        self.inner
+            .used
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| used.checked_add(more).filter(|n| *n <= self.inner.limit))
+            .is_ok()
+    }
+}
+
+/// One connection's charge on a [`Budget`], given back when dropped.
+struct Charge {
+    budget: Budget,
+    now: usize,
+}
+
+impl Charge {
+    fn set(&mut self, to: usize) -> bool {
+        if to == self.now {
+            return true;
+        }
+        if self.budget.recharge(self.now, to) {
+            self.now = to;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl Drop for Charge {
+    fn drop(&mut self) {
+        self.budget.recharge(self.now, 0);
+    }
 }
 
 /// The driver's scratch for one call: the reply, the clock reading the
-/// driver took, seeded randomness, and the events to record.
+/// driver took, seeded randomness, the events to record, and what the
+/// call asked for.
 pub struct ServeCtx<'a> {
-    reply: &'a mut Vec<u8>,
+    s: &'a mut Scratch,
     now: Instant,
-    rng: &'a mut Lcg,
-    events: &'a mut Vec<Event>,
-    logging: bool,
     conn: &'a ConnInfo,
-    timer: &'a mut TimerRequest,
-    deferred: &'a mut Option<Box<dyn Pending>>,
-    bytes_in: u64,
-    unread: &'a [u8],
+    timers: &'a [(Timer, Instant)],
 }
 
 impl ServeCtx<'_> {
-    /// Bytes to send, after anything already there.
+    /// Bytes to send, after anything already there. Over UDP, they go to
+    /// the sender of the datagram being handled, as one datagram.
     pub fn reply(&mut self) -> &mut Vec<u8> {
-        self.reply
+        &mut self.s.reply
     }
 
     /// The run's clock, read by the driver before this call.
@@ -295,57 +568,95 @@ impl ServeCtx<'_> {
     }
 
     /// A random number from the connection's own generator, seeded from
-    /// the world's.
+    /// [`ServeOptions::seed`] and the connection's number.
     pub fn random_u64(&mut self) -> u64 {
-        self.rng.next()
+        self.s.rng.next()
     }
 
-    /// Asks for one [`Service::on_tick`] after `d`, counted from when the
-    /// driver next waits for input. Replaces a timer asked for before.
-    pub fn wake_in(&mut self, d: Duration) {
-        *self.timer = TimerRequest::Set(d);
+    /// Arms the timer `name` to go off `d` after this call's reply is
+    /// written, replacing it if it is armed.
+    pub fn set_timer(&mut self, name: Timer, d: Duration) {
+        self.s.timers.retain(|(n, _)| *n != name);
+        self.s.timers.push((name, Some(d)));
     }
 
-    /// Cancels the timer.
-    pub fn cancel_wake(&mut self) {
-        *self.timer = TimerRequest::Cancel;
+    /// Disarms the timer `name`.
+    pub fn cancel_timer(&mut self, name: Timer) {
+        self.s.timers.retain(|(n, _)| *n != name);
+        self.s.timers.push((name, None));
+    }
+
+    /// When the timer `name` goes off, if it is armed. A timer set in this
+    /// call says `now` plus its duration.
+    pub fn timer(&self, name: Timer) -> Option<Instant> {
+        if let Some((_, d)) = self.s.timers.iter().find(|(n, _)| *n == name) {
+            return d.map(|d| self.now + d);
+        }
+        self.timers.iter().find(|(n, _)| *n == name).map(|(_, at)| *at)
     }
 
     /// Records `event` in the journal, from this connection.
     pub fn log(&mut self, event: Event) {
-        if self.logging {
-            self.events.push(event);
+        if self.s.logging {
+            self.s.events.push(event);
         }
     }
 
     /// Whether events reach anyone. A service skips building an event that
     /// would be thrown away.
     pub fn logging(&self) -> bool {
-        self.logging
+        self.s.logging
     }
 
-    /// The connection: its number, sandbox and addresses.
+    /// The connection: its number, sandbox, addresses and transport.
     pub fn conn(&self) -> &ConnInfo {
         self.conn
     }
 
     /// How many bytes the client has sent so far.
     pub fn bytes_in(&self) -> u64 {
-        self.bytes_in
+        self.s.bytes_in
     }
 
     /// In [`Service::on_fail`], the bytes the decoder could not use: a
     /// message cut off by the end of input, or bytes that are not this
     /// protocol. Empty in every other call.
     pub fn unread(&self) -> &[u8] {
-        self.unread
+        &self.s.unread
     }
 
     /// Hands the driver async work whose bytes it writes, in order, after
-    /// this call's reply and before it reads on. At most one at a time: a
-    /// second call replaces the first.
+    /// this call's reply and before it reads on. Timers and wakes wait
+    /// too. Several are run one after another.
     pub fn defer(&mut self, work: impl Pending) {
-        *self.deferred = Some(Box::new(work));
+        self.s.ordered.push(Box::new(work));
+    }
+
+    /// Starts async work under `key` that runs beside the reads and the
+    /// other keyed work. Its frames are written whole, as they come;
+    /// [`Service::on_done`] hears when it ends. Work already under `key`
+    /// is cancelled first.
+    pub fn defer_keyed(&mut self, key: u64, work: impl Pending) {
+        self.s.keyed.push((key, Some(Box::new(work))));
+    }
+
+    /// Cancels the keyed work under `key`, if it runs.
+    pub fn cancel_keyed(&mut self, key: u64) {
+        self.s.keyed.push((key, None));
+    }
+
+    /// A handle that wakes this connection's service from anywhere: see
+    /// [`WakeHandle`].
+    pub fn wake_handle(&self) -> WakeHandle {
+        self.s.wake.clone()
+    }
+
+    /// Sends `bytes` as one datagram to `to`. For datagram services
+    /// ([`serve_datagram`]): several per call, to anyone, at any time, such
+    /// as a retransmission in packets that fit the path, or a heartbeat
+    /// from [`Service::on_timer`]. A connection's driver drops them.
+    pub fn send_to(&mut self, to: SocketAddr, bytes: Vec<u8>) {
+        self.s.datagrams.push((to, bytes));
     }
 }
 
@@ -353,42 +664,81 @@ impl ServeCtx<'_> {
 struct Scratch {
     reply: Vec<u8>,
     events: Vec<Event>,
+    datagrams: Vec<(SocketAddr, Vec<u8>)>,
     rng: Lcg,
     logging: bool,
-    timer: TimerRequest,
-    deferred: Option<Box<dyn Pending>>,
+    timers: Vec<(Timer, Option<Duration>)>,
+    ordered: Vec<Box<dyn Pending>>,
+    keyed: Vec<(u64, Option<Box<dyn Pending>>)>,
+    wake: WakeHandle,
     bytes_in: u64,
     unread: Vec<u8>,
 }
 
 impl Scratch {
-    fn new(seed: u64, logging: bool) -> Scratch {
+    fn new(seed: u64) -> Scratch {
         Scratch {
             reply: Vec::new(),
             events: Vec::new(),
+            datagrams: Vec::new(),
             rng: Lcg::new(seed),
-            logging,
-            timer: TimerRequest::Unchanged,
-            deferred: None,
+            logging: true,
+            timers: Vec::new(),
+            ordered: Vec::new(),
+            keyed: Vec::new(),
+            wake: WakeHandle::new(),
             bytes_in: 0,
             unread: Vec::new(),
         }
     }
 
-    fn ctx<'a>(&'a mut self, now: Instant, conn: &'a ConnInfo) -> ServeCtx<'a> {
-        ServeCtx {
-            reply: &mut self.reply,
-            now,
-            rng: &mut self.rng,
-            events: &mut self.events,
-            logging: self.logging,
-            conn,
-            timer: &mut self.timer,
-            deferred: &mut self.deferred,
-            bytes_in: self.bytes_in,
-            unread: &self.unread,
+    /// Throws away what a call asked for: after a panic, or a call whose
+    /// output cannot be written.
+    fn discard(&mut self) {
+        self.reply.clear();
+        self.datagrams.clear();
+        self.ordered.clear();
+        self.keyed.clear();
+    }
+}
+
+/// Applies the timer requests of the last call at `now`.
+fn arm(timers: &mut Vec<(Timer, Instant)>, requests: &mut Vec<(Timer, Option<Duration>)>, now: Instant) {
+    for (name, d) in requests.drain(..) {
+        timers.retain(|(n, _)| *n != name);
+        if let Some(d) = d {
+            timers.push((name, now + d));
         }
     }
+}
+
+/// The index of the timer due first at `now`, if one is.
+fn due(timers: &[(Timer, Instant)], now: Instant) -> Option<usize> {
+    let (i, (_, at)) = timers.iter().enumerate().min_by_key(|(_, (_, at))| *at)?;
+    (*at <= now).then_some(i)
+}
+
+/// Runs `f`, turning a panic into its message.
+fn guarded<R>(f: impl FnOnce() -> R) -> Result<R, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|p| {
+        if let Some(s) = p.downcast_ref::<&str>() {
+            (*s).to_owned()
+        } else if let Some(s) = p.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "a panic with no message".to_owned()
+        }
+    })
+}
+
+/// A connection's seed: `seed` mixed with its number (SplitMix64), so
+/// connections draw different numbers and a run with the same connections
+/// repeats.
+pub fn conn_seed(seed: u64, id: u64) -> u64 {
+    let mut z = seed ^ id.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
 }
 
 // ---------------------------------------------------------------------------
@@ -516,14 +866,16 @@ pub type TlsSelect = Arc<dyn Fn(Option<&str>, &Cx) -> Option<Arc<ServerConfig>> 
 /// How [`listen`] and [`serve`] run.
 #[derive(Clone)]
 pub struct ServeOptions {
-    /// Connections one listener serves at once; past this, a new one is
-    /// reset as soon as it is accepted. Default 64.
+    /// Connections served at once; past this, a new one is reset as soon
+    /// as it is accepted, and counts until its socket is gone. Default 64.
     pub max_conns: usize,
     /// Close a connection after this long with no bytes from the client,
     /// while the driver waits for them. Default 10 seconds. `None` waits
     /// forever.
     pub idle: Option<Duration>,
-    /// Where events go. `None` drops them.
+    /// Where events go. `None` drops them. Whether anyone reads them is
+    /// checked again before each call, so a dashboard attached later sees
+    /// long-lived connections too.
     pub journal: Option<Journal>,
     /// Records both directions.
     pub record: Option<Transcript>,
@@ -531,14 +883,22 @@ pub struct ServeOptions {
     pub faults: Option<FaultPlan>,
     /// Shake hands first, with the config this picks.
     pub tls: Option<TlsSelect>,
-    /// How long a client has from connecting to finish its TLS handshake.
-    /// Default 10 seconds.
+    /// The config for [`Upgrade::Tls`]. Without one, a service that asks
+    /// for TLS is closed with a `conn.error` event.
+    pub starttls: Option<TlsSelect>,
+    /// How long a client has from connecting (or from STARTTLS) to finish
+    /// its TLS handshake. Default 10 seconds.
     pub handshake: Duration,
     /// Record `conn.open` and `conn.close` events. Default on.
     pub connection_events: bool,
     /// The read buffer's limit, at least the decoder's capacity. Larger
     /// lets the decoder see more at once. Default 0: the capacity.
     pub read_buffer: usize,
+    /// The bytes each connection's holdings are charged to. Default none.
+    pub budget: Option<Budget>,
+    /// The seed every connection's randomness ([`ServeCtx::random_u64`])
+    /// is drawn from, mixed with its number ([`conn_seed`]). Default 0.
+    pub seed: u64,
     /// Numbers connections, from 1. Clones of these options share it.
     pub ids: Arc<AtomicU64>,
 }
@@ -552,9 +912,12 @@ impl Default for ServeOptions {
             record: None,
             faults: None,
             tls: None,
+            starttls: None,
             handshake: Duration::from_secs(10),
             connection_events: true,
             read_buffer: 0,
+            budget: None,
+            seed: 0,
             ids: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -569,7 +932,10 @@ impl std::fmt::Debug for ServeOptions {
             .field("record", &self.record.is_some())
             .field("faults", &self.faults)
             .field("tls", &self.tls.is_some())
+            .field("starttls", &self.starttls.is_some())
             .field("connection_events", &self.connection_events)
+            .field("budget", &self.budget)
+            .field("seed", &self.seed)
             .finish()
     }
 }
@@ -600,6 +966,12 @@ impl ServeOptions {
         ServeOptions { tls: Some(Arc::new(select)), ..self }
     }
 
+    /// Shakes hands with `config` when the service asks for
+    /// [`Upgrade::Tls`].
+    pub fn starttls(self, config: Arc<ServerConfig>) -> ServeOptions {
+        ServeOptions { starttls: Some(Arc::new(move |_, _| Some(config.clone()))), ..self }
+    }
+
     /// Sets the idle limit.
     pub fn idle(self, idle: Option<Duration>) -> ServeOptions {
         ServeOptions { idle, ..self }
@@ -610,26 +982,41 @@ impl ServeOptions {
         ServeOptions { max_conns, ..self }
     }
 
+    /// Charges every connection to `budget`.
+    pub fn budget(self, budget: Budget) -> ServeOptions {
+        ServeOptions { budget: Some(budget), ..self }
+    }
+
+    /// Sets the seed.
+    pub fn seed(self, seed: u64) -> ServeOptions {
+        ServeOptions { seed, ..self }
+    }
+
     /// Turns `conn.open` and `conn.close` events on or off.
     pub fn connection_events(self, on: bool) -> ServeOptions {
         ServeOptions { connection_events: on, ..self }
     }
 
-    fn next_id(&self) -> u64 {
+    /// The next connection number.
+    pub fn next_id(&self) -> u64 {
         self.ids.fetch_add(1, Ordering::Relaxed) + 1
     }
 }
 
 // ---------------------------------------------------------------------------
-// The driver
+// Handing back
 
-/// Why [`serve`] stopped early.
+/// Why [`serve`] stopped early. The connection was closed, and the journal
+/// has a `conn.error` or `conn.panic` event that says why.
 #[derive(Debug)]
 pub enum ServeError<E> {
-    /// The service returned this error. The connection was closed.
+    /// The service returned this error.
     Service(E),
-    /// Deferred work failed. The connection was closed.
+    /// Ordered deferred work failed.
     Pending(fictionet::Error),
+    /// A call into the service, or its deferred work, panicked with this
+    /// message.
+    Panic(String),
 }
 
 impl<E: core::fmt::Display> core::fmt::Display for ServeError<E> {
@@ -637,6 +1024,7 @@ impl<E: core::fmt::Display> core::fmt::Display for ServeError<E> {
         match self {
             ServeError::Service(e) => write!(f, "service: {e}"),
             ServeError::Pending(e) => write!(f, "deferred work: {e}"),
+            ServeError::Panic(m) => write!(f, "panic: {m}"),
         }
     }
 }
@@ -648,9 +1036,11 @@ impl<E: core::error::Error> core::error::Error for ServeError<E> {}
 pub enum Served<C> {
     /// The connection is closed, or broken.
     Closed(End),
-    /// The service handed the connection back ([`Flow::Upgrade`], or its
-    /// decoder ended).
-    Upgraded(Prefixed<C>),
+    /// The service asked for an upgrade the caller performs: the
+    /// connection with its unread bytes. [`serve`] performs
+    /// [`Upgrade::Tls`] itself and returns only [`Upgrade::Handoff`];
+    /// [`serve_once`] returns both.
+    Upgraded(Upgrade, Prefixed<C>),
 }
 
 /// A connection with bytes already read from it in front: what a handoff
@@ -707,7 +1097,14 @@ impl<C: Connection> Connection for Prefixed<C> {
     fn poll_shutdown(&mut self, cx: &Cx, task: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
         self.conn.poll_shutdown(cx, task)
     }
+
+    fn poll_gone(&self, task: &mut Context<'_>) -> Poll<()> {
+        self.conn.poll_gone(task)
+    }
 }
+
+// ---------------------------------------------------------------------------
+// Faults on one connection
 
 /// Bytes waiting to enter the decoder, and the waits between them that
 /// delay faults asked for.
@@ -746,6 +1143,16 @@ impl<D: Decode> ConnFaults<D>
 where
     D::Error: Clone,
 {
+    fn new(plan: &FaultPlan, id: u64, decoder: D) -> ConnFaults<D> {
+        let seed = conn_seed(plan.get().seed, id);
+        ConnFaults {
+            plan: plan.clone(),
+            inbound: Faults::new(seed, FAULT_OUTPUT, FAULT_HELD),
+            outbound: Faults::new(seed ^ 1, FAULT_OUTPUT, FAULT_HELD),
+            front: Some(Stream::new(decoder)),
+        }
+    }
+
     /// Runs the byte rules for the client's chunk, then the item rules,
     /// and adds what comes out to `queue`.
     fn inbound(&mut self, chunk: &[u8], eof: bool, queue: &mut VecDeque<Segment>) {
@@ -847,236 +1254,606 @@ where
 
     /// Runs the outbound byte rules over one chunk: the bytes to write and
     /// where to wait.
-    fn outbound(&mut self, chunk: &[u8]) -> (Vec<u8>, Option<FaultDelay>) {
+    fn outbound(&mut self, chunk: Vec<u8>) -> (Vec<u8>, Option<FaultDelay>) {
         let plan = self.plan.get();
         if plan.outbound.is_empty() {
-            return (chunk.to_vec(), None);
+            return (chunk, None);
         }
         let mut out = Vec::new();
-        match self.outbound.bytes(&plan.outbound, chunk, &mut out) {
+        match self.outbound.bytes(&plan.outbound, &chunk, &mut out) {
             Ok(delay) => (out, delay),
-            Err(_) => (chunk.to_vec(), None),
+            Err(_) => (chunk, None),
         }
     }
 }
 
-/// `fut`, unless `deadline` passes first. `Err(true)` if the region was
-/// cancelled, `Err(false)` on the deadline.
-pub async fn until<T>(cx: &Cx, deadline: Option<Instant>, fut: impl Future<Output = T>) -> Result<T, bool> {
-    let mut fut = pin!(fut);
-    let mut sleep = pin!(deadline.map(|d| cx.sleep_until(d)));
-    let mut cancelled = pin!(cx.cancelled());
-    poll_fn(|task| {
-        if let Poll::Ready(v) = fut.as_mut().poll(task) {
-            return Poll::Ready(Ok(v));
-        }
-        if cancelled.as_mut().poll(task).is_ready() {
-            return Poll::Ready(Err(true));
-        }
-        if let Some(sleep) = sleep.as_mut().as_pin_mut() {
-            match sleep.poll(task) {
-                Poll::Ready(Ok(())) => return Poll::Ready(Err(false)),
-                Poll::Ready(Err(_)) => return Poll::Ready(Err(true)),
-                Poll::Pending => {}
-            }
-        }
-        Poll::Pending
-    })
-    .await
+// ---------------------------------------------------------------------------
+// The state machine the driver and the harness share
+
+/// What the driver writes, in order.
+enum Out {
+    Bytes(Vec<u8>),
+    Delay(Duration),
 }
 
-/// What woke the driver while it waited for input.
-enum Woke {
-    Read(Result<usize, ConnError>),
-    Timer,
-    Idle,
-    Cancelled,
-    Gone,
+/// Async work the driver runs, with what it wrote so far.
+struct Work {
+    pending: Box<dyn Pending>,
+    written: u64,
 }
 
-/// One connection being served.
-struct Driver<'o, S: Service, C> {
-    conn: C,
-    info: ConnInfo,
-    opts: &'o ServeOptions,
-    scratch: Scratch,
-    timer_armed: Option<Duration>,
-    deadline: Option<Instant>,
+/// What went wrong beyond the connection's end.
+enum Failure<E> {
+    Service(E),
+    Pending(fictionet::Error),
+    Panic(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum State {
+    Running,
+    /// Ending: ordered work drains, then `on_end`, then its work drains.
+    Ending { end: End, called: bool },
+    Upgrading(Upgrade),
+    Ended(End),
+}
+
+/// The next item from a service's decoder.
+type Decoded<S> = Option<Result<<<S as Service>::Decode as Decode>::Item, Fail<<<S as Service>::Decode as Decode>::Error>>>;
+
+/// What the state machine needs next.
+#[derive(Debug, PartialEq, Eq)]
+enum Next {
+    /// Write what is out, then ask again.
+    Again,
+    /// An inbound fault delay: wait this long, then ask again.
+    Sleep(Duration),
+    /// Wait for something: bytes (if `read`), deferred work, a wake (if
+    /// `wake`), or the deadline.
+    Wait { read: bool, wake: bool, deadline: Option<Instant> },
+    /// Hand the connection on.
+    Upgrade(Upgrade),
+    /// Done: write what is out if the end allows, then close.
+    Closed(End),
+}
+
+/// One connection's state, with no I/O: the decoder and the bytes waiting
+/// for it, the service's timers and deferred work, and what is to be
+/// written. [`serve_once`] and [`Harness`] both run it.
+struct Core<S: Service> {
+    cx: Option<Cx>,
+    stream: Stream<S::Decode>,
+    read_buffer: usize,
     faults: Option<ConnFaults<S::Decode>>,
     queue: VecDeque<Segment>,
-    /// Bytes written to the client so far, for the transcript.
-    out_offset: u64,
-    gone: Option<GoneWatch>,
-    ended: bool,
+    record: Option<Transcript>,
+    s: Scratch,
+    info: ConnInfo,
+    timers: Vec<(Timer, Instant)>,
+    idle: Option<Duration>,
+    idle_from: Instant,
+    eof: bool,
+    ordered: VecDeque<Work>,
+    keyed: Vec<(u64, Work)>,
+    held_flow: Option<Flow>,
+    state: State,
+    out: VecDeque<Out>,
+    failure: Option<Failure<S::Error>>,
+    decode_fail: Option<Fail<<S::Decode as Decode>::Error>>,
+    budget: Option<Budget>,
+    charge: Option<Charge>,
 }
 
-impl<S: Service, C: Connection> Driver<'_, S, C>
+impl<S: Service> Core<S>
 where
-    <S::Decode as Decode>::Error: Clone + Send,
+    <S::Decode as Decode>::Error: Clone,
 {
-    /// Sends the events of the last call to the journal.
-    fn flush_events(&mut self, cx: &Cx) {
-        if self.scratch.events.is_empty() {
+    fn new(cx: Option<Cx>, service: &S, info: ConnInfo, opts: &ServeOptions, wake: Option<WakeHandle>, now: Instant) -> Core<S> {
+        let id = info.id.unwrap_or(0);
+        let mut s = Scratch::new(conn_seed(opts.seed, id));
+        if let Some(w) = wake {
+            s.wake = w;
+        }
+        Core {
+            cx,
+            stream: Stream::with_buffer(service.decoder(), opts.read_buffer),
+            read_buffer: opts.read_buffer,
+            faults: opts.faults.as_ref().map(|plan| ConnFaults::new(plan, id, service.decoder())),
+            queue: VecDeque::new(),
+            record: opts.record.clone(),
+            s,
+            info,
+            timers: Vec::new(),
+            idle: opts.idle,
+            idle_from: now,
+            eof: false,
+            ordered: VecDeque::new(),
+            keyed: Vec::new(),
+            held_flow: None,
+            state: State::Running,
+            out: VecDeque::new(),
+            failure: None,
+            decode_fail: None,
+            budget: opts.budget.clone(),
+            charge: None,
+        }
+    }
+
+    /// Takes the first charge, then calls `on_open`. A connection whose
+    /// first charge does not fit is closed with no call.
+    fn open(&mut self, service: &mut S, world: &S::World, now: Instant) {
+        if let Some(budget) = self.budget.clone() {
+            let mut charge = Charge { budget, now: 0 };
+            if !charge.set(self.holding(service)) {
+                self.end_now(End::Budget);
+                return;
+            }
+            self.charge = Some(charge);
+        }
+        self.call(now, |ctx| service.on_open(world, ctx));
+    }
+
+    /// The bytes this connection holds, as charged to its budget.
+    fn holding(&mut self, service: &S) -> usize {
+        let queued: usize = self.queue.iter().map(|s| if let Segment::Bytes(b, at) = s { b.len() - at } else { 0 }).sum();
+        self.stream
+            .decoder()
+            .capacity()
+            .max(self.read_buffer)
+            .saturating_add(self.stream.held())
+            .saturating_add(queued)
+            .saturating_add(service.held())
+    }
+
+    /// Bytes from the client.
+    fn input(&mut self, bytes: &[u8], now: Instant) {
+        self.s.bytes_in += bytes.len() as u64;
+        self.idle_from = now;
+        match &mut self.faults {
+            Some(f) => f.inbound(bytes, false, &mut self.queue),
+            None => self.queue.push_back(Segment::Bytes(bytes.to_vec(), 0)),
+        }
+    }
+
+    /// The client will send nothing more.
+    fn input_eof(&mut self) {
+        self.eof = true;
+        if let Some(f) = &mut self.faults {
+            f.inbound(&[], true, &mut self.queue);
+        }
+    }
+
+    /// The connection broke, or the world is stopping.
+    fn broken(&mut self, end: End) {
+        self.out.clear();
+        self.finish(end);
+    }
+
+    /// Whether the driver has async work to poll.
+    fn has_work(&self) -> bool {
+        !self.ordered.is_empty() || !self.keyed.is_empty()
+    }
+
+    /// Bytes read but not decoded, for a handoff.
+    fn unread(&mut self) -> Vec<u8> {
+        let mut unread = self.stream.unread().to_vec();
+        for segment in self.queue.drain(..) {
+            if let Segment::Bytes(bytes, at) = segment {
+                unread.extend_from_slice(&bytes[at..]);
+            }
+        }
+        unread
+    }
+
+    fn push_out(&mut self, bytes: Vec<u8>) {
+        if bytes.is_empty() {
             return;
         }
-        let events = std::mem::take(&mut self.scratch.events);
-        if let Some(journal) = &self.opts.journal {
-            for event in events {
-                journal.record(cx, &self.info, event);
-            }
-        }
-    }
-
-    /// Writes `bytes`, through the outbound faults and the transcript.
-    async fn write(&mut self, cx: &Cx, bytes: &[u8]) -> Result<(), ConnError> {
-        if bytes.is_empty() {
-            return Ok(());
-        }
-        let (out, delay) = match &mut self.faults {
+        let (bytes, delay) = match &mut self.faults {
             Some(f) => f.outbound(bytes),
-            None => (bytes.to_vec(), None),
+            None => (bytes, None),
         };
-        let at = delay.map_or(out.len(), |d| d.at.min(out.len()));
-        self.write_now(cx, &out[..at]).await?;
-        if let Some(delay) = delay {
-            cx.sleep(delay.duration).await.map_err(|_| ConnError::Cancelled)?;
-            self.write_now(cx, &out[at..]).await?;
-        }
-        Ok(())
-    }
-
-    async fn write_now(&mut self, cx: &Cx, bytes: &[u8]) -> Result<(), ConnError> {
-        if bytes.is_empty() {
-            return Ok(());
-        }
-        if let Some(t) = &self.opts.record {
-            let start = self.out_offset;
-            let end = start.saturating_add(bytes.len() as u64);
-            t.observe::<(), String>(self.info.id.unwrap_or(0), Direction::ServerToClient, StreamEvent::Skipped { bytes, range: start..end });
-        }
-        self.out_offset = self.out_offset.saturating_add(bytes.len() as u64);
-        self.conn.write_all(cx, bytes).await
-    }
-
-    /// After a call: records its events, takes its timer, writes its reply
-    /// and runs its deferred work. `Err` with the end if the connection
-    /// ended meanwhile.
-    async fn after(&mut self, cx: &Cx) -> Result<(), End> {
-        self.flush_events(cx);
-        match std::mem::take(&mut self.scratch.timer) {
-            TimerRequest::Unchanged => {}
-            TimerRequest::Set(d) => {
-                self.timer_armed = Some(d);
-                self.deadline = None;
-            }
-            TimerRequest::Cancel => {
-                self.timer_armed = None;
-                self.deadline = None;
-            }
-        }
-        let reply = std::mem::take(&mut self.scratch.reply);
-        if let Err(e) = self.write(cx, &reply).await {
-            return Err(conn_end(e));
-        }
-        if let Some(work) = self.scratch.deferred.take() {
-            self.run_pending(cx, work).await?;
-        }
-        Ok(())
-    }
-
-    async fn run_pending(&mut self, cx: &Cx, mut work: Box<dyn Pending>) -> Result<(), End> {
-        let mut written = 0u64;
-        let logging = self.scratch.logging;
-        loop {
-            let mut events = Vec::new();
-            let next = {
-                let info = &self.info;
-                let gone = &self.gone;
-                let mut cancelled = pin!(cx.cancelled());
-                poll_fn(|task| {
-                    let mut ctx = PendingCtx { cx, events: &mut events, written, conn: info, logging };
-                    if let Poll::Ready(next) = work.poll_next(&mut ctx, task) {
-                        return Poll::Ready(Ok(next));
-                    }
-                    if cancelled.as_mut().poll(task).is_ready() {
-                        return Poll::Ready(Err(End::Cancelled));
-                    }
-                    if let Some(g) = gone
-                        && g.poll_gone(task).is_ready()
-                    {
-                        return Poll::Ready(Err(End::Conn(ConnError::Reset)));
-                    }
-                    Poll::Pending
-                })
-                .await
-            };
-            self.scratch.events.append(&mut events);
-            match next {
-                Ok(Some(Ok(bytes))) => {
-                    self.flush_events(cx);
-                    if let Err(e) = self.write(cx, &bytes).await {
-                        self.cancel_pending(cx, &mut work, written);
-                        return Err(conn_end(e));
-                    }
-                    written += bytes.len() as u64;
-                }
-                Ok(Some(Err(_))) => {
-                    self.flush_events(cx);
-                    return Err(End::Closed);
-                }
-                Ok(None) => {
-                    self.flush_events(cx);
-                    return Ok(());
-                }
-                Err(end) => {
-                    self.cancel_pending(cx, &mut work, written);
-                    return Err(end);
-                }
+        match delay {
+            None => self.out.push_back(Out::Bytes(bytes)),
+            Some(FaultDelay { at, duration }) => {
+                let mut bytes = bytes;
+                let rest = bytes.split_off(at.min(bytes.len()));
+                self.out.push_back(Out::Bytes(bytes));
+                self.out.push_back(Out::Delay(duration));
+                self.out.push_back(Out::Bytes(rest));
             }
         }
     }
 
-    fn cancel_pending(&mut self, cx: &Cx, work: &mut Box<dyn Pending>, written: u64) {
+    fn pending_ctx<'a>(cx: Option<&'a Cx>, events: &'a mut Vec<Event>, written: u64, conn: &'a ConnInfo, logging: bool) -> PendingCtx<'a> {
+        PendingCtx { cx, events, written, conn, logging }
+    }
+
+    fn cancel_work(&mut self, mut work: Work) {
         let mut events = Vec::new();
-        let mut ctx = PendingCtx { cx, events: &mut events, written, conn: &self.info, logging: self.scratch.logging };
-        work.cancel(&mut ctx);
-        self.scratch.events.append(&mut events);
-        self.flush_events(cx);
+        let mut ctx = Self::pending_ctx(self.cx.as_ref(), &mut events, work.written, &self.info, self.s.logging);
+        let _ = guarded(|| work.pending.cancel(&mut ctx));
+        self.s.events.append(&mut events);
     }
 
-    /// Ends the connection: `on_end`, the last reply if it can still be
-    /// written, and a shutdown.
-    async fn finish(&mut self, cx: &Cx, service: &mut S, world: &S::World, end: End) -> Result<End, ServeError<S::Error>> {
-        if self.ended {
-            return Ok(end);
+    fn cancel_all(&mut self, ordered: bool) {
+        for (_, work) in std::mem::take(&mut self.keyed) {
+            self.cancel_work(work);
         }
-        self.ended = true;
-        let result = service.on_end(end, world, &mut self.scratch.ctx(cx.now(), &self.info));
-        self.flush_events(cx);
-        let writable = matches!(end, End::Eof | End::Closed | End::Failed | End::Idle);
-        if writable {
-            let reply = std::mem::take(&mut self.scratch.reply);
-            let _ = self.write(cx, &reply).await;
-            if let Some(work) = self.scratch.deferred.take() {
-                let _ = self.run_pending(cx, work).await;
+        if ordered {
+            for work in std::mem::take(&mut self.ordered) {
+                self.cancel_work(work);
             }
-            let _ = until(cx, Some(cx.now() + Duration::from_secs(5)), self.conn.shutdown(cx)).await;
         }
-        if self.opts.connection_events
-            && let Some(j) = &self.opts.journal
-        {
-            j.record(cx, &self.info, Event::new("conn", "close").field("end", end_name(end)).summary(format!("connection closed: {}", end_name(end))));
-        }
-        self.scratch.deferred = None;
-        result.map_err(ServeError::Service)?;
-        Ok(end)
     }
 
-    fn arm_timer(&mut self, now: Instant) {
-        if let Some(d) = self.timer_armed.take() {
-            self.deadline = Some(now + d);
+    /// Takes what the last call asked for: its reply, its deferred work.
+    fn collect(&mut self) {
+        let reply = std::mem::take(&mut self.s.reply);
+        self.push_out(reply);
+        self.s.datagrams.clear();
+        for pending in std::mem::take(&mut self.s.ordered) {
+            self.ordered.push_back(Work { pending, written: 0 });
+        }
+        for (key, work) in std::mem::take(&mut self.s.keyed) {
+            if let Some(i) = self.keyed.iter().position(|(k, _)| *k == key) {
+                let (_, old) = self.keyed.remove(i);
+                self.cancel_work(old);
+            }
+            if let Some(pending) = work {
+                self.keyed.push((key, Work { pending, written: 0 }));
+            }
         }
     }
+
+    /// A call panicked: nothing it asked for happens, and the connection
+    /// ends with no more calls.
+    fn panicked(&mut self, message: String) {
+        self.s.discard();
+        self.failure = Some(Failure::Panic(message));
+        self.cancel_all(true);
+        self.end_now(End::Panicked);
+    }
+
+    /// Ends at once: no more calls, nothing more written.
+    fn end_now(&mut self, end: End) {
+        self.out.clear();
+        self.held_flow = None;
+        self.s.wake.close();
+        self.state = State::Ended(end);
+    }
+
+    /// Calls the service with a context for this call, then takes what it
+    /// asked for.
+    fn call(&mut self, now: Instant, f: impl FnOnce(&mut ServeCtx<'_>) -> Result<Flow, S::Error>) {
+        let result = {
+            let mut ctx = ServeCtx { s: &mut self.s, now, conn: &self.info, timers: &self.timers };
+            guarded(|| f(&mut ctx))
+        };
+        match result {
+            Err(message) => self.panicked(message),
+            Ok(Err(e)) => {
+                self.collect();
+                self.failure.get_or_insert(Failure::Service(e));
+                self.finish(End::Closed);
+            }
+            Ok(Ok(flow)) => {
+                self.collect();
+                if flow != Flow::Continue && self.held_flow.is_none() {
+                    self.held_flow = Some(flow);
+                }
+            }
+        }
+    }
+
+    /// Starts ending with `end`. A writable end drains ordered work and
+    /// writes `on_end`'s reply; any other end cancels the work.
+    fn finish(&mut self, end: End) {
+        if self.state != State::Running {
+            return;
+        }
+        self.held_flow = None;
+        self.s.wake.close();
+        self.cancel_all(!end.writable());
+        if !end.writable() {
+            self.out.clear();
+        }
+        self.state = State::Ending { end, called: false };
+    }
+
+    fn apply(&mut self, flow: Flow, service: &S) {
+        match flow {
+            Flow::Continue => {}
+            Flow::Close => self.finish(End::Closed),
+            Flow::Upgrade(Upgrade::Decoder) => {
+                let unread = self.stream.unread().to_vec();
+                self.stream = Stream::with_buffer(service.decoder(), self.read_buffer);
+                if !unread.is_empty() {
+                    self.queue.push_front(Segment::Bytes(unread, 0));
+                }
+            }
+            Flow::Upgrade(how) => {
+                self.cancel_all(true);
+                self.s.wake.close();
+                self.state = State::Upgrading(how);
+            }
+        }
+    }
+
+    /// The decoder failed with `fail`.
+    fn failed(&mut self, service: &mut S, world: &S::World, now: Instant, fail: Fail<<S::Decode as Decode>::Error>) {
+        self.s.unread = self.stream.unread().to_vec();
+        let result = {
+            let mut ctx = ServeCtx { s: &mut self.s, now, conn: &self.info, timers: &self.timers };
+            guarded(|| service.on_fail(&fail, world, &mut ctx))
+        };
+        self.s.unread = Vec::new();
+        self.decode_fail = Some(fail);
+        match result {
+            Err(message) => self.panicked(message),
+            Ok(result) => {
+                self.collect();
+                if let Err(e) = result {
+                    self.failure.get_or_insert(Failure::Service(e));
+                }
+                self.finish(End::Failed);
+            }
+        }
+    }
+
+    /// Moves bytes from the queue into the decoder, up to a fault delay.
+    /// Returns how many it took.
+    fn feed(&mut self) -> usize {
+        let mut pushed = 0;
+        while let Some(Segment::Bytes(bytes, at)) = self.queue.front_mut() {
+            let n = self.stream.push(&bytes[*at..]);
+            *at += n;
+            pushed += n;
+            if *at == bytes.len() {
+                self.queue.pop_front();
+            } else {
+                break;
+            }
+        }
+        pushed
+    }
+
+    fn next_item(&mut self) -> Decoded<S> {
+        let tag = self.info.id.unwrap_or(0);
+        let record = &self.record;
+        self.stream.with_next_observed(
+            |item, _, _| item,
+            |event| {
+                if let Some(t) = record {
+                    t.observe(tag, Direction::ClientToServer, event);
+                }
+            },
+        )
+    }
+
+    fn next_deadline(&self) -> Option<Instant> {
+        let timer = self.timers.iter().map(|(_, at)| *at).min();
+        // Keyed work running is not a silent client.
+        let idle = self.idle.filter(|_| self.keyed.is_empty()).map(|i| self.idle_from + i);
+        match (timer, idle) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// One step: at most one call into the service.
+    fn advance(&mut self, service: &mut S, world: &S::World, now: Instant) -> Next {
+        arm(&mut self.timers, &mut self.s.timers, now);
+        match self.state {
+            State::Ended(end) => return Next::Closed(end),
+            State::Upgrading(how) => return Next::Upgrade(how),
+            State::Ending { end, called } => return self.ending(service, world, now, end, called),
+            State::Running => {}
+        }
+        if !self.ordered.is_empty() {
+            // Reads, timers and wakes wait for ordered work.
+            return Next::Wait { read: false, wake: false, deadline: None };
+        }
+        if let Some(flow) = self.held_flow.take() {
+            self.apply(flow, service);
+            return Next::Again;
+        }
+        if self.charge.is_some() {
+            let need = self.holding(service);
+            if let Some(charge) = &mut self.charge
+                && !charge.set(need)
+            {
+                self.finish(End::Budget);
+                return Next::Again;
+            }
+        }
+        // A due timer before more input, so input cannot starve it.
+        if let Some(i) = due(&self.timers, now) {
+            let (name, _) = self.timers.remove(i);
+            self.call(now, |ctx| service.on_timer(name, world, ctx));
+            return Next::Again;
+        }
+        if self.s.wake.take() {
+            self.call(now, |ctx| service.on_wake(world, ctx));
+            return Next::Again;
+        }
+        if let Some(idle) = self.idle
+            && self.keyed.is_empty()
+            && now >= self.idle_from + idle
+        {
+            self.finish(End::Idle);
+            return Next::Again;
+        }
+        loop {
+            let pushed = self.feed();
+            if self.eof && self.queue.is_empty() {
+                self.stream.end();
+            }
+            match self.next_item() {
+                Some(Ok(item)) => {
+                    self.idle_from = now;
+                    self.call(now, |ctx| service.on_item(item, world, ctx));
+                    return Next::Again;
+                }
+                Some(Err(fail)) => {
+                    self.failed(service, world, now, fail);
+                    return Next::Again;
+                }
+                None => {}
+            }
+            if self.stream.is_done() {
+                if self.eof && self.queue.is_empty() && self.stream.unread().is_empty() {
+                    self.finish(End::Eof);
+                } else {
+                    // The decoder ended: the rest belongs to what comes
+                    // next, which the service decides.
+                    self.call(now, |ctx| service.on_decoder_end(world, ctx).map(|f| if f == Flow::Continue { Flow::Upgrade(Upgrade::Decoder) } else { f }));
+                }
+                return Next::Again;
+            }
+            if pushed > 0 {
+                // Bytes the decoder took are progress, item or not.
+                continue;
+            }
+            if let Some(Segment::Wait(d)) = self.queue.front() {
+                let d = *d;
+                self.queue.pop_front();
+                return Next::Sleep(d);
+            }
+            if !self.queue.is_empty() {
+                // The decoder took nothing and yielded nothing.
+                let fail = Fail::Stuck { unread: self.stream.buffered(), capacity: self.stream.decoder().capacity() };
+                self.failed(service, world, now, fail);
+                return Next::Again;
+            }
+            break;
+        }
+        Next::Wait { read: !self.eof, wake: true, deadline: self.next_deadline() }
+    }
+
+    fn ending(&mut self, service: &mut S, world: &S::World, now: Instant, end: End, called: bool) -> Next {
+        if !self.ordered.is_empty() {
+            return Next::Wait { read: false, wake: false, deadline: None };
+        }
+        if called {
+            self.state = State::Ended(end);
+            return Next::Closed(end);
+        }
+        self.state = State::Ending { end, called: true };
+        let result = {
+            let mut ctx = ServeCtx { s: &mut self.s, now, conn: &self.info, timers: &self.timers };
+            guarded(|| service.on_end(end, world, &mut ctx))
+        };
+        match result {
+            Err(message) => {
+                self.panicked(message);
+                return Next::Again;
+            }
+            Ok(Err(e)) => {
+                self.failure.get_or_insert(Failure::Service(e));
+            }
+            Ok(Ok(())) => {}
+        }
+        self.s.keyed.clear();
+        if end.writable() {
+            let reply = std::mem::take(&mut self.s.reply);
+            self.push_out(reply);
+            for pending in std::mem::take(&mut self.s.ordered) {
+                self.ordered.push_back(Work { pending, written: 0 });
+            }
+        }
+        self.s.discard();
+        Next::Again
+    }
+
+    /// Polls the deferred work. Returns whether any made progress: bytes
+    /// to write, or work that ended.
+    fn poll_work(&mut self, service: &mut S, world: &S::World, now: Instant, task: &mut Context<'_>) -> bool {
+        let mut progress = false;
+        if let Some(work) = self.ordered.front_mut() {
+            let mut events = Vec::new();
+            let polled = {
+                let mut ctx = PendingCtx { cx: self.cx.as_ref(), events: &mut events, written: work.written, conn: &self.info, logging: self.s.logging };
+                guarded(|| work.pending.poll_next(&mut ctx, task))
+            };
+            self.s.events.append(&mut events);
+            match polled {
+                Err(message) => {
+                    self.panicked(message);
+                    return true;
+                }
+                Ok(Poll::Pending) => {}
+                Ok(Poll::Ready(Some(Ok(bytes)))) => {
+                    work.written += bytes.len() as u64;
+                    self.push_out(bytes);
+                    return true;
+                }
+                Ok(Poll::Ready(None)) => {
+                    self.ordered.pop_front();
+                    return true;
+                }
+                Ok(Poll::Ready(Some(Err(e)))) => {
+                    self.ordered.pop_front();
+                    self.failure.get_or_insert(Failure::Pending(e));
+                    for work in std::mem::take(&mut self.ordered) {
+                        self.cancel_work(work);
+                    }
+                    self.finish(End::Closed);
+                    return true;
+                }
+            }
+        }
+        let mut i = 0;
+        while i < self.keyed.len() && self.state == State::Running {
+            let mut events = Vec::new();
+            let polled = {
+                let (_, work) = &mut self.keyed[i];
+                let mut ctx = PendingCtx { cx: self.cx.as_ref(), events: &mut events, written: work.written, conn: &self.info, logging: self.s.logging };
+                guarded(|| work.pending.poll_next(&mut ctx, task))
+            };
+            self.s.events.append(&mut events);
+            let done = match polled {
+                Err(message) => {
+                    self.panicked(message);
+                    return true;
+                }
+                Ok(Poll::Pending) => {
+                    i += 1;
+                    continue;
+                }
+                Ok(Poll::Ready(Some(Ok(bytes)))) => {
+                    self.keyed[i].1.written += bytes.len() as u64;
+                    self.push_out(bytes);
+                    progress = true;
+                    i += 1;
+                    continue;
+                }
+                Ok(Poll::Ready(None)) => Done::Finished,
+                Ok(Poll::Ready(Some(Err(e)))) => Done::Failed(e.to_string()),
+            };
+            let (key, _) = self.keyed.remove(i);
+            progress = true;
+            self.idle_from = now;
+            self.call(now, |ctx| service.on_done(key, done, world, ctx));
+        }
+        progress
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The driver
+
+/// How big each read is.
+const READ: usize = 16 * 1024;
+
+/// What woke the driver while it waited.
+enum Woke {
+    Read(Result<usize, ConnError>),
+    Work,
+    Wake,
+    Time,
+    Cancelled,
+    Gone,
 }
 
 fn conn_end(e: ConnError) -> End {
@@ -1086,34 +1863,79 @@ fn conn_end(e: ConnError) -> End {
     }
 }
 
-fn end_name(end: End) -> &'static str {
-    match end {
-        End::Eof => "eof",
-        End::Closed => "closed",
-        End::Failed => "failed",
-        End::Idle => "idle",
-        End::Conn(ConnError::Reset) => "reset",
-        End::Conn(ConnError::Broken) => "broken",
-        End::Conn(_) => "error",
-        End::Cancelled => "cancelled",
+/// Records an event if `journal` takes it.
+fn record(cx: &Cx, journal: Option<&Journal>, info: &ConnInfo, event: Event) {
+    if let Some(j) = journal {
+        j.record(cx, info, event);
     }
 }
 
-/// How big each read is.
-const READ: usize = 16 * 1024;
-
-/// Serves one connection with `service` until it ends. Returns how it
-/// ended, or the connection with its unread bytes after a handoff.
+/// Serves one connection with `service` until it ends: TLS first with
+/// [`ServeOptions::tls`], then the service, with every [`Upgrade::Tls`]
+/// it asks for performed with [`ServeOptions::starttls`]. Returns how it
+/// ended, or the connection with its unread bytes after
+/// [`Upgrade::Handoff`].
 ///
-/// `info` names the connection in events; [`listen`] fills it in. `gone`,
-/// when given, ends the connection as soon as the client resets it, even
-/// while deferred work runs and nothing reads (see
-/// [`TcpConnection::gone_watch`](crate::stdlib::tcp::TcpConnection::gone_watch)).
+/// `info` names the connection in events; [`listen`] fills it in. The
+/// connection ends as soon as the client resets it, even while deferred
+/// work runs and nothing reads ([`Connection::poll_gone`]).
 pub async fn serve<S, C>(
     cx: &Cx,
     conn: C,
     info: ConnInfo,
-    gone: Option<GoneWatch>,
+    service: &mut S,
+    world: &S::World,
+    opts: &ServeOptions,
+) -> Result<Served<Box<dyn Connection>>, ServeError<S::Error>>
+where
+    S: Service,
+    C: Connection,
+    <S::Decode as Decode>::Error: Clone + Send,
+{
+    let mut conn: Box<dyn Connection> = Box::new(conn);
+    let mut info = info;
+    if let Some(select) = &opts.tls {
+        match accept_tls(cx, conn, &info, select, cx.now() + opts.handshake, opts.journal.as_ref(), || false).await {
+            Some((tls, i)) => {
+                conn = Box::new(tls);
+                info = i;
+            }
+            None => return Ok(Served::Closed(End::Conn(ConnError::Broken))),
+        }
+    }
+    let mut first = true;
+    let wake = WakeHandle::new();
+    loop {
+        let served = run(cx, conn, info.clone(), service, world, opts, first, wake.clone()).await?;
+        first = false;
+        let rest = match served {
+            Served::Upgraded(Upgrade::Tls, rest) => rest,
+            other => return Ok(other),
+        };
+        let Some(select) = &opts.starttls else {
+            let event = Event::new("conn", "error").level(Level::Notice).summary("the service asked for TLS, and there is no TLS config").field("error", "no TLS config for the upgrade");
+            record(cx, opts.journal.as_ref(), &info, event);
+            return Ok(Served::Closed(End::Failed));
+        };
+        let deadline = cx.now() + opts.handshake;
+        match accept_tls(cx, rest, &info, select, deadline, opts.journal.as_ref(), || false).await {
+            Some((tls, i)) => {
+                conn = Box::new(tls);
+                info = i;
+            }
+            None => return Ok(Served::Closed(End::Conn(ConnError::Broken))),
+        }
+    }
+}
+
+/// Serves one connection with `service` until it ends or asks for
+/// [`Upgrade::Tls`] or [`Upgrade::Handoff`], which it returns with the
+/// connection and its unread bytes. [`serve`] runs this and performs the
+/// TLS upgrades.
+pub async fn serve_once<S, C>(
+    cx: &Cx,
+    conn: C,
+    info: ConnInfo,
     service: &mut S,
     world: &S::World,
     opts: &ServeOptions,
@@ -1123,250 +1945,170 @@ where
     C: Connection,
     <S::Decode as Decode>::Error: Clone + Send,
 {
-    let logging = opts.journal.as_ref().is_some_and(|j| j.wants(cx));
-    let seed = cx.random_u64();
-    let faults = opts.faults.as_ref().map(|plan| {
-        let seed = plan.get().seed ^ info.id.unwrap_or(0).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        ConnFaults {
-            plan: plan.clone(),
-            inbound: Faults::new(seed, FAULT_OUTPUT, FAULT_HELD),
-            outbound: Faults::new(seed ^ 1, FAULT_OUTPUT, FAULT_HELD),
-            front: Some(Stream::new(service.decoder())),
-        }
-    });
-    let mut d: Driver<'_, S, C> = Driver {
-        conn,
-        info,
-        opts,
-        scratch: Scratch::new(seed, logging),
-        timer_armed: None,
-        deadline: None,
-        faults,
-        queue: VecDeque::new(),
-        out_offset: 0,
-        gone,
-        ended: false,
-    };
-    if opts.connection_events
-        && let Some(j) = &opts.journal
-    {
-        j.record(cx, &d.info, Event::new("conn", "open").summary("connection opened"));
-    }
-    let mut stream = Stream::with_buffer(service.decoder(), opts.read_buffer);
-    let tag = d.info.id.unwrap_or(0);
-    let flow = service.on_open(world, &mut d.scratch.ctx(cx.now(), &d.info)).map_err(ServeError::Service);
-    let flow = match flow {
-        Ok(flow) => flow,
-        Err(e) => {
-            let _ = d.finish(cx, service, world, End::Closed).await;
-            return Err(e);
-        }
-    };
-    if let Err(end) = d.after(cx).await {
-        return d.finish(cx, service, world, end).await.map(Served::Closed);
-    }
-    match flow {
-        Flow::Continue => {}
-        Flow::Close => return d.finish(cx, service, world, End::Closed).await.map(Served::Closed),
-        Flow::Upgrade => return Ok(Served::Upgraded(upgraded(d, stream))),
-    }
-    let mut buf = vec![0u8; READ];
-    let mut eof = false;
-    let mut idle_from = cx.now();
-    loop {
-        // Feed what waits, up to the first delay.
-        while let Some(front) = d.queue.front_mut() {
-            match front {
-                Segment::Bytes(bytes, at) => {
-                    let n = stream.push(&bytes[*at..]);
-                    *at += n;
-                    if *at == bytes.len() {
-                        d.queue.pop_front();
-                    } else {
-                        break;
-                    }
-                }
-                Segment::Wait(_) => break,
-            }
-        }
-        if eof && d.queue.is_empty() {
-            stream.end();
-        }
-        // Every item that is whole.
-        let mut handled = false;
-        loop {
-            enum Called<E> {
-                Item(Result<Flow, E>),
-                Failed(Result<(), E>),
-                Nothing,
-            }
-            let called = {
-            let record = opts.record.clone();
-            let next = stream.with_next_observed(
-                |item, _, _| item,
-                |event| {
-                    if let Some(t) = &record {
-                        t.observe(tag, Direction::ClientToServer, event);
-                    }
-                },
-            );
-            match next {
-                Some(Ok(item)) => Called::Item(service.on_item(item, world, &mut d.scratch.ctx(cx.now(), &d.info))),
-                Some(Err(fail)) => {
-                    d.scratch.unread = stream.unread().to_vec();
-                    let result = service.on_fail(&fail, world, &mut d.scratch.ctx(cx.now(), &d.info));
-                    d.scratch.unread = Vec::new();
-                    Called::Failed(result)
-                }
-                None => Called::Nothing,
-            }
-            };
-            match called {
-                Called::Item(flow) => {
-                    handled = true;
-                    let flow = match flow {
-                        Ok(flow) => flow,
-                        Err(e) => {
-                            let _ = d.finish(cx, service, world, End::Closed).await;
-                            return Err(ServeError::Service(e));
-                        }
-                    };
-                    if let Err(end) = d.after(cx).await {
-                        return d.finish(cx, service, world, end).await.map(Served::Closed);
-                    }
-                    match flow {
-                        Flow::Continue => {}
-                        Flow::Close => return d.finish(cx, service, world, End::Closed).await.map(Served::Closed),
-                        Flow::Upgrade => return Ok(Served::Upgraded(upgraded(d, stream))),
-                    }
-                }
-                Called::Failed(result) => {
-                    if let Err(e) = result {
-                        let _ = d.finish(cx, service, world, End::Failed).await;
-                        return Err(ServeError::Service(e));
-                    }
-                    if let Err(end) = d.after(cx).await {
-                        return d.finish(cx, service, world, end).await.map(Served::Closed);
-                    }
-                    return d.finish(cx, service, world, End::Failed).await.map(Served::Closed);
-                }
-                Called::Nothing => break,
-            }
-        }
-        if stream.is_done() {
-            if stream.failed().is_none() && !(eof && d.queue.is_empty() && stream.unread().is_empty()) {
-                // The decoder ended: the rest belongs to the next protocol.
-                return Ok(Served::Upgraded(upgraded(d, stream)));
-            }
-            return d.finish(cx, service, world, End::Eof).await.map(Served::Closed);
-        }
-        if handled {
-            idle_from = cx.now();
-        }
-        // A delay a fault asked for, once everything before it is in.
-        if let Some(Segment::Wait(w)) = d.queue.front() {
-            let w = *w;
-            d.queue.pop_front();
-            if cx.sleep(w).await.is_err() {
-                return d.finish(cx, service, world, End::Cancelled).await.map(Served::Closed);
-            }
-            continue;
-        }
-        if !d.queue.is_empty() || eof {
-            // The decoder cannot take more until it makes progress, which
-            // the next pass reports as stuck if it never does.
-            if !handled && !eof {
-                return d.finish(cx, service, world, End::Failed).await.map(Served::Closed);
-            }
-            continue;
-        }
-        // Wait for bytes, the timer, idleness, a reset or the end.
-        d.arm_timer(cx.now());
-        let idle_at = opts.idle.map(|i| idle_from + i);
-        let woke = {
-            let conn = &mut d.conn;
-            let gone = &d.gone;
-            let timer = d.deadline;
-            let mut timer_sleep = pin!(timer.map(|t| cx.sleep_until(t)));
-            let mut idle_sleep = pin!(idle_at.map(|t| cx.sleep_until(t)));
-            let mut cancelled = pin!(cx.cancelled());
-            poll_fn(|task| {
-                if let Poll::Ready(r) = conn.poll_read(cx, task, &mut buf) {
-                    return Poll::Ready(Woke::Read(r));
-                }
-                if cancelled.as_mut().poll(task).is_ready() {
-                    return Poll::Ready(Woke::Cancelled);
-                }
-                if let Some(g) = gone
-                    && g.poll_gone(task).is_ready()
-                {
-                    return Poll::Ready(Woke::Gone);
-                }
-                if let Some(s) = timer_sleep.as_mut().as_pin_mut()
-                    && s.poll(task).is_ready()
-                {
-                    return Poll::Ready(Woke::Timer);
-                }
-                if let Some(s) = idle_sleep.as_mut().as_pin_mut()
-                    && s.poll(task).is_ready()
-                {
-                    return Poll::Ready(Woke::Idle);
-                }
-                Poll::Pending
-            })
-            .await
-        };
-        match woke {
-            Woke::Read(Ok(0)) => {
-                eof = true;
-                if let Some(f) = &mut d.faults {
-                    f.inbound(&[], true, &mut d.queue);
-                }
-            }
-            Woke::Read(Ok(n)) => {
-                d.scratch.bytes_in += n as u64;
-                idle_from = cx.now();
-                match &mut d.faults {
-                    Some(f) => f.inbound(&buf[..n], false, &mut d.queue),
-                    None => d.queue.push_back(Segment::Bytes(buf[..n].to_vec(), 0)),
-                }
-            }
-            Woke::Read(Err(e)) => return d.finish(cx, service, world, conn_end(e)).await.map(Served::Closed),
-            Woke::Cancelled => return d.finish(cx, service, world, End::Cancelled).await.map(Served::Closed),
-            Woke::Gone => return d.finish(cx, service, world, End::Conn(ConnError::Reset)).await.map(Served::Closed),
-            Woke::Idle => return d.finish(cx, service, world, End::Idle).await.map(Served::Closed),
-            Woke::Timer => {
-                d.deadline = None;
-                let flow = service.on_tick(world, &mut d.scratch.ctx(cx.now(), &d.info));
-                let flow = match flow {
-                    Ok(flow) => flow,
-                    Err(e) => {
-                        let _ = d.finish(cx, service, world, End::Closed).await;
-                        return Err(ServeError::Service(e));
-                    }
-                };
-                if let Err(end) = d.after(cx).await {
-                    return d.finish(cx, service, world, end).await.map(Served::Closed);
-                }
-                match flow {
-                    Flow::Continue => {}
-                    Flow::Close => return d.finish(cx, service, world, End::Closed).await.map(Served::Closed),
-                    Flow::Upgrade => return Ok(Served::Upgraded(upgraded(d, stream))),
-                }
-            }
-        }
-    }
+    run(cx, conn, info, service, world, opts, true, WakeHandle::new()).await
 }
 
-/// The connection and every byte not yet decoded, for a handoff.
-fn upgraded<S: Service, C>(d: Driver<'_, S, C>, stream: Stream<S::Decode>) -> Prefixed<C> {
-    let mut unread = stream.unread().to_vec();
-    for segment in d.queue {
-        if let Segment::Bytes(bytes, at) = segment {
-            unread.extend_from_slice(&bytes[at..]);
+#[allow(clippy::too_many_arguments)]
+async fn run<S, C>(
+    cx: &Cx,
+    mut conn: C,
+    info: ConnInfo,
+    service: &mut S,
+    world: &S::World,
+    opts: &ServeOptions,
+    first: bool,
+    wake: WakeHandle,
+) -> Result<Served<C>, ServeError<S::Error>>
+where
+    S: Service,
+    C: Connection,
+    <S::Decode as Decode>::Error: Clone + Send,
+{
+    let journal = opts.journal.as_ref();
+    let wants = |cx: &Cx| journal.is_some_and(|j| j.wants(cx));
+    if first && opts.connection_events {
+        record(cx, journal, &info, Event::new("conn", "open").summary("connection opened"));
+    }
+    let mut core: Core<S> = Core::new(Some(cx.clone()), service, info, opts, Some(wake), cx.now());
+    core.s.logging = wants(cx);
+    core.open(service, world, cx.now());
+    let tag = core.info.id.unwrap_or(0);
+    let mut buf = vec![0u8; READ];
+    let mut out_offset = 0u64;
+    let mut run = 0u32;
+    loop {
+        if !core.s.events.is_empty() {
+            for event in std::mem::take(&mut core.s.events) {
+                record(cx, journal, &core.info, event);
+            }
+        }
+        // Write what is out, through the transcript.
+        while let Some(out) = core.out.pop_front() {
+            match out {
+                Out::Bytes(bytes) => {
+                    if bytes.is_empty() {
+                        continue;
+                    }
+                    if let Some(t) = &opts.record {
+                        let end = out_offset.saturating_add(bytes.len() as u64);
+                        t.observe::<(), String>(tag, Direction::ServerToClient, StreamEvent::Skipped { bytes: &bytes, range: out_offset..end });
+                    }
+                    out_offset = out_offset.saturating_add(bytes.len() as u64);
+                    if let Err(e) = conn.write_all(cx, &bytes).await {
+                        core.broken(conn_end(e));
+                    }
+                }
+                Out::Delay(d) => {
+                    if cx.sleep(d).await.is_err() {
+                        core.broken(End::Cancelled);
+                    }
+                }
+            }
+        }
+        core.s.logging = wants(cx);
+        let now = cx.now();
+        let next = core.advance(service, world, now);
+        match next {
+            Next::Again => {
+                run = (run + 1) % 64;
+                if run == 0 && cx.yield_now().await.is_err() {
+                    core.broken(End::Cancelled);
+                }
+            }
+            Next::Sleep(d) => {
+                if cx.sleep(d).await.is_err() {
+                    core.broken(End::Cancelled);
+                }
+            }
+            Next::Wait { read, wake, deadline } => {
+                let woke = {
+                    let conn = &mut conn;
+                    let buf = &mut buf;
+                    let core = &mut core;
+                    let service = &mut *service;
+                    let mut sleep = pin!(deadline.map(|t| cx.sleep_until(t)));
+                    let mut cancelled = pin!(cx.cancelled());
+                    poll_fn(|task| {
+                        if cancelled.as_mut().poll(task).is_ready() {
+                            return Poll::Ready(Woke::Cancelled);
+                        }
+                        if core.has_work() && core.poll_work(service, world, cx.now(), task) {
+                            return Poll::Ready(Woke::Work);
+                        }
+                        if wake && core.s.wake.poll(task).is_ready() {
+                            return Poll::Ready(Woke::Wake);
+                        }
+                        if read && let Poll::Ready(r) = conn.poll_read(cx, task, buf) {
+                            return Poll::Ready(Woke::Read(r));
+                        }
+                        if conn.poll_gone(task).is_ready() {
+                            return Poll::Ready(Woke::Gone);
+                        }
+                        if let Some(s) = sleep.as_mut().as_pin_mut()
+                            && s.poll(task).is_ready()
+                        {
+                            return Poll::Ready(Woke::Time);
+                        }
+                        Poll::Pending
+                    })
+                    .await
+                };
+                match woke {
+                    Woke::Read(Ok(0)) => core.input_eof(),
+                    Woke::Read(Ok(n)) => core.input(&buf[..n], cx.now()),
+                    Woke::Read(Err(e)) => core.broken(conn_end(e)),
+                    Woke::Gone => core.broken(End::Conn(ConnError::Reset)),
+                    Woke::Cancelled => core.broken(End::Cancelled),
+                    Woke::Work | Woke::Wake | Woke::Time => {}
+                }
+            }
+            Next::Upgrade(how) => {
+                for event in std::mem::take(&mut core.s.events) {
+                    record(cx, journal, &core.info, event);
+                }
+                if opts.connection_events {
+                    record(cx, journal, &core.info, Event::new("conn", "upgrade").summary(format!("connection upgraded: {}", how.as_str())).field("to", how.as_str()));
+                }
+                let unread = core.unread();
+                return Ok(Served::Upgraded(how, Prefixed::new(unread, conn)));
+            }
+            Next::Closed(end) => {
+                for event in std::mem::take(&mut core.s.events) {
+                    record(cx, journal, &core.info, event);
+                }
+                if end.writable() {
+                    let _ = cx.race(Some(cx.now() + Duration::from_secs(5)), conn.shutdown(cx)).await;
+                }
+                let info = core.info.clone();
+                let failure = core.failure.take();
+                match &failure {
+                    Some(Failure::Service(e)) => {
+                        let event = Event::new("conn", "error").level(Level::Notice).summary(format!("the service failed: {e}")).field("error", e.to_string()).field("kind", "service");
+                        record(cx, journal, &info, event);
+                    }
+                    Some(Failure::Pending(e)) => {
+                        let event = Event::new("conn", "error").level(Level::Notice).summary(format!("deferred work failed: {e}")).field("error", e.to_string()).field("kind", "deferred");
+                        record(cx, journal, &info, event);
+                    }
+                    Some(Failure::Panic(m)) => {
+                        let event = Event::new("conn", "panic").level(Level::Alarm).summary(format!("the service panicked: {m}")).field("message", m.as_str());
+                        record(cx, journal, &info, event);
+                    }
+                    None => {}
+                }
+                if opts.connection_events {
+                    record(cx, journal, &info, Event::new("conn", "close").field("end", end.as_str()).summary(format!("connection closed: {}", end.as_str())));
+                }
+                drop(core);
+                return match failure {
+                    Some(Failure::Service(e)) => Err(ServeError::Service(e)),
+                    Some(Failure::Pending(e)) => Err(ServeError::Pending(e)),
+                    Some(Failure::Panic(m)) => Err(ServeError::Panic(m)),
+                    None => Ok(Served::Closed(end)),
+                };
+            }
         }
     }
-    Prefixed::new(unread, d.conn)
 }
 
 // ---------------------------------------------------------------------------
@@ -1374,7 +2116,6 @@ fn upgraded<S: Service, C>(d: Driver<'_, S, C>, stream: Stream<S::Decode>) -> Pr
 
 /// How a TLS handshake ended, as the `tls.handshake` event says.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum TlsOutcome {
     /// It finished, with this protocol agreed by ALPN.
     Accepted {
@@ -1451,7 +2192,7 @@ pub async fn accept_tls<C: Connection>(
             }
         }
     };
-    let done = until(cx, Some(deadline), handshake).await;
+    let done = cx.race(Some(deadline), handshake).await;
     let (conn, outcome) = match done {
         Ok(Some(conn)) => {
             let alpn = conn.alpn().map(<[u8]>::to_vec);
@@ -1459,8 +2200,8 @@ pub async fn accept_tls<C: Connection>(
         }
         Ok(None) if rejected => (None, TlsOutcome::Rejected),
         Ok(None) => (None, TlsOutcome::Closed),
-        Err(false) => (None, TlsOutcome::TimedOut),
-        Err(true) => (None, TlsOutcome::Aborted),
+        Err(Raced::Deadline) => (None, TlsOutcome::TimedOut),
+        Err(Raced::Cancelled) => (None, TlsOutcome::Aborted),
     };
     let outcome = match failed {
         Some(HandshakeError::Alert(a)) => TlsOutcome::Alert(a),
@@ -1504,7 +2245,9 @@ pub async fn accept_tls<C: Connection>(
 /// Accepts connections on `listener` and serves each with a fresh service
 /// from `make`, in a task of its own, until the listener closes or the
 /// region is cancelled. With [`ServeOptions::tls`], each connection shakes
-/// hands first. Returns the accepting task.
+/// hands first. Past [`ServeOptions::max_conns`], a new connection is
+/// reset; each counts until its socket is gone, so a client that never
+/// finishes closing cannot open more. Returns the accepting task.
 pub fn listen<S, M>(cx: &Cx, mut listener: Listener, world: Arc<S::World>, make: M, opts: ServeOptions) -> Task
 where
     S: Service,
@@ -1520,52 +2263,57 @@ where
                 Err(ConnError::Cancelled | ConnError::Closed) => return Ok(()),
                 Err(_) => continue,
             };
-            if open.load(Ordering::Relaxed) >= opts.max_conns {
+            let Some(guard) = Counted::enter(&open, opts.max_conns) else {
                 conn.reset();
                 continue;
-            }
-            open.fetch_add(1, Ordering::Relaxed);
-            let guard = Counted(open.clone());
+            };
+            conn.hold_until_gone(Box::new(guard));
             let info = ConnInfo::new(opts.next_id(), conn.local_addr(), conn.peer_addr());
             let (world, make, opts) = (world.clone(), make.clone(), opts.clone());
             cx.spawn(move |cx| async move {
-                let _guard = guard;
-                let gone = Some(conn.gone_watch());
                 let mut service = make();
-                match &opts.tls {
-                    None => {
-                        let _ = serve(&cx, conn, info, gone, &mut service, &world, &opts).await;
-                    }
-                    Some(select) => {
-                        let deadline = cx.now() + opts.handshake;
-                        if let Some((conn, info)) = accept_tls(&cx, conn, &info, select, deadline, opts.journal.as_ref(), || false).await {
-                            let _ = serve(&cx, conn, info, gone, &mut service, &world, &opts).await;
-                        }
-                    }
-                }
+                let _ = serve(&cx, conn, info, &mut service, &world, &opts).await;
                 Ok(())
             });
         }
     })
 }
 
-/// Counts one open connection until dropped.
-struct Counted(Arc<AtomicUsize>);
+/// Counts one open connection until dropped. Public so a copied network
+/// can use the same count.
+pub struct Counted(Arc<AtomicUsize>);
 
-impl Drop for Counted {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
+impl Counted {
+    /// Counts one more in `open`, unless it already counts `max`.
+    pub fn enter(open: &Arc<AtomicUsize>, max: usize) -> Option<Counted> {
+        open.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < max).then_some(n + 1)).ok()?;
+        Some(Counted(open.clone()))
     }
 }
 
-/// Serves every datagram on `socket` with `service`, one at a time, until
-/// the socket closes or the region is cancelled.
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Datagrams
+
+/// Serves every datagram on `socket` with one `service`, until the socket
+/// closes or the region is cancelled.
 ///
 /// Each datagram is decoded on its own, with a fresh decoder that sees the
-/// end of input after it, as DNS, DHCP and Modbus over UDP frame their
-/// messages. The reply bytes of one datagram's items go back to its sender
-/// as one datagram. The service's [`ConnInfo`] names the sender in `peer`.
-/// Timers and deferred work are not used over UDP.
+/// end of input after it, as DNS, DHCP, Kerberos and Modbus over UDP frame
+/// their messages. The reply bytes of one datagram's items go back to its
+/// sender as one datagram; [`ServeCtx::send_to`] sends more, to anyone.
+/// The service's [`ConnInfo`] names the sender in `peer`, with
+/// [`Transport::Udp`]. [`Service::on_open`] is called once at the start,
+/// timers and wakes work as over a connection (with no sender: use
+/// `send_to`), and a decoder failure is answered with
+/// [`Service::on_fail`]. [`Flow::Close`] drops the rest of a datagram.
+/// Deferred work is not run. A service error is recorded as `conn.error`
+/// and serving goes on; a panic is recorded as `conn.panic` and ends it.
 pub async fn serve_datagram<S>(
     cx: &Cx,
     mut socket: Socket,
@@ -1578,42 +2326,134 @@ where
     S: Service,
     <S::Decode as Decode>::Error: Clone + Send,
 {
-    let mut scratch = Scratch::new(cx.random_u64(), opts.journal.as_ref().is_some_and(|j| j.wants(cx)));
+    let journal = opts.journal.as_ref();
+    let base = ConnInfo { local: Some(local), transport: Transport::Udp, ..ConnInfo::default() };
+    let mut s = Scratch::new(conn_seed(opts.seed, u64::from(local.port())));
+    let mut timers: Vec<(Timer, Instant)> = Vec::new();
+    let wake = s.wake.clone();
+    // One call, then its datagrams and events. The reply stays for the
+    // caller to send, or drop.
+    let called = |s: &mut Scratch,
+                  timers: &[(Timer, Instant)],
+                  socket: &mut Socket,
+                  info: &ConnInfo,
+                  f: &mut dyn FnMut(&mut ServeCtx<'_>) -> Result<Flow, S::Error>|
+     -> Result<Flow, String> {
+        s.logging = journal.is_some_and(|j| j.wants(cx));
+        let result = {
+            let mut ctx = ServeCtx { s: &mut *s, now: cx.now(), conn: info, timers };
+            guarded(|| f(&mut ctx))
+        };
+        for event in std::mem::take(&mut s.events) {
+            record(cx, journal, info, event);
+        }
+        let flow = match result {
+            Err(m) => {
+                s.discard();
+                let event = Event::new("conn", "panic").level(Level::Alarm).summary(format!("the service panicked: {m}")).field("message", m.as_str());
+                record(cx, journal, info, event);
+                return Err(m);
+            }
+            Ok(Err(e)) => {
+                let event = Event::new("conn", "error").level(Level::Notice).summary(format!("the service failed: {e}")).field("error", e.to_string()).field("kind", "service");
+                record(cx, journal, info, event);
+                Flow::Close
+            }
+            Ok(Ok(flow)) => flow,
+        };
+        for (to, bytes) in s.datagrams.drain(..) {
+            socket.send_to(&bytes, to);
+        }
+        s.ordered.clear();
+        s.keyed.clear();
+        Ok(flow)
+    };
+    if let Err(m) = called(&mut s, &timers, &mut socket, &base, &mut |ctx| service.on_open(world, ctx)) {
+        return Err(ServeError::Panic(m));
+    }
+    s.reply.clear();
     let mut run = 0u32;
-    while let Ok((datagram, from)) = socket.recv(cx).await {
-        let info = ConnInfo { local: Some(local), peer: Some(from), ..ConnInfo::default() };
+    loop {
+        let now = cx.now();
+        arm(&mut timers, &mut s.timers, now);
+        if let Some(i) = due(&timers, now) {
+            let (name, _) = timers.remove(i);
+            if let Err(m) = called(&mut s, &timers, &mut socket, &base, &mut |ctx| service.on_timer(name, world, ctx)) {
+                return Err(ServeError::Panic(m));
+            }
+            s.reply.clear();
+            continue;
+        }
+        if wake.take() {
+            if let Err(m) = called(&mut s, &timers, &mut socket, &base, &mut |ctx| service.on_wake(world, ctx)) {
+                return Err(ServeError::Panic(m));
+            }
+            s.reply.clear();
+            continue;
+        }
+        let deadline = timers.iter().map(|(_, at)| *at).min();
+        let got = {
+            let mut recv = pin!(socket.recv(cx));
+            let mut sleep = pin!(deadline.map(|t| cx.sleep_until(t)));
+            poll_fn(|task| {
+                if let Poll::Ready(r) = recv.as_mut().poll(task) {
+                    return Poll::Ready(Some(r));
+                }
+                if wake.poll(task).is_ready() {
+                    return Poll::Ready(None);
+                }
+                if let Some(s) = sleep.as_mut().as_pin_mut()
+                    && s.poll(task).is_ready()
+                {
+                    return Poll::Ready(None);
+                }
+                Poll::Pending
+            })
+            .await
+        };
+        let Some(got) = got else { continue };
+        let Ok((datagram, from)) = got else { break };
+        let info = ConnInfo { peer: Some(from), ..base.clone() };
+        s.bytes_in = s.bytes_in.saturating_add(datagram.len() as u64);
         let mut stream = Stream::with_buffer(service.decoder(), datagram.len());
-        let n = stream.push(&datagram);
+        let taken = stream.push(&datagram);
         stream.end();
-        let mut fail = n < datagram.len();
         loop {
-            match stream.next() {
+            let flow = match stream.next() {
                 Some(Ok(item)) => {
-                    let flow = service.on_item(item, world, &mut scratch.ctx(cx.now(), &info)).map_err(ServeError::Service)?;
-                    if flow != Flow::Continue {
-                        break;
+                    let mut item = Some(item);
+                    called(&mut s, &timers, &mut socket, &info, &mut |ctx| match item.take() {
+                        Some(item) => service.on_item(item, world, ctx),
+                        None => Ok(Flow::Close),
+                    })
+                }
+                Some(Err(fail)) => {
+                    s.unread = stream.unread().to_vec();
+                    let flow = called(&mut s, &timers, &mut socket, &info, &mut |ctx| service.on_fail(&fail, world, ctx).map(|()| Flow::Close));
+                    s.unread = Vec::new();
+                    flow
+                }
+                None => {
+                    if taken < datagram.len() {
+                        // Longer than the decoder could hold at once.
+                        let fail = Fail::Stuck { unread: datagram.len(), capacity: stream.decoder().capacity() };
+                        s.unread = datagram.clone();
+                        let flow = called(&mut s, &timers, &mut socket, &info, &mut |ctx| service.on_fail(&fail, world, ctx).map(|()| Flow::Close));
+                        s.unread = Vec::new();
+                        flow
+                    } else {
+                        Ok(Flow::Close)
                     }
                 }
-                Some(Err(e)) => {
-                    scratch.unread = stream.unread().to_vec();
-                    let result = service.on_fail(&e, world, &mut scratch.ctx(cx.now(), &info));
-                    scratch.unread = Vec::new();
-                    result.map_err(ServeError::Service)?;
-                    fail = false;
-                    break;
-                }
-                None => break,
+            };
+            match flow {
+                Err(m) => return Err(ServeError::Panic(m)),
+                Ok(Flow::Continue) => {}
+                Ok(_) => break,
             }
         }
-        let _ = fail;
-        scratch.deferred = None;
-        if let Some(j) = &opts.journal {
-            for event in std::mem::take(&mut scratch.events) {
-                j.record(cx, &info, event);
-            }
-        }
-        scratch.events.clear();
-        let reply = std::mem::take(&mut scratch.reply);
+        // The replies to one datagram's items go back as one datagram.
+        let reply = std::mem::take(&mut s.reply);
         if !reply.is_empty() {
             socket.send_to(&reply, from);
         }
@@ -1622,13 +2462,14 @@ where
             break;
         }
     }
+    wake.close();
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // The harness
 
-/// Why [`Harness::push`] stopped.
+/// Why a [`Harness`] call stopped.
 #[derive(Debug)]
 pub enum HarnessError<D, S> {
     /// The decoder failed. [`Service::on_fail`] ran, and its reply is in
@@ -1636,8 +2477,14 @@ pub enum HarnessError<D, S> {
     Decode(Fail<D>),
     /// The service returned an error.
     Service(S),
+    /// Ordered deferred work failed.
+    Pending(fictionet::Error),
+    /// A call panicked with this message.
+    Panic(String),
     /// The connection is closed: no more bytes are taken.
     Closed,
+    /// The service asked for this upgrade; see [`Harness::resume`].
+    Upgraded(Upgrade),
 }
 
 impl<D: core::fmt::Display, S: core::fmt::Display> core::fmt::Display for HarnessError<D, S> {
@@ -1645,29 +2492,51 @@ impl<D: core::fmt::Display, S: core::fmt::Display> core::fmt::Display for Harnes
         match self {
             HarnessError::Decode(e) => write!(f, "decoder: {e}"),
             HarnessError::Service(e) => write!(f, "service: {e}"),
+            HarnessError::Pending(e) => write!(f, "deferred work: {e}"),
+            HarnessError::Panic(m) => write!(f, "panic: {m}"),
             HarnessError::Closed => f.write_str("the connection is closed"),
+            HarnessError::Upgraded(u) => write!(f, "the service asked for an upgrade: {}", u.as_str()),
         }
     }
 }
 
-impl<D: core::error::Error, S: core::error::Error> core::error::Error for HarnessError<D, S> {}
+impl<D: core::fmt::Debug + core::fmt::Display, S: core::error::Error> core::error::Error for HarnessError<D, S> {}
+
+/// A waker that remembers it was woken, for the harness's polls.
+struct Flag(AtomicBool);
+
+impl Wake for Flag {
+    fn wake(self: Arc<Self>) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.store(true, Ordering::Release);
+    }
+}
 
 /// Runs a service with no I/O and no runtime: push the client's bytes,
-/// get the reply. For unit tests, fuzz targets and contract checks. The
-/// clock stands still until [`advance`](Self::advance) moves it, and the
-/// timer goes off then.
+/// get the reply. For unit tests, fuzz targets and contract checks. It
+/// runs the same state machine as [`serve`], so timers, wakes, deferred
+/// work, upgrades and ends behave as they do over a connection. The clock
+/// stands still until [`advance`](Self::advance) moves it; inbound fault
+/// delays take no time.
+///
+/// Deferred work is polled until it waits on something other than
+/// itself; [`poll`](Self::poll) polls it again. Work that needs a [`Cx`]
+/// gets one from [`with_cx`](Self::with_cx).
 pub struct Harness<S: Service> {
     service: S,
     world: S::World,
-    stream: Stream<S::Decode>,
-    scratch: Scratch,
-    conn: ConnInfo,
+    core: Core<S>,
+    opts: ServeOptions,
     now: Instant,
-    deadline: Option<Instant>,
     opened: bool,
-    closed: Option<End>,
     events: Vec<Event>,
     output: Vec<u8>,
+    upgraded: Option<Upgrade>,
+    /// Whether a call returned the upgrade.
+    reported: bool,
 }
 
 type HarnessResult<S> = Result<Vec<u8>, HarnessError<<<S as Service>::Decode as Decode>::Error, <S as Service>::Error>>;
@@ -1676,55 +2545,103 @@ impl<S: Service> Harness<S>
 where
     <S::Decode as Decode>::Error: Clone,
 {
-    /// A connection to `service`, with `world`, at time zero, numbered 1.
+    /// A connection to `service`, with `world`, at time zero, numbered 1,
+    /// with no idle limit.
     pub fn new(service: S, world: S::World) -> Harness<S> {
-        let stream = Stream::new(service.decoder());
+        Harness::with_options(service, world, ServeOptions::default().idle(None))
+    }
+
+    /// The same with `opts`: an idle limit, a fault plan, a budget, a
+    /// seed. The journal, TLS and connection cap are not used.
+    pub fn with_options(service: S, world: S::World, opts: ServeOptions) -> Harness<S> {
+        let info = ConnInfo { id: Some(1), ..ConnInfo::default() };
+        let core = Core::new(None, &service, info, &opts, None, Instant::ZERO);
         Harness {
             service,
             world,
-            stream,
-            scratch: Scratch::new(1, true),
-            conn: ConnInfo { id: Some(1), ..ConnInfo::default() },
+            core,
+            opts,
             now: Instant::ZERO,
-            deadline: None,
             opened: false,
-            closed: None,
             events: Vec::new(),
             output: Vec::new(),
+            upgraded: None,
+            reported: false,
         }
     }
 
     /// The connection the service sees.
     pub fn with_conn(mut self, conn: ConnInfo) -> Harness<S> {
-        self.conn = conn;
+        self.core.info = conn;
         self
     }
 
-    fn take(&mut self) -> Vec<u8> {
-        self.events.append(&mut self.scratch.events);
-        match std::mem::take(&mut self.scratch.timer) {
-            TimerRequest::Unchanged => {}
-            TimerRequest::Set(d) => self.deadline = Some(self.now + d),
-            TimerRequest::Cancel => self.deadline = None,
-        }
-        self.scratch.deferred = None;
-        let reply = std::mem::take(&mut self.scratch.reply);
-        self.output.extend_from_slice(&reply);
-        reply
+    /// Gives deferred work a [`Cx`] ([`PendingCtx::cx`]), for work that
+    /// sleeps or spawns.
+    pub fn with_cx(mut self, cx: Cx) -> Harness<S> {
+        self.core.cx = Some(cx);
+        self
     }
 
-    fn flow(&mut self, flow: Flow) {
-        if flow != Flow::Continue && self.closed.is_none() {
-            self.end_with(End::Closed);
+    /// Runs the state machine until it waits.
+    fn run(&mut self) -> HarnessResult<S> {
+        let mut reply = Vec::new();
+        let flag = Arc::new(Flag(AtomicBool::new(false)));
+        let waker = Waker::from(flag.clone());
+        let mut idle_polls = 0;
+        loop {
+            self.drain(&mut reply);
+            match self.core.advance(&mut self.service, &self.world, self.now) {
+                Next::Again | Next::Sleep(_) => {}
+                Next::Wait { .. } => {
+                    if !self.core.has_work() || idle_polls > 1000 {
+                        break;
+                    }
+                    flag.0.store(false, Ordering::Release);
+                    let progress = self.core.poll_work(&mut self.service, &self.world, self.now, &mut Context::from_waker(&waker));
+                    if progress {
+                        idle_polls = 0;
+                    } else if flag.0.load(Ordering::Acquire) {
+                        idle_polls += 1;
+                    } else {
+                        break;
+                    }
+                }
+                Next::Upgrade(how) => {
+                    self.upgraded = Some(how);
+                    break;
+                }
+                Next::Closed(_) => break,
+            }
         }
+        self.drain(&mut reply);
+        if let Some(f) = self.core.failure.take() {
+            return Err(match f {
+                Failure::Service(e) => HarnessError::Service(e),
+                Failure::Pending(e) => HarnessError::Pending(e),
+                Failure::Panic(m) => HarnessError::Panic(m),
+            });
+        }
+        if let Some(fail) = self.core.decode_fail.take() {
+            return Err(HarnessError::Decode(fail));
+        }
+        if let Some(how) = self.upgraded
+            && !self.reported
+        {
+            self.reported = true;
+            return Err(HarnessError::Upgraded(how));
+        }
+        Ok(reply)
     }
 
-    fn end_with(&mut self, end: End) {
-        if self.closed.is_some() {
-            return;
+    fn drain(&mut self, reply: &mut Vec<u8>) {
+        self.events.append(&mut self.core.s.events);
+        while let Some(out) = self.core.out.pop_front() {
+            if let Out::Bytes(b) = out {
+                self.output.extend_from_slice(&b);
+                reply.extend_from_slice(&b);
+            }
         }
-        self.closed = Some(end);
-        let _ = self.service.on_end(end, &self.world, &mut self.scratch.ctx(self.now, &self.conn));
     }
 
     /// Opens the connection, if it is not open yet: what the service
@@ -1734,92 +2651,134 @@ where
             return Ok(Vec::new());
         }
         self.opened = true;
-        let flow = self.service.on_open(&self.world, &mut self.scratch.ctx(self.now, &self.conn)).map_err(HarnessError::Service)?;
-        self.flow(flow);
-        Ok(self.take())
+        self.core.open(&mut self.service, &self.world, self.now);
+        self.run()
+    }
+
+    fn check_open(&self) -> Result<(), HarnessError<<S::Decode as Decode>::Error, S::Error>> {
+        if let Some(how) = self.upgraded {
+            return Err(HarnessError::Upgraded(how));
+        }
+        if self.closed() {
+            return Err(HarnessError::Closed);
+        }
+        Ok(())
     }
 
     /// The client sends `bytes`. Returns the reply to them.
     pub fn push(&mut self, bytes: &[u8]) -> HarnessResult<S> {
         let mut reply = self.open()?;
-        if self.closed.is_some() {
-            return Err(HarnessError::Closed);
-        }
-        let mut rest = bytes;
-        self.scratch.bytes_in += bytes.len() as u64;
-        loop {
-            let n = self.stream.push(rest);
-            rest = &rest[n..];
-            reply.extend(self.items()?);
-            if self.closed.is_some() || self.stream.is_done() || rest.is_empty() {
-                return Ok(reply);
-            }
-            if n == 0 {
-                return Err(HarnessError::Closed);
-            }
-        }
-    }
-
-    fn items(&mut self) -> HarnessResult<S> {
-        let mut reply = Vec::new();
-        while self.closed.is_none() {
-            match self.stream.next() {
-                Some(Ok(item)) => {
-                    let flow = self.service.on_item(item, &self.world, &mut self.scratch.ctx(self.now, &self.conn)).map_err(HarnessError::Service)?;
-                    self.flow(flow);
-                    reply.extend(self.take());
-                }
-                Some(Err(e)) => {
-                    self.scratch.unread = self.stream.unread().to_vec();
-                    let result = self.service.on_fail(&e, &self.world, &mut self.scratch.ctx(self.now, &self.conn));
-                    self.scratch.unread = Vec::new();
-                    result.map_err(HarnessError::Service)?;
-                    self.end_with(End::Failed);
-                    reply.extend(self.take());
-                    return Err(HarnessError::Decode(e));
-                }
-                None => break,
-            }
-        }
+        self.check_open()?;
+        self.core.input(bytes, self.now);
+        reply.extend(self.run()?);
         Ok(reply)
     }
 
     /// The client half-closes: the service sees the end of input.
     pub fn end(&mut self) -> HarnessResult<S> {
         let mut reply = self.open()?;
-        self.stream.end();
-        reply.extend(self.items()?);
-        self.end_with(End::Eof);
-        reply.extend(self.take());
+        self.check_open()?;
+        self.core.input_eof();
+        reply.extend(self.run()?);
         Ok(reply)
     }
 
-    /// Moves the clock by `d`. If the timer goes off, the service ticks;
-    /// returns its reply.
+    /// Moves the clock by `d`. Timers that come due go off, in order, each
+    /// at its own time, so a timer set again from `on_timer` counts from
+    /// when it went off; returns their replies.
     pub fn advance(&mut self, d: Duration) -> HarnessResult<S> {
-        self.now = self.now + d;
-        if self.closed.is_some() || self.deadline.is_none_or(|t| t > self.now) {
-            return Ok(Vec::new());
+        let until = self.now + d;
+        let mut reply = Vec::new();
+        loop {
+            if self.closed() || self.upgraded.is_some() {
+                self.now = until;
+                return Ok(reply);
+            }
+            let next = self.core.next_deadline();
+            match next {
+                Some(at) if at <= until => self.now = self.now.max(at),
+                _ => {
+                    self.now = until;
+                    reply.extend(self.run()?);
+                    return Ok(reply);
+                }
+            }
+            reply.extend(self.run()?);
+            if self.core.next_deadline() == next {
+                // Due, and still waiting: deferred work holds it back.
+                self.now = until;
+                reply.extend(self.run()?);
+                return Ok(reply);
+            }
         }
-        self.deadline = None;
-        let flow = self.service.on_tick(&self.world, &mut self.scratch.ctx(self.now, &self.conn)).map_err(HarnessError::Service)?;
-        self.flow(flow);
-        Ok(self.take())
     }
 
-    /// When the timer will go off, if it is set.
+    /// Polls deferred work again, and handles a wake: what they wrote.
+    pub fn poll(&mut self) -> HarnessResult<S> {
+        if self.closed() || self.upgraded.is_some() {
+            return Ok(Vec::new());
+        }
+        self.run()
+    }
+
+    /// After [`HarnessError::Upgraded`]: goes on as [`serve`] does once the
+    /// upgrade is done, as the connection `conn` (for TLS, with `tls` set).
+    /// The service gets a fresh decoder that reads the unread bytes, and
+    /// [`Service::on_open`] again. Returns what it sends.
+    pub fn resume(&mut self, conn: ConnInfo) -> HarnessResult<S> {
+        if self.upgraded.take().is_none() {
+            return Ok(Vec::new());
+        }
+        self.reported = false;
+        let unread = self.core.unread();
+        let wake = WakeHandle::new();
+        let cx = self.core.cx.take();
+        let mut core = Core::new(cx, &self.service, conn, &self.opts, Some(wake), self.now);
+        core.s.bytes_in = self.core.s.bytes_in;
+        if !unread.is_empty() {
+            core.queue.push_back(Segment::Bytes(unread, 0));
+        }
+        self.core = core;
+        self.core.open(&mut self.service, &self.world, self.now);
+        self.run()
+    }
+
+    /// A handle that wakes the service; [`poll`](Self::poll) runs the wake.
+    pub fn wake_handle(&self) -> WakeHandle {
+        self.core.s.wake.clone()
+    }
+
+    /// When the first armed timer goes off, if one is armed.
     pub fn deadline(&self) -> Option<Instant> {
-        self.deadline
+        self.core.timers.iter().map(|(_, at)| *at).min()
+    }
+
+    /// When the timer `name` goes off, if it is armed.
+    pub fn timer(&self, name: Timer) -> Option<Instant> {
+        self.core.timers.iter().find(|(n, _)| *n == name).map(|(_, at)| *at)
+    }
+
+    /// How many deferred works run: ordered, then keyed.
+    pub fn pending(&self) -> (usize, usize) {
+        (self.core.ordered.len(), self.core.keyed.len())
     }
 
     /// Whether the connection has ended.
     pub fn closed(&self) -> bool {
-        self.closed.is_some()
+        matches!(self.core.state, State::Ended(_))
     }
 
     /// How it ended.
     pub fn end_reason(&self) -> Option<End> {
-        self.closed
+        match self.core.state {
+            State::Ended(end) => Some(end),
+            _ => None,
+        }
+    }
+
+    /// The upgrade the service asked for, if it did.
+    pub fn upgraded(&self) -> Option<Upgrade> {
+        self.upgraded
     }
 
     /// Every event the service recorded.

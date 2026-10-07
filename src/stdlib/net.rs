@@ -4,11 +4,12 @@
 //!
 //! [`Net`] builds the whole network around the [`Host`]s a world declares.
 //! Each host has addresses, DNS names, and services on its ports: any
-//! [`Service`] over TCP or UDP, the same over TLS chosen by SNI, and HTTP
-//! sites ([`httpd`]) with name-based virtual hosting.
-//! Every sandbox that attaches is put on the sandboxes' subnet, given an
-//! address by DHCP or by its first packet, and kept from reaching the other
-//! sandboxes. A world then writes only its services.
+//! [`Service`] over TCP or UDP, the same over TLS chosen by SNI, and any
+//! [`Accept`] of the world's own, such as [`httpd::Site`] for HTTP with
+//! name-based virtual hosting. Every sandbox that attaches is put on the
+//! sandboxes' subnet, given an address by DHCP or by its first packet, and
+//! kept from reaching the other sandboxes. A world then writes only its
+//! services.
 //!
 //! An office: a domain controller that answers LDAP and Kerberos, a web
 //! server, and a PLC, with DNS names for each:
@@ -31,19 +32,9 @@
 //! let intranet = httpd::Router::new().get("/", |_, _| http::Response::new("intranet\n".into()));
 //! Net::new()
 //!     .journal(Journal::new().to_file("/tmp/office-journal.jsonl")?)
-//!     .host("dc01")
-//!         .at("10.20.0.10".parse::<std::net::Ipv4Addr>()?)
-//!         .dns_name("dc01.corp.test")
-//!         .tcp(389, directory.clone(), || Ldap)
-//!         .done()
-//!     .host("www")
-//!         .dns_name("intranet.corp.test")
-//!         .http(80, intranet)
-//!         .done()
-//!     .host("plc1")
-//!         .at("10.30.0.5".parse::<std::net::Ipv4Addr>()?)
-//!         .tcp(502, plant, || Plc)
-//!         .done()
+//!     .host("dc01", |h| h.at("10.20.0.10".parse::<std::net::Ipv4Addr>().unwrap()).dns_name("dc01.corp.test").tcp(389, directory.clone(), || Ldap))
+//!     .host("www", |h| h.dns_name("intranet.corp.test").accept(80, httpd::Site::new(intranet)))
+//!     .host("plc1", |h| h.at("10.30.0.5".parse::<std::net::Ipv4Addr>().unwrap()).tcp(502, plant, || Plc))
 //!     .serve(&cx, attachments)?;
 //! # Ok(())
 //! # }
@@ -78,25 +69,35 @@
 //!   address gets ICMP "host unreachable" (ICMPv6 "address unreachable").
 //! - **Machines** answer pings, reset TCP to closed ports and answer UDP to
 //!   closed ports with "port unreachable". A sandbox may have 256
-//!   connections open at once to one machine; past that, new ones are
-//!   reset.
+//!   connections open at once to one machine
+//!   ([`Net::connections_per_peer`]); past that, new ones are reset. Each
+//!   service has its own cap too ([`ServeOptions::max_conns`]).
+//! - **Budgets.** What every connection from one sandbox holds is charged
+//!   to that sandbox's [`Budget`], 256 MiB unless
+//!   [`Net::sandbox_budget`] says otherwise: a connection that would pass
+//!   it is closed.
 //! - **Every link** inside the network holds at most 4 MiB of packets each
 //!   way; past that, packets are dropped, as on a congested link.
-//! - **The journal**, if set ([`Net::journal`]), gets every fact: `net`
-//!   events for sandboxes attaching, binding, detaching and packets
-//!   dropped (`net.blocked`), `dns.query` for every DNS message,
-//!   `tls.handshake` for every handshake on a TLS port, and each service's
-//!   own events. Every event names its sandbox and, for a connection, its
-//!   number (from 1, on every port of every machine).
+//! - **The journal**, if set ([`Net::journal`]), gets every fact: a
+//!   `journal.start` entry first, `net` events for sandboxes attaching,
+//!   binding, detaching and packets dropped (`net.blocked`), `dns.query`
+//!   for every DNS message, `tls.handshake` for every handshake on a TLS
+//!   port, and each service's own events. Every event names its sandbox
+//!   and, for a connection, its number (from 1, on every port of every
+//!   machine).
+//! - **Errors.** A host that cannot be served as declared, such as one at
+//!   an address a host cannot have, two services on one port, or a port
+//!   that cannot be listened on, makes [`Net::serve`] fail.
 //!
 //! The limits and rules are those [`web::Sites`](crate::stdlib::web::Sites)
 //! documents in detail, which runs on this.
 
+use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::task::Poll;
 use std::time::Duration;
@@ -105,15 +106,17 @@ use fictionet::stdlib::codec::Decode;
 use fictionet::stdlib::dhcp::{self, opt};
 use fictionet::stdlib::dns::op::{Edns, Message, MessageType, OpCode, ResponseCode};
 use fictionet::stdlib::dns::rr::{DNSClass, RData, Record, RecordType, rdata::A, rdata::AAAA};
-use fictionet::stdlib::httpd::{self, Handler, HttpOptions, VHost, VirtualHosts};
 use fictionet::stdlib::ip::{Header, Intake, Reassembly};
-use fictionet::stdlib::journal::{ConnInfo, Event, Journal, Level, Sandbox, opt as jopt};
+use fictionet::stdlib::journal::{ConnInfo, Event, Fields, Journal, Level, Sandbox, opt as jopt};
 use fictionet::stdlib::route::{self, Prefix, Router};
-use fictionet::stdlib::serve::{self, ServeOptions, Service, TlsSelect};
+use fictionet::stdlib::serve::{self, Budget, Counted, ServeOptions, Service, TlsSelect};
 use fictionet::stdlib::tls::ServerConfig;
 use fictionet::stdlib::{ConnError, Connection, ConnectionExt, PortEvent, Ports, icmp, ip, tcp, udp};
 use fictionet::time::Instant;
 use fictionet::{Attachment, Attachments, Cx, End, Error, Interface, InterfaceExt, Packet};
+
+#[cfg(doc)]
+use fictionet::stdlib::httpd;
 
 const PROTO_TCP: u8 = 6;
 const PROTO_UDP: u8 = 17;
@@ -144,18 +147,6 @@ const MAX_UNKNOWN_NAMES: usize = 100_000;
 /// world sets another limit.
 pub const MAX_HOSTS: usize = 20_000;
 
-/// How many connections one peer address may have open at one machine (or
-/// at the gateway's DNS) at once, counted until each has finished closing.
-pub const CONNECTIONS_PER_PEER: usize = 256;
-
-/// How long a client has, from connecting, to finish its TLS handshake, or
-/// on an HTTP port without TLS to send its first bytes.
-pub const HANDSHAKE_TIME: Duration = Duration::from_secs(10);
-
-/// How long a DNS-over-TCP connection may sit idle between queries (RFC
-/// 7766, section 6.2.3).
-const DNS_TCP_IDLE: Duration = Duration::from_secs(10);
-
 /// How long resolvers may keep an answer, in seconds.
 const TTL: u32 = 60;
 
@@ -167,6 +158,45 @@ fn link() -> (End, End) {
 /// whole network down with it.
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A name as hosts are kept: lowercase, without a trailing dot.
+fn normalize(name: &str) -> String {
+    name.trim_end_matches('.').to_ascii_lowercase()
+}
+
+// ---------------------------------------------------------------------------
+// Limits
+
+/// The network's limits and timers, for [`Net::limits`]. Tests set small
+/// ones so they do not wait out real-world timeouts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    /// How many connections one peer address may have open at one machine
+    /// (or at the gateway's DNS) at once, counted until each has finished
+    /// closing. Default 256.
+    pub connections_per_peer: usize,
+    /// How long a client has, from connecting, to finish its TLS handshake,
+    /// or on an HTTP port without TLS to send its first bytes. Default 10
+    /// seconds.
+    pub handshake: Duration,
+    /// How long a DNS-over-TCP connection may sit idle between queries (RFC
+    /// 7766, section 6.2.3). Default 10 seconds.
+    pub dns_tcp_idle: Duration,
+    /// Bytes the connections of one sandbox may hold at once, all services
+    /// together: see [`Budget`]. Default 256 MiB.
+    pub sandbox_budget: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Limits {
+        Limits {
+            connections_per_peer: 256,
+            handshake: Duration::from_secs(10),
+            dns_tcp_idle: Duration::from_secs(10),
+            sandbox_budget: 256 << 20,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -183,12 +213,51 @@ enum Family {
 /// Picks the TLS config for one handshake, with randomness from the `Cx`.
 pub type ConfigFor = Arc<dyn Fn(&Cx) -> Arc<ServerConfig> + Send + Sync>;
 
-/// Serves one accepted connection of one port. [`Host::tcp`] and the
-/// others make these; a world can write its own for [`Host::accept`].
-pub trait Accept: Send + Sync + 'static {
-    /// Serves `conn`, which arrived as `info` says. `gone` says when the
-    /// client reset it. `journal` is the network's.
-    fn serve(&self, cx: Cx, conn: Box<dyn Connection>, info: ConnInfo, gone: tcp::GoneWatch, journal: Option<Journal>) -> Pin<Box<dyn Future<Output = ()> + Send>>;
+/// One connection, accepted on a port of a machine, as an [`Accept`] gets
+/// it.
+pub struct Arrival {
+    /// The connection: after the TLS handshake, on a TLS port.
+    pub conn: Box<dyn Connection>,
+    /// Who it is from, and where it arrived.
+    pub info: ConnInfo,
+    /// The TCP socket underneath, to keep a count until it is gone
+    /// ([`tcp::GoneWatch::hold_until_gone`]) or to reset it.
+    pub socket: tcp::GoneWatch,
+    /// The network's journal.
+    pub journal: Option<Journal>,
+    /// The budget of the sandbox it came from.
+    pub budget: Option<Budget>,
+    /// [`Limits::handshake`]: how long a client has to send its first
+    /// bytes.
+    pub handshake: Duration,
+    /// The network's seed ([`Net::seed`]), for [`ServeOptions::seed`].
+    pub seed: u64,
+}
+
+/// Serves connections on one port of a host. [`Host::tcp`] and
+/// [`Host::tls`] make one for a [`Service`]; [`httpd::Site`] is HTTP's.
+/// A world writes its own for anything else.
+pub trait Accept: Any + Send + Sync {
+    /// Serves one connection.
+    fn serve(&self, cx: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>>;
+
+    /// The protocols to offer with ALPN when this serves a TLS port, such
+    /// as `h2` and `http/1.1`. Default none: the config's own list.
+    fn alpn(&self) -> Vec<Vec<u8>> {
+        Vec::new()
+    }
+
+    /// A host is placed on this accept's port at its address (for a TLS
+    /// port, on one of the port's names), with the DNS names `names` and
+    /// the accept `other`. The first host on a port is offered its own
+    /// accept. Returns whether this accept serves that host too, as
+    /// virtual hosts share an HTTP port; if not, `other` serves the port
+    /// alone, which on a plain port is an error. The default takes only
+    /// itself.
+    fn share(&self, names: &[String], other: &Arc<dyn Accept>) -> bool {
+        let _ = names;
+        std::ptr::addr_eq(self as *const Self, Arc::as_ptr(other))
+    }
 }
 
 /// Serves a [`Service`] made fresh for each connection.
@@ -196,6 +265,13 @@ struct ServiceAccept<S: Service, M> {
     world: Arc<S::World>,
     make: M,
     opts: ServeOptions,
+    open: Arc<AtomicUsize>,
+}
+
+impl<S: Service, M> ServiceAccept<S, M> {
+    fn new(world: Arc<S::World>, make: M, opts: ServeOptions) -> ServiceAccept<S, M> {
+        ServiceAccept { world, make, opts, open: Arc::default() }
+    }
 }
 
 impl<S, M> Accept for ServiceAccept<S, M>
@@ -204,92 +280,62 @@ where
     M: Fn() -> S + Send + Sync + 'static,
     <S::Decode as Decode>::Error: Clone + Send,
 {
-    fn serve(&self, cx: Cx, conn: Box<dyn Connection>, info: ConnInfo, gone: tcp::GoneWatch, journal: Option<Journal>) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    fn serve(&self, cx: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        let Some(guard) = Counted::enter(&self.open, self.opts.max_conns) else {
+            if let Some(j) = &arrival.journal {
+                let (src, dst) = (arrival.info.peer, arrival.info.local);
+                let event = blocked_event(BlockedWhy::TooManyConnections, Some(PROTO_TCP), src.map(|a| a.ip()), dst.map(|a| a.ip()), dst.map(|a| a.port()));
+                j.record(&cx, &arrival.info, event);
+            }
+            arrival.socket.reset();
+            return Box::pin(async {});
+        };
+        arrival.socket.hold_until_gone(Box::new(guard));
         let mut service = (self.make)();
         let world = self.world.clone();
         let mut opts = self.opts.clone();
-        if journal.is_some() {
-            opts.journal = journal;
+        if arrival.journal.is_some() {
+            opts.journal = arrival.journal;
         }
+        if opts.budget.is_none() {
+            opts.budget = arrival.budget;
+        }
+        opts.seed ^= arrival.seed;
+        let (conn, info) = (arrival.conn, arrival.info);
         Box::pin(async move {
-            let _ = serve::serve(&cx, conn, info, Some(gone), &mut service, &world, &opts).await;
+            let _ = serve::serve(&cx, conn, info, &mut service, &world, &opts).await;
         })
     }
 }
 
-/// Serves HTTP with a machine's virtual hosts for one port.
-struct HttpAccept {
-    vhosts: VirtualHosts,
-    opts: HttpOptions,
+/// Starts serving a UDP port of a machine: the socket, its address, the
+/// journal and the seed.
+type UdpStart = Arc<dyn Fn(&Cx, udp::Socket, SocketAddr, Option<Journal>, u64) + Send + Sync>;
+
+/// Which names a TLS service on a port answers to, by the SNI the client
+/// sends.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Sni {
+    /// Every name, and none: the port's fallback.
+    Any,
+    /// Each of the host's DNS names ([`Host::dns_name`]).
+    Names,
+    /// This name.
+    Name(String),
 }
 
-impl Accept for HttpAccept {
-    fn serve(&self, cx: Cx, conn: Box<dyn Connection>, info: ConnInfo, gone: tcp::GoneWatch, _journal: Option<Journal>) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-        let handler: Arc<dyn Handler> = Arc::new(self.vhosts.clone());
-        let opts = self.opts.clone();
-        Box::pin(async move {
-            httpd::serve_connection(&cx, conn, info, Some(gone), handler, &opts).await;
-        })
+impl From<&str> for Sni {
+    fn from(name: &str) -> Sni {
+        Sni::Name(normalize(name))
     }
-}
-
-/// Starts serving a UDP port of a machine.
-type UdpStart = Arc<dyn Fn(&Cx, udp::Socket, SocketAddr, Option<Journal>) + Send + Sync>;
-
-/// One TLS name on a port: its config, and what serves the connection
-/// after the handshake.
-#[derive(Clone)]
-enum AfterTls {
-    Accept(Arc<dyn Accept>),
-    /// HTTP, with the port's virtual hosts.
-    Http,
 }
 
 /// What a host serves on one port.
 #[derive(Clone)]
 enum PortSpec {
     Tcp(Arc<dyn Accept>),
-    Tls { sni: Option<String>, config: ConfigFor, then: AfterTls },
-    Http { vhost: VHost, tls: Option<ConfigFor> },
+    Tls { sni: Sni, config: ConfigFor, accept: Arc<dyn Accept> },
     Udp(UdpStart),
-}
-
-/// A website on ports 80 and 443, as [`web::Sites`](crate::stdlib::web::Sites)
-/// serves one: see [`Host::web`].
-#[derive(Clone)]
-pub struct Website {
-    handler: Arc<dyn Handler>,
-    tls: Option<ConfigFor>,
-    plain_http: bool,
-    default_host: bool,
-}
-
-impl Website {
-    /// A website served by `handler`, over plain HTTP only.
-    pub fn new(handler: impl Handler) -> Website {
-        Website { handler: Arc::new(handler), tls: None, plain_http: false, default_host: false }
-    }
-
-    /// The same, from a shared handler.
-    pub fn shared(handler: Arc<dyn Handler>) -> Website {
-        Website { handler, tls: None, plain_http: false, default_host: false }
-    }
-
-    /// Serves it over HTTPS on port 443, with the config `config_for`
-    /// returns for each handshake. Port 80 then redirects to https.
-    pub fn tls(self, config_for: impl Fn(&Cx) -> Arc<ServerConfig> + Send + Sync + 'static) -> Website {
-        Website { tls: Some(Arc::new(config_for)), ..self }
-    }
-
-    /// With TLS, answers plain HTTP on port 80 too, with no redirect.
-    pub fn plain_http(self) -> Website {
-        Website { plain_http: true, ..self }
-    }
-
-    /// Answers requests at its address whose host names no site there.
-    pub fn default_host(self) -> Website {
-        Website { default_host: true, ..self }
-    }
 }
 
 /// One host: its addresses, DNS names and services. See [`Net::host`] and
@@ -302,21 +348,12 @@ pub struct Host {
     at_v6: Option<Ipv6Addr>,
     family: Family,
     ports: Vec<(u16, PortSpec)>,
-    default_host: bool,
 }
 
 impl Host {
     /// A host called `label` (for observers), with no names or services.
     pub fn new(label: &str) -> Host {
-        Host {
-            label: label.to_owned(),
-            names: Vec::new(),
-            at: None,
-            at_v6: None,
-            family: Family::Both,
-            ports: Vec::new(),
-            default_host: false,
-        }
+        Host { label: label.to_owned(), names: Vec::new(), at: None, at_v6: None, family: Family::Both, ports: Vec::new() }
     }
 
     /// Serves the host at `addr`, IPv4 or IPv6, which sets its address of
@@ -325,8 +362,9 @@ impl Host {
     ///
     /// The address must be one a host can have, outside the sandboxes'
     /// subnet: not unspecified, broadcast, multicast or loopback, and for
-    /// IPv6 not link-local or IPv4-mapped. If it is not, the host is not
-    /// served.
+    /// IPv6 not link-local or IPv4-mapped. If it is not, [`Net::serve`]
+    /// fails; a host made by [`Net::resolve`] is not served, and its name
+    /// gets NXDOMAIN.
     pub fn at(self, addr: impl Into<IpAddr>) -> Host {
         match addr.into() {
             IpAddr::V4(a) => Host { at: Some(a), ..self },
@@ -345,48 +383,45 @@ impl Host {
     }
 
     /// Makes the gateway's DNS answer `name` with the host's addresses. A
-    /// host can have many names; its HTTP sites and TLS services are
-    /// served under each.
+    /// host can have many names; its HTTP sites and TLS services for
+    /// [`Sni::Names`] are served under each.
     pub fn dns_name(mut self, name: &str) -> Host {
-        self.names.push(httpd::normalize(name));
+        self.names.push(normalize(name));
         self
     }
 
     /// Serves TCP `port` with a [`Service`] made by `make` for each
     /// connection, sharing `world`. Connections are numbered, and the
     /// service's events reach the network's journal.
-    pub fn tcp<S, M>(mut self, port: u16, world: Arc<S::World>, make: M) -> Host
+    pub fn tcp<S, M>(self, port: u16, world: Arc<S::World>, make: M) -> Host
     where
         S: Service,
         M: Fn() -> S + Send + Sync + 'static,
         <S::Decode as Decode>::Error: Clone + Send,
     {
-        let accept = ServiceAccept { world, make, opts: ServeOptions::default().connection_events(false) };
-        self.ports.push((port, PortSpec::Tcp(Arc::new(accept))));
-        self
+        self.tcp_with(port, world, make, ServeOptions::default().connection_events(false))
     }
 
     /// The same with these options: a transcript, a fault plan, an idle
-    /// limit. The network's journal replaces any in `opts`.
-    pub fn tcp_with<S, M>(mut self, port: u16, world: Arc<S::World>, make: M, opts: ServeOptions) -> Host
+    /// limit, a connection cap, a STARTTLS config. The network's journal
+    /// replaces any in `opts`, and the sandbox's budget applies when
+    /// `opts` has none.
+    pub fn tcp_with<S, M>(self, port: u16, world: Arc<S::World>, make: M, opts: ServeOptions) -> Host
     where
         S: Service,
         M: Fn() -> S + Send + Sync + 'static,
         <S::Decode as Decode>::Error: Clone + Send,
     {
-        let accept = ServiceAccept { world, make, opts };
-        self.ports.push((port, PortSpec::Tcp(Arc::new(accept))));
-        self
+        self.accept(port, ServiceAccept::new(world, make, opts))
     }
 
-    /// Serves TCP `port` with TLS for `sni` (or for every name, with
-    /// `None`), then a [`Service`] made by `make`. Several `tls` calls on one
-    /// port route by SNI; a name with no entry is rejected with
-    /// `unrecognized_name`.
+    /// Serves TCP `port` with TLS for the names `sni` gives, then a
+    /// [`Service`] made by `make`. Several `tls` calls on one port route
+    /// by SNI; a name with no entry is rejected with `unrecognized_name`.
     pub fn tls<S, M>(
-        mut self,
+        self,
         port: u16,
-        sni: Option<&str>,
+        sni: impl Into<Sni>,
         config_for: impl Fn(&Cx) -> Arc<ServerConfig> + Send + Sync + 'static,
         world: Arc<S::World>,
         make: M,
@@ -396,24 +431,51 @@ impl Host {
         M: Fn() -> S + Send + Sync + 'static,
         <S::Decode as Decode>::Error: Clone + Send,
     {
-        let accept = ServiceAccept { world, make, opts: ServeOptions::default().connection_events(false) };
-        let spec = PortSpec::Tls { sni: sni.map(httpd::normalize), config: Arc::new(config_for), then: AfterTls::Accept(Arc::new(accept)) };
+        let accept = ServiceAccept::new(world, make, ServeOptions::default().connection_events(false));
+        self.tls_accept(port, sni, config_for, accept)
+    }
+
+    /// Serves TCP `port` with `accept`.
+    pub fn accept(mut self, port: u16, accept: impl Accept) -> Host {
+        self.ports.push((port, PortSpec::Tcp(Arc::new(accept))));
+        self
+    }
+
+    /// Serves TCP `port` with TLS for the names `sni` gives, with the
+    /// config `config_for` returns for each handshake, then `accept`.
+    pub fn tls_accept(mut self, port: u16, sni: impl Into<Sni>, config_for: impl Fn(&Cx) -> Arc<ServerConfig> + Send + Sync + 'static, accept: impl Accept) -> Host {
+        let spec = PortSpec::Tls { sni: sni.into(), config: Arc::new(config_for), accept: Arc::new(accept) };
         self.ports.push((port, spec));
         self
     }
 
-    /// Serves UDP `port` with a [`Service`] that reads one datagram at a
-    /// time ([`serve::serve_datagram`]).
-    pub fn udp<S, M>(mut self, port: u16, world: Arc<S::World>, make: M) -> Host
+    /// Serves UDP `port` with one [`Service`] made by `make`, which gets
+    /// every datagram ([`serve::serve_datagram`]).
+    pub fn udp<S, M>(self, port: u16, world: Arc<S::World>, make: M) -> Host
     where
         S: Service,
         M: Fn() -> S + Send + Sync + 'static,
         <S::Decode as Decode>::Error: Clone + Send,
     {
-        let start: UdpStart = Arc::new(move |cx, socket, local, journal| {
+        self.udp_with(port, world, make, ServeOptions::default())
+    }
+
+    /// The same with these options. The network's journal replaces any in
+    /// `opts`.
+    pub fn udp_with<S, M>(mut self, port: u16, world: Arc<S::World>, make: M, opts: ServeOptions) -> Host
+    where
+        S: Service,
+        M: Fn() -> S + Send + Sync + 'static,
+        <S::Decode as Decode>::Error: Clone + Send,
+    {
+        let start: UdpStart = Arc::new(move |cx, socket, local, journal, seed| {
             let mut service = make();
             let world = world.clone();
-            let opts = ServeOptions { journal, ..ServeOptions::default() };
+            let mut opts = opts.clone();
+            if journal.is_some() {
+                opts.journal = journal;
+            }
+            opts.seed ^= seed;
             cx.spawn(move |cx| async move {
                 let _ = serve::serve_datagram(&cx, socket, local, &mut service, &world, &opts).await;
                 Ok(())
@@ -421,159 +483,6 @@ impl Host {
         });
         self.ports.push((port, PortSpec::Udp(start)));
         self
-    }
-
-    /// Serves TCP `port` with `accept`, a connection handler of the world's
-    /// own.
-    pub fn accept(mut self, port: u16, accept: impl Accept) -> Host {
-        self.ports.push((port, PortSpec::Tcp(Arc::new(accept))));
-        self
-    }
-
-    /// Serves plain HTTP on `port` with `handler`, for each of the host's
-    /// names. Hosts at one address share the port, and each request goes
-    /// to the host its `Host` header names ([`VirtualHosts`]).
-    pub fn http(mut self, port: u16, handler: impl Handler) -> Host {
-        self.ports.push((port, PortSpec::Http { vhost: VHost::new(handler), tls: None }));
-        self
-    }
-
-    /// Serves HTTPS on `port` with `handler`, for each of the host's names,
-    /// with the config `config_for` returns. ALPN offers `h2` and
-    /// `http/1.1`.
-    pub fn https(mut self, port: u16, config_for: impl Fn(&Cx) -> Arc<ServerConfig> + Send + Sync + 'static, handler: impl Handler) -> Host {
-        let vhost = VHost { handler: Arc::new(handler), https: true, plain_http: false };
-        self.ports.push((port, PortSpec::Http { vhost, tls: Some(Arc::new(config_for)) }));
-        self
-    }
-
-    /// Serves `site` on ports 80 and 443 the way websites are served: with
-    /// TLS, HTTPS on 443 and a redirect to it on 80 (unless
-    /// [`plain_http`](Website::plain_http)); without, plain HTTP on 80.
-    pub fn web(mut self, site: Website) -> Host {
-        let https = site.tls.is_some();
-        self.default_host |= site.default_host;
-        let plain = VHost { handler: site.handler.clone(), https, plain_http: site.plain_http };
-        self.ports.push((80, PortSpec::Http { vhost: plain, tls: None }));
-        if let Some(config) = site.tls {
-            let secure = VHost { handler: site.handler, https: true, plain_http: false };
-            self.ports.push((443, PortSpec::Http { vhost: secure, tls: Some(config) }));
-        }
-        self
-    }
-
-    /// Makes the host's HTTP sites the default ones at its address: they
-    /// answer requests whose host names no site there.
-    pub fn default_host(self) -> Host {
-        Host { default_host: true, ..self }
-    }
-}
-
-/// [`Host`], while it is added to a [`Net`]: [`done`](Self::done) adds it.
-/// [`Net::add_host`] adds a host built on its own.
-pub struct HostBuilder {
-    net: Net,
-    host: Host,
-}
-
-impl HostBuilder {
-    /// See [`Host::at`].
-    pub fn at(self, addr: impl Into<IpAddr>) -> HostBuilder {
-        HostBuilder { host: self.host.at(addr), ..self }
-    }
-
-    /// See [`Host::ipv4_only`].
-    pub fn ipv4_only(self) -> HostBuilder {
-        HostBuilder { host: self.host.ipv4_only(), ..self }
-    }
-
-    /// See [`Host::ipv6_only`].
-    pub fn ipv6_only(self) -> HostBuilder {
-        HostBuilder { host: self.host.ipv6_only(), ..self }
-    }
-
-    /// See [`Host::dns_name`].
-    pub fn dns_name(self, name: &str) -> HostBuilder {
-        HostBuilder { host: self.host.dns_name(name), ..self }
-    }
-
-    /// See [`Host::tcp`].
-    pub fn tcp<S, M>(self, port: u16, world: Arc<S::World>, make: M) -> HostBuilder
-    where
-        S: Service,
-        M: Fn() -> S + Send + Sync + 'static,
-        <S::Decode as Decode>::Error: Clone + Send,
-    {
-        HostBuilder { host: self.host.tcp(port, world, make), ..self }
-    }
-
-    /// See [`Host::tcp_with`].
-    pub fn tcp_with<S, M>(self, port: u16, world: Arc<S::World>, make: M, opts: ServeOptions) -> HostBuilder
-    where
-        S: Service,
-        M: Fn() -> S + Send + Sync + 'static,
-        <S::Decode as Decode>::Error: Clone + Send,
-    {
-        HostBuilder { host: self.host.tcp_with(port, world, make, opts), ..self }
-    }
-
-    /// See [`Host::tls`].
-    pub fn tls<S, M>(
-        self,
-        port: u16,
-        sni: Option<&str>,
-        config_for: impl Fn(&Cx) -> Arc<ServerConfig> + Send + Sync + 'static,
-        world: Arc<S::World>,
-        make: M,
-    ) -> HostBuilder
-    where
-        S: Service,
-        M: Fn() -> S + Send + Sync + 'static,
-        <S::Decode as Decode>::Error: Clone + Send,
-    {
-        HostBuilder { host: self.host.tls(port, sni, config_for, world, make), ..self }
-    }
-
-    /// See [`Host::udp`].
-    pub fn udp<S, M>(self, port: u16, world: Arc<S::World>, make: M) -> HostBuilder
-    where
-        S: Service,
-        M: Fn() -> S + Send + Sync + 'static,
-        <S::Decode as Decode>::Error: Clone + Send,
-    {
-        HostBuilder { host: self.host.udp(port, world, make), ..self }
-    }
-
-    /// See [`Host::accept`].
-    pub fn accept(self, port: u16, accept: impl Accept) -> HostBuilder {
-        HostBuilder { host: self.host.accept(port, accept), ..self }
-    }
-
-    /// See [`Host::http`].
-    pub fn http(self, port: u16, handler: impl Handler) -> HostBuilder {
-        HostBuilder { host: self.host.http(port, handler), ..self }
-    }
-
-    /// See [`Host::https`].
-    pub fn https(self, port: u16, config_for: impl Fn(&Cx) -> Arc<ServerConfig> + Send + Sync + 'static, handler: impl Handler) -> HostBuilder {
-        HostBuilder { host: self.host.https(port, config_for, handler), ..self }
-    }
-
-    /// See [`Host::web`].
-    pub fn web(self, site: Website) -> HostBuilder {
-        HostBuilder { host: self.host.web(site), ..self }
-    }
-
-    /// See [`Host::default_host`].
-    pub fn default_host(self) -> HostBuilder {
-        HostBuilder { host: self.host.default_host(), ..self }
-    }
-
-    /// Adds the host to the network.
-    pub fn done(self) -> Net {
-        let mut net = self.net;
-        net.hosts.push(self.host);
-        net
     }
 }
 
@@ -596,6 +505,9 @@ pub struct Net {
     routes: Vec<(String, Prefix)>,
     registry: Option<fictionet::observe::Registry>,
     group: String,
+    limits: Limits,
+    seed: u64,
+    start: Fields,
 }
 
 impl Default for Net {
@@ -618,6 +530,9 @@ impl Net {
             routes: Vec::new(),
             registry: None,
             group: "net".to_owned(),
+            limits: Limits::default(),
+            seed: 0,
+            start: Fields::new(),
         }
     }
 
@@ -644,9 +559,17 @@ impl Net {
         Net { journal: Some(journal), ..self }
     }
 
-    /// Starts a host called `label`; [`HostBuilder::done`] adds it.
-    pub fn host(self, label: &str) -> HostBuilder {
-        HostBuilder { net: self, host: Host::new(label) }
+    /// Adds the fields of the `journal.start` entry the network records
+    /// first ([`Journal::start`]), such as the date the world says it is.
+    pub fn start_fields(self, start: Fields) -> Net {
+        Net { start, ..self }
+    }
+
+    /// Adds a host called `label`, built by `build`:
+    /// `net.host("dc01", |h| h.at(addr).tcp(389, directory, || Ldap))`.
+    pub fn host(mut self, label: &str, build: impl FnOnce(Host) -> Host) -> Net {
+        self.hosts.push(build(Host::new(label)));
+        self
     }
 
     /// Adds a host built on its own.
@@ -658,7 +581,9 @@ impl Net {
     /// Asks `resolve` for a host the first time a name that no host has is
     /// looked up. `Some(host)` creates it then, with that name as a DNS
     /// name; `None` gives NXDOMAIN. The answer is kept for the run.
-    /// `resolve` must return quickly: it runs inside the DNS task.
+    /// `resolve` must return quickly: it runs inside the DNS task. A host
+    /// that cannot be served is recorded as a `net.error` event, and its
+    /// name gets NXDOMAIN.
     pub fn resolve(self, resolve: impl Fn(&str) -> Option<Host> + Send + Sync + 'static) -> Net {
         Net { resolver: Some(Arc::new(resolve)), ..self }
     }
@@ -689,15 +614,30 @@ impl Net {
         Net { group: name.to_owned(), ..self }
     }
 
+    /// Sets the network's limits and timers.
+    pub fn limits(self, limits: Limits) -> Net {
+        Net { limits, ..self }
+    }
+
+    /// Sets the seed every service's randomness is drawn from, mixed with
+    /// each connection's number ([`ServeOptions::seed`]). Default 0: runs
+    /// whose connections arrive in the same order draw the same numbers.
+    pub fn seed(self, seed: u64) -> Net {
+        Net { seed, ..self }
+    }
+
     /// Builds the network and starts it. Every sandbox in `attachments`,
     /// including ones that attach later, is connected.
     ///
-    /// Returns immediately. The network runs in background tasks in `cx`'s
-    /// region until that region is cancelled. Fails if a subnet cannot be
-    /// used.
+    /// Returns once every host is placed. The network runs in background
+    /// tasks in `cx`'s region until that region is cancelled. Fails if a
+    /// subnet cannot be used, or a host cannot be served as declared.
     pub fn serve(self, cx: &Cx, mut attachments: Attachments) -> Result<(), Error> {
         let subnet = Subnet::new(self.subnet)?;
         let subnet6 = if self.ipv6 { Some(Subnet6::new(self.subnet_v6)?) } else { None };
+        if let Some(journal) = &self.journal {
+            journal.start(cx, self.start);
+        }
         if let Some(registry) = self.registry {
             cx.observe_protocols(registry);
         }
@@ -734,15 +674,19 @@ impl Net {
             gateway_tcp: Mutex::new(Vec::new()),
             hooks,
             fixed: routes.iter().map(|(_, p)| *p).collect(),
+            limits: self.limits,
+            seed: self.seed,
+            budgets: Mutex::default(),
         });
         start_gateway(&shared)?;
         {
             let mut world = lock(&shared.world);
             for host in self.hosts {
                 let names = host.names.clone();
-                let placed = shared.place(&mut world, host);
+                let label = host.label.clone();
+                let placed = shared.place(&mut world, host).map_err(|e| format!("host {label}: {e}"))?;
                 for name in names {
-                    world.names.insert(name, placed.map_or(Known::NoHost, Known::Host));
+                    world.names.insert(name, Known::Host(placed));
                 }
             }
         }
@@ -779,7 +723,7 @@ struct Hooks {
 }
 
 impl Hooks {
-    /// Whether events are kept: a journal is set.
+    /// Whether events are recorded: a journal is set.
     fn on(&self) -> bool {
         self.journal.is_some()
     }
@@ -1024,6 +968,10 @@ struct Shared {
     hooks: Arc<Hooks>,
     /// Prefixes of trusted sandboxes ([`Net::route`]).
     fixed: Vec<Prefix>,
+    limits: Limits,
+    seed: u64,
+    /// Each sandbox's budget, by its address.
+    budgets: Mutex<HashMap<IpAddr, Budget>>,
 }
 
 fn prefix_contains(p: &Prefix, a: IpAddr) -> bool {
@@ -1058,9 +1006,14 @@ impl Shared {
                 if !host.names.iter().any(|n| n == name) {
                     host.names.insert(0, name.to_owned());
                 }
+                let label = host.label.clone();
                 match self.place(&mut world, host) {
-                    Some(p) => Known::Host(p),
-                    None => Known::NoHost,
+                    Ok(p) => Known::Host(p),
+                    Err(e) => {
+                        let event = Event::new("net", "error").level(Level::Notice).summary(format!("host {label} for {name}: {e}")).field("name", name).field("error", e);
+                        self.hooks.record(&self.cx, &ConnInfo::default(), event);
+                        Known::NoHost
+                    }
                 }
             }
             None => Known::NoHost,
@@ -1073,28 +1026,28 @@ impl Shared {
     }
 
     /// Gives `host` its addresses and machines, and adds its services.
-    /// `None` if an address given with `at` cannot be served, or it ends up
-    /// with no address.
-    fn place(self: &Arc<Self>, world: &mut World, host: Host) -> Option<Placed> {
+    /// Fails if an address given with `at` cannot be served, it ends up
+    /// with no address, or a service cannot be added.
+    fn place(self: &Arc<Self>, world: &mut World, host: Host) -> Result<Placed, String> {
         let wants_v4 = host.family != Family::V6;
         let subnet6 = self.subnet6.filter(|_| host.family != Family::V4);
         let mut placed = Placed::default();
         if wants_v4 {
             placed.v4 = match host.at {
                 Some(a) if may_serve_v4(a, &self.subnet) => Some(a),
-                Some(_) => return None,
+                Some(a) => return Err(format!("{a} is not an address a host can have here")),
                 None => world.free_auto(&self.subnet),
             };
         }
         if let Some(subnet6) = subnet6 {
             placed.v6 = match host.at_v6 {
                 Some(a) if may_serve_v6(a, &subnet6) => Some(a),
-                Some(_) => return None,
+                Some(a) => return Err(format!("{a} is not an address a host can have here")),
                 None => world.free_auto6(&subnet6),
             };
         }
         if placed == Placed::default() {
-            return None;
+            return Err("no address is left for it".into());
         }
         let label = host.names.first().cloned().unwrap_or_else(|| host.label.clone());
         let addrs = placed.v4.map(IpAddr::V4).into_iter().chain(placed.v6.map(IpAddr::V6));
@@ -1107,24 +1060,35 @@ impl Shared {
                     m
                 }
             };
-            machine.add(&host);
+            machine.add(&host)?;
         }
-        Some(placed)
+        Ok(placed)
+    }
+
+    /// The budget of the sandbox at `peer`.
+    fn budget(&self, peer: IpAddr) -> Budget {
+        lock(&self.budgets).entry(peer).or_insert_with(|| Budget::new(self.limits.sandbox_budget)).clone()
     }
 }
-
 // ---------------------------------------------------------------------------
 // Machines
 
-/// Open connections by peer address, for [`CONNECTIONS_PER_PEER`].
-#[derive(Default)]
-struct Peers(Mutex<HashMap<IpAddr, usize>>);
+/// Open connections by peer address, for
+/// [`Limits::connections_per_peer`].
+struct Peers {
+    open: Mutex<HashMap<IpAddr, usize>>,
+    max: usize,
+}
 
 impl Peers {
+    fn new(max: usize) -> Arc<Peers> {
+        Arc::new(Peers { open: Mutex::default(), max })
+    }
+
     fn enter(self: &Arc<Self>, peer: IpAddr) -> Option<PeerGuard> {
-        let mut map = lock(&self.0);
+        let mut map = lock(&self.open);
         let n = map.entry(peer).or_default();
-        if *n >= CONNECTIONS_PER_PEER {
+        if *n >= self.max {
             return None;
         }
         *n += 1;
@@ -1139,7 +1103,7 @@ struct PeerGuard {
 
 impl Drop for PeerGuard {
     fn drop(&mut self) {
-        let mut map = lock(&self.peers.0);
+        let mut map = lock(&self.peers.open);
         if let Some(n) = map.get_mut(&self.peer) {
             *n -= 1;
             if *n == 0 {
@@ -1149,18 +1113,19 @@ impl Drop for PeerGuard {
     }
 }
 
-/// A TLS name on a port, with the config cached with ALPN set for HTTP.
+/// A TLS name on a port: its config, with the accept's ALPN list set
+/// (cached), and the accept that serves it.
 struct TlsName {
     config: ConfigFor,
-    then: AfterTls,
-    http: bool,
+    accept: Arc<dyn Accept>,
+    alpn: Vec<Vec<u8>>,
     last: Mutex<Option<(Arc<ServerConfig>, Arc<ServerConfig>)>>,
 }
 
 impl TlsName {
     fn config(&self, cx: &Cx) -> Arc<ServerConfig> {
         let given = (self.config)(cx);
-        if !self.http {
+        if self.alpn.is_empty() {
             return given;
         }
         let mut last = lock(&self.last);
@@ -1170,7 +1135,7 @@ impl TlsName {
             return with_alpn.clone();
         }
         let mut config = (*given).clone();
-        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        config.alpn_protocols = self.alpn.clone();
         let config = Arc::new(config);
         *last = Some((given, config.clone()));
         config
@@ -1183,8 +1148,6 @@ struct Port {
     plain: RwLock<Option<Arc<dyn Accept>>>,
     /// TLS by SNI; the empty name is "any name".
     tls: RwLock<HashMap<String, Arc<TlsName>>>,
-    http: VirtualHosts,
-    http_opts: Mutex<Option<HttpOptions>>,
 }
 
 /// One address with its services.
@@ -1196,7 +1159,7 @@ struct Machine {
     ports: Mutex<HashMap<u16, Arc<Port>>>,
     udp_ports: Mutex<HashSet<u16>>,
     peers: Arc<Peers>,
-    hooks: Arc<Hooks>,
+    shared: std::sync::Weak<Shared>,
 }
 
 impl Machine {
@@ -1217,77 +1180,86 @@ impl Machine {
             udp,
             ports: Mutex::new(HashMap::new()),
             udp_ports: Mutex::new(HashSet::new()),
-            peers: Arc::default(),
-            hooks: shared.hooks.clone(),
+            peers: Peers::new(shared.limits.connections_per_peer),
+            shared: Arc::downgrade(shared),
         })
     }
 
     /// The port `port`, made and listened on if it is new.
-    fn port(self: &Arc<Self>, port: u16) -> Option<Arc<Port>> {
+    fn port(self: &Arc<Self>, port: u16) -> Result<Arc<Port>, String> {
         let mut ports = lock(&self.ports);
         if let Some(p) = ports.get(&port) {
-            return Some(p.clone());
+            return Ok(p.clone());
         }
-        let listener = self.tcp.listen(port).ok()?;
+        let listener = self.tcp.listen(port).map_err(|e| format!("TCP port {port} at {}: {e}", self.addr))?;
         let p: Arc<Port> = Arc::default();
         ports.insert(port, p.clone());
         let (m, slot) = (self.clone(), p.clone());
         self.cx.spawn(move |cx| accept(cx, listener, m, slot));
-        Some(p)
+        Ok(p)
     }
 
-    /// Adds a host's services. A port's plain service, once set, stays: a
-    /// second host at this address cannot take it.
-    fn add(self: &Arc<Self>, host: &Host) {
-        let journal = self.hooks.journal.clone();
+    /// Adds a host's services.
+    fn add(self: &Arc<Self>, host: &Host) -> Result<(), String> {
+        let journal = self.shared.upgrade().and_then(|s| s.hooks.journal.clone());
+        let seed = self.shared.upgrade().map_or(0, |s| s.seed);
+        let addr = self.addr;
         for (number, spec) in &host.ports {
             match spec {
                 PortSpec::Udp(start) => {
-                    if lock(&self.udp_ports).insert(*number)
-                        && let Ok(socket) = self.udp.bind(*number)
-                    {
-                        start(&self.cx, socket, SocketAddr::new(self.addr, *number), journal.clone());
+                    if !lock(&self.udp_ports).insert(*number) {
+                        return Err(format!("UDP port {number} at {addr} is already served"));
                     }
+                    let socket = self.udp.bind(*number).map_err(|e| format!("UDP port {number} at {addr}: {e}"))?;
+                    start(&self.cx, socket, SocketAddr::new(addr, *number), journal.clone(), seed);
                 }
                 PortSpec::Tcp(accept) => {
-                    let Some(port) = self.port(*number) else { continue };
-                    port.plain.write().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(|| accept.clone());
-                }
-                PortSpec::Tls { sni, config, then } => {
-                    let Some(port) = self.port(*number) else { continue };
-                    let name = Arc::new(TlsName { config: config.clone(), then: then.clone(), http: false, last: Mutex::new(None) });
-                    let mut tls = port.tls.write().unwrap_or_else(|e| e.into_inner());
-                    tls.entry(sni.clone().unwrap_or_default()).or_insert(name);
-                }
-                PortSpec::Http { vhost, tls } => {
-                    let Some(port) = self.port(*number) else { continue };
-                    {
-                        let mut opts = lock(&port.http_opts);
-                        if opts.is_none() {
-                            *opts = Some(HttpOptions {
-                                first_bytes: Some(HANDSHAKE_TIME),
-                                journal: journal.clone(),
-                                ..HttpOptions::default()
-                            });
-                            if tls.is_none() {
-                                let accept: Arc<dyn Accept> = Arc::new(HttpAccept { vhosts: port.http.clone(), opts: opts.clone().unwrap_or_default() });
-                                port.plain.write().unwrap_or_else(|e| e.into_inner()).get_or_insert(accept);
+                    let port = self.port(*number)?;
+                    let mut plain = port.plain.write().unwrap_or_else(|e| e.into_inner());
+                    match &*plain {
+                        None => {
+                            accept.share(&host.names, accept);
+                            *plain = Some(accept.clone());
+                        }
+                        Some(front) => {
+                            if !front.share(&host.names, accept) {
+                                return Err(format!("TCP port {number} at {addr} is already served by another host"));
                             }
                         }
                     }
-                    for name in &host.names {
-                        port.http.insert(name, vhost.clone());
-                        if let Some(config) = tls {
-                            let entry = Arc::new(TlsName { config: config.clone(), then: AfterTls::Http, http: true, last: Mutex::new(None) });
-                            port.tls.write().unwrap_or_else(|e| e.into_inner()).entry(name.clone()).or_insert(entry);
+                }
+                PortSpec::Tls { sni, config, accept } => {
+                    let port = self.port(*number)?;
+                    let names: Vec<String> = match sni {
+                        Sni::Any => vec![String::new()],
+                        Sni::Name(n) => vec![n.clone()],
+                        Sni::Names if host.names.is_empty() => {
+                            return Err(format!("TLS on port {number} is for the host's names, and it has none"));
                         }
+                        Sni::Names => host.names.clone(),
+                    };
+                    let mut tls = port.tls.write().unwrap_or_else(|e| e.into_inner());
+                    if let Some(taken) = names.iter().find(|n| tls.contains_key(*n)) {
+                        let name = if taken.is_empty() { "any name" } else { taken.as_str() };
+                        return Err(format!("TLS port {number} at {addr} already serves {name}"));
                     }
-                    if host.default_host {
-                        port.http.set_default(vhost.clone());
+                    let front = tls.values().next().map(|t| t.accept.clone());
+                    let served_by = match front {
+                        Some(front) if front.share(&host.names, accept) => front,
+                        _ => {
+                            accept.share(&host.names, accept);
+                            accept.clone()
+                        }
+                    };
+                    for name in names {
+                        let alpn = served_by.alpn();
+                        let entry = TlsName { config: config.clone(), accept: served_by.clone(), alpn, last: Mutex::new(None) };
+                        tls.insert(name, Arc::new(entry));
                     }
                 }
             }
         }
+        Ok(())
     }
 
     /// Whether TCP `port` is open here.
@@ -1322,22 +1294,22 @@ async fn accept(cx: Cx, mut listener: tcp::Listener, machine: Arc<Machine>, port
     loop {
         match listener.accept(&cx).await {
             Ok(conn) => {
+                let Some(shared) = machine.shared.upgrade() else { return Ok(()) };
+                let hooks = shared.hooks.clone();
                 let Some(guard) = machine.peers.enter(conn.peer_addr().ip()) else {
-                    too_many(&cx, &machine.hooks, &conn);
+                    too_many(&cx, &hooks, &conn);
                     conn.reset();
                     continue;
                 };
                 conn.hold_until_gone(Box::new(guard));
-                let hooks = machine.hooks.clone();
                 let sandbox = hooks.on().then(|| hooks.sandbox_at(conn.peer_addr().ip()));
-                let id = if hooks.on() { hooks.next_conn() } else { 0 };
-                let info = ConnInfo::new(id, conn.local_addr(), conn.peer_addr()).from_sandbox(sandbox);
+                let info = ConnInfo::new(hooks.next_conn(), conn.local_addr(), conn.peer_addr()).from_sandbox(sandbox);
                 let accepted = cx.now();
                 let port = port.clone();
                 cx.spawn(move |cx| async move {
                     let _ = cx
                         .region(move |cx| async move {
-                            connection(cx, conn, info, accepted, port, hooks).await;
+                            connection(cx, conn, info, accepted, port, shared).await;
                             Ok(())
                         })
                         .await;
@@ -1351,14 +1323,25 @@ async fn accept(cx: Cx, mut listener: tcp::Listener, machine: Arc<Machine>, port
 }
 
 /// Serves one connection: TLS by SNI first if the port has TLS names, then
-/// the service.
-async fn connection(cx: Cx, conn: tcp::TcpConnection, info: ConnInfo, accepted: Instant, port: Arc<Port>, hooks: Arc<Hooks>) {
-    let gone = conn.gone_watch();
+/// the name's accept.
+async fn connection(cx: Cx, conn: tcp::TcpConnection, info: ConnInfo, accepted: Instant, port: Arc<Port>, shared: Arc<Shared>) {
+    let hooks = shared.hooks.clone();
+    let socket = conn.gone_watch();
+    let peer = conn.peer_addr().ip();
+    let arrival = |conn: Box<dyn Connection>, info: ConnInfo| Arrival {
+        conn,
+        info,
+        socket: socket.clone(),
+        journal: hooks.journal.clone(),
+        budget: Some(shared.budget(peer)),
+        handshake: shared.limits.handshake,
+        seed: shared.seed,
+    };
     let has_tls = !port.tls.read().unwrap_or_else(|e| e.into_inner()).is_empty();
     if !has_tls {
         let plain = port.plain.read().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some(accept) = plain {
-            accept.serve(cx.clone(), Box::new(conn), info, gone, hooks.journal.clone()).await;
+            accept.serve(cx.clone(), arrival(Box::new(conn), info)).await;
         }
         return;
     }
@@ -1375,19 +1358,12 @@ async fn connection(cx: Cx, conn: tcp::TcpConnection, info: ConnInfo, accepted: 
     let sandbox_id = info.sandbox.as_ref().map(|s| s.id);
     let detached = || sandbox_id.is_some_and(|id| !hooks.is_attached(id));
     let journal = hooks.journal.as_ref();
-    let Some((tls, info)) = serve::accept_tls(&cx, conn, &info, &select, accepted + HANDSHAKE_TIME, journal, detached).await else {
+    let deadline = accepted + shared.limits.handshake;
+    let Some((tls, info)) = serve::accept_tls(&cx, conn, &info, &select, deadline, journal, detached).await else {
         return;
     };
     let Some(name) = lock(&chosen).take() else { return };
-    let conn: Box<dyn Connection> = Box::new(tls);
-    match &name.then {
-        AfterTls::Accept(accept) => accept.serve(cx.clone(), conn, info, gone, hooks.journal.clone()).await,
-        AfterTls::Http => {
-            let opts = lock(&port.http_opts).clone().unwrap_or_default();
-            let handler: Arc<dyn Handler> = Arc::new(port.http.clone());
-            httpd::serve_connection(&cx, conn, info, Some(gone), handler, &opts).await;
-        }
-    }
+    name.accept.serve(cx.clone(), arrival(Box::new(tls), info)).await;
 }
 
 /// Answers pings to `addr`.
@@ -1492,7 +1468,7 @@ fn answer(shared: &Arc<Shared>, bytes: &[u8]) -> Answered {
         return Answered::none();
     }
     let first = query.queries.first().filter(|_| query.queries.len() == 1);
-    let mut name = first.map(|q| httpd::normalize(&q.name().to_ascii()));
+    let mut name = first.map(|q| normalize(&q.name().to_ascii()));
     let qtype = first.map(|q| u16::from(q.query_type()));
     let event_answer;
     let mut reply = Message::response(query.metadata.id, query.metadata.op_code);
@@ -1573,7 +1549,7 @@ async fn dns_udp(cx: Cx, mut socket: udp::Socket, shared: Arc<Shared>) -> fictio
 
 /// DNS over TCP on the gateway's port 53.
 async fn dns_tcp(cx: Cx, mut listener: tcp::Listener, shared: Arc<Shared>) -> fictionet::Result {
-    let peers = Arc::new(Peers::default());
+    let peers = Peers::new(shared.limits.connections_per_peer);
     loop {
         match listener.accept(&cx).await {
             Ok(conn) => {
@@ -1615,7 +1591,7 @@ async fn dns_conn(cx: &Cx, mut conn: tcp::TcpConnection, shared: &Arc<Shared>) -
             }
             Ok(Some(query))
         };
-        let Ok(read) = serve::until(cx, Some(cx.now() + DNS_TCP_IDLE), read).await else { return Ok(()) };
+        let Ok(read) = cx.race(Some(cx.now() + shared.limits.dns_tcp_idle), read).await else { return Ok(()) };
         let Some(query) = read? else { return Ok(()) };
         let answered = answer(shared, &query);
         if let Some(info) = &info {

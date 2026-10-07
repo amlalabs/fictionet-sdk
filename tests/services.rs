@@ -6,9 +6,8 @@
 
 use std::collections::BTreeSet;
 use std::convert::Infallible;
-use std::future::{Future, poll_fn};
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::pin::pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::task::{Context, Poll};
@@ -31,7 +30,7 @@ use fictionet::stdlib::route::Prefix;
 use fictionet::stdlib::scenario::Scenario;
 use fictionet::stdlib::serve::{
     self, End as Ended, FaultPlan, Flow, Harness, HarnessError, Pending, PendingCtx, Plan, ServeCtx, ServeOptions, Served,
-    Service, Transcript,
+    Service, Timer, Transcript, Upgrade,
 };
 use fictionet::stdlib::{ConnError, Connection, ip, tcp, udp};
 use fictionet::{Cx, End, Interface, block_on, pair, run};
@@ -70,18 +69,7 @@ where
 }
 
 async fn timeout<T>(cx: &Cx, d: Duration, fut: impl Future<Output = T>) -> Option<T> {
-    let mut fut = pin!(fut);
-    let mut sleep = pin!(cx.sleep(d));
-    poll_fn(|task| {
-        if let Poll::Ready(v) = fut.as_mut().poll(task) {
-            return Poll::Ready(Some(v));
-        }
-        if sleep.as_mut().poll(task).is_ready() {
-            return Poll::Ready(None);
-        }
-        Poll::Pending
-    })
-    .await
+    cx.race(Some(cx.now() + d), fut).await.ok()
 }
 
 /// Two machines joined by a cable: a server at 10.9.0.1 and a client at
@@ -113,7 +101,7 @@ async fn read_some<C: Connection>(cx: &Cx, conn: &mut C, want: usize) -> Vec<u8>
 // ---------------------------------------------------------------------------
 // Services used below
 
-/// Echoes each line, closes on `quit`, hands over on `starttls`, and on
+/// Echoes each line, closes on `quit`, hands over on `handoff`, and on
 /// `later` answers through deferred work.
 struct Echo;
 
@@ -142,7 +130,7 @@ impl Service for Echo {
                 ctx.reply().extend_from_slice(b"bye\n");
                 Ok(Flow::Close)
             }
-            b"starttls" => Ok(Flow::Upgrade),
+            b"handoff" => Ok(Flow::Upgrade(Upgrade::Handoff)),
             b"later" => {
                 ctx.defer(Later { step: 0 });
                 Ok(Flow::Continue)
@@ -203,7 +191,7 @@ impl Service for Ticker {
     }
 
     fn on_open(&mut self, _: &(), ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
-        ctx.wake_in(Duration::from_millis(30));
+        ctx.set_timer("tick", Duration::from_millis(30));
         Ok(Flow::Continue)
     }
 
@@ -211,13 +199,13 @@ impl Service for Ticker {
         Ok(Flow::Continue)
     }
 
-    fn on_tick(&mut self, _: &(), ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
+    fn on_timer(&mut self, _: Timer, _: &(), ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
         self.ticks += 1;
         ctx.reply().extend_from_slice(b"tick\n");
         if self.ticks == 3 {
             return Ok(Flow::Close);
         }
-        ctx.wake_in(Duration::from_millis(30));
+        ctx.set_timer("tick", Duration::from_millis(30));
         Ok(Flow::Continue)
     }
 }
@@ -608,8 +596,8 @@ fn a_handoff_returns_the_connection_with_its_unread_bytes() {
         let (tx, rx) = mpsc::channel();
         cx.spawn(move |cx| async move {
             let conn = listener.accept(&cx).await?;
-            let served = serve::serve(&cx, conn, ConnInfo::default(), None, &mut Echo, &(), &ServeOptions::default()).await;
-            if let Ok(Served::Upgraded(mut rest)) = served {
+            let served = serve::serve(&cx, conn, ConnInfo::default(), &mut Echo, &(), &ServeOptions::default()).await;
+            if let Ok(Served::Upgraded(Upgrade::Handoff, mut rest)) = served {
                 let _ = tx.send(rest.unread().to_vec());
                 // What follows is the next protocol's: here, raw bytes.
                 rest.write_all(&cx, b"upgraded\n").await?;
@@ -617,7 +605,7 @@ fn a_handoff_returns_the_connection_with_its_unread_bytes() {
             Ok(())
         });
         let mut conn = client.connect(&cx, SocketAddr::new(SERVER.into(), 25)).await?;
-        conn.write_all(&cx, b"starttls\n\x16\x03\x01").await?;
+        conn.write_all(&cx, b"handoff\n\x16\x03\x01").await?;
         assert_eq!(read_some(&cx, &mut conn, 15).await, b"hello\nupgraded\n");
         assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), b"\x16\x03\x01");
         Ok(())
@@ -820,15 +808,8 @@ fn a_plc_and_a_web_server_on_one_net_with_observe_decoding_both() {
         Net::new()
             .journal(journal.clone())
             .ipv4_only()
-            .host("plc")
-            .at(PLC_ADDR)
-            .dns_name("plc1.plant.test")
-            .tcp(modbus::PORT, plant.clone(), || Plc)
-            .done()
-            .host("hmi")
-            .dns_name("hmi.plant.test")
-            .http(80, hmi)
-            .done()
+            .host("plc", |h| h.at(PLC_ADDR).dns_name("plc1.plant.test").tcp(modbus::PORT, plant.clone(), || Plc))
+            .host("hmi", |h| h.dns_name("hmi.plant.test").accept(80, httpd::Site::new(hmi)))
             .serve(&cx, attachments)?;
 
         let s = sandbox(&cx, attacher.attach("operator")?, ME);
@@ -899,11 +880,7 @@ fn net_serves_udp_services_and_trusted_sandboxes() {
         Net::new()
             .journal(journal)
             .ipv4_only()
-            .host("svc")
-            .at(Ipv4Addr::new(10, 40, 0, 1))
-            .tcp(7, Arc::new(()), || Echo)
-            .udp(9, counter.clone(), || Udp)
-            .done()
+            .host("svc", |h| h.at(Ipv4Addr::new(10, 40, 0, 1)).tcp(7, Arc::new(()), || Echo).udp(9, counter.clone(), || Udp))
             .route("box", Prefix { addr: Ipv4Addr::new(10, 50, 0, 7).into(), len: 32 })
             .serve(&cx, attachments)?;
         let s = sandbox(&cx, attacher.attach("agent")?, ME);
@@ -966,7 +943,11 @@ fn a_scenario_changes_the_world_on_time_and_grades_the_journal() {
         assert_eq!(faults.get().seed, 3);
 
         let (attacher, attachments) = fictionet::attachments();
-        Net::new().journal(journal).ipv4_only().host("plc").at(PLC_ADDR).tcp_with(502, plant, || Plc, ServeOptions::default().faults(faults.clone())).done().serve(&cx, attachments)?;
+        Net::new()
+            .journal(journal)
+            .ipv4_only()
+            .host("plc", |h| h.at(PLC_ADDR).tcp_with(502, plant, || Plc, ServeOptions::default().faults(faults.clone())))
+            .serve(&cx, attachments)?;
         let s = sandbox(&cx, attacher.attach("op")?, ME);
         let mut conn = s.tcp.connect(&cx, SocketAddr::new(PLC_ADDR.into(), 502)).await?;
         conn.write_all(&cx, &mb(1, MbRequest::ReadHoldingRegisters { address: 1, quantity: 1 })).await?;
@@ -1001,7 +982,7 @@ fn a_tower_service_runs_as_a_handler() {
                 let handler: Arc<dyn httpd::Handler> = Arc::new(httpd::tower(app.clone()));
                 let info = ConnInfo::new(1, conn.local_addr(), conn.peer_addr());
                 cx.spawn(move |cx| async move {
-                    httpd::serve_connection(&cx, conn, info, None, handler, &httpd::HttpOptions::default()).await;
+                    httpd::serve_connection(&cx, conn, info, handler, &httpd::HttpOptions::default()).await;
                     Ok(())
                 });
             }
@@ -1075,8 +1056,8 @@ fn net_routes_tls_by_name_to_each_service() {
             .add_host(
                 fictionet::stdlib::net::Host::new("tls")
                     .at(addr)
-                    .tls(6514, Some("a.test"), move |_| ca.clone(), Arc::new(()), || Echo)
-                    .tls(6514, Some("b.test"), move |_| cb.clone(), Arc::new(()), || Upper),
+                    .tls(6514, "a.test", move |_| ca.clone(), Arc::new(()), || Echo)
+                    .tls(6514, "b.test", move |_| cb.clone(), Arc::new(()), || Upper),
             )
             .serve(&cx, attachments)?;
         let s = sandbox(&cx, attacher.attach("agent")?, ME);
@@ -1164,4 +1145,737 @@ fn http1_survives_mixed_and_random_input() {
         assert_eq!(run(&[&input[..at], &input[at..]]), whole, "cut at {at} of {:?}", String::from_utf8_lossy(&input));
         assert!(whole.2);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Fixes from the service-layer review: each test below failed, or could
+// not be written, before its fix.
+
+/// A decoder that skips a long run of bytes is making progress: the
+/// connection stays open, as in the harness. Before, the driver took a
+/// pass with no item for a stuck decoder and closed the connection as
+/// failed.
+#[test]
+fn a_decoder_that_skips_a_long_line_keeps_the_connection_open() {
+    /// Echo on 16-byte lines.
+    struct Short;
+    impl Service for Short {
+        type Decode = Lines;
+        type World = ();
+        type Error = Infallible;
+        fn decoder(&self) -> Lines {
+            Lines::new(16, Ending::LfOrCrlf)
+        }
+        fn on_item(&mut self, line: Result<Vec<u8>, LineError>, _: &(), ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
+            match line {
+                Ok(line) => ctx.reply().extend_from_slice(&[line.as_slice(), b"\n"].concat()),
+                Err(_) => ctx.reply().extend_from_slice(b"long\n"),
+            }
+            Ok(Flow::Continue)
+        }
+    }
+    let mut input = vec![b'x'; 100];
+    input.extend_from_slice(b"\nok\n");
+    let mut h = Harness::new(Short, ());
+    assert_eq!(h.push(&input).unwrap(), b"long\nok\n");
+    assert!(!h.closed());
+    world(move |cx| async move {
+        let (server, _su, client, _cu) = two_machines(&cx);
+        let journal = Journal::new();
+        let kept = journal.keep(100);
+        serve::listen(&cx, server.listen(7)?, Arc::new(()), || Short, ServeOptions::default().journal(journal));
+        let mut conn = client.connect(&cx, SocketAddr::new(SERVER.into(), 7)).await?;
+        conn.write_all(&cx, &input).await?;
+        assert_eq!(read_some(&cx, &mut conn, 8).await, b"long\nok\n");
+        assert!(kept.of("conn", "close").is_empty(), "{:?}", kept.of("conn", "close"));
+        Ok(())
+    });
+}
+
+/// The harness runs deferred work and reports an upgrade, as the driver
+/// does. Before, it dropped the work and took an upgrade for a close.
+#[test]
+fn the_harness_runs_deferred_work_and_reports_upgrades() {
+    let mut h = Harness::new(Echo, ());
+    let got = h.push(b"one\nlater\ntwo\n");
+    assert_eq!(got.as_deref().map(String::from_utf8_lossy).unwrap(), "hello\none\nlater\ntwo\n");
+    assert!(h.events().iter().any(|e| e.is("echo", "later")));
+    assert!(matches!(h.push(b"handoff\nrest"), Err(HarnessError::Upgraded(Upgrade::Handoff))));
+    assert_eq!(h.upgraded(), Some(Upgrade::Handoff));
+    assert!(!h.closed());
+}
+
+/// SMTP-style STARTTLS: the banner, then `STARTTLS`, then TLS on the same
+/// connection with the same service.
+struct Mail {
+    tls: bool,
+}
+
+impl Service for Mail {
+    type Decode = Lines;
+    type World = ();
+    type Error = Infallible;
+    fn decoder(&self) -> Lines {
+        Lines::new(512, Ending::LfOrCrlf)
+    }
+    fn on_open(&mut self, _: &(), ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
+        // After STARTTLS the client speaks first.
+        self.tls = ctx.conn().tls;
+        if !self.tls {
+            ctx.reply().extend_from_slice(b"220 mail ready\r\n");
+        }
+        Ok(Flow::Continue)
+    }
+    fn on_item(&mut self, line: Result<Vec<u8>, LineError>, _: &(), ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
+        let line = line.unwrap_or_default();
+        match line.as_slice() {
+            b"STARTTLS" if !self.tls => {
+                ctx.reply().extend_from_slice(b"220 go ahead\r\n");
+                Ok(Flow::Upgrade(Upgrade::Tls))
+            }
+            b"EHLO" => {
+                let sni = ctx.conn().sni.as_deref().unwrap_or("-").to_owned();
+                ctx.reply().extend_from_slice(format!("250 hello tls={} sni={sni}\r\n", self.tls).as_bytes());
+                Ok(Flow::Continue)
+            }
+            _ => {
+                ctx.reply().extend_from_slice(b"500 what\r\n");
+                Ok(Flow::Continue)
+            }
+        }
+    }
+}
+
+#[test]
+fn the_harness_resumes_after_starttls() {
+    let mut h = Harness::new(Mail { tls: false }, ());
+    assert_eq!(h.open().unwrap(), b"220 mail ready\r\n");
+    let got = h.push(b"STARTTLS\r\n");
+    assert!(matches!(got, Err(HarnessError::Upgraded(Upgrade::Tls))), "{got:?}");
+    assert_eq!(h.output(), b"220 mail ready\r\n220 go ahead\r\n");
+    // What a TLS layer would hand on after its handshake.
+    let mut conn = ConnInfo::default().over_tls(Some("mail.test"), None);
+    conn.id = Some(1);
+    h.resume(conn).unwrap();
+    assert_eq!(h.push(b"EHLO\r\n").unwrap(), b"250 hello tls=true sni=mail.test\r\n");
+}
+
+#[test]
+#[cfg(feature = "tokio")]
+fn net_performs_starttls_for_a_service_that_asks() {
+    let (config, roots) = tls_pair(&["mail.test"]);
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+    let result = rt.block_on(run(move |cx| async move {
+        let journal = Journal::new();
+        let kept = journal.keep(1000);
+        let (attacher, attachments) = fictionet::attachments();
+        let addr = Ipv4Addr::new(10, 40, 0, 25);
+        let opts = ServeOptions::default().starttls(config.clone());
+        Net::new()
+            .journal(journal)
+            .ipv4_only()
+            .host("mail", |h| h.at(addr).dns_name("mail.test").tcp_with(25, Arc::new(()), || Mail { tls: false }, opts))
+            .serve(&cx, attachments)?;
+        let s = sandbox(&cx, attacher.attach("agent")?, ME);
+        let mut tcp = s.tcp.connect(&cx, SocketAddr::new(addr.into(), 25)).await?;
+        assert_eq!(read_some(&cx, &mut tcp, 16).await, b"220 mail ready\r\n");
+        tcp.write_all(&cx, b"STARTTLS\r\n").await?;
+        assert_eq!(read_some(&cx, &mut tcp, 14).await, b"220 go ahead\r\n");
+        let client = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let mut tls = tokio_rustls::TlsConnector::from(Arc::new(client))
+            .connect(rustls::pki_types::ServerName::try_from("mail.test").unwrap(), tcp.into_tokio(&cx))
+            .await?;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        tls.write_all(b"EHLO\r\n").await?;
+        let mut buf = [0u8; 128];
+        let n = tls.read(&mut buf).await?;
+        assert_eq!(&buf[..n], b"250 hello tls=true sni=mail.test\r\n");
+        let handshakes = kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("tls", "handshake")).await;
+        assert_eq!(handshakes[0].str("outcome"), Some("accepted"));
+        Err::<(), fictionet::Error>(Box::new(Done))
+    }));
+    assert!(result.unwrap_err().downcast_ref::<Done>().is_some());
+}
+
+/// An exchange's order book: each subscriber's wake handle, and the fills
+/// waiting for it.
+#[derive(Default)]
+struct Book {
+    subscribers: Mutex<Vec<(serve::WakeHandle, Arc<Mutex<Vec<String>>>)>>,
+}
+
+/// `sub` subscribes the connection to fills; `fill X` sends X to every
+/// subscriber, from this connection, through the others' wake handles.
+struct Trader {
+    inbox: Arc<Mutex<Vec<String>>>,
+}
+
+impl Service for Trader {
+    type Decode = Lines;
+    type World = Book;
+    type Error = Infallible;
+    fn decoder(&self) -> Lines {
+        Lines::new(64, Ending::LfOrCrlf)
+    }
+    fn on_item(&mut self, line: Result<Vec<u8>, LineError>, book: &Book, ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
+        let line = String::from_utf8(line.unwrap_or_default()).unwrap_or_default();
+        if line == "sub" {
+            book.subscribers.lock().unwrap().push((ctx.wake_handle(), self.inbox.clone()));
+            ctx.reply().extend_from_slice(b"subscribed\n");
+        } else if let Some(fill) = line.strip_prefix("fill ") {
+            let mut subscribers = book.subscribers.lock().unwrap();
+            subscribers.retain(|(w, _)| !w.is_closed());
+            for (wake, inbox) in subscribers.iter() {
+                inbox.lock().unwrap().push(fill.to_owned());
+                wake.wake();
+            }
+            ctx.reply().extend_from_slice(b"ok\n");
+        }
+        Ok(Flow::Continue)
+    }
+    fn on_wake(&mut self, _: &Book, ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
+        for fill in self.inbox.lock().unwrap().drain(..) {
+            ctx.reply().extend_from_slice(format!("execution {fill}\n").as_bytes());
+        }
+        Ok(Flow::Continue)
+    }
+}
+
+#[test]
+fn another_connection_wakes_a_service_to_push_a_fill() {
+    let mut h = Harness::new(Trader { inbox: Arc::default() }, Book::default());
+    assert_eq!(h.push(b"sub\n").unwrap(), b"subscribed\n");
+    let inbox = h.world().subscribers.lock().unwrap()[0].1.clone();
+    inbox.lock().unwrap().push("7@100".into());
+    h.wake_handle().wake();
+    assert_eq!(h.poll().unwrap(), b"execution 7@100\n");
+
+    world(|cx| async move {
+        let (server, _su, client, _cu) = two_machines(&cx);
+        serve::listen(&cx, server.listen(9000)?, Arc::new(Book::default()), || Trader { inbox: Arc::default() }, ServeOptions::default());
+        let to = SocketAddr::new(SERVER.into(), 9000);
+        let mut a = client.connect(&cx, to).await?;
+        a.write_all(&cx, b"sub\n").await?;
+        assert_eq!(read_some(&cx, &mut a, 11).await, b"subscribed\n");
+        let mut b = client.connect(&cx, to).await?;
+        b.write_all(&cx, b"fill 5@99\n").await?;
+        assert_eq!(read_some(&cx, &mut b, 3).await, b"ok\n");
+        // A sent nothing: the fill comes because B's order woke it.
+        assert_eq!(read_some(&cx, &mut a, 15).await, b"execution 5@99\n");
+        Ok(())
+    });
+}
+
+/// A FIX-like session with named timers: a heartbeat every 10 ms and a
+/// logon deadline, and a count of the client's lines.
+struct Session {
+    lines: u64,
+    beats: u64,
+}
+
+impl Service for Session {
+    type Decode = Lines;
+    type World = ();
+    type Error = Infallible;
+    fn decoder(&self) -> Lines {
+        Lines::new(64, Ending::LfOrCrlf)
+    }
+    fn on_open(&mut self, _: &(), ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
+        ctx.set_timer("heartbeat", Duration::from_millis(10));
+        ctx.set_timer("logon", Duration::from_millis(25));
+        Ok(Flow::Continue)
+    }
+    fn on_item(&mut self, line: Result<Vec<u8>, LineError>, _: &(), ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
+        self.lines += 1;
+        if line.as_deref() == Ok(b"slow") {
+            // Work that takes a while, so the client's bytes pile up.
+            let started = std::time::Instant::now();
+            while started.elapsed() < Duration::from_micros(50) {}
+        }
+        if line.as_deref() == Ok(b"logon") {
+            ctx.cancel_timer("logon");
+            ctx.reply().extend_from_slice(b"logged on\n");
+        }
+        if line.as_deref() == Ok(b"end") {
+            ctx.reply().extend_from_slice(format!("end lines={} beats={}\n", self.lines, self.beats).as_bytes());
+            return Ok(Flow::Close);
+        }
+        Ok(Flow::Continue)
+    }
+    fn on_timer(&mut self, timer: Timer, _: &(), ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
+        match timer {
+            "heartbeat" => {
+                self.beats += 1;
+                ctx.set_timer("heartbeat", Duration::from_millis(10));
+                Ok(Flow::Continue)
+            }
+            "logon" => {
+                ctx.reply().extend_from_slice(b"logon timed out\n");
+                Ok(Flow::Close)
+            }
+            _ => Ok(Flow::Continue),
+        }
+    }
+}
+
+#[test]
+fn named_timers_run_side_by_side() {
+    let mut h = Harness::new(Session { lines: 0, beats: 0 }, ());
+    h.open().unwrap();
+    assert_eq!(h.timer("logon"), Some(fictionet::time::Instant::ZERO + Duration::from_millis(25)));
+    h.advance(Duration::from_millis(20)).unwrap();
+    assert_eq!(h.service().beats, 2);
+    h.push(b"logon\n").unwrap();
+    assert_eq!(h.timer("logon"), None);
+    h.advance(Duration::from_millis(30)).unwrap();
+    assert!(!h.closed());
+    assert_eq!(h.service().beats, 5);
+
+    // Without a logon, the logon timer closes the session, heartbeats or not.
+    let mut h = Harness::new(Session { lines: 0, beats: 0 }, ());
+    h.open().unwrap();
+    assert_eq!(h.advance(Duration::from_millis(30)).unwrap(), b"logon timed out\n");
+    assert!(h.closed());
+}
+
+/// A client that never stops sending cannot starve the heartbeat: due
+/// timers go before more input. Before, the driver read whenever bytes
+/// were there and only then looked at its one timer.
+#[test]
+fn continuous_input_cannot_starve_a_timer() {
+    world(|cx| async move {
+        let (server, _su, client, _cu) = two_machines(&cx);
+        serve::listen(&cx, server.listen(7)?, Arc::new(()), || Session { lines: 0, beats: 0 }, ServeOptions::default());
+        let mut conn = client.connect(&cx, SocketAddr::new(SERVER.into(), 7)).await?;
+        let mut flood = b"logon\n".to_vec();
+        for _ in 0..10_000 {
+            flood.extend_from_slice(b"slow\n");
+        }
+        flood.extend_from_slice(b"end\n");
+        let started = std::time::Instant::now();
+        conn.write_all(&cx, &flood).await?;
+        let reply = String::from_utf8(read_some(&cx, &mut conn, 1 << 10).await).unwrap();
+        // The work took at least 500 ms: a 10 ms heartbeat that is never
+        // starved beats nearly every 10 ms of it.
+        let expected = started.elapsed().as_millis().min(500) as u64 / 10;
+        let beats: u64 = reply.rsplit("beats=").next().unwrap().trim().parse().unwrap();
+        assert!(reply.contains("end lines=10002"), "{reply}");
+        assert!(beats >= expected * 7 / 10, "{reply}, expected about {expected}");
+        Ok(())
+    });
+}
+
+/// Whose turn it is among keyed works, and the wakers of those waiting.
+#[derive(Default)]
+struct Baton {
+    turn: usize,
+    open: bool,
+    waiting: Vec<std::task::Waker>,
+}
+
+/// One stream's response: `frames` frames, each written on its turn, so
+/// two of them interleave frame by frame.
+struct Frames {
+    stream: usize,
+    of: usize,
+    sent: usize,
+    frames: usize,
+    baton: Arc<Mutex<Baton>>,
+}
+
+impl Pending for Frames {
+    fn poll_next(&mut self, _ctx: &mut PendingCtx<'_>, task: &mut Context<'_>) -> Poll<Option<Result<Vec<u8>, fictionet::Error>>> {
+        if self.sent == self.frames {
+            return Poll::Ready(None);
+        }
+        let mut baton = self.baton.lock().unwrap();
+        if !baton.open || baton.turn % self.of != self.stream {
+            baton.waiting.push(task.waker().clone());
+            return Poll::Pending;
+        }
+        baton.turn += 1;
+        for w in baton.waiting.drain(..) {
+            w.wake();
+        }
+        self.sent += 1;
+        Poll::Ready(Some(Ok(format!("[{} {}]", self.stream, self.sent).into_bytes())))
+    }
+}
+
+/// HTTP/2 in miniature: `get` opens a stream whose response is keyed work;
+/// `ping` is answered at once, while responses are still on their way.
+struct Mux {
+    streams: usize,
+    baton: Arc<Mutex<Baton>>,
+}
+
+impl Service for Mux {
+    type Decode = Lines;
+    type World = ();
+    type Error = Infallible;
+    fn decoder(&self) -> Lines {
+        Lines::new(64, Ending::LfOrCrlf)
+    }
+    fn on_item(&mut self, line: Result<Vec<u8>, LineError>, _: &(), ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
+        match line.as_deref() {
+            Ok(b"get") => {
+                let work = Frames { stream: self.streams, of: 2, sent: 0, frames: 3, baton: self.baton.clone() };
+                ctx.defer_keyed(self.streams as u64, work);
+                self.streams += 1;
+            }
+            Ok(b"ping") => ctx.reply().extend_from_slice(b"(pong)"),
+            _ => {}
+        }
+        Ok(Flow::Continue)
+    }
+    fn on_done(&mut self, key: u64, done: serve::Done, _: &(), ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
+        assert_eq!(done, serve::Done::Finished);
+        ctx.reply().extend_from_slice(format!("(done {key})").as_bytes());
+        Ok(Flow::Continue)
+    }
+}
+
+/// Checks that two streams' frames alternate, and each stream's end comes
+/// after its last frame.
+fn interleaved(out: &str) {
+    let frames = out.replace("(done 0)", "").replace("(done 1)", "");
+    assert_eq!(frames, "[0 1][1 1][0 2][1 2][0 3][1 3]", "{out}");
+    assert!(out.find("(done 0)") > out.find("[0 3]"), "{out}");
+    assert!(out.find("(done 1)") > out.find("[1 3]"), "{out}");
+}
+
+#[test]
+fn keyed_work_interleaves_two_responses_while_reads_go_on() {
+    let baton = Arc::new(Mutex::new(Baton { open: true, ..Baton::default() }));
+    let mut h = Harness::new(Mux { streams: 0, baton }, ());
+    let out = String::from_utf8(h.push(b"get\nget\n").unwrap()).unwrap();
+    interleaved(&out);
+    assert_eq!(h.pending(), (0, 0));
+
+    world(|cx| async move {
+        let (server, _su, client, _cu) = two_machines(&cx);
+        let baton = Arc::new(Mutex::new(Baton::default()));
+        let shared = baton.clone();
+        serve::listen(&cx, server.listen(7)?, Arc::new(()), move || Mux { streams: 0, baton: shared.clone() }, ServeOptions::default());
+        let mut conn = client.connect(&cx, SocketAddr::new(SERVER.into(), 7)).await?;
+        conn.write_all(&cx, b"get\nget\nping\n").await?;
+        // Both responses wait for the gate; the ping is answered anyway.
+        assert_eq!(read_some(&cx, &mut conn, 6).await, b"(pong)");
+        {
+            let mut b = baton.lock().unwrap();
+            b.open = true;
+            for w in b.waiting.drain(..) {
+                w.wake();
+            }
+        }
+        interleaved(&String::from_utf8(read_some(&cx, &mut conn, 46).await).unwrap());
+        Ok(())
+    });
+}
+
+#[test]
+fn datagram_services_send_several_datagrams_and_tick() {
+    /// MoldUDP64 in miniature: `req N` is answered with N datagrams, and a
+    /// heartbeat goes to the world's subscriber every 20 ms.
+    struct Mold;
+    impl Service for Mold {
+        type Decode = Lines;
+        type World = SocketAddr;
+        type Error = Infallible;
+        fn decoder(&self) -> Lines {
+            Lines::new(64, Ending::LfOrCrlf)
+        }
+        fn on_open(&mut self, _: &SocketAddr, ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
+            ctx.set_timer("heartbeat", Duration::from_millis(20));
+            Ok(Flow::Continue)
+        }
+        fn on_item(&mut self, line: Result<Vec<u8>, LineError>, _: &SocketAddr, ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
+            let line = String::from_utf8(line.unwrap_or_default()).unwrap_or_default();
+            let n: u32 = line.strip_prefix("req ").and_then(|n| n.parse().ok()).unwrap_or(0);
+            let to = ctx.conn().peer.unwrap();
+            for i in 1..=n {
+                ctx.send_to(to, format!("packet {i} over {}", ctx.conn().transport.as_str()).into_bytes());
+            }
+            Ok(Flow::Continue)
+        }
+        fn on_timer(&mut self, _: Timer, subscriber: &SocketAddr, ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
+            ctx.send_to(*subscriber, b"heartbeat".to_vec());
+            ctx.set_timer("heartbeat", Duration::from_millis(20));
+            Ok(Flow::Continue)
+        }
+    }
+    world(|cx| async move {
+        let (_s, server, _c, client) = two_machines(&cx);
+        let socket = server.bind(9)?;
+        let subscriber = SocketAddr::new(Ipv4Addr::new(10, 9, 0, 2).into(), 4001);
+        let mut feed = client.bind(4001)?;
+        cx.spawn(move |cx| async move {
+            let local = SocketAddr::new(SERVER.into(), 9);
+            let _ = serve::serve_datagram(&cx, socket, local, &mut Mold, &subscriber, &ServeOptions::default()).await;
+            Ok(())
+        });
+        let mut s = client.bind(4000)?;
+        s.send_to(b"req 3\n", SocketAddr::new(SERVER.into(), 9));
+        for i in 1..=3 {
+            assert_eq!(s.recv(&cx).await?.0, format!("packet {i} over udp").into_bytes());
+        }
+        assert_eq!(feed.recv(&cx).await?.0, b"heartbeat");
+        assert_eq!(feed.recv(&cx).await?.0, b"heartbeat");
+        Ok(())
+    });
+}
+
+/// Panics on `boom`.
+struct Fragile;
+
+impl Service for Fragile {
+    type Decode = Lines;
+    type World = ();
+    type Error = std::io::Error;
+    fn decoder(&self) -> Lines {
+        Lines::new(64, Ending::LfOrCrlf)
+    }
+    fn on_item(&mut self, line: Result<Vec<u8>, LineError>, _: &(), ctx: &mut ServeCtx<'_>) -> Result<Flow, std::io::Error> {
+        match line.as_deref() {
+            Ok(b"boom") => panic!("the service fell over"),
+            Ok(b"fail") => Err(std::io::Error::other("the service gave up")),
+            _ => {
+                ctx.reply().extend_from_slice(b"fine\n");
+                Ok(Flow::Continue)
+            }
+        }
+    }
+}
+
+/// A panic closes its connection, is journaled, and the world goes on.
+/// Before, it ended the whole run. A service error is journaled too.
+#[test]
+fn a_panic_or_an_error_closes_only_its_connection() {
+    let mut h = Harness::new(Fragile, ());
+    assert!(matches!(h.push(b"boom\n"), Err(HarnessError::Panic(m)) if m.contains("fell over")));
+    assert_eq!(h.end_reason(), Some(Ended::Panicked));
+    world(|cx| async move {
+        let (attacher, attachments) = fictionet::attachments();
+        let journal = Journal::new();
+        let kept = journal.keep(1000);
+        let addr = Ipv4Addr::new(10, 40, 0, 9);
+        Net::new().journal(journal).ipv4_only().host("svc", |h| h.at(addr).tcp(7, Arc::new(()), || Fragile)).serve(&cx, attachments)?;
+        let s = sandbox(&cx, attacher.attach("agent")?, ME);
+        let to = SocketAddr::new(addr.into(), 7);
+        let mut a = s.tcp.connect(&cx, to).await?;
+        a.write_all(&cx, b"boom\n").await?;
+        assert_eq!(read_some(&cx, &mut a, 1).await, b"");
+        let mut b = s.tcp.connect(&cx, to).await?;
+        b.write_all(&cx, b"hi\nfail\n").await?;
+        assert_eq!(read_some(&cx, &mut b, 10).await, b"fine\n");
+        let panic = kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("conn", "panic")).await;
+        assert!(panic[0].str("message").unwrap().contains("fell over"));
+        let error = kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("conn", "error")).await;
+        assert_eq!(error[0].str("error"), Some("the service gave up"));
+        assert_eq!(error[0].conn.id, Some(2));
+        Ok(())
+    });
+}
+
+/// Net counts each service's connections against its cap, and charges
+/// every connection from a sandbox to that sandbox's budget. Before, Net
+/// read neither.
+#[test]
+fn net_caps_connections_per_service_and_bytes_per_sandbox() {
+    /// Echo on lines up to 40 KiB: a decoder that holds up to that much.
+    struct Wide;
+    impl Service for Wide {
+        type Decode = Lines;
+        type World = ();
+        type Error = Infallible;
+        fn decoder(&self) -> Lines {
+            Lines::new(40 << 10, Ending::LfOrCrlf)
+        }
+        fn on_open(&mut self, _: &(), ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
+            ctx.reply().extend_from_slice(b"hello\n");
+            Ok(Flow::Continue)
+        }
+        fn on_item(&mut self, _: Result<Vec<u8>, LineError>, _: &(), _: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
+            Ok(Flow::Continue)
+        }
+    }
+    world(|cx| async move {
+        let (attacher, attachments) = fictionet::attachments();
+        let journal = Journal::new();
+        let kept = journal.keep(1000);
+        let addr = Ipv4Addr::new(10, 40, 0, 3);
+        let limits = fictionet::stdlib::net::Limits { sandbox_budget: 100 << 10, ..Default::default() };
+        let capped = ServeOptions::default().max_conns(1).connection_events(false);
+        let wide = ServeOptions::default();
+        Net::new()
+            .journal(journal)
+            .ipv4_only()
+            .limits(limits)
+            .host("svc", |h| h.at(addr).tcp_with(7, Arc::new(()), || Echo, capped).tcp_with(8, Arc::new(()), || Wide, wide))
+            .serve(&cx, attachments)?;
+        let s = sandbox(&cx, attacher.attach("agent")?, ME);
+        let mut a = s.tcp.connect(&cx, SocketAddr::new(addr.into(), 7)).await?;
+        assert_eq!(read_some(&cx, &mut a, 6).await, b"hello\n");
+        let mut b = s.tcp.connect(&cx, SocketAddr::new(addr.into(), 7)).await?;
+        let mut buf = [0u8; 16];
+        let r = timeout(&cx, Duration::from_secs(2), b.read(&cx, &mut buf)).await.expect("an answer");
+        assert!(matches!(r, Err(ConnError::Reset) | Ok(0)), "{r:?}");
+        let blocked = kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("net", "blocked")).await;
+        assert_eq!(blocked[0].str("why"), Some("TooManyConnections"));
+
+        // Two 40 KiB decoders fit the 100 KiB budget; a third does not.
+        let to = SocketAddr::new(addr.into(), 8);
+        let mut c = s.tcp.connect(&cx, to).await?;
+        let mut d = s.tcp.connect(&cx, to).await?;
+        assert_eq!(read_some(&cx, &mut c, 6).await, b"hello\n");
+        assert_eq!(read_some(&cx, &mut d, 6).await, b"hello\n");
+        let mut e = s.tcp.connect(&cx, to).await?;
+        assert_eq!(read_some(&cx, &mut e, 6).await, b"");
+        let closed = kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("conn", "close")).await;
+        assert_eq!(closed[0].str("end"), Some("budget"));
+        Ok(())
+    });
+}
+
+/// Net fails on a host it cannot serve as declared. Before, each of these
+/// was dropped without a word.
+#[test]
+fn net_refuses_a_host_it_cannot_serve() {
+    world(|cx| async move {
+        let fail = |net: Net| {
+            let (_attacher, attachments) = fictionet::attachments();
+            net.ipv4_only().serve(&cx, attachments).err().map(|e| e.to_string())
+        };
+        let twice = fail(Net::new().host("a", |h| h.at(Ipv4Addr::new(10, 40, 0, 1)).tcp(7, Arc::new(()), || Echo).tcp(7, Arc::new(()), || Echo)));
+        assert!(twice.as_deref().is_some_and(|e| e.contains("already served")), "{twice:?}");
+        let bad = fail(Net::new().host("b", |h| h.at(Ipv4Addr::new(224, 0, 0, 1)).tcp(7, Arc::new(()), || Echo)));
+        assert!(bad.as_deref().is_some_and(|e| e.contains("224.0.0.1")), "{bad:?}");
+        let udp = fail(Net::new().host("c", |h| h.at(Ipv4Addr::new(10, 40, 0, 2)).udp(9, Arc::new(()), || Echo).udp(9, Arc::new(()), || Echo)));
+        assert!(udp.is_some(), "{udp:?}");
+        Ok(())
+    });
+}
+
+/// A journal that nobody read when the connection opened still gets the
+/// connection's later events once a sink is added. Before, whether to log
+/// was decided once, at the start.
+#[test]
+fn a_sink_added_mid_connection_sees_its_events() {
+    world(|cx| async move {
+        let (server, _su, client, _cu) = two_machines(&cx);
+        let journal = Journal::new().dashboard(false);
+        serve::listen(&cx, server.listen(7)?, Arc::new(()), || Echo, ServeOptions::default().journal(journal.clone()));
+        let mut conn = client.connect(&cx, SocketAddr::new(SERVER.into(), 7)).await?;
+        conn.write_all(&cx, b"before\n").await?;
+        assert_eq!(read_some(&cx, &mut conn, 13).await, b"hello\nbefore\n");
+        let kept = journal.keep(100);
+        conn.write_all(&cx, b"after\n").await?;
+        assert_eq!(read_some(&cx, &mut conn, 6).await, b"after\n");
+        let lines = kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("echo", "line")).await;
+        assert_eq!(lines[0].event.summary, "after");
+        Ok(())
+    });
+}
+
+/// Draws one number per connection.
+struct Dice;
+
+impl Service for Dice {
+    type Decode = Lines;
+    type World = ();
+    type Error = Infallible;
+    fn decoder(&self) -> Lines {
+        Lines::new(64, Ending::LfOrCrlf)
+    }
+    fn on_open(&mut self, _: &(), ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
+        let n = ctx.random_u64();
+        ctx.reply().extend_from_slice(format!("{n}\n").as_bytes());
+        Ok(Flow::Close)
+    }
+    fn on_item(&mut self, _: Result<Vec<u8>, LineError>, _: &(), _: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
+        Ok(Flow::Continue)
+    }
+}
+
+/// Two runs with the same seed and the same connections draw the same
+/// numbers; connections differ from each other. Before, each connection
+/// was seeded from the operating system.
+#[test]
+fn a_seeded_run_repeats_its_randomness() {
+    let draws = |seed: u64| {
+        let (tx, rx) = mpsc::channel();
+        world(move |cx| async move {
+            let (server, _su, client, _cu) = two_machines(&cx);
+            serve::listen(&cx, server.listen(7)?, Arc::new(()), || Dice, ServeOptions::default().seed(seed));
+            let mut got = Vec::new();
+            for _ in 0..2 {
+                let mut conn = client.connect(&cx, SocketAddr::new(SERVER.into(), 7)).await?;
+                got.push(String::from_utf8(read_some(&cx, &mut conn, 64).await).unwrap());
+            }
+            tx.send(got).unwrap();
+            Ok(())
+        });
+        rx.recv().unwrap()
+    };
+    let first = draws(7);
+    assert_eq!(first, draws(7));
+    assert_ne!(first[0], first[1]);
+    assert_ne!(first, draws(8));
+}
+
+/// The network's journal starts with an entry that puts the run's clock on
+/// a calendar.
+#[test]
+fn a_net_journal_starts_with_a_wall_clock_anchor() {
+    world(|cx| async move {
+        let journal = Journal::new();
+        let kept = journal.keep(100);
+        let (_attacher, attachments) = fictionet::attachments();
+        let date = Fields::new().with("world_date", "2026-10-06");
+        Net::new().journal(journal).start_fields(date).serve(&cx, attachments)?;
+        let first = &kept.entries()[0];
+        assert!(first.is("journal", "start"));
+        assert_eq!(first.at, fictionet::time::Instant::ZERO);
+        assert_eq!(first.str("world_date"), Some("2026-10-06"));
+        assert!(first.get("wall").and_then(json::Value::as_f64).is_some_and(|w| w > 1.7e9));
+        Ok(())
+    });
+}
+
+/// A body that trickles in is cut off by its own timer. Before, the head
+/// timer was cancelled on the head and nothing replaced it.
+#[test]
+fn http1_closes_a_request_whose_body_never_finishes() {
+    let mut h = Harness::new(Http1::new(Router::new()), ());
+    h.push(b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 10\r\n\r\nabc").unwrap();
+    assert_eq!(h.advance(Duration::from_secs(29)).unwrap(), b"");
+    assert!(!h.closed());
+    h.advance(Duration::from_secs(2)).unwrap();
+    assert!(h.closed());
+}
+
+/// A closed connection counts against the cap until its socket is gone, so
+/// a client that never finishes closing cannot open more. Before, the
+/// count dropped when the service ended.
+#[test]
+fn a_connection_counts_until_its_socket_is_gone() {
+    world(|cx| async move {
+        let (server, _su, client, _cu) = two_machines(&cx);
+        serve::listen(&cx, server.listen(7)?, Arc::new(()), || Echo, ServeOptions::default().max_conns(1));
+        let to = SocketAddr::new(SERVER.into(), 7);
+        let mut a = client.connect(&cx, to).await?;
+        a.write_all(&cx, b"quit\n").await?;
+        assert_eq!(read_some(&cx, &mut a, 10).await, b"hello\nbye\n");
+        // The server closed its side; `a` keeps its own open.
+        let mut b = client.connect(&cx, to).await?;
+        let mut buf = [0u8; 16];
+        let r = timeout(&cx, Duration::from_secs(2), b.read(&cx, &mut buf)).await.expect("an answer");
+        assert!(matches!(r, Err(ConnError::Reset) | Ok(0)), "{r:?}");
+        drop(a);
+        Ok(())
+    });
 }
