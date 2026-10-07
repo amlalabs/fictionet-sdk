@@ -780,6 +780,8 @@ impl State {
     /// that have closed.
     fn housekeeping(&mut self, now: smoltcp::time::Instant) {
         let mut woken = Vec::new();
+        // Removed after the loop: `listeners` is borrowed in it.
+        let mut gone = Vec::new();
         for l in self.listeners.values_mut() {
             let mut i = 0;
             let mut moved = false;
@@ -801,9 +803,7 @@ impl State {
                         if l.idle.is_empty() {
                             l.idle.push(h);
                         } else {
-                            self.sockets.remove(self.handles.remove(&h).expect("a socket has a slot"));
-                            self.pages.remove(&h);
-                            self.dirty.remove(&h);
+                            gone.push(h);
                         }
                     }
                     TcpState::Closed | TcpState::TimeWait => {
@@ -812,11 +812,7 @@ impl State {
                             self.by_tuple.remove(&(c.local, c.remote));
                             l.left(c.remote.ip());
                         }
-                        // `remove_socket`, field by field: `listeners` is
-                        // borrowed.
-                        self.sockets.remove(self.handles.remove(&h).expect("a socket has a slot"));
-                        self.pages.remove(&h);
-                        self.dirty.remove(&h);
+                        gone.push(h);
                     }
                     _ => {
                         l.embryonic.swap_remove(i);
@@ -828,6 +824,9 @@ impl State {
             if moved && let Some(w) = l.waker.take() {
                 woken.push(w);
             }
+        }
+        for h in gone {
+            self.remove_socket(h);
         }
         let mut i = 0;
         self.next_tidy = None;

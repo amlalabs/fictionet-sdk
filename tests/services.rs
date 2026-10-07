@@ -1675,33 +1675,45 @@ impl Service for Fragile {
     }
 }
 
-/// A panic closes its connection, is recorded, and the world goes on.
-/// Before, it ended the whole run. A service error is recorded too.
+/// A service error closes only its connection and is recorded. A panic
+/// is not caught: it ends the run, as a panic anywhere in a world does.
+/// Before, the driver caught it and the world went on.
 #[test]
-fn a_panic_or_an_error_closes_only_its_connection() {
+fn an_error_closes_only_its_connection_and_a_panic_ends_the_run() {
     let mut h = Harness::new(Fragile, ());
-    assert!(matches!(h.push(b"boom\n"), Err(HarnessError::Panic(m)) if m.contains("fell over")));
-    assert_eq!(h.end_reason(), Some(Ended::Panicked));
-    world(|cx| async move {
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h.push(b"boom\n")));
+    assert!(caught.is_err());
+
+    let addr = Ipv4Addr::new(10, 40, 0, 9);
+    let to = SocketAddr::new(addr.into(), 7);
+    world(move |cx| async move {
         let (attacher, attachments) = fictionet::attachments();
         let kept = cx.events();
-        let addr = Ipv4Addr::new(10, 40, 0, 9);
         Net::new().ipv4_only().host("svc", |h| h.at(addr).tcp(7, Arc::new(()), || Fragile)).serve(&cx, attachments)?;
         let s = sandbox(&cx, attacher.attach("agent")?, ME);
-        let to = SocketAddr::new(addr.into(), 7);
-        let mut a = s.tcp.connect(&cx, to).await?;
-        a.write_all(&cx, b"boom\n").await?;
-        assert_eq!(read_some(&cx, &mut a, 1).await, b"");
         let mut b = s.tcp.connect(&cx, to).await?;
         b.write_all(&cx, b"hi\nfail\n").await?;
         assert_eq!(read_some(&cx, &mut b, 10).await, b"fine\n");
-        let panic = kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("conn", "panic")).await;
-        assert!(panic[0].str("message").unwrap().contains("fell over"));
         let error = kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("conn", "error")).await;
         assert_eq!(error[0].str("error"), Some("the service gave up"));
-        assert_eq!(error[0].conn.id, Some(2));
+        assert_eq!(error[0].conn.id, Some(1));
         Ok(())
     });
+
+    let ran = std::thread::spawn(move || {
+        block_on(run(move |cx| async move {
+            let (attacher, attachments) = fictionet::attachments();
+            Net::new().ipv4_only().host("svc", |h| h.at(addr).tcp(7, Arc::new(()), || Fragile)).serve(&cx, attachments)?;
+            let s = sandbox(&cx, attacher.attach("agent")?, ME);
+            let mut a = s.tcp.connect(&cx, to).await?;
+            a.write_all(&cx, b"boom\n").await?;
+            cx.sleep(Duration::from_secs(30)).await?;
+            Ok(())
+        }))
+    })
+    .join();
+    let panic = ran.expect_err("the run should end with the panic");
+    assert_eq!(panic.downcast_ref::<&str>(), Some(&"the service fell over"));
 }
 
 /// Says hello, then takes lines up to 40 KiB: a decoder that holds up to
