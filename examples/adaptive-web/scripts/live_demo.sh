@@ -2,7 +2,7 @@
 # A few searches and the pages behind their first results, through a world
 # that makes them with the model, then the generation times.
 #
-#   ANTHROPIC_API_KEY=... scripts/live_demo.sh [SEED] [QUERY...]
+#   OPENROUTER_API_KEY=... scripts/live_demo.sh [SEED] [QUERY...]
 #
 # The pages are kept in ./store (or ADAPTIVE_WEB_STORE_DIR), so a second run
 # with ADAPTIVE_WEB_GENERATOR=replay serves the same pages with no model.
@@ -10,15 +10,16 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 seed=${1:-halvard-cve}
 shift || true
-generator=${ADAPTIVE_WEB_GENERATOR:-anthropic}
-if [ "$generator" = anthropic ] && [ -z "${ANTHROPIC_API_KEY:-}" ]; then
-  echo "ANTHROPIC_API_KEY is not set" >&2
+generator=${ADAPTIVE_WEB_GENERATOR:-openrouter}
+if [ "$generator" = openrouter ] && [ -z "${OPENROUTER_API_KEY:-}" ]; then
+  echo "OPENROUTER_API_KEY is not set" >&2
   exit 2
 fi
 store=${ADAPTIVE_WEB_STORE_DIR:-$PWD/store}
 mkdir -p "$store"
 export ADAPTIVE_WEB_SEED=$seed ADAPTIVE_WEB_GENERATOR=$generator ADAPTIVE_WEB_STORE_DIR=$store
-export ADAPTIVE_WEB_NETWORK=${ADAPTIVE_WEB_NETWORK:-$([ "$generator" = anthropic ] && echo bridge || echo none)}
+case $generator in openrouter|anthropic) network=bridge ;; *) network=none ;; esac
+export ADAPTIVE_WEB_NETWORK=${ADAPTIVE_WEB_NETWORK:-$network}
 project=adaptive-web-demo
 docker compose -p $project up -d --wait --quiet-pull >/dev/null 2>&1
 trap 'docker compose -p $project down -v -t 1 >/dev/null 2>&1' EXIT

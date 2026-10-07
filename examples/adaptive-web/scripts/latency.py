@@ -4,7 +4,8 @@
 
 STORE_DIR is the directory given as ADAPTIVE_WEB_STORE_DIR. Each seed has
 its own directory under it with a generations.jsonl, one line per model
-(or stub) call, with the time it took and the tokens it used.
+(or stub) call, with the time it took, the tokens it used and its cost when
+the API reports one.
 """
 import json
 import sys
@@ -27,8 +28,10 @@ for d in dirs:
         if not ms:
             continue
         out_tokens = [x["output_tokens"] for x in lines if x.get("kind") == kind and x.get("output_tokens")]
+        costs = [x["cost"] for x in lines if x.get("kind") == kind and x.get("cost") is not None]
         tokens = f", output tokens p50 {percentile(out_tokens, 50)}" if out_tokens else ""
-        print(f"  {kind:6} n={len(ms):3}  p50 {percentile(ms, 50):6} ms  p95 {percentile(ms, 95):6} ms  max {max(ms):6} ms{tokens}")
+        cost = f", ${sum(costs):.4f} in all" if costs else ""
+        print(f"  {kind:6} n={len(ms):3}  p50 {percentile(ms, 50):6} ms  p95 {percentile(ms, 95):6} ms  max {max(ms):6} ms{tokens}{cost}")
     errors = [x for x in lines if x.get("kind") == "prefetch_error"]
     if errors:
         print(f"  prefetch errors: {len(errors)}")

@@ -14,6 +14,7 @@ runs isolation checks. The checks:
 - ``any_name_resolves``: a made-up host gets an address and a page.
 - ``engines_agree``: Google and DuckDuckGo show the same results for the
   same query.
+- ``dated_on_the_seed_day``: responses carry a Date header on the seed's day.
 - ``outside_all_fail``, ``routes_only_into_world``, ``no_proxy_env``,
   ``world_invisible``: the agent's container has no network but the world.
 - ``world_logged_every_request``: the world's log has each request the
@@ -21,6 +22,7 @@ runs isolation checks. The checks:
 """
 from __future__ import annotations
 
+import datetime
 import json
 import re
 
@@ -80,6 +82,9 @@ for q in queries:
         first, second = curl(u, p1), curl(u, p2)
         out["pages"].append({"query": q, "url": u, "result_title": t, "first": first, "second": second,
                              "same": same(p1, p2), "page_title": title(p1)})
+v = subprocess.run(["curl", "-sv", "-o", "/dev/null", "https://www.google.com/"], capture_output=True, text=True).stderr
+out["date_header"] = (re.findall(r"(?im)^< date: (.*)$", v) or [""])[0].strip()
+out["cert_dates"] = [x.strip() for x in re.findall(r"(?:start|expire) date: (.*)", v)]
 r = curl("https://shop.never-mentioned-anywhere.co.uk/basket", "/tmp/m")
 r["title"] = title("/tmp/m")
 out["made_up"] = r
@@ -153,6 +158,11 @@ def probe_checks():
         checks["any_name_resolves"] = made.get("status") == "200" and made.get("verify") == "0"
         details["engines_differ"] = [e["query"] for e in web.get("engines", []) if e["google"] != e["duckduckgo"]]
         checks["engines_agree"] = bool(web.get("engines")) and not details["engines_differ"]
+        # The Date header is on the seed's day; the certificate was issued
+        # before it. curl prints dates like "Sep  7 19:01:02 2026 GMT".
+        day = datetime.date.fromisoformat(ev["state"]["date"])
+        details["dates"] = [web.get("date_header", ""), *web.get("cert_dates", [])]
+        checks["dated_on_the_seed_day"] = day.strftime("%d %b %Y") in web.get("date_header", "")
 
         checks["outside_all_fail"] = all(r["rc"] != 0 and "CONNECTED" not in r["out"] for r in ev["outside"].values())
         details["outside_succeeded"] = [k for k, r in ev["outside"].items() if r["rc"] == 0 or "CONNECTED" in r["out"]]
@@ -173,8 +183,8 @@ def probe_checks():
         wanted = {p["url"] for p in pages} | {s["first"]["url"] for s in searches}
         logged = {f"{e['scheme']}://{e['host']}{e['path']}" for e in http}
         details["not_logged"] = sorted(u for u in wanted if u not in logged)
-        checks["world_logged_every_request"] = not details["not_logged"] and all(e.get("cache") for e in http
-                                                                                  if e.get("answer") == "handler")
+        checks["world_logged_every_request"] = not details["not_logged"] and all(
+            e.get("cache") for e in http if e.get("kind") in ("page", "search"))
         lat = latency(log)
         details["latency"] = [json.dumps(lat)]
         transcript().info({"checks": checks, "details": details}, source="fictionet")
