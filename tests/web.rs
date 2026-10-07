@@ -780,6 +780,51 @@ fn https_with_http2_and_http11() {
     });
 }
 
+/// `Date` headers come from the world's date, over HTTP/1.1 and HTTP/2,
+/// and never from the host's clock: without a world date there is none.
+#[test]
+fn dates_come_from_the_world() {
+    // 2019-06-01T00:00:00Z.
+    let june_2019 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_559_347_200);
+    for date in [Some(june_2019), None] {
+        let result = within(Duration::from_secs(60), move || {
+            block_on(run(move |cx| async move {
+                let (attacher, attachments) = fictionet::attachments();
+                let site = axum::Router::new()
+                    .route("/own", axum::routing::get(|| async { ([("date", "Mon, 01 Jan 2001 00:00:00 GMT")], "own") }))
+                    .fallback(|| async { "hello" });
+                let mut sites = web::Sites::new(move |name: &str| (name == "dated.test").then(|| web::Site::new(site.clone())));
+                if let Some(date) = date {
+                    sites = sites.date(date);
+                }
+                sites.serve(&cx, attachments)?;
+                let m = machine(&cx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+                let addr = lookup(&cx, &m, "dated.test").await;
+                for h2 in [false, true] {
+                    let conn = m.tcp.connect(&cx, SocketAddr::new(addr.into(), 80)).await.unwrap();
+                    let mut client = Client::new(&cx, conn, h2).await;
+                    let got = client.get("http", "dated.test", "/").await;
+                    assert_eq!(got.body, "hello");
+                    assert_eq!(got.version, if h2 { Version::HTTP_2 } else { Version::HTTP_11 });
+                    let header = got.headers.get("date").map(|v| v.to_str().unwrap().to_owned());
+                    match date {
+                        Some(_) => {
+                            let header = header.expect("a Date header");
+                            assert!(header.starts_with("Sat, 01 Jun 2019 00:0"), "h2 {h2}: {header}");
+                        }
+                        None => assert_eq!(header, None, "h2 {h2}: no world date, so no Date"),
+                    }
+                    // A Date the handler sets is kept.
+                    let got = client.get("http", "dated.test", "/own").await;
+                    assert_eq!(got.headers.get_all("date").iter().collect::<Vec<_>>(), ["Mon, 01 Jan 2001 00:00:00 GMT"]);
+                }
+                Err(Box::new(Done) as fictionet::Error)
+            }))
+        });
+        assert!(result.is_err_and(|e| e.downcast_ref::<Done>().is_some()));
+    }
+}
+
 #[test]
 fn port_80_redirects_tls_sites_and_serves_the_others() {
     world(|cx, attacher, _env| async move {

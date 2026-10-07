@@ -533,6 +533,7 @@ pub struct Sites {
     ipv6: bool,
     max_sites: usize,
     journal: Option<Journal>,
+    date: Option<std::time::SystemTime>,
 }
 
 /// The callback given to [`Sites::new`].
@@ -558,7 +559,16 @@ impl Sites {
             ipv6: true,
             max_sites: crate::stdlib::net::MAX_HOSTS,
             journal: None,
+            date: None,
         }
+    }
+
+    /// Sets the world's date and time at the start of the run. Every site
+    /// then sends a `Date` header: this date plus the run's clock. Without
+    /// it, responses have no `Date` header; the host's clock is never used.
+    /// See [`httpd`'s Dates](crate::stdlib::httpd#dates).
+    pub fn date(self, start: std::time::SystemTime) -> Sites {
+        Sites { date: Some(start), ..self }
     }
 
     /// Records everything `Sites` does in `journal`. See [Events](self#events).
@@ -610,12 +620,20 @@ impl Sites {
     /// with other services next to the websites.
     pub fn into_net(self) -> Net {
         let site_for = self.site_for;
+        let date = self.date;
         let mut net = Net::new()
             .group("web::Sites")
             .subnet(self.subnet)
             .subnet(self.subnet_v6)
             .max_hosts(self.max_sites)
-            .resolve(move |name| site_for(name).map(|site| site.into_host(name)));
+            .resolve(move |name| {
+                site_for(name).map(|mut site| {
+                    if let Some(date) = date {
+                        site.website = site.website.date(date);
+                    }
+                    site.into_host(name)
+                })
+            });
         if !self.ipv6 {
             net = net.ipv4_only();
         }
