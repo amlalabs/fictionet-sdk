@@ -130,11 +130,11 @@ fn fastcgi_chunked_round_trip() {
         content: vec![],
         padding: 255,
     };
-    let bytes = round_trip(fastcgi::Frames::new, &[good.clone(), bad, good]);
+    let bytes = round_trip(fastcgi::Records::new, &[good.clone(), bad, good]);
     stack(
-        || fastcgi::Frames::new().map(|record| fastcgi::BeginRequest::parse(&record.content)),
+        || fastcgi::Records::new().map(|record| fastcgi::BeginRequest::parse(&record.content)),
         &bytes,
-        &[Ok(body), Err(fastcgi::BodyError), Ok(body)],
+        &[Ok(body), Err(fastcgi::Error::BodyLength), Ok(body)],
     );
 }
 
@@ -198,15 +198,15 @@ fn zabbix_chunked_round_trip() {
     let good = message.to_packet();
     let mut large = good.clone();
     large.flags |= zabbix::flags::LARGE;
-    let bytes = round_trip(zabbix::Frames::new, &[good, large]);
+    let bytes = round_trip(zabbix::Packets::new, &[good, large]);
     stack(
-        || zabbix::Frames::new().map(|packet| zabbix::Message::parse(&packet.data)),
+        || zabbix::Packets::new().map(|packet| zabbix::Message::parse(&packet.data)),
         &bytes,
         &[Ok(message.clone()), Ok(message)],
     );
     // Compression flags and opaque compressed bytes survive the wire layer.
     round_trip(
-        zabbix::Frames::new,
+        zabbix::Packets::new,
         &[zabbix::Packet {
             flags: zabbix::flags::KNOWN,
             reserved: 64,
@@ -215,11 +215,11 @@ fn zabbix_chunked_round_trip() {
     );
     let invalid = zabbix::Packet::new(vec![0xff]);
     let valid = zabbix::Message::response(false, None).unwrap();
-    let bytes = round_trip(zabbix::Frames::new, &[invalid, valid.to_packet()]);
+    let bytes = round_trip(zabbix::Packets::new, &[invalid, valid.to_packet()]);
     stack(
-        || zabbix::Frames::new().map(|packet| zabbix::Message::parse(&packet.data)),
+        || zabbix::Packets::new().map(|packet| zabbix::Message::parse(&packet.data)),
         &bytes,
-        &[Err(zabbix::MessageError::Utf8), Ok(valid)],
+        &[Err(zabbix::Error::Utf8), Ok(valid)],
     );
 }
 
@@ -239,10 +239,10 @@ fn bgp_rejects_oversize_at_named_limit() {
 
 #[test]
 fn fastcgi_rejects_oversize_at_named_limit() {
-    assert_eq!(fastcgi::Frames::new().capacity(), fastcgi::MAX_RECORD);
+    assert_eq!(fastcgi::Records::new().capacity(), fastcgi::MAX_RECORD);
     // The wire fields cannot exceed MAX_RECORD. Use MAX_CONTENT as the
     // configured total record limit to refuse a record that also needs padding.
-    let make = || fastcgi::Frames::with_limit(fastcgi::MAX_CONTENT);
+    let make = || fastcgi::Records::with_limit(fastcgi::MAX_CONTENT);
     assert_eq!(make().capacity(), fastcgi::MAX_CONTENT);
     let header = [
         fastcgi::VERSION,
@@ -257,7 +257,7 @@ fn fastcgi_rejects_oversize_at_named_limit() {
     rejects(
         make,
         &header,
-        fastcgi::FrameError::TooLong {
+        fastcgi::Error::RecordTooLong {
             length: fastcgi::MAX_RECORD,
             limit: fastcgi::MAX_CONTENT,
         },
@@ -270,7 +270,7 @@ fn fastcgi_rejects_oversize_at_named_limit() {
         padding: u8::MAX,
     };
     let bytes = Wire::to_bytes(&record).unwrap();
-    let mut stream = Stream::new(fastcgi::Frames::new());
+    let mut stream = Stream::new(fastcgi::Records::new());
     assert_eq!(stream.push(&bytes), fastcgi::MAX_RECORD);
     assert_eq!(stream.next(), Some(Ok(record)));
 }
@@ -299,14 +299,14 @@ fn thrift_rejects_oversize_at_named_limit() {
     rejects(
         thrift::Frames::new,
         &length.to_be_bytes(),
-        thrift::FrameError::Length(length),
+        thrift::Error::FrameLength(length),
     );
 }
 
 #[test]
 fn zabbix_rejects_oversize_at_named_limit() {
     assert_eq!(
-        zabbix::Frames::new().capacity(),
+        zabbix::Packets::new().capacity(),
         zabbix::DEFAULT_LIMIT + zabbix::LARGE_HEADER_LEN
     );
     for flags in [
@@ -321,9 +321,9 @@ fn zabbix_rejects_oversize_at_named_limit() {
         }
         .to_bytes().unwrap();
         rejects(
-            zabbix::Frames::new,
+            zabbix::Packets::new,
             &header,
-            zabbix::PacketError::TooLarge {
+            zabbix::Error::TooLarge {
                 len,
                 limit: zabbix::DEFAULT_LIMIT,
             },
@@ -335,9 +335,9 @@ fn zabbix_rejects_oversize_at_named_limit() {
         }
         .to_bytes().unwrap();
         rejects(
-            zabbix::Frames::new,
+            zabbix::Packets::new,
             &header,
-            zabbix::PacketError::ReservedTooLarge {
+            zabbix::Error::ReservedTooLarge {
                 len,
                 limit: zabbix::DEFAULT_LIMIT,
             },
@@ -400,19 +400,19 @@ fn configurable_limits_clamp_and_accept_empty_frames() {
     rejects(
         || thrift::Frames::with_limit(2),
         &[0, 0, 0, 3],
-        thrift::FrameError::Length(3),
+        thrift::Error::FrameLength(3),
     );
     assert_eq!(
         kafka::Frames::with_limit(usize::MAX).limit(),
         kafka::MAX_FRAME
     );
     assert_eq!(
-        fastcgi::Frames::with_limit(usize::MAX).limit(),
+        fastcgi::Records::with_limit(usize::MAX).limit(),
         fastcgi::MAX_RECORD
     );
-    assert_eq!(fastcgi::Frames::with_limit(0).limit(), fastcgi::HEADER_LEN);
+    assert_eq!(fastcgi::Records::with_limit(0).limit(), fastcgi::HEADER_LEN);
     assert_eq!(
-        zabbix::Frames::with_limit(usize::MAX).limit(),
+        zabbix::Packets::with_limit(usize::MAX).limit(),
         zabbix::MAX_DATA
     );
     stack(
@@ -422,7 +422,7 @@ fn configurable_limits_clamp_and_accept_empty_frames() {
     );
     let packet = zabbix::Packet::new(vec![]);
     stack(
-        || zabbix::Frames::with_limit(0),
+        || zabbix::Packets::with_limit(0),
         &packet.to_bytes().unwrap(),
         &[packet],
     );
@@ -433,7 +433,7 @@ fn configurable_limits_clamp_and_accept_empty_frames() {
         padding: 0,
     };
     stack(
-        || fastcgi::Frames::with_limit(0),
+        || fastcgi::Records::with_limit(0),
         &record.to_bytes().unwrap(),
         &[record],
     );

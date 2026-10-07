@@ -3,13 +3,13 @@
 
 use fictionet::stdlib::codec::{Decode, Fail, Stream, Wire, contract, test_support::decode_all};
 use fictionet::stdlib::thrift::{
-    EncodedMessage, Error, Frame, Frames, MAX_FRAME, MAX_MESSAGE, Messages, ValueBody,
+    EncodedMessage, EncodedMessages, Error, Frame, Frames, MAX_FRAME, MAX_MESSAGE, ValueBody,
 };
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(Messages::new, data, 2 * Messages::new().capacity());
-    contract::check_decode_with_held_limit(Messages::new, data, Messages::new().held());
+    contract::check_decode_with_alloc_limit(EncodedMessages::new, data, 2 * EncodedMessages::new().capacity());
+    contract::check_decode_with_held_limit(EncodedMessages::new, data, EncodedMessages::new().held());
     contract::check_decode_with_alloc_limit(Frames::new, data, 2 * Frames::new().capacity());
     let limit = usize::from(data.first().copied().unwrap_or(0));
     contract::check_decode_with_alloc_limit(|| Frames::with_limit(limit), data, 2 * Frames::with_limit(limit).capacity());
@@ -21,7 +21,7 @@ fuzz_target!(|data: &[u8]| {
         contract::check_wire_value(&frame);
         contract::check_wire::<EncodedMessage>(&frame.0);
     }
-    let mut stream = Stream::new(Messages::new());
+    let mut stream = Stream::new(EncodedMessages::new());
     let mut pushed = 0;
     let mut start = 0;
     while !stream.is_done() {
