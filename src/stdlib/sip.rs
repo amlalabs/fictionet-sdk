@@ -10,7 +10,7 @@
 //!
 //! Nothing here reads a socket. A world that plays a phone or a proxy reads
 //! a UDP message with [`Message::read_datagram`]. Over TCP, it pushes bytes
-//! into [`Stream<Frames>`](fictionet::stdlib::codec::Stream), which splits messages by
+//! into [`Stream<Messages>`](fictionet::stdlib::codec::Stream), which splits messages by
 //! their Content-Length. Either way, it reads the headers it needs with
 //! [`Message::vias`], [`Message::from`], [`Message::cseq`] and the others,
 //! builds its answer (often with [`Message::reply`]), and sends the bytes
@@ -527,7 +527,7 @@ impl Message {
 
 /// Reads complete SIP units with bounded line and body framing.
 ///
-/// Use with [`Stream<Frames>`](fictionet::stdlib::codec::Stream). Items are `Result<Message, Error>`.
+/// Use with [`Stream<Messages>`](fictionet::stdlib::codec::Stream). Items are `Result<Message, Error>`.
 /// A bad start line or header is an error item once a trusted body length
 /// and the complete unit are available. Invalid lengths and byte limits
 /// end the stream. Bare LF is a stream error: only CRLF ends SIP lines,
@@ -543,43 +543,43 @@ impl Message {
 /// Each call yields at most one unit and returns control to the caller.
 ///
 /// ```
-/// use fictionet::stdlib::{codec::{Stream, Wire}, sip::{Frames, Message}};
+/// use fictionet::stdlib::{codec::{Stream, Wire}, sip::{Message, Messages}};
 ///
 /// let bytes = b"SIP/2.0 200 OK\r\nContent-Length: 0\r\n\r\n";
 /// let message = <Message as Wire>::parse(bytes)?;
-/// let mut stream = Stream::new(Frames::new());
+/// let mut stream = Stream::new(Messages::new());
 /// assert_eq!(stream.push(bytes), bytes.len());
 /// assert_eq!(stream.next(), Some(Ok(Ok(message))));
 /// stream.end();
 /// assert_eq!(stream.next(), None);
 /// # Ok::<(), fictionet::stdlib::sip::Error>(())
 /// ```
-pub struct Frames {
+pub struct Messages {
     lines: Lines,
     scanned: usize,
     body: Option<(usize, usize)>,
 }
 
-impl core::fmt::Debug for Frames {
+impl core::fmt::Debug for Messages {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Frames").field("scanned", &self.scanned).field("body", &self.body).finish_non_exhaustive()
+        f.debug_struct("Messages").field("scanned", &self.scanned).field("body", &self.body).finish_non_exhaustive()
     }
 }
 
-impl Default for Frames {
+impl Default for Messages {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Frames {
+impl Messages {
     /// Creates a decoder using [`MAX_LINE`], [`MAX_HEAD`], and [`MAX_BODY`].
     pub fn new() -> Self {
         Self { lines: Lines::new(MAX_LINE, Ending::Crlf), scanned: 0, body: None }
     }
 }
 
-impl Decode for Frames {
+impl Decode for Messages {
     type Item = Result<Message, Error>;
     type Error = Error;
     const NAME: &'static str = "SIP";
@@ -716,7 +716,7 @@ fn read_wire(bytes: &[u8]) -> Result<Message, Error> {
     if bytes.len() > MAX_MESSAGE {
         return Err(Error::TooLong);
     }
-    let mut frames = Frames::new();
+    let mut frames = Messages::new();
     let mut rest = bytes;
     loop {
         match frames.decode(rest, true)? {
@@ -2845,12 +2845,12 @@ mod tests {
     #[test]
     fn stream_framing() {
         let bytes = [b"\r\n\r\n".as_slice(), &invite(), b"\r\n", &ok()].concat();
-        contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_MESSAGE);
+        contract::check_decode_with_alloc_limit(Messages::new, &bytes, 2 * MAX_MESSAGE);
         assert_eq!(
-            decode_all(Frames::new, &bytes),
+            decode_all(Messages::new, &bytes),
             (vec![Ok(Message::parse(&invite()).unwrap()), Ok(Message::parse(&ok()).unwrap())], None)
         );
-        let mut stream = Stream::new(Frames::new());
+        let mut stream = Stream::new(Messages::new());
         let missing = b"OPTIONS sip:a@b SIP/2.0\r\n\r\n";
         assert_eq!(stream.push(missing), missing.len());
         assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::MissingContentLength))));
@@ -2859,11 +2859,11 @@ mod tests {
         assert_eq!(stream.failed(), Some(&Fail::Protocol(Error::MissingContentLength)));
         assert_eq!(stream.unread(), missing);
         let bytes = vec![b'X'; MAX_HEAD];
-        contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_MESSAGE);
-        assert_eq!(decode_all(Frames::new, &bytes).1, Some(Fail::Protocol(Error::TooLong)));
-        assert_eq!(Frames::new().decode(&bytes[..MAX_HEAD - 1], false), Ok(Step::Need));
+        contract::check_decode_with_alloc_limit(Messages::new, &bytes, 2 * MAX_MESSAGE);
+        assert_eq!(decode_all(Messages::new, &bytes).1, Some(Fail::Protocol(Error::TooLong)));
+        assert_eq!(Messages::new().decode(&bytes[..MAX_HEAD - 1], false), Ok(Step::Need));
         assert_eq!(
-            decode_all(Frames::new, b"INFO sip:a@b SIP/2.0\r\nl: 9999999\r\n\r\n").1,
+            decode_all(Messages::new, b"INFO sip:a@b SIP/2.0\r\nl: 9999999\r\n\r\n").1,
             Some(Fail::Protocol(Error::TooLong))
         );
     }
@@ -2873,7 +2873,7 @@ mod tests {
         let one = b"\r\nOPTIONS sip:a@b SIP/2.0\r\nl: 1\r\n\r\nx";
         let bytes = one.repeat(50_000);
         let started = std::time::Instant::now();
-        let (items, failure) = decode_all(Frames::new, &bytes);
+        let (items, failure) = decode_all(Messages::new, &bytes);
         assert_eq!(failure, None);
         assert_eq!(items.len(), 50_000);
         assert!(items.iter().all(Result::is_ok));
@@ -2883,10 +2883,10 @@ mod tests {
     #[test]
     fn every_truncated_prefix() {
         for whole in [invite(), ok(), compact()] {
-            contract::check_decode_with_alloc_limit(Frames::new, &whole, 2 * MAX_MESSAGE);
+            contract::check_decode_with_alloc_limit(Messages::new, &whole, 2 * MAX_MESSAGE);
             for n in 0..whole.len() {
                 let part = &whole[..n];
-                assert_eq!(Frames::new().decode(part, false), Ok(Step::Need), "{n} bytes");
+                assert_eq!(Messages::new().decode(part, false), Ok(Step::Need), "{n} bytes");
                 assert_eq!(Message::parse(part), Err(Error::Incomplete), "{n} bytes");
                 assert_eq!(Message::read_datagram(part), Err(Error::Incomplete), "{n} bytes");
             }
@@ -2914,10 +2914,10 @@ mod tests {
     }
 
     fn check(data: &[u8]) -> usize {
-        contract::check_decode_with_alloc_limit(Frames::new, data, 2 * MAX_MESSAGE);
-        contract::check_decode_with_held_limit(Frames::new, data, 0);
+        contract::check_decode_with_alloc_limit(Messages::new, data, 2 * MAX_MESSAGE);
+        contract::check_decode_with_held_limit(Messages::new, data, 0);
         contract::check_wire::<Message>(data);
-        let (items, _) = decode_all(Frames::new, data);
+        let (items, _) = decode_all(Messages::new, data);
         for message in items.iter().flatten() {
             round_trip(message);
         }
@@ -3142,7 +3142,7 @@ mod tests {
 
     #[test]
     fn stream_holds_at_most_one_message() {
-        let mut stream = Stream::new(Frames::new());
+        let mut stream = Stream::new(Messages::new());
         let bytes = vec![b'\r'; MAX_MESSAGE + 1];
         assert_eq!(stream.push(&bytes), MAX_MESSAGE);
         assert_eq!(stream.push(b"extra"), 0);
@@ -3151,16 +3151,16 @@ mod tests {
         assert_eq!(stream.next(), None);
         assert_eq!(stream.push(&bytes), bytes.len());
         let one = b"OPTIONS sip:a@b SIP/2.0\r\nl: 4\r\n\r\nbody";
-        let (items, failure) = decode_all(Frames::new, &one.repeat(40_000));
+        let (items, failure) = decode_all(Messages::new, &one.repeat(40_000));
         assert_eq!(failure, None);
         assert_eq!(items.len(), 40_000);
         assert!(items.iter().all(Result::is_ok));
         let mut crlfs = b"\r\n".repeat(MAX_MESSAGE);
         crlfs.extend(one);
-        let (items, failure) = decode_all(Frames::new, &crlfs);
+        let (items, failure) = decode_all(Messages::new, &crlfs);
         assert_eq!(failure, None);
         assert_eq!(items, [Ok(Message::parse(one).unwrap())]);
-        contract::check_decode_with_alloc_limit(Frames::new, &crlfs, 2 * MAX_MESSAGE);
+        contract::check_decode_with_alloc_limit(Messages::new, &crlfs, 2 * MAX_MESSAGE);
     }
 
     #[test]

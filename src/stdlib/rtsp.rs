@@ -14,7 +14,7 @@
 //!
 //! Nothing here reads a socket. A world that plays a camera pushes the
 //! bytes it reads into [`Stream<Frames>`](fictionet::stdlib::codec::Stream), which splits the
-//! stream into [`Item`]s: messages, by their Content-Length, and
+//! stream into [`Frame`]s: messages, by their Content-Length, and
 //! interleaved frames, by their length. It reads the headers it needs with
 //! [`Message::cseq`], [`Message::session`], [`Message::transports`] and
 //! [`Message::range`], builds its answer (often with [`Message::reply`]),
@@ -32,7 +32,7 @@
 //! Writers always emit CRLF. Lines exclude their endings and are bounded
 //! by [`MAX_LINE`]. The whole head, including endings, is bounded by
 //! [`MAX_HEAD`]; the header count by [`MAX_HEADERS`]; bodies by [`MAX_BODY`].
-//! Interleaved `$` frames are separate [`Item`]s, with [`MAX_INTERLEAVED`]
+//! Interleaved `$` frames are separate [`Frame`]s, with [`MAX_INTERLEAVED`]
 //! payload bytes and a four-byte header.
 //!
 //! Content-Length selects exactly that many body bytes. Without it, there
@@ -48,14 +48,14 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::{Stream, Wire};
-//! use fictionet::stdlib::rtsp::{Frames, Interleaved, Item, TransportParam};
+//! use fictionet::stdlib::rtsp::{Frame, Frames, Interleaved, TransportParam};
 //!
 //! let mut stream = Stream::new(Frames::new());
 //! let request_bytes = b"SETUP rtsp://example.com/foo/bar/baz.rm RTSP/1.0\r\n\
 //!     CSeq: 302\r\n\
 //!     Transport: RTP/AVP;unicast;client_port=4588-4589\r\n\r\n";
 //! assert_eq!(stream.push(request_bytes), request_bytes.len());
-//! let Some(Ok(Ok(Item::Message(request)))) = stream.next() else { panic!() };
+//! let Some(Ok(Ok(Frame::Message(request)))) = stream.next() else { panic!() };
 //! assert_eq!(request.method(), Some("SETUP"));
 //! assert_eq!(request.cseq(), Ok(302));
 //! let mut transport = request.transports().unwrap().remove(0);
@@ -76,7 +76,7 @@
 //! // Media over the same connection comes in frames that start with `$`.
 //! assert_eq!(stream.push(b"$\x00\x00\x04abcd"), 8);
 //! let frame = Interleaved { channel: 0, data: b"abcd".to_vec() };
-//! assert_eq!(stream.next(), Some(Ok(Ok(Item::Interleaved(frame)))));
+//! assert_eq!(stream.next(), Some(Ok(Ok(Frame::Interleaved(frame)))));
 //! assert_eq!(stream.next(), None);
 //! ```
 
@@ -514,7 +514,7 @@ impl Interleaved {
 
 /// What an RTSP connection carries: a message or an interleaved frame.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Item {
+pub enum Frame {
     /// A request or a response.
     Message(Message),
     /// A frame of binary data.
@@ -523,7 +523,7 @@ pub enum Item {
 
 /// Reads complete RTSP units with bounded line and body framing.
 ///
-/// Use with [`Stream<Frames>`](fictionet::stdlib::codec::Stream). Items are `Result<Item, Error>`.
+/// Use with [`Stream<Frames>`](fictionet::stdlib::codec::Stream). Items are `Result<Frame, Error>`.
 /// A bad start line or header is an error item once a trusted body length
 /// and the complete unit are available. Invalid lengths and byte limits
 /// end the stream. Once the head is complete, bare LF in RTSP 2.0 ends the
@@ -545,7 +545,7 @@ pub enum Item {
 /// let message = <Message as Wire>::parse(bytes)?;
 /// let mut stream = Stream::new(Frames::new());
 /// assert_eq!(stream.push(bytes), bytes.len());
-/// assert_eq!(stream.next(), Some(Ok(Ok(fictionet::stdlib::rtsp::Item::Message(message)))));
+/// assert_eq!(stream.next(), Some(Ok(Ok(fictionet::stdlib::rtsp::Frame::Message(message)))));
 /// stream.end();
 /// assert_eq!(stream.next(), None);
 /// # Ok::<(), fictionet::stdlib::rtsp::Error>(())
@@ -576,7 +576,7 @@ impl Frames {
 }
 
 impl Decode for Frames {
-    type Item = Result<Item, Error>;
+    type Item = Result<Frame, Error>;
     type Error = Error;
     const NAME: &'static str = "RTSP";
 
@@ -593,7 +593,7 @@ impl Decode for Frames {
             }
             if input.first() == Some(&INTERLEAVED_MARKER) {
                 return Ok(match Interleaved::parse_prefix(input)? {
-                    Some((frame, used)) => Step::Item(Ok(Item::Interleaved(frame)), used),
+                    Some((frame, used)) => Step::Item(Ok(Frame::Interleaved(frame)), used),
                     None => Step::Need,
                 });
             }
@@ -634,7 +634,7 @@ impl Decode for Frames {
         });
         self.scanned = 0;
         self.body = None;
-        Ok(Step::Item(message.map(Item::Message), used))
+        Ok(Step::Item(message.map(Frame::Message), used))
     }
 }
 
@@ -716,7 +716,7 @@ fn frame_length_value(length: &mut Option<usize>, bytes: &[u8]) -> Result<(), Er
     Ok(())
 }
 
-fn read_wire(bytes: &[u8]) -> Result<Item, Error> {
+fn read_wire(bytes: &[u8]) -> Result<Frame, Error> {
     if bytes.len() > MAX_MESSAGE {
         return Err(Error::TooLong);
     }
@@ -749,7 +749,7 @@ impl Wire for Message {
     /// Refuses malformed, incomplete, trailing, or over-limit input and
     /// values whose CRLF form would exceed the head or line limit.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        let Item::Message(message) = read_wire(bytes)? else {
+        let Frame::Message(message) = read_wire(bytes)? else {
             return Err(Error::StartLine);
         };
         message_size(&message)?;
@@ -898,7 +898,7 @@ impl Wire for Interleaved {
     }
 }
 
-impl Wire for Item {
+impl Wire for Frame {
     type ParseError = Error;
     type WriteError = Error;
 
@@ -907,7 +907,7 @@ impl Wire for Item {
     /// whose canonical form exceeds a named limit.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         let item = read_wire(bytes)?;
-        if let Item::Message(message) = &item {
+        if let Frame::Message(message) = &item {
             message_size(message)?;
         }
         Ok(item)
@@ -2615,9 +2615,9 @@ mod tests {
             RTSP/1.0 200 OK\r\nCSeq: 2\r\n\r\n";
         let items = items_of(stream);
         assert_eq!(items.len(), 2, "{items:?}");
-        let Ok(Item::Message(first)) = &items[0] else { panic!() };
+        let Ok(Frame::Message(first)) = &items[0] else { panic!() };
         assert!(first.body.is_empty());
-        let Ok(Item::Message(second)) = &items[1] else { panic!() };
+        let Ok(Frame::Message(second)) = &items[1] else { panic!() };
         assert_eq!(second.cseq(), Ok(2));
         // RFC 7826 section 5.4: in RTSP 2.0 the Content-Length always counts.
         let m = msg(b"RTSP/2.0 304 Not Modified\r\nCSeq: 1\r\nContent-Length: 2\r\n\r\nab");
@@ -2790,9 +2790,9 @@ mod tests {
         assert_eq!(too_big.to_bytes(), Err(Error::TooLong));
         let mut stream = Stream::new(Frames::new());
         assert_eq!(stream.push(b"\r\n$\x01\x00\x00x"), 7);
-        assert_eq!(stream.next(), Some(Ok(Ok(Item::Interleaved(Interleaved { channel: 1, data: vec![] })))));
+        assert_eq!(stream.next(), Some(Ok(Ok(Frame::Interleaved(Interleaved { channel: 1, data: vec![] })))));
         assert_eq!(stream.unread(), b"x");
-        assert_eq!(Item::parse(b"\r\n$\x01\x00\x00x"), Err(Error::Trailing));
+        assert_eq!(Frame::parse(b"\r\n$\x01\x00\x00x"), Err(Error::Trailing));
     }
 
     #[test]
@@ -2891,9 +2891,9 @@ mod tests {
         for bytes in &items {
             contract::check_decode_with_alloc_limit(Frames::new, bytes, 2 * MAX_MESSAGE);
             for n in 0..bytes.len() {
-                assert_eq!(Item::parse(&bytes[..n]), Err(Error::Incomplete));
+                assert_eq!(Frame::parse(&bytes[..n]), Err(Error::Incomplete));
             }
-            assert!(Item::parse(bytes).is_ok());
+            assert!(Frame::parse(bytes).is_ok());
         }
     }
 
@@ -2940,18 +2940,18 @@ mod tests {
         bytes.extend(PLAY2);
         contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_MESSAGE);
         let want = vec![
-            Ok(Item::Message(msg(OPTIONS))),
-            Ok(Item::Interleaved(frame.clone())),
-            Ok(Item::Message(msg(&describe_ok()))),
-            Ok(Item::Interleaved(frame)),
-            Ok(Item::Message(msg(PLAY2))),
+            Ok(Frame::Message(msg(OPTIONS))),
+            Ok(Frame::Interleaved(frame.clone())),
+            Ok(Frame::Message(msg(&describe_ok()))),
+            Ok(Frame::Interleaved(frame)),
+            Ok(Frame::Message(msg(PLAY2))),
         ];
         assert_eq!(decode_all(Frames::new, &bytes), (want, None));
         let mut stream = Stream::new(Frames::new());
         assert_eq!(stream.push(b"RTSP/9.9 200 OK\r\n\r\n"), 19);
         assert_eq!(stream.next(), Some(Ok(Err(Error::Version))));
         assert_eq!(stream.push(OPTIONS), OPTIONS.len());
-        assert_eq!(stream.next(), Some(Ok(Ok(Item::Message(msg(OPTIONS))))));
+        assert_eq!(stream.next(), Some(Ok(Ok(Frame::Message(msg(OPTIONS))))));
         assert_eq!(stream.push(&vec![b'A'; MAX_HEAD - 1]), MAX_HEAD - 1);
         assert_eq!(stream.next(), None);
         assert_eq!(stream.push(b"A"), 1);
@@ -2977,11 +2977,11 @@ mod tests {
         let bytes = message.to_bytes().unwrap();
         let started = std::time::Instant::now();
         contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_MESSAGE);
-        assert_eq!(decode_all(Frames::new, &bytes), (vec![Ok(Item::Message(message))], None));
+        assert_eq!(decode_all(Frames::new, &bytes), (vec![Ok(Frame::Message(message))], None));
         assert!(started.elapsed().as_secs() < 10, "took {:?}", started.elapsed());
     }
 
-    fn items_of(bytes: &[u8]) -> Vec<Result<Item, Error>> {
+    fn items_of(bytes: &[u8]) -> Vec<Result<Frame, Error>> {
         let (items, failure) = decode_all(Frames::new, bytes);
         assert_eq!(failure, None);
         items
@@ -2991,7 +2991,7 @@ mod tests {
         contract::check_decode_with_alloc_limit(Frames::new, data, 2 * MAX_MESSAGE);
         contract::check_decode_with_held_limit(Frames::new, data, 0);
         contract::check_wire::<Message>(data);
-        contract::check_wire::<Item>(data);
+        contract::check_wire::<Frame>(data);
         contract::check_wire::<Interleaved>(data);
         let (items, _) = decode_all(Frames::new, data);
         for item in items.iter().flatten() {
@@ -3001,9 +3001,9 @@ mod tests {
         items.iter().flatten().count()
     }
 
-    fn round_trip(item: &Item) {
+    fn round_trip(item: &Frame) {
         contract::check_wire_value(item);
-        if let Item::Interleaved(frame) = item {
+        if let Frame::Interleaved(frame) = item {
             frame.to_bytes().unwrap();
             return;
         }
@@ -3011,7 +3011,7 @@ mod tests {
             assert!(matches!(error, Error::TooLong | Error::TooMany), "{error:?} for {item:?}");
             return;
         }
-        if let Item::Message(message) = item {
+        if let Frame::Message(message) = item {
             if let Ok(value) = message.session() {
                 contract::check_wire_value(&value);
                 value.to_bytes().unwrap();

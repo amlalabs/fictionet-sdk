@@ -10,7 +10,7 @@
 //!
 //! Nothing here reads a socket. A world that plays a SIP phone takes the
 //! body of an INVITE, reads it with [`SessionDescription::parse`] (or a
-//! [`Stream<Descriptions>`](fictionet::stdlib::codec::Stream), with a body ending at EOF),
+//! [`Stream<SessionDescriptions>`](fictionet::stdlib::codec::Stream), with a body ending at EOF),
 //! picks the streams and codecs it will take, and writes its answer with
 //! [`SessionDescription::write`].
 //! Which codecs a world accepts, and what it does with the media, is up
@@ -257,8 +257,9 @@ impl Attribute {
     }
 }
 
-/// Why bytes are not a session description, or why a description cannot
-/// be written. Lines count from 1.
+/// Why bytes are not a session description, why a description cannot
+/// be written, or why an attribute is not the kind a typed helper reads.
+/// Lines count from 1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     /// The description is longer than [`MAX_LEN`].
@@ -311,6 +312,9 @@ pub enum Error {
     /// A required line is missing: `v=`, `o=`, `s=` or `t=`, or a `c=`
     /// for a media description when the session has none.
     Missing(char),
+    /// An attribute is not the kind a typed helper reads, or the helper's
+    /// fields cannot be written as one.
+    Attribute,
 }
 
 impl core::fmt::Display for Error {
@@ -329,6 +333,7 @@ impl core::fmt::Display for Error {
             Error::Syntax { line, kind } => write!(f, "line {line} is a malformed '{kind}=' line"),
             Error::Order { line, kind } => write!(f, "line {line}: '{kind}=' is not allowed here"),
             Error::Missing(kind) => write!(f, "required '{kind}=' line missing"),
+            Error::Attribute => f.write_str("malformed SDP attribute"),
         }
     }
 }
@@ -404,20 +409,20 @@ fn next_stage(cur: u8, kind: u8) -> Option<u8> {
 /// ending are accepted. Each ending counts as CRLF toward [`MAX_LEN`].
 /// Syntax, limit, and missing-field errors end the body with [`Error`].
 #[derive(Debug)]
-pub struct Descriptions {
+pub struct SessionDescriptions {
     description: Option<Description>,
     total: usize,
     lines: usize,
     scanned: usize,
 }
 
-impl Default for Descriptions {
+impl Default for SessionDescriptions {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Descriptions {
+impl SessionDescriptions {
     /// Creates a decoder for one body.
     pub fn new() -> Self {
         Self { description: Some(Description::default()), total: 0, lines: 0, scanned: 0 }
@@ -445,7 +450,7 @@ impl Descriptions {
     }
 }
 
-impl Decode for Descriptions {
+impl Decode for SessionDescriptions {
     type Item = SessionDescription;
     type Error = Error;
     const NAME: &'static str = "SDP";
@@ -1224,7 +1229,7 @@ impl Wire for SessionDescription {
     /// invalid syntax, line order, missing fields, and size limit violations.
     /// Obsolete `k=` lines are checked and dropped.
     fn parse(mut bytes: &[u8]) -> Result<Self, Error> {
-        let mut descriptions = Descriptions::new();
+        let mut descriptions = SessionDescriptions::new();
         loop {
             match descriptions.decode(bytes, true)? {
                 codec::Step::Skip(used) => {
@@ -1406,29 +1411,16 @@ impl Media {
     }
 }
 
-/// Why an attribute is not the kind a typed helper reads, or why the
-/// helper's fields cannot be written as one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AttributeError;
-
-impl core::fmt::Display for AttributeError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("malformed SDP attribute")
-    }
-}
-
-impl core::error::Error for AttributeError {}
-
 /// The value of an attribute named `name`, or an error.
-fn value_of<'a>(a: &'a Attribute, name: &str) -> Result<&'a str, AttributeError> {
+fn value_of<'a>(a: &'a Attribute, name: &str) -> Result<&'a str, Error> {
     match &a.value {
         Some(v) if a.name == name => Ok(v),
-        _ => Err(AttributeError),
+        _ => Err(Error::Attribute),
     }
 }
 
-fn check(ok: bool) -> Result<(), AttributeError> {
-    if ok { Ok(()) } else { Err(AttributeError) }
+fn check(ok: bool) -> Result<(), Error> {
+    if ok { Ok(()) } else { Err(Error::Attribute) }
 }
 
 /// Whether an attribute named `name` with `value` fits on one line,
@@ -1440,7 +1432,7 @@ fn fits(name: &str, value: &str) -> bool {
 
 /// The value of an attribute named `name` that fits on one line, or an
 /// error.
-fn line_value<'a>(a: &'a Attribute, name: &str) -> Result<&'a str, AttributeError> {
+fn line_value<'a>(a: &'a Attribute, name: &str) -> Result<&'a str, Error> {
     let v = value_of(a, name)?;
     check(fits(name, v))?;
     Ok(v)
@@ -1448,7 +1440,7 @@ fn line_value<'a>(a: &'a Attribute, name: &str) -> Result<&'a str, AttributeErro
 
 /// Appends `parts` to `v`, or fails if the attribute named `name` would
 /// no longer fit on one line. Nothing is copied when it fails.
-fn push_fitting(v: &mut String, name: &str, parts: &[&str]) -> Result<(), AttributeError> {
+fn push_fitting(v: &mut String, name: &str, parts: &[&str]) -> Result<(), Error> {
     let more = parts.iter().map(|p| p.len()).fold(0usize, usize::saturating_add);
     check(fits(name, "") && v.len().saturating_add(more) <= MAX_LINE_LEN - "a=:".len() - name.len())?;
     for p in parts {
@@ -1478,12 +1470,12 @@ pub struct RtpMap {
 
 impl RtpMap {
     /// Reads an `rtpmap` attribute.
-    pub fn from_attribute(a: &Attribute) -> Result<RtpMap, AttributeError> {
+    pub fn from_attribute(a: &Attribute) -> Result<RtpMap, Error> {
         let v = line_value(a, "rtpmap")?;
-        let (pt, rest) = v.split_once(' ').ok_or(AttributeError)?;
+        let (pt, rest) = v.split_once(' ').ok_or(Error::Attribute)?;
         let mut parts = rest.splitn(3, '/');
-        let encoding = parts.next().and_then(token).ok_or(AttributeError)?;
-        let clock = parts.next().and_then(integer).filter(|&c| c > 0).ok_or(AttributeError)?;
+        let encoding = parts.next().and_then(token).ok_or(Error::Attribute)?;
+        let clock = parts.next().and_then(integer).filter(|&c| c > 0).ok_or(Error::Attribute)?;
         let params = match parts.next() {
             Some(p) => {
                 check(is_channels(p))?;
@@ -1491,11 +1483,11 @@ impl RtpMap {
             }
             None => None,
         };
-        let payload = integer(pt).filter(|&p| p <= u64::from(MAX_PAYLOAD_TYPE)).ok_or(AttributeError)?;
+        let payload = integer(pt).filter(|&p| p <= u64::from(MAX_PAYLOAD_TYPE)).ok_or(Error::Attribute)?;
         Ok(RtpMap {
             payload: payload as u8,
             encoding,
-            clock_rate: u32::try_from(clock).map_err(|_| AttributeError)?,
+            clock_rate: u32::try_from(clock).map_err(|_| Error::Attribute)?,
             params,
         })
     }
@@ -1504,7 +1496,7 @@ impl RtpMap {
     /// [`MAX_PAYLOAD_TYPE`], the clock rate is 0, the parameters are not a
     /// channel count, a field holds characters the syntax does not allow,
     /// or the attribute would not fit on one line.
-    pub fn to_attribute(&self) -> Result<Attribute, AttributeError> {
+    pub fn to_attribute(&self) -> Result<Attribute, Error> {
         check(self.payload <= MAX_PAYLOAD_TYPE && self.clock_rate > 0)?;
         check(is_token(&self.encoding) && self.params.as_deref().is_none_or(is_channels))?;
         let mut v = String::new();
@@ -1534,9 +1526,9 @@ pub struct Fmtp {
 
 impl Fmtp {
     /// Reads an `fmtp` attribute.
-    pub fn from_attribute(a: &Attribute) -> Result<Fmtp, AttributeError> {
+    pub fn from_attribute(a: &Attribute) -> Result<Fmtp, Error> {
         let v = line_value(a, "fmtp")?;
-        let (format, params) = v.split_once(' ').ok_or(AttributeError)?;
+        let (format, params) = v.split_once(' ').ok_or(Error::Attribute)?;
         check(is_token(format) && is_text(params))?;
         Ok(Fmtp { format: format.to_string(), params: params.to_string() })
     }
@@ -1544,7 +1536,7 @@ impl Fmtp {
     /// The `fmtp` attribute. It fails if the format is not a token, the
     /// settings are empty or hold a line break, or the attribute would not
     /// fit on one line.
-    pub fn to_attribute(&self) -> Result<Attribute, AttributeError> {
+    pub fn to_attribute(&self) -> Result<Attribute, Error> {
         check(is_token(&self.format) && is_text(&self.params))?;
         let mut v = String::new();
         push_fitting(&mut v, "fmtp", &[&self.format, " ", &self.params])?;
@@ -1732,8 +1724,8 @@ impl Candidate {
     /// Reads a `candidate` attribute. `raddr` and `rport` may come in
     /// either order, anywhere after the type. The keywords `typ`, `raddr`
     /// and `rport` match in any case.
-    pub fn from_attribute(a: &Attribute) -> Result<Candidate, AttributeError> {
-        Candidate::parse(line_value(a, "candidate")?).ok_or(AttributeError)
+    pub fn from_attribute(a: &Attribute) -> Result<Candidate, Error> {
+        Candidate::parse(line_value(a, "candidate")?).ok_or(Error::Attribute)
     }
 
     /// Whether `raddr` and `rport` are there when the type needs them, and
@@ -1800,7 +1792,7 @@ impl Candidate {
     /// known type's name, `raddr` and `rport` do not suit the type, an
     /// extension is named `raddr` or `rport` in any case, or the attribute
     /// would not fit on one line.
-    pub fn to_attribute(&self) -> Result<Attribute, AttributeError> {
+    pub fn to_attribute(&self) -> Result<Attribute, Error> {
         check(
             is_foundation(&self.foundation)
                 && (1..=MAX_COMPONENT).contains(&self.component)
@@ -1889,11 +1881,11 @@ mod tests {
         a=sendonly\r\n\
         m=application 0 UDP/DTLS/SCTP webrtc-datachannel\r\n";
 
-    // Adapter and chunking checks: Wire::parse also uses Descriptions.
+    // Adapter and chunking checks: Wire::parse also uses SessionDescriptions.
     fn check_description(b: &[u8]) -> Result<SessionDescription, Error> {
-        contract::check_decode_with_alloc_limit(Descriptions::new, b, 2 * (MAX_LINE_LEN + 2));
-        contract::check_decode_with_held_limit(Descriptions::new, b, MAX_LEN);
-        let (mut items, failure) = decode_all(Descriptions::new, b);
+        contract::check_decode_with_alloc_limit(SessionDescriptions::new, b, 2 * (MAX_LINE_LEN + 2));
+        contract::check_decode_with_held_limit(SessionDescriptions::new, b, MAX_LEN);
+        let (mut items, failure) = decode_all(SessionDescriptions::new, b);
         match failure {
             Some(codec::Fail::Protocol(error)) => Err(error),
             None => {
@@ -2168,7 +2160,7 @@ mod tests {
         let fits = format!("t=0 0\r\na=x:{}\r\n", "y".repeat(MAX_LINE_LEN - 4));
         assert!(SessionDescription::parse(&with(&fits)).is_ok());
         // A long line is caught before its end comes.
-        let mut d = Stream::new(Descriptions::new());
+        let mut d = Stream::new(SessionDescriptions::new());
         assert_eq!(d.push(&vec![b'a'; MAX_LINE_LEN + 2]), MAX_LINE_LEN + 2);
         assert_eq!(d.next(), Some(Err(codec::Fail::Protocol(Error::LineTooLong { line: 1 }))));
         assert_eq!(d.push(b"\r\nv=0"), 5);
@@ -2334,18 +2326,18 @@ mod tests {
             "x opus/8000",
             "96 opus/4294967296",
         ] {
-            assert_eq!(RtpMap::from_attribute(&Attribute::new("rtpmap", bad)), Err(AttributeError), "{bad}");
+            assert_eq!(RtpMap::from_attribute(&Attribute::new("rtpmap", bad)), Err(Error::Attribute), "{bad}");
         }
-        assert_eq!(RtpMap::from_attribute(&Attribute::new("fmtp", "96 opus/8000")), Err(AttributeError));
-        assert_eq!(RtpMap::from_attribute(&Attribute::flag("rtpmap")), Err(AttributeError));
+        assert_eq!(RtpMap::from_attribute(&Attribute::new("fmtp", "96 opus/8000")), Err(Error::Attribute));
+        assert_eq!(RtpMap::from_attribute(&Attribute::flag("rtpmap")), Err(Error::Attribute));
         let mut r = RtpMap { payload: 128, encoding: "PCMU".into(), clock_rate: 8000, params: None };
-        assert_eq!(r.to_attribute(), Err(AttributeError));
+        assert_eq!(r.to_attribute(), Err(Error::Attribute));
         r.payload = 0;
         r.params = Some("a b".into());
-        assert_eq!(r.to_attribute(), Err(AttributeError));
+        assert_eq!(r.to_attribute(), Err(Error::Attribute));
         r.params = None;
         r.encoding = "a/b".into();
-        assert_eq!(r.to_attribute(), Err(AttributeError));
+        assert_eq!(r.to_attribute(), Err(Error::Attribute));
     }
 
     #[test]
@@ -2359,10 +2351,10 @@ mod tests {
         assert_eq!(back.parameters(), [("profile-level-id", Some("42e01f")), ("packetization-mode", Some("1"))]);
         assert_eq!(back, f);
         for bad in ["97", "97 ", "9:7 x"] {
-            assert_eq!(Fmtp::from_attribute(&Attribute::new("fmtp", bad)), Err(AttributeError), "{bad}");
+            assert_eq!(Fmtp::from_attribute(&Attribute::new("fmtp", bad)), Err(Error::Attribute), "{bad}");
         }
-        assert_eq!(Fmtp { format: "97".into(), params: String::new() }.to_attribute(), Err(AttributeError));
-        assert_eq!(Fmtp { format: "9 7".into(), params: "x".into() }.to_attribute(), Err(AttributeError));
+        assert_eq!(Fmtp { format: "97".into(), params: String::new() }.to_attribute(), Err(Error::Attribute));
+        assert_eq!(Fmtp { format: "9 7".into(), params: "x".into() }.to_attribute(), Err(Error::Attribute));
     }
 
     #[test]
@@ -2413,20 +2405,20 @@ mod tests {
             "1 1 UDP 1 a 1 typ host  generation 0",
         ];
         for v in bad {
-            assert_eq!(Candidate::from_attribute(&Attribute::new("candidate", v)), Err(AttributeError), "{v}");
+            assert_eq!(Candidate::from_attribute(&Attribute::new("candidate", v)), Err(Error::Attribute), "{v}");
         }
         let mut c2 = c.clone();
         c2.extensions.push(("raddr".into(), "x".into()));
-        assert_eq!(c2.to_attribute(), Err(AttributeError));
+        assert_eq!(c2.to_attribute(), Err(Error::Attribute));
         let mut c2 = c.clone();
         c2.component = 0;
-        assert_eq!(c2.to_attribute(), Err(AttributeError));
+        assert_eq!(c2.to_attribute(), Err(Error::Attribute));
         let mut c2 = c.clone();
         c2.kind = CandidateType::Other("a b".into());
-        assert_eq!(c2.to_attribute(), Err(AttributeError));
+        assert_eq!(c2.to_attribute(), Err(Error::Attribute));
         let mut c2 = c;
         c2.related_address = Some(String::new());
-        assert_eq!(c2.to_attribute(), Err(AttributeError));
+        assert_eq!(c2.to_attribute(), Err(Error::Attribute));
     }
 
     #[test]
@@ -2567,11 +2559,11 @@ mod tests {
         // clock-rate is an integer, which starts with a nonzero digit, and
         // payload-type is "0" or such an integer.
         for bad in ["96 opus/0", "96 opus/048000", "096 opus/48000", "00 PCMU/8000"] {
-            assert_eq!(RtpMap::from_attribute(&Attribute::new("rtpmap", bad)), Err(AttributeError), "{bad}");
+            assert_eq!(RtpMap::from_attribute(&Attribute::new("rtpmap", bad)), Err(Error::Attribute), "{bad}");
         }
         assert!(RtpMap::from_attribute(&Attribute::new("rtpmap", "0 PCMU/8000")).is_ok());
         let r = RtpMap { payload: 0, encoding: "PCMU".into(), clock_rate: 0, params: None };
-        assert_eq!(r.to_attribute(), Err(AttributeError));
+        assert_eq!(r.to_attribute(), Err(Error::Attribute));
         // A format that is not a plain number names no payload type.
         let d = SessionDescription::parse(&with(
             "c=IN IP4 192.0.2.9\r\nt=0 0\r\nm=audio 1 udp +96\r\na=rtpmap:96 opus/48000\r\n",
@@ -2589,7 +2581,7 @@ mod tests {
         for name in ["host", "srflx", "prflx", "relay", "HOST"] {
             let mut c = host.clone();
             c.kind = CandidateType::Other(name.into());
-            assert_eq!(c.to_attribute(), Err(AttributeError), "{name}");
+            assert_eq!(c.to_attribute(), Err(Error::Attribute), "{name}");
         }
         for kind in [CandidateType::Host, CandidateType::Relay, CandidateType::Other("x-new".into())] {
             assert_eq!(CandidateType::from_name(kind.as_str()), kind);
@@ -2610,9 +2602,9 @@ mod tests {
         let mut c2 = c;
         c2.related_address = None;
         c2.extensions.push(("RADDR".into(), "x".into()));
-        assert_eq!(c2.to_attribute(), Err(AttributeError));
+        assert_eq!(c2.to_attribute(), Err(Error::Attribute));
         let bad = Attribute::new("candidate", "1 1 UDP 1 a 1 typ host raddr a RADDR b");
-        assert_eq!(Candidate::from_attribute(&bad), Err(AttributeError));
+        assert_eq!(Candidate::from_attribute(&bad), Err(Error::Attribute));
     }
 
     #[test]
@@ -2671,7 +2663,7 @@ mod tests {
 
     #[test]
     fn decoder_stops_at_the_first_error() {
-        let mut d = Stream::new(Descriptions::new());
+        let mut d = Stream::new(SessionDescriptions::new());
         assert_eq!(d.push(b"v=0\r\nq=1\r\n"), 10);
         let error = codec::Fail::Protocol(Error::UnknownType { line: 2, kind: 'q' });
         assert_eq!(d.next(), Some(Err(error.clone())));
@@ -2697,7 +2689,7 @@ mod tests {
         for e in all {
             assert!(!e.to_string().is_empty());
         }
-        assert!(!AttributeError.to_string().is_empty());
+        assert!(!Error::Attribute.to_string().is_empty());
     }
 
     // Regressions from review.
@@ -2708,13 +2700,13 @@ mod tests {
         // is copied, and so are long rtpmap and fmtp values.
         let base = "1 1 UDP 1 192.0.2.1 9 typ host";
         let long = format!("{base}{}", " x y".repeat(2000));
-        assert_eq!(Candidate::from_attribute(&Attribute::new("candidate", &long)), Err(AttributeError));
+        assert_eq!(Candidate::from_attribute(&Attribute::new("candidate", &long)), Err(Error::Attribute));
         assert_eq!(
             Fmtp::from_attribute(&Attribute::new("fmtp", &format!("96 {}", "x;".repeat(5000)))),
-            Err(AttributeError)
+            Err(Error::Attribute)
         );
         let enc = "a".repeat(MAX_LINE_LEN);
-        assert_eq!(RtpMap::from_attribute(&Attribute::new("rtpmap", &format!("96 {enc}/8000"))), Err(AttributeError));
+        assert_eq!(RtpMap::from_attribute(&Attribute::new("rtpmap", &format!("96 {enc}/8000"))), Err(Error::Attribute));
         // The longest candidate that fits on a line reads, writes and goes
         // in a description.
         let room = MAX_LINE_LEN - "a=candidate:".len() - base.len() - " x ".len();
@@ -2727,11 +2719,11 @@ mod tests {
         assert_eq!(SessionDescription::parse(&d.to_bytes().unwrap()), Ok(d));
         // One byte more is refused both ways.
         let over = format!("{fits}y");
-        assert_eq!(Candidate::from_attribute(&Attribute::new("candidate", &over)), Err(AttributeError));
+        assert_eq!(Candidate::from_attribute(&Attribute::new("candidate", &over)), Err(Error::Attribute));
         let mut c2 = c;
         c2.extensions[0].1.push('y');
-        assert_eq!(c2.to_attribute(), Err(AttributeError));
-        assert_eq!(Fmtp { format: "96".into(), params: "x".repeat(MAX_LINE_LEN) }.to_attribute(), Err(AttributeError));
+        assert_eq!(c2.to_attribute(), Err(Error::Attribute));
+        assert_eq!(Fmtp { format: "96".into(), params: "x".repeat(MAX_LINE_LEN) }.to_attribute(), Err(Error::Attribute));
     }
 
     #[test]
@@ -2862,14 +2854,14 @@ mod tests {
         let at =
             |p: &str| Candidate::from_attribute(&Attribute::new("candidate", &format!("1 1 UDP {p} a 1 typ host")));
         for p in ["0", "2147483648", "4294967295"] {
-            assert_eq!(at(p), Err(AttributeError), "{p}");
+            assert_eq!(at(p), Err(Error::Attribute), "{p}");
         }
         assert_eq!(at("1").unwrap().priority, 1);
         let c = at("2147483647").unwrap();
         assert_eq!(c.priority, MAX_PRIORITY);
         assert!(c.to_attribute().is_ok());
         for p in [0, MAX_PRIORITY + 1, u32::MAX] {
-            assert_eq!(Candidate { priority: p, ..c.clone() }.to_attribute(), Err(AttributeError), "{p}");
+            assert_eq!(Candidate { priority: p, ..c.clone() }.to_attribute(), Err(Error::Attribute), "{p}");
         }
     }
 
@@ -2883,7 +2875,7 @@ mod tests {
             "1 1 UDP 1 192.0.2.1 9 typ host raddr 10.0.0.1 rport 9",
             "1 1 UDP 1 192.0.2.1 9 typ host rport 9",
         ] {
-            assert_eq!(at(v), Err(AttributeError), "{v}");
+            assert_eq!(at(v), Err(Error::Attribute), "{v}");
         }
         for v in ["1 1 UDP 1 192.0.2.1 9 typ relay raddr 0.0.0.0 rport 9", "1 1 UDP 1 192.0.2.1 9 typ x-new rport 9"] {
             let c = at(v).unwrap();
@@ -2892,10 +2884,10 @@ mod tests {
         let host = at("1 1 UDP 1 192.0.2.1 9 typ host").unwrap();
         let mut c = host.clone();
         c.related_port = Some(9);
-        assert_eq!(c.to_attribute(), Err(AttributeError));
+        assert_eq!(c.to_attribute(), Err(Error::Attribute));
         let mut c = host;
         c.kind = CandidateType::Relay;
-        assert_eq!(c.to_attribute(), Err(AttributeError));
+        assert_eq!(c.to_attribute(), Err(Error::Attribute));
         c.related_address = Some("0.0.0.0".into());
         c.related_port = Some(9);
         assert!(c.to_attribute().is_ok());
@@ -2920,28 +2912,28 @@ mod tests {
             "1 1 UDP 1 a 1 typ ho#st",
             "1 1 UDP 1 a 1 typ host a{b 1",
         ] {
-            assert_eq!(at(v), Err(AttributeError), "{v}");
+            assert_eq!(at(v), Err(Error::Attribute), "{v}");
         }
         // Ports may have leading zeros.
         let c = at("1 1 UDP 1 a 000009 typ srflx raddr b rport 0000009").unwrap();
         assert_eq!((c.port, c.related_port), (9, Some(9)));
         let mut c2 = c.clone();
         c2.extensions.push(("x".into(), "\u{e9}".into()));
-        assert_eq!(c2.to_attribute(), Err(AttributeError));
+        assert_eq!(c2.to_attribute(), Err(Error::Attribute));
         let mut c2 = c;
         c2.transport = "U{DP".into();
-        assert_eq!(c2.to_attribute(), Err(AttributeError));
+        assert_eq!(c2.to_attribute(), Err(Error::Attribute));
     }
 
     #[test]
     fn rtpmap_channels_are_a_count() {
         for bad in ["96 opus/48000/0", "96 opus/48000/02", "96 opus/48000/stereo/extra", "96 opus/48000/stereo"] {
-            assert_eq!(RtpMap::from_attribute(&Attribute::new("rtpmap", bad)), Err(AttributeError), "{bad}");
+            assert_eq!(RtpMap::from_attribute(&Attribute::new("rtpmap", bad)), Err(Error::Attribute), "{bad}");
         }
         let r = RtpMap::from_attribute(&Attribute::new("rtpmap", "96 opus/48000/2")).unwrap();
         for p in ["0", "02", "x"] {
             let r = RtpMap { params: Some(p.into()), ..r.clone() };
-            assert_eq!(r.to_attribute(), Err(AttributeError), "{p}");
+            assert_eq!(r.to_attribute(), Err(Error::Attribute), "{p}");
         }
     }
 
