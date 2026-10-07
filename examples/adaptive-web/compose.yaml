@@ -1,0 +1,108 @@
+# The adaptive web on Fictionet, for Inspect's stock "docker" provider.
+#
+#   fictionet - the world: web::Sites in Rust for any name, and the Python
+#               backend that makes and keeps pages, on its own 127.0.0.1.
+#               Offline (the default) it has no network at all. Live, it
+#               needs a network to reach the model API, and only it has one.
+#   attach    - fictionet attach --type tun: makes tun0 in its own network
+#               namespace and relays its packets to the world socket.
+#   default   - the agent. It joins attach's network namespace, so its only
+#               interface is tun0. It has no extra capabilities and does not
+#               see the world socket.
+#
+# Settings, from the environment of the shell that runs Inspect or Compose:
+#   ADAPTIVE_WEB_SEED         the seed; Inspect sets it from sample metadata
+#                             (SAMPLE_METADATA_SEED)
+#   ADAPTIVE_WEB_GENERATOR    stub (default), anthropic or replay
+#   ADAPTIVE_WEB_NETWORK      the world's network: none (default), or bridge
+#                             for anthropic
+#   ADAPTIVE_WEB_MODEL, ADAPTIVE_WEB_PREFETCH   see world/backend/backend.py
+#   ADAPTIVE_WEB_STORE_DIR    an absolute host directory to keep pages in
+#                             across runs; by default a volume per run
+#   ANTHROPIC_API_KEY         passed through for anthropic; never logged
+
+x-build: &build
+  context: ../..
+  dockerfile: examples/adaptive-web/docker/Dockerfile
+
+services:
+  fictionet:
+    build:
+      <<: *build
+      target: world
+    image: fictionet-adaptive-web-world:dev
+    network_mode: ${ADAPTIVE_WEB_NETWORK:-none}
+    # The world is trusted. NET_ADMIN lets it raise its socket buffers to
+    # attach past the system limit, so a burst of packets is not lost.
+    cap_add: [NET_ADMIN]
+    environment:
+      ADAPTIVE_WEB_SEED: ${SAMPLE_METADATA_SEED:-${ADAPTIVE_WEB_SEED:-halvard-cve}}
+      ADAPTIVE_WEB_GENERATOR: ${ADAPTIVE_WEB_GENERATOR:-stub}
+      ADAPTIVE_WEB_MODEL: ${ADAPTIVE_WEB_MODEL:-}
+      ADAPTIVE_WEB_PREFETCH: ${ADAPTIVE_WEB_PREFETCH:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    volumes:
+      - sock:/run/fictionet/sock
+      - ${ADAPTIVE_WEB_STORE_DIR:-store}:/var/lib/adaptive-web
+    healthcheck:
+      test: ["CMD", "test", "-f", "/run/fictionet/ready"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+      start_period: 1s
+
+  attach:
+    build:
+      <<: *build
+      target: attach
+    image: fictionet-adaptive-web-attach:dev
+    command:
+      - fictionet
+      - attach
+      - --world
+      - unix:/run/fictionet/sock/world.sock
+      - --name
+      - agent
+      - --type
+      - tun
+      - --ip-addr
+      - 10.0.0.2/24
+      - --gateway
+      - 10.0.0.1
+      - --dns
+      - 10.0.0.1
+      - --no-ip-addr-v6
+      - --no-gateway-v6
+      - --no-dns-v6
+      - --ready-file
+      - /run/attach-ready
+    network_mode: none
+    cap_add: [NET_ADMIN]
+    devices:
+      - /dev/net/tun
+    volumes:
+      - sock:/run/fictionet/sock
+    depends_on:
+      fictionet:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "test", "-f", "/run/attach-ready"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+      start_period: 1s
+
+  default:
+    build:
+      <<: *build
+      target: agent
+    image: fictionet-adaptive-web-agent:dev
+    network_mode: "service:attach"
+    depends_on:
+      attach:
+        condition: service_healthy
+    init: true
+
+volumes:
+  sock:
+  store:

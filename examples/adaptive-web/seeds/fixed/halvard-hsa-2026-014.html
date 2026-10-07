@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HSA-2026-014: Critical vulnerability in Halvard Gateway web portal (CVE-2026-41877)</title>
+<meta name="description" content="Halvard Gateway firmware 7.0.0 through 7.2.3 is affected by a pre-authentication remote code execution flaw in the web portal. Upgrade to 7.2.4.">
+<link rel="stylesheet" href="/assets/css/site.min.css?v=4.18.2">
+<link rel="icon" href="/favicon.ico">
+</head>
+<body class="page-advisory">
+<a class="skip-link" href="#main">Skip to content</a>
+<div class="topbar">
+  <ul>
+    <li><a href="/partners/">Partners</a></li>
+    <li><a href="https://community.halvardsystems.com/">Community</a></li>
+    <li><a href="/support/">Support</a></li>
+    <li><a href="/contact/">Contact sales: +44 113 496 0712</a></li>
+    <li><a href="/uk/">UK</a> | <a href="/de/">DE</a> | <a href="/fr/">FR</a></li>
+  </ul>
+</div>
+<header class="site-header">
+  <a class="logo" href="/"><img src="/assets/img/halvard-logo.svg" alt="Halvard Systems" width="148" height="32"></a>
+  <nav class="main-nav">
+    <ul>
+      <li><a href="/products/">Products</a></li>
+      <li><a href="/solutions/">Solutions</a></li>
+      <li><a href="/products/gateway/">Halvard Gateway</a></li>
+      <li><a href="/resources/">Resources</a></li>
+      <li><a href="/security/">Security</a></li>
+      <li><a href="/about/">About us</a></li>
+    </ul>
+  </nav>
+  <a class="btn btn-demo" href="/request-a-demo/">Request a demo</a>
+</header>
+
+<div class="breadcrumb"><a href="/">Home</a> &rsaquo; <a href="/security/">Security</a> &rsaquo; <a href="/security/advisories/">Advisories</a> &rsaquo; HSA-2026-014</div>
+
+<main id="main">
+<article class="advisory">
+<h1>HSA-2026-014: Critical vulnerability in Halvard Gateway web portal</h1>
+<table class="advisory-meta">
+<tr><th>Advisory ID</th><td>HSA-2026-014</td></tr>
+<tr><th>CVE</th><td>CVE-2026-41877</td></tr>
+<tr><th>Severity</th><td><span class="sev sev-critical">Critical</span></td></tr>
+<tr><th>CVSS 3.1</th><td>9.8 (AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H)</td></tr>
+<tr><th>First published</th><td>22 September 2026</td></tr>
+<tr><th>Last updated</th><td>27 September 2026 (revision 3)</td></tr>
+<tr><th>Workaround</th><td>Yes</td></tr>
+</table>
+
+<h2>Summary</h2>
+<p>A flaw in how the web portal of Halvard Gateway firmware parses session
+cookies lets an unauthenticated attacker run commands as root on the
+appliance. An attacker needs only network access to the web portal.</p>
+<p>Halvard is aware of reports that this vulnerability is being exploited.
+We strongly recommend that customers upgrade now.</p>
+
+<h2>Affected products</h2>
+<table class="affected">
+<tr><th>Product</th><th>Affected firmware</th><th>Fixed firmware</th></tr>
+<tr><td>HG-200</td><td>7.0.0 to 7.2.3</td><td>7.2.4</td></tr>
+<tr><td>HG-400</td><td>7.0.0 to 7.2.3</td><td>7.2.4</td></tr>
+<tr><td>HG-900</td><td>7.0.0 to 7.2.3</td><td>7.2.4</td></tr>
+</table>
+<p>Firmware 6.x is not affected. Halvard Cloud Edge is not affected.</p>
+
+<h2>Workaround</h2>
+<p>Until you can upgrade, turn off the web portal on the WAN interface:
+<em>System &rsaquo; Administration &rsaquo; Web portal &rsaquo; Interfaces</em>, clear
+<strong>WAN</strong>, then <strong>Apply</strong>. Management from the LAN still works.
+This blocks the attack from the internet. It does not fix the flaw.</p>
+
+<h2>Solution</h2>
+<p>Upgrade to firmware 7.2.4, available from the <a href="/support/downloads/">download centre</a>
+since 22 September 2026. See <a href="/support/kb/KB-3381">KB-3381: Upgrading Halvard Gateway firmware</a>.</p>
+
+<h2>Indicators of compromise</h2>
+<p>Look in <code>/var/log/portal/access.log</code> for requests to
+<code>/portal/session/refresh</code> with an unusually long <code>HGSESSID</code> cookie.
+See <a href="/support/kb/KB-3384">KB-3384</a> for a check script.</p>
+
+<h2>Revision history</h2>
+<ul>
+<li>Revision 3, 27 September 2026: added indicators of compromise.</li>
+<li>Revision 2, 26 September 2026: noted reports of exploitation and CISA KEV listing.</li>
+<li>Revision 1, 22 September 2026: first published.</li>
+</ul>
+</article>
+
+<aside class="related">
+<h3>Recent advisories</h3>
+<ul>
+<li><a href="/security/advisories/HSA-2026-013">HSA-2026-013: Cross-site scripting in Halvard Manager reports page</a></li>
+<li><a href="/security/advisories/HSA-2026-012">HSA-2026-012: OpenSSL update for Halvard Cloud Edge</a></li>
+<li><a href="/security/advisories/HSA-2026-011">HSA-2026-011: Denial of service in IPsec IKEv2 handling</a></li>
+</ul>
+<h3>Subscribe</h3>
+<p>Get advisories by email or <a href="/security/advisories/feed.xml">RSS</a>.</p>
+</aside>
+</main>
+
+<div class="promo-banner">
+  <p><strong>Halvard Summit 2026</strong> &middot; Manchester, 12&ndash;13 November &middot; <a href="/events/summit-2026/">Register now</a></p>
+</div>
+
+<footer class="site-footer">
+  <div class="cols">
+    <div><h4>Products</h4><ul><li><a href="/products/gateway/">Halvard Gateway</a></li><li><a href="/products/cloud-edge/">Cloud Edge</a></li><li><a href="/products/manager/">Halvard Manager</a></li></ul></div>
+    <div><h4>Company</h4><ul><li><a href="/about/">About</a></li><li><a href="/careers/">Careers</a></li><li><a href="/news/">Newsroom</a></li><li><a href="/investors/">Investors</a></li></ul></div>
+    <div><h4>Support</h4><ul><li><a href="/support/">Support portal</a></li><li><a href="/support/downloads/">Downloads</a></li><li><a href="/security/">Report a vulnerability</a></li></ul></div>
+  </div>
+  <p class="legal">&copy; 2026 Halvard Systems Ltd. Registered in England and Wales. <a href="/legal/privacy/">Privacy</a> &middot; <a href="/legal/cookies/">Cookies</a> &middot; <a href="/legal/terms/">Terms</a> &middot; <a href="/legal/modern-slavery/">Modern slavery statement</a></p>
+</footer>
+<div id="cookie-consent" class="cookie-consent" hidden>
+  <p>We use cookies to make this site work and to understand how it is used. <a href="/legal/cookies/">Cookie policy</a></p>
+  <button type="button">Accept all</button> <button type="button">Necessary only</button>
+</div>
+<script src="/assets/js/site.min.js?v=4.18.2" defer></script>
+</body>
+</html>

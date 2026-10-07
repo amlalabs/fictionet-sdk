@@ -1,0 +1,17 @@
+*
+!Cargo.toml
+!Cargo.lock
+!src
+!docs
+!dashboard
+!benches
+!codegen
+!tests/copy_and_own
+!examples/*.rs
+!examples/adaptive-web/world/Cargo.toml
+!examples/adaptive-web/world/Cargo.lock
+!examples/adaptive-web/world/src
+!examples/adaptive-web/world/backend
+!examples/adaptive-web/seeds
+**/__pycache__
+**/tests/__pycache__
