@@ -92,7 +92,8 @@ pub const MAX_ENTITY: usize = 16 * 1024 * 1024;
 /// The longest boundary line, including CR LF, dashes, padding, and CR LF.
 /// Derived from RFC 2046's [`MAX_BOUNDARY`] and this module's [`MAX_PADDING`].
 pub const MAX_BOUNDARY_LINE: usize = MAX_BOUNDARY + MAX_PADDING + 8;
-/// Why bytes are not a multipart body. Once [`Parts`] meets one, it
+/// Why bytes are not a multipart body, or why a part, entity, or
+/// parameterized header cannot be written. Once [`Parts`] meets one, it
 /// reads no further.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Error {
@@ -101,9 +102,10 @@ pub enum Error {
     Boundary,
     /// The body ended before the closing boundary line.
     Truncated,
-    /// The body holds more than [`MAX_PARTS`] parts.
+    /// The body holds, or a writer was given, more than [`MAX_PARTS`] parts.
     TooManyParts,
-    /// A part's header block is longer than [`MAX_HEADER_BYTES`].
+    /// A part's header block, or a parameterized value being written, is
+    /// longer than [`MAX_HEADER_BYTES`].
     HeaderTooLong,
     /// A part has more than [`MAX_HEADERS`] header fields.
     TooManyHeaders,
@@ -115,10 +117,23 @@ pub enum Error {
     /// any amount of padding, but a body part may not hold the boundary at
     /// all, so the parser refuses the body rather than guess.
     Padding,
-    /// A part or preamble is longer than [`MAX_PART`].
+    /// A part or preamble is longer than [`MAX_PART`]. A part being
+    /// written counts its headers too.
     TooLong,
     /// A complete entity is longer than [`MAX_ENTITY`].
     EntityTooLong,
+    /// The boundary, after `--`, appears in the preamble or in a part
+    /// being written.
+    BoundaryInData,
+    /// A header name being written is empty or holds a character other
+    /// than visible ASCII, or a colon. A parameter name is empty or is not
+    /// a token.
+    HeaderName,
+    /// A header value being written holds CR or LF, or starts or ends with
+    /// a space or tab.
+    HeaderValue,
+    /// The value cannot be written without changing it.
+    Unwritable,
 }
 
 impl core::fmt::Display for Error {
@@ -133,57 +148,15 @@ impl core::fmt::Display for Error {
             Error::Padding => "multipart boundary line has too much padding",
             Error::TooLong => "multipart part or preamble is over the size limit",
             Error::EntityTooLong => "multipart entity is over the size limit",
+            Error::BoundaryInData => "the boundary appears in the data",
+            Error::HeaderName => "a header name is not valid",
+            Error::HeaderValue => "a header value is not valid",
+            Error::Unwritable => "value cannot be written without changing it",
         })
     }
 }
 
 impl core::error::Error for Error {}
-
-/// Why a multipart part, entity, or parameterized header cannot be written.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum WriteError {
-    /// The boundary is not one RFC 2046 allows.
-    Boundary,
-    /// The boundary, after `--`, appears in the preamble or in a part.
-    BoundaryInData,
-    /// There are more than [`MAX_PARTS`] parts.
-    TooManyParts,
-    /// A part has more than [`MAX_HEADERS`] header fields.
-    TooManyHeaders,
-    /// A part's header block or a parameterized value would be longer than
-    /// [`MAX_HEADER_BYTES`].
-    HeaderTooLong,
-    /// A header name is empty or holds a character other than visible
-    /// ASCII, or a colon. A parameter name is empty or is not a token.
-    HeaderName,
-    /// A header value holds CR or LF, or starts or ends with a space or tab.
-    HeaderValue,
-    /// A part is longer than [`MAX_PART`], including its headers.
-    TooLong,
-    /// A complete entity is longer than [`MAX_ENTITY`].
-    EntityTooLong,
-    /// The value cannot be written without changing it.
-    Unwritable,
-}
-
-impl core::fmt::Display for WriteError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(match self {
-            WriteError::Boundary => "not a valid multipart boundary",
-            WriteError::BoundaryInData => "the boundary appears in the data",
-            WriteError::TooManyParts => "too many parts",
-            WriteError::TooManyHeaders => "too many header fields in a part",
-            WriteError::HeaderTooLong => "a part's header block is too long",
-            WriteError::HeaderName => "a header name is not valid",
-            WriteError::HeaderValue => "a header value is not valid",
-            WriteError::TooLong => "multipart part is over the size limit",
-            WriteError::EntityTooLong => "multipart entity is over the size limit",
-            WriteError::Unwritable => "value cannot be written without changing it",
-        })
-    }
-}
-
-impl core::error::Error for WriteError {}
 
 /// Whether `b` is a boundary RFC 2046 allows: 1 to 70 characters from its
 /// set (letters, digits, space and `'()+_,-./:=?`), not ending in a space.
@@ -390,16 +363,16 @@ impl ParamValue {
         self.params.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
     }
 
-    fn header_text(&self) -> Result<String, WriteError> {
+    fn header_text(&self) -> Result<String, Error> {
         let v = &self.value;
         if v.contains(['\r', '\n']) || v.trim_matches(is_wsp_char).len() != v.len() {
-            return Err(WriteError::HeaderValue);
+            return Err(Error::HeaderValue);
         }
         if v.is_empty() || v.contains(';') {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         if self.params.len() > MAX_PARAMETERS {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         let len = self.params.iter().fold(v.len(), |n, (name, value)| {
             let quoted = value.is_empty() || !value.bytes().all(is_token);
@@ -408,18 +381,18 @@ impl ParamValue {
                 .saturating_add(3).saturating_add(if quoted { 2 } else { 0 })
         });
         if len > MAX_HEADER_BYTES {
-            return Err(WriteError::HeaderTooLong);
+            return Err(Error::HeaderTooLong);
         }
         let mut out = v.clone();
         for (i, (name, value)) in self.params.iter().enumerate() {
             if name.is_empty() || !name.bytes().all(is_token) {
-                return Err(WriteError::HeaderName);
+                return Err(Error::HeaderName);
             }
             if value.contains(['\r', '\n']) {
-                return Err(WriteError::HeaderValue);
+                return Err(Error::HeaderValue);
             }
             if self.params[..i].iter().any(|(n, _)| n.eq_ignore_ascii_case(name)) {
-                return Err(WriteError::Unwritable);
+                return Err(Error::Unwritable);
             }
             out.push_str("; ");
             out.push_str(name);
@@ -443,7 +416,7 @@ impl ParamValue {
 
 impl Wire for ParamValue {
     type ParseError = Error;
-    type WriteError = WriteError;
+    type WriteError = Error;
 
     /// Reads a UTF-8 parameterized header value. Refuses malformed or
     /// repeated parameters, CR or LF, and raw or canonical headers beyond
@@ -462,12 +435,12 @@ impl Wire for ParamValue {
     /// lengths, and values that would read back differently. The main value
     /// must be nonempty, have no semicolon, CR or LF, and have no surrounding
     /// spaces or tabs. A parameter name must be a token. Duplicate names
-    /// are compared without case. Invalid names return [`WriteError::HeaderName`],
+    /// are compared without case. Invalid names return [`Error::HeaderName`],
     /// CR, LF, or surrounding spaces or tabs in the main value return
-    /// [`WriteError::HeaderValue`]. Oversized headers return
-    /// [`WriteError::HeaderTooLong`]. Other refusals return
-    /// [`WriteError::Unwritable`]. Leaves `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+    /// [`Error::HeaderValue`]. Oversized headers return
+    /// [`Error::HeaderTooLong`]. Other refusals return
+    /// [`Error::Unwritable`]. Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         let text = self.header_text()?;
         out.extend_from_slice(text.as_bytes());
         Ok(())
@@ -580,7 +553,7 @@ impl Part {
 
 impl Wire for Part {
     type ParseError = Error;
-    type WriteError = WriteError;
+    type WriteError = Error;
 
     /// Reads one header block and its complete body, without boundary lines.
     /// Every byte after the empty header line belongs to the body. Refuses
@@ -602,7 +575,7 @@ impl Wire for Part {
     /// headers. Refuses invalid header names, CR or LF or surrounding
     /// whitespace in values, excessive headers, and parts over [`MAX_PART`].
     /// On error, `out` is unchanged.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         validate_part(self)?;
         for (name, value) in &self.headers.fields {
             out.extend_from_slice(name.as_bytes());
@@ -616,25 +589,25 @@ impl Wire for Part {
     }
 }
 
-fn validate_part(part: &Part) -> Result<usize, WriteError> {
+fn validate_part(part: &Part) -> Result<usize, Error> {
     if part.headers.fields.len() > MAX_HEADERS {
-        return Err(WriteError::TooManyHeaders);
+        return Err(Error::TooManyHeaders);
     }
     for (name, value) in &part.headers.fields {
         if name.is_empty() || !name.bytes().all(is_ftext) {
-            return Err(WriteError::HeaderName);
+            return Err(Error::HeaderName);
         }
         if !valid_value(value) {
-            return Err(WriteError::HeaderValue);
+            return Err(Error::HeaderValue);
         }
     }
     // Compact separators keep parsed folded headers within the same cap.
     let header = header_block_size(part, 1);
     if header > MAX_HEADER_BYTES {
-        return Err(WriteError::HeaderTooLong);
+        return Err(Error::HeaderTooLong);
     }
     if header.saturating_add(part.body.len()) > MAX_PART {
-        return Err(WriteError::TooLong);
+        return Err(Error::TooLong);
     }
     Ok(header)
 }
@@ -908,35 +881,35 @@ impl Multipart {
 
     /// Chooses a free boundary and returns a complete MIME entity.
     /// Refuses invalid boundary bases and bodies beyond the writer limits.
-    pub fn with_free_boundary(self, base: &str) -> Result<Entity, WriteError> {
+    pub fn with_free_boundary(self, base: &str) -> Result<Entity, Error> {
         let boundary = self.pick_boundary(base)?;
         Ok(self.with_boundary(boundary))
     }
 
-    fn render(&self, boundary: &str) -> Result<Vec<u8>, WriteError> {
+    fn render(&self, boundary: &str) -> Result<Vec<u8>, Error> {
         self.validate()?;
         if !valid_boundary(boundary) {
-            return Err(WriteError::Boundary);
+            return Err(Error::Boundary);
         }
         let mut dash = b"--".to_vec();
         dash.extend_from_slice(boundary.as_bytes());
         if self.slices().iter().any(|s| find(s, &dash).is_some()) {
-            return Err(WriteError::BoundaryInData);
+            return Err(Error::BoundaryInData);
         }
         let mut size = self.preamble.len()
             .checked_add(if self.preamble.is_empty() { 0 } else { 2 })
             .and_then(|n| n.checked_add(dash.len()))
             .and_then(|n| n.checked_add(4))
             .and_then(|n| n.checked_add(self.epilogue.len()))
-            .ok_or(WriteError::EntityTooLong)?;
+            .ok_or(Error::EntityTooLong)?;
         for part in &self.parts {
             size = size.checked_add(header_block_size(part, header_separator(part).len()))
                 .and_then(|n| n.checked_add(part.body.len()))
                 .and_then(|n| n.checked_add(dash.len() + 4))
-                .ok_or(WriteError::EntityTooLong)?;
+                .ok_or(Error::EntityTooLong)?;
         }
         if size > MAX_ENTITY {
-            return Err(WriteError::EntityTooLong);
+            return Err(Error::EntityTooLong);
         }
         let mut out = Vec::with_capacity(size);
         if !self.preamble.is_empty() {
@@ -961,7 +934,7 @@ impl Multipart {
         out.extend_from_slice(b"--\r\n");
         out.extend_from_slice(&self.epilogue);
         if out.len() > MAX_ENTITY {
-            return Err(WriteError::EntityTooLong);
+            return Err(Error::EntityTooLong);
         }
         Ok(out)
     }
@@ -970,10 +943,10 @@ impl Multipart {
     /// `base` if that is free. Otherwise it is `base` (cut to 61
     /// characters), a hyphen and the lowest 8-digit hex number that makes
     /// it free. Refuses invalid bases and bodies beyond the writer limits.
-    pub fn pick_boundary(&self, base: &str) -> Result<String, WriteError> {
+    pub fn pick_boundary(&self, base: &str) -> Result<String, Error> {
         self.validate()?;
         if !valid_boundary(base) {
-            return Err(WriteError::Boundary);
+            return Err(Error::Boundary);
         }
         let mut dash = b"--".to_vec();
         dash.extend_from_slice(base.as_bytes());
@@ -1003,17 +976,17 @@ impl Multipart {
         }
         let mut n: u32 = 0;
         while used.contains(&n) {
-            n = n.checked_add(1).ok_or(WriteError::BoundaryInData)?;
+            n = n.checked_add(1).ok_or(Error::BoundaryInData)?;
         }
         Ok(format!("{prefix}{n:08x}"))
     }
 
-    fn validate(&self) -> Result<(), WriteError> {
+    fn validate(&self) -> Result<(), Error> {
         if self.parts.len() > MAX_PARTS {
-            return Err(WriteError::TooManyParts);
+            return Err(Error::TooManyParts);
         }
         if self.preamble.len() > MAX_PART {
-            return Err(WriteError::TooLong);
+            return Err(Error::TooLong);
         }
         let mut size = self.preamble.len().saturating_add(self.epilogue.len());
         for part in &self.parts {
@@ -1021,7 +994,7 @@ impl Multipart {
             size = size.saturating_add(header).saturating_add(part.body.len());
         }
         if size > MAX_ENTITY {
-            return Err(WriteError::EntityTooLong);
+            return Err(Error::EntityTooLong);
         }
         Ok(())
     }
@@ -1064,7 +1037,7 @@ pub struct Body {
 
 impl Wire for Body {
     type ParseError = Error;
-    type WriteError = WriteError;
+    type WriteError = Error;
 
     /// Reads a complete body starting with its delimiter line. Refuses a
     /// preamble, invalid or colliding boundaries, malformed parts, missing
@@ -1093,30 +1066,28 @@ impl Wire for Body {
     }
 
     /// Appends only the multipart body. Refuses nonempty preambles and
-    /// nonempty bodies whose boundary ends in `--` as [`WriteError::Unwritable`].
+    /// nonempty bodies whose boundary ends in `--` as [`Error::Unwritable`].
     /// Also refuses invalid or colliding boundaries, invalid headers,
     /// excessive counts, parts over [`MAX_PART`], and output over
     /// [`MAX_ENTITY`]. On error, `out` is unchanged.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         if !self.multipart.preamble.is_empty()
             || (!self.multipart.parts.is_empty() && self.boundary.ends_with("--"))
         {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         out.extend_from_slice(&self.multipart.render(&self.boundary)?);
         Ok(())
     }
 }
 
-fn parse_error(error: WriteError) -> Error {
+/// Maps a write refusal met while checking parsed input to the parse
+/// error a reader reports for it.
+fn parse_error(error: Error) -> Error {
     match error {
-        WriteError::Boundary | WriteError::BoundaryInData => Error::Boundary,
-        WriteError::TooManyParts => Error::TooManyParts,
-        WriteError::TooManyHeaders => Error::TooManyHeaders,
-        WriteError::HeaderTooLong => Error::HeaderTooLong,
-        WriteError::HeaderName | WriteError::HeaderValue | WriteError::Unwritable => Error::Header,
-        WriteError::TooLong => Error::TooLong,
-        WriteError::EntityTooLong => Error::EntityTooLong,
+        Error::BoundaryInData => Error::Boundary,
+        Error::HeaderName | Error::HeaderValue | Error::Unwritable => Error::Header,
+        other => other,
     }
 }
 
@@ -1133,7 +1104,7 @@ pub struct Entity {
 
 impl Wire for Entity {
     type ParseError = Error;
-    type WriteError = WriteError;
+    type WriteError = Error;
 
     /// Reads a `Content-Type: multipart/mixed` header, an empty line, and
     /// its complete body. Refuses other headers, extra parameters, invalid
@@ -1173,14 +1144,14 @@ impl Wire for Entity {
     /// is unchanged. Header lines use `name: value`, or compact `name:value`
     /// when spaces would exceed the header or part cap. Preamble, body,
     /// and epilogue bytes are preserved.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
-        let content_type = content_type("mixed", &self.boundary).ok_or(WriteError::Boundary)?;
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        let content_type = content_type("mixed", &self.boundary).ok_or(Error::Boundary)?;
         let mut bytes = b"Content-Type: ".to_vec();
         content_type.write(&mut bytes)?;
         bytes.extend_from_slice(b"\r\n\r\n");
         let body = self.multipart.render(&self.boundary)?;
         if bytes.len().saturating_add(body.len()) > MAX_ENTITY {
-            return Err(WriteError::EntityTooLong);
+            return Err(Error::EntityTooLong);
         }
         bytes.extend_from_slice(&body);
         out.extend_from_slice(&bytes);
@@ -1524,14 +1495,14 @@ Content-Type: text/plain
     #[test]
     fn parameter_write_errors_are_specific() {
         for (value, expected) in [
-            (ParamValue { value: "x".into(), params: vec![("bad name".into(), "v".into())] }, WriteError::HeaderName),
-            (ParamValue { value: "x\r\ny".into(), params: vec![] }, WriteError::HeaderValue),
-            (ParamValue { value: "x".into(), params: vec![("n".into(), "v\n".into())] }, WriteError::HeaderValue),
-            (ParamValue { value: "x".repeat(MAX_HEADER_BYTES + 1), params: vec![] }, WriteError::HeaderTooLong),
-            (ParamValue { value: "x".into(), params: vec![("n".into(), "\"".repeat(MAX_HEADER_BYTES / 2))] }, WriteError::HeaderTooLong),
-            (ParamValue { value: " x".into(), params: vec![] }, WriteError::HeaderValue),
-            (ParamValue { value: "x;y".into(), params: vec![] }, WriteError::Unwritable),
-            (ParamValue { value: "x".into(), params: vec![("n".into(), "v".into()), ("N".into(), "v".into())] }, WriteError::Unwritable),
+            (ParamValue { value: "x".into(), params: vec![("bad name".into(), "v".into())] }, Error::HeaderName),
+            (ParamValue { value: "x\r\ny".into(), params: vec![] }, Error::HeaderValue),
+            (ParamValue { value: "x".into(), params: vec![("n".into(), "v\n".into())] }, Error::HeaderValue),
+            (ParamValue { value: "x".repeat(MAX_HEADER_BYTES + 1), params: vec![] }, Error::HeaderTooLong),
+            (ParamValue { value: "x".into(), params: vec![("n".into(), "\"".repeat(MAX_HEADER_BYTES / 2))] }, Error::HeaderTooLong),
+            (ParamValue { value: " x".into(), params: vec![] }, Error::HeaderValue),
+            (ParamValue { value: "x;y".into(), params: vec![] }, Error::Unwritable),
+            (ParamValue { value: "x".into(), params: vec![("n".into(), "v".into()), ("N".into(), "v".into())] }, Error::Unwritable),
         ] {
             let mut out = b"keep".to_vec();
             assert_eq!(value.write(&mut out), Err(expected));
@@ -1554,11 +1525,11 @@ Content-Type: text/plain
         let oversized = Multipart {
             epilogue: vec![b'e'; MAX_ENTITY], ..Multipart::default()
         }.with_boundary("b");
-        assert_eq!(oversized.to_bytes(), Err(WriteError::EntityTooLong));
+        assert_eq!(oversized.to_bytes(), Err(Error::EntityTooLong));
         contract::check_wire_value(&oversized);
         assert_eq!(Multipart::parse(&vec![b'x'; MAX_ENTITY + 1], "b"), Err(Error::EntityTooLong));
         let long = ParamValue { value: "x".repeat(MAX_HEADER_BYTES + 1), params: vec![] };
-        assert_eq!(long.to_bytes(), Err(WriteError::HeaderTooLong));
+        assert_eq!(long.to_bytes(), Err(Error::HeaderTooLong));
         contract::check_wire_value(&long);
         assert_eq!(ParamValue::parse(b"x\r\ny"), Err(Error::Header));
         contract::check_wire::<ParamValue>(b"x;n=\"a b\"");
@@ -1723,7 +1694,7 @@ Content-Type: text/plain
         over.push_str("--b--");
         assert_eq!(Multipart::parse(raw(over.as_bytes()), "b"), Err(Error::TooManyParts));
         ok.parts.push(Part::default());
-        assert_eq!(ok.clone().with_boundary("b").to_bytes(), Err(WriteError::TooManyParts));
+        assert_eq!(ok.clone().with_boundary("b").to_bytes(), Err(Error::TooManyParts));
     }
 
     fn sample() -> Multipart {
@@ -1782,7 +1753,7 @@ Content-Type: text/plain
     fn picking_a_boundary() {
         let mut m =
             Multipart { parts: vec![Part::field("x", "--XyZ and --XyZ-00000000").unwrap()], ..Multipart::default() };
-        assert_eq!(m.clone().with_boundary("XyZ").to_bytes(), Err(WriteError::BoundaryInData));
+        assert_eq!(m.clone().with_boundary("XyZ").to_bytes(), Err(Error::BoundaryInData));
         assert_eq!(m.pick_boundary("XyZ").unwrap(), "XyZ-00000001");
         m.preamble = b"--XyZ-00000001".to_vec();
         assert_eq!(m.pick_boundary("XyZ").unwrap(), "XyZ-00000002");
@@ -1796,13 +1767,13 @@ Content-Type: text/plain
         let b = m.pick_boundary(&base).unwrap();
         assert!(valid_boundary(&b));
         assert_eq!(b.len(), MAX_BOUNDARY);
-        assert_eq!(m.pick_boundary("bad;"), Err(WriteError::Boundary));
+        assert_eq!(m.pick_boundary("bad;"), Err(Error::Boundary));
         // The boundary in a header counts too.
         let h = Multipart {
             parts: vec![Part { headers: Headers { fields: vec![("X".into(), "--k".into())] }, body: vec![] }],
             ..Multipart::default()
         };
-        assert_eq!(h.clone().with_boundary("k").to_bytes(), Err(WriteError::BoundaryInData));
+        assert_eq!(h.clone().with_boundary("k").to_bytes(), Err(Error::BoundaryInData));
         assert_eq!(h.pick_boundary("k").unwrap(), "k-00000000");
     }
 
@@ -1812,20 +1783,20 @@ Content-Type: text/plain
             parts: vec![Part { headers: Headers { fields: vec![(name.into(), value.into())] }, body: vec![] }],
             ..Multipart::default()
         };
-        assert_eq!(with("A", "v").clone().with_boundary("").to_bytes(), Err(WriteError::Boundary));
+        assert_eq!(with("A", "v").clone().with_boundary("").to_bytes(), Err(Error::Boundary));
         assert!(with("A", "").clone().with_boundary("b").to_bytes().is_ok());
-        assert_eq!(with("", "v").clone().with_boundary("b").to_bytes(), Err(WriteError::HeaderName));
-        assert_eq!(with("A B", "v").clone().with_boundary("b").to_bytes(), Err(WriteError::HeaderName));
-        assert_eq!(with("A:", "v").clone().with_boundary("b").to_bytes(), Err(WriteError::HeaderName));
-        assert_eq!(with("A", "v\r\nX: y").clone().with_boundary("b").to_bytes(), Err(WriteError::HeaderValue));
-        assert_eq!(with("A", " v").clone().with_boundary("b").to_bytes(), Err(WriteError::HeaderValue));
-        assert_eq!(with("A", "v\t").clone().with_boundary("b").to_bytes(), Err(WriteError::HeaderValue));
-        assert_eq!(with("A", &"v".repeat(MAX_HEADER_BYTES)).clone().with_boundary("b").to_bytes(), Err(WriteError::HeaderTooLong));
+        assert_eq!(with("", "v").clone().with_boundary("b").to_bytes(), Err(Error::HeaderName));
+        assert_eq!(with("A B", "v").clone().with_boundary("b").to_bytes(), Err(Error::HeaderName));
+        assert_eq!(with("A:", "v").clone().with_boundary("b").to_bytes(), Err(Error::HeaderName));
+        assert_eq!(with("A", "v\r\nX: y").clone().with_boundary("b").to_bytes(), Err(Error::HeaderValue));
+        assert_eq!(with("A", " v").clone().with_boundary("b").to_bytes(), Err(Error::HeaderValue));
+        assert_eq!(with("A", "v\t").clone().with_boundary("b").to_bytes(), Err(Error::HeaderValue));
+        assert_eq!(with("A", &"v".repeat(MAX_HEADER_BYTES)).clone().with_boundary("b").to_bytes(), Err(Error::HeaderTooLong));
         let fits = with("A", &"v".repeat(MAX_HEADER_BYTES - 7));
         assert_eq!(Multipart::parse(raw(&fits.clone().with_boundary("b").to_bytes().unwrap()), "b").unwrap(), fits);
         let mut many = with("A", "v");
         many.parts[0].headers.fields = vec![("A".into(), "v".into()); MAX_HEADERS + 1];
-        assert_eq!(many.clone().with_boundary("b").to_bytes(), Err(WriteError::TooManyHeaders));
+        assert_eq!(many.clone().with_boundary("b").to_bytes(), Err(Error::TooManyHeaders));
         assert_eq!(Part::field("a\r\n", "v"), None);
         assert_eq!(Part::file("a", "f", "text/plain\r\n", "v"), None);
         assert_eq!(Part::file("a", "f\n", "text/plain", "v"), None);
@@ -1932,7 +1903,7 @@ Content-Type: text/plain
             parts: vec![Part { headers: Headers { fields: vec![("--x".into(), "y".into())] }, body: vec![] }],
             ..Multipart::default()
         };
-        assert_eq!(m.clone().with_boundary("x: y").to_bytes(), Err(WriteError::BoundaryInData));
+        assert_eq!(m.clone().with_boundary("x: y").to_bytes(), Err(Error::BoundaryInData));
         let b = m.pick_boundary("x: y").unwrap();
         assert_ne!(b, "x: y");
         let bytes = m.clone().with_boundary(&b).to_bytes().unwrap();
@@ -1941,7 +1912,7 @@ Content-Type: text/plain
         let mut c = m.clone();
         c.parts[0].headers.fields.push(("P".into(), "p".repeat(MAX_HEADER_BYTES - 14)));
         assert_eq!(header_separator(&c.parts[0]), b":");
-        assert_eq!(c.clone().with_boundary("x:y").to_bytes(), Err(WriteError::BoundaryInData));
+        assert_eq!(c.clone().with_boundary("x:y").to_bytes(), Err(Error::BoundaryInData));
         let b = c.pick_boundary("x:y").unwrap();
         assert_eq!(Multipart::parse(raw(&c.clone().with_boundary(&b).to_bytes().unwrap()), &b).unwrap(), c);
     }

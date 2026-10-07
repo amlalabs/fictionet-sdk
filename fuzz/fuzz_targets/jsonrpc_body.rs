@@ -6,18 +6,18 @@ use fictionet::stdlib::codec::{
 };
 use fictionet::stdlib::{
     json::{self, Limits, Value},
-    jsonrpc::{self, Batch, Body, Incoming, Message, ParseError},
+    jsonrpc::{self, Batch, Body, Error, Incoming, Message},
 };
 use libfuzzer_sys::fuzz_target;
 
-fn check_error(error: ParseError) {
+fn check_error(error: Error) {
     let reply = Message::Response(error.response());
     reply.to_bytes().expect("parse error response must fit");
     reply.write_line(&mut Vec::new()).unwrap();
     contract::check_wire_value(&reply);
 }
 
-fn check_incoming(incoming: Result<Incoming, ParseError>) {
+fn check_incoming(incoming: Result<Incoming, Error>) {
     match incoming {
         Ok(incoming) => {
             let items = match incoming {

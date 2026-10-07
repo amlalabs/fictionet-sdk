@@ -3,7 +3,7 @@
 
 use fictionet::stdlib::codec::{Fail, Wire, contract, test_support::decode_all};
 use fictionet::stdlib::urlencoded_form::{
-    EncodeSet, Field, FieldError, Fields, Form, FormError, MAX_INPUT, MAX_PAIRS, PercentEncoded,
+    EncodeSet, Error, Field, Fields, Form, MAX_INPUT, MAX_PAIRS, PercentEncoded,
     decode_component, percent_decode, query_of,
 };
 use libfuzzer_sys::fuzz_target;
@@ -29,19 +29,19 @@ fuzz_target!(|data: &[u8]| {
             assert_eq!(error, None);
             assert_eq!(whole, form);
         }
-        Err(FormError::TooManyPairs) if data.len() <= MAX_INPUT => {
+        Err(Error::TooManyPairs) if data.len() <= MAX_INPUT => {
             assert_eq!(
                 error,
-                Some(Fail::Protocol(FieldError::Form(FormError::TooManyPairs)))
+                Some(Fail::Protocol(Error::TooManyPairs))
             );
         }
-        Err(FormError::TooLong) if data.len() > MAX_INPUT => assert!(error.is_some()),
+        Err(Error::TooLong) if data.len() > MAX_INPUT => assert!(error.is_some()),
         Err(_) => {}
     }
     if error.is_none() {
         match form.to_bytes() {
             Ok(bytes) => assert_eq!(Form::parse(&bytes), Ok(form)),
-            Err(e) => assert_eq!(e, FormError::TooLong),
+            Err(e) => assert_eq!(e, Error::TooLong),
         }
     }
     assert_eq!(percent_decode(data).is_err(), data.len() > MAX_INPUT);
@@ -51,7 +51,7 @@ fuzz_target!(|data: &[u8]| {
     for set in EncodeSet::ALL {
         let encoded = match PercentEncoded::new(data, set, set == EncodeSet::Form) {
             Ok(value) => value,
-            Err(e) => { assert_eq!(e, FormError::TooLong); continue; }
+            Err(e) => { assert_eq!(e, Error::TooLong); continue; }
         };
         contract::check_wire_value(&encoded);
         let bytes = encoded.to_bytes().unwrap();

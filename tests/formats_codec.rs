@@ -70,17 +70,17 @@ fn multipart_body_boundaries_and_refusals() {
         },
     };
     let mut out = b"keep".to_vec();
-    assert_eq!(body.write(&mut out), Err(mime::WriteError::Unwritable));
+    assert_eq!(body.write(&mut out), Err(mime::Error::Unwritable));
     assert_eq!(out, b"keep");
     body.multipart.preamble.clear();
     body.multipart.parts.push(mime::Part::default());
     body.boundary = "b--".into();
-    assert_eq!(body.write(&mut out), Err(mime::WriteError::Unwritable));
+    assert_eq!(body.write(&mut out), Err(mime::Error::Unwritable));
     assert_eq!(out, b"keep");
     contract::check_wire_value(&body);
     body.boundary = "b".into();
     body.multipart.parts[0].body = b"--b".to_vec();
-    assert_eq!(body.write(&mut out), Err(mime::WriteError::BoundaryInData));
+    assert_eq!(body.write(&mut out), Err(mime::Error::BoundaryInData));
     assert_eq!(out, b"keep");
     contract::check_wire_value(&body);
 }
@@ -208,7 +208,7 @@ fn form_stream_accepts_expanding_replacement_text() {
     assert!(fields == expected);
     assert_eq!(
         <form::Field as Wire>::parse(&input),
-        Err(form::FieldError::Form(form::FormError::TooLong))
+        Err(form::Error::TooLong)
     );
 }
 
@@ -414,11 +414,11 @@ fn form_chunked_round_trip_and_eof() {
     assert_eq!(decode_all(form::Fields::new, &written), (expected, None));
     assert_eq!(
         <form::Field as Wire>::parse(b"a=b&c=d"),
-        Err(form::FieldError::Trailing)
+        Err(form::Error::Trailing)
     );
     assert_eq!(
         <form::Field as Wire>::parse(b""),
-        Err(form::FieldError::Empty)
+        Err(form::Error::Empty)
     );
     // Malformed escapes are complete fields under the form grammar.
     assert_eq!(
@@ -437,9 +437,7 @@ fn form_rejects_oversize_at_named_capacity() {
     );
     assert_eq!(
         stream.next(),
-        Some(Err(Fail::Protocol(form::FieldError::Form(
-            form::FormError::TooLong
-        ))))
+        Some(Err(Fail::Protocol(form::Error::TooLong)))
     );
     assert!(stream.next().is_none());
 }
