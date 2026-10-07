@@ -1,8 +1,9 @@
-//! HTTP/2 and gRPC in a capture: [`Capture`] presents each direction's
-//! frames, header blocks and gRPC messages, on
-//! [`stdlib::http2`](fictionet::stdlib::http2)'s observation
-//! readers ([`Frames::for_observation`] and
-//! [`HeaderBlocks::for_observation`]) and [`grpc::Messages`].
+//! HTTP/2 and gRPC in a capture: [`Capture`](fictionet::observe::http2::Capture) presents each
+//! direction's frames, header blocks and gRPC messages, on
+//! [`stdlib::http2`](fictionet::stdlib::http2)'s observation readers
+//! ([`Frames::for_observation`](fictionet::stdlib::http2::Frames::for_observation)
+//! and [`HeaderBlocks::for_observation`](fictionet::stdlib::http2::HeaderBlocks::for_observation))
+//! and [`grpc::Messages`](fictionet::stdlib::grpc::Messages).
 //!
 //! The file uses only public observe and stdlib APIs, so a copy of it can
 //! replace the built-in, registered the same way.

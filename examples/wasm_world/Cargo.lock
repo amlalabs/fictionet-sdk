@@ -178,7 +178,6 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
- "httparse",
  "hyper",
  "libc",
  "ring",
