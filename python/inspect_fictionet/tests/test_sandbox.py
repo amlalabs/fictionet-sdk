@@ -111,23 +111,23 @@ def test_proxy(tmp_path, kind, port, variables, scheme):
     token = (tmp_path / "proxy-token").read_text().strip()
     assert len(token) == 32
     assert oct((tmp_path / "proxy-token").stat().st_mode & 0o777) == "0o600"
-    assert c["configs"]["fictionet-token"]["content"].strip() == token
+    assert c["configs"]["relay-token"]["content"].strip() == token
 
     args = attach["command"]
     assert f"--listen=127.0.0.1:{port}" in args
-    assert "--token-file=/run/fictionet-token/token" in args
+    assert "--token-file=/run/relay-token/token" in args
     assert "--ip-addr=10.0.0.2" in args  # no prefix
     assert not any(a.startswith(("--gateway", "--no-", "--mtu")) for a in args)
     assert "devices" not in attach
     assert attach["cap_add"] == ["DAC_OVERRIDE"]
-    assert attach["configs"][0]["target"] == "/run/fictionet-token/token"
+    assert attach["configs"][0]["target"] == "/run/relay-token/token"
 
     # The agent: proxy variables with the token, the token file, no capabilities.
     for v in variables:
-        assert agent["environment"][v] == f"{scheme}://fictionet:{token}@127.0.0.1:{port}"
+        assert agent["environment"][v] == f"{scheme}://relay:{token}@127.0.0.1:{port}"
     assert agent["environment"]["NO_PROXY"] == ""
-    assert agent["environment"]["FICTIONET_TOKEN_FILE"] == "/run/fictionet-token/token"
-    assert agent["configs"][0]["target"] == "/run/fictionet-token/token"
+    assert agent["environment"]["RELAY_TOKEN_FILE"] == "/run/relay-token/token"
+    assert agent["configs"][0]["target"] == "/run/relay-token/token"
     assert agent["cap_drop"] == ["ALL"]
     assert agent["user"] == "1000:1000"
     assert agent["network_mode"] == "service:attach"
@@ -173,7 +173,7 @@ def test_build_and_cargo_example(tmp_path):
         (dict(world_ca="/var/../run/relay/ca.pem"), "must not be /run/relay"),
         (dict(world_ca="/run/./relay//x/ca.pem"), "must not be /run/relay"),
         (dict(world_ca="/run/ca.pem"), "must not be /run/relay"),
-        (dict(world_ca="/run/fictionet-token/ca.pem"), "must not be /run/fictionet-token"),
+        (dict(world_ca="/run/relay-token/ca.pem"), "must not be /run/relay-token"),
         (dict(world_ca="/ca.pem"), "absolute path"),
         (dict(agent_limits=Limits(memory="lots")), "agent_limits: memory must be"),
         (dict(world_limits=Limits(memory="0")), "world_limits: memory must be"),
@@ -201,6 +201,8 @@ def test_k8s_values(tmp_path):
     assert spec.type == "k8s"
     assert Path(spec.config.chart) == chart_path()
     v = yaml.safe_load(spec.config.values.read_text())
+    # The agent's hostname is its pod's name: agent-env-<release>-default-0.
+    assert v["global"] == {"nameOverride": "agent-env"}
     assert v["attach"] == {
         "image": ATTACH_IMAGE, "type": "tun", "name": "agent", "worldWait": 60, "ipAddr": "10.0.0.2/24",
         "dns": "10.0.0.1", "gateway": "10.0.0.1", "ipAddrV6": "", "gatewayV6": "", "dnsV6": "",

@@ -5,7 +5,7 @@
 //! it in `Proxy-Authorization` (Basic, with the token as the password, or
 //! Bearer), and the SOCKS5 door as the password of RFC 1929's
 //! username/password method. The username is not checked: it may be
-//! anything, such as `fictionet` or the sandbox's name.
+//! anything, such as `relay` or the sandbox's name.
 
 /// The longest token: SOCKS5 carries a password in at most 255 bytes.
 pub const MAX_TOKEN: usize = 255;
@@ -146,16 +146,16 @@ mod tests {
     #[test]
     fn proxy_authorization_values() {
         let t = token();
-        // "fictionet:s3cret-token"
-        assert!(t.check_header(b"Basic ZmljdGlvbmV0OnMzY3JldC10b2tlbg=="));
-        assert!(t.check_header(b"basic   ZmljdGlvbmV0OnMzY3JldC10b2tlbg=="));
+        // "relay:s3cret-token"
+        assert!(t.check_header(b"Basic cmVsYXk6czNjcmV0LXRva2Vu"));
+        assert!(t.check_header(b"basic   cmVsYXk6czNjcmV0LXRva2Vu"));
         // ":s3cret-token": an empty username.
         assert!(t.check_header(b"Basic OnMzY3JldC10b2tlbg=="));
         // "s3cret-token:": the token as the username, no password.
         assert!(t.check_header(b"Basic czNjcmV0LXRva2VuOg=="));
         assert!(t.check_header(b"Bearer s3cret-token"));
-        // "fictionet:wrong", "s3cret-token:x", no colon, garbage.
-        assert!(!t.check_header(b"Basic ZmljdGlvbmV0Ondyb25n"));
+        // "relay:wrong", "s3cret-token:x", no colon, garbage.
+        assert!(!t.check_header(b"Basic cmVsYXk6d3Jvbmc="));
         assert!(!t.check_header(b"Basic czNjcmV0LXRva2VuOng="));
         assert!(!t.check_header(b"Basic czNjcmV0LXRva2Vu"));
         assert!(!t.check_header(b"Basic !!!!"));

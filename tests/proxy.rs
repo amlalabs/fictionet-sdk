@@ -22,8 +22,8 @@ use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 
 const BIN: &str = env!("CARGO_BIN_EXE_fictionet");
 const TOKEN: &str = "tok-3f9a2c";
-/// "fictionet:tok-3f9a2c" in base64.
-const BASIC: &str = "Basic ZmljdGlvbmV0OnRvay0zZjlhMmM=";
+/// "relay:tok-3f9a2c" in base64.
+const BASIC: &str = "Basic cmVsYXk6dG9rLTNmOWEyYw==";
 /// The address `secure.test` has, with TLS on 443.
 const SECURE: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 10);
 
@@ -347,7 +347,7 @@ fn socks_login(s: &mut TcpStream, user: &[u8], password: &[u8]) -> ([u8; 2], [u8
 /// stream and the reply.
 fn socks_connect(a: &Attach, name: &str, port: u16) -> (TcpStream, [u8; 10]) {
     let mut s = a.connect();
-    assert_eq!(socks_login(&mut s, b"fictionet", TOKEN.as_bytes()), ([5, 2], [1, 0]));
+    assert_eq!(socks_login(&mut s, b"relay", TOKEN.as_bytes()), ([5, 2], [1, 0]));
     let mut req = vec![5, 1, 0, 3, name.len() as u8];
     req.extend_from_slice(name.as_bytes());
     req.extend_from_slice(&port.to_be_bytes());
@@ -413,8 +413,8 @@ fn https_through_both_doors_with_curl() {
         let out = c.output().unwrap();
         String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr)
     };
-    let http = format!("http://fictionet:{TOKEN}@{}", h.addr);
-    let socks = format!("socks5h://fictionet:{TOKEN}@{}", s.addr);
+    let http = format!("http://relay:{TOKEN}@{}", h.addr);
+    let socks = format!("socks5h://relay:{TOKEN}@{}", s.addr);
     assert_eq!(run(http.clone(), "https://secure.test/", Some(&ca)), "secure site\n");
     assert_eq!(run(http.clone(), "http://plain.test/", None), "plain site\n");
     assert_eq!(run(socks.clone(), "https://secure.test/", Some(&ca)), "secure site\n");
@@ -425,7 +425,7 @@ fn https_through_both_doors_with_curl() {
     assert!(run(http.clone(), "https://nope.test/", None).contains("response 502"));
     assert!(run(socks.clone(), "https://nope.test/", None).contains("(4)"));
     assert!(run(format!("http://{}", h.addr), "https://secure.test/", None).contains("response 407"));
-    assert!(run(format!("socks5h://fictionet:wrong@{}", s.addr), "https://secure.test/", None).contains("rejected"));
+    assert!(run(format!("socks5h://relay:wrong@{}", s.addr), "https://secure.test/", None).contains("rejected"));
 }
 
 /// An axum WebSocket handler in the world, through the HTTP door with a
@@ -468,10 +468,10 @@ fn websockets_pass_through_the_http_door() {
 fn tokens_are_checked() {
     let world = World::start();
     let a = Attach::start(&world, "http_proxy", "t1", "10.0.0.2");
-    for auth in [None, Some("Basic ZmljdGlvbmV0Ondyb25n"), Some("Bearer wrong"), Some("Basic !!")] {
+    for auth in [None, Some("Basic cmVsYXk6d3Jvbmc="), Some("Bearer wrong"), Some("Basic !!")] {
         let (mut s, head) = connect(&a, "plain.test:80", auth);
         assert!(head.starts_with("HTTP/1.1 407 Proxy Authentication Required\r\n"), "{auth:?}: {head}");
-        assert!(head.contains("Proxy-Authenticate: Basic realm=\"fictionet\""), "{head}");
+        assert!(head.contains("Proxy-Authenticate: Basic realm=\"proxy\""), "{head}");
         // And the connection is closed.
         let _ = read_all(&mut s);
     }
@@ -482,7 +482,7 @@ fn tokens_are_checked() {
 
     let b = Attach::start(&world, "socks5", "t2", "10.0.0.3");
     let mut s = b.connect();
-    assert_eq!(socks_login(&mut s, b"fictionet", b"wrong"), ([5, 2], [1, 1]));
+    assert_eq!(socks_login(&mut s, b"relay", b"wrong"), ([5, 2], [1, 1]));
     assert_eq!(read_all(&mut s), b"", "closed after a wrong token");
     // A client that offers only "no authentication" is turned away.
     let mut s = b.connect();
@@ -512,7 +512,7 @@ fn failures_get_proxy_answers() {
         let started = Instant::now();
         let (_, head) = connect(&a, target, Some(BASIC));
         assert!(head.starts_with(&format!("HTTP/1.1 {status}\r\n")), "{target}: {head}");
-        assert!(head.contains(&format!("X-Fictionet-Error: {why}\r\n")), "{target}: {head}");
+        assert!(head.contains(&format!("X-Proxy-Error: {why}\r\n")), "{target}: {head}");
         assert!(started.elapsed() < Duration::from_secs(3), "{target} took {:?}", started.elapsed());
     }
     // A request that is not a proxy request.
@@ -677,7 +677,7 @@ fn clients_waiting_for_a_connection_hear_that_the_world_is_gone() {
         write!(c, "CONNECT 192.0.2.{i}:443 HTTP/1.1\r\nProxy-Authorization: {BASIC}\r\n\r\n").unwrap();
         https.push(c);
         let mut c = s.connect();
-        assert_eq!(socks_login(&mut c, b"fictionet", TOKEN.as_bytes()), ([5, 2], [1, 0]));
+        assert_eq!(socks_login(&mut c, b"relay", TOKEN.as_bytes()), ([5, 2], [1, 0]));
         c.write_all(&[5, 1, 0, 1, 192, 0, 2, i, 1, 187]).unwrap();
         socks.push(c);
     }
@@ -690,7 +690,7 @@ fn clients_waiting_for_a_connection_hear_that_the_world_is_gone() {
     for mut c in https {
         let head = read_head(&mut c);
         assert!(head.starts_with("HTTP/1.1 503 "), "{head:?}\n{}", h.log());
-        assert!(head.contains("X-Fictionet-Error: the world is gone\r\n"), "{head}");
+        assert!(head.contains("X-Proxy-Error: the world is gone\r\n"), "{head}");
     }
     for mut c in socks {
         let mut reply = [0u8; 10];

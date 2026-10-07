@@ -134,7 +134,7 @@ check "the agent's CPU is limited to 1" '^100000 100000 $' agent cat /sys/fs/cgr
 # 2. Through the proxies.
 check "the agent is uid 1000 with no capabilities" '^uid=1000.* CapEff:\s+0+ $' \
     agent sh -c 'id; grep CapEff /proc/self/status'
-check "the chart set the proxy variables" '^https_proxy=http://fictionet:\*\*\*@127\.0\.0\.1:8080 $' \
+check "the chart set the proxy variables" '^https_proxy=http://relay:\*\*\*@127\.0\.0\.1:8080 $' \
     agent sh -c 'echo "https_proxy=$https_proxy" | sed "s/:[^:@]*@/:***@/"'
 check "https to the world's site through the HTTP door" '^hello from https example.test 443 over HTTP/2.0 $' \
     agent curl -sS https://example.test/
@@ -162,7 +162,7 @@ check "the kubelet at the pod's gateway ($gateway) is unreachable" "Couldn't con
 check "the world's socket is not in the agent's container" 'No such file or directory' agent ls /run/relay
 
 # 4. Tokens, and the world's edge.
-check "a wrong token gets 407" 'response 407' agent curl -sS -x http://fictionet:wrong@127.0.0.1:8080 https://example.test/
+check "a wrong token gets 407" 'response 407' agent curl -sS -x http://relay:wrong@127.0.0.1:8080 https://example.test/
 check "the API server's address through the proxy is a world address with no machine: 502" 'response 502' \
     agent curl -sS -m 10 -k "https://$api/version"
 check "a real name through the proxy does not exist in the world: 502" 'response 502' agent curl -sS -m 10 https://example.com/

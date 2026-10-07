@@ -192,7 +192,7 @@ mod tests {
     }
 
     fn full(request: &[u8]) -> Vec<u8> {
-        [&[5, 2, 0, 2][..], &login(b"fictionet", b"tok"), request].concat()
+        [&[5, 2, 0, 2][..], &login(b"relay", b"tok"), request].concat()
     }
 
     fn target(r: Result<Connect, Refusal>) -> Result<(Host, u16), Refusal> {
@@ -222,7 +222,7 @@ mod tests {
 
     #[test]
     fn a_bad_or_missing_token_is_refused() {
-        let (r, out) = run([&[5, 1, 2][..], &login(b"fictionet", b"nope")].concat());
+        let (r, out) = run([&[5, 1, 2][..], &login(b"relay", b"nope")].concat());
         assert_eq!(r, Err(Refusal::BadToken));
         assert_eq!(out, [5, 2, 1, 1]);
         // Only "no authentication" offered.

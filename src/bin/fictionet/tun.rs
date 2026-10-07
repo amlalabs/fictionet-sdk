@@ -281,7 +281,7 @@ fn resolv_conf_path(args: &AttachArgs) -> Option<PathBuf> {
 }
 
 pub(crate) fn resolv_conf(servers: &[IpAddr]) -> String {
-    let mut out = String::from("# Written by fictionet attach.\n");
+    let mut out = String::from("# Written by attach.\n");
     for s in servers {
         out.push_str(&format!("nameserver {s}\n"));
     }
@@ -435,8 +435,8 @@ mod tests {
     #[test]
     fn resolv_conf_lists_servers_in_order() {
         let s = resolv_conf(&["10.0.0.1".parse().unwrap(), "fd00::1".parse().unwrap()]);
-        assert_eq!(s, "# Written by fictionet attach.\nnameserver 10.0.0.1\nnameserver fd00::1\n");
-        assert_eq!(resolv_conf(&[]), "# Written by fictionet attach.\n");
+        assert_eq!(s, "# Written by attach.\nnameserver 10.0.0.1\nnameserver fd00::1\n");
+        assert_eq!(resolv_conf(&[]), "# Written by attach.\n");
     }
 
     #[test]
@@ -468,7 +468,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         let path = dir.join("a/b/resolv.conf");
         write_resolv_conf(&path, &["10.0.0.1".parse().unwrap()]).unwrap();
-        assert_eq!(fs::read_to_string(&path).unwrap(), "# Written by fictionet attach.\nnameserver 10.0.0.1\n");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "# Written by attach.\nnameserver 10.0.0.1\n");
 
         // A second write keeps the same file (the same inode), as a bind
         // mount of it needs.
@@ -476,7 +476,7 @@ mod tests {
         let before = fs::metadata(&path).unwrap().ino();
         write_resolv_conf(&path, &[]).unwrap();
         assert_eq!(fs::metadata(&path).unwrap().ino(), before);
-        assert_eq!(fs::read_to_string(&path).unwrap(), "# Written by fictionet attach.\n");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "# Written by attach.\n");
         fs::remove_dir_all(&dir).unwrap();
     }
 }

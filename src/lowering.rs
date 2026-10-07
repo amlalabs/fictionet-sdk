@@ -468,7 +468,7 @@
 //! ```text
 //! $ fictionet attach --world unix:/run/fictionet/world.sock --name agent --type http_proxy \
 //!     --listen 127.0.0.1:8080 --token-file /run/fictionet/token --ip-addr 10.0.0.2 --dns 10.0.0.1
-//! $ curl -sS --cacert /run/fictionet/ca.pem -x http://fictionet:$TOKEN@127.0.0.1:8080 https://example.test/
+//! $ curl -sS --cacert /run/fictionet/ca.pem -x http://relay:$TOKEN@127.0.0.1:8080 https://example.test/
 //! hello from https example.test 443 over HTTP/2.0
 //! ```
 //!

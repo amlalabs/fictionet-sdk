@@ -524,7 +524,7 @@ fn lock_device(name: &str, index: u32) -> Result<OwnedFd, Failure> {
         return Err(err("making the device lock")(io::Error::last_os_error()));
     }
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    let id = format!("fictionet-attach-tap/{index}");
+    let id = format!("attach-tap/{index}");
     // SAFETY: an all-zero sockaddr_un is valid.
     let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     addr.sun_family = libc::AF_UNIX as libc::sa_family_t;

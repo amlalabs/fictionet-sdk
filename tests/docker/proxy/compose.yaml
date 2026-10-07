@@ -19,7 +19,7 @@ x-attach: &attach
   volumes:
     - sock:/run/fictionet
   environment:
-    TOKEN: ${FICTIONET_TOKEN:?run ./run.sh, which makes a token}
+    TOKEN: ${RELAY_TOKEN:?run ./run.sh, which makes a token}
   depends_on:
     world:
       condition: service_healthy
@@ -86,15 +86,15 @@ services:
     volumes:
       - ca:/run/ca:ro
     environment:
-      HTTP_PROXY: http://fictionet:${FICTIONET_TOKEN}@attach-http:8080
-      http_proxy: http://fictionet:${FICTIONET_TOKEN}@attach-http:8080
-      HTTPS_PROXY: http://fictionet:${FICTIONET_TOKEN}@attach-http:8080
-      https_proxy: http://fictionet:${FICTIONET_TOKEN}@attach-http:8080
+      HTTP_PROXY: http://relay:${RELAY_TOKEN}@attach-http:8080
+      http_proxy: http://relay:${RELAY_TOKEN}@attach-http:8080
+      HTTPS_PROXY: http://relay:${RELAY_TOKEN}@attach-http:8080
+      https_proxy: http://relay:${RELAY_TOKEN}@attach-http:8080
       NO_PROXY: ""
       no_proxy: ""
       NODE_USE_ENV_PROXY: "1"
       # The SOCKS5 door, for the checks that use it.
-      SOCKS: socks5h://fictionet:${FICTIONET_TOKEN}@attach-socks:1080
+      SOCKS: socks5h://relay:${RELAY_TOKEN}@attach-socks:1080
       # The world's CA, for every client's own trust store.
       SSL_CERT_FILE: /run/ca/ca.pem
       CURL_CA_BUNDLE: /run/ca/ca.pem

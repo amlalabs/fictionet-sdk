@@ -178,7 +178,7 @@ fn packets_cross_both_ways_and_refuse_and_world_close_end_attach() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(status.code(), Some(0), "{err}");
     assert!(err.contains("the world closed the connection"), "{err}");
-    assert_eq!(std::fs::read_to_string(dir.join("resolv-first")).unwrap(), "# Written by fictionet attach.\nnameserver 10.0.0.1\n");
+    assert_eq!(std::fs::read_to_string(dir.join("resolv-first")).unwrap(), "# Written by attach.\nnameserver 10.0.0.1\n");
     // The refused attach never touched its resolv.conf.
     assert_eq!(std::fs::read_to_string(dir.join("resolv-second")).unwrap(), "nameserver 192.0.2.1\n");
     let _ = std::fs::remove_dir_all(&dir);
@@ -242,7 +242,7 @@ fn resolv_conf_flag_picks_the_file_and_a_failed_write_names_it() {
     drop(listening);
 
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
-    assert_eq!(std::fs::read_to_string(&custom).unwrap(), "# Written by fictionet attach.\nnameserver 10.0.0.1\n");
+    assert_eq!(std::fs::read_to_string(&custom).unwrap(), "# Written by attach.\nnameserver 10.0.0.1\n");
     let err = String::from_utf8_lossy(&failed.stderr);
     assert_eq!(failed.status.code(), Some(1), "{err}");
     assert!(err.contains(bad) && err.contains("--no-resolv-conf"), "{err}");

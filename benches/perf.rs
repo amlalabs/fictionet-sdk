@@ -1329,9 +1329,9 @@ fn fictionet_bin() -> String {
     std::env::var("FICTIONET_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_fictionet").to_string())
 }
 
-/// "fictionet:<token>" in base64, for the token the proxy group uses.
+/// "relay:<token>" in base64, for the token the proxy group uses.
 const PROXY_TOKEN: &str = "bench-token";
-const PROXY_AUTH: &str = "Basic ZmljdGlvbmV0OmJlbmNoLXRva2Vu";
+const PROXY_AUTH: &str = "Basic cmVsYXk6YmVuY2gtdG9rZW4=";
 
 fn proxy(o: &Options) {
     let mut t = Table::new(&["workload", "DNS queries for the name", "time, ms"]);

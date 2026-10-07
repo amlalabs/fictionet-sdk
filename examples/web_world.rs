@@ -76,7 +76,7 @@ fn main() -> Result {
     // Python 3.13 and later check certificates strictly: a CA must say
     // what its key is for, and a leaf must name the key that signed it.
     ca.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    ca.distinguished_name.push(rcgen::DnType::CommonName, "Fictionet web_world CA");
+    ca.distinguished_name.push(rcgen::DnType::CommonName, "web_world CA");
     let ca_key = KeyPair::generate()?;
     let ca = ca.self_signed(&ca_key)?;
     let names = ["example.test", "www.example.test", "v4only.test", "v6only.test"];

@@ -72,9 +72,9 @@ spec:
         # attach. Without these, each container sees its own empty copy.
         # Other runtimes ignore them. The node's containerd must pass
         # dev.gvisor.* pod annotations to runsc (pod_annotations).
-        dev.gvisor.spec.mount.fictionet.share: pod
-        dev.gvisor.spec.mount.fictionet.type: tmpfs
-        dev.gvisor.spec.mount.fictionet.options: rw
+        dev.gvisor.spec.mount.relay.share: pod
+        dev.gvisor.spec.mount.relay.type: tmpfs
+        dev.gvisor.spec.mount.relay.options: rw
     spec:
       {{- with $.Values.runtimeClassName }}
       runtimeClassName: {{ . }}
@@ -136,7 +136,7 @@ spec:
             {{- toYaml . | nindent 12 }}
           {{- end }}
           volumeMounts:
-            - name: fictionet
+            - name: relay
               mountPath: /run/relay
             {{- range $svc.shared }}
             - name: shared-{{ .name }}
@@ -190,11 +190,11 @@ spec:
               type: RuntimeDefault
           {{- end }}
           volumeMounts:
-            - name: fictionet
+            - name: relay
               mountPath: /run/relay
             {{- if $proxy }}
             - name: token
-              mountPath: /run/fictionet-token
+              mountPath: /run/relay-token
               readOnly: true
             {{- end }}
         {{- if and $proxy $.Values.networkPolicy.waitForEnforcement }}
@@ -255,15 +255,15 @@ spec:
           {{- if $proxy }}
           {{- /* The proxy variables, with the token from the Secret. */}}
           {{- $port := include "fictionet.proxyPort" $attach }}
-          {{- $env = append $env (dict "name" "FICTIONET_TOKEN" "valueFrom" (dict "secretKeyRef" (dict "name" $secret "key" "token"))) }}
+          {{- $env = append $env (dict "name" "RELAY_TOKEN" "valueFrom" (dict "secretKeyRef" (dict "name" $secret "key" "token"))) }}
           {{- if eq $attach.type "http_proxy" }}
-          {{- $url := printf "http://fictionet:$(FICTIONET_TOKEN)@127.0.0.1:%s" $port }}
+          {{- $url := printf "http://relay:$(RELAY_TOKEN)@127.0.0.1:%s" $port }}
           {{- range list "HTTP_PROXY" "http_proxy" "HTTPS_PROXY" "https_proxy" }}
           {{- $env = append $env (dict "name" . "value" $url) }}
           {{- end }}
           {{- $env = append $env (dict "name" "NODE_USE_ENV_PROXY" "value" "1") }}
           {{- else }}
-          {{- $url := printf "socks5h://fictionet:$(FICTIONET_TOKEN)@127.0.0.1:%s" $port }}
+          {{- $url := printf "socks5h://relay:$(RELAY_TOKEN)@127.0.0.1:%s" $port }}
           {{- range list "ALL_PROXY" "all_proxy" }}
           {{- $env = append $env (dict "name" . "value" $url) }}
           {{- end }}
@@ -303,7 +303,7 @@ spec:
       volumes:
         # The world's socket and attach's ready file. Never mounted in the
         # agent's container.
-        - name: fictionet
+        - name: relay
           emptyDir:
             medium: Memory
             sizeLimit: 1Mi

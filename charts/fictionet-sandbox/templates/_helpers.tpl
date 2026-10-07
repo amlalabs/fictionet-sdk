@@ -53,7 +53,7 @@ dict with "attach" (the config) and "service" (the service's name).
 - {{ $a.type | quote }}
 {{- if ne $a.type "tun" }}
 - {{ printf "--listen=127.0.0.1:%s" (include "fictionet.proxyPort" $a) | quote }}
-- --token-file=/run/fictionet-token/token
+- --token-file=/run/relay-token/token
 - {{ printf "--ip-addr=%s" (first (splitList "/" (required "attach.ipAddr is required for the proxy types" $a.ipAddr))) | quote }}
 - {{ printf "--dns=%s" (required "attach.dns is required for the proxy types" $a.dns) | quote }}
 - --ready-file=/run/relay/attach.ready

@@ -199,7 +199,7 @@ attach tries once.
 connection into packets from --ip-addr (a plain address, such as
 10.0.0.2). It looks names up with the world's DNS server, --dns. Clients
 must give the token in --token-file as the password in the proxy URL:
-http://fictionet:<token>@host:port or socks5h://fictionet:<token>@host:port.
+http://relay:<token>@host:port or socks5h://relay:<token>@host:port.
 These types take no --gateway, --netns, --mtu, --down-link, --resolv-conf
 or IPv6 flag: there is no device, route or resolv.conf to set.
 

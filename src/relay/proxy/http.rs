@@ -16,7 +16,7 @@
 //!
 //! Every request must carry the token in `Proxy-Authorization`, or gets
 //! `407`. A connection that cannot be made gets `502`, `503` or `504`,
-//! with the reason in an `X-Fictionet-Error` header and the body.
+//! with the reason in an `X-Proxy-Error` header and the body.
 //!
 //! The door relays: the world's site is the client's server, and the
 //! client is the site's. So it reads heads both ways by their syntax
@@ -265,12 +265,12 @@ pub fn rewrite_response(head: &[u8]) -> Result<Option<Answer>, String> {
 }
 
 /// An answer that ends the exchange, with the reason in
-/// `X-Fictionet-Error` and the body. `407` asks for Basic credentials.
+/// `X-Proxy-Error` and the body. `407` asks for Basic credentials.
 pub fn error_response(status: u16, why: &str) -> Vec<u8> {
     let why = why.replace(['\r', '\n'], " ");
-    let challenge = if status == 407 { "Proxy-Authenticate: Basic realm=\"fictionet\"\r\n" } else { "" };
+    let challenge = if status == 407 { "Proxy-Authenticate: Basic realm=\"proxy\"\r\n" } else { "" };
     format!(
-        "HTTP/1.1 {status} {}\r\n{challenge}X-Fictionet-Error: {why}\r\nContent-Type: text/plain\r\n\
+        "HTTP/1.1 {status} {}\r\n{challenge}X-Proxy-Error: {why}\r\nContent-Type: text/plain\r\n\
          Content-Length: {}\r\nConnection: close\r\n\r\n{why}\n",
         reason(status),
         why.len() + 1
@@ -394,11 +394,11 @@ mod tests {
     fn error_answers_say_why() {
         let r = String::from_utf8(error_response(502, "no such name in the world")).unwrap();
         assert!(r.starts_with("HTTP/1.1 502 Bad Gateway\r\n"), "{r}");
-        assert!(r.contains("\r\nX-Fictionet-Error: no such name in the world\r\n"), "{r}");
+        assert!(r.contains("\r\nX-Proxy-Error: no such name in the world\r\n"), "{r}");
         assert!(r.ends_with("\r\n\r\nno such name in the world\n"), "{r}");
         assert!(r.contains("Content-Length: 26\r\n"), "{r}");
         let r = String::from_utf8(error_response(407, "no token")).unwrap();
-        assert!(r.contains("Proxy-Authenticate: Basic realm=\"fictionet\"\r\n"), "{r}");
+        assert!(r.contains("Proxy-Authenticate: Basic realm=\"proxy\"\r\n"), "{r}");
         // A reason cannot add header lines.
         let r = String::from_utf8(error_response(502, "a\r\nX-Evil: 1")).unwrap();
         assert!(!r.contains("\r\nX-Evil"), "{r}");

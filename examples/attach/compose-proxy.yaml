@@ -50,7 +50,7 @@ services:
     security_opt: [no-new-privileges:true]
     volumes: [ca:/run/ca:ro]        # the world's CA certificate, read-only
     environment:
-      HTTPS_PROXY: &proxy http://fictionet:${FICTIONET_TOKEN:?set FICTIONET_TOKEN}@attach:8080
+      HTTPS_PROXY: &proxy http://relay:${RELAY_TOKEN:?set RELAY_TOKEN}@attach:8080
       https_proxy: *proxy
       HTTP_PROXY: *proxy
       http_proxy: *proxy
@@ -71,7 +71,7 @@ networks:
 
 secrets:
   token:
-    environment: FICTIONET_TOKEN
+    environment: RELAY_TOKEN
 
 volumes:
   sock:

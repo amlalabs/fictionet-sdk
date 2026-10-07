@@ -37,9 +37,9 @@ Backend = Literal["docker", "k8s"]
 
 _SOCKET_DIR = "/run/relay"
 _READY_FILE = "/run/relay/attach.ready"
-_TOKEN_DIR = "/run/fictionet-token"
+_TOKEN_DIR = "/run/relay-token"
 _TOKEN_FILE = f"{_TOKEN_DIR}/token"
-_PROXY_USER = "fictionet"
+_PROXY_USER = "relay"
 
 # Variables that point common clients at one CA file.
 _CA_ENV = ("SSL_CERT_FILE", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS", "GIT_SSL_CAINFO")
@@ -424,7 +424,7 @@ def compose_config(cfg: _Config, cache: Path, token: str | None = None) -> dict[
         # No device and no NET_ADMIN. DAC_OVERRIDE lets root connect to a
         # socket that the world's user owns.
         attach["cap_add"] = ["DAC_OVERRIDE"]
-        attach["configs"] = [{"source": "fictionet-token", "target": _TOKEN_FILE, "mode": 0o444}]
+        attach["configs"] = [{"source": "relay-token", "target": _TOKEN_FILE, "mode": 0o444}]
     else:
         attach["cap_add"] = ["NET_ADMIN", "DAC_OVERRIDE"]
         attach["devices"] = ["/dev/net/tun"]
@@ -438,8 +438,8 @@ def compose_config(cfg: _Config, cache: Path, token: str | None = None) -> dict[
     if cfg.proxy:
         assert token is not None
         env |= cfg.proxy_env(token)
-        env["FICTIONET_TOKEN_FILE"] = _TOKEN_FILE
-        agent["configs"] = [{"source": "fictionet-token", "target": _TOKEN_FILE, "mode": 0o444}]
+        env["RELAY_TOKEN_FILE"] = _TOKEN_FILE
+        agent["configs"] = [{"source": "relay-token", "target": _TOKEN_FILE, "mode": 0o444}]
         # Nothing to configure in the network: no capabilities at all.
         agent["cap_drop"] = ["ALL"]
     else:
@@ -465,7 +465,7 @@ def compose_config(cfg: _Config, cache: Path, token: str | None = None) -> dict[
         "volumes": {"sock": tmpfs()} | ({"ca": tmpfs()} if cfg.ca_dir else {}),
     }
     if cfg.proxy:
-        out["configs"] = {"fictionet-token": {"content": token + "\n"}}
+        out["configs"] = {"relay-token": {"content": token + "\n"}}
     return out
 
 
@@ -716,7 +716,10 @@ def k8s_values(cfg: _Config) -> dict[str, Any]:
         attach["imagePullPolicy"] = cfg.image_pull_policy
         world["imagePullPolicy"] = cfg.image_pull_policy
         service["imagePullPolicy"] = cfg.image_pull_policy
-    return _merge({"attach": attach, "services": {"default": service}}, cfg.k8s_values)
+    # The pod's name is the agent's hostname. Named as Inspect's own
+    # agent-env chart names its pods, it says nothing about the harness.
+    base = {"global": {"nameOverride": "agent-env"}, "attach": attach, "services": {"default": service}}
+    return _merge(base, cfg.k8s_values)
 
 
 def _merge(base: dict[str, Any], extra: Mapping[str, Any]) -> dict[str, Any]:

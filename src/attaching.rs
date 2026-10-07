@@ -357,7 +357,7 @@
 //! fe80::/64 dev tun0 proto kernel metric 256 pref medium
 //! default via 2001:db8::1 dev tun0 proto static metric 1024 onlink pref medium
 //! $ cat /etc/resolv.conf
-//! # Written by fictionet attach.
+//! # Written by attach.
 //! nameserver 10.0.0.1
 //! nameserver 2001:db8::1
 //! $ ls /sys/class/net
@@ -910,8 +910,8 @@
 //!
 //! **The token** stops other clients from using this sandbox's proxy. One
 //! attach serves one sandbox, so it has one token. A client gives it as the
-//! password in the proxy URL: `http://fictionet:TOKEN@attach:8080`, or
-//! `socks5h://fictionet:TOKEN@attach:1080`. Attach does not check the
+//! password in the proxy URL: `http://relay:TOKEN@attach:8080`, or
+//! `socks5h://relay:TOKEN@attach:1080`. Attach does not check the
 //! username. The HTTP proxy also accepts
 //! `Proxy-Authorization: Bearer TOKEN`, and both proxies accept the token
 //! as the username with no password, for clients that put only one value
@@ -936,11 +936,11 @@
 //! attach's `--token-file`:
 //!
 //! ```sh
-//! export HTTPS_PROXY=http://fictionet:$TOKEN@attach:8080 https_proxy=http://fictionet:$TOKEN@attach:8080
-//! export HTTP_PROXY=http://fictionet:$TOKEN@attach:8080 http_proxy=http://fictionet:$TOKEN@attach:8080
+//! export HTTPS_PROXY=http://relay:$TOKEN@attach:8080 https_proxy=http://relay:$TOKEN@attach:8080
+//! export HTTP_PROXY=http://relay:$TOKEN@attach:8080 http_proxy=http://relay:$TOKEN@attach:8080
 //! export NO_PROXY= no_proxy= NODE_USE_ENV_PROXY=1
 //! # or, for socks5:
-//! export ALL_PROXY=socks5h://fictionet:$TOKEN@attach:1080
+//! export ALL_PROXY=socks5h://relay:$TOKEN@attach:1080
 //! ```
 //!
 //! Set both the uppercase and lowercase forms, because curl reads only the
@@ -996,7 +996,7 @@
 //! ## Errors
 //!
 //! When a connection cannot be made, attach answers the client as soon as
-//! it knows. The HTTP proxy puts the reason in an `X-Fictionet-Error`
+//! it knows. The HTTP proxy puts the reason in an `X-Proxy-Error`
 //! header and in the body. The SOCKS5 proxy answers with a reply code:
 //!
 //! | In the world | `http_proxy` | `socks5` reply |
@@ -1016,13 +1016,13 @@
 //! curl: (7) CONNECT tunnel failed, response 502
 //! $ curl -sS -i http://nope.test/
 //! HTTP/1.1 502 Bad Gateway
-//! X-Fictionet-Error: no such name in the world
+//! X-Proxy-Error: no such name in the world
 //! Content-Type: text/plain
 //! Content-Length: 26
 //! Connection: close
 //!
 //! no such name in the world
-//! $ curl -sS -x socks5h://fictionet:$TOKEN@attach:1080 https://plain.test/
+//! $ curl -sS -x socks5h://relay:$TOKEN@attach:1080 https://plain.test/
 //! curl: (97) cannot complete SOCKS5 connection to plain.test. (5)
 //! ```
 //!
@@ -1099,25 +1099,25 @@
 //! other container on it. The start order works as in the `tun` file:
 //! attach waits for the world's socket with `--world-wait`, and the agent
 //! starts once attach's healthcheck passes. The token comes from the
-//! environment variable `FICTIONET_TOKEN`. Compose gives it to attach as a
+//! environment variable `RELAY_TOKEN`. Compose gives it to attach as a
 //! file, `/run/secrets/token`, and puts it in the agent's proxy URLs.
 //!
 #![cfg_attr(doc, doc = concat!("```yaml\n", include_str!("../examples/attach/compose-proxy.yaml"), "```"))]
 //!
 //! For `socks5`, change attach's `--type` and port, and give the agent
-//! `ALL_PROXY=socks5h://fictionet:${FICTIONET_TOKEN}@attach:1080` instead
+//! `ALL_PROXY=socks5h://relay:${RELAY_TOKEN}@attach:1080` instead
 //! of the HTTP variables.
 //!
 //! ### Run it with Compose
 //!
 //! You need Docker Engine with Compose v2. Run these from the top directory of the repository,
-//! in one shell, since every command reads `FICTIONET_TOKEN`. The site
+//! in one shell, since every command reads `RELAY_TOKEN`. The site
 //! answers through the proxy. Around the proxy, the agent can neither
 //! look a name up nor reach an address. A real name, sent through the
 //! proxy, does not exist in the world:
 //!
 //! ```text
-//! $ export FICTIONET_TOKEN=$(od -An -tx1 -N24 /dev/urandom | tr -d ' \n')
+//! $ export RELAY_TOKEN=$(od -An -tx1 -N24 /dev/urandom | tr -d ' \n')
 //! $ docker compose -f examples/attach/compose-proxy.yaml build
 //! $ docker compose -f examples/attach/compose-proxy.yaml up -d --wait
 //! $ docker compose -f examples/attach/compose-proxy.yaml exec agent curl -sS https://example.test/
@@ -1247,11 +1247,11 @@
 //! nameserver 127.0.0.1
 //! options ndots:1
 //! $ env | grep -i proxy
-//! HTTPS_PROXY=http://fictionet:***@127.0.0.1:8080
+//! HTTPS_PROXY=http://relay:***@127.0.0.1:8080
 //! ...
 //! $ curl -sS https://example.test/
 //! hello from https example.test 443 over HTTP/2.0
-//! $ curl -sS -x http://fictionet:wrong@127.0.0.1:8080 https://example.test/
+//! $ curl -sS -x http://relay:wrong@127.0.0.1:8080 https://example.test/
 //! curl: (56) CONNECT tunnel failed, response 407
 //! $ curl -sS --noproxy '*' https://example.test/
 //! curl: (6) Could not resolve host: example.test

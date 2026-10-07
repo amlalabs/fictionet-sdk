@@ -154,7 +154,7 @@
 //! fe80::/64 dev tun0 proto kernel metric 256 pref medium
 //! default via 2001:db8::1 dev tun0 proto static metric 1024 onlink pref medium
 //! $ sudo ip netns exec agent cat /etc/resolv.conf
-//! # Written by fictionet attach.
+//! # Written by attach.
 //! nameserver 10.0.0.1
 //! nameserver 2001:db8::1
 //! ```
@@ -321,7 +321,7 @@
 //! | `curl: (35) TLS connect error: error:0A000458:SSL routines::tlsv1 unrecognized name` | The world has no HTTPS site under that name. Here, `https://shared.test/` (a plain HTTP site) and `https://203.0.113.10/` (an address, so curl sends no name) both fail this way. | Use a name that has an HTTPS site. [`Sites`](crate::stdlib::web::Sites) picks the certificate by the name the client sends, and refuses the handshake for a name with no TLS. A certificate that does not cover the name, from a world's own TLS setup, fails differently: `openssl s_client` reports `Verification error: hostname mismatch`. Add the name to the certificate. |
 //! | `curl: (6) Could not resolve host: nope.test` | `sudo ip netns exec agent dig nope.test` shows `status: NXDOMAIN` from `SERVER: 10.0.0.1#53`: the world has no site with that name. | Fix the name, or add a site for it to the world. |
 //! | `curl: (7) Failed to connect to plain.test:443 after 3 ms: Could not connect to server` | `dig +short plain.test` answers an address, such as `198.18.0.1`, and `curl http://plain.test/` works. The site exists, but has no TLS, so port 443 is closed. | Use `http://`, or give the site a certificate with [`Site::tls`](crate::stdlib::web::Site::tls). |
-//! | With the [HTTP proxy type](crate::attaching#behind-a-proxy-http_proxy-and-socks5) (`--type http_proxy`), curl says `Could not resolve host: example.test`, or Node says `getaddrinfo ENOTFOUND example.test` | The client did not use the proxy, and looked the name up on the host. `curl -sv https://example.test/ 2>&1 \| grep -E 'proxy tunnel\|NO_PROXY'` prints `Establishing HTTP proxy tunnel to example.test:443` when curl uses it. | Set `https_proxy` (and `http_proxy`) to `http://fictionet:<token>@<host>:<port>`, with the host and port that attach listens on (`--listen`): `attach:8080` in the [Compose setup](crate::attaching#the-proxy-in-docker-compose), `127.0.0.1:8080` in a [pod](crate::attaching#the-proxy-on-kubernetes). Take the world's names out of `NO_PROXY`. Node's built-in `fetch` ignores these variables unless `NODE_USE_ENV_PROXY=1` is set. |
+//! | With the [HTTP proxy type](crate::attaching#behind-a-proxy-http_proxy-and-socks5) (`--type http_proxy`), curl says `Could not resolve host: example.test`, or Node says `getaddrinfo ENOTFOUND example.test` | The client did not use the proxy, and looked the name up on the host. `curl -sv https://example.test/ 2>&1 \| grep -E 'proxy tunnel\|NO_PROXY'` prints `Establishing HTTP proxy tunnel to example.test:443` when curl uses it. | Set `https_proxy` (and `http_proxy`) to `http://relay:<token>@<host>:<port>`, with the host and port that attach listens on (`--listen`): `attach:8080` in the [Compose setup](crate::attaching#the-proxy-in-docker-compose), `127.0.0.1:8080` in a [pod](crate::attaching#the-proxy-on-kubernetes). Take the world's names out of `NO_PROXY`. Node's built-in `fetch` ignores these variables unless `NODE_USE_ENV_PROXY=1` is set. |
 //! | The ready file exists, but requests fail or time out | The ready file does not mean the world serves requests yet. Make one end-to-end request. | See [Readiness](#readiness) below. |
 //!
 //! ## When `dig` works but programs cannot resolve names

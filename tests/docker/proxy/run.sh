@@ -26,8 +26,8 @@ here="$(cd "$(dirname "$0")" && pwd)"
 compose=(docker compose -f "$here/compose.yaml")
 failures=0
 # One token for this run. The sandbox gets it in its proxy URLs.
-FICTIONET_TOKEN="$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')"
-export FICTIONET_TOKEN
+RELAY_TOKEN="$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')"
+export RELAY_TOKEN
 
 cleanup() { "${compose[@]}" down -v --remove-orphans --timeout 2 >/dev/null 2>&1 || true; }
 trap cleanup EXIT
@@ -88,19 +88,19 @@ check "go net/http through socks5 (HTTPS_PROXY=socks5://)" '^200 hello from http
 
 # 2. Tokens.
 check "no token: 407" 'response 407' agent curl -sS -x http://attach-http:8080 https://example.test/
-check "a wrong token: 407" 'response 407' agent curl -sS -x http://fictionet:wrong@attach-http:8080 https://example.test/
+check "a wrong token: 407" 'response 407' agent curl -sS -x http://relay:wrong@attach-http:8080 https://example.test/
 check "a wrong token, plain HTTP: 407" '^407 $' \
-    agent curl -sS -o /dev/null -w '%{http_code}\n' -x http://fictionet:wrong@attach-http:8080 http://plain.test/
+    agent curl -sS -o /dev/null -w '%{http_code}\n' -x http://relay:wrong@attach-http:8080 http://plain.test/
 check "socks5 with a wrong token is rejected" 'rejected by the SOCKS5 server' \
-    agent curl -sS -x socks5h://fictionet:wrong@attach-socks:1080 https://example.test/
+    agent curl -sS -x socks5h://relay:wrong@attach-socks:1080 https://example.test/
 check "socks5 with no login is refused" 'No authentication method was acceptable' \
     agent curl -sS -x socks5h://attach-socks:1080 https://example.test/
 
 # 3. Failures.
 check "no such name: 502" 'response 502' agent curl -sS https://nope.test/
-check "the reason is in X-Fictionet-Error" 'X-Fictionet-Error: no such name in the world' \
-    agent curl -sS -o /dev/null -D - -x "http://fictionet:$FICTIONET_TOKEN@attach-http:8080" http://nope.test/
-check "a closed port: 502, connection refused" '< HTTP/1.1 502 Bad Gateway.*< X-Fictionet-Error: connection refused' \
+check "the reason is in X-Proxy-Error" 'X-Proxy-Error: no such name in the world' \
+    agent curl -sS -o /dev/null -D - -x "http://relay:$RELAY_TOKEN@attach-http:8080" http://nope.test/
+check "a closed port: 502, connection refused" '< HTTP/1.1 502 Bad Gateway.*< X-Proxy-Error: connection refused' \
     agent curl -sS -v https://plain.test/
 check "socks5: no such name is reply 4" 'connection to nope.test. \(4\)' socks 'curl -sS -x "$SOCKS" https://nope.test/'
 check "socks5: a closed port is reply 5" 'connection to plain.test. \(5\)' socks 'curl -sS -x "$SOCKS" https://plain.test/'

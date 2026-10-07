@@ -6,8 +6,8 @@
 . "$(dirname "$0")/lib.sh"
 
 token="$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')"
-proxy="http://fictionet:$token@127.0.0.1:8080"
-socks="socks5h://fictionet:$token@127.0.0.1:1080"
+proxy="http://relay:$token@127.0.0.1:8080"
+socks="socks5h://relay:$token@127.0.0.1:1080"
 
 cleanup() {
     stop_pid "${http_pid:-}"
@@ -76,9 +76,9 @@ agent 'curl -sS -x "$SOCKS" https://example.test/'
 
 step "What does not work"
 note "A wrong token is refused:"
-agent 'curl -sS -x http://fictionet:wrong@127.0.0.1:8080 https://example.test/'
+agent 'curl -sS -x http://relay:wrong@127.0.0.1:8080 https://example.test/'
 note "A name the world does not have gets 502, and attach says why:"
-agent 'curl -sS -o /dev/null -D - http://nope.test/ | grep -iE "^HTTP|^x-fictionet"'
+agent 'curl -sS -o /dev/null -D - http://nope.test/ | grep -iE "^HTTP|^x-proxy-error"'
 agent 'curl -sS -x "$SOCKS" https://nope.test/'
 note "Around the proxy there is no network, and the world's socket is out of reach:"
 agent 'curl -sS -m 5 --noproxy "*" http://1.1.1.1/'

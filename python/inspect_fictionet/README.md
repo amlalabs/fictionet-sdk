@@ -235,7 +235,7 @@ is the agent's only way out. The agent gets:
 - the proxy variables: `HTTP_PROXY`, `HTTPS_PROXY` and their lowercase forms
   for `http_proxy`, or `ALL_PROXY` for `socks5`, with an empty `NO_PROXY`;
 - the proxy token in those URLs, and in a file named by
-  `FICTIONET_TOKEN_FILE` (`/run/fictionet-token/token`);
+  `RELAY_TOKEN_FILE` (`/run/relay-token/token`);
 - no capabilities at all (`cap_drop: [ALL]`).
 
 The token is made once per cache directory and reused, so the compose file
@@ -253,7 +253,7 @@ way around the proxy. "What keeps the agent
 in" in [`src/attaching.rs`](../../src/attaching.rs) says exactly what is
 checked.
 
-The agent gets the token in `FICTIONET_TOKEN` and in the proxy URLs, with no
+The agent gets the token in `RELAY_TOKEN` and in the proxy URLs, with no
 token file. Attach runs as uid 65532, the published world image's user, so
 it can open the world's socket. For a world that runs as another user, set
 `k8s_values={"attach": {"runAsUser": <the world's uid>}}`. For a world that
@@ -291,7 +291,10 @@ fictionet_sandbox(WEB_WORLD_IMAGE, world_args=[...], world_ca="/run/ca/ca.pem",
 ```
 
 Each sample is one pod. The world and attach run as native sidecars, and the
-agent's container starts only once attach is ready. The chart needs
+agent's container starts only once attach is ready. The pod's name is the
+agent's hostname, so the package names the release's objects as Inspect's
+own chart does (`global.nameOverride: agent-env`): the agent sees
+`agent-env-<release>-default-0`. The chart needs
 Kubernetes 1.29 or later. "On Kubernetes" in
 [`src/attaching.rs`](../../src/attaching.rs) explains the pod, and the chart's
 [`values.yaml`](../../charts/fictionet-sandbox/values.yaml) lists what else
