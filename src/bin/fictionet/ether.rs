@@ -84,12 +84,18 @@ pub(crate) fn frame(dst: Mac, src: Mac, ethertype: u16, payload: &[u8]) -> Vec<u
 /// VM: broadcast for 255.255.255.255, the multicast MAC for a multicast
 /// address, and otherwise `vm` (broadcast while the VM's MAC is not known
 /// yet). `None` if the packet is neither IPv4 nor IPv6.
-pub(crate) fn destination(packet: &[u8], vm: Option<Mac>) -> Option<(Mac, u16)> {
+///
+/// A known subnet's directed broadcast also uses the broadcast MAC.
+/// Prefixes /31 and /32 have no directed broadcast. With Family::FromWorld,
+/// attach does not know the subnet and treats directed broadcasts as unicast.
+pub(crate) fn destination(packet: &[u8], vm: Option<Mac>, subnet: Option<(Ipv4Addr, u8)>) -> Option<(Mac, u16)> {
     let unicast = vm.unwrap_or(BROADCAST);
     match packet.first()? >> 4 {
         4 if packet.len() >= 20 => {
             let d: [u8; 4] = packet[16..20].try_into().unwrap();
-            let mac = if d == [255; 4] {
+            let mac = if d == [255; 4] || subnet.is_some_and(|(addr, prefix)| {
+                prefix < 31 && u32::from_be_bytes(d) == u32::from(addr) | (u32::MAX >> prefix)
+            }) {
                 BROADCAST
             } else if Ipv4Addr::from(d).is_multicast() {
                 [0x01, 0x00, 0x5e, d[1] & 0x7f, d[2], d[3]]
@@ -538,19 +544,19 @@ pub(crate) mod tests {
 
     #[test]
     fn destinations() {
-        let to = |dst: Ipv4Addr| destination(&ipv4(Ipv4Addr::new(10, 0, 0, 1), dst, UDP, &[]), Some(VM));
+        let to = |dst: Ipv4Addr| destination(&ipv4(Ipv4Addr::new(10, 0, 0, 1), dst, UDP, &[]), Some(VM), None);
         assert_eq!(to(Ipv4Addr::new(10, 0, 0, 2)), Some((VM, IPV4)));
         assert_eq!(to(Ipv4Addr::BROADCAST), Some((BROADCAST, IPV4)));
         assert_eq!(to(Ipv4Addr::new(239, 129, 2, 3)), Some(([1, 0, 0x5e, 1, 2, 3], IPV4)));
         let p = ipv4(Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 2), UDP, &[]);
-        assert_eq!(destination(&p, None), Some((BROADCAST, IPV4)), "the VM's MAC is not known yet");
+        assert_eq!(destination(&p, None, None), Some((BROADCAST, IPV4)), "the VM's MAC is not known yet");
         let p = ipv6(link_local(GATEWAY_MAC), "ff02::1:ff12:3456".parse().unwrap(), UDP, 1, &[]);
-        assert_eq!(destination(&p, Some(VM)), Some(([0x33, 0x33, 0xff, 0x12, 0x34, 0x56], IPV6)));
+        assert_eq!(destination(&p, Some(VM), None), Some(([0x33, 0x33, 0xff, 0x12, 0x34, 0x56], IPV6)));
         let p = ipv6(link_local(GATEWAY_MAC), "fd00::2".parse().unwrap(), UDP, 1, &[]);
-        assert_eq!(destination(&p, Some(VM)), Some((VM, IPV6)));
-        assert_eq!(destination(&[0x50; 40], Some(VM)), None);
-        assert_eq!(destination(&[0x45; 19], Some(VM)), None);
-        assert_eq!(destination(&[], Some(VM)), None);
+        assert_eq!(destination(&p, Some(VM), None), Some((VM, IPV6)));
+        assert_eq!(destination(&[0x50; 40], Some(VM), None), None);
+        assert_eq!(destination(&[0x45; 19], Some(VM), None), None);
+        assert_eq!(destination(&[], Some(VM), None), None);
     }
 
     #[test]

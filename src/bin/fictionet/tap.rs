@@ -241,7 +241,7 @@ impl Link {
     pub(crate) fn router_advert(&self) -> Option<Vec<u8>> {
         let Family::Serve(lease) = &self.v6 else { return None };
         let ra = addresses::router_advert(lease, self.mtu);
-        let (dst, _) = ether::destination(&ra, self.vm)?;
+        let (dst, _) = ether::destination(&ra, self.vm, None)?;
         Some(ether::frame(dst, ether::GATEWAY_MAC, ether::IPV6, &ra))
     }
 
@@ -251,7 +251,11 @@ impl Link {
         if packet.len() > self.mtu as usize {
             return None;
         }
-        let (dst, ethertype) = ether::destination(packet, self.vm)?;
+        let subnet = match &self.v4 {
+            Family::Serve(lease) => Some((lease.addr.addr, lease.addr.prefix)),
+            _ => None,
+        };
+        let (dst, ethertype) = ether::destination(packet, self.vm, subnet)?;
         Some(ether::header(dst, ether::GATEWAY_MAC, ethertype))
     }
 }
@@ -1133,6 +1137,31 @@ mod tests {
         assert!(at(Step::Redirect { from: 8, to: 7 }) < at(Step::VmUp));
         assert!(at(Step::ClearVm) < at(Step::AddIngress(7)));
         assert!(at(Step::NoIpv6(7)) < at(Step::VmUp) && at(Step::NoIpv6(8)) < at(Step::OwnUp));
+    }
+
+    #[test]
+    fn world_directed_broadcast_uses_the_served_subnet() {
+        let mut link = served();
+        link.frame_from_vm(&discover());
+        for (dst, mac) in [
+            ("10.0.0.255", ether::BROADCAST),
+            ("10.0.1.255", VM),
+            ("10.0.0.2", VM),
+        ] {
+            let p = ether::ipv4(Ipv4Addr::new(10, 0, 0, 1), dst.parse().unwrap(), 1, &[]);
+            assert_eq!(link.to_vm(&p).unwrap()[..6], mac);
+        }
+        for prefix in [0, 30, 31, 32] {
+            let Family::Serve(lease) = &mut link.v4 else { unreachable!() };
+            lease.addr.prefix = prefix;
+            let dst = if prefix == 0 { Ipv4Addr::BROADCAST } else { Ipv4Addr::new(10, 0, 0, if prefix == 32 { 2 } else { 3 }) };
+            let p = ether::ipv4(Ipv4Addr::new(10, 0, 0, 1), dst, 1, &[]);
+            let mac = if prefix < 31 { ether::BROADCAST } else { VM };
+            assert_eq!(link.to_vm(&p).unwrap()[..6], mac);
+        }
+        link.v4 = Family::FromWorld;
+        let p = ether::ipv4(Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 255), 1, &[]);
+        assert_eq!(link.to_vm(&p).unwrap()[..6], VM);
     }
 
     #[test]
