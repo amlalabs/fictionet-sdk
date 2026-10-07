@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "codegen"]
+members = [".", "codegen", "codegen/tests/layouts"]
 exclude = ["fuzz"]
 resolver = "3"
 
