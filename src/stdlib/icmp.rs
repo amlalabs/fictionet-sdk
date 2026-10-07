@@ -117,6 +117,26 @@ fn set_icmp_checksum(icmp: &mut [u8], pseudo: u32) {
 /// from or to an address that is not one host. The answer quotes as much
 /// of the packet as fits in 576 bytes (RFC 1812).
 pub fn host_unreachable(packet: &[u8], from: std::net::Ipv4Addr) -> Option<Packet> {
+    error_v4(packet, from, 3, 1)
+}
+
+/// The ICMP "time exceeded in transit" answer (type 11, code 0) to the IPv4
+/// or IPv6 packet `packet`, sent from `from`, as a router sends it when a
+/// packet's TTL or hop limit runs out. For IPv6 it is ICMPv6 type 3, code 0.
+/// This is what `traceroute` reads.
+///
+/// `None` where the RFCs forbid an answer, as for [`host_unreachable`] and
+/// [`address_unreachable`], or when `from` is not of the packet's family.
+pub fn time_exceeded(packet: &[u8], from: IpAddr) -> Option<Packet> {
+    match (wire::version(packet)?, from) {
+        (4, IpAddr::V4(from)) => error_v4(packet, from, 11, 0),
+        (6, IpAddr::V6(from)) => error_v6(packet, from, 3, 0),
+        _ => None,
+    }
+}
+
+/// An ICMP error of `kind` and `code` about `packet`, from `from`.
+fn error_v4(packet: &[u8], from: std::net::Ipv4Addr, kind: u8, code: u8) -> Option<Packet> {
     let v4 = V4::parse(packet, false)?;
     if v4.frag_offset() != 0 {
         return None;
@@ -136,7 +156,7 @@ pub fn host_unreachable(packet: &[u8], from: std::net::Ipv4Addr) -> Option<Packe
         }
     }
     let quote = &packet[..v4.total.min(576 - 28)];
-    let mut icmp = vec![3, 1, 0, 0, 0, 0, 0, 0];
+    let mut icmp = vec![kind, code, 0, 0, 0, 0, 0, 0];
     icmp.extend_from_slice(quote);
     let sum = wire::checksum(0, &icmp);
     icmp[2..4].copy_from_slice(&sum.to_be_bytes());
@@ -154,6 +174,11 @@ pub fn host_unreachable(packet: &[u8], from: std::net::Ipv4Addr) -> Option<Packe
 /// answer quotes as much of the packet as fits in the minimum MTU, 1280
 /// bytes.
 pub fn address_unreachable(packet: &[u8], from: std::net::Ipv6Addr) -> Option<Packet> {
+    error_v6(packet, from, 1, 3)
+}
+
+/// An ICMPv6 error of `kind` and `code` about `packet`, from `from`.
+fn error_v6(packet: &[u8], from: std::net::Ipv6Addr, kind: u8, code: u8) -> Option<Packet> {
     let v6 = V6::parse(packet, false)?;
     if let Some((at, _)) = v6.frag
         && u16::from_be_bytes([packet[at + 2], packet[at + 3]]) & 0xfff8 != 0
@@ -171,7 +196,7 @@ pub fn address_unreachable(packet: &[u8], from: std::net::Ipv6Addr) -> Option<Pa
         return None;
     }
     let quote = &packet[..v6.end.min(1280 - 48)];
-    let mut icmp = vec![1, 3, 0, 0, 0, 0, 0, 0];
+    let mut icmp = vec![kind, code, 0, 0, 0, 0, 0, 0];
     icmp.extend_from_slice(quote);
     let sum = crate::stdlib::udp::transport_checksum(from.into(), src.into(), wire::PROTO_ICMPV6, &icmp);
     icmp[2..4].copy_from_slice(&sum.to_be_bytes());
