@@ -37,7 +37,7 @@ fn receive(mut t: ReadTransfer) -> Vec<u8> {
                 assert!(data.len() <= size);
                 got.extend_from_slice(data);
                 if data.len() < size {
-                    assert_eq!(t.on_ack(*block), Event::Complete);
+                    assert_eq!(t.receive_ack(*block), Event::Complete);
                     assert_eq!(t.current(), None);
                     return got;
                 }
@@ -45,7 +45,7 @@ fn receive(mut t: ReadTransfer) -> Vec<u8> {
             }
             other => panic!("sent {other:?}"),
         };
-        match t.on_ack(ack) {
+        match t.receive_ack(ack) {
             Event::Send(p) => packet = p,
             other => panic!("got {other:?} before the client saw a short block"),
         }
@@ -86,7 +86,7 @@ fuzz_target!(|data: &[u8]| {
         let agreed = negotiate(&[TftpOption::new("blksize", &blksize)], None, MAX_BLOCK_SIZE);
         let mut t = ReadTransfer::negotiated(rest.to_vec(), &agreed);
         for ack in rest.chunks_exact(2) {
-            if let Event::Send(Packet::Data { data, .. }) = t.on_ack(u16::from_be_bytes([ack[0], ack[1]])) {
+            if let Event::Send(Packet::Data { data, .. }) = t.receive_ack(u16::from_be_bytes([ack[0], ack[1]])) {
                 assert!(data.len() <= usize::from(t.block_size()));
             }
         }

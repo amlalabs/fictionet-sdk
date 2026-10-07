@@ -51,7 +51,7 @@ mod sessions {
                 server.send(&message).unwrap();
                 continue;
             }
-            match server.next_message() {
+            match server.next() {
                 Some(item) => {
                     let failed = !matches!(item, Ok(Ok(_)));
                     got.push(item);
@@ -99,7 +99,7 @@ mod sessions {
                     client.send(&message).unwrap();
                     continue;
                 }
-                match client.next_message() {
+                match client.next() {
                     Some(item) => {
                         let failed = !matches!(item, Ok(Ok(_)));
                         got.push(item.map(|result| result.map(|message| (message, client.pixel_format()))));
@@ -184,7 +184,7 @@ fuzz_target!(|data: &[u8]| {
     contract::check_decode_with_alloc_limit(
         || {
             let mut d = ServerMessages::with_limit(4096);
-            d.set_mode(server_phase, dialect, format).unwrap();
+            d.set_phase(server_phase, dialect, format).unwrap();
             d
         },
         input,

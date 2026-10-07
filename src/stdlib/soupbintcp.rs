@@ -641,7 +641,7 @@ impl Clock {
 
 /// Where a [`Client`] is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ClientState {
+pub enum ClientPhase {
     /// Created; [`Client::start`] sends the login request.
     Connected,
     /// Login request sent; waiting for the answer.
@@ -668,7 +668,7 @@ pub enum ClientState {
 #[derive(Clone, Copy, Debug)]
 pub struct Client {
     login: Login,
-    state: ClientState,
+    phase: ClientPhase,
     clock: Clock,
     session: Alpha<SESSION_LENGTH>,
     next: u64,
@@ -679,15 +679,15 @@ impl Client {
     pub fn new(login: Login, timers: Timers, now_ms: u64) -> Result<Self, Error> {
         Ok(Self {
             login,
-            state: ClientState::Connected,
+            phase: ClientPhase::Connected,
             clock: Clock::new(timers, now_ms)?,
             session: login.session,
             next: login.sequence,
         })
     }
     /// Where the session is.
-    pub fn state(&self) -> ClientState {
-        self.state
+    pub fn phase(&self) -> ClientPhase {
+        self.phase
     }
     /// The session requested, then the one the server accepted.
     pub fn session(&self) -> Alpha<SESSION_LENGTH> {
@@ -701,10 +701,10 @@ impl Client {
     pub fn start(&mut self, now_ms: u64) -> Result<Vec<Action>, Error> {
         let mut s = *self;
         s.clock.advance(now_ms)?;
-        if s.state != ClientState::Connected {
+        if s.phase != ClientPhase::Connected {
             return Err(Error::State);
         }
-        s.state = ClientState::LoginSent;
+        s.phase = ClientPhase::LoginSent;
         s.clock.since = now_ms;
         s.clock.sent = now_ms;
         *self = s;
@@ -732,7 +732,7 @@ impl Client {
             Err(_) => {
                 let mut s = *self;
                 s.clock.advance(now_ms)?;
-                if s.state == ClientState::Closed {
+                if s.phase == ClientPhase::Closed {
                     return Err(Error::State);
                 }
                 let actions = s.close(CloseReason::Protocol);
@@ -742,20 +742,20 @@ impl Client {
         }
     }
     fn receive_inner(&mut self, packet: &Packet) -> Result<Vec<Action>, Error> {
-        if self.state == ClientState::Closed {
+        if self.phase == ClientPhase::Closed {
             return Err(Error::State);
         }
         self.clock.received = self.clock.now;
-        match (self.state, packet) {
+        match (self.phase, packet) {
             (_, Packet::Debug(_)) => Ok(Vec::new()),
-            (ClientState::LoginSent, Packet::LoginAccepted { session, sequence }) => {
+            (ClientPhase::LoginSent, Packet::LoginAccepted { session, sequence }) => {
                 // Sequence numbers start at 1 in every session (1.2).
                 if *sequence == 0
                     || (!self.login.session.is_blank() && !self.login.session.same_text(session))
                 {
                     return Ok(self.close(CloseReason::Protocol));
                 }
-                self.state = ClientState::LoggedIn;
+                self.phase = ClientPhase::LoggedIn;
                 self.session = *session;
                 self.next = *sequence;
                 // Heartbeats are owed from login on (1.3).
@@ -765,18 +765,18 @@ impl Client {
                     sequence: *sequence,
                 })])
             }
-            (ClientState::LoginSent, Packet::LoginRejected(reason)) => {
+            (ClientPhase::LoginSent, Packet::LoginRejected(reason)) => {
                 let mut actions = vec![Action::Event(Event::Rejected(*reason))];
                 actions.extend(self.close(CloseReason::Rejected));
                 Ok(actions)
             }
-            (ClientState::LoggedIn, Packet::SequencedData(_)) => {
+            (ClientPhase::LoggedIn, Packet::SequencedData(_)) => {
                 let sequence = self.next;
                 self.next = sequence.checked_add(1).ok_or(Error::Sequence)?;
                 Ok(vec![Action::Event(Event::Sequenced { sequence })])
             }
-            (ClientState::LoggedIn, Packet::ServerHeartbeat) => Ok(Vec::new()),
-            (ClientState::LoggedIn, Packet::EndOfSession) => {
+            (ClientPhase::LoggedIn, Packet::ServerHeartbeat) => Ok(Vec::new()),
+            (ClientPhase::LoggedIn, Packet::EndOfSession) => {
                 Ok(self.close(CloseReason::EndOfSession))
             }
             _ => Ok(self.close(CloseReason::Protocol)),
@@ -792,7 +792,7 @@ impl Client {
         if text.len() > MAX_PAYLOAD {
             return Err(Error::TooLong);
         }
-        if self.state == ClientState::Closed {
+        if self.phase == ClientPhase::Closed {
             return Err(Error::State);
         }
         self.clock.advance(now_ms)?;
@@ -808,7 +808,7 @@ impl Client {
         if message.len() > MAX_PAYLOAD {
             return Err(Error::TooLong);
         }
-        if self.state != ClientState::LoggedIn {
+        if self.phase != ClientPhase::LoggedIn {
             return Err(Error::State);
         }
         self.clock.advance(now_ms)?;
@@ -817,7 +817,7 @@ impl Client {
     }
     /// Sends a Logout Request and closes (2.3.4). Only once logged in.
     pub fn logout(&mut self, now_ms: u64) -> Result<Vec<Action>, Error> {
-        if self.state != ClientState::LoggedIn {
+        if self.phase != ClientPhase::LoggedIn {
             return Err(Error::State);
         }
         self.clock.advance(now_ms)?;
@@ -831,29 +831,29 @@ impl Client {
     /// A closed session returns nothing.
     pub fn tick(&mut self, now_ms: u64) -> Result<Vec<Action>, Error> {
         self.clock.advance(now_ms)?;
-        Ok(match self.state {
-            ClientState::Connected | ClientState::Closed => Vec::new(),
-            ClientState::LoginSent if self.clock.login_expired() => {
+        Ok(match self.phase {
+            ClientPhase::Connected | ClientPhase::Closed => Vec::new(),
+            ClientPhase::LoginSent if self.clock.login_expired() => {
                 self.close(CloseReason::LoginTimeout)
             }
-            ClientState::LoginSent => Vec::new(),
-            ClientState::LoggedIn if self.clock.idle() => self.close(CloseReason::IdleTimeout),
-            ClientState::LoggedIn if self.clock.heartbeat_due() => {
+            ClientPhase::LoginSent => Vec::new(),
+            ClientPhase::LoggedIn if self.clock.idle() => self.close(CloseReason::IdleTimeout),
+            ClientPhase::LoggedIn if self.clock.heartbeat_due() => {
                 self.clock.sent = now_ms;
                 vec![Action::Send(Packet::ClientHeartbeat)]
             }
-            ClientState::LoggedIn => Vec::new(),
+            ClientPhase::LoggedIn => Vec::new(),
         })
     }
     fn close(&mut self, reason: CloseReason) -> Vec<Action> {
-        self.state = ClientState::Closed;
+        self.phase = ClientPhase::Closed;
         vec![Action::Event(Event::Disconnected(reason))]
     }
 }
 
 /// Where a [`Server`] is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ServerState {
+pub enum ServerPhase {
     /// Waiting for the client's login request.
     AwaitingLogin,
     /// A login request arrived; the caller must accept or reject it.
@@ -873,7 +873,7 @@ pub enum ServerState {
 /// which numbers them. Driving rules are those of [`Client`].
 #[derive(Clone, Copy, Debug)]
 pub struct Server {
-    state: ServerState,
+    phase: ServerPhase,
     clock: Clock,
     session: Alpha<SESSION_LENGTH>,
     next: u64,
@@ -883,15 +883,15 @@ impl Server {
     /// starts now.
     pub fn new(timers: Timers, now_ms: u64) -> Result<Self, Error> {
         Ok(Self {
-            state: ServerState::AwaitingLogin,
+            phase: ServerPhase::AwaitingLogin,
             clock: Clock::new(timers, now_ms)?,
             session: Alpha::blank(),
             next: 0,
         })
     }
     /// Where the session is.
-    pub fn state(&self) -> ServerState {
-        self.state
+    pub fn phase(&self) -> ServerPhase {
+        self.phase
     }
     /// The accepted session; blank before login.
     pub fn session(&self) -> Alpha<SESSION_LENGTH> {
@@ -908,21 +908,21 @@ impl Server {
     pub fn receive(&mut self, packet: &Packet, now_ms: u64) -> Result<Vec<Action>, Error> {
         let mut s = *self;
         s.clock.advance(now_ms)?;
-        if s.state == ServerState::Closed {
+        if s.phase == ServerPhase::Closed {
             return Err(Error::State);
         }
         s.clock.received = now_ms;
-        let actions = match (s.state, packet) {
+        let actions = match (s.phase, packet) {
             (_, Packet::Debug(_)) => Vec::new(),
-            (ServerState::AwaitingLogin, Packet::LoginRequest(login)) => {
-                s.state = ServerState::LoginPending;
+            (ServerPhase::AwaitingLogin, Packet::LoginRequest(login)) => {
+                s.phase = ServerPhase::LoginPending;
                 vec![Action::Event(Event::LoginRequested(*login))]
             }
-            (ServerState::LoggedIn, Packet::UnsequencedData(_)) => {
+            (ServerPhase::LoggedIn, Packet::UnsequencedData(_)) => {
                 vec![Action::Event(Event::Unsequenced)]
             }
-            (ServerState::LoggedIn, Packet::ClientHeartbeat) => Vec::new(),
-            (ServerState::LoggedIn, Packet::LogoutRequest) => s.close(CloseReason::Logout),
+            (ServerPhase::LoggedIn, Packet::ClientHeartbeat) => Vec::new(),
+            (ServerPhase::LoggedIn, Packet::LogoutRequest) => s.close(CloseReason::Logout),
             _ => s.close(CloseReason::Protocol),
         };
         *self = s;
@@ -940,7 +940,7 @@ impl Server {
             Err(_) => {
                 let mut s = *self;
                 s.clock.advance(now_ms)?;
-                if s.state == ServerState::Closed {
+                if s.phase == ServerPhase::Closed {
                     return Err(Error::State);
                 }
                 let actions = s.close(CloseReason::Protocol);
@@ -959,14 +959,14 @@ impl Server {
         sequence: u64,
         now_ms: u64,
     ) -> Result<Vec<Action>, Error> {
-        if self.state != ServerState::LoginPending {
+        if self.phase != ServerPhase::LoginPending {
             return Err(Error::State);
         }
         if sequence == 0 {
             return Err(Error::Sequence);
         }
         self.clock.advance(now_ms)?;
-        self.state = ServerState::LoggedIn;
+        self.phase = ServerPhase::LoggedIn;
         self.session = session;
         self.next = sequence;
         self.clock.sent = now_ms;
@@ -979,7 +979,7 @@ impl Server {
     }
     /// Refuses the pending login and closes (2.2.2).
     pub fn reject(&mut self, reason: RejectReason, now_ms: u64) -> Result<Vec<Action>, Error> {
-        if self.state != ServerState::LoginPending {
+        if self.phase != ServerPhase::LoginPending {
             return Err(Error::State);
         }
         self.clock.advance(now_ms)?;
@@ -995,7 +995,7 @@ impl Server {
         if message.len() > MAX_PAYLOAD {
             return Err(Error::TooLong);
         }
-        if self.state != ServerState::LoggedIn {
+        if self.phase != ServerPhase::LoggedIn {
             return Err(Error::State);
         }
         let next = self.next.checked_add(1).ok_or(Error::Sequence)?;
@@ -1009,7 +1009,7 @@ impl Server {
         if text.len() > MAX_PAYLOAD {
             return Err(Error::TooLong);
         }
-        if self.state == ServerState::Closed {
+        if self.phase == ServerPhase::Closed {
             return Err(Error::State);
         }
         self.clock.advance(now_ms)?;
@@ -1018,7 +1018,7 @@ impl Server {
     }
     /// Sends End of Session and closes (2.2.5). Only once logged in.
     pub fn end_session(&mut self, now_ms: u64) -> Result<Vec<Action>, Error> {
-        if self.state != ServerState::LoggedIn {
+        if self.phase != ServerPhase::LoggedIn {
             return Err(Error::State);
         }
         self.clock.advance(now_ms)?;
@@ -1032,25 +1032,25 @@ impl Server {
     /// A closed session returns nothing.
     pub fn tick(&mut self, now_ms: u64) -> Result<Vec<Action>, Error> {
         self.clock.advance(now_ms)?;
-        Ok(match self.state {
-            ServerState::Closed => Vec::new(),
-            ServerState::AwaitingLogin | ServerState::LoginPending => {
+        Ok(match self.phase {
+            ServerPhase::Closed => Vec::new(),
+            ServerPhase::AwaitingLogin | ServerPhase::LoginPending => {
                 if self.clock.login_expired() {
                     self.close(CloseReason::LoginTimeout)
                 } else {
                     Vec::new()
                 }
             }
-            ServerState::LoggedIn if self.clock.idle() => self.close(CloseReason::IdleTimeout),
-            ServerState::LoggedIn if self.clock.heartbeat_due() => {
+            ServerPhase::LoggedIn if self.clock.idle() => self.close(CloseReason::IdleTimeout),
+            ServerPhase::LoggedIn if self.clock.heartbeat_due() => {
                 self.clock.sent = now_ms;
                 vec![Action::Send(Packet::ServerHeartbeat)]
             }
-            ServerState::LoggedIn => Vec::new(),
+            ServerPhase::LoggedIn => Vec::new(),
         })
     }
     fn close(&mut self, reason: CloseReason) -> Vec<Action> {
-        self.state = ServerState::Closed;
+        self.phase = ServerPhase::Closed;
         vec![Action::Event(Event::Disconnected(reason))]
     }
 }
@@ -1341,7 +1341,7 @@ mod tests {
             server.receive(&request[0], 0).unwrap(),
             [Action::Event(Event::LoginRequested(login()))]
         );
-        assert_eq!(server.state(), ServerState::LoginPending);
+        assert_eq!(server.phase(), ServerPhase::LoginPending);
         let accepted = sends(&server.accept(session(), 5, 0).unwrap());
         assert_eq!(
             client.receive(&accepted[0], 0).unwrap(),
@@ -1356,7 +1356,7 @@ mod tests {
     #[test]
     fn login_and_sequence_numbering() {
         let (mut client, mut server) = pair();
-        assert_eq!(client.state(), ClientState::LoggedIn);
+        assert_eq!(client.phase(), ClientPhase::LoggedIn);
         assert_eq!(server.next_sequence(), 5);
         for (i, msg) in [&b"a"[..], b"b", b"c"].iter().enumerate() {
             let p = server.send(msg, 10).unwrap();
@@ -1427,13 +1427,13 @@ mod tests {
                 .is_empty()
         );
         let _ = client.tick(15_999).unwrap();
-        assert_eq!(client.state(), ClientState::LoggedIn);
+        assert_eq!(client.phase(), ClientPhase::LoggedIn);
         assert_eq!(
             client.tick(16_000).unwrap(),
             [Action::Event(Event::Disconnected(CloseReason::IdleTimeout))]
         );
         let _ = server.tick(16_999).unwrap();
-        assert_eq!(server.state(), ServerState::LoggedIn);
+        assert_eq!(server.phase(), ServerPhase::LoggedIn);
         assert_eq!(
             server.tick(17_000).unwrap(),
             [Action::Event(Event::Disconnected(CloseReason::IdleTimeout))]
@@ -1484,7 +1484,7 @@ mod tests {
                 Action::Event(Event::Disconnected(CloseReason::Rejected))
             ]
         );
-        assert_eq!(client.state(), ClientState::Closed);
+        assert_eq!(client.phase(), ClientPhase::Closed);
     }
 
     #[test]
@@ -1589,7 +1589,7 @@ mod tests {
             sequence: 0,
         };
         assert_eq!(client.receive(&zero, 1).unwrap(), closed);
-        assert_eq!(client.state(), ClientState::Closed);
+        assert_eq!(client.phase(), ClientPhase::Closed);
     }
 
     #[test]
@@ -1664,7 +1664,7 @@ mod tests {
         let mut pending = Server::new(Timers::default(), 0).unwrap();
         let _ = pending.receive(&Packet::LoginRequest(login()), 0).unwrap();
         assert_eq!(pending.accept(session(), 0, 0), Err(Error::Sequence));
-        assert_eq!(pending.state(), ServerState::LoginPending);
+        assert_eq!(pending.phase(), ServerPhase::LoginPending);
     }
 
     #[test]
@@ -1688,7 +1688,7 @@ mod tests {
             client.receive(&Packet::SequencedData(Vec::new()), 0),
             Err(Error::Sequence)
         );
-        assert_eq!(client.state(), ClientState::LoggedIn);
+        assert_eq!(client.phase(), ClientPhase::LoggedIn);
     }
 
     #[test]
@@ -1706,7 +1706,7 @@ mod tests {
                     Ok(actions) => {
                         assert!(actions.len() <= 2);
                         if matches!(p, Packet::SequencedData(_))
-                            && client.state() == ClientState::LoggedIn
+                            && client.phase() == ClientPhase::LoggedIn
                         {
                             assert_eq!(client.next_sequence(), before + 1);
                         }

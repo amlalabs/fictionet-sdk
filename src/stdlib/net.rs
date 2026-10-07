@@ -2368,7 +2368,7 @@ impl Filter {
     }
 
     fn forward(&mut self, fcx: &Cx, route: Option<usize>, packet: Packet) {
-        let packet = match self.reassembly.intake(packet, fcx.now()) {
+        let packet = match self.reassembly.push(packet, fcx.now()) {
             Intake::Whole(p) => p,
             Intake::Waiting => return,
             Intake::Refused { packet, answer } => {

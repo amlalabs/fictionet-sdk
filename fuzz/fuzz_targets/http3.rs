@@ -5,7 +5,7 @@ use fictionet::stdlib::{
     codec::{Decode, Wire, contract, test_support::decode_all},
     http3::{
         self, Endpoint, Event, Frame, Frames, HeaderKind, HeaderList, MessageSide, Priority,
-        PriorityElement, RequestResult, RequestState, Session, Settings, StreamHeader, StreamHeaders, StreamItem, StreamItems,
+        PriorityElement, RequestResult, RequestStream, Session, Settings, StreamHeader, StreamHeaders, StreamItem, StreamItems,
     },
     qpack::{self, SectionResult, Table},
 };
@@ -91,7 +91,7 @@ fn shared_qpack(bytes: &[u8], side: MessageSide) {
     let mut session = Session::new(sender, 3, http3::MAX_FRAME * 2);
     assert_eq!(session.push(encoder_id, &StreamHeader::QpackEncoder.to_bytes().unwrap()), 1);
     let mut table = Table::new(4096);
-    let mut states = [RequestState::new(0, side, true).unwrap(), RequestState::new(4, side, true).unwrap()];
+    let mut states = [RequestStream::new(0, side, true).unwrap(), RequestStream::new(4, side, true).unwrap()];
     let mut held = qpack::BlockedSections::new(2);
     let mut inputs = [first, second, encoder];
     let mut active = [true; 2];
@@ -197,11 +197,11 @@ fuzz_target!(|input: &[u8]| {
     for extended_connect in [false, true] {
         let request = Some(HeaderKind::Request { extended_connect });
         for (mut state, request) in [
-            (RequestState::new(0, MessageSide::Request, extended_connect).unwrap(), request),
-            (RequestState::new(0, MessageSide::Response, extended_connect).unwrap(), None),
-            (RequestState::new(0, MessageSide::HeadResponse, extended_connect).unwrap(), None),
-            (RequestState::new(0, MessageSide::ConnectResponse, extended_connect).unwrap(), None),
-            (RequestState::push(3).unwrap(), None),
+            (RequestStream::new(0, MessageSide::Request, extended_connect).unwrap(), request),
+            (RequestStream::new(0, MessageSide::Response, extended_connect).unwrap(), None),
+            (RequestStream::new(0, MessageSide::HeadResponse, extended_connect).unwrap(), None),
+            (RequestStream::new(0, MessageSide::ConnectResponse, extended_connect).unwrap(), None),
+            (RequestStream::push(3).unwrap(), None),
         ] {
             for frame in &items {
                 let Ok(frame) = frame else { break };

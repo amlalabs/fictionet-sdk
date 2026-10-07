@@ -24,7 +24,7 @@ pub fn reassemble(packets: impl IntoIterator<Item = (u64, Vec<u8>)>) -> Vec<Pack
             r.expire(now);
             r.check();
         }
-        match r.intake(Packet(bytes.clone()), now) {
+        match r.push(Packet(bytes.clone()), now) {
             Intake::Whole(p) if p.0 != bytes => out.push(p),
             Intake::Refused { answer: Some(answer), .. } => out.push(answer),
             _ => {}

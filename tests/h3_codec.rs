@@ -36,7 +36,7 @@ fn literal_headers(fields: &[Field]) -> Frame {
 fn blocked_stream_keeps_frames_in_connection_budget_until_unpaused() {
     let mut table = Table::new(4096);
     table.apply(EI::SetCapacity(4096)).unwrap();
-    let mut state = http3::RequestState::new(0, http3::MessageSide::Response, false).unwrap();
+    let mut state = http3::RequestStream::new(0, http3::MessageSide::Response, false).unwrap();
     let mut session = Session::new(Endpoint::Server, 4, http3::MAX_FRAME);
     let data = Frame::Data(vec![7; 10]);
     let mut bytes = wire(&Frame::Headers(vec![2, 0, 0x80]));
@@ -166,21 +166,21 @@ fn request_field_limit_rejects_oversized_fields() {
     let bytes = wire(&frame);
     assert!((2000..2200).contains(&bytes.len()));
     let expected = http3::Error::Qpack(qpack::Error::FieldSectionTooLarge);
-    let mut state = http3::RequestState::new(0, http3::MessageSide::Request, false).unwrap().with_field_limit(1000);
+    let mut state = http3::RequestStream::new(0, http3::MessageSide::Request, false).unwrap().with_field_limit(1000);
     assert!(matches!(state.step(&frame, &Table::new(0)), Err(e) if e == expected));
 }
 
 #[test]
 fn request_field_limit_survives_blocked_retries() {
-    use http3::{Event, MessageSide, RequestResult, RequestState};
+    use http3::{Event, MessageSide, RequestResult, RequestStream};
     // Cover request HEADERS, push HEADERS, trailers, and PUSH_PROMISE.
     for kind in 0..4 {
         let mut table = Table::new(4096);
         table.apply(EI::SetCapacity(4096)).unwrap();
         let mut state = match kind {
-            0 => RequestState::new(0, MessageSide::Request, false).unwrap(),
-            1 => RequestState::push(3).unwrap(),
-            _ => RequestState::new(0, MessageSide::Response, false).unwrap(),
+            0 => RequestStream::new(0, MessageSide::Request, false).unwrap(),
+            1 => RequestStream::push(3).unwrap(),
+            _ => RequestStream::new(0, MessageSide::Response, false).unwrap(),
         }
         .with_field_limit(1000);
         if kind == 2 {
@@ -220,7 +220,7 @@ fn request_field_limit_survives_blocked_retries() {
 
 #[test]
 fn received_lengths_are_normalized_and_request_state_checks_body() {
-    use http3::{Event, HeaderKind, HeaderList, MessageSide, RequestResult, RequestState};
+    use http3::{Event, HeaderKind, HeaderList, MessageSide, RequestResult, RequestStream};
     let fields = received_request(&["5", "5"]);
     let headers = HeaderList::from_fields(fields.clone(), HeaderKind::Request { extended_connect: false }).unwrap();
     assert_eq!(headers.fields.len(), 5);
@@ -231,14 +231,14 @@ fn received_lengths_are_normalized_and_request_state_checks_body() {
     };
     assert_eq!(HeaderList::from_fields(fields, HeaderKind::Request { extended_connect: false }), Ok(headers.clone()));
     let table = Table::new(0);
-    let mut state = RequestState::new(0, MessageSide::Request, false).unwrap();
+    let mut state = RequestStream::new(0, MessageSide::Request, false).unwrap();
     assert_eq!(state.step(&frame, &table), Ok(RequestResult::Event { event: Ok(Event::Headers(headers)), ack: None }));
     assert_eq!(
         state.step(&Frame::Data(b"hello".to_vec()), &table),
         Ok(RequestResult::Event { event: Ok(Event::Data(b"hello".to_vec())), ack: None })
     );
     assert_eq!(state.finish(), Ok(()));
-    let mut state = RequestState::new(0, MessageSide::Request, false).unwrap();
+    let mut state = RequestStream::new(0, MessageSide::Request, false).unwrap();
     state.step(&frame, &table).unwrap();
     assert_eq!(state.finish(), Err(http3::Error::Message("DATA differs from Content-Length")));
     assert!(
@@ -249,7 +249,7 @@ fn received_lengths_are_normalized_and_request_state_checks_body() {
 
 #[test]
 fn request_blocked_value_resumes_after_table_update() {
-    use http3::{Event, MessageSide, RequestResult, RequestState};
+    use http3::{Event, MessageSide, RequestResult, RequestStream};
     let mut table = Table::new(4096);
     table.set_capacity(4096).unwrap();
     let frame = Frame::Headers(section(
@@ -263,7 +263,7 @@ fn request_blocked_value_resumes_after_table_update() {
             Rep::Indexed { static_table: true, index: 1 },
         ],
     ));
-    let mut state = RequestState::new(4, MessageSide::Request, false).unwrap();
+    let mut state = RequestStream::new(4, MessageSide::Request, false).unwrap();
     let RequestResult::Blocked(blocked) = state.step(&frame, &table).unwrap() else { panic!("must block") };
     assert!(state.is_blocked());
     assert_eq!(state.step(&Frame::Data(vec![]), &table), Err(http3::Error::State));
@@ -282,13 +282,13 @@ fn request_blocked_value_resumes_after_table_update() {
 
 #[test]
 fn two_request_states_resume_in_qpack_release_order() {
-    use http3::{Event, MessageSide, RequestResult, RequestState};
+    use http3::{Event, MessageSide, RequestResult, RequestStream};
     let mut table = Table::new(4096);
     table.set_capacity(4096).unwrap();
     let mut held = qpack::BlockedSections::new(2);
     let mut states = [
-        RequestState::new(0, MessageSide::Request, false).unwrap(),
-        RequestState::new(4, MessageSide::Request, false).unwrap(),
+        RequestStream::new(0, MessageSide::Request, false).unwrap(),
+        RequestStream::new(4, MessageSide::Request, false).unwrap(),
     ];
     let mut session = Session::new(Endpoint::Client, 2, 2 * http3::MAX_FRAME);
     for (id, required) in [(0, 2), (4, 1)] {
@@ -417,11 +417,11 @@ fn request_state_checks_message_sequences() {
     {
         let table = Table::new(0);
         let mut state = if push {
-            let mut state = http3::RequestState::push(3).unwrap();
+            let mut state = http3::RequestStream::push(3).unwrap();
             state.set_push_side(side).unwrap();
             state
         } else {
-            http3::RequestState::new(0, side, false).unwrap()
+            http3::RequestStream::new(0, side, false).unwrap()
         };
         let mut outcome = Ok(());
         for frame in frames {
@@ -442,9 +442,9 @@ fn request_state_checks_message_sequences() {
 
 #[test]
 fn request_state_resumes_blocked_trailers_and_push_promises() {
-    use http3::{Event, MessageSide, RequestResult, RequestState};
+    use http3::{Event, MessageSide, RequestResult, RequestStream};
     for promise in [false, true] {
-        let mut state = RequestState::new(0, MessageSide::Response, false).unwrap();
+        let mut state = RequestStream::new(0, MessageSide::Response, false).unwrap();
         let mut table = Table::new(4096);
         table.set_capacity(4096).unwrap();
         state.step(&literal_headers(&[Field::new(":status", "200")]), &table).unwrap();
@@ -484,7 +484,7 @@ fn request_field_errors_preserve_qpack_acknowledgments() {
         let insert = EI::InsertWithLiteralName { name: b":status".to_vec(), value: b"200".to_vec() };
         let frame =
             Frame::Headers(section(1, 1, table.max_entries(), &[Rep::Indexed { static_table: false, index: 0 }]));
-        let mut state = http3::RequestState::new(0, http3::MessageSide::Request, false).unwrap();
+        let mut state = http3::RequestStream::new(0, http3::MessageSide::Request, false).unwrap();
         let result = if delayed {
             let http3::RequestResult::Blocked(blocked) = state.step(&frame, &table).unwrap() else {
                 panic!("must block")

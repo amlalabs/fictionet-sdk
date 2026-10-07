@@ -8,7 +8,7 @@
 //!
 //! [`Session`] routes ordered stream bytes under a shared input budget.
 //! For a single stream, use [`Stream<Frames>`](fictionet::stdlib::codec::Stream),
-//! [`ControlFrames`], or [`StreamHeaders`]. [`RequestState`] validates decoded
+//! [`ControlFrames`], or [`StreamHeaders`]. [`RequestStream`] validates decoded
 //! request and push frames. QPACK tables and blocked sections belong to the
 //! caller, who applies instructions and sends acknowledgment values between
 //! items. Unknown frames are returned for inspection.
@@ -23,7 +23,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::{codec::Wire, http3::{HeaderKind, HeaderList, Frame,
-//!     RequestState, RequestResult, MessageSide, Event, MAX_FIELD_SECTION_SIZE}, qpack};
+//!     RequestStream, RequestResult, MessageSide, Event, MAX_FIELD_SECTION_SIZE}, qpack};
 //! let headers = HeaderList { fields: vec![
 //!     qpack::Field::new(":method", "GET"),
 //!     qpack::Field::new(":scheme", "https"),
@@ -33,7 +33,7 @@
 //! let mut encoder = qpack::Encoder::new(0, MAX_FIELD_SECTION_SIZE);
 //! let section = headers.section(&mut encoder, 0, HeaderKind::Request { extended_connect: false })?;
 //! let frame = Frame::headers(&section)?;
-//! let mut state = RequestState::new(0, MessageSide::Request, false)?;
+//! let mut state = RequestStream::new(0, MessageSide::Request, false)?;
 //! let table = qpack::Table::new(0);
 //! assert_eq!(state.step(&frame, &table)?, RequestResult::Event { event: Ok(Event::Headers(headers)), ack: None });
 //! state.finish()?;
@@ -307,7 +307,7 @@ pub enum PriorityElement {
 }
 
 /// One HTTP/3 frame. HEADERS and PUSH_PROMISE retain their encoded QPACK
-/// sections; use HeaderList or RequestState to validate their HTTP fields.
+/// sections; use HeaderList or RequestStream to validate their HTTP fields.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Frame {
     /// A chunk of message content or tunnel data.
@@ -954,7 +954,7 @@ fn uri_path(path: &[u8]) -> bool {
 impl HeaderList {
     /// Validates received fields and normalizes repeated identical Content-Length
     /// values to one field. For response context such
-    /// as HEAD or CONNECT, use [`RequestState`] to enforce message semantics.
+    /// as HEAD or CONNECT, use [`RequestStream`] to enforce message semantics.
     pub fn from_fields(fields: Vec<qpack::Field>, kind: HeaderKind) -> Result<Self, Error> {
         Self::received(fields, kind, false).map(|(headers, _)| headers)
     }
@@ -1289,7 +1289,7 @@ pub enum RequestResult {
         ack: Option<qpack::DecoderInstruction>,
     },
     /// Call [`Session::pause`] until the section can be retried, then
-    /// [`RequestState::resume`] and [`Session::unpause`] before reading more frames.
+    /// [`RequestStream::resume`] and [`Session::unpause`] before reading more frames.
     Blocked(qpack::BlockedSection),
 }
 
@@ -1321,7 +1321,7 @@ pub enum RequestResult {
 /// let frame = Wire::to_bytes(&Frame::headers(&section)?)?;
 /// assert_eq!(input.push(&frame), frame.len());
 /// let table = qpack::Table::new(0);
-/// let mut state = http3::RequestState::new(0, MessageSide::Response, false)?;
+/// let mut state = http3::RequestStream::new(0, MessageSide::Response, false)?;
 /// let result = state.step(&input.next().unwrap()??, &table)?;
 /// assert!(matches!(result, http3::RequestResult::Event { event: Ok(http3::Event::Headers(_)), ack: None }));
 /// input.end();
@@ -1330,7 +1330,7 @@ pub enum RequestResult {
 /// # Ok::<(), Box<dyn core::error::Error>>(())
 /// ```
 #[derive(Clone, Debug)]
-pub struct RequestState {
+pub struct RequestStream {
     stream: u64,
     side: MessageSide,
     push: bool,
@@ -1345,7 +1345,7 @@ pub struct RequestState {
     tunnel: bool,
     stopped: bool,
 }
-impl RequestState {
+impl RequestStream {
     /// Makes message state for stream 0, 4, 8, and so on. Set extended_connect only
     /// when the server's ENABLE_CONNECT_PROTOCOL setting permits it.
     pub fn new(stream: u64, side: MessageSide, extended_connect: bool) -> Result<Self, Error> {
@@ -1908,7 +1908,7 @@ enum StreamKind {
 ///
 /// [`Session`] drives these with [`codec::Demux`]. Tables, blocked
 /// sections, acknowledgment values, and HTTP request semantics belong to
-/// the caller. Use [`RequestState::step`] between frame items, or
+/// the caller. Use [`RequestStream::step`] between frame items, or
 /// [`qpack::decode_section`] and [`HeaderList::from_fields`] for standalone
 /// sections. Unknown stream payloads are skipped in bounded
 /// chunks. Every variant owns no input and retains no output queue. Any FIN
@@ -2034,12 +2034,12 @@ type StreamFactory = Box<dyn FnMut(&u64) -> StreamItems + Send>;
 /// request ordering, or settings negotiation. Those are session decisions
 /// made between items. The caller owns [`qpack::Table`] and
 /// [`qpack::BlockedSections`]; their limits are separate from input.
-/// Use [`RequestState::step`] for request/push frame items, or
+/// Use [`RequestStream::step`] for request/push frame items, or
 /// [`HeaderList::from_fields`] for standalone received fields.
 /// A paused stream yields [`Step::Need`] without receiving EOF. Its saved
 /// stream retains input and EOF, charged to the shared budget as held bytes.
 /// On [`RequestResult::Blocked`], call [`Self::pause`] so later frames stay
-/// in the input budget. Retry the section and call [`RequestState::resume`],
+/// in the input budget. Retry the section and call [`RequestStream::resume`],
 /// then [`Self::unpause`] when it is no longer blocked.
 /// Acknowledgments and insert increments come back as values to send.
 pub struct Session {
@@ -2112,7 +2112,7 @@ impl Session {
     }
     /// Resumes a paused stream with its recorded EOF state.
     /// Buffered bytes and their offsets are preserved. Call after the blocked
-    /// section has been retried and accepted by [`RequestState::resume`].
+    /// section has been retried and accepted by [`RequestStream::resume`].
     /// Absent and unpaused keys are unchanged; terminal failures are not restarted.
     pub fn unpause(&mut self, id: u64) {
         if let Some(saved) = self.paused.remove(&id)
@@ -2183,7 +2183,7 @@ mod tests {
         test_support::{decode_all, mutate},
     };
 
-    fn event(state: &mut RequestState, frame: Frame, table: &qpack::Table) -> Result<Event, Error> {
+    fn event(state: &mut RequestStream, frame: Frame, table: &qpack::Table) -> Result<Event, Error> {
         match state.step(&frame, table)? {
             RequestResult::Event { event, .. } => event,
             RequestResult::Blocked(_) => Err(Error::State),
@@ -2235,7 +2235,7 @@ mod tests {
         assert_eq!(Frame::parse(&bytes), Ok(frame.clone()));
     }
     fn messages(side: MessageSide, frames: &[Frame]) -> (Vec<Event>, Result<(), Error>) {
-        let mut state = RequestState::new(0, side, false).unwrap();
+        let mut state = RequestStream::new(0, side, false).unwrap();
         let table = plain_qpack();
         let (items, failure) = decode_all(Frames::new, &join(frames));
         assert!(failure.is_none());
@@ -2634,10 +2634,10 @@ mod tests {
             Err(Error::UnexpectedFrame(5))
         );
         for id in [1, 2, 3, u64::MAX] {
-            assert!(RequestState::new(id, MessageSide::Request, false).is_err());
+            assert!(RequestStream::new(id, MessageSide::Request, false).is_err());
         }
         for id in [0, 1, 2, u64::MAX] {
-            assert!(RequestState::push(id).is_err());
+            assert!(RequestStream::push(id).is_err());
         }
     }
     #[test]
@@ -2693,9 +2693,9 @@ mod tests {
         let (events, result) = messages(MessageSide::Response, &frames);
         assert_eq!(result, Ok(()));
         assert_eq!(events.len(), frames.len());
-        let mut state = RequestState::push(3).unwrap();
+        let mut state = RequestStream::push(3).unwrap();
         assert_eq!(event(&mut state, promise, &plain_qpack()), Err(Error::UnexpectedFrame(5)));
-        let mut state = RequestState::push(3).unwrap();
+        let mut state = RequestStream::push(3).unwrap();
         assert!(matches!(event(&mut state, headers(&response("103")), &plain_qpack()), Ok(Event::Informational(_))));
         assert!(matches!(event(&mut state, headers(&response("200")), &plain_qpack()), Ok(Event::Headers(_))));
         assert_eq!(state.finish(), Ok(()));
@@ -2863,7 +2863,7 @@ mod tests {
             h.fields.last_mut().unwrap().value = protocol.as_bytes().to_vec();
             assert!(h.validate(HeaderKind::Request { extended_connect: true }).is_err());
         }
-        let mut d = RequestState::new(0, MessageSide::Request, true).unwrap();
+        let mut d = RequestStream::new(0, MessageSide::Request, true).unwrap();
         assert_eq!(event(&mut d, headers(&extended), &plain_qpack()), Ok(Event::Headers(extended)));
         assert_eq!(d.finish(), Ok(()));
     }
@@ -2961,7 +2961,7 @@ mod tests {
         let section = headers.section(&mut encoder, 0, HeaderKind::Request { extended_connect: false }).unwrap();
         let wire = join(&[Frame::headers(&section).unwrap(), Frame::Data(vec![42])]);
         let mut table = qpack::Table::new(4096);
-        let mut state = RequestState::new(0, MessageSide::Request, false).unwrap();
+        let mut state = RequestStream::new(0, MessageSide::Request, false).unwrap();
         let mut session = Session::new(Endpoint::Client, 4, MAX_FRAME);
         assert_eq!(session.push(0, &wire), wire.len());
         let (_, Ok(Ok(StreamItem::Frame(frame)))) = session.next().unwrap() else { panic!() };
@@ -2992,7 +2992,7 @@ mod tests {
             let insert = encoder.insert(b"x", b"y").unwrap().1;
             encoder.apply_instruction(qpack::DecoderInstruction::InsertCountIncrement(1)).unwrap();
             let mut table = qpack::Table::new(4096);
-            let mut state = RequestState::new(0, MessageSide::Response, false).unwrap();
+            let mut state = RequestStream::new(0, MessageSide::Response, false).unwrap();
             let mut list = match pending {
                 0 => response("103"),
                 1 => fields(&[]),
@@ -3025,18 +3025,18 @@ mod tests {
     }
     #[test]
     fn qpack_errors_and_blocked_validation_are_not_suppressed() {
-        let mut state = RequestState::new(0, MessageSide::Request, false).unwrap();
+        let mut state = RequestStream::new(0, MessageSide::Request, false).unwrap();
         assert_eq!(
             event(&mut state, Frame::Headers(vec![]), &plain_qpack()),
             Err(Error::Qpack(qpack::Error::Truncated))
         );
         assert_eq!(state.step(&Frame::Data(vec![]), &plain_qpack()), Err(Error::State));
-        let mut state = RequestState::new(0, MessageSide::Request, false).unwrap();
+        let mut state = RequestStream::new(0, MessageSide::Request, false).unwrap();
         state.pending = Some(PendingSection::Headers);
         let result =
             state.resume(0, Ok(qpack::SectionResult::Fields { fields: response("200").fields, ack: None })).unwrap();
         assert!(matches!(result, RequestResult::Event { event: Err(Error::Message(_)), .. }));
-        let mut state = RequestState::new(0, MessageSide::Request, false).unwrap();
+        let mut state = RequestStream::new(0, MessageSide::Request, false).unwrap();
         state.pending = Some(PendingSection::Headers);
         assert_eq!(state.resume(0, Err(qpack::Error::Huffman)), Err(Error::Qpack(qpack::Error::Huffman)));
     }
@@ -3052,9 +3052,9 @@ mod tests {
         contract::check_decode_with_alloc_limit(Frames::new, &join(&frames), 2 * MAX_FRAME);
         for push in [false, true] {
             let mut state = if push {
-                RequestState::push(3).unwrap()
+                RequestStream::push(3).unwrap()
             } else {
-                RequestState::new(0, MessageSide::Response, false).unwrap()
+                RequestStream::new(0, MessageSide::Response, false).unwrap()
             };
             let events: Vec<_> =
                 frames.iter().cloned().map(|frame| event(&mut state, frame, &plain_qpack()).unwrap()).collect();
@@ -3075,7 +3075,7 @@ mod tests {
         let table = plain_qpack();
         let promise = Frame::PushPromise { push_id: 7, field_section: encoded(&request()) };
         for started in [false, true] {
-            let mut state = RequestState::push(3).unwrap();
+            let mut state = RequestStream::push(3).unwrap();
             if started {
                 assert_eq!(event(&mut state, headers(&response("200")), &table), Ok(Event::Headers(response("200"))));
             }
@@ -3090,7 +3090,7 @@ mod tests {
         for bytes in [vec![], vec![0x21, 0]] {
             let (items, error) = decode_all(Frames::new, &bytes);
             assert!(error.is_none());
-            let mut state = RequestState::new(0, MessageSide::Request, false).unwrap();
+            let mut state = RequestStream::new(0, MessageSide::Request, false).unwrap();
             for frame in items {
                 event(&mut state, frame.unwrap(), &plain_qpack()).unwrap();
             }
@@ -3265,11 +3265,11 @@ mod tests {
             }
             for extended_connect in [false, true] {
                 for mut state in [
-                    RequestState::new(0, MessageSide::Request, extended_connect).unwrap(),
-                    RequestState::new(0, MessageSide::Response, extended_connect).unwrap(),
-                    RequestState::new(0, MessageSide::HeadResponse, extended_connect).unwrap(),
-                    RequestState::new(0, MessageSide::ConnectResponse, extended_connect).unwrap(),
-                    RequestState::push(3).unwrap(),
+                    RequestStream::new(0, MessageSide::Request, extended_connect).unwrap(),
+                    RequestStream::new(0, MessageSide::Response, extended_connect).unwrap(),
+                    RequestStream::new(0, MessageSide::HeadResponse, extended_connect).unwrap(),
+                    RequestStream::new(0, MessageSide::ConnectResponse, extended_connect).unwrap(),
+                    RequestStream::push(3).unwrap(),
                 ] {
                     for item in &items {
                         if item.clone().and_then(|frame| event(&mut state, frame, &plain_qpack())).is_err() {
@@ -3336,7 +3336,7 @@ mod tests {
         assert_eq!(result, Ok(()));
         // The check happens before QPACK, so a section that would block is refused too.
         let table = qpack::Table::new(4096);
-        let mut state = RequestState::new(0, MessageSide::ConnectResponse, false).unwrap();
+        let mut state = RequestStream::new(0, MessageSide::ConnectResponse, false).unwrap();
         event(&mut state, headers(&response("200")), &table).unwrap();
         assert_eq!(
             event(&mut state, Frame::Headers(vec![2, 0, 0x80]), &table),
@@ -3368,7 +3368,7 @@ mod tests {
         let mut h = response("200");
         h.fields.push(qpack::Field::new("content-length", "99"));
         let run = |side: Option<MessageSide>, frames: &[Frame]| {
-            let mut d = RequestState::push(3).unwrap();
+            let mut d = RequestStream::push(3).unwrap();
             // The promise may arrive after the push stream's bytes.
             if let Some(side) = side {
                 d.set_push_side(side).unwrap();
@@ -3384,12 +3384,12 @@ mod tests {
             Err(Error::Message(_))
         ));
         assert!(matches!(run(None, &[headers(&h)]), Err(Error::Message(_))));
-        let mut d = RequestState::push(3).unwrap();
+        let mut d = RequestStream::push(3).unwrap();
         assert_eq!(d.set_push_side(MessageSide::Request), Err(Error::State));
         assert_eq!(d.set_push_side(MessageSide::ConnectResponse), Err(Error::State));
         event(&mut d, headers(&response("200")), &plain_qpack()).unwrap();
         assert_eq!(d.set_push_side(MessageSide::HeadResponse), Err(Error::State));
-        let mut d = RequestState::new(0, MessageSide::Response, false).unwrap();
+        let mut d = RequestStream::new(0, MessageSide::Response, false).unwrap();
         assert_eq!(d.set_push_side(MessageSide::HeadResponse), Err(Error::State));
     }
     #[test]

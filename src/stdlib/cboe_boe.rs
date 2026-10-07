@@ -2045,7 +2045,7 @@ pub enum Action<M, E = Event> {
 
 /// Where a [`Client`] is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ClientState {
+pub enum ClientPhase {
     /// Created; [`Client::start`] sends the Login Request.
     Connected,
     /// Login Request sent.
@@ -2093,7 +2093,7 @@ pub struct ClientConfig {
 #[derive(Clone, Debug)]
 pub struct Client {
     config: ClientConfig,
-    state: ClientState,
+    phase: ClientPhase,
     clock: Clock,
     last: BTreeMap<u8, u32>,
     next: u32,
@@ -2113,15 +2113,15 @@ impl Client {
         let clock = Clock::new(config.timers, now_ms)?;
         Ok(Self {
             config,
-            state: ClientState::Connected,
+            phase: ClientPhase::Connected,
             clock,
             last: last_received.iter().map(|u| (u.unit, u.sequence)).collect(),
             next: 1,
         })
     }
     /// Where the session is.
-    pub fn state(&self) -> ClientState {
-        self.state
+    pub fn phase(&self) -> ClientPhase {
+        self.phase
     }
     /// The last sequence received per unit.
     pub fn last_received(&self) -> Vec<UnitSequence> {
@@ -2136,7 +2136,7 @@ impl Client {
     }
     /// Sends the Login Request.
     pub fn start(&mut self, now_ms: u64) -> Result<Vec<Action<Inbound>>, Error> {
-        if self.state != ClientState::Connected {
+        if self.phase != ClientPhase::Connected {
             return Err(Error::State);
         }
         let mut groups = Vec::new();
@@ -2161,7 +2161,7 @@ impl Client {
         };
         Check::check(&login.params)?;
         self.clock.advance(now_ms)?;
-        self.state = ClientState::LoginSent;
+        self.phase = ClientPhase::LoginSent;
         self.clock.since = now_ms;
         self.clock.sent = now_ms;
         Ok(vec![Action::Send(login.into())])
@@ -2176,7 +2176,7 @@ impl Client {
         // Both refusals come before any change, so nothing is staged: a
         // copy of the client (its configuration and unit map) per message
         // would cost more than the message.
-        if self.state == ClientState::Closed {
+        if self.phase == ClientPhase::Closed {
             return Err(Error::State);
         }
         self.clock.advance(now_ms)?;
@@ -2192,7 +2192,7 @@ impl Client {
         match frame {
             Ok(m) => self.receive(m, now_ms),
             Err(_) => {
-                if self.state == ClientState::Closed {
+                if self.phase == ClientPhase::Closed {
                     return Err(Error::State);
                 }
                 self.clock.advance(now_ms)?;
@@ -2201,10 +2201,10 @@ impl Client {
         }
     }
     fn receive_inner(&mut self, message: &Outbound) -> Vec<Action<Inbound>> {
-        use ClientState as S;
+        use ClientPhase as S;
         self.clock.received = self.clock.now;
-        let in_session = matches!(self.state, S::Replaying | S::LoggedIn | S::LoggingOut);
-        match (self.state, message) {
+        let in_session = matches!(self.phase, S::Replaying | S::LoggedIn | S::LoggingOut);
+        match (self.phase, message) {
             (S::LoginSent, Outbound::LoginResponse(r))
                 if r.status == codes::login_status::ACCEPTED =>
             {
@@ -2212,7 +2212,7 @@ impl Client {
                     return self.close(CloseReason::Protocol);
                 };
                 self.next = next;
-                self.state = S::Replaying;
+                self.phase = S::Replaying;
                 self.clock.sent = self.clock.now;
                 vec![Action::Event(Event::LoggedIn {
                     last_received_sequence: r.last_received_sequence,
@@ -2228,7 +2228,7 @@ impl Client {
                 actions
             }
             (S::Replaying, Outbound::ReplayComplete(_)) => {
-                self.state = S::LoggedIn;
+                self.phase = S::LoggedIn;
                 vec![Action::Event(Event::ReplayComplete)]
             }
             (_, Outbound::ServerHeartbeat(_)) if in_session => Vec::new(),
@@ -2274,7 +2274,7 @@ impl Client {
     /// Order, Purge Orders) and returns it to write. Only once logged in
     /// and replay is complete: Cboe rejects orders during replay.
     pub fn send(&mut self, mut message: Inbound, now_ms: u64) -> Result<Inbound, Error> {
-        if !message.is_application() || self.state != ClientState::LoggedIn {
+        if !message.is_application() || self.phase != ClientPhase::LoggedIn {
             return Err(Error::State);
         }
         let sequence = self.next;
@@ -2287,20 +2287,20 @@ impl Client {
     }
     /// Sends a Logout Request. Cboe answers with a Logout and closes.
     pub fn logout(&mut self, now_ms: u64) -> Result<Vec<Action<Inbound>>, Error> {
-        if !matches!(self.state, ClientState::Replaying | ClientState::LoggedIn) {
+        if !matches!(self.phase, ClientPhase::Replaying | ClientPhase::LoggedIn) {
             return Err(Error::State);
         }
         self.clock.advance(now_ms)?;
-        self.state = ClientState::LoggingOut;
+        self.phase = ClientPhase::LoggingOut;
         self.clock.sent = now_ms;
         Ok(vec![Action::Send(LogoutRequest::default().into())])
     }
     /// Runs the timers: the login timeout, the idle timeout, and a Client
     /// Heartbeat after [`Timers::heartbeat_ms`] of sending nothing.
     pub fn tick(&mut self, now_ms: u64) -> Result<Vec<Action<Inbound>>, Error> {
-        use ClientState as S;
+        use ClientPhase as S;
         self.clock.advance(now_ms)?;
-        Ok(match self.state {
+        Ok(match self.phase {
             S::Connected | S::Closed => Vec::new(),
             S::LoginSent if self.clock.login_expired() => self.close(CloseReason::LoginTimeout),
             S::LoginSent => Vec::new(),
@@ -2313,14 +2313,14 @@ impl Client {
         })
     }
     fn close(&mut self, reason: CloseReason) -> Vec<Action<Inbound>> {
-        self.state = ClientState::Closed;
+        self.phase = ClientPhase::Closed;
         vec![Action::Event(Event::Disconnected(reason))]
     }
 }
 
 /// Where a [`Server`] is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ServerState {
+pub enum ServerPhase {
     /// Waiting for the Login Request.
     AwaitingLogin,
     /// A Login Request arrived; the caller must accept or reject it.
@@ -2350,7 +2350,7 @@ pub enum ServerState {
 /// reason "!" and closes. Driving rules are those of [`Client`].
 #[derive(Clone, Debug)]
 pub struct Server {
-    state: ServerState,
+    phase: ServerPhase,
     clock: Clock,
     request: Option<LoginRequest>,
     returns: BTreeMap<u8, Vec<u8>>,
@@ -2361,7 +2361,7 @@ impl Server {
     /// A server for a connection accepted at `now_ms`.
     pub fn new(timers: Timers, now_ms: u64) -> Result<Self, Error> {
         Ok(Self {
-            state: ServerState::AwaitingLogin,
+            phase: ServerPhase::AwaitingLogin,
             clock: Clock::new(timers, now_ms)?,
             request: None,
             returns: BTreeMap::new(),
@@ -2370,8 +2370,8 @@ impl Server {
         })
     }
     /// Where the session is.
-    pub fn state(&self) -> ServerState {
-        self.state
+    pub fn phase(&self) -> ServerPhase {
+        self.phase
     }
     /// The return bitfields the login asked for, per message type.
     pub fn returns(&self) -> &BTreeMap<u8, Vec<u8>> {
@@ -2394,15 +2394,15 @@ impl Server {
         message: &Inbound,
         now_ms: u64,
     ) -> Result<Vec<Action<Outbound>>, Error> {
-        use ServerState as S;
-        if self.state == S::Closed {
+        use ServerPhase as S;
+        if self.phase == S::Closed {
             return Err(Error::State);
         }
         self.clock.advance(now_ms)?;
         self.clock.received = now_ms;
-        Ok(match (self.state, message) {
+        Ok(match (self.phase, message) {
             (S::AwaitingLogin, Inbound::LoginRequest(login)) => {
-                self.state = S::LoginPending;
+                self.phase = S::LoginPending;
                 self.request = Some(login.clone());
                 vec![Action::Event(Event::LoginRequested(login.clone()))]
             }
@@ -2443,12 +2443,12 @@ impl Server {
         match frame {
             Ok(m) => self.receive(m, now_ms),
             Err(_) => {
-                if self.state == ServerState::Closed {
+                if self.phase == ServerPhase::Closed {
                     return Err(Error::State);
                 }
                 self.clock.advance(now_ms)?;
-                Ok(match self.state {
-                    ServerState::AwaitingLogin | ServerState::LoginPending => {
+                Ok(match self.phase {
+                    ServerPhase::AwaitingLogin | ServerPhase::LoginPending => {
                         self.close(CloseReason::Protocol)
                     }
                     _ => self.violation("Invalid message"),
@@ -2523,7 +2523,7 @@ impl Server {
         available: &[UnitSequence],
         now_ms: u64,
     ) -> Result<Vec<Action<Outbound>>, Error> {
-        if self.state != ServerState::LoginPending {
+        if self.phase != ServerPhase::LoginPending {
             return Err(Error::State);
         }
         if available.len() > 255 {
@@ -2613,9 +2613,9 @@ impl Server {
         self.clock.received = now_ms;
         if actions.len() == 1 {
             actions.push(Action::Send(ReplayComplete::default().into()));
-            self.state = ServerState::LoggedIn;
+            self.phase = ServerPhase::LoggedIn;
         } else {
-            self.state = ServerState::Replaying;
+            self.phase = ServerPhase::Replaying;
         }
         Ok(actions)
     }
@@ -2626,7 +2626,7 @@ impl Server {
         text: &str,
         now_ms: u64,
     ) -> Result<Vec<Action<Outbound>>, Error> {
-        if self.state != ServerState::LoginPending || status == codes::login_status::ACCEPTED {
+        if self.phase != ServerPhase::LoginPending || status == codes::login_status::ACCEPTED {
             return Err(Error::State);
         }
         Text::<60>::new(text)?;
@@ -2667,7 +2667,7 @@ impl Server {
     /// message that is not sequenced, or whose unit and sequence were
     /// never sent.
     pub fn replay(&mut self, message: &Outbound, now_ms: u64) -> Result<Outbound, Error> {
-        if self.state != ServerState::Replaying {
+        if self.phase != ServerPhase::Replaying {
             return Err(Error::State);
         }
         let Header { unit, sequence } = *message.header();
@@ -2681,12 +2681,12 @@ impl Server {
     }
     /// Ends the replay with Replay Complete.
     pub fn replay_complete(&mut self, now_ms: u64) -> Result<Vec<Action<Outbound>>, Error> {
-        if self.state != ServerState::Replaying {
+        if self.phase != ServerPhase::Replaying {
             return Err(Error::State);
         }
         self.clock.advance(now_ms)?;
         self.clock.sent = now_ms;
-        self.state = ServerState::LoggedIn;
+        self.phase = ServerPhase::LoggedIn;
         Ok(vec![Action::Send(ReplayComplete::default().into())])
     }
     /// Numbers an application message and returns it to write. A
@@ -2694,7 +2694,7 @@ impl Server {
     /// (1 to 255); an unsequenced one gets unit and sequence 0. Refuses
     /// session messages, which the server sends itself.
     pub fn send(&mut self, mut message: Outbound, now_ms: u64) -> Result<Outbound, Error> {
-        if self.state != ServerState::LoggedIn || message.is_session() {
+        if self.phase != ServerPhase::LoggedIn || message.is_session() {
             return Err(Error::State);
         }
         if message.is_sequenced() {
@@ -2727,7 +2727,7 @@ impl Server {
         text: &str,
         now_ms: u64,
     ) -> Result<Vec<Action<Outbound>>, Error> {
-        if !matches!(self.state, ServerState::Replaying | ServerState::LoggedIn) {
+        if !matches!(self.phase, ServerPhase::Replaying | ServerPhase::LoggedIn) {
             return Err(Error::State);
         }
         Text::<60>::new(text)?;
@@ -2758,9 +2758,9 @@ impl Server {
     /// reason "!"), and a Server Heartbeat after [`Timers::heartbeat_ms`]
     /// of sending nothing.
     pub fn tick(&mut self, now_ms: u64) -> Result<Vec<Action<Outbound>>, Error> {
-        use ServerState as S;
+        use ServerPhase as S;
         self.clock.advance(now_ms)?;
-        Ok(match self.state {
+        Ok(match self.phase {
             S::Closed => Vec::new(),
             S::AwaitingLogin | S::LoginPending if self.clock.login_expired() => {
                 self.close(CloseReason::LoginTimeout)
@@ -2779,7 +2779,7 @@ impl Server {
         })
     }
     fn close(&mut self, reason: CloseReason) -> Vec<Action<Outbound>> {
-        self.state = ServerState::Closed;
+        self.phase = ServerPhase::Closed;
         vec![Action::Event(Event::Disconnected(reason))]
     }
 }
@@ -4420,8 +4420,8 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(server.state(), ServerState::Replaying);
-        assert_eq!(client.state(), ClientState::Replaying);
+        assert_eq!(server.phase(), ServerPhase::Replaying);
+        assert_eq!(client.phase(), ClientPhase::Replaying);
         assert_eq!(client.next_sequence(), 151);
         // Orders are refused during replay, on both sides.
         let order: Inbound = NewOrder {
@@ -4543,7 +4543,7 @@ mod tests {
                 text: text("Sequence went backwards")
             }
         );
-        assert_eq!(client.state(), ClientState::Closed);
+        assert_eq!(client.phase(), ClientPhase::Closed);
         assert_eq!(
             client.last_received(),
             [
@@ -4576,7 +4576,7 @@ mod tests {
                 matches!(&events[..], [Event::Rejected { status: s, .. }, Event::Disconnected(CloseReason::Rejected), ..] if *s == status),
                 "{events:?}"
             );
-            assert_eq!(server.state(), ServerState::Closed);
+            assert_eq!(server.phase(), ServerPhase::Closed);
         };
         let one = |unit, sequence| [UnitSequence { unit, sequence }];
         refuse(&one(1, 11), config(), b'Q');
@@ -4592,7 +4592,7 @@ mod tests {
         let mut server = Server::new(Timers::default(), 0).unwrap();
         let events = login(&mut client, &mut server, &one(1, 0));
         assert_eq!(events.len(), 2, "{events:?}");
-        assert_eq!(client.state(), ClientState::LoggedIn);
+        assert_eq!(client.phase(), ClientPhase::LoggedIn);
         let mut server = Server::new(Timers::default(), 0).unwrap();
         assert_eq!(server.reject(b'N', "x", 0), Err(Error::State));
         server.receive(&LoginRequest::default().into(), 0).unwrap();
@@ -4614,7 +4614,7 @@ mod tests {
         let mut client = Client::new(config(), &[], 0).unwrap();
         let mut server = Server::new(Timers::default(), 0).unwrap();
         login(&mut client, &mut server, &[]);
-        assert_eq!(client.state(), ClientState::LoggedIn);
+        assert_eq!(client.phase(), ClientPhase::LoggedIn);
         assert_eq!(client.tick(500).unwrap(), []);
         assert_eq!(
             client.tick(1_003).unwrap(),
@@ -4646,7 +4646,7 @@ mod tests {
         let Action::Send(req) = client.logout(10).unwrap().remove(0) else {
             panic!()
         };
-        assert_eq!(client.state(), ClientState::LoggingOut);
+        assert_eq!(client.phase(), ClientPhase::LoggingOut);
         let out = server.receive(&req, 11).unwrap();
         let events = deliver_to_client(&mut client, out, 12);
         assert_eq!(

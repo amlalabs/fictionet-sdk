@@ -47,20 +47,20 @@
 //! assert_eq!(oack.to_bytes().unwrap(), b"\x00\x06blksize\x001024\x00tsize\x001500\x00");
 //!
 //! // ACK 0 accepts the options, and block 1 follows.
-//! let Event::Send(Packet::Data { block: 1, data }) = transfer.on_packet(&Packet::parse(&[0, 4, 0, 0]).unwrap())
+//! let Event::Send(Packet::Data { block: 1, data }) = transfer.receive(&Packet::parse(&[0, 4, 0, 0]).unwrap())
 //! else {
 //!     panic!("expected block 1")
 //! };
 //! assert_eq!(data.len(), 1024);
 //! // A second ACK 0 is a duplicate. It sends nothing.
-//! assert_eq!(transfer.on_packet(&Packet::Ack { block: 0 }), Event::Duplicate);
+//! assert_eq!(transfer.receive(&Packet::Ack { block: 0 }), Event::Duplicate);
 //!
 //! // Block 2 holds the last 476 bytes, and its ACK ends the transfer.
-//! let Event::Send(Packet::Data { block: 2, data }) = transfer.on_packet(&Packet::Ack { block: 1 }) else {
+//! let Event::Send(Packet::Data { block: 2, data }) = transfer.receive(&Packet::Ack { block: 1 }) else {
 //!     panic!("expected block 2")
 //! };
 //! assert_eq!(data.len(), 476);
-//! assert_eq!(transfer.on_packet(&Packet::Ack { block: 2 }), Event::Complete);
+//! assert_eq!(transfer.receive(&Packet::Ack { block: 2 }), Event::Complete);
 //! assert!(transfer.is_complete());
 //! assert_eq!(transfer.current(), None);
 //! ```
@@ -579,7 +579,7 @@ impl ReadTransfer {
     }
 
     /// Takes an ACK from the client and says what to do next.
-    pub fn on_ack(&mut self, block: u16) -> Event {
+    pub fn receive_ack(&mut self, block: u16) -> Event {
         match self.state {
             State::Aborted => Event::Unexpected,
             State::Complete if block == wire(self.blocks) => Event::Duplicate,
@@ -600,9 +600,9 @@ impl ReadTransfer {
 
     /// Takes any packet from the client: an ACK moves the transfer on, an
     /// ERROR ends it, and anything else is [`Event::Unexpected`].
-    pub fn on_packet(&mut self, packet: &Packet) -> Event {
+    pub fn receive(&mut self, packet: &Packet) -> Event {
         match packet {
-            Packet::Ack { block } => self.on_ack(*block),
+            Packet::Ack { block } => self.receive_ack(*block),
             Packet::Error { code, .. } if self.state == State::Running => {
                 self.state = State::Aborted;
                 Event::Aborted(*code)
@@ -1172,7 +1172,7 @@ mod tests {
                 }
                 other => panic!("sent {other:?}"),
             };
-            match t.on_ack(ack) {
+            match t.receive_ack(ack) {
                 Event::Send(p) => packet = p,
                 Event::Complete => return got,
                 other => panic!("got {other:?}"),
@@ -1186,12 +1186,12 @@ mod tests {
         assert_eq!(t.blocks(), 1);
         assert_eq!(t.current(), Some(Packet::Data { block: 1, data: b"hello".to_vec() }));
         // ACK 0 is the block before: a duplicate.
-        assert_eq!(t.on_ack(0), Event::Duplicate);
-        assert_eq!(t.on_ack(9), Event::Unexpected);
-        assert_eq!(t.on_ack(1), Event::Complete);
+        assert_eq!(t.receive_ack(0), Event::Duplicate);
+        assert_eq!(t.receive_ack(9), Event::Unexpected);
+        assert_eq!(t.receive_ack(1), Event::Complete);
         assert!(t.is_complete());
-        assert_eq!(t.on_ack(1), Event::Duplicate);
-        assert_eq!(t.on_ack(2), Event::Unexpected);
+        assert_eq!(t.receive_ack(1), Event::Duplicate);
+        assert_eq!(t.receive_ack(2), Event::Unexpected);
         assert_eq!(t.current(), None);
     }
 
@@ -1201,8 +1201,8 @@ mod tests {
         assert_eq!(t.blocks(), 3);
         assert_eq!(run(t.clone()), vec![7; 1024]);
         let mut t = t;
-        t.on_ack(1);
-        t.on_ack(2);
+        t.receive_ack(1);
+        t.receive_ack(2);
         assert_eq!(t.current(), Some(Packet::Data { block: 3, data: vec![] }));
         // An empty file is one empty block.
         let t = ReadTransfer::new(vec![]);
@@ -1216,13 +1216,13 @@ mod tests {
         assert_eq!(t.blocks(), 70_001);
         assert_eq!(run(t.clone()), data);
         let mut t = t;
-        assert!(matches!(t.on_ack(0), Event::Send(Packet::Data { block: 1, .. })));
+        assert!(matches!(t.receive_ack(0), Event::Send(Packet::Data { block: 1, .. })));
         for k in 1..=65535u16 {
-            assert!(matches!(t.on_ack(k), Event::Send(_)));
+            assert!(matches!(t.receive_ack(k), Event::Send(_)));
         }
         assert!(matches!(t.current(), Some(Packet::Data { block: 0, .. })));
-        assert_eq!(t.on_ack(65535), Event::Duplicate);
-        assert!(matches!(t.on_ack(0), Event::Send(Packet::Data { block: 1, .. })));
+        assert_eq!(t.receive_ack(65535), Event::Duplicate);
+        assert!(matches!(t.receive_ack(0), Event::Send(Packet::Data { block: 1, .. })));
         assert_eq!(t.in_flight(), 65537);
     }
 
@@ -1233,14 +1233,14 @@ mod tests {
         assert_eq!(t.block_size(), 8);
         assert!(matches!(t.current(), Some(Packet::OptionAck { .. })));
         // With the OACK in flight, 65535 is not a duplicate.
-        assert_eq!(t.on_ack(65535), Event::Unexpected);
-        assert_eq!(t.on_packet(&Packet::Data { block: 1, data: vec![] }), Event::Unexpected);
-        assert!(matches!(t.on_packet(&Packet::Ack { block: 0 }), Event::Send(Packet::Data { block: 1, .. })));
+        assert_eq!(t.receive_ack(65535), Event::Unexpected);
+        assert_eq!(t.receive(&Packet::Data { block: 1, data: vec![] }), Event::Unexpected);
+        assert!(matches!(t.receive(&Packet::Ack { block: 0 }), Event::Send(Packet::Data { block: 1, .. })));
         let error = Packet::error(ErrorCode::DiskFull);
-        assert_eq!(t.on_packet(&error), Event::Aborted(ErrorCode::DiskFull));
+        assert_eq!(t.receive(&error), Event::Aborted(ErrorCode::DiskFull));
         assert!(t.is_aborted());
-        assert_eq!(t.on_packet(&error), Event::Unexpected);
-        assert_eq!(t.on_ack(1), Event::Unexpected);
+        assert_eq!(t.receive(&error), Event::Unexpected);
+        assert_eq!(t.receive_ack(1), Event::Unexpected);
         assert_eq!(t.current(), None);
         // RFC 1350: with no options, blocks are 512 bytes.
         let t = ReadTransfer::new(vec![1; 1000]);
@@ -1464,7 +1464,7 @@ mod tests {
             let mut t = ReadTransfer::negotiated(buf.clone(), &blksize);
             for _ in 0..rng.index(20) {
                 let ack = if rng.coin() { wire(t.in_flight()) } else { rng.next() as u16 };
-                if let Event::Send(Packet::Data { data, .. }) = t.on_ack(ack) {
+                if let Event::Send(Packet::Data { data, .. }) = t.receive_ack(ack) {
                     assert!(data.len() <= usize::from(t.block_size()));
                 }
             }

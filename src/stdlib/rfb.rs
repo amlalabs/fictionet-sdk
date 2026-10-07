@@ -50,21 +50,21 @@
 //! let mut server = Server::new();
 //! assert_eq!(server.send(&ServerMessage::Version(Version::V3_8)).unwrap(), b"RFB 003.008\n");
 //! let _ = server.push(b"RFB 003.008\n");
-//! assert_eq!(server.next_message(), Some(Ok(Ok(ClientMessage::Version(Version::V3_8)))));
+//! assert_eq!(server.next(), Some(Ok(Ok(ClientMessage::Version(Version::V3_8)))));
 //! // Offer one security type, None, and let the client in.
 //! assert_eq!(server.send(&ServerMessage::SecurityTypes(vec![1])).unwrap(), [1, 1]);
 //! let _ = server.push(&[1]);
-//! assert_eq!(server.next_message(), Some(Ok(Ok(ClientMessage::SecurityType(1)))));
+//! assert_eq!(server.next(), Some(Ok(Ok(ClientMessage::SecurityType(1)))));
 //! assert_eq!(server.send(&ServerMessage::SecurityOk).unwrap(), [0, 0, 0, 0]);
 //! // ClientInit: the client is happy to share the desktop.
 //! let _ = server.push(&[1]);
-//! assert_eq!(server.next_message(), Some(Ok(Ok(ClientMessage::ClientInit { shared: true }))));
+//! assert_eq!(server.next(), Some(Ok(Ok(ClientMessage::ClientInit { shared: true }))));
 //! let init = ServerInit { width: 640, height: 480, format: PixelFormat::TRUE_COLOR_32, name: b"tank".to_vec() };
 //! assert_eq!(server.send(&ServerMessage::ServerInit(init)).unwrap().len(), 2 + 2 + 16 + 4 + 4);
 //! // The client asks for the whole screen.
 //! let _ = server.push(&[3, 0, 0, 0, 0, 0, 0x02, 0x80, 0x01, 0xe0]);
 //! assert_eq!(
-//!     server.next_message(),
+//!     server.next(),
 //!     Some(Ok(Ok(ClientMessage::FramebufferUpdateRequest { incremental: false, x: 0, y: 0, width: 640, height: 480 })))
 //! );
 //! ```
@@ -662,7 +662,7 @@ impl Decode for ClientMessages {
 
 /// Reads server handshake and normal messages in a chosen mode.
 ///
-/// [`set_mode`](Self::set_mode) supplies the phase, negotiated dialect and
+/// [`set_phase`](Self::set_phase) supplies the phase, negotiated dialect and
 /// pixel format between items. Mode stays selected until changed. `Closed`
 /// and `Unsupported` return `End` without consuming the unread suffix.
 /// Complete body failures are [`Error`] items; unknown message types, encodings and
@@ -700,11 +700,11 @@ impl ServerMessages {
     pub fn phase(&self) -> Phase {
         self.phase
     }
-    /// Selects a mode before decoding or just after an item. Once decoding
+    /// Sets the phase, with the dialect and pixel format, before decoding or just after an item. Once decoding
     /// returns `Need` with unread bytes, changes (including `Closed`) return
     /// [`Error::PartialUnit`] until that unit completes. Invalid pixel formats
     /// and client-only phases return [`Error::PixelFormat`] or [`Error::Phase`].
-    pub fn set_mode(
+    pub fn set_phase(
         &mut self,
         phase: Phase,
         dialect: Dialect,
@@ -799,7 +799,7 @@ impl Server {
     }
     /// Adds what fits. Keep the unaccepted suffix and drain before retrying.
     /// Before the client's turn, exceeding [`MAX_PENDING`] buffered bytes
-    /// or the stream's smaller capacity closes the session; `next_message`
+    /// or the stream's smaller capacity closes the session; `next`
     /// reports [`FrameError::OutOfTurn`]. After completion, takes and drops all bytes.
     #[must_use = "bytes past the returned count were not taken"]
     pub fn push(&mut self, bytes: &[u8]) -> usize {
@@ -828,7 +828,7 @@ impl Server {
     }
     /// Takes one client item when it is the client's turn. The caller sends
     /// the next server handshake unit before calling again.
-    pub fn next_message(
+    pub fn next(
         &mut self,
     ) -> Option<Result<Result<ClientMessage, Error>, codec::Fail<FrameError>>> {
         if !self.state.phase.client_turn()
@@ -942,7 +942,7 @@ impl Client {
     }
     /// Adds what fits. Keep the unaccepted suffix and drain before retrying.
     /// Before the server's turn, exceeding [`MAX_PENDING`] buffered bytes
-    /// or the stream's smaller capacity closes the session; `next_message`
+    /// or the stream's smaller capacity closes the session; `next`
     /// reports [`FrameError::OutOfTurn`]. After completion, takes and drops all bytes.
     #[must_use = "bytes past the returned count were not taken"]
     pub fn push(&mut self, bytes: &[u8]) -> usize {
@@ -971,7 +971,7 @@ impl Client {
     }
     /// Takes one server item when it is the server's turn. Send the next
     /// client handshake unit before calling again when the turn changes.
-    pub fn next_message(
+    pub fn next(
         &mut self,
     ) -> Option<Result<Result<ServerMessage, Error>, codec::Fail<FrameError>>> {
         if !self.state.phase.server_turn()
@@ -2068,12 +2068,12 @@ mod tests {
         let mut c = Client::new();
         let to_client = |s: &mut Server, c: &mut Client, m: ServerMessage| {
             let _ = c.push(&s.send(&m).unwrap());
-            assert_eq!(c.next_message(), Some(Ok(Ok(m))));
+            assert_eq!(c.next(), Some(Ok(Ok(m))));
             assert_eq!(c.buffered(), 0);
         };
         let to_server = |s: &mut Server, c: &mut Client, m: ClientMessage| {
             let _ = s.push(&c.send(&m).unwrap());
-            assert_eq!(s.next_message(), Some(Ok(Ok(m))));
+            assert_eq!(s.next(), Some(Ok(Ok(m))));
             assert_eq!(s.buffered(), 0);
         };
         to_client(&mut s, &mut c, ServerMessage::Version(Version::V3_8));
@@ -2249,9 +2249,9 @@ mod tests {
         assert_eq!(server_bytes(&reason, Dialect::V3_3, &f).unwrap()[..8], [0, 0, 0, 0, 0, 0, 0, 8]);
         // An ended stream drops later input.
         let mut s = s;
-        assert_eq!(s.next_message(), None);
+        assert_eq!(s.next(), None);
         assert_eq!(s.push(&[1, 2, 3]), 3);
-        assert_eq!(s.next_message(), None);
+        assert_eq!(s.next(), None);
         assert_eq!(s.buffered(), 0);
         assert_eq!(s.send(&ServerMessage::Bell), Err(Error::Phase(Phase::Closed)));
     }
@@ -2261,22 +2261,22 @@ mod tests {
         let mut s = Server::new();
         s.send(&ServerMessage::Version(Version::V3_8)).unwrap();
         let _ = s.push(b"RFB 003.008\n");
-        s.next_message().unwrap().unwrap().unwrap();
+        s.next().unwrap().unwrap().unwrap();
         s.send(&ServerMessage::SecurityTypes(vec![18, 19])).unwrap();
         let _ = s.push(&[19]);
-        assert_eq!(s.next_message(), Some(Ok(Ok(ClientMessage::SecurityType(19)))));
+        assert_eq!(s.next(), Some(Ok(Ok(ClientMessage::SecurityType(19)))));
         assert_eq!(s.phase(), Phase::Unsupported(19));
         assert_eq!(s.send(&ServerMessage::SecurityOk), Err(Error::Phase(Phase::Unsupported(19))));
-        assert_eq!(s.next_message(), None);
+        assert_eq!(s.next(), None);
         let _ = s.push(&[0]);
-        assert_eq!(s.next_message(), None);
+        assert_eq!(s.next(), None);
         // A 3.3 server can name one too.
         let mut c = Client::new();
         let _ = c.push(b"RFB 003.003\n");
-        c.next_message().unwrap().unwrap().unwrap();
+        c.next().unwrap().unwrap().unwrap();
         c.send(&ClientMessage::Version(Version::V3_3)).unwrap();
         let _ = c.push(&[0, 0, 0, 16]);
-        assert_eq!(c.next_message(), Some(Ok(Ok(ServerMessage::SecurityType(16)))));
+        assert_eq!(c.next(), Some(Ok(Ok(ServerMessage::SecurityType(16)))));
         assert_eq!(c.phase(), Phase::Unsupported(16));
     }
 
@@ -2285,18 +2285,18 @@ mod tests {
         let mut s = Server::new();
         s.send(&ServerMessage::Version(Version::V3_8)).unwrap();
         let _ = s.push(b"RFB 003.008\n");
-        s.next_message().unwrap().unwrap().unwrap();
+        s.next().unwrap().unwrap().unwrap();
         s.send(&ServerMessage::SecurityTypes(vec![2])).unwrap();
         let _ = s.push(&[1]);
-        assert_eq!(s.next_message(), Some(Ok(Err(Error::NotOffered(1)))));
-        assert_eq!(s.next_message(), None);
+        assert_eq!(s.next(), Some(Ok(Err(Error::NotOffered(1)))));
+        assert_eq!(s.next(), None);
         // A client world cannot pick one either.
         let mut c = Client::new();
         let _ = c.push(b"RFB 003.008\n");
-        c.next_message().unwrap().unwrap().unwrap();
+        c.next().unwrap().unwrap().unwrap();
         c.send(&ClientMessage::Version(Version::V3_8)).unwrap();
         let _ = c.push(&[1, 2]);
-        assert_eq!(c.next_message(), Some(Ok(Ok(ServerMessage::SecurityTypes(vec![2])))));
+        assert_eq!(c.next(), Some(Ok(Ok(ServerMessage::SecurityTypes(vec![2])))));
         assert_eq!(c.send(&ClientMessage::SecurityType(1)), Err(Error::NotOffered(1)));
         assert_eq!(c.phase(), Phase::SecurityChoice);
         assert_eq!(c.send(&ClientMessage::SecurityType(2)), Ok(vec![2]));
@@ -2309,7 +2309,7 @@ mod tests {
         s.send(&ServerMessage::Version(Version::V3_8)).unwrap();
         assert_eq!(s.send(&ServerMessage::Version(Version::V3_8)), Err(Error::Phase(Phase::ClientVersion)));
         let _ = s.push(b"RFB 003.008\n");
-        s.next_message().unwrap().unwrap().unwrap();
+        s.next().unwrap().unwrap().unwrap();
         // A 3.8 server offers a list; a single type is 3.3's.
         assert_eq!(s.send(&ServerMessage::SecurityType(1)), Err(Error::Phase(Phase::SecurityOffer)));
         assert_eq!(s.send(&ServerMessage::SecurityTypes(vec![])), Err(Error::Unwritable));
@@ -2323,7 +2323,7 @@ mod tests {
         let mut s = Server::new();
         s.send(&ServerMessage::Version(Version::V3_3)).unwrap();
         let _ = s.push(b"RFB 003.003\n");
-        s.next_message().unwrap().unwrap().unwrap();
+        s.next().unwrap().unwrap().unwrap();
         assert_eq!(s.send(&ServerMessage::SecurityTypes(vec![1])), Err(Error::Phase(Phase::SecurityOffer)));
         assert_eq!(s.send(&ServerMessage::SecurityType(0)), Err(Error::Unwritable));
     }
@@ -2336,19 +2336,19 @@ mod tests {
         let mut s = Server::new();
         s.send(&ServerMessage::Version(Version::V3_3)).unwrap();
         let _ = s.push(b"RFB 003.008\n");
-        s.next_message().unwrap().unwrap().unwrap();
+        s.next().unwrap().unwrap().unwrap();
         assert_eq!(s.dialect(), Dialect::V3_3);
         assert_eq!(s.send(&ServerMessage::SecurityType(1)), Ok(vec![0, 0, 0, 1]));
         // A client world that answers a 3.7 server with 3.8 reads a 3.7 list.
         let mut c = Client::new();
         let _ = c.push(b"RFB 003.007\n");
-        c.next_message().unwrap().unwrap().unwrap();
+        c.next().unwrap().unwrap().unwrap();
         c.send(&ClientMessage::Version(Version::V3_8)).unwrap();
         assert_eq!(c.dialect(), Dialect::V3_7);
         // A server version past 3.8, such as 3.889, leaves the client's.
         let mut c = Client::new();
         let _ = c.push(b"RFB 003.889\n");
-        c.next_message().unwrap().unwrap().unwrap();
+        c.next().unwrap().unwrap().unwrap();
         c.send(&ClientMessage::Version(Version::V3_8)).unwrap();
         assert_eq!(c.dialect(), Dialect::V3_8);
     }
@@ -2369,14 +2369,14 @@ mod tests {
         let mut s = Server::new();
         // The client's version, sent before the server's.
         let _ = s.push(b"RFB 003.008\n");
-        assert_eq!(s.next_message(), None);
+        assert_eq!(s.next(), None);
         s.send(&ServerMessage::Version(Version::V3_8)).unwrap();
-        assert_eq!(s.next_message(), Some(Ok(Ok(ClientMessage::Version(Version::V3_8)))));
+        assert_eq!(s.next(), Some(Ok(Ok(ClientMessage::Version(Version::V3_8)))));
         // Too much early is an error.
         let _ = s.push(&vec![0; MAX_PENDING + 1]);
-        assert_eq!(s.next_message(), Some(Err(codec::Fail::Protocol(FrameError::OutOfTurn))));
+        assert_eq!(s.next(), Some(Err(codec::Fail::Protocol(FrameError::OutOfTurn))));
         assert_eq!(s.push(&[1]), 1);
-        assert_eq!(s.next_message(), None);
+        assert_eq!(s.next(), None);
         assert_eq!(s.buffered(), MAX_PENDING);
     }
 
@@ -2384,10 +2384,10 @@ mod tests {
     fn server_init_example() {
         let mut c = Client::new();
         let _ = c.push(b"RFB 003.003\n");
-        c.next_message().unwrap().unwrap().unwrap();
+        c.next().unwrap().unwrap().unwrap();
         c.send(&ClientMessage::Version(Version::V3_3)).unwrap();
         let _ = c.push(&[0, 0, 0, 1]);
-        assert_eq!(c.next_message(), Some(Ok(Ok(ServerMessage::SecurityType(1)))));
+        assert_eq!(c.next(), Some(Ok(Ok(ServerMessage::SecurityType(1)))));
         assert_eq!(c.send(&ClientMessage::ClientInit { shared: true }), Ok(vec![1]));
         let mut bytes = vec![0x04, 0x00, 0x03, 0x00];
         bytes.extend_from_slice(&[16, 16, 1, 1, 0, 31, 0, 63, 0, 31, 11, 5, 0, 0, 0, 0]);
@@ -2395,13 +2395,13 @@ mod tests {
         for n in 0..bytes.len() {
             let mut c2 = Client::new();
             let _ = c2.push(b"RFB 003.003\n");
-            c2.next_message().unwrap().unwrap().unwrap();
+            c2.next().unwrap().unwrap().unwrap();
             c2.send(&ClientMessage::Version(Version::V3_3)).unwrap();
             let _ = c2.push(&[0, 0, 0, 1]);
-            c2.next_message().unwrap().unwrap().unwrap();
+            c2.next().unwrap().unwrap().unwrap();
             c2.send(&ClientMessage::ClientInit { shared: true }).unwrap();
             let _ = c2.push(&bytes[..n]);
-            assert_eq!(c2.next_message(), None, "{n} bytes");
+            assert_eq!(c2.next(), None, "{n} bytes");
         }
         let _ = c.push(&bytes);
         let format = PixelFormat {
@@ -2417,17 +2417,17 @@ mod tests {
             blue_shift: 0,
         };
         let init = ServerInit { width: 1024, height: 768, format, name: b"abc".to_vec() };
-        assert_eq!(c.next_message(), Some(Ok(Ok(ServerMessage::ServerInit(init.clone())))));
+        assert_eq!(c.next(), Some(Ok(Ok(ServerMessage::ServerInit(init.clone())))));
         assert_eq!(c.pixel_format(), format);
         assert_eq!(server_bytes(&ServerMessage::ServerInit(init), Dialect::V3_3, &format), Ok(bytes));
         // Raw pixels are now two bytes each.
         let _ = c.push(&[0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0xab, 0xcd]);
-        let Some(Ok(Ok(ServerMessage::FramebufferUpdate(r)))) = c.next_message() else { panic!() };
+        let Some(Ok(Ok(ServerMessage::FramebufferUpdate(r)))) = c.next() else { panic!() };
         assert_eq!(r[0].contents, Contents::Raw(vec![0xab, 0xcd]));
         // After SetPixelFormat, four.
         c.send(&ClientMessage::SetPixelFormat(PixelFormat::TRUE_COLOR_32)).unwrap();
         let _ = c.push(&[0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 1, 2, 3, 4]);
-        let Some(Ok(Ok(ServerMessage::FramebufferUpdate(r)))) = c.next_message() else { panic!() };
+        let Some(Ok(Ok(ServerMessage::FramebufferUpdate(r)))) = c.next() else { panic!() };
         assert_eq!(r[0].contents, Contents::Raw(vec![1, 2, 3, 4]));
     }
 
@@ -2471,7 +2471,7 @@ mod tests {
                     server.send(&message).unwrap();
                     continue;
                 }
-                match server.next_message() {
+                match server.next() {
                     Some(item) => {
                         let failed = !matches!(item, Ok(Ok(_)));
                         got.push(item);
@@ -2519,7 +2519,7 @@ mod tests {
                         client.send(&message).unwrap();
                         continue;
                     }
-                    match client.next_message() {
+                    match client.next() {
                         Some(item) => {
                             let failed = !matches!(item, Ok(Ok(_)));
                             got.push(item.map(|result| result.map(|message| (message, client.pixel_format()))));
@@ -2626,20 +2626,20 @@ mod tests {
         let started = std::time::Instant::now();
         for (i, chunk) in chunks(&bytes, &[1]).enumerate() {
             assert_eq!(client.push(chunk), 1);
-            if i + 1 < bytes.len() { assert_eq!(client.next_message(), None); }
+            if i + 1 < bytes.len() { assert_eq!(client.next(), None); }
             assert!(client.buffered() <= MAX_MESSAGE);
         }
-        assert_eq!(client.next_message(), Some(Ok(Ok(update))));
+        assert_eq!(client.next(), Some(Ok(Ok(update))));
         assert_eq!(client.buffered(), 0);
         let message = ClientMessage::PointerEvent { buttons: 0, x: 1, y: 1 };
         let bytes = message.to_bytes().unwrap();
         for _ in 0..100_000 {
             for (i, chunk) in chunks(&bytes, &[1]).enumerate() {
                 assert_eq!(server.push(chunk), 1);
-                if i + 1 < bytes.len() { assert_eq!(server.next_message(), None); }
+                if i + 1 < bytes.len() { assert_eq!(server.next(), None); }
                 assert!(server.buffered() <= MAX_CLIENT_MESSAGE);
             }
-            assert_eq!(server.next_message(), Some(Ok(Ok(message.clone()))));
+            assert_eq!(server.next(), Some(Ok(Ok(message.clone()))));
         }
         assert_eq!(server.buffered(), 0);
         assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
@@ -2713,10 +2713,10 @@ mod tests {
             for (i, chunk) in chunks(&bytes, &[1]).enumerate() {
                 assert_eq!(s.push(chunk), chunk.len());
                 if i + 1 < bytes.len() {
-                    assert_eq!(s.next_message(), None);
+                    assert_eq!(s.next(), None);
                 }
             }
-            assert_eq!(s.next_message(), Some(Ok(Ok(m))));
+            assert_eq!(s.next(), Some(Ok(Ok(m))));
         }
         // Handshake messages are fixed bytes.
         assert_eq!(SecurityChoice(2).to_bytes(), Ok(vec![2]));
@@ -2739,10 +2739,10 @@ mod tests {
             for (i, chunk) in chunks(&bytes, &[1]).enumerate() {
                 assert_eq!(c.push(chunk), chunk.len());
                 if i + 1 < bytes.len() {
-                    assert_eq!(c.next_message(), None);
+                    assert_eq!(c.next(), None);
                 }
             }
-            assert_eq!(c.next_message(), Some(Ok(Ok(m))));
+            assert_eq!(c.next(), Some(Ok(Ok(m))));
         }
         assert_eq!(server_bytes(&ServerMessage::Bell, Dialect::V3_3, &f), Ok(vec![2]));
         assert!(ServerMessage::SecurityOk.is_handshake());
@@ -2794,14 +2794,14 @@ mod tests {
         // Through a session, the error sticks.
         let (mut s, _) = converse(Version::V3_8, ServerMessage::SecurityTypes(vec![1]), Some(1), Some(ServerMessage::SecurityOk));
         let _ = s.push(&[9]);
-        assert_eq!(s.next_message(), Some(Err(codec::Fail::Protocol(FrameError::MessageType(9)))));
+        assert_eq!(s.next(), Some(Err(codec::Fail::Protocol(FrameError::MessageType(9)))));
         assert_eq!(s.push(&[2]), 1);
-        assert_eq!(s.next_message(), None);
+        assert_eq!(s.next(), None);
         assert_eq!(s.buffered(), 1);
         let mut s = Server::new();
         s.send(&ServerMessage::Version(Version::V3_8)).unwrap();
         let _ = s.push(b"RFB 3.8\n");
-        assert_eq!(s.next_message(), Some(Err(codec::Fail::Protocol(FrameError::Version))));
+        assert_eq!(s.next(), Some(Err(codec::Fail::Protocol(FrameError::Version))));
         // Every error has words.
         for e in [Error::Version, Error::Encoding(5), Error::Phase(Phase::Normal), Error::Unwritable, Error::Truncated] {
             assert!(!e.to_string().is_empty());
@@ -2868,13 +2868,13 @@ mod tests {
     /// Passes a client message to the server through bytes.
     fn client_says(s: &mut Server, c: &mut Client, m: ClientMessage) {
         let _ = s.push(&c.send(&m).unwrap());
-        assert_eq!(s.next_message(), Some(Ok(Ok(m))));
+        assert_eq!(s.next(), Some(Ok(Ok(m))));
     }
 
     /// Passes a server message to the client through bytes.
     fn server_says(s: &mut Server, c: &mut Client, m: ServerMessage) {
         let _ = c.push(&s.send(&m).unwrap());
-        assert_eq!(c.next_message(), Some(Ok(Ok(m))));
+        assert_eq!(c.next(), Some(Ok(Ok(m))));
     }
 
     #[test]
@@ -2889,7 +2889,7 @@ mod tests {
         let mut got = 0;
         for r in chunks(&bytes[4..], &[16]) {
             let _ = c.push(r);
-            match c.next_message() {
+            match c.next() {
                 Some(m) => {
                     m.unwrap().unwrap();
                     got += 1;
@@ -2922,28 +2922,28 @@ mod tests {
         // An update half read keeps its format.
         let (_, mut c) = normal_pair();
         let _ = c.push(&update[..18]);
-        assert_eq!(c.next_message(), None);
+        assert_eq!(c.next(), None);
         assert_eq!(c.send(&ClientMessage::SetPixelFormat(f8)), Err(Error::Outstanding));
         assert_eq!(c.pixel_format(), PixelFormat::TRUE_COLOR_32);
         let _ = c.push(&update[18..]);
-        let Some(Ok(Ok(ServerMessage::FramebufferUpdate(r)))) = c.next_message() else { panic!() };
+        let Some(Ok(Ok(ServerMessage::FramebufferUpdate(r)))) = c.next() else { panic!() };
         assert_eq!(r[0].contents, Contents::Raw(vec![0xaa, 0xbb, 0xcc, 0xdd]));
         assert_eq!(c.send(&ClientMessage::SetPixelFormat(f8)).map(|b| b.len()), Ok(20));
         // So does an update whose first byte alone has come.
         let (_, mut c) = normal_pair();
         let _ = c.push(&update[..1]);
-        assert_eq!(c.next_message(), None);
+        assert_eq!(c.next(), None);
         assert_eq!(c.send(&ClientMessage::SetPixelFormat(f8)), Err(Error::Outstanding));
         // An outstanding request waits for its update.
         let (_, mut c) = normal_pair();
         c.send(&ClientMessage::FramebufferUpdateRequest { incremental: true, x: 0, y: 0, width: 1, height: 1 }).unwrap();
         assert_eq!(c.send(&ClientMessage::SetPixelFormat(f8)), Err(Error::Outstanding));
         let _ = c.push(&update);
-        c.next_message().unwrap().unwrap().unwrap();
+        c.next().unwrap().unwrap().unwrap();
         c.send(&ClientMessage::SetPixelFormat(f8)).unwrap();
         assert_eq!(c.pixel_format(), f8);
         let _ = c.push(&[0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0x5a]);
-        let Some(Ok(Ok(ServerMessage::FramebufferUpdate(r)))) = c.next_message() else { panic!() };
+        let Some(Ok(Ok(ServerMessage::FramebufferUpdate(r)))) = c.next() else { panic!() };
         assert_eq!(r[0].contents, Contents::Raw(vec![0x5a]));
     }
 
@@ -2959,15 +2959,15 @@ mod tests {
         assert_eq!(c.send(&ClientMessage::SetPixelFormat(bad)), Err(Error::PixelFormat));
         assert_eq!(c.pixel_format(), PixelFormat::TRUE_COLOR_32);
         let _ = s.push(&b);
-        assert_eq!(s.next_message(), Some(Ok(Err(Error::PixelFormat))));
+        assert_eq!(s.next(), Some(Ok(Err(Error::PixelFormat))));
         // A ServerInit in 24 bits per pixel is refused before the first
         // update, on both sides.
         let mut c = Client::new();
         let _ = c.push(b"RFB 003.003\n");
-        c.next_message().unwrap().unwrap().unwrap();
+        c.next().unwrap().unwrap().unwrap();
         c.send(&ClientMessage::Version(Version::V3_3)).unwrap();
         let _ = c.push(&[0, 0, 0, 1]);
-        c.next_message().unwrap().unwrap().unwrap();
+        c.next().unwrap().unwrap().unwrap();
         c.send(&ClientMessage::ClientInit { shared: true }).unwrap();
         let f24 = PixelFormat { bits_per_pixel: 24, ..PixelFormat::TRUE_COLOR_32 };
         let init = ServerMessage::ServerInit(ServerInit { width: 1, height: 1, format: f24, name: vec![] });
@@ -2978,7 +2978,7 @@ mod tests {
         bytes.extend_from_slice(&raw);
         bytes.extend_from_slice(&[0, 0, 0, 0]);
         let _ = c.push(&bytes);
-        assert_eq!(c.next_message(), Some(Ok(Err(Error::PixelFormat))));
+        assert_eq!(c.next(), Some(Ok(Err(Error::PixelFormat))));
     }
 
     #[test]
@@ -2998,7 +2998,7 @@ mod tests {
         ] {
             assert_eq!(s.send(&bad), Err(Error::Rectangle), "{bad:?}");
             let _ = c.push(&server_bytes(&bad, Dialect::V3_8, &f).unwrap());
-            assert_eq!(c.next_message(), Some(Ok(Err(Error::Rectangle))), "{bad:?}");
+            assert_eq!(c.next(), Some(Ok(Err(Error::Rectangle))), "{bad:?}");
         }
         // The edges are inside, and the cursor's hot spot is not checked.
         let good = update(vec![
@@ -3007,17 +3007,17 @@ mod tests {
             rect(0, 0, 24, 8, Contents::CopyRect { src_x: 1000, src_y: 760 }),
         ]);
         let _ = c.push(&s.send(&good).unwrap());
-        assert_eq!(c.next_message(), Some(Ok(Ok(good))));
+        assert_eq!(c.next(), Some(Ok(Ok(good))));
         // DesktopSize shrinks the framebuffer for the updates after it.
         client_says(&mut s, &mut c, request);
         let shrink = update(vec![rect(1000, 0, 8, 8, Contents::Raw(vec![0; 256])), rect(0, 0, 640, 480, Contents::DesktopSize)]);
         let _ = c.push(&s.send(&shrink).unwrap());
-        assert_eq!(c.next_message(), Some(Ok(Ok(shrink))));
+        assert_eq!(c.next(), Some(Ok(Ok(shrink))));
         client_says(&mut s, &mut c, ClientMessage::FramebufferUpdateRequest { incremental: true, x: 0, y: 0, width: 1, height: 1 });
         let past = update(vec![rect(640, 0, 1, 1, Contents::Raw(vec![0; 4]))]);
         assert_eq!(s.send(&past), Err(Error::Rectangle));
         let _ = c.push(&server_bytes(&past, Dialect::V3_8, &f).unwrap());
-        assert_eq!(c.next_message(), Some(Ok(Err(Error::Rectangle))));
+        assert_eq!(c.next(), Some(Ok(Err(Error::Rectangle))));
     }
 
     #[test]
@@ -3093,17 +3093,17 @@ mod tests {
         let mut s = Server::new();
         s.send(&ServerMessage::Version(Version::V3_8)).unwrap();
         let _ = s.push(b"RFB 003.008\n");
-        s.next_message().unwrap().unwrap().unwrap();
+        s.next().unwrap().unwrap().unwrap();
         assert_eq!(s.send(&ServerMessage::SecurityTypes(vec![0])), Err(Error::Unwritable));
         assert_eq!(s.send(&ServerMessage::SecurityTypes(vec![1, 0])), Err(Error::Unwritable));
         assert_eq!(s.phase(), Phase::SecurityOffer);
         // A client world cannot pick 0, even from a peer that offered it.
         let mut c = Client::new();
         let _ = c.push(b"RFB 003.008\n");
-        c.next_message().unwrap().unwrap().unwrap();
+        c.next().unwrap().unwrap().unwrap();
         c.send(&ClientMessage::Version(Version::V3_8)).unwrap();
         let _ = c.push(&[2, 0, 1]);
-        assert_eq!(c.next_message(), Some(Ok(Ok(ServerMessage::SecurityTypes(vec![0, 1])))));
+        assert_eq!(c.next(), Some(Ok(Ok(ServerMessage::SecurityTypes(vec![0, 1])))));
         assert_eq!(c.send(&ClientMessage::SecurityType(0)), Err(Error::Unwritable));
         assert_eq!(c.phase(), Phase::SecurityChoice);
         assert_eq!(c.send(&ClientMessage::SecurityType(1)), Ok(vec![1]));
@@ -3122,7 +3122,7 @@ mod tests {
     }
     fn normal_server(format: PixelFormat) -> ServerMessages {
         let mut d = ServerMessages::new();
-        d.set_mode(Phase::Normal, Dialect::V3_8, format).unwrap();
+        d.set_phase(Phase::Normal, Dialect::V3_8, format).unwrap();
         d
     }
 

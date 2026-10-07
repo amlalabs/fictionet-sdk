@@ -1246,10 +1246,10 @@ pub enum Role {
     /// Waits for Logon, then confirms it.
     Acceptor,
 }
-/// Connection state. Sequence counters belong to the FIX session and can be
+/// Where a [`Session`] is. Sequence counters belong to the FIX session and can be
 /// saved by the caller and passed to a new machine after a disconnection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SessionState {
+pub enum Phase {
     /// No Logon has been sent or accepted.
     AwaitingLogon,
     /// Waiting for a Logon confirmation.
@@ -1453,7 +1453,7 @@ fn action(actions: &mut Vec<Action>, value: Action) -> Result<(), FrameError> {
 #[derive(Clone, Debug)]
 pub struct Session {
     config: SessionConfig,
-    state: SessionState,
+    phase: Phase,
     incoming: u32,
     outgoing: u32,
     last_now: u64,
@@ -1486,7 +1486,7 @@ impl Session {
         let heartbeat = config.heartbeat_seconds;
         Ok(Self {
             config,
-            state: SessionState::AwaitingLogon,
+            phase: Phase::AwaitingLogon,
             incoming: next_inbound,
             outgoing: next_outbound,
             last_now: now_ms,
@@ -1505,9 +1505,9 @@ impl Session {
             replay_ranges: std::collections::VecDeque::new(),
         })
     }
-    /// Current connection state.
-    pub fn state(&self) -> SessionState {
-        self.state
+    /// Where the session is.
+    pub fn phase(&self) -> Phase {
+        self.phase
     }
     /// Next inbound sequence number to persist.
     pub fn next_inbound(&self) -> u32 {
@@ -1531,7 +1531,7 @@ impl Session {
         sending_time: &[u8],
     ) -> Result<Vec<Action>, FrameError> {
         self.transaction(now_ms, sending_time, |s, actions| {
-            if s.state != SessionState::Established || s.test.is_some() {
+            if s.phase != Phase::Established || s.test.is_some() {
                 return Err(FrameError::State);
             }
             if id.len() > MAX_TEST_REQUEST_ID_LENGTH {
@@ -1552,7 +1552,7 @@ impl Session {
         reset: bool,
     ) -> Result<Vec<Action>, FrameError> {
         self.transaction(now_ms, sending_time, |s, actions| {
-            if s.config.role != Role::Initiator || s.state != SessionState::AwaitingLogon {
+            if s.config.role != Role::Initiator || s.phase != Phase::AwaitingLogon {
                 return Err(FrameError::State);
             }
             if reset && !s.config.allow_logon_reset {
@@ -1564,7 +1564,7 @@ impl Session {
             }
             s.reset_requested = reset;
             s.logon(now_ms, sending_time, reset, actions)?;
-            s.state = SessionState::LogonSent;
+            s.phase = Phase::LogonSent;
             s.state_since = now_ms;
             Ok(())
         })
@@ -1613,21 +1613,21 @@ impl Session {
     /// Any non-garbled inbound message satisfies a probe (Vol 2 state row 14).
     pub fn tick(&mut self, now_ms: u64, sending_time: &[u8]) -> Result<Vec<Action>, FrameError> {
         self.transaction(now_ms, sending_time, |s, actions| {
-            match s.state {
-                SessionState::Closed => return Ok(()),
-                SessionState::AwaitingLogon | SessionState::LogonSent => {
+            match s.phase {
+                Phase::Closed => return Ok(()),
+                Phase::AwaitingLogon | Phase::LogonSent => {
                     if now_ms.saturating_sub(s.state_since) >= s.config.logon_timeout_ms {
                         s.close(CloseReason::LogonTimeout, actions)?;
                     }
                     return Ok(());
                 }
-                SessionState::LogoutSent | SessionState::LogoutReceived => {
+                Phase::LogoutSent | Phase::LogoutReceived => {
                     if now_ms.saturating_sub(s.state_since) >= s.config.logout_timeout_ms {
                         s.close(CloseReason::LogoutTimeout, actions)?;
                     }
                     return Ok(());
                 }
-                SessionState::Established => {}
+                Phase::Established => {}
             }
             if s.pending_logout.is_some_and(|(_, since)| {
                 now_ms.saturating_sub(since) >= s.config.logout_timeout_ms
@@ -1670,7 +1670,7 @@ impl Session {
     ) -> Result<Vec<Action>, FrameError> {
         body.validate()?;
         self.transaction(now_ms, sending_time, |s, actions| {
-            if s.state != SessionState::Established {
+            if s.phase != Phase::Established {
                 return Err(FrameError::State);
             }
             if admin(body.msg_type()) || body.version()? != s.config.version {
@@ -1704,7 +1704,7 @@ impl Session {
         sending_time: &[u8],
     ) -> Result<Vec<Action>, FrameError> {
         self.transaction(now_ms, sending_time, |s, actions| {
-            if s.state != SessionState::Established {
+            if s.phase != Phase::Established {
                 return Err(FrameError::State);
             }
             let fields = [(58, text)];
@@ -1715,7 +1715,7 @@ impl Session {
                 sending_time,
                 actions,
             )?;
-            s.state = SessionState::LogoutSent;
+            s.phase = Phase::LogoutSent;
             s.state_since = now_ms;
             Ok(())
         })
@@ -1735,7 +1735,7 @@ impl Session {
         sending_time: &[u8],
     ) -> Result<Vec<Action>, FrameError> {
         self.transaction(now_ms, sending_time, |s, actions| {
-            if s.state != SessionState::Established {
+            if s.phase != Phase::Established {
                 return Err(FrameError::State);
             }
             seq(reference)?;
@@ -1843,7 +1843,7 @@ impl Session {
         sending_time: &[u8],
     ) -> Result<Vec<Action>, FrameError> {
         self.transaction(now_ms, sending_time, |s, actions| {
-            if s.state != SessionState::Established {
+            if s.phase != Phase::Established {
                 return Err(FrameError::State);
             }
             seq(next)?;
@@ -1880,14 +1880,14 @@ impl Session {
     }
     fn initial(&self) -> bool {
         matches!(
-            self.state,
-            SessionState::AwaitingLogon | SessionState::LogonSent
+            self.phase,
+            Phase::AwaitingLogon | Phase::LogonSent
         )
     }
     fn recovery_state(&self) -> Result<(), FrameError> {
         if matches!(
-            self.state,
-            SessionState::Established | SessionState::LogoutSent | SessionState::LogoutReceived
+            self.phase,
+            Phase::Established | Phase::LogoutSent | Phase::LogoutReceived
         ) {
             Ok(())
         } else {
@@ -1970,7 +1970,7 @@ impl Session {
         self.send_fresh(message, now, actions)
     }
     fn close(&mut self, reason: CloseReason, actions: &mut Vec<Action>) -> Result<(), FrameError> {
-        self.state = SessionState::Closed;
+        self.phase = Phase::Closed;
         self.test = None;
         action(actions, Action::Event(Event::Disconnected(reason)))
     }
@@ -2069,7 +2069,7 @@ impl Session {
     ) -> Result<(), FrameError> {
         self.emit(b"5", &[], now, time, actions)?;
         self.pending_logout = None;
-        self.state = SessionState::LogoutReceived;
+        self.phase = Phase::LogoutReceived;
         self.state_since = now;
         Ok(())
     }
@@ -2087,7 +2087,7 @@ impl Session {
         time: &[u8],
         actions: &mut Vec<Action>,
     ) -> Result<(), FrameError> {
-        if self.state == SessionState::Closed {
+        if self.phase == Phase::Closed {
             return Err(FrameError::State);
         }
         let initial = self.initial();
@@ -2101,7 +2101,7 @@ impl Session {
             }
             return self.fatal(CloseReason::Protocol, b"Logon required", now, time, actions);
         }
-        if initial && self.config.role == Role::Initiator && self.state != SessionState::LogonSent {
+        if initial && self.config.role == Role::Initiator && self.phase != Phase::LogonSent {
             return self.fatal(
                 CloseReason::Protocol,
                 b"Unexpected Logon",
@@ -2382,7 +2382,7 @@ impl Session {
             if self.config.role == Role::Acceptor {
                 self.logon(now, time, reset, actions)?;
             }
-            self.state = SessionState::Established;
+            self.phase = Phase::Established;
             self.state_since = now;
             action(
                 actions,
@@ -2404,13 +2404,13 @@ impl Session {
             read_input!(number(message, 16), 16, 6);
             self.resend_request(message, n, now, time, actions)?;
         } else if kind == b"5" && !duplicate {
-            if self.state == SessionState::LogoutSent {
+            if self.phase == Phase::LogoutSent {
                 if !high {
                     self.incoming = advance(self.incoming)?;
                 }
                 return self.close(CloseReason::Logout, actions);
             }
-            if self.state != SessionState::LogoutReceived {
+            if self.phase != Phase::LogoutReceived {
                 if high {
                     // Preserve the first request's deadline on repeated Logout.
                     self.pending_logout.get_or_insert((n, now));
@@ -2757,7 +2757,7 @@ mod tests {
             .receive(&inbound(version, b"A", 1, fields), 0, TIME)
             .unwrap();
         checked(&response);
-        assert_eq!(s.state(), SessionState::Established);
+        assert_eq!(s.phase(), Phase::Established);
         s
     }
     fn wire_body(body: &[u8]) -> Vec<u8> {
@@ -2851,7 +2851,7 @@ mod tests {
         }
         let actions = received_bytes(&mut session, HIGH_FOUR, u64::from(MAX_RESEND_ATTEMPTS) + 1);
         assert_eq!(sends(&actions)[0].msg_type(), b"5");
-        assert_eq!(session.state(), SessionState::Closed);
+        assert_eq!(session.phase(), Phase::Closed);
     }
 
     #[test]
@@ -2911,7 +2911,7 @@ mod tests {
         let actions = received_bytes(&mut session, b"8=FIX.4.4\x019=90\x0135=4\x0134=3\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0143=Y\x01122=20261006-12:00:00\x01123=Y\x0136=6\x0110=135\x01", 3);
         assert_eq!(sends(&actions)[0].msg_type(), b"5");
         assert_eq!(session.next_inbound(), 6);
-        assert_eq!(session.state(), SessionState::LogoutReceived);
+        assert_eq!(session.phase(), Phase::LogoutReceived);
     }
 
     #[test]
@@ -2923,7 +2923,7 @@ mod tests {
         let actions = session.tick(2001, TIME).unwrap();
         assert_eq!(sends(&actions).len(), 1);
         assert_eq!(sends(&actions)[0].msg_type(), b"5");
-        assert_eq!(session.state(), SessionState::LogoutReceived);
+        assert_eq!(session.phase(), Phase::LogoutReceived);
     }
 
     #[test]
@@ -2971,7 +2971,7 @@ mod tests {
             let mut session = established(Version::Fix44);
             let actions = session.receive_frame(&items[0], 1, TIME).unwrap();
             assert_eq!(sends(&actions)[0].msg_type(), b"5");
-            assert_eq!(session.state(), SessionState::Closed);
+            assert_eq!(session.phase(), Phase::Closed);
             assert_eq!(session.next_inbound(), 2);
         }
     }
@@ -3018,7 +3018,7 @@ mod tests {
             assert_eq!(sends(&actions)[0].msg_type(), b"5");
             assert_eq!(session.next_inbound(), 5);
             assert_eq!(session.next_outbound(), 8);
-            assert_eq!(session.state(), SessionState::Closed);
+            assert_eq!(session.phase(), Phase::Closed);
         }
         let mut session = Session::new(
             SessionConfig::new(Version::Fix44, Role::Acceptor, "LOCAL", "PEER").unwrap(),
@@ -3085,7 +3085,7 @@ mod tests {
         assert_eq!(sent[0].msg_type(), b"5");
         assert_eq!(session.next_inbound(), 6);
         assert!(sends(&received_bytes(&mut session, replay, 4)).is_empty());
-        assert_eq!(session.state(), SessionState::LogoutReceived);
+        assert_eq!(session.phase(), Phase::LogoutReceived);
     }
 
     #[test]
@@ -3099,7 +3099,7 @@ mod tests {
         received_bytes(&mut session, REPLAY_TWO, now);
         let sent = sends(&received_bytes(&mut session, REPLAY_FOUR, now + 1));
         assert_eq!(sent[0].get(7), Some(b"3".as_slice()));
-        assert_eq!(session.state(), SessionState::Established);
+        assert_eq!(session.phase(), Phase::Established);
     }
 
     #[test]
@@ -3113,7 +3113,7 @@ mod tests {
         )
         .unwrap();
         received_bytes(&mut session, b"8=FIXT.1.1\x019=71\x0135=A\x0134=1\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0198=0\x01108=30\x011137=6\x0110=008\x01", 0);
-        assert_eq!(session.state(), SessionState::Established);
+        assert_eq!(session.phase(), Phase::Established);
         assert!(received_bytes(&mut session, b"8=FIXT.1.1\x019=52\x0135=0\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0110=158\x01", 1).is_empty());
         assert_eq!(session.next_inbound(), 3);
     }
@@ -3143,7 +3143,7 @@ mod tests {
                 if role == Role::Initiator { session.start(0, TIME, true).unwrap(); }
                 let before = (session.next_inbound(), session.next_outbound());
                 let actions = received_bytes(&mut session, bytes, 1);
-                assert_eq!(session.state(), SessionState::Closed);
+                assert_eq!(session.phase(), Phase::Closed);
                 let sent = sends(&actions);
                 assert_eq!(sent.len(), 1);
                 assert_eq!(sent[0].msg_type(), b"5");
@@ -3159,7 +3159,7 @@ mod tests {
         let mut session = established(Version::Fix44);
         let actions = received_bytes(&mut session, b"8=FIX.4.4\x019=57\x0135=4\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0136=2\x0110=050\x01", 1);
         assert!(sends(&actions).is_empty());
-        assert_eq!(session.state(), SessionState::Established);
+        assert_eq!(session.phase(), Phase::Established);
         assert_eq!((session.next_inbound(), session.next_outbound()), (2, 2));
     }
 
@@ -3173,7 +3173,7 @@ mod tests {
             assert_eq!(sent.len(), 1);
             assert_eq!(sent[0].msg_type(), b"3");
             assert_eq!(sent[0].get(373), Some(b"5".as_slice()));
-            assert_eq!(session.state(), SessionState::Established);
+            assert_eq!(session.phase(), Phase::Established);
             assert_eq!(session.next_inbound(), 2);
         }
     }
@@ -3184,7 +3184,7 @@ mod tests {
         let mut session = established(Version::Fix44);
         let actions = received_bytes(&mut session, b"8=FIX.4.4\x019=67\x0135=4\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x01123=Y\x0136=10003\x0110=034\x01", 1);
         assert!(sends(&actions).is_empty());
-        assert_eq!(session.state(), SessionState::Established);
+        assert_eq!(session.phase(), Phase::Established);
         assert_eq!(session.next_inbound(), 10003);
     }
 
@@ -3194,7 +3194,7 @@ mod tests {
         let mut session = established(Version::Fix44);
         let actions = received_bytes(&mut session, b"8=FIX.4.4\x019=52\x0135=5\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0110=085\x01", 1);
         assert_eq!(sends(&actions)[0].msg_type(), b"5");
-        assert_ne!(session.state(), SessionState::Closed);
+        assert_ne!(session.phase(), Phase::Closed);
         assert!(
             !actions
                 .iter()
@@ -3220,7 +3220,7 @@ mod tests {
             let now = u64::from(second) * 1000;
             session.receive(&app, now, TIME).unwrap();
             checked(&session.tick(now, TIME).unwrap());
-            assert_eq!(session.state(), SessionState::Established);
+            assert_eq!(session.phase(), Phase::Established);
         }
     }
 
@@ -3280,7 +3280,7 @@ mod tests {
             assert!(has_event(&actions, Event::Rejected { sequence: 2, tag: Some(tag), reason }), "{tag}");
             assert_eq!(sends(&actions)[0].get(373), Some(reason.to_string().as_bytes()));
             assert_eq!(session.next_inbound(), 3);
-            assert_eq!(session.state(), SessionState::Established);
+            assert_eq!(session.phase(), Phase::Established);
             // Repeating the same malformed sequence cannot trigger its own
             // ResendRequest again, or roll back the previous inbound advance.
             let again = received_bytes(&mut session, bytes, 2);
@@ -3306,7 +3306,7 @@ mod tests {
                 if role == Role::Initiator { session.start(0, TIME, true).unwrap(); }
                 let before = (session.next_inbound(), session.next_outbound());
                 let actions = received_bytes(&mut session, bytes, 1);
-                assert_eq!(session.state(), SessionState::Closed);
+                assert_eq!(session.phase(), Phase::Closed);
                 assert_eq!(sends(&actions).len(), 1);
                 assert_eq!(sends(&actions)[0].msg_type(), b"5");
                 assert_eq!(session.next_inbound(), before.0);
@@ -3322,7 +3322,7 @@ mod tests {
         let actions = received_bytes(&mut session, b"8=FIX.4.4\x019=47\x0135=0\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0110=125\x01", 1);
         assert_eq!(sends(&actions).len(), 1);
         assert_eq!(sends(&actions)[0].msg_type(), b"5");
-        assert_eq!(session.state(), SessionState::Closed);
+        assert_eq!(session.phase(), Phase::Closed);
         assert_eq!(session.next_inbound(), 2);
         let mut session = established(Version::Fix44);
         let actions = received_bytes(&mut session, b"8=FIX.4.4\x019=52\x0135=0\x0134=2\x0149=EVIL\x0152=20261006-12:00:01.000\x0156=LOCAL\x0110=084\x01", 1);
@@ -3333,7 +3333,7 @@ mod tests {
         );
         assert_eq!(sent[0].get(373), Some(b"9".as_slice()));
         assert_eq!(session.next_inbound(), 3);
-        assert_eq!(session.state(), SessionState::Closed);
+        assert_eq!(session.phase(), Phase::Closed);
     }
 
     #[test]
@@ -3368,13 +3368,13 @@ mod tests {
             checked(&actions);
             if accepted {
                 assert!(sends(&actions).is_empty());
-                assert_eq!(session.state(), SessionState::Established);
+                assert_eq!(session.phase(), Phase::Established);
             } else {
                 let sent = sends(&actions);
                 assert_eq!(sent.len(), 2);
                 assert_eq!(sent[0].get(373), Some(b"10".as_slice()));
                 assert_eq!(sent[1].msg_type(), b"5");
-                assert_eq!(session.state(), SessionState::Closed);
+                assert_eq!(session.phase(), Phase::Closed);
             }
             assert_eq!(session.next_inbound(), 3);
         }
@@ -3996,7 +3996,7 @@ mod tests {
             let response = sends(&server.receive(&request, 1, TIME).unwrap()).remove(0);
             let actions = client.receive(&response, 2, TIME).unwrap();
             checked(&actions);
-            assert_eq!(client.state(), SessionState::Established);
+            assert_eq!(client.phase(), Phase::Established);
             assert_eq!(client.next_inbound(), 2);
             let app = NewOrderSingle::builder(version).unwrap().finish().unwrap();
             let out = sends(&client.send(&app, 3, TIME).unwrap()).remove(0);
@@ -4010,7 +4010,7 @@ mod tests {
             ));
             let logout = sends(&client.logout(b"done", 5, TIME).unwrap()).remove(0);
             let actions = server.receive(&logout, 6, TIME).unwrap();
-            assert_eq!(server.state(), SessionState::LogoutReceived);
+            assert_eq!(server.phase(), Phase::LogoutReceived);
             let reply = sends(&actions).remove(0);
             assert!(has_event(
                 &client.receive(&reply, 7, TIME).unwrap(),
@@ -4182,7 +4182,7 @@ mod tests {
             Event::Disconnected(CloseReason::SequenceTooLow)
         ));
         checked(&events);
-        assert_eq!(s.state(), SessionState::Closed);
+        assert_eq!(s.phase(), Phase::Closed);
     }
 
     #[test]
@@ -4209,7 +4209,7 @@ mod tests {
                 reason: 5
             }
         ));
-        assert_eq!(s.state(), SessionState::Established);
+        assert_eq!(s.phase(), Phase::Established);
         assert_eq!(s.next_inbound(), 50);
     }
 
