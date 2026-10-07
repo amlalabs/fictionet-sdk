@@ -18,13 +18,16 @@
 //!   every host the same address again.
 //! - **TLS** ([`Ca`]): a host's certificate is made at its first handshake
 //!   and signed by the CA that `ca.py` made when the image was built.
-//! - **Content** ([`content`]): every site forwards to the Python backend
+//! - **Dates** ([`world_start`]): the world's clock starts on the seed's
+//!   date, so every response's `Date` header is in the scenario, and each
+//!   certificate was issued shortly before it.
+//! - **Pages** ([`backend`]): every site forwards to the Python backend
 //!   on 127.0.0.1, which makes, stores and serves the pages.
 //! - **Ground truth**: `state.json` and `log.jsonl` in `--state-dir`, the
 //!   ready file, and the store. The log is written from the run's events
 //!   ([`events`]).
 
-pub mod content;
+pub mod backend;
 pub mod events;
 pub mod log;
 
@@ -49,7 +52,7 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde_json::{Value, json};
 
-use crate::content::Content;
+use crate::backend::Backend;
 use crate::log::Log;
 
 /// The gateway, where `Sites` runs DNS (its default subnet is 10.0.0.0/24).
@@ -241,44 +244,75 @@ impl Addresses {
     }
 }
 
+/// The world's date at the start of the run: the seed's day (`YYYY-MM-DD`,
+/// UTC) at the host's time of day, so the clock reads like an ordinary day.
+pub fn world_start(date: &str) -> fictionet::Result<SystemTime> {
+    let bad = |why: String| {
+        fictionet::Error::msg(format!(
+            "the seed's date {date:?} is not a YYYY-MM-DD date: {why}"
+        ))
+    };
+    let parts: Vec<&str> = date.split('-').collect();
+    let [y, m, d] = parts[..] else {
+        return Err(bad("it does not have three parts".into()));
+    };
+    let number = |p: &str| p.parse::<u16>().map_err(|e| bad(e.to_string()));
+    let month = time::Month::try_from(number(m)? as u8).map_err(|e| bad(e.to_string()))?;
+    let day = time::Date::from_calendar_date(number(y)? as i32, month, number(d)? as u8)
+        .map_err(|e| bad(e.to_string()))?;
+    let now = time::OffsetDateTime::now_utc();
+    Ok(day.with_time(now.time()).assume_utc().into())
+}
+
 /// The world's certificate authority, which signs a certificate for each
 /// host at its first handshake.
 pub struct Ca {
     issuer: rcgen::Certificate,
     key: KeyPair,
     der: CertificateDer<'static>,
+    start: SystemTime,
 }
 
 impl Ca {
     /// Loads `ca.pem` and `ca.key` from `dir`, as `ca.py` leaves them.
-    pub fn load(dir: &Path) -> fictionet::Result<Ca> {
+    /// `start` is the world's date at the start of the run.
+    pub fn load(dir: &Path, start: SystemTime) -> fictionet::Result<Ca> {
         let pem = std::fs::read_to_string(dir.join("ca.pem"))?;
         let key = KeyPair::from_pem(&std::fs::read_to_string(dir.join("ca.key"))?)?;
         let der = CertificateDer::from_pem_slice(pem.as_bytes())?.into_owned();
         // The CA's own fields (name, key identifier), to sign leaves with.
         let issuer = CertificateParams::from_ca_cert_pem(&pem)?.self_signed(&key)?;
-        Ok(Ca { issuer, key, der })
+        Ok(Ca {
+            issuer,
+            key,
+            der,
+            start,
+        })
     }
 
-    /// A certificate for `host`, like ca.py's `_mint`: the host as CN and
-    /// SAN, valid from a day ago for 90 days, for server auth. The chain
-    /// sent is the leaf, then the CA. Returns the TLS config and the
-    /// validity, for the log.
+    /// A certificate for `host`: the host as CN and SAN, for server auth,
+    /// issued 30 days before the world's date. The chain sent is the leaf,
+    /// then the CA. Returns the TLS config and the validity, for the log.
+    ///
+    /// A client checks the certificate against its own clock, which is the
+    /// host's, not the world's. So the validity covers both: it starts 30
+    /// days before the earlier of the two, and lasts 90 days, or longer if
+    /// that would end within 30 days of the later one.
     pub fn config(
         &self,
         cx: &Cx,
         host: &str,
     ) -> fictionet::Result<(Arc<ServerConfig>, String, String)> {
-        let now = time::OffsetDateTime::now_utc();
+        let world_now = time::OffsetDateTime::from(self.start + cx.now().since_start());
+        let host_now = time::OffsetDateTime::now_utc();
+        let not_before = world_now.min(host_now) - time::Duration::days(30);
+        let not_after = (not_before + time::Duration::days(90))
+            .max(world_now.max(host_now) + time::Duration::days(30));
         let mut params = CertificateParams::new(vec![host.to_owned()])?;
         params.distinguished_name = DistinguishedName::new();
         params.distinguished_name.push(
             DnType::CommonName,
             host.chars().take(64).collect::<String>(),
-        );
-        let (not_before, not_after) = (
-            now - time::Duration::days(1),
-            now + time::Duration::days(90),
         );
         params.not_before = not_before;
         params.not_after = not_after;
@@ -288,14 +322,10 @@ impl Ca {
         let key = KeyPair::generate()?;
         let cert = params.signed_by(&key, &self.issuer, &self.key)?;
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
-        let config = tls::config_builder(
-            cx,
-            SystemTime::now(),
-            rustls::crypto::ring::default_provider(),
-        )
-        .with_safe_default_protocol_versions()?
-        .with_no_client_auth()
-        .with_single_cert(vec![cert.der().clone(), self.der.clone()], key)?;
+        let config = tls::config_builder(cx, self.start, rustls::crypto::ring::default_provider())
+            .with_safe_default_protocol_versions()?
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.der().clone(), self.der.clone()], key)?;
         let day = |t: time::OffsetDateTime| {
             format!("{:04}-{:02}-{:02}", t.year(), t.month() as u8, t.day())
         };
@@ -305,14 +335,16 @@ impl Ca {
 
 /// Builds the network: a site for every name [`admit`] lets in, at its
 /// address from `addresses`, with a certificate from `ca` made at its first
-/// handshake, every request answered by `content` and logged. Returns at
-/// once; the network runs in `cx`'s region.
+/// handshake, every request answered by `backend` and logged, and every
+/// response dated from `start`, the world's date at the start of the run.
+/// Returns at once; the network runs in `cx`'s region.
 pub fn serve(
     cx: &Cx,
     addresses: Arc<Addresses>,
     ca: Arc<Ca>,
-    content: Content,
+    backend: Backend,
     log: Arc<Log>,
+    start: SystemTime,
     attachments: fictionet::Attachments,
 ) -> fictionet::Result {
     events::log_to(cx, log);
@@ -337,7 +369,7 @@ pub fn serve(
         );
         let (ca, name) = (ca.clone(), host.to_owned());
         let config: Arc<OnceLock<Arc<ServerConfig>>> = Arc::new(OnceLock::new());
-        Some(web::Site::new(content.clone()).at(addr).tls(move |cx| {
+        Some(web::Site::new(backend.clone()).at(addr).tls(move |cx| {
             config
                 .get_or_init(|| {
                     let (config, not_before, not_after) = ca
@@ -355,6 +387,7 @@ pub fn serve(
                 .clone()
         }))
     })
+    .date(start)
     // The agent's sandbox has IPv6 off.
     .ipv4_only()
     .serve(cx, attachments)?;
@@ -554,6 +587,22 @@ mod tests {
         ] {
             assert_eq!(admit(name), Err(why), "{name}");
         }
+    }
+
+    #[test]
+    fn the_world_starts_on_the_seeds_day() {
+        let start = time::OffsetDateTime::from(world_start("2026-03-14").unwrap());
+        assert_eq!(
+            (start.year(), start.month() as u8, start.day()),
+            (2026, 3, 14)
+        );
+        assert!(world_start("2026-02-30").is_err());
+        assert!(
+            world_start("14/03/2026")
+                .unwrap_err()
+                .to_string()
+                .contains("not a YYYY-MM-DD date")
+        );
     }
 
     #[test]

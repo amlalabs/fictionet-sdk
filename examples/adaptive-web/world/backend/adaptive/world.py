@@ -10,8 +10,14 @@ Every request is one of:
 - a new page: made from the seed, its mentions (the searches and links that
   led to it) and what the world has already said, then stored. Its links
   are written down as mentions of their targets in turn.
+- a stylesheet, script, image or font: a small fixed answer.
 
-In replay mode nothing new is made: a URL the store does not hold is a 404.
+The consistency rules live here: a page takes the title its first mention
+showed, a result for a URL the world already knows shows what the world
+said about it, and every snippet is checked against the page behind it.
+
+Without a generator (replay) nothing new is made: a URL the store does not
+hold is a 404, and a query it does not hold has no results.
 """
 from __future__ import annotations
 
@@ -23,7 +29,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from urllib.parse import parse_qs, urljoin
 
-from . import model, render, stub
+from . import render, stub, tells
+from .generate import Made, Model, PageAsk
 from .seed import Seed, target_of
 from .store import Store
 
@@ -47,34 +54,70 @@ def norm_query(q: str) -> str:
 
 
 def text_of(markup: str) -> str:
+    """The text of an HTML fragment, as one line."""
+    markup = re.sub(r"(?is)<(script|style)\b.*?</\1>", " ", markup)
     return " ".join(html.unescape(re.sub(r"<[^>]+>", " ", markup)).split())
 
 
 def snippet_core(snippet: str) -> str:
+    """A snippet without its ellipses and a leading date, the part that must
+    appear on the page word for word."""
     s = snippet.replace("...", " ").replace("…", " ")
-    s = re.sub(r"^\s*\w{3} \d{1,2}, \d{4}\s*[—-]\s*", "", s)
+    s = re.sub(r"^\s*(\w{3} \d{1,2}, \d{4}|\d+ (days?|hours?) ago)\s*[—–-]\s*", "", s)
     return " ".join(s.split())
+
+
+def unsupported_snippets(mentions: list[dict], page_text: str) -> list[str]:
+    """The search snippets for a page that the page does not back up.
+
+    A snippet is often stitched together from several places on the page
+    ("12 replies. Kwame Osei: Just finished ..."), so it is split into
+    sentences and fields, and each piece of 20 characters or more is looked
+    for on the page by its first 60 characters, ignoring case and spacing.
+    A snippet is backed up when at least half of its pieces are found."""
+    text = " ".join(page_text.split()).lower()
+    out = []
+    for m in mentions:
+        if m.get("via") != "search" or not m.get("snippet"):
+            continue
+        pieces = [p for p in re.split(r"(?<=[.!?:])\s+|\s+[|·]\s+", snippet_core(m["snippet"])) if len(p) >= 20]
+        found = sum(" ".join(p.split())[:60].lower() in text for p in pieces)
+        if pieces and found * 2 < len(pieces):
+            out.append(m["snippet"])
+    return out
 
 
 LINK = re.compile(r"""<a\b[^>]*\bhref\s*=\s*["']([^"'#]+)[^"']*["'][^>]*>(.*?)</a>""", re.I | re.S)
 
 
 class World:
-    def __init__(self, seed: Seed, store: Store, generator: str = "stub", model_name: str = model.DEFAULT_MODEL,
-                 prefetch: int = 0):
+    def __init__(self, seed: Seed, store: Store, generator: Model | stub.Stub | None, prefetch: int = 0):
+        """`generator` makes new results and pages; None replays the store.
+        `prefetch` is how many pages behind each new result list to make
+        ahead of time."""
         self.seed = seed
         self.store = store
-        self.mode = generator
+        self.generator = generator
         self.year = seed.date[:4]
-        self.prefetch = prefetch
-        self.llm = model.Anthropic(model_name) if generator == "anthropic" else None
-        self.pool = ThreadPoolExecutor(max_workers=4) if prefetch else None
-        self.served: set[tuple[str, str]] = set()
-        self.served_lock = threading.Lock()
+        self.prefetch = prefetch if generator else 0
+        self.pool = ThreadPoolExecutor(max_workers=4) if self.prefetch else None
+        # Pages made ahead of time that have not been asked for yet: their
+        # first request is logged as `prefetched`, with the time they took.
+        self.unserved: set[tuple[str, str]] = set()
+        self.unserved_lock = threading.Lock()
+
+    def cast(self) -> list[dict]:
+        """The people the world names, made by the generator the first time
+        a page or result list needs them."""
+        def make() -> dict:
+            made = self.generator.cast()
+            self.store.log_generation({"kind": "cast", **made.usage(), "raw": made.raw})
+            return {"people": made.fields, **made.usage()}
+        return self.store.cast_once(make)["people"]
 
     @property
-    def model_name(self) -> str:
-        return self.llm.model if self.llm else self.mode
+    def model(self) -> str:
+        return self.generator.model if self.generator else "replay"
 
     # --- entry point ---------------------------------------------------
     def handle(self, method: str, host: str, target: str, form: dict[str, str] | None = None) -> Response:
@@ -83,206 +126,170 @@ class World:
         args = {k: v[0] for k, v in parse_qs(query, keep_blank_values=True).items()}
         if form:
             args.update(form)
+        q = args.get("q", "").strip()
         if host in ("google.com", "bing.com"):
             return redirect(f"https://www.{host}{target}", 301)
         if host == "www.google.com":
-            if path == "/search" and args.get("q", "").strip():
-                return self.search("google", args["q"], int(args.get("start", "0") or 0))
+            if path == "/search" and q:
+                return self.search("google", q, number(args.get("start")))
             if path == "/url" and args.get("q", "").startswith("http"):
                 return redirect(args["q"], 302)
             if path in ("/", "/webhp"):
-                return html_response(render.google_home(), {"kind": "search_home"})
+                return html_response(render.google_home(), {"kind": "search_home"}, server="gws")
         if host in ("html.duckduckgo.com", "duckduckgo.com", "lite.duckduckgo.com"):
             if path == "/l/" and args.get("uddg", "").startswith("http"):
                 return redirect(args["uddg"], 302)
             if path in ("/html", "/html/", "/lite", "/lite/", "/"):
-                if args.get("q", "").strip():
-                    return self.search("duckduckgo", args["q"], int(args.get("s", "0") or 0))
-                return html_response(render.duckduckgo_home(), {"kind": "search_home"})
-        if host == "www.bing.com" and path == "/search" and args.get("q", "").strip():
-            return self.search("bing", args["q"], int(args.get("first", "1") or 1) - 1)
-        asset = static_asset(path)
-        if asset and not self.seed.fixed_for(host, target):
+                if q:
+                    return self.search("duckduckgo", q, number(args.get("s")))
+                return html_response(render.duckduckgo_home(), {"kind": "search_home"}, server="nginx")
+        if host == "www.bing.com" and path == "/search" and q:
+            return self.search("bing", q, max(0, number(args.get("first")) - 1))
+        if not self.seed.fixed_for(host, target) and (asset := static_asset(path)):
             return asset
         return self.page(host, target)
 
     # --- searches ------------------------------------------------------
     def search(self, engine: str, query: str, start: int = 0) -> Response:
-        start = max(0, start)
         key = norm_query(query) + (f" (from {start})" if start >= 10 else "")
-        record = self.store.search(key)
-        cache = "cached"
-        if record is None:
-            with self.store.lock("search " + key):
-                record = self.store.search(key)
-                if record is None:
-                    if self.mode == "replay":
-                        record = {"query": query, "results": [], "related": [], "questions": [], "ads": []}
-                        cache = "missing"
-                    else:
-                        record = self._make_search(key, query)
-                        cache = "generated"
-        if engine == "google":
-            body = render.google(query, record, start)
-        elif engine == "duckduckgo":
-            body = render.duckduckgo(query, record)
-        else:
-            body = render.bing(query, record)
-        meta = {"kind": "search", "engine": engine, "search": query, "cache": cache,
-                "gen_ms": record.get("gen_ms") if cache == "generated" else None,
-                "model": record.get("model"), "results": len(record["results"])}
-        return html_response(body, meta)
+        record, cache = self.store.search(key), "cached"
+        if record is None and self.generator is None:
+            record, cache = {"query": query, "results": []}, "missing"
+        elif record is None:
+            record, made = self.store.search_once(key, lambda: self._make_search(key, query))
+            if made:
+                cache = "generated"
+                for r in record["results"][:self.prefetch]:
+                    self.pool.submit(self._prefetch, *target_of(r["url"]))
+        body = {"google": render.google, "duckduckgo": render.duckduckgo, "bing": render.bing}[engine](query, record, start)
+        meta = {"kind": "search", "engine": engine, "search": query, "cache": cache, "model": record.get("model"),
+                "results": len(record["results"])}
+        if cache == "generated":
+            meta |= {"gen_ms": record.get("gen_ms"), "cost": record.get("cost")}
+        return html_response(body, meta, server=render.ENGINE_SERVERS[engine])
 
     def _known(self) -> list[dict]:
+        """Pages the world has: the seed's fixed pages and the last 40 made."""
         known = [{"url": f.url, "title": f.title, "snippet": f.description} for f in self.seed.fixed]
-        pages = self.store.root / "pages"
-        if pages.is_dir():
-            for p in sorted(pages.rglob("@page.json"), key=lambda p: p.stat().st_mtime)[-40:]:
-                r = self.store._read(p) or {}
-                if r.get("status") == 200 and r.get("title"):
-                    known.append({"url": r["url"], "title": r["title"], "snippet": r.get("description", "")})
+        known += [{"url": p["url"], "title": p["title"], "snippet": p["description"]}
+                  for p in self.store.pages()[-40:] if p["status"] == 200 and p["title"]]
         return known
 
     def _make_search(self, key: str, query: str) -> dict:
-        started = time.monotonic()
-        known = self._known()
-        info: dict = {"model": self.model_name}
-        if self.llm:
-            system, user = model.search_prompt(self.seed, query, known, self.store.recent_claims())
-            text, info = self.llm.complete(system, user, max_tokens=2500)
-            raw = text
-            made = model.parse_search(text)
-        else:
-            made = stub.search(self.seed, query, known)
-            raw = None
-        gen_ms = round((time.monotonic() - started) * 1000)
+        made = self.generator.search(query, self._known(), self.store.recent_claims(), self.cast())
         results = []
-        seen = set()
-        for rank, r in enumerate(made["results"], 1):
+        for rank, r in enumerate(made.fields["results"], 1):
             host, target = target_of(r["url"])
-            if not host or r["url"] in seen:
+            if not host or any(x["url"] == r["url"] for x in results):
                 continue
-            seen.add(r["url"])
-            # A result for a URL the world already knows keeps what it said.
-            page = self.store.page(host, target)
-            fixed = self.seed.fixed_for(host, target)
-            earlier = [m for m in self.store.mentions(host, target) if m.get("title")]
-            if page and page.get("title"):
-                r = dict(r, title=page["title"], snippet=page.get("description") or r["snippet"])
-            elif fixed:
-                r = dict(r, title=fixed.title or r["title"], snippet=fixed.description or r["snippet"])
-            elif earlier:
-                r = dict(r, title=earlier[0]["title"])
+            r = self._as_known(host, target, r)
             results.append(r)
             self.store.add_mention(host, target, {"via": "search", "query": query, "rank": rank, "title": r["title"],
                                                   "snippet": r["snippet"], "date": r.get("date", "")})
-        record = {"query": query, "key": key, "results": results, "related": made.get("related", []),
-                  "questions": made.get("questions", []), "ads": made.get("ads", []),
-                  "model": info.get("model"), "gen_ms": gen_ms, "created": time.time()}
-        self.store.save_search(key, record)
-        self.store.log_generation({"kind": "search", "query": query, "model": info.get("model"), "gen_ms": gen_ms,
-                                   "input_tokens": info.get("input_tokens"), "output_tokens": info.get("output_tokens"),
-                                   "raw": raw})
-        if self.pool:
-            for r in results[:self.prefetch]:
-                host, target = target_of(r["url"])
-                self.pool.submit(self._prefetch, host, target)
-        return record
+        self.store.log_generation({"kind": "search", "query": query, **made.usage(), "raw": made.raw})
+        return {"query": query, "key": key, "results": results, "related": made.fields.get("related", []),
+                "questions": made.fields.get("questions", []), "ads": made.fields.get("ads", []),
+                **made.usage(), "created": time.time()}
+
+    def _as_known(self, host: str, target: str, result: dict) -> dict:
+        """A result for a URL the world already knows shows what the world
+        said about it: the page's title and description, the fixed page's,
+        or the title an earlier result showed."""
+        page = self.store.page(host, target)
+        fixed = self.seed.fixed_for(host, target)
+        earlier = [m["title"] for m in self.store.mentions(host, target) if m.get("title")]
+        if page and page.get("title"):
+            return dict(result, title=page["title"], snippet=page.get("description") or result["snippet"])
+        if fixed:
+            return dict(result, title=fixed.title or result["title"], snippet=fixed.description or result["snippet"])
+        if earlier:
+            return dict(result, title=earlier[0])
+        return result
 
     def _prefetch(self, host: str, target: str) -> None:
         try:
             self.page(host, target, prefetch=True)
-        except Exception as err:  # noqa: BLE001 - a failed prefetch is retried on request
-            self.store.log_generation({"kind": "prefetch_error", "url": f"https://{host}{target}", "error": str(err)})
+        except Exception as err:  # noqa: BLE001 - a page that failed ahead of time is made again on request
+            self.store.log_generation({"kind": "prefetch_error", "url": f"https://{host}{target}",
+                                       "error": f"{type(err).__name__}: {err}"})
 
     # --- pages ---------------------------------------------------------
     def page(self, host: str, target: str, prefetch: bool = False) -> Response:
         fixed = self.seed.fixed_for(host, target)
         if fixed:
-            body = fixed.file.read_bytes()
-            if self.store.page(host, target) is None:
-                with self.store.lock(f"page {host}{target}"):
-                    if self.store.page(host, target) is None:
-                        record = {"url": fixed.url, "status": 200, "title": fixed.title, "description": fixed.description,
-                                  "claims": [], "generated_by": "fixed", "created": time.time(), "file": str(fixed.file)}
-                        self.store.save_page(host, target, record)
-                        self._note_links(fixed.url, body.decode("utf-8", "replace"))
-            return Response(200, fixed.content_type, body, meta={"kind": "page", "cache": "fixed", "title": fixed.title})
-        record = self.store.page(host, target)
-        cache = "cached"
-        if record is not None and record.get("prefetched") and not prefetch and self.mode != "replay":
-            # The first request for a page made ahead of time says so, with
-            # the time it took to make.
-            with self.served_lock:
-                if (host, target) not in self.served:
-                    cache = "prefetched"
+            return self._fixed(host, target, fixed)
+        record, cache = self.store.page(host, target), "cached"
+        if record is None and self.generator is None:
+            return self._not_found(host, target, "missing")
         if record is None:
-            with self.store.lock(f"page {host}{target}"):
-                record = self.store.page(host, target)
-                if record is None:
-                    if self.mode == "replay":
-                        return self._not_found(host, target, "missing")
-                    record = self._make_page(host, target, prefetch)
-                    cache = "generated"
-        if not prefetch:
-            with self.served_lock:
-                self.served.add((host, target))
+            record, made = self.store.page_once(host, target, lambda: self._make_page(host, target, prefetch))
+            if made:
+                cache = "generated"
+                if record["content_type"].startswith("text/html"):
+                    self._note_links(record["url"], record["body"])
+        if not prefetch and record.get("prefetched"):
+            with self.unserved_lock:
+                if (host, target) in self.unserved:
+                    self.unserved.discard((host, target))
+                    cache = "prefetched"
         meta = {"kind": "page", "cache": cache, "title": record.get("title"), "model": record.get("model"),
-                "gen_ms": record.get("gen_ms") if cache != "cached" else None,
                 "prefetched": bool(record.get("prefetched")), "claims": record.get("claims", []),
                 "mentions": len(record.get("context", {}).get("mentions", [])),
-                "unsupported_snippets": record.get("unsupported_snippets", [])}
-        return Response(record["status"], record["content_type"], record["body"].encode("utf-8"), meta=meta)
+                "unsupported_snippets": record.get("unsupported_snippets", []), "tells": record.get("tells", [])}
+        if cache != "cached":
+            meta |= {"gen_ms": record.get("gen_ms"), "cost": record.get("cost")}
+        profile = self.store.site(host)
+        return Response(record["status"], record["content_type"], record["body"].encode("utf-8"),
+                        {"Server": render.server_of(profile)}, meta)
+
+    def _fixed(self, host: str, target: str, fixed) -> Response:
+        body = fixed.file.read_bytes()
+
+        def make() -> dict:
+            return {"url": fixed.url, "status": 200, "title": fixed.title, "description": fixed.description,
+                    "claims": [], "model": "fixed", "created": time.time(), "file": fixed.file.name}
+
+        _, made = self.store.page_once(host, target, make)
+        if made:
+            self._note_links(fixed.url, body.decode("utf-8", "replace"))
+        return Response(200, fixed.content_type, body, {"Server": "nginx"},
+                        {"kind": "page", "cache": "fixed", "title": fixed.title})
 
     def _not_found(self, host: str, target: str, cache: str) -> Response:
-        body = render.not_found(host, self.store.site(host), target, self.year)
-        return html_response(body, {"kind": "page", "cache": cache}, status=404)
+        profile = self.store.site(host)
+        body = render.not_found(host, profile, target, self.year)
+        return html_response(body, {"kind": "page", "cache": cache}, status=404, server=render.server_of(profile))
 
     def _make_page(self, host: str, target: str, prefetch: bool) -> dict:
         url = f"https://{host}{target}"
         mentions = self.store.mentions(host, target)
-        profile = self.store.site(host)
-        host_pages = self.store.pages_on(host)
-        claims = self.store.recent_claims()
-        started = time.monotonic()
-        raw = None
-        info: dict = {"model": self.model_name}
-        if self.llm:
-            system, user = model.page_prompt(self.seed, url, mentions, profile, host_pages, claims, self.seed.about(host))
-            raw, info = self.llm.complete(system, user, max_tokens=3000)
-            made = model.parse_page(raw)
-        else:
-            made = stub.page(self.seed, host, target, mentions, host_pages)
-        gen_ms = round((time.monotonic() - started) * 1000)
-        if profile is None:
-            profile = self.store.save_site_once(host, made.get("site") or stub.site_profile(host))
+        ask = PageAsk(url, host, target, mentions, self.store.site(host), self.store.pages(host)[:20],
+                      self.store.recent_claims(), self.cast())
+        made: Made = self.generator.page(ask)
+        page = made.fields
+        profile = ask.profile or self.store.site_once(host, page.get("site") or stub.site_profile(host))
         titles = [m["title"] for m in mentions if m.get("title")]
         if titles:
-            made["title"] = titles[0]
-        is_html = made["content_type"].startswith("text/html")
-        text = text_of(made["body"]) if is_html else made["body"]
-        unsupported = [m["snippet"] for m in mentions if m.get("via") == "search" and m.get("snippet")
-                       and snippet_core(m["snippet"])[:80].lower() not in " ".join(text.split()).lower()]
-        if is_html:
-            if made["status"] == 404:
-                body = render.not_found(host, profile, target, self.year)
-            else:
-                body = render.page(host, profile, made, self.year)
+            page["title"] = titles[0]
+        is_html = page["content_type"].startswith("text/html")
+        if not is_html:
+            body = page["body"]
+        elif page["status"] == 404 and not mentions:
+            body = render.not_found(host, profile, target, self.year)
         else:
-            body = made["body"]
-        record = {"url": url, "status": made["status"], "content_type": made["content_type"], "title": made["title"],
-                  "description": made.get("description", ""), "date": made.get("date", ""), "claims": made["claims"],
-                  "body": body, "generated_by": "anthropic" if self.llm else "stub", "model": info.get("model"),
-                  "gen_ms": gen_ms, "input_tokens": info.get("input_tokens"),
-                  "output_tokens": info.get("output_tokens"), "prefetched": prefetch, "created": time.time(),
-                  "context": {"mentions": mentions}, "unsupported_snippets": unsupported}
-        self.store.save_page(host, target, record)
-        self.store.log_generation({"kind": "page", "url": url, "model": info.get("model"), "gen_ms": gen_ms,
-                                   "input_tokens": info.get("input_tokens"),
-                                   "output_tokens": info.get("output_tokens"), "raw": raw})
-        if is_html:
-            self._note_links(url, body)
-        return record
+            # A page something pointed at exists, whatever the model said.
+            page["status"] = 200
+            body = render.page(host, profile, page, self.year)
+        self.store.log_generation({"kind": "page", "url": url, **made.usage(), "raw": made.raw})
+        if prefetch:
+            with self.unserved_lock:
+                self.unserved.add((host, target))
+        return {"url": url, "status": page["status"], "content_type": page["content_type"], "title": page["title"],
+                "description": page.get("description", ""), "date": page.get("date", ""), "claims": page["claims"],
+                "body": body, **made.usage(), "prefetched": prefetch, "created": time.time(),
+                "context": {"mentions": mentions},
+                "unsupported_snippets": unsupported_snippets(mentions, text_of(page["body"]) if is_html else body),
+                "tells": tells.find(text_of(page["body"]) if is_html else body)}
 
     def _note_links(self, url: str, markup: str) -> None:
         """Writes down every link of a page as a mention of its target, so a
@@ -297,6 +304,14 @@ class World:
             anchor_text = text_of(anchor)[:160]
             if anchor_text:
                 self.store.add_mention(host, target, {"via": "link", "from": url, "anchor": anchor_text})
+
+
+def number(text: str | None) -> int:
+    """A page offset from a query string; 0 when it is missing or not a number."""
+    try:
+        return max(0, int(text or 0))
+    except ValueError:
+        return 0
 
 
 # A 1x1 transparent GIF.
@@ -315,22 +330,22 @@ def static_asset(path: str) -> Response | None:
     they get a small fixed answer, so a browser-like client costs no model
     calls. robots.txt allows everything."""
     if path == "/robots.txt":
-        return Response(200, "text/plain; charset=utf-8", b"User-agent: *\nAllow: /\n", meta={"kind": "asset", "cache": "none"})
+        return Response(200, "text/plain; charset=utf-8", b"User-agent: *\nAllow: /\n", {}, {"kind": "asset"})
     dot = path.rfind(".")
     if dot > path.rfind("/") and path[dot:].lower() in ASSETS:
         ctype, body = ASSETS[path[dot:].lower()]
-        return Response(200, ctype, body, meta={"kind": "asset", "cache": "none"})
+        return Response(200, ctype, body, {}, {"kind": "asset"})
     return None
 
 
 def redirect(location: str, status: int) -> Response:
     body = f'<html><head><title>{status} Moved</title></head><body><a href="{html.escape(location)}">here</a></body></html>'
     return Response(status, "text/html; charset=utf-8", body.encode(), {"Location": location},
-                    meta={"kind": "redirect", "cache": "none", "location": location})
+                    {"kind": "redirect", "location": location})
 
 
-def html_response(body: str, meta: dict, status: int = 200) -> Response:
-    return Response(status, "text/html; charset=utf-8", body.encode("utf-8"), meta=meta)
+def html_response(body: str, meta: dict, status: int = 200, server: str = "nginx") -> Response:
+    return Response(status, "text/html; charset=utf-8", body.encode("utf-8"), {"Server": server}, meta)
 
 
 def decode_form(body: bytes) -> dict[str, str]:

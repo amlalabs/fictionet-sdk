@@ -10,13 +10,15 @@ that share words with the page.
 from __future__ import annotations
 
 import datetime as dt
+import json
 import re
 from html import escape
-from urllib.parse import quote, urlsplit
+import time
+from urllib.parse import quote
 
+from .generate import Made, PageAsk
+from .prompts import expected_type
 from .seed import Seed
-
-MODEL = "stub"
 
 STOP = {"a", "an", "and", "are", "at", "be", "by", "can", "do", "does", "for", "from", "how", "i", "in", "is",
         "it", "my", "of", "on", "or", "should", "the", "to", "what", "when", "which", "who", "why", "with", "you",
@@ -115,7 +117,7 @@ def site_profile(host: str) -> dict:
     # The registered name: "wikipedia" for en.wikipedia.org, "bbc" for www.bbc.co.uk.
     label = labels[-3] if len(labels) >= 3 and len(labels[-2]) <= 3 and len(labels[-1]) == 2 else labels[-2]
     name = " ".join(p.capitalize() for p in label.replace("-", " ").split()) or host
-    return {"name": name, "tagline": f"News and guides from {name}",
+    return {"name": name, "kind": "news", "tagline": f"News and guides from {name}",
             "nav": ["Home|/", "News|/news/", "Guides|/guides/", "Reviews|/reviews/", "About|/about/"],
             "footer": ["About us|/about/", "Contact|/contact/", "Privacy|/privacy/", "Terms|/terms/", "Careers|/careers/"]}
 
@@ -137,13 +139,11 @@ def page(seed: Seed, host: str, target: str, mentions: list[dict], host_pages: l
     title = titles[0] if titles else (anchors[0] if anchors else title_from(host, target))
     text = " ".join([title, url, *snippets, *anchors])
     facts = facts_for(seed, text)
-    path = target.split("?")[0]
-    if path.endswith(".json") or host.startswith("api."):
-        import json
+    if expected_type(url) == "application/json":
         body = json.dumps({"url": url, "title": title, "updated": seed.date, "items": snippets + facts}, indent=2)
         return {"status": 200, "content_type": "application/json", "title": title, "description": "",
                 "date": seed.date, "claims": snippets + facts, "body": body, "sidebar": [], "ad": ""}
-    if path.endswith((".txt", ".md", ".py", ".sh", ".cfg", ".toml", ".yaml", ".yml")):
+    if expected_type(url) == "text/plain":
         body = "\n".join([title, "", *snippets, *facts, ""])
         return {"status": 200, "content_type": "text/plain; charset=utf-8", "title": title, "description": "",
                 "date": seed.date, "claims": snippets + facts, "body": body, "sidebar": [], "ad": ""}
@@ -169,5 +169,25 @@ def page(seed: Seed, host: str, target: str, mentions: list[dict], host_pages: l
             "ad": "Switch your broadband and save up to 30%. Offer ends Sunday.", "site": site_profile(host)}
 
 
-def host_of(url: str) -> str:
-    return (urlsplit(url).hostname or "").lower()
+
+class Stub:
+    """The offline generator, with the same interface as `generate.Model`."""
+
+    model = "stub"
+
+    def __init__(self, seed: Seed):
+        self.seed = seed
+
+    def cast(self) -> Made:
+        """No one: the stub's pages name no people."""
+        return Made([], self.model, 0)
+
+    def search(self, query: str, known: list[dict], claims: list[dict], cast: list[dict]) -> Made:
+        started = time.monotonic()
+        fields = search(self.seed, query, known)
+        return Made(fields, self.model, round((time.monotonic() - started) * 1000))
+
+    def page(self, ask: PageAsk) -> Made:
+        started = time.monotonic()
+        fields = page(self.seed, ask.host, ask.target, ask.mentions, ask.host_pages)
+        return Made(fields, self.model, round((time.monotonic() - started) * 1000))

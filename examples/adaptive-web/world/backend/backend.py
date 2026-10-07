@@ -5,7 +5,8 @@ addresses, a certificate for each host, TLS and HTTP. For every request
 that reaches a site it asks this server for the page, with the site's host
 in the Host header. The answer carries one extra header, X-Adaptive-Meta,
 with what the log records (percent-encoded JSON). The world takes it off
-before the agent sees the response.
+before the agent sees the response. This server sends no Date header: the
+world adds one from the seed's date.
 
 This server listens only on 127.0.0.1 in the world container's network
 namespace. The agent's sandbox is in another namespace and cannot reach it.
@@ -14,14 +15,16 @@ Usage: python3 backend.py PORT
 
 Environment:
   ADAPTIVE_WEB_SEED       seed name (in seeds/) or path. Required.
-  ADAPTIVE_WEB_GENERATOR  stub (default), anthropic, or replay
-  ADAPTIVE_WEB_MODEL      model for anthropic (default claude-haiku-4-5-20251001)
+  ADAPTIVE_WEB_GENERATOR  stub (default), openrouter, anthropic, or replay
+  ADAPTIVE_WEB_MODEL      the model (default: llm.DEFAULT_MODELS for the provider)
   ADAPTIVE_WEB_STORE      where pages are kept (default /var/lib/adaptive-web);
                           each seed gets its own directory under it
   ADAPTIVE_WEB_PREFETCH   pages to make ahead from each new result list
-                          (default 3 with anthropic, else 0)
+                          (default 3 with a model, else 0)
+  ADAPTIVE_WEB_REASONING  reasoning effort for OpenRouter models that think
   ADAPTIVE_WEB_SEEDS      the seeds directory (default ../../seeds, else /app/seeds)
-  ANTHROPIC_API_KEY       the API key, for anthropic only. Never logged.
+  OPENROUTER_API_KEY, ANTHROPIC_API_KEY
+                          the provider's key. Never logged or stored.
 
 When it is listening, it prints one line of JSON to stdout, which the world
 waits for: the seed, the generator, the store, and the fixed addresses.
@@ -37,11 +40,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote
 
-from adaptive import model, seed as seeds
+from adaptive import llm, seed as seeds
+from adaptive.generate import Model
 from adaptive.store import Store
+from adaptive.stub import Stub
 from adaptive.world import World, decode_form
 
-# The search engines answer at their real addresses.
+# The search engines answer at addresses they use on the internet.
 ENGINE_ADDRESSES = {
     "www.google.com": "142.250.180.4",
     "google.com": "142.250.180.14",
@@ -52,11 +57,12 @@ ENGINE_ADDRESSES = {
     "bing.com": "150.171.28.10",
 }
 
+UNAVAILABLE = (b"<html><head><title>503 Service Temporarily Unavailable</title></head><body><center>"
+               b"<h1>503 Service Temporarily Unavailable</h1></center><hr><center>nginx</center></body></html>")
+
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "nginx"
-    sys_version = ""
     world: World
 
     def log_message(self, *args):
@@ -69,14 +75,15 @@ class Handler(BaseHTTPRequestHandler):
             r = self.world.handle(method, host, self.path, form)
         except Exception as err:  # noqa: BLE001 - the agent sees a 503, the log sees why
             traceback.print_exc()
-            body = b"<html><head><title>503 Service Temporarily Unavailable</title></head><body><center><h1>503 Service Temporarily Unavailable</h1></center><hr><center>nginx</center></body></html>"
-            self._send(503, "text/html", body, {}, {"kind": "error", "cache": "none", "error": str(err)[:300]}, method)
+            meta = {"kind": "error", "error": f"{type(err).__name__}: {err}"[:400]}
+            self._send(503, "text/html", UNAVAILABLE, {"Server": "nginx"}, meta, method)
             return
         r.meta["serve_ms"] = round((time.monotonic() - started) * 1000)
         self._send(r.status, r.content_type, r.body, r.headers, r.meta, method)
 
-    def _send(self, status, ctype, body, headers, meta, method):
-        self.send_response(status)
+    def _send(self, status: int, ctype: str, body: bytes, headers: dict, meta: dict, method: str):
+        # send_response_only: no Server or Date of this server's own.
+        self.send_response_only(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "private, max-age=0")
@@ -106,6 +113,15 @@ class Server(ThreadingHTTPServer):
     request_queue_size = 128
 
 
+def generator_for(seed: seeds.Seed, kind: str, model: str) -> Model | Stub | None:
+    """The generator named by ADAPTIVE_WEB_GENERATOR; None for replay."""
+    if kind == "stub":
+        return Stub(seed)
+    if kind == "replay":
+        return None
+    return Model(seed, llm.client(kind, model))
+
+
 def main() -> int:
     port = int(sys.argv[1])
     here = Path(__file__).resolve().parent
@@ -117,25 +133,25 @@ def main() -> int:
         print("ADAPTIVE_WEB_SEED is not set", file=sys.stderr)
         return 2
     seed = seeds.load(seeds.find(name, seeds_dir))
-    generator = os.environ.get("ADAPTIVE_WEB_GENERATOR", "stub")
-    if generator not in ("stub", "anthropic", "replay"):
-        print(f"ADAPTIVE_WEB_GENERATOR must be stub, anthropic or replay, not {generator!r}", file=sys.stderr)
+    kind = os.environ.get("ADAPTIVE_WEB_GENERATOR") or "stub"
+    if kind not in ("stub", "openrouter", "anthropic", "replay"):
+        print(f"ADAPTIVE_WEB_GENERATOR must be stub, openrouter, anthropic or replay, not {kind!r}", file=sys.stderr)
         return 2
-    model_name = os.environ.get("ADAPTIVE_WEB_MODEL") or model.DEFAULT_MODEL
-    prefetch = int(os.environ.get("ADAPTIVE_WEB_PREFETCH") or (3 if generator == "anthropic" else 0))
-    store = Store(Path(os.environ.get("ADAPTIVE_WEB_STORE", "/var/lib/adaptive-web")) / seed.name)
     try:
-        world = World(seed, store, generator, model_name, prefetch)
-    except model.ModelError as err:
-        print(f"cannot start the {generator} generator: {err}", file=sys.stderr)
+        generator = generator_for(seed, kind, os.environ.get("ADAPTIVE_WEB_MODEL", ""))
+    except llm.Error as err:
+        print(f"cannot start the {kind} generator: {err}", file=sys.stderr)
         return 2
+    prefetch = int(os.environ.get("ADAPTIVE_WEB_PREFETCH") or (3 if isinstance(generator, Model) else 0))
+    store = Store(Path(os.environ.get("ADAPTIVE_WEB_STORE", "/var/lib/adaptive-web")) / seed.name)
+    world = World(seed, store, generator, prefetch)
     Handler.world = world
     server = Server(("127.0.0.1", port), Handler)
     addresses = {h: {"addr": a, "why": "search engine"} for h, a in ENGINE_ADDRESSES.items()}
     addresses |= {h: {"addr": a, "why": "seed"} for h, a in seed.addresses.items()}
     print(json.dumps({
-        "seed": seed.name, "date": seed.date, "question": seed.question, "generator": generator,
-        "model": world.model_name, "prefetch": prefetch, "store": str(store.root.resolve()),
+        "seed": seed.name, "date": seed.date, "question": seed.question, "generator": kind,
+        "model": world.model, "prefetch": world.prefetch, "store": str(store.root.resolve()),
         "addresses": addresses, "fixed": [f.url for f in seed.fixed],
     }), flush=True)
     server.serve_forever()

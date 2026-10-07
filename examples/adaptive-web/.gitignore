@@ -3,3 +3,4 @@ logs/
 store/
 __pycache__/
 world/target/
+.ruff_cache/

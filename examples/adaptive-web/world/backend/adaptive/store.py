@@ -5,6 +5,7 @@
                                                existed: search results, links
     pages/<host>/@site.json                    the host's name, navigation, footer
     searches/<query>/@search.json              one result list, shared by every engine
+    @cast.json                                 the people pages name, made once
     claims.jsonl                               every page's stated claims, in order
     generations.jsonl                          every generator call: inputs, output, time
 
@@ -17,13 +18,17 @@ name that starts with `%` alone, `?`, `+` or `@`, so the store's own files
 (`@...`) and the marks never collide with a URL's segments.
 
 Every write goes to a temporary file first and is renamed into place, so a
-reader never sees half a page.
+reader never sees half a page. Next to a file that is made once there is a
+lock file (`@page.lock`, `@search.lock`, `@site.lock`, `@mentions.lock`, `@cast.lock`).
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import threading
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -62,17 +67,14 @@ def query_dir(query: str) -> str:
 
 
 class Store:
+    """The files of one seed's world. Safe to share between threads and
+    between processes: whatever is made once is made under a lock (`flock`
+    on a `@...lock` file next to it), so the first maker writes it and any
+    other waits, then reads what the first wrote."""
+
     def __init__(self, root: Path):
         self.root = root
         root.mkdir(parents=True, exist_ok=True)
-        self._append_lock = threading.Lock()
-        self._locks: dict[str, threading.Lock] = {}
-        self._locks_lock = threading.Lock()
-
-    # --- locking: one generation per key at a time ---------------------
-    def lock(self, key: str) -> threading.Lock:
-        with self._locks_lock:
-            return self._locks.setdefault(key, threading.Lock())
 
     # --- paths ---------------------------------------------------------
     def page_dir(self, host: str, target: str) -> Path:
@@ -81,7 +83,23 @@ class Store:
     def host_dir(self, host: str) -> Path:
         return self.root / "pages" / _name(host)
 
+    def search_dir(self, key: str) -> Path:
+        return self.root / "searches" / query_dir(key)
+
     # --- files ---------------------------------------------------------
+    @staticmethod
+    @contextmanager
+    def _locked(path: Path) -> Iterator[None]:
+        """Holds an exclusive flock on `path` while the block runs. Each call
+        opens the file anew, so the lock also holds between threads."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
+
     @staticmethod
     def _read(path: Path) -> Any:
         try:
@@ -97,63 +115,85 @@ class Store:
         os.replace(tmp, path)
 
     def _append(self, name: str, value: Any) -> None:
-        line = json.dumps(value, ensure_ascii=False) + "\n"
-        with self._append_lock, open(self.root / name, "a", encoding="utf-8") as f:
-            f.write(line)
+        # One write of one line to a file opened for appending: lines from
+        # several writers do not mix.
+        with open(self.root / name, "a", encoding="utf-8") as f:
+            f.write(json.dumps(value, ensure_ascii=False) + "\n")
+
+    def _once(self, path: Path, make: Callable[[], dict]) -> tuple[dict, bool]:
+        """The record at `path`, or `make()`'s, written there. Returns it and
+        whether this call made it."""
+        record = self._read(path)
+        if record is not None:
+            return record, False
+        with self._locked(path.with_name(path.stem + ".lock")):
+            record = self._read(path)
+            if record is not None:
+                return record, False
+            record = make()
+            self._write(path, record)
+            return record, True
 
     # --- pages ---------------------------------------------------------
     def page(self, host: str, target: str) -> dict | None:
         return self._read(self.page_dir(host, target) / "@page.json")
 
-    def save_page(self, host: str, target: str, record: dict) -> None:
-        self._write(self.page_dir(host, target) / "@page.json", record)
-        for claim in record.get("claims", []):
-            self._append("claims.jsonl", {"url": record["url"], "claim": claim})
+    def page_once(self, host: str, target: str, make: Callable[[], dict]) -> tuple[dict, bool]:
+        """The stored page, or the one `make()` returns, stored. One caller
+        makes it; the others wait for it. Returns the page and whether this
+        call made it."""
+        record, made = self._once(self.page_dir(host, target) / "@page.json", make)
+        if made:
+            for claim in record.get("claims", []):
+                self._append("claims.jsonl", {"url": record["url"], "claim": claim})
+        return record, made
 
-    def pages_on(self, host: str, limit: int = 30) -> list[dict]:
-        """Pages already served on `host`: url, title, claims. Oldest first."""
-        out = []
-        base = self.host_dir(host)
+    def pages(self, host: str = "") -> list[dict]:
+        """Every stored page (or every page of `host`), oldest first: url,
+        title, description, status, claims."""
+        base = self.host_dir(host) if host else self.root / "pages"
         if not base.is_dir():
-            return out
+            return []
+        out = []
         for p in base.rglob("@page.json"):
             r = self._read(p) or {}
-            out.append({"url": r.get("url"), "title": r.get("title"), "claims": r.get("claims", [])[:6],
-                        "created": r.get("created", 0)})
+            out.append({"url": r.get("url"), "title": r.get("title"), "description": r.get("description", ""),
+                        "status": r.get("status"), "claims": r.get("claims", [])[:6], "created": r.get("created", 0)})
         out.sort(key=lambda r: r["created"])
-        return out[:limit]
+        return out
 
     def mentions(self, host: str, target: str) -> list[dict]:
         return self._read(self.page_dir(host, target) / "@mentions.json") or []
 
     def add_mention(self, host: str, target: str, mention: dict) -> None:
-        with self.lock(f"mentions {host}{target}"):
-            path = self.page_dir(host, target) / "@mentions.json"
+        path = self.page_dir(host, target) / "@mentions.json"
+        with self._locked(path.with_name("@mentions.lock")):
             current = self._read(path) or []
             if mention not in current:
-                current.append(mention)
-                self._write(path, current)
+                self._write(path, current + [mention])
 
     def site(self, host: str) -> dict | None:
         return self._read(self.host_dir(host) / "@site.json")
 
-    def save_site_once(self, host: str, profile: dict) -> dict:
-        """Keeps the first profile written for a host and returns it."""
-        with self.lock(f"site {host}"):
-            current = self.site(host)
-            if current is not None:
-                return current
-            existing = len(list((self.root / "pages").glob("*/@site.json"))) if (self.root / "pages").is_dir() else 0
-            profile = dict(profile, style=existing)
-            self._write(self.host_dir(host) / "@site.json", profile)
-            return profile
+    def site_once(self, host: str, profile: dict) -> dict:
+        """The host's layout: the first one written for it. A new one gets
+        `style`, the number of hosts that had a layout before it."""
+        def make() -> dict:
+            pages = self.root / "pages"
+            return dict(profile, style=len(list(pages.glob("*/@site.json"))))
+        return self._once(self.host_dir(host) / "@site.json", make)[0]
+
+    # --- the cast ------------------------------------------------------
+    def cast_once(self, make: Callable[[], dict]) -> dict:
+        """The people the world names, made once (`@cast.json`)."""
+        return self._once(self.root / "@cast.json", make)[0]
 
     # --- searches ------------------------------------------------------
-    def search(self, query: str) -> dict | None:
-        return self._read(self.root / "searches" / query_dir(query) / "@search.json")
+    def search(self, key: str) -> dict | None:
+        return self._read(self.search_dir(key) / "@search.json")
 
-    def save_search(self, query: str, record: dict) -> None:
-        self._write(self.root / "searches" / query_dir(query) / "@search.json", record)
+    def search_once(self, key: str, make: Callable[[], dict]) -> tuple[dict, bool]:
+        return self._once(self.search_dir(key) / "@search.json", make)
 
     # --- logs ----------------------------------------------------------
     def recent_claims(self, limit: int = 40) -> list[dict]:

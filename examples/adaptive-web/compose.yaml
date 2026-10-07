@@ -13,13 +13,15 @@
 # Settings, from the environment of the shell that runs Inspect or Compose:
 #   ADAPTIVE_WEB_SEED         the seed; Inspect sets it from sample metadata
 #                             (SAMPLE_METADATA_SEED)
-#   ADAPTIVE_WEB_GENERATOR    stub (default), anthropic or replay
+#   ADAPTIVE_WEB_GENERATOR    stub (default), openrouter, anthropic or replay
 #   ADAPTIVE_WEB_NETWORK      the world's network: none (default), or bridge
-#                             for anthropic
-#   ADAPTIVE_WEB_MODEL, ADAPTIVE_WEB_PREFETCH   see world/backend/backend.py
+#                             for openrouter and anthropic
+#   ADAPTIVE_WEB_MODEL, ADAPTIVE_WEB_PREFETCH, ADAPTIVE_WEB_REASONING
+#                             see world/backend/backend.py
 #   ADAPTIVE_WEB_STORE_DIR    an absolute host directory to keep pages in
 #                             across runs; by default a volume per run
-#   ANTHROPIC_API_KEY         passed through for anthropic; never logged
+#   OPENROUTER_API_KEY, ANTHROPIC_API_KEY
+#                             passed through for a model; never logged
 
 x-build: &build
   context: ../..
@@ -40,6 +42,8 @@ services:
       ADAPTIVE_WEB_GENERATOR: ${ADAPTIVE_WEB_GENERATOR:-stub}
       ADAPTIVE_WEB_MODEL: ${ADAPTIVE_WEB_MODEL:-}
       ADAPTIVE_WEB_PREFETCH: ${ADAPTIVE_WEB_PREFETCH:-}
+      ADAPTIVE_WEB_REASONING: ${ADAPTIVE_WEB_REASONING:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
     volumes:
       - sock:/run/fictionet/sock

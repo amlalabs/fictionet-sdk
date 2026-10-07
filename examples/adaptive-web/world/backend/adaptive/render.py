@@ -3,8 +3,9 @@
 The generator writes what a page says. The parts every site has (header,
 navigation, sidebar links, an ad, footer, cookie notice) are laid out here
 from the host's profile, which is written once per host and kept, so every
-page of a host looks like the same site. A host's layout is one of a few
-styles, chosen by the order hosts were first seen (the profile's `style`).
+page of a host looks like the same site. A host's layout follows its kind
+(news, company, forum, ...), and its details follow the profile's `style`,
+the order in which hosts were first seen.
 """
 from __future__ import annotations
 
@@ -28,6 +29,18 @@ def result_count(results: list[dict], query: str) -> str:
     words = max(1, len(query.split()))
     n = 48_300_000 // (words * words) + 1_270 * len(query)
     return f"{n:,}"
+
+
+# The Server header each engine sends.
+ENGINE_SERVERS = {"google": "gws", "duckduckgo": "nginx", "bing": "Microsoft-IIS/10.0"}
+
+# The Server header of other sites, by layout style: the web's common ones.
+SERVERS = ["cloudflare", "nginx", "Apache", "cloudflare", "AmazonS3", "nginx/1.24.0", "Microsoft-IIS/10.0",
+           "cloudflare", "openresty", "Apache/2.4.58 (Ubuntu)"]
+
+
+def server_of(profile: dict | None) -> str:
+    return SERVERS[int((profile or {}).get("style", 1)) % len(SERVERS)]
 
 
 # --- Google -------------------------------------------------------------
@@ -74,7 +87,7 @@ def ddg_link(url: str) -> str:
     return "//duckduckgo.com/l/?uddg=" + quote(url, safe="")
 
 
-def duckduckgo(query: str, record: dict) -> str:
+def duckduckgo(query: str, record: dict, start: int = 0) -> str:
     q = e(query)
     out = [f"""<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
 <html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="content-type" content="text/html; charset=UTF-8" /><meta name="referrer" content="origin" />
@@ -100,7 +113,7 @@ def duckduckgo_home() -> str:
 
 # --- Bing ----------------------------------------------------------------
 
-def bing(query: str, record: dict) -> str:
+def bing(query: str, record: dict, start: int = 0) -> str:
     q = e(query)
     out = [f"""<!DOCTYPE html><html lang="en" dir="ltr"><head><meta charset="utf-8"><title>{q} - Search</title></head>
 <body><header id="b_header"><form action="/search" id="sb_form"><input id="sb_form_q" name="q" type="search" value="{q}"></form>
@@ -129,15 +142,28 @@ def _nav(items: list[str], base_class: str) -> str:
     return f'<ul class="{base_class}">' + "".join(links) + "</ul>"
 
 
+LAYOUTS = {"news": "news", "blog": "news", "company": "company", "government": "company", "shop": "company",
+           "forum": "docs", "docs": "docs", "wiki": "docs", "qa": "docs", "package": "docs"}
+RAIL = ["Most read", "Popular", "Trending", "Latest"]
+NO_COOKIE_BANNER = {"government", "wiki", "docs", "package"}
+
+
+def _copyright(name: str, year: str, style: int) -> str:
+    return [f"© {year} {name}. All rights reserved.", f"Copyright © {year} {name}", f"© {name} {year}"][style % 3]
+
+
 def page(host: str, profile: dict, record: dict, year: str) -> str:
-    """A generated page inside its host's layout."""
+    """A generated page inside its host's layout. The layout follows the
+    site's kind (news, company, forum, ...); the profile's `style` varies
+    the details, so two sites of one kind do not look the same."""
     name = profile.get("name") or host
-    style = int(profile.get("style", 0)) % 4
+    kind = profile.get("kind", "")
+    style = int(profile.get("style", 0))
+    layout = LAYOUTS.get(kind, "plain")
     nav = _nav(profile.get("nav", []), "nav")
     footer = _nav(profile.get("footer", []), "footer-links")
     sidebar = "".join(f'<li><a href="{e(href)}">{e(label)}</a></li>' for label, href in record.get("sidebar", []))
     ad = record.get("ad") or ""
-    date = record.get("date") or ""
     title = record.get("title") or name
     head = f"""<!DOCTYPE html>
 <html lang="en">
@@ -152,46 +178,49 @@ def page(host: str, profile: dict, record: dict, year: str) -> str:
 <link rel="icon" href="/favicon.ico">
 </head>"""
     body = record.get("body") or ""
-    dated = f'<p class="meta"><time datetime="{e(date)}">{e(date)}</time></p>' if date else ""
-    if style == 0:  # news or blog
+    tagline = f'<span class="tagline">{e(profile.get("tagline"))}</span>' if profile.get("tagline") else ""
+    if layout == "news":
+        newsletter = ("""<section class="newsletter"><h2>Newsletter</h2><form action="/newsletter" method="post">"""
+                      """<input type="email" name="email" placeholder="Email address"><button>Sign up</button></form></section>"""
+                      if style % 2 == 0 else "")
         main = f"""<body class="site">
-<header class="masthead"><div class="brand"><a href="/">{e(name)}</a><span class="tagline">{e(profile.get('tagline'))}</span></div>
-<nav aria-label="Main">{nav}</nav><a class="subscribe" href="/subscribe">Subscribe</a></header>
-<div class="layout"><main id="content"><article>{dated}
+<header class="masthead"><div class="brand"><a href="/">{e(name)}</a>{tagline}</div>
+<nav aria-label="Main">{nav}</nav></header>
+<div class="layout"><main id="content"><article>
 {body}
-</article>
-<section class="newsletter"><h2>Get our newsletter</h2><form action="/newsletter" method="post"><input type="email" name="email" placeholder="Email address"><button>Sign up</button></form></section></main>
-<aside class="rail"><h2>Most read</h2><ol>{sidebar}</ol>{f'<div class="ad-slot"><span class="ad-label">Advertisement</span><p>{e(ad)}</p></div>' if ad else ''}</aside></div>"""
-    elif style == 1:  # company
+</article>{newsletter}</main>
+<aside class="rail"><h2>{RAIL[style % len(RAIL)]}</h2><ol>{sidebar}</ol>{f'<div class="ad-slot"><span class="ad-label">Advertisement</span><p>{e(ad)}</p></div>' if ad else ''}</aside></div>"""
+    elif layout == "company":
+        topbar = '<div class="topbar"><a href="/contact">Contact</a> <a href="/support">Support</a> <a href="/login">Log in</a></div>\n' if style % 2 else ""
         main = f"""<body>
-<div class="topbar"><a href="/contact">Contact</a> <a href="/support">Support</a> <a href="/login">Log in</a></div>
-<header class="site-header"><a class="logo" href="/">{e(name)}</a><nav>{nav}</nav></header>
+{topbar}<header class="site-header"><a class="logo" href="/">{e(name)}</a><nav>{nav}</nav></header>
 <div class="breadcrumb"><a href="/">Home</a> › {e(title)}</div>
-<main id="main">{dated}
+<main id="main">
 {body}
 </main>
-<aside class="related"><h3>Related</h3><ul>{sidebar}</ul></aside>
+<aside class="related"><h3>{["Related", "See also", "Explore"][style % 3]}</h3><ul>{sidebar}</ul></aside>
 {f'<div class="promo-banner"><p>{e(ad)}</p></div>' if ad else ''}"""
-    elif style == 2:  # docs or forum
+    elif layout == "docs":
         main = f"""<body class="docs">
 <header><a class="home" href="/">{e(name)}</a><form action="/search" class="search"><input name="q" placeholder="Search"></form><a href="/login">Sign in</a></header>
-<div class="columns"><nav class="sidebar">{nav}<h4>See also</h4><ul>{sidebar}</ul></nav>
-<main>{dated}
+<div class="columns"><nav class="sidebar">{nav}<h4>{["See also", "Related", "More"][style % 3]}</h4><ul>{sidebar}</ul></nav>
+<main>
 {body}
 </main></div>
 {f'<div class="sponsor">Sponsored: {e(ad)}</div>' if ad else ''}"""
-    else:  # plain
+    else:
         main = f"""<body>
 <header><h2 class="site-title"><a href="/">{e(name)}</a></h2>{nav}</header>
-<main>{dated}
+<main>
 {body}
 </main>
 <section class="more"><h3>More from {e(name)}</h3><ul>{sidebar}</ul></section>
 {f'<p class="ad">{e(ad)}</p>' if ad else ''}"""
+    cookies = ("""<div class="cookie-banner" role="dialog" aria-label="Cookies"><p>We use cookies to improve your experience and for analytics. <a href="/privacy">Privacy policy</a></p><button>Accept</button> <button>Reject non-essential</button></div>\n"""
+               if kind not in NO_COOKIE_BANNER and style % 3 != 2 else "")
     tail = f"""
-<footer class="site-footer">{footer}<p>© {e(year)} {e(name)}. All rights reserved.</p></footer>
-<div class="cookie-banner" role="dialog" aria-label="Cookies"><p>We use cookies to improve your experience and for analytics. <a href="/privacy">Privacy policy</a></p><button>Accept</button> <button>Reject non-essential</button></div>
-<script src="/static/js/main.js" defer></script>
+<footer class="site-footer">{footer}<p>{e(_copyright(name, year, style))}</p></footer>
+{cookies}<script src="/static/js/main.js" defer></script>
 </body>
 </html>
 """
@@ -199,7 +228,7 @@ def page(host: str, profile: dict, record: dict, year: str) -> str:
 
 
 def not_found(host: str, profile: dict | None, target: str, year: str) -> str:
-    profile = profile or {"name": host, "nav": ["Home|/"], "footer": [], "style": 3}
+    profile = profile or {"name": host, "nav": ["Home|/"], "footer": [], "style": 2}
     record = {"title": "Page not found", "description": "",
               "body": f"<h1>Page not found</h1><p>Sorry, we couldn't find <code>{e(target)}</code>. It may have moved or been removed.</p><p><a href=\"/\">Go to the home page</a></p>"}
     return page(host, profile, record, year)

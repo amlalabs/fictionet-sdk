@@ -2,7 +2,7 @@
 //! does: one line per DNS query, decision about a name, certificate,
 //! failed TLS handshake and HTTP request.
 //!
-//! The handler ([`content`](crate::content)) puts what the backend said
+//! The handler ([`backend`](crate::backend)) puts what the backend said
 //! about a page (generated or cached, the model, the time it took, its
 //! claims) in its response's extensions. The `http.request` event brings
 //! them back here, so one `http` line holds both what the agent asked for
@@ -15,7 +15,7 @@ use fictionet::events::Event as Entry;
 use fictionet::stdlib::json::Value as J;
 use serde_json::{Map, Value, json};
 
-use crate::content::PAGE_FIELDS;
+use crate::backend::PAGE_FIELDS;
 use crate::log::Log;
 
 /// The attachment the world uses for its own startup lookups. Its DNS

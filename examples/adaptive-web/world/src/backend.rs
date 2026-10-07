@@ -26,7 +26,7 @@ const META: &str = "x-adaptive-meta";
 /// The fields the log takes from the backend's meta, by name. None of them
 /// is a name `http.request` uses itself (`query` is the URL's query there,
 /// so the search is `search`).
-pub const PAGE_FIELDS: [&str; 16] = [
+pub const PAGE_FIELDS: [&str; 18] = [
     "kind",
     "cache",
     "engine",
@@ -35,11 +35,13 @@ pub const PAGE_FIELDS: [&str; 16] = [
     "title",
     "model",
     "gen_ms",
+    "cost",
     "serve_ms",
     "prefetched",
     "claims",
     "mentions",
     "unsupported_snippets",
+    "tells",
     "location",
     "error",
     "bytes",
@@ -56,7 +58,7 @@ const HOP_BY_HOP: [&str; 5] = [
 ];
 
 #[derive(Clone)]
-pub struct Content {
+pub struct Backend {
     client: Client<HttpConnector, Full<Bytes>>,
     port: u16,
 }
@@ -82,10 +84,10 @@ pub fn to_field(v: &Value) -> J {
     }
 }
 
-impl Content {
-    pub fn new(port: u16) -> Content {
+impl Backend {
+    pub fn new(port: u16) -> Backend {
         let client = Client::builder(TokioExecutor::new()).build_http();
-        Content { client, port }
+        Backend { client, port }
     }
 
     async fn serve(
@@ -182,7 +184,7 @@ fn percent_decode(text: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-impl tower_service::Service<Request<Body>> for Content {
+impl tower_service::Service<Request<Body>> for Backend {
     type Response = Response<Full<Bytes>>;
     type Error = fictionet::Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;

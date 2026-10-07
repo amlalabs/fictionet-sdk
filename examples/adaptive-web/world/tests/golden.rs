@@ -20,9 +20,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
-use adaptive_web_world::content::Content;
+use adaptive_web_world::backend::Backend;
 use adaptive_web_world::log::Log;
-use adaptive_web_world::{Addresses, Args, Ca, fixed_addresses, look_up_all, serve, start_backend};
+use adaptive_web_world::{
+    Addresses, Args, Ca, fixed_addresses, look_up_all, serve, start_backend, world_start,
+};
 use bytes::Bytes;
 use fictionet::prelude::*;
 use fictionet::stdlib::dns::op::{Message, Query};
@@ -116,6 +118,15 @@ async fn get<IO>(io: IO, host: &str, path: &str) -> (u16, Bytes)
 where
     IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    let (status, _, body) = request(io, host, path).await;
+    (status, body)
+}
+
+/// One HTTP/1.1 request; returns the status, the Date header and the body.
+async fn request<IO>(io: IO, host: &str, path: &str) -> (u16, String, Bytes)
+where
+    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let (mut send, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(io))
         .await
         .unwrap();
@@ -130,8 +141,13 @@ where
         .unwrap();
     let response = send.send_request(request).await.unwrap();
     let status = response.status().as_u16();
+    let date = response
+        .headers()
+        .get("date")
+        .map(|d| d.to_str().unwrap().to_owned())
+        .unwrap_or_default();
     let body = response.into_body().collect().await.unwrap().to_bytes();
-    (status, body)
+    (status, date, body)
 }
 
 /// Looks `host` up and fetches `path` from it over HTTPS.
@@ -187,6 +203,24 @@ fn split_url(url: &str) -> (String, String) {
     )
 }
 
+/// The example's seeds, copied to `base` with the world's date set to
+/// `date`, a day other than today, to check that the world's clock follows
+/// the seed.
+fn seeds_dated(base: &std::path::Path, date: &str) -> PathBuf {
+    let from = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../seeds");
+    let to = base.join("seeds");
+    std::fs::create_dir_all(to.join("fixed")).unwrap();
+    for entry in std::fs::read_dir(from.join("fixed")).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::copy(entry.path(), to.join("fixed").join(entry.file_name())).unwrap();
+    }
+    let seed = std::fs::read_to_string(from.join("halvard-cve.md")).unwrap();
+    let seed = seed.replace("date = \"2026-10-07\"", &format!("date = \"{date}\""));
+    assert!(seed.contains(date), "the seed's date line changed");
+    std::fs::write(to.join("halvard-cve.md"), seed).unwrap();
+    to
+}
+
 /// A CA in a fresh directory, as `ca.py` leaves it: `ca.pem` and `ca.key`.
 fn ca_dir(base: &std::path::Path) -> PathBuf {
     let dir = base.join("ca");
@@ -217,6 +251,7 @@ fn the_log_is_the_recorded_one() {
     // SAFETY: set before any thread of this test process reads the environment.
     unsafe {
         std::env::set_var("ADAPTIVE_WEB_SEED", "halvard-cve");
+        std::env::set_var("ADAPTIVE_WEB_SEEDS", seeds_dated(&base, "2026-09-30"));
         std::env::set_var("ADAPTIVE_WEB_GENERATOR", "stub");
         std::env::set_var("ADAPTIVE_WEB_STORE", base.join("store"));
     }
@@ -237,7 +272,8 @@ fn the_log_is_the_recorded_one() {
         p
     };
     let addresses = Arc::new(Addresses::new(fixed, Some(&store.join("addresses.jsonl"))).unwrap());
-    let ca = Arc::new(Ca::load(&args.ca_dir).unwrap());
+    let start = world_start(backend["date"].as_str().unwrap()).unwrap();
+    let ca = Arc::new(Ca::load(&args.ca_dir, start).unwrap());
     let log_path = base.join("log.jsonl");
     let log = Arc::new(Log::create(&log_path).unwrap());
 
@@ -250,7 +286,15 @@ fn the_log_is_the_recorded_one() {
             .unwrap();
         let result = rt.block_on(fictionet::run(move |cx| async move {
             let (attacher, attachments) = fictionet::attachments();
-            serve(&cx, addresses, ca, Content::new(port), log, attachments)?;
+            serve(
+                &cx,
+                addresses,
+                ca,
+                Backend::new(port),
+                log,
+                start,
+                attachments,
+            )?;
             look_up_all(&cx, &attacher, &pinned).await?;
 
             let end = attacher.attach("agent").unwrap();
@@ -280,6 +324,15 @@ fn the_log_is_the_recorded_one() {
             assert_eq!(status, 200);
             let found = results(std::str::from_utf8(&page).unwrap());
             assert_eq!(found.len(), 10, "ten results");
+            // Responses are dated on the seed's day.
+            let addr = lookup(&cx, &m, "www.google.com").await.unwrap();
+            let conn = m
+                .tcp
+                .connect(&cx, SocketAddr::new(addr.into(), 80))
+                .await
+                .unwrap();
+            let (_, date, _) = request(conn.into_tokio(&cx), "www.google.com", "/").await;
+            assert!(date.contains("30 Sep 2026"), "Date: {date}");
             for (url, title) in found.iter().take(4) {
                 let (host, path) = split_url(url);
                 let (status, first) = fetch(&cx, &m, &host, &path).await;
@@ -330,6 +383,11 @@ fn the_log_is_the_recorded_one() {
     assert_eq!(result.as_deref(), Some("done"));
 
     let text = std::fs::read_to_string(&log_path).unwrap();
+    // Certificates were issued 30 days before the seed's day (2026-09-30),
+    // which is before the host's day, and cover today on the host's clock.
+    for line in text.lines().filter(|l| l.contains(r#""type":"cert""#)) {
+        assert!(line.contains(r#""not_before":"2026-08-31""#), "{line}");
+    }
     let mut got: Vec<String> = text
         .lines()
         .map(|l| {
