@@ -3669,16 +3669,16 @@ mod tests {
         assert_eq!(Request::parse(command::TREE_CONNECT, &b), Err(Error::OddString));
         // Create contexts that run off their region, or link backwards.
         let mut body = Request::Create(create_request()).message(0).map(|m| m.body).unwrap();
-        let ctx = le32(&body, 48).unwrap() as usize - 64;
-        body[ctx] = 8; // Next below 16
+        let offset = le32(&body, 48).unwrap() as usize - 64;
+        body[offset] = 8; // Next below 16
         assert_eq!(Request::parse(command::CREATE, &body), Err(Error::Buffer));
-        body[ctx] = 0xf0;
+        body[offset] = 0xf0;
         assert_eq!(Request::parse(command::CREATE, &body), Err(Error::Buffer));
         let mut body = Request::Create(create_request()).message(0).map(|m| m.body).unwrap();
-        body[ctx + 6] = 30; // name past its context
+        body[offset + 6] = 30; // name past its context
         assert_eq!(Request::parse(command::CREATE, &body), Err(Error::Buffer));
         let n = body.len();
-        body[52..56].copy_from_slice(&((n - ctx) as u32 - 4).to_le_bytes());
+        body[52..56].copy_from_slice(&((n - offset) as u32 - 4).to_le_bytes());
         assert_eq!(Request::parse(command::CREATE, &body), Err(Error::Buffer));
         // A context region of a few bytes.
         let mut body = Request::Create(create_request()).message(0).map(|m| m.body).unwrap();
@@ -3938,15 +3938,15 @@ mod tests {
         assert_eq!(Request::parse(command::NEGOTIATE, &body), Err(Error::Align(105)));
         // 2.2.13.2: create contexts, their Next and their DataOffset too.
         let good = Request::Create(create_request()).message(0).map(|m| m.body).unwrap();
-        let ctx = le32(&good, 48).unwrap() as usize - 64;
+        let offset = le32(&good, 48).unwrap() as usize - 64;
         let mut body = good.clone();
-        body.insert(ctx, 0);
-        body[48..52].copy_from_slice(&(ctx as u32 + 65).to_le_bytes());
-        assert_eq!(Request::parse(command::CREATE, &body), Err(Error::Align(ctx as u32 + 65)));
+        body.insert(offset, 0);
+        body[48..52].copy_from_slice(&(offset as u32 + 65).to_le_bytes());
+        assert_eq!(Request::parse(command::CREATE, &body), Err(Error::Align(offset as u32 + 65)));
         let mut body = good.clone();
-        body[ctx] = 20;
+        body[offset] = 20;
         assert_eq!(Request::parse(command::CREATE, &body), Err(Error::Align(20)));
-        let second = ctx + 24;
+        let second = offset + 24;
         let mut body = good.clone();
         body[second + 10] = 20;
         assert_eq!(Request::parse(command::CREATE, &body), Err(Error::Align(20)));
@@ -4141,10 +4141,10 @@ mod tests {
     #[test]
     fn create_context_data_may_come_before_its_name() {
         // 2.2.13.2: name and data have their own offsets, in no set order.
-        let mut ctx = le(&[0, 24, 4, 0, 16, 8], &[4, 2, 2, 2, 2, 4]);
-        ctx.extend_from_slice(&4096u64.to_le_bytes());
-        ctx.extend_from_slice(b"AlSi");
-        let body = create_with(120, &[], &ctx);
+        let mut offset = le(&[0, 24, 4, 0, 16, 8], &[4, 2, 2, 2, 2, 4]);
+        offset.extend_from_slice(&4096u64.to_le_bytes());
+        offset.extend_from_slice(b"AlSi");
+        let body = create_with(120, &[], &offset);
         let Ok(Request::Create(c)) = Request::parse(command::CREATE, &body) else { panic!() };
         let want = CreateContext { name: b"AlSi".to_vec(), data: 4096u64.to_le_bytes().to_vec() };
         assert_eq!(c.contexts, [want]);
@@ -4153,9 +4153,9 @@ mod tests {
         assert!(back.len() <= body.len() + 7);
         assert_eq!(Request::parse(command::CREATE, &back), Ok(Request::Create(c)));
         // Name and data over the same bytes are still refused.
-        let mut ctx = le(&[0, 16, 4, 0, 16, 8], &[4, 2, 2, 2, 2, 4]);
-        ctx.extend_from_slice(&[0; 8]);
-        assert_eq!(Request::parse(command::CREATE, &create_with(120, &[], &ctx)), Err(Error::Overlap));
+        let mut offset = le(&[0, 16, 4, 0, 16, 8], &[4, 2, 2, 2, 2, 4]);
+        offset.extend_from_slice(&[0; 8]);
+        assert_eq!(Request::parse(command::CREATE, &create_with(120, &[], &offset)), Err(Error::Overlap));
     }
 
     #[test]
@@ -4165,17 +4165,17 @@ mod tests {
         assert_eq!(Request::parse(command::CREATE, &body), Err(Error::Align(122)));
         assert!(Request::parse(command::CREATE, &create_with(128, &u16s("a"), &[])).is_ok());
         // 2.2.13.2: a create context's name is 8-byte aligned.
-        let mut ctx = le(&[0, 17, 4, 0, 0, 0], &[4, 2, 2, 2, 2, 4]);
-        ctx.extend_from_slice(b"\0MxAc");
-        assert_eq!(Request::parse(command::CREATE, &create_with(120, &[], &ctx)), Err(Error::Align(17)));
+        let mut offset = le(&[0, 17, 4, 0, 0, 0], &[4, 2, 2, 2, 2, 4]);
+        offset.extend_from_slice(b"\0MxAc");
+        assert_eq!(Request::parse(command::CREATE, &create_with(120, &[], &offset)), Err(Error::Align(17)));
         // A Next of 24 that reaches the end of the region, with no context
         // there.
-        let mut ctx = le(&[24, 16, 4, 0, 0, 0], &[4, 2, 2, 2, 2, 4]);
-        ctx.extend_from_slice(b"MxAc");
-        ctx.resize(24, 0);
-        assert_eq!(Request::parse(command::CREATE, &create_with(120, &[], &ctx)), Err(Error::Buffer));
-        ctx[0] = 0;
-        assert!(Request::parse(command::CREATE, &create_with(120, &[], &ctx)).is_ok());
+        let mut offset = le(&[24, 16, 4, 0, 0, 0], &[4, 2, 2, 2, 2, 4]);
+        offset.extend_from_slice(b"MxAc");
+        offset.resize(24, 0);
+        assert_eq!(Request::parse(command::CREATE, &create_with(120, &[], &offset)), Err(Error::Buffer));
+        offset[0] = 0;
+        assert!(Request::parse(command::CREATE, &create_with(120, &[], &offset)).is_ok());
     }
 
     #[test]

@@ -30,7 +30,7 @@ use fictionet::stdlib::net::{Accept, Arrival, Net, Sni};
 use fictionet::stdlib::route::Prefix;
 use fictionet::stdlib::scenario::Scenario;
 use fictionet::stdlib::serve::{
-    self, Budget, Ended, FaultPlan, Flow, Harness, HarnessError, Pending, PendingCtx, Plan, ServeCtx, ServeOptions, Served,
+    self, Budget, Ended, FaultPlan, Flow, Harness, HarnessError, Pending, PendingDriver, Plan, Driver, ServeOptions, Served,
     Service, Timer, Transcript, Upgrade,
 };
 use fictionet::stdlib::{ConnError, Connection, ip, tcp, udp};
@@ -115,38 +115,38 @@ impl Service for Echo {
         Lines::new(64, Ending::LfOrCrlf)
     }
 
-    fn on_open(&mut self, _: &(), ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
-        ctx.reply().extend_from_slice(b"hello\n");
+    fn on_open(&mut self, _: &(), driver: &mut Driver<'_>) -> Result<Flow, Infallible> {
+        driver.reply().extend_from_slice(b"hello\n");
         Ok(Flow::Continue)
     }
 
-    fn on_item(&mut self, line: Result<Vec<u8>, LineError>, _: &(), ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
+    fn on_item(&mut self, line: Result<Vec<u8>, LineError>, _: &(), driver: &mut Driver<'_>) -> Result<Flow, Infallible> {
         let Ok(line) = line else {
-            ctx.reply().extend_from_slice(b"too long\n");
+            driver.reply().extend_from_slice(b"too long\n");
             return Ok(Flow::Continue);
         };
-        ctx.log(Event::new("echo", "line").summary(String::from_utf8_lossy(&line)).field("bytes", line.len() as u64));
+        driver.log(Event::new("echo", "line").summary(String::from_utf8_lossy(&line)).field("bytes", line.len() as u64));
         match line.as_slice() {
             b"quit" => {
-                ctx.reply().extend_from_slice(b"bye\n");
+                driver.reply().extend_from_slice(b"bye\n");
                 Ok(Flow::Close)
             }
             b"handoff" => Ok(Flow::Upgrade(Upgrade::Handoff)),
             b"later" => {
-                ctx.defer(Later { step: 0 });
+                driver.defer(Later { step: 0 });
                 Ok(Flow::Continue)
             }
             _ => {
-                ctx.reply().extend_from_slice(&line);
-                ctx.reply().push(b'\n');
+                driver.reply().extend_from_slice(&line);
+                driver.reply().push(b'\n');
                 Ok(Flow::Continue)
             }
         }
     }
 
-    fn on_end(&mut self, end: Ended, _: &(), ctx: &mut ServeCtx<'_>) -> Result<(), Infallible> {
+    fn on_end(&mut self, end: Ended, _: &(), driver: &mut Driver<'_>) -> Result<(), Infallible> {
         if end == Ended::Eof {
-            ctx.reply().extend_from_slice(b"eof\n");
+            driver.reply().extend_from_slice(b"eof\n");
         }
         Ok(())
     }
@@ -158,7 +158,7 @@ struct Later {
 }
 
 impl Pending for Later {
-    fn poll_next(&mut self, ctx: &mut PendingCtx<'_>, cx: &mut Context<'_>) -> Poll<Option<Result<Vec<u8>, fictionet::Error>>> {
+    fn poll_next(&mut self, driver: &mut PendingDriver<'_>, cx: &mut Context<'_>) -> Poll<Option<Result<Vec<u8>, fictionet::Error>>> {
         if self.step == 0 {
             // Not ready the first time: the driver waits for the waker.
             self.step = 1;
@@ -169,7 +169,7 @@ impl Pending for Later {
         match self.step {
             2 => Poll::Ready(Some(Ok(b"la".to_vec()))),
             3 => {
-                ctx.log(Event::new("echo", "later").field("written", ctx.written()));
+                driver.log(Event::new("echo", "later").field("written", driver.written()));
                 Poll::Ready(Some(Ok(b"ter\n".to_vec())))
             }
             _ => Poll::Ready(None),
@@ -191,22 +191,22 @@ impl Service for Ticker {
         Lines::new(64, Ending::LfOrCrlf)
     }
 
-    fn on_open(&mut self, _: &(), ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
-        ctx.set_timer("tick", Duration::from_millis(30));
+    fn on_open(&mut self, _: &(), driver: &mut Driver<'_>) -> Result<Flow, Infallible> {
+        driver.set_timer("tick", Duration::from_millis(30));
         Ok(Flow::Continue)
     }
 
-    fn on_item(&mut self, _: Result<Vec<u8>, LineError>, _: &(), _: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
+    fn on_item(&mut self, _: Result<Vec<u8>, LineError>, _: &(), _: &mut Driver<'_>) -> Result<Flow, Infallible> {
         Ok(Flow::Continue)
     }
 
-    fn on_timer(&mut self, _: Timer, _: &(), ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
+    fn on_timer(&mut self, _: Timer, _: &(), driver: &mut Driver<'_>) -> Result<Flow, Infallible> {
         self.ticks += 1;
-        ctx.reply().extend_from_slice(b"tick\n");
+        driver.reply().extend_from_slice(b"tick\n");
         if self.ticks == 3 {
             return Ok(Flow::Close);
         }
-        ctx.set_timer("tick", Duration::from_millis(30));
+        driver.set_timer("tick", Duration::from_millis(30));
         Ok(Flow::Continue)
     }
 }
@@ -231,12 +231,12 @@ impl Service for Plc {
         modbus::Frames
     }
 
-    fn on_item(&mut self, frame: Frame, plant: &Plant, ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
+    fn on_item(&mut self, frame: Frame, plant: &Plant, driver: &mut Driver<'_>) -> Result<Flow, Infallible> {
         let mut registers = plant.registers.lock().unwrap();
         let pdu = match MbRequest::parse(&frame.pdu) {
             Ok(MbRequest::ReadHoldingRegisters { address, quantity }) => {
                 let (a, n) = (usize::from(address), usize::from(quantity));
-                ctx.log(Event::new("modbus", "read").field("address", u32::from(address)).field("quantity", u32::from(quantity)));
+                driver.log(Event::new("modbus", "read").field("address", u32::from(address)).field("quantity", u32::from(quantity)));
                 match registers.get(a..a + n) {
                     Some(values) => MbResponse::Registers(values.to_vec()).to_pdu(3).unwrap(),
                     None => Exception::IllegalDataAddress.to_pdu(3),
@@ -246,7 +246,7 @@ impl Service for Plc {
                 Some(r) => {
                     *r = value;
                     let unsafe_write = address == 0 && value > plant.limit;
-                    ctx.log(
+                    driver.log(
                         Event::new("modbus", "write_register")
                             .summary(format!("register {address} = {value}"))
                             .level(if unsafe_write { Level::Alarm } else { Level::Info })
@@ -260,7 +260,7 @@ impl Service for Plc {
             Ok(other) => Exception::IllegalFunction.to_pdu(other.function()),
             Err(e) => e.to_pdu(frame.function().unwrap_or(0)),
         };
-        frame.reply(pdu).write(ctx.reply()).unwrap();
+        frame.reply(pdu).write(driver.reply()).unwrap();
         Ok(Flow::Continue)
     }
 }
@@ -324,12 +324,12 @@ fn a_decoder_failure_is_handed_to_the_service_with_what_it_could_not_read() {
         fn decoder(&self) -> modbus::Frames {
             modbus::Frames
         }
-        fn on_item(&mut self, _: Frame, _: &(), _: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
+        fn on_item(&mut self, _: Frame, _: &(), _: &mut Driver<'_>) -> Result<Flow, Infallible> {
             Ok(Flow::Continue)
         }
-        fn on_fail(&mut self, _: &fictionet::stdlib::codec::Fail<modbus::Error>, _: &(), ctx: &mut ServeCtx<'_>) -> Result<(), Infallible> {
-            self.unread = ctx.unread().to_vec();
-            ctx.reply().extend_from_slice(b"no");
+        fn on_fail(&mut self, _: &fictionet::stdlib::codec::Fail<modbus::Error>, _: &(), driver: &mut Driver<'_>) -> Result<(), Infallible> {
+            self.unread = driver.unread().to_vec();
+            driver.reply().extend_from_slice(b"no");
             Ok(())
         }
     }
@@ -674,9 +674,9 @@ fn serve_datagram_answers_each_datagram() {
         fn decoder(&self) -> Lines {
             Lines::new(64, Ending::LfOrCrlf)
         }
-        fn on_item(&mut self, _: Result<Vec<u8>, LineError>, n: &AtomicUsize, ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
+        fn on_item(&mut self, _: Result<Vec<u8>, LineError>, n: &AtomicUsize, driver: &mut Driver<'_>) -> Result<Flow, Infallible> {
             let total = n.fetch_add(1, Ordering::SeqCst) + 1;
-            ctx.reply().extend_from_slice(format!("{total};").as_bytes());
+            driver.reply().extend_from_slice(format!("{total};").as_bytes());
             Ok(Flow::Continue)
         }
     }
@@ -853,9 +853,9 @@ fn net_serves_udp_services_and_trusted_sandboxes() {
             fn decoder(&self) -> Lines {
                 Lines::new(64, Ending::LfOrCrlf)
             }
-            fn on_item(&mut self, _: Result<Vec<u8>, LineError>, n: &AtomicUsize, ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
-                ctx.log(Event::new("udp", "datagram"));
-                ctx.reply().extend_from_slice(format!("{}\n", n.fetch_add(1, Ordering::SeqCst) + 1).as_bytes());
+            fn on_item(&mut self, _: Result<Vec<u8>, LineError>, n: &AtomicUsize, driver: &mut Driver<'_>) -> Result<Flow, Infallible> {
+                driver.log(Event::new("udp", "datagram"));
+                driver.reply().extend_from_slice(format!("{}\n", n.fetch_add(1, Ordering::SeqCst) + 1).as_bytes());
                 Ok(Flow::Continue)
             }
         }
@@ -1055,9 +1055,9 @@ fn net_routes_tls_by_name_to_each_service() {
         fn decoder(&self) -> Lines {
             Lines::new(64, Ending::LfOrCrlf)
         }
-        fn on_item(&mut self, line: Result<Vec<u8>, LineError>, _: &(), ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
-            ctx.reply().extend_from_slice(&line.unwrap_or_default().to_ascii_uppercase());
-            ctx.reply().push(b'\n');
+        fn on_item(&mut self, line: Result<Vec<u8>, LineError>, _: &(), driver: &mut Driver<'_>) -> Result<Flow, Infallible> {
+            driver.reply().extend_from_slice(&line.unwrap_or_default().to_ascii_uppercase());
+            driver.reply().push(b'\n');
             Ok(Flow::Continue)
         }
     }
@@ -1183,10 +1183,10 @@ fn a_decoder_that_skips_a_long_line_keeps_the_connection_open() {
         fn decoder(&self) -> Lines {
             Lines::new(16, Ending::LfOrCrlf)
         }
-        fn on_item(&mut self, line: Result<Vec<u8>, LineError>, _: &(), ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
+        fn on_item(&mut self, line: Result<Vec<u8>, LineError>, _: &(), driver: &mut Driver<'_>) -> Result<Flow, Infallible> {
             match line {
-                Ok(line) => ctx.reply().extend_from_slice(&[line.as_slice(), b"\n"].concat()),
-                Err(_) => ctx.reply().extend_from_slice(b"long\n"),
+                Ok(line) => driver.reply().extend_from_slice(&[line.as_slice(), b"\n"].concat()),
+                Err(_) => driver.reply().extend_from_slice(b"long\n"),
             }
             Ok(Flow::Continue)
         }
@@ -1234,28 +1234,28 @@ impl Service for Mail {
     fn decoder(&self) -> Lines {
         Lines::new(512, Ending::LfOrCrlf)
     }
-    fn on_open(&mut self, _: &(), ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
+    fn on_open(&mut self, _: &(), driver: &mut Driver<'_>) -> Result<Flow, Infallible> {
         // After STARTTLS the client speaks first.
-        self.tls = ctx.conn().tls;
+        self.tls = driver.conn().tls;
         if !self.tls {
-            ctx.reply().extend_from_slice(b"220 mail ready\r\n");
+            driver.reply().extend_from_slice(b"220 mail ready\r\n");
         }
         Ok(Flow::Continue)
     }
-    fn on_item(&mut self, line: Result<Vec<u8>, LineError>, _: &(), ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
+    fn on_item(&mut self, line: Result<Vec<u8>, LineError>, _: &(), driver: &mut Driver<'_>) -> Result<Flow, Infallible> {
         let line = line.unwrap_or_default();
         match line.as_slice() {
             b"STARTTLS" if !self.tls => {
-                ctx.reply().extend_from_slice(b"220 go ahead\r\n");
+                driver.reply().extend_from_slice(b"220 go ahead\r\n");
                 Ok(Flow::Upgrade(Upgrade::Tls))
             }
             b"EHLO" => {
-                let sni = ctx.conn().sni.as_deref().unwrap_or("-").to_owned();
-                ctx.reply().extend_from_slice(format!("250 hello tls={} sni={sni}\r\n", self.tls).as_bytes());
+                let sni = driver.conn().sni.as_deref().unwrap_or("-").to_owned();
+                driver.reply().extend_from_slice(format!("250 hello tls={} sni={sni}\r\n", self.tls).as_bytes());
                 Ok(Flow::Continue)
             }
             _ => {
-                ctx.reply().extend_from_slice(b"500 what\r\n");
+                driver.reply().extend_from_slice(b"500 what\r\n");
                 Ok(Flow::Continue)
             }
         }
@@ -1340,11 +1340,11 @@ impl Service for Trader {
     fn decoder(&self) -> Lines {
         Lines::new(64, Ending::LfOrCrlf)
     }
-    fn on_item(&mut self, line: Result<Vec<u8>, LineError>, book: &Book, ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
+    fn on_item(&mut self, line: Result<Vec<u8>, LineError>, book: &Book, driver: &mut Driver<'_>) -> Result<Flow, Infallible> {
         let line = String::from_utf8(line.unwrap_or_default()).unwrap_or_default();
         if line == "sub" {
-            book.subscribers.lock().unwrap().push((ctx.wake_handle(), self.inbox.clone()));
-            ctx.reply().extend_from_slice(b"subscribed\n");
+            book.subscribers.lock().unwrap().push((driver.wake_handle(), self.inbox.clone()));
+            driver.reply().extend_from_slice(b"subscribed\n");
         } else if let Some(fill) = line.strip_prefix("fill ") {
             let mut subscribers = book.subscribers.lock().unwrap();
             subscribers.retain(|(w, _)| !w.is_closed());
@@ -1352,13 +1352,13 @@ impl Service for Trader {
                 inbox.lock().unwrap().push(fill.to_owned());
                 wake.wake();
             }
-            ctx.reply().extend_from_slice(b"ok\n");
+            driver.reply().extend_from_slice(b"ok\n");
         }
         Ok(Flow::Continue)
     }
-    fn on_wake(&mut self, _: &Book, ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
+    fn on_wake(&mut self, _: &Book, driver: &mut Driver<'_>) -> Result<Flow, Infallible> {
         for fill in self.inbox.lock().unwrap().drain(..) {
-            ctx.reply().extend_from_slice(format!("execution {fill}\n").as_bytes());
+            driver.reply().extend_from_slice(format!("execution {fill}\n").as_bytes());
         }
         Ok(Flow::Continue)
     }
@@ -1403,12 +1403,12 @@ impl Service for Session {
     fn decoder(&self) -> Lines {
         Lines::new(64, Ending::LfOrCrlf)
     }
-    fn on_open(&mut self, _: &(), ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
-        ctx.set_timer("heartbeat", Duration::from_millis(10));
-        ctx.set_timer("logon", Duration::from_millis(25));
+    fn on_open(&mut self, _: &(), driver: &mut Driver<'_>) -> Result<Flow, Infallible> {
+        driver.set_timer("heartbeat", Duration::from_millis(10));
+        driver.set_timer("logon", Duration::from_millis(25));
         Ok(Flow::Continue)
     }
-    fn on_item(&mut self, line: Result<Vec<u8>, LineError>, _: &(), ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
+    fn on_item(&mut self, line: Result<Vec<u8>, LineError>, _: &(), driver: &mut Driver<'_>) -> Result<Flow, Infallible> {
         self.lines += 1;
         if line.as_deref() == Ok(b"slow") {
             // Work that takes a while, so the client's bytes pile up.
@@ -1416,24 +1416,24 @@ impl Service for Session {
             while started.elapsed() < Duration::from_micros(50) {}
         }
         if line.as_deref() == Ok(b"logon") {
-            ctx.cancel_timer("logon");
-            ctx.reply().extend_from_slice(b"logged on\n");
+            driver.cancel_timer("logon");
+            driver.reply().extend_from_slice(b"logged on\n");
         }
         if line.as_deref() == Ok(b"end") {
-            ctx.reply().extend_from_slice(format!("end lines={} beats={}\n", self.lines, self.beats).as_bytes());
+            driver.reply().extend_from_slice(format!("end lines={} beats={}\n", self.lines, self.beats).as_bytes());
             return Ok(Flow::Close);
         }
         Ok(Flow::Continue)
     }
-    fn on_timer(&mut self, timer: Timer, _: &(), ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
+    fn on_timer(&mut self, timer: Timer, _: &(), driver: &mut Driver<'_>) -> Result<Flow, Infallible> {
         match timer {
             "heartbeat" => {
                 self.beats += 1;
-                ctx.set_timer("heartbeat", Duration::from_millis(10));
+                driver.set_timer("heartbeat", Duration::from_millis(10));
                 Ok(Flow::Continue)
             }
             "logon" => {
-                ctx.reply().extend_from_slice(b"logon timed out\n");
+                driver.reply().extend_from_slice(b"logon timed out\n");
                 Ok(Flow::Close)
             }
             _ => Ok(Flow::Continue),
@@ -1507,7 +1507,7 @@ struct Frames {
 }
 
 impl Pending for Frames {
-    fn poll_next(&mut self, _ctx: &mut PendingCtx<'_>, cx: &mut Context<'_>) -> Poll<Option<Result<Vec<u8>, fictionet::Error>>> {
+    fn poll_next(&mut self, _ctx: &mut PendingDriver<'_>, cx: &mut Context<'_>) -> Poll<Option<Result<Vec<u8>, fictionet::Error>>> {
         if self.sent == self.frames {
             return Poll::Ready(None);
         }
@@ -1539,21 +1539,21 @@ impl Service for Mux {
     fn decoder(&self) -> Lines {
         Lines::new(64, Ending::LfOrCrlf)
     }
-    fn on_item(&mut self, line: Result<Vec<u8>, LineError>, _: &(), ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
+    fn on_item(&mut self, line: Result<Vec<u8>, LineError>, _: &(), driver: &mut Driver<'_>) -> Result<Flow, Infallible> {
         match line.as_deref() {
             Ok(b"get") => {
                 let work = Frames { stream: self.streams, of: 2, sent: 0, frames: 3, baton: self.baton.clone() };
-                ctx.defer_keyed(self.streams as u64, work);
+                driver.defer_keyed(self.streams as u64, work);
                 self.streams += 1;
             }
-            Ok(b"ping") => ctx.reply().extend_from_slice(b"(pong)"),
+            Ok(b"ping") => driver.reply().extend_from_slice(b"(pong)"),
             _ => {}
         }
         Ok(Flow::Continue)
     }
-    fn on_done(&mut self, key: u64, done: serve::Done, _: &(), ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
+    fn on_done(&mut self, key: u64, done: serve::Done, _: &(), driver: &mut Driver<'_>) -> Result<Flow, Infallible> {
         assert!(matches!(done, serve::Done::Finished), "{done:?}");
-        ctx.reply().extend_from_slice(format!("(done {key})").as_bytes());
+        driver.reply().extend_from_slice(format!("(done {key})").as_bytes());
         Ok(Flow::Continue)
     }
 }
@@ -1608,22 +1608,22 @@ fn datagram_services_send_several_datagrams_and_tick() {
         fn decoder(&self) -> Lines {
             Lines::new(64, Ending::LfOrCrlf)
         }
-        fn on_open(&mut self, _: &SocketAddr, ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
-            ctx.set_timer("heartbeat", Duration::from_millis(20));
+        fn on_open(&mut self, _: &SocketAddr, driver: &mut Driver<'_>) -> Result<Flow, Infallible> {
+            driver.set_timer("heartbeat", Duration::from_millis(20));
             Ok(Flow::Continue)
         }
-        fn on_item(&mut self, line: Result<Vec<u8>, LineError>, _: &SocketAddr, ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
+        fn on_item(&mut self, line: Result<Vec<u8>, LineError>, _: &SocketAddr, driver: &mut Driver<'_>) -> Result<Flow, Infallible> {
             let line = String::from_utf8(line.unwrap_or_default()).unwrap_or_default();
             let n: u32 = line.strip_prefix("req ").and_then(|n| n.parse().ok()).unwrap_or(0);
-            let to = ctx.conn().peer.unwrap();
+            let to = driver.conn().peer.unwrap();
             for i in 1..=n {
-                ctx.send_to(to, format!("packet {i} over {}", ctx.conn().transport.as_str()).into_bytes());
+                driver.send_to(to, format!("packet {i} over {}", driver.conn().transport.as_str()).into_bytes());
             }
             Ok(Flow::Continue)
         }
-        fn on_timer(&mut self, _: Timer, subscriber: &SocketAddr, ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
-            ctx.send_to(*subscriber, b"heartbeat".to_vec());
-            ctx.set_timer("heartbeat", Duration::from_millis(20));
+        fn on_timer(&mut self, _: Timer, subscriber: &SocketAddr, driver: &mut Driver<'_>) -> Result<Flow, Infallible> {
+            driver.send_to(*subscriber, b"heartbeat".to_vec());
+            driver.set_timer("heartbeat", Duration::from_millis(20));
             Ok(Flow::Continue)
         }
     }
@@ -1658,12 +1658,12 @@ impl Service for Fragile {
     fn decoder(&self) -> Lines {
         Lines::new(64, Ending::LfOrCrlf)
     }
-    fn on_item(&mut self, line: Result<Vec<u8>, LineError>, _: &(), ctx: &mut ServeCtx<'_>) -> Result<Flow, std::io::Error> {
+    fn on_item(&mut self, line: Result<Vec<u8>, LineError>, _: &(), driver: &mut Driver<'_>) -> Result<Flow, std::io::Error> {
         match line.as_deref() {
             Ok(b"boom") => panic!("the service fell over"),
             Ok(b"fail") => Err(std::io::Error::other("the service gave up")),
             _ => {
-                ctx.reply().extend_from_slice(b"fine\n");
+                driver.reply().extend_from_slice(b"fine\n");
                 Ok(Flow::Continue)
             }
         }
@@ -1722,11 +1722,11 @@ impl Service for Wide {
     fn decoder(&self) -> Lines {
         Lines::new(40 << 10, Ending::LfOrCrlf)
     }
-    fn on_open(&mut self, _: &(), ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
-        ctx.reply().extend_from_slice(b"hello\n");
+    fn on_open(&mut self, _: &(), driver: &mut Driver<'_>) -> Result<Flow, Infallible> {
+        driver.reply().extend_from_slice(b"hello\n");
         Ok(Flow::Continue)
     }
-    fn on_item(&mut self, _: Result<Vec<u8>, LineError>, _: &(), _: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
+    fn on_item(&mut self, _: Result<Vec<u8>, LineError>, _: &(), _: &mut Driver<'_>) -> Result<Flow, Infallible> {
         Ok(Flow::Continue)
     }
 }
@@ -1834,12 +1834,12 @@ impl Service for Dice {
     fn decoder(&self) -> Lines {
         Lines::new(64, Ending::LfOrCrlf)
     }
-    fn on_open(&mut self, _: &(), ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
-        let n = ctx.random_u64();
-        ctx.reply().extend_from_slice(format!("{n}\n").as_bytes());
+    fn on_open(&mut self, _: &(), driver: &mut Driver<'_>) -> Result<Flow, Infallible> {
+        let n = driver.random_u64();
+        driver.reply().extend_from_slice(format!("{n}\n").as_bytes());
         Ok(Flow::Close)
     }
-    fn on_item(&mut self, _: Result<Vec<u8>, LineError>, _: &(), _: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
+    fn on_item(&mut self, _: Result<Vec<u8>, LineError>, _: &(), _: &mut Driver<'_>) -> Result<Flow, Infallible> {
         Ok(Flow::Continue)
     }
 }
@@ -1936,16 +1936,16 @@ fn hosts_and_members_share_a_lan_on_the_net() {
         fn decoder(&self) -> Lines {
             Lines::new(64, Ending::LfOrCrlf)
         }
-        fn on_open(&mut self, _: &SocketAddr, ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
-            ctx.set_timer("tick", Duration::from_millis(20));
+        fn on_open(&mut self, _: &SocketAddr, driver: &mut Driver<'_>) -> Result<Flow, Infallible> {
+            driver.set_timer("tick", Duration::from_millis(20));
             Ok(Flow::Continue)
         }
-        fn on_item(&mut self, _: Result<Vec<u8>, LineError>, _: &SocketAddr, _: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
+        fn on_item(&mut self, _: Result<Vec<u8>, LineError>, _: &SocketAddr, _: &mut Driver<'_>) -> Result<Flow, Infallible> {
             Ok(Flow::Continue)
         }
-        fn on_timer(&mut self, _: Timer, group: &SocketAddr, ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
-            ctx.send_to(*group, b"tick".to_vec());
-            ctx.set_timer("tick", Duration::from_millis(20));
+        fn on_timer(&mut self, _: Timer, group: &SocketAddr, driver: &mut Driver<'_>) -> Result<Flow, Infallible> {
+            driver.send_to(*group, b"tick".to_vec());
+            driver.set_timer("tick", Duration::from_millis(20));
             Ok(Flow::Continue)
         }
     }

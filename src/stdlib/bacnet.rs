@@ -2950,11 +2950,11 @@ mod tests {
             for n in 0..ib.len() {
                 assert!(IAm::parse(&ib[..n]).is_err());
             }
-            let mut ctx = Vec::new();
-            ContextValue::<{ tag::UNSIGNED }> { number: r % 40, value: Value::Unsigned(u64::from(rng.next() as u8) << (r % 56)) }.write(&mut ctx).unwrap();
-            check_prefixes(&ctx);
-            for n in 0..ctx.len() {
-                assert!(ContextValue::<{ tag::UNSIGNED }>::parse(&ctx[..n]).is_err());
+            let mut encoded = Vec::new();
+            ContextValue::<{ tag::UNSIGNED }> { number: r % 40, value: Value::Unsigned(u64::from(rng.next() as u8) << (r % 56)) }.write(&mut encoded).unwrap();
+            check_prefixes(&encoded);
+            for n in 0..encoded.len() {
+                assert!(ContextValue::<{ tag::UNSIGNED }>::parse(&encoded[..n]).is_err());
             }
         }
     }

@@ -29,7 +29,7 @@
 //! ```
 //! use fictionet::stdlib::codec::{Ending, LineError, Lines};
 //! use fictionet::events::Event;
-//! use fictionet::stdlib::serve::{Flow, Harness, Service, ServeCtx};
+//! use fictionet::stdlib::serve::{Flow, Harness, Service, Driver};
 //!
 //! struct Echo;
 //! impl Service for Echo {
@@ -37,14 +37,14 @@
 //!     type State = ();
 //!     type Error = std::convert::Infallible;
 //!     fn decoder(&self) -> Lines { Lines::new(1024, Ending::LfOrCrlf) }
-//!     fn on_item(&mut self, line: Result<Vec<u8>, LineError>, _: &(), ctx: &mut ServeCtx<'_>) -> Result<Flow, Self::Error> {
+//!     fn on_item(&mut self, line: Result<Vec<u8>, LineError>, _: &(), driver: &mut Driver<'_>) -> Result<Flow, Self::Error> {
 //!         let line = line.unwrap_or_default();
 //!         if line == b"quit" {
 //!             return Ok(Flow::Close);
 //!         }
-//!         ctx.log(Event::new("echo", "line").field("bytes", line.len() as u64));
-//!         ctx.reply().extend_from_slice(&line);
-//!         ctx.reply().push(b'\n');
+//!         driver.log(Event::new("echo", "line").field("bytes", line.len() as u64));
+//!         driver.reply().extend_from_slice(&line);
+//!         driver.reply().push(b'\n');
 //!         Ok(Flow::Continue)
 //!     }
 //! }
@@ -66,7 +66,7 @@
 //! # impl serve::Service for Echo {
 //! #     type Decoder = fictionet::stdlib::codec::Lines; type State = (); type Error = std::convert::Infallible;
 //! #     fn decoder(&self) -> Self::Decoder { fictionet::stdlib::codec::Lines::new(64, fictionet::stdlib::codec::Ending::LfOrCrlf) }
-//! #     fn on_item(&mut self, _: Result<Vec<u8>, fictionet::stdlib::codec::LineError>, _: &(), _: &mut serve::ServeCtx<'_>) -> std::result::Result<serve::Flow, Self::Error> { Ok(serve::Flow::Continue) }
+//! #     fn on_item(&mut self, _: Result<Vec<u8>, fictionet::stdlib::codec::LineError>, _: &(), _: &mut serve::Driver<'_>) -> std::result::Result<serve::Flow, Self::Error> { Ok(serve::Flow::Continue) }
 //! # }
 //! # fn world(fcx: &Cx, side: fictionet::End) -> Result {
 //! let (tcp, _udp, _icmp, _other) = ip::split_protocols(fcx, side);
@@ -96,17 +96,17 @@
 //!   [`Fail::Stuck`]. Input the buffer cannot take (a failed allocation,
 //!   a datagram larger than the buffer) fails with [`Fail::Refused`].
 //!   [`Service::on_fail`] hears both.
-//! - **Timers.** [`ServeCtx::set_timer`] arms a named timer; several can
+//! - **Timers.** [`Driver::set_timer`] arms a named timer; several can
 //!   run at once. Each counts from when the call's reply is written. A due
 //!   timer is handled before more input is read, so a client that never
 //!   stops sending cannot starve a heartbeat.
-//! - **Wakes.** [`ServeCtx::wake_handle`] gives a handle the world or
+//! - **Wakes.** [`Driver::wake_handle`] gives a handle the world or
 //!   another connection keeps; [`WakeHandle::wake`] calls
 //!   [`Service::on_wake`] in this connection's task, for a fill pushed to
 //!   a trader or a notification pushed to a client.
-//! - **Deferred work.** [`ServeCtx::defer`] hands the driver async work
+//! - **Deferred work.** [`Driver::defer`] hands the driver async work
 //!   whose bytes it writes, in order, before it reads on (an HTTP/1
-//!   response from a tower service). [`ServeCtx::defer_keyed`] starts work
+//!   response from a tower service). [`Driver::defer_keyed`] starts work
 //!   that runs beside the reads and the other keyed work, each writing
 //!   whole frames as they come, and [`Service::on_done`] hears when one
 //!   ends: concurrent responses, as HTTP/2 streams need.
@@ -194,33 +194,33 @@ pub trait Service: Send + 'static {
     /// The connection is open and nothing is read yet. A protocol whose
     /// server speaks first (SSH, SMTP, FTP banners) writes here. Called
     /// again after [`Upgrade::Tls`], once the handshake is done:
-    /// `ctx.conn().tls` is then true.
-    fn on_open(&mut self, _state: &Self::State, _ctx: &mut ServeCtx<'_>) -> Result<Flow, Self::Error> {
+    /// `driver.conn().tls` is then true.
+    fn on_open(&mut self, _state: &Self::State, _ctx: &mut Driver<'_>) -> Result<Flow, Self::Error> {
         Ok(Flow::Continue)
     }
 
-    /// One decoded item. Append reply bytes with [`ServeCtx::reply`].
+    /// One decoded item. Append reply bytes with [`Driver::reply`].
     fn on_item(
         &mut self,
         item: <Self::Decoder as Decode>::Item,
         state: &Self::State,
-        ctx: &mut ServeCtx<'_>,
+        driver: &mut Driver<'_>,
     ) -> Result<Flow, Self::Error>;
 
-    /// The timer named `timer`, set with [`ServeCtx::set_timer`], went off.
-    fn on_timer(&mut self, _timer: Timer, _state: &Self::State, _ctx: &mut ServeCtx<'_>) -> Result<Flow, Self::Error> {
+    /// The timer named `timer`, set with [`Driver::set_timer`], went off.
+    fn on_timer(&mut self, _timer: Timer, _state: &Self::State, _ctx: &mut Driver<'_>) -> Result<Flow, Self::Error> {
         Ok(Flow::Continue)
     }
 
     /// The connection's [`WakeHandle`] was woken. Several wakes before the
     /// driver gets to it are one call.
-    fn on_wake(&mut self, _state: &Self::State, _ctx: &mut ServeCtx<'_>) -> Result<Flow, Self::Error> {
+    fn on_wake(&mut self, _state: &Self::State, _ctx: &mut Driver<'_>) -> Result<Flow, Self::Error> {
         Ok(Flow::Continue)
     }
 
-    /// Work started with [`ServeCtx::defer_keyed`] under `key` ended, as
+    /// Work started with [`Driver::defer_keyed`] under `key` ended, as
     /// `done` says. Not called for work the service cancelled or replaced.
-    fn on_done(&mut self, _key: u64, _done: Done, _state: &Self::State, _ctx: &mut ServeCtx<'_>) -> Result<Flow, Self::Error> {
+    fn on_done(&mut self, _key: u64, _done: Done, _state: &Self::State, _ctx: &mut Driver<'_>) -> Result<Flow, Self::Error> {
         Ok(Flow::Continue)
     }
 
@@ -230,7 +230,7 @@ pub trait Service: Send + 'static {
         &mut self,
         _error: &Fail<<Self::Decoder as Decode>::Error>,
         _state: &Self::State,
-        _ctx: &mut ServeCtx<'_>,
+        _ctx: &mut Driver<'_>,
     ) -> Result<(), Self::Error> {
         Ok(())
     }
@@ -239,12 +239,12 @@ pub trait Service: Send + 'static {
     /// the bytes after it belong to something else. [`Flow::Continue`]
     /// goes on with a fresh decoder, as [`Upgrade::Decoder`] does. The
     /// default hands the connection back ([`Upgrade::Handoff`]).
-    fn on_decoder_end(&mut self, _state: &Self::State, _ctx: &mut ServeCtx<'_>) -> Result<Flow, Self::Error> {
+    fn on_decoder_end(&mut self, _state: &Self::State, _ctx: &mut Driver<'_>) -> Result<Flow, Self::Error> {
         Ok(Flow::Upgrade(Upgrade::Handoff))
     }
 
     /// The connection ended, for the reason in `end`. Called once, last.
-    fn on_end(&mut self, _end: Ended, _state: &Self::State, _ctx: &mut ServeCtx<'_>) -> Result<(), Self::Error> {
+    fn on_end(&mut self, _end: Ended, _state: &Self::State, _ctx: &mut Driver<'_>) -> Result<(), Self::Error> {
         Ok(())
     }
 
@@ -358,8 +358,8 @@ pub enum Done {
     Failed(fictionet::Error),
 }
 
-/// Async work a service hands the driver with [`ServeCtx::defer`] or
-/// [`ServeCtx::defer_keyed`]: bytes to write as they come, such as a
+/// Async work a service hands the driver with [`Driver::defer`] or
+/// [`Driver::defer_keyed`]: bytes to write as they come, such as a
 /// response from a tower service.
 pub trait Pending: Send + 'static {
     /// The next bytes to write, or `None` when done. Keyed work yields
@@ -369,13 +369,13 @@ pub trait Pending: Send + 'static {
     /// framing; on keyed work it ends that work ([`Done::Failed`]).
     ///
     /// The driver polls the work again only once the bytes it returned
-    /// were written, so [`PendingCtx::written`] then counts them.
-    fn poll_next(&mut self, ctx: &mut PendingCtx<'_>, cx: &mut Context<'_>) -> Poll<Option<Result<Vec<u8>, fictionet::Error>>>;
+    /// were written, so [`PendingDriver::written`] then counts them.
+    fn poll_next(&mut self, driver: &mut PendingDriver<'_>, cx: &mut Context<'_>) -> Poll<Option<Result<Vec<u8>, fictionet::Error>>>;
 
     /// The connection went away, the world is stopping, or the service
     /// cancelled the work, before it finished. The work is dropped after
     /// this.
-    fn cancel(&mut self, _ctx: &mut PendingCtx<'_>) {}
+    fn cancel(&mut self, _ctx: &mut PendingDriver<'_>) {}
 
     /// Bytes the work holds while it waits, such as a response body not
     /// yet returned. Charged to the connection's [`Budget`]. Default 0.
@@ -385,7 +385,7 @@ pub trait Pending: Send + 'static {
 }
 
 /// What deferred work sees while it runs.
-pub struct PendingCtx<'a> {
+pub struct PendingDriver<'a> {
     fcx: Option<&'a Cx>,
     events: &'a mut Vec<Event>,
     written: u64,
@@ -393,7 +393,7 @@ pub struct PendingCtx<'a> {
     close: bool,
 }
 
-impl PendingCtx<'_> {
+impl PendingDriver<'_> {
     /// The connection's context, for async work. `None` in a [`Harness`]
     /// made without one ([`Harness::with_fcx`]).
     pub fn fcx(&self) -> Option<&Cx> {
@@ -425,7 +425,7 @@ impl PendingCtx<'_> {
 
 /// Wakes one connection's service from anywhere: the world, another
 /// connection, a scenario step. Cheap to clone. Get one with
-/// [`ServeCtx::wake_handle`] and keep it where the event happens, such as
+/// [`Driver::wake_handle`] and keep it where the event happens, such as
 /// in an order book next to the order it belongs to.
 ///
 /// Each [`wake`](Self::wake) asks for one [`Service::on_wake`]; wakes
@@ -592,17 +592,17 @@ impl Drop for Charge {
     }
 }
 
-/// The driver's scratch for one call: the reply, the clock reading the
-/// driver took, seeded randomness, the events to record, and what the
-/// call asked for.
-pub struct ServeCtx<'a> {
+/// The service's side of the driver, for one call: the reply, the clock
+/// reading the driver took, seeded randomness, the events to record, and
+/// what the call asked for. Every [`Service`] method takes it as `driver`.
+pub struct Driver<'a> {
     s: &'a mut Scratch,
     now: Instant,
     conn: &'a ConnInfo,
     timers: &'a [(Timer, Instant)],
 }
 
-impl ServeCtx<'_> {
+impl Driver<'_> {
     /// Bytes to send, after anything already there. Over UDP, they go to
     /// the sender of the datagram being handled, as one datagram.
     pub fn reply(&mut self) -> &mut Vec<u8> {
@@ -979,7 +979,7 @@ pub struct ServeOptions {
     pub read_buffer: usize,
     /// The bytes each connection's holdings are charged to. Default none.
     pub budget: Option<Budget>,
-    /// The seed every connection's randomness ([`ServeCtx::random_u64`])
+    /// The seed every connection's randomness ([`Driver::random_u64`])
     /// is drawn from, mixed with its number ([`conn_seed`]). Default 0.
     pub seed: u64,
     /// Names the sandbox each datagram came from, in its [`ConnInfo`].
@@ -1401,7 +1401,7 @@ struct Work {
     id: u64,
     pending: Box<dyn Pending>,
     written: u64,
-    /// Close the connection once it is done ([`PendingCtx::close`]).
+    /// Close the connection once it is done ([`PendingDriver::close`]).
     close: bool,
 }
 
@@ -1518,7 +1518,7 @@ where
             }
             self.charge = Some(charge);
         }
-        self.call(now, |ctx| service.on_open(state, ctx));
+        self.call(now, |driver| service.on_open(state, driver));
     }
 
     /// The bytes this connection holds, as charged to its budget.
@@ -1650,14 +1650,14 @@ where
         }
     }
 
-    fn pending_ctx<'a>(fcx: Option<&'a Cx>, events: &'a mut Vec<Event>, written: u64, conn: &'a ConnInfo) -> PendingCtx<'a> {
-        PendingCtx { fcx, events, written, conn, close: false }
+    fn pending_ctx<'a>(fcx: Option<&'a Cx>, events: &'a mut Vec<Event>, written: u64, conn: &'a ConnInfo) -> PendingDriver<'a> {
+        PendingDriver { fcx, events, written, conn, close: false }
     }
 
     fn cancel_work(&mut self, mut work: Work) {
         let mut events = Vec::new();
-        let mut ctx = Self::pending_ctx(self.fcx.as_ref(), &mut events, work.written, &self.info);
-        work.pending.cancel(&mut ctx);
+        let mut driver = Self::pending_ctx(self.fcx.as_ref(), &mut events, work.written, &self.info);
+        work.pending.cancel(&mut driver);
         self.s.events.append(&mut events);
     }
 
@@ -1703,10 +1703,10 @@ where
 
     /// Calls the service with a context for this call, then takes what it
     /// asked for.
-    fn call(&mut self, now: Instant, f: impl FnOnce(&mut ServeCtx<'_>) -> Result<Flow, S::Error>) {
+    fn call(&mut self, now: Instant, f: impl FnOnce(&mut Driver<'_>) -> Result<Flow, S::Error>) {
         let result = {
-            let mut ctx = ServeCtx { s: &mut self.s, now, conn: &self.info, timers: &self.timers };
-            f(&mut ctx)
+            let mut driver = Driver { s: &mut self.s, now, conn: &self.info, timers: &self.timers };
+            f(&mut driver)
         };
         match result {
             Err(e) => {
@@ -1761,8 +1761,8 @@ where
     fn failed(&mut self, service: &mut S, state: &S::State, now: Instant, fail: Fail<<S::Decoder as Decode>::Error>) {
         self.s.unread = self.stream.unread().to_vec();
         let result = {
-            let mut ctx = ServeCtx { s: &mut self.s, now, conn: &self.info, timers: &self.timers };
-            service.on_fail(&fail, state, &mut ctx)
+            let mut driver = Driver { s: &mut self.s, now, conn: &self.info, timers: &self.timers };
+            service.on_fail(&fail, state, &mut driver)
         };
         self.s.unread = Vec::new();
         self.decode_fail = Some(fail);
@@ -1834,11 +1834,11 @@ where
         // A due timer before more input, so input cannot starve it.
         if let Some(i) = due(&self.timers, now) {
             let (name, _) = self.timers.remove(i);
-            self.call(now, |ctx| service.on_timer(name, state, ctx));
+            self.call(now, |driver| service.on_timer(name, state, driver));
             return Next::Again;
         }
         if self.s.wake.take() {
-            self.call(now, |ctx| service.on_wake(state, ctx));
+            self.call(now, |driver| service.on_wake(state, driver));
             return Next::Again;
         }
         if let Some(idle) = self.idle
@@ -1856,7 +1856,7 @@ where
             match self.next_item() {
                 Some(Ok(item)) => {
                     self.idle_from = now;
-                    self.call(now, |ctx| service.on_item(item, state, ctx));
+                    self.call(now, |driver| service.on_item(item, state, driver));
                     return Next::Again;
                 }
                 Some(Err(fail)) => {
@@ -1875,7 +1875,7 @@ where
                 } else {
                     // The decoder ended: the rest belongs to what comes
                     // next, which the service decides.
-                    self.call(now, |ctx| service.on_decoder_end(state, ctx).map(|f| if f == Flow::Continue { Flow::Upgrade(Upgrade::Decoder) } else { f }));
+                    self.call(now, |driver| service.on_decoder_end(state, driver).map(|f| if f == Flow::Continue { Flow::Upgrade(Upgrade::Decoder) } else { f }));
                 }
                 return Next::Again;
             }
@@ -1911,8 +1911,8 @@ where
         }
         self.state = State::Ending { end, called: true };
         let result = {
-            let mut ctx = ServeCtx { s: &mut self.s, now, conn: &self.info, timers: &self.timers };
-            service.on_end(end, state, &mut ctx)
+            let mut driver = Driver { s: &mut self.s, now, conn: &self.info, timers: &self.timers };
+            service.on_end(end, state, &mut driver)
         };
         if let Err(e) = result {
             self.failure.get_or_insert(Failure::Service(e));
@@ -1937,8 +1937,8 @@ where
         if let Some(work) = self.ordered.front_mut() {
             let mut events = Vec::new();
             let (polled, close) = {
-                let mut ctx = PendingCtx { fcx: self.fcx.as_ref(), events: &mut events, written: work.written, conn: &self.info, close: false };
-                (work.pending.poll_next(&mut ctx, cx), ctx.close)
+                let mut driver = PendingDriver { fcx: self.fcx.as_ref(), events: &mut events, written: work.written, conn: &self.info, close: false };
+                (work.pending.poll_next(&mut driver, cx), driver.close)
             };
             work.close |= close;
             let (id, close) = (work.id, work.close);
@@ -1972,8 +1972,8 @@ where
             let mut events = Vec::new();
             let (polled, close) = {
                 let (_, work) = &mut self.keyed[i];
-                let mut ctx = PendingCtx { fcx: self.fcx.as_ref(), events: &mut events, written: work.written, conn: &self.info, close: false };
-                (work.pending.poll_next(&mut ctx, cx), ctx.close)
+                let mut driver = PendingDriver { fcx: self.fcx.as_ref(), events: &mut events, written: work.written, conn: &self.info, close: false };
+                (work.pending.poll_next(&mut driver, cx), driver.close)
             };
             self.keyed[i].1.close |= close;
             self.s.events.append(&mut events);
@@ -1995,7 +1995,7 @@ where
             let (key, work) = self.keyed.remove(i);
             progress = true;
             self.idle_from = now;
-            self.call(now, |ctx| service.on_done(key, done, state, ctx));
+            self.call(now, |driver| service.on_done(key, done, state, driver));
             if work.close {
                 self.finish_after_work();
             }
@@ -2531,7 +2531,7 @@ impl Drop for Counted {
 /// Each datagram is decoded on its own, with a fresh decoder that sees the
 /// end of input after it, as DNS, DHCP, Kerberos and Modbus over UDP frame
 /// their messages. The reply bytes of one datagram's items go back to its
-/// sender as one datagram; [`ServeCtx::send_to`] sends more, to anyone.
+/// sender as one datagram; [`Driver::send_to`] sends more, to anyone.
 /// The service's [`ConnInfo`] names the sender in `peer`, with
 /// [`Transport::Udp`]. [`Service::on_open`] is called once at the start,
 /// timers and wakes work as over a connection (with no sender: use
@@ -2559,11 +2559,11 @@ where
                   timers: &[(Timer, Instant)],
                   socket: &mut Socket,
                   info: &ConnInfo,
-                  f: &mut dyn FnMut(&mut ServeCtx<'_>) -> Result<Flow, S::Error>|
+                  f: &mut dyn FnMut(&mut Driver<'_>) -> Result<Flow, S::Error>|
      -> Flow {
         let result = {
-            let mut ctx = ServeCtx { s: &mut *s, now: fcx.now(), conn: info, timers };
-            f(&mut ctx)
+            let mut driver = Driver { s: &mut *s, now: fcx.now(), conn: info, timers };
+            f(&mut driver)
         };
         for event in std::mem::take(&mut s.events) {
             record(fcx, info, event);
@@ -2583,7 +2583,7 @@ where
         s.keyed.clear();
         flow
     };
-    called(&mut s, &timers, &mut socket, &base, &mut |ctx| service.on_open(state, ctx));
+    called(&mut s, &timers, &mut socket, &base, &mut |driver| service.on_open(state, driver));
     s.reply.clear();
     let mut run = 0u32;
     let ended = loop {
@@ -2591,12 +2591,12 @@ where
         arm(&mut timers, &mut s.timers, now);
         if let Some(i) = due(&timers, now) {
             let (name, _) = timers.remove(i);
-            called(&mut s, &timers, &mut socket, &base, &mut |ctx| service.on_timer(name, state, ctx));
+            called(&mut s, &timers, &mut socket, &base, &mut |driver| service.on_timer(name, state, driver));
             s.reply.clear();
             continue;
         }
         if wake.take() {
-            called(&mut s, &timers, &mut socket, &base, &mut |ctx| service.on_wake(state, ctx));
+            called(&mut s, &timers, &mut socket, &base, &mut |driver| service.on_wake(state, driver));
             s.reply.clear();
             continue;
         }
@@ -2637,14 +2637,14 @@ where
             let flow = match stream.next() {
                 Some(Ok(item)) => {
                     let mut item = Some(item);
-                    called(&mut s, &timers, &mut socket, &info, &mut |ctx| match item.take() {
-                        Some(item) => service.on_item(item, state, ctx),
+                    called(&mut s, &timers, &mut socket, &info, &mut |driver| match item.take() {
+                        Some(item) => service.on_item(item, state, driver),
                         None => Ok(Flow::Close),
                     })
                 }
                 Some(Err(fail)) => {
                     s.unread = stream.unread().to_vec();
-                    let flow = called(&mut s, &timers, &mut socket, &info, &mut |ctx| service.on_fail(&fail, state, ctx).map(|()| Flow::Close));
+                    let flow = called(&mut s, &timers, &mut socket, &info, &mut |driver| service.on_fail(&fail, state, driver).map(|()| Flow::Close));
                     s.unread = Vec::new();
                     flow
                 }
@@ -2653,7 +2653,7 @@ where
                         // Longer than the decoder could hold at once.
                         let fail = Fail::Refused { unread: datagram.len(), limit: stream.limit() };
                         s.unread = datagram.clone();
-                        let flow = called(&mut s, &timers, &mut socket, &info, &mut |ctx| service.on_fail(&fail, state, ctx).map(|()| Flow::Close));
+                        let flow = called(&mut s, &timers, &mut socket, &info, &mut |driver| service.on_fail(&fail, state, driver).map(|()| Flow::Close));
                         s.unread = Vec::new();
                         flow
                     } else {
@@ -2797,7 +2797,7 @@ where
         self
     }
 
-    /// Gives deferred work a [`Cx`] ([`PendingCtx::fcx`]), for work that
+    /// Gives deferred work a [`Cx`] ([`PendingDriver::fcx`]), for work that
     /// sleeps or spawns.
     pub fn with_fcx(mut self, fcx: Cx) -> Harness<S> {
         self.core.fcx = Some(fcx);

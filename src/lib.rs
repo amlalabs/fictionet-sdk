@@ -174,7 +174,7 @@
 //! use fictionet::stdlib::httpd::{Router, Server};
 //! use fictionet::events::Event;
 //! use fictionet::stdlib::net::Net;
-//! use fictionet::stdlib::serve::{Flow, ServeCtx, Service};
+//! use fictionet::stdlib::serve::{Flow, Driver, Service};
 //!
 //! /// Echoes each line back.
 //! struct Echo;
@@ -186,11 +186,11 @@
 //!     fn decoder(&self) -> Lines {
 //!         Lines::new(1024, Ending::LfOrCrlf)
 //!     }
-//!     fn on_item(&mut self, line: std::result::Result<Vec<u8>, LineError>, _: &(), ctx: &mut ServeCtx<'_>) -> std::result::Result<Flow, Self::Error> {
+//!     fn on_item(&mut self, line: std::result::Result<Vec<u8>, LineError>, _: &(), driver: &mut Driver<'_>) -> std::result::Result<Flow, Self::Error> {
 //!         let line = line.unwrap_or_default();
-//!         ctx.log(Event::new("echo", "line").field("bytes", line.len() as u64));
-//!         ctx.reply().extend_from_slice(&line);
-//!         ctx.reply().push(b'\n');
+//!         driver.log(Event::new("echo", "line").field("bytes", line.len() as u64));
+//!         driver.reply().extend_from_slice(&line);
+//!         driver.reply().push(b'\n');
 //!         Ok(Flow::Continue)
 //!     }
 //! }

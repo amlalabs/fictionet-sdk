@@ -94,12 +94,12 @@ fuzz_target!(|data: &[u8]| {
     // Any bytes as the body of each message type, too.
     let bodies = (1..=6).map(|kind| Frame { kind, body: data.to_vec() });
     for f in frames.into_iter().chain(bodies) {
-        for ctx in CONTEXTS {
-            let strict = Message::decode(&f, &ctx);
+        for negotiated in CONTEXTS {
+            let strict = Message::decode(&f, &negotiated);
             // RFC 7606 closes the connection only for errors the strict
             // reader has too, and reads the same UPDATE when it has none.
             if f.kind == kind::UPDATE {
-                match Update::receive(&f.body, &ctx) {
+                match Update::receive(&f.body, &negotiated) {
                     Ok(r) => {
                         if r.withdraw.is_some() {
                             assert!(strict.is_err());
@@ -110,7 +110,7 @@ fuzz_target!(|data: &[u8]| {
                     }
                     Err(e) => {
                         assert!(strict.is_err());
-                        assert!(encode(&Message::Notification(e.notification().unwrap()), &ctx).is_ok());
+                        assert!(encode(&Message::Notification(e.notification().unwrap()), &negotiated).is_ok());
                     }
                 }
             }
@@ -119,38 +119,38 @@ fuzz_target!(|data: &[u8]| {
                 // routes, and reads back the same.
                 Ok(m) => {
                     if mixes(&m) {
-                        assert!(matches!(encode(&m, &ctx), Err(Error::Unwritable)));
+                        assert!(matches!(encode(&m, &negotiated), Err(Error::Unwritable)));
                         continue;
                     }
-                    let bytes = encode(&m, &ctx).unwrap();
+                    let bytes = encode(&m, &negotiated).unwrap();
                     let back = Frame::parse(&bytes).unwrap();
-                    assert_eq!(Message::decode(&back, &ctx), Ok(m));
+                    assert_eq!(Message::decode(&back, &negotiated), Ok(m));
                 }
                 // An error's notification can always be sent.
                 Err(e) => {
                     let n = Message::Notification(e.notification().unwrap());
-                    assert!(encode(&n, &ctx).is_ok());
+                    assert!(encode(&n, &negotiated).is_ok());
                 }
             }
         }
     }
     // The body readers on their own, given bodies of any length: what
     // they read can be written, and their errors can be sent.
-    let ctx = CONTEXTS[1];
-    let read = [Open::parse(data).map(Message::Open), Update::parse(data, &ctx).map(Message::Update)];
+    let negotiated = CONTEXTS[1];
+    let read = [Open::parse(data).map(Message::Open), Update::parse(data, &negotiated).map(Message::Update)];
     for r in read {
         match r {
-            Ok(m) => assert!(mixes(&m) || encode(&m, &ctx).is_ok()),
-            Err(e) => assert!(encode(&Message::Notification(e.notification().unwrap()), &ctx).is_ok()),
+            Ok(m) => assert!(mixes(&m) || encode(&m, &negotiated).is_ok()),
+            Err(e) => assert!(encode(&Message::Notification(e.notification().unwrap()), &negotiated).is_ok()),
         }
     }
     // An UPDATE built from public fields: a frame the writer gives fits in
     // a message and reads back as the same value.
     let u = Message::Update(update_from(data));
-    for ctx in CONTEXTS {
-        if let Ok(frame) = u.to_frame(&ctx) {
+    for negotiated in CONTEXTS {
+        if let Ok(frame) = u.to_frame(&negotiated) {
             assert!(frame.body.len() <= MAX_BODY_LEN);
-            assert_eq!(Message::decode(&frame, &ctx).as_ref(), Ok(&u));
+            assert_eq!(Message::decode(&frame, &negotiated).as_ref(), Ok(&u));
         }
     }
 });

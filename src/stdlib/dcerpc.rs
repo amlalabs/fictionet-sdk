@@ -1644,10 +1644,10 @@ mod tests {
         // C706 12.6.3.1: if_version is a u32, the major version in the low
         // 16 bits. Little-endian, that is major then minor as two u16s.
         let v = SyntaxId { uuid: Uuid::NIL, major: 3, minor: 1 };
-        let ctx = |s| Context { id: 0, abstract_syntax: s, transfer_syntaxes: vec![] };
+        let context = |s| Context { id: 0, abstract_syntax: s, transfer_syntaxes: vec![] };
         let mut p = Pdu::new(
             1,
-            Body::Bind(Bind { max_xmit_frag: 0, max_recv_frag: 0, assoc_group: 0, contexts: vec![ctx(v)] }),
+            Body::Bind(Bind { max_xmit_frag: 0, max_recv_frag: 0, assoc_group: 0, contexts: vec![context(v)] }),
         );
         let b = round_trip(&p);
         assert_eq!(b[48..52], [3, 0, 1, 0]);

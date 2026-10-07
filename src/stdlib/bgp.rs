@@ -61,9 +61,9 @@
 //! // The world answers as AS 4200000000, which needs four octets.
 //! let ours = Open::new(4_200_000_000, 90, Ipv4Addr::new(198, 51, 100, 1), vec![]);
 //! assert_eq!(ours.my_as, AS_TRANS);
-//! let ctx = Context::negotiated(&ours, &open);
-//! assert!(ctx.four_octet_as);
-//! let keepalive = Message::Keepalive.to_frame(&ctx).and_then(|frame| frame.to_bytes()).unwrap();
+//! let negotiated = Context::negotiated(&ours, &open);
+//! assert!(negotiated.four_octet_as);
+//! let keepalive = Message::Keepalive.to_frame(&negotiated).and_then(|frame| frame.to_bytes()).unwrap();
 //! assert_eq!(keepalive[16..], [0, 19, 4]);
 //!
 //! // Announce 203.0.113.0/24 with the world's AS as the whole path.
@@ -76,7 +76,7 @@
 //!     ],
 //!     nlri: vec![Prefix::new(Ipv4Addr::new(203, 0, 113, 0).into(), 24).unwrap()],
 //! };
-//! let bytes = Message::Update(update.clone()).to_frame(&ctx).and_then(|frame| frame.to_bytes()).unwrap();
+//! let bytes = Message::Update(update.clone()).to_frame(&negotiated).and_then(|frame| frame.to_bytes()).unwrap();
 //! // No withdrawn routes, then 20 bytes of attributes.
 //! assert_eq!(bytes[19..23], [0, 0, 0, 20]);
 //! // The prefix comes last: its length in bits, then 3 bytes.
@@ -84,7 +84,7 @@
 //!
 //! pump(&mut stream, &bytes, |frame| frames.push(frame)).unwrap();
 //! let frame = frames.pop().unwrap();
-//! assert_eq!(Message::decode(&frame, &ctx), Ok(Message::Update(update)));
+//! assert_eq!(Message::decode(&frame, &negotiated), Ok(Message::Update(update)));
 //! finish(&mut stream, |_| unreachable!()).unwrap();
 //! ```
 
@@ -589,18 +589,18 @@ pub enum Message {
 }
 
 impl Message {
-    /// Reads the message in `frame`. `ctx` says how AS numbers in an
+    /// Reads the message in `frame`. `negotiated` says how AS numbers in an
     /// UPDATE read and how a ROUTE-REFRESH of the wrong length is
     /// reported. An UPDATE is read as [`Update::parse`] reads it: every
     /// error is one that closes the connection. Pass the body of an UPDATE
     /// frame to [`Update::receive`] for the error handling of RFC 7606.
-    pub fn decode(frame: &Frame, ctx: &Context) -> Result<Message, Error> {
+    pub fn decode(frame: &Frame, negotiated: &Context) -> Result<Message, Error> {
         let len = frame.body.len().saturating_add(HEADER_LEN);
         let field = length_field(&frame.body);
         // RFC 7313 section 5: with enhanced route refresh, a refresh start
         // or end of the wrong length has its own error, with the message.
         if frame.kind == kind::ROUTE_REFRESH
-            && ctx.enhanced_route_refresh
+            && negotiated.enhanced_route_refresh
             && len <= MAX_MESSAGE_LEN
             && frame.body.len() != 4
             && matches!(frame.body.get(2), Some(1 | 2))
@@ -625,7 +625,7 @@ impl Message {
         let b = &frame.body[..];
         Ok(match frame.kind {
             kind::OPEN => Message::Open(Open::parse(b)?),
-            kind::UPDATE => Message::Update(Update::parse(b, ctx)?),
+            kind::UPDATE => Message::Update(Update::parse(b, negotiated)?),
             kind::NOTIFICATION => Message::Notification(Notification::parse(b).ok_or(Error::BadMessageLength(field))?),
             kind::KEEPALIVE => Message::Keepalive,
             _ => Message::RouteRefresh(RouteRefresh::parse(b).ok_or(Error::BadMessageLength(field))?),
@@ -644,11 +644,11 @@ impl Message {
     }
 
     /// The message as a frame, checked so that [`Message::decode`] reads
-    /// it back with the same `ctx`.
-    pub fn to_frame(&self, ctx: &Context) -> Result<Frame, Error> {
+    /// it back with the same `negotiated`.
+    pub fn to_frame(&self, negotiated: &Context) -> Result<Frame, Error> {
         let body = match self {
             Message::Open(o) => o.to_body()?,
-            Message::Update(u) => u.to_body(ctx)?,
+            Message::Update(u) => u.to_body(negotiated)?,
             Message::Notification(n) => n.to_body()?,
             Message::Keepalive => Vec::new(),
             Message::RouteRefresh(r) => r.to_body(),
@@ -1299,9 +1299,9 @@ impl Attribute {
     /// error: an AS4_PATH or AS4_AGGREGATOR in a four-octet session, or an
     /// AS4_PATH with no segments left once its confederation segments are
     /// dropped.
-    fn parse(flags: u8, kind: u8, v: &[u8], raw: &[u8], ctx: &Context) -> Result<Option<Attribute>, Error> {
+    fn parse(flags: u8, kind: u8, v: &[u8], raw: &[u8], negotiated: &Context) -> Result<Option<Attribute>, Error> {
         if kind == attr::AS4_PATH || kind == attr::AS4_AGGREGATOR {
-            return parse_as4(flags, kind, v, raw, ctx);
+            return parse_as4(flags, kind, v, raw, negotiated);
         }
         let Some(expected) = known_flags(kind) else {
             if flags & flag::OPTIONAL == 0 {
@@ -1330,7 +1330,7 @@ impl Attribute {
                 [c] => Attribute::Origin(Origin::from_code(*c).ok_or_else(|| Error::InvalidOrigin(raw.to_vec()))?),
                 _ => return Err(length()),
             },
-            attr::AS_PATH => Attribute::AsPath(parse_as_path(v, ctx.four_octet_as).ok_or(Error::MalformedAsPath)?),
+            attr::AS_PATH => Attribute::AsPath(parse_as_path(v, negotiated.four_octet_as).ok_or(Error::MalformedAsPath)?),
             attr::NEXT_HOP => {
                 let a = Ipv4Addr::from(u32_value()?);
                 if !host_address(a) {
@@ -1343,7 +1343,7 @@ impl Attribute {
             attr::ATOMIC_AGGREGATE if v.is_empty() => Attribute::AtomicAggregate,
             attr::ATOMIC_AGGREGATE => return Err(length()),
             attr::AGGREGATOR => {
-                let (asn, address) = match (v, ctx.four_octet_as) {
+                let (asn, address) = match (v, negotiated.four_octet_as) {
                     ([a, b, x @ ..], false) if x.len() == 4 => (u32::from(u16::from_be_bytes([*a, *b])), x),
                     ([a, b, c, d, x @ ..], true) if x.len() == 4 => (u32::from_be_bytes([*a, *b, *c, *d]), x),
                     _ => return Err(length()),
@@ -1369,13 +1369,13 @@ impl Attribute {
     }
 
     /// Writes the attribute, header and value, onto `out`.
-    fn write(&self, out: &mut Vec<u8>, ctx: &Context) -> Result<(), Error> {
+    fn write(&self, out: &mut Vec<u8>, negotiated: &Context) -> Result<(), Error> {
         let kind = self.kind();
         let mut v = Vec::new();
         let mut partial = false;
         match self {
             Attribute::Origin(o) => v.push(o.code()),
-            Attribute::AsPath(segments) => put_segments(&mut v, segments, ctx.four_octet_as)?,
+            Attribute::AsPath(segments) => put_segments(&mut v, segments, negotiated.four_octet_as)?,
             Attribute::NextHop(a) => {
                 if !host_address(*a) {
                     return Err(Error::Unwritable);
@@ -1388,7 +1388,7 @@ impl Attribute {
                 if *asn == 0 {
                     return Err(Error::Unwritable);
                 }
-                put_asn(&mut v, *asn, ctx.four_octet_as)?;
+                put_asn(&mut v, *asn, negotiated.four_octet_as)?;
                 v.extend_from_slice(&address.octets());
                 partial = *p;
             }
@@ -1439,12 +1439,12 @@ impl Attribute {
                 }
                 let flags = *flags;
                 if *kind == attr::AS4_PATH || *kind == attr::AS4_AGGREGATOR {
-                    if ctx.four_octet_as {
+                    if negotiated.four_octet_as {
                         return Err(Error::Unwritable);
                     }
                     // A reader keeps the attribute as it is only if it is
                     // well formed.
-                    match parse_as4(flags, *kind, value, &[], ctx) {
+                    match parse_as4(flags, *kind, value, &[], negotiated) {
                         Ok(Some(Attribute::Unknown { value: read, .. })) if read == *value => {}
                         _ => return Err(Error::Unwritable),
                     }
@@ -1463,8 +1463,8 @@ impl Attribute {
 /// is an `AttributeFlags` error, and a malformed one, or one naming AS 0
 /// (RFC 7607), an `OptionalAttribute` error; RFC 6793 drops the attribute
 /// for both. Confederation segments in an AS4_PATH are dropped.
-fn parse_as4(flags: u8, kind: u8, v: &[u8], raw: &[u8], ctx: &Context) -> Result<Option<Attribute>, Error> {
-    if ctx.four_octet_as {
+fn parse_as4(flags: u8, kind: u8, v: &[u8], raw: &[u8], negotiated: &Context) -> Result<Option<Attribute>, Error> {
+    if negotiated.four_octet_as {
         return Ok(None);
     }
     if flags & (flag::OPTIONAL | flag::TRANSITIVE) != flag::OPTIONAL | flag::TRANSITIVE {
@@ -1635,15 +1635,15 @@ fn missing(seen: &[bool; 256], nlri: bool) -> Option<u8> {
 
 impl Update {
     /// Reads an UPDATE's body, the bytes after the header, as RFC 4271
-    /// does: every error is one that closes the connection. `ctx` says how
+    /// does: every error is one that closes the connection. `negotiated` says how
     /// many octets an AS number takes. A body longer than
     /// [`MAX_BODY_LEN`] is a bad length. Two things RFC 6793 drops without
     /// an error are dropped here too: AS4_PATH and AS4_AGGREGATOR in a
     /// four-octet session, and malformed ones in a two-octet session.
     /// MP_REACH_NLRI and MP_UNREACH_NLRI come first in the attributes
     /// read, wherever they were in the message.
-    pub fn parse(b: &[u8], ctx: &Context) -> Result<Update, Error> {
-        read_update(b, ctx, true).map(|r| r.update)
+    pub fn parse(b: &[u8], negotiated: &Context) -> Result<Update, Error> {
+        read_update(b, negotiated, true).map(|r| r.update)
     }
 
     /// Reads an UPDATE's body with the error handling of RFC 7606, which
@@ -1652,8 +1652,8 @@ impl Update {
     /// For other errors it returns what it read and says what to do with
     /// it. LOCAL_PREF is handled as from an internal peer; a world peering
     /// with an external one drops it itself.
-    pub fn receive(b: &[u8], ctx: &Context) -> Result<Received, Error> {
-        read_update(b, ctx, false)
+    pub fn receive(b: &[u8], negotiated: &Context) -> Result<Received, Error> {
+        read_update(b, negotiated, false)
     }
 
     /// The attribute of type `kind`, if the UPDATE has one.
@@ -1661,7 +1661,7 @@ impl Update {
         self.attributes.iter().find(|a| a.kind() == kind)
     }
 
-    fn to_body(&self, ctx: &Context) -> Result<Vec<u8>, Error> {
+    fn to_body(&self, negotiated: &Context) -> Result<Vec<u8>, Error> {
         // RFC 7606 section 5.1: one kind of routes per UPDATE, and an
         // MP_REACH_NLRI or MP_UNREACH_NLRI first.
         let is_mp = |a: &Attribute| matches!(a, Attribute::MpReach(_) | Attribute::MpUnreach(_));
@@ -1683,7 +1683,7 @@ impl Update {
             if core::mem::replace(&mut seen[usize::from(a.kind())], true) {
                 return Err(Error::Unwritable);
             }
-            a.write(&mut out, ctx)?;
+            a.write(&mut out, negotiated)?;
         }
         let alen = (out.len() - at - 2) as u16;
         out[at..at + 2].copy_from_slice(&alen.to_be_bytes());
@@ -1741,7 +1741,7 @@ fn handling(kind: u8, e: &Error) -> Handling {
 
 /// Reads an UPDATE's body. `strict` returns the first error, as RFC 4271
 /// does; otherwise errors are handled as RFC 7606 says.
-fn read_update(b: &[u8], ctx: &Context, strict: bool) -> Result<Received, Error> {
+fn read_update(b: &[u8], negotiated: &Context, strict: bool) -> Result<Received, Error> {
     if b.len() > MAX_BODY_LEN {
         return Err(Error::BadMessageLength(length_field(b)));
     }
@@ -1793,7 +1793,7 @@ fn read_update(b: &[u8], ctx: &Context, strict: bool) -> Result<Received, Error>
             discarded.push(Error::MalformedAttributeList);
             continue;
         }
-        match Attribute::parse(flags, kind, value, raw, ctx) {
+        match Attribute::parse(flags, kind, value, raw, negotiated) {
             Ok(Some(a)) => {
                 have[usize::from(kind)] = true;
                 attributes.push(a);
@@ -1966,14 +1966,14 @@ mod tests {
         out
     }
 
-    fn decode(bytes: &[u8], ctx: &Context) -> Result<Message, Error> {
+    fn decode(bytes: &[u8], negotiated: &Context) -> Result<Message, Error> {
         let Step::Item(frame, used) = Frames.decode(bytes, true)? else { panic!("a whole frame") };
         assert_eq!(used, bytes.len());
-        Message::decode(&frame, ctx)
+        Message::decode(&frame, negotiated)
     }
 
-    fn update_body(body: &[u8], ctx: &Context) -> Result<Message, Error> {
-        Message::decode(&Frame { kind: kind::UPDATE, body: body.to_vec() }, ctx)
+    fn update_body(body: &[u8], negotiated: &Context) -> Result<Message, Error> {
+        Message::decode(&Frame { kind: kind::UPDATE, body: body.to_vec() }, negotiated)
     }
 
     fn v4(a: u8, b: u8, c: u8, d: u8, len: u8) -> Prefix {
@@ -2571,8 +2571,8 @@ mod tests {
     fn writers_refuse_what_readers_refuse() {
         let id = Ipv4Addr::new(10, 0, 0, 1);
         let open = |p: Vec<Parameter>| Message::Open(Open { my_as: 1, hold_time: 90, bgp_id: id, parameters: p });
-        let bad = |m: Message, ctx: &Context| encode(&m, ctx).unwrap_err();
-        let invalid = |m: Message, ctx: &Context| matches!(bad(m, ctx), Error::Unwritable);
+        let bad = |m: Message, negotiated: &Context| encode(&m, negotiated).unwrap_err();
+        let invalid = |m: Message, negotiated: &Context| matches!(bad(m, negotiated), Error::Unwritable);
         assert!(invalid(Message::Open(Open { hold_time: 2, ..Open::new(1, 0, id, vec![]) }), &TWO));
         assert!(invalid(Message::Open(Open::new(1, 0, Ipv4Addr::UNSPECIFIED, vec![])), &TWO));
         assert!(invalid(open(vec![Parameter::Other { kind: 2, value: vec![] }]), &TWO));
@@ -2681,26 +2681,26 @@ mod tests {
 
     #[test]
     fn samples_round_trip() {
-        for (b, ctx) in samples() {
-            let m = decode(&b, &ctx).unwrap();
+        for (b, negotiated) in samples() {
+            let m = decode(&b, &negotiated).unwrap();
             if let Message::Open(open) = &m { contract::check_wire_value(open); }
-            assert_eq!(encode(&m, &ctx).unwrap(), b, "{m:?}");
+            assert_eq!(encode(&m, &negotiated).unwrap(), b, "{m:?}");
         }
     }
 
     #[test]
     fn every_truncated_prefix_waits_for_more() {
-        for (b, ctx) in samples() {
+        for (b, negotiated) in samples() {
             for n in 0..b.len() {
                 assert_eq!(Frames.decode(&b[..n], false), Ok(Step::Need), "{n} of {} bytes", b.len());
             }
             // Bodies cut short never read as the whole message, and never
             // panic.
             let frame = Frame::parse(&b).unwrap();
-            let whole = Message::decode(&frame, &ctx).unwrap();
+            let whole = Message::decode(&frame, &negotiated).unwrap();
             for n in 0..frame.body.len() {
                 let cut = Frame { kind: frame.kind, body: frame.body[..n].to_vec() };
-                if let Ok(m) = Message::decode(&cut, &ctx) {
+                if let Ok(m) = Message::decode(&cut, &negotiated) {
                     assert_ne!(m, whole);
                 }
             }
@@ -2750,10 +2750,10 @@ mod tests {
     /// error handling of RFC 7606 closes the connection only for errors
     /// the strict reader has too.
     fn check_frame(frame: &Frame) {
-        for ctx in [TWO, FOUR] {
+        for negotiated in [TWO, FOUR] {
             if frame.kind == kind::UPDATE {
-                let strict = Message::decode(frame, &ctx);
-                match Update::receive(&frame.body, &ctx) {
+                let strict = Message::decode(frame, &negotiated);
+                match Update::receive(&frame.body, &negotiated) {
                     Ok(r) => {
                         if r.withdraw.is_some() {
                             assert!(strict.is_err());
@@ -2764,22 +2764,22 @@ mod tests {
                     }
                     Err(e) => {
                         assert!(strict.is_err());
-                        assert!(encode(&Message::Notification(e.notification().unwrap()), &ctx).is_ok());
+                        assert!(encode(&Message::Notification(e.notification().unwrap()), &negotiated).is_ok());
                     }
                 }
             }
-            if let Ok(m) = Message::decode(frame, &ctx) {
+            if let Ok(m) = Message::decode(frame, &negotiated) {
                 if mixes(&m) {
-                    assert!(matches!(encode(&m, &ctx), Err(Error::Unwritable)));
+                    assert!(matches!(encode(&m, &negotiated), Err(Error::Unwritable)));
                     continue;
                 }
-                let bytes = encode(&m, &ctx).unwrap_or_else(|e| panic!("{m:?} cannot be written: {e}"));
+                let bytes = encode(&m, &negotiated).unwrap_or_else(|e| panic!("{m:?} cannot be written: {e}"));
                 assert!(bytes.len() <= MAX_MESSAGE_LEN);
                 let back = Frame::parse(&bytes).unwrap();
-                assert_eq!(Message::decode(&back, &ctx), Ok(m));
-            } else if let Err(e) = Message::decode(frame, &ctx) {
+                assert_eq!(Message::decode(&back, &negotiated), Ok(m));
+            } else if let Err(e) = Message::decode(frame, &negotiated) {
                 let n = e.notification().unwrap();
-                assert!(encode(&Message::Notification(n), &ctx).is_ok());
+                assert!(encode(&Message::Notification(n), &negotiated).is_ok());
             }
         }
     }
@@ -3138,8 +3138,8 @@ mod tests {
 
     #[test]
     fn review_as4_attributes_are_checked() {
-        let with = |raw: &[u8], ctx: &Context| {
-            let Ok(Message::Update(u)) = update_body(&route_with(raw), ctx) else { panic!("{raw:?}") };
+        let with = |raw: &[u8], negotiated: &Context| {
+            let Ok(Message::Update(u)) = update_body(&route_with(raw), negotiated) else { panic!("{raw:?}") };
             u.attributes.len()
         };
         let path = [0xc0, 17, 6, 2, 1, 0, 1, 0, 0];
@@ -3179,10 +3179,10 @@ mod tests {
         };
         assert_eq!(u.attributes[3], Attribute::Unknown { flags: 0xc0, kind: 17, value: vec![2, 1, 0, 1, 0, 0] });
         // Writers refuse what readers drop.
-        let route = |a: Attribute, ctx: &Context| {
+        let route = |a: Attribute, negotiated: &Context| {
             let mut u = Update::parse(&route_with(&[]), &TWO).unwrap();
             u.attributes.push(a);
-            encode(&Message::Update(u), ctx)
+            encode(&Message::Update(u), negotiated)
         };
         let unknown = |flags, kind, value: &[u8]| Attribute::Unknown { flags, kind, value: value.to_vec() };
         assert!(route(unknown(0xc0, 17, &path[3..]), &TWO).is_ok());
@@ -3196,9 +3196,9 @@ mod tests {
 
     #[test]
     fn review_enhanced_route_refresh_length() {
-        let ctx = Context { enhanced_route_refresh: true, ..TWO };
+        let negotiated = Context { enhanced_route_refresh: true, ..TWO };
         let frame = Frame { kind: kind::ROUTE_REFRESH, body: vec![0, 2, 1, 1, 0] };
-        let Err(e) = Message::decode(&frame, &ctx) else { panic!() };
+        let Err(e) = Message::decode(&frame, &negotiated) else { panic!() };
         let mut whole = header(24, 5);
         whole.extend_from_slice(&frame.body);
         assert_eq!(e, Error::RouteRefreshLength(whole.clone()));
@@ -3208,11 +3208,11 @@ mod tests {
         // error.
         assert_eq!(Message::decode(&frame, &TWO), Err(Error::BadMessageLength(24)));
         let plain = Frame { kind: kind::ROUTE_REFRESH, body: vec![0, 2, 0, 1, 0] };
-        assert_eq!(Message::decode(&plain, &ctx), Err(Error::BadMessageLength(24)));
+        assert_eq!(Message::decode(&plain, &negotiated), Err(Error::BadMessageLength(24)));
         // The longest such message still fits in a NOTIFICATION.
         let long = Frame { kind: kind::ROUTE_REFRESH, body: [&[0, 2, 2, 1][..], &[0; MAX_BODY_LEN - 4]].concat() };
-        let e = Message::decode(&long, &ctx).unwrap_err();
-        assert!(encode(&Message::Notification(e.notification().unwrap()), &ctx).is_ok());
+        let e = Message::decode(&long, &negotiated).unwrap_err();
+        assert!(encode(&Message::Notification(e.notification().unwrap()), &negotiated).is_ok());
         // The capability is negotiated when both sides send it.
         let id = Ipv4Addr::new(10, 0, 0, 1);
         let err =
@@ -3260,12 +3260,12 @@ mod tests {
             }
             let nlri = if r.coin() { vec![prefix(&mut r)] } else { vec![] };
             let u = Update { withdrawn, attributes, nlri };
-            for ctx in [TWO, FOUR] {
+            for negotiated in [TWO, FOUR] {
                 let m = Message::Update(u.clone());
-                if let Ok(frame) = m.to_frame(&ctx) {
+                if let Ok(frame) = m.to_frame(&negotiated) {
                     written += 1;
                     assert!(frame.body.len() <= MAX_BODY_LEN);
-                    assert_eq!(Message::decode(&frame, &ctx).as_ref(), Ok(&m));
+                    assert_eq!(Message::decode(&frame, &negotiated).as_ref(), Ok(&m));
                     assert_eq!(frame.to_bytes().map(|b| b.len()), Ok(HEADER_LEN + frame.body.len()));
                 }
             }

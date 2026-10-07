@@ -16,7 +16,7 @@ use fictionet::events::{ConnInfo, Event};
 use fictionet::stdlib::codec::{Ending, ItemFault, Lcg, LineError, Lines, Rewrite, Rule, Trigger};
 use fictionet::stdlib::httpd::{self, Body, Exchange, Handler, Http1, HttpOptions, Limits, Reply, Router};
 use fictionet::stdlib::json;
-use fictionet::stdlib::serve::{self, Budget, Ended, FaultPlan, Flow, Harness, Plan, ServeCtx, ServeOptions, Service};
+use fictionet::stdlib::serve::{self, Budget, Ended, FaultPlan, Flow, Harness, Plan, Driver, ServeOptions, Service};
 use fictionet::stdlib::{Connection, ConnectionExt, ip, tcp};
 use fictionet::{Cx, block_on, pair, run};
 use http_body::Frame;
@@ -119,8 +119,8 @@ impl Service for Loud {
     fn decoder(&self) -> Lines {
         Lines::new(64, Ending::LfOrCrlf)
     }
-    fn on_item(&mut self, _: Result<Vec<u8>, LineError>, _: &(), ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
-        ctx.reply().resize(self.size, b'x');
+    fn on_item(&mut self, _: Result<Vec<u8>, LineError>, _: &(), driver: &mut Driver<'_>) -> Result<Flow, Infallible> {
+        driver.reply().resize(self.size, b'x');
         Ok(Flow::Continue)
     }
 }

@@ -114,7 +114,7 @@ use fictionet::stdlib::http1::{self, Event as H1, RequestHead};
 use fictionet::events::{ConnInfo, Event, Fields, Level, float, opt};
 use fictionet::stdlib::json::Value;
 use fictionet::stdlib::net::{Accept, Arrival, ConfigFor, Host, Sni};
-use fictionet::stdlib::serve::{self, Budget, Ended, Flow, Pending, PendingCtx, Prefixed, ServeCtx, ServeOptions, Timer};
+use fictionet::stdlib::serve::{self, Budget, Ended, Flow, Pending, PendingDriver, Prefixed, Driver, ServeOptions, Timer};
 use fictionet::stdlib::tls::ServerConfig;
 use fictionet::stdlib::{ConnError, Connection, ConnectionExt};
 use fictionet::time::Instant;
@@ -865,16 +865,16 @@ impl Http1 {
         self
     }
 
-    fn respond(&mut self, ctx: &mut ServeCtx<'_>) -> Flow {
+    fn respond(&mut self, driver: &mut Driver<'_>) -> Flow {
         let body = Body::from(std::mem::take(&mut self.body));
         let body = if self.too_big { partial(body.bytes().unwrap_or_default(), "the request body is too large") } else { body };
         let close = self.too_big;
-        self.dispatch(ctx, body, close)
+        self.dispatch(driver, body, close)
     }
 
     /// Calls the handler for the request whose head is pending, with
     /// `body`. `close` closes the connection after the answer.
-    fn dispatch(&mut self, ctx: &mut ServeCtx<'_>, body: Body, close: bool) -> Flow {
+    fn dispatch(&mut self, driver: &mut Driver<'_>, body: Body, close: bool) -> Flow {
         let Some(head) = self.head.take() else { return Flow::Close };
         let version = match head.version {
             http1::Version::Http10 => Version::HTTP_10,
@@ -884,19 +884,19 @@ impl Http1 {
         let request = match to_request(&head, version, body) {
             Some(r) => r,
             None => {
-                let date = date_header(self.date, ctx.now());
-                write_simple(ctx.reply(), version, StatusCode::BAD_REQUEST, date);
+                let date = date_header(self.date, driver.now());
+                write_simple(driver.reply(), version, StatusCode::BAD_REQUEST, date);
                 return Flow::Close;
             }
         };
         let mut request = request;
-        request.extensions_mut().insert(ctx.conn().clone());
+        request.extensions_mut().insert(driver.conn().clone());
         let head_only = request.method() == Method::HEAD;
-        let tracker = Tracker::new(&request, ctx.conn(), self.started);
-        let now = ctx.now();
-        let conn = ctx.conn().clone();
+        let tracker = Tracker::new(&request, driver.conn(), self.started);
+        let now = driver.now();
+        let conn = driver.conn().clone();
         let reply = {
-            let mut rng = || ctx.random_u64();
+            let mut rng = || driver.random_u64();
             self.handler.call(request, &mut Exchange::new(now, &mut rng, &conn))
         };
         let close = !keep_alive;
@@ -906,16 +906,16 @@ impl Http1 {
             Reply::Now(response) => (None, Some(response)),
             Reply::Later(work) => (Some(work), None),
         };
-        ctx.defer(Streaming::new(work, response, version, head_only, close, tracker).dated(self.date, now));
-        self.after(ctx, close)
+        driver.defer(Streaming::new(work, response, version, head_only, close, tracker).dated(self.date, now));
+        self.after(driver, close)
     }
 
-    fn after(&mut self, ctx: &mut ServeCtx<'_>, close: bool) -> Flow {
-        ctx.cancel_timer(BODY);
+    fn after(&mut self, driver: &mut Driver<'_>, close: bool) -> Flow {
+        driver.cancel_timer(BODY);
         if close {
             return Flow::Close;
         }
-        ctx.set_timer(HEAD, self.opts.header_timeout);
+        driver.set_timer(HEAD, self.opts.header_timeout);
         Flow::Continue
     }
 }
@@ -1093,15 +1093,15 @@ impl serve::Service for Http1 {
         http1::RequestEvents::with_limits(self.opts.head)
     }
 
-    fn on_open(&mut self, _: &(), ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
-        ctx.set_timer(HEAD, self.opts.header_timeout);
+    fn on_open(&mut self, _: &(), driver: &mut Driver<'_>) -> Result<Flow, Infallible> {
+        driver.set_timer(HEAD, self.opts.header_timeout);
         Ok(Flow::Continue)
     }
 
-    fn on_item(&mut self, item: H1<RequestHead>, _: &(), ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
+    fn on_item(&mut self, item: H1<RequestHead>, _: &(), driver: &mut Driver<'_>) -> Result<Flow, Infallible> {
         match item {
             H1::Head(head) => {
-                ctx.cancel_timer(HEAD);
+                driver.cancel_timer(HEAD);
                 if asks_upgrade(&head) {
                     let mut bytes = Vec::new();
                     if fictionet::stdlib::codec::Wire::write(&head, &mut bytes).is_ok() {
@@ -1109,11 +1109,11 @@ impl serve::Service for Http1 {
                         return Ok(Flow::Upgrade(serve::Upgrade::Handoff));
                     }
                 }
-                ctx.set_timer(BODY, self.opts.body_timeout);
+                driver.set_timer(BODY, self.opts.body_timeout);
                 if head.expects_continue() {
-                    ctx.reply().extend_from_slice(b"HTTP/1.1 100 Continue\r\n\r\n");
+                    driver.reply().extend_from_slice(b"HTTP/1.1 100 Continue\r\n\r\n");
                 }
-                self.started = ctx.now();
+                self.started = driver.now();
                 self.head = Some(head);
                 self.body.clear();
                 self.too_big = false;
@@ -1125,12 +1125,12 @@ impl serve::Service for Http1 {
                     self.body.extend_from_slice(&bytes);
                 }
             }
-            H1::Done => return Ok(self.respond(ctx)),
+            H1::Done => return Ok(self.respond(driver)),
         }
         Ok(Flow::Continue)
     }
 
-    fn on_timer(&mut self, _: Timer, _: &(), _ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
+    fn on_timer(&mut self, _: Timer, _: &(), _ctx: &mut Driver<'_>) -> Result<Flow, Infallible> {
         Ok(Flow::Close)
     }
 
@@ -1138,37 +1138,37 @@ impl serve::Service for Http1 {
         self.body.len()
     }
 
-    fn on_fail(&mut self, error: &serve_fail::Fail, _: &(), ctx: &mut ServeCtx<'_>) -> Result<(), Infallible> {
+    fn on_fail(&mut self, error: &serve_fail::Fail, _: &(), driver: &mut Driver<'_>) -> Result<(), Infallible> {
         if self.head.is_some() {
             // The body was cut off: the handler still sees what came, as a
             // body that ends in an error.
             let mut got = std::mem::take(&mut self.body);
             let room = self.opts.body.saturating_sub(got.len());
-            got.extend_from_slice(&ctx.unread()[..ctx.unread().len().min(room)]);
+            got.extend_from_slice(&driver.unread()[..driver.unread().len().min(room)]);
             let body = partial(Bytes::from(got), "the request body was cut off");
-            self.dispatch(ctx, body, true);
+            self.dispatch(driver, body, true);
             return Ok(());
         }
         if matches!(error, fictionet::stdlib::codec::Fail::Protocol(http1::Error::Host))
-            && let Some(head) = without_host(ctx.unread())
+            && let Some(head) = without_host(driver.unread())
         {
             // An HTTP/1.1 request with no Host field: the handler answers
             // it, as a request that names no host (`400`, `no_host`).
             self.head = Some(head);
-            self.started = ctx.now();
-            self.dispatch(ctx, Body::empty(), true);
+            self.started = driver.now();
+            self.dispatch(driver, Body::empty(), true);
             return Ok(());
         }
-        ctx.log(error_event(ctx.conn(), "protocol", error.to_string()));
-        let date = date_header(self.date, ctx.now());
-        write_simple(ctx.reply(), Version::HTTP_11, StatusCode::BAD_REQUEST, date);
+        driver.log(error_event(driver.conn(), "protocol", error.to_string()));
+        let date = date_header(self.date, driver.now());
+        write_simple(driver.reply(), Version::HTTP_11, StatusCode::BAD_REQUEST, date);
         Ok(())
     }
 
-    fn on_end(&mut self, end: Ended, _: &(), ctx: &mut ServeCtx<'_>) -> Result<(), Infallible> {
+    fn on_end(&mut self, end: Ended, _: &(), driver: &mut Driver<'_>) -> Result<(), Infallible> {
         if end == Ended::Conn(ConnError::Broken) {
-            let e = error_event(ctx.conn(), "transport", "a TLS record did not decrypt".into());
-            ctx.log(e);
+            let e = error_event(driver.conn(), "transport", "a TLS record did not decrypt".into());
+            driver.log(e);
         }
         Ok(())
     }
@@ -1247,8 +1247,8 @@ impl Streaming {
     }
 
     /// Counts the last piece's body bytes once the driver wrote it all.
-    fn confirm(&mut self, ctx: &PendingCtx<'_>) {
-        if ctx.written() >= self.returned {
+    fn confirm(&mut self, driver: &PendingDriver<'_>) {
+        if driver.written() >= self.returned {
             self.body_sent += std::mem::take(&mut self.in_flight);
         }
     }
@@ -1260,13 +1260,13 @@ impl Streaming {
         Poll::Ready(Some(Ok(bytes)))
     }
 
-    fn end(&mut self, ctx: &mut PendingCtx<'_>, complete: bool) {
+    fn end(&mut self, driver: &mut PendingDriver<'_>, complete: bool) {
         if self.finished {
             return;
         }
         self.finished = true;
         if let Some(e) = self.tracker.finish(self.extra.take(), self.status, self.body_sent, complete) {
-            ctx.log(e);
+            driver.log(e);
         }
     }
 
@@ -1283,12 +1283,12 @@ impl Streaming {
 }
 
 impl Pending for Streaming {
-    fn poll_next(&mut self, ctx: &mut PendingCtx<'_>, cx: &mut Context<'_>) -> Poll<Option<Result<Vec<u8>, Error>>> {
+    fn poll_next(&mut self, driver: &mut PendingDriver<'_>, cx: &mut Context<'_>) -> Poll<Option<Result<Vec<u8>, Error>>> {
         // The driver polls again only once the last piece is written.
-        self.confirm(ctx);
+        self.confirm(driver);
         loop {
             if let Some(work) = self.work.take() {
-                self.making = Some(match ctx.fcx() {
+                self.making = Some(match driver.fcx() {
                     Some(fcx) => work(fcx.clone()),
                     None => Box::pin(std::future::ready(Err(fictionet::Error::msg("this answer needs a Cx: give the harness one with Harness::with_fcx")))),
                 });
@@ -1307,12 +1307,12 @@ impl Pending for Streaming {
                 let response = Response::from_parts(parts, Body::empty());
                 let len = body.size_hint().exact();
                 let mut head = Vec::new();
-                let now = ctx.fcx().map_or(self.asked, Cx::now);
+                let now = driver.fcx().map_or(self.asked, Cx::now);
                 self.close = encode(&mut head, self.version, &response, len, self.head_only, self.close, date_header(self.date, now));
                 if self.close {
                     // An HTTP/1.0 body of unknown length ends with the
                     // connection, whatever the request asked for.
-                    ctx.close();
+                    driver.close();
                 }
                 self.status = Some(response.status());
                 self.extra = response.extensions().get::<Fields>().cloned();
@@ -1338,7 +1338,7 @@ impl Pending for Streaming {
                 return self.piece(out, piece.len());
             }
             let Some(body) = &mut self.body else {
-                self.end(ctx, true);
+                self.end(driver, true);
                 return Poll::Ready(None);
             };
             match Pin::new(body).poll_frame(cx) {
@@ -1352,7 +1352,7 @@ impl Pending for Streaming {
                 }
                 Poll::Ready(Some(Err(e))) => {
                     self.body = None;
-                    self.end(ctx, false);
+                    self.end(driver, false);
                     return Poll::Ready(Some(Err(e)));
                 }
                 Poll::Ready(Some(Ok(frame))) => {
@@ -1366,12 +1366,12 @@ impl Pending for Streaming {
         }
     }
 
-    fn cancel(&mut self, ctx: &mut PendingCtx<'_>) {
-        self.confirm(ctx);
+    fn cancel(&mut self, driver: &mut PendingDriver<'_>) {
+        self.confirm(driver);
         if self.status.is_none() {
             self.extra = None;
         }
-        self.end(ctx, false);
+        self.end(driver, false);
     }
 
     fn held(&self) -> usize {

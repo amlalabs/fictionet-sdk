@@ -26,7 +26,7 @@ service appends its reply and records what it saw:
 ```rust
 use fictionet::stdlib::codec::{Ending, LineError, Lines};
 use fictionet::events::{Event, Level};
-use fictionet::stdlib::serve::{Flow, ServeCtx, Service};
+use fictionet::stdlib::serve::{Flow, Driver, Service};
 
 /// A login prompt that takes one password and closes.
 struct Prompt;
@@ -40,21 +40,21 @@ impl Service for Prompt {
         Lines::new(256, Ending::LfOrCrlf)
     }
 
-    fn on_open(&mut self, _: &String, ctx: &mut ServeCtx<'_>) -> Result<Flow, Self::Error> {
-        ctx.reply().extend_from_slice(b"password: ");
+    fn on_open(&mut self, _: &String, driver: &mut Driver<'_>) -> Result<Flow, Self::Error> {
+        driver.reply().extend_from_slice(b"password: ");
         Ok(Flow::Continue)
     }
 
-    fn on_item(&mut self, line: Result<Vec<u8>, LineError>, password: &String, ctx: &mut ServeCtx<'_>) -> Result<Flow, Self::Error> {
+    fn on_item(&mut self, line: Result<Vec<u8>, LineError>, password: &String, driver: &mut Driver<'_>) -> Result<Flow, Self::Error> {
         let line = line.unwrap_or_default();
         let right = line == password.as_bytes();
-        ctx.log(
+        driver.log(
             Event::new("prompt", "login")
                 .summary(if right { "login" } else { "wrong password" })
                 .level(if right { Level::Alarm } else { Level::Info })
                 .field("right", right),
         );
-        ctx.reply().extend_from_slice(if right { b"welcome\n" } else { b"no\n" });
+        driver.reply().extend_from_slice(if right { b"welcome\n" } else { b"no\n" });
         Ok(Flow::Close)
     }
 }
@@ -66,24 +66,24 @@ is made fresh for each connection.
 
 A service can also:
 
-- **Run timers.** `ctx.set_timer("heartbeat", d)` arms a named timer and
+- **Run timers.** `driver.set_timer("heartbeat", d)` arms a named timer and
   `on_timer` hears which one went off. A FIX session has four (heartbeat,
   TestRequest, logon, logout), each armed and cancelled on its own. A due
   timer is handled before more input is read, so a client that never
   stops sending cannot starve it.
-- **Be woken.** `ctx.wake_handle()` gives a handle the world keeps, such
+- **Be woken.** `driver.wake_handle()` gives a handle the world keeps, such
   as next to an order in the book. When another trader's order fills it,
   that connection calls `handle.wake()`, and this connection's `on_wake`
   writes the execution report. SMB2 oplock breaks, LDAP persistent search
   and MCP notifications work the same way.
-- **Hand over async work.** `ctx.defer(work)` runs work whose bytes are
+- **Hand over async work.** `driver.defer(work)` runs work whose bytes are
   written in order before the next item (an HTTP/1 response from a tower
-  service). `ctx.defer_keyed(key, work)` runs work beside the reads and
+  service). `driver.defer_keyed(key, work)` runs work beside the reads and
   the other keyed work, each writing whole frames, and `on_done` hears
   when one ends: concurrent responses, as HTTP/2 streams need.
 - **Upgrade the connection.** `Flow::Upgrade(Upgrade::Tls)` shakes hands
   as a TLS server with `ServeOptions::starttls` and calls `on_open` again
-  over TLS (`ctx.conn().tls` is then true): STARTTLS in SMTP, IMAP and
+  over TLS (`driver.conn().tls` is then true): STARTTLS in SMTP, IMAP and
   LDAP, and Postgres's `SSLRequest`. `Upgrade::Decoder` goes on with a
   fresh decoder; `Upgrade::Handoff` hands the connection and its unread
   bytes back to whoever called `serve`.
@@ -117,14 +117,14 @@ connection ends it at once, also while a write waits.
 Kerberos frames a message with a four-byte length over TCP, and sends one
 message per datagram over UDP. `Service::Decoder` is one type, so write
 two thin services over one core of your own: each picks its decoder and
-hands the message to the shared code. `ctx.conn().transport` says which
+hands the message to the shared code. `driver.conn().transport` says which
 one the call came over, so the KDC can answer `KRB_ERR_RESPONSE_TOO_BIG`
 on UDP. Serve them with `Host::tcp(88, ..)` and `Host::udp(88, ..)` and
 the same `State`.
 
 ### Dates belong to the world
 
-`ctx.now()` is the run's clock: time since the run started, with no
+`driver.now()` is the run's clock: time since the run started, with no
 date. A service that needs a date, such as for ticket lifetimes,
 certificate validity or a FIX `SendingTime`, takes it from its `State`,
 which decides what day it is in the world. Record the world's date in the
@@ -135,7 +135,7 @@ holds the host's wall clock at the start of the run.
 HTTP follows the same rule. `httpd` sends a `Date` header only when the
 world gave its date at the start of the run (`Sites::date`, `Server::date`,
 `Website::date`, `Http1::date` or `HttpOptions::date`), and the header is
-that date plus `ctx.now()`. With no world date, responses carry no `Date`
+that date plus `driver.now()`. With no world date, responses carry no `Date`
 header at all, as RFC 9110 allows for a server without a clock: a world
 that never says what day it is never leaks the host's. A `Date` a handler
 sets itself goes out as it is.
@@ -190,7 +190,7 @@ Other kinds of port:
   connection cap, an idle limit, a fault plan, a STARTTLS config.
 - `udp(port, world, make)`: one service for the port, which gets every
   datagram, each decoded on its own as DNS and Modbus over UDP frame their
-  messages. It can send several datagrams to anyone (`ctx.send_to`) and
+  messages. It can send several datagrams to anyone (`driver.send_to`) and
   run timers, as a MoldUDP64 server does for retransmissions and
   heartbeats.
 - `tls(port, sni, config, world, make)`: TLS first, picked by the name the

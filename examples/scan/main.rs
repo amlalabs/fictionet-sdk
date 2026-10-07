@@ -30,7 +30,7 @@ use std::sync::Arc;
 use fictionet::stdlib::codec::{Decode, Step};
 use fictionet::stdlib::net::{Host, Net};
 use fictionet::stdlib::route::Prefix;
-use fictionet::stdlib::serve::{Flow, ServeCtx, Service};
+use fictionet::stdlib::serve::{Flow, Driver, Service};
 use fictionet::time::{Duration, ms};
 use fictionet::{Attachments, Cx, Result};
 
@@ -178,14 +178,14 @@ impl Service for Port {
         Head { ignore: matches!(self.kind, Kind::Banner(_)) }
     }
 
-    fn on_open(&mut self, _: &(), ctx: &mut ServeCtx<'_>) -> std::result::Result<Flow, Infallible> {
+    fn on_open(&mut self, _: &(), driver: &mut Driver<'_>) -> std::result::Result<Flow, Infallible> {
         if let Kind::Banner(line) = self.kind {
-            ctx.reply().extend_from_slice(line.as_bytes());
+            driver.reply().extend_from_slice(line.as_bytes());
         }
         Ok(Flow::Continue)
     }
 
-    fn on_item(&mut self, _: (), _: &(), ctx: &mut ServeCtx<'_>) -> std::result::Result<Flow, Infallible> {
+    fn on_item(&mut self, _: (), _: &(), driver: &mut Driver<'_>) -> std::result::Result<Flow, Infallible> {
         let Kind::Http { status, server, title } = self.kind else { return Ok(Flow::Continue) };
         self.request += 1;
         let body = format!("<!doctype html><html><head><title>{title}</title></head><body><h1>{title}</h1></body></html>\n");
@@ -193,8 +193,8 @@ impl Service for Port {
             "{status}\r\nServer: {server}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         );
-        ctx.reply().extend_from_slice(head.as_bytes());
-        ctx.reply().extend_from_slice(body.as_bytes());
+        driver.reply().extend_from_slice(head.as_bytes());
+        driver.reply().extend_from_slice(body.as_bytes());
         Ok(Flow::Close)
     }
 }
