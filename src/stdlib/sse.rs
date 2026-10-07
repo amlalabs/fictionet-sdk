@@ -722,6 +722,21 @@ mod tests {
     }
 
     #[test]
+    fn cr_dispatches_without_waiting() {
+        // A server can end lines with CR and keep the stream open. The event
+        // must not wait for the next byte or for EOF.
+        for bytes in [&b"data:x\r\r"[..], b"data:x\r\n\r", b"data:x\n\r"] {
+            let mut stream = Stream::new(Events::default());
+            let mut out = Vec::new();
+            assert_eq!(pump(&mut stream, bytes, |e| out.push(e)), Ok(bytes.len()));
+            assert_eq!(out, [Event::new("x")], "{bytes:?}");
+            // A split CRLF stays one terminator.
+            assert_eq!(pump(&mut stream, b"\ndata:y\r\r", |e| out.push(e)), Ok(9));
+            assert_eq!(out, [Event::new("x"), Event::new("y")], "{bytes:?}");
+        }
+    }
+
+    #[test]
     fn whatwg_stock() {
         assert_eq!(
             events(b"data: YHOO\ndata: +2\ndata: 10\n\n"),

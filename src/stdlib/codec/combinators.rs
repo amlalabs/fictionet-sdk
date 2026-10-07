@@ -111,8 +111,9 @@ pub enum Ending {
     Crlf,
     /// LF, optionally preceded by CR.
     LfOrCrlf,
-    /// LF, CR, or CR followed by LF. A final CR waits for one more byte
-    /// or EOF so a split CRLF remains one terminator.
+    /// LF, CR, or CR followed by LF. A final CR ends its line at once.
+    /// If the next byte, in a later chunk, is LF, it is skipped, so a
+    /// split CRLF remains one terminator.
     LfOrCrOrCrlf,
 }
 /// Why one line was refused. Framing continues after the refused line.
@@ -147,6 +148,9 @@ pub struct Lines {
     ending: Ending,
     scanned: usize,
     skipping: bool,
+    // The last terminator was a CR at the end of the input, so an LF that
+    // starts the next input belongs to it.
+    after_cr: bool,
 }
 impl Lines {
     /// Creates a reader. `max` excludes the terminator and is clamped to
@@ -157,6 +161,7 @@ impl Lines {
             ending,
             scanned: 0,
             skipping: false,
+            after_cr: false,
         }
     }
 }
@@ -168,6 +173,12 @@ impl Decode for Lines {
         self.max.saturating_add(2)
     }
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Self::Item>, Infallible> {
+        if self.after_cr && !input.is_empty() {
+            self.after_cr = false;
+            if input.first() == Some(&b'\n') {
+                return Ok(Step::Skip(1));
+            }
+        }
         if self.skipping {
             self.scanned = 0;
             if let Some(i) = input.iter().position(|b| {
@@ -175,11 +186,10 @@ impl Decode for Lines {
             }) {
                 let mut n = i.saturating_add(1);
                 if self.ending == Ending::LfOrCrOrCrlf && input.get(i) == Some(&b'\r') {
-                    if n == input.len() && !eof {
-                        return Ok(if i == 0 { Step::Need } else { Step::Skip(i) });
-                    }
                     if input.get(n) == Some(&b'\n') {
                         n = n.saturating_add(1);
+                    } else {
+                        self.after_cr = n == input.len() && !eof;
                     }
                 }
                 self.skipping = false;
@@ -207,17 +217,10 @@ impl Decode for Lines {
             let any_cr = self.ending == Ending::LfOrCrOrCrlf;
             let mut n = i.saturating_add(1);
             if any_cr && input.get(i) == Some(&b'\r') {
-                if n == input.len() && !eof {
-                    self.scanned = i;
-                    if i <= self.max {
-                        return Ok(Step::Need);
-                    }
-                    self.scanned = 0;
-                    self.skipping = true;
-                    return Ok(Step::Item(Err(LineError::TooLong { max: self.max }), i));
-                }
                 if input.get(n) == Some(&b'\n') {
                     n = n.saturating_add(1);
+                } else {
+                    self.after_cr = n == input.len() && !eof;
                 }
             }
             let cr = !any_cr && i.checked_sub(1).and_then(|p| input.get(p)) == Some(&b'\r');

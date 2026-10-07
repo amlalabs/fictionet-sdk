@@ -561,14 +561,25 @@ fn lines_cr_lf_and_crlf() {
         vec![Err(LineError::TooLong { max: 1 }), Ok(b"x".to_vec())]
     );
     let mut stream = Stream::new(Lines::new(3, ending));
+    // A final CR ends the line at once. A split LF is skipped later.
     assert_eq!(stream.push(b"abc\r"), 4);
-    assert!(stream.next().is_none());
-    assert_eq!(stream.push(b"\n"), 1);
     assert_eq!(stream.next(), Some(Ok(Ok(b"abc".to_vec()))));
+    assert_eq!(stream.offset(), 4);
+    assert_eq!(stream.push(b"\n"), 1);
+    assert!(stream.next().is_none());
     assert_eq!(stream.offset(), 5);
     assert_eq!(stream.push(b"x\r"), 2);
-    assert!(stream.next().is_none());
+    assert_eq!(stream.next(), Some(Ok(Ok(b"x".to_vec()))));
+    assert_eq!(stream.push(b"\r"), 1);
+    assert_eq!(stream.next(), Some(Ok(Ok(vec![]))));
     stream.end();
+    assert!(stream.next().is_none());
+    // An overlong line ending in a final CR is refused without waiting,
+    // and the LF after it is still one terminator with the CR.
+    let mut stream = Stream::new(Lines::new(1, ending));
+    assert_eq!(stream.push(b"ab\r"), 3);
+    assert_eq!(stream.next(), Some(Ok(Err(LineError::TooLong { max: 1 }))));
+    assert_eq!(stream.push(b"\nx\n"), 3);
     assert_eq!(stream.next(), Some(Ok(Ok(b"x".to_vec()))));
     assert!(stream.next().is_none());
 }
