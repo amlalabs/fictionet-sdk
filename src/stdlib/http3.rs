@@ -182,15 +182,25 @@ pub enum Error {
     Incomplete,
     /// A QPACK operation failed.
     Qpack(qpack::Error),
+    /// Invalid QPACK encoder-stream framing or instruction contents.
+    QpackEncoderStream(qpack::Error),
+    /// Invalid QPACK decoder-stream framing or instruction contents.
+    QpackDecoderStream(qpack::Error),
     /// Invalid RFC 8941 Priority dictionary syntax.
     Priority,
     /// The caller must resume a blocked section or use the appropriate state. This is not a peer protocol error.
     State,
+    /// An exact parse ran out of input before a complete frame or stream
+    /// header, including empty input.
+    Truncated,
+    /// Bytes follow the first complete value of an exact parse.
+    Trailing,
 }
 
 impl Error {
-    /// The suggested application error code, or None for a local API condition
-    /// or an invalid Priority dictionary that the application can ignore.
+    /// The suggested application error code, or None for a local API condition,
+    /// an exact parse that did not read one whole value, or an invalid Priority
+    /// dictionary that the application can ignore.
     /// MESSAGE_ERROR applies to the stream; framing errors affect the connection.
     pub fn application_code(self) -> Option<u64> {
         use error_code as c;
@@ -204,8 +214,10 @@ impl Error {
             Self::ClosedCriticalStream => c::CLOSED_CRITICAL_STREAM,
             Self::Message(_) => c::MESSAGE_ERROR,
             Self::Incomplete => c::REQUEST_INCOMPLETE,
-            Self::Unwritable | Self::State | Self::Priority => return None,
+            Self::Unwritable | Self::State | Self::Priority | Self::Truncated | Self::Trailing => return None,
             Self::Qpack(_) => c::QPACK_DECOMPRESSION_FAILED,
+            Self::QpackEncoderStream(_) => c::QPACK_ENCODER_STREAM_ERROR,
+            Self::QpackDecoderStream(_) => c::QPACK_DECODER_STREAM_ERROR,
         })
     }
 }
@@ -216,11 +228,22 @@ impl std::fmt::Display for Error {
             Self::Unwritable => f.write_str("value cannot be written without changing it"),
             Self::Message(s) => f.write_str(s),
             Self::Qpack(e) => write!(f, "QPACK: {e}"),
+            Self::QpackEncoderStream(e) => write!(f, "QPACK encoder stream: {e}"),
+            Self::QpackDecoderStream(e) => write!(f, "QPACK decoder stream: {e}"),
+            Self::Truncated => f.write_str("input ended before a complete HTTP/3 value"),
+            Self::Trailing => f.write_str("bytes follow the HTTP/3 value"),
             _ => write!(f, "HTTP/3: {self:?}"),
         }
     }
 }
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Qpack(e) | Self::QpackEncoderStream(e) | Self::QpackDecoderStream(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 /// Whether a frame type, setting, stream type or error code is in the
 /// reserved grease sequence 0x1f * N + 0x21.
@@ -1572,98 +1595,21 @@ impl RequestState {
 // ---------------------------------------------------------------------
 // Slice decoders and the connection's shared input budget.
 
-/// Why an exact [`Wire`] parse did not read one complete frame or stream header.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FrameParseError {
-    /// The frame or stream header was invalid.
-    Frame(Error),
-    /// The input ended before a complete value, including empty input.
-    Truncated,
-    /// Bytes follow the first complete value.
-    Trailing,
-}
-
-impl std::fmt::Display for FrameParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Frame(e) => e.fmt(f),
-            Self::Truncated => f.write_str("input ended before a complete HTTP/3 value"),
-            Self::Trailing => f.write_str("bytes follow the HTTP/3 value"),
-        }
-    }
-}
-
-impl std::error::Error for FrameParseError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Frame(e) => Some(e),
-            Self::Truncated | Self::Trailing => None,
-        }
-    }
-}
-
-/// An HTTP/3 stream failure, with the QPACK stream role kept for error codes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StreamError {
-    /// An HTTP/3 framing or session error.
-    Http3(Error),
-    /// Invalid QPACK encoder-stream framing or instruction contents.
-    QpackEncoder(qpack::Error),
-    /// Invalid QPACK decoder-stream framing or instruction contents.
-    QpackDecoder(qpack::Error),
-}
-
-impl StreamError {
-    /// The suggested application error code; local API conditions have none.
-    pub fn application_code(self) -> Option<u64> {
-        match self {
-            Self::Http3(e) => e.application_code(),
-            Self::QpackEncoder(_) => Some(error_code::QPACK_ENCODER_STREAM_ERROR),
-            Self::QpackDecoder(_) => Some(error_code::QPACK_DECODER_STREAM_ERROR),
-        }
-    }
-}
-
-impl From<Error> for StreamError {
-    fn from(error: Error) -> Self {
-        Self::Http3(error)
-    }
-}
-
-impl std::fmt::Display for StreamError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Http3(e) => e.fmt(f),
-            Self::QpackEncoder(e) => write!(f, "QPACK encoder stream: {e}"),
-            Self::QpackDecoder(e) => write!(f, "QPACK decoder stream: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for StreamError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Http3(e) => Some(e),
-            Self::QpackEncoder(e) | Self::QpackDecoder(e) => Some(e),
-        }
-    }
-}
-
-fn exact<T>(result: Result<Option<(T, usize)>, Error>, len: usize) -> Result<T, FrameParseError> {
-    match result.map_err(FrameParseError::Frame)? {
+fn exact<T>(result: Result<Option<(T, usize)>, Error>, len: usize) -> Result<T, Error> {
+    match result? {
         Some((value, used)) if used == len => Ok(value),
-        Some(_) => Err(FrameParseError::Trailing),
-        None => Err(FrameParseError::Truncated),
+        Some(_) => Err(Error::Trailing),
+        None => Err(Error::Truncated),
     }
 }
 
 impl Wire for Frame {
-    type ParseError = FrameParseError;
+    type ParseError = Error;
     type WriteError = Error;
 
     /// Reads exactly one frame. Refuses truncation, trailing bytes, forbidden types, invalid payloads, and limits.
     /// Nonminimal QUIC integers are accepted. QPACK bytes remain opaque.
-    fn parse(bytes: &[u8]) -> Result<Self, FrameParseError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         exact(Self::parse_prefix(bytes), bytes.len())
     }
 
@@ -1768,11 +1714,11 @@ impl Wire for Settings {
 }
 
 impl Wire for StreamHeader {
-    type ParseError = FrameParseError;
+    type ParseError = Error;
     type WriteError = Error;
 
     /// Reads one stream prefix. Refuses truncation and trailing bytes.
-    fn parse(bytes: &[u8]) -> Result<Self, FrameParseError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         exact(Self::parse_prefix(bytes), bytes.len())
     }
 
@@ -1967,7 +1913,7 @@ enum StreamKind {
 /// sections. Unknown stream payloads are skipped in bounded
 /// chunks. Every variant owns no input and retains no output queue. Any FIN
 /// on a control or QPACK stream, including within a partial unit, returns
-/// [`StreamError::Http3`] carrying [`Error::ClosedCriticalStream`].
+/// [`Error::ClosedCriticalStream`].
 #[derive(Clone, Debug)]
 pub struct StreamItems {
     kind: StreamKind,
@@ -1998,8 +1944,8 @@ impl StreamItems {
 
 fn stream_step<T>(
     step: Step<T>,
-    wrap: impl FnOnce(T) -> Result<StreamItem, StreamError>,
-) -> Step<Result<StreamItem, StreamError>> {
+    wrap: impl FnOnce(T) -> Result<StreamItem, Error>,
+) -> Step<Result<StreamItem, Error>> {
     match step {
         Step::Item(item, used) => Step::Item(wrap(item), used),
         Step::Need => Step::Need,
@@ -2009,8 +1955,8 @@ fn stream_step<T>(
 }
 
 impl Decode for StreamItems {
-    type Item = Result<StreamItem, StreamError>;
-    type Error = StreamError;
+    type Item = Result<StreamItem, Error>;
+    type Error = Error;
     const NAME: &'static str = "HTTP/3 stream";
 
     fn capacity(&self) -> usize {
@@ -2031,7 +1977,7 @@ impl Decode for StreamItems {
         }
     }
 
-    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Self::Item>, StreamError> {
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Self::Item>, Error> {
         Ok(match &mut self.kind {
             StreamKind::Header(decoder) => {
                 stream_step(decoder.decode(input, eof)?, |header| Ok(StreamItem::Header(header)))
@@ -2042,27 +1988,27 @@ impl Decode for StreamItems {
             }
             StreamKind::Encoder => {
                 if eof && input.is_empty() {
-                    return Err(Error::ClosedCriticalStream.into());
+                    return Err(Error::ClosedCriticalStream);
                 }
-                let step = qpack::EncoderInstructions.decode(input, eof).map_err(StreamError::QpackEncoder)?;
+                let step = qpack::EncoderInstructions.decode(input, eof).map_err(Error::QpackEncoderStream)?;
                 if eof && matches!(step, Step::Need) {
-                    return Err(Error::ClosedCriticalStream.into());
+                    return Err(Error::ClosedCriticalStream);
                 }
-                stream_step(step, |item| item.map(StreamItem::EncoderInstruction).map_err(StreamError::QpackEncoder))
+                stream_step(step, |item| item.map(StreamItem::EncoderInstruction).map_err(Error::QpackEncoderStream))
             }
             StreamKind::Decoder => {
                 if eof && input.is_empty() {
-                    return Err(Error::ClosedCriticalStream.into());
+                    return Err(Error::ClosedCriticalStream);
                 }
-                let step = qpack::DecoderInstructions.decode(input, eof).map_err(StreamError::QpackDecoder)?;
+                let step = qpack::DecoderInstructions.decode(input, eof).map_err(Error::QpackDecoderStream)?;
                 if eof && matches!(step, Step::Need) {
-                    return Err(Error::ClosedCriticalStream.into());
+                    return Err(Error::ClosedCriticalStream);
                 }
-                stream_step(step, |item| item.map(StreamItem::DecoderInstruction).map_err(StreamError::QpackDecoder))
+                stream_step(step, |item| item.map(StreamItem::DecoderInstruction).map_err(Error::QpackDecoderStream))
             }
             StreamKind::Ignore if input.is_empty() => Step::Need,
             StreamKind::Ignore => Step::Skip(input.len()),
-            StreamKind::Invalid => return Err(Error::Id.into()),
+            StreamKind::Invalid => return Err(Error::Id),
             StreamKind::Paused(_) => Step::Need,
         })
     }
@@ -2191,7 +2137,7 @@ impl Session {
     /// Complete-unit errors are the inner result; framing errors are outer.
     /// A header handoff is completed before another payload item is read.
     #[allow(clippy::should_implement_trait, clippy::type_complexity)]
-    pub fn next(&mut self) -> Option<(u64, Result<Result<StreamItem, StreamError>, codec::Fail<StreamError>>)> {
+    pub fn next(&mut self) -> Option<(u64, Result<Result<StreamItem, Error>, codec::Fail<Error>>)> {
         let (id, result) = self.streams.next()?;
         if let Ok(Ok(StreamItem::Header(header))) = &result
             && let Some(stream) = self.streams.get_mut(&id)
@@ -2408,7 +2354,7 @@ mod tests {
             assert!(!is_reserved(n));
         }
         for t in [2, 6, 8, 9] {
-            assert_eq!(Frame::parse(&[t]), Err(FrameParseError::Frame(Error::UnexpectedFrame(u64::from(t)))));
+            assert_eq!(Frame::parse(&[t]), Err(Error::UnexpectedFrame(u64::from(t))));
             assert!(Frame::Unknown { frame_type: u64::from(t), payload: vec![] }.to_bytes().is_err());
         }
         for t in [0, 1, 3, 4, 5, 7, 0x0d, 0x0f0700, 0x0f0701] {
@@ -2424,11 +2370,11 @@ mod tests {
             for payload in [vec![], vec![0, 0], vec![0x40], vec![0; 9]] {
                 let mut bytes = vec![t, payload.len() as u8];
                 bytes.extend_from_slice(&payload);
-                assert_eq!(Frame::parse(&bytes), Err(FrameParseError::Frame(Error::Frame)));
+                assert_eq!(Frame::parse(&bytes), Err(Error::Frame));
             }
         }
         for bytes in [vec![5, 0], vec![5, 1, 0x40], vec![0x80, 0x0f, 7, 0, 0]] {
-            assert_eq!(Frame::parse(&bytes), Err(FrameParseError::Frame(Error::Frame)));
+            assert_eq!(Frame::parse(&bytes), Err(Error::Frame));
         }
         for id in [1, 2, 3, MAX_VARINT] {
             let mut b = vec![0x80, 0x0f, 7, 0];
@@ -2436,7 +2382,7 @@ mod tests {
             put_varint(id, &mut payload).unwrap();
             put_varint(payload.len() as u64, &mut b).unwrap();
             b.extend_from_slice(&payload);
-            assert_eq!(Frame::parse(&b), Err(FrameParseError::Frame(Error::Id)));
+            assert_eq!(Frame::parse(&b), Err(Error::Id));
             assert_eq!(
                 Frame::PriorityUpdate { element: PriorityElement::Request(id), value: vec![] }.to_bytes(),
                 Err(Error::Unwritable)
@@ -2493,7 +2439,7 @@ mod tests {
             let mut bytes = Vec::new();
             put_varint(t, &mut bytes).unwrap();
             put_varint(MAX_FRAME_PAYLOAD as u64 + 1, &mut bytes).unwrap();
-            assert_eq!(Frame::parse(&bytes), Err(FrameParseError::Frame(Error::Limit)));
+            assert_eq!(Frame::parse(&bytes), Err(Error::Limit));
         }
         let s = Settings { entries: (0..=MAX_SETTINGS).map(|n| Setting { id: 100 + n as u64, value: 0 }).collect() };
         assert_eq!(s.to_bytes(), Err(Error::Unwritable));

@@ -531,18 +531,18 @@ fn decoder_instruction_capacity_is_one_bounded_integer() {
 
 #[test]
 fn http3_stream_errors_keep_role_specific_application_codes() {
-    use http3::{Error, StreamError as E};
+    use http3::Error as E;
     for (header, bytes, expected, code) in [
         (
             StreamHeader::QpackEncoder,
             vec![0xc0, 0x81, 0],
-            E::QpackEncoder(qpack::Error::Huffman),
+            E::QpackEncoderStream(qpack::Error::Huffman),
             http3::error_code::QPACK_ENCODER_STREAM_ERROR,
         ),
         (
             StreamHeader::QpackDecoder,
             vec![0],
-            E::QpackDecoder(qpack::Error::ZeroIncrement),
+            E::QpackDecoderStream(qpack::Error::ZeroIncrement),
             http3::error_code::QPACK_DECODER_STREAM_ERROR,
         ),
     ] {
@@ -551,24 +551,24 @@ fn http3_stream_errors_keep_role_specific_application_codes() {
         assert_eq!(input.next(), Some(Ok(Err(expected))));
         assert_eq!(expected.application_code(), Some(code));
     }
-    let closed = E::Http3(Error::ClosedCriticalStream);
+    let closed = E::ClosedCriticalStream;
     assert_eq!(closed.application_code(), Some(http3::error_code::CLOSED_CRITICAL_STREAM));
 }
 
 #[test]
 fn wire_errors_distinguish_truncation_trailing_and_protocol() {
-    use http3::FrameParseError as H;
-    use qpack::ParseError as Q;
-    assert_eq!(<EI as Wire>::parse(&[0x3f]), Err(Q::Truncated));
-    assert_eq!(<DI as Wire>::parse(&[0xff]), Err(Q::Truncated));
-    assert_eq!(<Rep as Wire>::parse(&[]), Err(Q::Truncated));
-    assert_eq!(<DI as Wire>::parse(&[0]), Err(Q::Instruction(qpack::Error::ZeroIncrement)));
+    use http3::Error as H;
+    use qpack::Error as Q;
+    assert_eq!(<EI as Wire>::parse(&[0x3f]), Err(Q::Incomplete));
+    assert_eq!(<DI as Wire>::parse(&[0xff]), Err(Q::Incomplete));
+    assert_eq!(<Rep as Wire>::parse(&[]), Err(Q::Incomplete));
+    assert_eq!(<DI as Wire>::parse(&[0]), Err(Q::ZeroIncrement));
     assert_eq!(<EI as Wire>::parse(&[0x20, 0]), Err(Q::Trailing));
     assert_eq!(<DI as Wire>::parse(&[1, 1]), Err(Q::Trailing));
     assert_eq!(<Rep as Wire>::parse(&[0xc0, 0]), Err(Q::Trailing));
     assert_eq!(<Frame as Wire>::parse(&[0, 2, 1]), Err(H::Truncated));
     assert_eq!(<Frame as Wire>::parse(&[0, 0, 0]), Err(H::Trailing));
-    assert_eq!(<Frame as Wire>::parse(&[2, 0]), Err(H::Frame(http3::Error::UnexpectedFrame(2))));
+    assert_eq!(<Frame as Wire>::parse(&[2, 0]), Err(H::UnexpectedFrame(2)));
     assert_eq!(<StreamHeader as Wire>::parse(&[0x40]), Err(H::Truncated));
     assert_eq!(<StreamHeader as Wire>::parse(&[0, 0]), Err(H::Trailing));
 }
@@ -633,7 +633,7 @@ fn connection_partial_critical_fin_survives_handoff() {
         assert!(matches!(session.next(), Some((2, Ok(Ok(StreamItem::Header(_)))))));
         assert_eq!(
             session.next(),
-            Some((2, Err(Fail::Protocol(http3::StreamError::Http3(http3::Error::ClosedCriticalStream)))))
+            Some((2, Err(Fail::Protocol(http3::Error::ClosedCriticalStream))))
         );
         assert!(session.next().is_none());
     }
@@ -653,7 +653,7 @@ fn http3_invalid_frame_headers_fail_without_buffering_payloads() {
         }
         let mut bytes = vec![kind];
         fictionet::stdlib::quic::VarInt(http3::MAX_FRAME_PAYLOAD as u64 + 1).write(&mut bytes).unwrap();
-        assert_eq!(<Frame as Wire>::parse(&bytes), Err(http3::FrameParseError::Frame(http3::Error::Limit)));
+        assert_eq!(<Frame as Wire>::parse(&bytes), Err(http3::Error::Limit));
         let mut stream = Stream::new(http3::Frames);
         assert_eq!(stream.push(&bytes), bytes.len());
         assert_eq!(stream.next(), Some(Err(Fail::Protocol(http3::Error::Limit))));
@@ -995,7 +995,7 @@ fn qpack_strict_writers() {
     }
     let mut trailing = wire(&EI::SetCapacity(8));
     trailing.push(0);
-    assert_eq!(<EI as Wire>::parse(&trailing), Err(qpack::ParseError::Trailing));
+    assert_eq!(<EI as Wire>::parse(&trailing), Err(qpack::Error::Trailing));
 }
 
 fn settings() -> Frame {
@@ -1311,7 +1311,7 @@ fn http3_connection_eof_survives_handoff_and_unknown_streams_are_skipped() {
     assert_eq!(session.next(), Some((11, Ok(Ok(StreamItem::Header(StreamHeader::QpackEncoder))))));
     assert_eq!(
         session.next(),
-        Some((11, Err(Fail::Protocol(http3::StreamError::Http3(http3::Error::ClosedCriticalStream)))))
+        Some((11, Err(Fail::Protocol(http3::Error::ClosedCriticalStream))))
     );
     assert!(session.next().is_none());
 }
@@ -1343,7 +1343,7 @@ fn http3_strict_writers_are_transactional() {
     contract::check_wire_value(&http3::Settings::default());
     let mut bytes = wire(&Frame::Data(vec![]));
     bytes.push(0);
-    assert_eq!(<Frame as Wire>::parse(&bytes), Err(http3::FrameParseError::Trailing));
+    assert_eq!(<Frame as Wire>::parse(&bytes), Err(http3::Error::Trailing));
 }
 
 #[test]
