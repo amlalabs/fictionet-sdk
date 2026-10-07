@@ -175,3 +175,58 @@ pub fn error(packet: &[u8], from: IpAddr, kind: u8, code: u8, word: u32) -> Opti
     set_checksum(&mut icmp, from, ip.src);
     Some(ip::packet(from, ip.src, proto, &icmp))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SRC: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2);
+    const DST: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 1, 0, 1);
+    const ROUTER: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+
+    /// A fragment of an IPv6 packet from `SRC` to `DST` at `offset`, whose
+    /// first fragment carries ICMPv6 of type `kind`.
+    fn fragment6(offset: u16, kind: u8) -> Vec<u8> {
+        let frag = [protocol::ICMPV6, 0, (offset >> 8) as u8, offset as u8 | 1, 0, 0, 0, 9];
+        let body = if offset == 0 { vec![kind, 0, 0, 0, 0, 0, 0, 0] } else { vec![kind; 8] };
+        let fields = Fields { ttl: 1, ..Fields::default() };
+        ip::packet_with(SRC.into(), DST.into(), protocol::FRAGMENT, fields, &[&frag[..], &body].concat()).0
+    }
+
+    /// Time exceeded and address unreachable now come from the one ICMP
+    /// error builder, so they answer a non-first IPv6 fragment as Linux
+    /// does: it holds no ICMPv6 type, so it may not be an error. Before,
+    /// they refused it, while parameter problem answered it.
+    #[test]
+    fn a_later_ipv6_fragment_is_answered() {
+        let later = fragment6(8, 1);
+        let answer = time_exceeded(&later, ROUTER.into()).expect("an answer").0;
+        let h = Header::parse(&answer).unwrap();
+        assert_eq!((h.src, h.dst, h.protocol), (ROUTER.into(), SRC.into(), protocol::ICMPV6));
+        let icmp = h.payload(&answer);
+        assert_eq!((icmp[0], icmp[1]), (3, 0));
+        assert_eq!(&icmp[8..], &later[..]);
+        assert_eq!(ip::transport_checksum(ROUTER.into(), SRC.into(), protocol::ICMPV6, icmp), 0);
+        assert!(address_unreachable(&later, ROUTER).is_some());
+        // A first fragment shows its type: an error gets no error, a ping
+        // does.
+        assert!(time_exceeded(&fragment6(0, 1), ROUTER.into()).is_none());
+        assert!(time_exceeded(&fragment6(0, 128), ROUTER.into()).is_some());
+    }
+
+    #[test]
+    fn errors_go_only_to_one_host() {
+        let to = |src: &str, dst: &str| ip::packet(src.parse().unwrap(), dst.parse().unwrap(), protocol::UDP, &[0; 8]).0;
+        let from = "10.0.0.1".parse().unwrap();
+        assert!(error(&to("10.0.0.2", "10.0.0.9"), from, 3, 3, 0).is_some());
+        for (src, dst) in [("0.0.0.0", "10.0.0.9"), ("127.0.0.1", "10.0.0.9"), ("224.0.0.1", "10.0.0.9"), ("10.0.0.2", "255.255.255.255")] {
+            assert!(error(&to(src, dst), from, 3, 3, 0).is_none(), "{src} to {dst}");
+        }
+        // Not from an address of the other family.
+        assert!(error(&to("10.0.0.2", "10.0.0.9"), ROUTER.into(), 3, 3, 0).is_none());
+        // An IPv4 ICMP error gets none; a ping does.
+        let icmp = |kind: u8| ip::packet("10.0.0.2".parse().unwrap(), "10.0.0.9".parse().unwrap(), protocol::ICMP, &[kind, 0, 0, 0, 0, 0, 0, 0]).0;
+        assert!(host_unreachable(&icmp(3), "10.0.0.1".parse().unwrap()).is_none());
+        assert!(host_unreachable(&icmp(8), "10.0.0.1".parse().unwrap()).is_some());
+    }
+}
