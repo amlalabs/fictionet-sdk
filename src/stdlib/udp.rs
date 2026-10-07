@@ -23,9 +23,12 @@ use crate::stdlib::icmp;
 use crate::stdlib::ip::{self, Fields, Header, protocol};
 use crate::{Cx, Error, Interface, Packet, RecvError};
 
-/// How many datagrams a socket holds before it drops new ones, like a full
-/// socket buffer.
-const QUEUE: usize = 1024;
+/// How many bytes of datagrams a socket holds before it drops new ones,
+/// like a full socket buffer, counting [`DATAGRAM_COST`] more for each.
+const QUEUE: usize = 1 << 20;
+/// What a queued datagram costs beyond its bytes: its sender's address and
+/// its place in the queue. So a flood of tiny datagrams is bounded too.
+const DATAGRAM_COST: usize = 64;
 
 /// Starts UDP for a machine with address `addr`, on the UDP packets of
 /// `inner`.
@@ -45,8 +48,9 @@ const QUEUE: usize = 1024;
 /// checksum field is zero: that means "no checksum" only over IPv4, and
 /// RFC 8200 forbids it over IPv6.
 ///
-/// A socket holds at most 1,024 datagrams it has not received yet. Further
-/// datagrams are dropped, as with a full socket buffer. ICMP messages that
+/// A socket holds at most 1 MiB of datagrams it has not received yet,
+/// counting 64 bytes more for each datagram. Further datagrams are dropped,
+/// as with a full socket buffer. ICMP messages that
 /// reach this layer, such as errors about datagrams it sent, are dropped.
 #[track_caller]
 pub fn endpoint(cx: &Cx, inner: impl Interface, addr: IpAddr) -> Endpoint {
@@ -89,6 +93,8 @@ struct State {
 #[derive(Default)]
 struct Queue {
     datagrams: VecDeque<(Vec<u8>, SocketAddr)>,
+    /// What `datagrams` holds, counted as for [`QUEUE`].
+    bytes: usize,
     waker: Option<Waker>,
 }
 
@@ -155,7 +161,9 @@ fn deliver(shared: &Shared, packet: Packet) {
         let mut st = shared.state.lock().unwrap();
         match st.sockets.get_mut(&dst_port) {
             Some(q) => {
-                if q.datagrams.len() < QUEUE {
+                let cost = udp.len() - 8 + DATAGRAM_COST;
+                if q.bytes + cost <= QUEUE {
+                    q.bytes += cost;
                     q.datagrams.push_back((udp[8..].to_vec(), from));
                 }
                 if let Some(w) = q.waker.take() {
@@ -250,6 +258,7 @@ impl Socket {
                 let stopped = st.stopped;
                 let q = st.sockets.get_mut(&port).expect("a bound socket has a queue");
                 if let Some(d) = q.datagrams.pop_front() {
+                    q.bytes -= d.0.len() + DATAGRAM_COST;
                     return Poll::Ready(Ok(d));
                 }
                 if stopped {
@@ -319,5 +328,45 @@ fn port_unreachable(packet: &[u8], addr: IpAddr) -> Option<Packet> {
     match addr {
         IpAddr::V4(_) => icmp::error(packet, addr, 3, 3, 0),
         IpAddr::V6(_) => icmp::error(packet, addr, 1, 4, 0),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{block_on, pair, run};
+
+    /// A UDP datagram from 10.0.0.2 to port 53 of 10.0.0.1, with a good
+    /// checksum.
+    fn datagram(data: &[u8]) -> Packet {
+        let (src, dst): (IpAddr, IpAddr) = ("10.0.0.2".parse().unwrap(), "10.0.0.1".parse().unwrap());
+        let mut u = [&[0, 9, 0, 53][..], &((8 + data.len()) as u16).to_be_bytes(), &[0, 0], data].concat();
+        let sum = ip::transport_checksum(src, dst, protocol::UDP, &u);
+        u[6..8].copy_from_slice(&sum.to_be_bytes());
+        ip::packet(src, dst, protocol::UDP, &u)
+    }
+
+    /// A socket's queue is bounded by bytes, not by datagrams: before, it
+    /// held 1,024 of any size, 64 MiB of the largest.
+    #[test]
+    fn a_socket_holds_at_most_its_queue_in_bytes() {
+        let result = block_on(run(|cx| async move {
+            let (mut raw, side) = pair();
+            let mut socket = endpoint(&cx, side, "10.0.0.1".parse().unwrap()).bind(53)?;
+            let big = vec![7; 60_000];
+            for _ in 0..40 {
+                raw.send(datagram(&big));
+            }
+            cx.sleep(crate::time::ms(10)).await?;
+            let fits = QUEUE / (big.len() + DATAGRAM_COST);
+            for _ in 0..fits {
+                assert_eq!(socket.recv(&cx).await?.0.len(), big.len());
+            }
+            // The rest were dropped, and the room is there again.
+            raw.send(datagram(b"after"));
+            assert_eq!(socket.recv(&cx).await?.0, b"after");
+            Err::<(), crate::Error>("done".into())
+        }));
+        assert_eq!(result.unwrap_err().to_string(), "done");
     }
 }
