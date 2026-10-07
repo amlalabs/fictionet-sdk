@@ -3,7 +3,7 @@
 
 use fictionet::stdlib::codec::{Decode, Step, Wire, contract, test_support::decode_all};
 use fictionet::stdlib::websocket::{
-    Close, Frame, Frames, Header, MAX_HEADERS, MAX_MESSAGE, Message, Messages, Opcode, Role, WriteError, check_request,
+    Close, Error, Frame, Frames, Header, MAX_HEADERS, MAX_MESSAGE, Message, Messages, Opcode, Role, check_request,
     check_response, request_headers,
 };
 use libfuzzer_sys::fuzz_target;
@@ -142,7 +142,7 @@ fuzz_target!(|data: &[u8]| {
                 // Changed public fields must be checked before making a reply.
                 u.accept.clear();
                 u.protocols.push(text.to_string());
-                assert_eq!(u.response_headers(Some(text)), Err(WriteError::Unwritable));
+                assert_eq!(u.response_headers(Some(text)), Err(Error::Unwritable));
             }
             Err(e) => assert!(matches!(e.status_code(), 400 | 426 | 431)),
         }

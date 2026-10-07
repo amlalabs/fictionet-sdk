@@ -9,7 +9,7 @@
 //! duplicates inside params, results, and error data are kept.
 //!
 //! For MCP stdio, [`Messages`] applies JSON parsing to [`Lines`]. Every line
-//! yields a message or a recoverable [`ParseError`]. Blank lines are errors.
+//! yields a message or a recoverable [`Error`]. Blank lines are errors.
 //! An MCP server may skip them by checking `error.kind == ErrorKind::BlankLine`.
 //! An overlong line yields one error, then skips through LF. A final line
 //! without LF is refused even if its JSON is complete. LF and CRLF work.
@@ -45,7 +45,7 @@
 //! `Stream::new(Collect::<json::Value>::new(json::MAX_SIZE))`, then call
 //! `finish` at that body's end. Pass the value to [`Incoming::from_value`]
 //! to retain each invalid batch entry. Convert a `CollectError::Parse` JSON
-//! error with [`ParseError::from`] to build its reply. [`parse_incoming`]
+//! error with [`Error::from`] to build its reply. [`parse_incoming`]
 //! provides the same entry handling for bytes already collected.
 //! Clients and strict callers can use `Collect::<Body>` to refuse a whole
 //! batch on any invalid entry. The MCP layer chooses which revisions permit
@@ -53,7 +53,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::{Collect, CollectError, Fail, Stream, Wire, finish, pump};
-//! use fictionet::stdlib::{json, jsonrpc::{Batch, Body, Incoming, Message, ParseError}};
+//! use fictionet::stdlib::{json, jsonrpc::{Batch, Body, Error, Incoming, Message}};
 //!
 //! let mut post = Stream::new(Collect::<json::Value>::new(json::MAX_SIZE));
 //! let mut values = Vec::new();
@@ -61,7 +61,7 @@
 //!     |value| values.push(value))?;
 //! let incoming = match finish(&mut post, |value| values.push(value)) {
 //!     Ok(()) => Incoming::from_value(values.pop().ok_or("missing body")?),
-//!     Err(Fail::Protocol(CollectError::Parse(error))) => Err(ParseError::from(error)),
+//!     Err(Fail::Protocol(CollectError::Parse(error))) => Err(Error::from(error)),
 //!     Err(error) => return Err(error.into()),
 //! };
 //! let (batch, entries) = match incoming {
@@ -159,7 +159,7 @@ pub enum Id {
 impl Id {
     /// Reads an identifier. Refuses other types and values beyond the default
     /// JSON limits.
-    pub fn from_value(mut value: Value) -> Result<Self, ParseError> {
+    pub fn from_value(mut value: Value) -> Result<Self, Error> {
         bounded(&value)?;
         match &mut value {
             Value::String(s) => Ok(Self::String(core::mem::take(s))),
@@ -179,7 +179,7 @@ impl Id {
     }
 
     /// Converts this identifier, refusing strings beyond the JSON limits.
-    pub fn to_value(&self) -> Result<Value, ParseError> {
+    pub fn to_value(&self) -> Result<Value, Error> {
         if let Self::String(s) = self
             && s.len() > json::MAX_SIZE
         {
@@ -209,7 +209,7 @@ pub enum Params {
 
 impl Params {
     /// Reads parameters, refusing scalars and values beyond JSON limits.
-    pub fn from_value(mut value: Value) -> Result<Self, ParseError> {
+    pub fn from_value(mut value: Value) -> Result<Self, Error> {
         bounded(&value)?;
         match &mut value {
             Value::Array(values) => Ok(Self::Array(core::mem::take(values))),
@@ -220,7 +220,7 @@ impl Params {
 
     /// Moves parameters into JSON without changing order or number text.
     /// Refuses values beyond the default JSON limits.
-    pub fn to_value(self) -> Result<Value, ParseError> {
+    pub fn to_value(self) -> Result<Value, Error> {
         let value = self.into_value();
         bounded(&value)?;
         Ok(value)
@@ -234,7 +234,7 @@ impl Params {
     }
 }
 
-/// Why a JSON-RPC value or framed line was refused.
+/// Why a JSON-RPC value or framed line was refused, or a write failed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ErrorKind {
     /// Invalid JSON syntax, including the parser's byte offset.
@@ -275,13 +275,16 @@ pub enum ErrorKind {
     Batch,
     /// A batch contains no entries.
     EmptyBatch,
+    /// The write destination could not grow, including length overflow.
+    Allocation,
 }
 
 /// A refusal with a readable id and optional zero-based batch position.
 /// Missing, malformed, and duplicate ids become [`Id::Null`]. An otherwise
 /// readable id is retained even when another envelope member is invalid.
+/// A refused write leaves the destination unchanged.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ParseError {
+pub struct Error {
     /// The failed rule.
     pub kind: ErrorKind,
     /// Recovered id. [`Self::response`] uses null if this id makes it too large.
@@ -291,15 +294,17 @@ pub struct ParseError {
     response: bool,
 }
 
-impl ParseError {
+impl Error {
     /// The standard response code. JSON syntax, blank lines, and unfinished
     /// lines map to parse error. Envelope, parameter shape, and resource
     /// limits, including [`LineError::TooLong`], map to invalid request
-    /// (-32600). Application argument checking uses [`INVALID_PARAMS`]
-    /// separately. Never automatically answer a response.
+    /// (-32600). A failed write allocation maps to internal error.
+    /// Application argument checking uses [`INVALID_PARAMS`] separately.
+    /// Never automatically answer a response.
     pub fn rpc_code(&self) -> i64 {
         match &self.kind {
             ErrorKind::Json(e) if is_limit(e) => INVALID_REQUEST,
+            ErrorKind::Allocation => INTERNAL_ERROR,
             ErrorKind::Json(_)
             | ErrorKind::BlankLine
             | ErrorKind::Line(LineError::Unterminated | LineError::BareLf) => PARSE_ERROR,
@@ -322,10 +327,10 @@ impl ParseError {
     /// when writing. Callers must check [`Self::is_response`] before replying.
     pub fn response(&self) -> Response {
         let code = self.rpc_code();
-        let message = if code == PARSE_ERROR {
-            "Parse error"
-        } else {
-            "Invalid Request"
+        let message = match code {
+            PARSE_ERROR => "Parse error",
+            INTERNAL_ERROR => "Internal error",
+            _ => "Invalid Request",
         };
         let reply = Response::error(self.id.clone(), code, message);
         if checked(&reply.value, Kind::Response).is_ok() {
@@ -336,7 +341,7 @@ impl ParseError {
     }
 }
 
-impl fmt::Display for ParseError {
+impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(index) = self.batch_index {
             write!(f, "batch entry {index}: ")?;
@@ -362,12 +367,21 @@ impl fmt::Display for ParseError {
             ErrorKind::MessageKind => f.write_str("unexpected JSON-RPC message kind"),
             ErrorKind::Batch => f.write_str("batch must be an array"),
             ErrorKind::EmptyBatch => f.write_str("empty JSON-RPC batch"),
+            ErrorKind::Allocation => f.write_str("JSON-RPC output allocation failed"),
         }
     }
 }
-impl core::error::Error for ParseError {}
+impl core::error::Error for Error {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match &self.kind {
+            ErrorKind::Json(e) | ErrorKind::Limit(e) => Some(e),
+            ErrorKind::Line(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
-impl From<json::Error> for ParseError {
+impl From<json::Error> for Error {
     /// Wraps a JSON parser error with a null id and no batch position.
     /// Syntax errors map to [`PARSE_ERROR`]; JSON limits map to
     /// [`INVALID_REQUEST`]. The input has no known response shape.
@@ -376,8 +390,8 @@ impl From<json::Error> for ParseError {
     }
 }
 
-fn problem(kind: ErrorKind) -> ParseError {
-    ParseError {
+fn problem(kind: ErrorKind) -> Error {
+    Error {
         kind,
         id: Id::Null,
         batch_index: None,
@@ -393,17 +407,17 @@ fn is_limit(e: &json::Error) -> bool {
             | json::ErrorKind::NumberTooLong
     )
 }
-fn bounded(value: &Value) -> Result<Vec<u8>, ParseError> {
+fn bounded(value: &Value) -> Result<Vec<u8>, Error> {
     value.to_bytes().map_err(|e| problem(ErrorKind::Limit(e)))
 }
-fn bounded_envelope(value: &Value) -> Result<Vec<u8>, ParseError> {
+fn bounded_envelope(value: &Value) -> Result<Vec<u8>, Error> {
     bounded(value).map_err(|mut error| {
         error.response = response_shape(value);
         error
     })
 }
-fn envelope_problem(kind: ErrorKind, value: &Value) -> ParseError {
-    ParseError {
+fn envelope_problem(kind: ErrorKind, value: &Value) -> Error {
+    Error {
         kind,
         id: recover_id(value),
         batch_index: None,
@@ -538,13 +552,13 @@ fn integer(number: &Number) -> bool {
         >= i64::try_from(fraction).unwrap_or(i64::MAX)
 }
 
-fn checked(value: &Value, kind: Kind) -> Result<Vec<u8>, ParseError> {
+fn checked(value: &Value, kind: Kind) -> Result<Vec<u8>, Error> {
     let bytes = bounded_envelope(value)?;
     check_envelope(value, kind)?;
     Ok(bytes)
 }
 
-fn check_envelope(value: &Value, kind: Kind) -> Result<(), ParseError> {
+fn check_envelope(value: &Value, kind: Kind) -> Result<(), Error> {
     let result = envelope(value).and_then(|actual| {
         if actual == kind {
             Ok(())
@@ -607,13 +621,13 @@ fn id_value(id: Id) -> Value {
 
 impl Request {
     /// Checks this message kind and the default JSON limits.
-    pub fn from_value(value: Value) -> Result<Self, ParseError> {
+    pub fn from_value(value: Value) -> Result<Self, Error> {
         checked(&value, Kind::Request)?;
         Ok(Self { value })
     }
     /// Checks and copies the complete value, preserving all members.
     /// Refuses invalid envelopes or values beyond default JSON limits.
-    pub fn to_value(&self) -> Result<Value, ParseError> {
+    pub fn to_value(&self) -> Result<Value, Error> {
         checked(&self.value, Kind::Request)?;
         Ok(self.value.clone())
     }
@@ -635,7 +649,7 @@ impl Request {
     }
     /// The id after checking the envelope members. Does not traverse params
     /// or extensions. Conversion and writing check their JSON limits.
-    pub fn id(&self) -> Result<Id, ParseError> {
+    pub fn id(&self) -> Result<Id, Error> {
         check_envelope(&self.value, Kind::Request)?;
         Ok(recover_id(&self.value))
     }
@@ -643,26 +657,26 @@ impl Request {
     /// members as [`Self::id`] does. The reply can exceed JSON limits, even
     /// for a valid request with a large id. Handle write errors so a refused
     /// reply does not stop dispatching later messages.
-    pub fn success(&self, result: Value) -> Result<Response, ParseError> {
+    pub fn success(&self, result: Value) -> Result<Response, Error> {
         Ok(Response::success(self.id()?, result))
     }
     /// Answers this request with an error and its exact id. Checks envelope
     /// members as [`Self::id`] does. The reply can exceed JSON limits, even
     /// for a valid request with a large id. Handle write errors so a refused
     /// reply does not stop dispatching later messages.
-    pub fn error(&self, code: i64, message: impl Into<String>) -> Result<Response, ParseError> {
+    pub fn error(&self, code: i64, message: impl Into<String>) -> Result<Response, Error> {
         Ok(Response::error(self.id()?, code, message))
     }
 }
 impl Notification {
     /// Checks this message kind and the default JSON limits.
-    pub fn from_value(value: Value) -> Result<Self, ParseError> {
+    pub fn from_value(value: Value) -> Result<Self, Error> {
         checked(&value, Kind::Notification)?;
         Ok(Self { value })
     }
     /// Checks and copies the complete value, preserving all members.
     /// Refuses invalid envelopes or values beyond default JSON limits.
-    pub fn to_value(&self) -> Result<Value, ParseError> {
+    pub fn to_value(&self) -> Result<Value, Error> {
         checked(&self.value, Kind::Notification)?;
         Ok(self.value.clone())
     }
@@ -685,12 +699,12 @@ impl Notification {
 
 /// A JSON-RPC error object. Its complete ordered value includes extensions.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Error {
+pub struct ErrorObject {
     /// The error object. Direct edits are checked on conversion and writing
     /// of a containing response, including an integer code and string message.
     pub value: Value,
 }
-impl Error {
+impl ErrorObject {
     /// Builds an error without data. Limits are checked on conversion or writing.
     pub fn new(code: i64, message: impl Into<String>) -> Self {
         Self {
@@ -702,13 +716,13 @@ impl Error {
     }
     /// Reads an error object with integer code, string message, and optional data.
     /// Extension members are kept. Refuses duplicate protocol members and limits.
-    pub fn from_value(value: Value) -> Result<Self, ParseError> {
+    pub fn from_value(value: Value) -> Result<Self, Error> {
         bounded(&value)?;
         error_object(&value).map_err(problem)?;
         Ok(Self { value })
     }
     /// Checks and copies this error, retaining its code spelling and member order.
-    pub fn to_value(&self) -> Result<Value, ParseError> {
+    pub fn to_value(&self) -> Result<Value, Error> {
         bounded(&self.value)?;
         error_object(&self.value).map_err(problem)?;
         Ok(self.value.clone())
@@ -734,17 +748,17 @@ pub enum Outcome {
     /// Successful method result, including null.
     Result(Value),
     /// Error object, including optional data and extension members.
-    Error(Error),
+    Error(ErrorObject),
 }
 impl Response {
     /// Checks this message kind and the default JSON limits.
-    pub fn from_value(value: Value) -> Result<Self, ParseError> {
+    pub fn from_value(value: Value) -> Result<Self, Error> {
         checked(&value, Kind::Response)?;
         Ok(Self { value })
     }
     /// Checks and copies the complete value, preserving all members.
     /// Refuses invalid envelopes or values beyond default JSON limits.
-    pub fn to_value(&self) -> Result<Value, ParseError> {
+    pub fn to_value(&self) -> Result<Value, Error> {
         checked(&self.value, Kind::Response)?;
         Ok(self.value.clone())
     }
@@ -762,11 +776,11 @@ impl Response {
     /// Builds an error response. Use [`Id::Null`] for an unreadable id.
     /// Limits are checked on conversion or writing.
     pub fn error(id: Id, code: i64, message: impl Into<String>) -> Self {
-        Self::with_error(id, Error::new(code, message))
+        Self::with_error(id, ErrorObject::new(code, message))
     }
     /// Builds a response from a complete error object, including data and
     /// extensions. The object and limits are checked on conversion or writing.
-    pub fn with_error(id: Id, error: Error) -> Self {
+    pub fn with_error(id: Id, error: ErrorObject) -> Self {
         Self {
             value: Value::Object(vec![
                 ("jsonrpc".into(), Value::from("2.0")),
@@ -776,18 +790,18 @@ impl Response {
         }
     }
     /// The response id, after checking the whole envelope and its limits.
-    pub fn id(&self) -> Result<Id, ParseError> {
+    pub fn id(&self) -> Result<Id, Error> {
         checked(&self.value, Kind::Response)?;
         Ok(recover_id(&self.value))
     }
     /// Checks the response and copies its single result or error payload.
-    pub fn outcome(&self) -> Result<Outcome, ParseError> {
+    pub fn outcome(&self) -> Result<Outcome, Error> {
         checked(&self.value, Kind::Response)?;
         if let Some(result) = self.value.get("result") {
             return Ok(Outcome::Result(result.clone()));
         }
         match self.value.get("error") {
-            Some(error) => Ok(Outcome::Error(Error {
+            Some(error) => Ok(Outcome::Error(ErrorObject {
                 value: error.clone(),
             })),
             None => Err(problem(ErrorKind::ResultOrError)),
@@ -808,11 +822,11 @@ pub enum Message {
 impl Message {
     /// Checks and classifies an envelope, keeping every member. Refuses the
     /// default JSON limits and malformed or ambiguous envelopes.
-    pub fn from_value(value: Value) -> Result<Self, ParseError> {
+    pub fn from_value(value: Value) -> Result<Self, Error> {
         bounded_envelope(&value)?;
         Self::from_bounded(value)
     }
-    fn from_bounded(value: Value) -> Result<Self, ParseError> {
+    fn from_bounded(value: Value) -> Result<Self, Error> {
         let kind = envelope(&value).map_err(|kind| envelope_problem(kind, &value))?;
         Ok(match kind {
             Kind::Request => Self::Request(Request { value }),
@@ -821,7 +835,7 @@ impl Message {
         })
     }
     /// Checks the variant, envelope, and limits, then copies its JSON value.
-    pub fn to_value(&self) -> Result<Value, ParseError> {
+    pub fn to_value(&self) -> Result<Value, Error> {
         self.render()?;
         Ok(self.value().clone())
     }
@@ -841,7 +855,7 @@ impl Message {
             Self::Response(r) => &mut r.value,
         }
     }
-    fn render(&self) -> Result<Vec<u8>, ParseError> {
+    fn render(&self) -> Result<Vec<u8>, Error> {
         let kind = match self {
             Self::Request(_) => Kind::Request,
             Self::Notification(_) => Kind::Notification,
@@ -851,18 +865,18 @@ impl Message {
     }
     /// Parses exactly one message with caller-selected JSON limits, clamped to
     /// JSON's hard caps. Arrays, trailing values, and invalid envelopes fail.
-    pub fn parse_with(input: &[u8], limits: &Limits) -> Result<Self, ParseError> {
-        Self::from_bounded(json::parse_with(input, limits).map_err(ParseError::from)?)
+    pub fn parse_with(input: &[u8], limits: &Limits) -> Result<Self, Error> {
+        Self::from_bounded(json::parse_with(input, limits).map_err(Error::from)?)
     }
     /// Appends compact JSON followed by one LF. Refuses invalid envelopes,
     /// JSON limits, or allocation failure.
     /// Strings are escaped by JSON and numbers have checked grammar, so valid
     /// values cannot produce raw newlines. Refusal leaves `out` unchanged.
-    pub fn write_line(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
-        let bytes = self.render().map_err(WriteError::Invalid)?;
+    pub fn write_line(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        let bytes = self.render()?;
         reserve(
             out,
-            bytes.len().checked_add(1).ok_or(WriteError::Allocation)?,
+            bytes.len().checked_add(1).ok_or(problem(ErrorKind::Allocation))?,
         )?;
         out.extend_from_slice(&bytes);
         out.push(b'\n');
@@ -880,7 +894,7 @@ pub struct Batch {
 impl Batch {
     /// Reads a nonempty batch. Reports the first bad entry with its position.
     /// Use [`Incoming::from_value`] to process every entry of a mixed batch.
-    pub fn from_value(mut value: Value) -> Result<Self, ParseError> {
+    pub fn from_value(mut value: Value) -> Result<Self, Error> {
         bounded(&value)?;
         let Value::Array(values) = &mut value else {
             return Err(problem(ErrorKind::Batch));
@@ -890,13 +904,13 @@ impl Batch {
     }
     /// Checks nonemptiness, every envelope, and total JSON limits, then copies
     /// the array. Staging is capped at JSON's size and element limits.
-    pub fn to_value(&self) -> Result<Value, ParseError> {
+    pub fn to_value(&self) -> Result<Value, Error> {
         // Writing to a bounded byte buffer avoids cloning an unbounded list
         // of individually valid messages before checking aggregate limits.
         let bytes = self.render_entries()?;
         json::parse_with(&bytes, &Limits::default()).map_err(|e| problem(ErrorKind::Limit(e)))
     }
-    fn render_entries(&self) -> Result<Vec<u8>, ParseError> {
+    fn render_entries(&self) -> Result<Vec<u8>, Error> {
         if self.messages.is_empty() {
             return Err(problem(ErrorKind::EmptyBatch));
         }
@@ -928,7 +942,7 @@ impl Batch {
         Ok(bytes)
     }
 }
-fn too_large() -> ParseError {
+fn too_large() -> Error {
     problem(ErrorKind::Limit(json::Error {
         kind: json::ErrorKind::TooLarge,
         offset: json::MAX_SIZE,
@@ -945,7 +959,7 @@ pub enum Body {
 }
 impl Body {
     /// Classifies a value. Invalid batch entries fail the whole conversion.
-    pub fn from_value(value: Value) -> Result<Self, ParseError> {
+    pub fn from_value(value: Value) -> Result<Self, Error> {
         if matches!(value, Value::Array(_)) {
             Batch::from_value(value).map(Self::Batch)
         } else {
@@ -953,7 +967,7 @@ impl Body {
         }
     }
     /// Checks this body and copies its ordered JSON value within default limits.
-    pub fn to_value(&self) -> Result<Value, ParseError> {
+    pub fn to_value(&self) -> Result<Value, Error> {
         match self {
             Self::Message(m) => m.to_value(),
             Self::Batch(b) => b.to_value(),
@@ -967,19 +981,19 @@ impl Body {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Incoming {
     /// A single message, or a refusal with its recovered id.
-    Message(Result<Message, ParseError>),
+    Message(Result<Message, Error>),
     /// A nonempty batch with one result per entry, in input order.
-    Batch(Vec<Result<Message, ParseError>>),
+    Batch(Vec<Result<Message, Error>>),
 }
 impl Incoming {
     /// Reads a body value within JSON limits. Empty arrays fail as a whole;
     /// every entry of a nonempty array gets its own result. Nested arrays
     /// are invalid entries. No valid neighboring message is discarded.
-    pub fn from_value(value: Value) -> Result<Self, ParseError> {
+    pub fn from_value(value: Value) -> Result<Self, Error> {
         bounded_envelope(&value)?;
         Self::from_bounded(value)
     }
-    fn from_bounded(mut value: Value) -> Result<Self, ParseError> {
+    fn from_bounded(mut value: Value) -> Result<Self, Error> {
         if let Value::Array(values) = &mut value {
             Ok(Self::Batch(
                 batch_entries(core::mem::take(values))?.collect(),
@@ -991,18 +1005,18 @@ impl Incoming {
 }
 /// Reads server input with default limits, retaining individual batch errors.
 /// Invalid JSON and empty batches return a single whole-body error.
-pub fn parse_incoming(input: &[u8]) -> Result<Incoming, ParseError> {
+pub fn parse_incoming(input: &[u8]) -> Result<Incoming, Error> {
     parse_incoming_with(input, &Limits::default())
 }
 /// Reads server input with tighter JSON limits and individual batch errors.
 /// Invalid JSON, resource limits, and empty arrays fail the whole body.
-pub fn parse_incoming_with(input: &[u8], limits: &Limits) -> Result<Incoming, ParseError> {
-    Incoming::from_bounded(json::parse_with(input, limits).map_err(ParseError::from)?)
+pub fn parse_incoming_with(input: &[u8], limits: &Limits) -> Result<Incoming, Error> {
+    Incoming::from_bounded(json::parse_with(input, limits).map_err(Error::from)?)
 }
 
 fn batch_entries(
     values: Vec<Value>,
-) -> Result<impl Iterator<Item = Result<Message, ParseError>>, ParseError> {
+) -> Result<impl Iterator<Item = Result<Message, Error>>, Error> {
     if values.is_empty() {
         return Err(problem(ErrorKind::EmptyBatch));
     }
@@ -1014,88 +1028,64 @@ fn batch_entries(
     }))
 }
 
-/// A strict writer refusal. The destination has not changed.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum WriteError {
-    /// Invalid envelope or JSON limit, with the failed rule and batch position.
-    Invalid(ParseError),
-    /// The destination could not grow, including length overflow.
-    Allocation,
-}
-impl fmt::Display for WriteError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Invalid(error) => write!(f, "unwritable JSON-RPC value: {error}"),
-            Self::Allocation => f.write_str("JSON-RPC output allocation failed"),
-        }
-    }
-}
-impl core::error::Error for WriteError {
-    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
-        match self {
-            Self::Invalid(error) => Some(error),
-            Self::Allocation => None,
-        }
-    }
-}
-fn reserve(out: &mut Vec<u8>, additional: usize) -> Result<(), WriteError> {
+fn reserve(out: &mut Vec<u8>, additional: usize) -> Result<(), Error> {
     out.len()
         .checked_add(additional)
-        .ok_or(WriteError::Allocation)?;
+        .ok_or(problem(ErrorKind::Allocation))?;
     out.try_reserve(additional)
-        .map_err(|_| WriteError::Allocation)
+        .map_err(|_| problem(ErrorKind::Allocation))
 }
-fn append(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), WriteError> {
+fn append(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), Error> {
     reserve(out, bytes.len())?;
     out.extend_from_slice(bytes);
     Ok(())
 }
 impl Wire for Message {
-    type ParseError = ParseError;
-    type WriteError = WriteError;
+    type ParseError = Error;
+    type WriteError = Error;
     /// Reads exactly one envelope within default JSON limits. Refuses batches,
     /// invalid versions, ids, params, response shapes, and trailing values.
-    fn parse(input: &[u8]) -> Result<Self, ParseError> {
+    fn parse(input: &[u8]) -> Result<Self, Error> {
         Self::parse_with(input, &Limits::default())
     }
     /// Appends compact JSON without a line ending. Refuses malformed or
     /// mismatched envelopes, JSON limits, and destination allocation failure.
     /// Refusal leaves `out` unchanged.
     /// JSON escaping and checked numbers prevent raw CR or LF in the output.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
-        let bytes = self.render().map_err(WriteError::Invalid)?;
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        let bytes = self.render()?;
         append(out, &bytes)
     }
 }
 impl Wire for Batch {
-    type ParseError = ParseError;
-    type WriteError = WriteError;
+    type ParseError = Error;
+    type WriteError = Error;
     /// Reads one nonempty array within default JSON limits. Refuses invalid
     /// entries, scalar bodies, empty batches, and trailing values.
-    fn parse(input: &[u8]) -> Result<Self, ParseError> {
-        Self::from_value(json::parse_with(input, &Limits::default()).map_err(ParseError::from)?)
+    fn parse(input: &[u8]) -> Result<Self, Error> {
+        Self::from_value(json::parse_with(input, &Limits::default()).map_err(Error::from)?)
     }
     /// Appends compact JSON. Refuses empty batches, invalid envelopes, and
     /// aggregate size, depth, or element limits, and destination allocation
     /// failure. Leaves `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
-        let bytes = self.render_entries().map_err(WriteError::Invalid)?;
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        let bytes = self.render_entries()?;
         // Accounts for the outer array's depth and aggregate element count.
-        Value::parse(&bytes).map_err(|e| WriteError::Invalid(problem(ErrorKind::Limit(e))))?;
+        Value::parse(&bytes).map_err(|e| problem(ErrorKind::Limit(e)))?;
         append(out, &bytes)
     }
 }
 impl Wire for Body {
-    type ParseError = ParseError;
-    type WriteError = WriteError;
+    type ParseError = Error;
+    type WriteError = Error;
     /// Reads one message or nonempty batch. Refuses invalid JSON, envelopes,
     /// trailing values, and default JSON limits.
-    fn parse(input: &[u8]) -> Result<Self, ParseError> {
-        Self::from_value(Value::parse(input).map_err(ParseError::from)?)
+    fn parse(input: &[u8]) -> Result<Self, Error> {
+        Self::from_value(Value::parse(input).map_err(Error::from)?)
     }
     /// Appends compact JSON. Refuses everything the contained message or
     /// batch writer refuses. On refusal, the destination is unchanged.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         match self {
             Self::Message(m) => m.write(out),
             Self::Batch(b) => b.write(out),
@@ -1104,14 +1094,14 @@ impl Wire for Body {
 }
 
 /// Newline-delimited single messages for stdio, built on [`Lines`].
-/// The item is `Result<Message, ParseError>`; errors do not stop framing.
+/// The item is `Result<Message, Error>`; errors do not stop framing.
 /// An MCP server may skip items whose public kind is [`ErrorKind::BlankLine`].
 /// It retains no input or payload state and processes input in linear time.
 pub struct Messages {
     lines: Map<Lines, LineParser>,
 }
 type LineParser =
-    Box<dyn FnMut(Result<Vec<u8>, LineError>) -> Result<Message, ParseError> + Send + Sync>;
+    Box<dyn FnMut(Result<Vec<u8>, LineError>) -> Result<Message, Error> + Send + Sync>;
 impl Default for Messages {
     fn default() -> Self {
         Self::new()
@@ -1143,7 +1133,7 @@ impl Messages {
     }
 }
 impl Decode for Messages {
-    type Item = Result<Message, ParseError>;
+    type Item = Result<Message, Error>;
     type Error = Infallible;
     const NAME: &'static str = "JSON-RPC lines";
     /// Line content cap plus two terminator bytes; at most 1 MiB plus two.
@@ -1190,7 +1180,7 @@ mod tests {
 
     // A tiny test dispatcher exercises the specification examples, including
     // per-entry errors and the absence of any reply to notification-only batches.
-    fn dispatch(message: Result<Message, ParseError>) -> Option<Message> {
+    fn dispatch(message: Result<Message, Error>) -> Option<Message> {
         let request = match message {
             Err(e) if !e.is_response() => return Some(Message::Response(e.response())),
             Ok(Message::Request(req)) => req,
@@ -1367,7 +1357,7 @@ mod tests {
             r#"{"x":-0,"result":{"text":"changed\nline","score":-0},"jsonrpc":"2.0","id":-0,"x":1.0}"#,
         );
         let error = r#"{"extra":-0,"data":{"z":1e400,"a":1.0},"message":"problem","code":-32600.00,"extra":1.0}"#;
-        let error = Error::from_value(value(error)).unwrap();
+        let error = ErrorObject::from_value(value(error)).unwrap();
         assert_eq!(error.code().unwrap().text(), "-32600.00");
         assert_eq!(error.message(), Some("problem"));
         assert_eq!(error.data(), Some(&value(r#"{"z":1e400,"a":1.0}"#)));
@@ -1505,7 +1495,7 @@ mod tests {
                 members.push((key.into(), Value::Null));
             }
             assert_eq!(
-                Error::from_value(v).unwrap_err().kind,
+                ErrorObject::from_value(v).unwrap_err().kind,
                 ErrorKind::Duplicate(key)
             );
         }
@@ -1526,7 +1516,7 @@ mod tests {
             "10e-1",
         ] {
             assert!(
-                Error::from_value(value(&format!(r#"{{"code":{code},"message":"x"}}"#))).is_ok(),
+                ErrorObject::from_value(value(&format!(r#"{{"code":{code},"message":"x"}}"#))).is_ok(),
                 "{code}"
             );
         }
@@ -1538,7 +1528,7 @@ mod tests {
             "1e-999999999999999",
         ] {
             assert_eq!(
-                Error::from_value(value(&format!(r#"{{"code":{code},"message":"x"}}"#)))
+                ErrorObject::from_value(value(&format!(r#"{{"code":{code},"message":"x"}}"#)))
                     .unwrap_err()
                     .kind,
                 ErrorKind::ErrorCode
@@ -1642,10 +1632,10 @@ mod tests {
             set(bad.value_mut(), key, replacement);
             contract::check_wire_value(&bad);
             let mut out = b"prefix".to_vec();
-            assert!(matches!(bad.write(&mut out), Err(WriteError::Invalid(_))));
+            assert!(matches!(bad.write(&mut out), Err(e) if e.kind != ErrorKind::Allocation));
             assert!(matches!(
                 bad.write_line(&mut out),
-                Err(WriteError::Invalid(_))
+                Err(e) if e.kind != ErrorKind::Allocation
             ));
             assert_eq!(out, b"prefix");
             assert!(bad.to_value().is_err());
@@ -1723,8 +1713,8 @@ mod tests {
         assert_eq!(bytes.iter().filter(|b| **b == b'\n').count(), 1);
         assert!(!bytes.contains(&b'\r'));
         assert_eq!(decode_all(Messages::new, &bytes), (vec![Ok(escaped)], None));
-        assert!(Error::new(INTERNAL_ERROR, "failure").data().is_none());
-        let mut null = Error::new(INTERNAL_ERROR, "failure");
+        assert!(ErrorObject::new(INTERNAL_ERROR, "failure").data().is_none());
+        let mut null = ErrorObject::new(INTERNAL_ERROR, "failure");
         set(&mut null.value, "data", Value::Null);
         assert_eq!(null.data(), Some(&Value::Null));
     }
@@ -1868,10 +1858,7 @@ mod tests {
         let mut out = vec![42];
         let error = batch.write(&mut out).unwrap_err();
         assert_eq!(out, [42]);
-        assert!(core::error::Error::source(&error).is_some());
-        let WriteError::Invalid(error) = error else {
-            panic!()
-        };
+        assert!(core::error::Error::source(&error).is_none());
         assert_eq!(error.kind, ErrorKind::ResultOrError);
         assert_eq!(error.id, Id::Number(Number::from_i64(5)));
         assert_eq!(error.batch_index, Some(1));

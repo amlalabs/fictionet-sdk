@@ -7,8 +7,9 @@ use fictionet::stdlib::codec::{Stream, Wire, contract, finish, pump};
 use fictionet::stdlib::x509::{
     AuthorityInfoAccess, AuthorityKeyIdentifier, BasicConstraints, Certificate, Crl,
     CrlDistributionPoints, CrlNumber, CrlReason, ExtendedKeyUsage, ExtensionValue, GeneralName,
-    IssuerAltName, KeyUsage, MAX_PEM_DATA, MAX_PEM_FRAME, Name, Pem, PemBlocks, RevokedCertificate,
-    SubjectAltName, SubjectKeyIdentifier, TbsCertList, TbsCertificate, Value, pem_decode,
+    IssuerAltName, KeyUsage, MAX_PEM_DATA, MAX_PEM_FRAME, Name, PemBlock, PemBlocks,
+    RevokedCertificate, SubjectAltName, SubjectKeyIdentifier, TbsCertList, TbsCertificate, Value,
+    pem_decode,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -96,7 +97,7 @@ fn der(data: &[u8]) {
             c.tbs.issuer.to_string(),
             c.tbs.validity.contains(0),
         );
-        let pem = Pem {
+        let pem = PemBlock {
             label: "CERTIFICATE".into(),
             data: c.to_bytes().unwrap(),
         }
@@ -127,7 +128,7 @@ fn der(data: &[u8]) {
         if let Some(r) = c.tbs.revoked.first() {
             assert!(c.is_revoked(&r.serial));
         }
-        let pem = Pem {
+        let pem = PemBlock {
             label: "X509 CRL".into(),
             data: c.to_bytes().unwrap(),
         }
@@ -167,22 +168,22 @@ fuzz_target!(|data: &[u8]| {
     }
     contract::check_decode(PemBlocks::new, data);
     contract::check_decode(|| PemBlocks::with_limit(128), data);
-    contract::check_wire::<Pem>(data);
-    let block = Pem {
+    contract::check_wire::<PemBlock>(data);
+    let block = PemBlock {
         label: "CERTIFICATE".into(),
         data: data.get(..MAX_PEM_DATA + 1).unwrap_or(data).to_vec(),
     };
     contract::check_wire_value(&block);
     if let Ok(text) = block.to_bytes() {
         contract::check_decode(PemBlocks::new, &text);
-        contract::check_wire::<Pem>(&text);
+        contract::check_wire::<PemBlock>(&text);
     }
 
     der(data);
     built(data);
 
     let mut stream = Stream::new(PemBlocks::new());
-    let mut inspect = |block: Pem| {
+    let mut inspect = |block: PemBlock| {
         contract::check_wire_value(&block);
         der(&block.data);
     };

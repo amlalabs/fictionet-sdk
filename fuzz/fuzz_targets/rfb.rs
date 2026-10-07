@@ -7,15 +7,15 @@ use fictionet::stdlib::{
 };
 
 use fictionet::stdlib::rfb::{
-    ClientMessage, Client, Dialect, Error, ParseError, PixelFormat, Phase, ServerInit, ServerMessage, Server, Version, Text,
+    ClientMessage, Client, Dialect, Error, FrameError, PixelFormat, Phase, ServerInit, ServerMessage, Server, Version, Text,
 };
 use libfuzzer_sys::fuzz_target;
 
 mod sessions {
-    use super::{Client, ClientMessage, Dialect, Error, ParseError, Phase, PixelFormat, Server, ServerInit, ServerMessage, Version, codec};
+    use super::{Client, ClientMessage, Dialect, Error, FrameError, Phase, PixelFormat, Server, ServerInit, ServerMessage, Version, codec};
 
     /// One session result, preserving both unit and terminal failures.
-    pub type Item<T> = Result<Result<T, ParseError>, codec::Fail<Error>>;
+    pub type Item<T> = Result<Result<T, Error>, codec::Fail<FrameError>>;
 
     fn server_turn(server: &Server, vnc: bool) -> Option<ServerMessage> {
         Some(match server.phase() {

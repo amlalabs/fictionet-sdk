@@ -4,7 +4,7 @@
 
 use fictionet::stdlib::codec::{Decode, Wire, contract, test_support::decode_all};
 use fictionet::stdlib::diameter::{
-    Address, Avp, Format, Frames, Identity, MAX_AVP_DATA, Message, Uri, Value, base_format, check,
+    Address, Avp, Format, Identity, MAX_AVP_DATA, Message, Messages, Uri, Value, base_format, check,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -26,10 +26,10 @@ const FORMATS: [Format; 14] = [
 ];
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(Frames::new, data, 2 * Frames::new().capacity());
+    contract::check_decode_with_alloc_limit(Messages::new, data, 2 * Messages::new().capacity());
     contract::check_wire::<Message>(data);
-    contract::check_decode_with_alloc_limit(|| Frames::with_limit(0), data, 2 * Frames::with_limit(0).capacity());
-    contract::check_decode_with_alloc_limit(|| Frames::with_limit(64), data, 2 * Frames::with_limit(64).capacity());
+    contract::check_decode_with_alloc_limit(|| Messages::with_limit(0), data, 2 * Messages::with_limit(0).capacity());
+    contract::check_decode_with_alloc_limit(|| Messages::with_limit(64), data, 2 * Messages::with_limit(64).capacity());
     let mut built = Message::request(u32::from(data.first().copied().unwrap_or(0)) << 20, 0, 1, 2);
     built.error = true;
     built.avps.push(Avp {
@@ -47,7 +47,7 @@ fuzz_target!(|data: &[u8]| {
         contract::check_wire_value(&built);
     }
 
-    let (items, _) = decode_all(Frames::new, data);
+    let (items, _) = decode_all(Messages::new, data);
     for malformed in items.iter().filter_map(|item| item.as_ref().err()) {
         assert!(malformed.header.avps.is_empty());
     }

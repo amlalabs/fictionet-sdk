@@ -3,8 +3,8 @@
 
 use fictionet::stdlib::codec::{Decode, Wire, contract, test_support::decode_all};
 use fictionet::stdlib::pop3::{
-    Command, Commands, Input, MAX_AUTH_LINE, MAX_REPLY_HELD, Output, Replies, Reply,
-    ReplyItemError, Request, ScanListing, UniqueIdListing,
+    Command, Error, Input, Inputs, MAX_AUTH_LINE, MAX_REPLY_HELD, Output, Outputs, Reply,
+    Request, ScanListing, UniqueIdListing,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -12,7 +12,7 @@ fn check_reply(reply: &Reply) {
     contract::check_wire_value(reply);
     if let Ok(bytes) = reply.to_bytes() {
         let make = || {
-            let mut replies = Replies::new();
+            let mut replies = Outputs::new();
             replies.expect(reply.body.is_some()).unwrap();
             replies
         };
@@ -25,20 +25,20 @@ fn check_reply(reply: &Reply) {
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(Commands::new, data, 2 * (MAX_AUTH_LINE + 2));
-    contract::check_decode_with_held_limit(Commands::new, data, 0);
+    contract::check_decode_with_alloc_limit(Inputs::new, data, 2 * (MAX_AUTH_LINE + 2));
+    contract::check_decode_with_held_limit(Inputs::new, data, 0);
     let raw = || {
-        let mut commands = Commands::new();
+        let mut commands = Inputs::new();
         commands.expect_line().unwrap();
         commands
     };
     contract::check_decode_with_alloc_limit(raw, data, 2 * (MAX_AUTH_LINE + 2));
     let auth = || {
-        let mut replies = Replies::new();
+        let mut replies = Outputs::new();
         replies.expect(false).unwrap();
         replies.expect_line().unwrap();
         replies.expect(true).unwrap();
-        replies.map(|item: Result<Output, ReplyItemError>| {
+        replies.map(|item: Result<Output, Error>| {
             if let Ok(Output::Line(line)) = &item {
                 assert!(line == b"+" || line.starts_with(b"+ "));
             }
@@ -49,7 +49,7 @@ fuzz_target!(|data: &[u8]| {
     contract::check_decode_with_held_limit(auth, data, MAX_REPLY_HELD);
     for multi in [false, true] {
         let make = || {
-            let mut replies = Replies::new();
+            let mut replies = Outputs::new();
             for _ in 0..4 {
                 replies.expect(multi).unwrap();
             }
@@ -78,7 +78,7 @@ fuzz_target!(|data: &[u8]| {
     contract::check_wire::<Reply>(data);
     contract::check_wire::<ScanListing>(data);
     contract::check_wire::<UniqueIdListing>(data);
-    for item in decode_all(Commands::new, data).0 {
+    for item in decode_all(Inputs::new, data).0 {
         if let Ok(Input::Command(command)) = item {
             contract::check_wire::<Command>(&command.to_bytes().unwrap());
             if let Ok(request) = Request::from_command(&command) {

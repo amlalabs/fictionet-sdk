@@ -32,7 +32,7 @@
 //! it closes the connection. RFC 7606 closes the connection for fewer
 //! UPDATE errors: most of them withdraw the UPDATE's routes or drop one
 //! attribute instead. [`Update::receive`] reads an UPDATE that way.
-//! Writers check the same rules and return an [`EncodeError`] instead of
+//! Writers check the same rules and return an [`Error`] instead of
 //! bytes a reader would refuse.
 //!
 //! ```
@@ -327,8 +327,9 @@ impl Context {
     }
 }
 
-/// Why bytes are not a BGP message this module can read. Each one maps to
-/// the NOTIFICATION a real speaker sends before it closes the connection.
+/// Why bytes are not a BGP message this module can read, or a message
+/// cannot be written. Each fault in what the peer sent maps to the
+/// NOTIFICATION a real speaker sends before it closes the connection.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
     /// The marker was not 16 bytes of 0xFF.
@@ -382,13 +383,24 @@ pub enum Error {
     /// not 4 bytes after its header (RFC 7313 section 5). It holds the
     /// whole message, header included, cut to what a NOTIFICATION holds.
     RouteRefreshLength(Vec<u8>),
+    /// An exact [`Wire`] parse of a [`Frame`] ended before a complete
+    /// frame, including empty input.
+    Truncated,
+    /// Bytes follow the first complete frame in an exact [`Wire`] parse.
+    Trailing,
+    /// A value cannot be written without changing it: its fields break a
+    /// rule the reader checks, or it does not fit in [`MAX_MESSAGE_LEN`]
+    /// bytes.
+    Unwritable,
 }
 
 impl Error {
     /// The NOTIFICATION a speaker sends for this error, with the data RFC
     /// 4271 asks for. Preserves the stored data. Caller-built errors with
-    /// excess data produce a notification that writing refuses.
-    pub fn notification(&self) -> Notification {
+    /// excess data produce a notification that writing refuses. It is
+    /// `None` for [`Error::Truncated`], [`Error::Trailing`] and
+    /// [`Error::Unwritable`], which are not faults a peer sent.
+    pub fn notification(&self) -> Option<Notification> {
         use subcode::{header as h, open as o, update as u};
         let (code, subcode, data) = match self {
             Error::ConnectionNotSynchronized => (code::MESSAGE_HEADER, h::CONNECTION_NOT_SYNCHRONIZED, vec![]),
@@ -417,8 +429,9 @@ impl Error {
                 subcode::route_refresh::INVALID_MESSAGE_LENGTH,
                 m.clone(),
             ),
+            Error::Truncated | Error::Trailing | Error::Unwritable => return None,
         };
-        Notification { code, subcode, data }
+        Some(Notification { code, subcode, data })
     }
 }
 
@@ -446,27 +459,14 @@ impl core::fmt::Display for Error {
             Error::InvalidNetworkField => f.write_str("invalid prefix"),
             Error::MalformedAsPath => f.write_str("malformed AS_PATH"),
             Error::RouteRefreshLength(_) => f.write_str("ROUTE-REFRESH of the wrong length"),
+            Error::Truncated => f.write_str("input ended before a complete BGP frame"),
+            Error::Trailing => f.write_str("bytes follow the BGP frame"),
+            Error::Unwritable => f.write_str("value cannot be written without changing it"),
         }
     }
 }
 
 impl core::error::Error for Error {}
-
-/// Why a message cannot be written: its fields break a rule the reader
-/// checks, or it does not fit in [`MAX_MESSAGE_LEN`] bytes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EncodeError {
-    /// The value cannot be written without changing it.
-    Unwritable,
-}
-
-impl core::fmt::Display for EncodeError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("value cannot be written without changing it")
-    }
-}
-
-impl core::error::Error for EncodeError {}
 
 /// One BGP message as the header splits it: its type and the bytes after
 /// the header. The marker is always all ones and the length is worked out
@@ -504,56 +504,26 @@ impl Frame {
     }
 }
 
-/// Why an exact [`Wire`] parse did not read one complete BGP frame.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum FrameParseError {
-    /// The frame header is invalid.
-    Frame(Error),
-    /// The input ended before a complete frame, including empty input.
-    Truncated,
-    /// Bytes follow the first complete frame.
-    Trailing,
-}
-
-impl core::fmt::Display for FrameParseError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Frame(e) => e.fmt(f),
-            Self::Truncated => f.write_str("input ended before a complete BGP frame"),
-            Self::Trailing => f.write_str("bytes follow the BGP frame"),
-        }
-    }
-}
-
-impl core::error::Error for FrameParseError {
-    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
-        match self {
-            Self::Frame(e) => Some(e),
-            Self::Truncated | Self::Trailing => None,
-        }
-    }
-}
-
 impl Wire for Frame {
-    type ParseError = FrameParseError;
-    type WriteError = EncodeError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads exactly one frame. Refuses a marker byte other than 0xFF,
     /// a length outside [`HEADER_LEN`] through [`MAX_MESSAGE_LEN`],
     /// incomplete input, and trailing bytes.
-    fn parse(b: &[u8]) -> Result<Self, FrameParseError> {
-        match Self::parse_prefix(b).map_err(FrameParseError::Frame)? {
+    fn parse(b: &[u8]) -> Result<Self, Error> {
+        match Self::parse_prefix(b)? {
             Some((frame, used)) if used == b.len() => Ok(frame),
-            Some(_) => Err(FrameParseError::Trailing),
-            None => Err(FrameParseError::Truncated),
+            Some(_) => Err(Error::Trailing),
+            None => Err(Error::Truncated),
         }
     }
 
     /// Appends the header and body. Refuses a body longer than
     /// [`MAX_BODY_LEN`] without changing `out`.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         if self.body.len() > MAX_BODY_LEN {
-            return Err(EncodeError::Unwritable);
+            return Err(Error::Unwritable);
         }
         out.extend_from_slice(&[0xff; MARKER_LEN]);
         out.extend_from_slice(&((HEADER_LEN + self.body.len()) as u16).to_be_bytes());
@@ -675,7 +645,7 @@ impl Message {
 
     /// The message as a frame, checked so that [`Message::decode`] reads
     /// it back with the same `ctx`.
-    pub fn to_frame(&self, ctx: &Context) -> Result<Frame, EncodeError> {
+    pub fn to_frame(&self, ctx: &Context) -> Result<Frame, Error> {
         let body = match self {
             Message::Open(o) => o.to_body()?,
             Message::Update(u) => u.to_body(ctx)?,
@@ -808,15 +778,15 @@ impl Open {
         self.four_octet_as().unwrap_or(u32::from(self.my_as))
     }
 
-    fn to_body(&self) -> Result<Vec<u8>, EncodeError> {
+    fn to_body(&self) -> Result<Vec<u8>, Error> {
         if self.my_as == 0 || self.capabilities().any(|c| *c == Capability::FourOctetAs(0)) {
-            return Err(EncodeError::Unwritable);
+            return Err(Error::Unwritable);
         }
         if self.hold_time == 1 || self.hold_time == 2 {
-            return Err(EncodeError::Unwritable);
+            return Err(Error::Unwritable);
         }
         if self.bgp_id.is_unspecified() {
-            return Err(EncodeError::Unwritable);
+            return Err(Error::Unwritable);
         }
         let mut params = Vec::new();
         let mut size = 0;
@@ -825,10 +795,10 @@ impl Open {
                 Parameter::Capabilities(caps) => (PARAMETER_CAPABILITIES, capabilities_bytes(caps)?),
                 Parameter::Other { kind, value } => {
                     if *kind == PARAMETER_CAPABILITIES {
-                        return Err(EncodeError::Unwritable);
+                        return Err(Error::Unwritable);
                     }
                     if *kind == PARAMETER_EXTENDED {
-                        return Err(EncodeError::Unwritable);
+                        return Err(Error::Unwritable);
                     }
                     bound(value)?;
                     (*kind, value.clone())
@@ -836,7 +806,7 @@ impl Open {
             };
             size += 3 + value.len();
             if size > MAX_BODY_LEN {
-                return Err(EncodeError::Unwritable);
+                return Err(Error::Unwritable);
             }
             params.push((kind, value));
         }
@@ -870,7 +840,7 @@ impl Open {
 
 impl Wire for Open {
     type ParseError = Error;
-    type WriteError = EncodeError;
+    type WriteError = Error;
 
     /// Reads an OPEN's body, the bytes after the header. A body shorter
     /// than 10 bytes or longer than [`MAX_BODY_LEN`] is a bad length.
@@ -929,7 +899,7 @@ impl Wire for Open {
 
     /// Appends an OPEN body. Refuses invalid fields, capabilities, or
     /// lengths without changing `out`. Uses RFC 9072 for long parameters.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         out.extend_from_slice(&self.to_body()?);
         Ok(())
     }
@@ -970,7 +940,7 @@ fn parse_capabilities(mut r: &[u8]) -> Result<Vec<Capability>, Error> {
     Ok(out)
 }
 
-fn capabilities_bytes(caps: &[Capability]) -> Result<Vec<u8>, EncodeError> {
+fn capabilities_bytes(caps: &[Capability]) -> Result<Vec<u8>, Error> {
     let mut out = Vec::new();
     for c in caps {
         let (code, value) = match c {
@@ -982,13 +952,13 @@ fn capabilities_bytes(caps: &[Capability]) -> Result<Vec<u8>, EncodeError> {
             Capability::FourOctetAs(a) => (capability::FOUR_OCTET_AS, a.to_be_bytes().to_vec()),
             Capability::GracefulRestart(g) => {
                 if g.flags > 0x0f {
-                    return Err(EncodeError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 if g.time > MAX_RESTART_TIME {
-                    return Err(EncodeError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 if g.families.len() > (MAX_PARAMETERS_LEN - 2) / 4 {
-                    return Err(EncodeError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 let mut v = vec![(g.flags << 4) | (g.time >> 8) as u8, g.time as u8];
                 for f in &g.families {
@@ -1006,10 +976,10 @@ fn capabilities_bytes(caps: &[Capability]) -> Result<Vec<u8>, EncodeError> {
                         | capability::GRACEFUL_RESTART
                         | capability::FOUR_OCTET_AS
                 ) {
-                    return Err(EncodeError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 if value.len() > MAX_PARAMETERS_LEN {
-                    return Err(EncodeError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 (*code, value.clone())
             }
@@ -1081,15 +1051,15 @@ fn read_prefixes(mut r: &[u8], v6: bool) -> Option<Vec<Prefix>> {
     Some(out)
 }
 
-fn write_prefixes(out: &mut Vec<u8>, prefixes: &[Prefix], v6: bool) -> Result<(), EncodeError> {
+fn write_prefixes(out: &mut Vec<u8>, prefixes: &[Prefix], v6: bool) -> Result<(), Error> {
     for p in prefixes {
         let octets = match (p.addr, v6) {
             (IpAddr::V4(a), false) if p.length <= 32 => a.octets().to_vec(),
             (IpAddr::V6(a), true) if p.length <= 128 => a.octets().to_vec(),
-            _ => return Err(EncodeError::Unwritable),
+            _ => return Err(Error::Unwritable),
         };
         if Prefix::new(p.addr, p.length) != Some(*p) {
-            return Err(EncodeError::Unwritable);
+            return Err(Error::Unwritable);
         }
         out.push(p.length);
         out.extend_from_slice(&octets[..usize::from(p.length).div_ceil(8)]);
@@ -1399,7 +1369,7 @@ impl Attribute {
     }
 
     /// Writes the attribute, header and value, onto `out`.
-    fn write(&self, out: &mut Vec<u8>, ctx: &Context) -> Result<(), EncodeError> {
+    fn write(&self, out: &mut Vec<u8>, ctx: &Context) -> Result<(), Error> {
         let kind = self.kind();
         let mut v = Vec::new();
         let mut partial = false;
@@ -1408,7 +1378,7 @@ impl Attribute {
             Attribute::AsPath(segments) => put_segments(&mut v, segments, ctx.four_octet_as)?,
             Attribute::NextHop(a) => {
                 if !host_address(*a) {
-                    return Err(EncodeError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 v.extend_from_slice(&a.octets())
             }
@@ -1416,7 +1386,7 @@ impl Attribute {
             Attribute::AtomicAggregate => {}
             Attribute::Aggregator { asn, address, partial: p } => {
                 if *asn == 0 {
-                    return Err(EncodeError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 put_asn(&mut v, *asn, ctx.four_octet_as)?;
                 v.extend_from_slice(&address.octets());
@@ -1424,7 +1394,7 @@ impl Attribute {
             }
             Attribute::Communities { values, partial: p } => {
                 if values.is_empty() {
-                    return Err(EncodeError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 for n in values {
                     v.extend_from_slice(&n.to_be_bytes());
@@ -1434,10 +1404,10 @@ impl Attribute {
             }
             Attribute::MpReach(m) => {
                 if m.next_hop.len() > 255 {
-                    return Err(EncodeError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 if !next_hop_length(m.afi, m.safi, m.next_hop.len()) {
-                    return Err(EncodeError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 v.extend_from_slice(&m.afi.to_be_bytes());
                 v.push(m.safi);
@@ -1453,30 +1423,30 @@ impl Attribute {
             }
             Attribute::Unknown { flags, kind, value } => {
                 if known_flags(*kind).is_some() {
-                    return Err(EncodeError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 if flags & flag::OPTIONAL == 0 {
-                    return Err(EncodeError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 if flags & !(flag::OPTIONAL | flag::TRANSITIVE | flag::PARTIAL) != 0 {
-                    return Err(EncodeError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 if flags & flag::PARTIAL != 0 && flags & flag::TRANSITIVE == 0 {
-                    return Err(EncodeError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 if value.len() > MAX_BODY_LEN {
-                    return Err(EncodeError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 let flags = *flags;
                 if *kind == attr::AS4_PATH || *kind == attr::AS4_AGGREGATOR {
                     if ctx.four_octet_as {
-                        return Err(EncodeError::Unwritable);
+                        return Err(Error::Unwritable);
                     }
                     // A reader keeps the attribute as it is only if it is
                     // well formed.
                     match parse_as4(flags, *kind, value, &[], ctx) {
                         Ok(Some(Attribute::Unknown { value: read, .. })) if read == *value => {}
-                        _ => return Err(EncodeError::Unwritable),
+                        _ => return Err(Error::Unwritable),
                     }
                 }
                 return put_attribute(out, flags, *kind, value);
@@ -1533,13 +1503,13 @@ fn next_hop_length(afi: u16, safi: u8, len: usize) -> bool {
 }
 
 /// Writes AS_PATH segments: each 1 to 255 AS numbers, none of them 0.
-fn put_segments(v: &mut Vec<u8>, segments: &[Segment], four: bool) -> Result<(), EncodeError> {
+fn put_segments(v: &mut Vec<u8>, segments: &[Segment], four: bool) -> Result<(), Error> {
     for s in segments {
         if s.asns.is_empty() || s.asns.len() > MAX_SEGMENT_ASNS {
-            return Err(EncodeError::Unwritable);
+            return Err(Error::Unwritable);
         }
         if s.asns.contains(&0) {
-            return Err(EncodeError::Unwritable);
+            return Err(Error::Unwritable);
         }
         v.push(s.kind.code());
         v.push(s.asns.len() as u8);
@@ -1559,19 +1529,19 @@ fn host_address(a: Ipv4Addr) -> bool {
     !matches!(a.octets()[0], 0 | 127 | 224..=255)
 }
 
-fn put_asn(v: &mut Vec<u8>, asn: u32, four: bool) -> Result<(), EncodeError> {
+fn put_asn(v: &mut Vec<u8>, asn: u32, four: bool) -> Result<(), Error> {
     if four {
         v.extend_from_slice(&asn.to_be_bytes());
     } else {
-        let a = u16::try_from(asn).map_err(|_| EncodeError::Unwritable)?;
+        let a = u16::try_from(asn).map_err(|_| Error::Unwritable)?;
         v.extend_from_slice(&a.to_be_bytes());
     }
     Ok(())
 }
 
-fn put_attribute(out: &mut Vec<u8>, flags: u8, kind: u8, value: &[u8]) -> Result<(), EncodeError> {
+fn put_attribute(out: &mut Vec<u8>, flags: u8, kind: u8, value: &[u8]) -> Result<(), Error> {
     if value.len() > MAX_BODY_LEN {
-        return Err(EncodeError::Unwritable);
+        return Err(Error::Unwritable);
     }
     if value.len() > 255 {
         out.push(flags | flag::EXTENDED_LENGTH);
@@ -1586,17 +1556,17 @@ fn put_attribute(out: &mut Vec<u8>, flags: u8, kind: u8, value: &[u8]) -> Result
     bound(out)
 }
 
-fn write_nlri(v: &mut Vec<u8>, afi: u16, safi: u8, nlri: &Nlri) -> Result<(), EncodeError> {
+fn write_nlri(v: &mut Vec<u8>, afi: u16, safi: u8, nlri: &Nlri) -> Result<(), Error> {
     match (nlri, prefix_family(afi, safi)) {
         (Nlri::Prefixes(p), true) => write_prefixes(v, p, afi == afi::IPV6),
         (Nlri::Raw(r), false) => {
             if r.len() > MAX_BODY_LEN {
-                return Err(EncodeError::Unwritable);
+                return Err(Error::Unwritable);
             }
             v.extend_from_slice(r);
             bound(v)
         }
-        _ => Err(EncodeError::Unwritable),
+        _ => Err(Error::Unwritable),
     }
 }
 
@@ -1691,16 +1661,16 @@ impl Update {
         self.attributes.iter().find(|a| a.kind() == kind)
     }
 
-    fn to_body(&self, ctx: &Context) -> Result<Vec<u8>, EncodeError> {
+    fn to_body(&self, ctx: &Context) -> Result<Vec<u8>, Error> {
         // RFC 7606 section 5.1: one kind of routes per UPDATE, and an
         // MP_REACH_NLRI or MP_UNREACH_NLRI first.
         let is_mp = |a: &Attribute| matches!(a, Attribute::MpReach(_) | Attribute::MpUnreach(_));
         let mp = self.attributes.iter().filter(|a| is_mp(a)).count();
         if usize::from(!self.withdrawn.is_empty()) + usize::from(!self.nlri.is_empty()) + mp > 1 {
-            return Err(EncodeError::Unwritable);
+            return Err(Error::Unwritable);
         }
         if mp == 1 && !self.attributes.first().is_some_and(is_mp) {
-            return Err(EncodeError::Unwritable);
+            return Err(Error::Unwritable);
         }
         let mut out = vec![0, 0];
         write_prefixes(&mut out, &self.withdrawn, false)?;
@@ -1711,7 +1681,7 @@ impl Update {
         let mut seen = [false; 256];
         for a in &self.attributes {
             if core::mem::replace(&mut seen[usize::from(a.kind())], true) {
-                return Err(EncodeError::Unwritable);
+                return Err(Error::Unwritable);
             }
             a.write(&mut out, ctx)?;
         }
@@ -1719,7 +1689,7 @@ impl Update {
         out[at..at + 2].copy_from_slice(&alen.to_be_bytes());
         write_prefixes(&mut out, &self.nlri, false)?;
         if missing(&seen, !self.nlri.is_empty()).is_some() {
-            return Err(EncodeError::Unwritable);
+            return Err(Error::Unwritable);
         }
         bound(&out)?;
         Ok(out)
@@ -1887,9 +1857,9 @@ impl Notification {
         Some(Notification { code: *code, subcode: *subcode, data: data.to_vec() })
     }
 
-    fn to_body(&self) -> Result<Vec<u8>, EncodeError> {
+    fn to_body(&self) -> Result<Vec<u8>, Error> {
         if self.data.len() > MAX_BODY_LEN - 2 {
-            return Err(EncodeError::Unwritable);
+            return Err(Error::Unwritable);
         }
         let mut out = vec![self.code, self.subcode];
         out.extend_from_slice(&self.data);
@@ -1945,8 +1915,8 @@ fn length_field(b: &[u8]) -> u16 {
 }
 
 /// Fails once a body being written has passed what a message can hold.
-fn bound(out: &[u8]) -> Result<(), EncodeError> {
-    if out.len() > MAX_BODY_LEN { Err(EncodeError::Unwritable) } else { Ok(()) }
+fn bound(out: &[u8]) -> Result<(), Error> {
+    if out.len() > MAX_BODY_LEN { Err(Error::Unwritable) } else { Ok(()) }
 }
 
 fn take<'a>(r: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
@@ -1982,7 +1952,7 @@ mod tests {
         test_support::{decode_all, mutate},
     };
 
-    fn encode(message: &Message, context: &Context) -> Result<Vec<u8>, EncodeError> {
+    fn encode(message: &Message, context: &Context) -> Result<Vec<u8>, Error> {
         message.to_frame(context)?.to_bytes()
     }
 
@@ -2312,7 +2282,7 @@ mod tests {
         // A frame built by hand with a body too long for any message.
         let big = Frame { kind: kind::NOTIFICATION, body: vec![0; MAX_BODY_LEN + 1] };
         assert_eq!(Message::decode(&big, &TWO), Err(Error::BadMessageLength(4097)));
-        assert_eq!(big.to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(big.to_bytes(), Err(Error::Unwritable));
         // Bodies passed straight to the readers, too short.
         assert_eq!(Open::parse(&[4, 0]), Err(Error::BadMessageLength(21)));
         assert_eq!(Update::parse(&[0], &TWO), Err(Error::MalformedAttributeList));
@@ -2454,7 +2424,7 @@ mod tests {
             let mut raw = vec![0x40, 3, 4];
             raw.extend_from_slice(&bad);
             assert_eq!(update_body(&body(bad), &TWO), Err(Error::InvalidNextHop(raw.clone())), "{bad:?}");
-            let n = Error::InvalidNextHop(raw.clone()).notification();
+            let n = Error::InvalidNextHop(raw.clone()).notification().unwrap();
             assert_eq!((n.code, n.subcode, n.data), (3, 8, raw));
             let u = Update {
                 attributes: vec![
@@ -2465,7 +2435,7 @@ mod tests {
                 nlri: vec![v4(10, 0, 0, 0, 8)],
                 ..Update::default()
             };
-            assert!(matches!(encode(&Message::Update(u), &TWO), Err(EncodeError::Unwritable)));
+            assert!(matches!(encode(&Message::Update(u), &TWO), Err(Error::Unwritable)));
         }
         for good in [[1, 0, 0, 0], [10, 0, 0, 1], [126, 255, 255, 255], [128, 0, 0, 1], [223, 255, 255, 254]] {
             assert!(update_body(&body(good), &TWO).is_ok(), "{good:?}");
@@ -2482,7 +2452,7 @@ mod tests {
         b.extend(vec![0u8; 0xfffb]);
         let e = Update::parse(&b, &FOUR).unwrap_err();
         assert_eq!(e, Error::BadMessageLength(u16::MAX));
-        assert!(encode(&Message::Notification(e.notification()), &FOUR).is_ok());
+        assert!(encode(&Message::Notification(e.notification().unwrap()), &FOUR).is_ok());
         // 4200 withdrawn /0 routes, one byte each: well formed, but too
         // many for one message.
         let mut withdrawn = vec![0x10, 0x68];
@@ -2517,11 +2487,11 @@ mod tests {
 
     #[test]
     fn notifications_for_errors() {
-        let n = Error::BadMessageLength(5000).notification();
+        let n = Error::BadMessageLength(5000).notification().unwrap();
         assert_eq!((n.code, n.subcode, &n.data[..]), (1, 2, &[0x13, 0x88][..]));
-        let n = Error::UnsupportedVersion(3).notification();
+        let n = Error::UnsupportedVersion(3).notification().unwrap();
         assert_eq!((n.code, n.subcode, &n.data[..]), (2, 1, &[0, 4][..]));
-        let n = Error::MissingWellKnownAttribute(3).notification();
+        let n = Error::MissingWellKnownAttribute(3).notification().unwrap();
         assert_eq!((n.code, n.subcode, &n.data[..]), (3, 3, &[3][..]));
         let all = [
             Error::ConnectionNotSynchronized,
@@ -2562,7 +2532,7 @@ mod tests {
             (3, 11),
         ];
         for (e, (c, s)) in all.iter().zip(want) {
-            let n = e.notification();
+            let n = e.notification().unwrap();
             assert_eq!((n.code, n.subcode), (c, s), "{e}");
             // Every notification can be sent.
             let b = encode(&Message::Notification(n.clone()), &TWO).unwrap();
@@ -2584,14 +2554,14 @@ mod tests {
                 Error::OptionalAttribute(data.clone()),
                 Error::RouteRefreshLength(data.clone()),
             ] {
-                let notification = error.notification();
+                let notification = error.notification().unwrap();
                 assert_eq!(notification.data, data);
                 let message = Message::Notification(notification);
                 if len == MAX_BODY_LEN - 2 {
                     let bytes = encode(&message, &TWO).unwrap();
                     assert_eq!(decode(&bytes, &TWO), Ok(message));
                 } else {
-                    assert_eq!(message.to_frame(&TWO), Err(EncodeError::Unwritable));
+                    assert_eq!(message.to_frame(&TWO), Err(Error::Unwritable));
                 }
             }
         }
@@ -2602,7 +2572,7 @@ mod tests {
         let id = Ipv4Addr::new(10, 0, 0, 1);
         let open = |p: Vec<Parameter>| Message::Open(Open { my_as: 1, hold_time: 90, bgp_id: id, parameters: p });
         let bad = |m: Message, ctx: &Context| encode(&m, ctx).unwrap_err();
-        let invalid = |m: Message, ctx: &Context| matches!(bad(m, ctx), EncodeError::Unwritable);
+        let invalid = |m: Message, ctx: &Context| matches!(bad(m, ctx), Error::Unwritable);
         assert!(invalid(Message::Open(Open { hold_time: 2, ..Open::new(1, 0, id, vec![]) }), &TWO));
         assert!(invalid(Message::Open(Open::new(1, 0, Ipv4Addr::UNSPECIFIED, vec![])), &TWO));
         assert!(invalid(open(vec![Parameter::Other { kind: 2, value: vec![] }]), &TWO));
@@ -2611,7 +2581,7 @@ mod tests {
         assert!(invalid(Message::Open(Open::new(0, 0, id, vec![])), &TWO));
         assert_eq!(
             bad(open(vec![Parameter::Other { kind: 1, value: vec![0; MAX_BODY_LEN] }]), &TWO),
-            EncodeError::Unwritable
+            Error::Unwritable
         );
         let caps = |c: Vec<Capability>| open(vec![Parameter::Capabilities(c)]);
         assert!(invalid(caps(vec![Capability::Other { code: 65, value: vec![0; 4] }]), &TWO));
@@ -2692,21 +2662,21 @@ mod tests {
         // Too much for one message.
         let mut many = well_known();
         many.push(Attribute::Communities { values: vec![1; 1100], partial: false });
-        assert_eq!(bad(route(many), &TWO), EncodeError::Unwritable);
+        assert_eq!(bad(route(many), &TWO), Error::Unwritable);
         let mut huge = well_known();
         huge.push(Attribute::Communities { values: vec![1; 10_000_000], partial: false });
-        assert_eq!(bad(route(huge), &TWO), EncodeError::Unwritable);
+        assert_eq!(bad(route(huge), &TWO), Error::Unwritable);
         let mut unknown = well_known();
         unknown.push(Attribute::Unknown { flags: 0x80, kind: 99, value: vec![0; 5000] });
-        assert_eq!(bad(route(unknown), &TWO), EncodeError::Unwritable);
-        assert_eq!(bad(reach(vec![0; 4], 9, Nlri::Raw(vec![0; 5000])), &TWO), EncodeError::Unwritable);
+        assert_eq!(bad(route(unknown), &TWO), Error::Unwritable);
+        assert_eq!(bad(reach(vec![0; 4], 9, Nlri::Raw(vec![0; 5000])), &TWO), Error::Unwritable);
         let note = Notification { code: 6, subcode: 0, data: vec![0; MAX_BODY_LEN - 1] };
-        assert_eq!(bad(Message::Notification(note), &TWO), EncodeError::Unwritable);
+        assert_eq!(bad(Message::Notification(note), &TWO), Error::Unwritable);
         let note = Notification { code: 6, subcode: 0, data: vec![0; MAX_BODY_LEN - 2] };
         let b = encode(&Message::Notification(note), &TWO).unwrap();
         assert_eq!(b.len(), MAX_MESSAGE_LEN);
         assert!(decode(&b, &TWO).is_ok());
-        assert!(!EncodeError::Unwritable.to_string().is_empty());
+        assert!(!Error::Unwritable.to_string().is_empty());
     }
 
     #[test]
@@ -2794,13 +2764,13 @@ mod tests {
                     }
                     Err(e) => {
                         assert!(strict.is_err());
-                        assert!(encode(&Message::Notification(e.notification()), &ctx).is_ok());
+                        assert!(encode(&Message::Notification(e.notification().unwrap()), &ctx).is_ok());
                     }
                 }
             }
             if let Ok(m) = Message::decode(frame, &ctx) {
                 if mixes(&m) {
-                    assert!(matches!(encode(&m, &ctx), Err(EncodeError::Unwritable)));
+                    assert!(matches!(encode(&m, &ctx), Err(Error::Unwritable)));
                     continue;
                 }
                 let bytes = encode(&m, &ctx).unwrap_or_else(|e| panic!("{m:?} cannot be written: {e}"));
@@ -2808,7 +2778,7 @@ mod tests {
                 let back = Frame::parse(&bytes).unwrap();
                 assert_eq!(Message::decode(&back, &ctx), Ok(m));
             } else if let Err(e) = Message::decode(frame, &ctx) {
-                let n = e.notification();
+                let n = e.notification().unwrap();
                 assert!(encode(&Message::Notification(n), &ctx).is_ok());
             }
         }
@@ -2905,7 +2875,7 @@ mod tests {
         // 4074 withdrawn /0 routes: 4076 bytes of withdrawn routes, then
         // the attribute length makes the body 4078, too long.
         let u = Update { withdrawn: vec![v4(0, 0, 0, 0, 0); 4074], ..Update::default() };
-        assert_eq!(Message::Update(u).to_frame(&TWO), Err(EncodeError::Unwritable));
+        assert_eq!(Message::Update(u).to_frame(&TWO), Err(Error::Unwritable));
         let u = Update { withdrawn: vec![v4(0, 0, 0, 0, 0); 4073], ..Update::default() };
         let f = Message::Update(u).to_frame(&TWO).unwrap();
         assert_eq!(f.body.len(), MAX_BODY_LEN);
@@ -2932,7 +2902,7 @@ mod tests {
             attributes: vec![Attribute::Unknown { flags: 0xa0, kind: 99, value: vec![] }],
             ..Update::default()
         };
-        assert!(matches!(encode(&Message::Update(bad), &TWO), Err(EncodeError::Unwritable)));
+        assert!(matches!(encode(&Message::Update(bad), &TWO), Err(Error::Unwritable)));
     }
 
     #[test]
@@ -2945,7 +2915,7 @@ mod tests {
         assert_eq!(u.withdrawn, [v4(10, 128, 0, 0, 9)]);
         // A prefix with bits set past its length is not written.
         let u = Update { withdrawn: vec![v4(192, 0, 2, 9, 24)], ..Update::default() };
-        assert!(matches!(encode(&Message::Update(u), &TWO), Err(EncodeError::Unwritable)));
+        assert!(matches!(encode(&Message::Update(u), &TWO), Err(Error::Unwritable)));
     }
 
     #[test]
@@ -2983,7 +2953,7 @@ mod tests {
             ],
             ..Update::default()
         };
-        assert!(matches!(encode(&Message::Update(u), &TWO), Err(EncodeError::Unwritable)));
+        assert!(matches!(encode(&Message::Update(u), &TWO), Err(Error::Unwritable)));
     }
 
     #[test]
@@ -2996,10 +2966,10 @@ mod tests {
         let n = b.len();
         b[n - 4..].copy_from_slice(&[0, 0, 0, 0]);
         assert_eq!(decode(&b, &TWO), Err(Error::BadPeerAs));
-        let n = Error::BadPeerAs.notification();
+        let n = Error::BadPeerAs.notification().unwrap();
         assert_eq!((n.code, n.subcode), (2, 2));
         let id = Ipv4Addr::new(10, 0, 0, 1);
-        assert!(matches!(encode(&Message::Open(Open::new(0, 90, id, vec![])), &TWO), Err(EncodeError::Unwritable)));
+        assert!(matches!(encode(&Message::Open(Open::new(0, 90, id, vec![])), &TWO), Err(Error::Unwritable)));
         // An AS_PATH or AGGREGATOR with AS 0 is malformed.
         assert_eq!(update_body(&[0, 0, 0, 7, 0x40, 2, 4, 2, 1, 0, 0], &TWO), Err(Error::MalformedAsPath));
         let raw = vec![0xc0, 7, 6, 0, 0, 10, 0, 0, 1];
@@ -3038,14 +3008,14 @@ mod tests {
             attributes: vec![Attribute::Origin(Origin::Igp), path.clone(), reach.clone()],
             ..Update::default()
         };
-        assert!(matches!(encode(&Message::Update(late), &TWO), Err(EncodeError::Unwritable)));
+        assert!(matches!(encode(&Message::Update(late), &TWO), Err(Error::Unwritable)));
         // Withdrawn routes with MP_REACH_NLRI are not written.
         let mixed = Update {
             withdrawn: vec![v4(10, 0, 0, 0, 8)],
             attributes: vec![reach.clone(), Attribute::Origin(Origin::Igp), path.clone()],
             ..Update::default()
         };
-        assert!(matches!(encode(&Message::Update(mixed), &TWO), Err(EncodeError::Unwritable)));
+        assert!(matches!(encode(&Message::Update(mixed), &TWO), Err(Error::Unwritable)));
         // A reader still takes the old layout, and puts MP_REACH_NLRI first.
         let mut body = vec![0, 0, 0, 31, 0x40, 1, 1, 0, 0x40, 2, 0, 0x80, 14, 21, 0, 2, 1, 16];
         body.extend_from_slice(&[0x20; 16]);
@@ -3232,7 +3202,7 @@ mod tests {
         let mut whole = header(24, 5);
         whole.extend_from_slice(&frame.body);
         assert_eq!(e, Error::RouteRefreshLength(whole.clone()));
-        let n = e.notification();
+        let n = e.notification().unwrap();
         assert_eq!((n.code, n.subcode, n.data), (7, 1, whole));
         // Without the capability, or for a plain request, it is a header
         // error.
@@ -3242,7 +3212,7 @@ mod tests {
         // The longest such message still fits in a NOTIFICATION.
         let long = Frame { kind: kind::ROUTE_REFRESH, body: [&[0, 2, 2, 1][..], &[0; MAX_BODY_LEN - 4]].concat() };
         let e = Message::decode(&long, &ctx).unwrap_err();
-        assert!(encode(&Message::Notification(e.notification()), &ctx).is_ok());
+        assert!(encode(&Message::Notification(e.notification().unwrap()), &ctx).is_ok());
         // The capability is negotiated when both sides send it.
         let id = Ipv4Addr::new(10, 0, 0, 1);
         let err =

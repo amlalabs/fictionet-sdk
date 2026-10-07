@@ -14,7 +14,7 @@
 //!
 //! Nothing here reads a socket. A world that plays a Zabbix server
 //! passes the bytes a [`tcp`](fictionet::stdlib::tcp) connection reads to a
-//! [`Stream<Frames>`](fictionet::stdlib::codec::Stream), gets [`Packet`]s back,
+//! [`Stream<Packets>`](fictionet::stdlib::codec::Stream), gets [`Packet`]s back,
 //! reads each one's [`Message`], and writes the reply's bytes back to
 //! the connection. Compressed data is reported with
 //! [`Packet::is_compressed`] and left as it came; it is not
@@ -28,7 +28,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
-//! use fictionet::stdlib::zabbix::{Frames, Kind, Message};
+//! use fictionet::stdlib::zabbix::{Kind, Message, Packets};
 //!
 //! // What zabbix_sender sends for one value.
 //! let json = br#"{"request":"sender data","data":[{"host":"web1","key":"cpu","value":"0.5"}]}"#;
@@ -37,7 +37,7 @@
 //! sent.extend_from_slice(&[0, 0, 0, 0]);
 //! sent.extend_from_slice(json);
 //!
-//! let mut stream = Stream::new(Frames::new());
+//! let mut stream = Stream::new(Packets::new());
 //! let mut packets = Vec::new();
 //! pump(&mut stream, &sent, |packet| packets.push(packet)).unwrap();
 //! finish(&mut stream, |_| unreachable!()).unwrap();
@@ -72,7 +72,7 @@ pub const LARGE_HEADER_LEN: usize = 21;
 /// The most data one packet may carry: 1 GiB, the limit Zabbix itself
 /// sets on what it receives.
 pub const MAX_DATA: usize = 1 << 30;
-/// The size limit used by [`Frames::new`].
+/// The size limit used by [`Packets::new`].
 pub const DEFAULT_LIMIT: usize = 16 << 20;
 /// How deeply arrays and objects may nest in a message's JSON.
 pub const MAX_DEPTH: usize = 64;
@@ -89,10 +89,11 @@ pub mod flags {
     pub const KNOWN: u8 = PROTOCOL | COMPRESSED | LARGE;
 }
 
-/// Why bytes are not a Zabbix packet. Whatever the reason, the connection holds no
-/// more packets a reader can find, and a real server closes it.
+/// Why bytes are not a Zabbix packet or message, or a value cannot be
+/// written. A packet fault from a decoder ends the stream: the connection
+/// holds no more packets a reader can find, and a real server closes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PacketError {
+pub enum Error {
     /// The value cannot be written without changing it.
     Unwritable,
     /// The packet did not start with `ZBXD`.
@@ -115,23 +116,48 @@ pub enum PacketError {
         /// The limit it passed.
         limit: usize,
     },
+    /// An exact parse found the input ended before a complete packet,
+    /// including empty input.
+    Truncated,
+    /// An exact parse found bytes after the first complete packet.
+    Trailing,
+    /// The message bytes are not UTF-8.
+    Utf8,
+    /// The message JSON is malformed at this byte offset.
+    Syntax(usize),
+    /// Arrays and objects nest deeper than [`MAX_DEPTH`].
+    TooDeep,
+    /// The message JSON is not an object.
+    NotObject,
+    /// The object has no string `request` or `response` member.
+    NoKind,
+    /// The message JSON would be longer than [`MAX_DATA`] bytes.
+    TooLong,
 }
 
-impl core::fmt::Display for PacketError {
+impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            PacketError::Unwritable => f.write_str("value cannot be written without changing it"),
-            PacketError::Magic => f.write_str("packet does not start with ZBXD"),
-            PacketError::Flags(b) => write!(f, "flags byte {b:#04x} is not a Zabbix protocol packet"),
-            PacketError::TooLarge { len, limit } => write!(f, "data length {len} is over the limit of {limit}"),
-            PacketError::ReservedTooLarge { len, limit } => {
+            Error::Unwritable => f.write_str("value cannot be written without changing it"),
+            Error::Magic => f.write_str("packet does not start with ZBXD"),
+            Error::Flags(b) => write!(f, "flags byte {b:#04x} is not a Zabbix protocol packet"),
+            Error::TooLarge { len, limit } => write!(f, "data length {len} is over the limit of {limit}"),
+            Error::ReservedTooLarge { len, limit } => {
                 write!(f, "reserved length {len} is over the limit of {limit}")
             }
+            Error::Truncated => f.write_str("input ended before a complete Zabbix packet"),
+            Error::Trailing => f.write_str("bytes follow the Zabbix packet"),
+            Error::Utf8 => f.write_str("message is not UTF-8"),
+            Error::Syntax(at) => write!(f, "malformed JSON at byte {at}"),
+            Error::TooDeep => write!(f, "JSON nests deeper than {MAX_DEPTH}"),
+            Error::NotObject => f.write_str("JSON is not an object"),
+            Error::NoKind => f.write_str("JSON object has no request or response member"),
+            Error::TooLong => write!(f, "JSON is longer than {MAX_DATA} bytes"),
         }
     }
 }
 
-impl core::error::Error for PacketError {}
+impl core::error::Error for Error {}
 
 /// A packet header: the flags and the two lengths that follow `ZBXD`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -150,16 +176,16 @@ impl Header {
     /// holds only part of one, and otherwise the header and its length.
     /// A wrong magic or flags byte is reported as soon as it comes. The
     /// lengths are not checked against any limit here.
-    fn parse_prefix(b: &[u8]) -> Result<Option<(Header, usize)>, PacketError> {
+    fn parse_prefix(b: &[u8]) -> Result<Option<(Header, usize)>, Error> {
         let n = b.len().min(MAGIC.len());
         if b[..n] != MAGIC[..n] {
-            return Err(PacketError::Magic);
+            return Err(Error::Magic);
         }
         let Some(&flag_byte) = b.get(4) else {
             return Ok(None);
         };
         if flag_byte & flags::PROTOCOL == 0 || flag_byte & !flags::KNOWN != 0 {
-            return Err(PacketError::Flags(flag_byte));
+            return Err(Error::Flags(flag_byte));
         }
         let large = flag_byte & flags::LARGE != 0;
         let (len, width) = if large { (LARGE_HEADER_LEN, 8) } else { (HEADER_LEN, 4) };
@@ -173,27 +199,27 @@ impl Header {
 }
 
 impl Wire for Header {
-    type ParseError = PacketParseError;
-    type WriteError = PacketError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads exactly one header. Refuses wrong magic, invalid flags,
     /// incomplete input, and trailing bytes. Lengths have no size limit here.
-    fn parse(b: &[u8]) -> Result<Self, PacketParseError> {
-        match Self::parse_prefix(b).map_err(PacketParseError::Packet)? {
+    fn parse(b: &[u8]) -> Result<Self, Error> {
+        match Self::parse_prefix(b)? {
             Some((header, used)) if used == b.len() => Ok(header),
-            Some(_) => Err(PacketParseError::Trailing),
-            None => Err(PacketParseError::Truncated),
+            Some(_) => Err(Error::Trailing),
+            None => Err(Error::Truncated),
         }
     }
 
     /// Appends the header. Refuses invalid flags and lengths that need
     /// the large flag when it is absent, without changing `out`.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), PacketError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         if self.flags & flags::PROTOCOL == 0 || self.flags & !flags::KNOWN != 0
             || (self.flags & flags::LARGE == 0
                 && (self.data_len > u64::from(u32::MAX) || self.reserved > u64::from(u32::MAX)))
         {
-            return Err(PacketError::Unwritable);
+            return Err(Error::Unwritable);
         }
         out.extend_from_slice(&MAGIC);
         out.push(self.flags);
@@ -235,20 +261,20 @@ impl Packet {
     /// [`MAX_DATA`] counts as [`MAX_DATA`]. The reserved length must be
     /// within the limit too, as Zabbix requires, since it is the size the
     /// data will have once decompressed.
-    fn parse_limited(b: &[u8], limit: usize) -> Result<Option<(Packet, usize)>, PacketError> {
+    fn parse_limited(b: &[u8], limit: usize) -> Result<Option<(Packet, usize)>, Error> {
         let limit = limit.min(MAX_DATA);
         let Some((header, used)) = Header::parse_prefix(b)? else {
             return Ok(None);
         };
         let len = match usize::try_from(header.data_len) {
             Ok(n) if n <= limit => n,
-            _ => return Err(PacketError::TooLarge { len: header.data_len, limit }),
+            _ => return Err(Error::TooLarge { len: header.data_len, limit }),
         };
         if !usize::try_from(header.reserved).is_ok_and(|n| n <= limit) {
-            return Err(PacketError::ReservedTooLarge { len: header.reserved, limit });
+            return Err(Error::ReservedTooLarge { len: header.reserved, limit });
         }
         let Some(end) = used.checked_add(len) else {
-            return Err(PacketError::TooLarge { len: header.data_len, limit });
+            return Err(Error::TooLarge { len: header.data_len, limit });
         };
         let Some(data) = b.get(used..end) else {
             return Ok(None);
@@ -274,57 +300,27 @@ impl Packet {
     }
 }
 
-/// Why an exact [`Wire`] parse did not read one complete Zabbix packet.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PacketParseError {
-    /// The packet header is invalid.
-    Packet(PacketError),
-    /// The input ended before a complete packet, including empty input.
-    Truncated,
-    /// Bytes follow the first complete packet.
-    Trailing,
-}
-
-impl core::fmt::Display for PacketParseError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Packet(e) => e.fmt(f),
-            Self::Truncated => f.write_str("input ended before a complete Zabbix packet"),
-            Self::Trailing => f.write_str("bytes follow the Zabbix packet"),
-        }
-    }
-}
-
-impl core::error::Error for PacketParseError {
-    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
-        match self {
-            Self::Packet(e) => Some(e),
-            Self::Truncated | Self::Trailing => None,
-        }
-    }
-}
-
 impl Wire for Packet {
-    type ParseError = PacketParseError;
-    type WriteError = PacketError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads exactly one packet. Refuses wrong magic, invalid flags,
     /// lengths over [`MAX_DATA`], incomplete input, and trailing bytes.
     /// The reserved length is checked even for uncompressed data.
-    fn parse(b: &[u8]) -> Result<Self, PacketParseError> {
-        match Self::parse_limited(b, MAX_DATA).map_err(PacketParseError::Packet)? {
+    fn parse(b: &[u8]) -> Result<Self, Error> {
+        match Self::parse_limited(b, MAX_DATA)? {
             Some((packet, used)) if used == b.len() => Ok(packet),
-            Some(_) => Err(PacketParseError::Trailing),
-            None => Err(PacketParseError::Truncated),
+            Some(_) => Err(Error::Trailing),
+            None => Err(Error::Truncated),
         }
     }
 
     /// Appends the header and data. Refuses invalid flags and data or
     /// reserved lengths over [`MAX_DATA`] without changing `out`.
     /// Compressed bytes remain unchanged.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), PacketError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         if self.data.len() > MAX_DATA || self.reserved > MAX_DATA as u64 {
-            return Err(PacketError::Unwritable);
+            return Err(Error::Unwritable);
         }
         let header = Header { flags: self.flags, data_len: self.data.len() as u64, reserved: self.reserved };
         header.write(out)?;
@@ -339,16 +335,16 @@ impl Wire for Packet {
 /// plus [`Self::limit`]. Partial packets return [`Step::Need`], including at
 /// EOF. The stream reports truncation at EOF and framing errors once.
 /// Compressed payloads remain bytes. Body parsing stays separate.
-/// [`Wire`] accepts data up to [`MAX_DATA`], but [`Frames::new`] refuses data
-/// over [`DEFAULT_LIMIT`]; use [`Frames::with_limit`] for larger packets.
+/// [`Wire`] accepts data up to [`MAX_DATA`], but [`Packets::new`] refuses data
+/// over [`DEFAULT_LIMIT`]; use [`Packets::with_limit`] for larger packets.
 ///
 /// ```
 /// use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
-/// use fictionet::stdlib::zabbix::{Frames, Packet};
+/// use fictionet::stdlib::zabbix::{Packet, Packets};
 ///
 /// let packet = Packet::new(b"hello".to_vec());
 /// let bytes = Wire::to_bytes(&packet)?;
-/// let mut stream = Stream::new(Frames::with_limit(16));
+/// let mut stream = Stream::new(Packets::with_limit(16));
 /// let mut packets = Vec::new();
 /// pump(&mut stream, &bytes[..3], |packet| packets.push(packet))?;
 /// pump(&mut stream, &bytes[3..], |packet| packets.push(packet))?;
@@ -357,11 +353,11 @@ impl Wire for Packet {
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[derive(Clone, Copy, Debug)]
-pub struct Frames {
+pub struct Packets {
     limit: usize,
 }
 
-impl Frames {
+impl Packets {
     /// Accepts packets with data and reserved lengths up to [`DEFAULT_LIMIT`].
     pub fn new() -> Self {
         Self::with_limit(DEFAULT_LIMIT)
@@ -380,22 +376,22 @@ impl Frames {
     }
 }
 
-impl Default for Frames {
+impl Default for Packets {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Decode for Frames {
+impl Decode for Packets {
     type Item = Packet;
-    type Error = PacketError;
+    type Error = Error;
     const NAME: &'static str = "Zabbix";
 
     fn capacity(&self) -> usize {
         LARGE_HEADER_LEN.saturating_add(self.limit)
     }
 
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Packet>, PacketError> {
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Packet>, Error> {
         Ok(match Packet::parse_limited(input, self.limit)? {
             Some((packet, used)) => Step::Item(packet, used),
             None => Step::Need,
@@ -421,38 +417,6 @@ pub enum Kind {
     /// A reply, with its `response` member, usually `success` or `failed`.
     Response(String),
 }
-
-/// Why bytes are not a Zabbix JSON message.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MessageError {
-    /// The bytes are not UTF-8.
-    Utf8,
-    /// The JSON is malformed at this byte offset.
-    Syntax(usize),
-    /// Arrays and objects nest deeper than [`MAX_DEPTH`].
-    TooDeep,
-    /// The JSON is not an object.
-    NotObject,
-    /// The object has no string `request` or `response` member.
-    NoKind,
-    /// The JSON would be longer than [`MAX_DATA`] bytes.
-    TooLong,
-}
-
-impl core::fmt::Display for MessageError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            MessageError::Utf8 => f.write_str("message is not UTF-8"),
-            MessageError::Syntax(at) => write!(f, "malformed JSON at byte {at}"),
-            MessageError::TooDeep => write!(f, "JSON nests deeper than {MAX_DEPTH}"),
-            MessageError::NotObject => f.write_str("JSON is not an object"),
-            MessageError::NoKind => f.write_str("JSON object has no request or response member"),
-            MessageError::TooLong => write!(f, "JSON is longer than {MAX_DATA} bytes"),
-        }
-    }
-}
-
-impl core::error::Error for MessageError {}
 
 /// One value `zabbix_sender` sends: which host and item it is for.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -492,7 +456,7 @@ pub struct Message {
 }
 
 impl Wire for Message {
-    type ParseError = MessageError;
+    type ParseError = Error;
     type WriteError = core::convert::Infallible;
 
     /// Reads a message from a packet's uncompressed data. The JSON must be
@@ -501,11 +465,11 @@ impl Wire for Message {
     /// decides the kind. If a member appears twice, the first one counts,
     /// and if that one is not a string it names no kind.
     /// Refuses invalid UTF-8, invalid JSON, excess depth or length, and a missing kind.
-    fn parse(data: &[u8]) -> Result<Message, MessageError> {
+    fn parse(data: &[u8]) -> Result<Message, Error> {
         if data.len() > MAX_DATA {
-            return Err(MessageError::TooLong);
+            return Err(Error::TooLong);
         }
-        let json = core::str::from_utf8(data).map_err(|_| MessageError::Utf8)?;
+        let json = core::str::from_utf8(data).map_err(|_| Error::Utf8)?;
         let (request, response) = scan(json.as_bytes())?;
         let kind = match (request, response) {
             (Some(r), _) => match r.as_str() {
@@ -515,7 +479,7 @@ impl Wire for Message {
                 _ => Kind::OtherRequest(r),
             },
             (None, Some(r)) => Kind::Response(r),
-            (None, None) => return Err(MessageError::NoKind),
+            (None, None) => return Err(Error::NoKind),
         };
         Ok(Message { kind, json: json.to_string() })
     }
@@ -549,7 +513,7 @@ impl Message {
     }
 
     /// An active agent's request for the items to collect for `host`.
-    pub fn active_checks(host: &str) -> Result<Message, MessageError> {
+    pub fn active_checks(host: &str) -> Result<Message, Error> {
         let mut j = String::from(r#"{"request":"active checks","host":"#);
         push_str(&mut j, host)?;
         j.push('}');
@@ -557,7 +521,7 @@ impl Message {
     }
 
     /// A sender's values for trapper items.
-    pub fn sender_data(values: &[SenderValue]) -> Result<Message, MessageError> {
+    pub fn sender_data(values: &[SenderValue]) -> Result<Message, Error> {
         let mut j = String::from(r#"{"request":"sender data","data":["#);
         for (i, v) in values.iter().enumerate() {
             if i > 0 {
@@ -571,7 +535,7 @@ impl Message {
             push_str(&mut j, &v.value)?;
             j.push('}');
             if j.len() > MAX_DATA {
-                return Err(MessageError::TooLong);
+                return Err(Error::TooLong);
             }
         }
         j.push_str("]}");
@@ -581,7 +545,7 @@ impl Message {
     /// An active agent's collected values, in session `session`, sent at
     /// `clock` seconds and `ns` nanoseconds. The caller gives the time,
     /// since this module reads no clock.
-    pub fn agent_data(session: &str, values: &[AgentValue], clock: u64, ns: u32) -> Result<Message, MessageError> {
+    pub fn agent_data(session: &str, values: &[AgentValue], clock: u64, ns: u32) -> Result<Message, Error> {
         let mut j = String::from(r#"{"request":"agent data","session":"#);
         push_str(&mut j, session)?;
         j.push_str(r#","data":["#);
@@ -597,7 +561,7 @@ impl Message {
             push_str(&mut j, &v.value)?;
             j.push_str(&format!(r#","id":{},"clock":{},"ns":{}}}"#, v.id, v.clock, v.ns));
             if j.len() > MAX_DATA {
-                return Err(MessageError::TooLong);
+                return Err(Error::TooLong);
             }
         }
         j.push_str(&format!(r#"],"clock":{clock},"ns":{ns}}}"#));
@@ -606,7 +570,7 @@ impl Message {
 
     /// A server's reply: `success` or `failed`, with an optional `info`
     /// text such as `processed: 1; failed: 0; total: 1`.
-    pub fn response(success: bool, info: Option<&str>) -> Result<Message, MessageError> {
+    pub fn response(success: bool, info: Option<&str>) -> Result<Message, Error> {
         let word = if success { "success" } else { "failed" };
         let mut j = format!(r#"{{"response":"{word}""#);
         if let Some(info) = info {
@@ -617,16 +581,16 @@ impl Message {
         Message::finish(Kind::Response(word.to_string()), j)
     }
 
-    fn finish(kind: Kind, json: String) -> Result<Message, MessageError> {
+    fn finish(kind: Kind, json: String) -> Result<Message, Error> {
         if json.len() > MAX_DATA {
-            return Err(MessageError::TooLong);
+            return Err(Error::TooLong);
         }
         Ok(Message { kind, json })
     }
 }
 
 /// Appends `s` as a JSON string, quoted and escaped.
-fn push_str(out: &mut String, s: &str) -> Result<(), MessageError> {
+fn push_str(out: &mut String, s: &str) -> Result<(), Error> {
     let length = s.chars().try_fold(2usize, |n, c| {
         n.checked_add(match c {
             '"' | '\\' | '\n' | '\r' | '\t' => 2,
@@ -635,7 +599,7 @@ fn push_str(out: &mut String, s: &str) -> Result<(), MessageError> {
         })
     }).and_then(|n| out.len().checked_add(n));
     if length.is_none_or(|n| n > MAX_DATA) {
-        return Err(MessageError::TooLong);
+        return Err(Error::TooLong);
     }
     out.push('"');
     for c in s.chars() {
@@ -657,7 +621,7 @@ fn push_str(out: &mut String, s: &str) -> Result<(), MessageError> {
 /// values of its first top-level `request` and `response` members, each
 /// only if it is a string. It loops instead of
 /// recursing, with a stack no deeper than [`MAX_DEPTH`].
-fn scan(b: &[u8]) -> Result<(Option<String>, Option<String>), MessageError> {
+fn scan(b: &[u8]) -> Result<(Option<String>, Option<String>), Error> {
     let mut s = Scanner { b, i: 0 };
     s.ws();
     // Any well-formed JSON value is read to the end first, so text that is
@@ -681,7 +645,7 @@ fn scan(b: &[u8]) -> Result<(Option<String>, Option<String>), MessageError> {
                 s.i += 1;
                 pending = None;
                 if stack.len() >= MAX_DEPTH {
-                    return Err(MessageError::TooDeep);
+                    return Err(Error::TooDeep);
                 }
                 stack.push(true);
                 s.ws();
@@ -700,7 +664,7 @@ fn scan(b: &[u8]) -> Result<(Option<String>, Option<String>), MessageError> {
                 s.i += 1;
                 pending = None;
                 if stack.len() >= MAX_DEPTH {
-                    return Err(MessageError::TooDeep);
+                    return Err(Error::TooDeep);
                 }
                 stack.push(false);
                 s.ws();
@@ -735,7 +699,7 @@ fn scan(b: &[u8]) -> Result<(Option<String>, Option<String>), MessageError> {
                 pending = None;
                 s.literal(b"null")?;
             }
-            _ => return Err(MessageError::Syntax(at)),
+            _ => return Err(Error::Syntax(at)),
         }
         // A value ended.
         loop {
@@ -743,9 +707,9 @@ fn scan(b: &[u8]) -> Result<(Option<String>, Option<String>), MessageError> {
             let Some(&top) = stack.last() else {
                 // The top-level object ended.
                 return if s.i != b.len() {
-                    Err(MessageError::Syntax(s.i))
+                    Err(Error::Syntax(s.i))
                 } else if !object {
-                    Err(MessageError::NotObject)
+                    Err(Error::NotObject)
                 } else {
                     Ok((request, response))
                 };
@@ -770,7 +734,7 @@ fn scan(b: &[u8]) -> Result<(Option<String>, Option<String>), MessageError> {
                     s.i += 1;
                     stack.pop();
                 }
-                _ => return Err(MessageError::Syntax(s.i)),
+                _ => return Err(Error::Syntax(s.i)),
             }
         }
     }
@@ -804,25 +768,25 @@ impl Scanner<'_> {
     }
 
     /// An object key, then the colon after it.
-    fn key(&mut self) -> Result<String, MessageError> {
+    fn key(&mut self) -> Result<String, Error> {
         if self.peek() != Some(b'"') {
-            return Err(MessageError::Syntax(self.i));
+            return Err(Error::Syntax(self.i));
         }
         let key = self.string()?;
         self.ws();
         if self.peek() != Some(b':') {
-            return Err(MessageError::Syntax(self.i));
+            return Err(Error::Syntax(self.i));
         }
         self.i += 1;
         Ok(key)
     }
 
-    fn literal(&mut self, word: &[u8]) -> Result<(), MessageError> {
+    fn literal(&mut self, word: &[u8]) -> Result<(), Error> {
         if self.b.get(self.i..).is_some_and(|rest| rest.starts_with(word)) {
             self.i += word.len();
             Ok(())
         } else {
-            Err(MessageError::Syntax(self.i))
+            Err(Error::Syntax(self.i))
         }
     }
 
@@ -834,7 +798,7 @@ impl Scanner<'_> {
         self.i - from
     }
 
-    fn number(&mut self) -> Result<(), MessageError> {
+    fn number(&mut self) -> Result<(), Error> {
         if self.peek() == Some(b'-') {
             self.i += 1;
         }
@@ -843,12 +807,12 @@ impl Scanner<'_> {
             Some(b'1'..=b'9') => {
                 self.digits();
             }
-            _ => return Err(MessageError::Syntax(self.i)),
+            _ => return Err(Error::Syntax(self.i)),
         }
         if self.peek() == Some(b'.') {
             self.i += 1;
             if self.digits() == 0 {
-                return Err(MessageError::Syntax(self.i));
+                return Err(Error::Syntax(self.i));
             }
         }
         if matches!(self.peek(), Some(b'e' | b'E')) {
@@ -857,20 +821,20 @@ impl Scanner<'_> {
                 self.i += 1;
             }
             if self.digits() == 0 {
-                return Err(MessageError::Syntax(self.i));
+                return Err(Error::Syntax(self.i));
             }
         }
         Ok(())
     }
 
-    fn hex4(&mut self) -> Result<u32, MessageError> {
+    fn hex4(&mut self) -> Result<u32, Error> {
         let mut v = 0u32;
         for _ in 0..4 {
             let d = match self.peek() {
                 Some(c @ b'0'..=b'9') => c - b'0',
                 Some(c @ b'a'..=b'f') => c - b'a' + 10,
                 Some(c @ b'A'..=b'F') => c - b'A' + 10,
-                _ => return Err(MessageError::Syntax(self.i)),
+                _ => return Err(Error::Syntax(self.i)),
             };
             v = (v << 4) | u32::from(d);
             self.i += 1;
@@ -880,21 +844,21 @@ impl Scanner<'_> {
 
     /// A string starting at the opening quote, decoded. The input is
     /// already known to be UTF-8, so bytes copied whole stay UTF-8.
-    fn string(&mut self) -> Result<String, MessageError> {
+    fn string(&mut self) -> Result<String, Error> {
         self.i += 1;
         let mut out: Vec<u8> = Vec::new();
         loop {
             let at = self.i;
             let Some(c) = self.peek() else {
-                return Err(MessageError::Syntax(at));
+                return Err(Error::Syntax(at));
             };
             self.i += 1;
             match c {
                 b'"' => break,
-                0..=0x1f => return Err(MessageError::Syntax(at)),
+                0..=0x1f => return Err(Error::Syntax(at)),
                 b'\\' => {
                     let Some(e) = self.peek() else {
-                        return Err(MessageError::Syntax(self.i));
+                        return Err(Error::Syntax(self.i));
                     };
                     self.i += 1;
                     let ch = match e {
@@ -910,12 +874,12 @@ impl Scanner<'_> {
                             let hi = self.hex4()?;
                             let code = if (0xd800..0xdc00).contains(&hi) {
                                 if self.peek() != Some(b'\\') || self.b.get(self.i + 1) != Some(&b'u') {
-                                    return Err(MessageError::Syntax(self.i));
+                                    return Err(Error::Syntax(self.i));
                                 }
                                 self.i += 2;
                                 let lo = self.hex4()?;
                                 if !(0xdc00..0xe000).contains(&lo) {
-                                    return Err(MessageError::Syntax(self.i));
+                                    return Err(Error::Syntax(self.i));
                                 }
                                 0x10000 + ((hi - 0xd800) << 10) + (lo - 0xdc00)
                             } else {
@@ -923,10 +887,10 @@ impl Scanner<'_> {
                             };
                             match char::from_u32(code) {
                                 Some(ch) => ch,
-                                None => return Err(MessageError::Syntax(self.i)),
+                                None => return Err(Error::Syntax(self.i)),
                             }
                         }
-                        _ => return Err(MessageError::Syntax(self.i - 1)),
+                        _ => return Err(Error::Syntax(self.i - 1)),
                     };
                     let mut buf = [0u8; 4];
                     out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
@@ -934,7 +898,7 @@ impl Scanner<'_> {
                 c => out.push(c),
             }
         }
-        String::from_utf8(out).map_err(|_| MessageError::Utf8)
+        String::from_utf8(out).map_err(|_| Error::Utf8)
     }
 }
 
@@ -996,35 +960,35 @@ mod tests {
         // Large lengths require an explicit large flag.
         let h = Header { flags: 0x03, data_len: 1, reserved: 1 << 40 };
         contract::check_wire_value(&h);
-        assert_eq!(h.to_bytes(), Err(PacketError::Unwritable));
+        assert_eq!(h.to_bytes(), Err(Error::Unwritable));
         let h = Header { flags: 0x07, ..h };
         contract::check_wire_value(&h);
         assert_eq!(Header::parse(&h.to_bytes().unwrap()), Ok(h));
         let p = Packet { flags: 0xf8, reserved: 0, data: vec![] };
         contract::check_wire_value(&p);
-        assert_eq!(p.to_bytes(), Err(PacketError::Unwritable));
+        assert_eq!(p.to_bytes(), Err(Error::Unwritable));
     }
 
     #[test]
     fn packet_errors() {
-        assert_eq!(Frames::with_limit(MAX_DATA).decode(b"ZBXE", false), Err(PacketError::Magic));
-        assert_eq!(Frames::with_limit(MAX_DATA).decode(b"X", false), Err(PacketError::Magic));
-        assert_eq!(Frames::with_limit(MAX_DATA).decode(b"HTTP/1.1", false), Err(PacketError::Magic));
-        assert_eq!(Frames::with_limit(MAX_DATA).decode(b"ZBXD\x00", false), Err(PacketError::Flags(0)));
-        assert_eq!(Frames::with_limit(MAX_DATA).decode(b"ZBXD\x02", false), Err(PacketError::Flags(2)));
-        assert_eq!(Frames::with_limit(MAX_DATA).decode(b"ZBXD\x09", false), Err(PacketError::Flags(9)));
+        assert_eq!(Packets::with_limit(MAX_DATA).decode(b"ZBXE", false), Err(Error::Magic));
+        assert_eq!(Packets::with_limit(MAX_DATA).decode(b"X", false), Err(Error::Magic));
+        assert_eq!(Packets::with_limit(MAX_DATA).decode(b"HTTP/1.1", false), Err(Error::Magic));
+        assert_eq!(Packets::with_limit(MAX_DATA).decode(b"ZBXD\x00", false), Err(Error::Flags(0)));
+        assert_eq!(Packets::with_limit(MAX_DATA).decode(b"ZBXD\x02", false), Err(Error::Flags(2)));
+        assert_eq!(Packets::with_limit(MAX_DATA).decode(b"ZBXD\x09", false), Err(Error::Flags(9)));
         let bytes = packet_bytes(1, b"hello", 0);
-        assert_eq!(Frames::with_limit(4).decode(&bytes, false), Err(PacketError::TooLarge { len: 5, limit: 4 }));
-        assert!(matches!(Frames::with_limit(5).decode(&bytes, false).unwrap(), Step::Item(_, _)));
+        assert_eq!(Packets::with_limit(4).decode(&bytes, false), Err(Error::TooLarge { len: 5, limit: 4 }));
+        assert!(matches!(Packets::with_limit(5).decode(&bytes, false).unwrap(), Step::Item(_, _)));
         // Over the limit is known from the header alone.
-        assert_eq!(Frames::with_limit(4).decode(&bytes[..13], false), Err(PacketError::TooLarge { len: 5, limit: 4 }));
+        assert_eq!(Packets::with_limit(4).decode(&bytes[..13], false), Err(Error::TooLarge { len: 5, limit: 4 }));
         let mut huge = b"ZBXD\x05".to_vec();
         huge.extend_from_slice(&u64::MAX.to_le_bytes());
         huge.extend_from_slice(&0u64.to_le_bytes());
-        assert_eq!(Frames::with_limit(MAX_DATA).decode(&huge, false), Err(PacketError::TooLarge { len: u64::MAX, limit: MAX_DATA }));
+        assert_eq!(Packets::with_limit(MAX_DATA).decode(&huge, false), Err(Error::TooLarge { len: u64::MAX, limit: MAX_DATA }));
         // A limit over MAX_DATA counts as MAX_DATA.
-        assert_eq!(Frames::with_limit(usize::MAX).limit(), MAX_DATA);
-        for e in [PacketError::Magic, PacketError::Flags(0), PacketError::TooLarge { len: 1, limit: 0 }] {
+        assert_eq!(Packets::with_limit(usize::MAX).limit(), MAX_DATA);
+        for e in [Error::Magic, Error::Flags(0), Error::TooLarge { len: 1, limit: 0 }] {
             assert!(!e.to_string().is_empty());
         }
     }
@@ -1034,26 +998,26 @@ mod tests {
     #[test]
     fn reserved_length_is_checked_against_the_limit() {
         let bytes = packet_bytes(3, &[0x78, 0x9c], 100);
-        assert_eq!(Frames::with_limit(99).decode(&bytes, false), Err(PacketError::ReservedTooLarge { len: 100, limit: 99 }));
-        assert!(matches!(Frames::with_limit(100).decode(&bytes, false).unwrap(), Step::Item(_, _)));
+        assert_eq!(Packets::with_limit(99).decode(&bytes, false), Err(Error::ReservedTooLarge { len: 100, limit: 99 }));
+        assert!(matches!(Packets::with_limit(100).decode(&bytes, false).unwrap(), Step::Item(_, _)));
         // Known from the header alone.
-        assert_eq!(Frames::with_limit(99).decode(&bytes[..13], false), Err(PacketError::ReservedTooLarge { len: 100, limit: 99 }));
+        assert_eq!(Packets::with_limit(99).decode(&bytes[..13], false), Err(Error::ReservedTooLarge { len: 100, limit: 99 }));
         let plain = packet_bytes(1, b"x", 5);
-        assert_eq!(Frames::with_limit(4).decode(&plain, false), Err(PacketError::ReservedTooLarge { len: 5, limit: 4 }));
-        let mut d = Stream::new(Frames::with_limit(10));
+        assert_eq!(Packets::with_limit(4).decode(&plain, false), Err(Error::ReservedTooLarge { len: 5, limit: 4 }));
+        let mut d = Stream::new(Packets::with_limit(10));
         assert_eq!(d.push(&packet_bytes(3, &[1], 11)[..13]), 13);
-        assert_eq!(d.next(), Some(Err(Fail::Protocol(PacketError::ReservedTooLarge { len: 11, limit: 10 }))));
+        assert_eq!(d.next(), Some(Err(Fail::Protocol(Error::ReservedTooLarge { len: 11, limit: 10 }))));
         assert!(d.next().is_none());
         let p = Packet { flags: 0x03, reserved: 1 << 40, data: vec![1] };
         contract::check_wire_value(&p);
-        assert_eq!(p.to_bytes(), Err(PacketError::Unwritable));
-        assert!(!PacketError::ReservedTooLarge { len: 1, limit: 0 }.to_string().is_empty());
+        assert_eq!(p.to_bytes(), Err(Error::Unwritable));
+        assert!(!Error::ReservedTooLarge { len: 1, limit: 0 }.to_string().is_empty());
     }
 
     // Text that is not JSON at all is a syntax error, not "not an object".
     #[test]
     fn malformed_json_is_a_syntax_error() {
-        use MessageError::*;
+        use Error::*;
         assert_eq!(Message::parse(b"abc"), Err(Syntax(0)));
         assert_eq!(Message::parse(b"agent.ping"), Err(Syntax(0)));
         assert_eq!(Message::parse(b"[1,"), Err(Syntax(3)));
@@ -1068,7 +1032,7 @@ mod tests {
     // must not stand in for a first one that is not a string.
     #[test]
     fn first_member_counts_even_when_not_a_string() {
-        use MessageError::*;
+        use Error::*;
         assert_eq!(Message::parse(br#"{"request":1,"request":"x"}"#), Err(NoKind));
         assert_eq!(Message::parse(br#"{"response":null,"response":"success"}"#), Err(NoKind));
         let m = Message::parse(br#"{"request":[],"response":"failed","request":"active checks"}"#).unwrap();
@@ -1085,8 +1049,8 @@ mod tests {
         large.extend_from_slice(b"wxyz");
         for bytes in [packet_bytes(1, b"{\"request\":\"active checks\",\"host\":\"a\"}", 0), large] {
             for n in 0..bytes.len() {
-                assert_eq!(Frames::new().decode(&bytes[..n], false), Ok(Step::Need), "{n} bytes");
-                assert_eq!(Packet::parse(&bytes[..n]), Err(PacketParseError::Truncated));
+                assert_eq!(Packets::new().decode(&bytes[..n], false), Ok(Step::Need), "{n} bytes");
+                assert_eq!(Packet::parse(&bytes[..n]), Err(Error::Truncated));
             }
             assert!(Packet::parse(&bytes).is_ok());
         }
@@ -1125,7 +1089,7 @@ mod tests {
 
     #[test]
     fn message_errors() {
-        use MessageError::*;
+        use Error::*;
         assert_eq!(Message::parse(b"{\"request\":\"\xff\"}"), Err(Utf8));
         assert_eq!(Message::parse(b""), Err(Syntax(0)));
         assert_eq!(Message::parse(b"  "), Err(Syntax(2)));
@@ -1200,11 +1164,11 @@ mod tests {
         let b = Packet { flags: 3, reserved: 7, data: vec![1, 2, 3] };
         let mut bytes = a.to_bytes().unwrap();
         b.write(&mut bytes).unwrap();
-        contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * Frames::new().capacity());
-        assert_eq!(decode_all(Frames::new, &bytes), (vec![a, b], None));
-        let mut d = Stream::new(Frames::with_limit(4));
+        contract::check_decode_with_alloc_limit(Packets::new, &bytes, 2 * Packets::new().capacity());
+        assert_eq!(decode_all(Packets::new, &bytes), (vec![a, b], None));
+        let mut d = Stream::new(Packets::with_limit(4));
         assert_eq!(d.push(&packet_bytes(1, b"hello", 0)[..13]), 13);
-        assert_eq!(d.next(), Some(Err(Fail::Protocol(PacketError::TooLarge { len: 5, limit: 4 }))));
+        assert_eq!(d.next(), Some(Err(Fail::Protocol(Error::TooLarge { len: 5, limit: 4 }))));
         assert_eq!(d.push(&bytes), bytes.len());
         assert!(d.next().is_none());
         assert_eq!(d.buffered(), 13);
@@ -1215,7 +1179,7 @@ mod tests {
         let one = Packet::new(vec![b'x'; 3]).to_bytes().unwrap();
         let bytes = one.repeat(200_000);
         let started = std::time::Instant::now();
-        let mut stream = Stream::new(Frames::new());
+        let mut stream = Stream::new(Packets::new());
         let mut n = 0;
         pump(&mut stream, &bytes, |_| n += 1).unwrap();
         finish(&mut stream, |_| n += 1).unwrap();
@@ -1225,11 +1189,11 @@ mod tests {
     }
 
     fn check_stream(data: &[u8], limit: usize) {
-        contract::check_decode_with_alloc_limit(|| Frames::with_limit(limit), data, 2 * Frames::with_limit(limit).capacity());
+        contract::check_decode_with_alloc_limit(|| Packets::with_limit(limit), data, 2 * Packets::with_limit(limit).capacity());
         contract::check_wire::<Packet>(data);
         contract::check_wire::<Header>(data);
         contract::check_wire::<Message>(data);
-        for p in decode_all(|| Frames::with_limit(limit), data).0 {
+        for p in decode_all(|| Packets::with_limit(limit), data).0 {
             contract::check_wire_value(&p);
             if let Ok(m) = Message::parse(&p.data) {
                 assert_eq!(m.json().as_bytes(), &p.data[..]);

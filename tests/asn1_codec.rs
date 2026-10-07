@@ -126,7 +126,7 @@ fn ldap_messages_round_trip() -> Result<(), Box<dyn core::error::Error>> {
     let mut both = bytes.clone();
     request.write(&mut both)?;
     round_trip(
-        ldap::Frames::new,
+        ldap::Messages::new,
         &both,
         &[request.clone(), request.clone()],
     );
@@ -136,9 +136,9 @@ fn ldap_messages_round_trip() -> Result<(), Box<dyn core::error::Error>> {
         &both,
         &[Ok(request.clone()), Ok(request)],
     );
-    truncated(ldap::Frames::new, bytes.get(..bytes.len() - 1).unwrap());
+    truncated(ldap::Messages::new, bytes.get(..bytes.len() - 1).unwrap());
     refused(
-        || ldap::Frames::with_limit(8),
+        || ldap::Messages::with_limit(8),
         &[0x30, 9],
         ldap::Error::TooLarge(11),
     );
@@ -147,7 +147,7 @@ fn ldap_messages_round_trip() -> Result<(), Box<dyn core::error::Error>> {
 
 #[test]
 fn ocsp_requests_and_responses_round_trip() -> Result<(), Box<dyn core::error::Error>> {
-    let request = ocsp::OcspRequest::new(vec![ocsp::Request {
+    let request = ocsp::Request::new(vec![ocsp::SingleRequest {
         cert_id: ocsp::CertId {
             hash_algorithm: ocsp::AlgorithmIdentifier::sha256(),
             issuer_name_hash: vec![1; 32],
@@ -158,16 +158,16 @@ fn ocsp_requests_and_responses_round_trip() -> Result<(), Box<dyn core::error::E
     }]);
     let bytes = request.to_bytes()?;
     round_trip(
-        || ocsp::Frames::new().map(|b| <ocsp::OcspRequest as Wire>::parse(&b)),
+        || ocsp::Frames::new().map(|b| <ocsp::Request as Wire>::parse(&b)),
         &bytes,
         &[Ok(request)],
     );
-    let response = ocsp::OcspResponse::error(ocsp::ResponseStatus::TryLater);
+    let response = ocsp::Response::error(ocsp::ResponseStatus::TryLater);
     let reply = response.to_bytes()?;
     let mut both = reply.clone();
     response.write(&mut both)?;
     round_trip(
-        || ocsp::Frames::new().map(|b| <ocsp::OcspResponse as Wire>::parse(&b)),
+        || ocsp::Frames::new().map(|b| <ocsp::Response as Wire>::parse(&b)),
         &both,
         &[Ok(response.clone()), Ok(response)],
     );
@@ -251,7 +251,7 @@ fn x509_pem_blocks_round_trip() -> Result<(), Box<dyn core::error::Error>> {
         algorithm,
         asn1::BitString::new(vec![8; 64], 0)?,
     )?;
-    let block = x509::Pem {
+    let block = x509::PemBlock {
         label: x509::PEM_CERTIFICATE.into(),
         data: certificate.to_bytes()?,
     };
@@ -280,7 +280,7 @@ fn x509_pem_blocks_round_trip() -> Result<(), Box<dyn core::error::Error>> {
 
 #[test]
 fn x509_pem_trailing_text_at_eof() -> Result<(), Box<dyn core::error::Error>> {
-    let text = x509::Pem {
+    let text = x509::PemBlock {
         label: "TEST".into(),
         data: vec![1, 2, 3],
     }
@@ -301,7 +301,7 @@ fn x509_pem_trailing_text_at_eof() -> Result<(), Box<dyn core::error::Error>> {
 
 #[test]
 fn x509_pem_text_lines_have_their_own_limit() -> Result<(), Box<dyn core::error::Error>> {
-    let text = x509::Pem {
+    let text = x509::PemBlock {
         label: "TEST".into(),
         data: vec![1, 2, 3],
     }
@@ -356,7 +356,7 @@ fn frame_limits_refuse_lengths_before_bodies() {
         refused(
             || kerberos::Frames::with_limit(limit),
             &[0, 0, 0, 128],
-            kerberos::FrameError::TooLong(128),
+            kerberos::Error::LengthTooLong(128),
         );
         assert_eq!(ocsp::Frames::with_limit(limit).capacity(), limit.max(16));
         assert_eq!(spnego::Frames::with_limit(limit).capacity(), limit.max(16));
@@ -425,7 +425,7 @@ fn kerberos_tcp_messages_round_trip() -> Result<(), Box<dyn core::error::Error>>
     refused(
         kerberos::Frames::new,
         &length.to_be_bytes(),
-        kerberos::FrameError::TooLong(length),
+        kerberos::Error::LengthTooLong(length),
     );
     Ok(())
 }

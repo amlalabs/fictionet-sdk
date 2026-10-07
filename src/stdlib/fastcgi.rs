@@ -13,7 +13,7 @@
 //! Specification 1.0.
 //!
 //! Nothing here reads a socket. A world that plays an application passes
-//! bytes from a connection to [`Stream<Frames>`](fictionet::stdlib::codec::Stream),
+//! bytes from a connection to [`Stream<Records>`](fictionet::stdlib::codec::Stream),
 //! gets [`Record`]s back, and hands each one
 //! to a [`Server`], which puts the streams of each request back
 //! together and gives a [`Request`] once all of it has come. The world
@@ -29,7 +29,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
-//! use fictionet::stdlib::fastcgi::{Frames, Pairs, Request, Role, Server, ServerEvent};
+//! use fictionet::stdlib::fastcgi::{Pairs, Records, Request, Role, Server, ServerEvent};
 //!
 //! // What a web server sends for GET /hello: two parameters and no body.
 //! let sent = Request {
@@ -45,7 +45,7 @@
 //! }
 //! .to_bytes().unwrap();
 //!
-//! let mut stream = Stream::new(Frames::new());
+//! let mut stream = Stream::new(Records::new());
 //! let mut server = Server::new();
 //! let mut reply = Vec::new();
 //! pump(&mut stream, &sent, |record| {
@@ -165,23 +165,160 @@ pub struct Record {
     pub padding: u8,
 }
 
-/// Why bytes are not a FastCGI record. The connection holds no more
-/// records a reader can find, and a real application closes it.
+/// Why bytes are not FastCGI records, pairs, bodies or a whole request or
+/// response, why a value cannot be written, or why a [`Server`] or
+/// [`Client`] cannot take a record into a request.
+///
+/// A record fault from [`Records`] ends the stream: the connection holds
+/// no more records a reader can find, and a real application closes it.
+///
+/// For a [`Server`], an error about a request whose streams were coming in
+/// drops what it held, and later records for it are ignored. The request
+/// stays open, as the specification keeps its ID active, until the
+/// application sends END_REQUEST and calls [`Server::end`]. A request
+/// refused at its BEGIN_REQUEST ([`Error::Body`],
+/// [`Error::UnknownRole`] or [`Error::TooManyRequests`]) is
+/// not opened.
+///
+/// For a [`Client`], an error drops the output gathered for the request,
+/// and its later STDOUT and STDERR records and its END_REQUEST are
+/// ignored. [`Error::TooManyRequests`] keeps nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RecordError {
-    /// The version byte was not 1.
+pub enum Error {
+    /// A record's version byte was not 1.
     Version(u8),
+    /// An exact record parse found the input ended before a complete
+    /// record, including empty input.
+    RecordTruncated,
+    /// An exact record parse found bytes after the first complete record.
+    Trailing,
+    /// The record exceeds the configured limit, including padding.
+    RecordTooLong {
+        /// The record length, including its header and padding.
+        length: usize,
+        /// The maximum accepted record length.
+        limit: usize,
+    },
+    /// A record's content is not the body its type needs: it is not 8
+    /// bytes.
+    BodyLength,
+    /// A length, name or value in name and value pairs runs past the end
+    /// of the bytes.
+    PairTruncated,
+    /// There are more than [`MAX_PAIRS`] name and value pairs.
+    TooManyPairs,
+    /// The encoded name and value pairs exceed [`MAX_PARAMS`] bytes.
+    PairsTooLong,
+    /// Records for a whole stream, request or response end before
+    /// completion.
+    SequenceTruncated,
+    /// Records have different IDs, an unexpected type, or follow completion.
+    Unexpected,
+    /// The value cannot be written without changing it.
+    Unwritable,
+    /// A record's content is not what its type needs: a BEGIN_REQUEST or
+    /// END_REQUEST body that is not 8 bytes, or PARAMS or GET_VALUES that
+    /// are not name and value pairs.
+    Body {
+        /// The request.
+        id: u16,
+        /// The record type.
+        kind: u8,
+    },
+    /// A request asks for a role a [`Server`] does not play. The
+    /// application answers with [`ProtocolStatus::UnknownRole`].
+    UnknownRole {
+        /// The request.
+        id: u16,
+        /// The role asked for.
+        role: u16,
+    },
+    /// [`MAX_REQUESTS`] are already open. The request is not taken, and an
+    /// application answers with [`ProtocolStatus::Overloaded`].
+    TooManyRequests {
+        /// The request.
+        id: u16,
+    },
+    /// A stream grew past its limit: [`MAX_PARAMS`] for PARAMS and
+    /// [`MAX_STREAM`] for the others. Or the stream bytes held across all
+    /// open requests grew past [`MAX_HELD`].
+    TooLarge {
+        /// The request.
+        id: u16,
+        /// The record type.
+        kind: u8,
+    },
+    /// A BEGIN_REQUEST came for a request that was already open. The new
+    /// one is refused. If the first one's streams were still coming in,
+    /// they are dropped, and the first stays open until [`Server::end`].
+    Duplicate {
+        /// The request.
+        id: u16,
+    },
+    /// A stream record came after the record that ended the stream.
+    AfterEnd {
+        /// The request.
+        id: u16,
+        /// The record type.
+        kind: u8,
+    },
+    /// A stream record came before the streams that go ahead of it had
+    /// ended. A web server sends PARAMS, then STDIN, then DATA.
+    OutOfOrder {
+        /// The request.
+        id: u16,
+        /// The record type.
+        kind: u8,
+    },
 }
 
-impl core::fmt::Display for RecordError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            RecordError::Version(v) => write!(f, "FastCGI version {v}, not 1"),
+impl Error {
+    /// The request the error is about, for an error a [`Server`] or
+    /// [`Client`] reports about one request.
+    pub fn id(&self) -> Option<u16> {
+        match *self {
+            Error::Body { id, .. }
+            | Error::UnknownRole { id, .. }
+            | Error::TooManyRequests { id }
+            | Error::TooLarge { id, .. }
+            | Error::Duplicate { id }
+            | Error::AfterEnd { id, .. }
+            | Error::OutOfOrder { id, .. } => Some(id),
+            _ => None,
         }
     }
 }
 
-impl core::error::Error for RecordError {}
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Error::Version(v) => write!(f, "FastCGI version {v}, not 1"),
+            Error::RecordTruncated => f.write_str("input ended before a complete FastCGI record"),
+            Error::Trailing => f.write_str("bytes follow the FastCGI record"),
+            Error::RecordTooLong { length, limit } => write!(f, "record length {length} exceeds {limit}"),
+            Error::BodyLength => f.write_str("record body is not 8 bytes"),
+            Error::PairTruncated => f.write_str("name and value pair runs past the end"),
+            Error::TooManyPairs => write!(f, "more than {MAX_PAIRS} name and value pairs"),
+            Error::PairsTooLong => write!(f, "pairs exceed {MAX_PARAMS} bytes"),
+            Error::SequenceTruncated => f.write_str("input ends before completion"),
+            Error::Unexpected => f.write_str("unexpected record in sequence"),
+            Error::Unwritable => f.write_str("value cannot be written without changing it"),
+            Error::Body { id, kind } => write!(f, "request {id}: malformed body in record type {kind}"),
+            Error::UnknownRole { id, role } => write!(f, "request {id}: unknown role {role}"),
+            Error::TooManyRequests { id } => write!(f, "request {id}: more than {MAX_REQUESTS} open"),
+            Error::TooLarge { id, kind } => write!(f, "request {id}: stream of record type {kind} too large"),
+            Error::Duplicate { id } => write!(f, "request {id}: begun twice"),
+            Error::AfterEnd { id, kind } => {
+                write!(f, "request {id}: record type {kind} after its stream ended")
+            }
+            Error::OutOfOrder { id, kind } => {
+                write!(f, "request {id}: record type {kind} before the streams ahead of it ended")
+            }
+        }
+    }
+}
+
+impl core::error::Error for Error {}
 
 impl Record {
     /// A record carrying `content`, padded to a multiple of 8 bytes as the
@@ -194,11 +331,11 @@ impl Record {
     /// Reads the record at the start of `b`. It returns `Ok(None)` if `b`
     /// holds only part of one, and otherwise the record and how many bytes
     /// of `b` it took, padding included.
-    fn parse_prefix(b: &[u8]) -> Result<Option<(Record, usize)>, RecordError> {
+    fn parse_prefix(b: &[u8]) -> Result<Option<(Record, usize)>, Error> {
         // A bad version is known from the first byte.
         match b.first() {
             None => return Ok(None),
-            Some(&v) if v != VERSION => return Err(RecordError::Version(v)),
+            Some(&v) if v != VERSION => return Err(Error::Version(v)),
             Some(_) => {}
         }
         if b.len() < HEADER_LEN {
@@ -244,86 +381,41 @@ impl Record {
 
     /// A GET_VALUES record asking for every name. Refuses excess pair
     /// counts and names that cannot fit together in one record.
-    pub fn get_values(names: &[&[u8]]) -> Result<Record, WriteError> {
+    pub fn get_values(names: &[&[u8]]) -> Result<Record, Error> {
         let (bytes, _) = encode_pairs_within(names.iter().map(|n| (*n, &[][..])), MAX_CONTENT)?;
         Ok(Record::new(kind::GET_VALUES, NULL_REQUEST_ID, &bytes))
     }
 
     /// A GET_VALUES_RESULT record carrying every pair. Refuses excess
     /// pair counts and pairs that cannot fit together in one record.
-    pub fn get_values_result(pairs: &Pairs) -> Result<Record, WriteError> {
+    pub fn get_values_result(pairs: &Pairs) -> Result<Record, Error> {
         let (bytes, _) = encode_pairs_within(borrowed(&pairs.0), MAX_CONTENT)?;
         Ok(Record::new(kind::GET_VALUES_RESULT, NULL_REQUEST_ID, &bytes))
     }
 }
 
-/// Why an exact [`Wire`] parse did not read one complete FastCGI record.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RecordParseError {
-    /// The record header is invalid.
-    Record(RecordError),
-    /// The input ended before a complete record, including empty input.
-    Truncated,
-    /// Bytes follow the first complete record.
-    Trailing,
-}
-
-impl core::fmt::Display for RecordParseError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Record(e) => e.fmt(f),
-            Self::Truncated => f.write_str("input ended before a complete FastCGI record"),
-            Self::Trailing => f.write_str("bytes follow the FastCGI record"),
-        }
-    }
-}
-
-impl core::error::Error for RecordParseError {
-    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
-        match self {
-            Self::Record(e) => Some(e),
-            Self::Truncated | Self::Trailing => None,
-        }
-    }
-}
-
-/// Why a value cannot be written without changing it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WriteError {
-    /// The value cannot be written without changing it.
-    Unwritable,
-}
-
-impl core::fmt::Display for WriteError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("value cannot be written without changing it")
-    }
-}
-
-impl core::error::Error for WriteError {}
-
 impl Wire for Record {
-    type ParseError = RecordParseError;
-    type WriteError = WriteError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads exactly one record, including padding. Refuses a version other
     /// than 1, incomplete input, and trailing bytes. Padding bytes may hold anything.
-    fn parse(b: &[u8]) -> Result<Self, RecordParseError> {
-        match Self::parse_prefix(b).map_err(RecordParseError::Record)? {
+    fn parse(b: &[u8]) -> Result<Self, Error> {
+        match Self::parse_prefix(b)? {
             Some((record, used)) if used == b.len() => Ok(record),
-            Some(_) => Err(RecordParseError::Trailing),
-            None => Err(RecordParseError::Truncated),
+            Some(_) => Err(Error::Trailing),
+            None => Err(Error::RecordTruncated),
         }
     }
 
     /// Appends the header, content, and zero padding. Refuses content over
     /// [`MAX_CONTENT`] or output length overflow without changing `out`.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         if self.content.len() > MAX_CONTENT {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         let length = HEADER_LEN + self.content.len() + usize::from(self.padding);
-        let end = out.len().checked_add(length).ok_or(WriteError::Unwritable)?;
+        let end = out.len().checked_add(length).ok_or(Error::Unwritable)?;
         out.push(VERSION);
         out.push(self.kind);
         out.extend_from_slice(&self.request_id.to_be_bytes());
@@ -336,44 +428,12 @@ impl Wire for Record {
     }
 }
 
-/// Why a bounded FastCGI frame stream cannot continue.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FrameError {
-    /// The record header is invalid.
-    Record(RecordError),
-    /// The record exceeds the configured limit, including padding.
-    TooLong {
-        /// The record length, including its header and padding.
-        length: usize,
-        /// The maximum accepted record length.
-        limit: usize,
-    },
-}
-
-impl core::fmt::Display for FrameError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Record(e) => e.fmt(f),
-            Self::TooLong { length, limit } => write!(f, "record length {length} exceeds {limit}"),
-        }
-    }
-}
-
-impl core::error::Error for FrameError {
-    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
-        match self {
-            Self::Record(e) => Some(e),
-            Self::TooLong { .. } => None,
-        }
-    }
-}
-
-fn parse_record_limited(b: &[u8], limit: usize) -> Result<Option<(Record, usize)>, FrameError> {
+fn parse_record_limited(b: &[u8], limit: usize) -> Result<Option<(Record, usize)>, Error> {
     // Preserve Record::parse error ordering: Version comes before TooLong.
     if let Some(&version) = b.first()
         && version != VERSION
     {
-        return Err(FrameError::Record(RecordError::Version(version)));
+        return Err(Error::Version(version));
     }
     if let Some(&[_, _, _, _, hi, lo, padding, _]) = b.get(..HEADER_LEN) {
         // The two length fields bound this sum by MAX_RECORD.
@@ -381,10 +441,10 @@ fn parse_record_limited(b: &[u8], limit: usize) -> Result<Option<(Record, usize)
             .saturating_add(usize::from(u16::from_be_bytes([hi, lo])))
             .saturating_add(usize::from(padding));
         if length > limit {
-            return Err(FrameError::TooLong { length, limit });
+            return Err(Error::RecordTooLong { length, limit });
         }
     }
-    Record::parse_prefix(b).map_err(FrameError::Record)
+    Record::parse_prefix(b)
 }
 
 /// Reads FastCGI records without holding input bytes.
@@ -395,11 +455,11 @@ fn parse_record_limited(b: &[u8], limit: usize) -> Result<Option<(Record, usize)
 ///
 /// ```
 /// use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
-/// use fictionet::stdlib::fastcgi::{Frames, Record, kind};
+/// use fictionet::stdlib::fastcgi::{Record, Records, kind};
 ///
 /// let record = Record { kind: kind::STDIN, request_id: 1, content: vec![7, 8], padding: 0 };
 /// let bytes = Wire::to_bytes(&record)?;
-/// let mut stream = Stream::new(Frames::new());
+/// let mut stream = Stream::new(Records::new());
 /// let mut records = Vec::new();
 /// pump(&mut stream, &bytes[..3], |record| records.push(record))?;
 /// pump(&mut stream, &bytes[3..], |record| records.push(record))?;
@@ -408,11 +468,11 @@ fn parse_record_limited(b: &[u8], limit: usize) -> Result<Option<(Record, usize)
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[derive(Clone, Copy, Debug)]
-pub struct Frames {
+pub struct Records {
     limit: usize,
 }
 
-impl Frames {
+impl Records {
     /// Accepts records up to [`MAX_RECORD`] bytes, including padding.
     pub fn new() -> Self {
         Self::with_limit(MAX_RECORD)
@@ -431,40 +491,28 @@ impl Frames {
     }
 }
 
-impl Default for Frames {
+impl Default for Records {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Decode for Frames {
+impl Decode for Records {
     type Item = Record;
-    type Error = FrameError;
+    type Error = Error;
     const NAME: &'static str = "FastCGI";
 
     fn capacity(&self) -> usize {
         self.limit
     }
 
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Record>, FrameError> {
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Record>, Error> {
         Ok(match parse_record_limited(input, self.limit)? {
             Some((record, used)) => Step::Item(record, used),
             None => Step::Need,
         })
     }
 }
-
-/// Why a record's content is not the body its type needs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BodyError;
-
-impl core::fmt::Display for BodyError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("record body is not 8 bytes")
-    }
-}
-
-impl core::error::Error for BodyError {}
 
 /// The role a request asks the application to play. Roles compare by
 /// number, so `Role::Other(1)` equals `Role::Responder`.
@@ -593,13 +641,13 @@ pub struct EndRequest {
 macro_rules! fixed_body {
     ($ty:ty, $read:expr, $write:expr) => {
         impl Wire for $ty {
-            type ParseError = BodyError;
+            type ParseError = Error;
             type WriteError = core::convert::Infallible;
 
             /// Reads an eight-byte body. Refuses any other length.
             /// Reserved bytes may hold anything.
-            fn parse(content: &[u8]) -> Result<Self, BodyError> {
-                if content.len() != 8 { return Err(BodyError); }
+            fn parse(content: &[u8]) -> Result<Self, Error> {
+                if content.len() != 8 { return Err(Error::BodyLength); }
                 Ok(($read)(content))
             }
 
@@ -639,29 +687,6 @@ fixed_body!(UnknownType,
     |b: &[u8]| UnknownType(b[0]),
     |v: &UnknownType| [v.0, 0, 0, 0, 0, 0, 0, 0]);
 
-/// Why bytes are not a list of name and value pairs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PairError {
-    /// A length, name or value runs past the end of the bytes.
-    Truncated,
-    /// There are more than [`MAX_PAIRS`] pairs.
-    TooMany,
-    /// The encoded pairs exceed [`MAX_PARAMS`] bytes.
-    TooLong,
-}
-
-impl core::fmt::Display for PairError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            PairError::TooLong => write!(f, "pairs exceed {MAX_PARAMS} bytes"),
-            PairError::Truncated => f.write_str("name and value pair runs past the end"),
-            PairError::TooMany => write!(f, "more than {MAX_PAIRS} name and value pairs"),
-        }
-    }
-}
-
-impl core::error::Error for PairError {}
-
 /// A list of FastCGI name and value pairs, bounded by [`MAX_PARAMS`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Pairs(
@@ -670,25 +695,25 @@ pub struct Pairs(
 );
 
 impl Wire for Pairs {
-    type ParseError = PairError;
-    type WriteError = WriteError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads name and value pairs. Each pair is the name's length, the
     /// value's length, the name and the value. A length below 128 takes one
     /// byte; a longer one takes four, with the top bit of the first set.
     /// Refuses truncated pairs, excess pair counts, and input over [`MAX_PARAMS`].
-    fn parse(b: &[u8]) -> Result<Self, PairError> {
-        if b.len() > MAX_PARAMS { return Err(PairError::TooLong); }
+    fn parse(b: &[u8]) -> Result<Self, Error> {
+        if b.len() > MAX_PARAMS { return Err(Error::PairsTooLong); }
         let mut out = Vec::new();
         let mut i = 0;
         while i < b.len() {
             if out.len() >= MAX_PAIRS {
-                return Err(PairError::TooMany);
+                return Err(Error::TooManyPairs);
             }
             let (name_len, at) = read_len(b, i)?;
             let (value_len, at) = read_len(b, at)?;
-            let name_end = at.checked_add(name_len).filter(|&e| e <= b.len()).ok_or(PairError::Truncated)?;
-            let value_end = name_end.checked_add(value_len).filter(|&e| e <= b.len()).ok_or(PairError::Truncated)?;
+            let name_end = at.checked_add(name_len).filter(|&e| e <= b.len()).ok_or(Error::PairTruncated)?;
+            let value_end = name_end.checked_add(value_len).filter(|&e| e <= b.len()).ok_or(Error::PairTruncated)?;
             out.push((b[at..name_end].to_vec(), b[name_end..value_end].to_vec()));
             i = value_end;
         }
@@ -697,7 +722,7 @@ impl Wire for Pairs {
 
     /// Appends pairs with one-byte or four-byte lengths. Refuses excess
     /// counts, lengths, or total size without changing `out`.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         let (bytes, _) = encode_pairs_within(borrowed(&self.0), MAX_PARAMS)?;
         out.extend_from_slice(&bytes);
         Ok(())
@@ -711,12 +736,12 @@ fn borrowed(pairs: &[(Vec<u8>, Vec<u8>)]) -> impl Iterator<Item = (&[u8], &[u8])
 
 /// Encodes all pairs within `max` bytes, or refuses the value.
 /// Returns the bytes and the end of each pair for PARAMS record boundaries.
-fn encode_pairs_within<'a>(pairs: impl Iterator<Item = (&'a [u8], &'a [u8])>, max: usize) -> Result<(Vec<u8>, Vec<usize>), WriteError> {
+fn encode_pairs_within<'a>(pairs: impl Iterator<Item = (&'a [u8], &'a [u8])>, max: usize) -> Result<(Vec<u8>, Vec<usize>), Error> {
     let mut out = Vec::new();
     let mut ends = Vec::new();
     for (count, (name, value)) in pairs.enumerate() {
         if count >= MAX_PAIRS || name.len() > MAX_PAIR_LEN || value.len() > MAX_PAIR_LEN {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         let size = len_size(name.len())
             .checked_add(len_size(value.len()))
@@ -725,7 +750,7 @@ fn encode_pairs_within<'a>(pairs: impl Iterator<Item = (&'a [u8], &'a [u8])>, ma
             .and_then(|s| s.checked_add(out.len()));
         match size {
             Some(total) if total <= max => {}
-            _ => return Err(WriteError::Unwritable),
+            _ => return Err(Error::Unwritable),
         }
         write_len(&mut out, name.len());
         write_len(&mut out, value.len());
@@ -749,20 +774,20 @@ fn write_len(out: &mut Vec<u8>, n: usize) {
 }
 
 /// The length at `b[i..]` and where the bytes after it start.
-fn read_len(b: &[u8], i: usize) -> Result<(usize, usize), PairError> {
-    let first = *b.get(i).ok_or(PairError::Truncated)?;
+fn read_len(b: &[u8], i: usize) -> Result<(usize, usize), Error> {
+    let first = *b.get(i).ok_or(Error::PairTruncated)?;
     if first < 0x80 {
         return Ok((usize::from(first), i + 1));
     }
-    let four = b.get(i..).and_then(|r| r.get(..4)).ok_or(PairError::Truncated)?;
+    let four = b.get(i..).and_then(|r| r.get(..4)).ok_or(Error::PairTruncated)?;
     let n = u32::from_be_bytes([four[0], four[1], four[2], four[3]]) & 0x7fff_ffff;
-    let n = usize::try_from(n).map_err(|_| PairError::Truncated)?;
+    let n = usize::try_from(n).map_err(|_| Error::PairTruncated)?;
     Ok((n, i + 4))
 }
 
 /// Appends the records of a stream: the data in records of at most
 /// [`MAX_CONTENT`] bytes, then the empty record that ends the stream.
-fn write_stream(out: &mut Vec<u8>, kind: u8, id: u16, data: &[u8]) -> Result<(), WriteError> {
+fn write_stream(out: &mut Vec<u8>, kind: u8, id: u16, data: &[u8]) -> Result<(), Error> {
     for chunk in data.chunks(CHUNK) {
         Record::new(kind, id, chunk).write(out)?;
     }
@@ -773,7 +798,7 @@ fn write_stream(out: &mut Vec<u8>, kind: u8, id: u16, data: &[u8]) -> Result<(),
 /// at `ends`. Each record ends at the end of a pair when one fits, since
 /// some applications, PHP-FPM among them, read the pairs of each PARAMS
 /// record on their own. A pair too long for one record spans records.
-fn write_params(out: &mut Vec<u8>, id: u16, bytes: &[u8], ends: &[usize]) -> Result<(), WriteError> {
+fn write_params(out: &mut Vec<u8>, id: u16, bytes: &[u8], ends: &[usize]) -> Result<(), Error> {
     let mut start = 0;
     while start < bytes.len() {
         let limit = start.saturating_add(CHUNK).min(bytes.len());
@@ -801,21 +826,21 @@ pub struct RecordStream {
 }
 
 impl Wire for RecordStream {
-    type ParseError = SequenceError;
-    type WriteError = WriteError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads a terminated record stream. Refuses mixed types or IDs,
     /// missing termination, trailing records, and excess stream lengths.
-    fn parse(bytes: &[u8]) -> Result<Self, SequenceError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         let mut value: Option<Self> = None;
         read_sequence(bytes, |record| {
             let v = value.get_or_insert_with(|| Self {
                 kind: record.kind, request_id: record.request_id, data: Vec::new(),
             });
-            if v.kind != record.kind { return Err(SequenceError::Unexpected); }
+            if v.kind != record.kind { return Err(Error::Unexpected); }
             let limit = if v.kind == kind::PARAMS { MAX_PARAMS } else { MAX_STREAM };
             if record.content.len() > limit.saturating_sub(v.data.len()) {
-                return Err(SequenceError::Stream(StreamError::TooLarge { id: v.request_id, kind: v.kind }));
+                return Err(Error::TooLarge { id: v.request_id, kind: v.kind });
             }
             v.data.extend_from_slice(&record.content);
             Ok(if record.content.is_empty() { value.take() } else { None })
@@ -824,9 +849,9 @@ impl Wire for RecordStream {
 
     /// Appends records and an empty terminator. Refuses data over
     /// [`MAX_PARAMS`] for PARAMS or [`MAX_STREAM`] otherwise, without changing `out`.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         let limit = if self.kind == kind::PARAMS { MAX_PARAMS } else { MAX_STREAM };
-        if self.data.len() > limit { return Err(WriteError::Unwritable); }
+        if self.data.len() > limit { return Err(Error::Unwritable); }
         let mut bytes = Vec::new();
         write_stream(&mut bytes, self.kind, self.request_id, &self.data)?;
         out.extend_from_slice(&bytes);
@@ -834,52 +859,18 @@ impl Wire for RecordStream {
     }
 }
 
-/// Why records do not form exactly one complete stream, request, or response.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SequenceError {
-    /// A record header is invalid.
-    Record(RecordError),
-    /// The request or response violates a protocol rule.
-    Stream(StreamError),
-    /// Input ends before completion.
-    Truncated,
-    /// Records have different IDs, an unexpected type, or follow completion.
-    Unexpected,
-}
-
-impl core::fmt::Display for SequenceError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Record(e) => e.fmt(f),
-            Self::Stream(e) => e.fmt(f),
-            Self::Truncated => f.write_str("input ends before completion"),
-            Self::Unexpected => f.write_str("unexpected record in sequence"),
-        }
-    }
-}
-
-impl core::error::Error for SequenceError {
-    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
-        match self {
-            Self::Record(e) => Some(e),
-            Self::Stream(e) => Some(e),
-            _ => None,
-        }
-    }
-}
-
-fn read_sequence<T>(mut bytes: &[u8], mut receive: impl FnMut(&Record) -> Result<Option<T>, SequenceError>) -> Result<T, SequenceError> {
+fn read_sequence<T>(mut bytes: &[u8], mut receive: impl FnMut(&Record) -> Result<Option<T>, Error>) -> Result<T, Error> {
     let mut id = None;
     while !bytes.is_empty() {
-        let (record, used) = Record::parse_prefix(bytes).map_err(SequenceError::Record)?.ok_or(SequenceError::Truncated)?;
-        if id.is_some_and(|id| id != record.request_id) { return Err(SequenceError::Unexpected); }
+        let (record, used) = Record::parse_prefix(bytes)?.ok_or(Error::SequenceTruncated)?;
+        if id.is_some_and(|id| id != record.request_id) { return Err(Error::Unexpected); }
         id = Some(record.request_id);
         bytes = &bytes[used..];
         if let Some(value) = receive(&record)? {
-            return if bytes.is_empty() { Ok(value) } else { Err(SequenceError::Unexpected) };
+            return if bytes.is_empty() { Ok(value) } else { Err(Error::Unexpected) };
         }
     }
-    Err(SequenceError::Truncated)
+    Err(Error::SequenceTruncated)
 }
 
 /// A whole request: the BEGIN_REQUEST body and every stream it carries,
@@ -936,28 +927,28 @@ pub struct Response {
 }
 
 impl Wire for Request {
-    type ParseError = SequenceError;
-    type WriteError = WriteError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads BEGIN_REQUEST, PARAMS, STDIN, and DATA for one request.
     /// Refuses malformed or out-of-order records, excess stream lengths,
     /// unsupported roles, BEGIN_REQUEST flags other than KEEP_CONN, missing
     /// completion, and trailing records.
-    fn parse(bytes: &[u8]) -> Result<Self, SequenceError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         let mut server = Server::new();
         let mut first = true;
         read_sequence(bytes, |record| {
             if record.request_id == 0 || (first && record.kind != kind::BEGIN_REQUEST)
                 || !matches!(record.kind, kind::BEGIN_REQUEST | kind::PARAMS | kind::STDIN | kind::DATA)
-            { return Err(SequenceError::Unexpected); }
+            { return Err(Error::Unexpected); }
             first = false;
             if record.kind == kind::BEGIN_REQUEST
                 && record.content.get(2).is_some_and(|flags| flags & !KEEP_CONN != 0)
-            { return Err(SequenceError::Unexpected); }
-            match server.receive(record).map_err(SequenceError::Stream)? {
+            { return Err(Error::Unexpected); }
+            match server.receive(record)? {
                 Some(ServerEvent::Request(request)) => Ok(Some(request)),
                 None => Ok(None),
-                _ => Err(SequenceError::Unexpected),
+                _ => Err(Error::Unexpected),
             }
         })
     }
@@ -968,13 +959,13 @@ impl Wire for Request {
     /// whole pairs unless a pair is too long for one record.
     /// Refuses zero IDs, unsupported roles, unused stream data, and excess
     /// lengths or pair counts without changing `out`.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         let role = Role::from_code(self.role.code());
         if self.id == 0 || matches!(role, Role::Other(_))
             || (role == Role::Authorizer && !self.stdin.is_empty())
             || (role != Role::Filter && !self.data.is_empty())
             || self.stdin.len() > MAX_STREAM || self.data.len() > MAX_STREAM
-        { return Err(WriteError::Unwritable); }
+        { return Err(Error::Unwritable); }
         let (params, ends) = encode_pairs_within(borrowed(&self.params.0), MAX_PARAMS)?;
         let begin = BeginRequest { role, flags: if self.keep_conn { KEEP_CONN } else { 0 } };
         let mut bytes = Record::begin_request(self.id, begin).to_bytes()?;
@@ -987,31 +978,31 @@ impl Wire for Request {
 }
 
 impl Wire for Response {
-    type ParseError = SequenceError;
-    type WriteError = WriteError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads STDOUT, STDERR, and END_REQUEST for one response. Refuses
     /// invalid records, excess stream lengths, zero or mixed IDs, missing
     /// END_REQUEST, and trailing records.
-    fn parse(bytes: &[u8]) -> Result<Self, SequenceError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         let mut client = Client::new();
         read_sequence(bytes, |record| {
             if record.request_id == 0 || !matches!(record.kind, kind::STDOUT | kind::STDERR | kind::END_REQUEST) {
-                return Err(SequenceError::Unexpected);
+                return Err(Error::Unexpected);
             }
-            match client.receive(record).map_err(SequenceError::Stream)? {
+            match client.receive(record)? {
                 Some(ClientEvent::Response(response)) => Ok(Some(response)),
                 None => Ok(None),
-                _ => Err(SequenceError::Unexpected),
+                _ => Err(Error::Unexpected),
             }
         })
     }
 
     /// Appends STDOUT, nonempty STDERR, and END_REQUEST. Refuses zero IDs
     /// and streams over [`MAX_STREAM`] without changing `out`.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         if self.id == 0 || self.stdout.len() > MAX_STREAM || self.stderr.len() > MAX_STREAM {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         let mut bytes = Vec::new();
         write_stream(&mut bytes, kind::STDOUT, self.id, &self.stdout)?;
@@ -1022,112 +1013,6 @@ impl Wire for Response {
         Ok(())
     }
 }
-
-/// Why a record cannot be taken into a request.
-///
-/// For a [`Server`], an error about a request whose streams were coming in
-/// drops what it held, and later records for it are ignored. The request
-/// stays open, as the specification keeps its ID active, until the
-/// application sends END_REQUEST and calls [`Server::end`]. A request
-/// refused at its BEGIN_REQUEST ([`StreamError::Body`],
-/// [`StreamError::UnknownRole`] or [`StreamError::TooManyRequests`]) is
-/// not opened.
-///
-/// For a [`Client`], an error drops the output gathered for the request,
-/// and its later STDOUT and STDERR records and its END_REQUEST are
-/// ignored. [`StreamError::TooManyRequests`] keeps nothing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StreamError {
-    /// A record's content is not what its type needs: a BEGIN_REQUEST or
-    /// END_REQUEST body that is not 8 bytes, or PARAMS or GET_VALUES that
-    /// are not name and value pairs.
-    Body {
-        /// The request.
-        id: u16,
-        /// The record type.
-        kind: u8,
-    },
-    /// A request asks for a role a [`Server`] does not play. The
-    /// application answers with [`ProtocolStatus::UnknownRole`].
-    UnknownRole {
-        /// The request.
-        id: u16,
-        /// The role asked for.
-        role: u16,
-    },
-    /// [`MAX_REQUESTS`] are already open. The request is not taken, and an
-    /// application answers with [`ProtocolStatus::Overloaded`].
-    TooManyRequests {
-        /// The request.
-        id: u16,
-    },
-    /// A stream grew past its limit: [`MAX_PARAMS`] for PARAMS and
-    /// [`MAX_STREAM`] for the others. Or the stream bytes held across all
-    /// open requests grew past [`MAX_HELD`].
-    TooLarge {
-        /// The request.
-        id: u16,
-        /// The record type.
-        kind: u8,
-    },
-    /// A BEGIN_REQUEST came for a request that was already open. The new
-    /// one is refused. If the first one's streams were still coming in,
-    /// they are dropped, and the first stays open until [`Server::end`].
-    Duplicate {
-        /// The request.
-        id: u16,
-    },
-    /// A stream record came after the record that ended the stream.
-    AfterEnd {
-        /// The request.
-        id: u16,
-        /// The record type.
-        kind: u8,
-    },
-    /// A stream record came before the streams that go ahead of it had
-    /// ended. A web server sends PARAMS, then STDIN, then DATA.
-    OutOfOrder {
-        /// The request.
-        id: u16,
-        /// The record type.
-        kind: u8,
-    },
-}
-
-impl StreamError {
-    /// The request the error is about.
-    pub fn id(&self) -> u16 {
-        match *self {
-            StreamError::Body { id, .. }
-            | StreamError::UnknownRole { id, .. }
-            | StreamError::TooManyRequests { id }
-            | StreamError::TooLarge { id, .. }
-            | StreamError::Duplicate { id }
-            | StreamError::AfterEnd { id, .. }
-            | StreamError::OutOfOrder { id, .. } => id,
-        }
-    }
-}
-
-impl core::fmt::Display for StreamError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            StreamError::Body { id, kind } => write!(f, "request {id}: malformed body in record type {kind}"),
-            StreamError::UnknownRole { id, role } => write!(f, "request {id}: unknown role {role}"),
-            StreamError::TooManyRequests { id } => write!(f, "request {id}: more than {MAX_REQUESTS} open"),
-            StreamError::TooLarge { id, kind } => write!(f, "request {id}: stream of record type {kind} too large"),
-            StreamError::Duplicate { id } => write!(f, "request {id}: begun twice"),
-            StreamError::AfterEnd { id, kind } => {
-                write!(f, "request {id}: record type {kind} after its stream ended")
-            }
-            StreamError::OutOfOrder { id, kind } => {
-                write!(f, "request {id}: record type {kind} before the streams ahead of it ended")
-            }
-        }
-    }
-}
-
-impl core::error::Error for StreamError {}
 
 /// What a [`Server`] makes of a record, when it makes something of it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1172,7 +1057,7 @@ struct Incoming {
 /// END_REQUEST. Until then the request counts toward [`MAX_REQUESTS`], an
 /// ABORT_REQUEST for it gives [`ServerEvent::Abort`], and a second
 /// BEGIN_REQUEST for it is refused. This holds for a request whose streams
-/// failed with a [`StreamError`] too, so the world answers it with
+/// failed with an [`Error`] too, so the world answers it with
 /// END_REQUEST and calls [`Server::end`] as well. The streams must come in
 /// the order the specification gives: PARAMS, then STDIN, then DATA.
 #[derive(Clone, Debug, Default)]
@@ -1233,7 +1118,7 @@ impl Server {
     /// for requests that are not open are ignored, and so are stream
     /// records for requests the application is answering and records of
     /// types an application does not read, such as STDOUT.
-    pub fn receive(&mut self, record: &Record) -> Result<Option<ServerEvent>, StreamError> {
+    pub fn receive(&mut self, record: &Record) -> Result<Option<ServerEvent>, Error> {
         let id = record.request_id;
         if record.is_management() {
             return match record.kind {
@@ -1242,7 +1127,7 @@ impl Server {
                     Ok(pairs) if pairs.iter().all(|(_, v)| v.is_empty()) => {
                         Ok(Some(ServerEvent::GetValues(pairs.into_iter().map(|(n, _)| n).collect())))
                     }
-                    _ => Err(StreamError::Body { id, kind: record.kind }),
+                    _ => Err(Error::Body { id, kind: record.kind }),
                 },
                 k => Ok(Some(ServerEvent::UnknownType(k))),
             };
@@ -1251,15 +1136,15 @@ impl Server {
             kind::BEGIN_REQUEST => {
                 if self.open.contains_key(&id) || self.answering.contains_key(&id) {
                     self.fail(id);
-                    return Err(StreamError::Duplicate { id });
+                    return Err(Error::Duplicate { id });
                 }
                 let body =
-                    BeginRequest::parse(&record.content).map_err(|_| StreamError::Body { id, kind: record.kind })?;
+                    BeginRequest::parse(&record.content).map_err(|_| Error::Body { id, kind: record.kind })?;
                 if let Role::Other(role) = body.role {
-                    return Err(StreamError::UnknownRole { id, role });
+                    return Err(Error::UnknownRole { id, role });
                 }
                 if self.open() >= MAX_REQUESTS {
-                    return Err(StreamError::TooManyRequests { id });
+                    return Err(Error::TooManyRequests { id });
                 }
                 let incoming = Incoming {
                     role: body.role,
@@ -1296,7 +1181,7 @@ impl Server {
                 let added = if ahead {
                     add_to_stream(buf, done, limit, held, id, record)
                 } else {
-                    Err(StreamError::OutOfOrder { id, kind: record.kind })
+                    Err(Error::OutOfOrder { id, kind: record.kind })
                 };
                 if let Err(e) = added {
                     self.fail(id);
@@ -1310,7 +1195,7 @@ impl Server {
                 }
                 let Some(req) = self.open.remove(&id) else { return Ok(None) };
                 self.answering.insert(id, req.keep_conn);
-                let params = Pairs::parse(&req.params).map_err(|_| StreamError::Body { id, kind: kind::PARAMS })?;
+                let params = Pairs::parse(&req.params).map_err(|_| Error::Body { id, kind: kind::PARAMS })?;
                 Ok(Some(ServerEvent::Request(Request {
                     id,
                     role: req.role,
@@ -1335,9 +1220,9 @@ fn add_to_stream(
     held: usize,
     id: u16,
     record: &Record,
-) -> Result<(), StreamError> {
+) -> Result<(), Error> {
     if *done {
-        return Err(StreamError::AfterEnd { id, kind: record.kind });
+        return Err(Error::AfterEnd { id, kind: record.kind });
     }
     if record.content.is_empty() {
         *done = true;
@@ -1345,7 +1230,7 @@ fn add_to_stream(
     }
     let room = limit.saturating_sub(buf.len()).min(MAX_HELD.saturating_sub(held));
     if record.content.len() > room {
-        return Err(StreamError::TooLarge { id, kind: record.kind });
+        return Err(Error::TooLarge { id, kind: record.kind });
     }
     buf.extend_from_slice(&record.content);
     Ok(())
@@ -1404,17 +1289,17 @@ impl Client {
     /// Records of types a web server does not read, such as STDIN, are
     /// ignored, and so are the records of a response after an error about
     /// it, up to and including its END_REQUEST.
-    pub fn receive(&mut self, record: &Record) -> Result<Option<ClientEvent>, StreamError> {
+    pub fn receive(&mut self, record: &Record) -> Result<Option<ClientEvent>, Error> {
         let id = record.request_id;
         if record.is_management() {
             return match record.kind {
                 kind::GET_VALUES_RESULT => match Pairs::parse(&record.content) {
                     Ok(pairs) => Ok(Some(ClientEvent::Values(pairs))),
-                    Err(_) => Err(StreamError::Body { id, kind: record.kind }),
+                    Err(_) => Err(Error::Body { id, kind: record.kind }),
                 },
                 kind::UNKNOWN_TYPE => match UnknownType::parse(&record.content) {
                     Ok(k) => Ok(Some(ClientEvent::UnknownType(k.0))),
-                    Err(_) => Err(StreamError::Body { id, kind: record.kind }),
+                    Err(_) => Err(Error::Body { id, kind: record.kind }),
                 },
                 _ => Ok(None),
             };
@@ -1422,7 +1307,7 @@ impl Client {
         match record.kind {
             kind::STDOUT | kind::STDERR => {
                 if !self.open.contains_key(&id) && self.open.len() >= MAX_REQUESTS {
-                    return Err(StreamError::TooManyRequests { id });
+                    return Err(Error::TooManyRequests { id });
                 }
                 let held = self.held();
                 let out = self.open.entry(id).or_default();
@@ -1446,7 +1331,7 @@ impl Client {
                     return Ok(None);
                 }
                 let end =
-                    EndRequest::parse(&record.content).map_err(|_| StreamError::Body { id, kind: record.kind })?;
+                    EndRequest::parse(&record.content).map_err(|_| Error::Body { id, kind: record.kind })?;
                 Ok(Some(ClientEvent::Response(Response {
                     id,
                     stdout: out.stdout,
@@ -1477,12 +1362,12 @@ mod tests {
     }
 
     fn records(bytes: &[u8]) -> Vec<Record> {
-        let (records, error) = decode_all(Frames::new, bytes);
+        let (records, error) = decode_all(Records::new, bytes);
         assert_eq!(error, None);
         records
     }
 
-    fn serve(bytes: &[u8]) -> Vec<Result<Option<ServerEvent>, StreamError>> {
+    fn serve(bytes: &[u8]) -> Vec<Result<Option<ServerEvent>, Error>> {
         let mut s = Server::new();
         records(bytes).iter().map(|r| s.receive(r)).collect()
     }
@@ -1499,7 +1384,7 @@ mod tests {
             data: Vec::new(),
         }
         .to_bytes().unwrap();
-        let mut stream = Stream::new(Frames::new());
+        let mut stream = Stream::new(Records::new());
         let mut server = Server::new();
         let mut reply = Vec::new();
         pump(&mut stream, &sent, |record| {
@@ -1600,24 +1485,24 @@ mod tests {
         assert_eq!(bytes, [1, 6, 1, 2, 0, 5, 3, 0, b'h', b'e', b'l', b'l', b'o', 0, 0, 0]);
         assert_eq!(Record::parse(&bytes), Ok(r));
         let odd = [1, 6, 0, 1, 0, 1, 2, 0, b'x', 0xaa, 0xbb, 1];
-        assert_eq!(Record::parse(&odd), Err(RecordParseError::Trailing));
+        assert_eq!(Record::parse(&odd), Err(Error::Trailing));
         assert_eq!(Record::parse(&odd[..11]), Ok(Record { kind: 6, request_id: 1, content: b"x".to_vec(), padding: 2 }));
         for n in 0..16 {
-            assert_eq!(Frames::new().decode(&bytes[..n], false), Ok(Step::Need), "{n} bytes");
-            assert_eq!(Record::parse(&bytes[..n]), Err(RecordParseError::Truncated));
+            assert_eq!(Records::new().decode(&bytes[..n], false), Ok(Step::Need), "{n} bytes");
+            assert_eq!(Record::parse(&bytes[..n]), Err(Error::RecordTruncated));
         }
-        assert_eq!(Record::parse(&[2]), Err(RecordParseError::Record(RecordError::Version(2))));
-        assert_eq!(Record::parse(&[0, 1, 0, 1, 0, 0, 0, 0]), Err(RecordParseError::Record(RecordError::Version(0))));
+        assert_eq!(Record::parse(&[2]), Err(Error::Version(2)));
+        assert_eq!(Record::parse(&[0, 1, 0, 1, 0, 0, 0, 0]), Err(Error::Version(0)));
         let mut big = Record { kind: 5, request_id: 9, content: vec![7; MAX_CONTENT + 10], padding: 255 };
         contract::check_wire_value(&big);
-        assert_eq!(big.to_bytes(), Err(WriteError::Unwritable));
+        assert_eq!(big.to_bytes(), Err(Error::Unwritable));
         big.content.truncate(MAX_CONTENT);
         let bytes = big.to_bytes().unwrap();
         assert_eq!(bytes.len(), MAX_RECORD);
         assert_eq!(Record::parse(&bytes), Ok(big));
         let oversized = Record::new(5, 1, &vec![0; MAX_CONTENT + 1]);
         assert_eq!(oversized.content.len(), MAX_CONTENT + 1);
-        assert_eq!(oversized.to_bytes(), Err(WriteError::Unwritable));
+        assert_eq!(oversized.to_bytes(), Err(Error::Unwritable));
     }
 
     #[test]
@@ -1634,17 +1519,17 @@ mod tests {
         // Every truncated prefix of a pair fails.
         let one = Pairs(vec![pair("NAME", &long)]).to_bytes().unwrap();
         for n in 1..one.len() {
-            assert_eq!(Pairs::parse(&one[..n]).map(|pairs| pairs.0), Err(PairError::Truncated), "{n} bytes");
+            assert_eq!(Pairs::parse(&one[..n]).map(|pairs| pairs.0), Err(Error::PairTruncated), "{n} bytes");
         }
         // A huge length is refused, not allocated.
-        assert_eq!(Pairs::parse(&[0xff, 0xff, 0xff, 0xff, 0]).map(|pairs| pairs.0), Err(PairError::Truncated));
+        assert_eq!(Pairs::parse(&[0xff, 0xff, 0xff, 0xff, 0]).map(|pairs| pairs.0), Err(Error::PairTruncated));
         // Too many pairs.
         let many = vec![0u8; 2 * (MAX_PAIRS + 1)];
-        assert_eq!(Pairs::parse(&many).map(|pairs| pairs.0), Err(PairError::TooMany));
+        assert_eq!(Pairs::parse(&many).map(|pairs| pairs.0), Err(Error::TooManyPairs));
         assert_eq!(Pairs::parse(&many[..2 * MAX_PAIRS]).map(|pairs| pairs.0).unwrap().len(), MAX_PAIRS);
         let too_many: Vec<(Vec<u8>, Vec<u8>)> = (0..MAX_PAIRS + 5).map(|_| pair("", "")).collect();
         contract::check_wire_value(&Pairs(too_many.clone()));
-        assert_eq!(Pairs(too_many).to_bytes(), Err(WriteError::Unwritable));
+        assert_eq!(Pairs(too_many).to_bytes(), Err(Error::Unwritable));
     }
 
     #[test]
@@ -1658,11 +1543,11 @@ mod tests {
         assert_eq!(EndRequest::parse(&e.to_bytes().unwrap()), Ok(e));
         assert_eq!(UnknownType::parse(&Record::unknown_type(42).content), Ok(UnknownType(42)));
         for n in 0..8 {
-            assert_eq!(BeginRequest::parse(&b.to_bytes().unwrap()[..n]), Err(BodyError));
-            assert_eq!(EndRequest::parse(&e.to_bytes().unwrap()[..n]), Err(BodyError));
-            assert_eq!(UnknownType::parse(&[0; 8][..n]), Err(BodyError));
+            assert_eq!(BeginRequest::parse(&b.to_bytes().unwrap()[..n]), Err(Error::BodyLength));
+            assert_eq!(EndRequest::parse(&e.to_bytes().unwrap()[..n]), Err(Error::BodyLength));
+            assert_eq!(UnknownType::parse(&[0; 8][..n]), Err(Error::BodyLength));
         }
-        assert_eq!(BeginRequest::parse(&[0; 9]), Err(BodyError));
+        assert_eq!(BeginRequest::parse(&[0; 9]), Err(Error::BodyLength));
         for c in 0..=255u8 {
             assert_eq!(ProtocolStatus::from_code(c).code(), c);
         }
@@ -1686,15 +1571,15 @@ mod tests {
         assert_eq!(c.receive(&Record::unknown_type(200)), Ok(Some(ClientEvent::UnknownType(200))));
         // Malformed management bodies.
         let bad = Record::new(kind::GET_VALUES, 0, &[5]);
-        assert_eq!(s.receive(&bad), Err(StreamError::Body { id: 0, kind: kind::GET_VALUES }));
+        assert_eq!(s.receive(&bad), Err(Error::Body { id: 0, kind: kind::GET_VALUES }));
         let bad = Record::new(kind::GET_VALUES_RESULT, 0, &[5]);
-        assert_eq!(c.receive(&bad), Err(StreamError::Body { id: 0, kind: kind::GET_VALUES_RESULT }));
+        assert_eq!(c.receive(&bad), Err(Error::Body { id: 0, kind: kind::GET_VALUES_RESULT }));
         let bad = Record::new(kind::UNKNOWN_TYPE, 0, &[5]);
-        assert_eq!(c.receive(&bad), Err(StreamError::Body { id: 0, kind: kind::UNKNOWN_TYPE }));
+        assert_eq!(c.receive(&bad), Err(Error::Body { id: 0, kind: kind::UNKNOWN_TYPE }));
         // Every management pair must fit in one record.
         let big: Vec<(Vec<u8>, Vec<u8>)> = (0..10).map(|i| (vec![b'a' + i], vec![0; 10_000])).collect();
-        assert_eq!(Record::get_values_result(&Pairs(big)), Err(WriteError::Unwritable));
-        assert_eq!(Record::get_values(&[&vec![0; MAX_CONTENT]]), Err(WriteError::Unwritable));
+        assert_eq!(Record::get_values_result(&Pairs(big)), Err(Error::Unwritable));
+        assert_eq!(Record::get_values(&[&vec![0; MAX_CONTENT]]), Err(Error::Unwritable));
 
     }
 
@@ -1705,14 +1590,14 @@ mod tests {
         // A bad BEGIN_REQUEST body.
         assert_eq!(
             s.receive(&Record::new(kind::BEGIN_REQUEST, 1, &[0, 1])),
-            Err(StreamError::Body { id: 1, kind: kind::BEGIN_REQUEST })
+            Err(Error::Body { id: 1, kind: kind::BEGIN_REQUEST })
         );
         // An unknown role.
-        assert_eq!(s.receive(&begin(1, Role::Other(9))), Err(StreamError::UnknownRole { id: 1, role: 9 }));
+        assert_eq!(s.receive(&begin(1, Role::Other(9))), Err(Error::UnknownRole { id: 1, role: 9 }));
         assert_eq!(s.open(), 0);
         // Begun twice: the first stays open until it is ended.
         assert_eq!(s.receive(&begin(1, Role::Responder)), Ok(None));
-        assert_eq!(s.receive(&begin(1, Role::Responder)), Err(StreamError::Duplicate { id: 1 }));
+        assert_eq!(s.receive(&begin(1, Role::Responder)), Err(Error::Duplicate { id: 1 }));
         assert_eq!(s.open(), 1);
         // Records for a failed request are ignored.
         assert_eq!(s.receive(&Record::new(kind::PARAMS, 1, b"x")), Ok(None));
@@ -1724,12 +1609,12 @@ mod tests {
         s.receive(&Record::new(kind::PARAMS, 2, &[])).unwrap();
         assert_eq!(
             s.receive(&Record::new(kind::PARAMS, 2, b"late")),
-            Err(StreamError::AfterEnd { id: 2, kind: kind::PARAMS })
+            Err(Error::AfterEnd { id: 2, kind: kind::PARAMS })
         );
         // Bad pairs in PARAMS, found once the stream ends.
         s.receive(&begin(3, Role::Authorizer)).unwrap();
         s.receive(&Record::new(kind::PARAMS, 3, &[9])).unwrap();
-        assert_eq!(s.receive(&Record::new(kind::PARAMS, 3, &[])), Err(StreamError::Body { id: 3, kind: kind::PARAMS }));
+        assert_eq!(s.receive(&Record::new(kind::PARAMS, 3, &[])), Err(Error::Body { id: 3, kind: kind::PARAMS }));
         // PARAMS past its limit.
         s.receive(&begin(4, Role::Responder)).unwrap();
         let chunk = vec![0u8; MAX_CONTENT];
@@ -1740,7 +1625,7 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(result, Err(StreamError::TooLarge { id: 4, kind: kind::PARAMS }));
+        assert_eq!(result, Err(Error::TooLarge { id: 4, kind: kind::PARAMS }));
         assert_eq!(s.open(), 4);
         assert_eq!(s.held(), 0);
         // STDIN past its limit.
@@ -1753,7 +1638,7 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(result, Err(StreamError::TooLarge { id: 5, kind: kind::STDIN }));
+        assert_eq!(result, Err(Error::TooLarge { id: 5, kind: kind::STDIN }));
         // Each failed request stays open until the application ends it.
         assert_eq!(s.open(), 5);
         for id in 1..=5 {
@@ -1764,7 +1649,7 @@ mod tests {
             assert_eq!(s.receive(&begin(id, Role::Responder)), Ok(None));
         }
         let over = MAX_REQUESTS as u16 + 1;
-        assert_eq!(s.receive(&begin(over, Role::Responder)), Err(StreamError::TooManyRequests { id: over }));
+        assert_eq!(s.receive(&begin(over, Role::Responder)), Err(Error::TooManyRequests { id: over }));
         assert_eq!(s.open(), MAX_REQUESTS);
         // Abort.
         assert_eq!(s.receive(&Record::abort_request(1)), Ok(Some(ServerEvent::Abort(1))));
@@ -1772,8 +1657,8 @@ mod tests {
         assert_eq!(s.receive(&Record::abort_request(1)), Ok(None));
         // STDOUT means nothing to an application.
         assert_eq!(s.receive(&Record::new(kind::STDOUT, 2, b"x")), Ok(None));
-        for e in [StreamError::Duplicate { id: 7 }, StreamError::TooLarge { id: 7, kind: 5 }] {
-            assert_eq!(e.id(), 7);
+        for e in [Error::Duplicate { id: 7 }, Error::TooLarge { id: 7, kind: 5 }] {
+            assert_eq!(e.id(), Some(7));
             assert!(!e.to_string().is_empty());
         }
     }
@@ -1783,18 +1668,18 @@ mod tests {
         let mut c = Client::new();
         assert_eq!(
             c.receive(&Record::new(kind::END_REQUEST, 1, &[0; 3])),
-            Err(StreamError::Body { id: 1, kind: kind::END_REQUEST })
+            Err(Error::Body { id: 1, kind: kind::END_REQUEST })
         );
         c.receive(&Record::new(kind::STDOUT, 1, &[])).unwrap();
         assert_eq!(
             c.receive(&Record::new(kind::STDOUT, 1, b"x")),
-            Err(StreamError::AfterEnd { id: 1, kind: kind::STDOUT })
+            Err(Error::AfterEnd { id: 1, kind: kind::STDOUT })
         );
         for id in 1..=MAX_REQUESTS as u16 {
             assert_eq!(c.receive(&Record::new(kind::STDERR, id, b"e")), Ok(None));
         }
         let over = MAX_REQUESTS as u16 + 1;
-        assert_eq!(c.receive(&Record::new(kind::STDOUT, over, b"x")), Err(StreamError::TooManyRequests { id: over }));
+        assert_eq!(c.receive(&Record::new(kind::STDOUT, over, b"x")), Err(Error::TooManyRequests { id: over }));
         let chunk = vec![1u8; MAX_CONTENT];
         let mut result = Ok(None);
         for _ in 0..=MAX_STREAM / MAX_CONTENT {
@@ -1803,7 +1688,7 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(result, Err(StreamError::TooLarge { id: 2, kind: kind::STDOUT }));
+        assert_eq!(result, Err(Error::TooLarge { id: 2, kind: kind::STDOUT }));
         // Records a web server does not read are ignored.
         assert_eq!(c.receive(&Record::new(kind::STDIN, 3, b"x")), Ok(None));
         assert_eq!(c.receive(&Record::new(kind::GET_VALUES, 0, &[])), Ok(None));
@@ -1827,7 +1712,7 @@ mod tests {
         // Management IDs cannot name a request.
         let zero = Request { id: 0, ..filter };
         contract::check_wire_value(&zero);
-        assert_eq!(zero.to_bytes(), Err(WriteError::Unwritable));
+        assert_eq!(zero.to_bytes(), Err(Error::Unwritable));
     }
 
     // The specification keeps a request ID active from BEGIN_REQUEST until
@@ -1856,7 +1741,7 @@ mod tests {
         assert_eq!(s.receive(&Record::abort_request(4)), Ok(Some(ServerEvent::Abort(4))));
         // A second BEGIN_REQUEST for it is refused, and the first stays.
         let begin = Record::begin_request(4, BeginRequest { role: Role::Responder, flags: 0 });
-        assert_eq!(s.receive(&begin), Err(StreamError::Duplicate { id: 4 }));
+        assert_eq!(s.receive(&begin), Err(Error::Duplicate { id: 4 }));
         assert_eq!(s.open(), 1);
         // Stray stream records for it are ignored.
         assert_eq!(s.receive(&Record::new(kind::STDIN, 4, b"x")), Ok(None));
@@ -1881,7 +1766,7 @@ mod tests {
         }
         let over = MAX_REQUESTS as u16 + 1;
         let begin = Record::begin_request(over, BeginRequest { role: Role::Responder, flags: 0 });
-        assert_eq!(s.receive(&begin), Err(StreamError::TooManyRequests { id: over }));
+        assert_eq!(s.receive(&begin), Err(Error::TooManyRequests { id: over }));
         assert!(s.end(1));
         assert_eq!(s.receive(&begin), Ok(None));
     }
@@ -1916,7 +1801,7 @@ mod tests {
             if flags & !KEEP_CONN == 0 {
                 assert_eq!(Request::parse(&bytes).unwrap().keep_conn, flags & KEEP_CONN != 0);
             } else {
-                assert_eq!(Request::parse(&bytes), Err(SequenceError::Unexpected));
+                assert_eq!(Request::parse(&bytes), Err(Error::Unexpected));
             }
         }
     }
@@ -1932,27 +1817,27 @@ mod tests {
             data: Vec::new(),
         };
         contract::check_wire_value(&req);
-        assert_eq!(req.to_bytes(), Err(WriteError::Unwritable));
+        assert_eq!(req.to_bytes(), Err(Error::Unwritable));
         req.stdin.truncate(MAX_STREAM);
-        assert_eq!(req.to_bytes(), Err(WriteError::Unwritable));
+        assert_eq!(req.to_bytes(), Err(Error::Unwritable));
         req.params.0.truncate(200);
         contract::check_wire_value(&req);
         assert_eq!(Request::parse(&req.to_bytes().unwrap()), Ok(req.clone()));
         for bad in [Request { id: 0, ..req.clone() }, Request { role: Role::Other(99), ..req.clone() },
             Request { role: Role::Authorizer, ..req.clone() }, Request { data: vec![1], ..req }] {
             contract::check_wire_value(&bad);
-            assert_eq!(bad.to_bytes(), Err(WriteError::Unwritable));
+            assert_eq!(bad.to_bytes(), Err(Error::Unwritable));
         }
         let mut resp = Response { id: 3, stdout: vec![1; MAX_STREAM + 1], stderr: vec![2; 70_000],
             app_status: 1, protocol_status: ProtocolStatus::RequestComplete };
         contract::check_wire_value(&resp);
-        assert_eq!(resp.to_bytes(), Err(WriteError::Unwritable));
+        assert_eq!(resp.to_bytes(), Err(Error::Unwritable));
         resp.stdout.truncate(MAX_STREAM);
         contract::check_wire_value(&resp);
         assert_eq!(Response::parse(&resp.to_bytes().unwrap()), Ok(resp.clone()));
         resp.id = 0;
         contract::check_wire_value(&resp);
-        assert_eq!(resp.to_bytes(), Err(WriteError::Unwritable));
+        assert_eq!(resp.to_bytes(), Err(Error::Unwritable));
         let empty = RecordStream { kind: kind::STDIN, request_id: 1, data: vec![] };
         assert_eq!(empty.to_bytes().unwrap(), Record::new(kind::STDIN, 1, &[]).to_bytes().unwrap());
     }
@@ -1963,11 +1848,11 @@ mod tests {
         let b = Record::new(kind::STDIN, 1, &[]);
         let mut bytes = a.to_bytes().unwrap();
         b.write(&mut bytes).unwrap();
-        contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_RECORD);
-        assert_eq!(decode_all(Frames::new, &bytes), (vec![a, b], None));
-        let mut stream = Stream::new(Frames::new());
+        contract::check_decode_with_alloc_limit(Records::new, &bytes, 2 * MAX_RECORD);
+        assert_eq!(decode_all(Records::new, &bytes), (vec![a, b], None));
+        let mut stream = Stream::new(Records::new());
         assert_eq!(stream.push(&[3, 1, 0, 1, 0, 0, 0, 0]), 8);
-        assert_eq!(stream.next(), Some(Err(Fail::Protocol(FrameError::Record(RecordError::Version(3))))));
+        assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::Version(3)))));
         assert_eq!(stream.push(&bytes), bytes.len());
         assert!(stream.next().is_none());
         assert_eq!(stream.buffered(), 8);
@@ -1976,7 +1861,7 @@ mod tests {
     #[test]
     fn stream_reads_many_small_records_in_linear_time() {
         let one = Record::new(kind::STDIN, 1, b"x").to_bytes().unwrap();
-        let mut stream = Stream::new(Frames::new());
+        let mut stream = Stream::new(Records::new());
         let mut count = 0;
         pump(&mut stream, &one.repeat(200_000), |_| count += 1).unwrap();
         finish(&mut stream, |_| count += 1).unwrap();
@@ -1998,11 +1883,11 @@ mod tests {
         let bytes = big.to_bytes().unwrap();
         let Some(Ok(Some(ServerEvent::Request(got)))) = serve(&bytes).pop() else { panic!() };
         assert_eq!(got, big);
-        let mut stream = Stream::new(Frames::new());
+        let mut stream = Stream::new(Records::new());
         assert_eq!(stream.push(&vec![1; MAX_RECORD + 1]), MAX_RECORD);
         assert_eq!(stream.buffered(), MAX_RECORD);
         let one = Record::new(kind::STDIN, 1, &vec![0; MAX_CONTENT]).to_bytes().unwrap();
-        let mut stream = Stream::new(Frames::new());
+        let mut stream = Stream::new(Records::new());
         let mut count = 0;
         pump(&mut stream, &one.repeat(20), |_| count += 1).unwrap();
         finish(&mut stream, |_| count += 1).unwrap();
@@ -2031,7 +1916,7 @@ mod tests {
                 }
             }
         }
-        let Some(StreamError::TooLarge { id, .. }) = failed else { panic!("{failed:?}") };
+        let Some(Error::TooLarge { id, .. }) = failed else { panic!("{failed:?}") };
         // Two whole requests' worth fit before the limit.
         assert!(id > 2);
         assert!(s.held() <= MAX_HELD);
@@ -2055,7 +1940,7 @@ mod tests {
                 }
             }
         }
-        assert!(matches!(failed, Some(StreamError::TooLarge { id, .. }) if id > 2));
+        assert!(matches!(failed, Some(Error::TooLarge { id, .. }) if id > 2));
         assert!(c.held() <= MAX_HELD);
         // An END_REQUEST frees what its response held.
         let before = c.held();
@@ -2067,7 +1952,7 @@ mod tests {
 
     /// Everything the fuzz target checks, on one input.
     fn check(data: &[u8]) {
-        contract::check_decode_with_alloc_limit(Frames::new, data, 2 * MAX_RECORD);
+        contract::check_decode_with_alloc_limit(Records::new, data, 2 * MAX_RECORD);
         contract::check_wire::<Record>(data);
         contract::check_wire::<Pairs>(data);
         contract::check_wire::<BeginRequest>(data);
@@ -2076,7 +1961,7 @@ mod tests {
         contract::check_wire::<RecordStream>(data);
         contract::check_wire::<Request>(data);
         contract::check_wire::<Response>(data);
-        let recs = decode_all(Frames::new, data).0;
+        let recs = decode_all(Records::new, data).0;
         let mut server = Server::new();
         let mut client = Client::new();
         for r in &recs {
@@ -2168,7 +2053,7 @@ mod tests {
             };
             let bytes = req.to_bytes().unwrap();
             contract::check_wire_value(&req);
-            contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_RECORD);
+            contract::check_decode_with_alloc_limit(Records::new, &bytes, 2 * MAX_RECORD);
             assert_eq!(Request::parse(&bytes), Ok(req));
             // Every truncated prefix leaves the request unfinished.
             let cut = rng.index(bytes.len());
@@ -2188,7 +2073,7 @@ mod tests {
         c.receive(&Record::new(kind::STDOUT, 1, &[])).unwrap();
         assert_eq!(
             c.receive(&Record::new(kind::STDOUT, 1, b"x")),
-            Err(StreamError::AfterEnd { id: 1, kind: kind::STDOUT })
+            Err(Error::AfterEnd { id: 1, kind: kind::STDOUT })
         );
         assert_eq!(c.receive(&Record::new(kind::STDOUT, 1, b"b")), Ok(None));
         assert_eq!(c.receive(&Record::new(kind::STDOUT, 1, &[])), Ok(None));
@@ -2236,7 +2121,7 @@ mod tests {
         for (kind, limit) in [(kind::STDOUT, MAX_STREAM), (kind::PARAMS, MAX_PARAMS)] {
             let mut value = RecordStream { kind, request_id: 1, data: vec![1; limit + 1] };
             contract::check_wire_value(&value);
-            assert_eq!(value.to_bytes(), Err(WriteError::Unwritable));
+            assert_eq!(value.to_bytes(), Err(Error::Unwritable));
             value.data.truncate(limit);
             contract::check_wire_value(&value);
             assert_eq!(RecordStream::parse(&value.to_bytes().unwrap()), Ok(value));
@@ -2245,7 +2130,7 @@ mod tests {
         server.receive(&Record::begin_request(1, BeginRequest { role: Role::Authorizer, flags: 0 })).unwrap();
         let pairs = RecordStream { kind: kind::PARAMS, request_id: 1, data: vec![0; MAX_PARAMS] };
         let last = records(&pairs.to_bytes().unwrap()).iter().map(|r| server.receive(r)).last().unwrap();
-        assert_eq!(last, Err(StreamError::Body { id: 1, kind: kind::PARAMS }));
+        assert_eq!(last, Err(Error::Body { id: 1, kind: kind::PARAMS }));
     }
 
     // A role or status given by number is the same value as the named one.
@@ -2267,7 +2152,7 @@ mod tests {
         s.receive(&Record::begin_request(1, BeginRequest { role: Role::Responder, flags: 0 })).unwrap();
         assert_eq!(
             s.receive(&Record::new(kind::STDIN, 1, b"x")),
-            Err(StreamError::OutOfOrder { id: 1, kind: kind::STDIN })
+            Err(Error::OutOfOrder { id: 1, kind: kind::STDIN })
         );
         assert_eq!(s.receive(&Record::new(kind::PARAMS, 1, &[])), Ok(None));
         assert_eq!(s.receive(&Record::new(kind::STDIN, 1, &[])), Ok(None));
@@ -2276,10 +2161,10 @@ mod tests {
         s.receive(&Record::new(kind::PARAMS, 2, &[])).unwrap();
         assert_eq!(
             s.receive(&Record::new(kind::DATA, 2, &[])),
-            Err(StreamError::OutOfOrder { id: 2, kind: kind::DATA })
+            Err(Error::OutOfOrder { id: 2, kind: kind::DATA })
         );
-        assert!(!StreamError::OutOfOrder { id: 2, kind: 8 }.to_string().is_empty());
-        assert_eq!(StreamError::OutOfOrder { id: 2, kind: 8 }.id(), 2);
+        assert!(!Error::OutOfOrder { id: 2, kind: 8 }.to_string().is_empty());
+        assert_eq!(Error::OutOfOrder { id: 2, kind: 8 }.id(), Some(2));
     }
 
     // The world can learn whether to keep the connection open for a
@@ -2307,9 +2192,9 @@ mod tests {
         s.receive(&Record::new(kind::PARAMS, 1, &[])).unwrap();
         s.receive(&Record::new(kind::STDIN, 1, b"a")).unwrap();
         // A second BEGIN_REQUEST does not drop the first.
-        assert_eq!(s.receive(&begin), Err(StreamError::Duplicate { id: 1 }));
+        assert_eq!(s.receive(&begin), Err(Error::Duplicate { id: 1 }));
         assert_eq!(s.open(), 1);
-        assert_eq!(s.receive(&begin), Err(StreamError::Duplicate { id: 1 }));
+        assert_eq!(s.receive(&begin), Err(Error::Duplicate { id: 1 }));
         assert!(s.end(1));
         assert_eq!(s.receive(&begin), Ok(None));
         s.receive(&Record::new(kind::PARAMS, 1, &[])).unwrap();
@@ -2325,7 +2210,7 @@ mod tests {
         assert!(s2.receive(&Record::new(kind::PARAMS, 5, &[])).is_err());
         assert_eq!(
             s2.receive(&Record::begin_request(5, BeginRequest { role: Role::Authorizer, flags: 0 })),
-            Err(StreamError::Duplicate { id: 5 })
+            Err(Error::Duplicate { id: 5 })
         );
         // A stream record after its end.
         let mut s3 = Server::new();
@@ -2333,7 +2218,7 @@ mod tests {
         s3.receive(&Record::new(kind::PARAMS, 1, &[1, 0, b'A'])).unwrap();
         s3.receive(&Record::new(kind::PARAMS, 1, &[])).unwrap();
         assert!(s3.receive(&Record::new(kind::PARAMS, 1, b"x")).is_err());
-        assert_eq!(s3.receive(&begin), Err(StreamError::Duplicate { id: 1 }));
+        assert_eq!(s3.receive(&begin), Err(Error::Duplicate { id: 1 }));
         assert_eq!(s3.open(), 1);
         assert_eq!(s3.held(), 0);
     }
@@ -2343,10 +2228,10 @@ mod tests {
     fn get_values_values_are_empty() {
         let mut s = Server::new();
         let bad = Record::new(kind::GET_VALUES, 0, &[1, 1, b'A', b'B']);
-        assert_eq!(s.receive(&bad), Err(StreamError::Body { id: 0, kind: kind::GET_VALUES }));
+        assert_eq!(s.receive(&bad), Err(Error::Body { id: 0, kind: kind::GET_VALUES }));
         // Every name must fit; no name is dropped.
         let long = vec![b'n'; MAX_CONTENT];
-        assert_eq!(Record::get_values(&[b"A", &long, b"B"]), Err(WriteError::Unwritable));
+        assert_eq!(Record::get_values(&[b"A", &long, b"B"]), Err(Error::Unwritable));
         let r = Record::get_values(&[b"A", b"B"]).unwrap();
         assert_eq!(s.receive(&r), Ok(Some(ServerEvent::GetValues(vec![b"A".to_vec(), b"B".to_vec()]))));
     }
@@ -2359,6 +2244,6 @@ mod tests {
     }
 
     fn records_prefix(bytes: &[u8]) -> Vec<Record> {
-        decode_all(Frames::new, bytes).0
+        decode_all(Records::new, bytes).0
     }
 }

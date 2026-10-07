@@ -165,11 +165,11 @@ impl Command {
         }
     }
 
-    fn from_code(c: u8) -> Result<Command, RipError> {
+    fn from_code(c: u8) -> Result<Command, Error> {
         match c {
             1 => Ok(Command::Request),
             2 => Ok(Command::Response),
-            _ => Err(RipError::Command(c)),
+            _ => Err(Error::Command(c)),
         }
     }
 
@@ -290,7 +290,7 @@ pub struct Message {
 /// written. Entries are counted from 0 in the order they are sent, the
 /// authentication entry included.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum RipError {
+pub enum Error {
     /// The message ends before its header does, or part way through an
     /// entry or the trailer header.
     Truncated,
@@ -366,33 +366,33 @@ pub enum RipError {
     Unwritable,
 }
 
-impl std::fmt::Display for RipError {
+impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RipError::Truncated => write!(f, "message cut short"),
-            RipError::Command(c) => write!(f, "command {c}, not 1 or 2"),
-            RipError::Version(v) => write!(f, "unknown version {v}"),
-            RipError::MustBeZero { offset } => write!(f, "must-be-zero field at offset {offset} is not zero"),
-            RipError::Family { entry, family } => write!(f, "entry {entry} has address family {family}"),
-            RipError::AuthPlace { entry } => write!(f, "authentication entry {entry} is not the first"),
-            RipError::WholeTable { entry } => write!(f, "entry {entry} is a malformed whole-table request"),
-            RipError::Metric { entry, metric } => write!(f, "entry {entry} has metric {metric}"),
-            RipError::Mask { entry } => write!(f, "entry {entry} has a mask that is not contiguous"),
-            RipError::PrefixLength { entry, len } => write!(f, "entry {entry} has prefix length {len}"),
-            RipError::PacketLength(n) => write!(f, "authentication packet length {n} is not valid"),
-            RipError::Trailer => write!(f, "authentication trailer header is not 0xffff 0x0001"),
-            RipError::AuthDataTooLong => write!(f, "authentication trailer is too long"),
-            RipError::AuthDataLen { declared, actual } => {
+            Error::Truncated => write!(f, "message cut short"),
+            Error::Command(c) => write!(f, "command {c}, not 1 or 2"),
+            Error::Version(v) => write!(f, "unknown version {v}"),
+            Error::MustBeZero { offset } => write!(f, "must-be-zero field at offset {offset} is not zero"),
+            Error::Family { entry, family } => write!(f, "entry {entry} has address family {family}"),
+            Error::AuthPlace { entry } => write!(f, "authentication entry {entry} is not the first"),
+            Error::WholeTable { entry } => write!(f, "entry {entry} is a malformed whole-table request"),
+            Error::Metric { entry, metric } => write!(f, "entry {entry} has metric {metric}"),
+            Error::Mask { entry } => write!(f, "entry {entry} has a mask that is not contiguous"),
+            Error::PrefixLength { entry, len } => write!(f, "entry {entry} has prefix length {len}"),
+            Error::PacketLength(n) => write!(f, "authentication packet length {n} is not valid"),
+            Error::Trailer => write!(f, "authentication trailer header is not 0xffff 0x0001"),
+            Error::AuthDataTooLong => write!(f, "authentication trailer is too long"),
+            Error::AuthDataLen { declared, actual } => {
                 write!(f, "authentication data is {actual} bytes, entry says {declared}")
             }
-            RipError::NoEntries => write!(f, "message has no entries"),
-            RipError::TooManyEntries => write!(f, "message has too many entries"),
-            RipError::Unwritable => write!(f, "value cannot be written without changing it"),
+            Error::NoEntries => write!(f, "message has no entries"),
+            Error::TooManyEntries => write!(f, "message has too many entries"),
+            Error::Unwritable => write!(f, "value cannot be written without changing it"),
         }
     }
 }
 
-impl std::error::Error for RipError {}
+impl std::error::Error for Error {}
 
 impl Message {
     /// Whether the message fits the [`MAX_DATAGRAM`] sending limit,
@@ -425,7 +425,7 @@ impl Message {
     /// in [`Message::parse`], which this matches on every message that
     /// passes it. Whether a destination is one a router should accept
     /// (not 127/8 or multicast, say) is left to world code.
-    pub fn receive(b: &[u8]) -> Result<Received<Message>, RipError> {
+    pub fn receive(b: &[u8]) -> Result<Received<Message>, Error> {
         let scan = Routes { receive: true, ..Routes::default() };
         scan.read(b).map(|(message, skipped)| Received { message, skipped })
     }
@@ -446,7 +446,7 @@ struct Routes {
     auth: Option<Auth>,
     routes: Vec<RouteEntry>,
     /// The entries skipped, in receive mode.
-    skipped: Vec<RipError>,
+    skipped: Vec<Error>,
     whole: bool,
     /// Where the entries end, when a cryptographic entry says so.
     entries_end: Option<usize>,
@@ -456,19 +456,19 @@ struct Routes {
 
 impl Routes {
     /// Reads every entry once from a complete payload.
-    fn read(mut self, b: &[u8]) -> Result<(Message, Vec<RipError>), RipError> {
-        let command = Command::from_code(*b.first().ok_or(RipError::Truncated)?)?;
-        let v = *b.get(1).ok_or(RipError::Truncated)?;
+    fn read(mut self, b: &[u8]) -> Result<(Message, Vec<Error>), Error> {
+        let command = Command::from_code(*b.first().ok_or(Error::Truncated)?)?;
+        let v = *b.get(1).ok_or(Error::Truncated)?;
         let version = match v {
             1 => Version::V1,
             2 => Version::V2,
             3.. if self.receive => Version::V2,
-            _ => return Err(RipError::Version(v)),
+            _ => return Err(Error::Version(v)),
         };
         if version == Version::V1 && b.get(2..b.len().min(4)).is_some_and(|s| s.iter().any(|&x| x != 0)) {
-            return Err(RipError::MustBeZero { offset: 2 });
+            return Err(Error::MustBeZero { offset: 2 });
         }
-        if b.len() < HEADER_LEN { return Err(RipError::Truncated); }
+        if b.len() < HEADER_LEN { return Err(Error::Truncated); }
         loop {
             let at = HEADER_LEN + self.entry * ENTRY_LEN;
             if self.entries_end.is_some_and(|end| at >= end) {
@@ -476,11 +476,11 @@ impl Routes {
             }
             let Some(e) = b.get(at..at + ENTRY_LEN) else { break };
             if self.entry >= MAX_ENTRIES {
-                return Err(RipError::TooManyEntries);
+                return Err(Error::TooManyEntries);
             }
             if let Err(err) = self.entry_at(command, version, at, e) {
                 let skippable =
-                    matches!(err, RipError::Family { .. } | RipError::Mask { .. } | RipError::Metric { .. });
+                    matches!(err, Error::Family { .. } | Error::Mask { .. } | Error::Metric { .. });
                 if !(self.receive && skippable) {
                     return Err(err);
                 }
@@ -492,50 +492,50 @@ impl Routes {
             if let Some(h) = b.get(end..end + TRAILER_HEADER_LEN)
                 && h != [0xff, 0xff, 0, 1]
             {
-                return Err(RipError::Trailer);
+                return Err(Error::Trailer);
             }
             if b.len().saturating_sub(end + TRAILER_HEADER_LEN) > MAX_AUTH_DATA {
-                return Err(RipError::AuthDataTooLong);
+                return Err(Error::AuthDataTooLong);
             }
         }
         let mut auth = self.auth;
         if let Some(end) = self.entries_end {
             if b.len() < end + TRAILER_HEADER_LEN {
-                return Err(RipError::Truncated);
+                return Err(Error::Truncated);
             }
             let data = &b[end + TRAILER_HEADER_LEN..];
             if let Some(Auth::Crypto(c)) = &mut auth {
                 let declared = usize::from(c.data_len);
                 if declared != data.len() && declared != data.len() + TRAILER_HEADER_LEN {
-                    return Err(RipError::AuthDataLen { declared: c.data_len, actual: data.len() });
+                    return Err(Error::AuthDataLen { declared: c.data_len, actual: data.len() });
                 }
                 c.data = data.to_vec();
             }
         } else if HEADER_LEN + self.entry * ENTRY_LEN != b.len() {
-            return Err(RipError::Truncated);
+            return Err(Error::Truncated);
         }
         if self.entry == 0 {
-            return Err(RipError::NoEntries);
+            return Err(Error::NoEntries);
         }
         let entries = if self.whole { Entries::WholeTable } else { Entries::Routes(self.routes) };
         Ok((Message { command, version, auth, entries }, self.skipped))
     }
 
     /// Reads entry number `self.entry`, the 20 bytes `e` at offset `at`.
-    fn entry_at(&mut self, command: Command, version: Version, at: usize, e: &[u8]) -> Result<(), RipError> {
+    fn entry_at(&mut self, command: Command, version: Version, at: usize, e: &[u8]) -> Result<(), Error> {
         let entry = self.entry;
         let fam = be16(e, 0);
         if version == Version::V1 && (fam == family::WHOLE_TABLE || fam == family::INET) {
             for (off, len) in [(2, 2), (8, 4), (12, 4)] {
                 if e[off..off + len].iter().any(|&x| x != 0) {
-                    return Err(RipError::MustBeZero { offset: at + off });
+                    return Err(Error::MustBeZero { offset: at + off });
                 }
             }
         }
         match fam {
             family::AUTH if version == Version::V2 => {
                 if entry != 0 {
-                    return Err(RipError::AuthPlace { entry });
+                    return Err(Error::AuthPlace { entry });
                 }
                 let kind = be16(e, 2);
                 let mut data = [0u8; 16];
@@ -549,7 +549,7 @@ impl Routes {
                             && (n - HEADER_LEN).is_multiple_of(ENTRY_LEN)
                             && n <= HEADER_LEN + MAX_ENTRIES * ENTRY_LEN;
                         if !ok {
-                            return Err(RipError::PacketLength(packet_len));
+                            return Err(Error::PacketLength(packet_len));
                         }
                         self.entries_end = Some(n);
                         Auth::Crypto(Crypto { key_id: e[6], data_len: e[7], sequence: be32(e, 8), data: Vec::new() })
@@ -563,21 +563,21 @@ impl Routes {
                 // after any authentication entry.
                 let first = entry == usize::from(self.auth.is_some());
                 if command != Command::Request || self.whole || !first || be32(e, 16) != u32::from(INFINITY) {
-                    return Err(RipError::WholeTable { entry });
+                    return Err(Error::WholeTable { entry });
                 }
                 self.whole = true;
             }
             family::INET => {
                 if self.whole {
-                    return Err(RipError::WholeTable { entry });
+                    return Err(Error::WholeTable { entry });
                 }
                 let mask = be32(e, 8);
                 if !contiguous(mask) {
-                    return Err(RipError::Mask { entry });
+                    return Err(Error::Mask { entry });
                 }
                 let metric = be32(e, 16);
                 if !command.allows_metric(metric) {
-                    return Err(RipError::Metric { entry, metric });
+                    return Err(Error::Metric { entry, metric });
                 }
                 self.routes.push(RouteEntry {
                     tag: be16(e, 2),
@@ -588,7 +588,7 @@ impl Routes {
                     metric: metric as u8,
                 });
             }
-            _ => return Err(RipError::Family { entry, family: fam }),
+            _ => return Err(Error::Family { entry, family: fam }),
         }
         Ok(())
     }
@@ -600,11 +600,11 @@ impl Routes {
 pub struct Received<M> {
     /// The message, without the entries skipped. Its routes may be empty
     /// even with no authentication entry, so [`Message::to_bytes`] or
-    /// [`NgMessage::to_bytes`] may fail on it with [`RipError::NoEntries`].
+    /// [`NgMessage::to_bytes`] may fail on it with [`Error::NoEntries`].
     pub message: M,
     /// Why each skipped entry was skipped, in order. Each error names its
     /// entry, counted as on the wire.
-    pub skipped: Vec<RipError>,
+    pub skipped: Vec<Error>,
 }
 
 /// One RIPng route.
@@ -630,7 +630,7 @@ pub enum NgEntry {
     /// `::` means the router that sent the message. It is always `::` or a
     /// link-local address (`fe80::/10`): RFC 2080 2.1.1 says a received
     /// next hop that is not link-local is read as `::`, and readers do so.
-    /// A writer fails with [`RipError::Unwritable`] on any other
+    /// A writer fails with [`Error::Unwritable`] on any other
     /// address. On the wire its metric is [`NEXT_HOP_METRIC`] and its tag
     /// and prefix length are zero.
     NextHop(Ipv6Addr),
@@ -674,7 +674,7 @@ impl NgMessage {
     /// every message that passes it. Whether a prefix is one a router
     /// should accept (not multicast or link-local, say) is left to world
     /// code.
-    pub fn receive(b: &[u8]) -> Result<Received<NgMessage>, RipError> {
+    pub fn receive(b: &[u8]) -> Result<Received<NgMessage>, Error> {
         let mut skipped = Vec::new();
         let message = scan_ng(b, Some(&mut skipped))?;
         Ok(Received { message, skipped })
@@ -683,23 +683,23 @@ impl NgMessage {
 
 /// Reads a complete RIPng header. Refuses an invalid command or version
 /// and a header shorter than [`HEADER_LEN`].
-fn ng_header(b: &[u8]) -> Result<Command, RipError> {
-    let &c = b.first().ok_or(RipError::Truncated)?;
+fn ng_header(b: &[u8]) -> Result<Command, Error> {
+    let &c = b.first().ok_or(Error::Truncated)?;
     let command = Command::from_code(c)?;
-    let &v = b.get(1).ok_or(RipError::Truncated)?;
+    let &v = b.get(1).ok_or(Error::Truncated)?;
     if v != 1 {
-        return Err(RipError::Version(v));
+        return Err(Error::Version(v));
     }
     if b.len() < HEADER_LEN {
-        return Err(RipError::Truncated);
+        return Err(Error::Truncated);
     }
     Ok(command)
 }
 
 /// Reads RIPng entry number `entry`, the 20 bytes `e`.
-fn ng_entry(command: Command, entry: usize, e: &[u8]) -> Result<NgEntry, RipError> {
+fn ng_entry(command: Command, entry: usize, e: &[u8]) -> Result<NgEntry, Error> {
     if entry >= MAX_NG_ENTRIES {
-        return Err(RipError::TooManyEntries);
+        return Err(Error::TooManyEntries);
     }
     let mut a = [0u8; 16];
     a.copy_from_slice(&e[..16]);
@@ -713,10 +713,10 @@ fn ng_entry(command: Command, entry: usize, e: &[u8]) -> Result<NgEntry, RipErro
     }
     let prefix_len = e[18];
     if prefix_len > MAX_PREFIX_LEN {
-        return Err(RipError::PrefixLength { entry, len: prefix_len });
+        return Err(Error::PrefixLength { entry, len: prefix_len });
     }
     if !command.allows_metric(u32::from(metric)) {
-        return Err(RipError::Metric { entry, metric: u32::from(metric) });
+        return Err(Error::Metric { entry, metric: u32::from(metric) });
     }
     Ok(NgEntry::Route(NgRoute { prefix, tag: be16(e, 16), prefix_len, metric }))
 }
@@ -731,7 +731,7 @@ fn is_whole_table_ng(r: NgRoute) -> bool {
 /// rule a prefix breaks is the first rule the whole message breaks. With
 /// `skip`, a route with a bad prefix length or metric is left out and its
 /// error added there instead.
-fn scan_ng(b: &[u8], mut skip: Option<&mut Vec<RipError>>) -> Result<NgMessage, RipError> {
+fn scan_ng(b: &[u8], mut skip: Option<&mut Vec<Error>>) -> Result<NgMessage, Error> {
     let command = ng_header(b)?;
     let mut entries = Vec::new();
     let mut count = 0;
@@ -739,7 +739,7 @@ fn scan_ng(b: &[u8], mut skip: Option<&mut Vec<RipError>>) -> Result<NgMessage, 
     while let Some(e) = b.get(at..at + ENTRY_LEN) {
         match ng_entry(command, count, e) {
             Ok(entry) => entries.push(entry),
-            Err(err @ (RipError::PrefixLength { .. } | RipError::Metric { .. })) if skip.is_some() => {
+            Err(err @ (Error::PrefixLength { .. } | Error::Metric { .. })) if skip.is_some() => {
                 if let Some(s) = skip.as_mut() {
                     s.push(err);
                 }
@@ -750,10 +750,10 @@ fn scan_ng(b: &[u8], mut skip: Option<&mut Vec<RipError>>) -> Result<NgMessage, 
         at += ENTRY_LEN;
     }
     if at != b.len() {
-        return Err(RipError::Truncated);
+        return Err(Error::Truncated);
     }
     if count == 0 {
-        return Err(RipError::NoEntries);
+        return Err(Error::NoEntries);
     }
     let whole =
         command == Command::Request && count == 1 && matches!(entries[..], [NgEntry::Route(r)] if is_whole_table_ng(r));
@@ -770,25 +770,25 @@ fn be32(b: &[u8], i: usize) -> u32 {
 }
 
 impl Wire for Message {
-    type ParseError = RipError;
-    type WriteError = RipError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads a complete UDP payload. Refuses invalid header, route,
     /// authentication, and length fields.
-    fn parse(b: &[u8]) -> Result<Self, RipError> {
+    fn parse(b: &[u8]) -> Result<Self, Error> {
         Routes::default().read(b).map(|(m, _)| m)
     }
 
     /// Appends a message. Refuses invalid fields, excessive route or digest
     /// lengths, and values that would read back differently. Preserves all
     /// parsed messages. Leaves the destination unchanged on error.
-    fn write(&self, destination: &mut Vec<u8>) -> Result<(), RipError> {
+    fn write(&self, destination: &mut Vec<u8>) -> Result<(), Error> {
         let routes = match &self.entries {
             Entries::WholeTable => 1,
             Entries::Routes(r) => r.len(),
         };
         if routes.saturating_add(usize::from(self.auth.is_some())) > MAX_ENTRIES {
-            return Err(RipError::TooManyEntries);
+            return Err(Error::TooManyEntries);
         }
         let mut out = Vec::with_capacity(MAX_MESSAGE);
         out.extend_from_slice(&[self.command.code(), self.version.code(), 0, 0]);
@@ -802,7 +802,7 @@ impl Wire for Message {
             }
             Some(Auth::Other { kind, data }) => {
                 if *kind == auth_type::PASSWORD || *kind == auth_type::CRYPTO {
-                    return Err(RipError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 out.extend_from_slice(&family::AUTH.to_be_bytes());
                 out.extend_from_slice(&kind.to_be_bytes());
@@ -810,7 +810,7 @@ impl Wire for Message {
             }
             Some(Auth::Crypto(c)) => {
                 if c.data.len() > MAX_AUTH_DATA {
-                    return Err(RipError::AuthDataTooLong);
+                    return Err(Error::AuthDataTooLong);
                 }
                 // At most 25 entries, so this fits in 16 bits.
                 let packet_len = (HEADER_LEN + (1 + routes) * ENTRY_LEN) as u16;
@@ -845,10 +845,10 @@ impl Wire for Message {
             out.extend_from_slice(data);
         }
         if Message::parse(&out)? != *self {
-            return Err(RipError::Unwritable);
+            return Err(Error::Unwritable);
         }
         if out.len() > MAX_MESSAGE {
-            return Err(RipError::TooManyEntries);
+            return Err(Error::TooManyEntries);
         }
         destination.extend_from_slice(&out);
         Ok(())
@@ -856,27 +856,27 @@ impl Wire for Message {
 }
 
 impl Wire for NgMessage {
-    type ParseError = RipError;
-    type WriteError = RipError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads a complete RIPng UDP payload. Refuses an invalid command or
     /// version, missing or partial entries, excessive entry counts, invalid
     /// prefix lengths, and metrics outside the command's range.
-    fn parse(b: &[u8]) -> Result<Self, RipError> {
+    fn parse(b: &[u8]) -> Result<Self, Error> {
         scan_ng(b, None)
     }
 
     /// Appends a RIPng message. Refuses missing or excessive entries, invalid
     /// prefix lengths or metrics, and next hops or whole-table forms that
     /// would read back differently. Leaves the destination unchanged on error.
-    fn write(&self, destination: &mut Vec<u8>) -> Result<(), RipError> {
+    fn write(&self, destination: &mut Vec<u8>) -> Result<(), Error> {
         let one = [NgEntry::Route(WHOLE_TABLE_NG)];
         let entries: &[NgEntry] = match &self.entries {
             NgEntries::WholeTable => &one,
             NgEntries::Entries(e) => e,
         };
         if entries.len() > MAX_NG_ENTRIES {
-            return Err(RipError::TooManyEntries);
+            return Err(Error::TooManyEntries);
         }
         let mut out = Vec::with_capacity(HEADER_LEN + entries.len() * ENTRY_LEN);
         out.extend_from_slice(&[self.command.code(), 1, 0, 0]);
@@ -895,7 +895,7 @@ impl Wire for NgMessage {
             }
         }
         if NgMessage::parse(&out)? != *self {
-            return Err(RipError::Unwritable);
+            return Err(Error::Unwritable);
         }
         destination.extend_from_slice(&out);
         Ok(())
@@ -910,7 +910,7 @@ mod tests {
         test_support::{decode_all, mutate},
     };
 
-    fn collect(b: &[u8]) -> Result<Message, RipError> {
+    fn collect(b: &[u8]) -> Result<Message, Error> {
         let make = || Collect::<Message>::new(MAX_MESSAGE);
         contract::check_decode_with_alloc_limit(make, b, 2 * (MAX_MESSAGE + 1));
         contract::check_wire::<Message>(b);
@@ -971,7 +971,7 @@ mod tests {
         b
     }
 
-    fn ng_collect(b: &[u8]) -> Result<NgMessage, RipError> {
+    fn ng_collect(b: &[u8]) -> Result<NgMessage, Error> {
         let make = || Collect::<NgMessage>::new(MAX_NG_MESSAGE);
         contract::check_decode_with_alloc_limit(make, b, 2 * (MAX_NG_MESSAGE + 1));
         contract::check_wire::<NgMessage>(b);
@@ -998,7 +998,7 @@ mod tests {
         parsed
     }
 
-    fn check(b: &[u8]) -> Result<Message, RipError> {
+    fn check(b: &[u8]) -> Result<Message, Error> {
         let p = Message::parse(b);
         assert_eq!(collect(b), p);
         if let Ok(m) = &p {
@@ -1019,7 +1019,7 @@ mod tests {
         p
     }
 
-    fn ng_check(b: &[u8]) -> Result<NgMessage, RipError> {
+    fn ng_check(b: &[u8]) -> Result<NgMessage, Error> {
         let p = NgMessage::parse(b);
         assert_eq!(ng_collect(b), p);
         if let Ok(m) = &p {
@@ -1196,43 +1196,43 @@ mod tests {
         let v1_route = v2_entry(0, [10, 0, 0, 0], [0; 4], [0; 4], 1);
         let mut pw = vec![0xff, 0xff, 0, 2];
         pw.extend_from_slice(&[0; 16]);
-        let cases: Vec<(Vec<u8>, RipError)> = vec![
-            (vec![], RipError::Truncated),
-            (vec![2, 2, 0], RipError::Truncated),
-            (msg(2, 2, &[route[..19].to_vec()]), RipError::Truncated),
-            (msg(3, 2, std::slice::from_ref(&route)), RipError::Command(3)),
-            (msg(0, 2, std::slice::from_ref(&route)), RipError::Command(0)),
-            (msg(2, 0, std::slice::from_ref(&route)), RipError::Version(0)),
-            (msg(2, 3, std::slice::from_ref(&route)), RipError::Version(3)),
-            ([vec![2, 1, 0, 1], v1_route.clone()].concat(), RipError::MustBeZero { offset: 2 }),
-            (vec![2, 1, 1], RipError::MustBeZero { offset: 2 }),
-            (msg(2, 1, &[v2_entry(1, [10, 0, 0, 0], [0; 4], [0; 4], 1)]), RipError::MustBeZero { offset: 6 }),
-            (msg(2, 1, std::slice::from_ref(&route)), RipError::MustBeZero { offset: 12 }),
-            (msg(2, 1, &[v2_entry(0, [10, 0, 0, 0], [0; 4], [1; 4], 1)]), RipError::MustBeZero { offset: 16 }),
-            (msg(2, 1, &[pw.clone()]), RipError::Family { entry: 0, family: 0xffff }),
+        let cases: Vec<(Vec<u8>, Error)> = vec![
+            (vec![], Error::Truncated),
+            (vec![2, 2, 0], Error::Truncated),
+            (msg(2, 2, &[route[..19].to_vec()]), Error::Truncated),
+            (msg(3, 2, std::slice::from_ref(&route)), Error::Command(3)),
+            (msg(0, 2, std::slice::from_ref(&route)), Error::Command(0)),
+            (msg(2, 0, std::slice::from_ref(&route)), Error::Version(0)),
+            (msg(2, 3, std::slice::from_ref(&route)), Error::Version(3)),
+            ([vec![2, 1, 0, 1], v1_route.clone()].concat(), Error::MustBeZero { offset: 2 }),
+            (vec![2, 1, 1], Error::MustBeZero { offset: 2 }),
+            (msg(2, 1, &[v2_entry(1, [10, 0, 0, 0], [0; 4], [0; 4], 1)]), Error::MustBeZero { offset: 6 }),
+            (msg(2, 1, std::slice::from_ref(&route)), Error::MustBeZero { offset: 12 }),
+            (msg(2, 1, &[v2_entry(0, [10, 0, 0, 0], [0; 4], [1; 4], 1)]), Error::MustBeZero { offset: 16 }),
+            (msg(2, 1, &[pw.clone()]), Error::Family { entry: 0, family: 0xffff }),
             (
                 msg(2, 2, &[route.clone(), [vec![0, 7], route[2..].to_vec()].concat()]),
-                RipError::Family { entry: 1, family: 7 },
+                Error::Family { entry: 1, family: 7 },
             ),
-            (msg(2, 2, &[route.clone(), pw.clone()]), RipError::AuthPlace { entry: 1 }),
-            (msg(2, 2, &[whole_table_entry()]), RipError::WholeTable { entry: 0 }),
-            (msg(1, 2, &[route.clone(), whole_table_entry()]), RipError::WholeTable { entry: 1 }),
-            (msg(1, 2, &[whole_table_entry(), route.clone()]), RipError::WholeTable { entry: 1 }),
-            (msg(1, 2, &[whole_table_entry(), whole_table_entry()]), RipError::WholeTable { entry: 1 }),
-            (msg(1, 2, &[[&[0u8; 16][..], &[0, 0, 0, 15]].concat()]), RipError::WholeTable { entry: 0 }),
+            (msg(2, 2, &[route.clone(), pw.clone()]), Error::AuthPlace { entry: 1 }),
+            (msg(2, 2, &[whole_table_entry()]), Error::WholeTable { entry: 0 }),
+            (msg(1, 2, &[route.clone(), whole_table_entry()]), Error::WholeTable { entry: 1 }),
+            (msg(1, 2, &[whole_table_entry(), route.clone()]), Error::WholeTable { entry: 1 }),
+            (msg(1, 2, &[whole_table_entry(), whole_table_entry()]), Error::WholeTable { entry: 1 }),
+            (msg(1, 2, &[[&[0u8; 16][..], &[0, 0, 0, 15]].concat()]), Error::WholeTable { entry: 0 }),
             (
                 msg(1, 1, &[[&[0u8, 0, 0, 1][..], &[0; 12], &[0, 0, 0, 16]].concat()]),
-                RipError::MustBeZero { offset: 6 },
+                Error::MustBeZero { offset: 6 },
             ),
-            (msg(2, 2, &[v2_entry(0, [10, 0, 0, 0], [0; 4], [0; 4], 0)]), RipError::Metric { entry: 0, metric: 0 }),
-            (msg(2, 2, &[v2_entry(0, [10, 0, 0, 0], [0; 4], [0; 4], 17)]), RipError::Metric { entry: 0, metric: 17 }),
+            (msg(2, 2, &[v2_entry(0, [10, 0, 0, 0], [0; 4], [0; 4], 0)]), Error::Metric { entry: 0, metric: 0 }),
+            (msg(2, 2, &[v2_entry(0, [10, 0, 0, 0], [0; 4], [0; 4], 17)]), Error::Metric { entry: 0, metric: 17 }),
             (
                 msg(1, 2, &[v2_entry(0, [10, 0, 0, 0], [0; 4], [0; 4], 0x100)]),
-                RipError::Metric { entry: 0, metric: 0x100 },
+                Error::Metric { entry: 0, metric: 0x100 },
             ),
-            (msg(2, 2, &[v2_entry(0, [10, 0, 0, 0], [255, 0, 255, 0], [0; 4], 1)]), RipError::Mask { entry: 0 }),
-            (vec![2, 2, 0, 0], RipError::NoEntries),
-            (msg(2, 2, &vec![route.clone(); MAX_ENTRIES + 1]), RipError::TooManyEntries),
+            (msg(2, 2, &[v2_entry(0, [10, 0, 0, 0], [255, 0, 255, 0], [0; 4], 1)]), Error::Mask { entry: 0 }),
+            (vec![2, 2, 0, 0], Error::NoEntries),
+            (msg(2, 2, &vec![route.clone(); MAX_ENTRIES + 1]), Error::TooManyEntries),
         ];
         for (b, e) in &cases {
             assert_eq!(check(b), Err(*e), "{b:?}");
@@ -1252,17 +1252,17 @@ mod tests {
             b
         };
         for n in [0, 20, 30, 504 + 20, 0xffff] {
-            assert_eq!(check(&with_len(n)), Err(RipError::PacketLength(n)));
+            assert_eq!(check(&with_len(n)), Err(Error::PacketLength(n)));
         }
         // A packet length past the trailer reads the trailer as an entry.
-        assert_eq!(check(&with_len(64)), Err(RipError::AuthPlace { entry: 2 }));
-        assert_eq!(check(&good[..44]), Err(RipError::Truncated));
+        assert_eq!(check(&with_len(64)), Err(Error::AuthPlace { entry: 2 }));
+        assert_eq!(check(&good[..44]), Err(Error::Truncated));
         let mut bad = good.clone();
         bad[47] = 2;
-        assert_eq!(check(&bad), Err(RipError::Trailer));
-        assert_eq!(check(&good[..46]), Err(RipError::Truncated));
-        assert_eq!(check(&crypto_message(16, &[1; 15])), Err(RipError::AuthDataLen { declared: 16, actual: 15 }));
-        assert_eq!(check(&crypto_message(255, &[1; 256])), Err(RipError::AuthDataTooLong));
+        assert_eq!(check(&bad), Err(Error::Trailer));
+        assert_eq!(check(&good[..46]), Err(Error::Truncated));
+        assert_eq!(check(&crypto_message(16, &[1; 15])), Err(Error::AuthDataLen { declared: 16, actual: 15 }));
+        assert_eq!(check(&crypto_message(255, &[1; 256])), Err(Error::AuthDataTooLong));
         assert!(check(&crypto_message(255, &[1; 255])).is_ok());
         // Packet length 24 is the authentication entry alone.
         let mut alone = vec![2, 2, 0, 0, 0xff, 0xff, 0, 3, 0, 24, 1, 0, 0, 0, 0, 1];
@@ -1275,21 +1275,21 @@ mod tests {
     fn ripng_errors() {
         let doc: Ipv6Addr = "2001:db8::".parse().unwrap();
         let route = ng_entry_bytes(doc, 0, 32, 1);
-        let cases: Vec<(Vec<u8>, RipError)> = vec![
-            (vec![], RipError::Truncated),
-            (vec![2, 1, 0], RipError::Truncated),
-            (msg(2, 1, &[route[..10].to_vec()]), RipError::Truncated),
-            (msg(9, 1, std::slice::from_ref(&route)), RipError::Command(9)),
-            (msg(2, 2, std::slice::from_ref(&route)), RipError::Version(2)),
-            (msg(2, 0, std::slice::from_ref(&route)), RipError::Version(0)),
+        let cases: Vec<(Vec<u8>, Error)> = vec![
+            (vec![], Error::Truncated),
+            (vec![2, 1, 0], Error::Truncated),
+            (msg(2, 1, &[route[..10].to_vec()]), Error::Truncated),
+            (msg(9, 1, std::slice::from_ref(&route)), Error::Command(9)),
+            (msg(2, 2, std::slice::from_ref(&route)), Error::Version(2)),
+            (msg(2, 0, std::slice::from_ref(&route)), Error::Version(0)),
             (
                 msg(2, 1, &[route.clone(), ng_entry_bytes(doc, 0, 129, 1)]),
-                RipError::PrefixLength { entry: 1, len: 129 },
+                Error::PrefixLength { entry: 1, len: 129 },
             ),
-            (msg(2, 1, &[ng_entry_bytes(doc, 0, 32, 0)]), RipError::Metric { entry: 0, metric: 0 }),
-            (msg(2, 1, &[ng_entry_bytes(doc, 0, 32, 17)]), RipError::Metric { entry: 0, metric: 17 }),
-            (msg(1, 1, &[ng_entry_bytes(doc, 0, 32, 0xfe)]), RipError::Metric { entry: 0, metric: 0xfe }),
-            (vec![2, 1, 0, 0], RipError::NoEntries),
+            (msg(2, 1, &[ng_entry_bytes(doc, 0, 32, 0)]), Error::Metric { entry: 0, metric: 0 }),
+            (msg(2, 1, &[ng_entry_bytes(doc, 0, 32, 17)]), Error::Metric { entry: 0, metric: 17 }),
+            (msg(1, 1, &[ng_entry_bytes(doc, 0, 32, 0xfe)]), Error::Metric { entry: 0, metric: 0xfe }),
+            (vec![2, 1, 0, 0], Error::NoEntries),
         ];
         for (b, e) in &cases {
             assert_eq!(ng_check(b), Err(*e), "{b:?}");
@@ -1299,7 +1299,7 @@ mod tests {
         for _ in 0..=MAX_NG_ENTRIES {
             big.extend_from_slice(&route);
         }
-        assert_eq!(ng_check(&big), Err(RipError::TooManyEntries));
+        assert_eq!(ng_check(&big), Err(Error::TooManyEntries));
         let at_most = &big[..MAX_NG_MESSAGE];
         assert!(ng_check(at_most).is_ok());
         // The header's unused field is ignored.
@@ -1325,55 +1325,55 @@ mod tests {
         };
         let mut m = base.clone();
         m.entries = Entries::Routes(vec![route; MAX_ENTRIES + 1]);
-        assert_eq!(m.to_bytes(), Err(RipError::TooManyEntries));
+        assert_eq!(m.to_bytes(), Err(Error::TooManyEntries));
         let mut m = base.clone();
         m.entries = Entries::Routes(vec![route; MAX_ENTRIES]);
         m.auth = Some(Auth::Password([0; 16]));
-        assert_eq!(m.to_bytes(), Err(RipError::TooManyEntries));
+        assert_eq!(m.to_bytes(), Err(Error::TooManyEntries));
         let mut m = base.clone();
         m.auth = Some(Auth::Crypto(Crypto { key_id: 1, data_len: 0, sequence: 0, data: vec![0; 256] }));
-        assert_eq!(m.to_bytes(), Err(RipError::AuthDataTooLong));
+        assert_eq!(m.to_bytes(), Err(Error::AuthDataTooLong));
         let mut m = base.clone();
         m.auth = Some(Auth::Crypto(Crypto { key_id: 1, data_len: 3, sequence: 0, data: vec![0; 16] }));
-        assert_eq!(m.to_bytes(), Err(RipError::AuthDataLen { declared: 3, actual: 16 }));
+        assert_eq!(m.to_bytes(), Err(Error::AuthDataLen { declared: 3, actual: 16 }));
         for kind in [auth_type::PASSWORD, auth_type::CRYPTO] {
             let mut m = base.clone();
             m.auth = Some(Auth::Other { kind, data: [0; 16] });
-            assert_eq!(m.to_bytes(), Err(RipError::Unwritable));
+            assert_eq!(m.to_bytes(), Err(Error::Unwritable));
         }
         let mut m = base.clone();
         m.version = Version::V1;
-        assert_eq!(m.to_bytes(), Err(RipError::MustBeZero { offset: 12 }));
+        assert_eq!(m.to_bytes(), Err(Error::MustBeZero { offset: 12 }));
         let mut m = Message::whole_table_request(Version::V1);
         m.auth = Some(Auth::Password([0; 16]));
-        assert_eq!(m.to_bytes(), Err(RipError::Family { entry: 0, family: 0xffff }));
+        assert_eq!(m.to_bytes(), Err(Error::Family { entry: 0, family: 0xffff }));
         let mut m = Message::whole_table_request(Version::V2);
         m.command = Command::Response;
-        assert_eq!(m.to_bytes(), Err(RipError::WholeTable { entry: 0 }));
+        assert_eq!(m.to_bytes(), Err(Error::WholeTable { entry: 0 }));
         let mut m = base.clone();
         m.entries = Entries::Routes(vec![RouteEntry { metric: 17, ..route }]);
-        assert_eq!(m.to_bytes(), Err(RipError::Metric { entry: 0, metric: 17 }));
+        assert_eq!(m.to_bytes(), Err(Error::Metric { entry: 0, metric: 17 }));
         let mut m = base.clone();
         m.entries = Entries::Routes(vec![]);
-        assert_eq!(m.to_bytes(), Err(RipError::NoEntries));
+        assert_eq!(m.to_bytes(), Err(Error::NoEntries));
 
         let whole = NgRoute { prefix: Ipv6Addr::UNSPECIFIED, tag: 0, prefix_len: 0, metric: 16 };
         let m = NgMessage { command: Command::Request, entries: NgEntries::Entries(vec![NgEntry::Route(whole)]) };
-        assert_eq!(m.to_bytes(), Err(RipError::Unwritable));
+        assert_eq!(m.to_bytes(), Err(Error::Unwritable));
         let m = NgMessage { command: Command::Response, entries: NgEntries::WholeTable };
-        assert_eq!(m.to_bytes(), Err(RipError::Unwritable));
+        assert_eq!(m.to_bytes(), Err(Error::Unwritable));
         let m = NgMessage { command: Command::Response, entries: NgEntries::Entries(vec![]) };
-        assert_eq!(m.to_bytes(), Err(RipError::NoEntries));
+        assert_eq!(m.to_bytes(), Err(Error::NoEntries));
         let m = NgMessage {
             command: Command::Response,
             entries: NgEntries::Entries(vec![NgEntry::NextHop(Ipv6Addr::UNSPECIFIED); MAX_NG_ENTRIES + 1]),
         };
-        assert_eq!(m.to_bytes(), Err(RipError::TooManyEntries));
+        assert_eq!(m.to_bytes(), Err(Error::TooManyEntries));
         let m = NgMessage {
             command: Command::Response,
             entries: NgEntries::Entries(vec![NgEntry::Route(NgRoute { prefix_len: 200, metric: 1, ..whole })]),
         };
-        assert_eq!(m.to_bytes(), Err(RipError::PrefixLength { entry: 0, len: 200 }));
+        assert_eq!(m.to_bytes(), Err(Error::PrefixLength { entry: 0, len: 200 }));
     }
 
     #[test]
@@ -1389,7 +1389,7 @@ mod tests {
                     // one whose length counts the trailer header.
                     Ok(_) => assert!(if crypto { k + 4 == b.len() } else { boundary }, "{k} {b:?}"),
                     Err(e) => assert!(
-                        matches!(e, RipError::Truncated | RipError::NoEntries | RipError::AuthDataLen { .. }),
+                        matches!(e, Error::Truncated | Error::NoEntries | Error::AuthDataLen { .. }),
                         "{k} {e:?}"
                     ),
                 }
@@ -1402,7 +1402,7 @@ mod tests {
                 let boundary = k >= HEADER_LEN && (k - HEADER_LEN).is_multiple_of(ENTRY_LEN);
                 match r {
                     Ok(_) => assert!(boundary),
-                    Err(e) => assert!(matches!(e, RipError::Truncated | RipError::NoEntries), "{k} {e:?}"),
+                    Err(e) => assert!(matches!(e, Error::Truncated | Error::NoEntries), "{k} {e:?}"),
                 }
             }
         }
@@ -1410,8 +1410,8 @@ mod tests {
 
     #[test]
     fn streams_report_parse_errors_once() {
-        assert_eq!(collect(&[7]), Err(RipError::Command(7)));
-        assert_eq!(ng_collect(&[1, 2]), Err(RipError::Version(2)));
+        assert_eq!(collect(&[7]), Err(Error::Command(7)));
+        assert_eq!(ng_collect(&[1, 2]), Err(Error::Version(2)));
         let b = [2, 2, 0, 0, 0, 2].repeat(10_000);
         contract::check_decode_with_alloc_limit(|| Collect::<Message>::new(MAX_MESSAGE), &b, 2 * (MAX_MESSAGE + 1));
     }
@@ -1432,14 +1432,14 @@ mod tests {
         // Its must-be-zero fields still are.
         let mut e = whole_table_entry();
         e[8] = 255;
-        assert_eq!(check(&msg(1, 1, &[e])), Err(RipError::MustBeZero { offset: 12 }));
+        assert_eq!(check(&msg(1, 1, &[e])), Err(Error::MustBeZero { offset: 12 }));
         // RFC 2080: the prefix, prefix length and metric decide; the tag
         // does not.
         let ng = msg(1, 1, &[ng_entry_bytes(Ipv6Addr::UNSPECIFIED, 7, 0, 16)]);
         assert_eq!(ng_check(&ng), Ok(NgMessage::whole_table_request()));
         let tagged = NgRoute { tag: 7, ..WHOLE_TABLE_NG };
         let m = NgMessage { command: Command::Request, entries: NgEntries::Entries(vec![NgEntry::Route(tagged)]) };
-        assert_eq!(m.to_bytes(), Err(RipError::Unwritable));
+        assert_eq!(m.to_bytes(), Err(Error::Unwritable));
     }
 
     #[test]
@@ -1448,7 +1448,7 @@ mod tests {
         // passes MAX_AUTH_DATA, through the collection contract.
         let mut long = crypto_message(16, &[1; 16]);
         long.resize(10_000, 7);
-        assert_eq!(check(&long), Err(RipError::AuthDataTooLong));
+        assert_eq!(check(&long), Err(Error::AuthDataTooLong));
         // A whole-table request with a crypto entry writes and reads back.
         let m = Message {
             command: Command::Request,
@@ -1463,12 +1463,12 @@ mod tests {
         let route = ng_entry_bytes("2001:db8::".parse().unwrap(), 0, 32, 1);
         let mut long = vec![2, 1, 0, 0];
         long.extend(route.repeat(MAX_NG_ENTRIES + 50));
-        assert_eq!(ng_collect(&long), Err(RipError::TooManyEntries));
+        assert_eq!(ng_collect(&long), Err(Error::TooManyEntries));
     }
 
     #[test]
     fn display_and_helpers() {
-        assert_eq!(RipError::Command(3).to_string(), "command 3, not 1 or 2");
+        assert_eq!(Error::Command(3).to_string(), "command 3, not 1 or 2");
         assert_eq!(Command::Response.code(), 2);
         assert_eq!(Version::V2.code(), 2);
         assert!(Command::Request.allows_metric(0));
@@ -1491,14 +1491,14 @@ mod tests {
         let bad_mask = v2_entry(0, [10, 0, 0, 0], [255, 0, 255, 0], [0; 4], 1);
         let b2 = v2_entry(0, [10, 2, 0, 0], [255, 255, 0, 0], [0; 4], 2);
         let b = msg(2, 2, &[a.clone(), bad_metric, bad_family, bad_mask, b2.clone()]);
-        assert_eq!(check(&b), Err(RipError::Metric { entry: 1, metric: 17 }));
+        assert_eq!(check(&b), Err(Error::Metric { entry: 1, metric: 17 }));
         let r = Message::receive(&b).unwrap();
         assert_eq!(
             r.skipped,
             vec![
-                RipError::Metric { entry: 1, metric: 17 },
-                RipError::Family { entry: 2, family: 7 },
-                RipError::Mask { entry: 3 },
+                Error::Metric { entry: 1, metric: 17 },
+                Error::Family { entry: 2, family: 7 },
+                Error::Mask { entry: 3 },
             ]
         );
         let good = Message::parse(&msg(2, 2, &[a.clone(), b2])).unwrap();
@@ -1509,25 +1509,25 @@ mod tests {
         let mut pw = vec![0xff, 0xff, 0, 2];
         pw.extend_from_slice(&[0; 16]);
         let r = Message::receive(&msg(2, 1, &[pw, v1.clone()])).unwrap();
-        assert_eq!(r.skipped, vec![RipError::Family { entry: 0, family: 0xffff }]);
+        assert_eq!(r.skipped, vec![Error::Family { entry: 0, family: 0xffff }]);
         assert_eq!(r.message, Message::parse(&msg(2, 1, &[v1])).unwrap());
         // Every entry skipped leaves no routes.
         let r = Message::receive(&msg(2, 2, &[route_bytes(0)])).unwrap();
         assert_eq!(r.message.entries, Entries::Routes(vec![]));
-        assert_eq!(r.message.to_bytes(), Err(RipError::NoEntries));
+        assert_eq!(r.message.to_bytes(), Err(Error::NoEntries));
         // Rules about the message as a whole still fail it.
-        assert_eq!(Message::receive(&msg(2, 2, &[a.clone(), a[..10].to_vec()])), Err(RipError::Truncated));
-        assert_eq!(Message::receive(&msg(2, 2, &[whole_table_entry()])), Err(RipError::WholeTable { entry: 0 }));
-        assert_eq!(Message::receive(&msg(2, 1, &[route_bytes(1)])), Err(RipError::MustBeZero { offset: 12 }));
+        assert_eq!(Message::receive(&msg(2, 2, &[a.clone(), a[..10].to_vec()])), Err(Error::Truncated));
+        assert_eq!(Message::receive(&msg(2, 2, &[whole_table_entry()])), Err(Error::WholeTable { entry: 0 }));
+        assert_eq!(Message::receive(&msg(2, 1, &[route_bytes(1)])), Err(Error::MustBeZero { offset: 12 }));
         // RFC 2080 2.4.2: the same for RIPng.
         let doc: Ipv6Addr = "2001:db8::".parse().unwrap();
         let ok = ng_entry_bytes(doc, 0, 32, 1);
         let b = msg(2, 1, &[ok.clone(), ng_entry_bytes(doc, 0, 129, 1), ng_entry_bytes(doc, 0, 32, 17), ok.clone()]);
-        assert_eq!(ng_check(&b), Err(RipError::PrefixLength { entry: 1, len: 129 }));
+        assert_eq!(ng_check(&b), Err(Error::PrefixLength { entry: 1, len: 129 }));
         let r = NgMessage::receive(&b).unwrap();
         assert_eq!(
             r.skipped,
-            vec![RipError::PrefixLength { entry: 1, len: 129 }, RipError::Metric { entry: 2, metric: 17 }]
+            vec![Error::PrefixLength { entry: 1, len: 129 }, Error::Metric { entry: 2, metric: 17 }]
         );
         assert_eq!(r.message, NgMessage::parse(&msg(2, 1, &[ok.clone(), ok])).unwrap());
         // A request whose only good entry is ::/0 with metric 16, after one
@@ -1544,11 +1544,11 @@ mod tests {
         let mut b = samples()[4].clone();
         b[1] = 3;
         b[2] = 9;
-        assert_eq!(check(&b), Err(RipError::Version(3)));
+        assert_eq!(check(&b), Err(Error::Version(3)));
         let r = Message::receive(&b).unwrap();
         assert_eq!(r.message, Message::parse(&samples()[4]).unwrap());
         b[1] = 0;
-        assert_eq!(Message::receive(&b), Err(RipError::Version(0)));
+        assert_eq!(Message::receive(&b), Err(Error::Version(0)));
     }
 
     #[test]
@@ -1565,7 +1565,7 @@ mod tests {
             command: Command::Response,
             entries: NgEntries::Entries(vec![NgEntry::NextHop(global), NgEntry::Route(route)]),
         };
-        assert_eq!(w.to_bytes(), Err(RipError::Unwritable));
+        assert_eq!(w.to_bytes(), Err(Error::Unwritable));
         // The edges of fe80::/10.
         for (a, kept) in [("fe80::1", true), ("febf:ffff::1", true), ("fec0::1", false), ("ff02::9", false)] {
             let a: Ipv6Addr = a.parse().unwrap();
@@ -1678,7 +1678,7 @@ mod tests {
         for _ in 0..MAX_ENTRIES {
             repeated.extend_from_within(HEADER_LEN..HEADER_LEN + ENTRY_LEN);
         }
-        assert_eq!(check(&repeated), Err(RipError::TooManyEntries));
+        assert_eq!(check(&repeated), Err(Error::TooManyEntries));
         let (mut ok, mut ng_ok) = (0, 0);
         // Deeper mutations need more trials to keep reaching valid messages.
         for _ in 0..12_000 {

@@ -283,12 +283,12 @@ pub enum Event {
         data: Vec<u8>,
     },
     /// Bytes that break the protocol. The decoder skips them and goes on.
-    Error(DecodeError),
+    Error(Error),
 }
 
-/// How the bytes [`Events`] read break the protocol.
+/// Why Telnet bytes break the protocol, or a value cannot be written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DecodeError {
+pub enum Error {
     /// IAC was followed by a byte that is no command (below 236).
     UnknownCommand(u8),
     /// IAC SE came with no subnegotiation open.
@@ -307,25 +307,72 @@ pub enum DecodeError {
     },
     /// The stream ended in the middle of a command or subnegotiation.
     Truncated,
+    /// A terminal type subnegotiation with no data.
+    Empty,
+    /// A terminal type code other than IS (0) or SEND (1).
+    UnknownCode(u8),
+    /// SEND followed by more bytes.
+    TrailingAfterSend,
+    /// A terminal type name that is empty or longer than
+    /// [`MAX_TERMINAL_TYPE`].
+    NameLength(usize),
+    /// A terminal type name with a byte that is not printable ASCII or a
+    /// space.
+    NameByte(u8),
+    /// A window size whose data is not exactly 4 bytes long.
+    WindowSizeLength(usize),
+    /// Data for another option longer than [`MAX_SUBNEGOTIATION`] bytes,
+    /// which [`Events`] never returns and the writer could not send
+    /// whole.
+    DataTooLong(usize),
+    /// The slice has no complete event.
+    Incomplete,
+    /// The slice contains bytes after the first event.
+    Trailing,
+    /// The input exceeds [`MAX_DATA`], [`MAX_SUBNEGOTIATION`], or [`MAX_EVENT_WIRE`].
+    TooLong,
+    /// An event of another kind was read where a typed subnegotiation was required.
+    UnexpectedEvent,
+    /// The value cannot be written without changing it.
+    Unwritable,
+    /// The output could not be allocated.
+    Allocation,
 }
 
-impl std::fmt::Display for DecodeError {
+impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            DecodeError::UnknownCommand(b) => write!(f, "IAC followed by {b}, which is no command"),
-            DecodeError::StraySubnegotiationEnd => f.write_str("IAC SE with no subnegotiation open"),
-            DecodeError::SubnegotiationTooLong { option } => {
+            Error::UnknownCommand(b) => write!(f, "IAC followed by {b}, which is no command"),
+            Error::StraySubnegotiationEnd => f.write_str("IAC SE with no subnegotiation open"),
+            Error::SubnegotiationTooLong { option } => {
                 write!(f, "subnegotiation for option {option} longer than {MAX_SUBNEGOTIATION} bytes")
             }
-            DecodeError::SubnegotiationInterrupted { option } => {
+            Error::SubnegotiationInterrupted { option } => {
                 write!(f, "subnegotiation for option {option} cut off by another command")
             }
-            DecodeError::Truncated => f.write_str("stream ended inside a command"),
+            Error::Truncated => f.write_str("stream ended inside a command"),
+            Error::Empty => f.write_str("terminal type subnegotiation with no data"),
+            Error::UnknownCode(c) => write!(f, "terminal type code {c}, not IS or SEND"),
+            Error::TrailingAfterSend => f.write_str("bytes after terminal type SEND"),
+            Error::NameLength(n) => {
+                write!(f, "terminal type name of {n} bytes, outside 1..={MAX_TERMINAL_TYPE}")
+            }
+            Error::NameByte(b) => write!(f, "byte {b} in a terminal type name"),
+            Error::WindowSizeLength(n) => write!(f, "window size of {n} bytes, not 4"),
+            Error::DataTooLong(n) => {
+                write!(f, "subnegotiation data of {n} bytes, more than {MAX_SUBNEGOTIATION}")
+            }
+            Error::Incomplete => f.write_str("incomplete Telnet event"),
+            Error::Trailing => f.write_str("bytes after Telnet event"),
+            Error::TooLong => f.write_str("Telnet event exceeds its wire limit"),
+            Error::UnexpectedEvent => f.write_str("expected a Telnet subnegotiation"),
+            Error::Unwritable => f.write_str("value cannot be written without changing it"),
+            Error::Allocation => f.write_str("Telnet output allocation failed"),
         }
     }
 }
 
-impl std::error::Error for DecodeError {}
+impl std::error::Error for Error {}
 
 /// A subnegotiation this module reads and writes.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -355,70 +402,27 @@ pub enum Subnegotiation {
     },
 }
 
-/// Why a subnegotiation's data is not what its option calls for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SubnegotiationError {
-    /// A terminal type subnegotiation with no data.
-    Empty,
-    /// A terminal type code other than IS (0) or SEND (1).
-    UnknownCode(u8),
-    /// SEND followed by more bytes.
-    TrailingBytes,
-    /// A terminal type name that is empty or longer than
-    /// [`MAX_TERMINAL_TYPE`].
-    NameLength(usize),
-    /// A terminal type name with a byte that is not printable ASCII or a
-    /// space.
-    NameByte(u8),
-    /// A window size whose data is not exactly 4 bytes long.
-    WindowSizeLength(usize),
-    /// Data for another option longer than [`MAX_SUBNEGOTIATION`] bytes,
-    /// which [`Events`] never returns and the writer could not send
-    /// whole.
-    TooLong(usize),
-}
-
-impl std::fmt::Display for SubnegotiationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SubnegotiationError::Empty => f.write_str("terminal type subnegotiation with no data"),
-            SubnegotiationError::UnknownCode(c) => write!(f, "terminal type code {c}, not IS or SEND"),
-            SubnegotiationError::TrailingBytes => f.write_str("bytes after terminal type SEND"),
-            SubnegotiationError::NameLength(n) => {
-                write!(f, "terminal type name of {n} bytes, outside 1..={MAX_TERMINAL_TYPE}")
-            }
-            SubnegotiationError::NameByte(b) => write!(f, "byte {b} in a terminal type name"),
-            SubnegotiationError::WindowSizeLength(n) => write!(f, "window size of {n} bytes, not 4"),
-            SubnegotiationError::TooLong(n) => {
-                write!(f, "subnegotiation data of {n} bytes, more than {MAX_SUBNEGOTIATION}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for SubnegotiationError {}
-
 impl Subnegotiation {
     /// Reads the data of a subnegotiation for `option`, as an
     /// [`Event::Subnegotiation`] carries it.
-    pub fn parse_data(option: u8, data: &[u8]) -> Result<Subnegotiation, SubnegotiationError> {
+    pub fn parse_data(option: u8, data: &[u8]) -> Result<Subnegotiation, Error> {
         match option {
             option::TERMINAL_TYPE => {
-                let (&code, rest) = data.split_first().ok_or(SubnegotiationError::Empty)?;
+                let (&code, rest) = data.split_first().ok_or(Error::Empty)?;
                 match code {
                     terminal_type::SEND if rest.is_empty() => Ok(Subnegotiation::TerminalTypeSend),
-                    terminal_type::SEND => Err(SubnegotiationError::TrailingBytes),
+                    terminal_type::SEND => Err(Error::TrailingAfterSend),
                     terminal_type::IS => {
                         if rest.is_empty() || rest.len() > MAX_TERMINAL_TYPE {
-                            return Err(SubnegotiationError::NameLength(rest.len()));
+                            return Err(Error::NameLength(rest.len()));
                         }
                         if let Some(&b) = rest.iter().find(|b| !is_name_byte(b)) {
-                            return Err(SubnegotiationError::NameByte(b));
+                            return Err(Error::NameByte(b));
                         }
                         // Every byte is ASCII, so this is one char per byte.
                         Ok(Subnegotiation::TerminalTypeIs(rest.iter().map(|&b| char::from(b)).collect()))
                     }
-                    c => Err(SubnegotiationError::UnknownCode(c)),
+                    c => Err(Error::UnknownCode(c)),
                 }
             }
             option::NAWS => match *data {
@@ -426,9 +430,9 @@ impl Subnegotiation {
                     width: u16::from_be_bytes([w0, w1]),
                     height: u16::from_be_bytes([h0, h1]),
                 }),
-                _ => Err(SubnegotiationError::WindowSizeLength(data.len())),
+                _ => Err(Error::WindowSizeLength(data.len())),
             },
-            _ if data.len() > MAX_SUBNEGOTIATION => Err(SubnegotiationError::TooLong(data.len())),
+            _ if data.len() > MAX_SUBNEGOTIATION => Err(Error::DataTooLong(data.len())),
             _ => Ok(Subnegotiation::Other { option, data: data.to_vec() }),
         }
     }
@@ -469,12 +473,12 @@ pub const MAX_EVENT_WIRE: usize = 2 * MAX_SUBNEGOTIATION + 5;
 ///
 /// Recoverable failures are [`Event::Error`] items. An oversized subnegotiation
 /// is discarded through IAC SE and reported as
-/// [`DecodeError::SubnegotiationTooLong`]. An interrupting command yields
-/// [`DecodeError::SubnegotiationInterrupted`] first, then the command on
+/// [`Error::SubnegotiationTooLong`]. An interrupting command yields
+/// [`Error::SubnegotiationInterrupted`] first, then the command on
 /// the next call. Discarding holds only an option code, with no byte buffer.
 /// Partial commands and subnegotiations return [`Step::Need`] at EOF for
 /// [`codec::Fail::Truncated`]. EOF during an oversized discarded unit is
-/// terminal [`DecodeError::Truncated`], since its prefix was consumed.
+/// terminal [`Error::Truncated`], since its prefix was consumed.
 ///
 /// Change binary mode only between items. The session owns negotiation:
 ///
@@ -599,7 +603,7 @@ impl Events {
                     let end = self.scanned;
                     self.reset_scan();
                     if next != cmd::SE {
-                        return Step::Item(Event::Error(DecodeError::SubnegotiationInterrupted { option }), end);
+                        return Step::Item(Event::Error(Error::SubnegotiationInterrupted { option }), end);
                     }
                     let raw = input.get(3..end).unwrap_or_default();
                     let mut data = Vec::new();
@@ -622,7 +626,7 @@ impl Events {
         }
     }
 
-    fn discard(&mut self, input: &[u8], eof: bool, option: u8) -> Result<Step<Event>, DecodeError> {
+    fn discard(&mut self, input: &[u8], eof: bool, option: u8) -> Result<Step<Event>, Error> {
         let mut at = 0usize;
         while let Some(&byte) = input.get(at) {
             if byte == IAC {
@@ -630,9 +634,9 @@ impl Events {
                 if next != IAC {
                     self.dropping = None;
                     return Ok(if next == cmd::SE {
-                        Step::Item(Event::Error(DecodeError::SubnegotiationTooLong { option }), at.saturating_add(2))
+                        Step::Item(Event::Error(Error::SubnegotiationTooLong { option }), at.saturating_add(2))
                     } else {
-                        Step::Item(Event::Error(DecodeError::SubnegotiationInterrupted { option }), at)
+                        Step::Item(Event::Error(Error::SubnegotiationInterrupted { option }), at)
                     });
                 }
             }
@@ -641,7 +645,7 @@ impl Events {
         if at > 0 {
             Ok(Step::Skip(at))
         } else if eof {
-            Err(DecodeError::Truncated)
+            Err(Error::Truncated)
         } else {
             Ok(Step::Need)
         }
@@ -665,14 +669,14 @@ fn data_byte(input: &[u8], at: usize, binary: bool, eof: bool) -> Option<(u8, us
 
 impl codec::Decode for Events {
     type Item = Event;
-    type Error = DecodeError;
+    type Error = Error;
     const NAME: &'static str = "Telnet";
 
     fn capacity(&self) -> usize {
         MAX_EVENT_WIRE.max(2 * self.data_limit)
     }
 
-    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Event>, DecodeError> {
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Event>, Error> {
         if let Some(option) = self.dropping {
             return self.discard(input, eof, option);
         }
@@ -698,94 +702,31 @@ impl codec::Decode for Events {
         let event = if let Some(command) = Command::from_byte(command) {
             Event::Command(command)
         } else if command == cmd::SE {
-            Event::Error(DecodeError::StraySubnegotiationEnd)
+            Event::Error(Error::StraySubnegotiationEnd)
         } else {
-            Event::Error(DecodeError::UnknownCommand(command))
+            Event::Error(Error::UnknownCommand(command))
         };
         Ok(Step::Item(event, 2))
     }
 }
 
-/// Why a byte slice is not exactly one event or typed subnegotiation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EventParseError {
-    /// A malformed event was found.
-    Decode(DecodeError),
-    /// The slice has no complete event.
-    Truncated,
-    /// The slice contains bytes after the first event.
-    Trailing,
-    /// The input exceeds [`MAX_DATA`], [`MAX_SUBNEGOTIATION`], or [`MAX_EVENT_WIRE`].
-    TooLong,
-    /// An event of another kind was read where a typed subnegotiation was required.
-    UnexpectedEvent,
-    /// A typed subnegotiation has invalid data.
-    Subnegotiation(SubnegotiationError),
-}
-
-impl core::fmt::Display for EventParseError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Decode(e) => e.fmt(f),
-            Self::Truncated => f.write_str("incomplete Telnet event"),
-            Self::Trailing => f.write_str("bytes after Telnet event"),
-            Self::TooLong => f.write_str("Telnet event exceeds its wire limit"),
-            Self::UnexpectedEvent => f.write_str("expected a Telnet subnegotiation"),
-            Self::Subnegotiation(e) => e.fmt(f),
-        }
-    }
-}
-
-impl core::error::Error for EventParseError {
-    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
-        match self {
-            Self::Decode(e) => Some(e),
-            Self::Subnegotiation(e) => Some(e),
-            _ => None,
-        }
-    }
-}
-
-/// Why a Telnet value cannot be written.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WriteError {
-    /// The value cannot be written without changing it.
-    Unwritable,
-    /// The output could not be allocated.
-    Allocation,
-}
-
-impl core::fmt::Display for WriteError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(match self {
-            Self::Unwritable => "value cannot be written without changing it",
-            Self::Allocation => "Telnet output allocation failed",
-        })
-    }
-}
-
-impl core::error::Error for WriteError {}
-
 impl Event {
-    fn parse_with(bytes: &[u8], binary: bool) -> Result<Self, EventParseError> {
+    fn parse_with(bytes: &[u8], binary: bool) -> Result<Self, Error> {
         if bytes.len() > MAX_EVENT_WIRE {
-            return Err(EventParseError::TooLong);
+            return Err(Error::TooLong);
         }
         let mut decoder = Events::with_limit(MAX_DATA);
         decoder.set_binary(binary);
-        match decoder
-            .decode(bytes, true)
-            .map_err(EventParseError::Decode)?
-        {
-            Step::Item(Event::Error(e), _) => Err(EventParseError::Decode(e)),
+        match decoder.decode(bytes, true)? {
+            Step::Item(Event::Error(e), _) => Err(e),
             Step::Item(event, used) if used == bytes.len() => Ok(event),
-            Step::Item(_, _) => Err(EventParseError::Trailing),
-            Step::Skip(_) => Err(EventParseError::TooLong),
-            _ => Err(EventParseError::Truncated),
+            Step::Item(_, _) => Err(Error::Trailing),
+            Step::Skip(_) => Err(Error::TooLong),
+            _ => Err(Error::Incomplete),
         }
     }
 
-    fn write_with(&self, out: &mut Vec<u8>, binary: bool) -> Result<(), WriteError> {
+    fn write_with(&self, out: &mut Vec<u8>, binary: bool) -> Result<(), Error> {
         let limit = match self {
             Self::Data(data) if !data.is_empty() && data.len() <= MAX_DATA => data.len().checked_mul(2),
             Self::Command(_) => Some(2),
@@ -793,10 +734,10 @@ impl Event {
             Self::Subnegotiation { data, .. } if data.len() <= MAX_SUBNEGOTIATION => {
                 data.len().checked_mul(2).and_then(|n| n.checked_add(5))
             }
-            _ => return Err(WriteError::Unwritable),
+            _ => return Err(Error::Unwritable),
         }
-        .ok_or(WriteError::Unwritable)?;
-        out.try_reserve(limit).map_err(|_| WriteError::Allocation)?;
+        .ok_or(Error::Unwritable)?;
+        out.try_reserve(limit).map_err(|_| Error::Allocation)?;
         match self {
             Self::Data(data) => {
                 for (i, &byte) in data.iter().enumerate() {
@@ -820,28 +761,28 @@ impl Event {
                 }
                 out.extend_from_slice(&[IAC, cmd::SE]);
             }
-            Self::Error(_) => return Err(WriteError::Unwritable),
+            Self::Error(_) => return Err(Error::Unwritable),
         }
         Ok(())
     }
 }
 
 impl Wire for Event {
-    type ParseError = EventParseError;
-    type WriteError = WriteError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads exactly one NVT event. Refuses diagnostics, partial units,
     /// trailing bytes, and values over [`MAX_DATA`] or [`MAX_SUBNEGOTIATION`].
     /// Input is bounded by [`MAX_EVENT_WIRE`]; use [`Events`] for longer streams.
     /// IAC escapes are undone. CR NUL becomes CR; CR LF stays unchanged.
-    fn parse(bytes: &[u8]) -> Result<Self, EventParseError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         Self::parse_with(bytes, false)
     }
 
     /// Writes one NVT event. Doubles IAC and follows a bare CR with NUL.
     /// Refuses empty data, diagnostics, and oversized payloads. Leaves
     /// `out` unchanged on refusal or allocation failure.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         self.write_with(out, false)
     }
 }
@@ -855,19 +796,19 @@ pub struct BinaryEvent(
 );
 
 impl Wire for BinaryEvent {
-    type ParseError = EventParseError;
-    type WriteError = WriteError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads one binary event. Refuses diagnostics, partial units, trailing
     /// bytes, and values over [`MAX_DATA`] or [`MAX_SUBNEGOTIATION`].
     /// Input is bounded by [`MAX_EVENT_WIRE`]; use [`Events`] for longer streams.
-    fn parse(bytes: &[u8]) -> Result<Self, EventParseError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         Event::parse_with(bytes, true).map(Self)
     }
 
     /// Writes a binary event with doubled IAC bytes. Refuses empty data,
     /// diagnostics, and oversized payloads without changing `out`.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         self.0.write_with(out, true)
     }
 }
@@ -875,12 +816,12 @@ impl Wire for BinaryEvent {
 impl Subnegotiation {
     /// Builds the event carrying this typed value. Refuses invalid names,
     /// known options in `Other`, and data over [`MAX_SUBNEGOTIATION`].
-    pub fn to_event(&self) -> Result<Event, WriteError> {
+    pub fn to_event(&self) -> Result<Event, Error> {
         let data = match self {
             Self::TerminalTypeSend => vec![terminal_type::SEND],
             Self::TerminalTypeIs(name) => {
                 if name.is_empty() || name.len() > MAX_TERMINAL_TYPE || !name.as_bytes().iter().all(is_name_byte) {
-                    return Err(WriteError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 let mut data = vec![terminal_type::IS];
                 data.extend_from_slice(name.as_bytes());
@@ -893,7 +834,7 @@ impl Subnegotiation {
             }
             Self::Other { option, data } => {
                 if matches!(*option, option::TERMINAL_TYPE | option::NAWS) || data.len() > MAX_SUBNEGOTIATION {
-                    return Err(WriteError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 data.clone()
             }
@@ -906,25 +847,25 @@ impl Subnegotiation {
 }
 
 impl Wire for Subnegotiation {
-    type ParseError = EventParseError;
-    type WriteError = WriteError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads one complete IAC SB ... IAC SE unit. Refuses other event kinds,
     /// trailing or partial units, invalid terminal names, wrong window size
     /// lengths, and oversized payloads.
-    fn parse(bytes: &[u8]) -> Result<Self, EventParseError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         match Event::parse(bytes)? {
             Event::Subnegotiation { option, data } => {
-                Self::parse_data(option, &data).map_err(EventParseError::Subnegotiation)
+                Self::parse_data(option, &data)
             }
-            _ => Err(EventParseError::UnexpectedEvent),
+            _ => Err(Error::UnexpectedEvent),
         }
     }
 
     /// Writes the typed value without changing it. Refuses known options
     /// in `Other`, invalid names, and oversized payloads. Leaves `out`
     /// unchanged on error. Temporary storage is at most [`MAX_SUBNEGOTIATION`].
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         self.to_event()?.write(out)
     }
 }
@@ -1269,7 +1210,7 @@ mod tests {
         for c in [Command::EndOfFile, Command::Suspend, Command::Abort] {
             assert_eq!(Command::from_byte(c.byte()), Some(c));
         }
-        assert_eq!(decode(&[255, 235]), [Event::Error(DecodeError::UnknownCommand(235))]);
+        assert_eq!(decode(&[255, 235]), [Event::Error(Error::UnknownCommand(235))]);
     }
 
     // A CR read outside binary mode drops its NUL, even if binary mode is
@@ -1307,7 +1248,7 @@ mod tests {
         ] {
             let sub = Subnegotiation::Other { option, data: data.to_vec() };
             let mut out = vec![7];
-            assert_eq!(sub.write(&mut out), Err(WriteError::Unwritable));
+            assert_eq!(sub.write(&mut out), Err(Error::Unwritable));
             assert_eq!(out, [7]);
             contract::check_wire_value(&sub);
         }
@@ -1391,11 +1332,11 @@ mod tests {
 
     #[test]
     fn subnegotiation_parse_errors() {
-        use SubnegotiationError::*;
+        use Error::*;
         let tt = option::TERMINAL_TYPE;
         assert_eq!(Subnegotiation::parse_data(tt, &[]), Err(Empty));
         assert_eq!(Subnegotiation::parse_data(tt, &[2]), Err(UnknownCode(2)));
-        assert_eq!(Subnegotiation::parse_data(tt, &[1, 0]), Err(TrailingBytes));
+        assert_eq!(Subnegotiation::parse_data(tt, &[1, 0]), Err(TrailingAfterSend));
         assert_eq!(Subnegotiation::parse_data(tt, &[0]), Err(NameLength(0)));
         assert_eq!(
             Subnegotiation::parse_data(tt, &[b'A'; 42][..]).map(|_| ()),
@@ -1419,7 +1360,7 @@ mod tests {
             Subnegotiation::parse_data(option::LINEMODE, &[1, 2]),
             Ok(Subnegotiation::Other { option: option::LINEMODE, data: vec![1, 2] })
         );
-        for e in [Empty, UnknownCode(2), TrailingBytes, NameLength(0), NameByte(1), WindowSizeLength(3), TooLong(1025)]
+        for e in [Empty, UnknownCode(2), TrailingAfterSend, NameLength(0), NameByte(1), WindowSizeLength(3), DataTooLong(1025)]
         {
             assert!(!e.to_string().is_empty());
         }
@@ -1430,21 +1371,21 @@ mod tests {
         for name in ["xterm\t256color", "", "é", &"A".repeat(100)] {
             let sub = Subnegotiation::TerminalTypeIs(name.into());
             contract::check_wire_value(&sub);
-            assert_eq!(sub.to_bytes(), Err(WriteError::Unwritable));
+            assert_eq!(sub.to_bytes(), Err(Error::Unwritable));
         }
         let sub = Subnegotiation::TerminalTypeIs("MTTS 137".into());
         assert_eq!(Subnegotiation::parse(&sub.to_bytes().unwrap()), Ok(sub));
         let sub = Subnegotiation::Other { option: 99, data: vec![IAC; 5000] };
-        assert_eq!(sub.to_bytes(), Err(WriteError::Unwritable));
+        assert_eq!(sub.to_bytes(), Err(Error::Unwritable));
         assert_eq!(
-            Event::Error(DecodeError::Truncated).to_bytes(),
-            Err(WriteError::Unwritable)
+            Event::Error(Error::Truncated).to_bytes(),
+            Err(Error::Unwritable)
         );
     }
 
     #[test]
     fn decode_errors() {
-        use DecodeError::*;
+        use Error::*;
         assert_eq!(decode(&[b'a', 255, 7, b'b']), [data(b"a"), Event::Error(UnknownCommand(7)), data(b"b")]);
         assert_eq!(decode(&[255, 240]), [Event::Error(StraySubnegotiationEnd)]);
         // Too long: dropped, and the stream goes on.
@@ -1813,9 +1754,9 @@ mod tests {
         let len = MAX_SUBNEGOTIATION + 1;
         assert_eq!(
             Subnegotiation::parse_data(99, &vec![7; len]),
-            Err(SubnegotiationError::TooLong(len))
+            Err(Error::DataTooLong(len))
         );
-        assert!(!SubnegotiationError::TooLong(len).to_string().is_empty());
+        assert!(!Error::DataTooLong(len).to_string().is_empty());
     }
 
     /// Two peers that each ask for options and answer the other, with the

@@ -133,7 +133,8 @@ pub const DEFAULT_MAX_EXECUTIONS: usize = 100_000;
 /// The most executions an [`Exchange`] may be configured to remember.
 pub const MAX_EXECUTIONS: usize = 1 << 24;
 
-/// Why bytes, a value or an operation were refused.
+/// Why bytes, a value or an operation were refused. An [`Exchange`] that
+/// refuses an operation is unchanged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     /// The message does not start with `BA BA`.
@@ -174,6 +175,19 @@ pub enum Error {
     Time,
     /// A sequence number that ran out, or one a replay may not carry.
     Sequence,
+    /// An [`Exchange`] configuration value outside its named limits, a
+    /// return table it cannot fill, or matching unit 0.
+    ExchangeConfig,
+    /// No live order, or no pending New Order, has this ClOrdID.
+    UnknownOrder(ClOrdId),
+    /// An execute or restatement of zero shares, or more than are open.
+    Shares,
+    /// No remembered execution has this ExecID.
+    UnknownExecution(u64),
+    /// OrderIDs or ExecIDs ran out.
+    Exhausted,
+    /// Exchange text too long or not printable.
+    Text,
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -194,6 +208,12 @@ impl fmt::Display for Error {
             Error::State => f.write_str("BOE operation not allowed now"),
             Error::Time => f.write_str("BOE time went backwards"),
             Error::Sequence => f.write_str("BOE sequence number is invalid"),
+            Error::ExchangeConfig => f.write_str("BOE exchange configuration is out of range"),
+            Error::UnknownOrder(c) => write!(f, "no BOE order {c:?}"),
+            Error::Shares => f.write_str("BOE share count is invalid"),
+            Error::UnknownExecution(e) => write!(f, "no BOE execution {e}"),
+            Error::Exhausted => f.write_str("BOE numbering is exhausted"),
+            Error::Text => f.write_str("BOE text is invalid"),
         }
     }
 }
@@ -1784,12 +1804,12 @@ pub mod codes {
 /// read from the first four bytes.
 ///
 /// ```
-/// use fictionet::stdlib::cboe_boe::{ClientHeartbeat, Frames, Inbound};
+/// use fictionet::stdlib::cboe_boe::{ClientHeartbeat, Inbound, Messages};
 /// use fictionet::stdlib::codec::{finish, pump, Stream, Wire};
 ///
 /// let bytes = ClientHeartbeat::default().to_bytes()?;
 /// assert_eq!(bytes, [0xBA, 0xBA, 8, 0, 3, 0, 0, 0, 0, 0]);
-/// let mut stream = Stream::new(Frames::<Inbound>::default());
+/// let mut stream = Stream::new(Messages::<Inbound>::default());
 /// let mut items = Vec::new();
 /// pump(&mut stream, &bytes[..3], |m| items.push(m))?;
 /// pump(&mut stream, &bytes[3..], |m| items.push(m))?;
@@ -1797,24 +1817,24 @@ pub mod codes {
 /// assert_eq!(items, [Ok(Inbound::ClientHeartbeat(ClientHeartbeat::default()))]);
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-pub struct Frames<M> {
+pub struct Messages<M> {
     limit: usize,
     message: PhantomData<fn() -> M>,
 }
-impl<M> Clone for Frames<M> {
+impl<M> Clone for Messages<M> {
     fn clone(&self) -> Self {
         *self
     }
 }
-impl<M> Copy for Frames<M> {}
-impl<M> fmt::Debug for Frames<M> {
+impl<M> Copy for Messages<M> {}
+impl<M> fmt::Debug for Messages<M> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Frames")
+        f.debug_struct("Messages")
             .field("limit", &self.limit)
             .finish()
     }
 }
-impl<M> Frames<M> {
+impl<M> Messages<M> {
     /// A framer that accepts messages up to `limit` bytes, from
     /// [`HEADER_LENGTH`] to [`MAX_MESSAGE`].
     pub fn with_limit(limit: usize) -> Self {
@@ -1828,12 +1848,12 @@ impl<M> Frames<M> {
         self.limit
     }
 }
-impl<M> Default for Frames<M> {
+impl<M> Default for Messages<M> {
     fn default() -> Self {
         Self::with_limit(MAX_MESSAGE)
     }
 }
-impl<M: Wire<ParseError = Error>> Decode for Frames<M> {
+impl<M: Wire<ParseError = Error>> Decode for Messages<M> {
     type Item = Result<M, Error>;
     type Error = Error;
     const NAME: &'static str = "BOE";
@@ -2162,7 +2182,7 @@ impl Client {
         self.clock.advance(now_ms)?;
         Ok(self.receive_inner(message))
     }
-    /// [`receive`](Self::receive) for a [`Frames`] item. A message that did
+    /// [`receive`](Self::receive) for a [`Messages`] item. A message that did
     /// not parse closes the session with [`CloseReason::Protocol`].
     pub fn receive_frame(
         &mut self,
@@ -2413,7 +2433,7 @@ impl Server {
             }
         })
     }
-    /// [`receive`](Self::receive) for a [`Frames`] item. A message that did
+    /// [`receive`](Self::receive) for a [`Messages`] item. A message that did
     /// not parse is a protocol violation.
     pub fn receive_frame(
         &mut self,
@@ -2789,36 +2809,6 @@ impl Default for ExchangeConfig {
     }
 }
 
-/// Why an [`Exchange`] refused an operation. The exchange is unchanged.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ExchangeError {
-    /// A configuration value outside its named limits.
-    Config,
-    /// No live order, or no pending New Order, has this ClOrdID.
-    UnknownOrder(ClOrdId),
-    /// An execute or restatement of zero shares, or more than are open.
-    Shares,
-    /// No remembered execution has this ExecID.
-    UnknownExecution(u64),
-    /// OrderIDs or ExecIDs ran out.
-    Exhausted,
-    /// Text too long or not printable.
-    Text,
-}
-impl fmt::Display for ExchangeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ExchangeError::Config => f.write_str("BOE exchange configuration is out of range"),
-            ExchangeError::UnknownOrder(c) => write!(f, "no BOE order {c:?}"),
-            ExchangeError::Shares => f.write_str("BOE share count is invalid"),
-            ExchangeError::UnknownExecution(e) => write!(f, "no BOE execution {e}"),
-            ExchangeError::Exhausted => f.write_str("BOE numbering is exhausted"),
-            ExchangeError::Text => f.write_str("BOE text is invalid"),
-        }
-    }
-}
-impl std::error::Error for ExchangeError {}
-
 /// An order an [`Exchange`] tracks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Order {
@@ -2946,14 +2936,14 @@ impl Exchange {
     pub fn new(
         config: ExchangeConfig,
         returns: BTreeMap<u8, Vec<u8>>,
-    ) -> Result<Self, ExchangeError> {
+    ) -> Result<Self, Error> {
         if !(1..=MAX_ORDERS).contains(&config.max_orders)
             || !(1..=MAX_EXECUTIONS).contains(&config.max_executions)
             || returns
                 .values()
                 .any(|b| Optional::<ReturnTable>::requested(b).is_err())
         {
-            return Err(ExchangeError::Config);
+            return Err(Error::ExchangeConfig);
         }
         Ok(Self {
             config,
@@ -3095,17 +3085,17 @@ impl Exchange {
         cl_ord_id: ClOrdId,
         unit: u8,
         now: u64,
-    ) -> Result<Outbound, ExchangeError> {
+    ) -> Result<Outbound, Error> {
         let order_id = self.next_order_id;
-        let next = order_id.checked_add(1).ok_or(ExchangeError::Exhausted)?;
+        let next = order_id.checked_add(1).ok_or(Error::Exhausted)?;
         if unit == 0 {
-            return Err(ExchangeError::Config);
+            return Err(Error::ExchangeConfig);
         }
         let order = self
             .orders
             .get_mut(&cl_ord_id)
             .filter(|o| !o.live)
-            .ok_or(ExchangeError::UnknownOrder(cl_ord_id))?;
+            .ok_or(Error::UnknownOrder(cl_ord_id))?;
         order.live = true;
         order.order_id = order_id;
         order.unit = unit;
@@ -3113,7 +3103,7 @@ impl Exchange {
         let order = self
             .orders
             .get(&cl_ord_id)
-            .ok_or(ExchangeError::UnknownOrder(cl_ord_id))?;
+            .ok_or(Error::UnknownOrder(cl_ord_id))?;
         Ok(OrderAcknowledgment {
             header: Header { unit, sequence: 0 },
             transaction_time: now,
@@ -3137,13 +3127,13 @@ impl Exchange {
         reason: u8,
         text: &str,
         now: u64,
-    ) -> Result<Outbound, ExchangeError> {
-        let text = Text::new(text).map_err(|_| ExchangeError::Text)?;
+    ) -> Result<Outbound, Error> {
+        let text = Text::new(text).map_err(|_| Error::Text)?;
         let order = self
             .orders
             .get(&cl_ord_id)
             .filter(|o| !o.live)
-            .ok_or(ExchangeError::UnknownOrder(cl_ord_id))?;
+            .ok_or(Error::UnknownOrder(cl_ord_id))?;
         let reply = OrderRejected {
             header: Header::default(),
             transaction_time: now,
@@ -3163,11 +3153,11 @@ impl Exchange {
         Ok(reply.into())
     }
 
-    fn live(&self, cl_ord_id: ClOrdId) -> Result<&Order, ExchangeError> {
+    fn live(&self, cl_ord_id: ClOrdId) -> Result<&Order, Error> {
         self.orders
             .get(&cl_ord_id)
             .filter(|o| o.live)
-            .ok_or(ExchangeError::UnknownOrder(cl_ord_id))
+            .ok_or(Error::UnknownOrder(cl_ord_id))
     }
     fn cancelled(&self, order: &Order, reason: u8, now: u64) -> Outbound {
         OrderCancelled {
@@ -3203,13 +3193,13 @@ impl Exchange {
         price: Price,
         liquidity: u8,
         now: u64,
-    ) -> Result<Outbound, ExchangeError> {
+    ) -> Result<Outbound, Error> {
         let order = self.live(cl_ord_id)?;
         if shares == 0 || shares > order.leaves_qty {
-            return Err(ExchangeError::Shares);
+            return Err(Error::Shares);
         }
         let exec_id = self.next_exec_id;
-        let next = exec_id.checked_add(1).ok_or(ExchangeError::Exhausted)?;
+        let next = exec_id.checked_add(1).ok_or(Error::Exhausted)?;
         let after = Order {
             leaves_qty: order.leaves_qty - shares,
             cum_qty: order.cum_qty.saturating_add(shares),
@@ -3277,7 +3267,7 @@ impl Exchange {
         cl_ord_id: ClOrdId,
         reason: u8,
         now: u64,
-    ) -> Result<Outbound, ExchangeError> {
+    ) -> Result<Outbound, Error> {
         let order = self.live(cl_ord_id)?;
         let reply = self.cancelled(order, reason, now);
         self.orders.remove(&cl_ord_id);
@@ -3291,10 +3281,10 @@ impl Exchange {
         leaves_qty: u32,
         reason: u8,
         now: u64,
-    ) -> Result<Outbound, ExchangeError> {
+    ) -> Result<Outbound, Error> {
         let order = self.live(cl_ord_id)?;
         if leaves_qty > order.order_qty.saturating_sub(order.cum_qty) {
-            return Err(ExchangeError::Shares);
+            return Err(Error::Shares);
         }
         let after = Order {
             leaves_qty,
@@ -3333,11 +3323,11 @@ impl Exchange {
         exec_id: u64,
         corrected: Price,
         now: u64,
-    ) -> Result<Outbound, ExchangeError> {
+    ) -> Result<Outbound, Error> {
         let e = self
             .executions
             .remove(&exec_id)
-            .ok_or(ExchangeError::UnknownExecution(exec_id))?;
+            .ok_or(Error::UnknownExecution(exec_id))?;
         let order = self.orders.get(&e.cl_ord_id);
         Ok(TradeCancelOrCorrect {
             header: Header {
@@ -4310,20 +4300,20 @@ mod tests {
         MassCancelAcknowledgment::default()
             .write(&mut bytes)
             .unwrap();
-        check_decode(Frames::<Outbound>::default, &bytes);
-        check_decode(|| Frames::<Outbound>::with_limit(12), &bytes);
-        check_decode_with_alloc_limit(Frames::<Outbound>::default, &bytes, 2 * MAX_MESSAGE);
-        let (items, failure) = decode_all(Frames::<Outbound>::default, &bytes);
+        check_decode(Messages::<Outbound>::default, &bytes);
+        check_decode(|| Messages::<Outbound>::with_limit(12), &bytes);
+        check_decode_with_alloc_limit(Messages::<Outbound>::default, &bytes, 2 * MAX_MESSAGE);
+        let (items, failure) = decode_all(Messages::<Outbound>::default, &bytes);
         assert!(failure.is_none());
         assert_eq!(items.len(), 5);
         assert_eq!(items[2], Err(Error::Type(0x99)));
-        let (_, failure) = decode_all(Frames::<Outbound>::default, &[0xBA, 0xBB, 8, 0]);
+        let (_, failure) = decode_all(Messages::<Outbound>::default, &[0xBA, 0xBB, 8, 0]);
         assert_eq!(failure, Some(Fail::Protocol(Error::Start)));
-        let (_, failure) = decode_all(Frames::<Outbound>::default, &[0x00]);
+        let (_, failure) = decode_all(Messages::<Outbound>::default, &[0x00]);
         assert_eq!(failure, Some(Fail::Protocol(Error::Start)));
-        let (_, failure) = decode_all(Frames::<Outbound>::default, &[0xBA, 0xBA, 7, 0]);
+        let (_, failure) = decode_all(Messages::<Outbound>::default, &[0xBA, 0xBA, 7, 0]);
         assert_eq!(failure, Some(Fail::Protocol(Error::Length)));
-        let (_, failure) = decode_all(|| Frames::<Outbound>::with_limit(11), &bytes);
+        let (_, failure) = decode_all(|| Messages::<Outbound>::with_limit(11), &bytes);
         assert_eq!(failure, Some(Fail::Protocol(Error::TooLong)));
     }
 
@@ -4765,7 +4755,7 @@ mod tests {
             ]
         );
         check_wire_value(&Outbound::from(ack));
-        assert_eq!(x.accept(id, 2, 2), Err(ExchangeError::UnknownOrder(id)));
+        assert_eq!(x.accept(id, 2, 2), Err(Error::UnknownOrder(id)));
         // Fill 100: ClearingFirm, ClearingAccount, OrderQty, LeavesQty.
         let Outbound::OrderExecution(e) = x.execute(id, 100, Price(99_000), b'A', 3).unwrap()
         else {
@@ -4783,7 +4773,7 @@ mod tests {
         );
         assert_eq!(
             x.execute(id, 201, Price(1), b'A', 3),
-            Err(ExchangeError::Shares)
+            Err(Error::Shares)
         );
         // Modify to 250 shares: LeavesQty 200 + (250 - 300) = 150.
         let modify: Inbound = ModifyOrder {
@@ -4818,7 +4808,7 @@ mod tests {
         assert_eq!((t.last_shares, t.clearing_firm), (100, text("FIRM")));
         assert_eq!(
             x.bust(1, Price(0), 5),
-            Err(ExchangeError::UnknownExecution(1))
+            Err(Error::UnknownExecution(1))
         );
         // Restate, then cancel at the member's request.
         let Outbound::OrderRestated(r) = x.restate(text("A2"), 100, b'L', 6).unwrap() else {
@@ -4862,7 +4852,7 @@ mod tests {
         assert_eq!(x.executions.len(), 2);
         assert_eq!(
             x.bust(10, Price(0), 3),
-            Err(ExchangeError::UnknownExecution(10))
+            Err(Error::UnknownExecution(10))
         );
         let Outbound::TradeCancelOrCorrect(t) = x.bust(12, Price(0), 3).unwrap() else {
             panic!()
@@ -4870,7 +4860,7 @@ mod tests {
         assert_eq!(t.exec_ref_id, 12);
         assert_eq!(
             x.bust(12, Price(0), 3),
-            Err(ExchangeError::UnknownExecution(12))
+            Err(Error::UnknownExecution(12))
         );
         assert!(x.bust(11, Price(0), 3).is_ok());
         assert!(x.executions.is_empty());
@@ -5227,8 +5217,8 @@ mod tests {
             for _ in 0..=rng.below(4) {
                 mutate(&mut rng, &mut bytes);
             }
-            check_decode(Frames::<Inbound>::default, &bytes);
-            check_decode(Frames::<Outbound>::default, &bytes);
+            check_decode(Messages::<Inbound>::default, &bytes);
+            check_decode(Messages::<Outbound>::default, &bytes);
         }
     }
 

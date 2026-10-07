@@ -7,9 +7,9 @@ use fictionet::stdlib::{
         test_support::decode_all,
     },
     fix::{
-        Action, ExecutionReport, Frames, GroupLayout, MAX_ACTIONS, MAX_MESSAGE_SIZE,
+        Action, ExecutionReport, GroupLayout, MAX_ACTIONS, MAX_MESSAGE_SIZE,
         MarketDataIncrementalRefresh, MarketDataRequest, MarketDataSnapshotFullRefresh, Message,
-        NewOrderSingle, OrderCancelReplaceRequest, OrderCancelRequest, Role, Session,
+        Messages, NewOrderSingle, OrderCancelReplaceRequest, OrderCancelRequest, Role, Session,
         SessionConfig, Version,
     },
 };
@@ -54,8 +54,8 @@ fuzz_target!(|input: &[u8]| {
         .get(..input.len().min(MAX_FUZZ_INPUT))
         .unwrap_or_default();
     check_wire::<Message>(data);
-    check_decode_with_alloc_limit(Frames::default, data, 2 * MAX_MESSAGE_SIZE);
-    let (messages, _) = decode_all(Frames::default, data);
+    check_decode_with_alloc_limit(Messages::default, data, 2 * MAX_MESSAGE_SIZE);
+    let (messages, _) = decode_all(Messages::default, data);
     for frame in messages {
         let config = SessionConfig::new(Version::Fix44, Role::Acceptor, "LOCAL", "PEER").unwrap();
         let mut session = Session::new(config, 1, 1, 0).unwrap();
@@ -86,13 +86,13 @@ fuzz_target!(|input: &[u8]| {
         built.push_data(95, data).unwrap();
         check_wire_value(&built);
         let wire = built.to_bytes().unwrap();
-        check_decode_with_alloc_limit(Frames::default, &wire, 2 * MAX_MESSAGE_SIZE);
+        check_decode_with_alloc_limit(Messages::default, &wire, 2 * MAX_MESSAGE_SIZE);
         // A complete garbled frame must not hide the valid frame after it.
         let mut corrupt = wire.clone();
         let digit = corrupt.len() - 2;
         corrupt[digit] = if corrupt[digit] == b'0' { b'1' } else { b'0' };
         corrupt.extend_from_slice(&wire);
-        check_decode_with_alloc_limit(Frames::default, &corrupt, 2 * MAX_MESSAGE_SIZE);
+        check_decode_with_alloc_limit(Messages::default, &corrupt, 2 * MAX_MESSAGE_SIZE);
         // Fixed garbles test recovery without mistaking arbitrary binary
         // payload bytes for intentional nested frame starts during resync.
         for bad in [
@@ -102,8 +102,8 @@ fuzz_target!(|input: &[u8]| {
             b"x",
         ] {
             let bytes = [bad, wire.as_slice()].concat();
-            check_decode_with_alloc_limit(Frames::default, &bytes, 2 * MAX_MESSAGE_SIZE);
-            let mut stream = Stream::new(Frames::default());
+            check_decode_with_alloc_limit(Messages::default, &bytes, 2 * MAX_MESSAGE_SIZE);
+            let mut stream = Stream::new(Messages::default());
             assert_eq!(stream.push(&bytes), bytes.len());
             assert_eq!(stream.next(), Some(Ok(Ok(built.clone()))));
             stream.end();
@@ -125,8 +125,8 @@ fuzz_target!(|input: &[u8]| {
     let sum = bytes.iter().fold(0u8, |sum, b| sum.wrapping_add(*b));
     bytes.extend_from_slice(format!("10={sum:03}\x01").as_bytes());
     check_wire::<Message>(&bytes);
-    check_decode_with_alloc_limit(Frames::default, &bytes, 2 * MAX_MESSAGE_SIZE);
-    let (frames, failure) = decode_all(Frames::default, &bytes);
+    check_decode_with_alloc_limit(Messages::default, &bytes, 2 * MAX_MESSAGE_SIZE);
+    let (frames, failure) = decode_all(Messages::default, &bytes);
     assert!(failure.is_none());
     assert_eq!(frames.len(), 1);
     let config = SessionConfig::new(Version::Fix44, Role::Acceptor, "LOCAL", "PEER").unwrap();

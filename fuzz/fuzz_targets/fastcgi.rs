@@ -5,19 +5,19 @@
 
 use fictionet::stdlib::codec::{Decode, Wire, contract, test_support::decode_all};
 use fictionet::stdlib::fastcgi::{
-    BeginRequest, Client, ClientEvent, EndRequest, Frames, MAX_CONTENT, MAX_HELD, MAX_REQUESTS,
-    Record, Pairs, Request, Response, RecordStream, UnknownType, Server, ServerEvent, StreamError, kind,
+    BeginRequest, Client, ClientEvent, EndRequest, Error, MAX_CONTENT, MAX_HELD, MAX_REQUESTS,
+    Record, Records, Pairs, Request, Response, RecordStream, UnknownType, Server, ServerEvent, kind,
 };
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(Frames::new, data, 2 * Frames::new().capacity());
+    contract::check_decode_with_alloc_limit(Records::new, data, 2 * Records::new().capacity());
     contract::check_wire::<Record>(data);
     let limit = usize::from(data.first().copied().unwrap_or(0));
     contract::check_decode_with_alloc_limit(
-        || Frames::with_limit(limit), data, 2 * Frames::with_limit(limit).capacity(),
+        || Records::with_limit(limit), data, 2 * Records::with_limit(limit).capacity(),
     );
-    contract::check_decode_with_alloc_limit(|| Frames::new().map(|record| BeginRequest::parse(&record.content)), data, 2 * Frames::new().capacity());
+    contract::check_decode_with_alloc_limit(|| Records::new().map(|record| BeginRequest::parse(&record.content)), data, 2 * Records::new().capacity());
     let built = Record {
         kind: data.first().copied().unwrap_or(0),
         request_id: 1,
@@ -26,7 +26,7 @@ fuzz_target!(|data: &[u8]| {
     };
     contract::check_wire_value(&built);
 
-    let whole = decode_all(Frames::new, data).0;
+    let whole = decode_all(Records::new, data).0;
 
     let mut server = Server::new();
     let mut client = Client::new();
@@ -49,7 +49,7 @@ fuzz_target!(|data: &[u8]| {
         if let Ok(Some(ServerEvent::Request(req))) = event {
             let mut s = Server::new();
             let mut got = None;
-            for r in decode_all(Frames::new, &req.to_bytes().unwrap()).0 {
+            for r in decode_all(Records::new, &req.to_bytes().unwrap()).0 {
                 if let Some(ServerEvent::Request(back)) = s.receive(&r).unwrap() {
                     got = Some(back);
                 }
@@ -60,7 +60,7 @@ fuzz_target!(|data: &[u8]| {
         let failed_before = matches!(r.kind, kind::STDOUT | kind::STDERR) && client_failed.contains(&r.request_id);
         let got = client.receive(r);
         match &got {
-            Err(StreamError::AfterEnd { id, .. } | StreamError::TooLarge { id, .. }) => {
+            Err(Error::AfterEnd { id, .. } | Error::TooLarge { id, .. }) => {
                 client_failed.insert(*id);
             }
             Ok(Some(ClientEvent::Response(resp))) => assert!(!client_failed.contains(&resp.id)),
@@ -75,7 +75,7 @@ fuzz_target!(|data: &[u8]| {
         if let Ok(Some(ClientEvent::Response(resp))) = got {
             let mut c = Client::new();
             let mut got = None;
-            for r in decode_all(Frames::new, &resp.to_bytes().unwrap()).0 {
+            for r in decode_all(Records::new, &resp.to_bytes().unwrap()).0 {
                 got = c.receive(&r).unwrap();
             }
             assert_eq!(got, Some(ClientEvent::Response(resp)));
@@ -99,7 +99,7 @@ fuzz_target!(|data: &[u8]| {
     if let Ok(bytes) = stream.to_bytes() {
         let mut client = Client::new();
         let mut got = Vec::new();
-        for r in decode_all(Frames::new, &bytes).0 {
+        for r in decode_all(Records::new, &bytes).0 {
             assert!(r.content.len() <= MAX_CONTENT);
             assert_eq!(client.receive(&r), Ok(None));
             got = r.content;

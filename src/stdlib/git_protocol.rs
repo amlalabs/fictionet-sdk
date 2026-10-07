@@ -11,7 +11,7 @@
 //!
 //! A world that plays a Git server passes bytes from a
 //! [`tcp`](fictionet::stdlib::tcp) connection to
-//! [`Stream<Frames>`](fictionet::stdlib::codec::Stream), reads the client's [`ProtoRequest`],
+//! [`Stream<Packets>`](fictionet::stdlib::codec::Stream), reads the client's [`ProtoRequest`],
 //! and writes back an
 //! [`Advertisement`] (version 0 or 1) or a [`CapabilityAdvertisement`]
 //! (version 2). It then reads the client's [`V2Request`]s or
@@ -101,63 +101,6 @@ pub enum Packet {
     Data(Vec<u8>),
 }
 
-/// Why bytes are not a pkt-line. The stream holds no more packets a
-/// reader can find, and a real server closes it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PacketError {
-    /// The length was not four hex digits.
-    Header,
-    /// The length was `0003`, which no packet uses.
-    Reserved,
-    /// The length was above [`MAX_PACKET`].
-    TooLong(usize),
-    /// The value cannot be written without changing it.
-    Unwritable,
-}
-
-impl std::fmt::Display for PacketError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PacketError::Unwritable => f.write_str("value cannot be written without changing it"),
-            PacketError::Header => write!(f, "pkt-line length is not four hex digits"),
-            PacketError::Reserved => write!(f, "pkt-line length 0003 is reserved"),
-            PacketError::TooLong(n) => write!(f, "pkt-line length {n} is above {MAX_PACKET}"),
-        }
-    }
-}
-
-impl std::error::Error for PacketError {}
-
-/// Why an exact [`Wire`] parse did not read one complete packet.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PacketParseError {
-    /// The pkt-line header is invalid.
-    Frame(PacketError),
-    /// The input ended before a complete packet, including empty input.
-    Truncated,
-    /// Bytes follow the first complete packet.
-    Trailing,
-}
-
-impl core::fmt::Display for PacketParseError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Frame(e) => e.fmt(f),
-            Self::Truncated => f.write_str("input ended before a complete Git packet"),
-            Self::Trailing => f.write_str("bytes follow the Git packet"),
-        }
-    }
-}
-
-impl core::error::Error for PacketParseError {
-    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
-        match self {
-            Self::Frame(e) => Some(e),
-            Self::Truncated | Self::Trailing => None,
-        }
-    }
-}
-
 impl Packet {
     /// A data packet holding the complete line and a line feed.
     /// Writing refuses a line longer than [`MAX_LINE`].
@@ -177,26 +120,26 @@ impl Packet {
 }
 
 impl Wire for Packet {
-    type ParseError = PacketParseError;
-    type WriteError = PacketError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads exactly one pkt-line. Hex digits may be upper or lower case.
     /// Refuses invalid lengths, incomplete input, and trailing bytes.
-    fn parse(b: &[u8]) -> Result<Self, PacketParseError> {
-        match Pkt::parse(b).map_err(PacketParseError::Frame)? {
+    fn parse(b: &[u8]) -> Result<Self, Error> {
+        match Pkt::parse(b)? {
             Some((packet, used)) if used == b.len() => Ok(packet.to_packet()),
-            Some(_) => Err(PacketParseError::Trailing),
-            None => Err(PacketParseError::Truncated),
+            Some(_) => Err(Error::Trailing),
+            None => Err(Error::Truncated),
         }
     }
 
     /// Appends one pkt-line. Refuses data above [`MAX_DATA`]. Leaves `out`
     /// unchanged on error. Control packets keep their wire form.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), PacketError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         if let Self::Data(data) = self
             && data.len() > MAX_DATA
         {
-            return Err(PacketError::Unwritable);
+            return Err(Error::Unwritable);
         }
         match self {
             Packet::Flush => out.extend_from_slice(b"0000"),
@@ -223,27 +166,27 @@ impl Wire for Packet {
 /// may follow. Before reading another item, the world must hand off with
 /// [`Stream::into_parts`](fictionet::stdlib::codec::Stream::into_parts), or
 /// [`Stream::swap`](fictionet::stdlib::codec::Stream::swap) to a pack decoder. Both
-/// preserve unread bytes; [`Frames`] cannot parse raw PACK data.
+/// preserve unread bytes; [`Packets`] cannot parse raw PACK data.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct Frames;
+pub struct Packets;
 
-impl Frames {
-    /// Creates a frame decoder with no retained state.
+impl Packets {
+    /// Creates a packet decoder with no retained state.
     pub fn new() -> Self {
         Self
     }
 }
 
-impl Decode for Frames {
+impl Decode for Packets {
     type Item = Packet;
-    type Error = PacketError;
+    type Error = Error;
     const NAME: &'static str = "Git pkt-line";
 
     fn capacity(&self) -> usize {
         MAX_PACKET
     }
 
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Packet>, PacketError> {
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Packet>, Error> {
         Ok(match Pkt::parse(input)? {
             Some((packet, used)) => Step::Item(packet.to_packet(), used),
             None => Step::Need,
@@ -280,11 +223,11 @@ impl<'a> Pkt<'a> {
         }
     }
 
-    fn parse(b: &'a [u8]) -> Result<Option<(Pkt<'a>, usize)>, PacketError> {
+    fn parse(b: &'a [u8]) -> Result<Option<(Pkt<'a>, usize)>, Error> {
         let mut len = 0usize;
         // A bad digit is known before the rest of the header comes.
         for &c in b.iter().take(HEADER_LEN) {
-            len = len * 16 + usize::from(hex_digit(c).ok_or(PacketError::Header)?);
+            len = len * 16 + usize::from(hex_digit(c).ok_or(Error::Header)?);
         }
         if b.len() < HEADER_LEN {
             return Ok(None);
@@ -293,8 +236,8 @@ impl<'a> Pkt<'a> {
             0 => Pkt::Flush,
             1 => Pkt::Delim,
             2 => Pkt::ResponseEnd,
-            3 => return Err(PacketError::Reserved),
-            n if n > MAX_PACKET => return Err(PacketError::TooLong(n)),
+            3 => return Err(Error::Reserved),
+            n if n > MAX_PACKET => return Err(Error::PacketTooLong(n)),
             n => match b.get(HEADER_LEN..n) {
                 Some(data) => Pkt::Data(data),
                 None => return Ok(None),
@@ -304,17 +247,23 @@ impl<'a> Pkt<'a> {
     }
 }
 
-/// Why packets are not the message a reader expected.
+/// Why bytes are not pkt-lines, or packets are not the message a reader
+/// expected, or a value cannot be written.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ParseError {
-    /// The unit is incomplete.
+pub enum Error {
+    /// A pkt-line length was not four hex digits. The stream holds no more
+    /// packets a reader can find, and a real server closes it.
+    Header,
+    /// A pkt-line length was `0003`, which no packet uses.
+    Reserved,
+    /// A pkt-line length was above [`MAX_PACKET`].
+    PacketTooLong(usize),
+    /// The unit is incomplete, including empty input.
     Truncated,
     /// Bytes remain after the unit.
     Trailing,
     /// The value cannot be written without changing it.
     Unwritable,
-    /// The bytes were not pkt-lines.
-    Packet(PacketError),
     /// A line was not UTF-8, or held a NUL or line feed where none may be.
     Text,
     /// An object id was not 40 or 64 hex digits, or in an advertisement
@@ -332,30 +281,26 @@ pub enum ParseError {
     Remote(String),
 }
 
-impl std::fmt::Display for ParseError {
+impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ParseError::Truncated => f.write_str("incomplete Git protocol unit"),
-            ParseError::Trailing => f.write_str("bytes after Git protocol unit"),
-            ParseError::Unwritable => f.write_str("value cannot be written without changing it"),
-            ParseError::Packet(e) => write!(f, "{e}"),
-            ParseError::Text => write!(f, "a line is not UTF-8 text on one line"),
-            ParseError::ObjectId => write!(f, "an object id is not 40 or 64 hex digits"),
-            ParseError::Syntax(what) => write!(f, "expected {what}"),
-            ParseError::TooLong => write!(f, "a field or line is too long"),
-            ParseError::TooMany => write!(f, "a list is too long"),
-            ParseError::Remote(m) => write!(f, "the other side reported an error: {m}"),
+            Error::Header => write!(f, "pkt-line length is not four hex digits"),
+            Error::Reserved => write!(f, "pkt-line length 0003 is reserved"),
+            Error::PacketTooLong(n) => write!(f, "pkt-line length {n} is above {MAX_PACKET}"),
+            Error::Truncated => f.write_str("incomplete Git protocol unit"),
+            Error::Trailing => f.write_str("bytes after Git protocol unit"),
+            Error::Unwritable => f.write_str("value cannot be written without changing it"),
+            Error::Text => write!(f, "a line is not UTF-8 text on one line"),
+            Error::ObjectId => write!(f, "an object id is not 40 or 64 hex digits"),
+            Error::Syntax(what) => write!(f, "expected {what}"),
+            Error::TooLong => write!(f, "a field or line is too long"),
+            Error::TooMany => write!(f, "a list is too long"),
+            Error::Remote(m) => write!(f, "the other side reported an error: {m}"),
         }
     }
 }
 
-impl std::error::Error for ParseError {}
-
-impl From<PacketError> for ParseError {
-    fn from(e: PacketError) -> ParseError {
-        ParseError::Packet(e)
-    }
-}
+impl std::error::Error for Error {}
 
 /// An object id: 40 hex digits for SHA-1 or 64 for SHA-256, kept in lower
 /// case. A value of this type always holds a valid one.
@@ -463,18 +408,18 @@ impl Capability {
         Capability { name: name.to_string(), value: Some(value.to_string()) }
     }
 
-    fn parse(s: &str) -> Result<Capability, ParseError> {
+    fn parse(s: &str) -> Result<Capability, Error> {
         let (name, value) = match s.split_once('=') {
             Some((n, v)) => (n, Some(v)),
             None => (s, None),
         };
         if !is_key(name) {
-            return Err(ParseError::Syntax("a capability name"));
+            return Err(Error::Syntax("a capability name"));
         }
         Ok(Capability { name: field(name)?, value: value.map(field).transpose()? })
     }
 
-    fn token(&self, v0: bool) -> Result<String, ParseError> {
+    fn token(&self, v0: bool) -> Result<String, Error> {
         let name = checked_key(&self.name)?;
         Ok(match &self.value {
             Some(value) => format!("{name}={}", checked_text(value, if v0 { &[' '] } else { &[] }, MAX_TEXT)?),
@@ -535,19 +480,19 @@ pub struct ProtoRequest {
 }
 
 impl ProtoRequest {
-    fn parse_prefix(b: &[u8]) -> Result<Option<(ProtoRequest, usize)>, ParseError> {
+    fn parse_prefix(b: &[u8]) -> Result<Option<(ProtoRequest, usize)>, Error> {
         match Pkt::parse(b)? {
             None => Ok(None),
             Some((Pkt::Data(d), used)) => Ok(Some((ProtoRequest::from_data(d)?, used))),
-            Some(_) => Err(ParseError::Syntax("a request line")),
+            Some(_) => Err(Error::Syntax("a request line")),
         }
     }
 
     /// Reads a request from a packet's data.
-    pub fn from_data(d: &[u8]) -> Result<ProtoRequest, ParseError> {
-        if d.len() > MAX_DATA { return Err(ParseError::TooLong); }
-        let sp = d.iter().position(|&c| c == b' ').ok_or(ParseError::Syntax("a request line"))?;
-        let service = Service::from_name(text(&d[..sp])?).ok_or(ParseError::Syntax("a service name"))?;
+    pub fn from_data(d: &[u8]) -> Result<ProtoRequest, Error> {
+        if d.len() > MAX_DATA { return Err(Error::TooLong); }
+        let sp = d.iter().position(|&c| c == b' ').ok_or(Error::Syntax("a request line"))?;
+        let service = Service::from_name(text(&d[..sp])?).ok_or(Error::Syntax("a service name"))?;
         let rest = &d[sp + 1..];
         let (path, mut rest) = until_nul(rest)?;
         let mut req = ProtoRequest { service, path: field(utf8(path)?)?, host: None, extra: Vec::new() };
@@ -558,19 +503,19 @@ impl ProtoRequest {
         }
         if let Some((&first, mut params)) = rest.split_first() {
             if first != 0 {
-                return Err(ParseError::Syntax("a NUL before extra parameters"));
+                return Err(Error::Syntax("a NUL before extra parameters"));
             }
             // After that NUL comes at least one parameter, and none is empty.
             if params.is_empty() {
-                return Err(ParseError::Syntax("an extra parameter"));
+                return Err(Error::Syntax("an extra parameter"));
             }
             while !params.is_empty() {
                 let (p, after) = until_nul(params)?;
                 if p.is_empty() {
-                    return Err(ParseError::Syntax("an extra parameter"));
+                    return Err(Error::Syntax("an extra parameter"));
                 }
                 if req.extra.len() >= MAX_CAPABILITIES {
-                    return Err(ParseError::TooMany);
+                    return Err(Error::TooMany);
                 }
                 req.extra.push(field(utf8(p)?)?);
                 params = after;
@@ -594,8 +539,8 @@ impl ProtoRequest {
 
     /// Builds the complete request packet. Refuses NULs, empty extra
     /// parameters, and fields or lists beyond their limits.
-    pub fn to_packet(&self) -> Result<Packet, ParseError> {
-        if self.extra.len() > MAX_CAPABILITIES { return Err(ParseError::Unwritable); }
+    pub fn to_packet(&self) -> Result<Packet, Error> {
+        if self.extra.len() > MAX_CAPABILITIES { return Err(Error::Unwritable); }
         let mut text = format!("{} {}\0", self.service.name(), checked_nul(&self.path)?);
         if let Some(host) = &self.host {
             text.push_str("host=");
@@ -606,17 +551,17 @@ impl ProtoRequest {
         for parameter in &self.extra {
             let parameter = checked_nul(parameter)?;
             if parameter.is_empty() || text.len().saturating_add(parameter.len()).saturating_add(1) > MAX_DATA {
-                return Err(ParseError::Unwritable);
+                return Err(Error::Unwritable);
             }
             text.push_str(parameter);
             text.push('\0');
         }
-        if text.len() > MAX_DATA { return Err(ParseError::Unwritable); }
+        if text.len() > MAX_DATA { return Err(Error::Unwritable); }
         Ok(Packet::Data(text.into_bytes()))
     }
 
-    fn encode(&self, out: &mut Vec<u8>) -> Result<(), ParseError> {
-        self.to_packet()?.write(out).map_err(|_| ParseError::Unwritable)
+    fn encode(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        self.to_packet()?.write(out).map_err(|_| Error::Unwritable)
     }
 }
 
@@ -628,16 +573,16 @@ pub struct ServiceHeader(
 );
 
 impl ServiceHeader {
-    fn parse_prefix(bytes: &[u8]) -> Result<Option<(Self, usize)>, ParseError> {
+    fn parse_prefix(bytes: &[u8]) -> Result<Option<(Self, usize)>, Error> {
         let Some((packets, used)) = until_flush(bytes, true)? else { return Ok(None) };
-        let [packet] = packets.as_slice() else { return Err(ParseError::Syntax("one service line")) };
+        let [packet] = packets.as_slice() else { return Err(Error::Syntax("one service line")) };
         let text = line(data_of(packet)?)?;
-        let name = text.strip_prefix("# service=").ok_or(ParseError::Syntax("# service="))?;
-        let service = Service::from_name(name).ok_or(ParseError::Syntax("a service name"))?;
+        let name = text.strip_prefix("# service=").ok_or(Error::Syntax("# service="))?;
+        let service = Service::from_name(name).ok_or(Error::Syntax("a service name"))?;
         Ok(Some((Self(service), used)))
     }
 
-    fn encode(&self, out: &mut Vec<u8>) -> Result<(), ParseError> {
+    fn encode(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         Packet::text(&format!("# service={}", self.0.name())).write(out)?;
         Packet::Flush.write(out)?;
         Ok(())
@@ -669,7 +614,7 @@ pub struct Advertisement {
 }
 
 impl Advertisement {
-    fn parse_prefix(b: &[u8]) -> Result<Option<(Advertisement, usize)>, ParseError> {
+    fn parse_prefix(b: &[u8]) -> Result<Option<(Advertisement, usize)>, Error> {
         let Some((packets, used)) = until_flush(b, true)? else { return Ok(None) };
         Ok(Some((Advertisement::read(&packets)?, used)))
     }
@@ -678,12 +623,12 @@ impl Advertisement {
     /// Every object id must be as long as the `object-format` capability
     /// says: 40 hex digits without one or with `sha1`, and 64 with
     /// `sha256`.
-    pub fn from_packets(packets: &[Packet]) -> Result<Advertisement, ParseError> {
-        if packets.len() > MAX_MESSAGE_PACKETS { return Err(ParseError::TooMany); }
+    pub fn from_packets(packets: &[Packet]) -> Result<Advertisement, Error> {
+        if packets.len() > MAX_MESSAGE_PACKETS { return Err(Error::TooMany); }
         Advertisement::read(&packets.iter().map(Pkt::of).collect::<Vec<_>>())
     }
 
-    fn read(packets: &[Pkt<'_>]) -> Result<Advertisement, ParseError> {
+    fn read(packets: &[Pkt<'_>]) -> Result<Advertisement, Error> {
         any_remote(packets)?;
         let mut ad = Advertisement::default();
         let mut rest = packets;
@@ -698,7 +643,7 @@ impl Advertisement {
             let d = strip_lf(data_of(p)?);
             // A writer adds a line feed, so the whole line must leave room.
             if d.len() > MAX_LINE {
-                return Err(ParseError::TooLong);
+                return Err(Error::TooLong);
             }
             let (head, caps) = match d.iter().position(|&c| c == 0) {
                 Some(n) => (&d[..n], Some(&d[n + 1..])),
@@ -722,14 +667,14 @@ impl Advertisement {
             let s = line(data_of(p)?)?;
             if let Some(id) = s.strip_prefix("shallow ") {
                 if ad.shallow.len() >= MAX_ITEMS {
-                    return Err(ParseError::TooMany);
+                    return Err(Error::TooMany);
                 }
                 ad.shallow.push(oid(id)?);
             } else if no_refs || !ad.shallow.is_empty() {
-                return Err(ParseError::Syntax("a shallow line"));
+                return Err(Error::Syntax("a shallow line"));
             } else {
                 if ad.refs.len() >= MAX_ITEMS {
-                    return Err(ParseError::TooMany);
+                    return Err(Error::TooMany);
                 }
                 ad.refs.push(ref_line(s)?);
             }
@@ -737,7 +682,7 @@ impl Advertisement {
         if let Some(n) = id_len(&ad.capabilities)
             && ad.refs.iter().map(|r| &r.id).chain(&ad.shallow).any(|id| id.as_str().len() != n)
         {
-            return Err(ParseError::ObjectId);
+            return Err(Error::ObjectId);
         }
         Ok(ad)
     }
@@ -747,13 +692,13 @@ impl Advertisement {
         find_capability(&self.capabilities, name)
     }
 
-    fn encode(&self, out: &mut Vec<u8>) -> Result<(), ParseError> {
-        if self.refs.len() > MAX_ITEMS || self.shallow.len() > MAX_ITEMS { return Err(ParseError::Unwritable); }
+    fn encode(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        if self.refs.len() > MAX_ITEMS || self.shallow.len() > MAX_ITEMS { return Err(Error::Unwritable); }
         let length = id_len(&self.capabilities);
         let fits = |id: &ObjectId| length.is_none_or(|n| id.as_str().len() == n);
         if self.refs.iter().any(|r| !fits(&r.id)) || self.shallow.iter().any(|id| !fits(id))
             || self.refs.first().is_some_and(|r| r.id.is_zero() && r.name == "capabilities^{}") {
-            return Err(ParseError::Unwritable);
+            return Err(Error::Unwritable);
         }
         if self.version_1 { Packet::text("version 1").write(out)?; }
         let mut first = match self.refs.first() {
@@ -780,26 +725,26 @@ pub struct CapabilityAdvertisement {
 }
 
 impl CapabilityAdvertisement {
-    fn parse_prefix(b: &[u8]) -> Result<Option<(CapabilityAdvertisement, usize)>, ParseError> {
+    fn parse_prefix(b: &[u8]) -> Result<Option<(CapabilityAdvertisement, usize)>, Error> {
         let Some((packets, used)) = until_flush(b, true)? else { return Ok(None) };
         Ok(Some((CapabilityAdvertisement::read(&packets)?, used)))
     }
 
     /// Reads an advertisement from its packets, not counting the flush.
-    pub fn from_packets(packets: &[Packet]) -> Result<CapabilityAdvertisement, ParseError> {
-        if packets.len() > MAX_MESSAGE_PACKETS { return Err(ParseError::TooMany); }
+    pub fn from_packets(packets: &[Packet]) -> Result<CapabilityAdvertisement, Error> {
+        if packets.len() > MAX_MESSAGE_PACKETS { return Err(Error::TooMany); }
         CapabilityAdvertisement::read(&packets.iter().map(Pkt::of).collect::<Vec<_>>())
     }
 
-    fn read(packets: &[Pkt<'_>]) -> Result<CapabilityAdvertisement, ParseError> {
+    fn read(packets: &[Pkt<'_>]) -> Result<CapabilityAdvertisement, Error> {
         any_remote(packets)?;
-        let Some((first, rest)) = packets.split_first() else { return Err(ParseError::Syntax("version 2")) };
+        let Some((first, rest)) = packets.split_first() else { return Err(Error::Syntax("version 2")) };
         let s = line(data_of(first)?)?;
         if s != "version 2" {
-            return Err(ParseError::Syntax("version 2"));
+            return Err(Error::Syntax("version 2"));
         }
         if rest.len() > MAX_CAPABILITIES {
-            return Err(ParseError::TooMany);
+            return Err(Error::TooMany);
         }
         let capabilities = rest.iter().map(|p| Capability::parse(line(data_of(p)?)?)).collect::<Result<_, _>>()?;
         Ok(CapabilityAdvertisement { capabilities })
@@ -810,7 +755,7 @@ impl CapabilityAdvertisement {
         find_capability(&self.capabilities, name)
     }
 
-    fn encode(&self, out: &mut Vec<u8>) -> Result<(), ParseError> {
+    fn encode(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         Packet::text("version 2").write(out)?;
         write_caps_v2(out, &self.capabilities)?;
         Packet::Flush.write(out)?;
@@ -833,9 +778,9 @@ pub struct Command {
 impl Command {
     /// The arguments read as `ls-refs` arguments. More than
     /// [`MAX_ITEMS`] is an error, as in a request read from bytes.
-    pub fn ls_refs_args(&self) -> Result<Vec<LsRefsArg>, ParseError> {
+    pub fn ls_refs_args(&self) -> Result<Vec<LsRefsArg>, Error> {
         if self.args.len() > MAX_ITEMS {
-            return Err(ParseError::TooMany);
+            return Err(Error::TooMany);
         }
         self.args.iter().map(|a| LsRefsArg::parse_line(checked_line(a)?)).collect()
     }
@@ -844,14 +789,14 @@ impl Command {
     /// is an error, as in a request read from bytes. So is `deepen` with
     /// `deepen-since` or `deepen-not`, which gitprotocol-v2 says cannot be
     /// used together.
-    pub fn fetch_args(&self) -> Result<Vec<ClientLine>, ParseError> {
+    pub fn fetch_args(&self) -> Result<Vec<ClientLine>, Error> {
         if self.args.len() > MAX_ITEMS {
-            return Err(ParseError::TooMany);
+            return Err(Error::TooMany);
         }
         let args = self.args.iter().map(|a| ClientLine::parse_line(checked_line(a)?)).collect::<Result<Vec<_>, _>>()?;
         let deepen = args.iter().any(|a| matches!(a, ClientLine::Deepen(_)));
         if deepen && args.iter().any(|a| matches!(a, ClientLine::DeepenSince(_) | ClientLine::DeepenNot(_))) {
-            return Err(ParseError::Syntax("deepen without deepen-since or deepen-not"));
+            return Err(Error::Syntax("deepen without deepen-since or deepen-not"));
         }
         Ok(args)
     }
@@ -867,7 +812,7 @@ pub enum V2Request {
 }
 
 impl V2Request {
-    fn parse_prefix(b: &[u8]) -> Result<Option<(V2Request, usize)>, ParseError> {
+    fn parse_prefix(b: &[u8]) -> Result<Option<(V2Request, usize)>, Error> {
         let Some((packets, used)) = until_flush(b, false)? else { return Ok(None) };
         Ok(Some((V2Request::read(&packets)?, used)))
     }
@@ -875,17 +820,17 @@ impl V2Request {
     /// Reads a request from its packets, not counting the flush. The
     /// delimiter packet before the arguments may be left out when there
     /// are none.
-    pub fn from_packets(packets: &[Packet]) -> Result<V2Request, ParseError> {
-        if packets.len() > MAX_MESSAGE_PACKETS { return Err(ParseError::TooMany); }
+    pub fn from_packets(packets: &[Packet]) -> Result<V2Request, Error> {
+        if packets.len() > MAX_MESSAGE_PACKETS { return Err(Error::TooMany); }
         V2Request::read(&packets.iter().map(Pkt::of).collect::<Vec<_>>())
     }
 
-    fn read(packets: &[Pkt<'_>]) -> Result<V2Request, ParseError> {
+    fn read(packets: &[Pkt<'_>]) -> Result<V2Request, Error> {
         let Some((first, rest)) = packets.split_first() else { return Ok(V2Request::Empty) };
         let s = line(data_of(first)?)?;
-        let name = s.strip_prefix("command=").ok_or(ParseError::Syntax("command="))?;
+        let name = s.strip_prefix("command=").ok_or(Error::Syntax("command="))?;
         if !is_key(name) {
-            return Err(ParseError::Syntax("a command name"));
+            return Err(Error::Syntax("a command name"));
         }
         let mut cmd = Command { name: field(name)?, capabilities: Vec::new(), args: Vec::new() };
         let mut in_args = false;
@@ -896,25 +841,25 @@ impl V2Request {
                     let s = line(d)?;
                     if in_args {
                         if cmd.args.len() >= MAX_ITEMS {
-                            return Err(ParseError::TooMany);
+                            return Err(Error::TooMany);
                         }
                         cmd.args.push(s.to_string());
                     } else {
                         if cmd.capabilities.len() >= MAX_CAPABILITIES {
-                            return Err(ParseError::TooMany);
+                            return Err(Error::TooMany);
                         }
                         cmd.capabilities.push(Capability::parse(s)?);
                     }
                 }
-                _ => return Err(ParseError::Syntax("a data packet")),
+                _ => return Err(Error::Syntax("a data packet")),
             }
         }
         Ok(V2Request::Command(cmd))
     }
 
-    fn encode(&self, out: &mut Vec<u8>) -> Result<(), ParseError> {
+    fn encode(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         if let Self::Command(command) = self {
-            if command.args.len() > MAX_ITEMS { return Err(ParseError::Unwritable); }
+            if command.args.len() > MAX_ITEMS { return Err(Error::Unwritable); }
             let name = checked_key(&command.name)?;
             Packet::text(&format!("command={name}")).write(out)?;
             write_caps_v2(out, &command.capabilities)?;
@@ -944,11 +889,11 @@ pub enum LsRefsArg {
 }
 
 impl LsRefsArg {
-    fn read(data: &[u8]) -> Result<Self, ParseError> {
+    fn read(data: &[u8]) -> Result<Self, Error> {
         Self::parse_line(line(data)?)
     }
 
-    fn parse_line(s: &str) -> Result<LsRefsArg, ParseError> {
+    fn parse_line(s: &str) -> Result<LsRefsArg, Error> {
         Ok(match s {
             "symrefs" => LsRefsArg::Symrefs,
             "peel" => LsRefsArg::Peel,
@@ -960,7 +905,7 @@ impl LsRefsArg {
         })
     }
 
-    fn encode_line(&self) -> Result<String, ParseError> {
+    fn encode_line(&self) -> Result<String, Error> {
         Ok(match self {
             LsRefsArg::Symrefs => "symrefs".to_string(),
             LsRefsArg::Peel => "peel".to_string(),
@@ -987,11 +932,11 @@ pub struct LsRef {
 }
 
 impl LsRef {
-    fn read(data: &[u8]) -> Result<LsRef, ParseError> {
+    fn read(data: &[u8]) -> Result<LsRef, Error> {
         let s = line(data)?;
         let mut parts = s.split(' ');
         let first = parts.next().unwrap_or("");
-        let name = parts.next().ok_or(ParseError::Syntax("a ref line"))?;
+        let name = parts.next().ok_or(Error::Syntax("a ref line"))?;
         let id = if first == "unborn" { None } else { Some(oid(first)?) };
         let mut r = LsRef { id, name: field(name)?, symref_target: None, peeled: None };
         for a in parts {
@@ -1004,7 +949,7 @@ impl LsRef {
         Ok(r)
     }
 
-    fn encode_line(&self) -> Result<String, ParseError> {
+    fn encode_line(&self) -> Result<String, Error> {
         let mut s = match &self.id {
             Some(id) => format!("{id} "),
             None => "unborn ".to_string(),
@@ -1072,11 +1017,11 @@ pub enum ClientLine {
 }
 
 impl ClientLine {
-    fn read(data: &[u8]) -> Result<ClientLine, ParseError> {
+    fn read(data: &[u8]) -> Result<ClientLine, Error> {
         ClientLine::parse_line(line(data)?)
     }
 
-    fn parse_line(s: &str) -> Result<ClientLine, ParseError> {
+    fn parse_line(s: &str) -> Result<ClientLine, Error> {
         Ok(match s {
             "done" => ClientLine::Done,
             "deepen-relative" => ClientLine::DeepenRelative,
@@ -1113,7 +1058,7 @@ impl ClientLine {
         })
     }
 
-    fn encode_line(&self) -> Result<String, ParseError> {
+    fn encode_line(&self) -> Result<String, Error> {
         Ok(match self {
             ClientLine::Want { id, capabilities } => {
                 let mut s = format!("want {id}");
@@ -1224,7 +1169,7 @@ pub enum ServerLine {
 }
 
 impl ServerLine {
-    fn read(data: &[u8]) -> Result<ServerLine, ParseError> {
+    fn read(data: &[u8]) -> Result<ServerLine, Error> {
         let s = line(data)?;
         if let Some(section) = Section::from_name(s) {
             return Ok(ServerLine::Section(section));
@@ -1239,7 +1184,7 @@ impl ServerLine {
                         Some((id, "continue")) => (id, Some(AckStatus::Continue)),
                         Some((id, "common")) => (id, Some(AckStatus::Common)),
                         Some((id, "ready")) => (id, Some(AckStatus::Ready)),
-                        Some(_) => return Err(ParseError::Syntax("an ACK status")),
+                        Some(_) => return Err(Error::Syntax("an ACK status")),
                     };
                     ServerLine::Ack { id: oid(id)?, status }
                 } else if let Some(id) = s.strip_prefix("shallow ") {
@@ -1255,7 +1200,7 @@ impl ServerLine {
         })
     }
 
-    fn encode_line(&self) -> Result<String, ParseError> {
+    fn encode_line(&self) -> Result<String, Error> {
         Ok(match self {
             ServerLine::Nak => "NAK".to_string(),
             ServerLine::Ack { id, status: None } => format!("ACK {id}"),
@@ -1273,7 +1218,7 @@ impl ServerLine {
 
 /// A side-band stream: the first byte of each data packet says which.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Band {
+pub enum Sideband {
     /// 1: packfile bytes.
     Pack,
     /// 2: progress text for the user's terminal.
@@ -1282,31 +1227,31 @@ pub enum Band {
     Error,
 }
 
-impl Band {
+impl Sideband {
     /// The band's number on the wire.
     pub fn code(self) -> u8 {
         match self {
-            Band::Pack => 1,
-            Band::Progress => 2,
-            Band::Error => 3,
+            Sideband::Pack => 1,
+            Sideband::Progress => 2,
+            Sideband::Error => 3,
         }
     }
 
     /// The band with this number.
-    pub fn from_code(c: u8) -> Option<Band> {
+    pub fn from_code(c: u8) -> Option<Sideband> {
         match c {
-            1 => Some(Band::Pack),
-            2 => Some(Band::Progress),
-            3 => Some(Band::Error),
+            1 => Some(Sideband::Pack),
+            2 => Some(Sideband::Progress),
+            3 => Some(Sideband::Error),
             _ => None,
         }
     }
 }
 
 /// Splits a side-band data packet into its band and payload.
-pub fn split_band(data: &[u8]) -> Result<(Band, &[u8]), ParseError> {
-    let (&c, rest) = data.split_first().ok_or(ParseError::Syntax("a band byte"))?;
-    Ok((Band::from_code(c).ok_or(ParseError::Syntax("band 1, 2 or 3"))?, rest))
+pub fn split_band(data: &[u8]) -> Result<(Sideband, &[u8]), Error> {
+    let (&c, rest) = data.split_first().ok_or(Error::Syntax("a band byte"))?;
+    Ok((Sideband::from_code(c).ok_or(Error::Syntax("band 1, 2 or 3"))?, rest))
 }
 
 /// `payload` as side-band packets on `band`, each at most `packet_max`
@@ -1314,7 +1259,7 @@ pub fn split_band(data: &[u8]) -> Result<(Band, &[u8]), ParseError> {
 /// [`SIDE_BAND_64K_PACKET`] for `side-band-64k`. A value out of that
 /// range is brought into it, so the packets add at most one byte in 199
 /// to the payload. An empty payload gives no packets.
-pub fn band_packets(band: Band, payload: &[u8], packet_max: usize) -> impl Iterator<Item = Packet> + '_ {
+pub fn band_packets(band: Sideband, payload: &[u8], packet_max: usize) -> impl Iterator<Item = Packet> + '_ {
     let chunk = packet_max.clamp(SIDE_BAND_PACKET, SIDE_BAND_64K_PACKET) - HEADER_LEN - 1;
     payload.chunks(chunk).map(move |piece| {
         let mut data = Vec::with_capacity(piece.len() + 1);
@@ -1326,9 +1271,9 @@ pub fn band_packets(band: Band, payload: &[u8], packet_max: usize) -> impl Itera
 
 /// A side-band payload or control packet returned by [`Bands`].
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Demuxed {
+pub enum Band {
     /// A data packet's payload and its band.
-    Data(Band, Vec<u8>),
+    Data(Sideband, Vec<u8>),
     /// A flush packet: the end of the pack.
     Flush,
     /// A delimiter packet.
@@ -1343,21 +1288,21 @@ pub enum Demuxed {
 pub struct Bands;
 
 impl Decode for Bands {
-    type Item = Demuxed;
-    type Error = ParseError;
+    type Item = Band;
+    type Error = Error;
     const NAME: &'static str = "Git side-band";
 
     fn capacity(&self) -> usize { MAX_PACKET }
 
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Demuxed>, ParseError> {
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Band>, Error> {
         let Some((packet, used)) = Pkt::parse(input)? else { return Ok(Step::Need) };
         let item = match packet {
-            Pkt::Flush => Demuxed::Flush,
-            Pkt::Delim => Demuxed::Delim,
-            Pkt::ResponseEnd => Demuxed::ResponseEnd,
+            Pkt::Flush => Band::Flush,
+            Pkt::Delim => Band::Delim,
+            Pkt::ResponseEnd => Band::ResponseEnd,
             Pkt::Data(data) => {
                 let (band, payload) = split_band(data)?;
-                Demuxed::Data(band, payload.to_vec())
+                Band::Data(band, payload.to_vec())
             }
         };
         Ok(Step::Item(item, used))
@@ -1376,7 +1321,7 @@ fn hex_digit(c: u8) -> Option<u8> {
 /// The packets before the first flush, borrowed from `b`, and how many
 /// bytes up to and including it. In a message from a server, `errors`,
 /// an `ERR` line ends the message at once, as gitprotocol-pack says.
-fn until_flush(b: &[u8], errors: bool) -> Result<Option<(Vec<Pkt<'_>>, usize)>, ParseError> {
+fn until_flush(b: &[u8], errors: bool) -> Result<Option<(Vec<Pkt<'_>>, usize)>, Error> {
     let mut at = 0;
     let mut packets = Vec::new();
     loop {
@@ -1390,7 +1335,7 @@ fn until_flush(b: &[u8], errors: bool) -> Result<Option<(Vec<Pkt<'_>>, usize)>, 
                     remote(d)?;
                 }
                 if packets.len() >= MAX_MESSAGE_PACKETS {
-                    return Err(ParseError::TooMany);
+                    return Err(Error::TooMany);
                 }
                 packets.push(p);
                 at += used;
@@ -1399,15 +1344,15 @@ fn until_flush(b: &[u8], errors: bool) -> Result<Option<(Vec<Pkt<'_>>, usize)>, 
     }
 }
 
-fn data_of<'a>(p: &Pkt<'a>) -> Result<&'a [u8], ParseError> {
+fn data_of<'a>(p: &Pkt<'a>) -> Result<&'a [u8], Error> {
     match *p {
         Pkt::Data(d) => Ok(d),
-        _ => Err(ParseError::Syntax("a data packet")),
+        _ => Err(Error::Syntax("a data packet")),
     }
 }
 
 /// The first `ERR` line among `packets`, as an error.
-fn any_remote(packets: &[Pkt<'_>]) -> Result<(), ParseError> {
+fn any_remote(packets: &[Pkt<'_>]) -> Result<(), Error> {
     packets.iter().try_for_each(|p| if let Pkt::Data(d) = p { remote(d) } else { Ok(()) })
 }
 
@@ -1428,89 +1373,89 @@ fn strip_lf(b: &[u8]) -> &[u8] {
     b.strip_suffix(b"\n").unwrap_or(b)
 }
 
-fn text(b: &[u8]) -> Result<&str, ParseError> {
+fn text(b: &[u8]) -> Result<&str, Error> {
     checked_line(utf8(b)?)
 }
 
-fn utf8(b: &[u8]) -> Result<&str, ParseError> {
-    std::str::from_utf8(b).map_err(|_| ParseError::Text)
+fn utf8(b: &[u8]) -> Result<&str, Error> {
+    std::str::from_utf8(b).map_err(|_| Error::Text)
 }
 
 /// `s`, if it can be one line.
-fn checked_line(s: &str) -> Result<&str, ParseError> {
+fn checked_line(s: &str) -> Result<&str, Error> {
     if s.contains(['\0', '\n']) {
-        return Err(ParseError::Text);
+        return Err(Error::Text);
     }
     if s.len() > MAX_LINE {
-        return Err(ParseError::TooLong);
+        return Err(Error::TooLong);
     }
     Ok(s)
 }
 
 /// A packet's data as one line of text, with one line feed taken off the
 /// end.
-fn line(data: &[u8]) -> Result<&str, ParseError> {
+fn line(data: &[u8]) -> Result<&str, Error> {
     text(strip_lf(data))
 }
 
-fn field(s: &str) -> Result<String, ParseError> {
+fn field(s: &str) -> Result<String, Error> {
     if s.len() > MAX_TEXT {
-        return Err(ParseError::TooLong);
+        return Err(Error::TooLong);
     }
     Ok(s.to_string())
 }
 
-fn oid(s: &str) -> Result<ObjectId, ParseError> {
-    ObjectId::parse(s).ok_or(ParseError::ObjectId)
+fn oid(s: &str) -> Result<ObjectId, Error> {
+    ObjectId::parse(s).ok_or(Error::ObjectId)
 }
 
-fn number<T: std::str::FromStr>(s: &str) -> Result<T, ParseError> {
+fn number<T: std::str::FromStr>(s: &str) -> Result<T, Error> {
     if s.is_empty() || !s.bytes().all(|c| c.is_ascii_digit()) {
-        return Err(ParseError::Syntax("a number"));
+        return Err(Error::Syntax("a number"));
     }
-    s.parse().map_err(|_| ParseError::Syntax("a number"))
+    s.parse().map_err(|_| Error::Syntax("a number"))
 }
 
 /// A packet's data as an error, if it is an `ERR` line. The message
 /// need not be UTF-8 text: the other side has given up either way.
-fn remote(d: &[u8]) -> Result<(), ParseError> {
+fn remote(d: &[u8]) -> Result<(), Error> {
     match strip_lf(d).strip_prefix(b"ERR ") {
-        Some(m) => Err(ParseError::Remote(clipped_text(&String::from_utf8_lossy(&m[..m.len().min(MAX_TEXT + 3)]), MAX_TEXT).to_string())),
+        Some(m) => Err(Error::Remote(clipped_text(&String::from_utf8_lossy(&m[..m.len().min(MAX_TEXT + 3)]), MAX_TEXT).to_string())),
         None => Ok(()),
     }
 }
 
 /// The bytes before the next NUL, and those after it.
-fn until_nul(b: &[u8]) -> Result<(&[u8], &[u8]), ParseError> {
-    let n = b.iter().position(|&c| c == 0).ok_or(ParseError::Syntax("a NUL"))?;
+fn until_nul(b: &[u8]) -> Result<(&[u8], &[u8]), Error> {
+    let n = b.iter().position(|&c| c == 0).ok_or(Error::Syntax("a NUL"))?;
     Ok((&b[..n], &b[n + 1..]))
 }
 
 /// `<id> <name>`, as in a version 0 advertisement.
-fn ref_line(s: &str) -> Result<AdvertisedRef, ParseError> {
-    let (id, name) = s.split_once(' ').ok_or(ParseError::Syntax("a ref line"))?;
+fn ref_line(s: &str) -> Result<AdvertisedRef, Error> {
+    let (id, name) = s.split_once(' ').ok_or(Error::Syntax("a ref line"))?;
     Ok(AdvertisedRef { id: oid(id)?, name: field(name)? })
 }
 
 /// A version 0 capability list: names split at spaces.
-fn parse_caps(s: &str) -> Result<Vec<Capability>, ParseError> {
+fn parse_caps(s: &str) -> Result<Vec<Capability>, Error> {
     let mut caps = Vec::new();
     for t in s.split(' ').filter(|t| !t.is_empty()) {
         if caps.len() >= MAX_CAPABILITIES {
-            return Err(ParseError::TooMany);
+            return Err(Error::TooMany);
         }
         caps.push(Capability::parse(t)?);
     }
     Ok(caps)
 }
 
-fn push_caps(out: &mut String, caps: &[Capability], first_sep: &str) -> Result<(), ParseError> {
-    if caps.len() > MAX_CAPABILITIES { return Err(ParseError::Unwritable); }
+fn push_caps(out: &mut String, caps: &[Capability], first_sep: &str) -> Result<(), Error> {
+    if caps.len() > MAX_CAPABILITIES { return Err(Error::Unwritable); }
     for (index, capability) in caps.iter().enumerate() {
         let token = capability.token(true)?;
         let separator = if index == 0 { first_sep } else { " " };
         if out.len().saturating_add(separator.len()).saturating_add(token.len()) > MAX_LINE {
-            return Err(ParseError::Unwritable);
+            return Err(Error::Unwritable);
         }
         out.push_str(separator);
         out.push_str(&token);
@@ -1518,8 +1463,8 @@ fn push_caps(out: &mut String, caps: &[Capability], first_sep: &str) -> Result<(
     Ok(())
 }
 
-fn write_caps_v2(out: &mut Vec<u8>, caps: &[Capability]) -> Result<(), ParseError> {
-    if caps.len() > MAX_CAPABILITIES { return Err(ParseError::Unwritable); }
+fn write_caps_v2(out: &mut Vec<u8>, caps: &[Capability]) -> Result<(), Error> {
+    if caps.len() > MAX_CAPABILITIES { return Err(Error::Unwritable); }
     for capability in caps { Packet::text(&capability.token(false)?).write(out)?; }
     Ok(())
 }
@@ -1534,19 +1479,19 @@ fn is_key_byte(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'-' || c == b'_'
 }
 
-fn checked_key(text: &str) -> Result<&str, ParseError> {
-    if text.len() > MAX_TEXT || !is_key(text) { return Err(ParseError::Unwritable); }
+fn checked_key(text: &str) -> Result<&str, Error> {
+    if text.len() > MAX_TEXT || !is_key(text) { return Err(Error::Unwritable); }
     Ok(text)
 }
 
-fn checked_nul(text: &str) -> Result<&str, ParseError> {
-    if text.len() > MAX_TEXT || text.contains('\0') { return Err(ParseError::Unwritable); }
+fn checked_nul(text: &str) -> Result<&str, Error> {
+    if text.len() > MAX_TEXT || text.contains('\0') { return Err(Error::Unwritable); }
     Ok(text)
 }
 
-fn checked_text<'a>(text: &'a str, excluded: &[char], max: usize) -> Result<&'a str, ParseError> {
+fn checked_text<'a>(text: &'a str, excluded: &[char], max: usize) -> Result<&'a str, Error> {
     if text.len() > max || text.chars().any(|c| c == '\0' || c == '\n' || excluded.contains(&c)) {
-        return Err(ParseError::Unwritable);
+        return Err(Error::Unwritable);
     }
     Ok(text)
 }
@@ -1566,26 +1511,26 @@ fn clipped_text(s: &str, max: usize) -> &str {
 macro_rules! message_wire {
     ($ty:ty, $parse_doc:literal, $write_doc:literal) => {
         impl Wire for $ty {
-            type ParseError = ParseError;
-            type WriteError = ParseError;
+            type ParseError = Error;
+            type WriteError = Error;
 
             #[doc = $parse_doc]
             /// Refuses incomplete or trailing packets and lists beyond their limits.
-            fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
+            fn parse(bytes: &[u8]) -> Result<Self, Error> {
                 match Self::parse_prefix(bytes)? {
                     Some((value, used)) if used == bytes.len() => Ok(value),
-                    Some(_) => Err(ParseError::Trailing),
-                    None => Err(ParseError::Truncated),
+                    Some(_) => Err(Error::Trailing),
+                    None => Err(Error::Truncated),
                 }
             }
 
             #[doc = $write_doc]
             /// Leaves the destination unchanged on error.
-            fn write(&self, out: &mut Vec<u8>) -> Result<(), ParseError> {
+            fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
                 let start = out.len();
                 if self.encode(out).is_err() || Self::parse(&out[start..]).as_ref() != Ok(self) {
                     out.truncate(start);
-                    return Err(ParseError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 Ok(())
             }
@@ -1599,10 +1544,10 @@ message_wire!(ServiceHeader,
     "Reads one smart HTTP service line followed by a flush. Refuses unknown services and any other packet layout.",
     "Appends the service announcement and flush. Every service value is representable.");
 message_wire!(Advertisement,
-    "Reads a version 0 or 1 ref advertisement through its flush. Refuses malformed refs or capabilities, object IDs inconsistent with object-format, and refs after shallow lines. An ERR line returns ParseError::Remote immediately, even before a flush; its text is limited to MAX_TEXT. Each parse starts at the beginning. For incremental input, collect packets with [`Stream<Frames>`](fictionet::stdlib::codec::Stream) and use [`Advertisement::from_packets`].",
+    "Reads a version 0 or 1 ref advertisement through its flush. Refuses malformed refs or capabilities, object IDs inconsistent with object-format, and refs after shallow lines. An ERR line returns Error::Remote immediately, even before a flush; its text is limited to MAX_TEXT. Each parse starts at the beginning. For incremental input, collect packets with [`Stream<Packets>`](fictionet::stdlib::codec::Stream) and use [`Advertisement::from_packets`].",
     "Appends refs, capabilities, shallow lines, and a flush. Refuses invalid fields, conflicting object formats, a first ref that would become the empty-ref marker, and values beyond the reader limits. SHA-1 is the default object format.");
 message_wire!(CapabilityAdvertisement,
-    "Reads version 2 and its capabilities through a flush. Refuses missing version 2 or malformed capabilities. An ERR line returns ParseError::Remote immediately, even before a flush; its text is limited to MAX_TEXT.",
+    "Reads version 2 and its capabilities through a flush. Refuses missing version 2 or malformed capabilities. An ERR line returns Error::Remote immediately, even before a flush; its text is limited to MAX_TEXT.",
     "Appends version 2, each capability, and a flush. Refuses malformed capability names or values and lists beyond MAX_CAPABILITIES.");
 message_wire!(V2Request,
     "Reads one version 2 request through its flush. A lone flush means Empty. Refuses missing command=, malformed capabilities, repeated delimiters, or control packets in arguments. The delimiter may be omitted when there are no arguments.",
@@ -1613,26 +1558,26 @@ macro_rules! line_wire {
         impl $ty {
             /// Builds a pkt-line around this value. Refuses values that cannot
             /// be represented without changing their fields.
-            pub fn to_packet(&self) -> Result<Packet, ParseError> {
+            pub fn to_packet(&self) -> Result<Packet, Error> {
                 Ok(Packet::Data(Wire::to_bytes(self)?))
             }
         }
         impl Wire for $ty {
-            type ParseError = ParseError;
-            type WriteError = ParseError;
+            type ParseError = Error;
+            type WriteError = Error;
 
             /// Reads one text line. Refuses invalid UTF-8, embedded line endings,
             /// malformed fields, and fields or lists beyond their limits.
-            fn parse(bytes: &[u8]) -> Result<Self, ParseError> { Self::read(bytes) }
+            fn parse(bytes: &[u8]) -> Result<Self, Error> { Self::read(bytes) }
 
             /// Appends the line and its line feed. Refuses invalid or oversized
             /// fields and any value that would read back differently.
             /// Leaves the destination unchanged on error.
-            fn write(&self, out: &mut Vec<u8>) -> Result<(), ParseError> {
+            fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
                 let mut text = self.encode_line()?;
-                if text.len() > MAX_LINE { return Err(ParseError::Unwritable); }
+                if text.len() > MAX_LINE { return Err(Error::Unwritable); }
                 text.push('\n');
-                if Self::read(text.as_bytes()).as_ref() != Ok(self) { return Err(ParseError::Unwritable); }
+                if Self::read(text.as_bytes()).as_ref() != Ok(self) { return Err(Error::Unwritable); }
                 out.extend_from_slice(text.as_bytes());
                 Ok(())
             }
@@ -1678,8 +1623,8 @@ mod tests {
             assert_eq!(packet, Packet::Data(data.to_vec()));
             assert_eq!(packet.to_bytes().unwrap(), bytes);
         }
-        assert_eq!(Packet::parse(b"0000rest"), Err(PacketParseError::Trailing));
-        assert_eq!(Frames::new().decode(b"0000rest", false), Ok(Step::Item(Packet::Flush, 4)));
+        assert_eq!(Packet::parse(b"0000rest"), Err(Error::Trailing));
+        assert_eq!(Packets::new().decode(b"0000rest", false), Ok(Step::Item(Packet::Flush, 4)));
         assert_eq!(Packet::parse(b"0001"), Ok(Packet::Delim));
         assert_eq!(Packet::parse(b"0002"), Ok(Packet::ResponseEnd));
         assert_eq!(Packet::parse(b"000Bfoobar\n"), Ok(Packet::Data(b"foobar\n".to_vec())));
@@ -1689,17 +1634,17 @@ mod tests {
 
     #[test]
     fn packet_errors() {
-        for (bytes, error) in [(&b"0003"[..], PacketError::Reserved), (b"fff1", PacketError::TooLong(0xfff1)),
-            (b"ffff", PacketError::TooLong(0xffff)), (b"00g0", PacketError::Header),
-            (b"x", PacketError::Header), (b"0 ", PacketError::Header)] {
-            assert_eq!(Packet::parse(bytes), Err(PacketParseError::Frame(error)));
+        for (bytes, error) in [(&b"0003"[..], Error::Reserved), (b"fff1", Error::PacketTooLong(0xfff1)),
+            (b"ffff", Error::PacketTooLong(0xffff)), (b"00g0", Error::Header),
+            (b"x", Error::Header), (b"0 ", Error::Header)] {
+            assert_eq!(Packet::parse(bytes), Err(error.clone()));
             assert!(!error.to_string().is_empty());
         }
-        assert_eq!(Frames::new().decode(b"fff0", false), Ok(Step::Need));
+        assert_eq!(Packets::new().decode(b"fff0", false), Ok(Step::Need));
         let bytes = b"000bfoobar\n";
         for n in 0..bytes.len() {
-            assert_eq!(Packet::parse(&bytes[..n]), Err(PacketParseError::Truncated));
-            assert_eq!(Frames::new().decode(&bytes[..n], false), Ok(Step::Need));
+            assert_eq!(Packet::parse(&bytes[..n]), Err(Error::Truncated));
+            assert_eq!(Packets::new().decode(&bytes[..n], false), Ok(Step::Need));
         }
     }
 
@@ -1723,24 +1668,24 @@ mod tests {
     #[test]
     fn stream_splits_packets() {
         let bytes = pkt(&["want x\n", "0001", "0000", "done\n"]);
-        contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_PACKET);
-        assert_eq!(decode_all(Frames::new, &bytes),
+        contract::check_decode_with_alloc_limit(Packets::new, &bytes, 2 * MAX_PACKET);
+        assert_eq!(decode_all(Packets::new, &bytes),
             (vec![Packet::text("want x"), Packet::Delim, Packet::Flush, Packet::text("done")], None));
-        let mut stream = Stream::new(Frames::new());
+        let mut stream = Stream::new(Packets::new());
         assert_eq!(stream.push(b"00"), 2);
         assert_eq!(stream.next(), None);
         assert_eq!(stream.buffered(), 2);
         assert_eq!(stream.push(b"03"), 2);
-        assert_eq!(stream.next(), Some(Err(Fail::Protocol(PacketError::Reserved))));
+        assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::Reserved))));
         assert_eq!(stream.next(), None);
-        assert_eq!(stream.failed(), Some(&Fail::Protocol(PacketError::Reserved)));
+        assert_eq!(stream.failed(), Some(&Fail::Protocol(Error::Reserved)));
     }
 
     #[test]
     fn stream_takes_many_small_packets_in_linear_time() {
         let stream: Vec<u8> = b"0009done\n".iter().copied().cycle().take(9 * 200_000).collect();
         let started = std::time::Instant::now();
-        let (packets, failed) = decode_all(Frames::new, &stream);
+        let (packets, failed) = decode_all(Packets::new, &stream);
         assert_eq!(failed, None);
         assert_eq!(packets.len(), 200_000);
         assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
@@ -1780,7 +1725,7 @@ mod tests {
 
     #[test]
     fn proto_request_errors() {
-        let syntax = |b: &[u8]| matches!(ProtoRequest::from_data(b), Err(ParseError::Syntax(_)));
+        let syntax = |b: &[u8]| matches!(ProtoRequest::from_data(b), Err(Error::Syntax(_)));
         assert!(syntax(b"git-upload-pack"));
         assert!(syntax(b"git-upload-dog /x\0"));
         assert!(syntax(b"git-upload-pack /x"));
@@ -1789,19 +1734,19 @@ mod tests {
         assert!(syntax(b"git-upload-pack /x\0\0version=2"));
         // Each extra parameter has at least one byte, and the NUL before
         // them is followed by at least one.
-        assert_eq!(ProtoRequest::from_data(b"git-upload-pack /x\0\0a\0\0"), Err(ParseError::Syntax("an extra parameter")));
-        assert_eq!(ProtoRequest::from_data(b"git-upload-pack /x\0\0\0"), Err(ParseError::Syntax("an extra parameter")));
-        assert_eq!(ProtoRequest::from_data(b"git-upload-pack /x\0host=h\0\0"), Err(ParseError::Syntax("an extra parameter")));
-        assert_eq!(ProtoRequest::from_data(b"git-upload-pack /\xff\0"), Err(ParseError::Text));
+        assert_eq!(ProtoRequest::from_data(b"git-upload-pack /x\0\0a\0\0"), Err(Error::Syntax("an extra parameter")));
+        assert_eq!(ProtoRequest::from_data(b"git-upload-pack /x\0\0\0"), Err(Error::Syntax("an extra parameter")));
+        assert_eq!(ProtoRequest::from_data(b"git-upload-pack /x\0host=h\0\0"), Err(Error::Syntax("an extra parameter")));
+        assert_eq!(ProtoRequest::from_data(b"git-upload-pack /\xff\0"), Err(Error::Text));
         let long = format!("git-upload-pack /{}\0", "x".repeat(MAX_TEXT));
-        assert_eq!(ProtoRequest::from_data(long.as_bytes()), Err(ParseError::TooLong));
+        assert_eq!(ProtoRequest::from_data(long.as_bytes()), Err(Error::TooLong));
         let many = format!("git-upload-pack /x\0\0{}", "p\0".repeat(MAX_CAPABILITIES + 1));
-        assert_eq!(ProtoRequest::from_data(many.as_bytes()), Err(ParseError::TooMany));
-        assert_eq!(ProtoRequest::parse(b"0000"), Err(ParseError::Syntax("a request line")));
-        assert_eq!(ProtoRequest::parse(b"0003"), Err(ParseError::Packet(PacketError::Reserved)));
+        assert_eq!(ProtoRequest::from_data(many.as_bytes()), Err(Error::TooMany));
+        assert_eq!(ProtoRequest::parse(b"0000"), Err(Error::Syntax("a request line")));
+        assert_eq!(ProtoRequest::parse(b"0003"), Err(Error::Reserved));
         let bytes = ProtoRequest { service: Service::UploadPack, path: "/p".into(), host: None, extra: vec![] }.to_bytes().unwrap();
         for n in 0..bytes.len() {
-            assert_eq!(ProtoRequest::parse(&bytes[..n]), Err(ParseError::Truncated));
+            assert_eq!(ProtoRequest::parse(&bytes[..n]), Err(Error::Truncated));
         }
     }
 
@@ -1815,7 +1760,7 @@ mod tests {
             ProtoRequest { extra: vec!["x".repeat(MAX_TEXT); MAX_CAPABILITIES], ..base.clone() },
             ProtoRequest { extra: vec![String::new(), "\0".into(), "version=2".into()], ..base.clone() },
         ] {
-            assert_eq!(request.to_bytes(), Err(ParseError::Unwritable));
+            assert_eq!(request.to_bytes(), Err(Error::Unwritable));
             contract::check_wire_value(&request);
         }
         let request = ProtoRequest { path: "/a\nb".into(), ..base };
@@ -1828,13 +1773,13 @@ mod tests {
         assert_eq!(bytes, b"001e# service=git-upload-pack\n0000");
         assert_eq!(ServiceHeader::parse(&bytes), Ok(ServiceHeader(Service::UploadPack)));
         for n in 0..bytes.len() {
-            assert_eq!(ServiceHeader::parse(&bytes[..n]), Err(ParseError::Truncated));
+            assert_eq!(ServiceHeader::parse(&bytes[..n]), Err(Error::Truncated));
         }
-        assert_eq!(ServiceHeader::parse(b"0000"), Err(ParseError::Syntax("one service line")));
-        assert_eq!(ServiceHeader::parse(&pkt(&["# x\n", "0000"])), Err(ParseError::Syntax("# service=")));
-        assert_eq!(ServiceHeader::parse(&pkt(&["# service=git-x\n", "0000"])), Err(ParseError::Syntax("a service name")));
-        assert_eq!(ServiceHeader::parse(&pkt(&["0001", "0000"])), Err(ParseError::Syntax("a data packet")));
-        assert_eq!(ServiceHeader::parse(&pkt(&["ERR no\n", "0000"])), Err(ParseError::Remote("no".into())));
+        assert_eq!(ServiceHeader::parse(b"0000"), Err(Error::Syntax("one service line")));
+        assert_eq!(ServiceHeader::parse(&pkt(&["# x\n", "0000"])), Err(Error::Syntax("# service=")));
+        assert_eq!(ServiceHeader::parse(&pkt(&["# service=git-x\n", "0000"])), Err(Error::Syntax("a service name")));
+        assert_eq!(ServiceHeader::parse(&pkt(&["0001", "0000"])), Err(Error::Syntax("a data packet")));
+        assert_eq!(ServiceHeader::parse(&pkt(&["ERR no\n", "0000"])), Err(Error::Remote("no".into())));
     }
 
     // gitprotocol-pack, "Reference Discovery".
@@ -1864,7 +1809,7 @@ mod tests {
         assert!(ad.capability("agent").is_none());
         assert_eq!(ad.to_bytes().unwrap(), bytes);
         for n in 0..bytes.len() {
-            assert_eq!(Advertisement::parse(&bytes[..n]), Err(ParseError::Truncated), "{n} bytes");
+            assert_eq!(Advertisement::parse(&bytes[..n]), Err(Error::Truncated), "{n} bytes");
         }
     }
 
@@ -1900,7 +1845,7 @@ mod tests {
             ],
             ..Advertisement::default()
         };
-        assert_eq!(odd.to_bytes(), Err(ParseError::Unwritable));
+        assert_eq!(odd.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&odd);
     }
 
@@ -1972,24 +1917,24 @@ mod tests {
     // gitprotocol-v2: key = 1*(ALPHA | DIGIT | "-_"); command = "command=" key.
     #[test]
     fn keys_are_checked() {
-        let name = Err(ParseError::Syntax("a capability name"));
+        let name = Err(Error::Syntax("a capability name"));
         assert_eq!(Advertisement::parse(&pkt(&[&format!("{A} HEAD\0ofs delta=x a.b\n"), "0000"])).map(|_| ()), name);
         assert_eq!(CapabilityAdvertisement::parse(&pkt(&["version 2\n", "ls refs\n", "0000"])).map(|_| ()), name);
         assert_eq!(CapabilityAdvertisement::parse(&pkt(&["version 2\n", "fetch/x=y\n", "0000"])).map(|_| ()), name);
         assert_eq!(ClientLine::parse(format!("want {A} th!n-pack").as_bytes()).map(|_| ()), name);
         let ok = CapabilityAdvertisement::parse(&pkt(&["version 2\n", "Ab-9_=v w\n", "0000"])).unwrap();
         assert_eq!(ok.capabilities, [Capability::with_value("Ab-9_", "v w")]);
-        let command = Err(ParseError::Syntax("a command name"));
+        let command = Err(Error::Syntax("a command name"));
         assert_eq!(V2Request::parse(&pkt(&["command=\n", "0000"])).map(|_| ()), command);
         assert_eq!(V2Request::parse(&pkt(&["command=ls refs\n", "0000"])).map(|_| ()), command);
         assert_eq!(V2Request::parse(&pkt(&["command=a=b\n", "0000"])).map(|_| ()), command);
         // A command whose name has nothing a key may hold is refused.
         let empty = V2Request::Command(Command { name: "?!".into(), capabilities: vec![], args: vec!["x".into()] });
-        assert_eq!(empty.to_bytes(), Err(ParseError::Unwritable));
+        assert_eq!(empty.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&empty);
         let cap = Capability::with_value("é x", "v");
         let ad = CapabilityAdvertisement { capabilities: vec![cap.clone(), Capability::new("~")] };
-        assert_eq!(ad.to_bytes(), Err(ParseError::Unwritable));
+        assert_eq!(ad.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&ad);
     }
 
@@ -1998,30 +1943,30 @@ mod tests {
         let first = format!("{A} HEAD\0ofs-delta\n");
         let parse = |lines: &[&str]| Advertisement::parse(&pkt(lines)).map(|_| ());
         let zero = format!("{} capabilities^{{}}\0\n", "0".repeat(40));
-        assert_eq!(parse(&[&zero, &format!("{A} x\n"), "0000"]), Err(ParseError::Syntax("a shallow line")));
-        assert_eq!(parse(&[&first, &format!("shallow {A}\n"), &format!("{A} x\n"), "0000"]), Err(ParseError::Syntax("a shallow line")));
-        assert_eq!(parse(&["nothex HEAD\0\n", "0000"]), Err(ParseError::ObjectId));
-        assert_eq!(parse(&[&first, "shallow zz\n", "0000"]), Err(ParseError::ObjectId));
-        assert_eq!(parse(&["ERR access denied\n", "0000"]), Err(ParseError::Remote("access denied".into())));
-        assert_eq!(parse(&[&first, "ERR later\n", "0000"]), Err(ParseError::Remote("later".into())));
-        assert_eq!(parse(&[&first, "0001", "0000"]), Err(ParseError::Syntax("a data packet")));
-        assert_eq!(parse(&["0002", "0000"]), Err(ParseError::Syntax("a data packet")));
-        assert_eq!(parse(&[A, "0000"]), Err(ParseError::Syntax("a ref line")));
-        assert_eq!(parse(&[&format!("{A} HEAD\0=x\n"), "0000"]), Err(ParseError::Syntax("a capability name")));
-        assert_eq!(parse(&[&format!("{A} HEAD\0a\0b\n"), "0000"]), Err(ParseError::Text));
-        assert_eq!(parse(&[&first, &format!("{A} a\0b\n"), "0000"]), Err(ParseError::Text));
-        assert_eq!(parse(&[&format!("{A} HEAD\0\u{0}\n"), "0000"]), Err(ParseError::Text));
+        assert_eq!(parse(&[&zero, &format!("{A} x\n"), "0000"]), Err(Error::Syntax("a shallow line")));
+        assert_eq!(parse(&[&first, &format!("shallow {A}\n"), &format!("{A} x\n"), "0000"]), Err(Error::Syntax("a shallow line")));
+        assert_eq!(parse(&["nothex HEAD\0\n", "0000"]), Err(Error::ObjectId));
+        assert_eq!(parse(&[&first, "shallow zz\n", "0000"]), Err(Error::ObjectId));
+        assert_eq!(parse(&["ERR access denied\n", "0000"]), Err(Error::Remote("access denied".into())));
+        assert_eq!(parse(&[&first, "ERR later\n", "0000"]), Err(Error::Remote("later".into())));
+        assert_eq!(parse(&[&first, "0001", "0000"]), Err(Error::Syntax("a data packet")));
+        assert_eq!(parse(&["0002", "0000"]), Err(Error::Syntax("a data packet")));
+        assert_eq!(parse(&[A, "0000"]), Err(Error::Syntax("a ref line")));
+        assert_eq!(parse(&[&format!("{A} HEAD\0=x\n"), "0000"]), Err(Error::Syntax("a capability name")));
+        assert_eq!(parse(&[&format!("{A} HEAD\0a\0b\n"), "0000"]), Err(Error::Text));
+        assert_eq!(parse(&[&first, &format!("{A} a\0b\n"), "0000"]), Err(Error::Text));
+        assert_eq!(parse(&[&format!("{A} HEAD\0\u{0}\n"), "0000"]), Err(Error::Text));
         let many = format!("{A} HEAD\0{}\n", "c ".repeat(MAX_CAPABILITIES + 1));
-        assert_eq!(parse(&[&many, "0000"]), Err(ParseError::TooMany));
+        assert_eq!(parse(&[&many, "0000"]), Err(Error::TooMany));
         let long = format!("{A} {}\n", "r".repeat(MAX_TEXT + 1));
-        assert_eq!(parse(&[&long, "0000"]), Err(ParseError::TooLong));
-        assert_eq!(Advertisement::parse(b"0003"), Err(ParseError::Packet(PacketError::Reserved)));
+        assert_eq!(parse(&[&long, "0000"]), Err(Error::TooLong));
+        assert_eq!(Advertisement::parse(b"0003"), Err(Error::Reserved));
         // Too many refs.
         let mut lines = vec![first.clone()];
         lines.extend((0..MAX_ITEMS).map(|i| format!("{A} r{i}\n")));
         lines.push("0000".into());
         let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
-        assert_eq!(parse(&refs), Err(ParseError::TooMany));
+        assert_eq!(parse(&refs), Err(Error::TooMany));
     }
 
     #[test]
@@ -2038,14 +1983,14 @@ mod tests {
                 .collect(),
             shallow: vec![],
         };
-        assert_eq!(ad.to_bytes(), Err(ParseError::Unwritable));
+        assert_eq!(ad.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&ad);
         // Many long capabilities stop where the line is full.
         let full = Advertisement {
             capabilities: vec![Capability::with_value("k", &"v".repeat(MAX_TEXT - 10)); 40],
             ..Advertisement::default()
         };
-        assert_eq!(full.to_bytes(), Err(ParseError::Unwritable));
+        assert_eq!(full.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&full);
     }
 
@@ -2067,23 +2012,23 @@ mod tests {
         assert_eq!(ad.capability("server-option"), Some(&Capability::new("server-option")));
         assert_eq!(ad.to_bytes().unwrap(), bytes);
         for n in 0..bytes.len() {
-            assert_eq!(CapabilityAdvertisement::parse(&bytes[..n]), Err(ParseError::Truncated));
+            assert_eq!(CapabilityAdvertisement::parse(&bytes[..n]), Err(Error::Truncated));
         }
-        assert_eq!(CapabilityAdvertisement::parse(b"0000"), Err(ParseError::Syntax("version 2")));
-        assert_eq!(CapabilityAdvertisement::parse(&pkt(&["version 1\n", "0000"])), Err(ParseError::Syntax("version 2")));
-        assert_eq!(CapabilityAdvertisement::parse(&pkt(&["ERR x\n", "0000"])), Err(ParseError::Remote("x".into())));
+        assert_eq!(CapabilityAdvertisement::parse(b"0000"), Err(Error::Syntax("version 2")));
+        assert_eq!(CapabilityAdvertisement::parse(&pkt(&["version 1\n", "0000"])), Err(Error::Syntax("version 2")));
+        assert_eq!(CapabilityAdvertisement::parse(&pkt(&["ERR x\n", "0000"])), Err(Error::Remote("x".into())));
         assert_eq!(
             CapabilityAdvertisement::parse(&pkt(&["version 2\n", "=v\n", "0000"])),
-            Err(ParseError::Syntax("a capability name"))
+            Err(Error::Syntax("a capability name"))
         );
-        assert_eq!(CapabilityAdvertisement::parse(&pkt(&["version 2\n", "0001", "0000"])), Err(ParseError::Syntax("a data packet")));
+        assert_eq!(CapabilityAdvertisement::parse(&pkt(&["version 2\n", "0001", "0000"])), Err(Error::Syntax("a data packet")));
         let mut many = vec!["version 2\n"];
         many.extend(std::iter::repeat_n("c\n", MAX_CAPABILITIES + 1));
         many.push("0000");
-        assert_eq!(CapabilityAdvertisement::parse(&pkt(&many)), Err(ParseError::TooMany));
+        assert_eq!(CapabilityAdvertisement::parse(&pkt(&many)), Err(Error::TooMany));
         // A capability named like an error reads back as a capability.
         let odd = CapabilityAdvertisement { capabilities: vec![Capability::new("ERR x"), Capability::new("=")] };
-        assert_eq!(odd.to_bytes(), Err(ParseError::Unwritable));
+        assert_eq!(odd.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&odd);
     }
 
@@ -2108,7 +2053,7 @@ mod tests {
         );
         assert_eq!(req.to_bytes().unwrap(), bytes);
         for n in 0..bytes.len() {
-            assert_eq!(V2Request::parse(&bytes[..n]), Err(ParseError::Truncated));
+            assert_eq!(V2Request::parse(&bytes[..n]), Err(Error::Truncated));
         }
         assert_eq!(V2Request::parse(b"0000"), Ok(V2Request::Empty));
         assert_eq!(V2Request::Empty.to_bytes().unwrap(), b"0000");
@@ -2133,34 +2078,34 @@ mod tests {
     #[test]
     fn v2_request_errors() {
         let parse = |lines: &[&str]| V2Request::parse(&pkt(lines)).map(|_| ());
-        assert_eq!(parse(&["ls-refs\n", "0000"]), Err(ParseError::Syntax("command=")));
-        assert_eq!(parse(&["0001", "0000"]), Err(ParseError::Syntax("a data packet")));
-        assert_eq!(parse(&["command=x\n", "0001", "0001", "0000"]), Err(ParseError::Syntax("a data packet")));
-        assert_eq!(parse(&["command=x\n", "0002", "0000"]), Err(ParseError::Syntax("a data packet")));
-        assert_eq!(parse(&["command=x\n", "=y\n", "0000"]), Err(ParseError::Syntax("a capability name")));
-        assert_eq!(parse(&["command=x\n", "0001", "a\nb\n", "0000"]), Err(ParseError::Text));
-        assert_eq!(parse(&["command=\u{0}\n", "0000"]), Err(ParseError::Text));
+        assert_eq!(parse(&["ls-refs\n", "0000"]), Err(Error::Syntax("command=")));
+        assert_eq!(parse(&["0001", "0000"]), Err(Error::Syntax("a data packet")));
+        assert_eq!(parse(&["command=x\n", "0001", "0001", "0000"]), Err(Error::Syntax("a data packet")));
+        assert_eq!(parse(&["command=x\n", "0002", "0000"]), Err(Error::Syntax("a data packet")));
+        assert_eq!(parse(&["command=x\n", "=y\n", "0000"]), Err(Error::Syntax("a capability name")));
+        assert_eq!(parse(&["command=x\n", "0001", "a\nb\n", "0000"]), Err(Error::Text));
+        assert_eq!(parse(&["command=\u{0}\n", "0000"]), Err(Error::Text));
         let mut many = vec!["command=x\n"];
         many.extend(std::iter::repeat_n("c\n", MAX_CAPABILITIES + 1));
         many.push("0000");
-        assert_eq!(parse(&many), Err(ParseError::TooMany));
+        assert_eq!(parse(&many), Err(Error::TooMany));
         let mut args = vec!["command=x\n", "0001"];
         args.extend(std::iter::repeat_n("a\n", MAX_ITEMS + 1));
         args.push("0000");
-        assert_eq!(parse(&args), Err(ParseError::TooMany));
+        assert_eq!(parse(&args), Err(Error::TooMany));
         let bad = Command { name: "fetch".into(), capabilities: vec![], args: vec!["want zz".into()] };
-        assert_eq!(bad.fetch_args(), Err(ParseError::ObjectId));
+        assert_eq!(bad.fetch_args(), Err(Error::ObjectId));
         let bad = Command { name: "ls-refs".into(), capabilities: vec![], args: vec!["a\nb".into()] };
-        assert_eq!(bad.ls_refs_args(), Err(ParseError::Text));
+        assert_eq!(bad.ls_refs_args(), Err(Error::Text));
         let long = Command { name: "ls-refs".into(), capabilities: vec![], args: vec![format!("ref-prefix {}", "p".repeat(MAX_TEXT + 1))] };
-        assert_eq!(long.ls_refs_args(), Err(ParseError::TooLong));
+        assert_eq!(long.ls_refs_args(), Err(Error::TooLong));
         // Writers refuse fields that would need changes.
         let req = V2Request::Command(Command {
             name: "a\nb".into(),
             capabilities: vec![Capability::with_value("k=k", "v\0v")],
             args: vec!["x\ny".into(), "z".repeat(MAX_DATA * 2)],
         });
-        assert_eq!(req.to_bytes(), Err(ParseError::Unwritable));
+        assert_eq!(req.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&req);
     }
 
@@ -2200,16 +2145,16 @@ mod tests {
         let other = ClientLine::parse(b"want\n").unwrap();
         assert_eq!(other.to_bytes().unwrap(), b"want\n");
         // Errors.
-        assert_eq!(ClientLine::parse(b"want 123\n"), Err(ParseError::ObjectId));
-        assert_eq!(ClientLine::parse(format!("have {}\n", &A[1..]).as_bytes()), Err(ParseError::ObjectId));
-        assert_eq!(ClientLine::parse(format!("want {A} =x").as_bytes()), Err(ParseError::Syntax("a capability name")));
-        assert_eq!(ClientLine::parse(b"deepen -1"), Err(ParseError::Syntax("a number")));
-        assert_eq!(ClientLine::parse(b"deepen "), Err(ParseError::Syntax("a number")));
-        assert_eq!(ClientLine::parse(b"deepen 99999999999"), Err(ParseError::Syntax("a number")));
-        assert_eq!(ClientLine::parse(b"deepen-since x"), Err(ParseError::Syntax("a number")));
-        assert_eq!(ClientLine::parse(b"done\n\n"), Err(ParseError::Text));
-        assert_eq!(ClientLine::parse(b"\xc3"), Err(ParseError::Text));
-        assert_eq!(ClientLine::parse(format!("filter {}", "f".repeat(MAX_TEXT + 1)).as_bytes()), Err(ParseError::TooLong));
+        assert_eq!(ClientLine::parse(b"want 123\n"), Err(Error::ObjectId));
+        assert_eq!(ClientLine::parse(format!("have {}\n", &A[1..]).as_bytes()), Err(Error::ObjectId));
+        assert_eq!(ClientLine::parse(format!("want {A} =x").as_bytes()), Err(Error::Syntax("a capability name")));
+        assert_eq!(ClientLine::parse(b"deepen -1"), Err(Error::Syntax("a number")));
+        assert_eq!(ClientLine::parse(b"deepen "), Err(Error::Syntax("a number")));
+        assert_eq!(ClientLine::parse(b"deepen 99999999999"), Err(Error::Syntax("a number")));
+        assert_eq!(ClientLine::parse(b"deepen-since x"), Err(Error::Syntax("a number")));
+        assert_eq!(ClientLine::parse(b"done\n\n"), Err(Error::Text));
+        assert_eq!(ClientLine::parse(b"\xc3"), Err(Error::Text));
+        assert_eq!(ClientLine::parse(format!("filter {}", "f".repeat(MAX_TEXT + 1)).as_bytes()), Err(Error::TooLong));
     }
 
     #[test]
@@ -2235,11 +2180,11 @@ mod tests {
         }
         assert_eq!(ServerLine::parse(b"0008NAK\n"), Ok(ServerLine::Other(Unknown::new("0008NAK"))));
         assert_eq!(ServerLine::parse(b"NAK\n"), Ok(ServerLine::Nak));
-        assert_eq!(ServerLine::parse(format!("ACK {A} maybe").as_bytes()), Err(ParseError::Syntax("an ACK status")));
-        assert_eq!(ServerLine::parse(b"ACK x"), Err(ParseError::ObjectId));
-        assert_eq!(ServerLine::parse(b"unshallow x"), Err(ParseError::ObjectId));
-        assert_eq!(ServerLine::parse(format!("ERR {}", "e".repeat(MAX_TEXT + 1)).as_bytes()), Err(ParseError::TooLong));
-        assert_eq!(ServerLine::Error("a\nb".into()).to_bytes(), Err(ParseError::Unwritable));
+        assert_eq!(ServerLine::parse(format!("ACK {A} maybe").as_bytes()), Err(Error::Syntax("an ACK status")));
+        assert_eq!(ServerLine::parse(b"ACK x"), Err(Error::ObjectId));
+        assert_eq!(ServerLine::parse(b"unshallow x"), Err(Error::ObjectId));
+        assert_eq!(ServerLine::parse(format!("ERR {}", "e".repeat(MAX_TEXT + 1)).as_bytes()), Err(Error::TooLong));
+        assert_eq!(ServerLine::Error("a\nb".into()).to_bytes(), Err(Error::Unwritable));
         // A wanted-refs entry reads as an LsRef.
         let other = ServerLine::parse(format!("{A} refs/heads/main\n").as_bytes()).unwrap();
         let ServerLine::Other(u) = other else { panic!() };
@@ -2255,12 +2200,12 @@ mod tests {
         let u = LsRef::parse(b"unborn HEAD symref-target:refs/heads/main x:y").unwrap();
         assert_eq!(u.id, None);
         assert_eq!(u.to_bytes().unwrap(), b"unborn HEAD symref-target:refs/heads/main\n");
-        assert_eq!(LsRef::parse(A.as_bytes()), Err(ParseError::Syntax("a ref line")));
-        assert_eq!(LsRef::parse(b"zz HEAD"), Err(ParseError::ObjectId));
-        assert_eq!(LsRef::parse(format!("{A} H peeled:q").as_bytes()), Err(ParseError::ObjectId));
-        assert_eq!(LsRef::parse(format!("{A} {}", "n".repeat(MAX_TEXT + 1)).as_bytes()), Err(ParseError::TooLong));
+        assert_eq!(LsRef::parse(A.as_bytes()), Err(Error::Syntax("a ref line")));
+        assert_eq!(LsRef::parse(b"zz HEAD"), Err(Error::ObjectId));
+        assert_eq!(LsRef::parse(format!("{A} H peeled:q").as_bytes()), Err(Error::ObjectId));
+        assert_eq!(LsRef::parse(format!("{A} {}", "n".repeat(MAX_TEXT + 1)).as_bytes()), Err(Error::TooLong));
         let odd = LsRef { id: None, name: "a b\0".into(), symref_target: Some("c d".into()), peeled: None };
-        assert_eq!(odd.to_bytes(), Err(ParseError::Unwritable));
+        assert_eq!(odd.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&odd);
         let empty = LsRef { id: Some(id(A)), name: String::new(), symref_target: None, peeled: None };
         assert_eq!(LsRef::parse(&empty.to_bytes().unwrap()), Ok(empty));
@@ -2283,8 +2228,8 @@ mod tests {
     fn side_band() {
         let pack = vec![7; 2500];
         let mut bytes = Vec::new();
-        for packet in band_packets(Band::Pack, &pack, SIDE_BAND_PACKET)
-            .chain(band_packets(Band::Progress, b"Counting objects: 3\r", SIDE_BAND_64K_PACKET))
+        for packet in band_packets(Sideband::Pack, &pack, SIDE_BAND_PACKET)
+            .chain(band_packets(Sideband::Progress, b"Counting objects: 3\r", SIDE_BAND_64K_PACKET))
             .chain([Packet::Flush]) { packet.write(&mut bytes).unwrap(); }
         contract::check_decode_with_alloc_limit(|| Bands, &bytes, 2 * MAX_PACKET);
         let (items, failure) = decode_all(|| Bands, &bytes);
@@ -2293,44 +2238,44 @@ mod tests {
         let mut sizes = Vec::new();
         for item in items {
             match item {
-                Demuxed::Data(Band::Pack, payload) => { sizes.push(payload.len()); got.extend(payload); }
-                Demuxed::Data(Band::Progress, payload) => assert_eq!(payload, b"Counting objects: 3\r"),
-                Demuxed::Flush => (),
+                Band::Data(Sideband::Pack, payload) => { sizes.push(payload.len()); got.extend(payload); }
+                Band::Data(Sideband::Progress, payload) => assert_eq!(payload, b"Counting objects: 3\r"),
+                Band::Flush => (),
                 other => panic!("{other:?}"),
             }
         }
         assert_eq!(got, pack);
         assert_eq!(sizes, [995, 995, 510]);
-        assert_eq!(band_packets(Band::Error, b"", 1000).count(), 0);
-        assert_eq!(band_packets(Band::Error, b"ab", 0).next().unwrap().to_bytes().unwrap(), b"0007\x03ab");
-        let small: usize = band_packets(Band::Pack, &[1; 99_500], 6).map(|p| p.to_bytes().unwrap().len()).sum();
+        assert_eq!(band_packets(Sideband::Error, b"", 1000).count(), 0);
+        assert_eq!(band_packets(Sideband::Error, b"ab", 0).next().unwrap().to_bytes().unwrap(), b"0007\x03ab");
+        let small: usize = band_packets(Sideband::Pack, &[1; 99_500], 6).map(|p| p.to_bytes().unwrap().len()).sum();
         assert_eq!(small, 99_500 + 100 * 5);
-        assert_eq!(&band_packets(Band::Pack, &vec![0; MAX_PACKET * 2], usize::MAX).next().unwrap().to_bytes().unwrap()[..4], b"fff0");
-        for band in [Band::Pack, Band::Progress, Band::Error] { assert_eq!(Band::from_code(band.code()), Some(band)); }
-        assert_eq!(split_band(b"\x02hi"), Ok((Band::Progress, &b"hi"[..])));
-        assert_eq!(split_band(b""), Err(ParseError::Syntax("a band byte")));
-        assert_eq!(split_band(b"\x04"), Err(ParseError::Syntax("band 1, 2 or 3")));
-        assert_eq!(decode_all(|| Bands, b"00010002000509"), (vec![Demuxed::Delim, Demuxed::ResponseEnd],
-            Some(Fail::Protocol(ParseError::Syntax("band 1, 2 or 3")))));
-        assert_eq!(decode_all(|| Bands, b"zz").1, Some(Fail::Protocol(ParseError::Packet(PacketError::Header))));
-        let mut stream = Stream::new(Frames::new());
+        assert_eq!(&band_packets(Sideband::Pack, &vec![0; MAX_PACKET * 2], usize::MAX).next().unwrap().to_bytes().unwrap()[..4], b"fff0");
+        for band in [Sideband::Pack, Sideband::Progress, Sideband::Error] { assert_eq!(Sideband::from_code(band.code()), Some(band)); }
+        assert_eq!(split_band(b"\x02hi"), Ok((Sideband::Progress, &b"hi"[..])));
+        assert_eq!(split_band(b""), Err(Error::Syntax("a band byte")));
+        assert_eq!(split_band(b"\x04"), Err(Error::Syntax("band 1, 2 or 3")));
+        assert_eq!(decode_all(|| Bands, b"00010002000509"), (vec![Band::Delim, Band::ResponseEnd],
+            Some(Fail::Protocol(Error::Syntax("band 1, 2 or 3")))));
+        assert_eq!(decode_all(|| Bands, b"zz").1, Some(Fail::Protocol(Error::Header)));
+        let mut stream = Stream::new(Packets::new());
         assert_eq!(stream.push(b"000dpackfile\n0006\x01P"), 19);
         assert_eq!(ServerLine::parse(stream.next().unwrap().unwrap().data().unwrap()), Ok(ServerLine::Section(Section::Packfile)));
         let mut stream = stream.swap(Bands);
-        assert_eq!(stream.next(), Some(Ok(Demuxed::Data(Band::Pack, b"P".to_vec()))));
+        assert_eq!(stream.next(), Some(Ok(Band::Data(Sideband::Pack, b"P".to_vec()))));
         assert_eq!(stream.next(), None);
     }
 
     #[test]
     fn errors_display() {
         for e in [
-            ParseError::Packet(PacketError::Header),
-            ParseError::Text,
-            ParseError::ObjectId,
-            ParseError::Syntax("x"),
-            ParseError::TooLong,
-            ParseError::TooMany,
-            ParseError::Remote("r".into()),
+            Error::Header,
+            Error::Text,
+            Error::ObjectId,
+            Error::Syntax("x"),
+            Error::TooLong,
+            Error::TooMany,
+            Error::Remote("r".into()),
         ] {
             assert!(!e.to_string().is_empty());
         }
@@ -2341,12 +2286,12 @@ mod tests {
     #[test]
     fn stream_buffer_is_bounded() {
         let bytes = b"0000".repeat(MAX_PACKET);
-        let mut stream = Stream::new(Frames::new());
+        let mut stream = Stream::new(Packets::new());
         assert_eq!(stream.push(&bytes), MAX_PACKET);
         assert_eq!(stream.push(b"0000"), 0);
         assert_eq!(stream.next(), Some(Ok(Packet::Flush)));
         assert_eq!(stream.push(b"0000"), 4);
-        contract::check_decode_with_alloc_limit(Frames::new, &bytes[..1024], 2 * MAX_PACKET);
+        contract::check_decode_with_alloc_limit(Packets::new, &bytes[..1024], 2 * MAX_PACKET);
         let mut bands = Stream::new(Bands);
         assert_eq!(bands.push(&bytes), MAX_PACKET);
         assert_eq!(bands.buffered(), MAX_PACKET);
@@ -2357,18 +2302,18 @@ mod tests {
     #[test]
     fn stream_hands_over_raw_bytes() {
         let bytes = b"0008NAK\nPACK\x00\x00\x00\x02";
-        let mut stream = Stream::new(Frames::new());
+        let mut stream = Stream::new(Packets::new());
         assert_eq!(stream.push(bytes), bytes.len());
         assert_eq!(ServerLine::parse(stream.next().unwrap().unwrap().data().unwrap()), Ok(ServerLine::Nak));
         assert_eq!(stream.into_parts().0.unread(), b"PACK\x00\x00\x00\x02");
-        assert!(Stream::new(Frames::new()).into_parts().0.unread().is_empty());
+        assert!(Stream::new(Packets::new()).into_parts().0.unread().is_empty());
     }
 
     #[test]
     fn command_args_are_bounded() {
         let many = Command { name: "fetch".into(), capabilities: vec![], args: vec!["done".into(); MAX_ITEMS + 1] };
-        assert_eq!(many.fetch_args(), Err(ParseError::TooMany));
-        assert_eq!(many.ls_refs_args(), Err(ParseError::TooMany));
+        assert_eq!(many.fetch_args(), Err(Error::TooMany));
+        assert_eq!(many.ls_refs_args(), Err(Error::TooMany));
     }
 
     // A first line of a whole packet with no line feed cannot be written
@@ -2382,7 +2327,7 @@ mod tests {
         };
         let full = format!("{} HEAD\0{}", "a".repeat(40), names(4015));
         assert_eq!(full.len(), MAX_DATA);
-        assert_eq!(Advertisement::parse(&pkt(&[&full, "0000"])), Err(ParseError::TooLong));
+        assert_eq!(Advertisement::parse(&pkt(&[&full, "0000"])), Err(Error::TooLong));
         let fits = format!("{} HEAD\0{}\n", "a".repeat(40), names(4014));
         assert_eq!(fits.len(), MAX_DATA);
         let ad = Advertisement::parse(&pkt(&[&fits, "0000"])).unwrap();
@@ -2404,7 +2349,7 @@ mod tests {
     // so no flush follows it.
     #[test]
     fn err_lines_end_a_message() {
-        let remote = |m: &str| Err::<(), _>(ParseError::Remote(m.into()));
+        let remote = |m: &str| Err::<(), _>(Error::Remote(m.into()));
         assert_eq!(Advertisement::parse(b"000bERR no\n").map(|_| ()), remote("no"));
         let first = format!("{A} HEAD\0ofs-delta\n");
         assert_eq!(Advertisement::parse(&pkt(&[&first, "ERR later\n"])).map(|_| ()), remote("later"));
@@ -2430,11 +2375,11 @@ mod tests {
     fn ids_follow_the_object_format() {
         let sha256 = format!("{C} HEAD\0object-format=sha256\n");
         assert!(Advertisement::parse(&pkt(&[&sha256, "0000"])).is_ok());
-        assert_eq!(Advertisement::parse(&pkt(&[&sha256, &format!("shallow {B}\n"), "0000"])), Err(ParseError::ObjectId));
-        assert_eq!(Advertisement::parse(&pkt(&[&sha256, &format!("{A} refs/x\n"), "0000"])), Err(ParseError::ObjectId));
-        assert_eq!(Advertisement::parse(&pkt(&[&format!("{C} HEAD\0ofs-delta\n"), "0000"])), Err(ParseError::ObjectId));
+        assert_eq!(Advertisement::parse(&pkt(&[&sha256, &format!("shallow {B}\n"), "0000"])), Err(Error::ObjectId));
+        assert_eq!(Advertisement::parse(&pkt(&[&sha256, &format!("{A} refs/x\n"), "0000"])), Err(Error::ObjectId));
+        assert_eq!(Advertisement::parse(&pkt(&[&format!("{C} HEAD\0ofs-delta\n"), "0000"])), Err(Error::ObjectId));
         let sha1 = format!("{C} HEAD\0object-format=sha1\n");
-        assert_eq!(Advertisement::parse(&pkt(&[&sha1, "0000"])), Err(ParseError::ObjectId));
+        assert_eq!(Advertisement::parse(&pkt(&[&sha1, "0000"])), Err(Error::ObjectId));
         // A format this module does not know is not checked.
         let odd = format!("{C} HEAD\0object-format=x\n");
         assert!(Advertisement::parse(&pkt(&[&odd, &format!("{A} refs/x\n"), "0000"])).is_ok());
@@ -2445,12 +2390,12 @@ mod tests {
             capabilities: vec![Capability::with_value("object-format", "sha256")],
             shallow: vec![id(B), id(C)],
         };
-        assert_eq!(ad.to_bytes(), Err(ParseError::Unwritable));
+        assert_eq!(ad.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&ad);
         let mut caps = vec![Capability::with_value("k", &"v".repeat(MAX_TEXT - 10)); 40];
         caps.push(Capability::with_value("object-format", "sha256"));
         let full = Advertisement { capabilities: caps, ..ad };
-        assert_eq!(full.to_bytes(), Err(ParseError::Unwritable));
+        assert_eq!(full.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&full);
     }
 
@@ -2463,7 +2408,7 @@ mod tests {
                 .fetch_args()
                 .map(|_| ())
         };
-        let both = Err(ParseError::Syntax("deepen without deepen-since or deepen-not"));
+        let both = Err(Error::Syntax("deepen without deepen-since or deepen-not"));
         assert_eq!(fetch(&["deepen 1", "deepen-since 1"]), both);
         assert_eq!(fetch(&["deepen-not refs/x", "deepen 2"]), both);
         assert_eq!(fetch(&["deepen-since 1", "deepen-not refs/x"]), Ok(()));
@@ -2471,7 +2416,7 @@ mod tests {
     }
 
     fn check(data: &[u8]) {
-        contract::check_decode_with_alloc_limit(Frames::new, data, 2 * MAX_PACKET);
+        contract::check_decode_with_alloc_limit(Packets::new, data, 2 * MAX_PACKET);
         contract::check_decode_with_alloc_limit(|| Bands, data, 2 * MAX_PACKET);
         contract::check_wire::<Packet>(data);
         contract::check_wire::<ProtoRequest>(data);
@@ -2480,7 +2425,7 @@ mod tests {
         contract::check_wire::<CapabilityAdvertisement>(data);
         contract::check_wire::<V2Request>(data);
         // Bytes still buffered are handed over without changes, even after a bad packet.
-        let mut stream = Stream::new(Frames::new());
+        let mut stream = Stream::new(Packets::new());
         let pushed = stream.push(data);
         let mut used = 0;
         while let Some(Ok(packet)) = stream.next() {
@@ -2488,7 +2433,7 @@ mod tests {
         }
         let (buffer, _) = stream.into_parts();
         assert_eq!(buffer.unread(), &data[used..pushed]);
-        for packet in decode_all(Frames::new, data).0 {
+        for packet in decode_all(Packets::new, data).0 {
             if let Some(bytes) = packet.data() {
                 contract::check_wire::<ClientLine>(bytes);
                 contract::check_wire::<ServerLine>(bytes);
@@ -2516,14 +2461,14 @@ mod tests {
         }
         let max = data.first().map_or(0, |b| usize::from(*b) * 300);
         let mut bytes = Vec::new();
-        for packet in band_packets(Band::Pack, data, max) {
+        for packet in band_packets(Sideband::Pack, data, max) {
             packet.write(&mut bytes).unwrap();
         }
         let (items, failure) = decode_all(|| Bands, &bytes);
         assert_eq!(failure, None);
         let mut back = Vec::new();
         for item in items {
-            let Demuxed::Data(Band::Pack, payload) = item else { panic!("unexpected band") };
+            let Band::Data(Sideband::Pack, payload) = item else { panic!("unexpected band") };
             back.extend(payload);
         }
         assert_eq!(back, data);
@@ -2566,8 +2511,8 @@ mod tests {
             Packet::text(&format!("unborn HEAD symref-target:refs/heads/main peeled:{B}")).to_bytes().unwrap(),
             Packet::text("# service=git-upload-pack").to_bytes().unwrap(),
             Packet::Data(b"git-upload-pack /x\0host=h\0\0version=2\0".to_vec()).to_bytes().unwrap(),
-            band_packets(Band::Pack, b"PACK", 1000).next().unwrap().to_bytes().unwrap(),
-            band_packets(Band::Progress, b"50%\r", 1000).next().unwrap().to_bytes().unwrap(),
+            band_packets(Sideband::Pack, b"PACK", 1000).next().unwrap().to_bytes().unwrap(),
+            band_packets(Sideband::Progress, b"50%\r", 1000).next().unwrap().to_bytes().unwrap(),
             b"0006\x07x".to_vec(),
             b"0005\xff".to_vec(),
         ];

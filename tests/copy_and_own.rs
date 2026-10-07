@@ -187,7 +187,7 @@ fn copied_fix_skips_garbled_frames_through_the_public_driver() {
     // FIX 4.4 Vol 2 case 3.b: discard an invalid checksum and continue.
     let good = b"8=FIX.4.4\x019=5\x0135=0\x0110=163\x01";
     let bad = b"8=FIX.4.4\x019=5\x0135=0\x0110=164\x01";
-    let mut stream = Stream::new(fix::Frames::default());
+    let mut stream = Stream::new(fix::Messages::default());
     let mut messages = Vec::new();
     pump(&mut stream, bad, |item| messages.push(item)).unwrap();
     pump(&mut stream, good, |item| messages.push(item)).unwrap();
@@ -221,7 +221,7 @@ fn copied_fix_passes_field_failures_to_the_session() {
     }
     session.receive(&logon, 0, time).unwrap();
     let bytes = b"8=FIX.4.4\x019=56\x0135=0\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0158=\x0110=255\x01";
-    let mut stream = Stream::new(fix::Frames::default());
+    let mut stream = Stream::new(fix::Messages::default());
     assert_eq!(stream.push(bytes), bytes.len());
     let frame = stream.next().unwrap().unwrap();
     assert_eq!(frame.as_ref().unwrap_err().reason(), 4);
@@ -247,16 +247,16 @@ fn copied_fast_uses_templates_and_the_public_driver() {
         .write(&value, &mut bytes)
         .unwrap();
     assert_eq!(bytes, [0xc0, 0x81]);
-    let mut stream = Stream::new(fast::Frames::new(templates.clone()));
+    let mut stream = Stream::new(fast::Messages::new(templates.clone()));
     assert_eq!(stream.push(&bytes), bytes.len());
     assert_eq!(stream.next().unwrap().unwrap(), value);
     assert_eq!(fast::UInt64::parse(&[0x81]).unwrap(), fast::UInt64(1));
-    let mut blocks = Stream::new(fast::BlockFrames::new(fast::Frames::new(
+    let mut blocks = Stream::new(fast::BlockMessages::new(fast::Messages::new(
         templates.clone(),
     )));
     assert_eq!(blocks.push(&[0, 0x82, 0xc0, 0x81]), 4);
     assert_eq!(blocks.next().unwrap().unwrap(), value);
-    let mut split = Stream::new(fast::BlockFrames::new(fast::Frames::new(
+    let mut split = Stream::new(fast::BlockMessages::new(fast::Messages::new(
         templates,
     )));
     assert_eq!(split.push(&[0x81, 0xc0, 0x81, 0x81]), 4);
@@ -288,7 +288,7 @@ fn copied_soupbintcp_frames_through_the_public_driver() {
     )
     .unwrap();
     client.start(0).unwrap();
-    let mut stream = Stream::new(soupbintcp::Frames::default());
+    let mut stream = Stream::new(soupbintcp::Packets::default());
     let mut events = Vec::new();
     for chunk in bytes.chunks(5) {
         pump(&mut stream, chunk, |frame| {
@@ -467,7 +467,7 @@ fn copied_cboe_boe_logs_in_and_acknowledges() {
     };
     let mut client = cboe_boe::Client::new(config, &[], 0).unwrap();
     let mut server = cboe_boe::Server::new(cboe_boe::Timers::default(), 0).unwrap();
-    let mut frames = Stream::new(cboe_boe::Frames::<cboe_boe::Inbound>::default());
+    let mut frames = Stream::new(cboe_boe::Messages::<cboe_boe::Inbound>::default());
     for action in client.start(0).unwrap() {
         if let Action::Send(m) = action {
             let bytes = m.to_bytes().unwrap();
@@ -536,7 +536,7 @@ fn copied_generated_cme_module_frames_packets() {
     };
     let bytes = packet.to_bytes().unwrap();
     assert_eq!(<cme_mdp3::Packet as Wire>::parse(&bytes).unwrap(), packet);
-    let mut stream = Stream::new(cme_mdp3::Frames);
+    let mut stream = Stream::new(cme_mdp3::Messages);
     let mut messages = Vec::new();
     for chunk in bytes[cme_mdp3::PACKET_HEADER..].chunks(3) {
         pump(&mut stream, chunk, |m| messages.push(m)).unwrap();

@@ -14,7 +14,7 @@
 //! and RFC 1002, sections 4.1 and 4.3.
 //!
 //! A world that plays a file server pushes bytes from a TCP connection
-//! into a [`Stream<Frames>`](fictionet::stdlib::codec::Stream), gets [`Packet`]s
+//! into a [`Stream<Packets>`](fictionet::stdlib::codec::Stream), gets [`Packet`]s
 //! back, and writes the bytes of its answers back to the connection. Which
 //! names it listens on, and what it says to a session request, is up to
 //! world code.
@@ -31,7 +31,7 @@
 //! reader would refuse or read back as a different value.
 //!
 //! ```
-//! use fictionet::stdlib::{codec::{Stream, Wire}, nbss::{Frames, Name, NegativeCode, Packet}};
+//! use fictionet::stdlib::{codec::{Stream, Wire}, nbss::{Name, NegativeCode, Packet, Packets}};
 //!
 //! /// A server that answers to FILESERVER and to *SMBSERVER.
 //! fn answer(packet: &Packet) -> Option<Packet> {
@@ -58,7 +58,7 @@
 //! // The called name starts with F (0x46), encoded as "EG".
 //! assert_eq!(bytes[4..7], [0x20, b'E', b'G']);
 //!
-//! let mut decoder = Stream::new(Frames::new());
+//! let mut decoder = Stream::new(Packets::new());
 //! // The request arrives in two pieces.
 //! assert_eq!(decoder.push(&bytes[..10]), 10);
 //! assert_eq!(decoder.next(), None);
@@ -332,7 +332,7 @@ pub enum Packet {
 }
 
 /// Why a session packet or name could not be read or written.
-/// An error from [`Frames`] ends the stream.
+/// An error from [`Packets`] ends the stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Error {
     /// The type is not one RFC 1002 defines.
@@ -455,10 +455,10 @@ impl Wire for Packet {
 /// and reports errors once. All packet errors end this decoder.
 ///
 /// ```
-/// use fictionet::stdlib::{codec::{Stream, Wire, finish, pump}, nbss::{Frames, Packet}};
+/// use fictionet::stdlib::{codec::{Stream, Wire, finish, pump}, nbss::{Packet, Packets}};
 /// let packet = Packet::Message(b"hello".to_vec());
 /// let bytes = Wire::to_bytes(&packet)?;
-/// let mut stream = Stream::new(Frames::with_limit(1024));
+/// let mut stream = Stream::new(Packets::with_limit(1024));
 /// let mut packets = Vec::new();
 /// for chunk in bytes.chunks(3) {
 ///     pump(&mut stream, chunk, |item| packets.push(item))?;
@@ -468,11 +468,11 @@ impl Wire for Packet {
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Frames {
+pub struct Packets {
     limit: usize,
 }
 
-impl Frames {
+impl Packets {
     /// Creates a decoder accepting bodies up to [`MAX_LENGTH`] bytes.
     pub fn new() -> Self {
         Self::with_limit(MAX_LENGTH)
@@ -489,13 +489,13 @@ impl Frames {
     }
 }
 
-impl Default for Frames {
+impl Default for Packets {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Decode for Frames {
+impl Decode for Packets {
     type Item = Packet;
     type Error = Error;
     const NAME: &'static str = "NBSS";
@@ -677,7 +677,7 @@ mod tests {
     #[test]
     fn packet_hashes_and_partial_input() {
         let bytes = request().to_bytes().unwrap();
-        let mut stream = Stream::new(Frames::new());
+        let mut stream = Stream::new(Packets::new());
         assert_eq!(stream.push(&bytes[..20]), 20);
         assert_eq!(stream.next(), None);
         assert_eq!(stream.push(&bytes[20..]), bytes.len() - 20);
@@ -702,11 +702,11 @@ mod tests {
     #[test]
     fn stream_bounds() {
         let data = [0x85, 0, 0, 0].repeat(1_000);
-        contract::check_decode_with_alloc_limit(|| Frames::with_limit(0), &data, 2 * HEADER_LEN);
-        let (packets, error) = decode_all(|| Frames::with_limit(0), &data);
+        contract::check_decode_with_alloc_limit(|| Packets::with_limit(0), &data, 2 * HEADER_LEN);
+        let (packets, error) = decode_all(|| Packets::with_limit(0), &data);
         assert_eq!(packets, vec![Packet::KeepAlive; 1_000]);
         assert_eq!(error, None);
-        let mut stream = Stream::new(Frames::new());
+        let mut stream = Stream::new(Packets::new());
         assert_eq!(stream.push(&vec![0; 3 * MAX_PACKET]), MAX_PACKET);
         assert_eq!(stream.push(&[0]), 0);
     }
@@ -878,14 +878,14 @@ mod tests {
 
     #[test]
     fn stream_limit() {
-        let make = || Frames::with_limit(10);
+        let make = || Packets::with_limit(10);
         assert_eq!(make().limit(), 10);
         let packet = Packet::Message(vec![1; 10]);
         assert_eq!(decode_all(make, &packet.to_bytes().unwrap()), (vec![packet], None));
         assert_eq!(decode_all(make, &[0, 0, 0, 11]).1, Some(Fail::Protocol(Error::TooLong(11))));
         assert_eq!(decode_all(make, &request().to_bytes().unwrap()[..4]).1, Some(Fail::Protocol(Error::TooLong(68))));
-        assert_eq!(Frames::with_limit(usize::MAX).limit(), MAX_LENGTH);
-        assert_eq!(Frames::default().limit(), MAX_LENGTH);
+        assert_eq!(Packets::with_limit(usize::MAX).limit(), MAX_LENGTH);
+        assert_eq!(Packets::default().limit(), MAX_LENGTH);
     }
 
     #[test]
@@ -899,16 +899,16 @@ mod tests {
             Packet::Retarget { address: [192, 168, 1, 2], port: 1139 },
         ];
         let stream: Vec<u8> = packets.iter().flat_map(|p| p.to_bytes().unwrap()).collect();
-        contract::check_decode_with_alloc_limit(Frames::new, &stream, 2 * MAX_PACKET);
-        assert_eq!(decode_all(Frames::new, &stream), (packets.to_vec(), None));
-        assert_eq!(decode_all(Frames::new, &[0x99, 0, 0, 0]).1, Some(Fail::Protocol(Error::Type(0x99))));
+        contract::check_decode_with_alloc_limit(Packets::new, &stream, 2 * MAX_PACKET);
+        assert_eq!(decode_all(Packets::new, &stream), (packets.to_vec(), None));
+        assert_eq!(decode_all(Packets::new, &[0x99, 0, 0, 0]).1, Some(Fail::Protocol(Error::Type(0x99))));
     }
 
     #[test]
     fn stream_takes_many_small_packets_in_linear_time() {
         let bytes = Packet::KeepAlive.to_bytes().unwrap().repeat(200_000);
         let started = std::time::Instant::now();
-        let (packets, error) = decode_all(Frames::new, &bytes);
+        let (packets, error) = decode_all(Packets::new, &bytes);
         assert_eq!(packets.len(), 200_000);
         assert_eq!(error, None);
         assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
@@ -939,7 +939,7 @@ mod tests {
                 bytes
             };
             mutate(&mut rng, &mut data);
-            contract::check_decode_with_alloc_limit(Frames::new, &data, 2 * MAX_PACKET);
+            contract::check_decode_with_alloc_limit(Packets::new, &data, 2 * MAX_PACKET);
             contract::check_wire::<Packet>(&data);
             contract::check_wire::<Name>(&data);
             let mut scope: Vec<Vec<u8>> =

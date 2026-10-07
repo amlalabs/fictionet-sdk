@@ -3,17 +3,17 @@
 #![no_main]
 
 use fictionet::stdlib::codec::{Decode, Wire, contract, test_support::decode_all};
-use fictionet::stdlib::zabbix::{Frames, Header, Message, Packet, SenderValue};
+use fictionet::stdlib::zabbix::{Header, Message, Packet, Packets, SenderValue};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(Frames::new, data, 2 * Frames::new().capacity());
+    contract::check_decode_with_alloc_limit(Packets::new, data, 2 * Packets::new().capacity());
     contract::check_wire::<Packet>(data);
     let limit = usize::from(data.first().copied().unwrap_or(0));
     contract::check_decode_with_alloc_limit(
-        || Frames::with_limit(limit), data, 2 * Frames::with_limit(limit).capacity(),
+        || Packets::with_limit(limit), data, 2 * Packets::with_limit(limit).capacity(),
     );
-    contract::check_decode_with_alloc_limit(|| Frames::new().map(|packet| Message::parse(&packet.data)), data, 2 * Frames::new().capacity());
+    contract::check_decode_with_alloc_limit(|| Packets::new().map(|packet| Message::parse(&packet.data)), data, 2 * Packets::new().capacity());
     let reserved = data
         .get(..8)
         .map(|bytes| {
@@ -29,10 +29,10 @@ fuzz_target!(|data: &[u8]| {
     };
     contract::check_wire_value(&built);
 
-    contract::check_decode_with_alloc_limit(|| Frames::with_limit(4096), data, 2 * Frames::with_limit(4096).capacity());
+    contract::check_decode_with_alloc_limit(|| Packets::with_limit(4096), data, 2 * Packets::with_limit(4096).capacity());
     contract::check_wire::<Header>(data);
     contract::check_wire::<Message>(data);
-    for p in decode_all(|| Frames::with_limit(4096), data).0 {
+    for p in decode_all(|| Packets::with_limit(4096), data).0 {
         contract::check_wire_value(&p);
         if let Ok(m) = Message::parse(&p.data) {
             assert_eq!(m.json().as_bytes(), &p.data[..]);

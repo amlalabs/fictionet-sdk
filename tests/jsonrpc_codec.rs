@@ -91,7 +91,7 @@ fn server_body_json_errors_have_public_rpc_conversion() {
         let Some(Fail::Protocol(CollectError::Parse(json_error))) = failure else {
             panic!("expected a JSON parse error");
         };
-        let error = jsonrpc::ParseError::from(json_error);
+        let error = jsonrpc::Error::from(json_error);
         assert_eq!(error.kind, ErrorKind::Json(json_error));
         assert_eq!(error.id, Id::Null);
         assert_eq!(error.batch_index, None);
@@ -109,7 +109,7 @@ fn server_body_json_errors_have_public_rpc_conversion() {
     let Some(Fail::Protocol(CollectError::Parse(json_error))) = failure else {
         panic!("expected a JSON limit error");
     };
-    let error = jsonrpc::ParseError::from(json_error);
+    let error = jsonrpc::Error::from(json_error);
     assert_eq!(error.rpc_code(), jsonrpc::INVALID_REQUEST);
     contract::check_wire_value(&Message::Response(error.response()));
 }
@@ -245,7 +245,7 @@ fn parse_error_with_near_limit_id_always_has_a_writable_response() {
     }
 }
 
-fn assert_error_response_writes(error: jsonrpc::ParseError) {
+fn assert_error_response_writes(error: jsonrpc::Error) {
     let reply = Message::Response(error.response());
     let bytes = reply.to_bytes().expect("parse error response must fit");
     assert_eq!(Message::parse(&bytes).unwrap(), reply);
@@ -335,7 +335,7 @@ fn dispatch_continues_after_refused_reply_and_ignores_responses() {
         if Message::Response(reply).write_line(&mut output).is_err() {
             refusals += 1;
         }
-        Ok::<_, jsonrpc::ParseError>(())
+        Ok::<_, jsonrpc::Error>(())
     })
     .unwrap();
     assert_eq!(refusals, 1);

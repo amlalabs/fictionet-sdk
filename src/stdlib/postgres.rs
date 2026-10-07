@@ -15,11 +15,12 @@
 //!
 //! Nothing here reads a socket. A world that plays a database server
 //! reads connection bytes through
-//! [`Stream<FrontendMessages>`](fictionet::stdlib::codec::Stream) and takes [`Frontend`]
-//! messages out. It answers with [`Backend`] messages, written by [`Wire::write`].
+//! [`Stream<FrontendMessages>`](fictionet::stdlib::codec::Stream) and takes each
+//! [`FrontendMessage`] out. It answers with a [`BackendMessage`] for each
+//! reply, written by [`Wire::write`].
 //! Which users exist, which passwords they have, and what a query returns
 //! are up to world code. A world that plays a client does the reverse,
-//! with [`BackendMessages`] and [`Wire::write`] on [`Frontend`].
+//! with [`BackendEvents`] and [`Wire::write`] on [`FrontendMessage`].
 //!
 //! Every reader checks lengths, counts, format codes and text, because
 //! the agent can send any bytes it likes. A message longer than
@@ -33,34 +34,34 @@
 //!
 //! ```
 //! use fictionet::stdlib::postgres::{
-//!     oid, Authentication, Backend, Field, Frontend, FrontendMessages, Startup, TransactionStatus,
+//!     oid, Authentication, BackendMessage, Field, FrontendMessage, FrontendMessages, Startup, TransactionStatus,
 //! };
 //! use fictionet::stdlib::codec::{Stream, Wire};
 //!
 //! let mut stream = Stream::new(FrontendMessages::new());
 //! // What psql sends: a StartupMessage, then a simple query.
-//! let mut input = Wire::to_bytes(&Frontend::Startup(Startup::new("alice", "shop"))).unwrap();
-//! Frontend::Query("SELECT 1".into()).write(&mut input).unwrap();
+//! let mut input = Wire::to_bytes(&FrontendMessage::Startup(Startup::new("alice", "shop"))).unwrap();
+//! FrontendMessage::Query("SELECT 1".into()).write(&mut input).unwrap();
 //! assert_eq!(stream.push(&input), input.len());
 //! stream.end();
 //!
 //! let mut replies = Vec::new();
 //! while let Some(message) = stream.next() {
 //!     match message.unwrap().unwrap() {
-//!         Frontend::Startup(startup) => {
+//!         FrontendMessage::Startup(startup) => {
 //!             assert_eq!(startup.get("user"), Some("alice"));
 //!             assert_eq!(startup.database(), Some("shop"));
-//!             replies.push(Backend::Authentication(Authentication::Ok));
-//!             replies.push(Backend::ParameterStatus { name: "server_version".into(), value: "16.4".into() });
-//!             replies.push(Backend::BackendKeyData { process_id: 4242, secret_key: vec![1, 2, 3, 4] });
-//!             replies.push(Backend::ReadyForQuery(TransactionStatus::Idle));
+//!             replies.push(BackendMessage::Authentication(Authentication::Ok));
+//!             replies.push(BackendMessage::ParameterStatus { name: "server_version".into(), value: "16.4".into() });
+//!             replies.push(BackendMessage::BackendKeyData { process_id: 4242, secret_key: vec![1, 2, 3, 4] });
+//!             replies.push(BackendMessage::ReadyForQuery(TransactionStatus::Idle));
 //!         }
-//!         Frontend::Query(sql) => {
+//!         FrontendMessage::Query(sql) => {
 //!             assert_eq!(sql, "SELECT 1");
-//!             replies.push(Backend::RowDescription(vec![Field::new("?column?", oid::INT4)]));
-//!             replies.push(Backend::DataRow(vec![Some(b"1".to_vec())]));
-//!             replies.push(Backend::CommandComplete("SELECT 1".into()));
-//!             replies.push(Backend::ReadyForQuery(TransactionStatus::Idle));
+//!             replies.push(BackendMessage::RowDescription(vec![Field::new("?column?", oid::INT4)]));
+//!             replies.push(BackendMessage::DataRow(vec![Some(b"1".to_vec())]));
+//!             replies.push(BackendMessage::CommandComplete("SELECT 1".into()));
+//!             replies.push(BackendMessage::ReadyForQuery(TransactionStatus::Idle));
 //!         }
 //!         other => panic!("unexpected {other:?}"),
 //!     }
@@ -115,7 +116,7 @@ pub const MAX_AUTH_MESSAGE: usize = 65_535;
 /// message: just under 1 GiB, PostgreSQL's own limit.
 pub const MAX_MESSAGE: usize = 0x3fff_fffe;
 /// The default length-field limit for [`FrontendMessages`] and
-/// [`BackendMessages`]: 1 MiB. Set it with their `with_limit` constructors.
+/// [`BackendEvents`]: 1 MiB. Set it with their `with_limit` constructors.
 pub const DEFAULT_MAX_MESSAGE: usize = 1 << 20;
 /// The longest cancel key, in bytes. Protocol 3.0 keys are always 4
 /// bytes; protocol 3.2 keys may be up to this long.
@@ -451,7 +452,7 @@ impl TransactionStatus {
 pub struct Startup {
     /// The minor version: 0 for protocol 3.0, 2 for 3.2. A server that
     /// speaks an older minor version answers with
-    /// [`Backend::NegotiateProtocolVersion`].
+    /// [`BackendMessage::NegotiateProtocolVersion`].
     pub minor_version: u16,
     /// The parameters, in the order sent: `user` (required), `database`,
     /// `application_name`, `client_encoding`, `options`, any run-time
@@ -553,7 +554,7 @@ impl FunctionCall {
 /// A message a client sends. The first four are the startup phase's,
 /// which have no type byte; the rest are typed.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Frontend {
+pub enum FrontendMessage {
     /// StartupMessage: opens a session.
     Startup(Startup),
     /// SSLRequest: asks to switch to TLS. The server answers with one
@@ -637,7 +638,7 @@ pub enum Frontend {
 }
 
 /// A SASLInitialResponse, read from or written as an
-/// [`Frontend::AuthResponse`] body.
+/// [`FrontendMessage::AuthResponse`] body.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SaslInitialResponse {
     /// The mechanism the client chose, such as `SCRAM-SHA-256`.
@@ -646,11 +647,11 @@ pub struct SaslInitialResponse {
     pub data: Option<Vec<u8>>,
 }
 
-impl Frontend {
+impl FrontendMessage {
     /// Wraps a password in an authentication message. Refuses NUL and
     /// passwords whose UTF-8 bytes exceed the authentication message limit.
-    pub fn password(password: &str) -> Result<Frontend, Error> {
-        Ok(Frontend::AuthResponse(
+    pub fn password(password: &str) -> Result<FrontendMessage, Error> {
+        Ok(FrontendMessage::AuthResponse(
             Password(password.into()).to_bytes()?,
         ))
     }
@@ -660,7 +661,7 @@ impl Frontend {
     pub fn is_startup(&self) -> bool {
         matches!(
             self,
-            Frontend::Startup(_) | Frontend::SslRequest | Frontend::GssEncRequest | Frontend::CancelRequest { .. }
+            Self::Startup(_) | Self::SslRequest | Self::GssEncRequest | Self::CancelRequest { .. }
         )
     }
 
@@ -668,23 +669,23 @@ impl Frontend {
     pub fn tag(&self) -> Option<u8> {
         use frontend_tag as t;
         Some(match self {
-            Frontend::Startup(_) | Frontend::SslRequest | Frontend::GssEncRequest | Frontend::CancelRequest { .. } => {
+            Self::Startup(_) | Self::SslRequest | Self::GssEncRequest | Self::CancelRequest { .. } => {
                 return None;
             }
-            Frontend::Bind(_) => t::BIND,
-            Frontend::Close { .. } => t::CLOSE,
-            Frontend::CopyData(_) => t::COPY_DATA,
-            Frontend::CopyDone => t::COPY_DONE,
-            Frontend::CopyFail(_) => t::COPY_FAIL,
-            Frontend::Describe { .. } => t::DESCRIBE,
-            Frontend::Execute { .. } => t::EXECUTE,
-            Frontend::Flush => t::FLUSH,
-            Frontend::FunctionCall(_) => t::FUNCTION_CALL,
-            Frontend::AuthResponse(_) => t::AUTH_RESPONSE,
-            Frontend::Parse { .. } => t::PARSE,
-            Frontend::Query(_) => t::QUERY,
-            Frontend::Sync => t::SYNC,
-            Frontend::Terminate => t::TERMINATE,
+            FrontendMessage::Bind(_) => t::BIND,
+            FrontendMessage::Close { .. } => t::CLOSE,
+            FrontendMessage::CopyData(_) => t::COPY_DATA,
+            FrontendMessage::CopyDone => t::COPY_DONE,
+            FrontendMessage::CopyFail(_) => t::COPY_FAIL,
+            FrontendMessage::Describe { .. } => t::DESCRIBE,
+            FrontendMessage::Execute { .. } => t::EXECUTE,
+            FrontendMessage::Flush => t::FLUSH,
+            FrontendMessage::FunctionCall(_) => t::FUNCTION_CALL,
+            FrontendMessage::AuthResponse(_) => t::AUTH_RESPONSE,
+            FrontendMessage::Parse { .. } => t::PARSE,
+            FrontendMessage::Query(_) => t::QUERY,
+            FrontendMessage::Sync => t::SYNC,
+            FrontendMessage::Terminate => t::TERMINATE,
         })
     }
 }
@@ -837,7 +838,7 @@ pub struct CopyFormat {
 
 /// A message a server sends.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Backend {
+pub enum BackendMessage {
     /// An Authentication request, or AuthenticationOk.
     Authentication(Authentication),
     /// BackendKeyData: what the client needs to cancel this session's
@@ -920,58 +921,51 @@ pub enum Backend {
     RowDescription(Vec<Field>),
 }
 
-impl Backend {
+impl BackendMessage {
     /// The type byte.
     pub fn tag(&self) -> u8 {
         use backend_tag as t;
         match self {
-            Backend::Authentication(_) => t::AUTHENTICATION,
-            Backend::BackendKeyData { .. } => t::BACKEND_KEY_DATA,
-            Backend::BindComplete => t::BIND_COMPLETE,
-            Backend::CloseComplete => t::CLOSE_COMPLETE,
-            Backend::CommandComplete(_) => t::COMMAND_COMPLETE,
-            Backend::CopyData(_) => t::COPY_DATA,
-            Backend::CopyDone => t::COPY_DONE,
-            Backend::CopyInResponse(_) => t::COPY_IN_RESPONSE,
-            Backend::CopyOutResponse(_) => t::COPY_OUT_RESPONSE,
-            Backend::CopyBothResponse(_) => t::COPY_BOTH_RESPONSE,
-            Backend::DataRow(_) => t::DATA_ROW,
-            Backend::EmptyQueryResponse => t::EMPTY_QUERY_RESPONSE,
-            Backend::ErrorResponse(_) => t::ERROR_RESPONSE,
-            Backend::FunctionCallResponse(_) => t::FUNCTION_CALL_RESPONSE,
-            Backend::NegotiateProtocolVersion { .. } => t::NEGOTIATE_PROTOCOL_VERSION,
-            Backend::NoData => t::NO_DATA,
-            Backend::NoticeResponse(_) => t::NOTICE_RESPONSE,
-            Backend::NotificationResponse { .. } => t::NOTIFICATION_RESPONSE,
-            Backend::ParameterDescription(_) => t::PARAMETER_DESCRIPTION,
-            Backend::ParameterStatus { .. } => t::PARAMETER_STATUS,
-            Backend::ParseComplete => t::PARSE_COMPLETE,
-            Backend::PortalSuspended => t::PORTAL_SUSPENDED,
-            Backend::ReadyForQuery(_) => t::READY_FOR_QUERY,
-            Backend::RowDescription(_) => t::ROW_DESCRIPTION,
+            BackendMessage::Authentication(_) => t::AUTHENTICATION,
+            BackendMessage::BackendKeyData { .. } => t::BACKEND_KEY_DATA,
+            BackendMessage::BindComplete => t::BIND_COMPLETE,
+            BackendMessage::CloseComplete => t::CLOSE_COMPLETE,
+            BackendMessage::CommandComplete(_) => t::COMMAND_COMPLETE,
+            BackendMessage::CopyData(_) => t::COPY_DATA,
+            BackendMessage::CopyDone => t::COPY_DONE,
+            BackendMessage::CopyInResponse(_) => t::COPY_IN_RESPONSE,
+            BackendMessage::CopyOutResponse(_) => t::COPY_OUT_RESPONSE,
+            BackendMessage::CopyBothResponse(_) => t::COPY_BOTH_RESPONSE,
+            BackendMessage::DataRow(_) => t::DATA_ROW,
+            BackendMessage::EmptyQueryResponse => t::EMPTY_QUERY_RESPONSE,
+            BackendMessage::ErrorResponse(_) => t::ERROR_RESPONSE,
+            BackendMessage::FunctionCallResponse(_) => t::FUNCTION_CALL_RESPONSE,
+            BackendMessage::NegotiateProtocolVersion { .. } => t::NEGOTIATE_PROTOCOL_VERSION,
+            BackendMessage::NoData => t::NO_DATA,
+            BackendMessage::NoticeResponse(_) => t::NOTICE_RESPONSE,
+            BackendMessage::NotificationResponse { .. } => t::NOTIFICATION_RESPONSE,
+            BackendMessage::ParameterDescription(_) => t::PARAMETER_DESCRIPTION,
+            BackendMessage::ParameterStatus { .. } => t::PARAMETER_STATUS,
+            BackendMessage::ParseComplete => t::PARSE_COMPLETE,
+            BackendMessage::PortalSuspended => t::PORTAL_SUSPENDED,
+            BackendMessage::ReadyForQuery(_) => t::READY_FOR_QUERY,
+            BackendMessage::RowDescription(_) => t::ROW_DESCRIPTION,
         }
     }
 }
 
-/// Why a message was refused. Complete typed body errors are stream items.
-/// Framing and startup errors end the stream. During authentication, world
-/// code also treats malformed typed bodies as fatal.
+/// Why bytes are not one PostgreSQL message, or a value cannot be written.
+/// It is the [`Wire`] error of every type here, and the error item of
+/// [`FrontendMessages`] and [`BackendEvents`] for a complete typed body.
+/// During authentication, world code also treats a malformed typed body
+/// as fatal. A body fault carries the message's type byte, or 0 for a
+/// startup-phase message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     /// The value cannot be written without changing it.
     Unwritable,
-    /// The connection opened with a TLS record, not a startup-phase
-    /// message: the client asked for direct TLS (`sslnegotiation=direct`).
-    /// A server that supports it starts TLS with the bytes
-    /// [`fictionet::stdlib::codec::Stream::into_parts`] retains, then calls
-    /// [`FrontendMessages::start_encryption`] on the returned decoder.
-    /// A new stream uses that decoder for decrypted bytes. As in
-    /// PostgreSQL, only the first byte of a connection is read this way.
-    DirectTls,
     /// A startup-phase message with a code that is neither protocol
-    /// version 3 nor a known request, or a second SSLRequest or
-    /// GSSENCRequest on one connection (PostgreSQL reads that as a
-    /// StartupMessage of protocol 1234.5679 or 1234.5680).
+    /// version 3 nor a known request.
     UnsupportedProtocol(u32),
     /// A type byte that no message in this direction has.
     UnknownType(u8),
@@ -985,116 +979,230 @@ pub enum Error {
         /// The limit it broke.
         max: usize,
     },
-    /// A message whose body does not match its type's layout.
-    Malformed {
+    /// The input ends before the message is complete.
+    Incomplete,
+    /// Bytes follow the message.
+    Trailing,
+    /// The body ended inside a field.
+    Truncated {
         /// The type byte, or 0 for a startup-phase message.
         tag: u8,
-        /// What was wrong.
-        reason: Malformed,
     },
+    /// Bytes were left after the last field.
+    TrailingBytes {
+        /// The type byte, or 0 for a startup-phase message.
+        tag: u8,
+    },
+    /// A string had no NUL before the end of the body.
+    UnterminatedString {
+        /// The type byte, or 0 for a startup-phase message.
+        tag: u8,
+    },
+    /// A string was not UTF-8, or a text-format parameter or function
+    /// argument was not UTF-8 text: PostgreSQL checks those against the
+    /// client encoding, which counts a NUL byte as invalid.
+    NotUtf8 {
+        /// The type byte, or 0 for a startup-phase message.
+        tag: u8,
+    },
+    /// A format code other than 0 (text) or 1 (binary), or a binary
+    /// column in a copy response whose overall format is text.
+    BadFormat {
+        /// The type byte.
+        tag: u8,
+        /// The format code.
+        code: i16,
+    },
+    /// A Bind or FunctionCall with a format count that is not 0, 1 or
+    /// the number of values.
+    FormatCount {
+        /// The type byte.
+        tag: u8,
+    },
+    /// A value length below -1 (which means NULL).
+    BadValueLength {
+        /// The type byte.
+        tag: u8,
+        /// The length field.
+        length: i32,
+    },
+    /// A Close or Describe target other than `S` or `P`.
+    BadTarget {
+        /// The type byte.
+        tag: u8,
+        /// The target byte.
+        target: u8,
+    },
+    /// A ReadyForQuery status other than `I`, `T` or `E`.
+    BadStatus {
+        /// The type byte.
+        tag: u8,
+        /// The status byte.
+        status: u8,
+    },
+    /// A cancel key that is empty or longer than [`MAX_SECRET_KEY`], or a
+    /// BackendKeyData key shorter than [`MIN_BACKEND_KEY`].
+    BadKeyLength {
+        /// The type byte, or 0 for a startup-phase message.
+        tag: u8,
+        /// The key's length.
+        length: usize,
+    },
+    /// An Authentication request code this module does not know.
+    BadAuth {
+        /// The type byte.
+        tag: u8,
+        /// The request code.
+        code: u32,
+    },
+    /// A list with no count of its own, or a 32-bit count, holding more
+    /// than [`MAX_COUNT`] items: SASL mechanisms, error fields or
+    /// unrecognized protocol options.
+    TooManyItems {
+        /// The type byte.
+        tag: u8,
+    },
+    /// An error or notice field code that came twice. "Any given field
+    /// type should appear at most once per message."
+    DuplicateField {
+        /// The type byte.
+        tag: u8,
+        /// The field code.
+        code: u8,
+    },
+}
+
+impl Error {
+    /// The type byte of a body fault, or `None` for any other error.
+    fn tag(&self) -> Option<u8> {
+        match *self {
+            Error::Truncated { tag }
+            | Error::TrailingBytes { tag }
+            | Error::UnterminatedString { tag }
+            | Error::NotUtf8 { tag }
+            | Error::BadFormat { tag, .. }
+            | Error::FormatCount { tag }
+            | Error::BadValueLength { tag, .. }
+            | Error::BadTarget { tag, .. }
+            | Error::BadStatus { tag, .. }
+            | Error::BadKeyLength { tag, .. }
+            | Error::BadAuth { tag, .. }
+            | Error::TooManyItems { tag }
+            | Error::DuplicateField { tag, .. } => Some(tag),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.tag() {
+            Some(0) => f.write_str("invalid startup packet: ")?,
+            Some(tag) => write!(f, "invalid message {}: ", show_tag(tag))?,
+            None => {}
+        }
         match self {
             Error::Unwritable => f.write_str("value cannot be written without changing it"),
-            Error::DirectTls => f.write_str("the connection opened with TLS, not a startup message"),
             Error::UnsupportedProtocol(code) => {
                 write!(f, "unsupported frontend protocol {}.{}", code >> 16, code & 0xffff)
             }
             Error::UnknownType(t) => write!(f, "invalid message type {}", show_tag(*t)),
             Error::BadLength(n) => write!(f, "invalid message length {n}"),
             Error::TooLong { length, max } => write!(f, "message length {length} is over the limit of {max}"),
-            Error::Malformed { tag: 0, reason } => write!(f, "invalid startup packet: {reason}"),
-            Error::Malformed { tag, reason } => write!(f, "invalid message {}: {reason}", show_tag(*tag)),
+            Error::Incomplete => f.write_str("PostgreSQL message ended early"),
+            Error::Trailing => f.write_str("bytes follow the PostgreSQL message"),
+            Error::Truncated { .. } => f.write_str("the body ends inside a field"),
+            Error::TrailingBytes { .. } => f.write_str("bytes are left after the last field"),
+            Error::UnterminatedString { .. } => f.write_str("a string has no terminating NUL"),
+            Error::NotUtf8 { .. } => f.write_str("a string is not UTF-8"),
+            Error::BadFormat { code, .. } => write!(f, "unsupported format code {code}"),
+            Error::FormatCount { .. } => f.write_str("the format count matches neither 0, 1 nor the values"),
+            Error::BadValueLength { length, .. } => write!(f, "invalid value length {length}"),
+            Error::BadTarget { target, .. } => write!(f, "invalid target {}", show_tag(*target)),
+            Error::BadStatus { status, .. } => write!(f, "invalid transaction status {}", show_tag(*status)),
+            Error::BadKeyLength { length, .. } => write!(f, "invalid cancel key length {length}"),
+            Error::BadAuth { code, .. } => write!(f, "unknown authentication request {code}"),
+            Error::TooManyItems { .. } => write!(f, "a list holds more than {MAX_COUNT} items"),
+            Error::DuplicateField { code, .. } => write!(f, "field {} appears twice", show_tag(*code)),
         }
     }
 }
 
 impl std::error::Error for Error {}
 
-/// What was wrong with a message's body.
+/// Why [`FrontendMessages`] or [`BackendEvents`] cannot find the next
+/// message. It ends the stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Malformed {
-    /// The body ended inside a field.
-    Truncated,
-    /// Bytes were left after the last field.
-    TrailingBytes,
-    /// A string had no NUL before the end of the body.
-    UnterminatedString,
-    /// A string was not UTF-8, or a text-format parameter or function
-    /// argument was not UTF-8 text: PostgreSQL checks those against the
-    /// client encoding, which counts a NUL byte as invalid.
-    NotUtf8,
-    /// A format code other than 0 (text) or 1 (binary), or a binary
-    /// column in a copy response whose overall format is text.
-    BadFormat(i16),
-    /// A Bind or FunctionCall with a format count that is not 0, 1 or
-    /// the number of values.
-    FormatCount,
-    /// A value length below -1 (which means NULL).
-    BadValueLength(i32),
-    /// A Close or Describe target other than `S` or `P`.
-    BadTarget(u8),
-    /// A ReadyForQuery status other than `I`, `T` or `E`.
-    BadStatus(u8),
-    /// A cancel key that is empty or longer than [`MAX_SECRET_KEY`], or a
-    /// BackendKeyData key shorter than [`MIN_BACKEND_KEY`].
-    BadKeyLength(usize),
-    /// An Authentication request code this module does not know.
-    BadAuth(u32),
-    /// A list with no count of its own, or a 32-bit count, holding more
-    /// than [`MAX_COUNT`] items: SASL mechanisms, error fields or
-    /// unrecognized protocol options.
-    TooManyItems,
-    /// An error or notice field code that came twice. "Any given field
-    /// type should appear at most once per message."
-    DuplicateField(u8),
+pub enum FrameError {
+    /// The connection opened with a TLS record, not a startup-phase
+    /// message: the client asked for direct TLS (`sslnegotiation=direct`).
+    /// A server that supports it starts TLS with the bytes
+    /// [`fictionet::stdlib::codec::Stream::into_parts`] retains, then calls
+    /// [`FrontendMessages::start_encryption`] on the returned decoder.
+    /// A new stream uses that decoder for decrypted bytes. As in
+    /// PostgreSQL, only the first byte of a connection is read this way.
+    DirectTls,
+    /// A startup-phase message with a code that is neither protocol
+    /// version 3 nor a known request, or a second SSLRequest or
+    /// GSSENCRequest on one connection (PostgreSQL reads that as a
+    /// StartupMessage of protocol 1234.5679 or 1234.5680).
+    UnsupportedProtocol(u32),
+    /// A type byte that no message in this direction has, or a byte other
+    /// than `S`, `G` or `N` where [`BackendEvents`] expects an encryption
+    /// response.
+    UnknownType(u8),
+    /// A length field below the least its message can have: 8 in the
+    /// startup phase, 4 after.
+    BadLength(u32),
+    /// A length field above what the message may have.
+    TooLong {
+        /// The length field.
+        length: u32,
+        /// The limit it broke.
+        max: usize,
+    },
+    /// A startup-phase message whose body does not match its layout. The
+    /// [`Error`] says what was wrong.
+    Startup(Error),
 }
 
-impl std::fmt::Display for Malformed {
+impl FrameError {
+    /// The fault that ends the stream, for an error met while finding or
+    /// reading a startup-phase message.
+    fn from_error(e: Error) -> FrameError {
+        match e {
+            Error::UnsupportedProtocol(code) => FrameError::UnsupportedProtocol(code),
+            Error::UnknownType(t) => FrameError::UnknownType(t),
+            Error::BadLength(n) => FrameError::BadLength(n),
+            Error::TooLong { length, max } => FrameError::TooLong { length, max },
+            e => FrameError::Startup(e),
+        }
+    }
+}
+
+impl std::fmt::Display for FrameError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Malformed::Truncated => f.write_str("the body ends inside a field"),
-            Malformed::TrailingBytes => f.write_str("bytes are left after the last field"),
-            Malformed::UnterminatedString => f.write_str("a string has no terminating NUL"),
-            Malformed::NotUtf8 => f.write_str("a string is not UTF-8"),
-            Malformed::BadFormat(c) => write!(f, "unsupported format code {c}"),
-            Malformed::FormatCount => f.write_str("the format count matches neither 0, 1 nor the values"),
-            Malformed::BadValueLength(n) => write!(f, "invalid value length {n}"),
-            Malformed::BadTarget(b) => write!(f, "invalid target {}", show_tag(*b)),
-            Malformed::BadStatus(b) => write!(f, "invalid transaction status {}", show_tag(*b)),
-            Malformed::BadKeyLength(n) => write!(f, "invalid cancel key length {n}"),
-            Malformed::BadAuth(c) => write!(f, "unknown authentication request {c}"),
-            Malformed::TooManyItems => write!(f, "a list holds more than {MAX_COUNT} items"),
-            Malformed::DuplicateField(c) => write!(f, "field {} appears twice", show_tag(*c)),
+            FrameError::DirectTls => f.write_str("the connection opened with TLS, not a startup message"),
+            FrameError::UnsupportedProtocol(code) => {
+                write!(f, "unsupported frontend protocol {}.{}", code >> 16, code & 0xffff)
+            }
+            FrameError::UnknownType(t) => write!(f, "invalid message type {}", show_tag(*t)),
+            FrameError::BadLength(n) => write!(f, "invalid message length {n}"),
+            FrameError::TooLong { length, max } => write!(f, "message length {length} is over the limit of {max}"),
+            FrameError::Startup(e) => e.fmt(f),
         }
     }
 }
 
-impl std::error::Error for Malformed {}
-
-/// Why bytes do not contain exactly one PostgreSQL wire message.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ParseError {
-    /// A message header or body was refused.
-    Message(Error),
-    /// The input ends before the message is complete.
-    Truncated,
-    /// Bytes follow the message.
-    Trailing,
-}
-
-impl core::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+impl std::error::Error for FrameError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Message(e) => e.fmt(f),
-            Self::Truncated => f.write_str("PostgreSQL message ended early"),
-            Self::Trailing => f.write_str("bytes follow the PostgreSQL message"),
+            FrameError::Startup(e) => Some(e),
+            _ => None,
         }
     }
 }
-impl core::error::Error for ParseError {}
 
 // Sizes include the length field but exclude the type byte. Use the
 // original field lengths.
@@ -1102,17 +1210,17 @@ fn size_sum(fixed: usize, fields: impl IntoIterator<Item = usize>) -> usize {
     fields.into_iter().fold(fixed, usize::saturating_add)
 }
 
-fn frontend_size(message: &Frontend) -> usize {
+fn frontend_size(message: &FrontendMessage) -> usize {
     match message {
-        Frontend::Startup(s) => size_sum(
+        FrontendMessage::Startup(s) => size_sum(
             9,
             s.params
                 .iter()
                 .map(|(n, v)| size_sum(2, [n.len(), v.len()])),
         ),
-        Frontend::SslRequest | Frontend::GssEncRequest => 8,
-        Frontend::CancelRequest { secret_key, .. } => secret_key.len().saturating_add(12),
-        Frontend::Bind(b) => size_sum(
+        FrontendMessage::SslRequest | FrontendMessage::GssEncRequest => 8,
+        FrontendMessage::CancelRequest { secret_key, .. } => secret_key.len().saturating_add(12),
+        FrontendMessage::Bind(b) => size_sum(
             12,
             [
                 b.portal.len(),
@@ -1122,20 +1230,20 @@ fn frontend_size(message: &Frontend) -> usize {
                 b.result_formats.len().saturating_mul(2),
             ],
         ),
-        Frontend::Close { name, .. } | Frontend::Describe { name, .. } => {
+        FrontendMessage::Close { name, .. } | FrontendMessage::Describe { name, .. } => {
             name.len().saturating_add(6)
         }
-        Frontend::CopyData(d) | Frontend::AuthResponse(d) => d.len().saturating_add(4),
-        Frontend::CopyFail(s) | Frontend::Query(s) => s.len().saturating_add(5),
-        Frontend::Execute { portal, .. } => portal.len().saturating_add(9),
-        Frontend::FunctionCall(f) => size_sum(
+        FrontendMessage::CopyData(d) | FrontendMessage::AuthResponse(d) => d.len().saturating_add(4),
+        FrontendMessage::CopyFail(s) | FrontendMessage::Query(s) => s.len().saturating_add(5),
+        FrontendMessage::Execute { portal, .. } => portal.len().saturating_add(9),
+        FrontendMessage::FunctionCall(f) => size_sum(
             14,
             [
                 f.arg_formats.len().saturating_mul(2),
                 size_sum(0, f.args.iter().map(|v| value_size(v.as_deref()))),
             ],
         ),
-        Frontend::Parse {
+        FrontendMessage::Parse {
             name,
             query,
             param_types,
@@ -1143,13 +1251,13 @@ fn frontend_size(message: &Frontend) -> usize {
             8,
             [name.len(), query.len(), param_types.len().saturating_mul(4)],
         ),
-        Frontend::CopyDone | Frontend::Flush | Frontend::Sync | Frontend::Terminate => 4,
+        FrontendMessage::CopyDone | FrontendMessage::Flush | FrontendMessage::Sync | FrontendMessage::Terminate => 4,
     }
 }
 
-fn backend_size(message: &Backend) -> usize {
+fn backend_size(message: &BackendMessage) -> usize {
     match message {
-        Backend::Authentication(a) => match a {
+        BackendMessage::Authentication(a) => match a {
             Authentication::Md5Password(_) => 12,
             Authentication::GssContinue(d)
             | Authentication::SaslContinue(d)
@@ -1159,36 +1267,36 @@ fn backend_size(message: &Backend) -> usize {
             }
             _ => 8,
         },
-        Backend::BackendKeyData { secret_key, .. } => secret_key.len().saturating_add(8),
-        Backend::CommandComplete(s) => s.len().saturating_add(5),
-        Backend::CopyData(d) => d.len().saturating_add(4),
-        Backend::CopyInResponse(c) | Backend::CopyOutResponse(c) | Backend::CopyBothResponse(c) => {
+        BackendMessage::BackendKeyData { secret_key, .. } => secret_key.len().saturating_add(8),
+        BackendMessage::CommandComplete(s) => s.len().saturating_add(5),
+        BackendMessage::CopyData(d) => d.len().saturating_add(4),
+        BackendMessage::CopyInResponse(c) | BackendMessage::CopyOutResponse(c) | BackendMessage::CopyBothResponse(c) => {
             c.columns.len().saturating_mul(2).saturating_add(7)
         }
-        Backend::DataRow(values) => size_sum(6, values.iter().map(|v| value_size(v.as_deref()))),
-        Backend::ErrorResponse(d) | Backend::NoticeResponse(d) => {
+        BackendMessage::DataRow(values) => size_sum(6, values.iter().map(|v| value_size(v.as_deref()))),
+        BackendMessage::ErrorResponse(d) | BackendMessage::NoticeResponse(d) => {
             size_sum(5, d.fields.iter().map(|(_, s)| s.len().saturating_add(2)))
         }
-        Backend::FunctionCallResponse(v) => value_size(v.as_deref()).saturating_add(4),
-        Backend::NegotiateProtocolVersion { unrecognized, .. } => {
+        BackendMessage::FunctionCallResponse(v) => value_size(v.as_deref()).saturating_add(4),
+        BackendMessage::NegotiateProtocolVersion { unrecognized, .. } => {
             size_sum(12, unrecognized.iter().map(|s| s.len().saturating_add(1)))
         }
-        Backend::NotificationResponse {
+        BackendMessage::NotificationResponse {
             channel, payload, ..
         } => size_sum(10, [channel.len(), payload.len()]),
-        Backend::ParameterDescription(types) => types.len().saturating_mul(4).saturating_add(6),
-        Backend::ParameterStatus { name, value } => size_sum(6, [name.len(), value.len()]),
-        Backend::ReadyForQuery(_) => 5,
-        Backend::RowDescription(fields) => {
+        BackendMessage::ParameterDescription(types) => types.len().saturating_mul(4).saturating_add(6),
+        BackendMessage::ParameterStatus { name, value } => size_sum(6, [name.len(), value.len()]),
+        BackendMessage::ReadyForQuery(_) => 5,
+        BackendMessage::RowDescription(fields) => {
             size_sum(6, fields.iter().map(|f| f.name.len().saturating_add(19)))
         }
-        Backend::BindComplete
-        | Backend::CloseComplete
-        | Backend::CopyDone
-        | Backend::EmptyQueryResponse
-        | Backend::NoData
-        | Backend::ParseComplete
-        | Backend::PortalSuspended => 4,
+        BackendMessage::BindComplete
+        | BackendMessage::CloseComplete
+        | BackendMessage::CopyDone
+        | BackendMessage::EmptyQueryResponse
+        | BackendMessage::NoData
+        | BackendMessage::ParseComplete
+        | BackendMessage::PortalSuspended => 4,
     }
 }
 
@@ -1207,9 +1315,9 @@ impl Wire for Password {
     /// missing NUL, invalid UTF-8, and bodies beyond [`MAX_AUTH_MESSAGE`] minus four.
     fn parse(body: &[u8]) -> Result<Self, Error> {
         auth_body_limit(body)?;
-        let mut r = Reader { b: body };
-        let password = r.cstr().map_err(auth_error)?;
-        r.end().map_err(auth_error)?;
+        let mut r = Reader { b: body, tag: frontend_tag::AUTH_RESPONSE };
+        let password = r.cstr()?;
+        r.end()?;
         Ok(Self(password))
     }
 
@@ -1228,15 +1336,8 @@ impl Wire for Password {
 impl SaslInitialResponse {
     /// Wraps this response in an authentication message. Refuses a NUL in
     /// the mechanism or fields that exceed the authentication message limit.
-    pub fn to_message(&self) -> Result<Frontend, Error> {
-        Ok(Frontend::AuthResponse(self.to_bytes()?))
-    }
-}
-
-fn auth_error(reason: Malformed) -> Error {
-    Error::Malformed {
-        tag: frontend_tag::AUTH_RESPONSE,
-        reason,
+    pub fn to_message(&self) -> Result<FrontendMessage, Error> {
+        Ok(FrontendMessage::AuthResponse(self.to_bytes()?))
     }
 }
 
@@ -1260,10 +1361,10 @@ impl Wire for SaslInitialResponse {
     /// and bodies beyond [`MAX_AUTH_MESSAGE`] minus four.
     fn parse(body: &[u8]) -> Result<Self, Error> {
         auth_body_limit(body)?;
-        let mut r = Reader { b: body };
-        let mechanism = r.cstr().map_err(auth_error)?;
-        let data = r.value().map_err(auth_error)?;
-        r.end().map_err(auth_error)?;
+        let mut r = Reader { b: body, tag: frontend_tag::AUTH_RESPONSE };
+        let mechanism = r.cstr()?;
+        let data = r.value()?;
+        r.end()?;
         Ok(Self { mechanism, data })
     }
 
@@ -1349,39 +1450,37 @@ impl Out {
     }
 }
 
-fn exact<M>(parsed: Option<(M, usize)>, length: usize) -> Result<M, ParseError> {
+fn exact<M>(parsed: Option<(M, usize)>, length: usize) -> Result<M, Error> {
     match parsed {
         Some((message, used)) if used == length => Ok(message),
-        Some(_) => Err(ParseError::Trailing),
-        None => Err(ParseError::Truncated),
+        Some(_) => Err(Error::Trailing),
+        None => Err(Error::Incomplete),
     }
 }
 
-impl Wire for Frontend {
-    type ParseError = ParseError;
+impl Wire for FrontendMessage {
+    type ParseError = Error;
     type WriteError = Error;
 
     /// Reads exactly one startup or typed message. Startup lengths begin
     /// with zero; typed messages begin with a tag. Refuses incomplete or
     /// trailing bytes, unknown tags or protocols, oversized messages, and
     /// malformed fields, counts, formats, keys, or UTF-8 text.
-    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         let parsed = if bytes.first() == Some(&0) {
-            split_startup(bytes, false).and_then(|part| {
+            split_startup(bytes).and_then(|part| {
                 part.map(|(body, used)| startup_body(body).map(|message| (message, used)))
                     .transpose()
             })
         } else {
             split_typed(bytes, frontend_limit, MAX_MESSAGE).and_then(|part| {
                 part.map(|(tag, body, used)| {
-                    frontend_body(tag, body)
-                        .map(|message| (message, used))
-                        .map_err(|reason| Error::Malformed { tag, reason })
+                    frontend_body(tag, body).map(|message| (message, used))
                 })
                 .transpose()
             })
         };
-        exact(parsed.map_err(ParseError::Message)?, bytes.len())
+        exact(parsed?, bytes.len())
     }
 
     /// Appends the length and complete body, with a type byte for typed messages. Refuses embedded
@@ -1429,9 +1528,9 @@ impl Wire for Frontend {
                 o.put(secret_key);
             }
             Self::Bind(b) => {
-                check_format_count(b.param_formats.len(), b.params.len())
+                check_format_count(frontend_tag::BIND, b.param_formats.len(), b.params.len())
                     .map_err(|_| Error::Unwritable)?;
-                check_text_values(&b.param_formats, &b.params).map_err(|_| Error::Unwritable)?;
+                check_text_values(frontend_tag::BIND, &b.param_formats, &b.params).map_err(|_| Error::Unwritable)?;
                 o.cstr(&b.portal)?;
                 o.cstr(&b.statement)?;
                 o.formats(&b.param_formats)?;
@@ -1449,9 +1548,9 @@ impl Wire for Frontend {
                 o.i32(*max_rows);
             }
             Self::FunctionCall(f) => {
-                check_format_count(f.arg_formats.len(), f.args.len())
+                check_format_count(frontend_tag::FUNCTION_CALL, f.arg_formats.len(), f.args.len())
                     .map_err(|_| Error::Unwritable)?;
-                check_text_values(&f.arg_formats, &f.args).map_err(|_| Error::Unwritable)?;
+                check_text_values(frontend_tag::FUNCTION_CALL, &f.arg_formats, &f.args).map_err(|_| Error::Unwritable)?;
                 o.u32(f.function);
                 o.formats(&f.arg_formats)?;
                 o.values(&f.args)?;
@@ -1476,21 +1575,16 @@ impl Wire for Frontend {
     }
 }
 
-impl Wire for Backend {
-    type ParseError = ParseError;
+impl Wire for BackendMessage {
+    type ParseError = Error;
     type WriteError = Error;
 
     /// Reads exactly one typed message. Refuses unknown tags, incomplete
     /// or trailing bytes, lengths above [`MAX_MESSAGE`], malformed fields,
     /// invalid UTF-8, duplicate diagnostic codes, and invalid counts or keys.
-    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
-        let parsed = split_typed(bytes, backend_limit, MAX_MESSAGE)
-            .map_err(ParseError::Message)?
-            .map(|(tag, body, used)| {
-                backend_body(tag, body)
-                    .map(|message| (message, used))
-                    .map_err(|reason| ParseError::Message(Error::Malformed { tag, reason }))
-            })
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        let parsed = split_typed(bytes, backend_limit, MAX_MESSAGE)?
+            .map(|(tag, body, used)| backend_body(tag, body).map(|message| (message, used)))
             .transpose()?;
         exact(parsed, bytes.len())
     }
@@ -1623,10 +1717,11 @@ impl Wire for Backend {
 
 /// Reads frontend startup and typed messages without retaining input.
 ///
-/// Items are `Result<Frontend, Error>`; error items are always
-/// [`Error::Malformed`] for a complete typed body, preserving its tag.
+/// Items are `Result<FrontendMessage, Error>`; an error item is always a
+/// body fault of a complete typed message, which carries its tag.
 /// Invalid framing, malformed startup-phase bodies, unsupported protocols,
-/// repeated encryption requests, and over-limit lengths end the stream.
+/// repeated encryption requests, and over-limit lengths end the stream
+/// with a [`FrameError`].
 /// Partial messages return [`Step::Need`], so [`fictionet::stdlib::codec::Stream`]
 /// reports truncation at EOF.
 ///
@@ -1635,7 +1730,7 @@ impl Wire for Backend {
 /// [`fictionet::stdlib::codec::Stream::into_parts`] and give its unread bytes to TLS or GSS,
 /// then call [`start_encryption`](Self::start_encryption) on the returned
 /// decoder and use a new stream for decrypted bytes. A direct ClientHello
-/// returns [`Error::DirectTls`] without consuming any bytes; the same
+/// returns [`FrameError::DirectTls`] without consuming any bytes; the same
 /// transfer applies. CancelRequest and Terminate also yield an item then End.
 ///
 /// To answer `N`, call [`refuse_encryption`](Self::refuse_encryption)
@@ -1645,20 +1740,20 @@ impl Wire for Backend {
 /// Keep any unaccepted part of a pushed slice for the next transport.
 ///
 /// ```
-/// use fictionet::stdlib::{codec::{Stream, Wire}, postgres::{Frontend, FrontendMessages, Startup}};
+/// use fictionet::stdlib::{codec::{Stream, Wire}, postgres::{FrontendMessage, FrontendMessages, Startup}};
 ///
-/// let mut input = Wire::to_bytes(&Frontend::SslRequest).unwrap();
-/// Frontend::Startup(Startup::new("alice", "shop")).write(&mut input).unwrap();
+/// let mut input = Wire::to_bytes(&FrontendMessage::SslRequest).unwrap();
+/// FrontendMessage::Startup(Startup::new("alice", "shop")).write(&mut input).unwrap();
 /// let mut stream = Stream::new(FrontendMessages::new());
 /// assert_eq!(stream.push(&input), input.len());
 /// let mut count = 0;
 /// while let Some(item) = stream.next() {
 ///     match item.unwrap().unwrap() {
-///         Frontend::SslRequest => {
+///         FrontendMessage::SslRequest => {
 ///             // The world answers N, then changes mode between items.
 ///             stream.decoder().refuse_encryption();
 ///         }
-///         Frontend::Startup(startup) => assert_eq!(startup.user(), Some("alice")),
+///         FrontendMessage::Startup(startup) => assert_eq!(startup.user(), Some("alice")),
 ///         other => panic!("unexpected {other:?}"),
 ///     }
 ///     count += 1;
@@ -1757,49 +1852,52 @@ impl Default for FrontendMessages {
 }
 
 impl Decode for FrontendMessages {
-    type Item = Result<Frontend, Error>;
-    type Error = Error;
+    type Item = Result<FrontendMessage, Error>;
+    type Error = FrameError;
     const NAME: &'static str = "PostgreSQL frontend";
 
     fn capacity(&self) -> usize {
         (MAX_STARTUP + 4).max(self.limit + 1)
     }
 
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Self::Item>, Error> {
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Self::Item>, FrameError> {
         if self.handoff || self.phase == Phase::Closed {
             return Ok(Step::End);
         }
         let (message, used) = if self.phase == Phase::Startup {
-            let Some((body, used)) = split_startup(input, !self.started)? else {
+            // A TLS handshake record starts with 22. No startup length can,
+            // since it would be far over the limit.
+            if !self.started && input.first() == Some(&0x16) {
+                return Err(FrameError::DirectTls);
+            }
+            let Some((body, used)) = split_startup(input).map_err(FrameError::from_error)? else {
                 return Ok(Step::Need);
             };
-            (Ok(startup_body(body)?), used)
+            (Ok(startup_body(body).map_err(FrameError::from_error)?), used)
         } else {
-            let Some((tag, body, used)) = split_typed(input, frontend_limit, self.limit)? else {
+            let split = split_typed(input, frontend_limit, self.limit).map_err(FrameError::from_error)?;
+            let Some((tag, body, used)) = split else {
                 return Ok(Step::Need);
             };
-            (
-                frontend_body(tag, body).map_err(|reason| Error::Malformed { tag, reason }),
-                used,
-            )
+            (frontend_body(tag, body), used)
         };
         match &message {
-            Ok(Frontend::SslRequest) => {
+            Ok(FrontendMessage::SslRequest) => {
                 if self.ssl_seen {
-                    return Err(Error::UnsupportedProtocol(SSL_REQUEST_CODE));
+                    return Err(FrameError::UnsupportedProtocol(SSL_REQUEST_CODE));
                 }
                 self.ssl_seen = true;
                 self.handoff = true;
             }
-            Ok(Frontend::GssEncRequest) => {
+            Ok(FrontendMessage::GssEncRequest) => {
                 if self.gss_seen {
-                    return Err(Error::UnsupportedProtocol(GSSENC_REQUEST_CODE));
+                    return Err(FrameError::UnsupportedProtocol(GSSENC_REQUEST_CODE));
                 }
                 self.gss_seen = true;
                 self.handoff = true;
             }
-            Ok(Frontend::Startup(_)) => self.phase = Phase::Messages,
-            Ok(Frontend::CancelRequest { .. } | Frontend::Terminate) => self.phase = Phase::Closed,
+            Ok(FrontendMessage::Startup(_)) => self.phase = Phase::Messages,
+            Ok(FrontendMessage::CancelRequest { .. } | FrontendMessage::Terminate) => self.phase = Phase::Closed,
             _ => {}
         }
         self.started = true;
@@ -1819,18 +1917,18 @@ pub enum EncryptionReply {
 }
 
 impl Wire for EncryptionReply {
-    type ParseError = ParseError;
+    type ParseError = Error;
     type WriteError = core::convert::Infallible;
 
     /// Reads one `S`, `G`, or `N`. Refuses empty input, other bytes, and trailing bytes.
-    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         match bytes {
             [ACCEPT_SSL] => Ok(Self::Ssl),
             [ACCEPT_GSSENC] => Ok(Self::Gss),
             [REFUSE_ENCRYPTION] => Ok(Self::Refused),
-            [] => Err(ParseError::Truncated),
-            [byte] => Err(ParseError::Message(Error::UnknownType(*byte))),
-            _ => Err(ParseError::Trailing),
+            [] => Err(Error::Incomplete),
+            [byte] => Err(Error::UnknownType(*byte)),
+            _ => Err(Error::Trailing),
         }
     }
 
@@ -1851,7 +1949,7 @@ pub enum BackendEvent {
     /// A one-byte encryption response.
     Encryption(EncryptionReply),
     /// A typed backend message.
-    Message(Backend),
+    Message(BackendMessage),
 }
 
 /// Reads backend messages and optional one-byte encryption responses.
@@ -1865,13 +1963,13 @@ pub enum BackendEvent {
 /// An `N` item resumes typed messages. World code may request another
 /// negotiation response between items if it sends another request.
 /// This mode accepts only `S`, `G` and `N`: an `E` ErrorResponse from an
-/// older server ends the stream with [`Error::UnknownType`].
+/// older server ends the stream with [`FrameError::UnknownType`].
 ///
 /// ```
 /// use fictionet::stdlib::codec::{Stream, finish, pump};
-/// use fictionet::stdlib::postgres::{Backend, BackendEvent, BackendMessages, EncryptionReply, TransactionStatus};
+/// use fictionet::stdlib::postgres::{BackendEvent, BackendEvents, BackendMessage, EncryptionReply, TransactionStatus};
 ///
-/// let mut decoder = BackendMessages::with_limit(64);
+/// let mut decoder = BackendEvents::with_limit(64);
 /// decoder.expect_encryption();
 /// let mut stream = Stream::new(decoder);
 /// let mut items = Vec::new();
@@ -1879,18 +1977,18 @@ pub enum BackendEvent {
 /// finish(&mut stream, |_| unreachable!())?;
 /// assert_eq!(items, [
 ///     BackendEvent::Encryption(EncryptionReply::Refused),
-///     BackendEvent::Message(Backend::ReadyForQuery(TransactionStatus::Idle)),
+///     BackendEvent::Message(BackendMessage::ReadyForQuery(TransactionStatus::Idle)),
 /// ]);
-/// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::postgres::Error>>(())
+/// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::postgres::FrameError>>(())
 /// ```
 #[derive(Clone, Debug)]
-pub struct BackendMessages {
+pub struct BackendEvents {
     limit: usize,
     encryption: bool,
     handoff: bool,
 }
 
-impl BackendMessages {
+impl BackendEvents {
     /// Reads typed messages up to [`DEFAULT_MAX_MESSAGE`].
     pub fn new() -> Self {
         Self::with_limit(DEFAULT_MAX_MESSAGE)
@@ -1917,22 +2015,22 @@ impl BackendMessages {
     }
 }
 
-impl Default for BackendMessages {
+impl Default for BackendEvents {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Decode for BackendMessages {
+impl Decode for BackendEvents {
     type Item = Result<BackendEvent, Error>;
-    type Error = Error;
+    type Error = FrameError;
     const NAME: &'static str = "PostgreSQL backend";
 
     fn capacity(&self) -> usize {
         self.limit + 1
     }
 
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Self::Item>, Error> {
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Self::Item>, FrameError> {
         if self.handoff {
             return Ok(Step::End);
         }
@@ -1944,18 +2042,17 @@ impl Decode for BackendMessages {
                 ACCEPT_SSL => EncryptionReply::Ssl,
                 ACCEPT_GSSENC => EncryptionReply::Gss,
                 REFUSE_ENCRYPTION => EncryptionReply::Refused,
-                _ => return Err(Error::UnknownType(byte)),
+                _ => return Err(FrameError::UnknownType(byte)),
             };
             self.encryption = false;
             self.handoff = reply != EncryptionReply::Refused;
             return Ok(Step::Item(Ok(BackendEvent::Encryption(reply)), 1));
         }
-        let Some((tag, body, used)) = split_typed(input, backend_limit, self.limit)? else {
+        let split = split_typed(input, backend_limit, self.limit).map_err(FrameError::from_error)?;
+        let Some((tag, body, used)) = split else {
             return Ok(Step::Need);
         };
-        let message = backend_body(tag, body)
-            .map(BackendEvent::Message)
-            .map_err(|reason| Error::Malformed { tag, reason });
+        let message = backend_body(tag, body).map(BackendEvent::Message);
         Ok(Step::Item(message, used))
     }
 }
@@ -2026,12 +2123,7 @@ fn split_typed(b: &[u8], limit: fn(u8) -> Option<usize>, max: usize) -> Result<O
 
 /// The body (after the length) and total size of the startup-phase
 /// message at the start of `b`, if it has all come.
-fn split_startup(b: &[u8], tls: bool) -> Result<Option<(&[u8], usize)>, Error> {
-    // A TLS handshake record starts with 22. No startup length can, since
-    // it would be far over the limit.
-    if tls && b.first() == Some(&0x16) {
-        return Err(Error::DirectTls);
-    }
+fn split_startup(b: &[u8]) -> Result<Option<(&[u8], usize)>, Error> {
     if b.len() < 4 {
         return Ok(None);
     }
@@ -2057,42 +2149,41 @@ fn split_startup(b: &[u8], tls: bool) -> Result<Option<(&[u8], usize)>, Error> {
 }
 
 /// Reads a startup-phase body, which starts with a known code.
-fn startup_body(body: &[u8]) -> Result<Frontend, Error> {
-    let bad = |reason| Error::Malformed { tag: 0, reason };
-    let mut r = Reader { b: body };
-    let code = r.u32().map_err(bad)?;
+fn startup_body(body: &[u8]) -> Result<FrontendMessage, Error> {
+    let mut r = Reader { b: body, tag: 0 };
+    let code = r.u32()?;
     let message = match code {
-        SSL_REQUEST_CODE => Frontend::SslRequest,
-        GSSENC_REQUEST_CODE => Frontend::GssEncRequest,
+        SSL_REQUEST_CODE => FrontendMessage::SslRequest,
+        GSSENC_REQUEST_CODE => FrontendMessage::GssEncRequest,
         CANCEL_REQUEST_CODE => {
-            let process_id = r.u32().map_err(bad)?;
+            let process_id = r.u32()?;
             let key = r.rest();
             if key.is_empty() || key.len() > MAX_SECRET_KEY {
-                return Err(bad(Malformed::BadKeyLength(key.len())));
+                return Err(Error::BadKeyLength { tag: 0, length: key.len() });
             }
-            Frontend::CancelRequest { process_id, secret_key: key.to_vec() }
+            FrontendMessage::CancelRequest { process_id, secret_key: key.to_vec() }
         }
         _ => {
             let mut params = Vec::new();
             loop {
-                let name = r.cstr().map_err(bad)?;
+                let name = r.cstr()?;
                 if name.is_empty() {
                     break;
                 }
-                let value = r.cstr().map_err(bad)?;
+                let value = r.cstr()?;
                 params.push((name, value));
             }
-            Frontend::Startup(Startup { minor_version: code as u16, params })
+            FrontendMessage::Startup(Startup { minor_version: code as u16, params })
         }
     };
-    r.end().map_err(bad)?;
+    r.end()?;
     Ok(message)
 }
 
 /// Reads a typed frontend body. `tag` is a known frontend type.
-fn frontend_body(tag: u8, body: &[u8]) -> Result<Frontend, Malformed> {
+fn frontend_body(tag: u8, body: &[u8]) -> Result<FrontendMessage, Error> {
     use frontend_tag as t;
-    let mut r = Reader { b: body };
+    let mut r = Reader { b: body, tag };
     let message = match tag {
         t::BIND => {
             let portal = r.cstr()?;
@@ -2100,36 +2191,36 @@ fn frontend_body(tag: u8, body: &[u8]) -> Result<Frontend, Malformed> {
             let param_formats = r.formats()?;
             let params = r.values()?;
             let result_formats = r.formats()?;
-            check_format_count(param_formats.len(), params.len())?;
-            check_text_values(&param_formats, &params)?;
-            Frontend::Bind(Bind { portal, statement, param_formats, params, result_formats })
+            check_format_count(tag, param_formats.len(), params.len())?;
+            check_text_values(tag, &param_formats, &params)?;
+            FrontendMessage::Bind(Bind { portal, statement, param_formats, params, result_formats })
         }
         t::CLOSE => {
             let target = r.target()?;
-            Frontend::Close { target, name: r.cstr()? }
+            FrontendMessage::Close { target, name: r.cstr()? }
         }
-        t::COPY_DATA => Frontend::CopyData(r.rest().to_vec()),
-        t::COPY_DONE => Frontend::CopyDone,
-        t::COPY_FAIL => Frontend::CopyFail(r.cstr()?),
+        t::COPY_DATA => FrontendMessage::CopyData(r.rest().to_vec()),
+        t::COPY_DONE => FrontendMessage::CopyDone,
+        t::COPY_FAIL => FrontendMessage::CopyFail(r.cstr()?),
         t::DESCRIBE => {
             let target = r.target()?;
-            Frontend::Describe { target, name: r.cstr()? }
+            FrontendMessage::Describe { target, name: r.cstr()? }
         }
         t::EXECUTE => {
             let portal = r.cstr()?;
-            Frontend::Execute { portal, max_rows: r.i32()? }
+            FrontendMessage::Execute { portal, max_rows: r.i32()? }
         }
-        t::FLUSH => Frontend::Flush,
+        t::FLUSH => FrontendMessage::Flush,
         t::FUNCTION_CALL => {
             let function = r.u32()?;
             let arg_formats = r.formats()?;
             let args = r.values()?;
             let result_format = r.format()?;
-            check_format_count(arg_formats.len(), args.len())?;
-            check_text_values(&arg_formats, &args)?;
-            Frontend::FunctionCall(FunctionCall { function, arg_formats, args, result_format })
+            check_format_count(tag, arg_formats.len(), args.len())?;
+            check_text_values(tag, &arg_formats, &args)?;
+            FrontendMessage::FunctionCall(FunctionCall { function, arg_formats, args, result_format })
         }
-        t::AUTH_RESPONSE => Frontend::AuthResponse(r.rest().to_vec()),
+        t::AUTH_RESPONSE => FrontendMessage::AuthResponse(r.rest().to_vec()),
         t::PARSE => {
             let name = r.cstr()?;
             let query = r.cstr()?;
@@ -2138,24 +2229,24 @@ fn frontend_body(tag: u8, body: &[u8]) -> Result<Frontend, Malformed> {
             for _ in 0..n {
                 param_types.push(r.u32()?);
             }
-            Frontend::Parse { name, query, param_types }
+            FrontendMessage::Parse { name, query, param_types }
         }
-        t::QUERY => Frontend::Query(r.cstr()?),
-        t::SYNC => Frontend::Sync,
-        _ => Frontend::Terminate,
+        t::QUERY => FrontendMessage::Query(r.cstr()?),
+        t::SYNC => FrontendMessage::Sync,
+        _ => FrontendMessage::Terminate,
     };
     r.end()?;
     Ok(message)
 }
 
 /// Reads a backend body. `tag` is a known backend type.
-fn backend_body(tag: u8, body: &[u8]) -> Result<Backend, Malformed> {
+fn backend_body(tag: u8, body: &[u8]) -> Result<BackendMessage, Error> {
     use backend_tag as t;
-    let mut r = Reader { b: body };
+    let mut r = Reader { b: body, tag };
     let message = match tag {
         t::AUTHENTICATION => {
             let code = r.u32()?;
-            Backend::Authentication(match code {
+            BackendMessage::Authentication(match code {
                 0 => Authentication::Ok,
                 2 => Authentication::KerberosV5,
                 3 => Authentication::CleartextPassword,
@@ -2174,7 +2265,7 @@ fn backend_body(tag: u8, body: &[u8]) -> Result<Backend, Malformed> {
                             break;
                         }
                         if names.len() == MAX_COUNT {
-                            return Err(Malformed::TooManyItems);
+                            return Err(Error::TooManyItems { tag });
                         }
                         names.push(name);
                     }
@@ -2182,38 +2273,38 @@ fn backend_body(tag: u8, body: &[u8]) -> Result<Backend, Malformed> {
                 }
                 11 => Authentication::SaslContinue(r.rest().to_vec()),
                 12 => Authentication::SaslFinal(r.rest().to_vec()),
-                c => return Err(Malformed::BadAuth(c)),
+                c => return Err(Error::BadAuth { tag, code: c }),
             })
         }
         t::BACKEND_KEY_DATA => {
             let process_id = r.u32()?;
             let key = r.rest();
             if key.len() < MIN_BACKEND_KEY || key.len() > MAX_SECRET_KEY {
-                return Err(Malformed::BadKeyLength(key.len()));
+                return Err(Error::BadKeyLength { tag, length: key.len() });
             }
-            Backend::BackendKeyData { process_id, secret_key: key.to_vec() }
+            BackendMessage::BackendKeyData { process_id, secret_key: key.to_vec() }
         }
-        t::BIND_COMPLETE => Backend::BindComplete,
-        t::CLOSE_COMPLETE => Backend::CloseComplete,
-        t::COMMAND_COMPLETE => Backend::CommandComplete(r.cstr()?),
-        t::COPY_DATA => Backend::CopyData(r.rest().to_vec()),
-        t::COPY_DONE => Backend::CopyDone,
+        t::BIND_COMPLETE => BackendMessage::BindComplete,
+        t::CLOSE_COMPLETE => BackendMessage::CloseComplete,
+        t::COMMAND_COMPLETE => BackendMessage::CommandComplete(r.cstr()?),
+        t::COPY_DATA => BackendMessage::CopyData(r.rest().to_vec()),
+        t::COPY_DONE => BackendMessage::CopyDone,
         t::COPY_IN_RESPONSE | t::COPY_OUT_RESPONSE | t::COPY_BOTH_RESPONSE => {
             let overall = r.u8()?;
-            let format = Format::from_code(i16::from(overall)).ok_or(Malformed::BadFormat(i16::from(overall)))?;
+            let format = Format::from_code(i16::from(overall)).ok_or(Error::BadFormat { tag, code: i16::from(overall) })?;
             let columns = r.formats()?;
             if format == Format::Text && columns.contains(&Format::Binary) {
-                return Err(Malformed::BadFormat(1));
+                return Err(Error::BadFormat { tag, code: 1 });
             }
             let c = CopyFormat { format, columns };
             match tag {
-                t::COPY_IN_RESPONSE => Backend::CopyInResponse(c),
-                t::COPY_OUT_RESPONSE => Backend::CopyOutResponse(c),
-                _ => Backend::CopyBothResponse(c),
+                t::COPY_IN_RESPONSE => BackendMessage::CopyInResponse(c),
+                t::COPY_OUT_RESPONSE => BackendMessage::CopyOutResponse(c),
+                _ => BackendMessage::CopyBothResponse(c),
             }
         }
-        t::DATA_ROW => Backend::DataRow(r.values()?),
-        t::EMPTY_QUERY_RESPONSE => Backend::EmptyQueryResponse,
+        t::DATA_ROW => BackendMessage::DataRow(r.values()?),
+        t::EMPTY_QUERY_RESPONSE => BackendMessage::EmptyQueryResponse,
         t::ERROR_RESPONSE | t::NOTICE_RESPONSE => {
             let mut fields = Vec::new();
             // Each code comes once, so there are at most 255 fields.
@@ -2224,33 +2315,33 @@ fn backend_body(tag: u8, body: &[u8]) -> Result<Backend, Malformed> {
                     break;
                 }
                 if std::mem::replace(&mut seen[usize::from(code)], true) {
-                    return Err(Malformed::DuplicateField(code));
+                    return Err(Error::DuplicateField { tag, code });
                 }
                 fields.push((code, r.cstr()?));
             }
             let d = Diagnostic { fields };
-            if tag == t::ERROR_RESPONSE { Backend::ErrorResponse(d) } else { Backend::NoticeResponse(d) }
+            if tag == t::ERROR_RESPONSE { BackendMessage::ErrorResponse(d) } else { BackendMessage::NoticeResponse(d) }
         }
-        t::FUNCTION_CALL_RESPONSE => Backend::FunctionCallResponse(r.value()?),
+        t::FUNCTION_CALL_RESPONSE => BackendMessage::FunctionCallResponse(r.value()?),
         t::NEGOTIATE_PROTOCOL_VERSION => {
             let version = r.u32()?;
             let n = r.u32()?;
             // Each name takes one byte on the wire and far more in memory,
             // so the count is held to the cap.
             if usize::try_from(n).map_or(true, |n| n > MAX_COUNT) {
-                return Err(Malformed::TooManyItems);
+                return Err(Error::TooManyItems { tag });
             }
             let mut unrecognized = Vec::new();
             for _ in 0..n {
                 unrecognized.push(r.cstr()?);
             }
-            Backend::NegotiateProtocolVersion { version, unrecognized }
+            BackendMessage::NegotiateProtocolVersion { version, unrecognized }
         }
-        t::NO_DATA => Backend::NoData,
+        t::NO_DATA => BackendMessage::NoData,
         t::NOTIFICATION_RESPONSE => {
             let process_id = r.u32()?;
             let channel = r.cstr()?;
-            Backend::NotificationResponse { process_id, channel, payload: r.cstr()? }
+            BackendMessage::NotificationResponse { process_id, channel, payload: r.cstr()? }
         }
         t::PARAMETER_DESCRIPTION => {
             let n = r.u16()?;
@@ -2258,17 +2349,17 @@ fn backend_body(tag: u8, body: &[u8]) -> Result<Backend, Malformed> {
             for _ in 0..n {
                 types.push(r.u32()?);
             }
-            Backend::ParameterDescription(types)
+            BackendMessage::ParameterDescription(types)
         }
         t::PARAMETER_STATUS => {
             let name = r.cstr()?;
-            Backend::ParameterStatus { name, value: r.cstr()? }
+            BackendMessage::ParameterStatus { name, value: r.cstr()? }
         }
-        t::PARSE_COMPLETE => Backend::ParseComplete,
-        t::PORTAL_SUSPENDED => Backend::PortalSuspended,
+        t::PARSE_COMPLETE => BackendMessage::ParseComplete,
+        t::PORTAL_SUSPENDED => BackendMessage::PortalSuspended,
         t::READY_FOR_QUERY => {
             let b = r.u8()?;
-            Backend::ReadyForQuery(TransactionStatus::from_byte(b).ok_or(Malformed::BadStatus(b))?)
+            BackendMessage::ReadyForQuery(TransactionStatus::from_byte(b).ok_or(Error::BadStatus { tag, status: b })?)
         }
         _ => {
             let n = r.u16()?;
@@ -2284,7 +2375,7 @@ fn backend_body(tag: u8, body: &[u8]) -> Result<Backend, Malformed> {
                     format: r.format()?,
                 });
             }
-            Backend::RowDescription(fields)
+            BackendMessage::RowDescription(fields)
         }
     };
     r.end()?;
@@ -2292,18 +2383,18 @@ fn backend_body(tag: u8, body: &[u8]) -> Result<Backend, Malformed> {
 }
 
 /// PostgreSQL's rule for format lists: none, one for all, or one each.
-fn check_format_count(formats: usize, values: usize) -> Result<(), Malformed> {
-    if formats <= 1 || formats == values { Ok(()) } else { Err(Malformed::FormatCount) }
+fn check_format_count(tag: u8, formats: usize, values: usize) -> Result<(), Error> {
+    if formats <= 1 || formats == values { Ok(()) } else { Err(Error::FormatCount { tag }) }
 }
 
 /// Refuses a text-format value that is not UTF-8 text with no NUL.
-fn check_text_values(formats: &[Format], values: &[Value]) -> Result<(), Malformed> {
+fn check_text_values(tag: u8, formats: &[Format], values: &[Value]) -> Result<(), Error> {
     for (i, v) in values.iter().enumerate() {
         if let Some(b) = v
             && format_for(formats, i) == Format::Text
             && (b.contains(&0) || std::str::from_utf8(b).is_err())
         {
-            return Err(Malformed::NotUtf8);
+            return Err(Error::NotUtf8 { tag });
         }
     }
     Ok(())
@@ -2321,76 +2412,78 @@ fn format_for(formats: &[Format], i: usize) -> Format {
 /// Reads fields from the front of a body.
 struct Reader<'a> {
     b: &'a [u8],
+    /// The message's type byte, or 0 for a startup-phase message.
+    tag: u8,
 }
 
 impl<'a> Reader<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8], Malformed> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
         if self.b.len() < n {
-            return Err(Malformed::Truncated);
+            return Err(Error::Truncated { tag: self.tag });
         }
         let (head, rest) = self.b.split_at(n);
         self.b = rest;
         Ok(head)
     }
 
-    fn u8(&mut self) -> Result<u8, Malformed> {
+    fn u8(&mut self) -> Result<u8, Error> {
         Ok(self.take(1)?[0])
     }
 
-    fn u16(&mut self) -> Result<u16, Malformed> {
+    fn u16(&mut self) -> Result<u16, Error> {
         let b = self.take(2)?;
         Ok(u16::from_be_bytes([b[0], b[1]]))
     }
 
-    fn i16(&mut self) -> Result<i16, Malformed> {
+    fn i16(&mut self) -> Result<i16, Error> {
         Ok(self.u16()? as i16)
     }
 
-    fn u32(&mut self) -> Result<u32, Malformed> {
+    fn u32(&mut self) -> Result<u32, Error> {
         let b = self.take(4)?;
         Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
     }
 
-    fn i32(&mut self) -> Result<i32, Malformed> {
+    fn i32(&mut self) -> Result<i32, Error> {
         Ok(self.u32()? as i32)
     }
 
-    fn cstr(&mut self) -> Result<String, Malformed> {
-        let end = self.b.iter().position(|&c| c == 0).ok_or(Malformed::UnterminatedString)?;
-        let s = std::str::from_utf8(&self.b[..end]).map_err(|_| Malformed::NotUtf8)?;
+    fn cstr(&mut self) -> Result<String, Error> {
+        let end = self.b.iter().position(|&c| c == 0).ok_or(Error::UnterminatedString { tag: self.tag })?;
+        let s = std::str::from_utf8(&self.b[..end]).map_err(|_| Error::NotUtf8 { tag: self.tag })?;
         self.b = &self.b[end + 1..];
         Ok(s.to_owned())
     }
 
-    fn format(&mut self) -> Result<Format, Malformed> {
+    fn format(&mut self) -> Result<Format, Error> {
         let c = self.i16()?;
-        Format::from_code(c).ok_or(Malformed::BadFormat(c))
+        Format::from_code(c).ok_or(Error::BadFormat { tag: self.tag, code: c })
     }
 
     /// A 16-bit count, then that many format codes.
-    fn formats(&mut self) -> Result<Vec<Format>, Malformed> {
+    fn formats(&mut self) -> Result<Vec<Format>, Error> {
         let n = self.u16()?;
         (0..n).map(|_| self.format()).collect()
     }
 
-    fn target(&mut self) -> Result<Target, Malformed> {
+    fn target(&mut self) -> Result<Target, Error> {
         let b = self.u8()?;
-        Target::from_byte(b).ok_or(Malformed::BadTarget(b))
+        Target::from_byte(b).ok_or(Error::BadTarget { tag: self.tag, target: b })
     }
 
     /// A 32-bit length (-1 for NULL), then that many bytes.
-    fn value(&mut self) -> Result<Value, Malformed> {
+    fn value(&mut self) -> Result<Value, Error> {
         let n = self.i32()?;
         match n {
             -1 => Ok(None),
-            n if n < 0 => Err(Malformed::BadValueLength(n)),
+            n if n < 0 => Err(Error::BadValueLength { tag: self.tag, length: n }),
             n => Ok(Some(self.take(n as usize)?.to_vec())),
         }
     }
 
     /// A 16-bit count, then that many values. Each value takes at least
     /// 4 bytes, so the body bounds the list.
-    fn values(&mut self) -> Result<Vec<Value>, Malformed> {
+    fn values(&mut self) -> Result<Vec<Value>, Error> {
         let n = self.u16()?;
         (0..n).map(|_| self.value()).collect()
     }
@@ -2399,8 +2492,8 @@ impl<'a> Reader<'a> {
         std::mem::take(&mut self.b)
     }
 
-    fn end(&self) -> Result<(), Malformed> {
-        if self.b.is_empty() { Ok(()) } else { Err(Malformed::TrailingBytes) }
+    fn end(&self) -> Result<(), Error> {
+        if self.b.is_empty() { Ok(()) } else { Err(Error::TrailingBytes { tag: self.tag }) }
     }
 }
 
@@ -2435,13 +2528,13 @@ mod tests {
                 frontend_size(&message),
                 bytes.len() - usize::from(message.tag().is_some())
             );
-            contract::check_wire::<Frontend>(&bytes);
+            contract::check_wire::<FrontendMessage>(&bytes);
         }
         for message in all_backend() {
             contract::check_wire_value(&message);
             let bytes = Wire::to_bytes(&message).unwrap();
             assert_eq!(backend_size(&message), bytes.len() - 1);
-            contract::check_wire::<Backend>(&bytes);
+            contract::check_wire::<BackendMessage>(&bytes);
         }
     }
 
@@ -2451,25 +2544,25 @@ mod tests {
             (
                 6,
                 SMALL_MESSAGE,
-                (|n| Frontend::Close {
+                (|n| FrontendMessage::Close {
                     target: Target::Statement,
                     name: "x".repeat(n),
-                }) as fn(usize) -> Frontend,
+                }) as fn(usize) -> FrontendMessage,
             ),
             (
                 4,
                 MAX_AUTH_MESSAGE,
-                (|n| Frontend::AuthResponse(vec![0; n])) as fn(usize) -> Frontend,
+                (|n| FrontendMessage::AuthResponse(vec![0; n])) as fn(usize) -> FrontendMessage,
             ),
             (
                 12,
                 MAX_STARTUP + 4,
                 (|n| {
-                    Frontend::Startup(Startup {
+                    FrontendMessage::Startup(Startup {
                         minor_version: 0,
                         params: vec![("u".into(), "x".repeat(n))],
                     })
-                }) as fn(usize) -> Frontend,
+                }) as fn(usize) -> FrontendMessage,
             ),
         ] {
             let message = make(limit - fixed);
@@ -2499,110 +2592,110 @@ mod tests {
     fn startup_message() {
         let bytes = startup_bytes();
         assert_eq!(bytes.len(), 55);
-        let m = Frontend::parse(&bytes).unwrap();
-        assert_eq!(m, Frontend::Startup(Startup::new("alice", "shop")));
+        let m = FrontendMessage::parse(&bytes).unwrap();
+        assert_eq!(m, FrontendMessage::Startup(Startup::new("alice", "shop")));
         assert_eq!(m.to_bytes().unwrap(), bytes);
-        let Frontend::Startup(s) = m else { panic!() };
+        let FrontendMessage::Startup(s) = m else { panic!() };
         assert_eq!(s.user(), Some("alice"));
         // With no database parameter, the database is the user's name.
         let s = Startup { minor_version: 2, params: vec![("user".into(), "bob".into())] };
         assert_eq!(s.database(), Some("bob"));
-        let bytes = Frontend::Startup(s.clone()).to_bytes().unwrap();
+        let bytes = FrontendMessage::Startup(s.clone()).to_bytes().unwrap();
         assert_eq!(&bytes[4..8], &PROTOCOL_3_2.to_be_bytes());
-        assert_eq!(Frontend::parse(&bytes).unwrap(), Frontend::Startup(s));
+        assert_eq!(FrontendMessage::parse(&bytes).unwrap(), FrontendMessage::Startup(s));
         // No parameters at all is the terminator alone.
-        let empty = Frontend::Startup(Startup::default()).to_bytes().unwrap();
+        let empty = FrontendMessage::Startup(Startup::default()).to_bytes().unwrap();
         assert_eq!(empty, [0, 0, 0, 9, 0, 3, 0, 0, 0]);
     }
 
     #[test]
     fn encryption_and_cancel_requests() {
         let ssl = [0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x2f];
-        assert_eq!(Frontend::parse(&ssl), Ok(Frontend::SslRequest));
-        assert_eq!(Frontend::SslRequest.to_bytes().unwrap(), ssl);
+        assert_eq!(FrontendMessage::parse(&ssl), Ok(FrontendMessage::SslRequest));
+        assert_eq!(FrontendMessage::SslRequest.to_bytes().unwrap(), ssl);
         let gss = [0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x30];
-        assert_eq!(Frontend::parse(&gss), Ok(Frontend::GssEncRequest));
-        assert_eq!(Frontend::GssEncRequest.to_bytes().unwrap(), gss);
+        assert_eq!(FrontendMessage::parse(&gss), Ok(FrontendMessage::GssEncRequest));
+        assert_eq!(FrontendMessage::GssEncRequest.to_bytes().unwrap(), gss);
         let cancel = [0, 0, 0, 16, 0x04, 0xd2, 0x16, 0x2e, 0, 0, 0x10, 0x92, 1, 2, 3, 4];
-        let m = Frontend::CancelRequest { process_id: 4242, secret_key: vec![1, 2, 3, 4] };
-        assert_eq!(Frontend::parse(&cancel), Ok(m.clone()));
+        let m = FrontendMessage::CancelRequest { process_id: 4242, secret_key: vec![1, 2, 3, 4] };
+        assert_eq!(FrontendMessage::parse(&cancel), Ok(m.clone()));
         assert_eq!(m.to_bytes().unwrap(), cancel);
         // A protocol 3.2 key of 32 bytes.
-        let long = Frontend::CancelRequest { process_id: 1, secret_key: vec![9; 32] };
-        assert_eq!(Frontend::parse(&long.to_bytes().unwrap()).unwrap(), long);
+        let long = FrontendMessage::CancelRequest { process_id: 1, secret_key: vec![9; 32] };
+        assert_eq!(FrontendMessage::parse(&long.to_bytes().unwrap()).unwrap(), long);
         assert!(m.is_startup() && m.tag().is_none());
     }
 
     #[test]
     fn simple_query_replies() {
         assert_eq!(
-            Frontend::parse(b"Q\0\0\0\x0dSELECT 1\0"),
-            Ok(Frontend::Query("SELECT 1".into()))
+            FrontendMessage::parse(b"Q\0\0\0\x0dSELECT 1\0"),
+            Ok(FrontendMessage::Query("SELECT 1".into()))
         );
-        let cases: Vec<(Backend, &[u8])> = vec![
-            (Backend::Authentication(Authentication::Ok), b"R\0\0\0\x08\0\0\0\0"),
-            (Backend::Authentication(Authentication::CleartextPassword), b"R\0\0\0\x08\0\0\0\x03"),
-            (Backend::Authentication(Authentication::Md5Password(*b"salt")), b"R\0\0\0\x0c\0\0\0\x05salt"),
+        let cases: Vec<(BackendMessage, &[u8])> = vec![
+            (BackendMessage::Authentication(Authentication::Ok), b"R\0\0\0\x08\0\0\0\0"),
+            (BackendMessage::Authentication(Authentication::CleartextPassword), b"R\0\0\0\x08\0\0\0\x03"),
+            (BackendMessage::Authentication(Authentication::Md5Password(*b"salt")), b"R\0\0\0\x0c\0\0\0\x05salt"),
             (
-                Backend::Authentication(Authentication::Sasl(vec!["SCRAM-SHA-256".into()])),
+                BackendMessage::Authentication(Authentication::Sasl(vec!["SCRAM-SHA-256".into()])),
                 b"R\0\0\0\x17\0\0\0\x0aSCRAM-SHA-256\0\0",
             ),
-            (Backend::Authentication(Authentication::SaslFinal(b"v=xyz".to_vec())), b"R\0\0\0\x0d\0\0\0\x0cv=xyz"),
+            (BackendMessage::Authentication(Authentication::SaslFinal(b"v=xyz".to_vec())), b"R\0\0\0\x0d\0\0\0\x0cv=xyz"),
             (
-                Backend::ParameterStatus { name: "client_encoding".into(), value: "UTF8".into() },
+                BackendMessage::ParameterStatus { name: "client_encoding".into(), value: "UTF8".into() },
                 b"S\0\0\0\x19client_encoding\0UTF8\0",
             ),
             (
-                Backend::BackendKeyData { process_id: 7, secret_key: vec![0, 0, 0, 9] },
+                BackendMessage::BackendKeyData { process_id: 7, secret_key: vec![0, 0, 0, 9] },
                 b"K\0\0\0\x0c\0\0\0\x07\0\0\0\x09",
             ),
-            (Backend::ReadyForQuery(TransactionStatus::Idle), b"Z\0\0\0\x05I"),
-            (Backend::ReadyForQuery(TransactionStatus::Failed), b"Z\0\0\0\x05E"),
-            (Backend::CommandComplete("SELECT 1".into()), b"C\0\0\0\x0dSELECT 1\0"),
-            (Backend::EmptyQueryResponse, b"I\0\0\0\x04"),
-            (Backend::ParseComplete, b"1\0\0\0\x04"),
-            (Backend::BindComplete, b"2\0\0\0\x04"),
-            (Backend::CloseComplete, b"3\0\0\0\x04"),
-            (Backend::NoData, b"n\0\0\0\x04"),
-            (Backend::PortalSuspended, b"s\0\0\0\x04"),
-            (Backend::CopyDone, b"c\0\0\0\x04"),
+            (BackendMessage::ReadyForQuery(TransactionStatus::Idle), b"Z\0\0\0\x05I"),
+            (BackendMessage::ReadyForQuery(TransactionStatus::Failed), b"Z\0\0\0\x05E"),
+            (BackendMessage::CommandComplete("SELECT 1".into()), b"C\0\0\0\x0dSELECT 1\0"),
+            (BackendMessage::EmptyQueryResponse, b"I\0\0\0\x04"),
+            (BackendMessage::ParseComplete, b"1\0\0\0\x04"),
+            (BackendMessage::BindComplete, b"2\0\0\0\x04"),
+            (BackendMessage::CloseComplete, b"3\0\0\0\x04"),
+            (BackendMessage::NoData, b"n\0\0\0\x04"),
+            (BackendMessage::PortalSuspended, b"s\0\0\0\x04"),
+            (BackendMessage::CopyDone, b"c\0\0\0\x04"),
             (
-                Backend::DataRow(vec![Some(b"42".to_vec()), None]),
+                BackendMessage::DataRow(vec![Some(b"42".to_vec()), None]),
                 b"D\0\0\0\x10\0\x02\0\0\0\x02\x34\x32\xff\xff\xff\xff",
             ),
-            (Backend::ParameterDescription(vec![oid::INT4]), b"t\0\0\0\x0a\0\x01\0\0\0\x17"),
+            (BackendMessage::ParameterDescription(vec![oid::INT4]), b"t\0\0\0\x0a\0\x01\0\0\0\x17"),
             (
-                Backend::CopyOutResponse(CopyFormat { format: Format::Text, columns: vec![Format::Text; 2] }),
+                BackendMessage::CopyOutResponse(CopyFormat { format: Format::Text, columns: vec![Format::Text; 2] }),
                 b"H\0\0\0\x0b\0\0\x02\0\0\0\0",
             ),
-            (Backend::FunctionCallResponse(None), b"V\0\0\0\x08\xff\xff\xff\xff"),
+            (BackendMessage::FunctionCallResponse(None), b"V\0\0\0\x08\xff\xff\xff\xff"),
             (
-                Backend::NotificationResponse { process_id: 1, channel: "c".into(), payload: "".into() },
+                BackendMessage::NotificationResponse { process_id: 1, channel: "c".into(), payload: "".into() },
                 b"A\0\0\0\x0b\0\0\0\x01c\0\0",
             ),
             (
-                Backend::NegotiateProtocolVersion { version: PROTOCOL_3_0, unrecognized: vec!["_pq_.x".into()] },
+                BackendMessage::NegotiateProtocolVersion { version: PROTOCOL_3_0, unrecognized: vec!["_pq_.x".into()] },
                 b"v\0\0\0\x13\0\x03\0\0\0\0\0\x01_pq_.x\0",
             ),
         ];
         for (message, bytes) in cases {
             assert_eq!(message.to_bytes().unwrap(), bytes, "{message:?}");
-            assert_eq!(Backend::parse(bytes), Ok(message));
+            assert_eq!(BackendMessage::parse(bytes), Ok(message));
         }
     }
 
     #[test]
     fn row_description_layout() {
         let field = Field::new("id", oid::INT4);
-        let bytes = Backend::RowDescription(vec![field.clone()])
+        let bytes = BackendMessage::RowDescription(vec![field.clone()])
             .to_bytes()
             .unwrap();
         let mut want = b"T\0\0\0\x1b\0\x01id\0".to_vec();
         want.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 23, 0, 4, 0xff, 0xff, 0xff, 0xff, 0, 0]);
         assert_eq!(bytes, want);
         assert_eq!(
-            Backend::parse(&bytes).unwrap(),
-            Backend::RowDescription(vec![field])
+            BackendMessage::parse(&bytes).unwrap(),
+            BackendMessage::RowDescription(vec![field])
         );
         assert_eq!(Field::new("t", oid::TEXT).type_size, -1);
     }
@@ -2611,18 +2704,18 @@ mod tests {
     fn error_response_layout() {
         let d = Diagnostic::error(sqlstate::UNDEFINED_TABLE, "relation \"x\" does not exist")
             .with(field_code::POSITION, "15");
-        let bytes = Backend::ErrorResponse(d.clone()).to_bytes().unwrap();
+        let bytes = BackendMessage::ErrorResponse(d.clone()).to_bytes().unwrap();
         let mut body = b"SERROR\0VERROR\0C42P01\0Mrelation \"x\" does not exist\0P15\0\0".to_vec();
         let mut want = vec![b'E'];
         want.extend_from_slice(&(body.len() as u32 + 4).to_be_bytes());
         want.append(&mut body);
         assert_eq!(bytes, want);
-        let back = Backend::parse(&bytes).unwrap();
-        assert_eq!(back, Backend::ErrorResponse(d.clone()));
+        let back = BackendMessage::parse(&bytes).unwrap();
+        assert_eq!(back, BackendMessage::ErrorResponse(d.clone()));
         assert_eq!(d.get(field_code::CODE), Some("42P01"));
         assert_eq!(d.get(field_code::HINT), None);
-        let notice = Backend::NoticeResponse(Diagnostic::new("NOTICE", sqlstate::SUCCESSFUL_COMPLETION, "hi"));
-        assert_eq!(Backend::parse(&notice.to_bytes().unwrap()).unwrap(), notice);
+        let notice = BackendMessage::NoticeResponse(Diagnostic::new("NOTICE", sqlstate::SUCCESSFUL_COMPLETION, "hi"));
+        assert_eq!(BackendMessage::parse(&notice.to_bytes().unwrap()).unwrap(), notice);
         assert_eq!(Diagnostic::fatal(sqlstate::INVALID_PASSWORD, "no").get(field_code::SEVERITY), Some("FATAL"));
     }
 
@@ -2638,17 +2731,17 @@ mod tests {
         b
     }
 
-    fn extended_messages() -> Vec<Frontend> {
+    fn extended_messages() -> Vec<FrontendMessage> {
         vec![
-            Frontend::Parse { name: "".into(), query: "SELECT $1".into(), param_types: vec![oid::INT4] },
-            Frontend::Bind(Bind {
+            FrontendMessage::Parse { name: "".into(), query: "SELECT $1".into(), param_types: vec![oid::INT4] },
+            FrontendMessage::Bind(Bind {
                 params: vec![Some(b"5".to_vec())],
                 result_formats: vec![Format::Binary],
                 ..Bind::default()
             }),
-            Frontend::Describe { target: Target::Portal, name: "".into() },
-            Frontend::Execute { portal: "".into(), max_rows: 0 },
-            Frontend::Sync,
+            FrontendMessage::Describe { target: Target::Portal, name: "".into() },
+            FrontendMessage::Execute { portal: "".into(), max_rows: 0 },
+            FrontendMessage::Sync,
         ]
     }
 
@@ -2666,7 +2759,7 @@ mod tests {
             message.unwrap().write(&mut written).unwrap();
         }
         assert_eq!(written, bytes);
-        let Frontend::Bind(b) = &extended_messages()[1] else {
+        let FrontendMessage::Bind(b) = &extended_messages()[1] else {
             panic!()
         };
         assert_eq!(b.param_format(0), Format::Text);
@@ -2675,16 +2768,16 @@ mod tests {
 
     #[test]
     fn other_frontend_messages() {
-        let cases: Vec<(Frontend, &[u8])> = vec![
-            (Frontend::Close { target: Target::Statement, name: "s1".into() }, b"C\0\0\0\x08Ss1\0"),
-            (Frontend::CopyData(b"1\tx\n".to_vec()), b"d\0\0\0\x081\tx\n"),
-            (Frontend::CopyDone, b"c\0\0\0\x04"),
-            (Frontend::CopyFail("no".into()), b"f\0\0\0\x07no\0"),
-            (Frontend::Flush, b"H\0\0\0\x04"),
-            (Frontend::Terminate, b"X\0\0\0\x04"),
-            (Frontend::password("pw").unwrap(), b"p\0\0\0\x07pw\0"),
+        let cases: Vec<(FrontendMessage, &[u8])> = vec![
+            (FrontendMessage::Close { target: Target::Statement, name: "s1".into() }, b"C\0\0\0\x08Ss1\0"),
+            (FrontendMessage::CopyData(b"1\tx\n".to_vec()), b"d\0\0\0\x081\tx\n"),
+            (FrontendMessage::CopyDone, b"c\0\0\0\x04"),
+            (FrontendMessage::CopyFail("no".into()), b"f\0\0\0\x07no\0"),
+            (FrontendMessage::Flush, b"H\0\0\0\x04"),
+            (FrontendMessage::Terminate, b"X\0\0\0\x04"),
+            (FrontendMessage::password("pw").unwrap(), b"p\0\0\0\x07pw\0"),
             (
-                Frontend::FunctionCall(FunctionCall {
+                FrontendMessage::FunctionCall(FunctionCall {
                     function: 1598,
                     arg_formats: vec![],
                     args: vec![None],
@@ -2695,30 +2788,30 @@ mod tests {
         ];
         for (message, bytes) in cases {
             assert_eq!(message.to_bytes().unwrap(), bytes, "{message:?}");
-            assert_eq!(Frontend::parse(bytes), Ok(message));
+            assert_eq!(FrontendMessage::parse(bytes), Ok(message));
         }
     }
 
     #[test]
     fn auth_responses() {
-        let Frontend::AuthResponse(body) = Frontend::password("md5abc").unwrap() else {
+        let FrontendMessage::AuthResponse(body) = FrontendMessage::password("md5abc").unwrap() else {
             panic!()
         };
         assert_eq!(Password::parse(&body), Ok(Password("md5abc".into())));
         assert_eq!(
             Password::parse(b"pw"),
-            Err(auth_error(Malformed::UnterminatedString))
+            Err(Error::UnterminatedString { tag: frontend_tag::AUTH_RESPONSE })
         );
         assert_eq!(
             Password::parse(b"pw\0x"),
-            Err(auth_error(Malformed::TrailingBytes))
+            Err(Error::TrailingBytes { tag: frontend_tag::AUTH_RESPONSE })
         );
         for data in [None, Some(vec![]), Some(b"n,,n=,r=abc".to_vec())] {
             let sasl = SaslInitialResponse {
                 mechanism: "SCRAM-SHA-256".into(),
                 data,
             };
-            let Frontend::AuthResponse(body) = sasl.to_message().unwrap() else {
+            let FrontendMessage::AuthResponse(body) = sasl.to_message().unwrap() else {
                 panic!()
             };
             assert_eq!(&body[..14], b"SCRAM-SHA-256\0");
@@ -2732,11 +2825,11 @@ mod tests {
         assert_eq!(none.to_bytes().unwrap(), b"X\0\xff\xff\xff\xff");
         assert_eq!(
             SaslInitialResponse::parse(b"X\0\0\0\0\x05ab"),
-            Err(auth_error(Malformed::Truncated))
+            Err(Error::Truncated { tag: frontend_tag::AUTH_RESPONSE })
         );
         assert_eq!(
             SaslInitialResponse::parse(b"X\0\xff\xff\xff\xfe"),
-            Err(auth_error(Malformed::BadValueLength(-2)))
+            Err(Error::BadValueLength { tag: frontend_tag::AUTH_RESPONSE, length: -2 })
         );
         for value in [
             SaslInitialResponse {
@@ -2751,10 +2844,10 @@ mod tests {
             assert_unwritable(&value);
         }
         assert_eq!(
-            Frontend::password(&"é".repeat(40_000)),
+            FrontendMessage::password(&"é".repeat(40_000)),
             Err(Error::Unwritable)
         );
-        assert_eq!(Frontend::password("a\0b"), Err(Error::Unwritable));
+        assert_eq!(FrontendMessage::password("a\0b"), Err(Error::Unwritable));
         let oversized = vec![0; MAX_AUTH_MESSAGE - 3];
         let too_long = Error::TooLong { length: MAX_AUTH_MESSAGE as u32 + 1, max: MAX_AUTH_MESSAGE };
         assert_eq!(Password::parse(&oversized), Err(too_long));
@@ -2780,266 +2873,261 @@ mod tests {
         b
     }
 
-    fn bad(tag: u8, reason: Malformed) -> Error {
-        Error::Malformed { tag, reason }
-    }
-
     #[test]
     fn startup_errors() {
         // A TLS ClientHello, known from its first byte.
         assert_eq!(
             FrontendMessages::new().decode(&[0x16], false),
-            Err(Error::DirectTls)
+            Err(FrameError::DirectTls)
         );
         assert_eq!(
-            Frontend::parse(&[0, 0, 0, 7]),
-            Err(ParseError::Message(Error::BadLength(7)))
+            FrontendMessage::parse(&[0, 0, 0, 7]),
+            Err(Error::BadLength(7))
         );
         assert_eq!(
-            Frontend::parse(&[0, 0, 0x27, 0x15]),
-            Err(ParseError::Message(Error::TooLong {
+            FrontendMessage::parse(&[0, 0, 0x27, 0x15]),
+            Err(Error::TooLong {
                 length: 10_005,
                 max: MAX_STARTUP + 4
-            }))
+            })
         );
         assert_eq!(
-            Frontend::parse(&[0, 0, 0x27, 0x14]),
-            Err(ParseError::Truncated)
+            FrontendMessage::parse(&[0, 0, 0x27, 0x14]),
+            Err(Error::Incomplete)
         );
         // Protocol 2.0, refused as soon as its version arrives.
         assert_eq!(
-            Frontend::parse(&[0, 0, 0, 9, 0, 2, 0, 0]),
-            Err(ParseError::Message(Error::UnsupportedProtocol(0x2_0000)))
+            FrontendMessage::parse(&[0, 0, 0, 9, 0, 2, 0, 0]),
+            Err(Error::UnsupportedProtocol(0x2_0000))
         );
         assert_eq!(
-            Frontend::parse(&startup_with(0x04d2_0000, b"\0")),
-            Err(ParseError::Message(Error::UnsupportedProtocol(0x04d2_0000)))
+            FrontendMessage::parse(&startup_with(0x04d2_0000, b"\0")),
+            Err(Error::UnsupportedProtocol(0x04d2_0000))
         );
         // Requests with bytes they should not have.
         assert_eq!(
-            Frontend::parse(&startup_with(SSL_REQUEST_CODE, b"x")),
-            Err(ParseError::Message(bad(0, Malformed::TrailingBytes)))
+            FrontendMessage::parse(&startup_with(SSL_REQUEST_CODE, b"x")),
+            Err(Error::TrailingBytes { tag: 0 })
         );
         assert_eq!(
-            Frontend::parse(&startup_with(GSSENC_REQUEST_CODE, b"x")),
-            Err(ParseError::Message(bad(0, Malformed::TrailingBytes)))
+            FrontendMessage::parse(&startup_with(GSSENC_REQUEST_CODE, b"x")),
+            Err(Error::TrailingBytes { tag: 0 })
         );
         assert_eq!(
-            Frontend::parse(&startup_with(CANCEL_REQUEST_CODE, b"\0\0")),
-            Err(ParseError::Message(bad(0, Malformed::Truncated)))
+            FrontendMessage::parse(&startup_with(CANCEL_REQUEST_CODE, b"\0\0")),
+            Err(Error::Truncated { tag: 0 })
         );
         assert_eq!(
-            Frontend::parse(&startup_with(CANCEL_REQUEST_CODE, &[0, 0, 0, 1])),
-            Err(ParseError::Message(bad(0, Malformed::BadKeyLength(0))))
+            FrontendMessage::parse(&startup_with(CANCEL_REQUEST_CODE, &[0, 0, 0, 1])),
+            Err(Error::BadKeyLength { tag: 0, length: 0 })
         );
         let mut long = vec![0, 0, 0, 1];
         long.extend_from_slice(&[5; 257]);
         assert_eq!(
-            Frontend::parse(&startup_with(CANCEL_REQUEST_CODE, &long)),
-            Err(ParseError::Message(bad(0, Malformed::BadKeyLength(257))))
+            FrontendMessage::parse(&startup_with(CANCEL_REQUEST_CODE, &long)),
+            Err(Error::BadKeyLength { tag: 0, length: 257 })
         );
         // Parameters with no terminator, no value, bytes after it, or bad
         // text.
         let v3 = PROTOCOL_3_0;
         assert_eq!(
-            Frontend::parse(&startup_with(v3, b"")),
-            Err(ParseError::Message(bad(0, Malformed::UnterminatedString)))
+            FrontendMessage::parse(&startup_with(v3, b"")),
+            Err(Error::UnterminatedString { tag: 0 })
         );
         assert_eq!(
-            Frontend::parse(&startup_with(v3, b"user\0")),
-            Err(ParseError::Message(bad(0, Malformed::UnterminatedString)))
+            FrontendMessage::parse(&startup_with(v3, b"user\0")),
+            Err(Error::UnterminatedString { tag: 0 })
         );
         assert_eq!(
-            Frontend::parse(&startup_with(v3, b"user\0a\0")),
-            Err(ParseError::Message(bad(0, Malformed::UnterminatedString)))
+            FrontendMessage::parse(&startup_with(v3, b"user\0a\0")),
+            Err(Error::UnterminatedString { tag: 0 })
         );
         assert_eq!(
-            Frontend::parse(&startup_with(v3, b"user\0a\0\0x")),
-            Err(ParseError::Message(bad(0, Malformed::TrailingBytes)))
+            FrontendMessage::parse(&startup_with(v3, b"user\0a\0\0x")),
+            Err(Error::TrailingBytes { tag: 0 })
         );
         assert_eq!(
-            Frontend::parse(&startup_with(v3, b"user\0\xff\0\0")),
-            Err(ParseError::Message(bad(0, Malformed::NotUtf8)))
+            FrontendMessage::parse(&startup_with(v3, b"user\0\xff\0\0")),
+            Err(Error::NotUtf8 { tag: 0 })
         );
-        assert!(Frontend::parse(&startup_with(v3, b"user\0a\0\0")).is_ok());
+        assert!(FrontendMessage::parse(&startup_with(v3, b"user\0a\0\0")).is_ok());
     }
 
     #[test]
     fn typed_errors() {
         assert_eq!(
-            Frontend::parse(b"Z"),
-            Err(ParseError::Message(Error::UnknownType(b'Z')))
+            FrontendMessage::parse(b"Z"),
+            Err(Error::UnknownType(b'Z'))
         );
         assert_eq!(
             FrontendMessages::established(SMALL_MESSAGE).decode(&[0], false),
-            Err(Error::UnknownType(0))
+            Err(FrameError::UnknownType(0))
         );
         assert_eq!(
-            Backend::parse(b"Q"),
-            Err(ParseError::Message(Error::UnknownType(b'Q')))
+            BackendMessage::parse(b"Q"),
+            Err(Error::UnknownType(b'Q'))
         );
         assert_eq!(
-            Frontend::parse(b"S\0\0\0\x03"),
-            Err(ParseError::Message(Error::BadLength(3)))
+            FrontendMessage::parse(b"S\0\0\0\x03"),
+            Err(Error::BadLength(3))
         );
         assert_eq!(
-            Backend::parse(b"Z\0\0\0\x00"),
-            Err(ParseError::Message(Error::BadLength(0)))
+            BackendMessage::parse(b"Z\0\0\0\x00"),
+            Err(Error::BadLength(0))
         );
         // Small messages are capped at 10000, as PostgreSQL does.
         assert_eq!(
-            Frontend::parse(b"S\0\0\x27\x11"),
-            Err(ParseError::Message(Error::TooLong {
+            FrontendMessage::parse(b"S\0\0\x27\x11"),
+            Err(Error::TooLong {
                 length: 10_001,
                 max: SMALL_MESSAGE
-            }))
+            })
         );
         assert_eq!(
-            Frontend::parse(b"p\0\x01\0\0"),
-            Err(ParseError::Message(Error::TooLong {
+            FrontendMessage::parse(b"p\0\x01\0\0"),
+            Err(Error::TooLong {
                 length: 65_536,
                 max: MAX_AUTH_MESSAGE
-            }))
+            })
         );
         assert_eq!(
-            Frontend::parse(b"Q\x40\0\0\0"),
-            Err(ParseError::Message(Error::TooLong {
+            FrontendMessage::parse(b"Q\x40\0\0\0"),
+            Err(Error::TooLong {
                 length: 0x4000_0000,
                 max: MAX_MESSAGE
-            }))
+            })
         );
         assert_eq!(
-            Backend::parse(b"D\xff\xff\xff\xff"),
-            Err(ParseError::Message(Error::TooLong {
+            BackendMessage::parse(b"D\xff\xff\xff\xff"),
+            Err(Error::TooLong {
                 length: u32::MAX,
                 max: MAX_MESSAGE
-            }))
+            })
         );
         assert_eq!(
-            Frontend::parse(b"Q\x3f\xff\xff\xfe"),
-            Err(ParseError::Truncated)
+            FrontendMessage::parse(b"Q\x3f\xff\xff\xfe"),
+            Err(Error::Incomplete)
         );
 
-        let f = |tag, body: &[u8]| Frontend::parse(&typed(tag, body));
-        let m = bad;
+        let f = |tag, body: &[u8]| FrontendMessage::parse(&typed(tag, body));
         assert_eq!(
             f(b'Q', b"abc"),
-            Err(ParseError::Message(m(b'Q', Malformed::UnterminatedString)))
+            Err(Error::UnterminatedString { tag: b'Q' })
         );
         assert_eq!(
             f(b'Q', b"a\0b"),
-            Err(ParseError::Message(m(b'Q', Malformed::TrailingBytes)))
+            Err(Error::TrailingBytes { tag: b'Q' })
         );
         assert_eq!(
             f(b'Q', b"\xc3\0"),
-            Err(ParseError::Message(m(b'Q', Malformed::NotUtf8)))
+            Err(Error::NotUtf8 { tag: b'Q' })
         );
         assert_eq!(
             f(b'S', b"x"),
-            Err(ParseError::Message(m(b'S', Malformed::TrailingBytes)))
+            Err(Error::TrailingBytes { tag: b'S' })
         );
         assert_eq!(
             f(b'C', b"X\0"),
-            Err(ParseError::Message(m(b'C', Malformed::BadTarget(b'X'))))
+            Err(Error::BadTarget { tag: b'C', target: b'X' })
         );
         assert_eq!(
             f(b'D', b""),
-            Err(ParseError::Message(m(b'D', Malformed::Truncated)))
+            Err(Error::Truncated { tag: b'D' })
         );
         assert_eq!(
             f(b'E', b"\0\0\0"),
-            Err(ParseError::Message(m(b'E', Malformed::Truncated)))
+            Err(Error::Truncated { tag: b'E' })
         );
         assert_eq!(
             f(b'P', b"\0q\0\0\x02\0\0\0\x17"),
-            Err(ParseError::Message(m(b'P', Malformed::Truncated)))
+            Err(Error::Truncated { tag: b'P' })
         );
         // Bind: a format code of 2, a length of -2, and two formats for
         // three values.
         assert_eq!(
             f(b'B', b"\0\0\0\x01\0\x02\0\0\0\0"),
-            Err(ParseError::Message(m(b'B', Malformed::BadFormat(2))))
+            Err(Error::BadFormat { tag: b'B', code: 2 })
         );
         assert_eq!(
             f(b'B', b"\0\0\0\0\0\x01\xff\xff\xff\xfe\0\0"),
-            Err(ParseError::Message(m(b'B', Malformed::BadValueLength(-2))))
+            Err(Error::BadValueLength { tag: b'B', length: -2 })
         );
         let mut three = b"\0\0\0\x02\0\0\0\x01\0\x03".to_vec();
         three.extend_from_slice(&[0xff; 12]);
         three.extend_from_slice(&[0, 0]);
         assert_eq!(
             f(b'B', &three),
-            Err(ParseError::Message(m(b'B', Malformed::FormatCount)))
+            Err(Error::FormatCount { tag: b'B' })
         );
         assert_eq!(
             f(b'B', b"\0\0\0\0\0\x01\0\0\0\x05ab\0\0"),
-            Err(ParseError::Message(m(b'B', Malformed::Truncated)))
+            Err(Error::Truncated { tag: b'B' })
         );
         assert_eq!(
             f(b'F', b"\0\0\0\x01\0\x02\0\0\0\0\0\0\0\0"),
-            Err(ParseError::Message(m(b'F', Malformed::FormatCount)))
+            Err(Error::FormatCount { tag: b'F' })
         );
         assert_eq!(
             f(b'F', b"\0\0\0\x01\0\0\0\0\0\x07"),
-            Err(ParseError::Message(m(b'F', Malformed::BadFormat(7))))
+            Err(Error::BadFormat { tag: b'F', code: 7 })
         );
 
-        let g = |tag, body: &[u8]| Backend::parse(&typed(tag, body));
+        let g = |tag, body: &[u8]| BackendMessage::parse(&typed(tag, body));
         assert_eq!(
             g(b'R', b"\0\0\0\x06"),
-            Err(ParseError::Message(m(b'R', Malformed::BadAuth(6))))
+            Err(Error::BadAuth { tag: b'R', code: 6 })
         );
         assert_eq!(
             g(b'R', b"\0\0\0\x05ab"),
-            Err(ParseError::Message(m(b'R', Malformed::Truncated)))
+            Err(Error::Truncated { tag: b'R' })
         );
         assert_eq!(
             g(b'R', b"\0\0\0\x0aSCRAM\0"),
-            Err(ParseError::Message(m(b'R', Malformed::UnterminatedString)))
+            Err(Error::UnterminatedString { tag: b'R' })
         );
         assert_eq!(
             g(b'R', b"\0\0\0\0x"),
-            Err(ParseError::Message(m(b'R', Malformed::TrailingBytes)))
+            Err(Error::TrailingBytes { tag: b'R' })
         );
         assert_eq!(
             g(b'K', b"\0\0\0\x01"),
-            Err(ParseError::Message(m(b'K', Malformed::BadKeyLength(0))))
+            Err(Error::BadKeyLength { tag: b'K', length: 0 })
         );
         assert_eq!(
             g(b'K', &[0; 261]),
-            Err(ParseError::Message(m(b'K', Malformed::BadKeyLength(257))))
+            Err(Error::BadKeyLength { tag: b'K', length: 257 })
         );
         assert_eq!(
             g(b'Z', b""),
-            Err(ParseError::Message(m(b'Z', Malformed::Truncated)))
+            Err(Error::Truncated { tag: b'Z' })
         );
         assert_eq!(
             g(b'G', b"\x02\0\0"),
-            Err(ParseError::Message(m(b'G', Malformed::BadFormat(2))))
+            Err(Error::BadFormat { tag: b'G', code: 2 })
         );
         assert_eq!(
             g(b'T', b"\0\x01a\0\0\0\0\0\0\0\0\0\0\x17\0\x04\xff\xff\xff\xff\0\x05"),
-            Err(ParseError::Message(m(b'T', Malformed::BadFormat(5))))
+            Err(Error::BadFormat { tag: b'T', code: 5 })
         );
         assert_eq!(
             g(b'E', b"SERROR\0"),
-            Err(ParseError::Message(m(b'E', Malformed::Truncated)))
+            Err(Error::Truncated { tag: b'E' })
         );
         assert_eq!(
             g(b'D', b"\0\x01\xff\xff\xff\xf0"),
-            Err(ParseError::Message(m(b'D', Malformed::BadValueLength(-16))))
+            Err(Error::BadValueLength { tag: b'D', length: -16 })
         );
         assert_eq!(
             g(b'v', b"\0\0\0\0\0\0\0\x01"),
-            Err(ParseError::Message(m(b'v', Malformed::UnterminatedString)))
+            Err(Error::UnterminatedString { tag: b'v' })
         );
         assert_eq!(
             g(b'v', b"\0\0\0\0\xff\xff\xff\xff"),
-            Err(ParseError::Message(m(b'v', Malformed::TooManyItems)))
+            Err(Error::TooManyItems { tag: b'v' })
         );
         assert_eq!(
             g(b't', b"\0\x02\0\0\0\x17"),
-            Err(ParseError::Message(m(b't', Malformed::Truncated)))
+            Err(Error::Truncated { tag: b't' })
         );
     }
 
@@ -3047,31 +3135,31 @@ mod tests {
     fn backend_key_is_at_least_4_bytes() {
         // The spec: "The minimum and maximum key length are 4 and 256
         // bytes", and libpq refuses a shorter key.
-        let g = |body: &[u8]| Backend::parse(&typed(b'K', body));
+        let g = |body: &[u8]| BackendMessage::parse(&typed(b'K', body));
         assert_eq!(
             g(&[0, 0, 0, 1, 1, 2, 3]),
-            Err(ParseError::Message(bad(b'K', Malformed::BadKeyLength(3))))
+            Err(Error::BadKeyLength { tag: b'K', length: 3 })
         );
         assert!(g(&[0, 0, 0, 1, 1, 2, 3, 4]).is_ok());
-        assert_unwritable(&Backend::BackendKeyData {
+        assert_unwritable(&BackendMessage::BackendKeyData {
             process_id: 0,
             secret_key: vec![7],
         });
         // The server reads a cancel key of 1 to 256 bytes.
         let c = startup_with(CANCEL_REQUEST_CODE, &[0, 0, 0, 1, 9]);
-        assert!(Frontend::parse(&c).is_ok());
+        assert!(FrontendMessage::parse(&c).is_ok());
     }
 
     #[test]
     fn text_copy_has_text_columns() {
         // "All must be zero if the overall copy format is textual."
-        let g = |body: &[u8]| Backend::parse(&typed(b'G', body));
+        let g = |body: &[u8]| BackendMessage::parse(&typed(b'G', body));
         assert_eq!(
             g(b"\0\0\0"),
-            Err(ParseError::Message(bad(b'G', Malformed::BadFormat(1))))
+            Err(Error::BadFormat { tag: b'G', code: 1 })
         );
         assert!(g(b"\0\0\0\0").is_ok());
-        let m = Backend::CopyOutResponse(CopyFormat { format: Format::Text, columns: vec![Format::Binary] });
+        let m = BackendMessage::CopyOutResponse(CopyFormat { format: Format::Text, columns: vec![Format::Binary] });
         assert_unwritable(&m);
     }
 
@@ -3091,13 +3179,13 @@ mod tests {
     fn each_encryption_request_comes_once() {
         for (first, second, code) in [
             (
-                Frontend::SslRequest,
-                Frontend::GssEncRequest,
+                FrontendMessage::SslRequest,
+                FrontendMessage::GssEncRequest,
                 SSL_REQUEST_CODE,
             ),
             (
-                Frontend::GssEncRequest,
-                Frontend::SslRequest,
+                FrontendMessage::GssEncRequest,
+                FrontendMessage::SslRequest,
                 GSSENC_REQUEST_CODE,
             ),
         ] {
@@ -3112,7 +3200,7 @@ mod tests {
             stream.decoder().refuse_encryption();
             assert_eq!(
                 stream.next(),
-                Some(Err(Fail::Protocol(Error::UnsupportedProtocol(code))))
+                Some(Err(Fail::Protocol(FrameError::UnsupportedProtocol(code))))
             );
             assert_eq!(stream.next(), None);
         }
@@ -3121,14 +3209,14 @@ mod tests {
     #[test]
     fn direct_tls_only_opens_a_connection() {
         let mut stream = Stream::new(FrontendMessages::new());
-        let mut input = Frontend::SslRequest.to_bytes().unwrap();
+        let mut input = FrontendMessage::SslRequest.to_bytes().unwrap();
         input.extend_from_slice(&[0x16, 3, 1, 0, 5]);
         assert_eq!(stream.push(&input), input.len());
-        assert_eq!(stream.next(), Some(Ok(Ok(Frontend::SslRequest))));
+        assert_eq!(stream.next(), Some(Ok(Ok(FrontendMessage::SslRequest))));
         stream.decoder().refuse_encryption();
         assert_eq!(
             stream.next(),
-            Some(Err(Fail::Protocol(Error::TooLong {
+            Some(Err(Fail::Protocol(FrameError::TooLong {
                 length: 0x1603_0100,
                 max: MAX_STARTUP + 4
             })))
@@ -3154,17 +3242,17 @@ mod tests {
     fn negotiate_carries_the_whole_version() {
         // The server sends FrontendProtocol, major and minor together, and
         // libpq refuses a version below PG_PROTOCOL(3, 0).
-        let m = Backend::NegotiateProtocolVersion { version: PROTOCOL_3_0, unrecognized: vec![] };
+        let m = BackendMessage::NegotiateProtocolVersion { version: PROTOCOL_3_0, unrecognized: vec![] };
         assert_eq!(m.to_bytes().unwrap(), b"v\0\0\0\x0c\0\x03\0\0\0\0\0\0");
-        let back = Backend::parse(b"v\0\0\0\x0c\0\x03\0\x02\0\0\0\0").unwrap();
-        assert_eq!(back, Backend::NegotiateProtocolVersion { version: PROTOCOL_3_2, unrecognized: vec![] });
+        let back = BackendMessage::parse(b"v\0\0\0\x0c\0\x03\0\x02\0\0\0\0").unwrap();
+        assert_eq!(back, BackendMessage::NegotiateProtocolVersion { version: PROTOCOL_3_2, unrecognized: vec![] });
     }
 
     #[test]
     fn accepted_encryption_ends_negotiation() {
         for (first, second, code) in [
-            (Frontend::SslRequest, Frontend::GssEncRequest, GSSENC_REQUEST_CODE),
-            (Frontend::GssEncRequest, Frontend::SslRequest, SSL_REQUEST_CODE),
+            (FrontendMessage::SslRequest, FrontendMessage::GssEncRequest, GSSENC_REQUEST_CODE),
+            (FrontendMessage::GssEncRequest, FrontendMessage::SslRequest, SSL_REQUEST_CODE),
         ] {
             let mut input = first.to_bytes().unwrap();
             input.extend_from_slice(b"injected");
@@ -3175,14 +3263,14 @@ mod tests {
             let (buffer, mut decoder) = stream.into_parts();
             assert_eq!(buffer.unread(), b"injected");
             decoder.start_encryption();
-            let startup = Frontend::Startup(Startup::new("alice", "shop"));
+            let startup = FrontendMessage::Startup(Startup::new("alice", "shop"));
             assert_eq!(
                 decode_all(|| decoder.clone(), &startup.to_bytes().unwrap()),
                 (vec![Ok(startup)], None)
             );
             assert_eq!(
                 decoder.decode(&second.to_bytes().unwrap(), false),
-                Err(Error::UnsupportedProtocol(code))
+                Err(FrameError::UnsupportedProtocol(code))
             );
         }
     }
@@ -3192,48 +3280,50 @@ mod tests {
         let hello = [0x16, 3, 1, 0, 5];
         let mut stream = Stream::new(FrontendMessages::new());
         assert_eq!(stream.push(&hello), hello.len());
-        assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::DirectTls))));
+        assert_eq!(stream.next(), Some(Err(Fail::Protocol(FrameError::DirectTls))));
         let (buffer, mut decoder) = stream.into_parts();
         assert_eq!(buffer.unread(), hello);
         decoder.start_encryption();
         assert_eq!(
             decoder.clone().decode(&hello, false),
-            Err(Error::TooLong {
+            Err(FrameError::TooLong {
                 length: 0x1603_0100,
                 max: MAX_STARTUP + 4
             })
         );
         let mut stream = Stream::new(decoder);
-        let mut input = Frontend::SslRequest.to_bytes().unwrap();
+        let mut input = FrontendMessage::SslRequest.to_bytes().unwrap();
         input.extend(startup_bytes());
         assert_eq!(stream.push(&input), input.len());
-        assert_eq!(stream.next(), Some(Ok(Ok(Frontend::SslRequest))));
+        assert_eq!(stream.next(), Some(Ok(Ok(FrontendMessage::SslRequest))));
         stream.decoder().refuse_encryption();
-        assert!(matches!(stream.next(), Some(Ok(Ok(Frontend::Startup(_))))));
+        assert!(matches!(stream.next(), Some(Ok(Ok(FrontendMessage::Startup(_))))));
     }
 
     #[test]
     fn errors_display() {
         let all = [
-            Error::DirectTls,
+            Error::Unwritable,
             Error::UnsupportedProtocol(0x2_0000),
             Error::UnknownType(0),
             Error::UnknownType(b'z'),
             Error::BadLength(1),
             Error::TooLong { length: 1, max: 0 },
-            bad(0, Malformed::Truncated),
-            bad(b'B', Malformed::TrailingBytes),
-            bad(b'B', Malformed::UnterminatedString),
-            bad(b'B', Malformed::NotUtf8),
-            bad(b'B', Malformed::BadFormat(3)),
-            bad(b'B', Malformed::FormatCount),
-            bad(b'B', Malformed::BadValueLength(-3)),
-            bad(b'C', Malformed::BadTarget(b'Q')),
-            bad(b'Z', Malformed::BadStatus(1)),
-            bad(0, Malformed::BadKeyLength(0)),
-            bad(b'R', Malformed::BadAuth(99)),
-            bad(b'v', Malformed::TooManyItems),
-            bad(b'E', Malformed::DuplicateField(b'C')),
+            Error::Incomplete,
+            Error::Trailing,
+            Error::Truncated { tag: 0 },
+            Error::TrailingBytes { tag: b'B' },
+            Error::UnterminatedString { tag: b'B' },
+            Error::NotUtf8 { tag: b'B' },
+            Error::BadFormat { tag: b'B', code: 3 },
+            Error::FormatCount { tag: b'B' },
+            Error::BadValueLength { tag: b'B', length: -3 },
+            Error::BadTarget { tag: b'C', target: b'Q' },
+            Error::BadStatus { tag: b'Z', status: 1 },
+            Error::BadKeyLength { tag: 0, length: 0 },
+            Error::BadAuth { tag: b'R', code: 99 },
+            Error::TooManyItems { tag: b'v' },
+            Error::DuplicateField { tag: b'E', code: b'C' },
         ];
         for e in all {
             assert!(!e.to_string().is_empty());
@@ -3241,6 +3331,22 @@ mod tests {
         }
         assert_eq!(Error::UnsupportedProtocol(0x2_0000).to_string(), "unsupported frontend protocol 2.0");
         assert_eq!(Error::UnknownType(b'z').to_string(), "invalid message type 'z'");
+        assert_eq!(Error::NotUtf8 { tag: b'B' }.to_string(), "invalid message 'B': a string is not UTF-8");
+        let frames = [
+            FrameError::DirectTls,
+            FrameError::UnsupportedProtocol(0x2_0000),
+            FrameError::UnknownType(b'z'),
+            FrameError::BadLength(1),
+            FrameError::TooLong { length: 1, max: 0 },
+            FrameError::Startup(Error::Truncated { tag: 0 }),
+        ];
+        for e in frames {
+            assert!(!e.to_string().is_empty());
+            let _: &dyn std::error::Error = &e;
+        }
+        let startup = FrameError::Startup(Error::BadKeyLength { tag: 0, length: 0 });
+        assert_eq!(startup.to_string(), "invalid startup packet: invalid cancel key length 0");
+        assert!(std::error::Error::source(&startup).is_some());
     }
 
     #[test]
@@ -3254,43 +3360,43 @@ mod tests {
                     FrontendMessages::established(SMALL_MESSAGE)
                 };
                 assert_eq!(decoder.decode(&bytes[..n], false), Ok(Step::Need));
-                assert_eq!(Frontend::parse(&bytes[..n]), Err(ParseError::Truncated));
+                assert_eq!(FrontendMessage::parse(&bytes[..n]), Err(Error::Incomplete));
             }
         }
         for message in all_backend() {
             let bytes = message.to_bytes().unwrap();
             for n in 0..bytes.len() {
                 assert_eq!(
-                    BackendMessages::new().decode(&bytes[..n], false),
+                    BackendEvents::new().decode(&bytes[..n], false),
                     Ok(Step::Need)
                 );
-                assert_eq!(Backend::parse(&bytes[..n]), Err(ParseError::Truncated));
+                assert_eq!(BackendMessage::parse(&bytes[..n]), Err(Error::Incomplete));
             }
         }
     }
 
     #[test]
     fn decoder_follows_the_phases() {
-        let mut input = Frontend::SslRequest.to_bytes().unwrap();
+        let mut input = FrontendMessage::SslRequest.to_bytes().unwrap();
         input.extend(startup_bytes());
         input.extend(extended_bytes());
-        Frontend::Terminate.write(&mut input).unwrap();
+        FrontendMessage::Terminate.write(&mut input).unwrap();
         input.extend_from_slice(b"Q\0\0\0\x05\0");
         let mut stream = Stream::new(FrontendMessages::new());
         assert_eq!(stream.push(&input), input.len());
-        assert_eq!(stream.next(), Some(Ok(Ok(Frontend::SslRequest))));
+        assert_eq!(stream.next(), Some(Ok(Ok(FrontendMessage::SslRequest))));
         assert_eq!(stream.decoder().phase(), Phase::Startup);
         stream.decoder().refuse_encryption();
-        assert!(matches!(stream.next(), Some(Ok(Ok(Frontend::Startup(_))))));
+        assert!(matches!(stream.next(), Some(Ok(Ok(FrontendMessage::Startup(_))))));
         assert_eq!(stream.decoder().phase(), Phase::Messages);
         for message in extended_messages() {
             assert_eq!(stream.next(), Some(Ok(Ok(message))));
         }
-        assert_eq!(stream.next(), Some(Ok(Ok(Frontend::Terminate))));
+        assert_eq!(stream.next(), Some(Ok(Ok(FrontendMessage::Terminate))));
         assert_eq!(stream.decoder().phase(), Phase::Closed);
         assert_eq!(stream.next(), None);
         assert_eq!(stream.unread(), b"Q\0\0\0\x05\0");
-        let cancel = Frontend::CancelRequest {
+        let cancel = FrontendMessage::CancelRequest {
             process_id: 1,
             secret_key: vec![1; 4],
         };
@@ -3308,12 +3414,12 @@ mod tests {
         for (input, expected) in [
             (
                 b"Q\0\0\0\x05\0".as_slice(),
-                Error::TooLong {
+                FrameError::TooLong {
                     length: 0x5100_0000,
                     max: MAX_STARTUP + 4,
                 },
             ),
-            (&[0x16, 3, 1, 0, 5], Error::DirectTls),
+            (&[0x16, 3, 1, 0, 5], FrameError::DirectTls),
         ] {
             let mut stream = Stream::new(FrontendMessages::new());
             assert_eq!(stream.push(input), input.len());
@@ -3327,7 +3433,7 @@ mod tests {
         let (_, error) = decode_all(|| FrontendMessages::with_limit(20_000), &input);
         assert_eq!(
             error,
-            Some(Fail::Protocol(Error::TooLong {
+            Some(Fail::Protocol(FrameError::TooLong {
                 length: 20_001,
                 max: 20_000
             }))
@@ -3336,7 +3442,7 @@ mod tests {
         input.push(b'?');
         assert_eq!(
             decode_all(FrontendMessages::new, &input).1,
-            Some(Fail::Protocol(Error::UnknownType(b'?')))
+            Some(Fail::Protocol(FrameError::UnknownType(b'?')))
         );
     }
 
@@ -3348,12 +3454,12 @@ mod tests {
             message.write(&mut input).unwrap();
         }
         contract::check_decode_with_alloc_limit(
-            BackendMessages::new,
+            BackendEvents::new,
             &input,
-            2 * BackendMessages::new().capacity(),
+            2 * BackendEvents::new().capacity(),
         );
         assert_eq!(
-            decode_all(BackendMessages::new, &input),
+            decode_all(BackendEvents::new, &input),
             (
                 messages
                     .into_iter()
@@ -3363,13 +3469,13 @@ mod tests {
             )
         );
         let (items, error) = decode_all(
-            || BackendMessages::with_limit(10_000),
+            || BackendEvents::with_limit(10_000),
             b"D\0\0\x27\x11Z\0\0\0\x05I",
         );
         assert!(items.is_empty());
         assert_eq!(
             error,
-            Some(Fail::Protocol(Error::TooLong {
+            Some(Fail::Protocol(FrameError::TooLong {
                 length: 10_001,
                 max: 10_000
             }))
@@ -3385,7 +3491,7 @@ mod tests {
             2 * (MAX_STARTUP + 4),
         );
         contract::check_decode_with_alloc_limit(
-            || BackendMessages::with_limit(10_000),
+            || BackendEvents::with_limit(10_000),
             &input,
             2 * 10_001,
         );
@@ -3393,14 +3499,14 @@ mod tests {
 
     #[test]
     fn interleaved_reads_preserve_the_backlog() {
-        let one = Backend::ParseComplete.to_bytes().unwrap();
+        let one = BackendMessage::ParseComplete.to_bytes().unwrap();
         let input = one.repeat(100);
-        let mut stream = Stream::new(BackendMessages::new());
+        let mut stream = Stream::new(BackendEvents::new());
         assert_eq!(stream.push(&input), input.len());
         for i in 1..=40 {
             assert_eq!(
                 stream.next(),
-                Some(Ok(Ok(BackendEvent::Message(Backend::ParseComplete))))
+                Some(Ok(Ok(BackendEvent::Message(BackendMessage::ParseComplete))))
             );
             assert_eq!(stream.push(&[]), 0);
             assert_eq!(stream.offset(), 5 * i);
@@ -3415,23 +3521,23 @@ mod tests {
         assert_eq!(
             decode_all(|| FrontendMessages::established(SMALL_MESSAGE), input),
             (
-                vec![Err(bad(b'P', Malformed::TrailingBytes)), Ok(Frontend::Sync)],
-                Some(Fail::Protocol(Error::BadLength(3))),
+                vec![Err(Error::TrailingBytes { tag: b'P' }), Ok(FrontendMessage::Sync)],
+                Some(Fail::Protocol(FrameError::BadLength(3))),
             )
         );
         assert_eq!(
-            decode_all(BackendMessages::new, b"Z\0\0\0\x05X1\0\0\0\x04"),
+            decode_all(BackendEvents::new, b"Z\0\0\0\x05X1\0\0\0\x04"),
             (
                 vec![
-                    Err(bad(b'Z', Malformed::BadStatus(b'X'))),
-                    Ok(BackendEvent::Message(Backend::ParseComplete))
+                    Err(Error::BadStatus { tag: b'Z', status: b'X' }),
+                    Ok(BackendEvent::Message(BackendMessage::ParseComplete))
                 ],
                 None,
             )
         );
         assert_eq!(
             decode_all(FrontendMessages::new, &startup_with(SSL_REQUEST_CODE, b"x")).1,
-            Some(Fail::Protocol(bad(0, Malformed::TrailingBytes)))
+            Some(Fail::Protocol(FrameError::Startup(Error::TrailingBytes { tag: 0 })))
         );
     }
 
@@ -3446,15 +3552,15 @@ mod tests {
             b.extend_from_slice(&(value.len() as u32).to_be_bytes());
             b.extend_from_slice(value);
             b.extend_from_slice(&[0, 0]);
-            Frontend::parse(&typed(b'B', &b))
+            FrontendMessage::parse(&typed(b'B', &b))
         };
         assert_eq!(
             bind(b"\0\0", b"a\0b"),
-            Err(ParseError::Message(bad(b'B', Malformed::NotUtf8)))
+            Err(Error::NotUtf8 { tag: b'B' })
         );
         assert_eq!(
             bind(b"\0\x01\0\0", b"\xff"),
-            Err(ParseError::Message(bad(b'B', Malformed::NotUtf8)))
+            Err(Error::NotUtf8 { tag: b'B' })
         );
         assert!(bind(b"\0\x01\0\x01", b"a\0\xff").is_ok());
         let call = |format: u8, value: &[u8]| {
@@ -3462,28 +3568,28 @@ mod tests {
             b.extend_from_slice(&(value.len() as u32).to_be_bytes());
             b.extend_from_slice(value);
             b.extend_from_slice(&[0, 0]);
-            Frontend::parse(&typed(b'F', &b))
+            FrontendMessage::parse(&typed(b'F', &b))
         };
         assert_eq!(
             call(0, b"\0"),
-            Err(ParseError::Message(bad(b'F', Malformed::NotUtf8)))
+            Err(Error::NotUtf8 { tag: b'F' })
         );
         assert!(call(1, b"\0").is_ok());
-        assert_unwritable(&Frontend::Bind(Bind {
+        assert_unwritable(&FrontendMessage::Bind(Bind {
             param_formats: vec![Format::Text, Format::Binary],
             params: vec![Some(b"a\0b".to_vec()), Some(b"a\0b".to_vec())],
             ..Bind::default()
         }));
-        assert_unwritable(&Frontend::FunctionCall(FunctionCall {
+        assert_unwritable(&FrontendMessage::FunctionCall(FunctionCall {
             args: vec![Some(b"ok\xc3".to_vec())],
             ..FunctionCall::default()
         }));
-        let binary = Frontend::Bind(Bind {
+        let binary = FrontendMessage::Bind(Bind {
             param_formats: vec![Format::Binary],
             params: vec![Some(b"a\0\xff".to_vec())],
             ..Bind::default()
         });
-        assert_eq!(Frontend::parse(&binary.to_bytes().unwrap()), Ok(binary));
+        assert_eq!(FrontendMessage::parse(&binary.to_bytes().unwrap()), Ok(binary));
     }
 
     #[test]
@@ -3496,10 +3602,10 @@ mod tests {
     #[test]
     fn error_fields_come_once() {
         // "Any given field type should appear at most once per message."
-        let g = |body: &[u8]| Backend::parse(&typed(b'E', body));
-        assert_eq!(g(b"C42P01\0C00000\0\0"), Err(ParseError::Message(bad(b'E', Malformed::DuplicateField(b'C')))));
+        let g = |body: &[u8]| BackendMessage::parse(&typed(b'E', body));
+        assert_eq!(g(b"C42P01\0C00000\0\0"), Err(Error::DuplicateField { tag: b'E', code: b'C' }));
         let d = Diagnostic::error(sqlstate::SYNTAX_ERROR, "x").with(field_code::CODE, sqlstate::INTERNAL_ERROR);
-        assert_unwritable(&Backend::ErrorResponse(d));
+        assert_unwritable(&BackendMessage::ErrorResponse(d));
     }
 
     #[test]
@@ -3510,8 +3616,8 @@ mod tests {
         body.extend(std::iter::repeat_n(0u8, 1_000_000));
         let m = typed(b'v', &body);
         assert_eq!(
-            Backend::parse(&m),
-            Err(ParseError::Message(bad(b'v', Malformed::TooManyItems)))
+            BackendMessage::parse(&m),
+            Err(Error::TooManyItems { tag: b'v' })
         );
         let mut body = 10u32.to_be_bytes().to_vec();
         for _ in 0..=MAX_COUNT {
@@ -3519,60 +3625,60 @@ mod tests {
         }
         body.push(0);
         assert_eq!(
-            Backend::parse(&typed(b'R', &body)),
-            Err(ParseError::Message(bad(b'R', Malformed::TooManyItems)))
+            BackendMessage::parse(&typed(b'R', &body)),
+            Err(Error::TooManyItems { tag: b'R' })
         );
         let names = vec!["a".to_string(); MAX_COUNT + 5];
-        assert_unwritable(&Backend::NegotiateProtocolVersion {
+        assert_unwritable(&BackendMessage::NegotiateProtocolVersion {
             version: PROTOCOL_3_0,
             unrecognized: names.clone(),
         });
-        assert_unwritable(&Backend::Authentication(Authentication::Sasl(names)));
+        assert_unwritable(&BackendMessage::Authentication(Authentication::Sasl(names)));
     }
 
     #[test]
     fn writers_refuse_values_that_would_change() {
         for message in [
-            Frontend::Startup(Startup {
+            FrontendMessage::Startup(Startup {
                 minor_version: 0,
                 params: vec![("".into(), "x".into())],
             }),
-            Frontend::Startup(Startup::new("al\0ice", "shop")),
-            Frontend::Startup(Startup::default().with("a\0b", "c")),
-            Frontend::Startup(Startup {
+            FrontendMessage::Startup(Startup::new("al\0ice", "shop")),
+            FrontendMessage::Startup(Startup::default().with("a\0b", "c")),
+            FrontendMessage::Startup(Startup {
                 minor_version: 0,
                 params: (0..2000)
                     .map(|i| (format!("p{i}"), "v".repeat(10)))
                     .collect(),
             }),
-            Frontend::CancelRequest {
+            FrontendMessage::CancelRequest {
                 process_id: 0,
                 secret_key: vec![],
             },
-            Frontend::CancelRequest {
+            FrontendMessage::CancelRequest {
                 process_id: 0,
                 secret_key: vec![1; 300],
             },
-            Frontend::Bind(Bind {
+            FrontendMessage::Bind(Bind {
                 param_formats: vec![Format::Binary, Format::Text],
                 params: vec![None; 3],
                 ..Bind::default()
             }),
-            Frontend::CopyFail("é".repeat(6000)),
-            Frontend::Execute {
+            FrontendMessage::CopyFail("é".repeat(6000)),
+            FrontendMessage::Execute {
                 portal: "p".repeat(20_000),
                 max_rows: 3,
             },
-            Frontend::Parse {
+            FrontendMessage::Parse {
                 name: "".into(),
                 query: "".into(),
                 param_types: vec![0; MAX_COUNT + 1],
             },
-            Frontend::Bind(Bind {
+            FrontendMessage::Bind(Bind {
                 result_formats: vec![Format::Text; MAX_COUNT + 1],
                 ..Bind::default()
             }),
-            Frontend::FunctionCall(FunctionCall {
+            FrontendMessage::FunctionCall(FunctionCall {
                 arg_formats: vec![Format::Text; 2],
                 args: vec![None; 3],
                 ..FunctionCall::default()
@@ -3581,21 +3687,21 @@ mod tests {
             assert_unwritable(&message);
         }
         for message in [
-            Backend::BackendKeyData {
+            BackendMessage::BackendKeyData {
                 process_id: 0,
                 secret_key: vec![],
             },
-            Backend::BackendKeyData {
+            BackendMessage::BackendKeyData {
                 process_id: 0,
                 secret_key: vec![0; MAX_SECRET_KEY + 1],
             },
-            Backend::ErrorResponse(Diagnostic {
+            BackendMessage::ErrorResponse(Diagnostic {
                 fields: vec![(0, "x".into()), (b'M', "m".into())],
             }),
-            Backend::Authentication(Authentication::Sasl(vec!["".into(), "A".into()])),
-            Backend::DataRow(vec![None; 70_000]),
-            Backend::ParameterDescription(vec![0; MAX_COUNT + 1]),
-            Backend::RowDescription(vec![Field::default(); MAX_COUNT + 1]),
+            BackendMessage::Authentication(Authentication::Sasl(vec!["".into(), "A".into()])),
+            BackendMessage::DataRow(vec![None; 70_000]),
+            BackendMessage::ParameterDescription(vec![0; MAX_COUNT + 1]),
+            BackendMessage::RowDescription(vec![Field::default(); MAX_COUNT + 1]),
         ] {
             assert_unwritable(&message);
         }
@@ -3619,16 +3725,16 @@ mod tests {
             let bytes = message.to_bytes();
             assert_eq!(bytes.is_ok(), clean_frontend(&message), "{message:?}");
             if let Ok(bytes) = bytes {
-                assert_eq!(Frontend::parse(&bytes), Ok(message));
-                contract::check_wire::<Frontend>(&bytes);
+                assert_eq!(FrontendMessage::parse(&bytes), Ok(message));
+                contract::check_wire::<FrontendMessage>(&bytes);
             }
             let message = random_backend(&mut rng);
             contract::check_wire_value(&message);
             let bytes = message.to_bytes();
             assert_eq!(bytes.is_ok(), clean_backend(&message), "{message:?}");
             if let Ok(bytes) = bytes {
-                assert_eq!(Backend::parse(&bytes), Ok(message));
-                contract::check_wire::<Backend>(&bytes);
+                assert_eq!(BackendMessage::parse(&bytes), Ok(message));
+                contract::check_wire::<BackendMessage>(&bytes);
             }
         }
     }
@@ -3662,24 +3768,24 @@ mod tests {
                 contract::check_decode_with_alloc_limit(make, input, 2 * make().capacity());
                 for m in decode_all(make, input).0.into_iter().flatten() {
                     let b = m.to_bytes().unwrap();
-                    assert_eq!(Frontend::parse(&b), Ok(m));
-                    contract::check_wire::<Frontend>(&b);
+                    assert_eq!(FrontendMessage::parse(&b), Ok(m));
+                    contract::check_wire::<FrontendMessage>(&b);
                 }
             }
-            contract::check_decode_with_alloc_limit(|| BackendMessages::with_limit(64), &data, 130);
-            for item in decode_all(|| BackendMessages::with_limit(64), &data)
+            contract::check_decode_with_alloc_limit(|| BackendEvents::with_limit(64), &data, 130);
+            for item in decode_all(|| BackendEvents::with_limit(64), &data)
                 .0
                 .into_iter()
                 .flatten()
             {
                 if let BackendEvent::Message(m) = item {
                     let b = m.to_bytes().unwrap();
-                    assert_eq!(Backend::parse(&b), Ok(m));
-                    contract::check_wire::<Backend>(&b);
+                    assert_eq!(BackendMessage::parse(&b), Ok(m));
+                    contract::check_wire::<BackendMessage>(&b);
                 }
             }
-            contract::check_wire::<Frontend>(&data);
-            contract::check_wire::<Backend>(&data);
+            contract::check_wire::<FrontendMessage>(&data);
+            contract::check_wire::<BackendMessage>(&data);
             contract::check_wire::<Password>(&data);
             contract::check_wire::<SaslInitialResponse>(&data);
         }
@@ -3692,7 +3798,7 @@ mod tests {
             if i == 1000 {
                 input.extend_from_slice(b"P\0\0\0\x09\0\0\0\0x");
             }
-            Frontend::Query(format!("SELECT {i}"))
+            FrontendMessage::Query(format!("SELECT {i}"))
                 .write(&mut input)
                 .unwrap();
         }
@@ -3701,76 +3807,76 @@ mod tests {
         let (got, failure) = decode_all(make, &input);
         assert_eq!(failure, None);
         assert_eq!(got.len(), 3002);
-        assert_eq!(got[1001], Err(bad(b'P', Malformed::TrailingBytes)));
-        assert_eq!(got[3001], Ok(Frontend::Query("SELECT 2999".into())));
-        let input = Backend::ParseComplete.to_bytes().unwrap().repeat(3000);
-        let make = || BackendMessages::with_limit(SMALL_MESSAGE);
+        assert_eq!(got[1001], Err(Error::TrailingBytes { tag: b'P' }));
+        assert_eq!(got[3001], Ok(FrontendMessage::Query("SELECT 2999".into())));
+        let input = BackendMessage::ParseComplete.to_bytes().unwrap().repeat(3000);
+        let make = || BackendEvents::with_limit(SMALL_MESSAGE);
         contract::check_decode_with_alloc_limit(make, &input, 2 * make().capacity());
         assert_eq!(decode_all(make, &input).0.len(), 3000);
     }
 
     /// One of every message, in a valid form.
-    fn all_frontend() -> Vec<Frontend> {
+    fn all_frontend() -> Vec<FrontendMessage> {
         let mut all = vec![
-            Frontend::Startup(Startup::new("u", "d")),
-            Frontend::SslRequest,
-            Frontend::GssEncRequest,
-            Frontend::CancelRequest { process_id: 9, secret_key: vec![1; 32] },
-            Frontend::Close { target: Target::Portal, name: "p".into() },
-            Frontend::CopyData(vec![1, 2, 3]),
-            Frontend::CopyDone,
-            Frontend::CopyFail("stop".into()),
-            Frontend::Flush,
-            Frontend::FunctionCall(FunctionCall {
+            FrontendMessage::Startup(Startup::new("u", "d")),
+            FrontendMessage::SslRequest,
+            FrontendMessage::GssEncRequest,
+            FrontendMessage::CancelRequest { process_id: 9, secret_key: vec![1; 32] },
+            FrontendMessage::Close { target: Target::Portal, name: "p".into() },
+            FrontendMessage::CopyData(vec![1, 2, 3]),
+            FrontendMessage::CopyDone,
+            FrontendMessage::CopyFail("stop".into()),
+            FrontendMessage::Flush,
+            FrontendMessage::FunctionCall(FunctionCall {
                 function: 1,
                 arg_formats: vec![Format::Binary, Format::Text],
                 args: vec![Some(vec![1]), None],
                 result_format: Format::Text,
             }),
-            Frontend::password("secret").unwrap(),
-            Frontend::Query("SELECT 'é'".into()),
-            Frontend::Terminate,
+            FrontendMessage::password("secret").unwrap(),
+            FrontendMessage::Query("SELECT 'é'".into()),
+            FrontendMessage::Terminate,
         ];
         all.extend(extended_messages());
         all
     }
 
-    fn all_backend() -> Vec<Backend> {
+    fn all_backend() -> Vec<BackendMessage> {
         let copy = CopyFormat { format: Format::Binary, columns: vec![Format::Binary] };
         vec![
-            Backend::Authentication(Authentication::Ok),
-            Backend::Authentication(Authentication::KerberosV5),
-            Backend::Authentication(Authentication::CleartextPassword),
-            Backend::Authentication(Authentication::Md5Password([1, 2, 3, 4])),
-            Backend::Authentication(Authentication::Gss),
-            Backend::Authentication(Authentication::GssContinue(vec![5])),
-            Backend::Authentication(Authentication::Sspi),
-            Backend::Authentication(Authentication::Sasl(vec!["SCRAM-SHA-256".into(), "SCRAM-SHA-256-PLUS".into()])),
-            Backend::Authentication(Authentication::SaslContinue(b"r=x".to_vec())),
-            Backend::Authentication(Authentication::SaslFinal(b"v=y".to_vec())),
-            Backend::BackendKeyData { process_id: 1, secret_key: vec![2; 4] },
-            Backend::BindComplete,
-            Backend::CloseComplete,
-            Backend::CommandComplete("INSERT 0 1".into()),
-            Backend::CopyData(b"a\n".to_vec()),
-            Backend::CopyDone,
-            Backend::CopyInResponse(copy.clone()),
-            Backend::CopyOutResponse(copy.clone()),
-            Backend::CopyBothResponse(copy),
-            Backend::DataRow(vec![Some(b"1".to_vec()), None, Some(vec![])]),
-            Backend::EmptyQueryResponse,
-            Backend::ErrorResponse(Diagnostic::error(sqlstate::SYNTAX_ERROR, "syntax error")),
-            Backend::FunctionCallResponse(Some(vec![0, 1])),
-            Backend::NegotiateProtocolVersion { version: PROTOCOL_3_0, unrecognized: vec![] },
-            Backend::NoData,
-            Backend::NoticeResponse(Diagnostic::new("WARNING", sqlstate::WARNING, "careful")),
-            Backend::NotificationResponse { process_id: 3, channel: "jobs".into(), payload: "42".into() },
-            Backend::ParameterDescription(vec![oid::TEXT, oid::INT8]),
-            Backend::ParameterStatus { name: "TimeZone".into(), value: "UTC".into() },
-            Backend::ParseComplete,
-            Backend::PortalSuspended,
-            Backend::ReadyForQuery(TransactionStatus::InTransaction),
-            Backend::RowDescription(vec![Field::new("a", oid::TEXT), Field::new("b", oid::BOOL)]),
+            BackendMessage::Authentication(Authentication::Ok),
+            BackendMessage::Authentication(Authentication::KerberosV5),
+            BackendMessage::Authentication(Authentication::CleartextPassword),
+            BackendMessage::Authentication(Authentication::Md5Password([1, 2, 3, 4])),
+            BackendMessage::Authentication(Authentication::Gss),
+            BackendMessage::Authentication(Authentication::GssContinue(vec![5])),
+            BackendMessage::Authentication(Authentication::Sspi),
+            BackendMessage::Authentication(Authentication::Sasl(vec!["SCRAM-SHA-256".into(), "SCRAM-SHA-256-PLUS".into()])),
+            BackendMessage::Authentication(Authentication::SaslContinue(b"r=x".to_vec())),
+            BackendMessage::Authentication(Authentication::SaslFinal(b"v=y".to_vec())),
+            BackendMessage::BackendKeyData { process_id: 1, secret_key: vec![2; 4] },
+            BackendMessage::BindComplete,
+            BackendMessage::CloseComplete,
+            BackendMessage::CommandComplete("INSERT 0 1".into()),
+            BackendMessage::CopyData(b"a\n".to_vec()),
+            BackendMessage::CopyDone,
+            BackendMessage::CopyInResponse(copy.clone()),
+            BackendMessage::CopyOutResponse(copy.clone()),
+            BackendMessage::CopyBothResponse(copy),
+            BackendMessage::DataRow(vec![Some(b"1".to_vec()), None, Some(vec![])]),
+            BackendMessage::EmptyQueryResponse,
+            BackendMessage::ErrorResponse(Diagnostic::error(sqlstate::SYNTAX_ERROR, "syntax error")),
+            BackendMessage::FunctionCallResponse(Some(vec![0, 1])),
+            BackendMessage::NegotiateProtocolVersion { version: PROTOCOL_3_0, unrecognized: vec![] },
+            BackendMessage::NoData,
+            BackendMessage::NoticeResponse(Diagnostic::new("WARNING", sqlstate::WARNING, "careful")),
+            BackendMessage::NotificationResponse { process_id: 3, channel: "jobs".into(), payload: "42".into() },
+            BackendMessage::ParameterDescription(vec![oid::TEXT, oid::INT8]),
+            BackendMessage::ParameterStatus { name: "TimeZone".into(), value: "UTC".into() },
+            BackendMessage::ParseComplete,
+            BackendMessage::PortalSuspended,
+            BackendMessage::ReadyForQuery(TransactionStatus::InTransaction),
+            BackendMessage::RowDescription(vec![Field::new("a", oid::TEXT), Field::new("b", oid::BOOL)]),
         ]
     }
 
@@ -3801,39 +3907,39 @@ mod tests {
         (0..rng.index(5)).map(|_| make(rng)).collect()
     }
 
-    fn clean_frontend(m: &Frontend) -> bool {
+    fn clean_frontend(m: &FrontendMessage) -> bool {
         let ok = |s: &String| !s.contains('\0');
         if frontend_size(m) > m.tag().and_then(frontend_limit).unwrap_or(MAX_STARTUP + 4) {
             return false;
         }
         match m {
-            Frontend::Startup(s) => s
+            FrontendMessage::Startup(s) => s
                 .params
                 .iter()
                 .all(|(n, v)| ok(n) && ok(v) && !n.is_empty()),
-            Frontend::CancelRequest { secret_key, .. } => {
+            FrontendMessage::CancelRequest { secret_key, .. } => {
                 (1..=MAX_SECRET_KEY).contains(&secret_key.len())
             }
-            Frontend::Bind(b) => {
+            FrontendMessage::Bind(b) => {
                 ok(&b.portal)
                     && ok(&b.statement)
                     && (b.param_formats.len() <= 1 || b.param_formats.len() == b.params.len())
                     && b.param_formats.len() <= MAX_COUNT
                     && b.params.len() <= MAX_COUNT
                     && b.result_formats.len() <= MAX_COUNT
-                    && check_text_values(&b.param_formats, &b.params).is_ok()
+                    && check_text_values(0, &b.param_formats, &b.params).is_ok()
             }
-            Frontend::FunctionCall(f) => {
+            FrontendMessage::FunctionCall(f) => {
                 (f.arg_formats.len() <= 1 || f.arg_formats.len() == f.args.len())
                     && f.arg_formats.len() <= MAX_COUNT
                     && f.args.len() <= MAX_COUNT
-                    && check_text_values(&f.arg_formats, &f.args).is_ok()
+                    && check_text_values(0, &f.arg_formats, &f.args).is_ok()
             }
-            Frontend::Close { name, .. } | Frontend::Describe { name, .. } => ok(name),
-            Frontend::CopyFail(s) | Frontend::Query(s) | Frontend::Execute { portal: s, .. } => {
+            FrontendMessage::Close { name, .. } | FrontendMessage::Describe { name, .. } => ok(name),
+            FrontendMessage::CopyFail(s) | FrontendMessage::Query(s) | FrontendMessage::Execute { portal: s, .. } => {
                 ok(s)
             }
-            Frontend::Parse {
+            FrontendMessage::Parse {
                 name,
                 query,
                 param_types,
@@ -3842,27 +3948,27 @@ mod tests {
         }
     }
 
-    fn clean_backend(m: &Backend) -> bool {
+    fn clean_backend(m: &BackendMessage) -> bool {
         let ok = |s: &str| !s.contains('\0');
         if backend_size(m) > MAX_MESSAGE {
             return false;
         }
         match m {
-            Backend::Authentication(Authentication::Sasl(names)) => {
+            BackendMessage::Authentication(Authentication::Sasl(names)) => {
                 names.len() <= MAX_COUNT && names.iter().all(|name| !name.is_empty() && ok(name))
             }
-            Backend::BackendKeyData { secret_key, .. } => {
+            BackendMessage::BackendKeyData { secret_key, .. } => {
                 (MIN_BACKEND_KEY..=MAX_SECRET_KEY).contains(&secret_key.len())
             }
-            Backend::CommandComplete(s) => ok(s),
-            Backend::CopyInResponse(c)
-            | Backend::CopyOutResponse(c)
-            | Backend::CopyBothResponse(c) => {
+            BackendMessage::CommandComplete(s) => ok(s),
+            BackendMessage::CopyInResponse(c)
+            | BackendMessage::CopyOutResponse(c)
+            | BackendMessage::CopyBothResponse(c) => {
                 c.columns.len() <= MAX_COUNT
                     && (c.format == Format::Binary || c.columns.iter().all(|f| *f == Format::Text))
             }
-            Backend::DataRow(values) => values.len() <= MAX_COUNT,
-            Backend::ErrorResponse(d) | Backend::NoticeResponse(d) => {
+            BackendMessage::DataRow(values) => values.len() <= MAX_COUNT,
+            BackendMessage::ErrorResponse(d) | BackendMessage::NoticeResponse(d) => {
                 let mut seen = [false; 256];
                 d.fields.iter().all(|(code, value)| {
                     *code != 0
@@ -3870,28 +3976,28 @@ mod tests {
                         && ok(value)
                 })
             }
-            Backend::NegotiateProtocolVersion { unrecognized, .. } => {
+            BackendMessage::NegotiateProtocolVersion { unrecognized, .. } => {
                 unrecognized.len() <= MAX_COUNT && unrecognized.iter().all(|name| ok(name))
             }
-            Backend::NotificationResponse {
+            BackendMessage::NotificationResponse {
                 channel, payload, ..
             } => ok(channel) && ok(payload),
-            Backend::ParameterDescription(types) => types.len() <= MAX_COUNT,
-            Backend::ParameterStatus { name, value } => ok(name) && ok(value),
-            Backend::RowDescription(fields) => {
+            BackendMessage::ParameterDescription(types) => types.len() <= MAX_COUNT,
+            BackendMessage::ParameterStatus { name, value } => ok(name) && ok(value),
+            BackendMessage::RowDescription(fields) => {
                 fields.len() <= MAX_COUNT && fields.iter().all(|f| ok(&f.name))
             }
-            Backend::Authentication(_)
-            | Backend::BindComplete
-            | Backend::CloseComplete
-            | Backend::CopyData(_)
-            | Backend::CopyDone
-            | Backend::EmptyQueryResponse
-            | Backend::FunctionCallResponse(_)
-            | Backend::NoData
-            | Backend::ParseComplete
-            | Backend::PortalSuspended
-            | Backend::ReadyForQuery(_) => true,
+            BackendMessage::Authentication(_)
+            | BackendMessage::BindComplete
+            | BackendMessage::CloseComplete
+            | BackendMessage::CopyData(_)
+            | BackendMessage::CopyDone
+            | BackendMessage::EmptyQueryResponse
+            | BackendMessage::FunctionCallResponse(_)
+            | BackendMessage::NoData
+            | BackendMessage::ParseComplete
+            | BackendMessage::PortalSuspended
+            | BackendMessage::ReadyForQuery(_) => true,
         }
     }
 
@@ -3902,20 +4008,20 @@ mod tests {
             .collect()
     }
 
-    fn random_frontend(rng: &mut Lcg) -> Frontend {
+    fn random_frontend(rng: &mut Lcg) -> FrontendMessage {
         let target = if rng.coin() {
             Target::Statement
         } else {
             Target::Portal
         };
         match rng.index(18) {
-            0 => Frontend::Startup(Startup {
+            0 => FrontendMessage::Startup(Startup {
                 minor_version: rng.index(4) as u16,
                 params: list(rng, |r| (random_text(r), random_text(r))),
             }),
-            1 => Frontend::SslRequest,
-            2 => Frontend::GssEncRequest,
-            3 => Frontend::CancelRequest {
+            1 => FrontendMessage::SslRequest,
+            2 => FrontendMessage::GssEncRequest,
+            3 => FrontendMessage::CancelRequest {
                 process_id: rng.next() as u32,
                 secret_key: rng.bytes(300),
             },
@@ -3926,7 +4032,7 @@ mod tests {
                     1 => vec![random_format(rng)],
                     _ => params.iter().map(|_| random_format(rng)).collect(),
                 };
-                Frontend::Bind(Bind {
+                FrontendMessage::Bind(Bind {
                     portal: random_text(rng),
                     statement: random_text(rng),
                     param_formats,
@@ -3934,41 +4040,41 @@ mod tests {
                     result_formats: list(rng, random_format),
                 })
             }
-            5 => Frontend::Close {
+            5 => FrontendMessage::Close {
                 target,
                 name: random_text(rng),
             },
-            6 => Frontend::CopyData(rng.bytes(300)),
-            7 => Frontend::CopyDone,
-            8 => Frontend::CopyFail(random_text(rng)),
-            9 => Frontend::Describe {
+            6 => FrontendMessage::CopyData(rng.bytes(300)),
+            7 => FrontendMessage::CopyDone,
+            8 => FrontendMessage::CopyFail(random_text(rng)),
+            9 => FrontendMessage::Describe {
                 target,
                 name: random_text(rng),
             },
-            10 => Frontend::Execute {
+            10 => FrontendMessage::Execute {
                 portal: random_text(rng),
                 max_rows: rng.next() as i32,
             },
-            11 => Frontend::Flush,
-            12 => Frontend::FunctionCall(FunctionCall {
+            11 => FrontendMessage::Flush,
+            12 => FrontendMessage::FunctionCall(FunctionCall {
                 function: rng.next() as u32,
                 arg_formats: list(rng, random_format),
                 args: list(rng, random_value),
                 result_format: random_format(rng),
             }),
-            13 => Frontend::AuthResponse(rng.bytes(300)),
-            14 => Frontend::Parse {
+            13 => FrontendMessage::AuthResponse(rng.bytes(300)),
+            14 => FrontendMessage::Parse {
                 name: random_text(rng),
                 query: random_text(rng),
                 param_types: list(rng, |r| r.next() as u32),
             },
-            15 => Frontend::Query(random_text(rng)),
-            16 => Frontend::Sync,
-            _ => Frontend::Terminate,
+            15 => FrontendMessage::Query(random_text(rng)),
+            16 => FrontendMessage::Sync,
+            _ => FrontendMessage::Terminate,
         }
     }
 
-    fn random_backend(rng: &mut Lcg) -> Backend {
+    fn random_backend(rng: &mut Lcg) -> BackendMessage {
         let diagnostic = |r: &mut Lcg| Diagnostic {
             fields: list(r, |r| (r.next() as u8, random_text(r))),
         };
@@ -3977,7 +4083,7 @@ mod tests {
             columns: list(r, random_format),
         };
         match rng.index(24) {
-            0 => Backend::Authentication(match rng.index(10) {
+            0 => BackendMessage::Authentication(match rng.index(10) {
                 0 => Authentication::Ok,
                 1 => Authentication::KerberosV5,
                 2 => Authentication::CleartextPassword,
@@ -3994,46 +4100,46 @@ mod tests {
                 8 => Authentication::SaslContinue(rng.bytes(300)),
                 _ => Authentication::SaslFinal(rng.bytes(300)),
             }),
-            1 => Backend::BackendKeyData {
+            1 => BackendMessage::BackendKeyData {
                 process_id: rng.next() as u32,
                 secret_key: rng.bytes(300),
             },
-            2 => Backend::BindComplete,
-            3 => Backend::CloseComplete,
-            4 => Backend::CommandComplete(random_text(rng)),
-            5 => Backend::CopyData(rng.bytes(300)),
-            6 => Backend::CopyDone,
-            7 => Backend::CopyInResponse(copy(rng)),
-            8 => Backend::CopyOutResponse(copy(rng)),
-            9 => Backend::CopyBothResponse(copy(rng)),
-            10 => Backend::DataRow(list(rng, random_value)),
-            11 => Backend::EmptyQueryResponse,
-            12 => Backend::ErrorResponse(diagnostic(rng)),
-            13 => Backend::FunctionCallResponse(random_value(rng)),
-            14 => Backend::NegotiateProtocolVersion {
+            2 => BackendMessage::BindComplete,
+            3 => BackendMessage::CloseComplete,
+            4 => BackendMessage::CommandComplete(random_text(rng)),
+            5 => BackendMessage::CopyData(rng.bytes(300)),
+            6 => BackendMessage::CopyDone,
+            7 => BackendMessage::CopyInResponse(copy(rng)),
+            8 => BackendMessage::CopyOutResponse(copy(rng)),
+            9 => BackendMessage::CopyBothResponse(copy(rng)),
+            10 => BackendMessage::DataRow(list(rng, random_value)),
+            11 => BackendMessage::EmptyQueryResponse,
+            12 => BackendMessage::ErrorResponse(diagnostic(rng)),
+            13 => BackendMessage::FunctionCallResponse(random_value(rng)),
+            14 => BackendMessage::NegotiateProtocolVersion {
                 version: rng.next() as u32,
                 unrecognized: list(rng, random_text),
             },
-            15 => Backend::NoData,
-            16 => Backend::NoticeResponse(diagnostic(rng)),
-            17 => Backend::NotificationResponse {
+            15 => BackendMessage::NoData,
+            16 => BackendMessage::NoticeResponse(diagnostic(rng)),
+            17 => BackendMessage::NotificationResponse {
                 process_id: rng.next() as u32,
                 channel: random_text(rng),
                 payload: random_text(rng),
             },
-            18 => Backend::ParameterDescription(list(rng, |r| r.next() as u32)),
-            19 => Backend::ParameterStatus {
+            18 => BackendMessage::ParameterDescription(list(rng, |r| r.next() as u32)),
+            19 => BackendMessage::ParameterStatus {
                 name: random_text(rng),
                 value: random_text(rng),
             },
-            20 => Backend::ParseComplete,
-            21 => Backend::PortalSuspended,
-            22 => Backend::ReadyForQuery(match rng.index(3) {
+            20 => BackendMessage::ParseComplete,
+            21 => BackendMessage::PortalSuspended,
+            22 => BackendMessage::ReadyForQuery(match rng.index(3) {
                 0 => TransactionStatus::Idle,
                 1 => TransactionStatus::InTransaction,
                 _ => TransactionStatus::Failed,
             }),
-            _ => Backend::RowDescription(list(rng, |r| Field {
+            _ => BackendMessage::RowDescription(list(rng, |r| Field {
                 name: random_text(r),
                 table_oid: r.next() as u32,
                 column: r.next() as i16,

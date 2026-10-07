@@ -10,7 +10,7 @@ use libfuzzer_sys::fuzz_target;
 struct Handshake(ClientMessages);
 impl Decode for Handshake {
     type Item = Result<ClientMessage, Error>;
-    type Error = DecodeError;
+    type Error = FrameError;
     const NAME: &'static str = "SOCKS scripted handshake";
     fn capacity(&self) -> usize { self.0.capacity() }
     fn decode(&mut self, bytes: &[u8], eof: bool) -> Result<Step<Self::Item>, Self::Error> {

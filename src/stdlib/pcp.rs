@@ -375,11 +375,10 @@ impl PcpOption {
     }
 }
 
-/// Why bytes are not a PCP request or response this module reads.
+/// Why bytes are not a PCP or NAT-PMP request or response this module
+/// reads, or a value cannot be written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum ParseError {
-    /// A NAT-PMP response failed while reading a gateway reply.
-    NatPmp(NatPmpError),
+pub enum Error {
     /// The value cannot be written without changing it.
     Unwritable,
     /// Too few bytes: under 2 (requests) or 4 (responses) to know the
@@ -406,43 +405,65 @@ pub enum ParseError {
     /// An option that may appear once appears again. The value is its
     /// code.
     DuplicateOption(u8),
+    /// NAT-PMP: bytes follow a fixed-size message.
+    NatPmpTrailing,
+    /// NAT-PMP: too few bytes for the opcode. The value is the length.
+    NatPmpShort(usize),
+    /// NAT-PMP: longer than [`MAX_MESSAGE`]. The value is the length.
+    NatPmpTooLong(usize),
+    /// NAT-PMP: a version other than 0. The value is the version byte.
+    NatPmpVersion(u8),
+    /// NAT-PMP: a request with an opcode of 128 or more, or a response
+    /// without.
+    NatPmpWrongDirection,
 }
 
-impl ParseError {
+impl Error {
     /// The result code a server answers this error with, or `None` if
     /// RFC 6887 says to drop the message without a word.
     pub fn result_code(self) -> Option<ResultCode> {
         match self {
-            ParseError::Short(_) | ParseError::WrongDirection | ParseError::Unwritable | ParseError::NatPmp(_) => None,
-            ParseError::Version(_) => Some(ResultCode::UnsuppVersion),
-            ParseError::TooLong(_) | ParseError::Unaligned(_) | ParseError::OpcodeData { .. } => {
+            Error::Short(_)
+            | Error::WrongDirection
+            | Error::Unwritable
+            | Error::NatPmpTrailing
+            | Error::NatPmpShort(_)
+            | Error::NatPmpTooLong(_)
+            | Error::NatPmpVersion(_)
+            | Error::NatPmpWrongDirection => None,
+            Error::Version(_) => Some(ResultCode::UnsuppVersion),
+            Error::TooLong(_) | Error::Unaligned(_) | Error::OpcodeData { .. } => {
                 Some(ResultCode::MalformedRequest)
             }
-            ParseError::MalformedOption | ParseError::DuplicateOption(_) => Some(ResultCode::MalformedOption),
+            Error::MalformedOption | Error::DuplicateOption(_) => Some(ResultCode::MalformedOption),
         }
     }
 }
 
-impl std::fmt::Display for ParseError {
+impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ParseError::NatPmp(e) => write!(f, "NAT-PMP response: {e}"),
-            ParseError::Unwritable => f.write_str("value cannot be written without changing it"),
-            ParseError::Short(n) => write!(f, "{n} bytes, too short for a PCP message"),
-            ParseError::WrongDirection => f.write_str("R bit says the message goes the other way"),
-            ParseError::Version(v) => write!(f, "version {v}, not 2 (PCP)"),
-            ParseError::TooLong(n) => write!(f, "{n} bytes, longer than {MAX_MESSAGE}"),
-            ParseError::Unaligned(n) => write!(f, "{n} bytes, not a multiple of 4"),
-            ParseError::OpcodeData { opcode, len } => {
+            Error::Unwritable => f.write_str("value cannot be written without changing it"),
+            Error::Short(n) => write!(f, "{n} bytes, too short for a PCP message"),
+            Error::WrongDirection => f.write_str("R bit says the message goes the other way"),
+            Error::Version(v) => write!(f, "version {v}, not 2 (PCP)"),
+            Error::TooLong(n) => write!(f, "{n} bytes, longer than {MAX_MESSAGE}"),
+            Error::Unaligned(n) => write!(f, "{n} bytes, not a multiple of 4"),
+            Error::OpcodeData { opcode, len } => {
                 write!(f, "{len} bytes of data, too short for opcode {opcode}")
             }
-            ParseError::MalformedOption => f.write_str("malformed option"),
-            ParseError::DuplicateOption(c) => write!(f, "option {c} repeated"),
+            Error::MalformedOption => f.write_str("malformed option"),
+            Error::DuplicateOption(c) => write!(f, "option {c} repeated"),
+            Error::NatPmpTrailing => f.write_str("bytes after the message"),
+            Error::NatPmpShort(n) => write!(f, "{n} bytes, too short for the NAT-PMP opcode"),
+            Error::NatPmpTooLong(n) => write!(f, "{n} bytes, longer than {MAX_MESSAGE} (NAT-PMP)"),
+            Error::NatPmpVersion(v) => write!(f, "version {v}, not 0 (NAT-PMP)"),
+            Error::NatPmpWrongDirection => f.write_str("opcode says the message goes the other way"),
         }
     }
 }
 
-impl std::error::Error for ParseError {}
+impl std::error::Error for Error {}
 
 /// A PCP request (RFC 6887 section 7.1).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -656,38 +677,6 @@ impl NatPmpProtocol {
         }
     }
 }
-
-/// Why bytes are not a NAT-PMP request or response this module reads.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum NatPmpError {
-    /// Bytes follow a fixed-size message.
-    Trailing,
-    /// The value cannot be written without changing it.
-    Unwritable,
-    /// Too few bytes for the opcode. The value is the length.
-    Short(usize),
-    /// Longer than [`MAX_MESSAGE`]. The value is the length.
-    TooLong(usize),
-    /// A version other than 0. The value is the version byte.
-    Version(u8),
-    /// A request with an opcode of 128 or more, or a response without.
-    WrongDirection,
-}
-
-impl std::fmt::Display for NatPmpError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            NatPmpError::Trailing => f.write_str("bytes after the message"),
-            NatPmpError::Unwritable => f.write_str("value cannot be written without changing it"),
-            NatPmpError::Short(n) => write!(f, "{n} bytes, too short for the NAT-PMP opcode"),
-            NatPmpError::TooLong(n) => write!(f, "{n} bytes, longer than {MAX_MESSAGE}"),
-            NatPmpError::Version(v) => write!(f, "version {v}, not 0 (NAT-PMP)"),
-            NatPmpError::WrongDirection => f.write_str("opcode says the message goes the other way"),
-        }
-    }
-}
-
-impl std::error::Error for NatPmpError {}
 
 /// A NAT-PMP request (RFC 6886 sections 3.2 and 3.3).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -966,15 +955,15 @@ pub fn unmapped(address: Ipv6Addr) -> IpAddr {
 
 /// The PCP length rules, once the header is known to be version 2:
 /// at least the header, at most [`MAX_MESSAGE`], a multiple of 4.
-fn check_length(b: &[u8]) -> Result<(), ParseError> {
+fn check_length(b: &[u8]) -> Result<(), Error> {
     if b.len() < HEADER_LEN {
-        return Err(ParseError::Short(b.len()));
+        return Err(Error::Short(b.len()));
     }
     if b.len() > MAX_MESSAGE {
-        return Err(ParseError::TooLong(b.len()));
+        return Err(Error::TooLong(b.len()));
     }
     if !b.len().is_multiple_of(4) {
-        return Err(ParseError::Unaligned(b.len()));
+        return Err(Error::Unaligned(b.len()));
     }
     Ok(())
 }
@@ -992,8 +981,8 @@ fn filter_prefix_ok(prefix: u8, address: &Ipv6Addr) -> bool {
 /// Reads the opcode's data and options after the header. `strict` is for
 /// requests: known options must have their lengths and appear no more
 /// often than allowed.
-fn read_body(op: u8, body: &[u8], strict: bool) -> Result<(Operation, Vec<PcpOption>), ParseError> {
-    let short = || ParseError::OpcodeData { opcode: op, len: body.len() };
+fn read_body(op: u8, body: &[u8], strict: bool) -> Result<(Operation, Vec<PcpOption>), Error> {
+    let short = || Error::OpcodeData { opcode: op, len: body.len() };
     match op {
         opcode::ANNOUNCE => Ok((Operation::Announce, read_options(body, strict)?)),
         opcode::MAP => {
@@ -1047,21 +1036,21 @@ fn read_map(d: &[u8]) -> Map {
 }
 
 /// Reads options until `b` ends.
-fn read_options(b: &[u8], strict: bool) -> Result<Vec<PcpOption>, ParseError> {
+fn read_options(b: &[u8], strict: bool) -> Result<Vec<PcpOption>, Error> {
     let mut out = Vec::new();
     let mut i = 0usize;
     let (mut third_party, mut prefer_failure) = (false, false);
     while i < b.len() {
         if out.len() >= MAX_OPTIONS {
-            return Err(ParseError::MalformedOption);
+            return Err(Error::MalformedOption);
         }
-        let h = b.get(i..i + OPTION_HEADER_LEN).ok_or(ParseError::MalformedOption)?;
+        let h = b.get(i..i + OPTION_HEADER_LEN).ok_or(Error::MalformedOption)?;
         let (code, len) = (h[0], usize::from(be16(h, 2)));
         let start = i + OPTION_HEADER_LEN;
-        let end = start.checked_add(len).ok_or(ParseError::MalformedOption)?;
+        let end = start.checked_add(len).ok_or(Error::MalformedOption)?;
         let padded = end.next_multiple_of(4);
         if padded > b.len() {
-            return Err(ParseError::MalformedOption);
+            return Err(Error::MalformedOption);
         }
         let data = &b[start..end];
         let option = match (code, len) {
@@ -1073,7 +1062,7 @@ fn read_options(b: &[u8], strict: bool) -> Result<Vec<PcpOption>, ParseError> {
                 remote_address: ip6(&data[4..20]),
             },
             (option_code::THIRD_PARTY | option_code::PREFER_FAILURE | option_code::FILTER, _) if strict => {
-                return Err(ParseError::MalformedOption);
+                return Err(Error::MalformedOption);
             }
             _ => PcpOption::Other { code, data: data.to_vec() },
         };
@@ -1085,7 +1074,7 @@ fn read_options(b: &[u8], strict: bool) -> Result<Vec<PcpOption>, ParseError> {
             };
             if let Some(seen) = seen {
                 if *seen {
-                    return Err(ParseError::DuplicateOption(code));
+                    return Err(Error::DuplicateOption(code));
                 }
                 *seen = true;
             }
@@ -1097,7 +1086,7 @@ fn read_options(b: &[u8], strict: bool) -> Result<Vec<PcpOption>, ParseError> {
 }
 
 /// Writes opcode data. Refuses oversized or unaligned opaque data.
-fn write_operation(out: &mut Vec<u8>, op: &Operation) -> Result<(), ParseError> {
+fn write_operation(out: &mut Vec<u8>, op: &Operation) -> Result<(), Error> {
     let write_map =
         |out: &mut Vec<u8>, nonce: &[u8; 12], protocol: u8, internal: u16, external: u16, addr: &Ipv6Addr| {
             out.extend_from_slice(nonce);
@@ -1120,7 +1109,7 @@ fn write_operation(out: &mut Vec<u8>, op: &Operation) -> Result<(), ParseError> 
         Operation::Other { data, .. } => {
             let room = MAX_MESSAGE.saturating_sub(out.len());
             if data.len() > room || !data.len().is_multiple_of(4) {
-                return Err(ParseError::Unwritable);
+                return Err(Error::Unwritable);
             }
             out.extend_from_slice(data);
         }
@@ -1130,9 +1119,9 @@ fn write_operation(out: &mut Vec<u8>, op: &Operation) -> Result<(), ParseError> 
 
 /// Writes every option. Refuses oversized options, duplicate request singletons
 /// and opaque request options that name a defined code.
-fn write_options(out: &mut Vec<u8>, options: &[PcpOption], request: bool) -> Result<(), ParseError> {
+fn write_options(out: &mut Vec<u8>, options: &[PcpOption], request: bool) -> Result<(), Error> {
     if options.len() > MAX_OPTIONS {
-        return Err(ParseError::Unwritable);
+        return Err(Error::Unwritable);
     }
     let (mut third_party, mut prefer_failure) = (false, false);
     for o in options {
@@ -1140,23 +1129,23 @@ fn write_options(out: &mut Vec<u8>, options: &[PcpOption], request: bool) -> Res
             let seen = match o {
                 PcpOption::ThirdParty(_) => Some(&mut third_party),
                 PcpOption::PreferFailure => Some(&mut prefer_failure),
-                PcpOption::Other { code: 1..=3, .. } => return Err(ParseError::Unwritable),
+                PcpOption::Other { code: 1..=3, .. } => return Err(Error::Unwritable),
                 _ => None,
             };
             if let Some(seen) = seen {
                 if *seen {
-                    return Err(ParseError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 *seen = true;
             }
         }
         if matches!(o, PcpOption::Other { data, .. } if data.len() > MAX_MESSAGE) {
-            return Err(ParseError::Unwritable);
+            return Err(Error::Unwritable);
         }
         let data = o.data();
         let size = OPTION_HEADER_LEN.saturating_add(data.len().next_multiple_of(4));
         if out.len().saturating_add(size) > MAX_MESSAGE {
-            return Err(ParseError::Unwritable);
+            return Err(Error::Unwritable);
         }
         out.extend_from_slice(&[o.code(), 0]);
         out.extend_from_slice(&(data.len() as u16).to_be_bytes());
@@ -1187,23 +1176,23 @@ fn ip4(b: &[u8]) -> Ipv4Addr {
 }
 
 impl Wire for Request {
-    type ParseError = ParseError;
-    type WriteError = ParseError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads a request. The checks run in the order of RFC 6887 section
     /// 8.2, so the first error found is the one a server reports. Known
     /// options must have their exact lengths, and THIRD_PARTY and
     /// PREFER_FAILURE may each appear once.
     /// Refuses malformed or trailing input.
-    fn parse(b: &[u8]) -> Result<Request, ParseError> {
+    fn parse(b: &[u8]) -> Result<Request, Error> {
         if b.len() < 2 {
-            return Err(ParseError::Short(b.len()));
+            return Err(Error::Short(b.len()));
         }
         if b[1] & RESPONSE_FLAG != 0 {
-            return Err(ParseError::WrongDirection);
+            return Err(Error::WrongDirection);
         }
         if b[0] != VERSION {
-            return Err(ParseError::Version(b[0]));
+            return Err(Error::Version(b[0]));
         }
         check_length(b)?;
         let op = b[1];
@@ -1213,7 +1202,7 @@ impl Wire for Request {
 
     /// Appends the request. Refuses oversized fields, unaligned opaque data, duplicate
     /// singleton options, and variants that would change. Leaves the destination unchanged on error.
-    fn write(&self, dst: &mut Vec<u8>) -> Result<(), ParseError> {
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
         let op = self.operation.opcode();
         let mut out = Vec::with_capacity(HEADER_LEN + PEER_LEN);
         out.extend_from_slice(&[VERSION, op, 0, 0]);
@@ -1222,7 +1211,7 @@ impl Wire for Request {
         write_operation(&mut out, &self.operation)?;
         write_options(&mut out, &self.options, true)?;
         if Self::parse(&out).as_ref() != Ok(self) {
-            return Err(ParseError::Unwritable);
+            return Err(Error::Unwritable);
         }
         dst.extend_from_slice(&out);
         Ok(())
@@ -1230,11 +1219,11 @@ impl Wire for Request {
 }
 
 impl Wire for Response {
-    type ParseError = ParseError;
-    type WriteError = ParseError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads a response. The checks run in the order of RFC 6887 section
-    /// 8.3. A reply whose version is not 2 is [`ParseError::Version`], and
+    /// 8.3. A reply whose version is not 2 is [`Error::Version`], and
     /// [`unsupported_version`] reads it. Clients must ignore options they
     /// do not understand, so a known option with the wrong length becomes
     /// [`PcpOption::Other`], repeats are kept, and MAP or PEER data or
@@ -1242,15 +1231,15 @@ impl Wire for Response {
     /// [`Operation::Other`]. Nonzero body reserved bytes or option padding
     /// also use that variant so error replies can copy the request body.
     /// Refuses malformed or trailing input.
-    fn parse(b: &[u8]) -> Result<Response, ParseError> {
+    fn parse(b: &[u8]) -> Result<Response, Error> {
         if b.len() < 4 {
-            return Err(ParseError::Short(b.len()));
+            return Err(Error::Short(b.len()));
         }
         if b[1] & RESPONSE_FLAG == 0 {
-            return Err(ParseError::WrongDirection);
+            return Err(Error::WrongDirection);
         }
         if b[0] != VERSION {
-            return Err(ParseError::Version(b[0]));
+            return Err(Error::Version(b[0]));
         }
         check_length(b)?;
         let op = b[1] & !RESPONSE_FLAG;
@@ -1270,7 +1259,7 @@ impl Wire for Response {
 
     /// Appends the response. Refuses oversized fields, unaligned opaque data and
     /// variants that would change. Leaves the destination unchanged on error.
-    fn write(&self, dst: &mut Vec<u8>) -> Result<(), ParseError> {
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
         let mut out = Vec::with_capacity(HEADER_LEN + PEER_LEN);
         out.extend_from_slice(&[VERSION, self.operation.opcode() | RESPONSE_FLAG, 0, self.result.code()]);
         out.extend_from_slice(&self.lifetime.to_be_bytes());
@@ -1279,7 +1268,7 @@ impl Wire for Response {
         write_operation(&mut out, &self.operation)?;
         write_options(&mut out, &self.options, false)?;
         if Self::parse(&out).as_ref() != Ok(self) {
-            return Err(ParseError::Unwritable);
+            return Err(Error::Unwritable);
         }
         dst.extend_from_slice(&out);
         Ok(())
@@ -1287,24 +1276,24 @@ impl Wire for Response {
 }
 
 impl Wire for NatPmpRequest {
-    type ParseError = NatPmpError;
-    type WriteError = NatPmpError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads a request, ignoring bytes past a fixed opcode body.
     /// Refuses incomplete headers or bodies, responses and oversized input.
-    fn parse(b: &[u8]) -> Result<NatPmpRequest, NatPmpError> {
+    fn parse(b: &[u8]) -> Result<NatPmpRequest, Error> {
         if b.len() < 2 {
-            return Err(NatPmpError::Short(b.len()));
+            return Err(Error::NatPmpShort(b.len()));
         }
         if b.len() > MAX_MESSAGE {
-            return Err(NatPmpError::TooLong(b.len()));
+            return Err(Error::NatPmpTooLong(b.len()));
         }
         if b[0] != NAT_PMP_VERSION {
-            return Err(NatPmpError::Version(b[0]));
+            return Err(Error::NatPmpVersion(b[0]));
         }
         let op = b[1];
         if op & RESPONSE_FLAG != 0 {
-            return Err(NatPmpError::WrongDirection);
+            return Err(Error::NatPmpWrongDirection);
         }
         Ok(match op {
             nat_pmp_opcode::EXTERNAL_ADDRESS => {
@@ -1312,7 +1301,7 @@ impl Wire for NatPmpRequest {
             },
             nat_pmp_opcode::MAP_UDP | nat_pmp_opcode::MAP_TCP => {
                 if b.len() < 12 {
-                    return Err(NatPmpError::Short(b.len()));
+                    return Err(Error::NatPmpShort(b.len()));
                 }
                 let protocol = if op == nat_pmp_opcode::MAP_UDP { NatPmpProtocol::Udp } else { NatPmpProtocol::Tcp };
                 NatPmpRequest::Map {
@@ -1328,7 +1317,7 @@ impl Wire for NatPmpRequest {
 
     /// Appends the request. Refuses oversized opaque data and unsupported opcode
     /// values that name defined requests or set the response bit. Leaves the destination unchanged on error.
-    fn write(&self, dst: &mut Vec<u8>) -> Result<(), NatPmpError> {
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
         let out = match self {
             NatPmpRequest::ExternalAddress => {
                 vec![NAT_PMP_VERSION, nat_pmp_opcode::EXTERNAL_ADDRESS]
@@ -1342,19 +1331,19 @@ impl Wire for NatPmpRequest {
             }
             NatPmpRequest::Unsupported { opcode, data } => {
                 if *opcode <= nat_pmp_opcode::MAP_TCP || *opcode >= RESPONSE_FLAG {
-                    return Err(NatPmpError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 let o = *opcode;
                 let mut out = vec![NAT_PMP_VERSION, o];
                 if data.len() > MAX_MESSAGE - 2 {
-                    return Err(NatPmpError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 out.extend_from_slice(data);
                 out
             }
         };
         if Self::parse(&out).as_ref() != Ok(self) {
-            return Err(NatPmpError::Unwritable);
+            return Err(Error::Unwritable);
         }
         dst.extend_from_slice(&out);
         Ok(())
@@ -1362,31 +1351,31 @@ impl Wire for NatPmpRequest {
 }
 
 impl Wire for NatPmpResponse {
-    type ParseError = NatPmpError;
-    type WriteError = NatPmpError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads a response. Bytes past a fixed opcode body are refused.
     /// Refuses malformed or trailing input.
-    fn parse(b: &[u8]) -> Result<NatPmpResponse, NatPmpError> {
+    fn parse(b: &[u8]) -> Result<NatPmpResponse, Error> {
         if b.len() < 4 {
-            return Err(NatPmpError::Short(b.len()));
+            return Err(Error::NatPmpShort(b.len()));
         }
         if b.len() > MAX_MESSAGE {
-            return Err(NatPmpError::TooLong(b.len()));
+            return Err(Error::NatPmpTooLong(b.len()));
         }
         if b[0] != NAT_PMP_VERSION {
-            return Err(NatPmpError::Version(b[0]));
+            return Err(Error::NatPmpVersion(b[0]));
         }
         let (op, result) = (b[1], NatPmpResult::from_code(be16(b, 2)));
         let need = |n: usize| {
-            if b.len() < n { Err(NatPmpError::Short(b.len())) } else if b.len() > n { Err(NatPmpError::Trailing) } else { Ok(()) }
+            if b.len() < n { Err(Error::NatPmpShort(b.len())) } else if b.len() > n { Err(Error::NatPmpTrailing) } else { Ok(()) }
         };
         Ok(match op {
             0 if result == NatPmpResult::UnsupportedVersion => {
                 need(8)?;
                 NatPmpResponse::UnsupportedVersion { epoch: be32(b, 4) }
             }
-            0..=127 => return Err(NatPmpError::WrongDirection),
+            0..=127 => return Err(Error::NatPmpWrongDirection),
             128 => {
                 need(12)?;
                 NatPmpResponse::ExternalAddress { result, epoch: be32(b, 4), address: ip4(&b[8..12]) }
@@ -1409,7 +1398,7 @@ impl Wire for NatPmpResponse {
 
     /// Appends the response. Refuses oversized opaque data and variants that would
     /// read as a different response. Leaves the destination unchanged on error.
-    fn write(&self, dst: &mut Vec<u8>) -> Result<(), NatPmpError> {
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
         let out = match self {
             NatPmpResponse::ExternalAddress { result, epoch, address } => {
                 let mut out = vec![NAT_PMP_VERSION, 128];
@@ -1434,20 +1423,20 @@ impl Wire for NatPmpResponse {
             }
             NatPmpResponse::Other { opcode, result, data } => {
                 if *opcode <= 2 || *opcode >= RESPONSE_FLAG {
-                    return Err(NatPmpError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 let op = opcode | RESPONSE_FLAG;
                 let mut out = vec![NAT_PMP_VERSION, op];
                 out.extend_from_slice(&result.code().to_be_bytes());
                 if data.len() > MAX_MESSAGE - 4 {
-                    return Err(NatPmpError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 out.extend_from_slice(data);
                 out
             }
         };
         if Self::parse(&out).as_ref() != Ok(self) {
-            return Err(NatPmpError::Unwritable);
+            return Err(Error::Unwritable);
         }
         dst.extend_from_slice(&out);
         Ok(())
@@ -1464,23 +1453,23 @@ pub enum Reply {
 }
 
 impl Wire for Reply {
-    type ParseError = ParseError;
-    type WriteError = ParseError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads one response. Refuses malformed lengths, versions and directions.
-    fn parse(b: &[u8]) -> Result<Self, ParseError> {
+    fn parse(b: &[u8]) -> Result<Self, Error> {
         if b.first() == Some(&NAT_PMP_VERSION) {
-            NatPmpResponse::parse(b).map(Self::NatPmp).map_err(ParseError::NatPmp)
+            NatPmpResponse::parse(b).map(Self::NatPmp)
         } else {
             Response::parse(b).map(Self::Pcp)
         }
     }
 
     /// Appends the complete response. Refuses values the selected protocol cannot preserve.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), ParseError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         match self {
             Self::Pcp(value) => value.write(out),
-            Self::NatPmp(value) => value.write(out).map_err(|_| ParseError::Unwritable),
+            Self::NatPmp(value) => value.write(out),
         }
     }
 }
@@ -1628,53 +1617,53 @@ mod tests {
     #[test]
     fn request_errors() {
         let good = map_request().to_bytes().unwrap();
-        assert_eq!(Request::parse(&[2]), Err(ParseError::Short(1)));
+        assert_eq!(Request::parse(&[2]), Err(Error::Short(1)));
         let mut b = good.clone();
         b[1] |= 0x80;
-        assert_eq!(Request::parse(&b), Err(ParseError::WrongDirection));
+        assert_eq!(Request::parse(&b), Err(Error::WrongDirection));
         let mut b = good.clone();
         b[0] = 3;
-        assert_eq!(Request::parse(&b), Err(ParseError::Version(3)));
-        assert_eq!(Request::parse(&[0, 0]), Err(ParseError::Version(0)));
-        assert_eq!(Request::parse(&good[..20]), Err(ParseError::Short(20)));
+        assert_eq!(Request::parse(&b), Err(Error::Version(3)));
+        assert_eq!(Request::parse(&[0, 0]), Err(Error::Version(0)));
+        assert_eq!(Request::parse(&good[..20]), Err(Error::Short(20)));
         let mut b = good.clone();
         b.resize(1104, 0);
-        assert_eq!(Request::parse(&b), Err(ParseError::TooLong(1104)));
-        assert_eq!(Request::parse(&good[..58]), Err(ParseError::Unaligned(58)));
-        assert_eq!(Request::parse(&good[..56]), Err(ParseError::OpcodeData { opcode: 1, len: 32 }));
+        assert_eq!(Request::parse(&b), Err(Error::TooLong(1104)));
+        assert_eq!(Request::parse(&good[..58]), Err(Error::Unaligned(58)));
+        assert_eq!(Request::parse(&good[..56]), Err(Error::OpcodeData { opcode: 1, len: 32 }));
         let peer = peer_request().to_bytes().unwrap();
-        assert_eq!(Request::parse(&peer[..60]), Err(ParseError::OpcodeData { opcode: 2, len: 36 }));
+        assert_eq!(Request::parse(&peer[..60]), Err(Error::OpcodeData { opcode: 2, len: 36 }));
         // An option header with no room for its data.
         let mut b = good.clone();
         b.extend_from_slice(&[1, 0, 0, 16]);
-        assert_eq!(Request::parse(&b), Err(ParseError::MalformedOption));
+        assert_eq!(Request::parse(&b), Err(Error::MalformedOption));
         // A known option with the wrong length.
         let mut b = good.clone();
         b.extend_from_slice(&[2, 0, 0, 4, 0, 0, 0, 0]);
-        assert_eq!(Request::parse(&b), Err(ParseError::MalformedOption));
+        assert_eq!(Request::parse(&b), Err(Error::MalformedOption));
         // A length that needs padding past the end.
         let mut b = good.clone();
         b.extend_from_slice(&[200, 0, 0, 5, 0, 0, 0, 0]);
-        assert_eq!(Request::parse(&b), Err(ParseError::MalformedOption));
+        assert_eq!(Request::parse(&b), Err(Error::MalformedOption));
         // PREFER_FAILURE twice.
         let mut b = good.clone();
         b.extend_from_slice(&[2, 0, 0, 0, 2, 0, 0, 0]);
-        assert_eq!(Request::parse(&b), Err(ParseError::DuplicateOption(2)));
+        assert_eq!(Request::parse(&b), Err(Error::DuplicateOption(2)));
         let mut b = good.clone();
         let third = [1, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
         b.extend_from_slice(&third);
         b.extend_from_slice(&third);
-        assert_eq!(Request::parse(&b), Err(ParseError::DuplicateOption(1)));
+        assert_eq!(Request::parse(&b), Err(Error::DuplicateOption(1)));
         // FILTER may repeat.
         let r = with(map_request(), vec![filter(0), filter(120)]);
         assert_eq!(Request::parse(&r.to_bytes().unwrap()), Ok(r));
         // Each error's result code.
-        assert_eq!(ParseError::Short(3).result_code(), None);
-        assert_eq!(ParseError::WrongDirection.result_code(), None);
-        assert_eq!(ParseError::Version(1).result_code(), Some(ResultCode::UnsuppVersion));
-        assert_eq!(ParseError::Unaligned(25).result_code(), Some(ResultCode::MalformedRequest));
-        assert_eq!(ParseError::DuplicateOption(1).result_code(), Some(ResultCode::MalformedOption));
-        for e in [ParseError::Short(1), ParseError::OpcodeData { opcode: 1, len: 0 }, ParseError::MalformedOption] {
+        assert_eq!(Error::Short(3).result_code(), None);
+        assert_eq!(Error::WrongDirection.result_code(), None);
+        assert_eq!(Error::Version(1).result_code(), Some(ResultCode::UnsuppVersion));
+        assert_eq!(Error::Unaligned(25).result_code(), Some(ResultCode::MalformedRequest));
+        assert_eq!(Error::DuplicateOption(1).result_code(), Some(ResultCode::MalformedOption));
+        for e in [Error::Short(1), Error::OpcodeData { opcode: 1, len: 0 }, Error::MalformedOption] {
             assert!(!e.to_string().is_empty());
         }
     }
@@ -1682,16 +1671,16 @@ mod tests {
     #[test]
     fn response_errors() {
         let good = map_request().reply(ResultCode::Success, 1, 2).to_bytes().unwrap();
-        assert_eq!(Response::parse(&good[..3]), Err(ParseError::Short(3)));
-        assert_eq!(Response::parse(&map_request().to_bytes().unwrap()), Err(ParseError::WrongDirection));
+        assert_eq!(Response::parse(&good[..3]), Err(Error::Short(3)));
+        assert_eq!(Response::parse(&map_request().to_bytes().unwrap()), Err(Error::WrongDirection));
         let mut b = good.clone();
         b[0] = 1;
-        assert_eq!(Response::parse(&b), Err(ParseError::Version(1)));
-        assert_eq!(Response::parse(&good[..20]), Err(ParseError::Short(20)));
-        assert_eq!(Response::parse(&good[..30]), Err(ParseError::Unaligned(30)));
+        assert_eq!(Response::parse(&b), Err(Error::Version(1)));
+        assert_eq!(Response::parse(&good[..20]), Err(Error::Short(20)));
+        assert_eq!(Response::parse(&good[..30]), Err(Error::Unaligned(30)));
         let mut b = good.clone();
         b.resize(1200, 0);
-        assert_eq!(Response::parse(&b), Err(ParseError::TooLong(1200)));
+        assert_eq!(Response::parse(&b), Err(Error::TooLong(1200)));
         // Short MAP data in a response is kept, not refused.
         let r = Response::parse(&good[..32]).unwrap();
         assert_eq!(r.operation, Operation::Other { opcode: 1, data: good[24..32].to_vec() });
@@ -1991,20 +1980,20 @@ mod tests {
 
     #[test]
     fn nat_pmp_errors() {
-        assert_eq!(NatPmpRequest::parse(&[0]), Err(NatPmpError::Short(1)));
-        assert_eq!(NatPmpRequest::parse(&[2, 1]), Err(NatPmpError::Version(2)));
-        assert_eq!(NatPmpRequest::parse(&[0, 128]), Err(NatPmpError::WrongDirection));
-        assert_eq!(NatPmpRequest::parse(&[0, 1, 0, 0]), Err(NatPmpError::Short(4)));
-        assert_eq!(NatPmpRequest::parse(&[0; 1101]), Err(NatPmpError::TooLong(1101)));
-        assert_eq!(NatPmpResponse::parse(&[0, 128, 0]), Err(NatPmpError::Short(3)));
-        assert_eq!(NatPmpResponse::parse(&[0; 1101]), Err(NatPmpError::TooLong(1101)));
-        assert_eq!(NatPmpResponse::parse(&[2, 128, 0, 0]), Err(NatPmpError::Version(2)));
-        assert_eq!(NatPmpResponse::parse(&[0, 1, 0, 0]), Err(NatPmpError::WrongDirection));
-        assert_eq!(NatPmpResponse::parse(&[0, 0, 0, 0, 0, 0, 0, 0]), Err(NatPmpError::WrongDirection));
-        assert_eq!(NatPmpResponse::parse(&[0, 0, 0, 1, 0, 0]), Err(NatPmpError::Short(6)));
-        assert_eq!(NatPmpResponse::parse(&[0, 128, 0, 0, 0, 0, 0, 0]), Err(NatPmpError::Short(8)));
-        assert_eq!(NatPmpResponse::parse(&[0, 129, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), Err(NatPmpError::Short(12)));
-        for e in [NatPmpError::Short(1), NatPmpError::TooLong(2), NatPmpError::Version(3), NatPmpError::WrongDirection]
+        assert_eq!(NatPmpRequest::parse(&[0]), Err(Error::NatPmpShort(1)));
+        assert_eq!(NatPmpRequest::parse(&[2, 1]), Err(Error::NatPmpVersion(2)));
+        assert_eq!(NatPmpRequest::parse(&[0, 128]), Err(Error::NatPmpWrongDirection));
+        assert_eq!(NatPmpRequest::parse(&[0, 1, 0, 0]), Err(Error::NatPmpShort(4)));
+        assert_eq!(NatPmpRequest::parse(&[0; 1101]), Err(Error::NatPmpTooLong(1101)));
+        assert_eq!(NatPmpResponse::parse(&[0, 128, 0]), Err(Error::NatPmpShort(3)));
+        assert_eq!(NatPmpResponse::parse(&[0; 1101]), Err(Error::NatPmpTooLong(1101)));
+        assert_eq!(NatPmpResponse::parse(&[2, 128, 0, 0]), Err(Error::NatPmpVersion(2)));
+        assert_eq!(NatPmpResponse::parse(&[0, 1, 0, 0]), Err(Error::NatPmpWrongDirection));
+        assert_eq!(NatPmpResponse::parse(&[0, 0, 0, 0, 0, 0, 0, 0]), Err(Error::NatPmpWrongDirection));
+        assert_eq!(NatPmpResponse::parse(&[0, 0, 0, 1, 0, 0]), Err(Error::NatPmpShort(6)));
+        assert_eq!(NatPmpResponse::parse(&[0, 128, 0, 0, 0, 0, 0, 0]), Err(Error::NatPmpShort(8)));
+        assert_eq!(NatPmpResponse::parse(&[0, 129, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), Err(Error::NatPmpShort(12)));
+        for e in [Error::NatPmpShort(1), Error::NatPmpTooLong(2), Error::NatPmpVersion(3), Error::NatPmpWrongDirection]
         {
             assert!(!e.to_string().is_empty());
         }
@@ -2118,14 +2107,14 @@ mod tests {
         // Too many options are refused.
         let many = vec![PcpOption::Other { code: 200, data: vec![1; 40] }; 100];
         let r = with(map_request(), many.clone());
-        assert_eq!(r.to_bytes(), Err(ParseError::Unwritable));
+        assert_eq!(r.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&r);
         let resp = Response { options: many, ..map_request().reply(ResultCode::Success, 0, 0) };
-        assert_eq!(resp.to_bytes(), Err(ParseError::Unwritable));
+        assert_eq!(resp.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&resp);
         // An oversized option refuses the whole value.
         let r = with(map_request(), vec![PcpOption::Other { code: 200, data: vec![0; 70000] }, filter(0)]);
-        assert_eq!(r.to_bytes(), Err(ParseError::Unwritable));
+        assert_eq!(r.to_bytes(), Err(Error::Unwritable));
         // Repeated singleton options and opaque known options are refused.
         let r = with(
             map_request(),
@@ -2137,7 +2126,7 @@ mod tests {
                 PcpOption::Other { code: 3, data: vec![1] },
             ],
         );
-        assert_eq!(r.to_bytes(), Err(ParseError::Unwritable));
+        assert_eq!(r.to_bytes(), Err(Error::Unwritable));
         // An unknown opcode that looks known is refused.
         let r = Request {
             lifetime: 0,
@@ -2145,13 +2134,13 @@ mod tests {
             operation: Operation::Other { opcode: 0x81, data: vec![0; 5000] },
             options: vec![],
         };
-        assert_eq!(r.to_bytes(), Err(ParseError::Unwritable));
+        assert_eq!(r.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&r);
         let resp = Response { operation: Operation::Other { opcode: 1, data: vec![] }, ..Response::announce(0) };
         contract::check_wire_value(&resp);
         // NAT-PMP.
         let r = NatPmpRequest::Unsupported { opcode: 1, data: vec![0; 5000] };
-        assert_eq!(r.to_bytes(), Err(NatPmpError::Unwritable));
+        assert_eq!(r.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&r);
         for opcode in [0, 1, 2, 0x80, 0x81, 3, 77] {
             let r = NatPmpResponse::Other { opcode, result: NatPmpResult::Success, data: vec![] };
@@ -2159,7 +2148,7 @@ mod tests {
             assert_eq!(r.to_bytes().is_ok(), matches!(opcode, 3 | 77));
         }
         let r = NatPmpResponse::Other { opcode: 9, result: NatPmpResult::Success, data: vec![0; 5000] };
-        assert_eq!(r.to_bytes(), Err(NatPmpError::Unwritable));
+        assert_eq!(r.to_bytes(), Err(Error::Unwritable));
         // Error replies to tiny or huge requests still read.
         assert!(Response::parse(&error_reply(&[],ResultCode::UnsuppVersion,1,1).to_bytes().unwrap()).is_ok());
         assert!(Response::parse(&error_reply(&[7; 3000],ResultCode::MalformedRequest,1,1).to_bytes().unwrap()).is_ok());

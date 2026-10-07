@@ -268,6 +268,11 @@ pub enum Error {
     Referenced,
     /// The value cannot be written without changing it.
     Unwritable,
+    /// An exact parse ran out of input before a complete value, including
+    /// empty input.
+    Incomplete,
+    /// Bytes follow the first complete value of an exact parse.
+    Trailing,
 }
 
 impl std::fmt::Display for Error {
@@ -290,6 +295,8 @@ impl std::fmt::Display for Error {
             Error::TooManyFields => f.write_str("too many fields"),
             Error::Referenced => f.write_str("would evict an entry still in use"),
             Error::Unwritable => f.write_str("value cannot be written without changing it"),
+            Error::Incomplete => f.write_str("input ended before a complete QPACK value"),
+            Error::Trailing => f.write_str("bytes follow the QPACK value"),
         }
     }
 }
@@ -376,17 +383,17 @@ fn put_integer(out: &mut Vec<u8>, prefix: u8, flags: u8, value: u64) -> Result<(
     prefix_int::write(out, prefix, flags, value).map_err(|_| Error::Unwritable)
 }
 
-fn parse_stop(stop: Stop) -> ParseError {
+fn parse_stop(stop: Stop) -> Error {
     match stop {
-        Stop::More => ParseError::Truncated,
-        Stop::Bad(error) => ParseError::Instruction(error),
+        Stop::More => Error::Incomplete,
+        Stop::Bad(error) => error,
     }
 }
 
-fn exact<T>(result: Result<(T, usize), ParseError>, len: usize) -> Result<T, ParseError> {
+fn exact<T>(result: Result<(T, usize), Error>, len: usize) -> Result<T, Error> {
     let (value, used) = result?;
     if used != len {
-        return Err(ParseError::Trailing);
+        return Err(Error::Trailing);
     }
     Ok(value)
 }
@@ -852,7 +859,7 @@ pub struct EncodedPrefix {
 }
 
 impl EncodedPrefix {
-    fn parse_prefix(bytes: &[u8]) -> Result<(Self, usize), ParseError> {
+    fn parse_prefix(bytes: &[u8]) -> Result<(Self, usize), Error> {
         let mut c = Cursor { b: bytes, i: 0 };
         let encoded_insert_count = c.int(8).map_err(parse_stop)?;
         let negative = c.peek().map_err(parse_stop)? & 0x80 != 0;
@@ -862,11 +869,11 @@ impl EncodedPrefix {
 }
 
 impl Wire for EncodedPrefix {
-    type ParseError = ParseError;
+    type ParseError = Error;
     type WriteError = Error;
 
     /// Reads one prefix. Refuses overflowing integers, truncation, and trailing bytes.
-    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         exact(Self::parse_prefix(bytes), bytes.len())
     }
 
@@ -896,24 +903,24 @@ pub struct FieldSection {
 }
 
 impl Wire for FieldSection {
-    type ParseError = ParseError;
+    type ParseError = Error;
     type WriteError = Error;
 
     /// Reads a complete section. Refuses malformed lines, truncation, and section size or count limits.
     /// Table-dependent reference checks belong to [`decode_section`].
-    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         if bytes.len() > MAX_SECTION_BYTES {
-            return Err(ParseError::Instruction(Error::FieldSectionTooLarge));
+            return Err(Error::FieldSectionTooLarge);
         }
         let (prefix, mut used) = EncodedPrefix::parse_prefix(bytes)?;
         let mut representations = Vec::new();
         while used < bytes.len() {
             if representations.len() == MAX_FIELDS {
-                return Err(ParseError::Instruction(Error::TooManyFields));
+                return Err(Error::TooManyFields);
             }
             let (rep, n) = Representation::parse_prefix(&bytes[used..]).map_err(|e| match e {
-                Error::Truncated => ParseError::Truncated,
-                other => ParseError::Instruction(other),
+                Error::Truncated => Error::Incomplete,
+                other => other,
             })?;
             used += n;
             representations.push(rep);
@@ -1454,50 +1461,20 @@ impl Decode for DecoderInstructions {
     }
 }
 
-/// Why an exact [`Wire`] parse did not read one complete QPACK value.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ParseError {
-    /// An instruction or field-line representation was invalid.
-    Instruction(Error),
-    /// The input ended before a complete value, including empty input.
-    Truncated,
-    /// Bytes follow the first complete value.
-    Trailing,
-}
-
-impl std::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Instruction(e) => e.fmt(f),
-            Self::Truncated => f.write_str("input ended before a complete QPACK value"),
-            Self::Trailing => f.write_str("bytes follow the QPACK value"),
-        }
-    }
-}
-
-impl std::error::Error for ParseError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Instruction(e) => Some(e),
-            Self::Truncated | Self::Trailing => None,
-        }
-    }
-}
-
 /// Strict encoding and exact parsing. SetCapacity is limited to
 /// [`MAX_TABLE_CAPACITY`] in both directions, even if the peer advertises more.
 impl Wire for EncoderInstruction {
-    type ParseError = ParseError;
+    type ParseError = Error;
     type WriteError = Error;
 
     /// Reads exactly one instruction. Refuses truncation, trailing bytes, integer overflow,
     /// invalid Huffman strings, oversized strings or capacity, and invalid static name indexes.
-    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
-        let parsed = match EncoderInstructions.decode(bytes, true).map_err(ParseError::Instruction)? {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        let parsed = match EncoderInstructions.decode(bytes, true)? {
             Step::Item(item, used) => Ok((item, used)),
-            _ => Err(ParseError::Truncated),
+            _ => Err(Error::Incomplete),
         };
-        exact(parsed, bytes.len())?.map_err(ParseError::Instruction)
+        exact(parsed, bytes.len())?
     }
 
     /// Writes one instruction, using Huffman strings when shorter. Refuses oversized strings,
@@ -1533,16 +1510,16 @@ fn check_decoder_instruction(instruction: &DecoderInstruction) -> Result<(), Err
 }
 
 impl Wire for DecoderInstruction {
-    type ParseError = ParseError;
+    type ParseError = Error;
     type WriteError = Error;
 
     /// Reads exactly one instruction. Refuses truncation, trailing bytes, overflow, and zero increments.
-    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
-        let parsed = match DecoderInstructions.decode(bytes, true).map_err(ParseError::Instruction)? {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        let parsed = match DecoderInstructions.decode(bytes, true)? {
             Step::Item(item, used) => Ok((item, used)),
-            _ => Err(ParseError::Truncated),
+            _ => Err(Error::Incomplete),
         };
-        exact(parsed, bytes.len())?.map_err(ParseError::Instruction)
+        exact(parsed, bytes.len())?
     }
 
     /// Writes one instruction. Refuses integers above MAX_INTEGER and zero increments.
@@ -1558,17 +1535,15 @@ impl Wire for DecoderInstruction {
 }
 
 impl Wire for Representation {
-    type ParseError = ParseError;
+    type ParseError = Error;
     type WriteError = Error;
 
     /// Reads one field line. Refuses truncation, trailing bytes, overflow, invalid Huffman
     /// strings, and excessive string lengths. Table references are resolved by decode_section.
-    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
-        let parsed = Self::parse_prefix(bytes).map_err(|e| {
-            match e {
-            Error::Truncated => ParseError::Truncated,
-            other => ParseError::Instruction(other),
-        }
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        let parsed = Self::parse_prefix(bytes).map_err(|e| match e {
+            Error::Truncated => Error::Incomplete,
+            other => other,
         });
         exact(parsed, bytes.len())
     }
@@ -2042,7 +2017,7 @@ mod tests {
             contract::check_wire_value(rep);
             let bytes = rep.to_bytes().unwrap();
             for n in 0..bytes.len() {
-                assert_eq!(Representation::parse(&bytes[..n]), Err(ParseError::Truncated));
+                assert_eq!(Representation::parse(&bytes[..n]), Err(Error::Incomplete));
             }
         }
         let large =
@@ -2050,8 +2025,8 @@ mod tests {
         assert_eq!(large.to_bytes(), Err(Error::Unwritable));
         let mut raw = vec![0x50];
         Integer::<7> { flags: 0, value: MAX_STRING as u64 + 1 }.write(&mut raw).unwrap();
-        assert_eq!(Representation::parse(&raw), Err(ParseError::Instruction(Error::StringTooLong)));
-        assert_eq!(Representation::parse(&[0x50, 0x81, 0xff]), Err(ParseError::Instruction(Error::Huffman)));
+        assert_eq!(Representation::parse(&raw), Err(Error::StringTooLong));
+        assert_eq!(Representation::parse(&[0x50, 0x81, 0xff]), Err(Error::Huffman));
     }
 
     #[test]
@@ -2086,7 +2061,7 @@ mod tests {
             contract::check_wire_value(&ins);
             contract::check_decode_with_alloc_limit(DecoderInstructions::new, &bytes, 2 * MAX_INTEGER_BYTES);
         }
-        assert_eq!(DecoderInstruction::parse(&[0xff; 12]), Err(ParseError::Instruction(Error::IntegerOverflow)));
+        assert_eq!(DecoderInstruction::parse(&[0xff; 12]), Err(Error::IntegerOverflow));
     }
 
     #[test]

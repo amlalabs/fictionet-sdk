@@ -39,7 +39,7 @@
 //! use fictionet::stdlib::asn1::{BitString, Oid, StringKind};
 //! use fictionet::stdlib::x509::{
 //!     AlgorithmIdentifier, BasicConstraints, Certificate, ExtensionValue, GeneralName, Name, PublicKeyInfo,
-//!     Pem, PEM_CERTIFICATE, SubjectAltName, TbsCertificate, Time, Validity, Value, Version, oid,
+//!     PemBlock, PEM_CERTIFICATE, SubjectAltName, TbsCertificate, Time, Validity, Value, Version, oid,
 //! };
 //!
 //! let id = |b: &[u8]| Oid::from_contents(b).unwrap();
@@ -78,7 +78,7 @@
 //! // the signature.
 //! let signature = BitString::new(vec![0x30, 0x00], 0).unwrap();
 //! let cert = Certificate::assemble(&tbs_der, ecdsa_sha256, signature).unwrap();
-//! let pem = Pem::new(PEM_CERTIFICATE, &cert).unwrap().to_bytes().unwrap();
+//! let pem = PemBlock::new(PEM_CERTIFICATE, &cert).unwrap().to_bytes().unwrap();
 //! let pem = String::from_utf8(pem).unwrap();
 //! assert!(pem.starts_with("-----BEGIN CERTIFICATE-----\n"));
 //!
@@ -279,7 +279,14 @@ impl fmt::Display for Error {
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Asn1(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 impl From<asn1::Error> for Error {
     fn from(e: asn1::Error) -> Error {
@@ -2284,14 +2291,14 @@ const MAX_PEM_CHARS: usize = MAX_PEM_DATA.div_ceil(3) * 4;
 /// [`Wire::parse`] accepts exactly one block with at most [`MAX_PEM_FRAME`]
 /// encoded bytes, including whitespace. [`pem_decode`] reads a bundle and applies per-line and decoded-data bounds.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Pem {
+pub struct PemBlock {
     /// The label, from the `-----BEGIN` line.
     pub label: String,
     /// The decoded bytes.
     pub data: Vec<u8>,
 }
 
-impl Pem {
+impl PemBlock {
     /// Builds a PEM block from a wire value. Refuses labels RFC 7468 does
     /// not allow, values their writer refuses, and data over [`MAX_PEM_DATA`].
     pub fn new<T: Wire>(label: &str, value: &T) -> Result<Self, Error>
@@ -2426,7 +2433,7 @@ enum Step {
     /// A line of this many bytes, newline included, was read.
     Line(usize),
     /// A block closed after this many bytes.
-    Block(Pem, usize),
+    Block(PemBlock, usize),
 }
 
 /// Reads PEM text a line at a time. Lines end in `\n` or `\r`, so a
@@ -2467,7 +2474,7 @@ impl Scanner {
             }
             let label = std::mem::take(&mut open.label);
             self.open = None;
-            return Ok(Step::Block(Pem { label, data }, used));
+            return Ok(Step::Block(PemBlock { label, data }, used));
         }
         let Some(n) = nl else {
             if !open.marker.starts_with(b) && b.len() > MAX_PEM_LINE {
@@ -2497,7 +2504,7 @@ impl Scanner {
 /// Every PEM block in `text`, in order, with the text around them
 /// skipped. A block with no end line is [`Error::Pem`], and more than
 /// [`MAX_PEM_BLOCKS`] blocks is [`Error::TooMany`].
-pub fn pem_decode(text: &[u8]) -> Result<Vec<Pem>, Error> {
+pub fn pem_decode(text: &[u8]) -> Result<Vec<PemBlock>, Error> {
     let mut scanner = Scanner::default();
     let mut pos = 0;
     let mut blocks = Vec::new();
@@ -2540,7 +2547,7 @@ fn first_pem_block(text: &[u8], label: &str) -> Result<Vec<u8>, Error> {
 /// the stream buffer so any unfinished block is reported as truncation.
 pub const MAX_PEM_FRAME: usize = 2 * MAX_PEM_CHARS + 2 * MAX_PEM_LINE;
 
-impl Wire for Pem {
+impl Wire for PemBlock {
     type ParseError = Error;
     type WriteError = Error;
 
@@ -2638,7 +2645,7 @@ impl Default for PemBlocks {
 }
 
 impl Decode for PemBlocks {
-    type Item = Pem;
+    type Item = PemBlock;
     type Error = Error;
     const NAME: &'static str = "PEM";
 
@@ -2646,7 +2653,7 @@ impl Decode for PemBlocks {
         self.limit.max(MAX_PEM_LINE).saturating_add(1)
     }
 
-    fn decode(&mut self, input: &[u8], eof: bool) -> Result<DecodeStep<Pem>, Error> {
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<DecodeStep<PemBlock>, Error> {
         // Bound direct calls as well as Stream input. Do not inspect a later
         // block before returning the current item.
         let input = input.get(..self.capacity()).unwrap_or(input);
@@ -2662,7 +2669,7 @@ impl Decode for PemBlocks {
                     if used > self.limit {
                         return Err(Error::TooLong);
                     }
-                    let block = <Pem as Wire>::parse(input.get(..used).ok_or(Error::Pem)?)?;
+                    let block = <PemBlock as Wire>::parse(input.get(..used).ok_or(Error::Pem)?)?;
                     self.reset();
                     return Ok(DecodeStep::Item(block, used));
                 }
@@ -3253,7 +3260,7 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
         let cert = Certificate::parse(&der).unwrap();
         assert_eq!(cert.to_bytes().unwrap(), der);
         assert_eq!(cert.tbs.to_bytes().unwrap(), cert.tbs_der);
-        assert_eq!(Pem::new(PEM_CERTIFICATE, &cert).unwrap().to_bytes().unwrap(), CERT_PEM.as_bytes());
+        assert_eq!(PemBlock::new(PEM_CERTIFICATE, &cert).unwrap().to_bytes().unwrap(), CERT_PEM.as_bytes());
         assert_eq!(Certificate::from_pem(CERT_PEM.as_bytes()).unwrap(), cert);
         // Each typed extension writes the bytes OpenSSL wrote.
         let tbs = &cert.tbs;
@@ -3298,7 +3305,7 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
         assert_eq!(tbs.extension(oid::CRL_NUMBER).unwrap().value, [0x02, 0x02, 0x10, 0x00]);
         assert_eq!(crl.to_bytes().unwrap(), der);
         assert_eq!(crl.tbs.to_bytes().unwrap(), crl.tbs_der);
-        assert_eq!(Pem::new(PEM_CRL, &crl).unwrap().to_bytes().unwrap(), CRL_PEM.as_bytes());
+        assert_eq!(PemBlock::new(PEM_CRL, &crl).unwrap().to_bytes().unwrap(), CRL_PEM.as_bytes());
         assert_eq!(Crl::from_pem(CRL_PEM.as_bytes()).unwrap(), crl);
         // The issuer's certificate is not a CRL, and the other way round.
         assert_eq!(Crl::from_pem(CERT_PEM.as_bytes()), Err(Error::NoBlock));
@@ -3385,7 +3392,7 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
         let tbs_der = tbs.to_bytes().unwrap();
         let signature = BitString::new(vec![0x30, 0x00], 0).unwrap();
         let cert = Certificate::assemble(&tbs_der, ecdsa_sha256, signature).unwrap();
-        let pem = String::from_utf8(Pem::new(PEM_CERTIFICATE, &cert).unwrap().to_bytes().unwrap()).unwrap();
+        let pem = String::from_utf8(PemBlock::new(PEM_CERTIFICATE, &cert).unwrap().to_bytes().unwrap()).unwrap();
         assert!(pem.starts_with("-----BEGIN CERTIFICATE-----\n"));
         let back = Certificate::from_pem(pem.as_bytes()).unwrap();
         assert_eq!(back.tbs_der, tbs_der);
@@ -3858,7 +3865,7 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
         ] {
             assert_eq!(base64_encode(data.as_bytes()), b64);
             assert_eq!(base64_decode(b64.as_bytes()).unwrap(), data.as_bytes());
-            let p = Pem { label: "X".into(), data: data.as_bytes().to_vec() };
+            let p = PemBlock { label: "X".into(), data: data.as_bytes().to_vec() };
             let text = String::from_utf8(p.to_bytes().unwrap()).unwrap();
             assert_eq!(
                 text,
@@ -3892,15 +3899,15 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
         assert_eq!(pem_decode(b"-----BEGIN -----\t \n-----END -----").unwrap()[0].label, "");
         // Labels the encoder refuses.
         for label in ["-X", "X-", "a\nb", "a  b", &"L".repeat(MAX_PEM_LABEL + 1)] {
-            assert_eq!(Pem { label: label.into(), data: vec![] }.to_bytes(), Err(Error::Pem), "{label}");
-            assert_eq!(Pem::new(label, &asn1::Frame(vec![5, 0])), Err(Error::Pem), "{label}");
+            assert_eq!(PemBlock { label: label.into(), data: vec![] }.to_bytes(), Err(Error::Pem), "{label}");
+            assert_eq!(PemBlock::new(label, &asn1::Frame(vec![5, 0])), Err(Error::Pem), "{label}");
         }
-        assert_eq!(Pem { label: "X".into(), data: vec![0; MAX_PEM_DATA + 1] }.to_bytes(), Err(Error::TooLong));
+        assert_eq!(PemBlock { label: "X".into(), data: vec![0; MAX_PEM_DATA + 1] }.to_bytes(), Err(Error::TooLong));
         let value = asn1::Frame(vec![5, 0]);
-        assert_eq!(Pem::new("X", &value).unwrap(), Pem { label: "X".into(), data: value.0 });
-        assert_eq!(Pem::new("X", &asn1::Frame(vec![4])), Err(Error::Asn1(asn1::Error::Truncated)));
+        assert_eq!(PemBlock::new("X", &value).unwrap(), PemBlock { label: "X".into(), data: value.0 });
+        assert_eq!(PemBlock::new("X", &asn1::Frame(vec![4])), Err(Error::Asn1(asn1::Error::Truncated)));
         // A big block encodes and decodes.
-        let big = Pem { label: "X".into(), data: (0..MAX_PEM_DATA).map(|i| i as u8).collect() };
+        let big = PemBlock { label: "X".into(), data: (0..MAX_PEM_DATA).map(|i| i as u8).collect() };
         assert_eq!(pem_decode(&big.to_bytes().unwrap()).unwrap(), [big]);
         // Too much data, too long a line, too many blocks.
         let mut text = b"-----BEGIN X-----\n".to_vec();
@@ -3997,7 +4004,7 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
 
     #[test]
     fn pem_decoder_takes_a_big_block_a_byte_at_a_time_in_linear_time() {
-        let big = Pem { label: "X".into(), data: vec![0x5a; MAX_PEM_DATA] }.to_bytes().unwrap();
+        let big = PemBlock { label: "X".into(), data: vec![0x5a; MAX_PEM_DATA] }.to_bytes().unwrap();
         let started = std::time::Instant::now();
         let mut d = Stream::new(PemBlocks::new());
         let mut n = 0;
@@ -4026,7 +4033,7 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
             let tbs = c.tbs.to_bytes().unwrap();
             assert_eq!(TbsCertificate::parse(&tbs).unwrap(), c.tbs);
             let _ = (c.tbs.subject.to_string(), c.tbs.issuer.to_string(), c.tbs.validity.contains(0));
-            let pem = Pem::new(PEM_CERTIFICATE, &c).unwrap().to_bytes().unwrap();
+            let pem = PemBlock::new(PEM_CERTIFICATE, &c).unwrap().to_bytes().unwrap();
             assert_eq!(Certificate::from_pem(&pem).unwrap(), c);
             for x in &c.tbs.extensions {
                 check_extension_value(&x.value);
@@ -4043,7 +4050,7 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
             if let Some(r) = c.tbs.revoked.first() {
                 assert!(c.is_revoked(&r.serial));
             }
-            let pem = Pem::new(PEM_CRL, &c).unwrap().to_bytes().unwrap();
+            let pem = PemBlock::new(PEM_CRL, &c).unwrap().to_bytes().unwrap();
             assert_eq!(Crl::from_pem(&pem).unwrap(), c);
         }
         if let Ok(n) = Name::parse(data) {
@@ -4300,7 +4307,7 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
         // broken or holds many blocks.
         let broken_after = format!("{CERT_PEM}-----BEGIN X-----\n!!!\n-----END X-----\n");
         assert_eq!(
-            Pem::new(PEM_CERTIFICATE, &Certificate::from_pem(broken_after.as_bytes()).unwrap()).unwrap().to_bytes().unwrap(),
+            PemBlock::new(PEM_CERTIFICATE, &Certificate::from_pem(broken_after.as_bytes()).unwrap()).unwrap().to_bytes().unwrap(),
             CERT_PEM.as_bytes()
         );
         let unterminated = format!("{CRL_PEM}-----BEGIN X-----\nZg==\n");
@@ -4374,7 +4381,7 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
         assert_eq!(cert.to_bytes().unwrap(), cert_der());
         cert.tbs.serial = vec![2];
         assert_eq!(cert.to_bytes(), Err(Error::Unwritable));
-        assert_eq!(Pem::new(PEM_CERTIFICATE, &cert), Err(Error::Unwritable));
+        assert_eq!(PemBlock::new(PEM_CERTIFICATE, &cert), Err(Error::Unwritable));
         let mut crl = Crl::parse(&crl_der()).unwrap();
         assert_eq!(crl.to_bytes().unwrap(), crl_der());
         crl.tbs.revoked.clear();
@@ -4566,21 +4573,21 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
     #[test]
     fn codec_pem_wire_is_exact_and_transactional() {
         use fictionet::stdlib::codec::{Wire, contract};
-        let block = Pem { label: "TEST".into(), data: vec![1, 2, 3, 4] };
+        let block = PemBlock { label: "TEST".into(), data: vec![1, 2, 3, 4] };
         contract::check_wire_value(&block);
-        let bytes = <Pem as Wire>::to_bytes(&block).unwrap();
-        contract::check_wire::<Pem>(&bytes);
+        let bytes = <PemBlock as Wire>::to_bytes(&block).unwrap();
+        contract::check_wire::<PemBlock>(&bytes);
         for tail in [&b"text"[..], &bytes] {
             let mut bad = bytes.clone();
             bad.extend_from_slice(tail);
-            assert!(<Pem as Wire>::parse(&bad).is_err());
+            assert!(<PemBlock as Wire>::parse(&bad).is_err());
         }
         let mut bad = b"prefix\n".to_vec();
         bad.extend_from_slice(&bytes);
-        assert!(<Pem as Wire>::parse(&bad).is_err());
+        assert!(<PemBlock as Wire>::parse(&bad).is_err());
         let mut out = vec![42];
-        assert!(Pem { label: "bad--label".into(), data: Vec::new() }.write(&mut out).is_err());
-        assert!(Pem { label: "TEST".into(), data: vec![0; MAX_PEM_DATA + 1] }.write(&mut out).is_err());
+        assert!(PemBlock { label: "bad--label".into(), data: Vec::new() }.write(&mut out).is_err());
+        assert!(PemBlock { label: "TEST".into(), data: vec![0; MAX_PEM_DATA + 1] }.write(&mut out).is_err());
         assert_eq!(out, [42]);
     }
 

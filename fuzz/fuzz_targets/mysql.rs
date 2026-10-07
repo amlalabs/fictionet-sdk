@@ -112,11 +112,11 @@ fn values(bytes: &[u8]) {
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(Frames::new, data, 2 * MAX_FRAME);
-    contract::check_decode_with_alloc_limit(|| Frames::with_limit(64), data, 2 * (64 + HEADER_LEN));
-    contract::check_wire::<Frame>(data);
+    contract::check_decode_with_alloc_limit(Packets::new, data, 2 * MAX_FRAME);
+    contract::check_decode_with_alloc_limit(|| Packets::with_limit(64), data, 2 * (64 + HEADER_LEN));
+    contract::check_wire::<Packet>(data);
     contract::check_wire::<Message>(data);
-    let frame = Frame { seq: data.first().copied().unwrap_or(0), payload: data.to_vec() };
+    let frame = Packet { seq: data.first().copied().unwrap_or(0), payload: data.to_vec() };
     contract::check_wire_value(&frame);
     let limit = data.first().map_or(MAX_MESSAGE, |&b| if b & 1 == 1 { usize::from(b) * 3 } else { MAX_MESSAGE });
     contract::check_decode_with_alloc_limit(|| Messages::with_limit(limit), data,

@@ -348,7 +348,7 @@ pub mod cboe_pitch;
 /// The packet layer is written by hand at the end of the file.
 /// [`Packet`](cme_mdp3::Packet) is one UDP datagram: the binary packet
 /// header (`MsgSeqNum` and `SendingTime`), then messages, each after a
-/// two-byte `MsgSize` that counts itself. [`Frames`](cme_mdp3::Frames)
+/// two-byte `MsgSize` that counts itself. [`Messages`](cme_mdp3::Messages)
 /// reads the same size-prefixed messages from a byte stream.
 ///
 /// ```
@@ -362,7 +362,7 @@ pub mod cboe_pitch;
 /// let bytes = packet.to_bytes()?;
 /// assert_eq!(bytes.len(), 12 + 2 + 8);
 /// assert_eq!(Packet::parse(&bytes)?, packet);
-/// # Ok::<(), fictionet::stdlib::cme_mdp3::PacketError>(())
+/// # Ok::<(), fictionet::stdlib::cme_mdp3::Error>(())
 /// ```
 pub mod cme_mdp3;
 pub mod coap;

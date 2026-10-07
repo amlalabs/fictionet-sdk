@@ -96,7 +96,8 @@ pub const MAX_EXECUTIONS: usize = 1 << 24;
 /// The most firms an [`Exchange`] can hold disabled at once.
 pub const MAX_DISABLED_FIRMS: usize = 1_024;
 
-/// Why bytes or a value were refused.
+/// Why bytes or a value were refused, or why an [`Exchange`] refused an
+/// operation. A refused operation leaves the exchange unchanged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     /// The bytes are shorter or longer than the message's fields and
@@ -118,6 +119,18 @@ pub enum Error {
     TooLong,
     /// A decimal price with more than four places, or too large.
     Price,
+    /// An [`Exchange`] configuration value outside its named limits.
+    Config,
+    /// No open order, or no pending enter or replace, has this token.
+    UnknownToken(Token),
+    /// An execute or cancel of zero shares, or more than are open.
+    Shares,
+    /// No remembered execution has this match number.
+    UnknownMatch(u64),
+    /// Order reference or match numbers ran out.
+    Exhausted,
+    /// A time earlier than one already used.
+    Time,
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -129,6 +142,12 @@ impl fmt::Display for Error {
             Error::Option(t) => write!(f, "invalid OUCH option, tag {t}"),
             Error::TooLong => f.write_str("OUCH appendage is too long"),
             Error::Price => f.write_str("OUCH price is invalid"),
+            Error::Config => f.write_str("OUCH exchange configuration is out of range"),
+            Error::UnknownToken(t) => write!(f, "no OUCH order {t:?}"),
+            Error::Shares => f.write_str("OUCH share count is invalid"),
+            Error::UnknownMatch(m) => write!(f, "no OUCH execution {m}"),
+            Error::Exhausted => f.write_str("OUCH numbering is exhausted"),
+            Error::Time => f.write_str("OUCH exchange time went backwards"),
         }
     }
 }
@@ -1345,36 +1364,6 @@ impl Default for ExchangeConfig {
     }
 }
 
-/// Why an [`Exchange`] refused an operation. The exchange is unchanged.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ExchangeError {
-    /// A configuration value outside its named limits.
-    Config,
-    /// No open order, or no pending enter or replace, has this token.
-    UnknownToken(Token),
-    /// An execute or cancel of zero shares, or more than are open.
-    Shares,
-    /// No remembered execution has this match number.
-    UnknownMatch(u64),
-    /// Order reference or match numbers ran out.
-    Exhausted,
-    /// A time earlier than one already used.
-    Time,
-}
-impl fmt::Display for ExchangeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ExchangeError::Config => f.write_str("OUCH exchange configuration is out of range"),
-            ExchangeError::UnknownToken(t) => write!(f, "no OUCH order {t:?}"),
-            ExchangeError::Shares => f.write_str("OUCH share count is invalid"),
-            ExchangeError::UnknownMatch(m) => write!(f, "no OUCH execution {m}"),
-            ExchangeError::Exhausted => f.write_str("OUCH numbering is exhausted"),
-            ExchangeError::Time => f.write_str("OUCH exchange time went backwards"),
-        }
-    }
-}
-impl std::error::Error for ExchangeError {}
-
 /// An order an [`Exchange`] tracks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Order {
@@ -1514,11 +1503,11 @@ pub struct Exchange {
 }
 impl Exchange {
     /// An exchange with no orders. Refuses limits outside their ranges.
-    pub fn new(config: ExchangeConfig) -> Result<Self, ExchangeError> {
+    pub fn new(config: ExchangeConfig) -> Result<Self, Error> {
         if !(1..=MAX_ORDERS).contains(&config.max_orders)
             || !(1..=MAX_EXECUTIONS).contains(&config.max_executions)
         {
-            return Err(ExchangeError::Config);
+            return Err(Error::Config);
         }
         Ok(Self {
             config,
@@ -1555,7 +1544,7 @@ impl Exchange {
 
     /// Handles one inbound message. Refuses a time before the last one
     /// used.
-    pub fn receive(&mut self, message: &Inbound, now: u64) -> Result<Vec<Action>, ExchangeError> {
+    pub fn receive(&mut self, message: &Inbound, now: u64) -> Result<Vec<Action>, Error> {
         self.check_time(now)?;
         self.now = now;
         Ok(match message {
@@ -1595,15 +1584,15 @@ impl Exchange {
     /// Accepts a pending enter or replace and returns the Accepted or
     /// Replaced message. A replace leaves `quantity` less the chain's
     /// executions open; with none left the reply says Order Dead.
-    pub fn accept(&mut self, token: Token, now: u64) -> Result<Outbound, ExchangeError> {
+    pub fn accept(&mut self, token: Token, now: u64) -> Result<Outbound, Error> {
         self.check_time(now)?;
         let order_ref = self.next_order_ref;
-        let next = order_ref.checked_add(1).ok_or(ExchangeError::Exhausted)?;
+        let next = order_ref.checked_add(1).ok_or(Error::Exhausted)?;
         if let Some(pending) = self.replaces.get(&token) {
             let original = self
                 .orders
                 .get(&pending.original)
-                .ok_or(ExchangeError::UnknownToken(pending.original))?;
+                .ok_or(Error::UnknownToken(pending.original))?;
             let r = &pending.request;
             let open = r.quantity.saturating_sub(original.executed);
             let order = Order {
@@ -1657,7 +1646,7 @@ impl Exchange {
             .orders
             .get_mut(&token)
             .filter(|o| !o.live)
-            .ok_or(ExchangeError::UnknownToken(token))?;
+            .ok_or(Error::UnknownToken(token))?;
         order.live = true;
         order.order_ref = order_ref;
         self.next_order_ref = next;
@@ -1689,7 +1678,7 @@ impl Exchange {
         token: Token,
         reason: u16,
         now: u64,
-    ) -> Result<Outbound, ExchangeError> {
+    ) -> Result<Outbound, Error> {
         self.check_time(now)?;
         let cl_ord_id = if let Some(p) = self.replaces.remove(&token) {
             self.replacing.remove(&p.original);
@@ -1699,7 +1688,7 @@ impl Exchange {
                 .orders
                 .get(&token)
                 .filter(|o| !o.live)
-                .ok_or(ExchangeError::UnknownToken(token))?;
+                .ok_or(Error::UnknownToken(token))?;
             let id = o.cl_ord_id;
             self.orders.remove(&token);
             id
@@ -1718,16 +1707,16 @@ impl Exchange {
         price: Price,
         liquidity_flag: u8,
         now: u64,
-    ) -> Result<Outbound, ExchangeError> {
+    ) -> Result<Outbound, Error> {
         self.check_time(now)?;
         let order = self.open(token)?;
         if quantity == 0 || quantity > order.quantity {
-            return Err(ExchangeError::Shares);
+            return Err(Error::Shares);
         }
         let match_number = self.next_match;
         let next = match_number
             .checked_add(1)
-            .ok_or(ExchangeError::Exhausted)?;
+            .ok_or(Error::Exhausted)?;
         let cl_ord_id = order.cl_ord_id;
         self.next_match = next;
         self.now = now;
@@ -1757,11 +1746,11 @@ impl Exchange {
         quantity: u32,
         reason: u8,
         now: u64,
-    ) -> Result<Outbound, ExchangeError> {
+    ) -> Result<Outbound, Error> {
         self.check_time(now)?;
         let order = self.open(token)?;
         if quantity == 0 || quantity > order.quantity {
-            return Err(ExchangeError::Shares);
+            return Err(Error::Shares);
         }
         self.now = now;
         self.take(token, quantity, false);
@@ -1775,9 +1764,9 @@ impl Exchange {
         match_number: u64,
         reason: u8,
         now: u64,
-    ) -> Result<Outbound, ExchangeError> {
+    ) -> Result<Outbound, Error> {
         self.check_time(now)?;
-        let unknown = ExchangeError::UnknownMatch(match_number);
+        let unknown = Error::UnknownMatch(match_number);
         // Match numbers are consecutive, so the slot is found by index.
         let back = self.next_match.checked_sub(match_number).ok_or(unknown)?;
         let len = self.executions.len();
@@ -1803,7 +1792,7 @@ impl Exchange {
     }
 
     /// A System Event message.
-    pub fn system_event(&mut self, event: u8, now: u64) -> Result<Outbound, ExchangeError> {
+    pub fn system_event(&mut self, event: u8, now: u64) -> Result<Outbound, Error> {
         self.check_time(now)?;
         self.now = now;
         Ok(SystemEvent {
@@ -1814,19 +1803,19 @@ impl Exchange {
         .into())
     }
 
-    fn check_time(&self, now: u64) -> Result<(), ExchangeError> {
+    fn check_time(&self, now: u64) -> Result<(), Error> {
         if now < self.now {
-            Err(ExchangeError::Time)
+            Err(Error::Time)
         } else {
             Ok(())
         }
     }
 
-    fn open(&self, token: Token) -> Result<&Order, ExchangeError> {
+    fn open(&self, token: Token) -> Result<&Order, Error> {
         self.orders
             .get(&token)
             .filter(|o| o.live)
-            .ok_or(ExchangeError::UnknownToken(token))
+            .ok_or(Error::UnknownToken(token))
     }
     /// Takes shares off an open order, checked by the caller, and closes
     /// it at zero, dropping any replace waiting on it.
@@ -2832,7 +2821,7 @@ mod tests {
         // Executing or canceling before accept is refused.
         assert_eq!(
             x.execute(token(1), 1, Price(1), b'A', 1),
-            Err(ExchangeError::UnknownToken(token(1)))
+            Err(Error::UnknownToken(token(1)))
         );
         let Outbound::OrderAccepted(a) = x.accept(token(1), 2).unwrap() else {
             panic!()
@@ -2843,7 +2832,7 @@ mod tests {
         );
         assert_eq!(
             x.accept(token(1), 2),
-            Err(ExchangeError::UnknownToken(token(1)))
+            Err(Error::UnknownToken(token(1)))
         );
         // 1.2: a repeat of the same UserRefNum is a retransmission.
         assert_eq!(
@@ -2860,7 +2849,7 @@ mod tests {
         assert_eq!((f.match_number, f.quantity), (1, 100));
         assert_eq!(
             x.execute(token(1), 401, Price(1), b'A', 4),
-            Err(ExchangeError::Shares)
+            Err(Error::Shares)
         );
         let out = sends(
             x.receive(
@@ -2913,7 +2902,7 @@ mod tests {
         assert_eq!((b.user_ref, b.cl_ord_id), (1, alpha("ORDER1")));
         assert_eq!(
             x.break_trade(1, b'E', 8),
-            Err(ExchangeError::UnknownMatch(1))
+            Err(Error::UnknownMatch(1))
         );
         // Account query: next UserRefNum on channel 0.
         let out = sends(
@@ -2969,7 +2958,7 @@ mod tests {
         assert_eq!(x.order(token(2)), None);
         assert_eq!(
             x.reject(token(2), 1, 4),
-            Err(ExchangeError::UnknownToken(token(2)))
+            Err(Error::UnknownToken(token(2)))
         );
         assert_eq!(
             Exchange::new(ExchangeConfig {
@@ -2977,7 +2966,7 @@ mod tests {
                 ..ExchangeConfig::default()
             })
             .err(),
-            Some(ExchangeError::Config)
+            Some(Error::Config)
         );
     }
 
@@ -3274,7 +3263,7 @@ mod tests {
     fn exchange_runs_over_soupbintcp() {
         use fictionet::stdlib::codec::{Stream, pump};
         use fictionet::stdlib::soupbintcp::{
-            Action as SAction, Alpha as SAlpha, Client, Event as SEvent, Frames, Login, Packet,
+            Action as SAction, Alpha as SAlpha, Client, Event as SEvent, Login, Packet, Packets,
             Server, Timers,
         };
         let login = Login {
@@ -3311,7 +3300,7 @@ mod tests {
             .unwrap()
             .to_bytes()
             .unwrap();
-        let mut frames = Stream::new(Frames::default());
+        let mut frames = Stream::new(Packets::default());
         let mut inbound = Vec::new();
         pump(&mut frames, &wire, |f| inbound.push(f)).unwrap();
         let Ok(Packet::UnsequencedData(payload)) = &inbound[0] else {
@@ -3378,7 +3367,7 @@ mod tests {
         assert_eq!(x.next_user_ref(0), Some(3));
         assert_eq!(
             x.accept(token(2), 3),
-            Err(ExchangeError::UnknownToken(token(2)))
+            Err(Error::UnknownToken(token(2)))
         );
     }
 
@@ -3403,7 +3392,7 @@ mod tests {
         x.execute(token(1), 100, Price(1), b'A', 3).unwrap();
         assert_eq!(
             x.accept(token(2), 4),
-            Err(ExchangeError::UnknownToken(token(2)))
+            Err(Error::UnknownToken(token(2)))
         );
         // Both slots are free again.
         for n in [4, 5] {
@@ -3433,7 +3422,7 @@ mod tests {
         for m in [0, 6, 7, 10, u64::MAX] {
             assert_eq!(
                 x.break_trade(m, b'E', 3),
-                Err(ExchangeError::UnknownMatch(m))
+                Err(Error::UnknownMatch(m))
             );
         }
         let Outbound::BrokenTrade(b) = x.break_trade(8, b'E', 3).unwrap() else {
@@ -3442,7 +3431,7 @@ mod tests {
         assert_eq!((b.match_number, b.user_ref), (8, 1));
         assert_eq!(
             x.break_trade(8, b'E', 3),
-            Err(ExchangeError::UnknownMatch(8))
+            Err(Error::UnknownMatch(8))
         );
         x.break_trade(9, b'E', 3).unwrap();
         // A new execution pushes out the broken 8.
@@ -3458,20 +3447,20 @@ mod tests {
         let before = format!("{x:?}");
         assert_eq!(
             x.receive(&enter(2, 100, Options::default()).into(), 4),
-            Err(ExchangeError::Time)
+            Err(Error::Time)
         );
-        assert_eq!(x.accept(token(1), 4), Err(ExchangeError::Time));
-        assert_eq!(x.reject(token(1), 1, 4), Err(ExchangeError::Time));
-        assert_eq!(x.system_event(b'S', 4), Err(ExchangeError::Time));
+        assert_eq!(x.accept(token(1), 4), Err(Error::Time));
+        assert_eq!(x.reject(token(1), 1, 4), Err(Error::Time));
+        assert_eq!(x.system_event(b'S', 4), Err(Error::Time));
         assert_eq!(format!("{x:?}"), before);
         x.accept(token(1), 6).unwrap();
         assert_eq!(
             x.execute(token(1), 1, Price(1), b'A', 5),
-            Err(ExchangeError::Time)
+            Err(Error::Time)
         );
-        assert_eq!(x.cancel(token(1), 1, b'U', 5), Err(ExchangeError::Time));
+        assert_eq!(x.cancel(token(1), 1, b'U', 5), Err(Error::Time));
         x.execute(token(1), 1, Price(1), b'A', 6).unwrap();
-        assert_eq!(x.break_trade(1, b'E', 5), Err(ExchangeError::Time));
+        assert_eq!(x.break_trade(1, b'E', 5), Err(Error::Time));
         x.break_trade(1, b'E', 6).unwrap();
     }
 

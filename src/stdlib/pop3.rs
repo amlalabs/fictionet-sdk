@@ -13,9 +13,9 @@
 //! response codes).
 //!
 //! Run a server's connection bytes through
-//! [`Stream<Commands>`](fictionet::stdlib::codec::Stream), interpret each [`Request`],
-//! and write a [`Reply`]. Clients use [`Stream<Replies>`](fictionet::stdlib::codec::Stream)
-//! and queue whether each reply has a body with [`Replies::expect`]. CRLF is
+//! [`Stream<Inputs>`](fictionet::stdlib::codec::Stream), interpret each [`Request`],
+//! and write a [`Reply`]. Clients use [`Stream<Outputs>`](fictionet::stdlib::codec::Stream)
+//! and queue whether each reply has a body with [`Outputs::expect`]. CRLF is
 //! required. Bad or overlong commands are error items. Overlong command
 //! remainders are skipped through LF, including at EOF. Short partial lines
 //! at EOF end the stream. Bad status lines end the stream when a body was
@@ -24,20 +24,20 @@
 //! authentication, and message storage belong to world code.
 //!
 //! During AUTH (RFC 5034), select one raw line between items with
-//! [`Commands::expect_line`] or [`Replies::expect_line`]. A challenge (`+`
+//! [`Inputs::expect_line`] or [`Outputs::expect_line`]. A challenge (`+`
 //! alone or `+ ` and data) leaves AUTH's reply expectation queued. A final
 //! status line consumes it.
 //!
 //! ```
-//! use fictionet::stdlib::{codec::{Stream, Wire}, pop3::{Commands, Input, Request, Reply, Replies, Output}};
+//! use fictionet::stdlib::{codec::{Stream, Wire}, pop3::{Inputs, Input, Request, Reply, Outputs, Output}};
 //!
-//! let mut commands = Stream::new(Commands::new());
+//! let mut commands = Stream::new(Inputs::new());
 //! assert_eq!(commands.push(b"USER alice\r\n"), 12);
 //! let Some(Ok(Ok(Input::Command(command)))) = commands.next() else { panic!() };
 //! assert_eq!(Request::from_command(&command).unwrap(), Request::User("alice".into()));
 //! let mut out = Vec::new();
 //! Reply::ok("alice is welcome").write(&mut out).unwrap();
-//! let mut replies = Stream::new(Replies::new());
+//! let mut replies = Stream::new(Outputs::new());
 //! replies.decoder().expect(false).unwrap();
 //! assert_eq!(replies.push(&out), out.len());
 //! assert_eq!(replies.next(), Some(Ok(Ok(Output::Reply(Reply::ok("alice is welcome"))))));
@@ -75,7 +75,7 @@ pub const MAX_BODY: usize = 8 << 20;
 /// a code is held only by the length of its line. A `-ERR` line has room
 /// for one byte less.
 pub const MAX_CODE: usize = MAX_REPLY_LINE - 8;
-/// The longest raw line [`Commands::expect_line`] and [`Replies::expect_line`]
+/// The longest raw line [`Inputs::expect_line`] and [`Outputs::expect_line`]
 /// select, excluding CRLF. The base64
 /// lines of an `AUTH` exchange have no limit of their own (RFC 5034,
 /// section 4), and this is well above what common mechanisms send.
@@ -109,38 +109,87 @@ pub struct Command {
     pub argument: Option<String>,
 }
 
-/// Why a line is not a command. A server answers with `-ERR` and reads the
-/// next line.
+/// Why bytes are not a POP3 command, reply or listing, or a value cannot
+/// be written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CommandError {
-    /// The line exceeded [`MAX_COMMAND_LINE`], or [`MAX_AUTH_LINE`] in raw mode.
+pub enum Error {
+    /// The command line exceeded [`MAX_COMMAND_LINE`], or [`MAX_AUTH_LINE`]
+    /// in raw mode. A server answers with `-ERR` and reads the next line.
     LineTooLong,
-    /// The line was not UTF-8, or held a control character.
+    /// The command line was not UTF-8, or held a control character.
     BadCharacter,
     /// The keyword was not three or four printable ASCII characters.
     BadKeyword,
+    /// An argument the command needs is not there.
+    MissingArgument,
+    /// There are more arguments than the command takes.
+    ExtraArgument,
+    /// Arguments were not split by single spaces.
+    ArgumentSpacing,
+    /// A number was not decimal digits, did not fit, or was a message
+    /// number of 0.
+    BadNumber,
+    /// An `APOP` digest was not 32 hex digits.
+    BadDigest,
+    /// The status line did not start with `+OK` or `-ERR` followed by a
+    /// space or the end of the line, or its text was not UTF-8 without
+    /// NUL, CR, or LF. A raw AUTH challenge ending in bare LF also gives
+    /// this.
+    BadStatus,
+    /// A body line used bare LF or contained an embedded CR. The whole
+    /// reply is rejected at its dot terminator.
+    BadBodyLine,
+    /// A scan or unique-id listing is invalid or oversized.
+    Listing,
+    /// Line framing or assembly failed while reading one value.
+    Framing(FrameError),
+    /// No complete value was present.
+    Incomplete,
+    /// Bytes follow the value.
+    Trailing,
+    /// The value cannot fit its wire grammar and limits without changing.
+    Unwritable,
 }
 
-impl std::fmt::Display for CommandError {
+impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            CommandError::LineTooLong => "command line too long",
-            CommandError::BadCharacter => "bad character in command line",
-            CommandError::BadKeyword => "bad command keyword",
+            Error::LineTooLong => "command line too long",
+            Error::BadCharacter => "bad character in command line",
+            Error::BadKeyword => "bad command keyword",
+            Error::MissingArgument => "missing argument",
+            Error::ExtraArgument => "too many arguments",
+            Error::ArgumentSpacing => "arguments must be split by single spaces",
+            Error::BadNumber => "bad number",
+            Error::BadDigest => "digest must be 32 hex digits",
+            Error::BadStatus => "status is not +OK or -ERR",
+            Error::BadBodyLine => "body line requires CRLF without embedded CR",
+            Error::Listing => "invalid POP3 listing",
+            Error::Framing(e) => return e.fmt(f),
+            Error::Incomplete => "incomplete POP3 value",
+            Error::Trailing => "bytes after POP3 value",
+            Error::Unwritable => "POP3 value cannot be written without changing it",
         })
     }
 }
 
-impl std::error::Error for CommandError {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Framing(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 impl Command {
-    fn parse_line(line: &[u8]) -> Result<Command, CommandError> {
+    fn parse_line(line: &[u8]) -> Result<Command, Error> {
         if line.len() > MAX_COMMAND_LINE - 2 {
-            return Err(CommandError::LineTooLong);
+            return Err(Error::LineTooLong);
         }
-        let s = std::str::from_utf8(line).map_err(|_| CommandError::BadCharacter)?;
+        let s = std::str::from_utf8(line).map_err(|_| Error::BadCharacter)?;
         if s.chars().any(char::is_control) {
-            return Err(CommandError::BadCharacter);
+            return Err(Error::BadCharacter);
         }
         let (keyword, argument) = match s.split_once(' ') {
             Some((k, a)) => (k, Some(a)),
@@ -149,7 +198,7 @@ impl Command {
         if !(MIN_KEYWORD..=MAX_KEYWORD).contains(&keyword.len())
             || !keyword.bytes().all(|c| c.is_ascii_graphic())
         {
-            return Err(CommandError::BadKeyword);
+            return Err(Error::BadKeyword);
         }
         Ok(Command {
             keyword: keyword.to_ascii_uppercase(),
@@ -202,61 +251,30 @@ pub enum Request {
     Capa,
     /// `STLS`: start TLS on this connection (RFC 2595). Bytes a decoder
     /// still holds after this command came in the clear, so a server
-    /// starts a new [`Commands`] stream once TLS is up.
+    /// starts a new [`Inputs`] stream once TLS is up.
     Stls,
     /// An unknown keyword, such as `AUTH`. The writer refuses keywords
     /// that would parse as a known request.
     Other(Command),
 }
 
-/// Why a known command's arguments are wrong. A server answers with
-/// `-ERR`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ArgumentError {
-    /// An argument the command needs is not there.
-    Missing,
-    /// There are more arguments than the command takes.
-    Extra,
-    /// Arguments were not split by single spaces.
-    Spacing,
-    /// A number was not decimal digits, did not fit, or was a message
-    /// number of 0.
-    BadNumber,
-    /// An `APOP` digest was not 32 hex digits.
-    BadDigest,
-}
-
-impl std::fmt::Display for ArgumentError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            ArgumentError::Missing => "missing argument",
-            ArgumentError::Extra => "too many arguments",
-            ArgumentError::Spacing => "arguments must be split by single spaces",
-            ArgumentError::BadNumber => "bad number",
-            ArgumentError::BadDigest => "digest must be 32 hex digits",
-        })
-    }
-}
-
-impl std::error::Error for ArgumentError {}
-
 impl Request {
     /// Reads a command's arguments. A keyword this module does not know
     /// gives [`Request::Other`].
-    pub fn from_command(c: &Command) -> Result<Request, ArgumentError> {
+    pub fn from_command(c: &Command) -> Result<Request, Error> {
         let keyword = c.keyword.to_ascii_uppercase();
         let arg = c.argument.as_deref().filter(|a| !a.is_empty());
         let args = || split_args(arg);
         let none = || match arg {
             None => Ok(()),
-            Some(_) => Err(ArgumentError::Extra),
+            Some(_) => Err(Error::ExtraArgument),
         };
         Ok(match keyword.as_str() {
             "USER" => {
                 let [name] = exact(args()?)?;
                 Request::User(name.to_string())
             }
-            "PASS" => Request::Pass(arg.ok_or(ArgumentError::Missing)?.to_string()),
+            "PASS" => Request::Pass(arg.ok_or(Error::MissingArgument)?.to_string()),
             "APOP" => {
                 let [name, digest] = exact(args()?)?;
                 Request::Apop {
@@ -281,7 +299,7 @@ impl Request {
                 let [m, n] = exact(args()?)?;
                 let lines = decimal(n)
                     .and_then(|n| u32::try_from(n).ok())
-                    .ok_or(ArgumentError::BadNumber)?;
+                    .ok_or(Error::BadNumber)?;
                 Request::Top {
                     msg: message(m)?,
                     lines,
@@ -296,10 +314,10 @@ impl Request {
 
     /// Builds a command without changing credentials or arguments.
     /// Refuses fields that exceed the command limit or parse differently.
-    pub fn to_command(&self) -> Result<Command, WriteError> {
+    pub fn to_command(&self) -> Result<Command, Error> {
         let short = |s: &str| {
             if s.len() > MAX_COMMAND_LINE {
-                Err(WriteError::Unwritable)
+                Err(Error::Unwritable)
             } else {
                 Ok(s.to_string())
             }
@@ -334,14 +352,14 @@ impl Request {
         };
         command.validate()?;
         if Self::from_command(&command).as_ref() != Ok(self) {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         Ok(command)
     }
 
     /// Whether a `+OK` answer to this request carries a body: `LIST` and
     /// `UIDL` with no argument, `RETR`, `TOP` and `CAPA`. A `-ERR` answer
-    /// never does. Pass this to [`Replies::expect`].
+    /// never does. Pass this to [`Outputs::expect`].
     pub fn multi_line(&self) -> bool {
         matches!(
             self,
@@ -367,54 +385,6 @@ pub struct Reply {
     /// The body, for a reply that has one, with the extra dots taken off.
     /// Every line in it ends with CRLF.
     pub body: Option<Vec<u8>>,
-}
-
-/// Why a status line is not a reply. A pending body makes this fatal.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReplyError {
-    /// The status line did not start with `+OK` or `-ERR` followed by a
-    /// space or the end of the line, or its text was not UTF-8 without
-    /// NUL, CR, or LF.
-    BadStatus,
-}
-
-impl std::fmt::Display for ReplyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            ReplyError::BadStatus => "status is not +OK or -ERR",
-        })
-    }
-}
-
-impl std::error::Error for ReplyError {}
-
-/// Why one item from [`Replies`] was rejected at a known boundary.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReplyItemError {
-    /// A malformed status line, or [`ReplyError::BadStatus`] for a raw AUTH
-    /// challenge ending in bare LF.
-    Reply(ReplyError),
-    /// A body line used bare LF or contained an embedded CR. The whole
-    /// reply is rejected at its dot terminator.
-    BadBodyLine,
-}
-
-impl core::fmt::Display for ReplyItemError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Reply(e) => e.fmt(f),
-            Self::BadBodyLine => f.write_str("body line requires CRLF without embedded CR"),
-        }
-    }
-}
-
-impl core::error::Error for ReplyItemError {
-    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
-        match self {
-            Self::Reply(e) => Some(e),
-            Self::BadBodyLine => None,
-        }
-    }
 }
 
 impl Reply {
@@ -455,32 +425,32 @@ impl Reply {
         Reply::ok(&format!("{count} {octets}"))
     }
 
-    fn parse_line(line: &[u8]) -> Result<Reply, ReplyError> {
+    fn parse_line(line: &[u8]) -> Result<Reply, Error> {
         let (ok, rest) = if let Some(r) = line.strip_prefix(b"+OK") {
             (true, r)
         } else if let Some(r) = line.strip_prefix(b"-ERR") {
             (false, r)
         } else {
-            return Err(ReplyError::BadStatus);
+            return Err(Error::BadStatus);
         };
         let rest = match rest {
             [] => rest,
             [b' ', t @ ..] => t,
-            _ => return Err(ReplyError::BadStatus),
+            _ => return Err(Error::BadStatus),
         };
-        let rest = core::str::from_utf8(rest).map_err(|_| ReplyError::BadStatus)?;
+        let rest = core::str::from_utf8(rest).map_err(|_| Error::BadStatus)?;
         if rest.bytes().any(|b| matches!(b, 0 | b'\r' | b'\n')) {
-            return Err(ReplyError::BadStatus);
+            return Err(Error::BadStatus);
         }
         let (code, text) = match split_code(rest.as_bytes()) {
             Some((code, text)) => (
                 Some(
                     core::str::from_utf8(code)
-                        .map_err(|_| ReplyError::BadStatus)?
+                        .map_err(|_| Error::BadStatus)?
                         .to_string(),
                 ),
                 core::str::from_utf8(text)
-                    .map_err(|_| ReplyError::BadStatus)?
+                    .map_err(|_| Error::BadStatus)?
                     .to_string(),
             ),
             None => (None, rest.to_string()),
@@ -566,14 +536,14 @@ struct Args<'a> {
 
 /// Splits an argument at single spaces, without keeping more than three
 /// pieces, however many spaces it holds.
-fn split_args(arg: Option<&str>) -> Result<Args<'_>, ArgumentError> {
+fn split_args(arg: Option<&str>) -> Result<Args<'_>, Error> {
     let mut out = Args {
         first: [""; 3],
         count: 0,
     };
     for piece in arg.into_iter().flat_map(|a| a.split(' ')) {
         if piece.is_empty() {
-            return Err(ArgumentError::Spacing);
+            return Err(Error::ArgumentSpacing);
         }
         if let Some(slot) = out.first.get_mut(out.count) {
             *slot = piece;
@@ -584,33 +554,33 @@ fn split_args(arg: Option<&str>) -> Result<Args<'_>, ArgumentError> {
 }
 
 /// Exactly `N` arguments.
-fn exact<const N: usize>(args: Args<'_>) -> Result<[&str; N], ArgumentError> {
+fn exact<const N: usize>(args: Args<'_>) -> Result<[&str; N], Error> {
     match args.count.cmp(&N) {
-        std::cmp::Ordering::Less => Err(ArgumentError::Missing),
-        std::cmp::Ordering::Greater => Err(ArgumentError::Extra),
+        std::cmp::Ordering::Less => Err(Error::MissingArgument),
+        std::cmp::Ordering::Greater => Err(Error::ExtraArgument),
         std::cmp::Ordering::Equal => args
             .first
             .get(..N)
             .and_then(|a| a.try_into().ok())
-            .ok_or(ArgumentError::Missing),
+            .ok_or(Error::MissingArgument),
     }
 }
 
 /// No arguments or one.
-fn optional(args: Args<'_>) -> Result<Option<&str>, ArgumentError> {
+fn optional(args: Args<'_>) -> Result<Option<&str>, Error> {
     match args.count {
         0 => Ok(None),
         1 => Ok(Some(args.first[0])),
-        _ => Err(ArgumentError::Extra),
+        _ => Err(Error::ExtraArgument),
     }
 }
 
 /// A message number: decimal, 1 or more.
-fn message(s: &str) -> Result<NonZeroU32, ArgumentError> {
+fn message(s: &str) -> Result<NonZeroU32, Error> {
     decimal(s)
         .and_then(|n| u32::try_from(n).ok())
         .and_then(NonZeroU32::new)
-        .ok_or(ArgumentError::BadNumber)
+        .ok_or(Error::BadNumber)
 }
 
 /// Decimal digits only, no sign, fitting in a `u64`. Leading zeros are
@@ -632,15 +602,15 @@ fn leading_decimal(s: &str) -> Option<u64> {
     decimal(s.get(..digits)?)
 }
 
-fn parse_digest(s: &str) -> Result<[u8; 16], ArgumentError> {
+fn parse_digest(s: &str) -> Result<[u8; 16], Error> {
     let b = s.as_bytes();
     if b.len() != 32 {
-        return Err(ArgumentError::BadDigest);
+        return Err(Error::BadDigest);
     }
     let mut out = [0u8; 16];
     for (o, pair) in out.iter_mut().zip(b.as_chunks::<2>().0) {
-        let hi = hex(pair[0]).ok_or(ArgumentError::BadDigest)?;
-        let lo = hex(pair[1]).ok_or(ArgumentError::BadDigest)?;
+        let hi = hex(pair[0]).ok_or(Error::BadDigest)?;
+        let lo = hex(pair[1]).ok_or(Error::BadDigest)?;
         *o = hi << 4 | lo;
     }
     Ok(out)
@@ -685,14 +655,14 @@ fn body_lines(body: &[u8]) -> impl Iterator<Item = &[u8]> {
         .map(|l| l.strip_suffix(b"\r").unwrap_or(l))
 }
 
-/// Maximum queued reply expectations in [`Replies`]. This is a local limit.
+/// Maximum queued reply expectations in [`Outputs`]. This is a local limit.
 pub const MAX_EXPECTATIONS: usize = 1024;
-/// Maximum retained reply bytes and expectation entries in [`Replies`].
+/// Maximum retained reply bytes and expectation entries in [`Outputs`].
 pub const MAX_REPLY_HELD: usize = MAX_BODY + MAX_REPLY_LINE + MAX_EXPECTATIONS;
 
-/// Why a shared POP3 decoder cannot continue.
+/// Why [`Inputs`] or [`Outputs`] cannot continue. It ends the stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DecodeError {
+pub enum FrameError {
     /// A line exceeded its limit or ended before CRLF.
     Line(codec::LineError),
     /// The body exceeded [`MAX_BODY`].
@@ -706,12 +676,12 @@ pub enum DecodeError {
     /// The expectation queue reached [`MAX_EXPECTATIONS`].
     ExpectationsFull,
     /// A malformed status line made a multiline reply's boundary uncertain.
-    Reply(ReplyError),
+    BadStatus,
     /// A raw line was requested while a line or body was in progress.
     State,
 }
 
-impl core::fmt::Display for DecodeError {
+impl core::fmt::Display for FrameError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Line(e) => e.fmt(f),
@@ -720,63 +690,22 @@ impl core::fmt::Display for DecodeError {
             Self::Incomplete => f.write_str("incomplete POP3 body"),
             Self::MissingExpectation => f.write_str("POP3 reply needs an expectation"),
             Self::ExpectationsFull => f.write_str("POP3 expectation queue is full"),
-            Self::Reply(e) => e.fmt(f),
+            Self::BadStatus => Error::BadStatus.fmt(f),
             Self::State => f.write_str("POP3 raw line requires a line boundary"),
         }
     }
 }
-impl core::error::Error for DecodeError {}
-
-/// Why bytes are not exactly one POP3 wire value.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ParseError {
-    /// A complete command is malformed.
-    Command(CommandError),
-    /// A complete reply is malformed.
-    Reply(ReplyItemError),
-    /// A known command has invalid arguments.
-    Argument(ArgumentError),
-    /// A scan or unique-id listing is invalid or oversized.
-    Listing,
-    /// Line framing or assembly failed.
-    Framing(DecodeError),
-    /// No complete value was present.
-    Incomplete,
-    /// Bytes follow the value.
-    Trailing,
-}
-
-impl core::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+impl core::error::Error for FrameError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
-            Self::Command(e) => e.fmt(f),
-            Self::Reply(e) => e.fmt(f),
-            Self::Argument(e) => e.fmt(f),
-            Self::Listing => f.write_str("invalid POP3 listing"),
-            Self::Framing(e) => e.fmt(f),
-            Self::Incomplete => f.write_str("incomplete POP3 value"),
-            Self::Trailing => f.write_str("bytes after POP3 value"),
+            Self::Line(e) => Some(e),
+            _ => None,
         }
     }
 }
-impl core::error::Error for ParseError {}
-
-/// Why a POP3 value cannot be written.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WriteError {
-    /// The value cannot fit its wire grammar and limits without changing.
-    Unwritable,
-}
-
-impl core::fmt::Display for WriteError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("POP3 value cannot be written without changing it")
-    }
-}
-impl core::error::Error for WriteError {}
 
 impl Command {
-    fn validate(&self) -> Result<(), WriteError> {
+    fn validate(&self) -> Result<(), Error> {
         let size = self.keyword.len().checked_add(
             self.argument
                 .as_ref()
@@ -793,35 +722,35 @@ impl Command {
                 .as_ref()
                 .is_some_and(|a| a.is_empty() || a.chars().any(char::is_control))
         {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         Ok(())
     }
 }
 
 impl Wire for Command {
-    type ParseError = ParseError;
-    type WriteError = WriteError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads exactly one command with CRLF. Refuses trailing bytes,
     /// controls, invalid UTF-8, invalid keywords, and oversized lines.
     /// Keywords become uppercase; empty arguments become `None`.
-    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         let mut lines = codec::Lines::new(MAX_COMMAND_LINE - 2, codec::Ending::Crlf);
-        match pop_line(&mut lines, bytes, true, false).map_err(ParseError::Framing)? {
+        match pop_line(&mut lines, bytes, true, false).map_err(Error::Framing)? {
             codec::Step::Item(line, used) if used == bytes.len() => {
-                let line = line.map_err(|_| ParseError::Command(CommandError::BadCharacter))?;
-                Command::parse_line(&line).map_err(ParseError::Command)
+                let line = line.map_err(|_| Error::BadCharacter)?;
+                Command::parse_line(&line)
             }
-            codec::Step::Item(_, _) => Err(ParseError::Trailing),
-            _ => Err(ParseError::Incomplete),
+            codec::Step::Item(_, _) => Err(Error::Trailing),
+            _ => Err(Error::Incomplete),
         }
     }
 
     /// Appends one command with CRLF. Refuses invalid or lowercase
     /// keywords, empty arguments, control characters, and oversized lines.
     /// Errors leave `out` unchanged.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         self.validate()?;
         let size = self
             .keyword
@@ -829,8 +758,8 @@ impl Wire for Command {
             .checked_add(self.argument.as_ref().map_or(0, String::len))
             .and_then(|n| n.checked_add(usize::from(self.argument.is_some())))
             .and_then(|n| n.checked_add(2))
-            .ok_or(WriteError::Unwritable)?;
-        out.try_reserve(size).map_err(|_| WriteError::Unwritable)?;
+            .ok_or(Error::Unwritable)?;
+        out.try_reserve(size).map_err(|_| Error::Unwritable)?;
         out.extend_from_slice(self.keyword.as_bytes());
         if let Some(arg) = &self.argument {
             out.push(b' ');
@@ -842,8 +771,8 @@ impl Wire for Command {
 }
 
 impl Wire for Reply {
-    type ParseError = ParseError;
-    type WriteError = WriteError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads exactly one status line, or a status and a dot-terminated body.
     /// Refuses trailing bytes, invalid status text, missing CRLF, embedded
@@ -852,34 +781,34 @@ impl Wire for Reply {
     /// or after one space; other bracketed text stays plain text.
     ///
     /// The supplied slice defines the whole value. Bytes after its status
-    /// line must form its body. Stream callers must use [`Replies::expect`]
+    /// line must form its body. Stream callers must use [`Outputs::expect`]
     /// because a stream has no such enclosing boundary.
-    fn parse(mut bytes: &[u8]) -> Result<Self, ParseError> {
+    fn parse(mut bytes: &[u8]) -> Result<Self, Error> {
         let body = bytes
             .iter()
             .take(MAX_REPLY_LINE)
             .position(|&b| b == b'\n')
             .is_some_and(|n| n.saturating_add(1) < bytes.len());
-        let mut replies = Replies::new();
-        replies.expect(body).map_err(ParseError::Framing)?;
+        let mut replies = Outputs::new();
+        replies.expect(body).map_err(Error::Framing)?;
         loop {
             match replies.decode(bytes, true).map_err(|e| match e {
-                DecodeError::Reply(e) => ParseError::Reply(ReplyItemError::Reply(e)),
-                e => ParseError::Framing(e),
+                FrameError::BadStatus => Error::BadStatus,
+                e => Error::Framing(e),
             })? {
                 codec::Step::Item(reply, used) => {
-                    let Output::Reply(reply) = reply.map_err(ParseError::Reply)? else {
-                        return Err(ParseError::Incomplete);
+                    let Output::Reply(reply) = reply? else {
+                        return Err(Error::Incomplete);
                     };
                     if used != bytes.len() {
-                        return Err(ParseError::Trailing);
+                        return Err(Error::Trailing);
                     }
                     return Ok(reply);
                 }
                 codec::Step::Skip(used) => {
-                    bytes = bytes.get(used..).ok_or(ParseError::Incomplete)?
+                    bytes = bytes.get(used..).ok_or(Error::Incomplete)?
                 }
-                _ => return Err(ParseError::Incomplete),
+                _ => return Err(Error::Incomplete),
             }
         }
     }
@@ -888,7 +817,7 @@ impl Wire for Reply {
     /// ambiguous text, NUL or CR/LF in status text, and bodies on `-ERR`.
     /// Body lines must already end in CRLF without embedded CR. Line and
     /// body limits apply. Errors leave `out` unchanged.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         let status = if self.ok {
             b"+OK".as_slice()
         } else {
@@ -899,7 +828,7 @@ impl Wire for Reply {
             || (!self.ok && self.body.is_some())
             || self.body.as_ref().is_some_and(|b| b.len() > MAX_BODY)
         {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         let mut size = status.len();
         let mut space = !self.text.is_empty();
@@ -909,41 +838,41 @@ impl Wire for Reply {
                     .split('/')
                     .all(|s| !s.is_empty() && s.bytes().all(rchar))
             {
-                return Err(WriteError::Unwritable);
+                return Err(Error::Unwritable);
             }
             size = size
                 .checked_add(code.len() + 3)
-                .ok_or(WriteError::Unwritable)?;
+                .ok_or(Error::Unwritable)?;
             let room = (MAX_REPLY_LINE - 2)
                 .checked_sub(size)
-                .ok_or(WriteError::Unwritable)?;
+                .ok_or(Error::Unwritable)?;
             if self.text.len() == room && !self.text.starts_with(' ') {
                 space = false;
             }
         } else if split_code(self.text.as_bytes()).is_some() {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         size = size
             .checked_add(self.text.len() + usize::from(space) + 2)
             .filter(|&n| n <= MAX_REPLY_LINE)
-            .ok_or(WriteError::Unwritable)?;
+            .ok_or(Error::Unwritable)?;
         if let Some(body) = &self.body {
             if !body.is_empty() && !body.ends_with(b"\r\n") {
-                return Err(WriteError::Unwritable);
+                return Err(Error::Unwritable);
             }
             for line in body.split_inclusive(|b| *b == b'\n') {
-                let content = line.strip_suffix(b"\r\n").ok_or(WriteError::Unwritable)?;
+                let content = line.strip_suffix(b"\r\n").ok_or(Error::Unwritable)?;
                 let stuffed = usize::from(content.starts_with(b"."));
                 if content.contains(&b'\r') || line.len().saturating_add(stuffed) > MAX_DATA_LINE {
-                    return Err(WriteError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 size = size
                     .checked_add(line.len() + stuffed)
-                    .ok_or(WriteError::Unwritable)?;
+                    .ok_or(Error::Unwritable)?;
             }
-            size = size.checked_add(3).ok_or(WriteError::Unwritable)?;
+            size = size.checked_add(3).ok_or(Error::Unwritable)?;
         }
-        out.try_reserve(size).map_err(|_| WriteError::Unwritable)?;
+        out.try_reserve(size).map_err(|_| Error::Unwritable)?;
         out.extend_from_slice(status);
         if let Some(code) = &self.code {
             out.extend_from_slice(b" [");
@@ -969,18 +898,18 @@ impl Wire for Reply {
 }
 
 impl Wire for Request {
-    type ParseError = ParseError;
-    type WriteError = WriteError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads a command and its arguments. Refuses invalid command framing,
     /// spacing, counts, message numbers, and APOP digests.
-    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
-        Self::from_command(&Command::parse(bytes)?).map_err(ParseError::Argument)
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        Self::from_command(&Command::parse(bytes)?)
     }
 
     /// Appends one request. Refuses invalid or oversized credentials and
     /// `Other` values that change when parsed. Errors leave `out` unchanged.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         self.to_command()?.write(out)
     }
 }
@@ -995,26 +924,26 @@ pub struct ScanListing {
 }
 
 impl Wire for ScanListing {
-    type ParseError = ParseError;
-    type WriteError = WriteError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads `msg octets`. Refuses missing or overflowing numbers, a zero
     /// message number, CR/LF, and lines over [`MAX_DATA_LINE`] minus CRLF.
     /// Text after the size's digits is ignored, as RFC 1939 permits.
-    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         if bytes.len() > MAX_DATA_LINE - 2 || bytes.iter().any(|b| matches!(b, b'\r' | b'\n')) {
-            return Err(ParseError::Listing);
+            return Err(Error::Listing);
         }
-        let (message, octets) = parse_scan_listing(bytes).ok_or(ParseError::Listing)?;
+        let (message, octets) = parse_scan_listing(bytes).ok_or(Error::Listing)?;
         Ok(Self { message, octets })
     }
 
     /// Appends decimal numbers separated by a space. Refuses allocation
     /// failure and leaves `out` unchanged. Every value fits the line limit.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         let line = format!("{} {}", self.message, self.octets);
         out.try_reserve(line.len())
-            .map_err(|_| WriteError::Unwritable)?;
+            .map_err(|_| Error::Unwritable)?;
         out.extend_from_slice(line.as_bytes());
         Ok(())
     }
@@ -1030,35 +959,35 @@ pub struct UniqueIdListing {
 }
 
 impl Wire for UniqueIdListing {
-    type ParseError = ParseError;
-    type WriteError = WriteError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads `msg uid`. Refuses zero or overflowing message numbers,
     /// empty or oversized IDs, spaces in IDs, and non-printable ASCII.
-    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         if bytes.len() > MAX_DATA_LINE - 2 {
-            return Err(ParseError::Listing);
+            return Err(Error::Listing);
         }
-        let (message, id) = parse_unique_id_listing(bytes).ok_or(ParseError::Listing)?;
+        let (message, id) = parse_unique_id_listing(bytes).ok_or(Error::Listing)?;
         Ok(Self { message, id })
     }
 
     /// Appends a message number and ID. Refuses empty or oversized IDs,
     /// spaces, and non-printable ASCII. Errors leave `out` unchanged.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         if self.id.is_empty()
             || self.id.len() > MAX_UID
             || !self.id.bytes().all(|b| b.is_ascii_graphic())
         {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         let message = self.message.to_string();
         let size = message
             .len()
             .checked_add(1)
             .and_then(|n| n.checked_add(self.id.len()))
-            .ok_or(WriteError::Unwritable)?;
-        out.try_reserve(size).map_err(|_| WriteError::Unwritable)?;
+            .ok_or(Error::Unwritable)?;
+        out.try_reserve(size).map_err(|_| Error::Unwritable)?;
         out.extend_from_slice(message.as_bytes());
         out.push(b' ');
         out.extend_from_slice(self.id.as_bytes());
@@ -1071,35 +1000,35 @@ fn pop_line(
     input: &[u8],
     eof: bool,
     recover_long: bool,
-) -> Result<codec::Step<Result<Vec<u8>, codec::LineError>>, DecodeError> {
+) -> Result<codec::Step<Result<Vec<u8>, codec::LineError>>, FrameError> {
     let step = match lines.decode(input, eof) {
         Ok(step) => step,
         Err(never) => match never {},
     };
     match step {
-        codec::Step::Item(Err(e @ codec::LineError::Unterminated), _) => Err(DecodeError::Line(e)),
+        codec::Step::Item(Err(e @ codec::LineError::Unterminated), _) => Err(FrameError::Line(e)),
         codec::Step::Item(Err(e @ codec::LineError::TooLong { .. }), _) if !recover_long => {
-            Err(DecodeError::Line(e))
+            Err(FrameError::Line(e))
         }
         step => Ok(step),
     }
 }
 
-/// One client command or raw AUTH answer from [`Commands`].
+/// One client command or raw AUTH answer from [`Inputs`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Input {
     /// A parsed command.
     Command(Command),
-    /// A raw line without CRLF, selected by [`Commands::expect_line`].
+    /// A raw line without CRLF, selected by [`Inputs::expect_line`].
     Line(Vec<u8>),
 }
 
-/// One server reply or raw AUTH challenge from [`Replies`].
+/// One server reply or raw AUTH challenge from [`Outputs`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Output {
     /// A complete reply, including its body when expected.
     Reply(Reply),
-    /// An AUTH challenge without CRLF, selected by [`Replies::expect_line`].
+    /// An AUTH challenge without CRLF, selected by [`Outputs::expect_line`].
     Line(Vec<u8>),
 }
 
@@ -1109,28 +1038,28 @@ pub enum Output {
 /// Syntax errors, bare LF, and overlong lines are error items; the decoder
 /// skips the rest of an overlong line through LF, then reads the next line.
 /// Every line error except [`codec::LineError::TooLong`] maps to
-/// [`CommandError::BadCharacter`]: a missing CR is invalid command framing,
-/// while unterminated lines end the stream through [`DecodeError::Line`]
+/// [`Error::BadCharacter`]: a missing CR is invalid command framing,
+/// while unterminated lines end the stream through [`FrameError::Line`]
 /// before this item mapping.
 /// An overlong line cut off at EOF is skipped after its error item, then
 /// ends cleanly. No input is retained.
 /// Call [`expect_line`](Self::expect_line) between items for one raw AUTH
 /// answer, bounded by [`MAX_AUTH_LINE`] bytes excluding CRLF. Input capacity
 /// is always `MAX_AUTH_LINE + 2`, so mode changes fit the same buffer.
-pub struct Commands {
+pub struct Inputs {
     lines: codec::Lines,
     raw_line: bool,
     partial: bool,
     skipping: bool,
 }
 
-impl Default for Commands {
+impl Default for Inputs {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Commands {
+impl Inputs {
     /// Creates a decoder with no pending command.
     pub fn new() -> Self {
         Self {
@@ -1144,9 +1073,9 @@ impl Commands {
     /// Selects one raw AUTH answer or cancellation line, without parsing it.
     /// Call between items. Refuses a partial line, a line still being skipped,
     /// or an already selected raw line, without changing the mode.
-    pub fn expect_line(&mut self) -> Result<(), DecodeError> {
+    pub fn expect_line(&mut self) -> Result<(), FrameError> {
         if self.partial || self.skipping || self.raw_line {
-            return Err(DecodeError::State);
+            return Err(FrameError::State);
         }
         self.raw_line = true;
         self.lines = codec::Lines::new(MAX_AUTH_LINE, codec::Ending::Crlf);
@@ -1154,16 +1083,16 @@ impl Commands {
     }
 }
 
-impl Decode for Commands {
-    type Item = Result<Input, CommandError>;
-    type Error = DecodeError;
+impl Decode for Inputs {
+    type Item = Result<Input, Error>;
+    type Error = FrameError;
     const NAME: &'static str = "POP3 commands";
 
     fn capacity(&self) -> usize {
         MAX_AUTH_LINE + 2
     }
 
-    fn decode(&mut self, input: &[u8], eof: bool) -> Result<codec::Step<Self::Item>, DecodeError> {
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<codec::Step<Self::Item>, FrameError> {
         Ok(match pop_line(&mut self.lines, input, eof, true)? {
             codec::Step::Item(line, used) => {
                 self.partial = false;
@@ -1175,8 +1104,8 @@ impl Decode for Commands {
                 }
                 codec::Step::Item(
                     line.map_err(|e| match e {
-                        codec::LineError::TooLong { .. } => CommandError::LineTooLong,
-                        _ => CommandError::BadCharacter,
+                        codec::LineError::TooLong { .. } => Error::LineTooLong,
+                        _ => Error::BadCharacter,
                     })
                     .and_then(|b| {
                         if raw {
@@ -1228,23 +1157,22 @@ impl Decode for Commands {
 /// [`MAX_BODY`] bounds the assembled body. Scanning is linear.
 /// A malformed status line is an error item for a single-line expectation,
 /// and ends the stream for a multiline expectation. A bad body line rejects
-/// its whole reply at the terminator with [`ReplyItemError::BadBodyLine`].
+/// its whole reply at the terminator with [`Error::BadBodyLine`].
 /// This covers bare LF and embedded CR. A bare LF after an AUTH challenge
-/// yields [`ReplyItemError::Reply`] wrapping [`ReplyError::BadStatus`] and
-/// leaves the queued expectation for the final reply. Line overflow,
-/// unterminated lines, and incomplete bodies end the stream. Retained state
-/// is bounded by [`MAX_REPLY_HELD`].
+/// yields [`Error::BadStatus`] and leaves the queued expectation for the
+/// final reply. Line overflow, unterminated lines, and incomplete bodies
+/// end the stream. Retained state is bounded by [`MAX_REPLY_HELD`].
 ///
 /// ```
-/// use fictionet::stdlib::{codec::Stream, pop3::{Replies, Output}};
-/// let mut replies = Stream::new(Replies::new());
+/// use fictionet::stdlib::{codec::Stream, pop3::{Outputs, Output}};
+/// let mut replies = Stream::new(Outputs::new());
 /// replies.decoder().expect(true).unwrap();
 /// let bytes = b"+OK message\r\n..x\r\n.\r\n";
 /// assert_eq!(replies.push(bytes), bytes.len());
 /// let Output::Reply(reply) = replies.next().unwrap().unwrap().unwrap() else { panic!() };
 /// assert_eq!(reply.body, Some(b".x\r\n".to_vec()));
 /// ```
-pub struct Replies {
+pub struct Outputs {
     lines: codec::Lines,
     expected: VecDeque<bool>,
     raw_line: bool,
@@ -1254,13 +1182,13 @@ pub struct Replies {
     rejected: bool,
 }
 
-impl Default for Replies {
+impl Default for Outputs {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Replies {
+impl Outputs {
     /// Creates a decoder with an empty expectation queue.
     pub fn new() -> Self {
         Self {
@@ -1276,9 +1204,9 @@ impl Replies {
 
     /// Queues whether a successful reply has a body. Refuses a full queue
     /// without changing it. Call between items as each command is sent.
-    pub fn expect(&mut self, multi_line: bool) -> Result<(), DecodeError> {
+    pub fn expect(&mut self, multi_line: bool) -> Result<(), FrameError> {
         if self.expected.len() >= MAX_EXPECTATIONS {
-            return Err(DecodeError::ExpectationsFull);
+            return Err(FrameError::ExpectationsFull);
         }
         self.expected.push_back(multi_line);
         Ok(())
@@ -1289,9 +1217,9 @@ impl Replies {
     /// is AUTH's final `+OK` or `-ERR` instead, it is read as a reply and
     /// consumes the expectation. Refuses an active body, a partial line, or
     /// an already selected raw line without changing state.
-    pub fn expect_line(&mut self) -> Result<(), DecodeError> {
+    pub fn expect_line(&mut self) -> Result<(), FrameError> {
         if self.pending.is_some() || self.partial || self.raw_line {
-            return Err(DecodeError::State);
+            return Err(FrameError::State);
         }
         self.raw_line = true;
         self.lines = codec::Lines::new(MAX_AUTH_LINE, codec::Ending::Crlf);
@@ -1304,9 +1232,9 @@ impl Replies {
     }
 }
 
-impl Decode for Replies {
-    type Item = Result<Output, ReplyItemError>;
-    type Error = DecodeError;
+impl Decode for Outputs {
+    type Item = Result<Output, Error>;
+    type Error = FrameError;
     const NAME: &'static str = "POP3 replies";
 
     fn capacity(&self) -> usize {
@@ -1324,15 +1252,15 @@ impl Decode for Replies {
             }))
     }
 
-    fn decode(&mut self, input: &[u8], eof: bool) -> Result<codec::Step<Self::Item>, DecodeError> {
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<codec::Step<Self::Item>, FrameError> {
         if !self.raw_line && self.pending.is_none() && self.expected.is_empty() && !input.is_empty()
         {
-            return Err(DecodeError::MissingExpectation);
+            return Err(FrameError::MissingExpectation);
         }
         let (line, used) = match pop_line(&mut self.lines, input, eof, false)? {
             codec::Step::Item(line, used) => (line, used),
             codec::Step::Need if eof && self.pending.is_some() => {
-                return Err(DecodeError::Incomplete);
+                return Err(FrameError::Incomplete);
             }
             codec::Step::Need => {
                 self.partial = !input.is_empty();
@@ -1353,13 +1281,13 @@ impl Decode for Replies {
             if sent == b"+" || sent.starts_with(b"+ ") {
                 return Ok(codec::Step::Item(
                     line.map(Output::Line)
-                        .map_err(|_| ReplyItemError::Reply(ReplyError::BadStatus)),
+                        .map_err(|_| Error::BadStatus),
                     used,
                 ));
             }
             // A status line is held to its own limit, as in status mode.
             if sent.len() > MAX_REPLY_LINE - 2 {
-                return Err(DecodeError::Line(codec::LineError::TooLong {
+                return Err(FrameError::Line(codec::LineError::TooLong {
                     max: MAX_REPLY_LINE - 2,
                 }));
             }
@@ -1368,10 +1296,10 @@ impl Decode for Replies {
             let multi = self
                 .expected
                 .pop_front()
-                .ok_or(DecodeError::MissingExpectation)?;
-            let reply = line.map_err(|_| ReplyError::BadStatus).and_then(|b| {
+                .ok_or(FrameError::MissingExpectation)?;
+            let reply = line.map_err(|_| Error::BadStatus).and_then(|b| {
                 if b.iter().any(|b| matches!(b, 0 | b'\r')) || core::str::from_utf8(&b).is_err() {
-                    return Err(ReplyError::BadStatus);
+                    return Err(Error::BadStatus);
                 }
                 Reply::parse_line(&b)
             });
@@ -1382,10 +1310,10 @@ impl Decode for Replies {
                     self.lines = codec::Lines::new(MAX_DATA_LINE - 2, codec::Ending::Crlf);
                     return Ok(codec::Step::Skip(used));
                 }
-                Err(e) if multi => return Err(DecodeError::Reply(e)),
+                Err(_) if multi => return Err(FrameError::BadStatus),
                 reply => {
                     return Ok(codec::Step::Item(
-                        reply.map(Output::Reply).map_err(ReplyItemError::Reply),
+                        reply.map(Output::Reply),
                         used,
                     ));
                 }
@@ -1395,12 +1323,12 @@ impl Decode for Replies {
             let reply = self
                 .pending
                 .take()
-                .ok_or(ReplyItemError::Reply(ReplyError::BadStatus));
+                .ok_or(Error::BadStatus);
             self.lines = codec::Lines::new(MAX_REPLY_LINE - 2, codec::Ending::Crlf);
             self.body_size = 0;
             return Ok(codec::Step::Item(
                 if core::mem::take(&mut self.rejected) {
-                    Err(ReplyItemError::BadBodyLine)
+                    Err(Error::BadBodyLine)
                 } else {
                     reply.map(Output::Reply)
                 },
@@ -1416,7 +1344,7 @@ impl Decode for Replies {
                 ))
             })
             .filter(|&n| n <= MAX_BODY)
-            .ok_or(DecodeError::BodyTooLong)?;
+            .ok_or(FrameError::BodyTooLong)?;
         match line {
             Ok(line) if !line.contains(&b'\r') && !self.rejected => {
                 if let Some(body) = self.pending.as_mut().and_then(|r| r.body.as_mut()) {
@@ -1426,7 +1354,7 @@ impl Decode for Replies {
                             .max(body.capacity().saturating_mul(2))
                             .min(MAX_BODY);
                         body.try_reserve_exact(target.saturating_sub(body.len()))
-                            .map_err(|_| DecodeError::Allocation)?;
+                            .map_err(|_| FrameError::Allocation)?;
                     }
                     body.extend_from_slice(line.strip_prefix(b".").unwrap_or(&line));
                     body.extend_from_slice(b"\r\n");
@@ -1459,49 +1387,49 @@ mod tests {
     fn n(value: u32) -> NonZeroU32 {
         NonZeroU32::new(value).unwrap()
     }
-    fn command(line: &[u8]) -> Result<Command, ParseError> {
+    fn command(line: &[u8]) -> Result<Command, Error> {
         Command::parse(&[line, b"\r\n"].concat())
     }
-    fn status(line: &[u8]) -> Result<Reply, ParseError> {
+    fn status(line: &[u8]) -> Result<Reply, Error> {
         Reply::parse(&[line, b"\r\n"].concat())
     }
-    fn request(line: &[u8]) -> Result<Request, ArgumentError> {
+    fn request(line: &[u8]) -> Result<Request, Error> {
         Request::from_command(&command(line).unwrap())
     }
-    fn refused(value: &impl Wire<WriteError = WriteError>) {
+    fn refused(value: &impl Wire<WriteError = Error>) {
         let mut out = b"prefix".to_vec();
-        assert_eq!(value.write(&mut out), Err(WriteError::Unwritable));
+        assert_eq!(value.write(&mut out), Err(Error::Unwritable));
         assert_eq!(out, b"prefix");
     }
-    fn reply_reader(multi: bool) -> Replies {
-        let mut replies = Replies::new();
+    fn reply_reader(multi: bool) -> Outputs {
+        let mut replies = Outputs::new();
         replies.expect(multi).unwrap();
         replies
     }
     #[test]
     fn argument_errors() {
-        assert_eq!(request(b"USER"), Err(ArgumentError::Missing));
-        assert_eq!(request(b"PASS"), Err(ArgumentError::Missing));
-        assert_eq!(request(b"USER a b"), Err(ArgumentError::Extra));
-        assert_eq!(request(b"USER  a"), Err(ArgumentError::Spacing));
-        assert_eq!(request(b"LIST 1 "), Err(ArgumentError::Spacing));
-        assert_eq!(request(b"APOP mrose"), Err(ArgumentError::Missing));
-        assert_eq!(request(b"APOP mrose c4c9"), Err(ArgumentError::BadDigest));
+        assert_eq!(request(b"USER"), Err(Error::MissingArgument));
+        assert_eq!(request(b"PASS"), Err(Error::MissingArgument));
+        assert_eq!(request(b"USER a b"), Err(Error::ExtraArgument));
+        assert_eq!(request(b"USER  a"), Err(Error::ArgumentSpacing));
+        assert_eq!(request(b"LIST 1 "), Err(Error::ArgumentSpacing));
+        assert_eq!(request(b"APOP mrose"), Err(Error::MissingArgument));
+        assert_eq!(request(b"APOP mrose c4c9"), Err(Error::BadDigest));
         assert_eq!(
             request(b"APOP mrose c4c9334bac560ecc979e58001b3e22fg"),
-            Err(ArgumentError::BadDigest)
+            Err(Error::BadDigest)
         );
-        assert_eq!(request(b"STAT 1"), Err(ArgumentError::Extra));
-        assert_eq!(request(b"NOOP x"), Err(ArgumentError::Extra));
-        assert_eq!(request(b"RSET x"), Err(ArgumentError::Extra));
-        assert_eq!(request(b"QUIT x"), Err(ArgumentError::Extra));
-        assert_eq!(request(b"CAPA x"), Err(ArgumentError::Extra));
-        assert_eq!(request(b"LIST 1 2"), Err(ArgumentError::Extra));
-        assert_eq!(request(b"UIDL 1 2"), Err(ArgumentError::Extra));
-        assert_eq!(request(b"RETR"), Err(ArgumentError::Missing));
-        assert_eq!(request(b"DELE"), Err(ArgumentError::Missing));
-        assert_eq!(request(b"TOP 1"), Err(ArgumentError::Missing));
-        assert_eq!(request(b"TOP 1 2 3"), Err(ArgumentError::Extra));
+        assert_eq!(request(b"STAT 1"), Err(Error::ExtraArgument));
+        assert_eq!(request(b"NOOP x"), Err(Error::ExtraArgument));
+        assert_eq!(request(b"RSET x"), Err(Error::ExtraArgument));
+        assert_eq!(request(b"QUIT x"), Err(Error::ExtraArgument));
+        assert_eq!(request(b"CAPA x"), Err(Error::ExtraArgument));
+        assert_eq!(request(b"LIST 1 2"), Err(Error::ExtraArgument));
+        assert_eq!(request(b"UIDL 1 2"), Err(Error::ExtraArgument));
+        assert_eq!(request(b"RETR"), Err(Error::MissingArgument));
+        assert_eq!(request(b"DELE"), Err(Error::MissingArgument));
+        assert_eq!(request(b"TOP 1"), Err(Error::MissingArgument));
+        assert_eq!(request(b"TOP 1 2 3"), Err(Error::ExtraArgument));
         for bad in [
             "0",
             "-1",
@@ -1512,65 +1440,65 @@ mod tests {
         ] {
             assert_eq!(
                 request(format!("RETR {bad}").as_bytes()),
-                Err(ArgumentError::BadNumber),
+                Err(Error::BadNumber),
                 "{bad}"
             );
             assert_eq!(
                 request(format!("LIST {bad}").as_bytes()),
-                Err(ArgumentError::BadNumber),
+                Err(Error::BadNumber),
                 "{bad}"
             );
         }
         assert_eq!(request(b"RETR 4294967295"), Ok(Request::Retr(n(u32::MAX))));
         assert_eq!(request(b"RETR 007"), Ok(Request::Retr(n(7))));
-        assert_eq!(request(b"TOP 1 x"), Err(ArgumentError::BadNumber));
-        assert_eq!(request(b"TOP 1 4294967296"), Err(ArgumentError::BadNumber));
-        assert_eq!(request(b"DELE 0"), Err(ArgumentError::BadNumber));
-        assert_eq!(request(b"UIDL 0"), Err(ArgumentError::BadNumber));
+        assert_eq!(request(b"TOP 1 x"), Err(Error::BadNumber));
+        assert_eq!(request(b"TOP 1 4294967296"), Err(Error::BadNumber));
+        assert_eq!(request(b"DELE 0"), Err(Error::BadNumber));
+        assert_eq!(request(b"UIDL 0"), Err(Error::BadNumber));
     }
 
     #[test]
     fn command_errors() {
         assert_eq!(
             command(b""),
-            Err(ParseError::Command(CommandError::BadKeyword))
+            Err(Error::BadKeyword)
         );
         assert_eq!(
             command(b"RE 1"),
-            Err(ParseError::Command(CommandError::BadKeyword))
+            Err(Error::BadKeyword)
         );
         assert_eq!(
             command(b"RETRY 1"),
-            Err(ParseError::Command(CommandError::BadKeyword))
+            Err(Error::BadKeyword)
         );
         assert_eq!(
             command(b"RE\xc3\xa9 1"),
-            Err(ParseError::Command(CommandError::BadKeyword))
+            Err(Error::BadKeyword)
         );
         assert_eq!(
             command(b" RETR 1"),
-            Err(ParseError::Command(CommandError::BadKeyword))
+            Err(Error::BadKeyword)
         );
         assert_eq!(
             command(b"RETR\t1"),
-            Err(ParseError::Command(CommandError::BadCharacter))
+            Err(Error::BadCharacter)
         );
         assert_eq!(
             command(b"PASS a\rb"),
-            Err(ParseError::Command(CommandError::BadCharacter))
+            Err(Error::BadCharacter)
         );
         assert_eq!(
             command(b"PASS \xff"),
-            Err(ParseError::Command(CommandError::BadCharacter))
+            Err(Error::BadCharacter)
         );
         assert_eq!(
             command(b"PASS \x7f"),
-            Err(ParseError::Command(CommandError::BadCharacter))
+            Err(Error::BadCharacter)
         );
         let long = [b"PASS ".as_slice(), &[b'a'; 249]].concat();
         assert!(matches!(
             command(&long),
-            Err(ParseError::Framing(DecodeError::Line(
+            Err(Error::Framing(FrameError::Line(
                 codec::LineError::TooLong { .. }
             )))
         ));
@@ -1617,7 +1545,7 @@ mod tests {
         assert_eq!(request(b"STLS"), Ok(Request::Stls));
         assert_eq!(Request::Stls.to_bytes().unwrap(), b"STLS\r\n");
         assert!(status(b"+OK Begin TLS negotiation").unwrap().ok);
-        assert_eq!(request(b"STLS now"), Err(ArgumentError::Extra));
+        assert_eq!(request(b"STLS now"), Err(Error::ExtraArgument));
     }
 
     #[test]
@@ -1898,9 +1826,7 @@ mod tests {
         ] {
             assert_eq!(
                 status(line),
-                Err(ParseError::Reply(ReplyItemError::Reply(
-                    ReplyError::BadStatus
-                ))),
+                Err(Error::BadStatus),
                 "{line:?}"
             );
         }
@@ -1915,7 +1841,7 @@ mod tests {
         data.extend_from_slice(b"\r\n.\r\n");
         assert!(matches!(
             Reply::parse(&data),
-            Err(ParseError::Framing(DecodeError::Line(_)))
+            Err(Error::Framing(FrameError::Line(_)))
         ));
         data.remove(5);
         assert!(Reply::parse(&data).is_ok());
@@ -1928,7 +1854,7 @@ mod tests {
         .concat();
         assert_eq!(
             Reply::parse(&big),
-            Err(ParseError::Framing(DecodeError::BodyTooLong))
+            Err(Error::Framing(FrameError::BodyTooLong))
         );
         for line in [b"0 12".as_slice(), b"1", b"1 x"] {
             assert!(ScanListing::parse(line).is_err());
@@ -1954,17 +1880,17 @@ mod tests {
         .concat();
         let expected = vec![
             Ok(Input::Command(command(b"NOOP").unwrap())),
-            Err(CommandError::LineTooLong),
-            Err(CommandError::BadKeyword),
+            Err(Error::LineTooLong),
+            Err(Error::BadKeyword),
             Ok(Input::Command(command(b"QUIT").unwrap())),
         ];
-        assert_eq!(decode_all(Commands::new, &wire), (expected, None));
-        contract::check_decode_with_alloc_limit(Commands::new, &wire, 2 * (MAX_AUTH_LINE + 2));
+        assert_eq!(decode_all(Inputs::new, &wire), (expected, None));
+        contract::check_decode_with_alloc_limit(Inputs::new, &wire, 2 * (MAX_AUTH_LINE + 2));
     }
 
     #[test]
     fn reply_errors_follow_the_expected_boundary() {
-        let mut replies = Replies::new();
+        let mut replies = Outputs::new();
         for multi in [false, true] {
             replies.expect(multi).unwrap();
         }
@@ -1972,7 +1898,7 @@ mod tests {
         let wire = b"+OK hi\r\nHELLO\r\n+OK\r\n";
         assert_eq!(stream.push(wire), wire.len());
         assert_eq!(stream.next(), Some(Ok(Ok(Output::Reply(Reply::ok("hi"))))));
-        let error = Fail::Protocol(DecodeError::Reply(ReplyError::BadStatus));
+        let error = Fail::Protocol(FrameError::BadStatus);
         assert_eq!(stream.next(), Some(Err(error)));
         assert_eq!(stream.next(), None);
         assert!(stream.failed().is_some());
@@ -2033,7 +1959,7 @@ mod tests {
             request.write(&mut wire).unwrap();
             contract::check_wire_value(request);
         }
-        let (items, error) = decode_all(Commands::new, &wire);
+        let (items, error) = decode_all(Inputs::new, &wire);
         assert_eq!(error, None);
         let got: Vec<_> = items
             .into_iter()
@@ -2045,7 +1971,7 @@ mod tests {
             })
             .collect();
         assert_eq!(got, requests);
-        contract::check_decode_with_alloc_limit(Commands::new, &wire, 2 * (MAX_AUTH_LINE + 2));
+        contract::check_decode_with_alloc_limit(Inputs::new, &wire, 2 * (MAX_AUTH_LINE + 2));
     }
 
     #[test]
@@ -2175,13 +2101,13 @@ mod tests {
         let wire = |n: usize| b"NOOP\r\n".repeat(n);
         let body = |n: usize| [b"+OK\r\n".to_vec(), b"a\r\n".repeat(n), b".\r\n".to_vec()].concat();
         fictionet::stdlib::codec::test_support::assert_linear("POP3 lines", 12_500, |n| {
-            let (items, error) = decode_all(Commands::new, &wire(n));
+            let (items, error) = decode_all(Inputs::new, &wire(n));
             assert_eq!(error, None);
             assert_eq!(items.len(), n);
             assert_eq!(Reply::parse(&body(n)).unwrap().lines().count(), n);
         });
         let (wire, body) = (wire(50_000), body(50_000));
-        contract::check_decode_with_alloc_limit(Commands::new, &wire, 2 * (MAX_AUTH_LINE + 2));
+        contract::check_decode_with_alloc_limit(Inputs::new, &wire, 2 * (MAX_AUTH_LINE + 2));
         contract::check_decode_with_alloc_limit(
             || reply_reader(true),
             &body,
@@ -2192,16 +2118,16 @@ mod tests {
     #[test]
     fn decoders_keep_bounded_buffers() {
         let wire = [vec![b'x'; 1 << 20], b"\r\nQUIT\r\n".to_vec()].concat();
-        let (items, error) = decode_all(Commands::new, &wire);
+        let (items, error) = decode_all(Inputs::new, &wire);
         assert_eq!(error, None);
         assert_eq!(
             items,
             vec![
-                Err(CommandError::LineTooLong),
+                Err(Error::LineTooLong),
                 Ok(Input::Command(command(b"QUIT").unwrap()))
             ]
         );
-        contract::check_decode_with_alloc_limit(Commands::new, &wire, 2 * (MAX_AUTH_LINE + 2));
+        contract::check_decode_with_alloc_limit(Inputs::new, &wire, 2 * (MAX_AUTH_LINE + 2));
         for multi in [false, true] {
             let make = || {
                 let mut r = reply_reader(multi);
@@ -2211,12 +2137,12 @@ mod tests {
             let wire = [b"+OK\r\n".to_vec(), vec![b'x'; 1 << 20], b"\r\n".to_vec()].concat();
             assert!(matches!(
                 decode_all(make, &wire).1,
-                Some(Fail::Protocol(DecodeError::Line(_)))
+                Some(Fail::Protocol(FrameError::Line(_)))
             ));
             contract::check_decode_with_alloc_limit(make, &wire, 2 * (MAX_AUTH_LINE + 2));
         }
         let many = b"NOOP\r\n".repeat(1 << 17);
-        contract::check_decode_with_alloc_limit(Commands::new, &many, 2 * (MAX_AUTH_LINE + 2));
+        contract::check_decode_with_alloc_limit(Inputs::new, &many, 2 * (MAX_AUTH_LINE + 2));
     }
 
     #[test]
@@ -2248,14 +2174,14 @@ mod tests {
             keyword: "USER".into(),
             argument: Some(" ".repeat(8 << 20)),
         };
-        assert_eq!(Request::from_command(&spaces), Err(ArgumentError::Spacing));
+        assert_eq!(Request::from_command(&spaces), Err(Error::ArgumentSpacing));
         let many = Command {
             keyword: "LIST".into(),
             argument: Some("1 ".repeat(1 << 20) + "1"),
         };
-        assert_eq!(Request::from_command(&many), Err(ArgumentError::Extra));
-        assert_eq!(request(b"TOP 1 2 3 "), Err(ArgumentError::Spacing));
-        assert_eq!(request(b"USER a b c d"), Err(ArgumentError::Extra));
+        assert_eq!(Request::from_command(&many), Err(Error::ExtraArgument));
+        assert_eq!(request(b"TOP 1 2 3 "), Err(Error::ArgumentSpacing));
+        assert_eq!(request(b"USER a b c d"), Err(Error::ExtraArgument));
         refused(&Reply::err("").with_code(&"A".repeat(16 << 20)));
         let reply = Reply::ok("").with_body(b"a\nb\r\nc".to_vec());
         let mut lines = reply.lines();
@@ -2340,7 +2266,7 @@ mod tests {
     #[test]
     fn auth_exchanges_read_as_lines() {
         let answer = "QUFB".repeat(1000);
-        let mut stream = Stream::new(Commands::new());
+        let mut stream = Stream::new(Inputs::new());
         let wire = format!("AUTH PLAIN\r\n{answer}\r\n*\r\nQUIT\r\n");
         assert_eq!(stream.push(wire.as_bytes()), wire.len());
         assert!(
@@ -2365,7 +2291,7 @@ mod tests {
         let mut stream = Stream::new(reply_reader(true));
         assert_eq!(stream.push(b"+OK\r\nx\r\n"), 8);
         assert_eq!(stream.next(), None);
-        assert_eq!(stream.decoder().expect_line(), Err(DecodeError::State));
+        assert_eq!(stream.decoder().expect_line(), Err(FrameError::State));
         assert_eq!(stream.push(b".\r\n"), 3);
         assert!(stream.next().unwrap().unwrap().is_ok());
         let make = || {
@@ -2376,7 +2302,7 @@ mod tests {
         let long = vec![b'+'; MAX_AUTH_LINE + 2];
         assert!(matches!(
             decode_all(make, &long).1,
-            Some(Fail::Protocol(DecodeError::Line(_)))
+            Some(Fail::Protocol(FrameError::Line(_)))
         ));
         contract::check_decode_with_alloc_limit(make, &long, 2 * (MAX_AUTH_LINE + 2));
     }
@@ -2440,7 +2366,7 @@ mod tests {
             for _ in 0..rng.index(5) {
                 mutate(&mut rng, &mut data);
             }
-            contract::check_decode_with_alloc_limit(Commands::new, &data, 2 * (MAX_AUTH_LINE + 2));
+            contract::check_decode_with_alloc_limit(Inputs::new, &data, 2 * (MAX_AUTH_LINE + 2));
             for multi in [false, true] {
                 contract::check_decode_with_alloc_limit(
                     || reply_reader(multi),

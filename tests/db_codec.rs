@@ -166,7 +166,7 @@ fn mongodb_chunked_round_trip() {
         },
     ];
     round_trip(
-        || mongodb::Frames::with_limit(128).map(Result::unwrap),
+        || mongodb::Messages::with_limit(128).map(Result::unwrap),
         &values,
     );
 }
@@ -174,21 +174,21 @@ fn mongodb_chunked_round_trip() {
 #[test]
 fn mongodb_refuses_length_from_header() {
     header_refusal(
-        || mongodb::Frames::with_limit(32),
+        || mongodb::Messages::with_limit(32),
         &33i32.to_le_bytes(),
-        mongodb::MessageError::Length(33),
+        mongodb::Error::Length(33),
     );
     let length = mongodb::MAX_MESSAGE_SIZE as i32 + 1;
     header_refusal(
-        mongodb::Frames::new,
+        mongodb::Messages::new,
         &length.to_le_bytes(),
-        mongodb::MessageError::Length(length),
+        mongodb::Error::Length(length),
     );
 }
 
 #[test]
 fn mongodb_truncated_frame_at_eof() {
-    eof_at_every_prefix(|| mongodb::Frames::new().map(Result::unwrap), mongo_ping());
+    eof_at_every_prefix(|| mongodb::Messages::new().map(Result::unwrap), mongo_ping());
 }
 
 #[test]
@@ -198,7 +198,7 @@ fn mongodb_wire_is_exact_and_transactional() {
     let joined = [bytes.as_slice(), &[0xff]].concat();
     assert_eq!(
         <mongodb::Message as Wire>::parse(&joined),
-        Err(mongodb::MessageError::Trailing)
+        Err(mongodb::Error::Trailing)
     );
     let mongodb::Body::Msg(mut msg) = value.body else {
         panic!("expected OP_MSG")
@@ -238,13 +238,13 @@ fn mongodb_body_recovery_and_terminal_failure() {
     bad.extend_from_slice(&[0; 4]); // No body section.
     let mut input = bad.clone();
     Wire::write(&good, &mut input).unwrap();
-    contract::check_decode(mongodb::Frames::new, &input);
+    contract::check_decode(mongodb::Messages::new, &input);
 
-    let mut stream = Stream::new(mongodb::Frames::new());
+    let mut stream = Stream::new(mongodb::Messages::new());
     assert_eq!(stream.push(&input), input.len());
     assert_eq!(
         stream.next(),
-        Some(Ok(Err(mongodb::MessageError::BodyCount(0))))
+        Some(Ok(Err(mongodb::Error::BodyCount(0))))
     );
     assert!(stream.failed().is_none());
     assert_eq!(stream.offset(), bad.len() as u64);
@@ -255,7 +255,7 @@ fn mongodb_body_recovery_and_terminal_failure() {
     assert_eq!(stream.offset(), input.len() as u64);
 
     assert_eq!(stream.push(&0i32.to_le_bytes()), 4);
-    let failure = Fail::Protocol(mongodb::MessageError::Length(0));
+    let failure = Fail::Protocol(mongodb::Error::Length(0));
     assert_eq!(stream.next(), Some(Err(failure.clone())));
     assert_eq!(stream.next(), None);
     assert_eq!(stream.failed(), Some(&failure));
@@ -271,30 +271,30 @@ fn mongodb_unknown_section_kind_ends_stream() {
     bad.extend_from_slice(&[0; 4]);
     bad.push(2);
     header_refusal(
-        mongodb::Frames::new,
+        mongodb::Messages::new,
         &bad,
-        mongodb::MessageError::SectionKind(2),
+        mongodb::Error::SectionKind(2),
     );
 }
 
 #[test]
 fn mysql_chunked_round_trip() {
     round_trip(
-        || mysql::Frames::with_limit(32),
+        || mysql::Packets::with_limit(32),
         &[
-            mysql::Frame {
+            mysql::Packet {
                 seq: 0,
                 payload: b"\x03SELECT 1".to_vec(),
             },
-            mysql::Frame {
+            mysql::Packet {
                 seq: 255,
                 payload: vec![],
             },
-            mysql::Frame {
+            mysql::Packet {
                 seq: 0,
                 payload: vec![0xff, 0, 7, 0x80],
             },
-            mysql::Frame {
+            mysql::Packet {
                 seq: 19,
                 payload: vec![0xa5; 32],
             },
@@ -305,22 +305,22 @@ fn mysql_chunked_round_trip() {
 #[test]
 fn mysql_refuses_length_from_header() {
     header_refusal(
-        || mysql::Frames::with_limit(8),
+        || mysql::Packets::with_limit(8),
         &[9, 0, 0, 7],
-        mysql::FrameError::TooLong(9),
+        mysql::Error::TooLong(9),
     );
     header_refusal(
-        || mysql::Frames::with_limit(0),
+        || mysql::Packets::with_limit(0),
         &[1, 0, 0, 0],
-        mysql::FrameError::TooLong(1),
+        mysql::Error::TooLong(1),
     );
 }
 
 #[test]
 fn mysql_truncated_frame_at_eof() {
     eof_at_every_prefix(
-        mysql::Frames::new,
-        mysql::Frame {
+        mysql::Packets::new,
+        mysql::Packet {
             seq: 255,
             payload: b"hello".to_vec(),
         },
@@ -329,25 +329,25 @@ fn mysql_truncated_frame_at_eof() {
 
 #[test]
 fn mysql_wire_is_exact_and_transactional() {
-    let value = mysql::Frame {
+    let value = mysql::Packet {
         seq: 7,
         payload: vec![0, 1, 2],
     };
     let bytes = exact_wire(&value);
     let joined = [bytes.as_slice(), &[0xff]].concat();
     assert_eq!(
-        <mysql::Frame as Wire>::parse(&joined),
-        Err(mysql::FrameParseError::Trailing)
+        <mysql::Packet as Wire>::parse(&joined),
+        Err(mysql::Error::Trailing)
     );
-    refused_write(&mysql::Frame {
+    refused_write(&mysql::Packet {
         seq: 7,
         payload: vec![0; mysql::MAX_PACKET_PAYLOAD + 1],
     });
-    let mut empty = mysql::Frames::with_limit(0);
+    let mut empty = mysql::Packets::with_limit(0);
     assert_eq!(
         empty.decode(&[0, 0, 0, 255], false),
         Ok(Step::Item(
-            mysql::Frame {
+            mysql::Packet {
                 seq: 255,
                 payload: vec![]
             },
@@ -359,14 +359,14 @@ fn mysql_wire_is_exact_and_transactional() {
 #[test]
 fn mysql_full_packet_and_message_assembly() {
     // A full physical packet requires a separate empty message terminator.
-    let full = mysql::Frame {
+    let full = mysql::Packet {
         seq: 255,
         payload: vec![0x42; mysql::MAX_PACKET_PAYLOAD],
     };
     let bytes = Wire::to_bytes(&full).unwrap();
     assert_eq!(bytes.len(), mysql::MAX_FRAME);
-    assert_eq!(<mysql::Frame as Wire>::parse(&bytes), Ok(full.clone()));
-    let mut stream = Stream::new(mysql::Frames::new());
+    assert_eq!(<mysql::Packet as Wire>::parse(&bytes), Ok(full.clone()));
+    let mut stream = Stream::new(mysql::Packets::new());
     assert_eq!(stream.push(&bytes), bytes.len());
     assert_eq!(stream.next(), Some(Ok(full.clone())));
     finish(&mut stream, |_| panic!("extra frame")).unwrap();
@@ -378,7 +378,7 @@ fn mysql_full_packet_and_message_assembly() {
     assert_eq!(stream.push(&[0, 0, 0, 0]), 4);
     assert_eq!(stream.next(), Some(Ok(mysql::Message { seq: 255, payload: full.payload })));
     assert_eq!(stream.held(), 0);
-    header_refusal(|| mysql::Messages::with_limit(0), &[1, 0, 0, 0], mysql::FrameError::TooLong(1));
+    header_refusal(|| mysql::Messages::with_limit(0), &[1, 0, 0, 0], mysql::Error::TooLong(1));
 }
 
 fn tds_packet() -> tds::Packet {
@@ -395,7 +395,7 @@ fn tds_packet() -> tds::Packet {
 #[test]
 fn tds_chunked_round_trip() {
     round_trip(
-        || tds::Frames::with_limit(32),
+        || tds::Packets::with_limit(32),
         &[
             tds_packet(),
             tds::Packet {
@@ -418,16 +418,16 @@ fn tds_chunked_round_trip() {
 #[test]
 fn tds_refuses_length_from_header() {
     header_refusal(
-        || tds::Frames::with_limit(16),
+        || tds::Packets::with_limit(16),
         &[1, 0, 0, 17],
-        tds::FrameError::TooLong(17),
+        tds::Error::TooLong(17),
     );
-    header_refusal(tds::Frames::new, &[1, 0, 0, 7], tds::FrameError::Length(7));
+    header_refusal(tds::Packets::new, &[1, 0, 0, 7], tds::Error::Length(7));
 }
 
 #[test]
 fn tds_truncated_frame_at_eof() {
-    eof_at_every_prefix(tds::Frames::new, tds_packet());
+    eof_at_every_prefix(tds::Packets::new, tds_packet());
 }
 
 #[test]
@@ -438,7 +438,7 @@ fn tds_wire_is_exact_and_transactional() {
     let joined = [bytes.as_slice(), &[0xff]].concat();
     assert_eq!(
         <tds::Packet as Wire>::parse(&joined),
-        Err(tds::PacketParseError::Trailing)
+        Err(tds::Error::Trailing)
     );
     let large = tds::Packet {
         data: vec![0; tds::MAX_PACKET - tds::HEADER_LEN + 1],
@@ -475,14 +475,14 @@ fn tds_message_assembly_and_terminal_failure() {
         spid: first.spid, data: b"abcdef".to_vec(),
     })));
     assert_eq!(stream.held(), 0);
-    header_refusal(|| tds::Messages::with_limit(6), &[1, 0, 0, 7], tds::FrameError::Length(7));
+    header_refusal(|| tds::Messages::with_limit(6), &[1, 0, 0, 7], tds::Error::Length(7));
 }
 
 #[test]
 fn git_chunked_round_trip() {
     use git_protocol::Packet;
     round_trip(
-        git_protocol::Frames::new,
+        git_protocol::Packets::new,
         &[
             Packet::Data(b"command=ls-refs\n".to_vec()),
             Packet::Delim,
@@ -498,26 +498,26 @@ fn git_chunked_round_trip() {
 #[test]
 fn git_refuses_length_from_header() {
     header_refusal(
-        git_protocol::Frames::new,
+        git_protocol::Packets::new,
         b"fff1",
-        git_protocol::PacketError::TooLong(65521),
+        git_protocol::Error::PacketTooLong(65521),
     );
     header_refusal(
-        git_protocol::Frames::new,
+        git_protocol::Packets::new,
         b"0003",
-        git_protocol::PacketError::Reserved,
+        git_protocol::Error::Reserved,
     );
     header_refusal(
-        git_protocol::Frames::new,
+        git_protocol::Packets::new,
         b"g",
-        git_protocol::PacketError::Header,
+        git_protocol::Error::Header,
     );
 }
 
 #[test]
 fn git_truncated_frame_at_eof() {
     eof_at_every_prefix(
-        git_protocol::Frames::new,
+        git_protocol::Packets::new,
         git_protocol::Packet::Data(b"hello\n".to_vec()),
     );
 }
@@ -537,7 +537,7 @@ fn git_wire_is_exact_and_transactional() {
         let joined = [bytes.as_slice(), b"0000"].concat();
         assert_eq!(
             <Packet as Wire>::parse(&joined),
-            Err(git_protocol::PacketParseError::Trailing)
+            Err(git_protocol::Error::Trailing)
         );
     }
     let upper = b"000Aabcdef";
@@ -554,15 +554,15 @@ fn git_wire_is_exact_and_transactional() {
 #[test]
 fn git_read_ahead_handoff_and_terminal_failure() {
     let bytes = b"0000".repeat(git_protocol::MAX_PACKET / 4 + 1);
-    let mut stream = Stream::new(git_protocol::Frames::new());
+    let mut stream = Stream::new(git_protocol::Packets::new());
     assert_eq!(stream.push(&bytes), git_protocol::MAX_PACKET);
     assert_eq!(stream.push(b"0000"), 0);
     assert_eq!(stream.next(), Some(Ok(git_protocol::Packet::Flush)));
     let (buffer, _) = stream.into_parts();
     assert_eq!(buffer.unread(), &bytes[4..git_protocol::MAX_PACKET]);
-    let mut stream = Stream::new(git_protocol::Frames::new());
+    let mut stream = Stream::new(git_protocol::Packets::new());
     assert_eq!(stream.push(b"0003PACK"), 8);
-    assert_eq!(stream.next(), Some(Err(Fail::Protocol(git_protocol::PacketError::Reserved))));
+    assert_eq!(stream.next(), Some(Err(Fail::Protocol(git_protocol::Error::Reserved))));
     assert_eq!(stream.next(), None);
     assert_eq!(stream.push(b"discarded"), 9);
     assert_eq!(stream.unread(), b"0003PACK");
@@ -579,7 +579,7 @@ fn sftp_packet() -> sftp::Packet {
 #[test]
 fn sftp_chunked_round_trip() {
     round_trip(
-        || sftp::Frames::with_limit(64),
+        || sftp::Packets::with_limit(64),
         &[
             sftp::Request::Init {
                 version: sftp::VERSION,
@@ -603,26 +603,26 @@ fn sftp_chunked_round_trip() {
 #[test]
 fn sftp_refuses_length_from_header() {
     header_refusal(
-        || sftp::Frames::with_limit(8),
+        || sftp::Packets::with_limit(8),
         &9u32.to_be_bytes(),
-        sftp::PacketError::TooLong(9),
+        sftp::Error::PacketTooLong(9),
     );
     header_refusal(
-        sftp::Frames::new,
+        sftp::Packets::new,
         &u32::MAX.to_be_bytes(),
-        sftp::PacketError::TooLong(u32::MAX),
+        sftp::Error::PacketTooLong(u32::MAX),
     );
     header_refusal(
-        || sftp::Frames::with_limit(0),
+        || sftp::Packets::with_limit(0),
         &1u32.to_be_bytes(),
-        sftp::PacketError::TooLong(1),
+        sftp::Error::PacketTooLong(1),
     );
-    header_refusal(sftp::Frames::new, &[0; 4], sftp::PacketError::Empty);
+    header_refusal(sftp::Packets::new, &[0; 4], sftp::Error::Empty);
 }
 
 #[test]
 fn sftp_truncated_frame_at_eof() {
-    eof_at_every_prefix(sftp::Frames::new, sftp_packet());
+    eof_at_every_prefix(sftp::Packets::new, sftp_packet());
 }
 
 #[test]
@@ -633,7 +633,7 @@ fn sftp_wire_is_exact_and_transactional() {
     let joined = [bytes.as_slice(), &[0xff]].concat();
     assert_eq!(
         <sftp::Packet as Wire>::parse(&joined),
-        Err(sftp::PacketParseError::Trailing)
+        Err(sftp::Error::PacketTrailing)
     );
     let large = sftp::Packet {
         kind: 0xff,
@@ -652,10 +652,10 @@ fn sftp_wire_is_exact_and_transactional() {
 
 #[test]
 fn sftp_limits_and_terminal_failure() {
-    let mut stream = Stream::new(sftp::Frames::with_limit(0));
+    let mut stream = Stream::new(sftp::Packets::with_limit(0));
     assert_eq!(stream.push(&[0, 0, 0, 1, 1]), 4);
     assert_eq!(stream.push(&[1]), 0);
-    assert_eq!(stream.next(), Some(Err(Fail::Protocol(sftp::PacketError::TooLong(1)))));
+    assert_eq!(stream.next(), Some(Err(Fail::Protocol(sftp::Error::PacketTooLong(1)))));
     assert_eq!(stream.next(), None);
     assert_eq!(stream.push(&[1; 9]), 9);
     assert_eq!(stream.unread(), [0, 0, 0, 1]);
@@ -663,30 +663,30 @@ fn sftp_limits_and_terminal_failure() {
 
 #[test]
 fn capacities_are_named_and_clamped() {
-    assert_eq!(mongodb::Frames::new(), mongodb::Frames::default());
-    assert_eq!(mysql::Frames::new(), mysql::Frames::default());
-    assert_eq!(tds::Frames::new(), tds::Frames::default());
-    assert_eq!(sftp::Frames::new(), sftp::Frames::default());
+    assert_eq!(mongodb::Messages::new(), mongodb::Messages::default());
+    assert_eq!(mysql::Packets::new(), mysql::Packets::default());
+    assert_eq!(tds::Packets::new(), tds::Packets::default());
+    assert_eq!(sftp::Packets::new(), sftp::Packets::default());
     assert_eq!(
-        git_protocol::Frames::new().capacity(),
+        git_protocol::Packets::new().capacity(),
         git_protocol::MAX_PACKET
     );
-    assert_eq!(mysql::Frames::new().capacity(), mysql::MAX_FRAME);
-    assert_eq!(sftp::Frames::new().capacity(), sftp::MAX_FRAME);
+    assert_eq!(mysql::Packets::new().capacity(), mysql::MAX_FRAME);
+    assert_eq!(sftp::Packets::new().capacity(), sftp::MAX_FRAME);
     for limit in [0, 1, 16, 4096, usize::MAX] {
-        let mongo = mongodb::Frames::with_limit(limit);
+        let mongo = mongodb::Messages::with_limit(limit);
         assert_eq!(
             mongo.limit(),
             limit.clamp(mongodb::HEADER_LEN, mongodb::MAX_MESSAGE_SIZE)
         );
         assert_eq!(mongo.capacity(), mongo.limit());
-        let mysql = mysql::Frames::with_limit(limit);
+        let mysql = mysql::Packets::with_limit(limit);
         assert_eq!(mysql.limit(), limit.min(mysql::MAX_PACKET_PAYLOAD));
         assert_eq!(mysql.capacity(), mysql::HEADER_LEN + mysql.limit());
-        let tds = tds::Frames::with_limit(limit);
+        let tds = tds::Packets::with_limit(limit);
         assert_eq!(tds.limit(), limit.clamp(tds::HEADER_LEN, tds::MAX_PACKET));
         assert_eq!(tds.capacity(), tds.limit());
-        let sftp = sftp::Frames::with_limit(limit);
+        let sftp = sftp::Packets::with_limit(limit);
         assert_eq!(sftp.limit(), limit.min(sftp::MAX_PACKET));
         assert_eq!(sftp.capacity(), sftp::LENGTH_LEN + sftp.limit());
     }
@@ -698,13 +698,13 @@ fn arbitrary_bytes_obey_decoder_and_wire_contracts() {
     for size in [0, 1, 3, 4, 7, 8, 16, 31, 64, 257] {
         let mut data = vec![0; size];
         rng.fill(&mut data);
-        contract::check_decode_with_alloc_limit(mongodb::Frames::new, &data, 2 * mongodb::MAX_MESSAGE_SIZE);
-        contract::check_decode_with_alloc_limit(mysql::Frames::new, &data, 2 * mysql::MAX_FRAME);
-        contract::check_decode_with_alloc_limit(tds::Frames::new, &data, 2 * tds::MAX_PACKET);
-        contract::check_decode_with_alloc_limit(git_protocol::Frames::new, &data, 2 * git_protocol::MAX_PACKET);
-        contract::check_decode_with_alloc_limit(sftp::Frames::new, &data, 2 * sftp::MAX_FRAME);
+        contract::check_decode_with_alloc_limit(mongodb::Messages::new, &data, 2 * mongodb::MAX_MESSAGE_SIZE);
+        contract::check_decode_with_alloc_limit(mysql::Packets::new, &data, 2 * mysql::MAX_FRAME);
+        contract::check_decode_with_alloc_limit(tds::Packets::new, &data, 2 * tds::MAX_PACKET);
+        contract::check_decode_with_alloc_limit(git_protocol::Packets::new, &data, 2 * git_protocol::MAX_PACKET);
+        contract::check_decode_with_alloc_limit(sftp::Packets::new, &data, 2 * sftp::MAX_FRAME);
         contract::check_wire::<mongodb::Message>(&data);
-        contract::check_wire::<mysql::Frame>(&data);
+        contract::check_wire::<mysql::Packet>(&data);
         contract::check_wire::<tds::Packet>(&data);
         contract::check_wire::<git_protocol::Packet>(&data);
         contract::check_wire::<sftp::Packet>(&data);
@@ -733,7 +733,7 @@ where
 fn large_frames_arrive_one_byte_at_a_time() {
     const PAYLOAD: usize = 64 * 1024;
     bytewise_frame(
-        || mongodb::Frames::with_limit(mongodb::HEADER_LEN + PAYLOAD).map(Result::unwrap),
+        || mongodb::Messages::with_limit(mongodb::HEADER_LEN + PAYLOAD).map(Result::unwrap),
         mongodb::Message {
             request_id: 1,
             response_to: 0,
@@ -744,25 +744,25 @@ fn large_frames_arrive_one_byte_at_a_time() {
         },
     );
     bytewise_frame(
-        || mysql::Frames::with_limit(PAYLOAD),
-        mysql::Frame {
+        || mysql::Packets::with_limit(PAYLOAD),
+        mysql::Packet {
             seq: 255,
             payload: vec![0xa5; PAYLOAD],
         },
     );
     bytewise_frame(
-        tds::Frames::new,
+        tds::Packets::new,
         tds::Packet {
             data: vec![0xa5; tds::MAX_PACKET - tds::HEADER_LEN],
             ..tds_packet()
         },
     );
     bytewise_frame(
-        git_protocol::Frames::new,
+        git_protocol::Packets::new,
         git_protocol::Packet::Data(vec![0xa5; git_protocol::MAX_DATA]),
     );
     bytewise_frame(
-        sftp::Frames::new,
+        sftp::Packets::new,
         sftp::Packet {
             kind: 0xff,
             body: vec![0xa5; sftp::MAX_PACKET - 1],
@@ -807,7 +807,7 @@ fn mongodb_writers_refuse_invalid_large_bodies() {
         ]))),
     };
     for flags in [0, 1 << 20] {
-        let error = mongodb::MessageError::Unwritable;
+        let error = mongodb::Error::Unwritable;
         let mongodb::Body::Msg(msg) = &mut value.body else {
             panic!("expected OP_MSG")
         };
@@ -823,10 +823,10 @@ fn mongodb_writers_refuse_invalid_large_bodies() {
 fn payload_readers_refuse_trailing_bytes() {
     let document = mongodb::Document::new();
     assert_eq!(mongodb::Document::parse(&[document.to_bytes().unwrap(), vec![0]].concat()),
-        Err(mongodb::BsonError::Trailing));
+        Err(mongodb::Error::BsonTrailing));
     let header = mongodb::Header { length: 16, request_id: 1, response_to: 0, op_code: -1 };
     assert_eq!(mongodb::Header::parse(&[header.to_bytes().unwrap(), vec![0]].concat()),
-        Err(mongodb::MessageError::Trailing));
+        Err(mongodb::Error::Trailing));
     let handshake = mysql::Handshake { auth_data: vec![1; 21], capabilities: mysql::capability::PLUGIN_AUTH,
         ..mysql::Handshake::default() };
     let response = mysql::HandshakeResponse {

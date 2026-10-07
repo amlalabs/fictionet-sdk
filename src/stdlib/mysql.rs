@@ -14,7 +14,7 @@
 //!
 //! Nothing here reads a socket. A world that plays a database server
 //! sends a [`Handshake`] inside a [`Message`]. It reads packets with
-//! [`Stream<Frames>`](fictionet::stdlib::codec::Stream), or uses [`Messages`] in that
+//! [`Stream<Packets>`](fictionet::stdlib::codec::Stream), or uses [`Messages`] in that
 //! driver to join split packets and check their sequence IDs. It reads
 //! each payload as a [`HandshakeResponse`] or [`Command`], then builds
 //! reply messages from [`OkPacket`], [`ErrPacket`], or [`ResultSet`].
@@ -22,7 +22,7 @@
 //! queries return. A client uses [`ResultReader`] to follow a result set.
 //!
 //! Every reader checks lengths. Bad bytes give an [`Error`] or a
-//! [`FrameError`]. Writers refuse fields that cannot be preserved.
+//! [`Error`]. Writers refuse fields that cannot be preserved.
 //!
 //! ```
 //! use fictionet::stdlib::codec::{Stream, Wire};
@@ -82,7 +82,7 @@ pub const HEADER_LEN: usize = 4;
 /// of it ends with an empty packet.
 pub const MAX_PACKET_PAYLOAD: usize = 0xff_ffff;
 /// The longest wire packet, including its four-byte header.
-/// This is the default input capacity of [`Frames`].
+/// This is the default input capacity of [`Packets`].
 pub const MAX_FRAME: usize = HEADER_LEN + MAX_PACKET_PAYLOAD;
 /// The longest message a [`Messages`] puts together, and the longest
 /// [`Message`] writes: 1 GiB, the largest `max_allowed_packet`
@@ -393,120 +393,55 @@ pub mod charset {
     pub const UTF8MB4_0900_AI_CI: u8 = 255;
 }
 
-/// Why a stream of packets cannot be read any further. A real server
-/// closes the connection.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FrameError {
-    /// EOF arrived before the final packet of a split message.
-    Incomplete,
-    /// The value cannot be written without changing it.
-    Unwritable,
-    /// A packet that continues a split message had the wrong sequence ID.
-    Sequence {
-        /// The ID the packet should have had: one more than the last.
-        expected: u8,
-        /// The ID it had.
-        got: u8,
-    },
-    /// A message or packet payload exceeds its size limit. For
-    /// [`Messages`], this is the assembled payload length, including
-    /// the packet that broke the limit. For [`Frames`], it is one
-    /// packet's payload length. Both exclude headers.
-    TooLong(usize),
-}
-
-impl std::fmt::Display for FrameError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            FrameError::Incomplete => f.write_str("incomplete split MySQL message"),
-            FrameError::Unwritable => f.write_str("value cannot be written without changing it"),
-            FrameError::Sequence { expected, got } => write!(f, "sequence ID {got}, expected {expected}"),
-            FrameError::TooLong(n) => write!(f, "message of at least {n} bytes is over the limit"),
-        }
-    }
-}
-
-impl std::error::Error for FrameError {}
-
-/// Why an exact [`Wire`] parse did not read one complete frame.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FrameParseError {
-    /// The packet length exceeds the frame limit.
-    Frame(FrameError),
-    /// The input ended before a complete frame, including empty input.
-    Truncated,
-    /// Bytes follow the first complete frame.
-    Trailing,
-}
-
-impl core::fmt::Display for FrameParseError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Frame(e) => e.fmt(f),
-            Self::Truncated => f.write_str("input ended before a complete MySQL frame"),
-            Self::Trailing => f.write_str("bytes follow the MySQL frame"),
-        }
-    }
-}
-
-impl core::error::Error for FrameParseError {
-    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
-        match self {
-            Self::Frame(e) => Some(e),
-            Self::Truncated | Self::Trailing => None,
-        }
-    }
-}
-
 /// One wire packet, before split messages are assembled.
 ///
 /// A full [`MAX_PACKET_PAYLOAD`] payload continues in the next packet.
 /// An empty packet can terminate such a message. This type preserves both
 /// forms and does not check sequence IDs across packets.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Frame {
+pub struct Packet {
     /// This packet's sequence ID.
     pub seq: u8,
     /// Payload bytes, without the four-byte header.
     pub payload: Vec<u8>,
 }
 
-impl Frame {
-    fn parse_prefix(b: &[u8], limit: usize) -> Result<Option<(Self, usize)>, FrameError> {
+impl Packet {
+    fn parse_prefix(b: &[u8], limit: usize) -> Result<Option<(Self, usize)>, Error> {
         let Some(&[a, b0, c, seq]) = b.get(..HEADER_LEN) else { return Ok(None) };
         let length = u32::from_le_bytes([a, b0, c, 0]);
-        let len = usize::try_from(length).map_err(|_| FrameError::TooLong(usize::MAX))?;
+        let len = usize::try_from(length).map_err(|_| Error::TooLong(usize::MAX))?;
         if len > limit.min(MAX_PACKET_PAYLOAD) {
-            return Err(FrameError::TooLong(len));
+            return Err(Error::TooLong(len));
         }
-        let end = HEADER_LEN.checked_add(len).ok_or(FrameError::TooLong(len))?;
+        let end = HEADER_LEN.checked_add(len).ok_or(Error::TooLong(len))?;
         Ok(b.get(HEADER_LEN..end).map(|payload| (Self { seq, payload: payload.to_vec() }, end)))
     }
 
 
 }
 
-impl Wire for Frame {
-    type ParseError = FrameParseError;
-    type WriteError = FrameError;
+impl Wire for Packet {
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads exactly one packet. Incomplete input and trailing bytes are errors.
-    fn parse(b: &[u8]) -> Result<Self, FrameParseError> {
-        match Frame::parse_prefix(b, MAX_PACKET_PAYLOAD).map_err(FrameParseError::Frame)? {
-            Some((frame, used)) if used == b.len() => Ok(frame),
-            Some(_) => Err(FrameParseError::Trailing),
-            None => Err(FrameParseError::Truncated),
+    fn parse(b: &[u8]) -> Result<Self, Error> {
+        match Packet::parse_prefix(b, MAX_PACKET_PAYLOAD)? {
+            Some((packet, used)) if used == b.len() => Ok(packet),
+            Some(_) => Err(Error::Trailing),
+            None => Err(Error::Truncated),
         }
     }
 
     /// Appends one packet. Refuses payloads above [`MAX_PACKET_PAYLOAD`].
     /// Leaves `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), FrameError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         let len = self.payload.len();
         if len > MAX_PACKET_PAYLOAD {
-            return Err(FrameError::Unwritable);
+            return Err(Error::Unwritable);
         }
-        let [a, b, c, _] = u32::try_from(len).map_err(|_| FrameError::Unwritable)?.to_le_bytes();
+        let [a, b, c, _] = u32::try_from(len).map_err(|_| Error::Unwritable)?.to_le_bytes();
         out.extend_from_slice(&[a, b, c, self.seq]);
         out.extend_from_slice(&self.payload);
         Ok(())
@@ -521,11 +456,11 @@ impl Wire for Frame {
 /// at EOF, so the stream reports truncation. Sequence IDs are preserved;
 /// message assembly and sequence checks remain in [`Messages`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Frames {
+pub struct Packets {
     limit: usize,
 }
 
-impl Frames {
+impl Packets {
     /// Reads packets with up to [`MAX_PACKET_PAYLOAD`] payload bytes.
     pub fn new() -> Self {
         Self::with_limit(MAX_PACKET_PAYLOAD)
@@ -543,34 +478,52 @@ impl Frames {
     }
 }
 
-impl Default for Frames {
+impl Default for Packets {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Decode for Frames {
-    type Item = Frame;
-    type Error = FrameError;
+impl Decode for Packets {
+    type Item = Packet;
+    type Error = Error;
     const NAME: &'static str = "MySQL";
 
     fn capacity(&self) -> usize {
         HEADER_LEN.saturating_add(self.limit)
     }
 
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, FrameError> {
-        Ok(match Frame::parse_prefix(input, self.limit)? {
-            Some((frame, used)) => Step::Item(frame, used),
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Packet>, Error> {
+        Ok(match Packet::parse_prefix(input, self.limit)? {
+            Some((packet, used)) => Step::Item(packet, used),
             None => Step::Need,
         })
     }
 }
 
-/// Why a payload is not the packet a reader expected.
+/// Why bytes are not the packet or message a reader expected, why a
+/// stream of packets cannot be read any further, or why a value cannot be
+/// written. A real server closes the connection on a stream fault.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
-    /// The payload ended inside a field, or a string had no closing NUL.
+    /// The input ended before a complete packet or message, including
+    /// empty input, or the payload ended inside a field, or a string had
+    /// no closing NUL.
     Truncated,
+    /// EOF arrived before the final packet of a split message.
+    Incomplete,
+    /// A packet that continues a split message had the wrong sequence ID.
+    Sequence {
+        /// The ID the packet should have had: one more than the last.
+        expected: u8,
+        /// The ID it had.
+        got: u8,
+    },
+    /// A message or packet payload exceeds its size limit. For
+    /// [`Messages`], this is the assembled payload length, including
+    /// the packet that broke the limit. For [`Packets`], it is one
+    /// packet's payload length. Both exclude headers.
+    TooLong(usize),
     /// The first byte is not the one this kind of packet starts with: a
     /// result set's column count of 0, a local file request on a
     /// connection without [`capability::LOCAL_FILES`], or a
@@ -591,7 +544,8 @@ pub enum Error {
     /// attributes with parameters, or a result set sent without its
     /// column definitions.
     Unsupported,
-    /// Bytes came after the last field where none may.
+    /// Bytes came after the last field where none may, or after one
+    /// complete packet or message.
     Trailing,
     /// A [`ResultReader`] got a packet after its last result had ended.
     Finished,
@@ -610,14 +564,17 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::Truncated => f.write_str("payload ended inside a field"),
+            Error::Truncated => f.write_str("input ended before a complete packet, or inside a field"),
+            Error::Incomplete => f.write_str("incomplete split MySQL message"),
+            Error::Sequence { expected, got } => write!(f, "sequence ID {got}, expected {expected}"),
+            Error::TooLong(n) => write!(f, "message of at least {n} bytes is over the limit"),
             Error::Header(b) => write!(f, "unexpected first byte {b:#04x}"),
             Error::LengthPrefix(b) => write!(f, "{b:#04x} does not start a length here"),
             Error::Version(v) => write!(f, "handshake protocol version {v}, not 10"),
             Error::FixedFields(n) => write!(f, "column fixed fields length {n}, not 12"),
             Error::TooMany => f.write_str("too many columns or attributes"),
             Error::Unsupported => f.write_str("packet layout not supported"),
-            Error::Trailing => f.write_str("bytes after the last field"),
+            Error::Trailing => f.write_str("bytes after the last field or packet"),
             Error::Finished => f.write_str("packet after the last result ended"),
             Error::Length(n) => write!(f, "length {n} does not fit the field"),
             Error::Value(v) => write!(f, "value {v} is not allowed in this field"),
@@ -663,20 +620,20 @@ impl Message {
 }
 
 impl Wire for Message {
-    type ParseError = FrameParseError;
-    type WriteError = FrameError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads exactly one assembled message. Refuses sequence gaps, excess
-    /// payload, missing final packets, incomplete frames, and trailing bytes.
-    fn parse(bytes: &[u8]) -> Result<Self, FrameParseError> {
+    /// payload, missing final packets, incomplete packets, and trailing bytes.
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         let mut decoder = Messages::new();
         let mut rest = bytes;
         loop {
-            match decoder.decode(rest, true).map_err(FrameParseError::Frame)? {
+            match decoder.decode(rest, true)? {
                 Step::Skip(used) => rest = &rest[used..],
                 Step::Item(value, used) if used == rest.len() => return Ok(value),
-                Step::Item(_, _) => return Err(FrameParseError::Trailing),
-                Step::Need | Step::End => return Err(FrameParseError::Truncated),
+                Step::Item(_, _) => return Err(Error::Trailing),
+                Step::Need | Step::End => return Err(Error::Truncated),
             }
         }
     }
@@ -684,9 +641,9 @@ impl Wire for Message {
     /// Appends packets with consecutive sequence IDs and the required
     /// short or empty final packet. Refuses payloads above [`MAX_MESSAGE`]
     /// before changing the destination.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), FrameError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         if self.payload.len() > MAX_MESSAGE {
-            return Err(FrameError::Unwritable);
+            return Err(Error::Unwritable);
         }
         put_packets(out, self.seq, &self.payload);
         Ok(())
@@ -742,24 +699,24 @@ impl Default for Messages {
 
 impl Decode for Messages {
     type Item = Message;
-    type Error = FrameError;
+    type Error = Error;
     const NAME: &'static str = "MySQL messages";
 
     fn capacity(&self) -> usize { HEADER_LEN + self.limit.min(MAX_PACKET_PAYLOAD) }
     fn held(&self) -> usize { self.partial.as_ref().map_or(0, |p| p.2.len()) }
 
-    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Message>, FrameError> {
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Message>, Error> {
         let Some(&[a, b, c, seq]) = input.get(..HEADER_LEN) else {
-            if eof && input.is_empty() && self.partial.is_some() { return Err(FrameError::Incomplete); }
+            if eof && input.is_empty() && self.partial.is_some() { return Err(Error::Incomplete); }
             return Ok(Step::Need);
         };
         let length = usize::from(a) | usize::from(b) << 8 | usize::from(c) << 16;
         if let Some((_, last, _)) = &self.partial {
             let expected = last.wrapping_add(1);
-            if seq != expected { return Err(FrameError::Sequence { expected, got: seq }); }
+            if seq != expected { return Err(Error::Sequence { expected, got: seq }); }
         }
         let total = self.held().saturating_add(length);
-        if total > self.limit { return Err(FrameError::TooLong(total)); }
+        if total > self.limit { return Err(Error::TooLong(total)); }
         let used = HEADER_LEN + length;
         let Some(payload) = input.get(HEADER_LEN..used) else { return Ok(Step::Need) };
         let (first, mut bytes) = match self.partial.take() {
@@ -768,7 +725,7 @@ impl Decode for Messages {
         };
         if total > bytes.capacity() {
             let target = total.max(bytes.capacity().saturating_mul(2)).min(self.limit);
-            bytes.try_reserve_exact(target.saturating_sub(bytes.len())).map_err(|_| FrameError::TooLong(total))?;
+            bytes.try_reserve_exact(target.saturating_sub(bytes.len())).map_err(|_| Error::TooLong(total))?;
         }
         bytes.extend_from_slice(payload);
         if length < MAX_PACKET_PAYLOAD { return Ok(Step::Item(Message { seq: first, payload: bytes }, used)); }
@@ -2734,13 +2691,13 @@ mod tests {
         assert_eq!(stream.next(), Some(Ok(full)));
         let mut bad = bytes.clone();
         *bad.last_mut().unwrap() = 9;
-        assert_eq!(decode_all(Messages::new, &bad).1, Some(Fail::Protocol(FrameError::Sequence { expected: 4, got: 9 })));
-        assert_eq!(decode_all(Messages::new, &bytes[..bytes.len() - 4]).1, Some(Fail::Protocol(FrameError::Incomplete)));
+        assert_eq!(decode_all(Messages::new, &bad).1, Some(Fail::Protocol(Error::Sequence { expected: 4, got: 9 })));
+        assert_eq!(decode_all(Messages::new, &bytes[..bytes.len() - 4]).1, Some(Fail::Protocol(Error::Incomplete)));
     }
 
     #[test]
     fn message_limits_and_stream() {
-        assert_eq!(decode_all(|| Messages::with_limit(10), &[11, 0, 0, 0]).1, Some(Fail::Protocol(FrameError::TooLong(11))));
+        assert_eq!(decode_all(|| Messages::with_limit(10), &[11, 0, 0, 0]).1, Some(Fail::Protocol(Error::TooLong(11))));
         assert_eq!(Messages::with_limit(10).decode(&[10, 0, 0, 0], false), Ok(Step::Need));
         assert_eq!(Messages::with_limit(usize::MAX).limit(), MAX_MESSAGE);
         let messages = vec![Message { seq: 0, payload: vec![] }, Message { seq: 1, payload: b"abc".to_vec() }];
@@ -2771,8 +2728,8 @@ mod tests {
         ] {
             assert!(!e.to_string().is_empty());
         }
-        assert!(!FrameError::TooLong(5).to_string().is_empty());
-        assert!(!FrameError::Sequence { expected: 1, got: 2 }.to_string().is_empty());
+        assert!(!Error::TooLong(5).to_string().is_empty());
+        assert!(!Error::Sequence { expected: 1, got: 2 }.to_string().is_empty());
     }
 
     // Regressions for an outside review of this module.
@@ -2783,7 +2740,7 @@ mod tests {
         let mut big = vec![17, 0, 0, 0];
         big.resize(1 << 20, 0);
         assert_eq!(stream.push(&big), 16 + HEADER_LEN);
-        assert_eq!(stream.next(), Some(Err(Fail::Protocol(FrameError::TooLong(17)))));
+        assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::TooLong(17)))));
         assert_eq!(stream.next(), None);
         let bytes = [1, 0, 0, 0, b'x'].repeat(1000);
         contract::check_decode_with_alloc_limit(|| Messages::with_limit(16), &bytes, 2 * (16 + HEADER_LEN));
@@ -2794,10 +2751,10 @@ mod tests {
     #[test]
     fn writers_refuse_messages_over_the_limit() {
         let message = Message { seq: 0, payload: vec![0; MAX_MESSAGE + 1] };
-        assert_eq!(message.to_bytes(), Err(FrameError::Unwritable));
+        assert_eq!(message.to_bytes(), Err(Error::Unwritable));
         assert_eq!(message.packets(), (MAX_MESSAGE + 1) / MAX_PACKET_PAYLOAD + 1);
         let mut bytes = vec![7];
-        assert_eq!(message.write(&mut bytes), Err(FrameError::Unwritable));
+        assert_eq!(message.write(&mut bytes), Err(Error::Unwritable));
         assert_eq!(bytes, [7]);
     }
 
@@ -3083,7 +3040,7 @@ mod tests {
             }
             let limit = 8 + rng.index(64);
             contract::check_decode_with_alloc_limit(|| Messages::with_limit(limit), &bytes, 2 * (limit + HEADER_LEN));
-            contract::check_decode_with_alloc_limit(|| Frames::with_limit(limit), &bytes, 2 * (limit + HEADER_LEN));
+            contract::check_decode_with_alloc_limit(|| Packets::with_limit(limit), &bytes, 2 * (limit + HEADER_LEN));
             contract::check_wire::<Message>(&bytes);
             for message in decode_all(|| Messages::with_limit(limit), &bytes).0 {
                 check_payload(&message.payload);

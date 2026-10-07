@@ -379,9 +379,11 @@ pub struct Packet {
     pub trailer: Vec<u8>,
 }
 
-/// Why a datagram is not an NTP packet this module can read.
+/// Why a datagram is not an NTP packet this module can read, why a value
+/// cannot be written, or why [`server_reply`] or [`kiss_reply`] would not
+/// answer a packet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ParseError {
+pub enum Error {
     /// A fixed field has the wrong byte count.
     FieldLength {
         /// The required byte count.
@@ -403,23 +405,33 @@ pub enum ParseError {
     /// The bytes after the header were not a multiple of 4, as extension
     /// fields and MACs always are. Holds how many there were.
     Trailer(usize),
+    /// The packet was not a request: neither a client's (mode 3) nor a
+    /// symmetric active peer's (mode 1). Holds its mode. Replies and
+    /// broadcasts get no answer.
+    NotClient(Mode),
+    /// The request's version was not 1 to 4, the versions RFC 4330 and RFC
+    /// 5905 define. Holds it. A reply copies the request's version, so it
+    /// would claim a protocol this module does not speak.
+    ReplyVersion(u8),
 }
 
-impl std::fmt::Display for ParseError {
+impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ParseError::FieldLength { want, got } => write!(f, "{got} bytes, expected {want}"),
-            ParseError::Unwritable => f.write_str("value cannot be written without changing it"),
-            ParseError::Short(n) => write!(f, "{n} bytes, shorter than the {HEADER_LEN}-byte NTP header"),
-            ParseError::Long(n) => write!(f, "{n} bytes, longer than the {MAX_PACKET} an NTP packet may have here"),
-            ParseError::Version(v) => write!(f, "NTP version {v}, not 1 to 7"),
-            ParseError::Mode(m) => write!(f, "NTP mode {m}, not 1 to 5"),
-            ParseError::Trailer(n) => write!(f, "{n} bytes after the NTP header, not a multiple of 4"),
+            Error::FieldLength { want, got } => write!(f, "{got} bytes, expected {want}"),
+            Error::Unwritable => f.write_str("value cannot be written without changing it"),
+            Error::Short(n) => write!(f, "{n} bytes, shorter than the {HEADER_LEN}-byte NTP header"),
+            Error::Long(n) => write!(f, "{n} bytes, longer than the {MAX_PACKET} an NTP packet may have here"),
+            Error::Version(v) => write!(f, "NTP version {v}, not 1 to 7"),
+            Error::Mode(m) => write!(f, "NTP mode {m}, not 1 to 5"),
+            Error::Trailer(n) => write!(f, "{n} bytes after the NTP header, not a multiple of 4"),
+            Error::NotClient(m) => write!(f, "NTP mode {} packet, not a request (mode 3 or 1)", m.bits()),
+            Error::ReplyVersion(v) => write!(f, "NTP version {v} request, not 1 to 4"),
         }
     }
 }
 
-impl std::error::Error for ParseError {}
+impl std::error::Error for Error {}
 
 impl Packet {
     /// A version 4 client request sent at `transmit`, by the client's own
@@ -504,41 +516,17 @@ impl Default for ServerInfo {
     }
 }
 
-/// Why [`server_reply`] or [`kiss_reply`] would not answer a packet.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReplyError {
-    /// The packet was not a request: neither a client's (mode 3) nor a
-    /// symmetric active peer's (mode 1). Holds its mode. Replies and
-    /// broadcasts get no answer.
-    NotClient(Mode),
-    /// The request's version was not 1 to 4, the versions RFC 4330 and RFC
-    /// 5905 define. Holds it. A reply copies the request's version, so it
-    /// would claim a protocol this module does not speak.
-    Version(u8),
-}
-
-impl std::fmt::Display for ReplyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ReplyError::NotClient(m) => write!(f, "NTP mode {} packet, not a request (mode 3 or 1)", m.bits()),
-            ReplyError::Version(v) => write!(f, "NTP version {v} request, not 1 to 4"),
-        }
-    }
-}
-
-impl std::error::Error for ReplyError {}
-
 /// The mode a reply to `request` takes: server (4) for a client request
 /// (3), and symmetric passive (2) for a symmetric active peer (1), as RFC
 /// 4330, section 5, says. Only versions 1 to 4 are answered.
-fn reply_mode(request: &Packet) -> Result<Mode, ReplyError> {
+fn reply_mode(request: &Packet) -> Result<Mode, Error> {
     let mode = match request.mode {
         Mode::Client => Mode::Server,
         Mode::SymmetricActive => Mode::SymmetricPassive,
-        other => return Err(ReplyError::NotClient(other)),
+        other => return Err(Error::NotClient(other)),
     };
     if !(1..=VERSION).contains(&request.version) {
-        return Err(ReplyError::Version(request.version));
+        return Err(Error::ReplyVersion(request.version));
     }
     Ok(mode)
 }
@@ -558,7 +546,7 @@ pub fn server_reply(
     server: &ServerInfo,
     receive: Timestamp,
     transmit: Timestamp,
-) -> Result<Packet, ReplyError> {
+) -> Result<Packet, Error> {
     let mode = reply_mode(request)?;
     Ok(Packet {
         leap: server.leap,
@@ -583,7 +571,7 @@ pub fn server_reply(
 /// version [`server_reply`] would. The request's transmit time goes into
 /// all four timestamps, so the reply tells the client nothing about the
 /// server's clock.
-pub fn kiss_reply(request: &Packet, code: KissCode) -> Result<Packet, ReplyError> {
+pub fn kiss_reply(request: &Packet, code: KissCode) -> Result<Packet, Error> {
     let mode = reply_mode(request)?;
     let t = request.transmit;
     Ok(Packet {
@@ -609,26 +597,26 @@ fn be32(b: &[u8], i: usize) -> u32 {
 }
 
 impl Wire for Packet {
-    type ParseError = ParseError;
-    type WriteError = ParseError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads one NTP packet from a whole UDP datagram.
     /// Refuses invalid headers and lengths. Reads the whole input.
-    fn parse(b: &[u8]) -> Result<Packet, ParseError> {
+    fn parse(b: &[u8]) -> Result<Packet, Error> {
         if b.len() < HEADER_LEN {
-            return Err(ParseError::Short(b.len()));
+            return Err(Error::Short(b.len()));
         }
         if b.len() > MAX_PACKET {
-            return Err(ParseError::Long(b.len()));
+            return Err(Error::Long(b.len()));
         }
         let version = (b[0] >> 3) & 7;
         if version == 0 {
-            return Err(ParseError::Version(version));
+            return Err(Error::Version(version));
         }
-        let mode = Mode::from_bits(b[0] & 7).ok_or(ParseError::Mode(b[0] & 7))?;
+        let mode = Mode::from_bits(b[0] & 7).ok_or(Error::Mode(b[0] & 7))?;
         let trailer = &b[HEADER_LEN..];
         if !trailer.len().is_multiple_of(4) {
-            return Err(ParseError::Trailer(trailer.len()));
+            return Err(Error::Trailer(trailer.len()));
         }
         Ok(Packet {
             leap: Leap::from_bits(b[0] >> 6),
@@ -650,9 +638,9 @@ impl Wire for Packet {
 
     /// Appends the packet. Refuses versions outside 1 to 7, trailers above [`MAX_TRAILER`],
     /// and trailer lengths that are not multiples of four. Leaves the destination unchanged on error.
-    fn write(&self, dst: &mut Vec<u8>) -> Result<(), ParseError> {
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
         if !(1..=7).contains(&self.version) || self.trailer.len() > MAX_TRAILER || !self.trailer.len().is_multiple_of(4) {
-            return Err(ParseError::Unwritable);
+            return Err(Error::Unwritable);
         }
         let trailer = &self.trailer;
         let mut out = Vec::with_capacity(HEADER_LEN + trailer.len());
@@ -675,20 +663,20 @@ impl Wire for Packet {
 }
 
 impl Wire for KissCode {
-    type ParseError = ParseError;
-    type WriteError = ParseError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads exactly four bytes. Refuses short or trailing input.
-    fn parse(b: &[u8]) -> Result<Self, ParseError> {
-        let bytes = b.try_into().map_err(|_| ParseError::FieldLength { want: 4, got: b.len() })?;
+    fn parse(b: &[u8]) -> Result<Self, Error> {
+        let bytes = b.try_into().map_err(|_| Error::FieldLength { want: 4, got: b.len() })?;
         Ok(Self::from_bytes(bytes))
     }
 
     /// Appends four bytes. Refuses an Other value that names a defined code.
-    fn write(&self, dst: &mut Vec<u8>) -> Result<(), ParseError> {
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
         let bytes = self.octets();
         if Self::from_bytes(bytes) != *self {
-            return Err(ParseError::Unwritable);
+            return Err(Error::Unwritable);
         }
         dst.extend_from_slice(&bytes);
         Ok(())
@@ -696,19 +684,19 @@ impl Wire for KissCode {
 }
 
 impl Wire for Timestamp {
-    type ParseError = ParseError;
-    type WriteError = ParseError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads exactly eight bytes. Refuses short or trailing input.
-    fn parse(b: &[u8]) -> Result<Self, ParseError> {
+    fn parse(b: &[u8]) -> Result<Self, Error> {
         if b.len() != 8 {
-            return Err(ParseError::FieldLength { want: 8, got: b.len() });
+            return Err(Error::FieldLength { want: 8, got: b.len() });
         }
         Ok(Self::read(b, 0))
     }
 
     /// Appends seconds and fraction in network order. Refuses no values.
-    fn write(&self, dst: &mut Vec<u8>) -> Result<(), ParseError> {
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
         dst.extend_from_slice(&self.seconds.to_be_bytes());
         dst.extend_from_slice(&self.fraction.to_be_bytes());
         Ok(())
@@ -885,7 +873,7 @@ mod tests {
             assert_eq!(code.to_string(), std::str::from_utf8(&bytes).unwrap());
         }
         assert_eq!(KissCode::from_bytes(*b"XYZW"), KissCode::Other(*b"XYZW"));
-        assert_eq!(KissCode::Other(*b"DENY").to_bytes(), Err(ParseError::Unwritable));
+        assert_eq!(KissCode::Other(*b"DENY").to_bytes(), Err(Error::Unwritable));
         assert_eq!(KissCode::Other(*b"GPS\0").to_string(), "GPS\\x00");
     }
 
@@ -922,15 +910,15 @@ mod tests {
                 assert_eq!(r.unwrap().version, v);
                 assert_eq!(k.unwrap().version, v);
             } else {
-                assert_eq!(r, Err(ReplyError::Version(v)));
-                assert_eq!(k, Err(ReplyError::Version(v)));
-                assert!(!ReplyError::Version(v).to_string().is_empty());
+                assert_eq!(r, Err(Error::ReplyVersion(v)));
+                assert_eq!(k, Err(Error::ReplyVersion(v)));
+                assert!(!Error::ReplyVersion(v).to_string().is_empty());
             }
         }
         // A request built in code with version 0 is refused too.
         let mut req = Packet::client_request(t);
         req.version = 0;
-        assert_eq!(server_reply(&req, &ServerInfo::default(), t, t), Err(ReplyError::Version(0)));
+        assert_eq!(server_reply(&req, &ServerInfo::default(), t, t), Err(Error::ReplyVersion(0)));
     }
 
     #[test]
@@ -949,8 +937,8 @@ mod tests {
         for mode in [Mode::SymmetricPassive, Mode::Server, Mode::Broadcast] {
             p.mode = mode;
             let e = server_reply(&p, &ServerInfo::default(), Timestamp::ZERO, Timestamp::ZERO).unwrap_err();
-            assert_eq!(e, ReplyError::NotClient(mode));
-            assert_eq!(kiss_reply(&p, KissCode::Deny), Err(ReplyError::NotClient(mode)));
+            assert_eq!(e, Error::NotClient(mode));
+            assert_eq!(kiss_reply(&p, KissCode::Deny), Err(Error::NotClient(mode)));
             assert!(!e.to_string().is_empty());
         }
     }
@@ -958,29 +946,29 @@ mod tests {
     #[test]
     fn parse_errors() {
         let good = sample();
-        assert_eq!(Packet::parse(&[]), Err(ParseError::Short(0)));
-        assert_eq!(Packet::parse(&good[..47]), Err(ParseError::Short(47)));
+        assert_eq!(Packet::parse(&[]), Err(Error::Short(0)));
+        assert_eq!(Packet::parse(&good[..47]), Err(Error::Short(47)));
         let long = vec![0x23; MAX_PACKET + 4];
-        assert_eq!(Packet::parse(&long), Err(ParseError::Long(MAX_PACKET + 4)));
+        assert_eq!(Packet::parse(&long), Err(Error::Long(MAX_PACKET + 4)));
         let mut most = vec![0u8; MAX_PACKET];
         most[0] = 0x23;
         assert!(Packet::parse(&most).is_ok());
         let mut b = good.clone();
         b[0] = 0x04; // Version 0.
-        assert_eq!(Packet::parse(&b), Err(ParseError::Version(0)));
+        assert_eq!(Packet::parse(&b), Err(Error::Version(0)));
         for m in [0u8, 6, 7] {
             b[0] = 0x20 | m;
-            assert_eq!(Packet::parse(&b), Err(ParseError::Mode(m)));
+            assert_eq!(Packet::parse(&b), Err(Error::Mode(m)));
         }
         let mut b = good.clone();
         b.push(0);
-        assert_eq!(Packet::parse(&b), Err(ParseError::Trailer(21)));
+        assert_eq!(Packet::parse(&b), Err(Error::Trailer(21)));
         for e in [
-            ParseError::Short(1),
-            ParseError::Long(2000),
-            ParseError::Version(0),
-            ParseError::Mode(6),
-            ParseError::Trailer(3),
+            Error::Short(1),
+            Error::Long(2000),
+            Error::Version(0),
+            Error::Mode(6),
+            Error::Trailer(3),
         ] {
             assert!(!e.to_string().is_empty());
         }
@@ -992,9 +980,9 @@ mod tests {
         for n in 0..good.len() {
             let r = Packet::parse(&good[..n]);
             if n < HEADER_LEN {
-                assert_eq!(r, Err(ParseError::Short(n)), "{n} bytes");
+                assert_eq!(r, Err(Error::Short(n)), "{n} bytes");
             } else if !(n - HEADER_LEN).is_multiple_of(4) {
-                assert_eq!(r, Err(ParseError::Trailer(n - HEADER_LEN)), "{n} bytes");
+                assert_eq!(r, Err(Error::Trailer(n - HEADER_LEN)), "{n} bytes");
             } else {
                 assert_eq!(r.unwrap().to_bytes().unwrap(), &good[..n], "{n} bytes");
             }
@@ -1006,13 +994,13 @@ mod tests {
         let mut p = Packet::client_request(Timestamp::from_unix(5, 5));
         for version in [0, 8, 200] {
             p.version = version;
-            assert_eq!(p.to_bytes(), Err(ParseError::Unwritable));
+            assert_eq!(p.to_bytes(), Err(Error::Unwritable));
             contract::check_wire_value(&p);
         }
         p.version = 4;
         for len in [MAX_TRAILER + 5000, 23] {
             p.trailer = vec![9; len];
-            assert_eq!(p.to_bytes(), Err(ParseError::Unwritable));
+            assert_eq!(p.to_bytes(), Err(Error::Unwritable));
             contract::check_wire_value(&p);
         }
         p.trailer = vec![9; MAX_TRAILER];

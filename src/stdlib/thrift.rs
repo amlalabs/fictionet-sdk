@@ -23,7 +23,7 @@
 //! each frame's [`EncodedMessage`], and writes
 //! the reply's bytes back. Values are read without a schema, into a
 //! tree of [`Value`]s, so world code decides what each field number
-//! means. On a connection without frames, a [`Messages`] decoder takes
+//! means. On a connection without frames, an [`EncodedMessages`] decoder takes
 //! the bytes and gives back whole messages.
 //!
 //! Every reader checks lengths, counts and nesting against the limits
@@ -93,7 +93,7 @@ pub const MAX_VALUES: usize = 1 << 20;
 /// The deepest nesting of values. A message's body is at depth 1, its
 /// fields at depth 2, and so on. Apache Thrift uses the same default.
 pub const MAX_DEPTH: usize = 64;
-/// The longest message [`Messages`] reads or [`EncodedMessage`] reads and
+/// The longest message [`EncodedMessages`] reads or [`EncodedMessage`] reads and
 /// writes. [`Message::to_frame`] enforces this limit too. It is the same
 /// as [`MAX_FRAME`].
 pub const MAX_MESSAGE: usize = MAX_FRAME;
@@ -388,7 +388,7 @@ pub struct ValueBody<const COMPACT: bool, const TYPE: u8>(
 
 impl<const COMPACT: bool, const TYPE: u8> Wire for ValueBody<COMPACT, TYPE> {
     type ParseError = Error;
-    type WriteError = WriteError;
+    type WriteError = Error;
 
     /// Reads exactly one value at depth 1. Refuses invalid types or encodings,
     /// values over [`MAX_VALUE_LEN`], [`MAX_DEPTH`], or [`MAX_VALUES`], excess
@@ -405,8 +405,8 @@ impl<const COMPACT: bool, const TYPE: u8> Wire for ValueBody<COMPACT, TYPE> {
     /// Appends the value. Refuses a type mismatch, excess depth, counts or
     /// lengths, and compact empty maps with types other than [`Type::Byte`].
     /// Leaves `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
-        if Some(self.0.ty()) != Type::from_binary_code(TYPE) { return Err(WriteError::Unwritable); }
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        if Some(self.0.ty()) != Type::from_binary_code(TYPE) { return Err(Error::Unwritable); }
         let mut bytes = Vec::new();
         Writer::new(&mut bytes, COMPACT).value(&self.0, 1)?;
         out.extend_from_slice(&bytes);
@@ -486,7 +486,7 @@ impl Message {
         Ok((Message { name, kind, seq, body }, protocol, r.pos))
     }
 
-    fn encode(&self, protocol: Protocol) -> Result<Vec<u8>, WriteError> {
+    fn encode(&self, protocol: Protocol) -> Result<Vec<u8>, Error> {
         let mut out = Vec::new();
         let name = self.name.as_bytes();
         let kind = self.kind.code();
@@ -516,7 +516,7 @@ impl Message {
 
     /// Wraps this message in a transport frame using `protocol`. Refuses
     /// invalid values and messages longer than [`MAX_MESSAGE`].
-    pub fn to_frame(&self, protocol: Protocol) -> Result<Frame, WriteError> {
+    pub fn to_frame(&self, protocol: Protocol) -> Result<Frame, Error> {
         Ok(Frame(self.encode(protocol)?))
     }
 
@@ -549,7 +549,7 @@ pub struct EncodedMessage {
 
 impl Wire for EncodedMessage {
     type ParseError = Error;
-    type WriteError = WriteError;
+    type WriteError = Error;
 
     /// Reads exactly one message, identifying its protocol from the first
     /// byte. Replies should use that protocol. Refuses invalid headers or
@@ -564,13 +564,16 @@ impl Wire for EncodedMessage {
     /// Appends a message. Refuses invalid values, compact empty maps with
     /// types other than [`Type::Byte`], and messages over [`MAX_MESSAGE`].
     /// Leaves `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         out.extend_from_slice(&self.message.encode(self.protocol)?);
         Ok(())
     }
 }
 
-/// Why bytes are not a Thrift message or value.
+/// Why bytes are not a Thrift message, value or frame, or a value cannot
+/// be written so that it reads back. A frame fault from [`Frames`] ends the
+/// stream: the connection holds no more frames a reader can find, and a
+/// real server closes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     /// Bytes follow the complete wire value.
@@ -601,6 +604,15 @@ pub enum Error {
     TooMany,
     /// A message exceeds [`MAX_MESSAGE`] or a value exceeds [`MAX_VALUE_LEN`].
     TooLong,
+    /// A frame's length was negative or above the configured limit.
+    FrameLength(i32),
+    /// An exact frame parse found the input ended before a complete
+    /// frame, including empty input.
+    FrameTruncated,
+    /// An exact frame parse found bytes after the first complete frame.
+    FrameTrailing,
+    /// The value cannot be written without changing it.
+    Unwritable,
 }
 
 impl core::fmt::Display for Error {
@@ -619,52 +631,23 @@ impl core::fmt::Display for Error {
             Error::TooDeep => write!(f, "values nested deeper than {MAX_DEPTH}"),
             Error::TooMany => write!(f, "more than {MAX_VALUES} values"),
             Error::TooLong => f.write_str("message or value exceeds its size limit"),
+            Error::FrameLength(n) => write!(f, "frame length {n} is negative or over the limit"),
+            Error::FrameTruncated => f.write_str("input ended before a complete Thrift frame"),
+            Error::FrameTrailing => f.write_str("bytes follow the Thrift frame"),
+            Error::Unwritable => f.write_str("value cannot be written without changing it"),
         }
     }
 }
 
 impl core::error::Error for Error {}
 
-/// Why a value or message cannot be written so that it reads back.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WriteError {
-    /// The value cannot be written without changing it.
-    Unwritable,
-}
-
-impl core::fmt::Display for WriteError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("value cannot be written without changing it")
-    }
-}
-
-impl core::error::Error for WriteError {}
-
-/// Why bytes are not a frame. The connection holds no more frames a
-/// reader can find, and a real server closes it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FrameError {
-    /// The length was negative or above the configured limit.
-    Length(i32),
-}
-
-impl core::fmt::Display for FrameError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            FrameError::Length(n) => write!(f, "frame length {n} is negative or over the limit"),
-        }
-    }
-}
-
-impl core::error::Error for FrameError {}
-
-fn parse_frame_limited(b: &[u8], limit: usize) -> Result<Option<(&[u8], usize)>, FrameError> {
+fn parse_frame_limited(b: &[u8], limit: usize) -> Result<Option<(&[u8], usize)>, Error> {
     let Some(header) = b.get(..FRAME_HEADER_LEN) else {
         return Ok(None);
     };
     let n = i32::from_be_bytes([header[0], header[1], header[2], header[3]]);
     if n < 0 || n as usize > limit {
-        return Err(FrameError::Length(n));
+        return Err(Error::FrameLength(n));
     }
     let end = FRAME_HEADER_LEN + n as usize;
     match b.get(FRAME_HEADER_LEN..end) {
@@ -683,54 +666,24 @@ pub struct Frame(
     pub Vec<u8>,
 );
 
-/// Why an exact [`Wire`] parse did not read one complete Thrift frame.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FrameParseError {
-    /// The frame header is invalid.
-    Frame(FrameError),
-    /// The input ended before a complete frame, including empty input.
-    Truncated,
-    /// Bytes follow the first complete frame.
-    Trailing,
-}
-
-impl core::fmt::Display for FrameParseError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Frame(e) => e.fmt(f),
-            Self::Truncated => f.write_str("input ended before a complete Thrift frame"),
-            Self::Trailing => f.write_str("bytes follow the Thrift frame"),
-        }
-    }
-}
-
-impl core::error::Error for FrameParseError {
-    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
-        match self {
-            Self::Frame(e) => Some(e),
-            Self::Truncated | Self::Trailing => None,
-        }
-    }
-}
-
 impl Wire for Frame {
-    type ParseError = FrameParseError;
-    type WriteError = WriteError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads exactly one frame. Refuses negative or excess lengths,
     /// incomplete input, and trailing bytes.
-    fn parse(b: &[u8]) -> Result<Self, FrameParseError> {
-        match parse_frame_limited(b, MAX_FRAME).map_err(FrameParseError::Frame)? {
+    fn parse(b: &[u8]) -> Result<Self, Error> {
+        match parse_frame_limited(b, MAX_FRAME)? {
             Some((payload, used)) if used == b.len() => Ok(Self(payload.to_vec())),
-            Some(_) => Err(FrameParseError::Trailing),
-            None => Err(FrameParseError::Truncated),
+            Some(_) => Err(Error::FrameTrailing),
+            None => Err(Error::FrameTruncated),
         }
     }
 
     /// Appends the length prefix and payload. Refuses payloads over
     /// [`MAX_FRAME`] without changing `out`.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
-        if self.0.len() > MAX_FRAME { return Err(WriteError::Unwritable); }
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        if self.0.len() > MAX_FRAME { return Err(Error::Unwritable); }
         out.extend_from_slice(&(self.0.len() as u32).to_be_bytes());
         out.extend_from_slice(&self.0);
         Ok(())
@@ -743,7 +696,7 @@ impl Wire for Frame {
 /// plus [`Self::limit`]. Partial frames return [`Step::Need`], including at EOF.
 /// The stream reports truncation at EOF and framing errors once. Map frames
 /// through [`EncodedMessage::parse`] to receive body errors as items.
-/// This reads framed transport; [`Messages`] reads unframed transport.
+/// This reads framed transport; [`EncodedMessages`] reads unframed transport.
 ///
 /// ```
 /// use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
@@ -755,7 +708,7 @@ impl Wire for Frame {
 /// pump(&mut stream, &[0, 2, 7, 8], |frame| frames.push(frame))?;
 /// finish(&mut stream, |frame| frames.push(frame))?;
 /// assert_eq!(frames, [Frame(vec![7, 8])]);
-/// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::thrift::FrameError>>(())
+/// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::thrift::Error>>(())
 /// ```
 #[derive(Clone, Copy, Debug)]
 pub struct Frames {
@@ -788,14 +741,14 @@ impl Default for Frames {
 
 impl Decode for Frames {
     type Item = Frame;
-    type Error = FrameError;
+    type Error = Error;
     const NAME: &'static str = "Thrift framed transport";
 
     fn capacity(&self) -> usize {
         FRAME_HEADER_LEN.saturating_add(self.limit)
     }
 
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, FrameError> {
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, Error> {
         Ok(match parse_frame_limited(input, self.limit)? {
             Some((payload, used)) => Step::Item(Frame(payload.to_vec()), used),
             None => Step::Need,
@@ -815,11 +768,11 @@ impl Decode for Frames {
 ///
 /// ```
 /// use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
-/// use fictionet::stdlib::thrift::{EncodedMessage, Message, MessageType, Messages, Protocol};
+/// use fictionet::stdlib::thrift::{EncodedMessage, EncodedMessages, Message, MessageType, Protocol};
 ///
 /// let call = Message { name: "ping".into(), kind: MessageType::Call, seq: 1, body: vec![] };
 /// let bytes = EncodedMessage { message: call.clone(), protocol: Protocol::Compact }.to_bytes()?;
-/// let mut stream = Stream::new(Messages::new());
+/// let mut stream = Stream::new(EncodedMessages::new());
 /// let mut messages = Vec::new();
 /// pump(&mut stream, &bytes[..2], |item| messages.push(item))?;
 /// pump(&mut stream, &bytes[2..], |item| messages.push(item))?;
@@ -828,14 +781,14 @@ impl Decode for Frames {
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[derive(Debug)]
-pub struct Messages {
+pub struct EncodedMessages {
     pos: usize,
     tasks: Vec<Task>,
     compact: bool,
     values: usize,
 }
 
-impl Messages {
+impl EncodedMessages {
     /// Creates an unframed decoder with a scan stack bounded by [`MAX_DEPTH`].
     pub fn new() -> Self {
         // Reserve the whole stack now: Need may advance a scan but must not
@@ -879,7 +832,7 @@ impl Messages {
     }
 }
 
-impl Clone for Messages {
+impl Clone for EncodedMessages {
     fn clone(&self) -> Self {
         // Vec::clone drops spare capacity, which would let held storage grow on Need.
         let mut tasks = Vec::with_capacity(self.tasks.capacity());
@@ -888,13 +841,13 @@ impl Clone for Messages {
     }
 }
 
-impl Default for Messages {
+impl Default for EncodedMessages {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Decode for Messages {
+impl Decode for EncodedMessages {
     type Item = EncodedMessage;
     type Error = Error;
     const NAME: &'static str = "Thrift unframed transport";
@@ -1333,18 +1286,18 @@ impl<'o> Writer<'o> {
         self.raw(&[byte]);
     }
 
-    fn check(&self) -> Result<(), WriteError> {
-        if self.failed { Err(WriteError::Unwritable) } else { Ok(()) }
+    fn check(&self) -> Result<(), Error> {
+        if self.failed { Err(Error::Unwritable) } else { Ok(()) }
     }
 
-    fn enter(&mut self, depth: usize) -> Result<(), WriteError> {
+    fn enter(&mut self, depth: usize) -> Result<(), Error> {
         self.check()?;
         if depth > MAX_DEPTH {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         self.values += 1;
         if self.values > MAX_VALUES {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         self.check()
     }
@@ -1378,9 +1331,9 @@ impl<'o> Writer<'o> {
     }
 
     /// A length or count, after checking it against `limit`.
-    fn len(&mut self, n: usize, limit: usize) -> Result<(), WriteError> {
+    fn len(&mut self, n: usize, limit: usize) -> Result<(), Error> {
         if n > limit {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         if self.compact {
             self.varint(n as u64);
@@ -1390,7 +1343,7 @@ impl<'o> Writer<'o> {
         self.check()
     }
 
-    fn binary(&mut self, b: &[u8]) -> Result<(), WriteError> {
+    fn binary(&mut self, b: &[u8]) -> Result<(), Error> {
         self.len(b.len(), MAX_BINARY_LEN)?;
         self.raw(b);
         self.check()
@@ -1400,7 +1353,7 @@ impl<'o> Writer<'o> {
         if self.compact { ty.compact_code() } else { ty.binary_code() }
     }
 
-    fn value(&mut self, v: &Value, depth: usize) -> Result<(), WriteError> {
+    fn value(&mut self, v: &Value, depth: usize) -> Result<(), Error> {
         self.enter(depth)?;
         match v {
             Value::Bool(b) => self.byte(match (self.compact, *b) {
@@ -1427,7 +1380,7 @@ impl<'o> Writer<'o> {
 
     /// A struct's fields and its stop byte. The struct itself is at
     /// `depth`.
-    fn fields(&mut self, fields: &[Field], depth: usize) -> Result<(), WriteError> {
+    fn fields(&mut self, fields: &[Field], depth: usize) -> Result<(), Error> {
         let mut last: i16 = 0;
         for f in fields {
             if self.compact {
@@ -1459,13 +1412,13 @@ impl<'o> Writer<'o> {
         self.check()
     }
 
-    fn list(&mut self, l: &List, depth: usize) -> Result<(), WriteError> {
+    fn list(&mut self, l: &List, depth: usize) -> Result<(), Error> {
         let n = l.items.len();
         if n > MAX_CONTAINER_LEN {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         if l.items.iter().any(|v| v.ty() != l.elem) {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         let code = self.code(l.elem);
         if self.compact {
@@ -1485,16 +1438,16 @@ impl<'o> Writer<'o> {
         self.check()
     }
 
-    fn map(&mut self, m: &Map, depth: usize) -> Result<(), WriteError> {
+    fn map(&mut self, m: &Map, depth: usize) -> Result<(), Error> {
         let n = m.entries.len();
         if self.compact && n == 0 && (m.key != Type::Byte || m.value != Type::Byte) {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         if n > MAX_CONTAINER_LEN {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         if m.entries.iter().any(|(k, v)| k.ty() != m.key || v.ty() != m.value) {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         let (k, v) = (self.code(m.key), self.code(m.value));
         if self.compact {
@@ -1538,7 +1491,7 @@ mod tests {
     ];
     const PROTOCOLS: [Protocol; 3] = [Protocol::Binary, Protocol::BinaryOld, Protocol::Compact];
 
-    fn value_bytes(value: &Value, protocol: Protocol) -> Result<Vec<u8>, WriteError> {
+    fn value_bytes(value: &Value, protocol: Protocol) -> Result<Vec<u8>, Error> {
         let mut out = Vec::new();
         Writer::new(&mut out, protocol.compact()).value(value, 1)?;
         Ok(out)
@@ -1659,7 +1612,7 @@ mod tests {
         let m = Map { key: Type::I32, value: Type::Binary, entries: vec![] };
         let typed = ValueBody::<true, 13>(Value::Map(m));
         contract::check_wire_value(&typed);
-        assert_eq!(typed.to_bytes(), Err(WriteError::Unwritable));
+        assert_eq!(typed.to_bytes(), Err(Error::Unwritable));
         let empty = ValueBody::<true, 13>(Value::Map(Map { key: Type::Byte, value: Type::Byte, entries: vec![] }));
         contract::check_wire_value(&empty);
         assert_eq!(empty.to_bytes().unwrap(), [0]);
@@ -1789,7 +1742,7 @@ mod tests {
             let ok = nested(MAX_DEPTH);
             let b = value_bytes(&ok, p).unwrap();
             assert_eq!(Value::parse_prefix(p, Type::List, &b), Ok((ok, b.len())));
-            assert_eq!(value_bytes(&nested(MAX_DEPTH + 1), p), Err(WriteError::Unwritable));
+            assert_eq!(value_bytes(&nested(MAX_DEPTH + 1), p), Err(Error::Unwritable));
             // One more level by hand.
             let mut deeper = if p == Protocol::Compact { vec![0x19] } else { vec![15, 0, 0, 0, 1] };
             deeper.extend_from_slice(&b);
@@ -1799,7 +1752,7 @@ mod tests {
         let m = Message { body: vec![Field { id: 1, value: nested(MAX_DEPTH - 1) }], ..add_call() };
         assert!(EncodedMessage { message: m.clone(), protocol: Protocol::Compact }.to_bytes().is_ok());
         let m = Message { body: vec![Field { id: 1, value: nested(MAX_DEPTH) }], ..add_call() };
-        assert_eq!(EncodedMessage { message: m.clone(), protocol: Protocol::Compact }.to_bytes(), Err(WriteError::Unwritable));
+        assert_eq!(EncodedMessage { message: m.clone(), protocol: Protocol::Compact }.to_bytes(), Err(Error::Unwritable));
         // A boolean field counts too.
         let mut v = Value::Struct(vec![Field { id: 1, value: Value::Bool(true) }]);
         for _ in 2..MAX_DEPTH {
@@ -1808,7 +1761,7 @@ mod tests {
         let b = value_bytes(&v, Protocol::Compact).unwrap();
         assert!(Value::parse_prefix(Protocol::Compact, Type::Struct, &b).is_ok());
         let v = Value::Struct(vec![Field { id: 1, value: v }]);
-        assert_eq!(value_bytes(&v, Protocol::Compact), Err(WriteError::Unwritable));
+        assert_eq!(value_bytes(&v, Protocol::Compact), Err(Error::Unwritable));
     }
 
     #[test]
@@ -1822,7 +1775,7 @@ mod tests {
             } else {
                 ValueBody::<false, 12>(v.clone()).write(&mut out)
             };
-            assert_eq!(result, Err(WriteError::Unwritable));
+            assert_eq!(result, Err(Error::Unwritable));
             assert_eq!(out, [7]);
         }
         // Built by hand: two lists of half the limit each.
@@ -1870,27 +1823,27 @@ mod tests {
     fn write_errors() {
         for p in PROTOCOLS {
             let l = Value::List(List { elem: Type::I32, items: vec![Value::I32(1), Value::I64(1)] });
-            assert_eq!(value_bytes(&l, p), Err(WriteError::Unwritable));
+            assert_eq!(value_bytes(&l, p), Err(Error::Unwritable));
             let m =
                 Value::Map(Map { key: Type::I32, value: Type::I32, entries: vec![(Value::I32(1), Value::Bool(true))] });
-            assert_eq!(value_bytes(&m, p), Err(WriteError::Unwritable));
+            assert_eq!(value_bytes(&m, p), Err(Error::Unwritable));
             let long = Value::List(List { elem: Type::Byte, items: vec![Value::Byte(0); MAX_CONTAINER_LEN + 1] });
-            assert_eq!(value_bytes(&long, p), Err(WriteError::Unwritable));
+            assert_eq!(value_bytes(&long, p), Err(Error::Unwritable));
             let at = Value::List(List { elem: Type::Byte, items: vec![Value::Byte(0); MAX_CONTAINER_LEN] });
             let b = value_bytes(&at, p).unwrap();
             assert_eq!(Value::parse_prefix(p, Type::List, &b), Ok((at, b.len())));
             let entries = vec![(Value::Byte(0), Value::Byte(0)); MAX_CONTAINER_LEN + 1];
             let long = Value::Map(Map { key: Type::Byte, value: Type::Byte, entries });
-            assert_eq!(value_bytes(&long, p), Err(WriteError::Unwritable));
+            assert_eq!(value_bytes(&long, p), Err(Error::Unwritable));
         }
         let big = Value::Binary(vec![0; MAX_BINARY_LEN + 1]);
-        assert_eq!(value_bytes(&big, Protocol::Binary), Err(WriteError::Unwritable));
+        assert_eq!(value_bytes(&big, Protocol::Binary), Err(Error::Unwritable));
         let at = Value::Binary(vec![0; MAX_BINARY_LEN]);
         let b = ValueBody::<true, 11>(at.clone()).to_bytes().unwrap();
         assert_eq!(Value::parse_prefix(Protocol::Compact, Type::Binary, &b), Ok((at, b.len())));
         let m = Message { name: "x".repeat(MAX_BINARY_LEN + 1), ..add_call() };
-        assert_eq!(EncodedMessage { message: m.clone(), protocol: Protocol::BinaryOld }.to_bytes(), Err(WriteError::Unwritable));
-        assert_eq!(Frame(vec![0; MAX_FRAME + 1]).to_bytes(), Err(WriteError::Unwritable));
+        assert_eq!(EncodedMessage { message: m.clone(), protocol: Protocol::BinaryOld }.to_bytes(), Err(Error::Unwritable));
+        assert_eq!(Frame(vec![0; MAX_FRAME + 1]).to_bytes(), Err(Error::Unwritable));
         let f = Frame(vec![0; MAX_FRAME]).to_bytes().unwrap();
         assert_eq!(Frame::parse(&f).unwrap().0.len(), MAX_FRAME);
     }
@@ -1904,11 +1857,11 @@ mod tests {
         assert_eq!(Frame::parse(&bytes), Ok(value));
         for n in 0..bytes.len() {
             assert_eq!(Frames::new().decode(&bytes[..n], false), Ok(Step::Need), "{n} bytes");
-            assert_eq!(Frame::parse(&bytes[..n]), Err(FrameParseError::Truncated));
+            assert_eq!(Frame::parse(&bytes[..n]), Err(Error::FrameTruncated));
         }
         assert_eq!(Frame::parse(&[0; 4]), Ok(Frame(vec![])));
-        assert_eq!(Frame::parse(&[0xff; 4]), Err(FrameParseError::Frame(FrameError::Length(-1))));
-        assert_eq!(Frame::parse(&[0x00, 0xfa, 0x00, 0x01]), Err(FrameParseError::Frame(FrameError::Length(16_384_001))));
+        assert_eq!(Frame::parse(&[0xff; 4]), Err(Error::FrameLength(-1)));
+        assert_eq!(Frame::parse(&[0x00, 0xfa, 0x00, 0x01]), Err(Error::FrameLength(16_384_001)));
     }
 
     #[test]
@@ -1921,7 +1874,7 @@ mod tests {
         assert_eq!(decode_all(Frames::new, &bytes), (vec![a, b], None));
         let mut stream = Stream::new(Frames::new());
         assert_eq!(stream.push(&[0x80, 0, 0, 0]), 4);
-        assert_eq!(stream.next(), Some(Err(Fail::Protocol(FrameError::Length(i32::MIN)))));
+        assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::FrameLength(i32::MIN)))));
         assert_eq!(stream.push(&bytes), bytes.len());
         assert!(stream.next().is_none());
         assert_eq!(stream.buffered(), 4);
@@ -1941,8 +1894,8 @@ mod tests {
     }
 
     fn check_messages(bytes: &[u8]) {
-        contract::check_decode_with_alloc_limit(Messages::new, bytes, 2 * Messages::new().capacity());
-        contract::check_decode_with_held_limit(Messages::new, bytes, Messages::new().held());
+        contract::check_decode_with_alloc_limit(EncodedMessages::new, bytes, 2 * EncodedMessages::new().capacity());
+        contract::check_decode_with_held_limit(EncodedMessages::new, bytes, EncodedMessages::new().held());
         contract::check_wire::<EncodedMessage>(bytes);
         let mut rest = bytes;
         let mut want = Vec::new();
@@ -1956,7 +1909,7 @@ mod tests {
                 Err(error) => break error,
             }
         };
-        let (items, failure) = decode_all(Messages::new, bytes);
+        let (items, failure) = decode_all(EncodedMessages::new, bytes);
         assert_eq!(items, want);
         if end != Error::Truncated {
             assert_eq!(failure, Some(Fail::Protocol(end)));
@@ -1979,7 +1932,7 @@ mod tests {
             0x00, 0x40, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0f, 0xff,
         ];
         assert_eq!(EncodedMessage::parse(&b), Err(Error::Trailing));
-        let Step::Item(EncodedMessage { message: m, protocol: p }, used) = Messages::new().decode(&b, false).unwrap() else { panic!() };
+        let Step::Item(EncodedMessage { message: m, protocol: p }, used) = EncodedMessages::new().decode(&b, false).unwrap() else { panic!() };
         assert_eq!(EncodedMessage::parse(&b[..used]).unwrap().message, m);
         assert_eq!(p, Protocol::Compact);
         assert!(matches!(m.body[0].value, Value::Double(x) if x.is_nan()));
@@ -1999,9 +1952,9 @@ mod tests {
             want.push(EncodedMessage { message, protocol });
         }
         check_messages(&bytes);
-        assert_eq!(decode_all(Messages::new, &bytes), (want, None));
+        assert_eq!(decode_all(EncodedMessages::new, &bytes), (want, None));
         let a = EncodedMessage { message: add_call(), protocol: Protocol::Binary }.to_bytes().unwrap();
-        let mut stream = Stream::new(Messages::new());
+        let mut stream = Stream::new(EncodedMessages::new());
         assert_eq!(stream.push(&a[..5]), 5);
         assert!(stream.next().is_none());
         assert_eq!(stream.buffered(), 5);
@@ -2017,8 +1970,8 @@ mod tests {
             (&[0x82, 0x21, 0, 1, 0xff][..], Error::BadUtf8),
             (&[0x82, 0x21, 0, 0, 0x19, 0xf9, 0x05, 0x0e][..], Error::BadType(14)),
         ] {
-            assert_eq!(Messages::new().decode(bytes, false), Err(error));
-            assert_eq!(decode_all(Messages::new, bytes), (vec![], Some(Fail::Protocol(error))));
+            assert_eq!(EncodedMessages::new().decode(bytes, false), Err(error));
+            assert_eq!(decode_all(EncodedMessages::new, bytes), (vec![], Some(Fail::Protocol(error))));
             check_messages(bytes);
         }
         let bad = [0x82, 0x21, 0, 0, 0x19, 0xf9, 0x05, 0x0e];
@@ -2026,7 +1979,7 @@ mod tests {
         // An exact read checks its whole-input limit first. A stream can
         // reject the first byte before it reaches that limit.
         let oversized = vec![0x81; MAX_MESSAGE + 1];
-        assert_eq!(Messages::new().decode(&oversized, false), Err(Error::BadProtocol(0x81)));
+        assert_eq!(EncodedMessages::new().decode(&oversized, false), Err(Error::BadProtocol(0x81)));
         assert_eq!(EncodedMessage::parse(&oversized), Err(Error::TooLong));
     }
 
@@ -2047,7 +2000,7 @@ mod tests {
             let mut bytes = prefix.clone();
             bytes.extend_from_slice(tail);
             check_messages(&bytes);
-            assert_eq!(decode_all(Messages::new, &bytes), (want.clone(), Some(failure)));
+            assert_eq!(decode_all(EncodedMessages::new, &bytes), (want.clone(), Some(failure)));
         }
     }
 
@@ -2061,7 +2014,7 @@ mod tests {
         for (message, protocol, size) in [(dense, Protocol::Compact, 1), (binary, Protocol::Binary, 16)] {
             let bytes = EncodedMessage { message: message.clone(), protocol }.to_bytes().unwrap();
             let started = std::time::Instant::now();
-            let mut stream = Stream::new(Messages::new());
+            let mut stream = Stream::new(EncodedMessages::new());
             let mut got = Vec::new();
             for part in chunks(&bytes, &[size]) {
                 pump(&mut stream, part, |item| got.push(item)).unwrap();
@@ -2078,7 +2031,7 @@ mod tests {
         bytes.extend_from_slice(&(MAX_BINARY_LEN as u32).to_be_bytes());
         let overhead = bytes.len() + 1;
         bytes.resize(overhead + MAX_BINARY_LEN, 0);
-        let mut stream = Stream::new(Messages::new());
+        let mut stream = Stream::new(EncodedMessages::new());
         let result = chunks(&bytes, &[1 << 20]).try_for_each(|part| pump(&mut stream, part, |_| unreachable!()).map(|_| ()));
         assert_eq!(result, Err(Fail::Protocol(Error::TooLong)));
         assert!(stream.buffered() <= stream.decoder().capacity());
@@ -2088,7 +2041,7 @@ mod tests {
         };
         let bytes = EncodedMessage { message: message.clone(), protocol: Protocol::Binary }.to_bytes().unwrap();
         assert_eq!(bytes.len(), MAX_MESSAGE);
-        assert_eq!(decode_all(Messages::new, &bytes), (vec![EncodedMessage { message, protocol: Protocol::Binary }], None));
+        assert_eq!(decode_all(EncodedMessages::new, &bytes), (vec![EncodedMessage { message, protocol: Protocol::Binary }], None));
     }
 
     #[test]
@@ -2100,11 +2053,11 @@ mod tests {
         };
         let value = EncodedMessage { message, protocol: Protocol::Binary };
         contract::check_wire_value(&value);
-        assert_eq!(value.to_bytes(), Err(WriteError::Unwritable));
+        assert_eq!(value.to_bytes(), Err(Error::Unwritable));
         let mut bytes = vec![0x80, 1, 0, 1, 0, 0, 0, 3, b'a', b'd', b'd', 0, 0, 0, 1, 11, 0, 1];
         bytes.extend_from_slice(&(MAX_BINARY_LEN as u32).to_be_bytes());
         bytes.resize(bytes.len() + MAX_BINARY_LEN + 1, 0);
-        let mut stream = Stream::new(Messages::new());
+        let mut stream = Stream::new(EncodedMessages::new());
         let capacity = stream.decoder().capacity();
         assert_eq!(capacity, MAX_MESSAGE + 1);
         assert!(bytes.len() > capacity);
@@ -2123,7 +2076,7 @@ mod tests {
         };
         let bytes = EncodedMessage { message: message.clone(), protocol: Protocol::Binary }.to_bytes().unwrap();
         assert_eq!(bytes.len(), MAX_MESSAGE);
-        let mut stream = Stream::new(Messages::new());
+        let mut stream = Stream::new(EncodedMessages::new());
         assert_eq!(stream.push(&bytes), bytes.len());
         assert_eq!(stream.next(), Some(Ok(EncodedMessage { message, protocol: Protocol::Binary })));
         assert_eq!(stream.buffered(), 0);
@@ -2134,7 +2087,7 @@ mod tests {
         let message = add_call();
         for protocol in PROTOCOLS {
             let bytes = EncodedMessage { message: message.clone(), protocol }.to_bytes().unwrap();
-            let mut decoder = Messages::new();
+            let mut decoder = EncodedMessages::new();
             let held = decoder.held();
             for end in 0..bytes.len() {
                 assert_eq!(decoder.decode(&bytes[..end], false), Ok(Step::Need));
@@ -2153,7 +2106,7 @@ mod tests {
         for protocol in PROTOCOLS {
             let bytes = EncodedMessage { message: message.clone(), protocol }.to_bytes().unwrap();
             for (len, eof) in [(0, true), (2, false)] {
-                let mut decoder = Messages::new();
+                let mut decoder = EncodedMessages::new();
                 assert_eq!(decoder.decode(&bytes[..bytes.len() - 1], false), Ok(Step::Need));
                 assert_eq!(decoder.decode(&bytes[..len], eof), Ok(Step::Need));
                 assert_eq!(decoder.decode(&bytes, false), Ok(Step::Item(EncodedMessage { message: message.clone(), protocol }, bytes.len())));
@@ -2174,7 +2127,7 @@ mod tests {
             want.push(EncodedMessage { message, protocol });
         }
         check_messages(&bytes);
-        assert_eq!(decode_all(Messages::new, &bytes), (want, None));
+        assert_eq!(decode_all(EncodedMessages::new, &bytes), (want, None));
     }
 
     #[test]
@@ -2184,7 +2137,7 @@ mod tests {
             let mut bytes = vec![0x82, 0x21, 0, 0];
             bytes.extend(core::iter::repeat_n(0x1c, depth - 1));
             bytes.extend(core::iter::repeat_n(0, depth));
-            let mut decoder = Messages::new();
+            let mut decoder = EncodedMessages::new();
             let held = decoder.held();
             assert!(held > 0 && held <= 2 * MAX_DEPTH * core::mem::size_of::<Task>());
             for end in 0..bytes.len() {
@@ -2202,20 +2155,20 @@ mod tests {
                 assert_eq!(decoder.decode(&[], false), Ok(Step::Need));
                 assert!(matches!(decoder.decode(&bytes, false), Ok(Step::Item(_, n)) if n == bytes.len()));
             } else {
-                assert_eq!(Messages::new().decode(&bytes, false), Err(Error::TooDeep));
+                assert_eq!(EncodedMessages::new().decode(&bytes, false), Err(Error::TooDeep));
             }
-            contract::check_decode_with_held_limit(Messages::new, &bytes, held);
+            contract::check_decode_with_held_limit(EncodedMessages::new, &bytes, held);
         }
         for protocol in PROTOCOLS {
             let bytes = EncodedMessage { message: add_call(), protocol }.to_bytes().unwrap();
             for at in 0..bytes.len() {
                 let mut malformed = bytes.clone();
                 malformed[at] = 0xff;
-                contract::check_decode_with_alloc_limit(Messages::new, &malformed, 2 * Messages::new().capacity());
+                contract::check_decode_with_alloc_limit(EncodedMessages::new, &malformed, 2 * EncodedMessages::new().capacity());
             }
         }
         contract::check_decode_with_alloc_limit(
-            Messages::new, &[0x82, 0x21, 0, 0, 0x19, 0xf9, 0x05, 0x0e], 2 * Messages::new().capacity(),
+            EncodedMessages::new, &[0x82, 0x21, 0, 0, 0x19, 0xf9, 0x05, 0x0e], 2 * EncodedMessages::new().capacity(),
         );
     }
 
@@ -2242,8 +2195,8 @@ mod tests {
             assert_eq!(Type::from_compact_code(t.compact_code()), Some(t));
         }
         assert!(!Error::TooDeep.to_string().is_empty());
-        assert!(!WriteError::Unwritable.to_string().is_empty());
-        assert!(!FrameError::Length(-1).to_string().is_empty());
+        assert!(!Error::Unwritable.to_string().is_empty());
+        assert!(!Error::FrameLength(-1).to_string().is_empty());
     }
 
     fn random_type(r: &mut Lcg, depth: usize) -> Type {

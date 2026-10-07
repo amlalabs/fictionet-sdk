@@ -9,7 +9,7 @@
 //! OpenSSH and almost every other implementation speak.
 //!
 //! A world that plays a file server passes bytes from the SSH channel
-//! to [`Stream<Frames>`](fictionet::stdlib::codec::Stream), gets
+//! to [`Stream<Packets>`](fictionet::stdlib::codec::Stream), gets
 //! [`Packet`]s back, reads each one's [`Request`], and writes the bytes of
 //! a [`Response`] back to the channel. Which files exist, what they hold
 //! and who may touch them is up to world code.
@@ -20,7 +20,7 @@
 //! Writers leave the destination unchanged when a value cannot be written.
 //!
 //! ```
-//! use fictionet::stdlib::sftp::{Attrs, Frames, Packet, Request, Response, Status, VERSION};
+//! use fictionet::stdlib::sftp::{Attrs, Packet, Packets, Request, Response, Status, VERSION};
 //! use fictionet::stdlib::codec::{Stream, Wire};
 //!
 //! /// A server holding one file, `/motd`, 12 bytes long.
@@ -42,7 +42,7 @@
 //!     }
 //! }
 //!
-//! let mut stream = Stream::new(Frames::new());
+//! let mut stream = Stream::new(Packets::new());
 //! // INIT, version 3: length 5, type 1, then the version.
 //! assert_eq!(stream.push(&[0, 0, 0, 5, 1, 0, 0, 0, 3]), 9);
 //! let init = stream.next().unwrap().unwrap();
@@ -78,7 +78,7 @@ pub const MAX_PACKET: usize = 256 * 1024;
 /// The length field before each packet.
 pub const LENGTH_LEN: usize = 4;
 /// The longest wire packet, including its four-byte length field.
-/// This is the default input capacity of [`Frames`].
+/// This is the default input capacity of [`Packets`].
 pub const MAX_FRAME: usize = LENGTH_LEN + MAX_PACKET;
 /// The most bytes of file data one WRITE, DATA or EXTENDED packet may
 /// carry. A server should not answer a READ with more.
@@ -201,71 +201,17 @@ pub struct Packet {
     pub body: Vec<u8>,
 }
 
-/// Why bytes are not an SFTP packet. Either way, the channel holds no
-/// more packets a reader can find, and a real server closes it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PacketError {
-    /// The length field was 0, so there is no type byte.
-    Empty,
-    /// The length field was over the limit.
-    TooLong(u32),
-    /// The value cannot be written without changing it.
-    Unwritable,
-}
-
-impl std::fmt::Display for PacketError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PacketError::Unwritable => f.write_str("value cannot be written without changing it"),
-            PacketError::Empty => f.write_str("packet length 0, with no type byte"),
-            PacketError::TooLong(n) => write!(f, "packet length {n}, over the limit"),
-        }
-    }
-}
-
-impl std::error::Error for PacketError {}
-
-/// Why an exact [`Wire`] parse did not read one complete packet.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PacketParseError {
-    /// The packet length is invalid.
-    Frame(PacketError),
-    /// The input ended before a complete packet, including empty input.
-    Truncated,
-    /// Bytes follow the first complete packet.
-    Trailing,
-}
-
-impl core::fmt::Display for PacketParseError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Frame(e) => e.fmt(f),
-            Self::Truncated => f.write_str("input ended before a complete SFTP packet"),
-            Self::Trailing => f.write_str("bytes follow the SFTP packet"),
-        }
-    }
-}
-
-impl core::error::Error for PacketParseError {
-    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
-        match self {
-            Self::Frame(e) => Some(e),
-            Self::Truncated | Self::Trailing => None,
-        }
-    }
-}
-
 impl Packet {
-    fn parse_prefix(b: &[u8], limit: usize) -> Result<Option<(Packet, usize)>, PacketError> {
+    fn parse_prefix(b: &[u8], limit: usize) -> Result<Option<(Packet, usize)>, Error> {
         let limit = limit.min(MAX_PACKET);
         let Some(head) = b.get(..LENGTH_LEN) else { return Ok(None) };
         let length = u32::from_be_bytes([head[0], head[1], head[2], head[3]]);
         let n = usize::try_from(length).unwrap_or(usize::MAX);
         if n == 0 {
-            return Err(PacketError::Empty);
+            return Err(Error::Empty);
         }
         if n > limit {
-            return Err(PacketError::TooLong(length));
+            return Err(Error::PacketTooLong(length));
         }
         let Some(rest) = b.get(LENGTH_LEN..LENGTH_LEN + n) else { return Ok(None) };
         let packet = Packet { kind: rest[0], body: rest[1..].to_vec() };
@@ -285,25 +231,25 @@ impl Packet {
 }
 
 impl Wire for Packet {
-    type ParseError = PacketParseError;
-    type WriteError = PacketError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads exactly one packet. Incomplete input and trailing bytes are errors.
-    fn parse(b: &[u8]) -> Result<Self, PacketParseError> {
-        match Packet::parse_prefix(b, MAX_PACKET).map_err(PacketParseError::Frame)? {
+    fn parse(b: &[u8]) -> Result<Self, Error> {
+        match Packet::parse_prefix(b, MAX_PACKET)? {
             Some((packet, used)) if used == b.len() => Ok(packet),
-            Some(_) => Err(PacketParseError::Trailing),
-            None => Err(PacketParseError::Truncated),
+            Some(_) => Err(Error::PacketTrailing),
+            None => Err(Error::PacketTruncated),
         }
     }
 
     /// Appends at most [`MAX_FRAME`] bytes. Refuses oversized bodies
-    /// with [`PacketError::Unwritable`] before changing `out`.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), PacketError> {
+    /// with [`Error::Unwritable`] before changing `out`.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         let len = self.body.len().saturating_add(1);
-        let length = u32::try_from(len).map_err(|_| PacketError::Unwritable)?;
+        let length = u32::try_from(len).map_err(|_| Error::Unwritable)?;
         if len > MAX_PACKET {
-            return Err(PacketError::Unwritable);
+            return Err(Error::Unwritable);
         }
         out.extend_from_slice(&length.to_be_bytes());
         out.push(self.kind);
@@ -320,11 +266,11 @@ impl Wire for Packet {
 /// including at EOF, so the stream reports truncation. Packet bodies
 /// remain bytes for [`Request::from_packet`] or [`Response::from_packet`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Frames {
+pub struct Packets {
     limit: usize,
 }
 
-impl Frames {
+impl Packets {
     /// Reads packets whose type and body occupy at most [`MAX_PACKET`] bytes.
     pub fn new() -> Self {
         Self::with_limit(MAX_PACKET)
@@ -343,22 +289,22 @@ impl Frames {
     }
 }
 
-impl Default for Frames {
+impl Default for Packets {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Decode for Frames {
+impl Decode for Packets {
     type Item = Packet;
-    type Error = PacketError;
+    type Error = Error;
     const NAME: &'static str = "SFTP";
 
     fn capacity(&self) -> usize {
         LENGTH_LEN.saturating_add(self.limit)
     }
 
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Packet>, PacketError> {
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Packet>, Error> {
         Ok(match Packet::parse_prefix(input, self.limit)? {
             Some((packet, used)) => Step::Item(packet, used),
             None => Step::Need,
@@ -366,15 +312,25 @@ impl Decode for Frames {
     }
 }
 
-/// Why a packet's body is not the request or response its type says.
+/// Why bytes are not an SFTP packet, why a packet's body is not the
+/// request or response its type says, or why a value cannot be written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ParseError {
+pub enum Error {
+    /// The length field was 0, so there is no type byte. The channel
+    /// holds no more packets a reader can find, and a real server closes
+    /// it.
+    Empty,
+    /// The length field was over the limit. As with [`Error::Empty`], a
+    /// real server closes the channel.
+    PacketTooLong(u32),
+    /// The input ended before a complete packet, including empty input.
+    PacketTruncated,
+    /// Bytes follow the first complete packet.
+    PacketTrailing,
     /// The type is not one this reader knows: a response type given to
     /// [`Request::from_packet`], a request type given to [`Response::from_packet`], or
     /// a number version 3 does not define.
     UnknownType(u8),
-    /// The packet framing is invalid.
-    Packet(PacketParseError),
     /// The value cannot be written without changing it.
     Unwritable,
     /// The body ended inside a field.
@@ -392,34 +348,37 @@ pub enum ParseError {
     AttrFlags(u32),
 }
 
-impl ParseError {
+impl Error {
     /// The status a server answers a request it cannot read with:
     /// [`Status::OpUnsupported`] for an unknown type and
     /// [`Status::BadMessage`] for the rest.
     pub fn status(self) -> Status {
         match self {
-            ParseError::UnknownType(_) => Status::OpUnsupported,
+            Error::UnknownType(_) => Status::OpUnsupported,
             _ => Status::BadMessage,
         }
     }
 }
 
-impl std::fmt::Display for ParseError {
+impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ParseError::Packet(e) => e.fmt(f),
-            ParseError::Unwritable => f.write_str("value cannot be written without changing it"),
-            ParseError::UnknownType(t) => write!(f, "packet type {t} is not known here"),
-            ParseError::Truncated => f.write_str("the packet ended inside a field"),
-            ParseError::Trailing => f.write_str("bytes after the last field"),
-            ParseError::TooLong => f.write_str("a field or the body over its limit"),
-            ParseError::TooMany => f.write_str("a count over its limit"),
-            ParseError::AttrFlags(x) => write!(f, "attribute flags {x:#x} are not defined in version 3"),
+            Error::Empty => f.write_str("packet length 0, with no type byte"),
+            Error::PacketTooLong(n) => write!(f, "packet length {n}, over the limit"),
+            Error::PacketTruncated => f.write_str("input ended before a complete SFTP packet"),
+            Error::PacketTrailing => f.write_str("bytes follow the SFTP packet"),
+            Error::Unwritable => f.write_str("value cannot be written without changing it"),
+            Error::UnknownType(t) => write!(f, "packet type {t} is not known here"),
+            Error::Truncated => f.write_str("the packet ended inside a field"),
+            Error::Trailing => f.write_str("bytes after the last field"),
+            Error::TooLong => f.write_str("a field or the body over its limit"),
+            Error::TooMany => f.write_str("a count over its limit"),
+            Error::AttrFlags(x) => write!(f, "attribute flags {x:#x} are not defined in version 3"),
         }
     }
 }
 
-impl std::error::Error for ParseError {}
+impl std::error::Error for Error {}
 
 /// The status codes a STATUS response carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -549,10 +508,10 @@ impl Attrs {
         f
     }
 
-    fn read(r: &mut Reader<'_>) -> Result<Attrs, ParseError> {
+    fn read(r: &mut Reader<'_>) -> Result<Attrs, Error> {
         let flags = r.u32()?;
         if flags & !attr_flags::ALL != 0 {
-            return Err(ParseError::AttrFlags(flags));
+            return Err(Error::AttrFlags(flags));
         }
         let mut a = Attrs::default();
         if flags & attr_flags::SIZE != 0 {
@@ -570,7 +529,7 @@ impl Attrs {
         if flags & attr_flags::EXTENDED != 0 {
             let count = r.u32()?;
             if usize::try_from(count).map_or(true, |c| c > MAX_ATTR_EXTENSIONS) {
-                return Err(ParseError::TooMany);
+                return Err(Error::TooMany);
             }
             for _ in 0..count {
                 a.extended.push(r.extension()?);
@@ -579,8 +538,8 @@ impl Attrs {
         Ok(a)
     }
 
-    fn encode(&self, out: &mut Vec<u8>) -> Result<(), ParseError> {
-        if self.extended.len() > MAX_ATTR_EXTENSIONS { return Err(ParseError::Unwritable); }
+    fn encode(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        if self.extended.len() > MAX_ATTR_EXTENSIONS { return Err(Error::Unwritable); }
         put_u32(out, self.flags());
         if let Some(s) = self.size {
             out.extend_from_slice(&s.to_be_bytes());
@@ -621,7 +580,7 @@ pub struct NameEntry {
 }
 
 impl NameEntry {
-    fn encode(&self, out: &mut Vec<u8>) -> Result<(), ParseError> {
+    fn encode(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         put_str(out, &self.filename, MAX_PATH)?;
         put_str(out, &self.longname, MAX_PATH)?;
         self.attrs.encode(out)?;
@@ -716,9 +675,9 @@ pub enum Request {
 
 impl Request {
     /// Reads the request in `packet`. A server answers a request it cannot
-    /// read with the status [`ParseError::status`] gives, using
+    /// read with the status [`Error::status`] gives, using
     /// [`Packet::id`] for the id.
-    pub fn from_packet(packet: &Packet) -> Result<Request, ParseError> {
+    pub fn from_packet(packet: &Packet) -> Result<Request, Error> {
         use packet_type as t;
         let mut r = Reader::new(packet)?;
         if packet.kind == t::INIT {
@@ -727,7 +686,7 @@ impl Request {
             return Ok(Request::Init { version, extensions });
         }
         if !matches!(packet.kind, t::OPEN..=t::SYMLINK | t::EXTENDED) {
-            return Err(ParseError::UnknownType(packet.kind));
+            return Err(Error::UnknownType(packet.kind));
         }
         let id = r.u32()?;
         let req = match packet.kind {
@@ -753,7 +712,7 @@ impl Request {
                 let name = r.string(MAX_EXTENSION_NAME)?;
                 let data = r.rest();
                 if data.len() > MAX_DATA {
-                    return Err(ParseError::TooLong);
+                    return Err(Error::TooLong);
                 }
                 Request::Extended { id, name, data: data.to_vec() }
             }
@@ -816,7 +775,7 @@ impl Request {
     }
 
     /// Builds the request packet. Refuses fields or lists over their limits.
-    pub fn to_packet(&self) -> Result<Packet, ParseError> {
+    pub fn to_packet(&self) -> Result<Packet, Error> {
         let mut b = Vec::new();
         if let Some(id) = self.id() {
             put_u32(&mut b, id);
@@ -868,7 +827,7 @@ impl Request {
                 put_raw(&mut b, data, MAX_DATA)?;
             }
         }
-        if b.len() >= MAX_PACKET { return Err(ParseError::Unwritable); }
+        if b.len() >= MAX_PACKET { return Err(Error::Unwritable); }
         Ok(Packet { kind: self.kind(), body: b })
     }
 
@@ -912,7 +871,7 @@ impl Response {
     /// Reads the response in `packet`. A STATUS that stops after its code,
     /// as some old servers send, reads with an empty message and language
     /// tag.
-    pub fn from_packet(packet: &Packet) -> Result<Response, ParseError> {
+    pub fn from_packet(packet: &Packet) -> Result<Response, Error> {
         use packet_type as t;
         let mut r = Reader::new(packet)?;
         let resp = match packet.kind {
@@ -933,7 +892,7 @@ impl Response {
             t::NAME => {
                 let (id, count) = (r.u32()?, r.u32()?);
                 if usize::try_from(count).map_or(true, |c| c > MAX_NAMES) {
-                    return Err(ParseError::TooMany);
+                    return Err(Error::TooMany);
                 }
                 let mut names = Vec::new();
                 for _ in 0..count {
@@ -947,11 +906,11 @@ impl Response {
                 let id = r.u32()?;
                 let data = r.rest();
                 if data.len() > MAX_DATA {
-                    return Err(ParseError::TooLong);
+                    return Err(Error::TooLong);
                 }
                 Response::ExtendedReply { id, data: data.to_vec() }
             }
-            k => return Err(ParseError::UnknownType(k)),
+            k => return Err(Error::UnknownType(k)),
         };
         r.end()?;
         Ok(resp)
@@ -985,7 +944,7 @@ impl Response {
     }
 
     /// Builds the response packet. Refuses fields or lists over their limits.
-    pub fn to_packet(&self) -> Result<Packet, ParseError> {
+    pub fn to_packet(&self) -> Result<Packet, Error> {
         let mut b = Vec::new();
         if let Some(id) = self.id() {
             put_u32(&mut b, id);
@@ -996,7 +955,7 @@ impl Response {
                 put_extensions(&mut b, extensions)?;
             }
             Response::Status { status, message, language, .. } => {
-                if matches!(status, Status::Other(0..=8)) { return Err(ParseError::Unwritable); }
+                if matches!(status, Status::Other(0..=8)) { return Err(Error::Unwritable); }
                 put_u32(&mut b, status.code());
                 put_str(&mut b, message, MAX_TEXT)?;
                 put_str(&mut b, language, MAX_TEXT)?;
@@ -1004,7 +963,7 @@ impl Response {
             Response::Handle { handle, .. } => put_str(&mut b, handle, MAX_HANDLE)?,
             Response::Data { data, .. } => put_str(&mut b, data, MAX_DATA)?,
             Response::Name { names, .. } => {
-                if names.len() > MAX_NAMES { return Err(ParseError::Unwritable); }
+                if names.len() > MAX_NAMES { return Err(Error::Unwritable); }
                 put_u32(&mut b, names.len() as u32);
                 for n in names {
                     n.encode(&mut b)?;
@@ -1013,7 +972,7 @@ impl Response {
             Response::Attrs { attrs, .. } => attrs.encode(&mut b)?,
             Response::ExtendedReply { data, .. } => put_raw(&mut b, data, MAX_DATA)?,
         }
-        if b.len() >= MAX_PACKET { return Err(ParseError::Unwritable); }
+        if b.len() >= MAX_PACKET { return Err(Error::Unwritable); }
         Ok(Packet { kind: self.kind(), body: b })
     }
 
@@ -1027,55 +986,55 @@ struct Reader<'a> {
 impl<'a> Reader<'a> {
     /// A reader of `packet`'s body. A body longer than a packet can hold
     /// is refused, so whatever reads from it can be written again.
-    fn new(packet: &'a Packet) -> Result<Reader<'a>, ParseError> {
+    fn new(packet: &'a Packet) -> Result<Reader<'a>, Error> {
         if packet.body.len() >= MAX_PACKET {
-            return Err(ParseError::TooLong);
+            return Err(Error::TooLong);
         }
         Ok(Reader { b: &packet.body })
     }
 
-    fn take(&mut self, n: usize) -> Result<&'a [u8], ParseError> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
         if n > self.b.len() {
-            return Err(ParseError::Truncated);
+            return Err(Error::Truncated);
         }
         let (head, rest) = self.b.split_at(n);
         self.b = rest;
         Ok(head)
     }
 
-    fn u32(&mut self) -> Result<u32, ParseError> {
+    fn u32(&mut self) -> Result<u32, Error> {
         let b = self.take(4)?;
         Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
     }
 
-    fn u64(&mut self) -> Result<u64, ParseError> {
+    fn u64(&mut self) -> Result<u64, Error> {
         let b = self.take(8)?;
         Ok(u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
     }
 
     /// A string: a 4-byte length, then that many bytes, at most `max`.
-    fn string(&mut self, max: usize) -> Result<Vec<u8>, ParseError> {
+    fn string(&mut self, max: usize) -> Result<Vec<u8>, Error> {
         let n = usize::try_from(self.u32()?).unwrap_or(usize::MAX);
         if n > max {
-            return Err(ParseError::TooLong);
+            return Err(Error::TooLong);
         }
         Ok(self.take(n)?.to_vec())
     }
 
-    fn path(&mut self) -> Result<Vec<u8>, ParseError> {
+    fn path(&mut self) -> Result<Vec<u8>, Error> {
         self.string(MAX_PATH)
     }
 
-    fn handle(&mut self) -> Result<Vec<u8>, ParseError> {
+    fn handle(&mut self) -> Result<Vec<u8>, Error> {
         self.string(MAX_HANDLE)
     }
 
-    fn extension(&mut self) -> Result<Extension, ParseError> {
+    fn extension(&mut self) -> Result<Extension, Error> {
         Ok(Extension { name: self.string(MAX_EXTENSION_NAME)?, data: self.string(MAX_TEXT)? })
     }
 
     /// A string of any length that fits in the body, not copied.
-    fn raw_string(&mut self) -> Result<&'a [u8], ParseError> {
+    fn raw_string(&mut self) -> Result<&'a [u8], Error> {
         let n = usize::try_from(self.u32()?).unwrap_or(usize::MAX);
         self.take(n)
     }
@@ -1084,7 +1043,7 @@ impl<'a> Reader<'a> {
     /// to ignore extensions a reader does not know, so a pair over a
     /// limit, or past the first [`MAX_EXTENSIONS`], is skipped rather
     /// than refused. The body bounds what is read.
-    fn extensions(&mut self) -> Result<Vec<Extension>, ParseError> {
+    fn extensions(&mut self) -> Result<Vec<Extension>, Error> {
         let mut out = Vec::new();
         while !self.b.is_empty() {
             let (name, data) = (self.raw_string()?, self.raw_string()?);
@@ -1099,8 +1058,8 @@ impl<'a> Reader<'a> {
         std::mem::take(&mut self.b)
     }
 
-    fn end(&self) -> Result<(), ParseError> {
-        if self.b.is_empty() { Ok(()) } else { Err(ParseError::Trailing) }
+    fn end(&self) -> Result<(), Error> {
+        if self.b.is_empty() { Ok(()) } else { Err(Error::Trailing) }
     }
 }
 
@@ -1108,30 +1067,30 @@ fn put_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_be_bytes());
 }
 
-fn put_raw(out: &mut Vec<u8>, bytes: &[u8], max: usize) -> Result<(), ParseError> {
+fn put_raw(out: &mut Vec<u8>, bytes: &[u8], max: usize) -> Result<(), Error> {
     if bytes.len() > max || bytes.len() > (MAX_PACKET - 1).saturating_sub(out.len()) {
-        return Err(ParseError::Unwritable);
+        return Err(Error::Unwritable);
     }
     out.extend_from_slice(bytes);
     Ok(())
 }
 
-fn put_str(out: &mut Vec<u8>, bytes: &[u8], max: usize) -> Result<(), ParseError> {
+fn put_str(out: &mut Vec<u8>, bytes: &[u8], max: usize) -> Result<(), Error> {
     if bytes.len() > max || bytes.len().saturating_add(4) > (MAX_PACKET - 1).saturating_sub(out.len()) {
-        return Err(ParseError::Unwritable);
+        return Err(Error::Unwritable);
     }
     put_u32(out, bytes.len() as u32);
     out.extend_from_slice(bytes);
     Ok(())
 }
 
-fn put_extension(out: &mut Vec<u8>, extension: &Extension) -> Result<(), ParseError> {
+fn put_extension(out: &mut Vec<u8>, extension: &Extension) -> Result<(), Error> {
     put_str(out, &extension.name, MAX_EXTENSION_NAME)?;
     put_str(out, &extension.data, MAX_TEXT)
 }
 
-fn put_extensions(out: &mut Vec<u8>, extensions: &[Extension]) -> Result<(), ParseError> {
-    if extensions.len() > MAX_EXTENSIONS { return Err(ParseError::Unwritable); }
+fn put_extensions(out: &mut Vec<u8>, extensions: &[Extension]) -> Result<(), Error> {
+    if extensions.len() > MAX_EXTENSIONS { return Err(Error::Unwritable); }
     for extension in extensions { put_extension(out, extension)?; }
     Ok(())
 }
@@ -1139,20 +1098,20 @@ fn put_extensions(out: &mut Vec<u8>, extensions: &[Extension]) -> Result<(), Par
 macro_rules! packet_wire {
     ($($ty:ty),+ $(,)?) => {$ (
         impl Wire for $ty {
-            type ParseError = ParseError;
-            type WriteError = ParseError;
+            type ParseError = Error;
+            type WriteError = Error;
 
             /// Reads exactly one packet. Refuses incomplete or trailing bytes,
             /// unknown packet types, and fields beyond their protocol limits.
-            fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
-                Self::from_packet(&Packet::parse(bytes).map_err(ParseError::Packet)?)
+            fn parse(bytes: &[u8]) -> Result<Self, Error> {
+                Self::from_packet(&Packet::parse(bytes)?)
             }
 
             /// Appends a complete packet. Refuses oversized fields or lists
             /// and status codes that would change the value when read back.
             /// Leaves the destination unchanged on error.
-            fn write(&self, out: &mut Vec<u8>) -> Result<(), ParseError> {
-                self.to_packet()?.write(out).map_err(|_| ParseError::Unwritable)
+            fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+                self.to_packet()?.write(out).map_err(|_| Error::Unwritable)
             }
         }
     )+};
@@ -1160,11 +1119,11 @@ macro_rules! packet_wire {
 packet_wire!(Request, Response);
 
 impl Wire for Attrs {
-    type ParseError = ParseError;
-    type WriteError = ParseError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads attributes. Refuses unknown flags, excess fields, and trailing bytes.
-    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         let mut reader = Reader { b: bytes };
         let value = Self::read(&mut reader)?;
         reader.end()?;
@@ -1173,7 +1132,7 @@ impl Wire for Attrs {
 
     /// Appends attributes. Refuses oversized extension fields or lists.
     /// Leaves the destination unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), ParseError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         let mut bytes = Vec::new();
         self.encode(&mut bytes)?;
         out.extend_from_slice(&bytes);
@@ -1319,7 +1278,7 @@ mod tests {
             assert_eq!(p.id(), req.id());
             assert_eq!(Request::from_packet(&p).as_ref(), Ok(&req), "{req:?}");
             // A request is not a response.
-            assert_eq!(Response::from_packet(&p), Err(ParseError::UnknownType(p.kind)));
+            assert_eq!(Response::from_packet(&p), Err(Error::UnknownType(p.kind)));
         }
     }
 
@@ -1331,7 +1290,7 @@ mod tests {
             assert_eq!(p.kind, resp.kind());
             assert_eq!(p.id(), resp.id());
             assert_eq!(Response::from_packet(&p).as_ref(), Ok(&resp), "{resp:?}");
-            assert_eq!(Request::from_packet(&p), Err(ParseError::UnknownType(p.kind)));
+            assert_eq!(Request::from_packet(&p), Err(Error::UnknownType(p.kind)));
         }
     }
 
@@ -1344,12 +1303,12 @@ mod tests {
         assert_eq!(Status::from_code(8), Status::OpUnsupported);
         for code in 0..=8 {
             let response = Response::Status { id: 1, status: Status::Other(code), message: vec![], language: vec![] };
-            assert_eq!(response.to_bytes(), Err(ParseError::Unwritable));
+            assert_eq!(response.to_bytes(), Err(Error::Unwritable));
             contract::check_wire_value(&response);
         }
         assert_eq!(Status::NoSuchFile.to_string(), "no such file");
-        assert_eq!(ParseError::UnknownType(77).status(), Status::OpUnsupported);
-        assert_eq!(ParseError::Truncated.status(), Status::BadMessage);
+        assert_eq!(Error::UnknownType(77).status(), Status::OpUnsupported);
+        assert_eq!(Error::Truncated.status(), Status::BadMessage);
     }
 
     #[test]
@@ -1375,18 +1334,18 @@ mod tests {
 
     #[test]
     fn packet_errors() {
-        for (bytes, error) in [(&[0, 0, 0, 0][..], PacketError::Empty),
-            (&[0, 4, 0, 1][..], PacketError::TooLong(0x40001)),
-            (&[0xff; 4][..], PacketError::TooLong(u32::MAX))] {
-            assert_eq!(Packet::parse(bytes), Err(PacketParseError::Frame(error)));
+        for (bytes, error) in [(&[0, 0, 0, 0][..], Error::Empty),
+            (&[0, 4, 0, 1][..], Error::PacketTooLong(0x40001)),
+            (&[0xff; 4][..], Error::PacketTooLong(u32::MAX))] {
+            assert_eq!(Packet::parse(bytes), Err(error));
         }
-        assert_eq!(Frames::new().decode(&[0, 4, 0, 0], false), Ok(Step::Need));
-        assert_eq!(Frames::with_limit(8).decode(&[0, 0, 0, 9], false), Err(PacketError::TooLong(9)));
-        assert_eq!(Frames::with_limit(8).decode(&[0, 0, 0, 8], false), Ok(Step::Need));
-        assert_eq!(Frames::with_limit(usize::MAX).decode(&[0, 4, 0, 1], false), Err(PacketError::TooLong(0x40001)));
-        assert_eq!(Packet::parse(&[0, 0, 0, 1, 7, 9]), Err(PacketParseError::Trailing));
+        assert_eq!(Packets::new().decode(&[0, 4, 0, 0], false), Ok(Step::Need));
+        assert_eq!(Packets::with_limit(8).decode(&[0, 0, 0, 9], false), Err(Error::PacketTooLong(9)));
+        assert_eq!(Packets::with_limit(8).decode(&[0, 0, 0, 8], false), Ok(Step::Need));
+        assert_eq!(Packets::with_limit(usize::MAX).decode(&[0, 4, 0, 1], false), Err(Error::PacketTooLong(0x40001)));
+        assert_eq!(Packet::parse(&[0, 0, 0, 1, 7, 9]), Err(Error::PacketTrailing));
         assert_eq!(Packet::parse(&[0, 0, 0, 1, 7]), Ok(Packet { kind: 7, body: vec![] }));
-        assert!(PacketError::Empty.to_string().contains('0'));
+        assert!(Error::Empty.to_string().contains('0'));
     }
 
     #[test]
@@ -1394,49 +1353,49 @@ mod tests {
         let p = |kind: u8, body: &[u8]| Packet { kind, body: body.to_vec() };
         let t = packet_type::STAT;
         // Unknown types.
-        assert_eq!(Request::from_packet(&p(0, &[])), Err(ParseError::UnknownType(0)));
-        assert_eq!(Request::from_packet(&p(21, &[0, 0, 0, 1])), Err(ParseError::UnknownType(21)));
-        assert_eq!(Request::from_packet(&p(packet_type::EXTENDED_REPLY, &[])), Err(ParseError::UnknownType(201)));
-        assert_eq!(Response::from_packet(&p(100, &[])), Err(ParseError::UnknownType(100)));
+        assert_eq!(Request::from_packet(&p(0, &[])), Err(Error::UnknownType(0)));
+        assert_eq!(Request::from_packet(&p(21, &[0, 0, 0, 1])), Err(Error::UnknownType(21)));
+        assert_eq!(Request::from_packet(&p(packet_type::EXTENDED_REPLY, &[])), Err(Error::UnknownType(201)));
+        assert_eq!(Response::from_packet(&p(100, &[])), Err(Error::UnknownType(100)));
         // Truncated: no id, a short path, a path length past the end.
-        assert_eq!(Request::from_packet(&p(t, &[0, 0])), Err(ParseError::Truncated));
-        assert_eq!(Request::from_packet(&p(t, &[0, 0, 0, 1, 0, 0])), Err(ParseError::Truncated));
-        assert_eq!(Request::from_packet(&p(t, &[0, 0, 0, 1, 0, 0, 0, 2, b'/'])), Err(ParseError::Truncated));
+        assert_eq!(Request::from_packet(&p(t, &[0, 0])), Err(Error::Truncated));
+        assert_eq!(Request::from_packet(&p(t, &[0, 0, 0, 1, 0, 0])), Err(Error::Truncated));
+        assert_eq!(Request::from_packet(&p(t, &[0, 0, 0, 1, 0, 0, 0, 2, b'/'])), Err(Error::Truncated));
         // Trailing bytes.
-        assert_eq!(Request::from_packet(&p(t, &[0, 0, 0, 1, 0, 0, 0, 1, b'/', 0])), Err(ParseError::Trailing));
-        assert_eq!(Response::from_packet(&p(packet_type::HANDLE, &[0, 0, 0, 1, 0, 0, 0, 0, 1])), Err(ParseError::Trailing));
+        assert_eq!(Request::from_packet(&p(t, &[0, 0, 0, 1, 0, 0, 0, 1, b'/', 0])), Err(Error::Trailing));
+        assert_eq!(Response::from_packet(&p(packet_type::HANDLE, &[0, 0, 0, 1, 0, 0, 0, 0, 1])), Err(Error::Trailing));
         // Strings over their limits.
         let len = |n: usize| (n as u32).to_be_bytes();
         let mut body = vec![0, 0, 0, 1];
         body.extend_from_slice(&len(MAX_PATH + 1));
         body.extend(std::iter::repeat_n(b'a', MAX_PATH + 1));
-        assert_eq!(Request::from_packet(&p(t, &body)), Err(ParseError::TooLong));
+        assert_eq!(Request::from_packet(&p(t, &body)), Err(Error::TooLong));
         body.truncate(4);
         body.extend_from_slice(&len(MAX_HANDLE + 1));
-        assert_eq!(Request::from_packet(&p(packet_type::CLOSE, &body)), Err(ParseError::TooLong));
+        assert_eq!(Request::from_packet(&p(packet_type::CLOSE, &body)), Err(Error::TooLong));
         body.truncate(4);
         body.extend_from_slice(&len(MAX_EXTENSION_NAME + 1));
-        assert_eq!(Request::from_packet(&p(packet_type::EXTENDED, &body)), Err(ParseError::TooLong));
+        assert_eq!(Request::from_packet(&p(packet_type::EXTENDED, &body)), Err(Error::TooLong));
         let mut ext = vec![0, 0, 0, 1, 0, 0, 0, 1, b'x'];
         ext.resize(ext.len() + MAX_DATA + 1, 0);
-        assert_eq!(Request::from_packet(&p(packet_type::EXTENDED, &ext)), Err(ParseError::TooLong));
+        assert_eq!(Request::from_packet(&p(packet_type::EXTENDED, &ext)), Err(Error::TooLong));
         let mut reply = vec![0, 0, 0, 1];
         reply.resize(4 + MAX_DATA + 1, 0);
-        assert_eq!(Response::from_packet(&p(packet_type::EXTENDED_REPLY, &reply)), Err(ParseError::TooLong));
+        assert_eq!(Response::from_packet(&p(packet_type::EXTENDED_REPLY, &reply)), Err(Error::TooLong));
         let mut data = vec![0, 0, 0, 1];
         data.extend_from_slice(&len(MAX_DATA + 1));
-        assert_eq!(Response::from_packet(&p(packet_type::DATA, &data)), Err(ParseError::TooLong));
+        assert_eq!(Response::from_packet(&p(packet_type::DATA, &data)), Err(Error::TooLong));
         let mut status = vec![0, 0, 0, 1, 0, 0, 0, 0];
         status.extend_from_slice(&len(MAX_TEXT + 1));
-        assert_eq!(Response::from_packet(&p(packet_type::STATUS, &status)), Err(ParseError::TooLong));
-        assert_eq!(Response::from_packet(&p(packet_type::STATUS, &[0, 0, 0, 1, 0, 0, 0, 0, 0])), Err(ParseError::Truncated));
+        assert_eq!(Response::from_packet(&p(packet_type::STATUS, &status)), Err(Error::TooLong));
+        assert_eq!(Response::from_packet(&p(packet_type::STATUS, &[0, 0, 0, 1, 0, 0, 0, 0, 0])), Err(Error::Truncated));
         // Counts over their limits.
         let mut names = vec![0, 0, 0, 1];
         names.extend_from_slice(&len(MAX_NAMES + 1));
-        assert_eq!(Response::from_packet(&p(packet_type::NAME, &names)), Err(ParseError::TooMany));
+        assert_eq!(Response::from_packet(&p(packet_type::NAME, &names)), Err(Error::TooMany));
         let mut attrs = vec![0, 0, 0, 1, 0x80, 0, 0, 0];
         attrs.extend_from_slice(&len(MAX_ATTR_EXTENSIONS + 1));
-        assert_eq!(Response::from_packet(&p(packet_type::ATTRS, &attrs)), Err(ParseError::TooMany));
+        assert_eq!(Response::from_packet(&p(packet_type::ATTRS, &attrs)), Err(Error::TooMany));
         let mut init = vec![0, 0, 0, 3];
         for _ in 0..=MAX_EXTENSIONS {
             init.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
@@ -1447,15 +1406,15 @@ mod tests {
         // Attribute flags version 3 does not define.
         assert_eq!(
             Response::from_packet(&p(packet_type::ATTRS, &[0, 0, 0, 1, 0, 0, 0, 0x10])),
-            Err(ParseError::AttrFlags(0x10))
+            Err(Error::AttrFlags(0x10))
         );
-        assert!(ParseError::AttrFlags(0x10).to_string().contains("0x10"));
+        assert!(Error::AttrFlags(0x10).to_string().contains("0x10"));
         // A body longer than a packet can hold.
         let huge = p(packet_type::EXTENDED_REPLY, &vec![0; MAX_PACKET]);
-        assert_eq!(Response::from_packet(&huge), Err(ParseError::TooLong));
-        assert_eq!(Request::from_packet(&Packet { kind: packet_type::EXTENDED, ..huge }), Err(ParseError::TooLong));
+        assert_eq!(Response::from_packet(&huge), Err(Error::TooLong));
+        assert_eq!(Request::from_packet(&Packet { kind: packet_type::EXTENDED, ..huge }), Err(Error::TooLong));
         // TooLong also covers raw data and whole bodies, not only strings.
-        assert_eq!(ParseError::TooLong.to_string(), "a field or the body over its limit");
+        assert_eq!(Error::TooLong.to_string(), "a field or the body over its limit");
     }
 
     #[test]
@@ -1468,8 +1427,8 @@ mod tests {
         for (p, is_request) in &packets {
             let bytes = p.to_bytes().unwrap();
             for n in 0..bytes.len() {
-                assert_eq!(Packet::parse(&bytes[..n]), Err(PacketParseError::Truncated), "{p:?} at {n}");
-                assert_eq!(Frames::new().decode(&bytes[..n], false), Ok(Step::Need));
+                assert_eq!(Packet::parse(&bytes[..n]), Err(Error::PacketTruncated), "{p:?} at {n}");
+                assert_eq!(Packets::new().decode(&bytes[..n], false), Ok(Step::Need));
             }
             let parse = |q: &Packet| {
                 if *is_request {
@@ -1507,25 +1466,25 @@ mod tests {
         let stat = Request::Stat { id: 1, path: s(b"/etc/passwd") };
         let b = stat.to_bytes().unwrap();
         let bytes = [&a[..], &b].concat();
-        contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_FRAME);
-        let (packets, failure) = decode_all(Frames::new, &bytes);
+        contract::check_decode_with_alloc_limit(Packets::new, &bytes, 2 * MAX_FRAME);
+        let (packets, failure) = decode_all(Packets::new, &bytes);
         assert_eq!(failure, None);
         assert_eq!(packets.len(), 2);
         assert_eq!(Request::from_packet(&packets[1]), Ok(stat));
-        let mut stream = Stream::new(Frames::new());
+        let mut stream = Stream::new(Packets::new());
         assert_eq!(stream.push(&[0, 0, 0, 0, 1]), 5);
-        assert_eq!(stream.next(), Some(Err(Fail::Protocol(PacketError::Empty))));
+        assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::Empty))));
         assert_eq!(stream.next(), None);
-        assert_eq!(stream.failed(), Some(&Fail::Protocol(PacketError::Empty)));
-        assert!(matches!(decode_all(|| Frames::with_limit(8), &b).1, Some(Fail::Protocol(PacketError::TooLong(_)))));
-        assert_eq!(decode_all(Frames::new, &b[..6]).1, Some(Fail::Truncated { unread: 6 }));
+        assert_eq!(stream.failed(), Some(&Fail::Protocol(Error::Empty)));
+        assert!(matches!(decode_all(|| Packets::with_limit(8), &b).1, Some(Fail::Protocol(Error::PacketTooLong(_)))));
+        assert_eq!(decode_all(Packets::new, &b[..6]).1, Some(Fail::Truncated { unread: 6 }));
     }
 
     #[test]
     fn stream_takes_many_small_packets_in_linear_time() {
         let one = Request::Readdir { id: 1, handle: s(b"d") }.to_bytes().unwrap();
         let started = std::time::Instant::now();
-        let (packets, failure) = decode_all(Frames::new, &one.repeat(200_000));
+        let (packets, failure) = decode_all(Packets::new, &one.repeat(200_000));
         assert_eq!(failure, None);
         assert_eq!(packets.len(), 200_000);
         assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
@@ -1533,9 +1492,9 @@ mod tests {
 
     #[test]
     fn writers_refuse_values_they_would_shorten() {
-        fn refused<T: Wire<WriteError = ParseError> + std::fmt::Debug + PartialEq>(value: T) {
+        fn refused<T: Wire<WriteError = Error> + std::fmt::Debug + PartialEq>(value: T) {
             let mut out = vec![7];
-            assert_eq!(value.write(&mut out), Err(ParseError::Unwritable));
+            assert_eq!(value.write(&mut out), Err(Error::Unwritable));
             assert_eq!(out, [7]);
             contract::check_wire_value(&value);
         }
@@ -1580,7 +1539,7 @@ mod tests {
             if fit < names.len() {
                 let next = Response::Name { id: 1, names: names[..fit + 1].to_vec() };
                 let mut out = vec![7];
-                assert_eq!(next.write(&mut out), Err(ParseError::Unwritable));
+                assert_eq!(next.write(&mut out), Err(Error::Unwritable));
                 assert_eq!(out, [7]);
             }
             fit
@@ -1612,9 +1571,9 @@ mod tests {
     fn stream_holds_at_most_one_packet() {
         let one = Request::Readdir { id: 1, handle: s(b"d") }.to_bytes().unwrap();
         let bytes = one.repeat(100);
-        contract::check_decode_with_alloc_limit(|| Frames::with_limit(64), &bytes, 2 * (LENGTH_LEN + 64));
-        assert_eq!(decode_all(|| Frames::with_limit(64), &bytes).0.len(), 100);
-        let mut stream = Stream::new(Frames::with_limit(64));
+        contract::check_decode_with_alloc_limit(|| Packets::with_limit(64), &bytes, 2 * (LENGTH_LEN + 64));
+        assert_eq!(decode_all(|| Packets::with_limit(64), &bytes).0.len(), 100);
+        let mut stream = Stream::new(Packets::with_limit(64));
         assert_eq!(stream.push(&bytes), LENGTH_LEN + 64);
         assert_eq!(stream.push(&one), 0);
     }
@@ -1625,10 +1584,10 @@ mod tests {
             let response = Response::status(1, Status::Failure, &text);
             let Response::Status { message, .. } = &response else { panic!() };
             assert_eq!(message, text.as_bytes());
-            assert_eq!(response.to_bytes(), Err(ParseError::Unwritable));
+            assert_eq!(response.to_bytes(), Err(Error::Unwritable));
             contract::check_wire_value(&response);
             let language = Response::Status { id: 1, status: Status::Failure, message: vec![], language: text.into_bytes() };
-            assert_eq!(language.to_bytes(), Err(ParseError::Unwritable));
+            assert_eq!(language.to_bytes(), Err(Error::Unwritable));
         }
         let response = Response::status(1, Status::Ok, "été");
         assert_eq!(Response::parse(&response.to_bytes().unwrap()), Ok(response));
@@ -1674,7 +1633,7 @@ mod tests {
         let mut cut = vec![0, 0, 0, 3];
         ext(&mut cut, b"a", 10);
         cut.truncate(cut.len() - 1);
-        assert_eq!(Request::from_packet(&Packet { kind: packet_type::INIT, body: cut }), Err(ParseError::Truncated));
+        assert_eq!(Request::from_packet(&Packet { kind: packet_type::INIT, body: cut }), Err(Error::Truncated));
     }
 
     #[test]
@@ -1685,7 +1644,7 @@ mod tests {
         for _ in 0..6000 {
             let mut bytes = if rng.coin() { seeds[rng.index(seeds.len())].clone() } else { rng.bytes(64) };
             mutate(&mut rng, &mut bytes);
-            contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_FRAME);
+            contract::check_decode_with_alloc_limit(Packets::new, &bytes, 2 * MAX_FRAME);
             contract::check_wire::<Packet>(&bytes);
             contract::check_wire::<Request>(&bytes);
             contract::check_wire::<Response>(&bytes);

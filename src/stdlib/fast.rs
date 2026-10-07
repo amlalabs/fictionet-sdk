@@ -6,14 +6,14 @@
 //! wire encodings, and appendices 1–2 define the template XML grammar.
 //! No exchange templates or session control protocol are included.
 //!
-//! [`Frames`] reads the message stream of section 10. [`BlockFrames`] reads
+//! [`Messages`] reads the message stream of section 10. [`BlockMessages`] reads
 //! the block form, `block ::= BlockSize message+`, and refuses a message that
 //! crosses a block boundary. [`Blocks`] yields raw block payloads.
 //! [`Encoder`] writes messages using the same templates. Resets are explicit
 //! and must occur at matching message boundaries at both endpoints (§6.3.1).
 //! Packet feeds usually reset dictionaries per packet. For those feeds, worlds
-//! call `stream.decoder().reset()` between datagrams when using [`Frames`],
-//! or `stream.decoder().frames().reset()` with [`BlockFrames`].
+//! call `stream.decoder().reset()` between datagrams when using [`Messages`],
+//! or `stream.decoder().messages().reset()` with [`BlockMessages`].
 //! Primitive units implement [`Wire`]. A message requires template and session
 //! state, so its writer is [`Encoder::write`]. Reportable encoding errors,
 //! including nonminimal encodings, are refused. Block sizes may be overlong (§10).
@@ -30,7 +30,7 @@
 //! let mut encoder = Encoder::new(templates.clone());
 //! let mut bytes = Vec::new();
 //! encoder.write(&message, &mut bytes)?;
-//! let mut stream = Stream::new(Frames::new(templates));
+//! let mut stream = Stream::new(Messages::new(templates));
 //! assert_eq!(stream.push(&bytes), bytes.len());
 //! assert_eq!(stream.next().transpose()?.unwrap(), message);
 //! assert_eq!(UInt32(128).to_bytes()?, [1, 0x80]);
@@ -2658,7 +2658,7 @@ fn block_header(input: &[u8]) -> Result<Option<(usize, usize)>, Error> {
 /// Block sizes exclude the header and may be overlong. The header is bounded
 /// by [`MAX_INTEGER_BYTES`] and the payload by [`MAX_MESSAGE_BYTES`]. This
 /// decoder keeps no input or state. To read the messages of a block stream,
-/// use [`BlockFrames`], which also refuses a message that crosses a block
+/// use [`BlockMessages`], which also refuses a message that crosses a block
 /// boundary. Joining payloads into one stream (for example with
 /// `codec::Pipe` and `Carry::Bytes`) loses those boundaries.
 ///
@@ -2700,42 +2700,42 @@ impl Decode for Blocks {
 /// Reads the messages of a FAST block stream (§10):
 /// `block ::= BlockSize message+`.
 ///
-/// Each BlockSize header is skipped, and [`Frames`] reads messages from the
+/// Each BlockSize header is skipped, and [`Messages`] reads messages from the
 /// bytes of that block only. A message that would continue past the end of
 /// its block is refused with [`Error::BlockBoundary`], as is a block whose
 /// payload ends inside a message. Block sizes may be overlong. The decoder
 /// holds no input, only the bytes left in the current block and the state
-/// of its [`Frames`].
+/// of its [`Messages`].
 ///
 /// ```
-/// use fictionet::stdlib::{codec::Stream, fast::{BlockFrames, Error, Frames, Templates}};
+/// use fictionet::stdlib::{codec::Stream, fast::{BlockMessages, Error, Messages, Templates}};
 /// let templates = Templates::from_xml(br#"<template
 ///     xmlns="http://www.fixprotocol.org/ns/fast/td/1.1" name="Empty" id="1"/>"#)?;
-/// let mut stream = Stream::new(BlockFrames::new(Frames::new(templates.clone())));
+/// let mut stream = Stream::new(BlockMessages::new(Messages::new(templates.clone())));
 /// assert_eq!(stream.push(&[0x82, 0xc0, 0x81]), 3);
 /// assert!(stream.next().transpose()?.is_some());
 /// // A message split across two blocks is refused.
-/// let mut stream = Stream::new(BlockFrames::new(Frames::new(templates)));
+/// let mut stream = Stream::new(BlockMessages::new(Messages::new(templates)));
 /// assert_eq!(stream.push(&[0x81, 0xc0, 0x81, 0x81]), 4);
 /// assert!(stream.next().unwrap().is_err());
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[derive(Clone, Debug)]
-pub struct BlockFrames {
-    frames: Frames,
+pub struct BlockMessages {
+    messages: Messages,
     remaining: usize,
 }
-impl BlockFrames {
-    /// Reads blocks from the start of a stream, each message with `frames`.
-    pub fn new(frames: Frames) -> Self {
+impl BlockMessages {
+    /// Reads blocks from the start of a stream, each message with `messages`.
+    pub fn new(messages: Messages) -> Self {
         Self {
-            frames,
+            messages,
             remaining: 0,
         }
     }
     /// The message decoder, for resets between messages.
-    pub fn frames(&mut self) -> &mut Frames {
-        &mut self.frames
+    pub fn messages(&mut self) -> &mut Messages {
+        &mut self.messages
     }
     /// Payload bytes of the current block not yet read as messages. Zero
     /// between blocks.
@@ -2743,7 +2743,7 @@ impl BlockFrames {
         self.remaining
     }
 }
-impl Decode for BlockFrames {
+impl Decode for BlockMessages {
     type Item = Message;
     type Error = Error;
     const NAME: &'static str = "FAST 1.1 block messages";
@@ -2754,10 +2754,10 @@ impl Decode for BlockFrames {
         MAX_MESSAGE_BYTES.max(MAX_INTEGER_BYTES)
     }
     fn held(&self) -> usize {
-        self.frames.held()
+        self.messages.held()
     }
     /// Skips a block header, or reads one message from the rest of the
-    /// current block. Refuses what [`Blocks`] and [`Frames`] refuse, and a
+    /// current block. Refuses what [`Blocks`] and [`Messages`] refuse, and a
     /// message that does not end within its block ([`Error::BlockBoundary`]).
     /// Partial headers and partial blocks return `Need`, including at EOF.
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Message>, Error> {
@@ -2773,7 +2773,7 @@ impl Decode for BlockFrames {
         let block = input
             .get(..input.len().min(self.remaining))
             .unwrap_or_default();
-        match self.frames.decode(block, eof)? {
+        match self.messages.decode(block, eof)? {
             Step::Item(message, n) => {
                 self.remaining = self.remaining.checked_sub(n).ok_or(Error::Range)?;
                 Ok(Step::Item(message, n))
@@ -2801,12 +2801,12 @@ impl Decode for BlockFrames {
 /// holds at most [`MAX_VALUES`] records and [`MAX_DICTIONARY_BYTES`] old data bytes.
 /// Invalid input terminates the stream. Partial input returns `Need` at EOF.
 #[derive(Clone, Debug)]
-pub struct Frames {
+pub struct Messages {
     templates: Templates,
     state: State,
     scanner: Scanner,
 }
-impl Frames {
+impl Messages {
     /// Starts with every dictionary entry undefined (§6.3.1).
     pub fn new(templates: Templates) -> Self {
         Self {
@@ -2843,7 +2843,7 @@ impl Frames {
         Ok(message)
     }
 }
-impl Decode for Frames {
+impl Decode for Messages {
     type Item = Message;
     type Error = Error;
     const NAME: &'static str = "FAST 1.1";
@@ -3279,10 +3279,10 @@ mod tests {
             writer.write(value, &mut bytes).unwrap();
         }
         assert_eq!(
-            decode_all(|| Frames::new(t.clone()), &bytes),
+            decode_all(|| Messages::new(t.clone()), &bytes),
             (values.to_vec(), None)
         );
-        check_decode_with_alloc_limit(|| Frames::new(t.clone()), &bytes, 2 * MAX_MESSAGE_BYTES);
+        check_decode_with_alloc_limit(|| Messages::new(t.clone()), &bytes, 2 * MAX_MESSAGE_BYTES);
         bytes
     }
     fn exact<T: Wire<ParseError = Error, WriteError = Error> + std::fmt::Debug + PartialEq>(
@@ -3448,11 +3448,11 @@ mod tests {
         );
         let t = templates("");
         assert_eq!(
-            Frames::new(t.clone()).parse_exact(&[0xe0, 0x81]),
+            Messages::new(t.clone()).parse_exact(&[0xe0, 0x81]),
             Err(Error::Presence)
         );
         check_decode_with_alloc_limit(
-            || Frames::new(t.clone()),
+            || Messages::new(t.clone()),
             &[0xe0, 0x81],
             2 * MAX_MESSAGE_BYTES,
         );
@@ -3618,7 +3618,7 @@ mod tests {
                 message(vec![Value::Null]),
             ],
         );
-        let mut decoder = Frames::new(t);
+        let mut decoder = Messages::new(t);
         assert_eq!(
             decoder.parse_exact(&[0xe0, 0x81, 0x80]).unwrap(),
             message(vec![Value::Null])
@@ -3631,11 +3631,11 @@ mod tests {
             "<uInt32 name=\"x\" presence=\"optional\"><copy key=\"k\"/></uInt32><uInt32 name=\"y\"><copy key=\"k\"/></uInt32>",
         );
         assert_eq!(
-            Frames::new(t).parse_exact(&[0xe0, 0x81, 0x80]),
+            Messages::new(t).parse_exact(&[0xe0, 0x81, 0x80]),
             Err(Error::Empty)
         );
         assert_eq!(
-            Frames::new(templates("<uInt32 name=\"x\"><copy/></uInt32>"))
+            Messages::new(templates("<uInt32 name=\"x\"><copy/></uInt32>"))
                 .parse_exact(&[0xc0, 0x81]),
             Err(Error::Undefined)
         );
@@ -3701,14 +3701,14 @@ mod tests {
         }
         let t = templates("<string name=\"s\" charset=\"unicode\"><delta value=\"é\"/></string>");
         assert_eq!(
-            Frames::new(t)
+            Messages::new(t)
                 .parse_exact(&[0xc0, 0x81, 0x81, 0x81, 0xa9])
                 .unwrap(),
             message(vec![Value::Unicode("é".into())])
         );
         let t = templates("<string name=\"s\"><delta/></string>");
         assert_eq!(
-            Frames::new(t).parse_exact(&[0xc0, 0x81, 0x81, 0x80]),
+            Messages::new(t).parse_exact(&[0xc0, 0x81, 0x81, 0x80]),
             Err(Error::Subtraction)
         );
     }
@@ -3790,7 +3790,7 @@ mod tests {
                 "<template name=\"A\" id=\"1\" dictionary=\"{scope}\"><typeRef name=\"Quote\"/><uInt32 name=\"x\"><copy value=\"1\"/></uInt32></template><template name=\"B\" id=\"2\" dictionary=\"{scope}\"><typeRef name=\"Quote\"/><uInt32 name=\"x\"><copy value=\"1\"/></uInt32></template>"
             ));
             let mut e = Encoder::new(t.clone());
-            let mut f = Frames::new(t);
+            let mut f = Messages::new(t);
             let a = message(vec![Value::UInt32(9)]);
             let b = Message {
                 template_id: 2,
@@ -3863,7 +3863,7 @@ mod tests {
             "<uInt32 name=\"x\"><copy key=\"k\"/></uInt32><string name=\"y\"><copy key=\"k\"/></string>",
         );
         assert_eq!(
-            Frames::new(t.clone()).parse_exact(&[0xf0, 0x81, 0x81, 0xc1]),
+            Messages::new(t.clone()).parse_exact(&[0xf0, 0x81, 0x81, 0xc1]),
             Err(Error::DictionaryType)
         );
         let mut out = vec![9];
@@ -3891,7 +3891,7 @@ mod tests {
             2 * (MAX_MESSAGE_BYTES + MAX_INTEGER_BYTES),
         );
         let t = templates("<uInt32 name=\"n\"><increment value=\"1\"/></uInt32>");
-        let make = || BlockFrames::new(Frames::new(t.clone()));
+        let make = || BlockMessages::new(Messages::new(t.clone()));
         assert_eq!(
             decode_all(make, &bytes),
             (
@@ -3909,14 +3909,14 @@ mod tests {
         }
     }
     #[test]
-    fn block_frames_refuse_messages_that_cross_block_boundaries() {
+    fn block_messages_refuse_messages_that_cross_block_boundaries() {
         use fictionet::stdlib::codec::Fail;
         let t = xml_templates(r#"<template name="A" id="1"/>"#);
         let empty = Message {
             template_id: 1,
             fields: Vec::new(),
         };
-        let make = || BlockFrames::new(Frames::new(t.clone()));
+        let make = || BlockMessages::new(Messages::new(t.clone()));
         // Block 1 holds only the presence map, block 2 the template ID.
         let split = [0x81, 0xc0, 0x81, 0x81];
         assert_eq!(
@@ -4024,8 +4024,8 @@ mod tests {
             "<template name=\"Full\" id=\"1\">{fields}</template><template name=\"Empty\" id=\"2\"/>"
         ));
         let mut encoder = Encoder::new(t.clone());
-        let mut frames = Frames::new(t.clone());
-        let mut exact = Frames::new(t);
+        let mut frames = Messages::new(t.clone());
+        let mut exact = Messages::new(t);
         let large = message(
             (0..MAX_DICTIONARY_ENTRIES)
                 .map(|i| Value::Bytes(if i < 16 { vec![7; 60_000] } else { Vec::new() }))
@@ -4082,8 +4082,8 @@ mod tests {
             Value::Unicode("OK".into()),
         ]);
         let mut encoder = Encoder::new(t.clone());
-        let mut frames = Frames::new(t.clone());
-        let mut exact = Frames::new(t);
+        let mut frames = Messages::new(t.clone());
+        let mut exact = Messages::new(t);
         let mut first = Vec::new();
         encoder.write(&valid, &mut first).unwrap();
         assert_eq!(
@@ -4152,7 +4152,7 @@ mod tests {
             "<uInt32 name=\"n\"><increment value=\"1\"/></uInt32><string name=\"c\"><constant value=\"OK\"/></string>",
         );
         let mut e = Encoder::new(t.clone());
-        let mut d = Frames::new(t);
+        let mut d = Messages::new(t);
         let mut out = vec![42];
         assert_eq!(
             e.write(
@@ -4278,29 +4278,29 @@ mod tests {
         let mut bytes = vec![0xc0, 0x81];
         put_integer((MAX_SEQUENCE_LENGTH + 1) as i128, false, false, &mut bytes).unwrap();
         assert_eq!(
-            Frames::new(t.clone()).parse_exact(&bytes),
+            Messages::new(t.clone()).parse_exact(&bytes),
             Err(Error::Limit("MAX_SEQUENCE_LENGTH"))
         );
-        check_decode_with_alloc_limit(|| Frames::new(t.clone()), &bytes, 2 * MAX_MESSAGE_BYTES);
+        check_decode_with_alloc_limit(|| Messages::new(t.clone()), &bytes, 2 * MAX_MESSAGE_BYTES);
         let t = templates(
             "<sequence name=\"outer\"><length><constant value=\"4096\"/></length><sequence name=\"inner\"><length><constant value=\"4096\"/></length></sequence></sequence>",
         );
         assert_eq!(
-            Frames::new(t.clone()).parse_exact(&[0xc0, 0x81]),
+            Messages::new(t.clone()).parse_exact(&[0xc0, 0x81]),
             Err(Error::Limit("MAX_VALUES"))
         );
         check_decode_with_alloc_limit(
-            || Frames::new(t.clone()),
+            || Messages::new(t.clone()),
             &[0xc0, 0x81],
             2 * MAX_MESSAGE_BYTES,
         );
         let t = templates("<templateRef/>");
         let bytes = [vec![0xc0, 0x81], vec![0x80; MAX_DEPTH]].concat();
         assert_eq!(
-            Frames::new(t.clone()).parse_exact(&bytes),
+            Messages::new(t.clone()).parse_exact(&bytes),
             Err(Error::Limit("MAX_DEPTH"))
         );
-        check_decode_with_alloc_limit(|| Frames::new(t.clone()), &bytes, 2 * MAX_MESSAGE_BYTES);
+        check_decode_with_alloc_limit(|| Messages::new(t.clone()), &bytes, 2 * MAX_MESSAGE_BYTES);
     }
     #[test]
     fn fragmented_long_fields_keep_bounded_state_and_progress() {
@@ -4311,7 +4311,7 @@ mod tests {
         ]);
         let mut bytes = Vec::new();
         Encoder::new(t.clone()).write(&m, &mut bytes).unwrap();
-        let mut stream = Stream::new(Frames::new(t));
+        let mut stream = Stream::new(Messages::new(t));
         let held = stream.held();
         let mut result = Vec::new();
         for part in chunks(&bytes, &[1]) {
@@ -4338,7 +4338,7 @@ mod tests {
             check_wire::<ByteVector>(&bytes);
             check_wire::<Decimal>(&bytes);
             check_wire::<PresenceMap>(&bytes);
-            check_decode_with_alloc_limit(|| Frames::new(t.clone()), &bytes, 2 * MAX_MESSAGE_BYTES);
+            check_decode_with_alloc_limit(|| Messages::new(t.clone()), &bytes, 2 * MAX_MESSAGE_BYTES);
         }
     }
     #[test]
@@ -4346,7 +4346,7 @@ mod tests {
         let bodies = (1..=17).map(|i| format!("<template name=\"T{i}\" id=\"{i}\"><byteVector name=\"v{i}\"><copy/></byteVector></template>")).collect::<String>();
         let t = xml_templates(&bodies);
         let mut e = Encoder::new(t.clone());
-        let mut d = Frames::new(t);
+        let mut d = Messages::new(t);
         for id in 1..=16 {
             let m = Message {
                 template_id: id,
@@ -4397,7 +4397,7 @@ mod tests {
             "a".repeat(257)
         ));
         assert_eq!(
-            Frames::new(t.clone()).parse_exact(&[0xc0, 0x81]),
+            Messages::new(t.clone()).parse_exact(&[0xc0, 0x81]),
             Err(Error::Limit("MAX_VALUE_BYTES"))
         );
         let m = message(vec![Value::Sequence(vec![
@@ -4426,7 +4426,7 @@ mod tests {
         }
         UInt32(MAX_STRING_BYTES as u32).write(&mut bytes).unwrap();
         assert_eq!(
-            Frames::new(t.clone()).decode(&bytes, false),
+            Messages::new(t.clone()).decode(&bytes, false),
             Err(Error::Limit("MAX_MESSAGE_BYTES"))
         );
         let m = message(vec![Value::Bytes(vec![0; MAX_STRING_BYTES]); 17]);
@@ -4591,7 +4591,7 @@ mod tests {
     #[test]
     fn cloned_decoders_preserve_framing_reservations() {
         let t = templates("<group name=\"g\"><string name=\"s\"/></group>");
-        let original = Frames::new(t);
+        let original = Messages::new(t);
         check_decode_with_alloc_limit(
             || original.clone(),
             &[0xc0, 0x81, b'A', 0xc2],
