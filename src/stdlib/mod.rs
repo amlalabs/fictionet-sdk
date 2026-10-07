@@ -295,7 +295,7 @@
 //! | [`stun`] | STUN messages and attributes, with a binding reply helper. | yes | yes |  |  |  | yes | yes |
 //! | [`syslog`] | Syslog messages in the RFC 5424 and RFC 3164 formats, and RFC 6587 stream framing. | yes | yes |  |  |  | yes | yes |
 //! | [`tcp`] | TCP listeners and connections for a machine on the simulated network, on smoltcp. |  |  |  |  |  | yes |  |
-//! | [`tcp_stream`] | TCP capture reassembly for observers: ordered bytes, gaps and end signals. |  |  |  |  |  | yes | yes |
+//! | [`tcp_reassembly`] | TCP capture reassembly for observers: ordered bytes, gaps and end signals. |  |  |  |  |  | yes | yes |
 //! | [`tds`] | TDS, the SQL Server protocol: packets, logins, SQL batches and response tokens. | yes | yes | `TokenReader` |  |  | yes | yes |
 //! | [`telnet`] | Telnet data and commands, option negotiation, terminal type and window size. | yes | yes | `Negotiation` |  |  | yes | yes |
 //! | [`tftp`] | TFTP packets, option negotiation, and one read transfer served. | yes | yes | `ReadTransfer` |  |  | yes | yes |
@@ -463,7 +463,7 @@ pub mod sse;
 pub mod stun;
 pub mod syslog;
 pub mod tcp;
-pub mod tcp_stream;
+pub mod tcp_reassembly;
 pub mod tds;
 pub mod telnet;
 pub mod tftp;

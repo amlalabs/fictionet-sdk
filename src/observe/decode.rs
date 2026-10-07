@@ -11,7 +11,7 @@ use std::fmt::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use super::json;
-use fictionet::stdlib::tcp_stream::{FlowKey, Reassembler, Segment, TcpEvent, conversation_key};
+use fictionet::stdlib::tcp_reassembly::{FlowKey, Reassembler, Segment, Chunk, conversation_key};
 use crate::watch::KeyLine;
 
 /// A field of a layer, and where its bytes are.
@@ -482,21 +482,21 @@ impl Dissector {
         let mut delivered = false;
         for event in flow.events {
             match event {
-                TcpEvent::Bytes { offset, bytes, input_offset, .. } => {
+                Chunk::Bytes { offset, bytes, input_offset, .. } => {
                     let conversation = self.conversations.entry(ckey).or_insert_with(|| super::Conversation::with_registry(ckey.1, ckey.3, self.registry.clone()));
                     let place = super::Place { stream_start: offset, buf: 0, offset: input_offset.and_then(|at| payload.0.checked_add(at)), len: bytes.len() };
                     conversation.data(reversed, &bytes, place, d, keys);
                     delivered = true;
                 }
-                TcpEvent::Gap { resumed: true, .. } => {
+                Chunk::Gap { resumed: true, .. } => {
                     let conversation = self.conversations.entry(ckey).or_insert_with(|| super::Conversation::with_registry(ckey.1, ckey.3, self.registry.clone()));
                     conversation.lost(reversed);
                 }
-                TcpEvent::Gap { resumed: false, .. } => gap = true,
+                Chunk::Gap { resumed: false, .. } => gap = true,
                 // Forwarding Protocol::end would end Observed streams, but
                 // reassembly still delivers captured payload after FIN or RST.
                 // Keep the conversation until a SYN replaces it.
-                TcpEvent::End { .. } => {}
+                Chunk::End { .. } => {}
             }
         }
         if gap {
@@ -908,7 +908,7 @@ mod tests {
 
     #[test]
     fn reassembly_gap_resets_the_http2_header_table() {
-        use fictionet::stdlib::tcp_stream::Limits;
+        use fictionet::stdlib::tcp_reassembly::Limits;
         let mut dis = Dissector { tcp: Reassembler::new(Limits { max_segments: 1, ..Limits::default() }), ..Dissector::default() };
         dis.decode(&tcp(40000, 80, 100, 0x02, b""), &[]);
         let mut first = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
@@ -931,7 +931,7 @@ mod tests {
 
     #[test]
     fn reassembly_gap_before_the_first_bytes_also_stops_http2() {
-        use fictionet::stdlib::tcp_stream::Limits;
+        use fictionet::stdlib::tcp_reassembly::Limits;
         let mut dis = Dissector { tcp: Reassembler::new(Limits { max_segments: 1, ..Limits::default() }), ..Dissector::default() };
         dis.decode(&tcp(40000, 80, 100, 0x02, b""), &[]);
         let mut first = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
@@ -945,7 +945,7 @@ mod tests {
 
     #[test]
     fn reassembly_gap_without_held_data_keeps_the_packet_tag() {
-        use fictionet::stdlib::tcp_stream::Limits;
+        use fictionet::stdlib::tcp_reassembly::Limits;
         let mut dis = Dissector { tcp: Reassembler::new(Limits { max_buffered: 0, ..Limits::default() }), ..Dissector::default() };
         dis.decode(&tcp(40000, 80, 100, 0x02, b""), &[]);
         let gap = dis.decode(&tcp(40000, 80, 110, 0x18, b"dropped"), &[]);

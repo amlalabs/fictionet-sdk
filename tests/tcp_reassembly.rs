@@ -1,5 +1,5 @@
 use fictionet::stdlib::codec::{Decode, Step, Stream, finish, pump};
-use fictionet::stdlib::tcp_stream::{FlowKey, Limits, Reassembler, Segment, TcpEvent};
+use fictionet::stdlib::tcp_reassembly::{FlowKey, Limits, Reassembler, Segment, Chunk};
 use std::convert::Infallible;
 
 struct UserDecoder;
@@ -57,16 +57,16 @@ fn public_events_drive_a_user_decoder_with_gap_and_end_hooks() {
         });
         for event in result.events {
             match event {
-                TcpEvent::Bytes { dir, bytes, .. } => {
+                Chunk::Bytes { dir, bytes, .. } => {
                     assert_eq!(dir, key());
                     pump(&mut decoder, &bytes, |pair| pairs.push(pair)).unwrap();
                 }
-                TcpEvent::Gap { resumed: true, .. } => {
+                Chunk::Gap { resumed: true, .. } => {
                     gaps += 1;
                     decoder = Stream::new(UserDecoder);
                 }
-                TcpEvent::Gap { resumed: false, .. } => panic!("expected a resumed gap"),
-                TcpEvent::End { reset, .. } => {
+                Chunk::Gap { resumed: false, .. } => panic!("expected a resumed gap"),
+                Chunk::End { reset, .. } => {
                     assert!(!reset);
                     ends += 1;
                     finish(&mut decoder, |pair| pairs.push(pair)).unwrap();
@@ -82,7 +82,7 @@ fn public_events_drive_a_user_decoder_with_gap_and_end_hooks() {
 
 #[test]
 fn copied_module_compiles_and_runs_in_a_consumer_crate() {
-    use fictionet_copy_modules::tcp_stream as copied;
+    use fictionet_copy_modules::tcp_reassembly as copied;
 
     let mut tcp = copied::Reassembler::default();
     let key = key();
@@ -113,7 +113,7 @@ fn copied_module_compiles_and_runs_in_a_consumer_crate() {
     let mut decoder = Stream::new(UserDecoder);
     let mut pairs = Vec::new();
     for event in result.events {
-        if let copied::TcpEvent::Bytes { bytes, .. } = event {
+        if let copied::Chunk::Bytes { bytes, .. } = event {
             pump(&mut decoder, &bytes, |pair| pairs.push(pair)).unwrap();
         }
     }

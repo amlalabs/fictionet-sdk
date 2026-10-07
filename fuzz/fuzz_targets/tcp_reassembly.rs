@@ -1,7 +1,7 @@
 #![no_main]
 
 use arbitrary::Arbitrary;
-use fictionet::stdlib::tcp_stream::{FlowKey, Limits, Reassembler, Segment, TcpEvent};
+use fictionet::stdlib::tcp_reassembly::{FlowKey, Limits, Reassembler, Segment, Chunk};
 use libfuzzer_sys::fuzz_target;
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
@@ -102,7 +102,7 @@ fuzz_target!(|input: Input| {
         for event in output.events {
             assert!(!closed, "end must be the last event for this segment");
             match event {
-                TcpEvent::Bytes {
+                Chunk::Bytes {
                     dir: event_dir,
                     offset,
                     bytes,
@@ -123,7 +123,7 @@ fuzz_target!(|input: Input| {
                     }
                     released = released.checked_add(bytes.len()).unwrap();
                 }
-                TcpEvent::Gap {
+                Chunk::Gap {
                     dir: event_dir,
                     offset,
                     ..
@@ -131,7 +131,7 @@ fuzz_target!(|input: Input| {
                     assert_eq!(event_dir, dir);
                     assert_eq!(offset, *positions.entry(dir).or_default());
                 }
-                TcpEvent::End {
+                Chunk::End {
                     dir: event_dir,
                     offset,
                     reset,

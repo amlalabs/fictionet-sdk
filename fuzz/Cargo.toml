@@ -75,8 +75,8 @@ doc = false
 bench = false
 
 [[bin]]
-name = "tcp_stream"
-path = "fuzz_targets/tcp_stream.rs"
+name = "tcp_reassembly"
+path = "fuzz_targets/tcp_reassembly.rs"
 test = false
 doc = false
 bench = false

@@ -1,7 +1,7 @@
 //! Bounded TCP capture reassembly with ordered bytes, gaps, and end signals.
 //!
 //! Feed captured [`Segment`] values to [`Reassembler::push`]. Route each
-//! [`TcpEvent`] by its [`FlowKey`] to the application's directional decoder.
+//! [`Chunk`] by its [`FlowKey`] to the application's directional decoder.
 //! A gap invalidates framing and compression state. An end marks input EOF.
 //! [`Limits`] bounds retained payloads, segments, and tracked directions.
 
@@ -66,7 +66,7 @@ pub struct Segment<'a> {
 
 /// Ordered output for one direction of a captured TCP connection.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TcpEvent {
+pub enum Chunk {
     /// New bytes, with retransmitted prefixes removed.
     Bytes {
         /// The direction that sent these bytes.
@@ -123,7 +123,7 @@ pub struct Reassembled {
     /// The flow bound cleared every connection. Discard all application state.
     pub cleared: bool,
     /// Events in delivery order. Bytes precede the segment's end signal.
-    pub events: Vec<TcpEvent>,
+    pub events: Vec<Chunk>,
 }
 
 #[derive(Debug)]
@@ -160,7 +160,7 @@ impl Flow {
         seq: u32,
         bytes: &[u8],
         input_offset: Option<usize>,
-    ) -> TcpEvent {
+    ) -> Chunk {
         let offset = self.delivered;
         let Some((delivered, position, len)) = u32::try_from(bytes.len()).ok().and_then(|len| {
             Some((
@@ -169,7 +169,7 @@ impl Flow {
                 len,
             ))
         }) else {
-            return TcpEvent::Gap {
+            return Chunk::Gap {
                 dir,
                 offset,
                 resumed: false,
@@ -178,7 +178,7 @@ impl Flow {
         self.delivered = delivered;
         self.position = position;
         self.next = Some(seq.wrapping_add(len));
-        TcpEvent::Bytes {
+        Chunk::Bytes {
             dir,
             offset,
             bytes: bytes.to_vec(),
@@ -197,7 +197,7 @@ impl Flow {
 ///
 /// If a new out-of-order segment would exceed either buffer bound, that
 /// segment is dropped. Reassembly skips to the earliest buffered segment,
-/// emits [`TcpEvent::Gap`], and drains its contiguous successors. With no
+/// emits [`Chunk::Gap`], and drains its contiguous successors. With no
 /// buffered segment it reports a gap and keeps waiting. The limits are
 /// checked before replacement, including for retransmits of held data.
 /// A retransmit counts against `max_segments` even if it replaces a segment.
@@ -222,11 +222,11 @@ impl Flow {
 /// are copied only when inserted or delivered, never rescanned per arrival.
 ///
 /// ```
-/// use fictionet::stdlib::tcp_stream::{Reassembler, Segment, TcpEvent};
+/// use fictionet::stdlib::tcp_reassembly::{Reassembler, Segment, Chunk};
 /// let key = ("192.0.2.1".parse()?, 40000, "192.0.2.2".parse()?, 80);
 /// let mut tcp = Reassembler::default();
 /// let result = tcp.push(Segment { key, seq: 10, ack: 0, flags: 0x18, payload: b"hello" });
-/// assert!(matches!(&result.events[..], [TcpEvent::Bytes { offset: 0, bytes, .. }] if bytes == b"hello"));
+/// assert!(matches!(&result.events[..], [Chunk::Bytes { offset: 0, bytes, .. }] if bytes == b"hello"));
 /// assert_eq!(tcp.buffered(), 0);
 /// # Ok::<(), std::net::AddrParseError>(())
 /// ```
@@ -387,7 +387,7 @@ impl Reassembler {
                 flow.next = Some(next.wrapping_add(jump));
                 flow.position = k;
                 gap = false;
-                result.events.push(TcpEvent::Gap {
+                result.events.push(Chunk::Gap {
                     dir: key,
                     offset: flow.delivered,
                     resumed: true,
@@ -412,7 +412,7 @@ impl Reassembler {
             }
         }
         if gap {
-            result.events.push(TcpEvent::Gap {
+            result.events.push(Chunk::Gap {
                 dir: key,
                 offset: flow.delivered,
                 resumed: false,
@@ -426,7 +426,7 @@ impl Reassembler {
                 flow.position = position;
             } else {
                 fin = false;
-                result.events.push(TcpEvent::Gap {
+                result.events.push(Chunk::Gap {
                     dir: key,
                     offset: flow.delivered,
                     resumed: false,
@@ -435,7 +435,7 @@ impl Reassembler {
         }
         if !flow.ended && (fin || flags & 0x04 != 0) {
             flow.ended = true;
-            result.events.push(TcpEvent::End {
+            result.events.push(Chunk::End {
                 dir: key,
                 offset: flow.delivered,
                 reset: flags & 0x04 != 0,
@@ -473,8 +473,8 @@ mod tests {
         }
     }
 
-    fn bytes(offset: u64, data: &[u8], input_offset: Option<usize>) -> TcpEvent {
-        TcpEvent::Bytes {
+    fn bytes(offset: u64, data: &[u8], input_offset: Option<usize>) -> Chunk {
+        Chunk::Bytes {
             dir: key(),
             offset,
             bytes: data.to_vec(),
@@ -482,8 +482,8 @@ mod tests {
         }
     }
 
-    fn gap(offset: u64, resumed: bool) -> TcpEvent {
-        TcpEvent::Gap {
+    fn gap(offset: u64, resumed: bool) -> Chunk {
+        Chunk::Gap {
             dir: key(),
             offset,
             resumed,
@@ -569,7 +569,7 @@ mod tests {
         );
         // As in the captured stream policy, the early FIN did not consume
         // a sequence number. Its retransmission can now close the stream.
-        let end = TcpEvent::End {
+        let end = Chunk::End {
             dir: key(),
             offset: 5,
             reset: false,
@@ -755,7 +755,7 @@ mod tests {
                 tcp.push(segment(101, flags, b"ab")).events,
                 [
                     bytes(0, b"ab", Some(0)),
-                    TcpEvent::End {
+                    Chunk::End {
                         dir: key(),
                         offset: 2,
                         reset: flags & 4 != 0
@@ -768,7 +768,7 @@ mod tests {
         tcp.push(segment(100, 2, b""));
         assert_eq!(
             tcp.push(segment(500, 4, b"")).events,
-            [TcpEvent::End {
+            [Chunk::End {
                 dir: key(),
                 offset: 0,
                 reset: true
@@ -808,7 +808,7 @@ mod tests {
                 ..response
             })
             .events,
-            [TcpEvent::Gap {
+            [Chunk::Gap {
                 dir: back,
                 offset: 0,
                 resumed: false
@@ -822,7 +822,7 @@ mod tests {
                 ..response
             })
             .events,
-            [TcpEvent::Bytes {
+            [Chunk::Bytes {
                 dir: back,
                 offset: 0,
                 bytes: b"ab".to_vec(),
@@ -922,7 +922,7 @@ mod tests {
             tcp.push(segment(101, 0x11, b"ab")).events,
             [
                 bytes(0, b"ab", Some(0)),
-                TcpEvent::End {
+                Chunk::End {
                     dir: key(),
                     offset: 2,
                     reset: false

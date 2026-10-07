@@ -1,8 +1,8 @@
 use fictionet::stdlib::{
     codec::{Demux, Wire},
-    grpc, hpack, http2, tcp_stream,
+    grpc, hpack, http2, tcp_reassembly,
 };
-use tcp_stream::{FlowKey, Segment, TcpEvent};
+use tcp_reassembly::{FlowKey, Segment, Chunk};
 
 fn key(direction: usize) -> FlowKey {
     let a = "192.0.2.1".parse().unwrap();
@@ -56,7 +56,7 @@ fn data(stream: u32, payload: &[u8], end: bool) -> Vec<u8> {
     out
 }
 struct Stack {
-    tcp: tcp_stream::Reassembler,
+    tcp: tcp_reassembly::Reassembler,
     h2: [http2::Connection; 2],
     calls: Demux<(usize, u32), grpc::Messages>,
     messages: Vec<(usize, u32, Vec<u8>)>,
@@ -68,7 +68,7 @@ struct Stack {
 impl Stack {
     fn new() -> Self {
         Self {
-            tcp: tcp_stream::Reassembler::new(tcp_stream::Limits {
+            tcp: tcp_reassembly::Reassembler::new(tcp_reassembly::Limits {
                 max_buffered: 128,
                 ..Default::default()
             }),
@@ -149,7 +149,7 @@ impl Stack {
             .events
         {
             match event {
-                TcpEvent::Bytes { dir, bytes, .. } => {
+                Chunk::Bytes { dir, bytes, .. } => {
                     let dir = usize::from(dir == key(1));
                     let mut rest = bytes.as_slice();
                     while !rest.is_empty() {
@@ -161,7 +161,7 @@ impl Stack {
                         assert!(n > 0);
                     }
                 }
-                TcpEvent::Gap { dir, .. } => {
+                Chunk::Gap { dir, .. } => {
                     let dir = usize::from(dir == key(1));
                     self.h2[dir].lost();
                     // This test uses streams 1 and 5. A world keeps its active
@@ -171,7 +171,7 @@ impl Stack {
                     }
                     self.gaps += 1;
                 }
-                TcpEvent::End { dir, .. } => {
+                Chunk::End { dir, .. } => {
                     let dir = usize::from(dir == key(1));
                     self.h2[dir].end();
                     while let Some(event) = self.h2[dir].next() {
