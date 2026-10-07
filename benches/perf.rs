@@ -1,7 +1,7 @@
 //! Fictionet's performance suite.
 //!
-//! Each group builds a small world, pushes traffic through it, and prints a
-//! table. The numbers that matter most are counts that do not depend on how
+//! Most groups build a small world and push traffic through it. The decoders
+//! group uses in-memory bytes. Each prints a table. The counts do not depend on how
 //! busy the machine is: allocations, packets sent and lost, round trips.
 //! Times and rates are medians of several runs, with the range beside them,
 //! because a shared machine makes any single run noisy.
@@ -120,6 +120,7 @@ const GROUPS: &[Group] = &[
     ("observe", "the cost of an observer watching the graph and ten sandbox links", observe),
     ("graph", "HTTP/2 latency with 1,000 sites while an observer watches the graph", graph),
     ("proxy", "fictionet attach --type http_proxy: DNS queries for cold and missing names", proxy),
+    ("decoders", "in-memory TPKT/COTP, HTTP/1 requests and ITCH in 16 KiB chunks", decoders),
 ];
 
 fn main() {
@@ -219,6 +220,86 @@ fn finish(result: fictionet::Result) {
     {
         panic!("the world failed: {e}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Decoders
+
+fn decoders(o: &Options) {
+    use std::hint::black_box;
+    use stdlib::codec::{Decode, Stream, Wire, pump, finish};
+    use stdlib::{http1, itch, tpkt};
+
+    // Keep construction here so a decoder rename changes just one line.
+    fn packets() -> impl Decode<Item = tpkt::Packet, Error = tpkt::Error> {
+        tpkt::Packets::new()
+    }
+    fn requests() -> impl Decode<Item = http1::Request, Error = http1::Error> {
+        http1::Requests::new()
+    }
+    fn messages() -> impl Decode<Item = Result<itch::Message, itch::Error>, Error = itch::Error> {
+        itch::Messages::default()
+    }
+
+    fn measure<D: Decode>(
+        o: &Options, name: &str, frame: &[u8], make: impl Fn() -> D,
+        mut consume: impl FnMut(D::Item),
+    ) -> Vec<String>
+    where
+        D::Error: Clone + std::fmt::Debug,
+    {
+        let count = (4 * 1024 * 1024_usize).div_ceil(frame.len());
+        let input = frame.repeat(count);
+        let mut rates = Vec::with_capacity(o.reps);
+        let mut items = Vec::with_capacity(o.reps);
+        let mut per = Vec::with_capacity(o.reps);
+        for _ in 0..o.reps {
+            let before = allocs();
+            let start = Instant::now();
+            let mut stream = Stream::new(make());
+            let mut decoded = 0;
+            let mut on = |item| {
+                consume(item);
+                decoded += 1;
+            };
+            for chunk in black_box(&input).chunks(16 * 1024) {
+                assert_eq!(pump(&mut stream, chunk, &mut on).unwrap(), chunk.len());
+            }
+            finish(&mut stream, &mut on).unwrap();
+            assert_eq!(decoded, count);
+            assert_eq!(stream.buffered(), 0);
+            drop(stream);
+            let seconds = start.elapsed().as_secs_f64();
+            let allocations = allocs() - before;
+            rates.push(input.len() as f64 / 1e6 / seconds);
+            items.push(decoded as f64 / seconds);
+            per.push(allocations as f64 / decoded as f64);
+        }
+        vec![name.to_string(), input.len().to_string(), count.to_string(),
+            spread(&rates, 1), spread(&items, 0), spread(&per, 4)]
+    }
+
+    // A COTP data TPDU with its end-of-message bit set and 128 payload bytes.
+    let mut payload = vec![2, 0xf0, 0x80];
+    payload.extend_from_slice(&[0x42; 128]);
+    let packet = tpkt::Packet::new(payload).to_bytes().unwrap();
+    let request = b"POST /orders HTTP/1.1\r\nHost: bench.local\r\nContent-Length: 16\r\n\r\n0123456789abcdef";
+    let order = itch::AddOrder {
+        header: itch::Header { locate: 7, tracking: 0, timestamp: itch::Timestamp::new(34_200_000_000_000).unwrap() },
+        order_ref: 1,
+        side: itch::Side::Buy,
+        shares: 300,
+        stock: itch::Alpha::right_padded("ZXZZT").unwrap(),
+        price: itch::Price4(102_500),
+    }.to_bytes().unwrap();
+    let mut message = (order.len() as u16).to_be_bytes().to_vec();
+    message.extend_from_slice(&order);
+
+    let mut t = Table::new(&["decoder", "bytes/run", "items/run", "MB/s", "items/s", "allocs/item"]);
+    t.row(measure(o, "TPKT/COTP", &packet, packets, |item| { black_box(item); }));
+    t.row(measure(o, "HTTP/1 requests", request, requests, |item| { black_box(item); }));
+    t.row(measure(o, "ITCH add orders", &message, messages, |item| { black_box(item.unwrap()); }));
+    t.print();
 }
 
 // ---------------------------------------------------------------------------
