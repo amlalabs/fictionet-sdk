@@ -930,8 +930,43 @@ doc = false
 bench = false
 
 [[bin]]
+name = "cme_mdp3"
+path = "fuzz_targets/cme_mdp3.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "moldudp64"
 path = "fuzz_targets/moldudp64.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "itch"
+path = "fuzz_targets/itch.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ouch"
+path = "fuzz_targets/ouch.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cboe_pitch"
+path = "fuzz_targets/cboe_pitch.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cboe_boe"
+path = "fuzz_targets/cboe_boe.rs"
 test = false
 doc = false
 bench = false

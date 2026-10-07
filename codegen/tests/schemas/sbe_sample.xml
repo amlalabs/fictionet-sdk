@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- A small schema that uses every feature the sbe front end maps. -->
+<sbe:messageSchema xmlns:sbe="http://fixprotocol.io/2016/sbe" package="sample" id="9" version="4" byteOrder="bigEndian" description="Front end sample">
+  <types>
+    <composite name="messageHeader">
+      <type name="blockLength" primitiveType="uint16"/>
+      <type name="templateId" primitiveType="uint16"/>
+      <type name="schemaId" primitiveType="uint16"/>
+      <type name="version" primitiveType="uint16"/>
+    </composite>
+    <composite name="groupSizeEncoding">
+      <type name="blockLength" primitiveType="uint16"/>
+      <type name="numInGroup" primitiveType="uint16" maxValue="100"/>
+    </composite>
+    <composite name="paddedGroupSize">
+      <type name="blockLength" primitiveType="uint16"/>
+      <type name="numInGroup" primitiveType="uint8" offset="3"/>
+    </composite>
+    <composite name="varString">
+      <type name="length" primitiveType="uint8" maxValue="20"/>
+      <type name="varData" primitiveType="char" length="0"/>
+    </composite>
+    <type name="Symbol" primitiveType="char" length="6" description="Padded symbol"/>
+    <type name="Code" primitiveType="char" presence="constant">X</type>
+    <type name="Venue" primitiveType="char" presence="constant" length="4">XCME</type>
+    <type name="Qty" primitiveType="int32" minValue="0" maxValue="1000000"/>
+    <type name="OpenQty" primitiveType="uint32" presence="optional" nullValue="0" minValue="1"/>
+    <type name="Level" primitiveType="int8" presence="optional"/>
+    <type name="Flag" primitiveType="char"/>
+    <type name="u8null" primitiveType="uint8" presence="optional"/>
+    <enum name="Side" encodingType="char">
+      <validValue name="Buy">1</validValue>
+      <validValue name="Sell">2</validValue>
+    </enum>
+    <enum name="Status" encodingType="u8null">
+      <validValue name="Open">0</validValue>
+      <validValue name="Closed" sinceVersion="3">1</validValue>
+    </enum>
+    <set name="Flags" encodingType="uint16">
+      <choice name="Ack">0</choice>
+      <choice name="Last" description="Last in its event">9</choice>
+    </set>
+    <composite name="Price" description="A decimal price.">
+      <type name="mantissa" primitiveType="int64"/>
+      <type name="exponent" primitiveType="int8" presence="constant">-2</type>
+    </composite>
+    <composite name="Quote">
+      <ref name="price" type="Price"/>
+      <ref name="side" type="Side" offset="9"/>
+      <enum name="Kind" encodingType="uint8">
+        <validValue name="Firm">1</validValue>
+        <validValue name="Indicative">2</validValue>
+      </enum>
+    </composite>
+  </types>
+  <sbe:message name="Order" id="1" blockLength="48" description="An order.">
+    <field name="id" id="1" type="uint64"/>
+    <field name="symbol" id="2" type="Symbol"/>
+    <field name="quote" id="3" type="Quote" offset="16"/>
+    <field name="qty" id="4" type="Qty"/>
+    <field name="open" id="5" type="OpenQty"/>
+    <field name="code" id="6" type="Code"/>
+    <field name="venue" id="7" type="Venue"/>
+    <field name="status" id="8" type="Status"/>
+    <field name="flags" id="9" type="Flags"/>
+    <field name="sideConst" id="10" type="Side" presence="constant" valueRef="Side.Sell"/>
+    <field name="flag" id="12" type="Flag"/>
+    <field name="maybe" id="13" type="uint16" presence="optional"/>
+    <field name="level" id="11" type="Level" sinceVersion="2"/>
+    <group name="fills" id="20" dimensionType="paddedGroupSize" blockLength="12">
+      <field name="price" id="21" type="Price"/>
+      <field name="qty" id="22" type="Qty"/>
+      <group name="legs" id="23">
+        <field name="ratio" id="24" type="int16"/>
+        <data name="note" id="25" type="varString"/>
+      </group>
+      <data name="text" id="26" type="varString"/>
+    </group>
+    <data name="memo" id="30" type="varString"/>
+  </sbe:message>
+  <sbe:message name="Ping" id="2"/>
+</sbe:messageSchema>
