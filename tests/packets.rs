@@ -513,11 +513,16 @@ fn router_longest_prefix_add_replace_and_removal_on_close() {
         ];
         let r = router(&cx, routes);
 
-        // Longest prefix wins, from any cable.
+        // Longest prefix wins, from any cable. The router lowers the TTL.
+        let hop = |src, dst, payload: &[u8]| {
+            let mut v = Vec::new();
+            PacketBuilder::ipv4(src, dst, 63).udp(1000, 53).write(&mut v, payload).unwrap();
+            v
+        };
         c.send(to4([10, 1, 2, 3], 1));
-        assert_eq!(recv_soon(&cx, &mut b).await.0, v4_udp(A4, [10, 1, 2, 3], &[1]));
+        assert_eq!(recv_soon(&cx, &mut b).await.0, hop(A4, [10, 1, 2, 3], &[1]));
         c.send(to4([10, 2, 0, 1], 2));
-        assert_eq!(recv_soon(&cx, &mut a).await.0, v4_udp(A4, [10, 2, 0, 1], &[2]));
+        assert_eq!(recv_soon(&cx, &mut a).await.0, hop(A4, [10, 2, 0, 1], &[2]));
         a.send(to4([8, 8, 8, 8], 3));
         assert_eq!(recv_soon(&cx, &mut c).await.0[28], 3);
         // Back out the cable it came in on, when that is the best route.
