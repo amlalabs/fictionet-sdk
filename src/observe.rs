@@ -471,7 +471,7 @@ mod present;
 mod registry;
 
 pub use present::{Observed, Place, Placement, Present};
-pub use registry::{Match, Protocol, Registry, Selection, Transport};
+pub use registry::{Match, Protocol, Registry, Selection};
 pub use decode::{Decoded, Dissector, Field, Layer};
 pub use crate::watch::KeyLine;
 

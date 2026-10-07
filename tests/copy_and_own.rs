@@ -49,9 +49,8 @@ fn copied_modbus_uses_the_public_driver_and_map() {
 
 #[test]
 fn copied_presenters_plug_into_observe_and_construct_display_items() {
-    use fictionet::observe::{
-        Decoded, Layer, Match, Observed, Place, Present, Registry, Selection, Transport,
-    };
+    use fictionet::events::Transport;
+    use fictionet::observe::{Decoded, Layer, Match, Observed, Place, Present, Registry, Selection};
     let mut registry = Registry::new();
     registry.register(
         "modbus",

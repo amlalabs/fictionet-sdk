@@ -1,20 +1,13 @@
 use super::{Decoded, KeyLine, Observed, Place, Present};
+use crate::events::Transport;
 use std::sync::Arc;
-
-/// The transport carrying an application conversation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Transport {
-    /// An ordered TCP byte stream.
-    Tcp,
-    /// One UDP datagram. The selected decoder receives EOF after it.
-    Udp,
-}
 
 /// Inputs to a protocol matcher. TCP ports are in conversation order;
 /// UDP ports are source then destination. `first` is a bounded prefix.
 #[derive(Clone, Copy, Debug)]
 pub struct Selection<'a> {
-    /// The transport carrying these bytes.
+    /// The transport carrying these bytes: an ordered TCP byte stream, or
+    /// one UDP datagram, after which the selected decoder receives EOF.
     pub transport: Transport,
     /// The conversation's two ports. TCP endpoints sort by address, then
     /// port. Direction zero sends from the first port to the second.

@@ -288,7 +288,9 @@ impl Sandbox {
     }
 }
 
-/// How a connection's bytes travel.
+/// How a connection's bytes travel. An event's connection and an observed
+/// conversation ([`observe::Selection`](crate::observe::Selection)) both
+/// use it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Transport {
     /// A byte stream: TCP, or TLS over it.

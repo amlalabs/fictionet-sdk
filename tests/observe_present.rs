@@ -1,6 +1,5 @@
-use fictionet::observe::{
-    Decoded, Dissector, Layer, Match, Present, Registry, Selection, Transport,
-};
+use fictionet::events::Transport;
+use fictionet::observe::{Decoded, Dissector, Layer, Match, Present, Registry, Selection};
 use fictionet::stdlib::codec::{Decode, Step};
 use std::convert::Infallible;
 

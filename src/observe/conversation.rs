@@ -1,6 +1,5 @@
-use fictionet::observe::{
-    Decoded, KeyLine, Match, Place, Protocol, Registry, Selection, Transport,
-};
+use fictionet::events::Transport;
+use fictionet::observe::{Decoded, KeyLine, Match, Place, Protocol, Registry, Selection};
 
 /// Selects and drives one ordered byte conversation in both directions.
 /// Direction zero sends from the first port to the second. TCP callers use

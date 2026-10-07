@@ -585,7 +585,7 @@ fn udp(p: &[u8], at: usize, end: usize, d: &mut Decoded, registry: &super::Regis
         return;
     }
     let bytes = &p[body.0..body.1];
-    let selection = super::Selection { transport: super::Transport::Udp, ports: (sport, dport), alpn: None, first: bytes.get(..bytes.len().min(64)).unwrap_or_default() };
+    let selection = super::Selection { transport: crate::events::Transport::Udp, ports: (sport, dport), alpn: None, first: bytes.get(..bytes.len().min(64)).unwrap_or_default() };
     if let Ok(mut protocol) = registry.open(selection) {
         let place = super::Place { stream_start: 0, buf: 0, offset: Some(body.0), len: bytes.len() };
         protocol.data(false, bytes, place, d, &[]);

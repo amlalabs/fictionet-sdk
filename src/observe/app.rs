@@ -17,7 +17,8 @@ use super::decode::Decoded;
 
 use super::protocols;
 use super::tls::TlsSession;
-use super::{Match, Registry, Transport};
+use super::{Match, Registry};
+use crate::events::Transport;
 const MAX_BUFFER: usize = 32 << 10;
 
 /// Sets the packet's protocol and info from a message at `level`: 1 for

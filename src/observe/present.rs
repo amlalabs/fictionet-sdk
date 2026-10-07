@@ -10,7 +10,8 @@ use crate::stdlib::codec::{Decode, Fail, Spans, Stream};
 /// The stream retains a terminal error while reporting it once to the caller.
 ///
 /// ```
-/// use fictionet::observe::{Layer, Present, Registry, Selection, Match, Transport};
+/// use fictionet::events::Transport;
+/// use fictionet::observe::{Layer, Present, Registry, Selection, Match};
 /// use fictionet::stdlib::codec::{Decode, Step};
 /// use std::convert::Infallible;
 /// struct Bytes;

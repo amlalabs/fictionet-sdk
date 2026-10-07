@@ -1,5 +1,6 @@
 use fictionet::{
-    observe::{Decoded, Match, Observed, Place, Registry, Selection, Transport, http2 as capture},
+    events::Transport,
+    observe::{Decoded, Match, Observed, Place, Registry, Selection, http2 as capture},
     stdlib::{codec::Wire, grpc, hpack, http2},
 };
 

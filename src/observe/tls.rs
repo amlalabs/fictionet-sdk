@@ -1,6 +1,7 @@
+use fictionet::events::Transport;
 use fictionet::observe::{
     Conversation, Decoded, KeyLine, Layer, Observed, Place, Placement, Present, Protocol, Registry,
-    Transport, protocols,
+    protocols,
 };
 
 /// One TLS connection: what its hellos said, and its keys.
