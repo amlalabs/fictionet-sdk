@@ -17,7 +17,7 @@
 //!   the `421 Misdirected Request` of [`web::Sites`](crate::stdlib::web::Sites).
 //!
 //! On a [`Net`](crate::stdlib::net::Net), a [`Site`] is the
-//! [`Accept`](crate::stdlib::net::Accept) that serves HTTP on a host's
+//! [`Accept`] that serves HTTP on a host's
 //! port: sites of several hosts at one address share the port as virtual
 //! hosts. [`Website`] puts a site on ports 80 and 443 the way websites
 //! are served. `Net` knows nothing of HTTP, so a copy of this file with

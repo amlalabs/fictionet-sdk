@@ -872,6 +872,7 @@ fn net_serves_udp_services_and_trusted_sandboxes() {
                 Lines::new(64, Ending::LfOrCrlf)
             }
             fn on_item(&mut self, _: Result<Vec<u8>, LineError>, n: &AtomicUsize, ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
+                ctx.log(Event::new("udp", "datagram"));
                 ctx.reply().extend_from_slice(format!("{}\n", n.fetch_add(1, Ordering::SeqCst) + 1).as_bytes());
                 Ok(Flow::Continue)
             }
@@ -889,6 +890,10 @@ fn net_serves_udp_services_and_trusted_sandboxes() {
         let mut u = s.udp.bind(5000)?;
         u.send_to(b"x\n", SocketAddr::new(Ipv4Addr::new(10, 40, 0, 1).into(), 9));
         assert_eq!(u.recv(&cx).await?.0, b"1\n");
+        // A datagram's events name its sandbox, as a connection's do.
+        let datagram = kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("udp", "datagram")).await;
+        assert_eq!(datagram[0].conn.sandbox.as_ref().map(|s| s.name.to_string()).as_deref(), Some("agent"));
+        assert_eq!(datagram[0].conn.transport, fictionet::stdlib::journal::Transport::Udp);
 
         // The trusted sandbox at its fixed address, reached from the agent.
         let boxed = sandbox(&cx, attacher.attach("box")?, Ipv4Addr::new(10, 50, 0, 7));

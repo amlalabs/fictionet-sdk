@@ -75,11 +75,11 @@
 //! - **Machines** answer pings, reset TCP to closed ports and answer UDP to
 //!   closed ports with "port unreachable". A sandbox may have 256
 //!   connections open at once to one machine
-//!   ([`Net::connections_per_peer`]); past that, new ones are reset. Each
+//!   ([`Limits::connections_per_peer`]); past that, new ones are reset. Each
 //!   service has its own cap too ([`ServeOptions::max_conns`]).
 //! - **Budgets.** What every connection from one sandbox holds is charged
 //!   to that sandbox's [`Budget`], 256 MiB unless
-//!   [`Net::sandbox_budget`] says otherwise: a connection that would pass
+//!   [`Limits::sandbox_budget`] says otherwise: a connection that would pass
 //!   it is closed.
 //! - **Every link** inside the network holds at most 4 MiB of packets each
 //!   way; past that, packets are dropped, as on a congested link.
@@ -314,8 +314,8 @@ where
 }
 
 /// Starts serving a UDP port of a machine: the socket, its address, the
-/// journal and the seed.
-type UdpStart = Arc<dyn Fn(&Cx, udp::Socket, SocketAddr, Option<Journal>, u64) + Send + Sync>;
+/// journal, the seed, and who the sandboxes are.
+type UdpStart = Arc<dyn Fn(&Cx, udp::Socket, SocketAddr, Option<Journal>, u64, Option<serve::SandboxOf>) + Send + Sync>;
 
 /// Which names a TLS service on a port answers to, by the SNI the client
 /// sends.
@@ -482,12 +482,13 @@ impl Host {
         M: Fn() -> S + Send + Sync + 'static,
         <S::Decode as Decode>::Error: Clone + Send,
     {
-        let start: UdpStart = Arc::new(move |cx, socket, local, journal, seed| {
+        let start: UdpStart = Arc::new(move |cx, socket, local, journal, seed, sandbox| {
             let mut service = make();
             let world = world.clone();
             let mut opts = opts.clone();
             if journal.is_some() {
                 opts.journal = journal;
+                opts.sandbox = sandbox;
             }
             opts.seed ^= seed;
             cx.spawn(move |cx| async move {
@@ -1419,6 +1420,10 @@ impl Machine {
     fn add(self: &Arc<Self>, host: &Host) -> Result<(), String> {
         let journal = self.shared.upgrade().and_then(|s| s.hooks.journal.clone());
         let seed = self.shared.upgrade().map_or(0, |s| s.seed);
+        let sandbox: Option<serve::SandboxOf> = self.shared.upgrade().map(|s| {
+            let hooks = s.hooks.clone();
+            Arc::new(move |a: IpAddr| Some(hooks.sandbox_at(a))) as serve::SandboxOf
+        });
         let addr = self.addr;
         for (number, spec) in &host.ports {
             match spec {
@@ -1427,7 +1432,7 @@ impl Machine {
                         return Err(format!("UDP port {number} at {addr} is already served"));
                     }
                     let socket = self.udp.bind(*number).map_err(|e| format!("UDP port {number} at {addr}: {e}"))?;
-                    start(&self.cx, socket, SocketAddr::new(addr, *number), journal.clone(), seed);
+                    start(&self.cx, socket, SocketAddr::new(addr, *number), journal.clone(), seed, sandbox.clone());
                 }
                 PortSpec::Tcp(accept) => {
                     let port = self.port(*number)?;

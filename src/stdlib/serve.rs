@@ -140,7 +140,7 @@ use fictionet::stdlib::codec::{
     Buffer, ByteFault, Decode, Direction, Fail, FaultDelay, Faults, ItemFault, Lcg, Record, Recorder, RewriteError,
     Rule, Stream, StreamEvent,
 };
-use fictionet::stdlib::journal::{ConnInfo, Event, Journal, Level, Transport};
+use fictionet::stdlib::journal::{ConnInfo, Event, Journal, Level, Sandbox, Transport};
 use fictionet::stdlib::tcp::Listener;
 use fictionet::stdlib::tls::{self, HandshakeError, ServerConfig, TlsConnection};
 use fictionet::stdlib::udp::Socket;
@@ -859,6 +859,10 @@ impl FaultPlan {
     }
 }
 
+/// Names the sandbox at an address, for the [`ConnInfo`] of a datagram
+/// ([`ServeOptions::sandbox`]).
+pub type SandboxOf = Arc<dyn Fn(std::net::IpAddr) -> Option<Sandbox> + Send + Sync>;
+
 /// Chooses the TLS config for a handshake from the client's SNI. `None`
 /// rejects the handshake with `unrecognized_name`.
 pub type TlsSelect = Arc<dyn Fn(Option<&str>, &Cx) -> Option<Arc<ServerConfig>> + Send + Sync>;
@@ -899,6 +903,10 @@ pub struct ServeOptions {
     /// The seed every connection's randomness ([`ServeCtx::random_u64`])
     /// is drawn from, mixed with its number ([`conn_seed`]). Default 0.
     pub seed: u64,
+    /// Names the sandbox each datagram came from, in its [`ConnInfo`].
+    /// [`Net`](crate::stdlib::net::Net) sets it; a connection's sandbox is
+    /// given with its `ConnInfo` instead.
+    pub sandbox: Option<SandboxOf>,
     /// Numbers connections, from 1. Clones of these options share it.
     pub ids: Arc<AtomicU64>,
 }
@@ -918,6 +926,7 @@ impl Default for ServeOptions {
             read_buffer: 0,
             budget: None,
             seed: 0,
+            sandbox: None,
             ids: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -2422,7 +2431,8 @@ where
         };
         let Some(got) = got else { continue };
         let Ok((datagram, from)) = got else { break };
-        let info = ConnInfo { peer: Some(from), ..base.clone() };
+        let sandbox = opts.sandbox.as_ref().and_then(|f| f(from.ip()));
+        let info = ConnInfo { peer: Some(from), sandbox, ..base.clone() };
         s.bytes_in = s.bytes_in.saturating_add(datagram.len() as u64);
         let mut stream = Stream::with_buffer(service.decoder(), datagram.len());
         let taken = stream.push(&datagram);
