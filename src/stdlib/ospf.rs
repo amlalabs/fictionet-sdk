@@ -841,11 +841,11 @@ impl std::error::Error for OspfError {}
 // Checksums.
 
 fn sum_words(mut sum: u64, b: &[u8]) -> u64 {
-    let mut chunks = b.chunks_exact(2);
-    for c in &mut chunks {
+    let (chunks, rest) = b.as_chunks::<2>();
+    for c in chunks {
         sum += u64::from(u16::from_be_bytes([c[0], c[1]]));
     }
-    if let [last] = chunks.remainder() {
+    if let [last] = rest {
         sum += u64::from(*last) << 8;
     }
     sum

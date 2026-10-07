@@ -762,7 +762,7 @@ fn decode_utf16le(b: &[u8]) -> Option<String> {
     if !b.len().is_multiple_of(2) {
         return None;
     }
-    let units = b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]]));
+    let units = b.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes([c[0], c[1]]));
     char::decode_utf16(units).collect::<Result<String, _>>().ok()
 }
 

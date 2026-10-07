@@ -372,11 +372,11 @@ pub(crate) fn parse_ip(p: &[u8]) -> Option<IpInfo> {
 }
 
 fn sum16(mut acc: u32, data: &[u8]) -> u32 {
-    let mut chunks = data.chunks_exact(2);
-    for c in &mut chunks {
+    let (chunks, rest) = data.as_chunks::<2>();
+    for c in chunks {
         acc += u16::from_be_bytes([c[0], c[1]]) as u32;
     }
-    if let [last] = chunks.remainder() {
+    if let [last] = rest {
         acc += (*last as u32) << 8;
     }
     acc

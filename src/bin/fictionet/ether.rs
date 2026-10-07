@@ -143,15 +143,15 @@ pub(crate) fn ip_packet(ethertype: u16, payload: &[u8]) -> Option<&[u8]> {
 
 /// The ones' complement sum of `data` as 16-bit words, added to `sum`.
 fn add(mut sum: u32, data: &[u8]) -> u32 {
-    let mut chunks = data.chunks_exact(2);
-    for c in &mut chunks {
+    let (chunks, rest) = data.as_chunks::<2>();
+    for c in chunks {
         sum += u16::from_be_bytes([c[0], c[1]]) as u32;
         // Fold early, so a long packet cannot overflow.
         if sum > 0xffff_0000 {
             sum = (sum & 0xffff) + (sum >> 16);
         }
     }
-    if let [last] = chunks.remainder() {
+    if let [last] = rest {
         sum += (*last as u32) << 8;
     }
     sum

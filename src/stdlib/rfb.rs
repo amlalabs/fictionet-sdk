@@ -1947,7 +1947,7 @@ fn client_normal(c: &mut Cur<'_>) -> Result<ClientMessage, Stop> {
             c.take(1)?;
             let n = usize::from(c.u16()?);
             let b = c.take(4 * n)?;
-            ClientMessage::SetEncodings(b.chunks_exact(4).map(|e| i32::from_be_bytes([e[0], e[1], e[2], e[3]])).collect())
+            ClientMessage::SetEncodings(b.as_chunks::<4>().0.iter().map(|e| i32::from_be_bytes([e[0], e[1], e[2], e[3]])).collect())
         }
         client_type::FRAMEBUFFER_UPDATE_REQUEST => {
             let incremental = c.u8()? != 0;
@@ -1992,7 +1992,9 @@ fn server_normal(c: &mut Cur<'_>, format: &PixelFormat) -> Result<ServerMessage,
             let n = usize::from(c.u16()?);
             let b = c.take(6 * n)?;
             let colors = b
-                .chunks_exact(6)
+                .as_chunks::<6>()
+                .0
+                .iter()
                 .map(|v| Color {
                     red: u16::from_be_bytes([v[0], v[1]]),
                     green: u16::from_be_bytes([v[2], v[3]]),

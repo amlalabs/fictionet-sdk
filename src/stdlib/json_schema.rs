@@ -1906,8 +1906,8 @@ fn uri(s: &str) -> bool {
     {
         return false;
     }
-    let (rest, fragment) = rest.split_once('#').map_or((rest, ""), |pair| pair);
-    let (path, query) = rest.split_once('?').map_or((rest, ""), |pair| pair);
+    let (rest, fragment) = rest.split_once('#').unwrap_or((rest, ""));
+    let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
     if !uri_component(query, b"/?@:") || !uri_component(fragment, b"/?@:") {
         return false;
     }

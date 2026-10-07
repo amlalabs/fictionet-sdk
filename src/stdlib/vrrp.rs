@@ -398,11 +398,11 @@ impl std::error::Error for VrrpError {}
 /// Adds `b` to a ones' complement sum, as 16-bit words with a zero byte
 /// added to an odd length.
 fn sum_words(mut sum: u64, b: &[u8]) -> u64 {
-    let mut words = b.chunks_exact(2);
-    for w in &mut words {
+    let (words, rest) = b.as_chunks::<2>();
+    for w in words {
         sum += u64::from(u16::from_be_bytes([w[0], w[1]]));
     }
-    if let [last] = words.remainder() {
+    if let [last] = rest {
         sum += u64::from(*last) << 8;
     }
     sum
@@ -562,7 +562,9 @@ impl Advertisement {
             Endpoints::V4 { .. } => Addresses::V4(v4_addresses(body)),
             Endpoints::V6 { .. } => {
                 let v6: Vec<Ipv6Addr> = body
-                    .chunks_exact(16)
+                    .as_chunks::<16>()
+                    .0
+                    .iter()
                     .map(|c| {
                         let mut o = [0u8; 16];
                         o.copy_from_slice(c);
@@ -720,7 +722,7 @@ impl Advertisement {
 }
 
 fn v4_addresses(b: &[u8]) -> Vec<Ipv4Addr> {
-    b.chunks_exact(4).map(|c| Ipv4Addr::new(c[0], c[1], c[2], c[3])).collect()
+    b.as_chunks::<4>().0.iter().map(|c| Ipv4Addr::new(c[0], c[1], c[2], c[3])).collect()
 }
 
 /// One bounded IP payload, with every received byte preserved.

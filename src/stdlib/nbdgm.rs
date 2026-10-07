@@ -154,7 +154,7 @@ pub fn decode_first_level(label: &[u8]) -> Option<[u8; NAME_LEN]> {
     }
     let half = |c: u8| if (b'A'..=b'P').contains(&c) { Some(c - b'A') } else { None };
     let mut out = [0u8; NAME_LEN];
-    for (i, pair) in label.chunks_exact(2).enumerate() {
+    for (i, pair) in label.as_chunks::<2>().0.iter().enumerate() {
         out[i] = half(pair[0])? << 4 | half(pair[1])?;
     }
     Some(out)

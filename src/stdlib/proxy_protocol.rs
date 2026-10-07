@@ -1339,7 +1339,7 @@ mod tests {
         assert_eq!(e(b"PROXY TCP4 1.2.3.4 5.6.7.8 1 \r\n"), Error::V1Port);
         assert_eq!(e(b"PROXY TCP4 1.2.3.4 5.6.7.8 1 +2\r\n"), Error::V1Port);
         assert_eq!(e(b"PROXY TCP4 1.2.3.4 5.6.7.8 1 123456\r\n"), Error::V1Port);
-        assert_eq!(e(&[b'P', b'R', b'O', b'X', b'Y', b' '].iter().copied().chain([b'x'; 101]).collect::<Vec<_>>()), Error::V1TooLong);
+        assert_eq!(e(&b"PROXY ".iter().copied().chain([b'x'; 101]).collect::<Vec<_>>()), Error::V1TooLong);
         // A port of 0 is allowed.
         assert!(Header::parse(b"PROXY TCP4 1.2.3.4 5.6.7.8 0 0\r\n").is_ok());
     }

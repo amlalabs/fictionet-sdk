@@ -393,12 +393,12 @@ pub fn checksum(b: &[u8]) -> u16 {
     // Folding the carry after every word keeps the sum within 17 bits, so
     // it cannot overflow however long `b` is.
     let mut sum: u32 = 0;
-    let mut words = b.chunks_exact(2);
-    for w in &mut words {
+    let (words, rest) = b.as_chunks::<2>();
+    for w in words {
         sum += u32::from(u16::from_be_bytes([w[0], w[1]]));
         sum = (sum & 0xffff) + (sum >> 16);
     }
-    if let [last] = words.remainder() {
+    if let [last] = rest {
         sum += u32::from(*last) << 8;
         sum = (sum & 0xffff) + (sum >> 16);
     }
@@ -423,7 +423,7 @@ fn be16(b: &[u8], i: usize) -> Option<u16> {
 fn addrs(b: &[u8], at: usize, n: usize) -> Result<(Vec<Ipv4Addr>, usize), IgmpError> {
     let end = n.checked_mul(4).and_then(|l| l.checked_add(at)).ok_or(IgmpError::Truncated)?;
     let s = b.get(at..end).ok_or(IgmpError::Truncated)?;
-    let out: Vec<Ipv4Addr> = s.chunks_exact(4).map(|c| Ipv4Addr::new(c[0], c[1], c[2], c[3])).collect();
+    let out: Vec<Ipv4Addr> = s.as_chunks::<4>().0.iter().map(|c| Ipv4Addr::new(c[0], c[1], c[2], c[3])).collect();
     check_sources(&out)?;
     Ok((out, end))
 }

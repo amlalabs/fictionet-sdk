@@ -638,7 +638,7 @@ fn parse_digest(s: &str) -> Result<[u8; 16], ArgumentError> {
         return Err(ArgumentError::BadDigest);
     }
     let mut out = [0u8; 16];
-    for (o, pair) in out.iter_mut().zip(b.chunks_exact(2)) {
+    for (o, pair) in out.iter_mut().zip(b.as_chunks::<2>().0) {
         let hi = hex(pair[0]).ok_or(ArgumentError::BadDigest)?;
         let lo = hex(pair[1]).ok_or(ArgumentError::BadDigest)?;
         *o = hi << 4 | lo;

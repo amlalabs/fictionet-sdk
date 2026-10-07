@@ -1539,13 +1539,13 @@ impl StringKind {
             StringKind::Visible => b.iter().all(|&c| (0x20..=0x7e).contains(&c)),
             StringKind::Universal => {
                 b.len().is_multiple_of(4)
-                    && b.chunks_exact(4).all(|c| char::from_u32(u32::from_be_bytes([c[0], c[1], c[2], c[3]])).is_some())
-                    && no_shifts(b.chunks_exact(4).map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]])))
+                    && b.as_chunks::<4>().0.iter().all(|c| char::from_u32(u32::from_be_bytes([c[0], c[1], c[2], c[3]])).is_some())
+                    && no_shifts(b.as_chunks::<4>().0.iter().map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]])))
             }
             StringKind::Bmp => {
                 b.len().is_multiple_of(2)
-                    && b.chunks_exact(2).all(|c| !(0xd800..=0xdfff).contains(&u16::from_be_bytes([c[0], c[1]])))
-                    && no_shifts(b.chunks_exact(2).map(|c| u32::from(u16::from_be_bytes([c[0], c[1]]))))
+                    && b.as_chunks::<2>().0.iter().all(|c| !(0xd800..=0xdfff).contains(&u16::from_be_bytes([c[0], c[1]])))
+                    && no_shifts(b.as_chunks::<2>().0.iter().map(|c| u32::from(u16::from_be_bytes([c[0], c[1]]))))
             }
             StringKind::Teletex | StringKind::Videotex | StringKind::Graphic | StringKind::General => true,
         };
@@ -1564,10 +1564,10 @@ impl StringKind {
         self.check(b)?;
         Ok(match self {
             StringKind::Universal => {
-                b.chunks_exact(4).filter_map(|c| char::from_u32(u32::from_be_bytes([c[0], c[1], c[2], c[3]]))).collect()
+                b.as_chunks::<4>().0.iter().filter_map(|c| char::from_u32(u32::from_be_bytes([c[0], c[1], c[2], c[3]]))).collect()
             }
             StringKind::Bmp => {
-                b.chunks_exact(2).filter_map(|c| char::from_u32(u32::from(u16::from_be_bytes([c[0], c[1]])))).collect()
+                b.as_chunks::<2>().0.iter().filter_map(|c| char::from_u32(u32::from(u16::from_be_bytes([c[0], c[1]])))).collect()
             }
             _ => String::from_utf8_lossy(b).into_owned(),
         })

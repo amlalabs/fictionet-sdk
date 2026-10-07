@@ -7,11 +7,10 @@
 //! address, TLS, and HTTP. You write only the sites.
 //!
 //! `Sites` is a preset on [`net::Net`](crate::stdlib::net::Net): each site
-//! is a [`Host`](crate::stdlib::net::Host) with a DNS name per site and a
-//! [`Website`] on ports 80 and 443, made when
-//! its name is first looked up. HTTP is
-//! [`httpd`](crate::stdlib::httpd), a service like any other. A world that
-//! needs other services next to its websites builds on `Net` directly.
+//! is a [`Host`] with a DNS name per site and a [`Website`] on ports 80
+//! and 443, made when its name is first looked up. HTTP is [`httpd`], a
+//! service like any other. A world that needs other services next to its
+//! websites builds on `Net` directly.
 //!
 //! In this world, two sites are served by the world's own axum routers.
 //! `en.wikipedia.org` has the IPv4 and IPv6 addresses it has on the real
@@ -19,9 +18,8 @@
 //! `github.com` and every name under it pass through to the real GitHub.
 //! Every other name does not exist. The certificates come from the world's
 //! own certificate authority (CA), loaded from the world's arguments. The
-//! world function gets its context ([`Cx`](crate::Cx)) and its sandboxes
-//! ([`Attachments`](crate::Attachments)), as
-//! [A world in code](crate#a-world-in-code) explains:
+//! world function gets its context ([`Cx`]) and its sandboxes
+//! ([`Attachments`]), as [A world in code](crate#a-world-in-code) explains:
 //!
 //! ```
 //! # use std::net::{Ipv4Addr, Ipv6Addr};

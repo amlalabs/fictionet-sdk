@@ -745,7 +745,7 @@ impl Parser<'_> {
     /// The `\uXXXX` that must follow a high surrogate, and the character
     /// the pair makes.
     fn low_surrogate(&mut self, high: u32, start: usize) -> Result<char, Error> {
-        for want in [b'\\', b'u'] {
+        for want in *b"\\u" {
             match self.b.get(self.i) {
                 None => return self.err(ErrorKind::UnexpectedEnd),
                 Some(&c) if c == want => self.i += 1,
