@@ -3,13 +3,13 @@
 
 use fictionet::stdlib::codec::{Decode, Fail, Wire, contract, test_support::decode_all};
 use fictionet::stdlib::smtp::{
-    Command, Data, DecodeError, Input, MAX_DATA, MAX_DATA_LINE, MAX_LINE, MAX_REPLY_TEXT,
-    ParseError, Replies, Reply, Request, Server,
+    Command, Data, Error, FrameError, Input, Inputs, MAX_DATA, MAX_DATA_LINE, MAX_LINE,
+    MAX_REPLY_TEXT, Replies, Reply, Request,
 };
 use libfuzzer_sys::fuzz_target;
 
-fn data_server() -> Server {
-    let mut server = Server::new();
+fn data_server() -> Inputs {
+    let mut server = Inputs::new();
     server.start_data().unwrap();
     server
 }
@@ -26,17 +26,17 @@ fn check_reply(reply: &Reply) {
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(Server::new, data, 2 * (MAX_DATA_LINE + 1));
+    contract::check_decode_with_alloc_limit(Inputs::new, data, 2 * (MAX_DATA_LINE + 1));
     contract::check_decode_with_alloc_limit(Replies::new, data, 2 * MAX_LINE);
     contract::check_decode_with_alloc_limit(data_server, data, 2 * (MAX_DATA_LINE + 1));
-    contract::check_decode_with_held_limit(Server::new, data, MAX_DATA);
+    contract::check_decode_with_held_limit(Inputs::new, data, MAX_DATA);
     contract::check_decode_with_held_limit(Replies::new, data, MAX_REPLY_TEXT);
     contract::check_decode_with_held_limit(data_server, data, MAX_DATA);
     contract::check_wire::<Command>(data);
     contract::check_wire::<Request>(data);
     contract::check_wire::<Reply>(data);
     contract::check_wire::<Data>(data);
-    for item in decode_all(Server::new, data).0 {
+    for item in decode_all(Inputs::new, data).0 {
         if let Ok(Input::Command(command)) = item {
             contract::check_wire_value(&command);
             if let Ok(request) = Request::from_command(&command) {
@@ -49,19 +49,26 @@ fuzz_target!(|data: &[u8]| {
     let (replies, failure) = decode_all(Replies::new, data);
     match Reply::parse(data) {
         Ok(reply) => assert_eq!(replies.first(), Some(&Ok(reply))),
-        Err(ParseError::Invalid(error)) => {
-            if let Some(first) = replies.first() {
-                assert_eq!(first, &Err(error));
-            } else {
-                assert_eq!(failure, Some(Fail::Protocol(DecodeError::Reply(error))));
-            }
-        }
-        Err(ParseError::Framing(error)) => {
+        Err(Error::Framing(error)) => {
             assert!(replies.is_empty());
             assert_eq!(failure, Some(Fail::Protocol(error)));
         }
-        Err(ParseError::Incomplete) => assert!(replies.is_empty()),
-        Err(ParseError::Trailing) => assert!(matches!(replies.first(), Some(Ok(_)))),
+        Err(Error::Incomplete) => assert!(replies.is_empty()),
+        Err(Error::Trailing) => assert!(matches!(replies.first(), Some(Ok(_)))),
+        Err(error) => {
+            if let Some(first) = replies.first() {
+                assert_eq!(first, &Err(error));
+            } else {
+                let fatal = match error {
+                    Error::LineEnding => FrameError::ReplyLineEnding,
+                    Error::Text => FrameError::ReplyText,
+                    Error::ReplyCode => FrameError::ReplyCode,
+                    Error::ReplyMismatch => FrameError::ReplyMismatch,
+                    _ => panic!("{error:?} is not a reply line fault"),
+                };
+                assert_eq!(failure, Some(Fail::Protocol(fatal)));
+            }
+        }
     }
     for reply in replies.into_iter().flatten() {
         check_reply(&reply);

@@ -18,7 +18,7 @@
 //! wait. A binary literal, `~{n}`, may also hold NUL bytes.
 //!
 //! Run a server's connection bytes through
-//! [`Stream<Commands>`](fictionet::stdlib::codec::Stream). Each item is a [`Command`],
+//! [`Stream<Inputs>`](fictionet::stdlib::codec::Stream). Each item is a [`Command`],
 //! a literal continuation, or a syntax error. Send a [`Response`] for each
 //! command. Clients read [`Stream<Responses>`](fictionet::stdlib::codec::Stream).
 //! Mailboxes, messages, and command execution belong to world code.
@@ -29,12 +29,12 @@
 //! overflows end the stream. Commands apply RFC 9051's non-synchronizing
 //! literal limit. Server responses cannot use non-synchronizing literals.
 //! Select raw AUTHENTICATE answers or IDLE `DONE` with
-//! [`Commands::expect_line`] between items.
+//! [`Inputs::expect_line`] between items.
 //!
 //! ```
-//! use fictionet::stdlib::{codec::{Stream, Wire}, imap::{Commands, Input, Response, Status}};
+//! use fictionet::stdlib::{codec::{Stream, Wire}, imap::{Inputs, Input, Response, Status}};
 //!
-//! let mut stream = Stream::new(Commands::new());
+//! let mut stream = Stream::new(Inputs::new());
 //! let line = b"a1 LOGIN alice {6}\r\n";
 //! assert_eq!(stream.push(line), line.len());
 //! assert!(matches!(stream.next(), Some(Ok(Ok(Input::Continue { size: 6, .. })))));
@@ -235,26 +235,26 @@ impl Command {
     /// Each offset is just after a synchronizing literal's marker and CRLF.
     /// Send bytes up to each offset, then wait for the peer's continuation.
     /// Refuses any input rejected by this command's exact parser.
-    pub fn continuation_offsets(bytes: &[u8]) -> Result<Vec<usize>, ParseError> {
+    pub fn continuation_offsets(bytes: &[u8]) -> Result<Vec<usize>, Error> {
         Self::parse(bytes)?;
-        let mut commands = Commands::new();
+        let mut commands = Inputs::new();
         let mut offsets = Vec::new();
         let mut at = 0usize;
         loop {
             match commands
-                .decode(bytes.get(at..).ok_or(ParseError::Incomplete)?, true)
-                .map_err(ParseError::Framing)?
+                .decode(bytes.get(at..).ok_or(Error::Incomplete)?, true)
+                .map_err(Error::Framing)?
             {
                 codec::Step::Item(Ok(Input::Continue { .. }), used) => {
-                    at = at.checked_add(used).ok_or(ParseError::Incomplete)?;
+                    at = at.checked_add(used).ok_or(Error::Incomplete)?;
                     offsets.push(at);
                 }
                 codec::Step::Skip(used) => {
-                    at = at.checked_add(used).ok_or(ParseError::Incomplete)?
+                    at = at.checked_add(used).ok_or(Error::Incomplete)?
                 }
                 codec::Step::Item(Ok(Input::Command(_)), _) => return Ok(offsets),
-                codec::Step::Item(Err(e), _) => return Err(ParseError::Invalid(e)),
-                _ => return Err(ParseError::Incomplete),
+                codec::Step::Item(Err(e), _) => return Err(e),
+                _ => return Err(Error::Incomplete),
             }
         }
     }
@@ -470,7 +470,7 @@ impl Response {
     }
 }
 
-/// Why bytes are not a command or response.
+/// Why bytes are not a command or response, or a value cannot be written.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
     /// The command or response breaks the grammar. The stream goes on
@@ -499,6 +499,14 @@ pub enum Error {
     /// its literals, or more than [`MAX_MESSAGE`] in all. The stream is
     /// broken.
     TooLong,
+    /// Line framing or assembly failed while reading one value.
+    Framing(FrameError),
+    /// No complete value was present.
+    Incomplete,
+    /// Bytes follow the value.
+    Trailing,
+    /// The value cannot fit its wire grammar and limits without changing.
+    Unwritable,
 }
 
 impl Error {
@@ -506,7 +514,11 @@ impl Error {
     pub fn tag(&self) -> Option<&str> {
         match self {
             Error::Syntax { tag, .. } | Error::LiteralTooLarge { tag, .. } => tag.as_deref(),
-            Error::TooLong => None,
+            Error::TooLong
+            | Error::Framing(_)
+            | Error::Incomplete
+            | Error::Trailing
+            | Error::Unwritable => None,
         }
     }
 }
@@ -517,20 +529,31 @@ impl std::fmt::Display for Error {
             Error::Syntax { reason, .. } => write!(f, "IMAP syntax error: {reason}"),
             Error::LiteralTooLarge { size, .. } => write!(f, "literal of {size} bytes is too large"),
             Error::TooLong => write!(f, "IMAP command or response is too long"),
+            Error::Framing(e) => e.fmt(f),
+            Error::Incomplete => f.write_str("incomplete IMAP value"),
+            Error::Trailing => f.write_str("bytes after IMAP value"),
+            Error::Unwritable => f.write_str("IMAP value cannot be written without changing it"),
         }
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Framing(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
-/// One command, literal continuation, or raw line from [`Commands`].
+/// One command, literal continuation, or raw line from [`Inputs`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Input {
     /// A whole command.
     Command(Command),
     /// The client sent `{size}` and waits for a continuation request.
     /// Send one, such as [`Response::continue_req`], and read the next item,
-    /// or call [`Commands::refuse_literal`] and answer `tag NO`.
+    /// or call [`Inputs::refuse_literal`] and answer `tag NO`.
     /// Every line ending in `{size}` requests a continuation, even if its
     /// start breaks the grammar; the whole command then yields [`Error::Syntax`].
     Continue {
@@ -539,7 +562,7 @@ pub enum Input {
         /// The literal's size, at most [`MAX_LITERAL`].
         size: usize,
     },
-    /// A raw line without CRLF, selected by [`Commands::expect_line`].
+    /// A raw line without CRLF, selected by [`Inputs::expect_line`].
     Line(Vec<u8>),
 }
 
@@ -891,7 +914,7 @@ fn parse_literal(c: &mut Cursor<'_>, allow_non_sync: bool, binary: bool) -> Resu
 
 /// The longest non-synchronizing literal a client sends, unless the
 /// server says it takes longer ones (RFC 9051, section 4.3).
-/// [`Commands`] enforces this limit without enabling the LITERAL+ extension.
+/// [`Inputs`] enforces this limit without enabling the LITERAL+ extension.
 pub const MAX_NON_SYNC: usize = 4096;
 
 /// Local maximum line size, including CRLF, for the shared decoders.
@@ -901,13 +924,23 @@ pub const MAX_LINE: usize = MAX_TEXT;
 /// Maximum assembled bytes and cached tag bytes in a shared decoder.
 pub const MAX_HELD: usize = MAX_MESSAGE + MAX_LINE;
 
-/// Why a shared IMAP decoder cannot continue.
+/// Why [`Inputs`] or [`Responses`] cannot continue. It ends the stream.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DecodeError {
+pub enum FrameError {
     /// A line exceeded its limit, ended early, or broke literal framing.
     Line(codec::LineError),
-    /// A message or non-synchronizing literal exceeded its limit.
-    Limit(Error),
+    /// A command or response held more than [`MAX_TEXT`] bytes outside
+    /// its literals, or more than [`MAX_MESSAGE`] in all.
+    TooLong,
+    /// A literal the sender does not wait to send is longer than
+    /// [`MAX_NON_SYNC`] or [`MAX_LITERAL`], or would push its command or
+    /// response past [`MAX_MESSAGE`].
+    LiteralTooLarge {
+        /// The tag at the start of the command, if there is one.
+        tag: Option<String>,
+        /// The size the literal announced.
+        size: u64,
+    },
     /// Storage for a bounded message could not be allocated.
     Allocation,
     /// EOF interrupted a literal or the command or response containing it.
@@ -916,84 +949,53 @@ pub enum DecodeError {
     State,
 }
 
-impl core::fmt::Display for DecodeError {
+impl core::fmt::Display for FrameError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Line(e) => e.fmt(f),
-            Self::Limit(e) => e.fmt(f),
+            Self::TooLong => f.write_str("IMAP command or response is too long"),
+            Self::LiteralTooLarge { size, .. } => write!(f, "literal of {size} bytes is too large"),
             Self::Allocation => f.write_str("IMAP assembly allocation failed"),
             Self::Incomplete => f.write_str("incomplete IMAP literal or message"),
             Self::State => f.write_str("IMAP raw line requires a command boundary"),
         }
     }
 }
-impl core::error::Error for DecodeError {}
-
-/// Why bytes are not exactly one IMAP wire value.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ParseError {
-    /// A complete command or response is malformed.
-    Invalid(Error),
-    /// Line framing or assembly failed.
-    Framing(DecodeError),
-    /// No complete value was present.
-    Incomplete,
-    /// Bytes follow the value.
-    Trailing,
-}
-
-impl core::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+impl core::error::Error for FrameError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
-            Self::Invalid(e) => e.fmt(f),
-            Self::Framing(e) => e.fmt(f),
-            Self::Incomplete => f.write_str("incomplete IMAP value"),
-            Self::Trailing => f.write_str("bytes after IMAP value"),
+            Self::Line(e) => Some(e),
+            _ => None,
         }
     }
 }
-impl core::error::Error for ParseError {}
-
-/// Why an IMAP value cannot be written.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WriteError {
-    /// The value cannot fit its wire grammar and limits without changing.
-    Unwritable,
-}
-
-impl core::fmt::Display for WriteError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("IMAP value cannot be written without changing it")
-    }
-}
-impl core::error::Error for WriteError {}
 
 impl Wire for Command {
-    type ParseError = ParseError;
-    type WriteError = WriteError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads one whole command with counted literals and final CRLF.
     /// Refuses trailing bytes, invalid grammar, non-synchronizing literals
     /// over [`MAX_NON_SYNC`], and text, literal, message, or nesting overflow.
     /// A section literal must fit its canonical quoted form.
-    fn parse(mut bytes: &[u8]) -> Result<Self, ParseError> {
-        let mut commands = Commands::new();
+    fn parse(mut bytes: &[u8]) -> Result<Self, Error> {
+        let mut commands = Inputs::new();
         loop {
-            match commands.decode(bytes, true).map_err(ParseError::Framing)? {
+            match commands.decode(bytes, true).map_err(Error::Framing)? {
                 codec::Step::Item(Ok(Input::Continue { .. }), used) | codec::Step::Skip(used) => {
-                    bytes = bytes.get(used..).ok_or(ParseError::Incomplete)?;
+                    bytes = bytes.get(used..).ok_or(Error::Incomplete)?;
                 }
                 codec::Step::Item(command, used) => {
-                    let command = command.map_err(ParseError::Invalid)?;
+                    let command = command?;
                     if used != bytes.len() {
-                        return Err(ParseError::Trailing);
+                        return Err(Error::Trailing);
                     }
                     return match command {
                         Input::Command(command) => Ok(command),
-                        Input::Continue { .. } | Input::Line(_) => Err(ParseError::Incomplete),
+                        Input::Continue { .. } | Input::Line(_) => Err(Error::Incomplete),
                     };
                 }
-                _ => return Err(ParseError::Incomplete),
+                _ => return Err(Error::Incomplete),
             }
         }
     }
@@ -1002,49 +1004,49 @@ impl Wire for Command {
     /// normalization, and all text, literal, message, or nesting overflows.
     /// Errors leave `out` unchanged. Use [`Self::continuation_offsets`] on
     /// the encoded bytes to wait before synchronizing literal payloads.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         let mut writer = Writer::new(false);
         writer.token(&self.tag, tag_char)?;
         writer.text(b" ")?;
         writer.token(&self.name, atom_char)?;
         if self.name.bytes().any(|b| b.is_ascii_lowercase()) {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         writer.args(&self.args)?;
         writer.text(b"\r\n")?;
         if Self::parse_message(&writer.out).as_ref() != Ok(self) {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         out.try_reserve(writer.out.len())
-            .map_err(|_| WriteError::Unwritable)?;
+            .map_err(|_| Error::Unwritable)?;
         out.extend_from_slice(&writer.out);
         Ok(())
     }
 }
 
 impl Wire for Response {
-    type ParseError = ParseError;
-    type WriteError = WriteError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads one whole response with CRLF framing and counted literal bytes.
     /// Refuses trailing bytes, invalid grammar, non-synchronizing literals,
     /// and text, literal, message, or nesting overflow. A section literal
     /// must fit its canonical quoted form.
-    fn parse(mut bytes: &[u8]) -> Result<Self, ParseError> {
+    fn parse(mut bytes: &[u8]) -> Result<Self, Error> {
         let mut responses = Responses::new();
         loop {
-            match responses.decode(bytes, true).map_err(ParseError::Framing)? {
+            match responses.decode(bytes, true).map_err(Error::Framing)? {
                 codec::Step::Item(response, used) => {
-                    let response = response.map_err(ParseError::Invalid)?;
+                    let response = response?;
                     if used != bytes.len() {
-                        return Err(ParseError::Trailing);
+                        return Err(Error::Trailing);
                     }
                     return Ok(response);
                 }
                 codec::Step::Skip(used) => {
-                    bytes = bytes.get(used..).ok_or(ParseError::Incomplete)?
+                    bytes = bytes.get(used..).ok_or(Error::Incomplete)?
                 }
-                _ => return Err(ParseError::Incomplete),
+                _ => return Err(Error::Incomplete),
             }
         }
     }
@@ -1052,7 +1054,7 @@ impl Wire for Response {
     /// Appends one response. Refuses invalid tags, codes, text, values,
     /// tagged BYE or PREAUTH, non-synchronizing literals, normalization,
     /// and all size or nesting overflows. Errors leave `out` unchanged.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         let mut writer = Writer::new(true);
         match self {
             Self::Continue { text } => {
@@ -1067,7 +1069,7 @@ impl Wire for Response {
             } => {
                 if let Some(tag) = tag {
                     if matches!(status, Status::Preauth | Status::Bye) {
-                        return Err(WriteError::Unwritable);
+                        return Err(Error::Unwritable);
                     }
                     writer.token(tag, tag_char)?;
                 } else {
@@ -1081,7 +1083,7 @@ impl Wire for Response {
                 }
                 if let Some(code) = code {
                     if code.is_empty() || code.len() > MAX_TEXT || code.contains(']') {
-                        return Err(WriteError::Unwritable);
+                        return Err(Error::Unwritable);
                     }
                     writer.text(b"[")?;
                     writer.response_text(code)?;
@@ -1092,7 +1094,7 @@ impl Wire for Response {
             Self::Data(values) => {
                 if matches!(values.first(), Some(Value::Atom(a)) if Status::from_word(a.as_bytes()).is_some())
                 {
-                    return Err(WriteError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 writer.text(b"*")?;
                 writer.args(values)?;
@@ -1100,10 +1102,10 @@ impl Wire for Response {
         }
         writer.text(b"\r\n")?;
         if Self::parse_message(&writer.out).as_ref() != Ok(self) {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         out.try_reserve(writer.out.len())
-            .map_err(|_| WriteError::Unwritable)?;
+            .map_err(|_| Error::Unwritable)?;
         out.extend_from_slice(&writer.out);
         Ok(())
     }
@@ -1125,19 +1127,19 @@ impl Writer {
         }
     }
 
-    fn append(&mut self, bytes: &[u8], literal: bool) -> Result<(), WriteError> {
+    fn append(&mut self, bytes: &[u8], literal: bool) -> Result<(), Error> {
         let total = self
             .out
             .len()
             .checked_add(bytes.len())
             .filter(|&n| n <= MAX_MESSAGE)
-            .ok_or(WriteError::Unwritable)?;
+            .ok_or(Error::Unwritable)?;
         if !literal {
             self.text = self
                 .text
                 .checked_add(bytes.len())
                 .filter(|&n| n <= MAX_TEXT)
-                .ok_or(WriteError::Unwritable)?;
+                .ok_or(Error::Unwritable)?;
         }
         if total > self.out.capacity() {
             let target = total
@@ -1145,31 +1147,31 @@ impl Writer {
                 .min(MAX_MESSAGE);
             self.out
                 .try_reserve_exact(target.saturating_sub(self.out.len()))
-                .map_err(|_| WriteError::Unwritable)?;
+                .map_err(|_| Error::Unwritable)?;
         }
         self.out.extend_from_slice(bytes);
         Ok(())
     }
 
-    fn text(&mut self, bytes: &[u8]) -> Result<(), WriteError> {
+    fn text(&mut self, bytes: &[u8]) -> Result<(), Error> {
         self.append(bytes, false)
     }
 
-    fn token(&mut self, value: &str, allowed: fn(u8) -> bool) -> Result<(), WriteError> {
+    fn token(&mut self, value: &str, allowed: fn(u8) -> bool) -> Result<(), Error> {
         if value.is_empty() || value.len() > MAX_TEXT || !value.bytes().all(allowed) {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         self.text(value.as_bytes())
     }
 
-    fn response_text(&mut self, value: &str) -> Result<(), WriteError> {
+    fn response_text(&mut self, value: &str) -> Result<(), Error> {
         if value.len() > MAX_TEXT || text_str(value.as_bytes()).is_err() {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         self.text(value.as_bytes())
     }
 
-    fn args(&mut self, values: &[Value]) -> Result<(), WriteError> {
+    fn args(&mut self, values: &[Value]) -> Result<(), Error> {
         for value in values {
             self.text(b" ")?;
             self.value(value)?;
@@ -1177,7 +1179,7 @@ impl Writer {
         Ok(())
     }
 
-    fn value(&mut self, value: &Value) -> Result<(), WriteError> {
+    fn value(&mut self, value: &Value) -> Result<(), Error> {
         let mut stack: Vec<(std::slice::Iter<'_, Value>, bool, bool)> = Vec::new();
         let mut next = Some(value);
         loop {
@@ -1185,20 +1187,20 @@ impl Writer {
                 match value {
                     Value::List(items) => {
                         if stack.len() >= MAX_DEPTH {
-                            return Err(WriteError::Unwritable);
+                            return Err(Error::Unwritable);
                         }
                         self.text(b"(")?;
                         stack.push((items.iter(), true, true));
                     }
                     Value::Atom(atom) => {
                         if atom.len() > MAX_TEXT || !atom_ok(atom.as_bytes()) {
-                            return Err(WriteError::Unwritable);
+                            return Err(Error::Unwritable);
                         }
                         self.text(atom.as_bytes())?;
                     }
                     Value::Quoted(bytes) => {
                         if bytes.len() > MAX_QUOTED || text_str(bytes).is_err() {
-                            return Err(WriteError::Unwritable);
+                            return Err(Error::Unwritable);
                         }
                         self.text(b"\"")?;
                         for byte in bytes {
@@ -1235,12 +1237,12 @@ impl Writer {
         }
     }
 
-    fn literal(&mut self, data: &[u8], non_sync: bool, binary: bool) -> Result<(), WriteError> {
+    fn literal(&mut self, data: &[u8], non_sync: bool, binary: bool) -> Result<(), Error> {
         if data.len() > MAX_LITERAL
             || (non_sync && (self.server || data.len() > MAX_NON_SYNC))
             || (!binary && data.contains(&0))
         {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         if binary {
             self.text(b"~")?;
@@ -1330,20 +1332,20 @@ impl MessageLines {
             .saturating_add(self.tag.as_ref().map_or(0, |tag| tag.len()))
     }
 
-    fn append(&mut self, bytes: &[u8]) -> Result<(), DecodeError> {
+    fn append(&mut self, bytes: &[u8]) -> Result<(), FrameError> {
         let size = self
             .message
             .len()
             .checked_add(bytes.len())
             .filter(|&n| n <= MAX_MESSAGE)
-            .ok_or(DecodeError::Limit(Error::TooLong))?;
+            .ok_or(FrameError::TooLong)?;
         if size > self.message.capacity() {
             let target = size
                 .max(self.message.capacity().saturating_mul(2))
                 .min(MAX_MESSAGE);
             self.message
                 .try_reserve_exact(target.saturating_sub(self.message.len()))
-                .map_err(|_| DecodeError::Allocation)?;
+                .map_err(|_| FrameError::Allocation)?;
         }
         self.message.extend_from_slice(bytes);
         Ok(())
@@ -1353,11 +1355,11 @@ impl MessageLines {
         &mut self,
         input: &[u8],
         eof: bool,
-    ) -> Result<codec::Step<Result<MailFrame, Error>>, DecodeError> {
+    ) -> Result<codec::Step<Result<MailFrame, Error>>, FrameError> {
         if self.remaining != 0 {
             if input.is_empty() {
                 return if eof {
-                    Err(DecodeError::Incomplete)
+                    Err(FrameError::Incomplete)
                 } else {
                     Ok(codec::Step::Need)
                 };
@@ -1386,7 +1388,7 @@ impl MessageLines {
                 let literals = !self.response
                     || self.kind.unwrap_or_else(|| classify(content(&candidate))) == Kind::Data;
                 if literals && marker(&candidate, !self.response).is_some() {
-                    return Err(DecodeError::Line(codec::LineError::BareLf));
+                    return Err(FrameError::Line(codec::LineError::BareLf));
                 }
                 let error = Error::Syntax {
                     tag: self
@@ -1399,9 +1401,9 @@ impl MessageLines {
                 self.reset();
                 return Ok(codec::Step::Item(Err(error), used));
             }
-            codec::Step::Item(Err(e), _) => return Err(DecodeError::Line(e)),
+            codec::Step::Item(Err(e), _) => return Err(FrameError::Line(e)),
             codec::Step::Need if eof && !self.message.is_empty() => {
-                return Err(DecodeError::Incomplete);
+                return Err(FrameError::Incomplete);
             }
             codec::Step::Need => {
                 self.partial = !input.is_empty();
@@ -1421,13 +1423,13 @@ impl MessageLines {
             .text
             .checked_add(line.len())
             .filter(|&n| n <= MAX_TEXT)
-            .ok_or(DecodeError::Limit(Error::TooLong))?;
+            .ok_or(FrameError::TooLong)?;
         let end = self
             .message
             .len()
             .checked_add(line.len())
             .filter(|&n| n <= MAX_MESSAGE)
-            .ok_or(DecodeError::Limit(Error::TooLong))?;
+            .ok_or(FrameError::TooLong)?;
         let literal = (!self.response || self.kind == Some(Kind::Data))
             .then(|| marker(&line, !self.response))
             .flatten();
@@ -1438,17 +1440,13 @@ impl MessageLines {
                 .filter(|&n| n <= limit)
                 .filter(|&n| end.checked_add(n).is_some_and(|total| total <= MAX_MESSAGE));
             let Some(count) = count else {
-                let waiting = !self.response && !non_sync;
-                let error = Error::LiteralTooLarge {
-                    tag: self.tag.as_deref().map(String::from),
-                    size,
-                    waiting,
-                };
-                if waiting {
+                let tag = self.tag.as_deref().map(String::from);
+                if !self.response && !non_sync {
                     self.reset();
+                    let error = Error::LiteralTooLarge { tag, size, waiting: true };
                     return Ok(codec::Step::Item(Err(error), used));
                 }
-                return Err(DecodeError::Limit(error));
+                return Err(FrameError::LiteralTooLarge { tag, size });
             };
             self.append(&line)?;
             self.remaining = count;
@@ -1490,25 +1488,25 @@ impl MessageLines {
 /// [`Input::Line`] under the same [`MAX_LINE`] limit, then resumes commands.
 ///
 /// ```
-/// use fictionet::stdlib::{codec::Stream, imap::{Commands, Input}};
-/// let mut stream = Stream::new(Commands::new());
+/// use fictionet::stdlib::{codec::Stream, imap::{Inputs, Input}};
+/// let mut stream = Stream::new(Inputs::new());
 /// let bytes = b"a LOGIN user {3}\r\nabc\r\n";
 /// assert_eq!(stream.push(bytes), bytes.len());
 /// assert!(matches!(stream.next(), Some(Ok(Ok(Input::Continue { size: 3, .. })))));
 /// assert!(matches!(stream.next(), Some(Ok(Ok(Input::Command(_))))));
 /// ```
-pub struct Commands {
+pub struct Inputs {
     framing: MessageLines,
     raw_line: bool,
 }
 
-impl Default for Commands {
+impl Default for Inputs {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Commands {
+impl Inputs {
     /// Creates a command decoder with no pending literal.
     pub fn new() -> Self {
         Self {
@@ -1521,14 +1519,14 @@ impl Commands {
     /// Call between items. Refuses a partial command, a pending literal, or
     /// an already selected raw line without changing the mode. Literal-looking
     /// text in this line is returned unchanged, without a continuation event.
-    pub fn expect_line(&mut self) -> Result<(), DecodeError> {
+    pub fn expect_line(&mut self) -> Result<(), FrameError> {
         if self.raw_line
             || self.framing.partial
             || !self.framing.message.is_empty()
             || self.framing.waiting
             || self.framing.remaining != 0
         {
-            return Err(DecodeError::State);
+            return Err(FrameError::State);
         }
         self.raw_line = true;
         Ok(())
@@ -1546,9 +1544,9 @@ impl Commands {
     }
 }
 
-impl Decode for Commands {
+impl Decode for Inputs {
     type Item = Result<Input, Error>;
-    type Error = DecodeError;
+    type Error = FrameError;
     const NAME: &'static str = "IMAP commands";
 
     fn capacity(&self) -> usize {
@@ -1559,7 +1557,7 @@ impl Decode for Commands {
         self.framing.held()
     }
 
-    fn decode(&mut self, input: &[u8], eof: bool) -> Result<codec::Step<Self::Item>, DecodeError> {
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<codec::Step<Self::Item>, FrameError> {
         if self.raw_line {
             let step = match self.framing.lines.decode(input, eof) {
                 Ok(step) => step,
@@ -1575,7 +1573,7 @@ impl Decode for Commands {
                             tag: None,
                             reason: "a line must end with CRLF",
                         }),
-                        Err(e) => return Err(DecodeError::Line(e)),
+                        Err(e) => return Err(FrameError::Line(e)),
                     };
                     codec::Step::Item(line, used)
                 }
@@ -1605,7 +1603,7 @@ impl Decode for Commands {
 /// Reads responses over CRLF lines and counted literals.
 ///
 /// Uses the same line, literal, assembly, and retained-state limits as
-/// [`Commands`]. Server literals must use `{n}`, never `{n+}`, and do not
+/// [`Inputs`]. Server literals must use `{n}`, never `{n+}`, and do not
 /// generate continuation events. A data response ending in `{n+}` is a
 /// syntax error item; the following line remains a separate response.
 /// A status or continuation response ending in `{n}` is ordinary text.
@@ -1632,7 +1630,7 @@ impl Responses {
 
 impl Decode for Responses {
     type Item = Result<Response, Error>;
-    type Error = DecodeError;
+    type Error = FrameError;
     const NAME: &'static str = "IMAP responses";
 
     fn capacity(&self) -> usize {
@@ -1643,7 +1641,7 @@ impl Decode for Responses {
         self.framing.held()
     }
 
-    fn decode(&mut self, input: &[u8], eof: bool) -> Result<codec::Step<Self::Item>, DecodeError> {
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<codec::Step<Self::Item>, FrameError> {
         Ok(match self.framing.decode(input, eof)? {
             codec::Step::Item(frame, used) => codec::Step::Item(
                 frame.and_then(|frame| match frame {
@@ -1680,7 +1678,7 @@ mod tests {
         Command::parse(bytes).is_err()
     }
     fn events(bytes: &[u8]) -> Vec<Result<Input, Error>> {
-        let (items, failure) = decode_all(Commands::new, bytes);
+        let (items, failure) = decode_all(Inputs::new, bytes);
         assert_eq!(failure, None);
         items
     }
@@ -1689,9 +1687,9 @@ mod tests {
         assert_eq!(failure, None);
         items
     }
-    fn refused(value: &impl Wire<WriteError = WriteError>) {
+    fn refused(value: &impl Wire<WriteError = Error>) {
         let mut out = b"prefix".to_vec();
-        assert_eq!(value.write(&mut out), Err(WriteError::Unwritable));
+        assert_eq!(value.write(&mut out), Err(Error::Unwritable));
         assert_eq!(out, b"prefix");
     }
     #[test]
@@ -2186,25 +2184,25 @@ mod tests {
             };
             assert_eq!(
                 Command::parse(bytes),
-                Err(ParseError::Invalid(error.clone())),
+                Err(error.clone()),
                 "{bytes:?}"
             );
-            assert_eq!(decode_all(Commands::new, bytes), (vec![Err(error)], None));
-            contract::check_decode_with_alloc_limit(Commands::new, bytes, 2 * MAX_LINE);
+            assert_eq!(decode_all(Inputs::new, bytes), (vec![Err(error)], None));
+            contract::check_decode_with_alloc_limit(Inputs::new, bytes, 2 * MAX_LINE);
         }
         assert_eq!(
             Command::parse(b"a NOOP\r\nb NOOP\r\n"),
-            Err(ParseError::Trailing)
+            Err(Error::Trailing)
         );
         for (bytes, error) in [
             (
                 b"a X \"ab".as_slice(),
-                DecodeError::Line(codec::LineError::Unterminated),
+                FrameError::Line(codec::LineError::Unterminated),
             ),
-            (b"a X {3}\r\nab", DecodeError::Incomplete),
+            (b"a X {3}\r\nab", FrameError::Incomplete),
         ] {
-            assert_eq!(Command::parse(bytes), Err(ParseError::Framing(error)));
-            contract::check_decode_with_alloc_limit(Commands::new, bytes, 2 * MAX_LINE);
+            assert_eq!(Command::parse(bytes), Err(Error::Framing(error)));
+            contract::check_decode_with_alloc_limit(Inputs::new, bytes, 2 * MAX_LINE);
         }
         for (depth, valid) in [(MAX_DEPTH, true), (MAX_DEPTH + 1, false)] {
             let bytes = [
@@ -2223,9 +2221,9 @@ mod tests {
                 };
                 assert_eq!(
                     Command::parse(&bytes),
-                    Err(ParseError::Invalid(error.clone()))
+                    Err(error.clone())
                 );
-                assert_eq!(decode_all(Commands::new, &bytes), (vec![Err(error)], None));
+                assert_eq!(decode_all(Inputs::new, &bytes), (vec![Err(error)], None));
             }
         }
         let quoted = [
@@ -2240,25 +2238,25 @@ mod tests {
         };
         assert_eq!(
             Command::parse(&quoted),
-            Err(ParseError::Invalid(error.clone()))
+            Err(error.clone())
         );
-        assert_eq!(decode_all(Commands::new, &quoted), (vec![Err(error)], None));
+        assert_eq!(decode_all(Inputs::new, &quoted), (vec![Err(error)], None));
         assert_eq!(
             Command::parse(b"a X {99999999999999999999999}\r\n"),
-            Err(ParseError::Invalid(Error::LiteralTooLarge {
+            Err(Error::LiteralTooLarge {
                 tag: Some("a".into()),
                 size: u64::MAX,
                 waiting: true
-            }))
+            })
         );
         assert!(matches!(
             Command::parse(b"a X {1048577+}\r\n"),
-            Err(ParseError::Framing(DecodeError::Limit(_)))
+            Err(Error::Framing(FrameError::LiteralTooLarge { .. }))
         ));
         for bytes in [vec![b'z'; MAX_TEXT + 4], vec![b'a'; MAX_MESSAGE + 1]] {
             assert!(matches!(
                 Command::parse(&bytes),
-                Err(ParseError::Framing(DecodeError::Line(_)))
+                Err(Error::Framing(FrameError::Line(_)))
             ));
         }
     }
@@ -2285,18 +2283,15 @@ mod tests {
         for bytes in [vec![b'z'; MAX_TEXT + 5], vec![b'*'; MAX_MESSAGE + 1]] {
             assert!(matches!(
                 Response::parse(&bytes),
-                Err(ParseError::Framing(DecodeError::Line(_)))
+                Err(Error::Framing(FrameError::Line(_)))
             ));
         }
         assert!(matches!(
             Response::parse(b"* 1 FETCH (BODY[] {2000000}\r\n"),
-            Err(ParseError::Framing(DecodeError::Limit(
-                Error::LiteralTooLarge {
-                    size: 2000000,
-                    waiting: false,
-                    ..
-                }
-            )))
+            Err(Error::Framing(FrameError::LiteralTooLarge {
+                size: 2000000,
+                ..
+            }))
         ));
     }
 
@@ -2309,14 +2304,14 @@ mod tests {
         ] {
             for cut in 0..bytes.len() {
                 assert!(Command::parse(&bytes[..cut]).is_err());
-                let (items, _) = decode_all(Commands::new, &bytes[..cut]);
+                let (items, _) = decode_all(Inputs::new, &bytes[..cut]);
                 assert!(
                     items
                         .iter()
                         .all(|e| matches!(e, Ok(Input::Continue { .. })))
                 );
             }
-            contract::check_decode_with_alloc_limit(Commands::new, bytes, 2 * MAX_LINE);
+            contract::check_decode_with_alloc_limit(Inputs::new, bytes, 2 * MAX_LINE);
         }
         for bytes in [
             b"* 12 FETCH (FLAGS (\\Seen) BODY[HEADER] {13}\r\nSubject: hi\r\n)\r\n".as_slice(),
@@ -2357,8 +2352,8 @@ mod tests {
             Ok(Input::Command(Command::new("a3", "X", vec![]))),
         ];
         assert_eq!(events(wire), expected);
-        contract::check_decode_with_alloc_limit(Commands::new, wire, 2 * MAX_LINE);
-        let mut stream = Stream::new(Commands::new());
+        contract::check_decode_with_alloc_limit(Inputs::new, wire, 2 * MAX_LINE);
+        let mut stream = Stream::new(Inputs::new());
         let wire = b"b1 APPEND INBOX {10}\r\nb2 NOOP\r\n";
         assert_eq!(stream.push(wire), wire.len());
         assert!(matches!(
@@ -2388,25 +2383,25 @@ mod tests {
             Error::LiteralTooLarge { waiting: true, .. }
         ));
         assert!(matches!(items[1], Ok(Input::Command(_))));
-        let mut stream = Stream::new(Commands::new());
+        let mut stream = Stream::new(Inputs::new());
         let wire = b"c1 APPEND INBOX {2000000+}\r\nc2 NOOP\r\n";
         assert_eq!(stream.push(wire), wire.len());
         assert!(matches!(
             stream.next(),
-            Some(Err(Fail::Protocol(DecodeError::Limit(_))))
+            Some(Err(Fail::Protocol(FrameError::LiteralTooLarge { .. })))
         ));
         assert_eq!(stream.next(), None);
         assert!(stream.failed().is_some());
         let items = events(b"e1 X (\r\ne2 NOOP\r\n");
         assert_eq!(items[0].as_ref().unwrap_err().tag(), Some("e1"));
         assert!(matches!(items[1], Ok(Input::Command(_))));
-        let mut stream = Stream::new(Commands::new());
+        let mut stream = Stream::new(Inputs::new());
         assert_eq!(stream.push(&vec![b'a'; MAX_TEXT - 1]), MAX_TEXT - 1);
         assert_eq!(stream.next(), None);
         assert_eq!(stream.push(b"a"), 1);
         assert_eq!(
             stream.next(),
-            Some(Err(Fail::Protocol(DecodeError::Line(
+            Some(Err(Fail::Protocol(FrameError::Line(
                 codec::LineError::TooLong { max: MAX_LINE - 2 }
             ))))
         );
@@ -2414,7 +2409,7 @@ mod tests {
 
     #[test]
     fn raw_lines() {
-        let mut stream = Stream::new(Commands::new());
+        let mut stream = Stream::new(Inputs::new());
         let wire = b"a AUTHENTICATE PLAIN\r\nAGFsaWNlAHNlY3JldA==\r\nDONE\r\nb NOOP\r\n";
         assert_eq!(stream.push(wire), wire.len());
         assert!(matches!(stream.next(), Some(Ok(Ok(Input::Command(_))))));
@@ -2429,7 +2424,7 @@ mod tests {
             stream.next(),
             Some(Ok(Ok(Input::Continue { .. })))
         ));
-        assert_eq!(stream.decoder().expect_line(), Err(DecodeError::State));
+        assert_eq!(stream.decoder().expect_line(), Err(FrameError::State));
     }
 
     #[test]
@@ -2454,10 +2449,7 @@ mod tests {
         contract::check_decode_with_alloc_limit(Responses::new, wire, 2 * MAX_LINE);
         assert!(matches!(
             decode_all(Responses::new, b"* 1 FETCH (BODY[] {2000000}\r\n").1,
-            Some(Fail::Protocol(DecodeError::Limit(Error::LiteralTooLarge {
-                waiting: false,
-                ..
-            })))
+            Some(Fail::Protocol(FrameError::LiteralTooLarge { .. }))
         ));
         let items = responses(b"* 1 FETCH (BODY[] {3+}\r\nabc)\r\n");
         assert_eq!(items.len(), 2);
@@ -2466,7 +2458,7 @@ mod tests {
         assert_eq!(stream.push(&vec![b'*'; MAX_TEXT + 1]), MAX_LINE);
         assert!(matches!(
             stream.next(),
-            Some(Err(Fail::Protocol(DecodeError::Line(_))))
+            Some(Err(Fail::Protocol(FrameError::Line(_))))
         ));
         assert_eq!(stream.next(), None);
     }
@@ -2516,10 +2508,10 @@ mod tests {
     fn literals_never_hold_nul() {
         assert!(matches!(
             Command::parse(b"a X {3}\r\na\0b\r\n"),
-            Err(ParseError::Invalid(Error::Syntax {
+            Err(Error::Syntax {
                 reason: "a literal holds NUL",
                 ..
-            }))
+            })
         ));
         assert!(Response::parse(b"* 1 FETCH (BODY[] {1}\r\n\0)\r\n").is_err());
         let items = events(b"a X {1+}\r\n\0\r\nb NOOP\r\n");
@@ -2550,10 +2542,10 @@ mod tests {
         for bytes in [b"a X \"\xff\"\r\n".as_slice(), b"a X \"a\xc3\"\r\n"] {
             assert!(matches!(
                 Command::parse(bytes),
-                Err(ParseError::Invalid(Error::Syntax {
+                Err(Error::Syntax {
                     reason: "a quoted string is not UTF-8",
                     ..
-                }))
+                })
             ));
         }
         assert!(Response::parse(b"* X \"a\xc3\"\r\n").is_err());
@@ -2594,7 +2586,7 @@ mod tests {
         let items = responses(&b"* 1 EXISTS\r\n".repeat(count));
         assert_eq!(items.len(), count);
         assert!(items.iter().all(|e| *e == Ok(Response::exists(1))));
-        let mut stream = Stream::new(Commands::new());
+        let mut stream = Stream::new(Inputs::new());
         assert_eq!(stream.push(b"a NOOP\r\nb NO"), 12);
         assert!(stream.next().is_some());
         assert_eq!(stream.push(b"OP\r\n"), 4);
@@ -2607,7 +2599,7 @@ mod tests {
     #[test]
     fn raw_lines_are_partition_invariant() {
         let make = || {
-            let mut c = Commands::new();
+            let mut c = Inputs::new();
             c.expect_line().unwrap();
             c
         };
@@ -2628,7 +2620,7 @@ mod tests {
         ));
         assert!(matches!(
             decode_all(make, &vec![b'a'; MAX_TEXT]).1,
-            Some(Fail::Protocol(DecodeError::Line(
+            Some(Fail::Protocol(FrameError::Line(
                 codec::LineError::TooLong { .. }
             )))
         ));
@@ -2642,8 +2634,8 @@ mod tests {
             b"\r\n".to_vec(),
         ]
         .concat();
-        contract::check_decode_with_alloc_limit(Commands::new, &bytes, 2 * MAX_LINE);
-        let mut stream = Stream::new(Commands::new());
+        contract::check_decode_with_alloc_limit(Inputs::new, &bytes, 2 * MAX_LINE);
+        let mut stream = Stream::new(Inputs::new());
         codec::pump(&mut stream, &bytes, |_| {}).unwrap();
         assert_eq!(stream.held(), 0);
         assert_eq!(stream.buffered(), 0);
@@ -2732,7 +2724,7 @@ mod tests {
     #[test]
     fn continuations_share_one_tag() {
         let tag = "t".repeat(32 * 1024);
-        let mut stream = Stream::new(Commands::new());
+        let mut stream = Stream::new(Inputs::new());
         let head = format!("{tag} LOGIN");
         assert_eq!(stream.push(head.as_bytes()), head.len());
         let mut seen: Option<Arc<str>> = None;
@@ -2764,14 +2756,14 @@ mod tests {
     }
 
     struct Refusals<'a> {
-        commands: Commands,
+        commands: Inputs,
         choices: &'a [u8],
         at: usize,
         refuse: bool,
     }
     impl Decode for Refusals<'_> {
         type Item = Result<Input, Error>;
-        type Error = DecodeError;
+        type Error = FrameError;
         const NAME: &'static str = "IMAP refusal test world";
         fn capacity(&self) -> usize {
             self.commands.capacity()
@@ -2779,7 +2771,7 @@ mod tests {
         fn held(&self) -> usize {
             self.commands.held()
         }
-        fn decode(&mut self, bytes: &[u8], eof: bool) -> Result<Step<Self::Item>, DecodeError> {
+        fn decode(&mut self, bytes: &[u8], eof: bool) -> Result<Step<Self::Item>, FrameError> {
             if core::mem::take(&mut self.refuse) {
                 assert!(self.commands.refuse_literal());
                 assert!(!self.commands.refuse_literal());
@@ -2797,7 +2789,7 @@ mod tests {
     #[test]
     fn refusals_in_a_stream() {
         let make = || Refusals {
-            commands: Commands::new(),
+            commands: Inputs::new(),
             choices: &[1],
             at: 0,
             refuse: false,
@@ -2824,7 +2816,7 @@ mod tests {
             let choices = rng.bytes(8);
             contract::check_decode_with_alloc_limit(
                 || Refusals {
-                    commands: Commands::new(),
+                    commands: Inputs::new(),
                     choices: &choices,
                     at: 0,
                     refuse: false,
@@ -2906,11 +2898,11 @@ mod tests {
         let (mut commands, mut replies) = (0, 0);
         for _ in 0..1024 {
             let bytes = generated_stream(&mut rng);
-            contract::check_decode_with_alloc_limit(Commands::new, &bytes, 2 * MAX_LINE);
+            contract::check_decode_with_alloc_limit(Inputs::new, &bytes, 2 * MAX_LINE);
             contract::check_decode_with_alloc_limit(Responses::new, &bytes, 2 * MAX_LINE);
             contract::check_wire::<Command>(&bytes);
             contract::check_wire::<Response>(&bytes);
-            for item in decode_all(Commands::new, &bytes).0 {
+            for item in decode_all(Inputs::new, &bytes).0 {
                 if let Ok(Input::Command(command)) = item {
                     commands += 1;
                     assert_eq!(Command::parse(&command.to_bytes().unwrap()), Ok(command));

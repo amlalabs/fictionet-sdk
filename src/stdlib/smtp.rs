@@ -9,21 +9,21 @@
 //! Command lines use the base 512-byte limit; extension-specific increases
 //! and BDAT binary chunk framing are not implemented.
 //!
-//! Run connection bytes through [`Stream<Server>`](fictionet::stdlib::codec::Stream).
-//! After accepting DATA and sending a 354 reply, call [`Server::start_data`].
+//! Run connection bytes through [`Stream<Inputs>`](fictionet::stdlib::codec::Stream).
+//! After accepting DATA and sending a 354 reply, call [`Inputs::start_data`].
 //! The next item is the complete unstuffed message. Its terminating dot
 //! returns the reader to commands. Use [`Stream<Replies>`](fictionet::stdlib::codec::Stream)
 //! on the client. Bad commands are error items; overlong lines are skipped.
 //! Partial lines at EOF, DATA overflow, and malformed multiline replies end
-//! the stream. Call [`Server::handoff`] after accepting STARTTLS, then take
+//! the stream. Call [`Inputs::handoff`] after accepting STARTTLS, then take
 //! the unread TLS bytes from the stream. Session state, authentication, TLS,
 //! and storage belong to the caller. Read headers separately with
 //! [`imf`](fictionet::stdlib::imf).
 //!
 //! ```
-//! use fictionet::stdlib::{codec::{Stream, Wire}, smtp::{Server, Input, Request, Reply}};
+//! use fictionet::stdlib::{codec::{Stream, Wire}, smtp::{Inputs, Input, Request, Reply}};
 //!
-//! let mut stream = Stream::new(Server::new());
+//! let mut stream = Stream::new(Inputs::new());
 //! let bytes = b"DATA\r\nSubject: hello\r\n\r\n..a leading dot\r\n.\r\nQUIT\r\n";
 //! assert_eq!(stream.push(bytes), bytes.len());
 //! let Some(Ok(Ok(Input::Command(command)))) = stream.next() else { panic!() };
@@ -54,7 +54,7 @@ pub const MAX_DATA_LINE: usize = 1000;
 pub const MAX_DATA: usize = 8 << 20;
 /// Local limit on lines in a multiline reply.
 pub const MAX_REPLY_LINES: usize = 1024;
-/// Why SMTP input is invalid.
+/// Why SMTP input is invalid, or a value cannot be read or written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     /// A line exceeds its size limit.
@@ -75,6 +75,14 @@ pub enum Error {
     ReplyLines,
     /// A message exceeded [`MAX_DATA`].
     TooMuchData,
+    /// Line framing or assembly failed while reading one value.
+    Framing(FrameError),
+    /// No complete value was present.
+    Incomplete,
+    /// Bytes follow the value.
+    Trailing,
+    /// The value cannot fit its wire grammar and limits without changing.
+    Unwritable,
 }
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -88,10 +96,21 @@ impl std::fmt::Display for Error {
             Self::ReplyMismatch => "SMTP multiline reply changed its code",
             Self::ReplyLines => "SMTP reply line count is outside its limit",
             Self::TooMuchData => "SMTP DATA exceeds the local size limit",
+            Self::Framing(e) => return e.fmt(f),
+            Self::Incomplete => "incomplete SMTP value",
+            Self::Trailing => "bytes after SMTP value",
+            Self::Unwritable => "SMTP value cannot be written without changing it",
         })
     }
 }
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Framing(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 fn text(b: &[u8]) -> Result<&str, Error> {
     let s = std::str::from_utf8(b).map_err(|_| Error::Text)?;
@@ -224,7 +243,7 @@ pub enum Request {
     Expn(String),
     /// Request help, optionally about a command.
     Help(Option<String>),
-    /// Start TLS (RFC 3207). Call [`Server::handoff`] once accepted, then
+    /// Start TLS (RFC 3207). Call [`Inputs::handoff`] once accepted, then
     /// pass the stream's unread bytes to TLS.
     StartTls,
     /// Start SASL authentication (RFC 4954). Credentials remain opaque.
@@ -313,13 +332,13 @@ impl Request {
 
     /// Builds the command for this request. Refuses invalid arguments,
     /// oversized fields, and `Other` values that change when parsed.
-    pub fn to_command(&self) -> Result<Command, WriteError> {
+    pub fn to_command(&self) -> Result<Command, Error> {
         match self {
             Self::Helo(s) | Self::Ehlo(s) | Self::Vrfy(s) | Self::Expn(s) if s.len() > MAX_LINE => {
-                return Err(WriteError::Unwritable);
+                return Err(Error::Unwritable);
             }
             Self::Noop(Some(s)) | Self::Help(Some(s)) if s.len() > MAX_LINE => {
-                return Err(WriteError::Unwritable);
+                return Err(Error::Unwritable);
             }
             _ => {}
         }
@@ -328,7 +347,7 @@ impl Request {
             Self::Ehlo(s) => Command::new("EHLO", Some(s)),
             Self::Mail { path, parameters } | Self::Rcpt { path, parameters } => {
                 if path.len() > MAX_LINE || parameters.len() > MAX_LINE {
-                    return Err(WriteError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 let mail = matches!(self, Self::Mail { .. });
                 let mut arg = format!("{}<{path}>", if mail { "FROM:" } else { "TO:" });
@@ -337,7 +356,7 @@ impl Request {
                     if parameter.keyword.len() > MAX_LINE
                         || parameter.value.as_ref().is_some_and(|v| v.len() > MAX_LINE)
                     {
-                        return Err(WriteError::Unwritable);
+                        return Err(Error::Unwritable);
                     }
                     arg.push(' ');
                     arg.push_str(&parameter.keyword);
@@ -346,7 +365,7 @@ impl Request {
                         arg.push_str(value);
                     }
                     if arg.len() > MAX_LINE {
-                        return Err(WriteError::Unwritable);
+                        return Err(Error::Unwritable);
                     }
                 }
                 Command::new(if mail { "MAIL" } else { "RCPT" }, Some(&arg))
@@ -368,7 +387,7 @@ impl Request {
                         .as_ref()
                         .is_some_and(|r| r.len() > MAX_LINE)
                 {
-                    return Err(WriteError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 let mut arg = mechanism.clone();
                 if let Some(response) = initial_response {
@@ -379,16 +398,16 @@ impl Request {
             }
             Self::Other(command) => {
                 if !matches!(
-                    Self::from_command(command).map_err(|_| WriteError::Unwritable)?,
+                    Self::from_command(command).map_err(|_| Error::Unwritable)?,
                     Self::Other(_)
                 ) {
-                    return Err(WriteError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 command.clone()
             }
         };
-        if Self::from_command(&command).map_err(|_| WriteError::Unwritable)? != *self {
-            return Err(WriteError::Unwritable);
+        if Self::from_command(&command).map_err(|_| Error::Unwritable)? != *self {
+            return Err(Error::Unwritable);
         }
         Ok(command)
     }
@@ -498,102 +517,108 @@ fn check_data_line(line: &[u8]) -> Result<(), Error> {
 /// Maximum text bytes retained while assembling a reply.
 pub const MAX_REPLY_TEXT: usize = MAX_REPLY_LINES * (MAX_LINE - 6);
 
-/// Why a shared SMTP decoder cannot continue.
+/// Why [`Inputs`] or [`Replies`] cannot continue. It ends the stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DecodeError {
+pub enum FrameError {
     /// A line exceeded its limit or ended before CRLF.
     Line(codec::LineError),
-    /// An assembly exceeded its named limit.
-    Limit(Error),
+    /// A DATA line exceeded [`MAX_DATA_LINE`].
+    LineTooLong,
+    /// A message exceeded [`MAX_DATA`].
+    TooMuchData,
+    /// A reply exceeded [`MAX_REPLY_LINES`] or [`MAX_REPLY_TEXT`].
+    ReplyLines,
     /// Storage for a bounded DATA assembly could not be allocated.
     Allocation,
     /// EOF interrupted DATA or a multiline reply.
     Incomplete,
-    /// A malformed line interrupted a multiline reply.
-    Reply(Error),
+    /// A line inside a multiline reply ended with a bare LF.
+    ReplyLineEnding,
+    /// A line inside a multiline reply held invalid UTF-8, NUL, or a
+    /// forbidden control character.
+    ReplyText,
+    /// A line inside a multiline reply had an invalid code or separator.
+    ReplyCode,
+    /// A multiline reply changed its code before the final line.
+    ReplyMismatch,
     /// A mode change was requested outside a command boundary.
     State,
 }
 
-impl core::fmt::Display for DecodeError {
+impl FrameError {
+    /// The fault of a malformed line inside a multiline reply.
+    /// Only these four faults reach a reply line in progress.
+    fn reply(e: Error) -> FrameError {
+        match e {
+            Error::LineEnding => FrameError::ReplyLineEnding,
+            Error::Text => FrameError::ReplyText,
+            Error::ReplyMismatch => FrameError::ReplyMismatch,
+            _ => FrameError::ReplyCode,
+        }
+    }
+
+    /// The same fault for a line read on its own, if this is a malformed
+    /// line inside a multiline reply.
+    fn reply_line(self) -> Option<Error> {
+        match self {
+            FrameError::ReplyLineEnding => Some(Error::LineEnding),
+            FrameError::ReplyText => Some(Error::Text),
+            FrameError::ReplyCode => Some(Error::ReplyCode),
+            FrameError::ReplyMismatch => Some(Error::ReplyMismatch),
+            _ => None,
+        }
+    }
+}
+
+impl core::fmt::Display for FrameError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Line(e) => e.fmt(f),
-            Self::Limit(e) => e.fmt(f),
+            Self::LineTooLong => Error::LineTooLong.fmt(f),
+            Self::TooMuchData => Error::TooMuchData.fmt(f),
+            Self::ReplyLines => Error::ReplyLines.fmt(f),
             Self::Allocation => f.write_str("SMTP assembly allocation failed"),
             Self::Incomplete => f.write_str("incomplete SMTP assembly"),
-            Self::Reply(e) => e.fmt(f),
+            Self::ReplyLineEnding => Error::LineEnding.fmt(f),
+            Self::ReplyText => Error::Text.fmt(f),
+            Self::ReplyCode => Error::ReplyCode.fmt(f),
+            Self::ReplyMismatch => Error::ReplyMismatch.fmt(f),
             Self::State => f.write_str("SMTP mode change requires a command boundary"),
         }
     }
 }
-impl core::error::Error for DecodeError {}
-
-/// Why bytes are not exactly one SMTP wire value.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ParseError {
-    /// A complete command or reply is malformed.
-    Invalid(Error),
-    /// Line framing or assembly failed.
-    Framing(DecodeError),
-    /// No complete value was present.
-    Incomplete,
-    /// Bytes follow the value.
-    Trailing,
-}
-
-impl core::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+impl core::error::Error for FrameError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
-            Self::Invalid(e) => e.fmt(f),
-            Self::Framing(e) => e.fmt(f),
-            Self::Incomplete => f.write_str("incomplete SMTP value"),
-            Self::Trailing => f.write_str("bytes after SMTP value"),
+            Self::Line(e) => Some(e),
+            _ => None,
         }
     }
 }
-impl core::error::Error for ParseError {}
-
-/// Why an SMTP value cannot be written.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WriteError {
-    /// The value cannot fit its wire grammar and limits without changing.
-    Unwritable,
-}
-
-impl core::fmt::Display for WriteError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("SMTP value cannot be written without changing it")
-    }
-}
-impl core::error::Error for WriteError {}
 
 impl Wire for Command {
-    type ParseError = ParseError;
-    type WriteError = WriteError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads exactly one command with CRLF. Refuses trailing bytes,
     /// invalid text or verbs, and lines over [`MAX_LINE`]. Unknown verbs
     /// are preserved. Verbs are normalized to uppercase.
-    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         let mut lines = codec::Lines::new(MAX_LINE - 2, codec::Ending::Crlf);
-        match smtp_line(&mut lines, bytes, true, false).map_err(ParseError::Framing)? {
-            codec::Step::Item(line, used) if used == bytes.len() => {
-                Command::parse_line(&line.map_err(ParseError::Invalid)?)
-                    .map_err(ParseError::Invalid)
-            }
-            codec::Step::Item(_, _) => Err(ParseError::Trailing),
-            _ => Err(ParseError::Incomplete),
+        match smtp_line(&mut lines, bytes, true, false).map_err(Error::Framing)? {
+            codec::Step::Item(line, used) if used == bytes.len() => Command::parse_line(&line?),
+            codec::Step::Item(_, _) => Err(Error::Trailing),
+            _ => Err(Error::Incomplete),
         }
     }
 
     /// Appends the command and CRLF. Refuses invalid verbs, non-uppercase
     /// verbs, forbidden text, and lines longer than [`MAX_LINE`].
     /// Errors leave `out` unchanged. Arguments are never changed.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
-        self.validate().map_err(|_| WriteError::Unwritable)?;
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        self.validate().map_err(|_| Error::Unwritable)?;
         if self.verb.bytes().any(|b| b.is_ascii_lowercase()) {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         let size = self
             .verb
@@ -601,8 +626,8 @@ impl Wire for Command {
             .checked_add(self.arg.as_ref().map_or(0, String::len))
             .and_then(|n| n.checked_add(usize::from(self.arg.is_some())))
             .and_then(|n| n.checked_add(2))
-            .ok_or(WriteError::Unwritable)?;
-        out.try_reserve(size).map_err(|_| WriteError::Unwritable)?;
+            .ok_or(Error::Unwritable)?;
+        out.try_reserve(size).map_err(|_| Error::Unwritable)?;
         out.extend_from_slice(self.verb.as_bytes());
         if let Some(arg) = &self.arg {
             out.push(b' ');
@@ -614,30 +639,28 @@ impl Wire for Command {
 }
 
 impl Wire for Reply {
-    type ParseError = ParseError;
-    type WriteError = WriteError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads one complete reply. Refuses trailing bytes, missing CRLF,
     /// invalid codes or text, mismatched continuation codes, and limits
     /// above [`MAX_LINE`], [`MAX_REPLY_LINES`], or [`MAX_REPLY_TEXT`].
-    fn parse(mut bytes: &[u8]) -> Result<Self, ParseError> {
+    fn parse(mut bytes: &[u8]) -> Result<Self, Error> {
         let mut replies = Replies::new();
         loop {
-            match replies.decode(bytes, true).map_err(|e| match e {
-                DecodeError::Reply(e) => ParseError::Invalid(e),
-                e => ParseError::Framing(e),
-            })? {
+            let step = replies.decode(bytes, true);
+            match step.map_err(|e| e.reply_line().unwrap_or(Error::Framing(e)))? {
                 codec::Step::Item(reply, used) => {
-                    let reply = reply.map_err(ParseError::Invalid)?;
+                    let reply = reply?;
                     if used != bytes.len() {
-                        return Err(ParseError::Trailing);
+                        return Err(Error::Trailing);
                     }
                     return Ok(reply);
                 }
                 codec::Step::Skip(used) => {
-                    bytes = bytes.get(used..).ok_or(ParseError::Incomplete)?
+                    bytes = bytes.get(used..).ok_or(Error::Incomplete)?
                 }
-                _ => return Err(ParseError::Incomplete),
+                _ => return Err(Error::Incomplete),
             }
         }
     }
@@ -645,20 +668,20 @@ impl Wire for Reply {
     /// Appends the reply with CRLF. Refuses invalid codes, empty or
     /// oversized line lists, forbidden text, and lines over [`MAX_LINE`].
     /// Errors leave `out` unchanged.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         if !valid_code(self.code) || self.lines.is_empty() || self.lines.len() > MAX_REPLY_LINES {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         let mut size = 0usize;
         for line in &self.lines {
             if line.len() > MAX_LINE - 6 || text(line.as_bytes()).is_err() {
-                return Err(WriteError::Unwritable);
+                return Err(Error::Unwritable);
             }
             size = size
                 .checked_add(line.len() + 6)
-                .ok_or(WriteError::Unwritable)?;
+                .ok_or(Error::Unwritable)?;
         }
-        out.try_reserve(size).map_err(|_| WriteError::Unwritable)?;
+        out.try_reserve(size).map_err(|_| Error::Unwritable)?;
         let code = self.code.to_string();
         for (i, line) in self.lines.iter().enumerate() {
             out.extend_from_slice(code.as_bytes());
@@ -675,18 +698,18 @@ impl Wire for Reply {
 }
 
 impl Wire for Request {
-    type ParseError = ParseError;
-    type WriteError = WriteError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads one command and interprets its arguments. Refuses invalid
     /// command framing, paths, parameters, and arguments for known verbs.
-    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
-        Self::from_command(&Command::parse(bytes)?).map_err(ParseError::Invalid)
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        Self::from_command(&Command::parse(bytes)?)
     }
 
     /// Appends one request. Refuses invalid arguments and values that
     /// would parse differently. Errors leave `out` unchanged.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         self.to_command()?.write(out)
     }
 }
@@ -699,30 +722,30 @@ pub struct Data {
 }
 
 impl Wire for Data {
-    type ParseError = ParseError;
-    type WriteError = WriteError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads one dot-terminated message and removes transparency dots.
     /// Refuses trailing bytes, missing CRLF, NUL, lines over
     /// [`MAX_DATA_LINE`], and messages over [`MAX_DATA`].
-    fn parse(mut bytes: &[u8]) -> Result<Self, ParseError> {
-        let mut server = Server::new();
-        server.start_data().map_err(ParseError::Framing)?;
+    fn parse(mut bytes: &[u8]) -> Result<Self, Error> {
+        let mut server = Inputs::new();
+        server.start_data().map_err(Error::Framing)?;
         loop {
-            match server.decode(bytes, true).map_err(ParseError::Framing)? {
+            match server.decode(bytes, true).map_err(Error::Framing)? {
                 codec::Step::Item(item, used) => {
-                    let Input::Message(message) = item.map_err(ParseError::Invalid)? else {
-                        return Err(ParseError::Incomplete);
+                    let Input::Message(message) = item? else {
+                        return Err(Error::Incomplete);
                     };
                     if used != bytes.len() {
-                        return Err(ParseError::Trailing);
+                        return Err(Error::Trailing);
                     }
                     return Ok(Self { bytes: message });
                 }
                 codec::Step::Skip(used) => {
-                    bytes = bytes.get(used..).ok_or(ParseError::Incomplete)?
+                    bytes = bytes.get(used..).ok_or(Error::Incomplete)?
                 }
-                _ => return Err(ParseError::Incomplete),
+                _ => return Err(Error::Incomplete),
             }
         }
     }
@@ -731,24 +754,24 @@ impl Wire for Data {
     /// bare CR or LF, unterminated content, and line or message overflow.
     /// Empty messages and 8-bit content are allowed. Errors leave `out`
     /// unchanged; extension negotiation belongs to the caller.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         if self.bytes.len() > MAX_DATA || (!self.bytes.is_empty() && !self.bytes.ends_with(b"\r\n"))
         {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         let mut size = self
             .bytes
             .len()
             .checked_add(3)
-            .ok_or(WriteError::Unwritable)?;
+            .ok_or(Error::Unwritable)?;
         for line in self.bytes.split_inclusive(|b| *b == b'\n') {
-            let content = line.strip_suffix(b"\r\n").ok_or(WriteError::Unwritable)?;
-            check_data_line(content).map_err(|_| WriteError::Unwritable)?;
+            let content = line.strip_suffix(b"\r\n").ok_or(Error::Unwritable)?;
+            check_data_line(content).map_err(|_| Error::Unwritable)?;
             size = size
                 .checked_add(usize::from(content.starts_with(b".")))
-                .ok_or(WriteError::Unwritable)?;
+                .ok_or(Error::Unwritable)?;
         }
-        out.try_reserve(size).map_err(|_| WriteError::Unwritable)?;
+        out.try_reserve(size).map_err(|_| Error::Unwritable)?;
         for line in self.bytes.split_inclusive(|b| *b == b'\n') {
             if line.starts_with(b".") {
                 out.push(b'.');
@@ -765,7 +788,7 @@ fn smtp_line(
     input: &[u8],
     eof: bool,
     recover_long: bool,
-) -> Result<codec::Step<Result<Vec<u8>, Error>>, DecodeError> {
+) -> Result<codec::Step<Result<Vec<u8>, Error>>, FrameError> {
     let step = match lines.decode(input, eof) {
         Ok(step) => step,
         Err(never) => match never {},
@@ -778,14 +801,14 @@ fn smtp_line(
         codec::Step::Item(Err(codec::LineError::TooLong { .. }), used) if recover_long => {
             codec::Step::Item(Err(Error::LineTooLong), used)
         }
-        codec::Step::Item(Err(e), _) => return Err(DecodeError::Line(e)),
+        codec::Step::Item(Err(e), _) => return Err(FrameError::Line(e)),
         codec::Step::Skip(used) => codec::Step::Skip(used),
         codec::Step::Need => codec::Step::Need,
         codec::Step::End => codec::Step::End,
     })
 }
 
-/// One command or one complete, unstuffed DATA message from [`Server`].
+/// One command or one complete, unstuffed DATA message from [`Inputs`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Input {
     /// A command, with its verb normalized to upper case.
@@ -821,15 +844,15 @@ enum Mode {
 /// [`codec::Stream::into_parts`] to obtain unread TLS bytes.
 ///
 /// ```
-/// use fictionet::stdlib::{codec::Stream, smtp::{Server, Input}};
-/// let mut stream = Stream::new(Server::new());
+/// use fictionet::stdlib::{codec::Stream, smtp::{Inputs, Input}};
+/// let mut stream = Stream::new(Inputs::new());
 /// assert_eq!(stream.push(b"DATA\r\n..x\r\n.\r\nQUIT\r\n"), 20);
 /// assert!(matches!(stream.next(), Some(Ok(Ok(Input::Command(_))))));
 /// stream.decoder().start_data().unwrap();
 /// assert_eq!(stream.next(), Some(Ok(Ok(Input::Message(b".x\r\n".to_vec())))));
 /// assert!(matches!(stream.next(), Some(Ok(Ok(Input::Command(_))))));
 /// ```
-pub struct Server {
+pub struct Inputs {
     lines: codec::Lines,
     mode: Mode,
     partial: bool,
@@ -839,13 +862,13 @@ pub struct Server {
     rejected: Option<Error>,
 }
 
-impl Default for Server {
+impl Default for Inputs {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Server {
+impl Inputs {
     /// Creates an empty decoder in command mode.
     pub fn new() -> Self {
         Self {
@@ -861,10 +884,10 @@ impl Server {
 
     /// Starts DATA at a command boundary after the world accepts it.
     /// Refuses other modes, partial lines, and lines still being skipped
-    /// with [`DecodeError::State`], without changing the mode.
-    pub fn start_data(&mut self) -> Result<(), DecodeError> {
+    /// with [`FrameError::State`], without changing the mode.
+    pub fn start_data(&mut self) -> Result<(), FrameError> {
         if self.mode != Mode::Command || self.partial || self.skipping {
-            return Err(DecodeError::State);
+            return Err(FrameError::State);
         }
         self.mode = Mode::Data;
         self.lines = codec::Lines::new(MAX_DATA_LINE - 1, codec::Ending::Crlf);
@@ -873,19 +896,19 @@ impl Server {
 
     /// Ends SMTP decoding at a command boundary for an accepted protocol switch.
     /// Refuses other modes, partial lines, and lines still being skipped
-    /// with [`DecodeError::State`], without changing the mode.
-    pub fn handoff(&mut self) -> Result<(), DecodeError> {
+    /// with [`FrameError::State`], without changing the mode.
+    pub fn handoff(&mut self) -> Result<(), FrameError> {
         if self.mode != Mode::Command || self.partial || self.skipping {
-            return Err(DecodeError::State);
+            return Err(FrameError::State);
         }
         self.mode = Mode::End;
         Ok(())
     }
 }
 
-impl Decode for Server {
+impl Decode for Inputs {
     type Item = Result<Input, Error>;
-    type Error = DecodeError;
+    type Error = FrameError;
     const NAME: &'static str = "SMTP server";
 
     fn capacity(&self) -> usize {
@@ -896,7 +919,7 @@ impl Decode for Server {
         self.data.len()
     }
 
-    fn decode(&mut self, input: &[u8], eof: bool) -> Result<codec::Step<Self::Item>, DecodeError> {
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<codec::Step<Self::Item>, FrameError> {
         if self.mode == Mode::End {
             return Ok(codec::Step::End);
         }
@@ -905,7 +928,7 @@ impl Decode for Server {
             codec::Step::Need => {
                 self.partial = !input.is_empty();
                 return if eof && self.mode == Mode::Data {
-                    Err(DecodeError::Incomplete)
+                    Err(FrameError::Incomplete)
                 } else {
                     Ok(codec::Step::Need)
                 };
@@ -939,7 +962,7 @@ impl Decode for Server {
             ));
         }
         if matches!(line, Err(Error::LineTooLong)) {
-            return Err(DecodeError::Limit(Error::LineTooLong));
+            return Err(FrameError::LineTooLong);
         }
         self.data_size = self
             .data_size
@@ -950,7 +973,7 @@ impl Decode for Server {
                 ))
             })
             .filter(|&n| n <= MAX_DATA)
-            .ok_or(DecodeError::Limit(Error::TooMuchData))?;
+            .ok_or(FrameError::TooMuchData)?;
         let result = line.and_then(|line| {
             let content = line.strip_prefix(b".").unwrap_or(&line);
             check_data_line(content)?;
@@ -965,13 +988,13 @@ impl Decode for Server {
                         .min(MAX_DATA);
                     self.data
                         .try_reserve_exact(target.saturating_sub(self.data.len()))
-                        .map_err(|_| DecodeError::Allocation)?;
+                        .map_err(|_| FrameError::Allocation)?;
                 }
                 self.data
                     .extend_from_slice(line.strip_prefix(b".").unwrap_or(&line));
                 self.data.extend_from_slice(b"\r\n");
             }
-            Err(Error::LineTooLong) => return Err(DecodeError::Limit(Error::LineTooLong)),
+            Err(Error::LineTooLong) => return Err(FrameError::LineTooLong),
             Err(e) => {
                 self.rejected.get_or_insert(e);
                 self.data.clear();
@@ -1014,7 +1037,7 @@ impl Replies {
 
 impl Decode for Replies {
     type Item = Result<Reply, Error>;
-    type Error = DecodeError;
+    type Error = FrameError;
     const NAME: &'static str = "SMTP replies";
 
     fn capacity(&self) -> usize {
@@ -1025,11 +1048,11 @@ impl Decode for Replies {
         self.text_size
     }
 
-    fn decode(&mut self, input: &[u8], eof: bool) -> Result<codec::Step<Self::Item>, DecodeError> {
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<codec::Step<Self::Item>, FrameError> {
         let (line, used) = match smtp_line(&mut self.lines, input, eof, false)? {
             codec::Step::Item(line, used) => (line, used),
             codec::Step::Need if eof && self.pending.is_some() => {
-                return Err(DecodeError::Incomplete);
+                return Err(FrameError::Incomplete);
             }
             codec::Step::Need => return Ok(codec::Step::Need),
             codec::Step::Skip(used) => return Ok(codec::Step::Skip(used)),
@@ -1068,8 +1091,8 @@ impl Decode for Replies {
                     used,
                 ))
             }
-            Err(Error::ReplyLines) => Err(DecodeError::Limit(Error::ReplyLines)),
-            Err(e) if pending => Err(DecodeError::Reply(e)),
+            Err(Error::ReplyLines) => Err(FrameError::ReplyLines),
+            Err(e) if pending => Err(FrameError::reply(e)),
             Err(e) => {
                 self.pending = None;
                 self.text_size = 0;
@@ -1087,15 +1110,15 @@ mod tests {
         test_support::{decode_all, mutate},
     };
 
-    fn data_server() -> Server {
-        let mut server = Server::new();
+    fn data_server() -> Inputs {
+        let mut server = Inputs::new();
         server.start_data().unwrap();
         server
     }
 
-    fn refused(value: &impl Wire<WriteError = WriteError>) {
+    fn refused(value: &impl Wire<WriteError = Error>) {
         let mut out = b"prefix".to_vec();
-        assert_eq!(value.write(&mut out), Err(WriteError::Unwritable));
+        assert_eq!(value.write(&mut out), Err(Error::Unwritable));
         assert_eq!(out, b"prefix");
     }
 
@@ -1172,19 +1195,19 @@ mod tests {
         }
         assert_eq!(
             Command::parse(b"NOOP\r\nQUIT\r\n"),
-            Err(ParseError::Trailing)
+            Err(Error::Trailing)
         );
         for line in [&b"NOOP\0"[..], b"\xff", b"NOOP\x7f"] {
             assert_eq!(
                 Command::parse(&[line, b"\r\n"].concat()),
-                Err(ParseError::Invalid(Error::Text))
+                Err(Error::Text)
             );
         }
         assert!(Command::new("NOOP QUIT", None).to_bytes().is_err());
         assert!(Command::new("NOOP", Some("x\r\nQUIT")).to_bytes().is_err());
         assert_eq!(
             Request::Other(Command::new("DATA", None)).to_bytes(),
-            Err(WriteError::Unwritable)
+            Err(Error::Unwritable)
         );
         assert!(
             Request::Mail {
@@ -1220,8 +1243,8 @@ mod tests {
             Err(Error::LineEnding),
             Ok(Input::Command(Command::new("QUIT", None))),
         ];
-        assert_eq!(decode_all(Server::new, &wire), (expected, None));
-        contract::check_decode_with_alloc_limit(Server::new, &wire, 2 * (MAX_DATA_LINE + 1));
+        assert_eq!(decode_all(Inputs::new, &wire), (expected, None));
+        contract::check_decode_with_alloc_limit(Inputs::new, &wire, 2 * (MAX_DATA_LINE + 1));
         refused(&Command::new("NOOP", Some(&"a".repeat(MAX_LINE - 6))));
     }
 
@@ -1239,27 +1262,27 @@ mod tests {
         );
         contract::check_decode_with_alloc_limit(Replies::new, bytes, 2 * MAX_LINE);
         for (bad, error, fatal) in [
-            (&b"250-hi\r\n550 done\r\n"[..], Error::ReplyMismatch, true),
+            (&b"250-hi\r\n550 done\r\n"[..], Error::ReplyMismatch, Some(FrameError::ReplyMismatch)),
             (
                 b"250-hi\r\n PIPELINING\r\n250 done\r\n",
                 Error::ReplyCode,
-                true,
+                Some(FrameError::ReplyCode),
             ),
-            (b"199 hi\r\n", Error::ReplyCode, false),
-            (b"260 hi\r\n", Error::ReplyCode, false),
-            (b"250xhi\r\n", Error::ReplyCode, false),
-            (b"250 hi\n", Error::LineEnding, false),
-            (b"250 hi\0\r\n", Error::Text, false),
+            (b"199 hi\r\n", Error::ReplyCode, None),
+            (b"260 hi\r\n", Error::ReplyCode, None),
+            (b"250xhi\r\n", Error::ReplyCode, None),
+            (b"250 hi\n", Error::LineEnding, None),
+            (b"250 hi\0\r\n", Error::Text, None),
         ] {
-            assert_eq!(Reply::parse(bad), Err(ParseError::Invalid(error)));
-            let expected = if fatal {
-                (vec![], Some(Fail::Protocol(DecodeError::Reply(error))))
+            assert_eq!(Reply::parse(bad), Err(error));
+            let expected = if let Some(fatal) = fatal {
+                (vec![], Some(Fail::Protocol(fatal)))
             } else {
                 (vec![Err(error)], None)
             };
             assert_eq!(decode_all(Replies::new, bad), expected);
             // A continuation failure ends the stream before a later valid reply.
-            if fatal {
+            if fatal.is_some() {
                 let followed = [bad, b"250 next\r\n"].concat();
                 assert_eq!(decode_all(Replies::new, &followed), expected);
                 contract::check_decode_with_alloc_limit(Replies::new, &followed, 2 * MAX_LINE);
@@ -1288,7 +1311,7 @@ mod tests {
         let endless = b"250-\r\n".repeat(MAX_REPLY_LINES);
         assert_eq!(
             decode_all(Replies::new, &endless).1,
-            Some(Fail::Protocol(DecodeError::Limit(Error::ReplyLines)))
+            Some(Fail::Protocol(FrameError::ReplyLines))
         );
         for reply in [
             Reply::new(250, &"x".repeat(MAX_LINE - 5)),
@@ -1306,9 +1329,7 @@ mod tests {
         assert_eq!(stream.push(bad), bad.len());
         assert_eq!(
             stream.next(),
-            Some(Err(Fail::Protocol(DecodeError::Reply(
-                Error::ReplyMismatch
-            ))))
+            Some(Err(Fail::Protocol(FrameError::ReplyMismatch)))
         );
         assert_eq!(stream.next(), None);
         assert!(stream.failed().is_some());
@@ -1332,15 +1353,15 @@ mod tests {
     #[test]
     fn data_switch_preserves_pipeline_and_tls_tail() {
         let bytes = b"DATA\r\n..x\r\n.\r\nQUIT\r\nSTARTTLS\r\n\x16\x03\x03\0\x05";
-        let mut stream = Stream::new(Server::new());
+        let mut stream = Stream::new(Inputs::new());
         assert_eq!(stream.push(bytes), bytes.len());
         assert_eq!(
             stream.next(),
             Some(Ok(Ok(Input::Command(Command::new("DATA", None)))))
         );
         stream.decoder().start_data().unwrap();
-        assert_eq!(stream.decoder().start_data(), Err(DecodeError::State));
-        assert_eq!(stream.decoder().handoff(), Err(DecodeError::State));
+        assert_eq!(stream.decoder().start_data(), Err(FrameError::State));
+        assert_eq!(stream.decoder().handoff(), Err(FrameError::State));
         assert_eq!(
             stream.next(),
             Some(Ok(Ok(Input::Message(b".x\r\n".to_vec()))))
@@ -1354,11 +1375,11 @@ mod tests {
         stream.decoder().handoff().unwrap();
         assert_eq!(stream.next(), None);
         assert_eq!(stream.into_parts().0.unread(), b"\x16\x03\x03\0\x05");
-        let mut stream = Stream::new(Server::new());
+        let mut stream = Stream::new(Inputs::new());
         assert_eq!(stream.push(b"NO"), 2);
         assert_eq!(stream.next(), None);
-        assert_eq!(stream.decoder().start_data(), Err(DecodeError::State));
-        assert_eq!(stream.decoder().handoff(), Err(DecodeError::State));
+        assert_eq!(stream.decoder().start_data(), Err(FrameError::State));
+        assert_eq!(stream.decoder().handoff(), Err(FrameError::State));
     }
 
     #[test]
@@ -1384,7 +1405,7 @@ mod tests {
             wire.extend_from_slice(b".\r\n");
             assert_eq!(
                 decode_all(data_server, &wire).1,
-                Some(Fail::Protocol(DecodeError::Limit(Error::LineTooLong)))
+                Some(Fail::Protocol(FrameError::LineTooLong))
             );
         }
         for bad in [&b"bare\n"[..], b"bare\r", b"nul\0\r\n", b"cr\rinside\r\n"] {
@@ -1431,7 +1452,7 @@ mod tests {
         assert_eq!(stream.push(b"\r\n"), 2);
         assert_eq!(
             stream.next(),
-            Some(Err(Fail::Protocol(DecodeError::Limit(Error::TooMuchData))))
+            Some(Err(Fail::Protocol(FrameError::TooMuchData)))
         );
         assert_eq!(stream.next(), None);
         refused(&Data {
@@ -1486,7 +1507,7 @@ mod tests {
             for _ in 0..rng.index(5) {
                 mutate(&mut rng, &mut bytes);
             }
-            contract::check_decode_with_alloc_limit(Server::new, &bytes, 2 * (MAX_DATA_LINE + 1));
+            contract::check_decode_with_alloc_limit(Inputs::new, &bytes, 2 * (MAX_DATA_LINE + 1));
             contract::check_decode_with_alloc_limit(Replies::new, &bytes, 2 * MAX_LINE);
             contract::check_decode_with_alloc_limit(data_server, &bytes, 2 * (MAX_DATA_LINE + 1));
             contract::check_wire::<Command>(&bytes);

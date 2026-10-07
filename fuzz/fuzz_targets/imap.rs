@@ -3,20 +3,20 @@
 
 use fictionet::stdlib::codec::{Decode, Step, Wire, contract, test_support::decode_all};
 use fictionet::stdlib::imap::{
-    Command, Commands, DecodeError, Error, Input, MAX_HELD, MAX_LINE, MAX_LITERAL, MAX_TEXT,
+    Command, Error, FrameError, Input, Inputs, MAX_HELD, MAX_LINE, MAX_LITERAL, MAX_TEXT,
     Response, Responses, Value,
 };
 use libfuzzer_sys::fuzz_target;
 
 struct Refusals<'a> {
-    commands: Commands,
+    commands: Inputs,
     choices: &'a [u8],
     at: usize,
     refuse: bool,
 }
 impl Decode for Refusals<'_> {
     type Item = Result<Input, Error>;
-    type Error = DecodeError;
+    type Error = FrameError;
     const NAME: &'static str = "IMAP refusal world";
     fn capacity(&self) -> usize {
         self.commands.capacity()
@@ -24,7 +24,7 @@ impl Decode for Refusals<'_> {
     fn held(&self) -> usize {
         self.commands.held()
     }
-    fn decode(&mut self, bytes: &[u8], eof: bool) -> Result<Step<Self::Item>, DecodeError> {
+    fn decode(&mut self, bytes: &[u8], eof: bool) -> Result<Step<Self::Item>, FrameError> {
         if core::mem::take(&mut self.refuse) {
             assert!(self.commands.refuse_literal());
             assert!(!self.commands.refuse_literal());
@@ -41,12 +41,12 @@ impl Decode for Refusals<'_> {
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(Commands::new, data, 2 * MAX_LINE);
+    contract::check_decode_with_alloc_limit(Inputs::new, data, 2 * MAX_LINE);
     contract::check_decode_with_alloc_limit(Responses::new, data, 2 * MAX_LINE);
-    contract::check_decode_with_held_limit(Commands::new, data, MAX_HELD);
+    contract::check_decode_with_held_limit(Inputs::new, data, MAX_HELD);
     contract::check_decode_with_held_limit(Responses::new, data, MAX_HELD);
     let raw = || {
-        let mut commands = Commands::new();
+        let mut commands = Inputs::new();
         commands.expect_line().unwrap();
         commands
     };
@@ -55,7 +55,7 @@ fuzz_target!(|data: &[u8]| {
     let choices = data.get(..8).unwrap_or(data);
     contract::check_decode_with_alloc_limit(
         || Refusals {
-            commands: Commands::new(),
+            commands: Inputs::new(),
             choices,
             at: 0,
             refuse: false,
@@ -65,7 +65,7 @@ fuzz_target!(|data: &[u8]| {
     );
     contract::check_wire::<Command>(data);
     contract::check_wire::<Response>(data);
-    for item in decode_all(Commands::new, data).0 {
+    for item in decode_all(Inputs::new, data).0 {
         if let Ok(Input::Command(command)) = item {
             let bytes = command.to_bytes().unwrap();
             contract::check_wire::<Command>(&bytes);
