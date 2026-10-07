@@ -19,7 +19,7 @@
 //! options, and a [`ReadTransfer`] works out which packet to send next
 //! for one read. When to resend a packet, and how many times, is up to
 //! the caller: on a timeout it sends [`ReadTransfer::current`] again.
-//! Read netascii DATA bodies with [`Stream<Netascii>`](fictionet::stdlib::codec::Stream)
+//! Read netascii DATA bodies with [`Stream<NetasciiBytes>`](fictionet::stdlib::codec::Stream)
 //! to retain a CR split across packets.
 //!
 //! Every reader checks lengths, because the agent can send any bytes it
@@ -128,7 +128,7 @@ pub mod option {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     /// Text with CR LF line endings and CR written as CR NUL. See
-    /// [`NetasciiByte`] and [`Netascii`].
+    /// [`NetasciiByte`] and [`NetasciiBytes`].
     NetAscii,
     /// Bytes as they are.
     Octet,
@@ -310,7 +310,7 @@ pub enum Packet {
 /// an ERROR packet with [`ErrorCode::IllegalOperation`], or drops the
 /// datagram.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ParseError {
+pub enum Error {
     /// The value cannot be written without changing it.
     Unwritable,
     /// The packet ends before its fixed fields do.
@@ -340,27 +340,27 @@ pub enum ParseError {
     TrailingBytes,
 }
 
-impl std::fmt::Display for ParseError {
+impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ParseError::Unwritable => f.write_str("value cannot be written without changing it"),
-            ParseError::Short => write!(f, "packet ends before its fixed fields"),
-            ParseError::TooLong(n) => write!(f, "packet of {n} bytes, longer than {MAX_PACKET}"),
-            ParseError::RequestTooLong(n) => write!(f, "request of {n} bytes, longer than {MAX_REQUEST}"),
-            ParseError::UnknownOpcode(op) => write!(f, "unknown opcode {op}"),
-            ParseError::Unterminated => write!(f, "string with no closing NUL"),
-            ParseError::StringTooLong => write!(f, "string longer than {MAX_STRING} bytes"),
-            ParseError::NotUtf8 => write!(f, "string is not UTF-8"),
-            ParseError::UnknownMode => write!(f, "mode is not netascii, octet or mail"),
-            ParseError::TooManyOptions => write!(f, "more than {MAX_OPTIONS} options"),
-            ParseError::MissingValue => write!(f, "option name with no value"),
-            ParseError::DuplicateOption => write!(f, "option named twice"),
-            ParseError::TrailingBytes => write!(f, "bytes after the packet's last field"),
+            Error::Unwritable => f.write_str("value cannot be written without changing it"),
+            Error::Short => write!(f, "packet ends before its fixed fields"),
+            Error::TooLong(n) => write!(f, "packet of {n} bytes, longer than {MAX_PACKET}"),
+            Error::RequestTooLong(n) => write!(f, "request of {n} bytes, longer than {MAX_REQUEST}"),
+            Error::UnknownOpcode(op) => write!(f, "unknown opcode {op}"),
+            Error::Unterminated => write!(f, "string with no closing NUL"),
+            Error::StringTooLong => write!(f, "string longer than {MAX_STRING} bytes"),
+            Error::NotUtf8 => write!(f, "string is not UTF-8"),
+            Error::UnknownMode => write!(f, "mode is not netascii, octet or mail"),
+            Error::TooManyOptions => write!(f, "more than {MAX_OPTIONS} options"),
+            Error::MissingValue => write!(f, "option name with no value"),
+            Error::DuplicateOption => write!(f, "option named twice"),
+            Error::TrailingBytes => write!(f, "bytes after the packet's last field"),
         }
     }
 }
 
-impl std::error::Error for ParseError {}
+impl std::error::Error for Error {}
 
 impl Packet {
     /// An ERROR packet with the code's standard message.
@@ -647,23 +647,23 @@ pub struct NetasciiByte(
 );
 
 impl Wire for NetasciiByte {
-    type ParseError = ParseError;
-    type WriteError = ParseError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads one netascii byte. Refuses empty input or more than one character.
     /// A lone CR is kept, as are bytes other than CR LF and CR NUL pairs.
-    fn parse(b: &[u8]) -> Result<Self, ParseError> {
+    fn parse(b: &[u8]) -> Result<Self, Error> {
         match b {
             [b'\r', b'\n'] => Ok(Self(b'\n')),
             [b'\r', 0] => Ok(Self(b'\r')),
             [byte] => Ok(Self(*byte)),
-            [] => Err(ParseError::Short),
-            _ => Err(ParseError::TrailingBytes),
+            [] => Err(Error::Short),
+            _ => Err(Error::TrailingBytes),
         }
     }
 
     /// Appends one encoded character. Refuses no values.
-    fn write(&self, dst: &mut Vec<u8>) -> Result<(), ParseError> {
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
         match self.0 {
             b'\n' => dst.extend_from_slice(b"\r\n"),
             b'\r' => dst.extend_from_slice(b"\r\0"),
@@ -674,14 +674,14 @@ impl Wire for NetasciiByte {
 }
 
 /// Reads netascii characters across DATA blocks.
-/// Use [`Stream<Netascii>`](fictionet::stdlib::codec::Stream) to retain a split CR pair.
+/// Use [`Stream<NetasciiBytes>`](fictionet::stdlib::codec::Stream) to retain a split CR pair.
 /// Its input buffer holds at most two bytes, and it holds no private bytes.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct Netascii;
+pub struct NetasciiBytes;
 
-impl Decode for Netascii {
+impl Decode for NetasciiBytes {
     type Item = NetasciiByte;
-    type Error = ParseError;
+    type Error = Error;
     const NAME: &'static str = "netascii";
 
     /// Two bytes suffice for one encoded character.
@@ -714,32 +714,32 @@ fn wire(k: u64) -> u16 {
 }
 
 /// Reads the NUL-terminated string at `*pos` and moves past it.
-fn take_str<'a>(b: &'a [u8], pos: &mut usize) -> Result<&'a str, ParseError> {
+fn take_str<'a>(b: &'a [u8], pos: &mut usize) -> Result<&'a str, Error> {
     let rest = b.get(*pos..).unwrap_or(&[]);
-    let end = rest.iter().position(|&c| c == 0).ok_or(ParseError::Unterminated)?;
+    let end = rest.iter().position(|&c| c == 0).ok_or(Error::Unterminated)?;
     if end > MAX_STRING {
-        return Err(ParseError::StringTooLong);
+        return Err(Error::StringTooLong);
     }
-    let s = std::str::from_utf8(&rest[..end]).map_err(|_| ParseError::NotUtf8)?;
+    let s = std::str::from_utf8(&rest[..end]).map_err(|_| Error::NotUtf8)?;
     *pos += end + 1;
     Ok(s)
 }
 
 /// Reads name and value pairs from `pos` to the end of `b`.
-fn take_options(b: &[u8], mut pos: usize) -> Result<Vec<TftpOption>, ParseError> {
+fn take_options(b: &[u8], mut pos: usize) -> Result<Vec<TftpOption>, Error> {
     let mut options = Vec::new();
     let mut names = std::collections::HashSet::new();
     while pos < b.len() {
         if options.len() >= MAX_OPTIONS {
-            return Err(ParseError::TooManyOptions);
+            return Err(Error::TooManyOptions);
         }
         let name = take_str(b, &mut pos)?;
         if pos >= b.len() {
-            return Err(ParseError::MissingValue);
+            return Err(Error::MissingValue);
         }
         let value = take_str(b, &mut pos)?;
         if !names.insert(name.to_ascii_lowercase()) {
-            return Err(ParseError::DuplicateOption);
+            return Err(Error::DuplicateOption);
         }
         options.push(TftpOption::new(name, value));
     }
@@ -761,9 +761,9 @@ fn clipped_utf8(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
-fn put_str(out: &mut Vec<u8>, s: &str) -> Result<(), ParseError> {
+fn put_str(out: &mut Vec<u8>, s: &str) -> Result<(), Error> {
     if s.len() > MAX_STRING || s.contains('\0') {
-        return Err(ParseError::Unwritable);
+        return Err(Error::Unwritable);
     }
     out.extend_from_slice(s.as_bytes());
     out.push(0);
@@ -792,26 +792,26 @@ fn clipped_options(options: &[TftpOption], start: usize, limit: usize) -> Vec<(&
     written
 }
 
-fn put_options(out: &mut Vec<u8>, options: &[TftpOption], limit: usize) -> Result<(), ParseError> {
+fn put_options(out: &mut Vec<u8>, options: &[TftpOption], limit: usize) -> Result<(), Error> {
     if options.len() > MAX_OPTIONS {
-        return Err(ParseError::Unwritable);
+        return Err(Error::Unwritable);
     }
     let mut names = std::collections::HashSet::new();
     for option in options {
         if option.name.len() > MAX_STRING || option.value.len() > MAX_STRING {
-            return Err(ParseError::Unwritable);
+            return Err(Error::Unwritable);
         }
         if !names.insert(option.name.to_ascii_lowercase()) {
-            return Err(ParseError::Unwritable);
+            return Err(Error::Unwritable);
         }
         put_str(out, &option.name)?;
         put_str(out, &option.value)?;
         if out.len() > limit {
-            return Err(ParseError::Unwritable);
+            return Err(Error::Unwritable);
         }
     }
     if out.len() > limit {
-        return Err(ParseError::Unwritable);
+        return Err(Error::Unwritable);
     }
     Ok(())
 }
@@ -821,62 +821,62 @@ fn be16(b: &[u8], i: usize) -> u16 {
 }
 
 impl Wire for Packet {
-    type ParseError = ParseError;
-    type WriteError = ParseError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads one packet: the whole of a UDP datagram's payload.
     /// Refuses malformed or trailing input.
-    fn parse(b: &[u8]) -> Result<Packet, ParseError> {
+    fn parse(b: &[u8]) -> Result<Packet, Error> {
         if b.len() > MAX_PACKET {
-            return Err(ParseError::TooLong(b.len()));
+            return Err(Error::TooLong(b.len()));
         }
         if b.len() < 2 {
-            return Err(ParseError::Short);
+            return Err(Error::Short);
         }
         let op = be16(b, 0);
         match op {
             opcode::RRQ | opcode::WRQ => {
                 if b.len() > MAX_REQUEST {
-                    return Err(ParseError::RequestTooLong(b.len()));
+                    return Err(Error::RequestTooLong(b.len()));
                 }
                 let mut pos = 2;
                 let filename = take_str(b, &mut pos)?.to_string();
-                let mode = Mode::from_name(take_str(b, &mut pos)?).ok_or(ParseError::UnknownMode)?;
+                let mode = Mode::from_name(take_str(b, &mut pos)?).ok_or(Error::UnknownMode)?;
                 let options = take_options(b, pos)?;
                 let request = Request { filename, mode, options };
                 Ok(if op == opcode::RRQ { Packet::ReadRequest(request) } else { Packet::WriteRequest(request) })
             }
             opcode::DATA => {
                 if b.len() < 4 {
-                    return Err(ParseError::Short);
+                    return Err(Error::Short);
                 }
                 Ok(Packet::Data { block: be16(b, 2), data: b[4..].to_vec() })
             }
             opcode::ACK => match b.len() {
-                0..4 => Err(ParseError::Short),
+                0..4 => Err(Error::Short),
                 4 => Ok(Packet::Ack { block: be16(b, 2) }),
-                _ => Err(ParseError::TrailingBytes),
+                _ => Err(Error::TrailingBytes),
             },
             opcode::ERROR => {
                 if b.len() < 4 {
-                    return Err(ParseError::Short);
+                    return Err(Error::Short);
                 }
                 let mut pos = 4;
                 let message = take_str(b, &mut pos)?.to_string();
                 if pos != b.len() {
-                    return Err(ParseError::TrailingBytes);
+                    return Err(Error::TrailingBytes);
                 }
                 Ok(Packet::Error { code: ErrorCode::from_code(be16(b, 2)), message })
             }
             opcode::OACK => Ok(Packet::OptionAck { options: take_options(b, 2)? }),
-            other => Err(ParseError::UnknownOpcode(other)),
+            other => Err(Error::UnknownOpcode(other)),
         }
     }
 
     /// Appends the complete packet. Refuses NULs or oversized strings, repeated options,
     /// requests above [`MAX_REQUEST`] and DATA above [`MAX_BLOCK_SIZE`].
     /// Leaves the destination unchanged on error.
-    fn write(&self, dst: &mut Vec<u8>) -> Result<(), ParseError> {
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
         let mut out = Vec::new();
         match self {
             Packet::ReadRequest(r) | Packet::WriteRequest(r) => {
@@ -889,7 +889,7 @@ impl Wire for Packet {
             }
             Packet::Data { block, data } => {
                 if data.len() > usize::from(MAX_BLOCK_SIZE) {
-                    return Err(ParseError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 out.reserve(4 + data.len());
                 out.extend_from_slice(&opcode::DATA.to_be_bytes());
@@ -989,40 +989,40 @@ mod tests {
 
     #[test]
     fn each_parse_error() {
-        assert_eq!(Packet::parse(&[]), Err(ParseError::Short));
-        assert_eq!(Packet::parse(&[0]), Err(ParseError::Short));
-        assert_eq!(Packet::parse(&vec![0; MAX_PACKET + 1]), Err(ParseError::TooLong(MAX_PACKET + 1)));
-        assert_eq!(Packet::parse(&[0, 7]), Err(ParseError::UnknownOpcode(7)));
-        assert_eq!(Packet::parse(&[0, 0, 1, 2]), Err(ParseError::UnknownOpcode(0)));
-        assert_eq!(Packet::parse(b"\x00\x01foo"), Err(ParseError::Unterminated));
-        assert_eq!(Packet::parse(b"\x00\x01foo\x00octet"), Err(ParseError::Unterminated));
+        assert_eq!(Packet::parse(&[]), Err(Error::Short));
+        assert_eq!(Packet::parse(&[0]), Err(Error::Short));
+        assert_eq!(Packet::parse(&vec![0; MAX_PACKET + 1]), Err(Error::TooLong(MAX_PACKET + 1)));
+        assert_eq!(Packet::parse(&[0, 7]), Err(Error::UnknownOpcode(7)));
+        assert_eq!(Packet::parse(&[0, 0, 1, 2]), Err(Error::UnknownOpcode(0)));
+        assert_eq!(Packet::parse(b"\x00\x01foo"), Err(Error::Unterminated));
+        assert_eq!(Packet::parse(b"\x00\x01foo\x00octet"), Err(Error::Unterminated));
         let mut long = b"\x00\x05\x00\x00".to_vec();
         long.extend_from_slice(&[b'a'; MAX_STRING + 1]);
         long.push(0);
-        assert_eq!(Packet::parse(&long), Err(ParseError::StringTooLong));
-        assert_eq!(Packet::parse(b"\x00\x01\xff\x00octet\x00"), Err(ParseError::NotUtf8));
-        assert_eq!(Packet::parse(b"\x00\x01foo\x00binary\x00"), Err(ParseError::UnknownMode));
+        assert_eq!(Packet::parse(&long), Err(Error::StringTooLong));
+        assert_eq!(Packet::parse(b"\x00\x01\xff\x00octet\x00"), Err(Error::NotUtf8));
+        assert_eq!(Packet::parse(b"\x00\x01foo\x00binary\x00"), Err(Error::UnknownMode));
         let mut many = b"\x00\x06".to_vec();
         for i in 0..=MAX_OPTIONS {
             many.extend_from_slice(format!("a{i}\x001\x00").as_bytes());
         }
-        assert_eq!(Packet::parse(&many), Err(ParseError::TooManyOptions));
-        assert_eq!(Packet::parse(b"\x00\x06blksize\x00"), Err(ParseError::MissingValue));
-        assert_eq!(Packet::parse(b"\x00\x06blksize\x0010"), Err(ParseError::Unterminated));
-        assert_eq!(Packet::parse(&[0, 4, 0, 1, 0]), Err(ParseError::TrailingBytes));
-        assert_eq!(Packet::parse(b"\x00\x05\x00\x00hi\x00x"), Err(ParseError::TrailingBytes));
-        assert_eq!(Packet::parse(&[0, 3, 0]), Err(ParseError::Short));
-        assert_eq!(Packet::parse(&[0, 4, 0]), Err(ParseError::Short));
-        assert_eq!(Packet::parse(&[0, 5, 0, 1]), Err(ParseError::Unterminated));
-        assert_eq!(Packet::parse(&[0, 5, 0]), Err(ParseError::Short));
+        assert_eq!(Packet::parse(&many), Err(Error::TooManyOptions));
+        assert_eq!(Packet::parse(b"\x00\x06blksize\x00"), Err(Error::MissingValue));
+        assert_eq!(Packet::parse(b"\x00\x06blksize\x0010"), Err(Error::Unterminated));
+        assert_eq!(Packet::parse(&[0, 4, 0, 1, 0]), Err(Error::TrailingBytes));
+        assert_eq!(Packet::parse(b"\x00\x05\x00\x00hi\x00x"), Err(Error::TrailingBytes));
+        assert_eq!(Packet::parse(&[0, 3, 0]), Err(Error::Short));
+        assert_eq!(Packet::parse(&[0, 4, 0]), Err(Error::Short));
+        assert_eq!(Packet::parse(&[0, 5, 0, 1]), Err(Error::Unterminated));
+        assert_eq!(Packet::parse(&[0, 5, 0]), Err(Error::Short));
         // Every error has a message.
         for e in [
-            ParseError::Short,
-            ParseError::TooLong(9),
-            ParseError::RequestTooLong(9),
-            ParseError::UnknownOpcode(9),
-            ParseError::MissingValue,
-            ParseError::DuplicateOption,
+            Error::Short,
+            Error::TooLong(9),
+            Error::RequestTooLong(9),
+            Error::UnknownOpcode(9),
+            Error::MissingValue,
+            Error::DuplicateOption,
         ] {
             assert!(!e.to_string().is_empty());
         }
@@ -1079,7 +1079,7 @@ mod tests {
             Packet::Data { block: 1, data: vec![1; MAX_PACKET * 2] },
             Packet::Error { code: ErrorCode::NotDefined, message: "x".repeat(5000) },
         ] {
-            assert_eq!(packet.to_bytes(), Err(ParseError::Unwritable));
+            assert_eq!(packet.to_bytes(), Err(Error::Unwritable));
             contract::check_wire_value(&packet);
         }
     }
@@ -1098,7 +1098,7 @@ mod tests {
             Packet::OptionAck { options: vec![TftpOption::new("tsize", "1\0")] },
             Packet::Error { code: ErrorCode::NotDefined, message: "no\0pe".to_string() },
         ] {
-            assert_eq!(packet.to_bytes(), Err(ParseError::Unwritable), "{packet:?}");
+            assert_eq!(packet.to_bytes(), Err(Error::Unwritable), "{packet:?}");
             contract::check_wire_value(&packet);
         }
         let fine = Packet::ReadRequest(request("a", vec![TftpOption::new("blksize", "512")]));
@@ -1259,7 +1259,7 @@ mod tests {
         rrq.extend_from_slice(&[b'1'; 101]);
         rrq.push(0);
         assert_eq!(rrq.len(), 513);
-        assert_eq!(Packet::parse(&rrq), Err(ParseError::RequestTooLong(513)));
+        assert_eq!(Packet::parse(&rrq), Err(Error::RequestTooLong(513)));
         rrq.truncate(512);
         *rrq.last_mut().unwrap() = 0;
         assert!(Packet::parse(&rrq).is_ok());
@@ -1267,7 +1267,7 @@ mod tests {
         let options: Vec<TftpOption> = (0..40).map(|i| TftpOption::new(&format!("o{i}"), &"9".repeat(60))).collect();
         for filename in [long, "a".into()] {
             let p = Packet::WriteRequest(Request { filename, mode: Mode::NetAscii, options: options.clone() });
-            assert_eq!(p.to_bytes(), Err(ParseError::Unwritable));
+            assert_eq!(p.to_bytes(), Err(Error::Unwritable));
             contract::check_wire_value(&p);
         }
         let bounded = Packet::WriteRequest(Request {
@@ -1282,12 +1282,12 @@ mod tests {
     fn repeated_options_are_rejected() {
         assert_eq!(
             Packet::parse(b"\x00\x01f\x00octet\x00blksize\x001024\x00BlkSize\x00512\x00"),
-            Err(ParseError::DuplicateOption)
+            Err(Error::DuplicateOption)
         );
-        assert_eq!(Packet::parse(b"\x00\x06tsize\x001\x00tsize\x002\x00"), Err(ParseError::DuplicateOption));
+        assert_eq!(Packet::parse(b"\x00\x06tsize\x001\x00tsize\x002\x00"), Err(Error::DuplicateOption));
         // The writer refuses repeated options.
         let p = Packet::OptionAck { options: vec![TftpOption::new("tsize", "1"), TftpOption::new("TSIZE", "2")] };
-        assert_eq!(p.to_bytes(), Err(ParseError::Unwritable));
+        assert_eq!(p.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&p);
         // negotiate() ignores every repeat, even after a first value it
         // could not accept, as its doc says.
@@ -1409,8 +1409,8 @@ mod tests {
             (&b"a\r\rb\r"[..], &b"a\r\rb\r"[..]),
             (&b"x\r\0\r\n\r\n\r\0y\r\0\r\0\0\r\0\rz\r\r\n\r"[..], &b"x\r\n\n\ry\r\r\0\r\rz\r\n\r"[..]),
         ] {
-            contract::check_decode_with_alloc_limit(|| Netascii, wire, 4);
-            let (items, error) = decode_all(|| Netascii, wire);
+            contract::check_decode_with_alloc_limit(|| NetasciiBytes, wire, 4);
+            let (items, error) = decode_all(|| NetasciiBytes, wire);
             assert_eq!(error, None);
             assert_eq!(items.into_iter().map(|c| c.0).collect::<Vec<_>>(), text);
         }
@@ -1470,10 +1470,10 @@ mod tests {
             }
             let mut encoded = Vec::new();
             for &byte in &buf { NetasciiByte(byte).write(&mut encoded).unwrap(); }
-            let (text, error) = fictionet::stdlib::codec::test_support::decode_all(|| Netascii, &encoded);
+            let (text, error) = fictionet::stdlib::codec::test_support::decode_all(|| NetasciiBytes, &encoded);
             assert_eq!(error, None);
             assert_eq!(text.into_iter().map(|c| c.0).collect::<Vec<_>>(), buf);
-            contract::check_decode_with_alloc_limit(|| Netascii, &buf, 4);
+            contract::check_decode_with_alloc_limit(|| NetasciiBytes, &buf, 4);
         }
     }
 }

@@ -28,7 +28,7 @@ impl Session {
 
 impl Decode for Session {
     type Item = Event;
-    type Error = telnet::DecodeError;
+    type Error = telnet::Error;
     const NAME: &'static str = "Telnet fuzz session";
 
     fn capacity(&self) -> usize {
@@ -135,7 +135,7 @@ fuzz_target!(|data: &[u8]| {
     contract::check_wire_value(&Subnegotiation::TerminalTypeIs(
         String::from_utf8_lossy(&payload).into_owned(),
     ));
-    contract::check_wire_value(&Event::Error(telnet::DecodeError::Truncated));
+    contract::check_wire_value(&Event::Error(telnet::Error::Truncated));
     let mut options = Negotiation::new();
     for option in 0..=255u8 {
         options.allow_local(option, option % 2 == 0);

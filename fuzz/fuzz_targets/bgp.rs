@@ -6,13 +6,13 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use fictionet::stdlib::bgp::{
-    Attribute, Context, EncodeError, Frame, Frames, MAX_BODY_LEN, Message, MpReach,
+    Attribute, Context, Error, Frame, Frames, MAX_BODY_LEN, Message, MpReach,
     Nlri, Open, Origin, Prefix, Segment, SegmentKind, Update, afi, kind, safi,
 };
 use fictionet::stdlib::codec::{Decode, Wire, contract, test_support::decode_all};
 use libfuzzer_sys::fuzz_target;
 
-fn encode(message: &Message, context: &Context) -> Result<Vec<u8>, EncodeError> {
+fn encode(message: &Message, context: &Context) -> Result<Vec<u8>, Error> {
     message.to_frame(context)?.to_bytes()
 }
 
@@ -110,7 +110,7 @@ fuzz_target!(|data: &[u8]| {
                     }
                     Err(e) => {
                         assert!(strict.is_err());
-                        assert!(encode(&Message::Notification(e.notification()), &ctx).is_ok());
+                        assert!(encode(&Message::Notification(e.notification().unwrap()), &ctx).is_ok());
                     }
                 }
             }
@@ -119,7 +119,7 @@ fuzz_target!(|data: &[u8]| {
                 // routes, and reads back the same.
                 Ok(m) => {
                     if mixes(&m) {
-                        assert!(matches!(encode(&m, &ctx), Err(EncodeError::Unwritable)));
+                        assert!(matches!(encode(&m, &ctx), Err(Error::Unwritable)));
                         continue;
                     }
                     let bytes = encode(&m, &ctx).unwrap();
@@ -128,7 +128,7 @@ fuzz_target!(|data: &[u8]| {
                 }
                 // An error's notification can always be sent.
                 Err(e) => {
-                    let n = Message::Notification(e.notification());
+                    let n = Message::Notification(e.notification().unwrap());
                     assert!(encode(&n, &ctx).is_ok());
                 }
             }
@@ -141,7 +141,7 @@ fuzz_target!(|data: &[u8]| {
     for r in read {
         match r {
             Ok(m) => assert!(mixes(&m) || encode(&m, &ctx).is_ok()),
-            Err(e) => assert!(encode(&Message::Notification(e.notification()), &ctx).is_ok()),
+            Err(e) => assert!(encode(&Message::Notification(e.notification().unwrap()), &ctx).is_ok()),
         }
     }
     // An UPDATE built from public fields: a frame the writer gives fits in

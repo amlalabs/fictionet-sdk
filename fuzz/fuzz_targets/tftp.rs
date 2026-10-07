@@ -5,7 +5,7 @@
 
 use fictionet::stdlib::codec::{Wire, contract};
 use fictionet::stdlib::tftp::{
-    DEFAULT_BLOCK_SIZE, Event, MAX_BLOCK_SIZE, MAX_REQUEST, Negotiated, Netascii, NetasciiByte,
+    DEFAULT_BLOCK_SIZE, Event, MAX_BLOCK_SIZE, MAX_REQUEST, Negotiated, NetasciiBytes, NetasciiByte,
     Packet, ReadTransfer, TftpOption, negotiate, parse_number,
 };
 use libfuzzer_sys::fuzz_target;
@@ -55,7 +55,7 @@ fn receive(mut t: ReadTransfer) -> Vec<u8> {
 fuzz_target!(|data: &[u8]| {
     contract::check_wire::<Packet>(data);
     contract::check_wire::<NetasciiByte>(data);
-    contract::check_decode_with_alloc_limit(|| Netascii, data, 4);
+    contract::check_decode_with_alloc_limit(|| NetasciiBytes, data, 4);
     if let Ok(p) = Packet::parse(data) {
         // What was read can be written, and reads back the same.
         let bytes = p.to_bytes().unwrap();
@@ -99,7 +99,7 @@ fuzz_target!(|data: &[u8]| {
         NetasciiByte(byte).write(&mut encoded).unwrap();
     }
     let (decoded, failure) =
-        fictionet::stdlib::codec::test_support::decode_all(|| Netascii, &encoded);
+        fictionet::stdlib::codec::test_support::decode_all(|| NetasciiBytes, &encoded);
     assert_eq!(failure, None);
     assert_eq!(decoded.into_iter().map(|b| b.0).collect::<Vec<_>>(), data);
 });

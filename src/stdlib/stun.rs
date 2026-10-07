@@ -283,8 +283,8 @@ impl Attribute {
     /// since it depends on the bytes before it; it comes back as an error.
     /// A value longer than [`MAX_VALUE`], which no message can hold, is
     /// refused before anything is copied.
-    pub fn parse(typ: u16, value: &[u8], transaction: &[u8; 12]) -> Result<Attribute, ParseError> {
-        let bad = || ParseError::AttributeValue {
+    pub fn parse(typ: u16, value: &[u8], transaction: &[u8; 12]) -> Result<Attribute, Error> {
+        let bad = || Error::AttributeValue {
             typ,
             len: value.len(),
         };
@@ -312,7 +312,7 @@ impl Attribute {
                 let class = u16::from(class_byte & 0x07);
                 let number = u16::from(*number_byte);
                 if !(3..=6).contains(&class) || number > 99 {
-                    return Err(ParseError::ErrorCode {
+                    return Err(Error::ErrorCode {
                         class: class_byte & 0x07,
                         number: *number_byte,
                     });
@@ -331,7 +331,7 @@ impl Attribute {
                     value.as_chunks::<2>().0.iter().filter_map(|c| be16(c, 0)).collect(),
                 ))
             }
-            attr::FINGERPRINT => Err(ParseError::FingerprintNotLast),
+            attr::FINGERPRINT => Err(Error::FingerprintNotLast),
             _ if !integrity_length_ok(typ, value.len()) => Err(bad()),
             _ => Ok(Attribute::Other {
                 typ,
@@ -342,8 +342,8 @@ impl Attribute {
 
     // Each allocation is bounded by MAX_VALUE. Text uses the parser's
     // limit so every parsed message can be written without changing it.
-    fn value(&self, transaction: &[u8; 12]) -> Result<Vec<u8>, WriteError> {
-        let bad = WriteError::Unwritable { typ: self.typ() };
+    fn value(&self, transaction: &[u8; 12]) -> Result<Vec<u8>, Error> {
+        let bad = Error::Unwritable { typ: self.typ() };
         match self {
             Attribute::MappedAddress(a)
             | Attribute::XorMappedAddress(a)
@@ -410,9 +410,10 @@ pub struct Message {
     pub fingerprint: bool,
 }
 
-/// Why bytes are not a STUN message.
+/// Why bytes are not a STUN message, or a message cannot be written
+/// without changing its fields.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ParseError {
+pub enum Error {
     /// Fewer bytes than the header, or than the header's length says.
     Truncated,
     /// More bytes than the header's length says. A UDP datagram holds
@@ -429,7 +430,8 @@ pub enum ParseError {
         /// The attribute's type.
         typ: u16,
     },
-    /// The message held more than [`MAX_ATTRIBUTES`] attributes.
+    /// The message held more than [`MAX_ATTRIBUTES`] attributes. A writer
+    /// counts FINGERPRINT too.
     TooManyAttributes,
     /// An attribute's value had a length its type does not allow.
     AttributeValue {
@@ -464,64 +466,8 @@ pub enum ParseError {
         /// The value the message carried.
         found: u32,
     },
-}
-
-impl ParseError {
-    /// Whether the error is in the header, so a byte stream holding it
-    /// cannot be split into messages any further. Other errors are in one
-    /// message's attributes, and the messages after it can still be read.
-    pub fn is_framing(&self) -> bool {
-        matches!(
-            self,
-            ParseError::TopBits(_) | ParseError::Length(_) | ParseError::MagicCookie(_)
-        )
-    }
-}
-
-impl core::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            ParseError::Truncated => f.write_str("message cut short"),
-            ParseError::TrailingBytes(n) => write!(f, "{n} bytes after the message"),
-            ParseError::TopBits(b) => {
-                write!(f, "first byte {b:#04x} has its top bits set, not STUN")
-            }
-            ParseError::Length(n) => write!(f, "message length {n} is not a multiple of 4"),
-            ParseError::MagicCookie(c) => write!(f, "magic cookie {c:#010x}, not 0x2112a442"),
-            ParseError::AttributeTruncated { typ } => {
-                write!(f, "attribute {typ:#06x} runs past the message")
-            }
-            ParseError::TooManyAttributes => write!(f, "more than {MAX_ATTRIBUTES} attributes"),
-            ParseError::AttributeValue { typ, len } => {
-                write!(f, "attribute {typ:#06x} has a bad length {len}")
-            }
-            ParseError::AddressFamily(fam) => write!(f, "address family {fam}, not 1 or 2"),
-            ParseError::Text { typ } => {
-                write!(f, "attribute {typ:#06x} is not UTF-8 or is too long")
-            }
-            ParseError::ErrorCode { class, number } => {
-                write!(f, "error code class {class} number {number}")
-            }
-            ParseError::FingerprintNotLast => f.write_str("FINGERPRINT is not the last attribute"),
-            ParseError::Fingerprint { expected, found } => {
-                write!(
-                    f,
-                    "FINGERPRINT {found:#010x}, the message gives {expected:#010x}"
-                )
-            }
-        }
-    }
-}
-
-impl core::error::Error for ParseError {}
-
-/// Why a message cannot be written without changing its fields.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WriteError {
     /// The method has bits outside the 12-bit field.
     Method(u16),
-    /// The attribute count, including FINGERPRINT, exceeds [`MAX_ATTRIBUTES`].
-    TooManyAttributes,
     /// The encoded attributes, including FINGERPRINT, exceed [`MAX_BODY`].
     BodyTooLong,
     /// An attribute cannot be read back as the same value.
@@ -536,13 +482,52 @@ pub enum WriteError {
     },
 }
 
-impl core::fmt::Display for WriteError {
+impl Error {
+    /// Whether the error is in the header, so a byte stream holding it
+    /// cannot be split into messages any further. Other errors are in one
+    /// message's attributes, and the messages after it can still be read.
+    pub fn is_framing(&self) -> bool {
+        matches!(
+            self,
+            Error::TopBits(_) | Error::Length(_) | Error::MagicCookie(_)
+        )
+    }
+}
+
+impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Method(method) => write!(f, "method {method:#06x} exceeds 12 bits"),
-            Self::TooManyAttributes => write!(f, "more than {MAX_ATTRIBUTES} attributes"),
-            Self::BodyTooLong => write!(f, "message body exceeds {MAX_BODY} bytes"),
-            Self::Unwritable { typ } => {
+            Error::Truncated => f.write_str("message cut short"),
+            Error::TrailingBytes(n) => write!(f, "{n} bytes after the message"),
+            Error::TopBits(b) => {
+                write!(f, "first byte {b:#04x} has its top bits set, not STUN")
+            }
+            Error::Length(n) => write!(f, "message length {n} is not a multiple of 4"),
+            Error::MagicCookie(c) => write!(f, "magic cookie {c:#010x}, not 0x2112a442"),
+            Error::AttributeTruncated { typ } => {
+                write!(f, "attribute {typ:#06x} runs past the message")
+            }
+            Error::TooManyAttributes => write!(f, "more than {MAX_ATTRIBUTES} attributes"),
+            Error::AttributeValue { typ, len } => {
+                write!(f, "attribute {typ:#06x} has a bad length {len}")
+            }
+            Error::AddressFamily(fam) => write!(f, "address family {fam}, not 1 or 2"),
+            Error::Text { typ } => {
+                write!(f, "attribute {typ:#06x} is not UTF-8 or is too long")
+            }
+            Error::ErrorCode { class, number } => {
+                write!(f, "error code class {class} number {number}")
+            }
+            Error::FingerprintNotLast => f.write_str("FINGERPRINT is not the last attribute"),
+            Error::Fingerprint { expected, found } => {
+                write!(
+                    f,
+                    "FINGERPRINT {found:#010x}, the message gives {expected:#010x}"
+                )
+            }
+            Error::Method(method) => write!(f, "method {method:#06x} exceeds 12 bits"),
+            Error::BodyTooLong => write!(f, "message body exceeds {MAX_BODY} bytes"),
+            Error::Unwritable { typ } => {
                 write!(
                     f,
                     "value cannot be written without changing it: attribute {typ:#06x}"
@@ -552,7 +537,7 @@ impl core::fmt::Display for WriteError {
     }
 }
 
-impl core::error::Error for WriteError {}
+impl core::error::Error for Error {}
 
 impl Message {
     /// A message with no attributes and no FINGERPRINT.
@@ -580,17 +565,17 @@ impl Message {
     /// after MESSAGE-INTEGRITY except MESSAGE-INTEGRITY-SHA256 and
     /// FINGERPRINT, and everything but FINGERPRINT after a
     /// MESSAGE-INTEGRITY-SHA256.
-    pub fn parse(b: &[u8]) -> Result<Message, ParseError> {
+    pub fn parse(b: &[u8]) -> Result<Message, Error> {
         let total = match header(b)? {
             Some(n) => n,
-            None => return Err(ParseError::Truncated),
+            None => return Err(Error::Truncated),
         };
         if b.len() > total {
-            return Err(ParseError::TrailingBytes(b.len() - total));
+            return Err(Error::TrailingBytes(b.len() - total));
         }
-        let (method, class) = split_type(be16(b, 0).ok_or(ParseError::Truncated)?);
+        let (method, class) = split_type(be16(b, 0).ok_or(Error::Truncated)?);
         let mut transaction = [0u8; 12];
-        transaction.copy_from_slice(b.get(8..HEADER_LEN).ok_or(ParseError::Truncated)?);
+        transaction.copy_from_slice(b.get(8..HEADER_LEN).ok_or(Error::Truncated)?);
         let mut attributes = Vec::new();
         let mut fingerprint = false;
         let mut integrity = Integrity::None;
@@ -599,18 +584,18 @@ impl Message {
         while at < total {
             let tail = b
                 .get(at..total)
-                .ok_or(ParseError::AttributeTruncated { typ: 0 })?;
+                .ok_or(Error::AttributeTruncated { typ: 0 })?;
             let [hi, lo, len_hi, len_lo, rest @ ..] = tail else {
-                return Err(ParseError::AttributeTruncated { typ: 0 });
+                return Err(Error::AttributeTruncated { typ: 0 });
             };
             let typ = u16::from_be_bytes([*hi, *lo]);
             let len = usize::from(u16::from_be_bytes([*len_hi, *len_lo]));
             let value = rest
                 .get(..len)
-                .ok_or(ParseError::AttributeTruncated { typ })?;
+                .ok_or(Error::AttributeTruncated { typ })?;
             count += 1;
             if count > MAX_ATTRIBUTES {
-                return Err(ParseError::TooManyAttributes);
+                return Err(Error::TooManyAttributes);
             }
             // Offsets stay multiples of 4 and the body is one, so the
             // padding always fits once the value does.
@@ -618,18 +603,18 @@ impl Message {
                 .checked_add(4)
                 .and_then(|n| n.checked_add(padded(len)))
                 .filter(|&n| n <= total)
-                .ok_or(ParseError::AttributeTruncated { typ })?;
+                .ok_or(Error::AttributeTruncated { typ })?;
             if typ == attr::FINGERPRINT {
                 if next != total {
-                    return Err(ParseError::FingerprintNotLast);
+                    return Err(Error::FingerprintNotLast);
                 }
                 if len != 4 {
-                    return Err(ParseError::AttributeValue { typ, len });
+                    return Err(Error::AttributeValue { typ, len });
                 }
-                let expected = crc32(b.get(..at).ok_or(ParseError::Truncated)?) ^ FINGERPRINT_XOR;
-                let found = be32(value, 0).ok_or(ParseError::AttributeValue { typ, len })?;
+                let expected = crc32(b.get(..at).ok_or(Error::Truncated)?) ^ FINGERPRINT_XOR;
+                let found = be32(value, 0).ok_or(Error::AttributeValue { typ, len })?;
                 if expected != found {
-                    return Err(ParseError::Fingerprint { expected, found });
+                    return Err(Error::Fingerprint { expected, found });
                 }
                 fingerprint = true;
             } else if integrity_keeps(&mut integrity, typ) {
@@ -637,7 +622,7 @@ impl Message {
                     Ok(a) => attributes.push(a),
                     // An address family this module does not know is
                     // ignored (RFC 8489, section 6.3.3).
-                    Err(ParseError::AddressFamily(_)) => {}
+                    Err(Error::AddressFamily(_)) => {}
                     Err(e) => return Err(e),
                 }
             }
@@ -755,7 +740,7 @@ impl Message {
     /// The source address is kept as given. IPv6 scope IDs and flow labels
     /// have no wire form. Clear them before calling this method, including
     /// the scope ID of a link-local address, or the writer returns
-    /// [`WriteError::Unwritable`].
+    /// [`Error::Unwritable`].
     pub fn success_response(&self, source: SocketAddr) -> Message {
         let mut m = Message::new(self.method, Class::SuccessResponse, self.transaction);
         m.attributes.push(Attribute::XorMappedAddress(source));
@@ -796,49 +781,49 @@ impl Message {
 }
 
 impl codec::Wire for Message {
-    type ParseError = ParseError;
-    type WriteError = WriteError;
+    type ParseError = Error;
+    type WriteError = Error;
 
-    /// Reads one complete datagram. Short input returns [`ParseError::Truncated`];
-    /// extra bytes return [`ParseError::TrailingBytes`]. Invalid header bits,
-    /// body alignment, or cookie return [`ParseError::TopBits`], [`ParseError::Length`],
-    /// or [`ParseError::MagicCookie`]. Attribute bounds and values return
-    /// [`ParseError::AttributeTruncated`], [`ParseError::TooManyAttributes`],
-    /// [`ParseError::AttributeValue`], [`ParseError::Text`], or [`ParseError::ErrorCode`].
-    /// A misplaced or incorrect fingerprint returns [`ParseError::FingerprintNotLast`]
-    /// or [`ParseError::Fingerprint`].
+    /// Reads one complete datagram. Short input returns [`Error::Truncated`];
+    /// extra bytes return [`Error::TrailingBytes`]. Invalid header bits,
+    /// body alignment, or cookie return [`Error::TopBits`], [`Error::Length`],
+    /// or [`Error::MagicCookie`]. Attribute bounds and values return
+    /// [`Error::AttributeTruncated`], [`Error::TooManyAttributes`],
+    /// [`Error::AttributeValue`], [`Error::Text`], or [`Error::ErrorCode`].
+    /// A misplaced or incorrect fingerprint returns [`Error::FingerprintNotLast`]
+    /// or [`Error::Fingerprint`].
     ///
     /// Unknown address families are skipped. After MESSAGE-INTEGRITY only
     /// MESSAGE-INTEGRITY-SHA256 and FINGERPRINT remain; after SHA256 only
     /// FINGERPRINT remains. Skipped attributes do not appear in the value.
-    fn parse(bytes: &[u8]) -> Result<Self, Self::ParseError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         Message::parse(bytes)
     }
 
     /// Appends a message with zero padding and a recomputed fingerprint.
-    /// A method over 12 bits returns [`WriteError::Method`]. Attribute count
-    /// and body size limits return [`WriteError::TooManyAttributes`] and
-    /// [`WriteError::BodyTooLong`]. Attributes that exceed their field limits,
+    /// A method over 12 bits returns [`Error::Method`]. Attribute count
+    /// and body size limits return [`Error::TooManyAttributes`] and
+    /// [`Error::BodyTooLong`]. Attributes that exceed their field limits,
     /// alias another variant, lose IPv6 scope or flow information, or would
-    /// be ignored after integrity return [`WriteError::Unwritable`].
+    /// be ignored after integrity return [`Error::Unwritable`].
     /// Errors leave `out` unchanged. Temporary buffers are bounded by
     /// [`MAX_MESSAGE`] and [`MAX_VALUE`]. Integrity values remain raw bytes;
     /// callers must compute them for the bytes they send. The caller bounds
     /// `out` across repeated writes.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         if self.method > 0x0fff {
-            return Err(WriteError::Method(self.method));
+            return Err(Error::Method(self.method));
         }
         let reserve = if self.fingerprint { 8 } else { 0 };
         if self.attributes.len() > MAX_ATTRIBUTES - usize::from(self.fingerprint) {
-            return Err(WriteError::TooManyAttributes);
+            return Err(Error::TooManyAttributes);
         }
         let mut body = Vec::new();
         let mut integrity = Integrity::None;
         for attribute in &self.attributes {
             let typ = attribute.typ();
             if !integrity_keeps(&mut integrity, typ) {
-                return Err(WriteError::Unwritable { typ });
+                return Err(Error::Unwritable { typ });
             }
             let value = attribute.value(&self.transaction)?;
             let end = body
@@ -846,8 +831,8 @@ impl codec::Wire for Message {
                 .checked_add(4)
                 .and_then(|n| n.checked_add(padded(value.len())))
                 .filter(|&n| n <= MAX_BODY - reserve)
-                .ok_or(WriteError::BodyTooLong)?;
-            let len = u16::try_from(value.len()).map_err(|_| WriteError::Unwritable { typ })?;
+                .ok_or(Error::BodyTooLong)?;
+            let len = u16::try_from(value.len()).map_err(|_| Error::Unwritable { typ })?;
             body.extend_from_slice(&typ.to_be_bytes());
             body.extend_from_slice(&len.to_be_bytes());
             body.extend_from_slice(&value);
@@ -856,12 +841,12 @@ impl codec::Wire for Message {
         let body_len = body
             .len()
             .checked_add(reserve)
-            .ok_or(WriteError::BodyTooLong)?;
+            .ok_or(Error::BodyTooLong)?;
         let total = HEADER_LEN
             .checked_add(body_len)
             .filter(|&n| n <= MAX_MESSAGE)
-            .ok_or(WriteError::BodyTooLong)?;
-        let length = u16::try_from(body_len).map_err(|_| WriteError::BodyTooLong)?;
+            .ok_or(Error::BodyTooLong)?;
+        let length = u16::try_from(body_len).map_err(|_| Error::BodyTooLong)?;
         let mut frame = Vec::with_capacity(total);
         frame.extend_from_slice(&message_type(self.method, self.class).to_be_bytes());
         frame.extend_from_slice(&length.to_be_bytes());
@@ -928,7 +913,7 @@ pub fn answer_binding(request: &Message, source: SocketAddr) -> Option<Message> 
 /// assert_eq!(item, Some(Ok(Ok(message))));
 /// stream.end();
 /// assert_eq!(stream.next(), None);
-/// # Ok::<(), fictionet::stdlib::stun::WriteError>(())
+/// # Ok::<(), fictionet::stdlib::stun::Error>(())
 /// ```
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Frames;
@@ -942,7 +927,7 @@ impl Frames {
 
 impl Decode for Frames {
     type Item = Vec<u8>;
-    type Error = ParseError;
+    type Error = Error;
 
     const NAME: &'static str = "STUN";
 
@@ -951,14 +936,14 @@ impl Decode for Frames {
     }
 
     /// Reads one frame. Invalid header bits, body alignment, or cookie
-    /// return [`ParseError::TopBits`], [`ParseError::Length`], or
-    /// [`ParseError::MagicCookie`]. Partial input returns [`Step::Need`],
+    /// return [`Error::TopBits`], [`Error::Length`], or
+    /// [`Error::MagicCookie`]. Partial input returns [`Step::Need`],
     /// including at EOF. Attribute validation belongs to [`Message::parse`].
     fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Self::Item>, Self::Error> {
         let Some(total) = header(input)? else {
             return Ok(Step::Need);
         };
-        let frame = input.get(..total).ok_or(ParseError::Truncated)?;
+        let frame = input.get(..total).ok_or(Error::Truncated)?;
         Ok(Step::Item(frame.to_vec(), total))
     }
 }
@@ -1000,27 +985,27 @@ const CRC_TABLE: [u32; 256] = {
 /// Checks as much of a header as `b` holds, in byte order: the top bits,
 /// the length, then the cookie. It returns the whole message's length once
 /// the header is there, and `None` while it is not.
-fn header(b: &[u8]) -> Result<Option<usize>, ParseError> {
+fn header(b: &[u8]) -> Result<Option<usize>, Error> {
     if let Some(&first) = b.first()
         && first & 0xc0 != 0
     {
-        return Err(ParseError::TopBits(first));
+        return Err(Error::TopBits(first));
     }
     let Some(length) = be16(b, 2) else {
         return Ok(None);
     };
     if !length.is_multiple_of(4) {
-        return Err(ParseError::Length(length));
+        return Err(Error::Length(length));
     }
     let Some(cookie) = be32(b, 4) else {
         return Ok(None);
     };
     if cookie != MAGIC_COOKIE {
-        return Err(ParseError::MagicCookie(cookie));
+        return Err(Error::MagicCookie(cookie));
     }
     let total = HEADER_LEN
         .checked_add(usize::from(length))
-        .ok_or(ParseError::Length(length))?;
+        .ok_or(Error::Length(length))?;
     if b.len() < total {
         return Ok(None);
     }
@@ -1056,8 +1041,8 @@ fn xor_key(transaction: &[u8; 12]) -> [u8; 16] {
     key
 }
 
-fn read_address(typ: u16, v: &[u8], xor: Option<&[u8; 12]>) -> Result<SocketAddr, ParseError> {
-    let bad = || ParseError::AttributeValue { typ, len: v.len() };
+fn read_address(typ: u16, v: &[u8], xor: Option<&[u8; 12]>) -> Result<SocketAddr, Error> {
+    let bad = || Error::AttributeValue { typ, len: v.len() };
     let [_, family, hi, lo, address @ ..] = v else {
         return Err(bad());
     };
@@ -1066,7 +1051,7 @@ fn read_address(typ: u16, v: &[u8], xor: Option<&[u8; 12]>) -> Result<SocketAddr
     match *family {
         1 => {
             if v.len() != 8 {
-                return Err(ParseError::AttributeValue { typ, len: v.len() });
+                return Err(Error::AttributeValue { typ, len: v.len() });
             }
             let mut ip = [0u8; 4];
             for ((out, byte), mask) in ip.iter_mut().zip(address).zip(key) {
@@ -1076,7 +1061,7 @@ fn read_address(typ: u16, v: &[u8], xor: Option<&[u8; 12]>) -> Result<SocketAddr
         }
         2 => {
             if v.len() != 20 {
-                return Err(ParseError::AttributeValue { typ, len: v.len() });
+                return Err(Error::AttributeValue { typ, len: v.len() });
             }
             let mut ip = [0u8; 16];
             for ((out, byte), mask) in ip.iter_mut().zip(address).zip(key) {
@@ -1089,7 +1074,7 @@ fn read_address(typ: u16, v: &[u8], xor: Option<&[u8; 12]>) -> Result<SocketAddr
                 0,
             )))
         }
-        f => Err(ParseError::AddressFamily(f)),
+        f => Err(Error::AddressFamily(f)),
     }
 }
 
@@ -1107,13 +1092,13 @@ fn write_address(a: SocketAddr, xor: Option<&[u8; 12]>) -> Vec<u8> {
     v
 }
 
-fn read_text(typ: u16, v: &[u8], max: usize) -> Result<String, ParseError> {
+fn read_text(typ: u16, v: &[u8], max: usize) -> Result<String, Error> {
     if v.len() > max {
-        return Err(ParseError::Text { typ });
+        return Err(Error::Text { typ });
     }
     match core::str::from_utf8(v) {
         Ok(s) => Ok(s.to_string()),
-        Err(_) => Err(ParseError::Text { typ }),
+        Err(_) => Err(Error::Text { typ }),
     }
 }
 
@@ -1333,7 +1318,7 @@ mod tests {
         assert_eq!(reply.xor_mapped_address(), Some(source));
         assert_write_error(
             &reply,
-            WriteError::Unwritable {
+            Error::Unwritable {
                 typ: attr::XOR_MAPPED_ADDRESS,
             },
         );
@@ -1402,25 +1387,25 @@ mod tests {
     #[test]
     fn header_errors() {
         let good = Message::binding_request([0; 12]).to_bytes().unwrap();
-        assert_eq!(Message::parse(&[]), Err(ParseError::Truncated));
+        assert_eq!(Message::parse(&[]), Err(Error::Truncated));
         let mut b = good.clone();
         b[0] = 0x40;
-        assert_eq!(Message::parse(&b), Err(ParseError::TopBits(0x40)));
-        assert_eq!(Message::parse(&[0x80]), Err(ParseError::TopBits(0x80)));
+        assert_eq!(Message::parse(&b), Err(Error::TopBits(0x40)));
+        assert_eq!(Message::parse(&[0x80]), Err(Error::TopBits(0x80)));
         let mut b = good.clone();
         b[3] = 2;
-        assert_eq!(Message::parse(&b), Err(ParseError::Length(2)));
+        assert_eq!(Message::parse(&b), Err(Error::Length(2)));
         let mut b = good.clone();
         b[4] = 0;
         assert_eq!(
             Message::parse(&b),
-            Err(ParseError::MagicCookie(0x0012_a442))
+            Err(Error::MagicCookie(0x0012_a442))
         );
         let mut b = good.clone();
         b.push(0);
-        assert_eq!(Message::parse(&b), Err(ParseError::TrailingBytes(1)));
-        assert!(ParseError::Length(2).is_framing());
-        assert!(!ParseError::Truncated.is_framing());
+        assert_eq!(Message::parse(&b), Err(Error::TrailingBytes(1)));
+        assert!(Error::Length(2).is_framing());
+        assert!(!Error::Truncated.is_framing());
         assert!(is_stun(&good));
         assert!(!is_stun(&good[..7]));
         assert!(!is_stun(&b"GET / HTTP/1.1"[..]));
@@ -1442,40 +1427,40 @@ mod tests {
         // A value running past the end.
         assert_eq!(
             p(&[0x80, 0x22, 0x00, 0x08, 0, 0, 0, 0]),
-            Err(ParseError::AttributeTruncated { typ: 0x8022 })
+            Err(Error::AttributeTruncated { typ: 0x8022 })
         );
         // Address: too short, wrong length, bad family.
         assert_eq!(
             p(&[0, 1, 0, 0]),
-            Err(ParseError::AttributeValue { typ: 1, len: 0 })
+            Err(Error::AttributeValue { typ: 1, len: 0 })
         );
         assert_eq!(
             p(&[0, 1, 0, 4, 0, 1, 0, 0]),
-            Err(ParseError::AttributeValue { typ: 1, len: 4 })
+            Err(Error::AttributeValue { typ: 1, len: 4 })
         );
         assert_eq!(
             p(&[0, 1, 0, 8, 0, 2, 0, 0, 1, 2, 3, 4]),
-            Err(ParseError::AttributeValue { typ: 1, len: 8 })
+            Err(Error::AttributeValue { typ: 1, len: 8 })
         );
         assert_eq!(
             Attribute::parse(0x20, &[0, 3, 0, 0, 1, 2, 3, 4], &[0; 12]),
-            Err(ParseError::AddressFamily(3))
+            Err(Error::AddressFamily(3))
         );
         // Error code: too short, class 7, number 100.
         assert_eq!(
             p(&[0, 9, 0, 0]),
-            Err(ParseError::AttributeValue { typ: 9, len: 0 })
+            Err(Error::AttributeValue { typ: 9, len: 0 })
         );
         assert_eq!(
             p(&[0, 9, 0, 4, 0, 0, 7, 0]),
-            Err(ParseError::ErrorCode {
+            Err(Error::ErrorCode {
                 class: 7,
                 number: 0
             })
         );
         assert_eq!(
             p(&[0, 9, 0, 4, 0, 0, 4, 100]),
-            Err(ParseError::ErrorCode {
+            Err(Error::ErrorCode {
                 class: 4,
                 number: 100
             })
@@ -1483,24 +1468,24 @@ mod tests {
         // Bad UTF-8, and text that is too long.
         assert_eq!(
             p(&[0x80, 0x22, 0, 1, 0xff, 0, 0, 0]),
-            Err(ParseError::Text { typ: 0x8022 })
+            Err(Error::Text { typ: 0x8022 })
         );
         let mut long = vec![0x80, 0x22, 0x02, 0xfc];
         long.resize(4 + 764, b'a');
-        assert_eq!(p(&long), Err(ParseError::Text { typ: 0x8022 }));
+        assert_eq!(p(&long), Err(Error::Text { typ: 0x8022 }));
         // An odd unknown-attribute list.
         assert_eq!(
             p(&[0, 0x0a, 0, 3, 0, 1, 0, 0]),
-            Err(ParseError::AttributeValue { typ: 0x0a, len: 3 })
+            Err(Error::AttributeValue { typ: 0x0a, len: 3 })
         );
         // FINGERPRINT: not last, wrong length, wrong value.
         assert_eq!(
             p(&[0x80, 0x28, 0, 4, 0, 0, 0, 0, 0x80, 0x22, 0, 0]),
-            Err(ParseError::FingerprintNotLast)
+            Err(Error::FingerprintNotLast)
         );
         assert_eq!(
             p(&[0x80, 0x28, 0, 0]),
-            Err(ParseError::AttributeValue {
+            Err(Error::AttributeValue {
                 typ: 0x8028,
                 len: 0
             })
@@ -1509,7 +1494,7 @@ mod tests {
         b[79] ^= 1;
         assert!(matches!(
             Message::parse(&b),
-            Err(ParseError::Fingerprint {
+            Err(Error::Fingerprint {
                 found: 0xc07d_4c97,
                 ..
             })
@@ -1519,17 +1504,17 @@ mod tests {
         b[24] = b'T';
         assert!(matches!(
             Message::parse(&b),
-            Err(ParseError::Fingerprint { .. })
+            Err(Error::Fingerprint { .. })
         ));
         // Too many attributes.
         let many: Vec<u8> = std::iter::repeat_n([0x80u8, 0x99, 0, 0], MAX_ATTRIBUTES + 1)
             .flatten()
             .collect();
-        assert_eq!(p(&many), Err(ParseError::TooManyAttributes));
+        assert_eq!(p(&many), Err(Error::TooManyAttributes));
         assert!(p(&many[4..]).is_ok());
         // Each error has words.
         assert!(
-            !ParseError::Fingerprint {
+            !Error::Fingerprint {
                 expected: 1,
                 found: 2
             }
@@ -1544,7 +1529,7 @@ mod tests {
             for n in 0..s.len() {
                 assert_eq!(
                     Message::parse(&s[..n]),
-                    Err(ParseError::Truncated),
+                    Err(Error::Truncated),
                     "{n} bytes"
                 );
                 let mut d = Stream::new(Frames);
@@ -1575,7 +1560,7 @@ mod tests {
             }
         }
         use Class::*;
-        let bad = Err(ParseError::AttributeValue { typ: 1, len: 0 });
+        let bad = Err(Error::AttributeValue { typ: 1, len: 0 });
         assert_eq!(
             got,
             [
@@ -1593,7 +1578,7 @@ mod tests {
         put(&mut d, &[0x00, 0x01, 0x00, 0x00, 1, 2, 3, 4]);
         assert_eq!(
             d.next().map(|r| r.map(|frame| Message::parse(&frame))),
-            Some(Err(codec::Fail::Protocol(ParseError::MagicCookie(
+            Some(Err(codec::Fail::Protocol(Error::MagicCookie(
                 0x0102_0304
             ))))
         );
@@ -1605,7 +1590,7 @@ mod tests {
         assert!(d.failed().is_some());
         assert_eq!(
             d.failed(),
-            Some(&codec::Fail::Protocol(ParseError::MagicCookie(0x0102_0304)))
+            Some(&codec::Fail::Protocol(Error::MagicCookie(0x0102_0304)))
         );
     }
 
@@ -1613,7 +1598,7 @@ mod tests {
     fn writers_refuse_invalid_fields() {
         let mut message = Message::binding_request([3; 12]);
         message.method = 0xffff;
-        assert_write_error(&message, WriteError::Method(0xffff));
+        assert_write_error(&message, Error::Method(0xffff));
         message.method = 1;
         for attribute in [
             Attribute::Software("é".repeat(500)),
@@ -1642,7 +1627,7 @@ mod tests {
         ] {
             let typ = attribute.typ();
             message.attributes = vec![attribute];
-            assert_write_error(&message, WriteError::Unwritable { typ });
+            assert_write_error(&message, Error::Unwritable { typ });
         }
         message.fingerprint = true;
         message.attributes = vec![
@@ -1652,7 +1637,7 @@ mod tests {
             };
             MAX_ATTRIBUTES + 10
         ];
-        assert_write_error(&message, WriteError::TooManyAttributes);
+        assert_write_error(&message, Error::TooManyAttributes);
     }
 
     // RFC 8489, section 14.3: a reader must take a USERNAME of up to 763
@@ -1761,7 +1746,7 @@ mod tests {
         assert!(m.attributes.is_empty());
         assert_eq!(
             Attribute::parse(1, &[0, 9, 0, 0], &[0; 12]),
-            Err(ParseError::AddressFamily(9))
+            Err(Error::AddressFamily(9))
         );
     }
 
@@ -1807,7 +1792,7 @@ mod tests {
         w.fingerprint = true;
         assert_eq!(
             w.to_bytes(),
-            Err(WriteError::Unwritable {
+            Err(Error::Unwritable {
                 typ: attr::SOFTWARE
             })
         );
@@ -1820,13 +1805,13 @@ mod tests {
         let p = |body: &[u8]| Message::parse(&with_body(body));
         assert_eq!(
             p(&[0, 8, 0, 4, 0, 0, 0, 0]),
-            Err(ParseError::AttributeValue { typ: 8, len: 4 })
+            Err(Error::AttributeValue { typ: 8, len: 4 })
         );
         let mut b = vec![0, 0x1c, 0, 18];
         b.resize(4 + 20, 0);
         assert_eq!(
             p(&b),
-            Err(ParseError::AttributeValue { typ: 0x1c, len: 18 })
+            Err(Error::AttributeValue { typ: 0x1c, len: 18 })
         );
         let mut b = vec![0, 0x1c, 0, 16];
         b.resize(4 + 16, 0);
@@ -1843,14 +1828,14 @@ mod tests {
         });
         assert_eq!(
             w.to_bytes(),
-            Err(WriteError::Unwritable {
+            Err(Error::Unwritable {
                 typ: attr::MESSAGE_INTEGRITY
             })
         );
         w.attributes.remove(0);
         assert_eq!(
             w.to_bytes(),
-            Err(WriteError::Unwritable {
+            Err(Error::Unwritable {
                 typ: attr::MESSAGE_INTEGRITY_SHA256
             })
         );
@@ -1886,7 +1871,7 @@ mod tests {
         });
         assert_eq!(
             w.to_bytes(),
-            Err(WriteError::Unwritable {
+            Err(Error::Unwritable {
                 typ: attr::MESSAGE_INTEGRITY_SHA256
             })
         );
@@ -1973,7 +1958,7 @@ mod tests {
     fn framing_error_ends_the_drain_loop() {
         let mut stream = Stream::new(Frames);
         assert_eq!(stream.push(&[0xc0]), 1);
-        let error = codec::Fail::Protocol(ParseError::TopBits(0xc0));
+        let error = codec::Fail::Protocol(Error::TopBits(0xc0));
         assert_eq!(stream.next(), Some(Err(error.clone())));
         assert_eq!(stream.next(), None);
         assert_eq!(stream.failed(), Some(&error));
@@ -1987,7 +1972,7 @@ mod tests {
         for typ in [0x8099, attr::UNKNOWN_ATTRIBUTES, attr::USERNAME] {
             assert_eq!(
                 Attribute::parse(typ, &big, &[0; 12]),
-                Err(ParseError::AttributeValue {
+                Err(Error::AttributeValue {
                     typ,
                     len: MAX_VALUE + 2
                 })
@@ -2048,11 +2033,11 @@ mod tests {
     fn codec_stack_end_to_end() {
         let request = Message::binding_request([8; 12]);
         let bad_attribute = with_body(&[0, 1, 0, 0]);
-        let attribute_error = ParseError::AttributeValue {
+        let attribute_error = Error::AttributeValue {
             typ: attr::MAPPED_ADDRESS,
             len: 0,
         };
-        let header_error = ParseError::TopBits(0xc0);
+        let header_error = Error::TopBits(0xc0);
         let mut bytes = SAMPLE_REQUEST.to_vec();
         bytes.extend_from_slice(&bad_attribute);
         request.write(&mut bytes).unwrap();
@@ -2141,11 +2126,11 @@ mod tests {
             }
         }
         for (bytes, error) in [
-            (&[0x80][..], ParseError::TopBits(0x80)),
-            (&[0, 1, 0, 2][..], ParseError::Length(2)),
+            (&[0x80][..], Error::TopBits(0x80)),
+            (&[0, 1, 0, 2][..], Error::Length(2)),
             (
                 &[0, 1, 0xff, 0xfc, 1, 2, 3, 4][..],
-                ParseError::MagicCookie(0x0102_0304),
+                Error::MagicCookie(0x0102_0304),
             ),
         ] {
             let mut stream = Stream::new(Frames::new());
@@ -2220,11 +2205,11 @@ mod tests {
         );
         assert!(matches!(
             <Message as Wire>::parse(&appended),
-            Err(ParseError::TrailingBytes(_))
+            Err(Error::TrailingBytes(_))
         ));
     }
 
-    fn assert_write_error(message: &Message, error: WriteError) {
+    fn assert_write_error(message: &Message, error: Error) {
         let mut out = vec![0x5a, 0xa5];
         assert_eq!(message.write(&mut out), Err(error));
         assert_eq!(out, [0x5a, 0xa5]);
@@ -2286,7 +2271,7 @@ mod tests {
             attributes.push(Attribute::Other { typ, value: vec![] });
         }
         for attribute in attributes {
-            let error = WriteError::Unwritable {
+            let error = Error::Unwritable {
                 typ: attribute.typ(),
             };
             let mut message = Message::binding_request([0; 12]);
@@ -2296,7 +2281,7 @@ mod tests {
         }
         let mut message = Message::binding_request([0; 12]);
         message.method = 0x1001;
-        assert_write_error(&message, WriteError::Method(0x1001));
+        assert_write_error(&message, Error::Method(0x1001));
     }
 
     #[test]
@@ -2324,7 +2309,7 @@ mod tests {
             (sha256.clone(), sha1),
             (sha256.clone(), sha256),
         ] {
-            let error = WriteError::Unwritable { typ: second.typ() };
+            let error = Error::Unwritable { typ: second.typ() };
             message.attributes = vec![first, second];
             assert_write_error(&message, error);
         }
@@ -2342,7 +2327,7 @@ mod tests {
         ];
         contract::check_wire::<Message>(&Wire::to_bytes(&message).unwrap());
         message.fingerprint = true;
-        assert_write_error(&message, WriteError::TooManyAttributes);
+        assert_write_error(&message, Error::TooManyAttributes);
         message.attributes.pop();
         contract::check_wire::<Message>(&Wire::to_bytes(&message).unwrap());
         message.fingerprint = false;
@@ -2352,7 +2337,7 @@ mod tests {
         }];
         assert_eq!(Wire::to_bytes(&message).unwrap().len(), MAX_MESSAGE);
         message.fingerprint = true;
-        assert_write_error(&message, WriteError::BodyTooLong);
+        assert_write_error(&message, Error::BodyTooLong);
         message.attributes = vec![Attribute::Other {
             typ: 0x8099,
             value: vec![0; MAX_VALUE - 8],
@@ -2365,7 +2350,7 @@ mod tests {
             typ: 0x8099,
             value: vec![0; 5],
         });
-        assert_write_error(&message, WriteError::BodyTooLong);
+        assert_write_error(&message, Error::BodyTooLong);
     }
 
     fn check_round_trip(bytes: &[u8]) {

@@ -100,7 +100,7 @@ impl Negotiated {
 
 impl Decode for Negotiated {
     type Item = tn::Event;
-    type Error = tn::DecodeError;
+    type Error = tn::Error;
     const NAME: &'static str = "test Telnet session";
 
     fn capacity(&self) -> usize {
@@ -209,10 +209,10 @@ fn telnet_recovers_from_bad_units_and_discards_oversized_subnegotiations() {
     bytes.extend_from_slice(&[tn::IAC, tn::cmd::SE, tn::IAC, 1, tn::IAC, tn::cmd::SE]);
     bytes.extend_from_slice(&[tn::IAC, tn::cmd::SB, 43, 7, tn::IAC, tn::cmd::NOP]);
     let want = vec![
-        tn::Event::Error(tn::DecodeError::SubnegotiationTooLong { option: 42 }),
-        tn::Event::Error(tn::DecodeError::UnknownCommand(1)),
-        tn::Event::Error(tn::DecodeError::StraySubnegotiationEnd),
-        tn::Event::Error(tn::DecodeError::SubnegotiationInterrupted { option: 43 }),
+        tn::Event::Error(tn::Error::SubnegotiationTooLong { option: 42 }),
+        tn::Event::Error(tn::Error::UnknownCommand(1)),
+        tn::Event::Error(tn::Error::StraySubnegotiationEnd),
+        tn::Event::Error(tn::Error::SubnegotiationInterrupted { option: 43 }),
         tn::Event::Command(tn::Command::Nop),
     ];
     contract::check_decode_with_held_limit(tn::Events::new, &bytes, 0);
@@ -225,7 +225,7 @@ fn telnet_recovers_from_bad_units_and_discards_oversized_subnegotiations() {
     assert_eq!(
         decode_all(tn::Events::new, &interrupted).0,
         [
-            tn::Event::Error(tn::DecodeError::SubnegotiationInterrupted { option: 42 }),
+            tn::Event::Error(tn::Error::SubnegotiationInterrupted { option: 42 }),
             tn::Event::Negotiation { verb: tn::Verb::Will, option: 0 },
         ]
     );
@@ -260,7 +260,7 @@ fn telnet_eof_reports_partial_units_once() {
         bounded(tn::Events::new, &input);
         assert_eq!(
             decode_all(tn::Events::new, &input).1,
-            Some(Fail::Protocol(tn::DecodeError::Truncated))
+            Some(Fail::Protocol(tn::Error::Truncated))
         );
     }
 }
@@ -271,7 +271,7 @@ fn telnet_wire_is_exact_strict_and_transactional() {
         tn::Event::Data(vec![]),
         tn::Event::Data(vec![1; tn::MAX_DATA + 1]),
         tn::Event::Subnegotiation { option: 42, data: vec![1; tn::MAX_SUBNEGOTIATION + 1] },
-        tn::Event::Error(tn::DecodeError::UnknownCommand(0)),
+        tn::Event::Error(tn::Error::UnknownCommand(0)),
     ] {
         contract::check_wire_value(&event);
         let mut out = vec![7, 8];
@@ -302,7 +302,7 @@ fn telnet_wire_is_exact_strict_and_transactional() {
     }
     assert_eq!(
         <tn::Event as Wire>::parse(&[255, 241, 1]),
-        Err(tn::EventParseError::Trailing)
+        Err(tn::Error::Trailing)
     );
     assert!(<tn::Event as Wire>::parse(&[255, 1]).is_err());
     let data = tn::Event::Data((0..=255).collect());
