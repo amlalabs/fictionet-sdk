@@ -399,11 +399,11 @@ fn a_linux_client_through_tun() {
                 Err(mpsc::TryRecvError::Disconnected) => {
                     let e = checks.join().unwrap_err();
                     let msg = e.downcast_ref::<String>().cloned().or(e.downcast_ref::<&str>().map(|s| s.to_string()));
-                    return Err(format!("the client checks failed: {msg:?}").into());
+                    return Err(fictionet::Error::msg(format!("the client checks failed: {msg:?}")));
                 }
             }
         }
-        Err(Box::new(Done) as fictionet::Error)
+        Err(fictionet::Error::from(Done))
     }));
     match result {
         Err(e) if e.downcast_ref::<Done>().is_some() => {}

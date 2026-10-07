@@ -151,9 +151,6 @@ impl<C: Connection + ?Sized> ConnectionExt for C {}
 /// Why a connection operation failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConnError {
-    /// The [region](crate::Cx#regions) of the `Cx` passed to the call was
-    /// cancelled while it waited.
-    Cancelled,
     /// The other side refused the connection. Only from connecting.
     Refused,
     /// The other side reset the connection.
@@ -166,22 +163,56 @@ pub enum ConnError {
     Closed,
     /// A layer got bytes it could not understand, such as a bad TLS record.
     Broken,
+    /// The [region](crate::Cx#regions) of the `Cx` passed to the call was
+    /// cancelled while it waited.
+    Cancelled,
 }
 
 impl std::fmt::Display for ConnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            ConnError::Cancelled => "the region was cancelled",
             ConnError::Refused => "connection refused",
             ConnError::Reset => "connection reset",
             ConnError::TimedOut => "connection timed out",
             ConnError::Closed => "the connection's carrier stopped",
             ConnError::Broken => "the connection got bytes it could not understand",
+            ConnError::Cancelled => "the region was cancelled",
         })
     }
 }
 
-impl std::error::Error for ConnError {}
+impl std::error::Error for ConnError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ConnError::Cancelled => Some(&Cancelled),
+            _ => None,
+        }
+    }
+}
+
+/// A connection's error as an [`std::io::Error`], for code that reads and
+/// writes through `std::io` or tokio's traits, such as
+/// [`Compat`](crate::tokio::Compat). The kind is the one std uses for the
+/// same failure; the `ConnError` is the source, so
+/// `e.get_ref().and_then(|e| e.downcast_ref::<ConnError>())` gets it back.
+///
+/// A cancel is [`ErrorKind::Other`](std::io::ErrorKind::Other), not
+/// `Interrupted`: std's read loops retry `Interrupted`, and a cancelled
+/// wait must end them.
+impl From<ConnError> for std::io::Error {
+    fn from(e: ConnError) -> Self {
+        use std::io::ErrorKind;
+        let kind = match e {
+            ConnError::Refused => ErrorKind::ConnectionRefused,
+            ConnError::Reset => ErrorKind::ConnectionReset,
+            ConnError::TimedOut => ErrorKind::TimedOut,
+            ConnError::Closed => ErrorKind::BrokenPipe,
+            ConnError::Broken => ErrorKind::InvalidData,
+            ConnError::Cancelled => ErrorKind::Other,
+        };
+        std::io::Error::new(kind, e)
+    }
+}
 
 impl From<Cancelled> for ConnError {
     fn from(_: Cancelled) -> Self {

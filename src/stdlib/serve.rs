@@ -126,6 +126,10 @@
 //!   ended. Its reply is written when the connection can still take it: the
 //!   client half-closed ([`End::Eof`]), the service closed, the service's
 //!   decoder failed, the connection sat idle or went over its budget.
+//! - **Stops.** When the world stops, the service hears [`End::Cancelled`]
+//!   and [`serve`] returns [`ServeError::Cancelled`], also when the stop
+//!   comes during a TLS handshake. A stop is never a closed or broken
+//!   connection.
 //! - **Upgrades.** A call that returns [`Flow::Upgrade`] says what comes
 //!   next: [`Upgrade::Tls`] shakes hands as a TLS server with
 //!   [`ServeOptions::starttls`] and calls [`Service::on_open`] again over
@@ -155,7 +159,7 @@ use fictionet::stdlib::tls::{self, HandshakeError, ServerConfig, TlsConnection};
 use fictionet::stdlib::udp::Socket;
 use fictionet::stdlib::{ConnError, Connection, ConnectionExt};
 use fictionet::time::Instant;
-use fictionet::{Cx, Raced, Task};
+use fictionet::{Cancelled, Cx, RaceError, RecvError, Task};
 
 // ---------------------------------------------------------------------------
 // The service
@@ -311,7 +315,9 @@ pub enum End {
     /// Reading or writing failed: the client reset the connection, or TLS
     /// broke ([`ConnError::Broken`]).
     Conn(ConnError),
-    /// The world is stopping.
+    /// The world is stopping: the region was cancelled. A notification
+    /// for [`Service::on_end`]; [`serve`] itself then returns
+    /// [`ServeError::Cancelled`].
     Cancelled,
 }
 
@@ -341,12 +347,13 @@ impl End {
 }
 
 /// How keyed work ended, as [`Service::on_done`] hears it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub enum Done {
     /// It wrote everything it had.
     Finished,
-    /// It failed with this message. Its bytes so far were written.
-    Failed(String),
+    /// It failed with this error, the work's own. Its bytes so far were
+    /// written.
+    Failed(fictionet::Error),
 }
 
 /// Async work a service hands the driver with [`ServeCtx::defer`] or
@@ -1076,14 +1083,19 @@ impl ServeOptions {
 // ---------------------------------------------------------------------------
 // Handing back
 
-/// Why [`serve`] stopped early. The connection was closed, and the run's
-/// events have a `conn.error` event that says why.
+/// Why [`serve`] stopped early. The connection was closed. For a failure,
+/// the run's events have a `conn.error` event that says why.
 #[derive(Debug)]
 pub enum ServeError<E> {
     /// The service returned this error.
     Service(E),
     /// Ordered deferred work failed.
     Pending(fictionet::Error),
+    /// The [region](fictionet::Cx#regions) of the `Cx` passed to the call
+    /// was cancelled: the world is stopping. The service heard
+    /// [`End::Cancelled`] in [`Service::on_end`], unless the cancel came
+    /// during the TLS handshake, before the service started.
+    Cancelled,
 }
 
 impl<E: core::fmt::Display> core::fmt::Display for ServeError<E> {
@@ -1091,16 +1103,32 @@ impl<E: core::fmt::Display> core::fmt::Display for ServeError<E> {
         match self {
             ServeError::Service(e) => write!(f, "service: {e}"),
             ServeError::Pending(e) => write!(f, "deferred work: {e}"),
+            ServeError::Cancelled => f.write_str("the region was cancelled"),
         }
     }
 }
 
-impl<E: core::error::Error> core::error::Error for ServeError<E> {}
+impl<E: core::error::Error + 'static> core::error::Error for ServeError<E> {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            ServeError::Service(e) => Some(e),
+            ServeError::Pending(e) => Some(&**e),
+            ServeError::Cancelled => Some(&fictionet::Cancelled),
+        }
+    }
+}
 
-/// How [`serve`] ended.
+impl<E> From<fictionet::Cancelled> for ServeError<E> {
+    fn from(_: fictionet::Cancelled) -> Self {
+        ServeError::Cancelled
+    }
+}
+
+/// How [`serve`] ended, when it was not cancelled.
 #[derive(Debug)]
 pub enum Served<C> {
-    /// The connection is closed, or broken.
+    /// The connection is closed, or broken. Never [`End::Cancelled`]: a
+    /// cancel is [`ServeError::Cancelled`].
     Closed(End),
     /// The service asked for an upgrade the caller performs: the
     /// connection with its unread bytes. [`serve`] performs
@@ -1143,6 +1171,10 @@ impl<C> Prefixed<C> {
 
 impl<C: Connection> Connection for Prefixed<C> {
     fn poll_read(&mut self, cx: &Cx, task: &mut Context<'_>, buf: &mut [u8]) -> Poll<Result<usize, ConnError>> {
+        // A cancel comes first, before the bytes held here.
+        if cx.is_cancelled() {
+            return Poll::Ready(Err(ConnError::Cancelled));
+        }
         if self.at < self.unread.len() {
             let n = buf.len().min(self.unread.len() - self.at);
             buf[..n].copy_from_slice(&self.unread[self.at..self.at + n]);
@@ -1953,7 +1985,7 @@ where
                     continue;
                 }
                 Poll::Ready(None) => Done::Finished,
-                Poll::Ready(Some(Err(e))) => Done::Failed(e.to_string()),
+                Poll::Ready(Some(Err(e))) => Done::Failed(e),
             };
             let (key, work) = self.keyed.remove(i);
             progress = true;
@@ -2052,7 +2084,9 @@ async fn write_all<C: Connection>(cx: &Cx, conn: &mut C, data: &[u8], stall: Opt
 /// [`ServeOptions::tls`], then the service, with every [`Upgrade::Tls`]
 /// it asks for performed with [`ServeOptions::starttls`]. Returns how it
 /// ended, or the connection with its unread bytes after
-/// [`Upgrade::Handoff`].
+/// [`Upgrade::Handoff`]. Returns [`ServeError::Cancelled`] if `cx`'s
+/// [region](fictionet::Cx#regions) is cancelled, also during a TLS
+/// handshake.
 ///
 /// `info` names the connection in events; [`listen`] fills it in. The
 /// connection ends as soon as the client resets it, even while deferred
@@ -2073,13 +2107,12 @@ where
     let mut conn: Box<dyn Connection> = Box::new(conn);
     let mut info = info;
     if let Some(select) = &opts.tls {
-        match accept_tls(cx, conn, &info, select, cx.now() + opts.handshake, || false).await {
-            Some((tls, i)) => {
-                conn = Box::new(tls);
-                info = i;
-            }
-            None => return Ok(Served::Closed(tls_failed(cx))),
-        }
+        let (tls, i) = match accept_tls(cx, conn, &info, select, cx.now() + opts.handshake, || false).await {
+            Ok(done) => done,
+            Err(e) => return tls_failed(e),
+        };
+        conn = Box::new(tls);
+        info = i;
     }
     let mut first = true;
     let wake = WakeHandle::new();
@@ -2096,20 +2129,22 @@ where
             return Ok(Served::Closed(End::Failed));
         };
         let deadline = cx.now() + opts.handshake;
-        match accept_tls(cx, rest, &info, select, deadline, || false).await {
-            Some((tls, i)) => {
-                conn = Box::new(tls);
-                info = i;
-            }
-            None => return Ok(Served::Closed(tls_failed(cx))),
-        }
+        let (tls, i) = match accept_tls(cx, rest, &info, select, deadline, || false).await {
+            Ok(done) => done,
+            Err(e) => return tls_failed(e),
+        };
+        conn = Box::new(tls);
+        info = i;
     }
 }
 
-/// How a connection whose TLS handshake failed ended: cancelled if `cx`
-/// was, else broken.
-fn tls_failed(cx: &Cx) -> End {
-    if cx.is_cancelled() { End::Cancelled } else { End::Conn(ConnError::Broken) }
+/// How [`serve`] ends when its TLS handshake fails: cancelled if the
+/// handshake was, else with the connection closed as broken.
+fn tls_failed<E>(e: HandshakeError) -> Result<Served<Box<dyn Connection>>, ServeError<E>> {
+    match e {
+        HandshakeError::Cancelled => Err(ServeError::Cancelled),
+        _ => Ok(Served::Closed(End::Conn(ConnError::Broken))),
+    }
 }
 
 /// Serves one connection with `service` until it ends or asks for
@@ -2287,6 +2322,7 @@ where
                 return match failure {
                     Some(Failure::Service(e)) => Err(ServeError::Service(e)),
                     Some(Failure::Pending(e)) => Err(ServeError::Pending(e)),
+                    None if end == End::Cancelled => Err(ServeError::Cancelled),
                     None => Ok(Served::Closed(end)),
                 };
             }
@@ -2315,13 +2351,15 @@ pub enum TlsOutcome {
     Closed,
     /// It did not finish in time.
     TimedOut,
-    /// The world ended it: the sandbox detached, or the world stopped.
-    Aborted,
+    /// The sandbox detached while it ran.
+    Detached,
+    /// The world stopped: the region was cancelled.
+    Cancelled,
 }
 
 impl TlsOutcome {
-    /// `accepted`, `rejected`, `alert`, `failed`, `closed`, `timed_out` or
-    /// `aborted`.
+    /// `accepted`, `rejected`, `alert`, `failed`, `closed`, `timed_out`,
+    /// `detached` or `cancelled`.
     pub fn as_str(&self) -> &'static str {
         match self {
             TlsOutcome::Accepted { .. } => "accepted",
@@ -2330,69 +2368,63 @@ impl TlsOutcome {
             TlsOutcome::Failed(_) => "failed",
             TlsOutcome::Closed => "closed",
             TlsOutcome::TimedOut => "timed_out",
-            TlsOutcome::Aborted => "aborted",
+            TlsOutcome::Detached => "detached",
+            TlsOutcome::Cancelled => "cancelled",
+        }
+    }
+
+    /// The outcome of a handshake that failed with `e`. `detached` says
+    /// whether the sandbox detached, for a reset that came from the world.
+    fn of(e: &HandshakeError, detached: bool) -> TlsOutcome {
+        match e {
+            HandshakeError::Alert(a) => TlsOutcome::Alert(*a),
+            HandshakeError::Failed(why) => TlsOutcome::Failed(why.clone()),
+            HandshakeError::Conn(ConnError::Broken) => TlsOutcome::Failed("the connection broke".into()),
+            HandshakeError::Rejected => TlsOutcome::Rejected,
+            HandshakeError::TimedOut => TlsOutcome::TimedOut,
+            HandshakeError::Cancelled => TlsOutcome::Cancelled,
+            HandshakeError::Conn(ConnError::Reset) if detached => TlsOutcome::Detached,
+            _ => TlsOutcome::Closed,
         }
     }
 }
 
 /// Shakes hands as a TLS server on `conn`, with the config `select` picks
 /// for the client's SNI, by `deadline`. Records a `tls.handshake` event
-/// with the outcome. `aborted` says whether the world itself
-/// ended the connection, for a reset that came from the world.
+/// with the outcome. `detached` says whether the sandbox has detached, for
+/// a reset that came from the world.
 ///
-/// Returns the TLS connection and `info` with its SNI and ALPN.
+/// Returns the TLS connection and `info` with its SNI and ALPN, or how the
+/// handshake failed: [`HandshakeError::Rejected`] when `select` has no
+/// config for the name, [`HandshakeError::TimedOut`] past `deadline`, and
+/// [`HandshakeError::Cancelled`] if `cx`'s [region](fictionet::Cx#regions)
+/// is cancelled.
 pub async fn accept_tls<C: Connection>(
     cx: &Cx,
     conn: C,
     info: &ConnInfo,
     select: &TlsSelect,
     deadline: Instant,
-    aborted: impl Fn() -> bool,
-) -> Option<(TlsConnection<C>, ConnInfo)> {
+    detached: impl Fn() -> bool,
+) -> Result<(TlsConnection<C>, ConnInfo), HandshakeError> {
     let mut sni: Option<String> = None;
-    let mut failed: Option<HandshakeError> = None;
-    let mut rejected = false;
     let handshake = async {
-        let hello = match tls::server_detailed(cx, conn).await {
-            Ok(hello) => hello,
-            Err(e) => {
-                failed = Some(e);
-                return None;
-            }
-        };
+        let hello = tls::server_detailed(cx, conn).await?;
         sni = hello.server_name().map(|n| n.trim_end_matches('.').to_ascii_lowercase());
         let Some(config) = select(sni.as_deref(), cx) else {
-            rejected = true;
             let _ = hello.reject(cx).await;
-            return None;
+            return Err(HandshakeError::Rejected);
         };
-        match hello.finish_detailed(cx, config).await {
-            Ok(conn) => Some(conn),
-            Err(e) => {
-                failed = Some(e);
-                None
-            }
-        }
+        hello.finish_detailed(cx, config).await
     };
-    let done = cx.race(Some(deadline), handshake).await;
-    let (conn, outcome) = match done {
-        Ok(Some(conn)) => {
-            let alpn = conn.alpn().map(<[u8]>::to_vec);
-            (Some(conn), TlsOutcome::Accepted { alpn })
-        }
-        Ok(None) if rejected => (None, TlsOutcome::Rejected),
-        Ok(None) => (None, TlsOutcome::Closed),
-        Err(Raced::Deadline) => (None, TlsOutcome::TimedOut),
-        Err(Raced::Cancelled) => (None, TlsOutcome::Aborted),
+    let done = match cx.race(Some(deadline), handshake).await {
+        Ok(done) => done,
+        Err(RaceError::Deadline) => Err(HandshakeError::TimedOut),
+        Err(RaceError::Cancelled) => Err(HandshakeError::Cancelled),
     };
-    let outcome = match failed {
-        Some(HandshakeError::Alert(a)) => TlsOutcome::Alert(a),
-        Some(HandshakeError::Failed(why)) => TlsOutcome::Failed(why),
-        Some(HandshakeError::Conn(ConnError::Broken)) => TlsOutcome::Failed("the connection broke".into()),
-        Some(HandshakeError::Conn(ConnError::Cancelled)) => TlsOutcome::Aborted,
-        Some(HandshakeError::Conn(ConnError::Reset)) if aborted() => TlsOutcome::Aborted,
-        Some(_) => TlsOutcome::Closed,
-        None => outcome,
+    let outcome = match &done {
+        Ok(conn) => TlsOutcome::Accepted { alpn: conn.alpn().map(<[u8]>::to_vec) },
+        Err(e) => TlsOutcome::of(e, detached()),
     };
     let mut event = Event::new("tls", "handshake")
         .summary(match &sni {
@@ -2412,9 +2444,9 @@ pub async fn accept_tls<C: Connection>(
         _ => {}
     }
     record(cx, info, event);
-    let conn = conn?;
+    let conn = done?;
     let info = info.clone().over_tls(sni.as_deref(), conn.alpn());
-    Some((conn, info))
+    Ok((conn, info))
 }
 
 // ---------------------------------------------------------------------------
@@ -2427,6 +2459,10 @@ pub async fn accept_tls<C: Connection>(
 /// reset; each counts until its socket is gone, so a client that never
 /// finishes closing cannot open more. Connections are numbered from 1, in
 /// the order they are accepted. Returns the accepting task.
+///
+/// A connection's failure is that connection's: the run's events record
+/// it as `conn.error`, and its task ends with `Ok`, so it does not fail
+/// the world.
 pub fn listen<S, M>(cx: &Cx, mut listener: Listener, world: Arc<S::World>, make: M, opts: ServeOptions) -> Task
 where
     S: Service,
@@ -2499,7 +2535,10 @@ impl Drop for Counted {
 /// Deferred work is not run. A service error is recorded as `conn.error`
 /// and serving goes on. A panic is not caught: it ends the run, as it
 /// does over a connection.
-pub async fn serve_datagram<S>(cx: &Cx, mut socket: Socket, local: SocketAddr, service: &mut S, world: &S::World, opts: &ServeOptions)
+///
+/// Returns `Ok(())` once the socket closes, and [`Cancelled`] if `cx`'s
+/// [region](fictionet::Cx#regions) is cancelled.
+pub async fn serve_datagram<S>(cx: &Cx, mut socket: Socket, local: SocketAddr, service: &mut S, world: &S::World, opts: &ServeOptions) -> Result<(), Cancelled>
 where
     S: Service,
     <S::Decode as Decode>::Error: Clone + Send,
@@ -2542,7 +2581,7 @@ where
     called(&mut s, &timers, &mut socket, &base, &mut |ctx| service.on_open(world, ctx));
     s.reply.clear();
     let mut run = 0u32;
-    loop {
+    let ended = loop {
         let now = cx.now();
         arm(&mut timers, &mut s.timers, now);
         if let Some(i) = due(&timers, now) {
@@ -2577,7 +2616,11 @@ where
             .await
         };
         let Some(got) = got else { continue };
-        let Ok((datagram, from)) = got else { break };
+        let (datagram, from) = match got {
+            Ok(got) => got,
+            Err(RecvError::Closed) => break Ok(()),
+            Err(RecvError::Cancelled) => break Err(Cancelled),
+        };
         let sandbox = opts.sandbox.as_ref().and_then(|f| f(from.ip()));
         let info = ConnInfo { peer: Some(from), sandbox, ..base.clone() };
         let _note = PanicNote::new(std::any::type_name::<S>(), &info);
@@ -2623,11 +2666,14 @@ where
             socket.send_to(&reply, from);
         }
         run = (run + 1) % 64;
-        if run == 0 && cx.yield_now().await.is_err() {
-            break;
+        if run == 0
+            && let Err(cancelled) = cx.yield_now().await
+        {
+            break Err(cancelled);
         }
-    }
+    };
     wake.close();
+    ended
 }
 
 // ---------------------------------------------------------------------------
@@ -2661,7 +2707,15 @@ impl<D: core::fmt::Display, S: core::fmt::Display> core::fmt::Display for Harnes
     }
 }
 
-impl<D: core::fmt::Debug + core::fmt::Display, S: core::error::Error> core::error::Error for HarnessError<D, S> {}
+impl<D: core::fmt::Debug + core::fmt::Display, S: core::error::Error + 'static> core::error::Error for HarnessError<D, S> {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            HarnessError::Service(e) => Some(e),
+            HarnessError::Pending(e) => Some(&**e),
+            HarnessError::Decode(_) | HarnessError::Closed | HarnessError::Upgraded(_) => None,
+        }
+    }
+}
 
 /// A waker that remembers it was woken, for the harness's polls.
 struct Flag(AtomicBool);

@@ -117,7 +117,8 @@ pub fn start(cx: &Cx, scenario: Arc<Scenario>, ids: Identities, log: Log, mut at
     let shared = Arc::new(path::Shared { scenario: scenario.clone(), log: log.clone() });
     let to_sites = inner.clone();
     cx.spawn(move |cx| async move {
-        while let Some(sandbox) = attachments.next(&cx).await {
+        loop {
+            let sandbox = attachments.next(&cx).await?;
             let name: Arc<str> = Arc::from(sandbox.name());
             match to_sites.attach(&name) {
                 Ok(end) => {
@@ -129,7 +130,6 @@ pub fn start(cx: &Cx, scenario: Arc<Scenario>, ids: Identities, log: Log, mut at
                 }
             }
         }
-        Ok(())
     });
     Ok(inner)
 }
@@ -171,7 +171,7 @@ pub fn state(scenario: &Scenario) -> Value {
 pub async fn look_up_all(cx: &Cx, attacher: &Attacher, scenario: &Scenario) -> Result {
     let from = SocketAddrV4::new(Ipv4Addr::from(u32::from(scenario.subnet.addr) + 254), 40000);
     let gateway = scenario.gateway();
-    let mut end: End = attacher.attach(events::LOOKUPS).map_err(|e| format!("lookups: {e}"))?;
+    let mut end: End = attacher.attach(events::LOOKUPS).map_err(|e| fictionet::Error::msg(format!("lookups: {e}")))?;
     let names = [BANK_NAMES[0], BANK_NAMES[1], STATUS_HOST];
     let mut waiting: HashMap<u16, &str> = HashMap::new();
     for (i, name) in names.iter().enumerate() {
@@ -193,7 +193,7 @@ pub async fn look_up_all(cx: &Cx, attacher: &Attacher, scenario: &Scenario) -> R
         .await;
         let Some(packet) = packet else {
             let left: Vec<_> = waiting.values().collect();
-            return Err(format!("no DNS answer for {left:?}").into());
+            return Err(fictionet::Error::msg(format!("no DNS answer for {left:?}")));
         };
         let p = &packet.0;
         if p.len() < 28 + 12 || p[9] != 17 {
@@ -206,7 +206,7 @@ pub async fn look_up_all(cx: &Cx, attacher: &Attacher, scenario: &Scenario) -> R
         let answers = u16::from_be_bytes([dns[6], dns[7]]);
         if let Some(name) = waiting.remove(&id) {
             if rcode != 0 || answers != 1 {
-                return Err(format!("DNS for {name}: rcode {rcode}, {answers} answers").into());
+                return Err(fictionet::Error::msg(format!("DNS for {name}: rcode {rcode}, {answers} answers")));
             }
         }
     }

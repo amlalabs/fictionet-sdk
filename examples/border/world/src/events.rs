@@ -145,7 +145,7 @@ fn tls(scenario: &Scenario, e: &Entry) -> Value {
         _ => {}
     }
     let outcome = match outcome {
-        "accepted" | "rejected" | "alert" | "failed" | "closed" | "timed_out" | "aborted" => outcome,
+        "accepted" | "rejected" | "alert" | "failed" | "closed" | "timed_out" | "detached" | "cancelled" => outcome,
         _ => "other",
     };
     fields.insert("outcome".into(), json!(outcome));

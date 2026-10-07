@@ -47,7 +47,7 @@ where
     let result = within(limit, move || {
         block_on(run(move |cx| async move {
             f(cx).await?;
-            Err(Box::new(Done) as fictionet::Error)
+            Err(fictionet::Error::from(Done))
         }))
     });
     match result {

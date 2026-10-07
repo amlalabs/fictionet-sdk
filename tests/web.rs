@@ -62,7 +62,7 @@ where
             let (attacher, attachments) = fictionet::attachments();
             let env = sites(&cx).serve_with(&cx, attachments)?;
             f(cx, attacher, env).await?;
-            Err(Box::new(Done) as fictionet::Error)
+            Err(fictionet::Error::from(Done))
         }))
     });
     match result {
@@ -819,7 +819,7 @@ fn dates_come_from_the_world() {
                     let got = client.get("http", "dated.test", "/own").await;
                     assert_eq!(got.headers.get_all("date").iter().collect::<Vec<_>>(), ["Mon, 01 Jan 2001 00:00:00 GMT"]);
                 }
-                Err(Box::new(Done) as fictionet::Error)
+                Err(fictionet::Error::from(Done))
             }))
         });
         assert!(result.is_err_and(|e| e.downcast_ref::<Done>().is_some()));
@@ -1339,7 +1339,7 @@ fn a_subnet_that_cannot_work_is_an_error() {
             a.send(ping(Ipv4Addr::new(172, 16, 5, 9), gw, 1));
             let (src, _, _, icmp) = parse(&recv_within(&cx, &mut a, Duration::from_secs(2)).await.unwrap());
             assert_eq!((src, icmp[0]), (gw, 0));
-            Err(Box::new(Done) as fictionet::Error)
+            Err(fictionet::Error::from(Done))
         }))
     });
     assert!(result.unwrap_err().downcast_ref::<Done>().is_some());
@@ -1412,7 +1412,7 @@ async fn the_proxy_answers_502_when_the_real_site_cannot_be_reached() {
             let got = client.get("http", "nowhere.invalid", "/").await;
             assert_eq!(got.status, StatusCode::BAD_GATEWAY, "{}", got.body);
             assert!(got.body.contains("nowhere.invalid"), "{}", got.body);
-            Err(Box::new(Done) as fictionet::Error)
+            Err(fictionet::Error::from(Done))
         }),
     )
     .await
@@ -1491,7 +1491,7 @@ async fn websockets_work_through_sites() {
             let mut conn = m.tcp.connect(&cx, SocketAddr::new(addr.into(), 80)).await.unwrap();
             let reply = websocket_echo(&cx, &mut conn, "ws.test", "hello").await;
             assert_eq!(reply, fictionet::stdlib::websocket::Message::Text("echo: hello".into()));
-            Err(Box::new(Done) as fictionet::Error)
+            Err(fictionet::Error::from(Done))
         }),
     )
     .await
@@ -2077,7 +2077,7 @@ where
                 .subnet(subnet)
                 .serve(&cx, attachments)?;
             f(cx, attacher).await?;
-            Err(Box::new(Done) as fictionet::Error)
+            Err(fictionet::Error::from(Done))
         }))
     });
     match result {
@@ -2320,7 +2320,7 @@ where
             let env = t.serve_with(&cx, attachments)?;
             let log = Log::new(&cx);
             f(cx, attacher, env, log).await?;
-            Err(Box::new(Done) as fictionet::Error)
+            Err(fictionet::Error::from(Done))
         }))
     });
     match result {
@@ -2339,7 +2339,7 @@ fn picked<T>(log: &Log, pick: impl FnMut(&Entry) -> Option<T>) -> Vec<T> {
 /// and returns them.
 async fn wait_for<T>(cx: &Cx, log: &Log, n: usize, mut pick: impl FnMut(&Entry) -> Option<T>) -> Vec<T> {
     let from = log.from.load(Ordering::SeqCst);
-    let got = log.events.wait(cx, n, Duration::from_secs(5), |e| e.seq > from && pick(e).is_some()).await;
+    let got = log.events.wait(cx, n, Duration::from_secs(5), |e| e.seq > from && pick(e).is_some()).await.expect("the world stopped");
     if got.len() < n {
         panic!("fewer than {n} such events: {:#?}", log.events.all());
     }
@@ -2524,7 +2524,7 @@ fn events_name_each_attachment_by_id() {
         assert_eq!((sandbox_of(&http[0]).unwrap().id, http[0].str("host"), http[0].str("path")), (1, Some("slow.test"), Some("/wait")));
         assert_eq!(local(&http[0]), SocketAddr::from((slow, 80)));
         let tls = wait_for(&cx, &log, 1, tls_seen).await;
-        assert_eq!((sandbox_of(&tls[0]).unwrap().id, outcome(&tls[0])), (1, "aborted".to_owned()));
+        assert_eq!((sandbox_of(&tls[0]).unwrap().id, outcome(&tls[0])), (1, "detached".to_owned()));
         let dns = wait_for(&cx, &log, 3, dns_seen).await;
         let ids: Vec<u64> = dns.iter().map(|d| sandbox_of(d).unwrap().id).collect();
         assert_eq!(ids, vec![1, 1, 2]);
@@ -2893,7 +2893,7 @@ fn a_reset_mid_request_drops_the_handler_without_events() {
             }
             // Checked here: stopping the world would drop the handler too.
             assert!(flag.load(Ordering::SeqCst), "the handler was dropped within 1 s of the reset");
-            Err(Box::new(Done) as fictionet::Error)
+            Err(fictionet::Error::from(Done))
         }))
     });
     assert!(matches!(&result, Err(e) if e.downcast_ref::<Done>().is_some()), "{:?}", result.err().map(|e| e.to_string()));
@@ -2928,7 +2928,7 @@ fn the_world_stops_while_handlers_wait() {
         assert!(picked(&log, http_seen).is_empty(), "both handlers still wait");
         // Keep both connections open while the world stops.
         let _keep = (h1, h2);
-        Err(Box::new(Done) as fictionet::Error)
+        Err(fictionet::Error::from(Done))
     });
     assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
 }
@@ -3534,7 +3534,7 @@ where
             make().serve(&cx, attachments)?;
             let log = Log::new(&cx);
             f(cx, attacher, log).await?;
-            Err(Box::new(Done) as fictionet::Error)
+            Err(fictionet::Error::from(Done))
         }))
     });
     match result {

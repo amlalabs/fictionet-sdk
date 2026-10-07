@@ -59,7 +59,7 @@ pub struct Ca {
     der: CertificateDer<'static>,
 }
 
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+type Result<T> = fictionet::Result<T>;
 
 fn serial() -> SerialNumber {
     let mut bytes = Vec::with_capacity(16);

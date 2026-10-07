@@ -557,11 +557,12 @@ impl SocketLink {
     }
 
     pub(crate) fn poll_recv(&mut self, cx: &Cx, task: &mut Context<'_>) -> Poll<Result<Packet, RecvError>> {
-        if self.closed {
-            return Poll::Ready(Err(RecvError::Closed));
-        }
+        // A cancel comes first, as it does for every wait.
         if cx.is_cancelled() {
             return Poll::Ready(Err(RecvError::Cancelled));
+        }
+        if self.closed {
+            return Poll::Ready(Err(RecvError::Closed));
         }
         if self.budget == 0 {
             self.budget = BUDGET;

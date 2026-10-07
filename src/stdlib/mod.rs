@@ -91,8 +91,9 @@
 //! **Functions you await.** These are `async`. They take `&Cx`, as every
 //! wait in Fictionet does, and run inside the task that awaits them. They
 //! start no task of their own. When the caller's region is cancelled, they
-//! return early with an error. Examples are [`tls::server`],
-//! [`tcp::Listener::accept`] and [`ConnectionExt::read`].
+//! return early with `Err`: [`Cancelled`], or their error
+//! type's `Cancelled` variant, such as [`ConnError::Cancelled`]. Examples are
+//! [`tls::server`], [`tcp::Listener::accept`] and [`ConnectionExt::read`].
 //!
 //! **Plain functions.** These read or build values. They never wait, take
 //! no context, and start nothing. Examples are [`icmp::echo_reply`], parsing
@@ -324,7 +325,7 @@ use std::task::{Context, Poll, Wake, Waker};
 use crate::cx::CancelWait;
 use crate::time::{Duration, Instant};
 use crate::cable::PACKET_COST;
-use crate::{Cx, End, Interface, Packet, RecvError};
+use crate::{Cancelled, Cx, End, Interface, Packet, RecvError};
 
 mod connection;
 pub mod amqp;
@@ -642,7 +643,7 @@ where
         // Port 0 is `inner`, port 1 our end of the new pair.
         let mut ports = Ports::new(vec![Box::new(inner), Box::new(mine)]);
         loop {
-            match ports.next(&cx, None, |_| Poll::Pending).await {
+            match ports.next(&cx, None, |_| Poll::Pending).await? {
                 Event::Packet(i, packet) => {
                     let direction = if i == 0 { Direction::FromInner } else { Direction::ToInner };
                     if keep(&cx, direction, &packet) {
@@ -650,7 +651,7 @@ where
                     }
                 }
                 Event::Timer => {}
-                Event::Closed(_) | Event::Cancelled | Event::Extra => return Ok(()),
+                Event::Closed(_) | Event::Extra => return Ok(()),
             }
         }
     });
@@ -721,7 +722,7 @@ where
         let mut queues = [Queue::default(), Queue::default()];
         loop {
             let deadline = queues.iter().filter_map(|q| q.packets.front().map(|(t, _)| *t)).min();
-            match ports.next(&cx, deadline, |_| Poll::Pending).await {
+            match ports.next(&cx, deadline, |_| Poll::Pending).await? {
                 Event::Packet(i, packet) => {
                     let now = cx.now();
                     let cost = packet.0.len() + PACKET_COST;
@@ -751,7 +752,7 @@ where
                     }
                     ports.spend(sent);
                 }
-                Event::Closed(_) | Event::Cancelled | Event::Extra => return Ok(()),
+                Event::Closed(_) | Event::Extra => return Ok(()),
             }
         }
     });
@@ -774,8 +775,6 @@ pub enum PortEvent {
     Timer,
     /// The extra source given to `next` is ready.
     Extra,
-    /// The region was cancelled.
-    Cancelled,
 }
 
 /// The interfaces one task serves, and the waiting that is common to all
@@ -944,26 +943,25 @@ impl Ports {
     }
 
     /// Waits for the next event: a packet or a close on any port, the
-    /// deadline, `extra` being ready, or a cancel. Yields first if the
-    /// budget is spent.
+    /// deadline, or `extra` being ready. Yields first if the budget is
+    /// spent. Returns early with [`Cancelled`] if `cx`'s
+    /// [region](Cx#regions) is cancelled.
     pub async fn next(
         &mut self,
         cx: &Cx,
         deadline: Option<Instant>,
         mut extra: impl FnMut(&mut Context<'_>) -> Poll<()>,
-    ) -> Event {
+    ) -> Result<Event, Cancelled> {
         if self.run >= BUDGET {
             self.run = 0;
-            if cx.yield_now().await.is_err() {
-                return Event::Cancelled;
-            }
+            cx.yield_now().await?;
         }
         if cx.is_cancelled() {
-            return Event::Cancelled;
+            return Err(Cancelled);
         }
         if let Some(d) = deadline && d <= cx.now() {
             self.run += 1;
-            return Event::Timer;
+            return Ok(Event::Timer);
         }
         let mut sleep = pin!(deadline.map(|d| cx.sleep_until(d)));
         let mut waited = false;
@@ -971,7 +969,7 @@ impl Ports {
             // The extra source first: a router takes new routes before it
             // forwards packets sent after they were added.
             if extra(task).is_ready() {
-                return Poll::Ready(Event::Extra);
+                return Poll::Ready(Ok(Event::Extra));
             }
             // Register the task before looking at the queue, so a slot that
             // becomes ready after the queue looked empty still wakes it.
@@ -991,36 +989,36 @@ impl Ports {
                         // It may hold more. It goes to the back, after the
                         // others that are ready, so each gets its turn.
                         self.lock_ready().push(i);
-                        return Poll::Ready(Event::Packet(i, packet));
+                        return Poll::Ready(Ok(Event::Packet(i, packet)));
                     }
                     Poll::Ready(Err(RecvError::Closed)) => {
                         self.close(i);
-                        return Poll::Ready(Event::Closed(i));
+                        return Poll::Ready(Ok(Event::Closed(i)));
                     }
-                    Poll::Ready(Err(RecvError::Cancelled)) => return Poll::Ready(Event::Cancelled),
+                    Poll::Ready(Err(RecvError::Cancelled)) => return Poll::Ready(Err(Cancelled)),
                     // Its waker puts it back in the queue when it has more.
                     Poll::Pending => {}
                 }
             }
             if let Some(sleep) = sleep.as_mut().as_pin_mut() {
                 match sleep.poll(task) {
-                    Poll::Ready(Ok(())) => return Poll::Ready(Event::Timer),
-                    Poll::Ready(Err(_)) => return Poll::Ready(Event::Cancelled),
+                    Poll::Ready(Ok(())) => return Poll::Ready(Ok(Event::Timer)),
+                    Poll::Ready(Err(Cancelled)) => return Poll::Ready(Err(Cancelled)),
                     Poll::Pending => {}
                 }
             }
             if cx.register_cancel(task.waker(), &mut self.wait) {
-                return Poll::Ready(Event::Cancelled);
+                return Poll::Ready(Err(Cancelled));
             }
             waited = true;
             Poll::Pending
         })
-        .await;
+        .await?;
         if waited {
             self.run = 0;
         }
         self.run += 1;
-        event
+        Ok(event)
     }
 }
 

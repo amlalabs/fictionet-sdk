@@ -44,10 +44,10 @@ fn main() -> Result {
         return Ok(());
     }
     if let Some(flag) = args.iter().find(|a| a.starts_with('-')) {
-        return Err(format!("unknown option {flag:?}\n{USAGE}").into());
+        return Err(fictionet::Error::msg(format!("unknown option {flag:?}\n{USAGE}")));
     }
     if args.len() > 2 {
-        return Err(format!("unexpected argument {:?}\n{USAGE}", args[2]).into());
+        return Err(fictionet::Error::msg(format!("unexpected argument {:?}\n{USAGE}", args[2])));
     }
     let socket = args.first().cloned().unwrap_or_else(|| "/run/fictionet/goad.sock".into());
     let prefix = parse_prefix(args.get(1).map_or("192.168.56", String::as_str))?;
@@ -76,7 +76,8 @@ fn main() -> Result {
 
     fictionet::block_on(fictionet::run(move |cx| async move {
         let lan = route::lan(&cx, subnet, None);
-        while let Some(sandbox) = attachments.next(&cx).await {
+        loop {
+            let sandbox = attachments.next(&cx).await?;
             let name = sandbox.name().to_owned();
             let Some(&addr) = members.get(name.as_str()) else {
                 println!("turned away {name}: no address is assigned to that member");
@@ -87,7 +88,6 @@ fn main() -> Result {
             cx.record(event);
             lan.add(addr, Box::new(sandbox) as Box<dyn Interface>)?;
         }
-        Ok(())
     }))
 }
 
@@ -96,8 +96,7 @@ fn parse_prefix(text: &str) -> Result<[u8; 3]> {
         .split('.')
         .map(str::parse)
         .collect::<std::result::Result<Vec<u8>, _>>();
-    let parts =
-        parts.map_err(|_| format!("{text:?} is not the first three octets of an IPv4 network"))?;
-    <[u8; 3]>::try_from(parts)
-        .map_err(|_| format!("{text:?} is not the first three octets of an IPv4 network").into())
+    let not_octets = || fictionet::Error::msg(format!("{text:?} is not the first three octets of an IPv4 network"));
+    let parts = parts.map_err(|_| not_octets())?;
+    <[u8; 3]>::try_from(parts).map_err(|_| not_octets())
 }

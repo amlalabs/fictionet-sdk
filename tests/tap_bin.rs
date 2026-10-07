@@ -179,7 +179,7 @@ fn a_fake_qemu_gets_dhcp_arp_and_the_world() {
                 }
                 // QEMU closed its socket: attach detached.
                 Some(Err(RecvError::Closed)) => break,
-                Some(Err(e)) => return Err(format!("{e:?}").into()),
+                Some(Err(e)) => return Err(fictionet::Error::msg(format!("{e:?}"))),
                 None => cx.sleep(fictionet::time::ms(10)).await?,
             }
         }

@@ -22,7 +22,7 @@ fn start_world(path: &str) -> fictionet::Listening {
     std::thread::spawn(move || {
         let _ = fictionet::block_on(fictionet::run(move |cx| async move {
             cx.spawn(move |cx| async move {
-                while let Some(a) = attachments.next(&cx).await {
+                while let Ok(a) = attachments.next(&cx).await {
                     drop(a);
                 }
                 Ok(())
@@ -150,7 +150,7 @@ fn start_two_links(path: &str) -> fictionet::Listening {
         let _ = fictionet::block_on(fictionet::run(move |cx| async move {
             // Observers find a world once it takes attachments.
             cx.spawn(move |cx| async move {
-                while let Some(a) = attachments.next(&cx).await {
+                while let Ok(a) = attachments.next(&cx).await {
                     drop(a);
                 }
                 Ok(())
@@ -264,7 +264,7 @@ fn a_watch_exits_0_when_the_world_ends() {
     let world_thread = std::thread::spawn(move || {
         let _ = fictionet::block_on(fictionet::run(move |cx| async move {
             cx.spawn(move |cx| async move {
-                while let Some(a) = attachments.next(&cx).await {
+                while let Ok(a) = attachments.next(&cx).await {
                     drop(a);
                 }
                 Ok(())

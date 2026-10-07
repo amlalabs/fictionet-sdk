@@ -1086,7 +1086,7 @@ fn every_task_stops_when_its_region_is_cancelled() {
             l.add("10.0.0.2".parse()?, Box::new(b))?;
             cx.sleep(ms(20)).await?;
             let _keep = (keep, r, l);
-            Err("stop".into())
+            Err(fictionet::Error::msg("stop"))
         }))
     });
     assert_eq!(result.unwrap_err().to_string(), "stop");

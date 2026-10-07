@@ -202,7 +202,7 @@ fn the_log_is_the_recorded_one() {
             // A name the world does not serve.
             assert!(tls(&cx, &m, wiki, "example.com").await.is_err());
             let _ = cx.sleep(Duration::from_millis(500)).await;
-            Err::<(), fictionet::Error>("done".into())
+            Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
         }));
         let _ = tx.send(result.err().map(|e| e.to_string()));
     });

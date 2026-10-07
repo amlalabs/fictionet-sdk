@@ -87,6 +87,10 @@ impl<C: Connection> TlsClient<C> {
 
 impl<C: Connection> Connection for TlsClient<C> {
     fn poll_read(&mut self, cx: &Cx, task: &mut Context<'_>, buf: &mut [u8]) -> Poll<Result<usize, ConnError>> {
+        // A cancel comes first, before plaintext already decrypted.
+        if cx.is_cancelled() {
+            return Poll::Ready(Err(ConnError::Cancelled));
+        }
         loop {
             match self.tls.reader().read(buf) {
                 Ok(n) => return Poll::Ready(Ok(n)),

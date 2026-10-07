@@ -1017,8 +1017,10 @@ impl EventLog {
     /// Waits until `n` held events match `pick`, checking every 10 ms on
     /// the run's clock, for at most `limit`. Returns those events, or every
     /// match so far if the time ran out. Each check first records the
-    /// counts of [repeats](self#repeats) that are due.
-    pub async fn wait(&self, cx: &Cx, n: usize, limit: std::time::Duration, mut pick: impl FnMut(&Event) -> bool) -> Vec<Event> {
+    /// counts of [repeats](self#repeats) that are due. Returns early with
+    /// [`Cancelled`](crate::Cancelled) if `cx`'s [region](Cx#regions) is
+    /// cancelled.
+    pub async fn wait(&self, cx: &Cx, n: usize, limit: std::time::Duration, mut pick: impl FnMut(&Event) -> bool) -> Result<Vec<Event>, crate::Cancelled> {
         let deadline = cx.now() + limit;
         loop {
             self.store.advance(cx.now());
@@ -1027,11 +1029,9 @@ impl EventLog {
                 held(&s, 0).filter(|e| pick(e)).map(|e| (**e).clone()).collect()
             };
             if got.len() >= n || cx.now() >= deadline {
-                return got;
+                return Ok(got);
             }
-            if cx.sleep(std::time::Duration::from_millis(10)).await.is_err() {
-                return got;
-            }
+            cx.sleep(std::time::Duration::from_millis(10)).await?;
         }
     }
 }

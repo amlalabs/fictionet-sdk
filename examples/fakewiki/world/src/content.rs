@@ -42,7 +42,7 @@ impl Content {
     }
 
     async fn serve(self, request: Request<Body>) -> Result<Response<Full<Bytes>>, fictionet::Error> {
-        let target = request.extensions().get::<web::Target>().cloned().ok_or("request without a web::Target")?;
+        let target = request.extensions().get::<web::Target>().cloned().ok_or_else(|| fictionet::Error::msg("request without a web::Target"))?;
         let method = request.method().clone();
         let path = request.uri().path_and_query().map(|p| p.as_str().to_owned()).unwrap_or_else(|| "/".into());
         let ua = request.headers().get(USER_AGENT).cloned();

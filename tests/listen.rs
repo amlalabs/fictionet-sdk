@@ -423,7 +423,7 @@ fn an_oversized_message_closes_the_connection() {
             assert_eq!(first, Packet(vec![1]));
             match a.recv(&cx).await {
                 Err(RecvError::Closed) => Ok(()),
-                Ok(p) => Err(format!("got a packet of {} bytes", p.0.len()).into()),
+                Ok(p) => Err(fictionet::Error::msg(format!("got a packet of {} bytes", p.0.len()))),
                 Err(e) => Err(e.into()),
             }
         }))

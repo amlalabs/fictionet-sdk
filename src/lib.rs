@@ -301,6 +301,7 @@ pub mod attaching;
 mod block_on;
 mod cable;
 mod cx;
+mod error;
 pub mod events;
 #[cfg(fuzzing)]
 #[doc(hidden)]
@@ -339,7 +340,8 @@ pub mod prelude {
 
 pub use attach::{AttachError, Attachment, Attacher, Attachments, attachments};
 pub use cable::{End, pair, pair_with_limit};
-pub use cx::{Cancelled, Cx, Raced, Task};
+pub use cx::{Cancelled, Cx, JoinError, RaceError, Task};
+pub use error::Error;
 pub use block_on::block_on;
 #[cfg(not(target_arch = "wasm32"))]
 pub use listen::{Listening, ParseWorldSocketError, WorldSocket, listen};
@@ -354,8 +356,6 @@ use std::task::{Context, Poll};
 /// `Sync` converts into [`Error`] with `?`.
 pub type Result<T = (), E = Error> = std::result::Result<T, E>;
 
-/// Any error a world returns: a boxed [`std::error::Error`].
-pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
 /// One IPv4 or IPv6 packet, exactly the bytes on the wire.
 ///
@@ -505,7 +505,14 @@ impl std::fmt::Display for RecvError {
     }
 }
 
-impl std::error::Error for RecvError {}
+impl std::error::Error for RecvError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            RecvError::Closed => None,
+            RecvError::Cancelled => Some(&Cancelled),
+        }
+    }
+}
 
 /// The README's example, `docs/readme/sites.rs`, compiled as a doctest.
 /// `tests/readme.rs` checks that the README shows exactly that file.

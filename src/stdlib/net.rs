@@ -498,8 +498,7 @@ impl Host {
             }
             opts.seed ^= seed;
             cx.spawn(move |cx| async move {
-                serve::serve_datagram(&cx, socket, local, &mut service, &world, &opts).await;
-                Ok(())
+                Ok(serve::serve_datagram(&cx, socket, local, &mut service, &world, &opts).await?)
             });
         });
         self.ports.push((port, PortSpec::Udp(start)));
@@ -737,7 +736,7 @@ impl Net {
             for host in self.hosts {
                 let names = host.names.clone();
                 let label = host.label.clone();
-                let placed = shared.place(&mut world, host).map_err(|e| format!("host {label}: {e}"))?;
+                let placed = shared.place(&mut world, host).map_err(|e| fictionet::Error::msg(format!("host {label}: {e}")))?;
                 for name in names {
                     world.names.insert(name, Known::Host(placed));
                 }
@@ -746,7 +745,8 @@ impl Net {
 
         let members = self.members;
         caller.spawn(move |cx| async move {
-            while let Some(sandbox) = attachments.next(&cx).await {
+            loop {
+                let sandbox = attachments.next(&cx).await?;
                 if let Some((_, prefix)) = routes.iter().find(|(n, _)| n == sandbox.name()) {
                     shared.router.add(*prefix, Box::new(sandbox));
                     continue;
@@ -758,7 +758,6 @@ impl Net {
                 let shared = shared.clone();
                 cx.spawn(move |cx| filter(cx, sandbox, shared));
             }
-            Ok(())
         });
         Ok(())
     }
@@ -830,10 +829,10 @@ struct Subnet {
 impl Subnet {
     fn new(p: Prefix) -> Result<Subnet, Error> {
         let IpAddr::V4(a) = p.addr else {
-            return Err(format!("the sandboxes' subnet {}/{} must be IPv4", p.addr, p.len).into());
+            return Err(fictionet::Error::msg(format!("the sandboxes' subnet {}/{} must be IPv4", p.addr, p.len)));
         };
         if !(8..=30).contains(&p.len) {
-            return Err(format!("the sandboxes' subnet {a}/{} must have a length from 8 to 30", p.len).into());
+            return Err(fictionet::Error::msg(format!("the sandboxes' subnet {a}/{} must have a length from 8 to 30", p.len)));
         }
         let mask = u32::MAX << (32 - p.len as u32);
         let net = u32::from(a) & mask;
@@ -873,17 +872,17 @@ struct Subnet6 {
 impl Subnet6 {
     fn new(p: Prefix) -> Result<Subnet6, Error> {
         let IpAddr::V6(a) = p.addr else {
-            return Err(format!("the sandboxes' IPv6 subnet {}/{} must be IPv6", p.addr, p.len).into());
+            return Err(fictionet::Error::msg(format!("the sandboxes' IPv6 subnet {}/{} must be IPv6", p.addr, p.len)));
         };
         if !(8..=126).contains(&p.len) {
-            return Err(format!("the sandboxes' IPv6 subnet {a}/{} must have a length from 8 to 126", p.len).into());
+            return Err(fictionet::Error::msg(format!("the sandboxes' IPv6 subnet {a}/{} must have a length from 8 to 126", p.len)));
         }
         let mask = u128::MAX << (128 - p.len as u32);
         let net = u128::from(a) & mask;
         let global = net >> 125 == 0b001;
         let ula = net >> 121 == 0b111_1110;
         if !(global || ula) {
-            return Err(format!("the sandboxes' IPv6 subnet {a}/{} must lie inside 2000::/3 or fc00::/7", p.len).into());
+            return Err(fictionet::Error::msg(format!("the sandboxes' IPv6 subnet {a}/{} must lie inside 2000::/3 or fc00::/7", p.len)));
         }
         Ok(Subnet6 { net, mask, gateway: Ipv6Addr::from(net + 1) })
     }
@@ -1081,13 +1080,13 @@ fn make_lans(
     for (name, prefix) in lans {
         let max = if prefix.addr.is_ipv4() { 30 } else { 126 };
         if prefix.len > max {
-            return Err(format!("LAN {name}: {}/{} leaves no room for members", prefix.addr, prefix.len).into());
+            return Err(fictionet::Error::msg(format!("LAN {name}: {}/{} leaves no room for members", prefix.addr, prefix.len)));
         }
         if overlap(&prefix, &sandboxes4) || sandboxes6.as_ref().is_some_and(|s| overlap(&prefix, s)) {
-            return Err(format!("LAN {name}: {}/{} overlaps the sandboxes' subnet", prefix.addr, prefix.len).into());
+            return Err(fictionet::Error::msg(format!("LAN {name}: {}/{} overlaps the sandboxes' subnet", prefix.addr, prefix.len)));
         }
         if let Some((other, _)) = made.iter().find(|(n, l)| **n == name || overlap(&prefix, &l.prefix)) {
-            return Err(format!("LAN {name}: {}/{} overlaps LAN {other}", prefix.addr, prefix.len).into());
+            return Err(fictionet::Error::msg(format!("LAN {name}: {}/{} overlaps LAN {other}", prefix.addr, prefix.len)));
         }
         let names = hooks.clone();
         let on_drop: route::OnDrop = Arc::new(move |cx: &Cx, packet: &Packet, why: &'static str| {
@@ -1100,22 +1099,22 @@ fn make_lans(
         let (lan_side, router_side) = link();
         lan.gateway(Box::new(lan_side))?;
         router.add(prefix, Box::new(router_side));
-        let dns = nth(&prefix, 1).ok_or("a LAN has room for its DNS")?;
+        let dns = nth(&prefix, 1).ok_or_else(|| fictionet::Error::msg("a LAN has room for its DNS"))?;
         made.insert(name, LanSeg { prefix, lan, dns, members: HashSet::new() });
     }
     for (member, lan, addr) in members {
         let Some(seg) = made.get_mut(lan) else {
-            return Err(format!("member {member}: there is no LAN called {lan}").into());
+            return Err(fictionet::Error::msg(format!("member {member}: there is no LAN called {lan}")));
         };
         let broadcast = match seg.prefix.addr {
             IpAddr::V4(a) => Some(IpAddr::V4(Ipv4Addr::from(u32::from(a) | (u32::MAX >> seg.prefix.len)))),
             IpAddr::V6(_) => None,
         };
         if !prefix_contains(&seg.prefix, *addr) || *addr == seg.prefix.addr || *addr == seg.dns || Some(*addr) == broadcast {
-            return Err(format!("member {member}: {addr} is not a member address of LAN {lan}").into());
+            return Err(fictionet::Error::msg(format!("member {member}: {addr} is not a member address of LAN {lan}")));
         }
         if !seg.members.insert(*addr) {
-            return Err(format!("member {member}: another member of LAN {lan} has {addr}").into());
+            return Err(fictionet::Error::msg(format!("member {member}: another member of LAN {lan} has {addr}")));
         }
     }
     Ok(made)
@@ -1573,7 +1572,7 @@ async fn connection(cx: Cx, conn: tcp::TcpConnection, info: ConnInfo, accepted: 
     });
     let detached = || sandbox_id.is_some_and(|id| !hooks.is_attached(id));
     let deadline = accepted + shared.limits.handshake;
-    let Some((tls, info)) = serve::accept_tls(&cx, conn, &info, &select, deadline, detached).await else {
+    let Ok((tls, info)) = serve::accept_tls(&cx, conn, &info, &select, deadline, detached).await else {
         return;
     };
     let Some(name) = lock(&chosen).take() else { return };
@@ -2155,13 +2154,13 @@ async fn filter(cx: Cx, sandbox: Attachment, shared: Arc<Shared>) -> fictionet::
     let _attached = attached;
     loop {
         let deadline = f.reassembly.next_expiry();
-        match f.ports.next(&cx, deadline, |_| Poll::Pending).await {
+        match f.ports.next(&cx, deadline, |_| Poll::Pending).await? {
             PortEvent::Packet(0, packet) => match ip::version(&packet.0) {
                 Some(6) => f.sent_v6(&cx, packet),
                 _ => f.sent_v4(&cx, packet),
             },
             PortEvent::Packet(_, packet) => f.ports.send(0, packet),
-            PortEvent::Closed(_) | PortEvent::Cancelled => return Ok(()),
+            PortEvent::Closed(_) => return Ok(()),
             PortEvent::Timer => f.reassembly.expire(cx.now()),
             PortEvent::Extra => {}
         }

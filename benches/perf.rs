@@ -946,7 +946,7 @@ fn http_run(case: HttpCase) -> HttpRun {
             let conn = m.tcp.connect(&cx, SocketAddr::new(addr.into(), 443)).await?;
             let alpn: &[u8] = if case.h2 { b"h2" } else { b"http/1.1" };
             let mut t = TlsClient::new(conn, &roots, "bench.test", alpn);
-            t.handshake(&cx).await.map_err(|e| format!("{e:?}"))?;
+            t.handshake(&cx).await.map_err(|e| fictionet::Error::msg(format!("{e:?}")))?;
             let mut c = Client::new(&cx, t, case.h2).await;
             for _ in 0..100 {
                 c.get().await;

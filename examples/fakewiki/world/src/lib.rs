@@ -131,13 +131,13 @@ pub fn start_backend(args: &Args) -> fictionet::Result<(Value, std::process::Chi
         .env("PYTHONUNBUFFERED", "1")
         .stdout(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("cannot start backend.py: {e}"))?;
-    let stdout = child.stdout.take().ok_or("no backend stdout")?;
+        .map_err(|e| fictionet::Error::msg(format!("cannot start backend.py: {e}")))?;
+    let stdout = child.stdout.take().ok_or_else(|| fictionet::Error::msg("no backend stdout"))?;
     let mut line = String::new();
     BufReader::new(stdout).read_line(&mut line)?;
     if line.trim().is_empty() {
         let status = child.wait()?;
-        return Err(format!("backend.py exited before it was ready ({status})").into());
+        return Err(fictionet::Error::msg(format!("backend.py exited before it was ready ({status})")));
     }
     Ok((serde_json::from_str(&line)?, child))
 }
@@ -190,7 +190,7 @@ const LOOKUP_FROM: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 254)
 /// for every answer. This makes `Sites` run its callback for each host, so
 /// each site and its address exist before the first sandbox attaches.
 pub async fn look_up_all(cx: &Cx, attacher: &Attacher, hosts: &[String]) -> fictionet::Result {
-    let mut end: End = attacher.attach(events::LOOKUPS).map_err(|e| format!("lookups: {e}"))?;
+    let mut end: End = attacher.attach(events::LOOKUPS).map_err(|e| fictionet::Error::msg(format!("lookups: {e}")))?;
     let mut waiting: HashMap<u16, &str> = HashMap::new();
     for (i, host) in hosts.iter().enumerate() {
         let id = i as u16 + 1;
@@ -212,7 +212,7 @@ pub async fn look_up_all(cx: &Cx, attacher: &Attacher, hosts: &[String]) -> fict
         .await;
         let Some(packet) = packet else {
             let left: Vec<_> = waiting.values().collect();
-            return Err(format!("no DNS answer for {left:?}").into());
+            return Err(fictionet::Error::msg(format!("no DNS answer for {left:?}")));
         };
         let p = &packet.0;
         // IPv4 + UDP from the gateway's port 53: id, flags, then counts.
@@ -226,7 +226,7 @@ pub async fn look_up_all(cx: &Cx, attacher: &Attacher, hosts: &[String]) -> fict
         let answers = u16::from_be_bytes([dns[6], dns[7]]);
         if let Some(host) = waiting.remove(&id) {
             if rcode != 0 || answers != 1 {
-                return Err(format!("DNS for {host}: rcode {rcode}, {answers} answers").into());
+                return Err(fictionet::Error::msg(format!("DNS for {host}: rcode {rcode}, {answers} answers")));
             }
         }
     }

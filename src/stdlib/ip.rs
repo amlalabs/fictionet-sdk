@@ -136,7 +136,7 @@ async fn split(
 ) -> fictionet::Result {
     loop {
         let deadline = reassembly.as_ref().and_then(|r| r.next_expiry());
-        match ports.next(&cx, deadline, |_| Poll::Pending).await {
+        match ports.next(&cx, deadline, |_| Poll::Pending).await? {
             Event::Packet(0, packet) => {
                 let packet = match reassembly.as_mut() {
                     Some(r) => match r.intake(packet, cx.now()) {
@@ -160,7 +160,7 @@ async fn split(
                     r.expire(cx.now());
                 }
             }
-            Event::Closed(0) | Event::Cancelled | Event::Extra => return Ok(()),
+            Event::Closed(0) | Event::Extra => return Ok(()),
             Event::Closed(_) => {
                 if ports.open() <= 1 {
                     return Ok(());
@@ -1492,7 +1492,7 @@ mod tests {
             }
             assert!(other.queued() <= QUEUE, "{} bytes wait", other.queued());
             assert!(other.queued() > QUEUE / 2, "{} bytes wait", other.queued());
-            Err::<(), crate::Error>("done".into())
+            Err::<(), crate::Error>(fictionet::Error::msg("done"))
         }));
         assert_eq!(result.unwrap_err().to_string(), "done");
     }

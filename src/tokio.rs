@@ -32,7 +32,7 @@
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use crate::stdlib::{ConnError, Connection};
+use crate::stdlib::Connection;
 use crate::Cx;
 
 /// Adds [`into_tokio`](ConnectionTokioExt::into_tokio) to every
@@ -44,9 +44,12 @@ pub trait ConnectionTokioExt: Connection + Sized {
     /// The wrapper keeps a clone of `cx`, because tokio's traits take no
     /// context. Its reads and writes still stop when `cx`'s
     /// [region](crate::Cx#regions) is cancelled: they fail with an I/O
-    /// error of kind `Interrupted`, since an I/O error is the only way
-    /// tokio's traits can report it. Other [`ConnError`]s map to the
-    /// matching I/O error kinds, such as `ConnectionReset`.
+    /// error whose source is
+    /// [`ConnError::Cancelled`](crate::stdlib::ConnError::Cancelled), since
+    /// an I/O error is the only way tokio's traits can report it. Every
+    /// [`ConnError`](crate::stdlib::ConnError) converts the same way, with
+    /// the matching I/O error kind, such as `ConnectionReset`, by
+    /// `ConnError`'s `From` impl for `std::io::Error`.
     fn into_tokio(self, cx: &Cx) -> Compat<Self> {
         Compat { inner: self, cx: cx.clone() }
     }
@@ -68,19 +71,6 @@ impl<C> Compat<C> {
     }
 }
 
-fn to_io(e: ConnError) -> std::io::Error {
-    use std::io::ErrorKind;
-    let kind = match e {
-        ConnError::Cancelled => ErrorKind::Interrupted,
-        ConnError::Refused => ErrorKind::ConnectionRefused,
-        ConnError::Reset => ErrorKind::ConnectionReset,
-        ConnError::TimedOut => ErrorKind::TimedOut,
-        ConnError::Closed => ErrorKind::BrokenPipe,
-        ConnError::Broken => ErrorKind::InvalidData,
-    };
-    std::io::Error::new(kind, e)
-}
-
 impl<C: Connection + Unpin> ::tokio::io::AsyncRead for Compat<C> {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -93,7 +83,7 @@ impl<C: Connection + Unpin> ::tokio::io::AsyncRead for Compat<C> {
                 buf.advance(n);
                 Poll::Ready(Ok(()))
             }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(to_io(e))),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e.into())),
             Poll::Pending => Poll::Pending,
         }
     }
@@ -102,7 +92,7 @@ impl<C: Connection + Unpin> ::tokio::io::AsyncRead for Compat<C> {
 impl<C: Connection + Unpin> ::tokio::io::AsyncWrite for Compat<C> {
     fn poll_write(self: Pin<&mut Self>, task: &mut Context<'_>, data: &[u8]) -> Poll<std::io::Result<usize>> {
         let this = self.get_mut();
-        this.inner.poll_write(&this.cx, task, data).map_err(to_io)
+        this.inner.poll_write(&this.cx, task, data).map_err(std::io::Error::from)
     }
 
     /// A connection hands bytes on as soon as `poll_write` takes them, so
@@ -113,6 +103,6 @@ impl<C: Connection + Unpin> ::tokio::io::AsyncWrite for Compat<C> {
 
     fn poll_shutdown(self: Pin<&mut Self>, task: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        this.inner.poll_shutdown(&this.cx, task).map_err(to_io)
+        this.inner.poll_shutdown(&this.cx, task).map_err(std::io::Error::from)
     }
 }

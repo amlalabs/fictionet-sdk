@@ -47,6 +47,7 @@ use crate::timer::timers;
 ///   wire its network, return `Ok(())`, and leave the network running.
 /// - When a task in the region returns an error, the region is cancelled.
 ///   The first error comes out once all of the region's tasks have ended.
+///   A [`Cancelled`] is not such an error: it says a wait was cancelled.
 ///   [`Cx::cancel`] cancels a region without an error, and the region then
 ///   ends with `Ok`, unless a task failed before the cancel.
 ///
@@ -76,8 +77,10 @@ use crate::timer::timers;
 /// Stopping is cooperative. Cancelling a region does not drop its tasks.
 /// Instead, [`Cx::cancelled`] finishes for every `Cx` in the region, and
 /// every wait in the region (`recv`, `sleep`, and the rest) returns early
-/// with [`Cancelled`]. Each task then ends on its own, usually by passing
-/// that error up with `?`.
+/// with [`Cancelled`], or with its error type's `Cancelled` variant, before
+/// anything the wait already holds. Each task then ends on its own, usually
+/// by passing that error up with `?`. A task that ends with a cancel has
+/// not failed, so its region keeps no error for it.
 ///
 /// Only Fictionet's own waits see a cancel. A task waiting on something
 /// else, such as a tokio socket or a database query, is not interrupted,
@@ -188,6 +191,13 @@ impl Cx {
     /// reaches the harness instead of disappearing. Work that is allowed to
     /// fail, such as serving one connection, handles its own errors and
     /// returns `Ok(())`.
+    ///
+    /// A cancel is not a failure. Work that returns [`Cancelled`], or an
+    /// error whose `Cancelled` variant says a wait was cancelled, ended
+    /// because its region, or the region of a `Cx` it waited on, was
+    /// cancelled. Its region keeps nothing and is not cancelled by it.
+    ///
+    /// A panic is not caught: it unwinds out of the run, which ends there.
     #[track_caller]
     pub fn spawn<F, Fut>(&self, work: F) -> Task
     where
@@ -216,7 +226,7 @@ impl Cx {
             // The run is gone, so the work can never run.
             drop(future);
             region.task_done(false);
-            join.finish(Err(Box::new(Cancelled)));
+            join.finish(Err(JoinError::Cancelled));
         }
         Task { join }
     }
@@ -339,14 +349,14 @@ impl Cx {
     ///
     /// ```
     /// # fictionet::block_on(fictionet::run(|cx| async move {
-    /// use fictionet::Raced;
+    /// use fictionet::RaceError;
     /// let late = cx.race(Some(cx.now() + std::time::Duration::from_millis(5)), std::future::pending::<()>()).await;
-    /// assert_eq!(late, Err(Raced::Deadline));
+    /// assert_eq!(late, Err(RaceError::Deadline));
     /// assert_eq!(cx.race(None, async { 7 }).await, Ok(7));
     /// # Ok(()) }))?;
     /// # Ok::<(), fictionet::Error>(())
     /// ```
-    pub async fn race<T>(&self, deadline: Option<Instant>, fut: impl Future<Output = T>) -> Result<T, Raced> {
+    pub async fn race<T>(&self, deadline: Option<Instant>, fut: impl Future<Output = T>) -> Result<T, RaceError> {
         let mut fut = std::pin::pin!(fut);
         let mut sleep = std::pin::pin!(deadline.map(|d| self.sleep_until(d)));
         let mut cancelled = std::pin::pin!(self.cancelled());
@@ -355,12 +365,12 @@ impl Cx {
                 return Poll::Ready(Ok(v));
             }
             if cancelled.as_mut().poll(task).is_ready() {
-                return Poll::Ready(Err(Raced::Cancelled));
+                return Poll::Ready(Err(RaceError::Cancelled));
             }
             if let Some(sleep) = sleep.as_mut().as_pin_mut() {
                 match sleep.poll(task) {
-                    Poll::Ready(Ok(())) => return Poll::Ready(Err(Raced::Deadline)),
-                    Poll::Ready(Err(_)) => return Poll::Ready(Err(Raced::Cancelled)),
+                    Poll::Ready(Ok(())) => return Poll::Ready(Err(RaceError::Deadline)),
+                    Poll::Ready(Err(_)) => return Poll::Ready(Err(RaceError::Cancelled)),
                     Poll::Pending => {}
                 }
             }
@@ -379,9 +389,9 @@ impl Cx {
     ///
     /// Returns immediately. Every task in the region then stops at its next
     /// wait, as after any cancel (see [Stopping](Cx#stopping)). The region
-    /// reports success: errors that its tasks return after this call, such
-    /// as the [`Cancelled`] that a task passes up with `?`, are not kept. An
-    /// error from before the call is still reported.
+    /// reports success: errors that its tasks return after this call are
+    /// not kept, and the [`Cancelled`] that a task passes up with `?` is
+    /// never a failure. An error from before the call is still reported.
     ///
     /// The world function and every task it spawns share the world's
     /// region, so calling this on any of their `Cx`s stops the whole world,
@@ -406,16 +416,22 @@ impl Cx {
     /// ended.
     ///
     /// `f` runs inside the task that awaits this. Its work is cancelled when
-    /// this region is. If `f` or any of its work returns an error, the new
-    /// region is cancelled and the first error is returned once all of its
-    /// work has ended. This region is not failed by it: the caller decides.
-    /// For work that is allowed to fail as a whole, such as serving one
-    /// connection with its HTTP/2 streams.
+    /// this region is. For work that is allowed to fail as a whole, such as
+    /// serving one connection with its HTTP/2 streams. Once all of the new
+    /// region's work has ended, this returns, as [`run`](crate::run) does:
+    ///
+    /// - `Ok(())` when every task, and `f`, returned `Ok`, or when the new
+    ///   region was stopped with [`Cx::cancel`].
+    /// - `Err` with the first failure when `f` or any of its work returned
+    ///   an error that is not a cancel. The new region is cancelled by it;
+    ///   this region is not failed by it: the caller decides.
+    /// - `Err` with [`Cancelled`] when the new region was cancelled from
+    ///   outside, because this region was, and some of its work ended with
+    ///   the cancel instead of finishing.
     ///
     /// Dropping the returned future before it finishes cancels the new
     /// region. Its work then ends on its own, as after any cancel, but
     /// nothing waits for it and its errors are lost.
-    #[allow(dead_code)]
     pub async fn region<F, Fut>(&self, f: F) -> crate::Result
     where
         F: FnOnce(Cx) -> Fut,
@@ -438,13 +454,18 @@ impl Cx {
         let mut work = Box::pin(f(Cx { run: self.run.clone(), region: child.clone(), group: self.group.clone() }));
         let result = work.as_mut().await;
         if let Err(e) = result {
-            child.fail(e);
+            if is_cancel(&*e) {
+                child.ended_by_cancel();
+            } else {
+                child.fail(e);
+            }
         }
         drop(work);
         poll_fn(|task| child.poll_done(task)).await;
         guard.0 = None;
         match child.take_error() {
             Some(e) => Err(e),
+            None if child.cut_short() => Err(Cancelled.into()),
             None => Ok(()),
         }
     }
@@ -481,40 +502,72 @@ impl Cx {
     }
 }
 
-/// The error a wait returns when its [region](Cx#regions) is cancelled.
+/// The one value that means "the [region](Cx#regions) was cancelled".
 ///
-/// Every wait in Fictionet returns early with this when the region of the
-/// `Cx` it was given is cancelled:
-/// [`Cx::sleep`], [`Cx::sleep_until`], [`Cx::yield_now`], [`Task::join`],
-/// [`Attachments::get`](crate::Attachments::get), and
-/// [`recv`](crate::InterfaceExt::recv) (as
-/// [`RecvError::Cancelled`](crate::RecvError::Cancelled)). Stdlib
-/// connections end with
-/// [`ConnError::Cancelled`](crate::stdlib::ConnError::Cancelled), and
-/// [`Attachments::next`](crate::Attachments::next) returns `None`. A task
-/// passes the error up with `?`, and so stops.
+/// Every Fictionet function that waits takes a `&Cx` and returns a
+/// `Result`. When the region of that `Cx` is cancelled, the wait returns
+/// early, and its error says so in one of two ways:
+///
+/// - Waits that cannot fail any other way return this value:
+///   [`Cx::sleep`], [`Cx::sleep_until`], [`Cx::yield_now`],
+///   [`Attachments::get`](crate::Attachments::get),
+///   [`Attachments::next`](crate::Attachments::next) and
+///   [`Ports::next`](crate::stdlib::Ports::next).
+/// - Waits with an error type of their own return its `Cancelled` variant,
+///   which `?` makes from this value and whose
+///   [`source`](std::error::Error::source) is this value:
+///   [`RecvError::Cancelled`](crate::RecvError::Cancelled),
+///   [`ConnError::Cancelled`](crate::stdlib::ConnError::Cancelled),
+///   [`RaceError::Cancelled`], [`JoinError::Cancelled`],
+///   [`HandshakeError::Cancelled`](crate::stdlib::tls::HandshakeError::Cancelled)
+///   and [`ServeError::Cancelled`](crate::stdlib::serve::ServeError::Cancelled).
+///
+/// A cancel is never reported as `None`, as `Ok`, or as another error such
+/// as a broken connection. A task passes the error up with `?`, and so
+/// stops. A task that ends with a cancel has not failed: its region does
+/// not keep the error and is not cancelled by it (see [`Cx::spawn`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cancelled;
 
+/// Whether `e` reports a cancel: it is [`Cancelled`], or `Cancelled` is in
+/// its chain of [`source`](std::error::Error::source)s, as it is for every
+/// error type's `Cancelled` variant.
+pub(crate) fn is_cancel(e: &(dyn std::error::Error + 'static)) -> bool {
+    std::iter::successors(Some(e), |e| e.source()).any(|e| e.is::<Cancelled>())
+}
+
 /// Why [`Cx::race`] ended without its future's output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Raced {
+pub enum RaceError {
     /// The deadline passed first.
     Deadline,
     /// The region was cancelled first.
     Cancelled,
 }
 
-impl std::fmt::Display for Raced {
+impl std::fmt::Display for RaceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Raced::Deadline => "the deadline passed",
-            Raced::Cancelled => "the region was cancelled",
+            RaceError::Deadline => "the deadline passed",
+            RaceError::Cancelled => "the region was cancelled",
         })
     }
 }
 
-impl std::error::Error for Raced {}
+impl std::error::Error for RaceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            RaceError::Deadline => None,
+            RaceError::Cancelled => Some(&Cancelled),
+        }
+    }
+}
+
+impl From<Cancelled> for RaceError {
+    fn from(_: Cancelled) -> Self {
+        RaceError::Cancelled
+    }
+}
 
 impl std::fmt::Display for Cancelled {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -530,6 +583,42 @@ impl From<Cancelled> for crate::RecvError {
     }
 }
 
+/// Why [`Task::join`] has no `Ok` for its task.
+#[derive(Clone, Debug)]
+pub enum JoinError {
+    /// The task returned this error. It is the same error its region
+    /// keeps, shared, not a copy: downcast it to the task's own type.
+    Failed(crate::Error),
+    /// The task did not finish: it ended with a cancel, or the region of
+    /// the `Cx` passed to `join` was cancelled first, or the run was
+    /// dropped.
+    Cancelled,
+}
+
+impl std::fmt::Display for JoinError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            JoinError::Failed(e) => write!(f, "the task failed: {e}"),
+            JoinError::Cancelled => f.write_str("the region was cancelled"),
+        }
+    }
+}
+
+impl std::error::Error for JoinError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            JoinError::Failed(e) => Some(&**e),
+            JoinError::Cancelled => Some(&Cancelled),
+        }
+    }
+}
+
+impl From<Cancelled> for JoinError {
+    fn from(_: Cancelled) -> Self {
+        JoinError::Cancelled
+    }
+}
+
 /// A handle to a background task started with [`Cx::spawn`].
 ///
 /// Dropping it detaches the task: the task keeps running, because its
@@ -541,15 +630,15 @@ pub struct Task {
 }
 
 impl Task {
-    /// Waits for the task to end, and returns what it returned.
+    /// Waits for the task to end. `Ok(())` if it returned `Ok`.
     ///
-    /// If the task failed, the error returned here carries the same message,
-    /// but the original error goes to the task's region, as [`Cx::spawn`]
-    /// says. The copy is ready before the failure cancels the region, so a
-    /// joiner in that same region still gets the message. If `cx`'s region
-    /// is cancelled before the task ends, or the run is dropped, this
-    /// returns [`Cancelled`] as the error.
-    pub async fn join(self, cx: &Cx) -> crate::Result {
+    /// If the task failed, this returns [`JoinError::Failed`] with the
+    /// task's own error, the same one its region keeps, as [`Cx::spawn`]
+    /// says. It is ready before the failure cancels the region, so a joiner
+    /// in that same region still gets it. If the task ended with a cancel,
+    /// or `cx`'s region is cancelled before the task ends, or the run is
+    /// dropped, this returns [`JoinError::Cancelled`].
+    pub async fn join(self, cx: &Cx) -> Result<(), JoinError> {
         let mut wait = CancelWait::default();
         poll_fn(|task| {
             let mut state = self.join.state.lock().unwrap();
@@ -557,7 +646,7 @@ impl Task {
                 return Poll::Ready(result);
             }
             if cx.is_cancelled() {
-                return Poll::Ready(Err(Box::new(Cancelled)));
+                return Poll::Ready(Err(JoinError::Cancelled));
             }
             match &state.waker {
                 Some(w) if w.will_wake(task.waker()) => {}
@@ -565,7 +654,7 @@ impl Task {
             }
             drop(state);
             if cx.register_cancel(task.waker(), &mut wait) {
-                return Poll::Ready(Err(Box::new(Cancelled)));
+                return Poll::Ready(Err(JoinError::Cancelled));
             }
             Poll::Pending
         })
@@ -581,12 +670,12 @@ pub(crate) struct JoinState {
 
 #[derive(Default)]
 struct JoinInner {
-    result: Option<crate::Result>,
+    result: Option<Result<(), JoinError>>,
     waker: Option<Waker>,
 }
 
 impl JoinState {
-    pub(crate) fn finish(&self, result: crate::Result) {
+    pub(crate) fn finish(&self, result: Result<(), JoinError>) {
         let waker = {
             let mut state = self.state.lock().unwrap();
             state.result = Some(result);
@@ -612,20 +701,6 @@ impl Drop for CancelWait {
     }
 }
 
-/// The error [`Task::join`] returns when the work failed. The work's own
-/// error goes to its region, and out of [`run`](crate::run), so the joiner
-/// gets this copy of its message.
-#[derive(Debug)]
-pub(crate) struct TaskFailed(pub(crate) String);
-
-impl std::fmt::Display for TaskFailed {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for TaskFailed {}
-
 /// A region: a group of work that is cancelled together and ends together.
 pub(crate) struct Region {
     run: Weak<RunShared>,
@@ -643,6 +718,8 @@ struct RegionState {
     next_key: u64,
     /// The first error of the region.
     error: Option<crate::Error>,
+    /// Some of its work ended with a cancel instead of finishing.
+    cancel_ended: bool,
     /// Spawned work that has not ended yet.
     live: usize,
     /// Woken when `live` drops to zero.
@@ -725,6 +802,18 @@ impl Region {
         drop(state);
         // Dropped outside the lock: dropping a waker can run any code.
         drop(old);
+    }
+
+    /// Notes that work in the region ended with a cancel. It is not a
+    /// failure: nothing is kept and nothing is cancelled.
+    pub(crate) fn ended_by_cancel(&self) {
+        self.state.lock().unwrap().cancel_ended = true;
+    }
+
+    /// Whether the region was cancelled from outside, not stopped with
+    /// [`Cx::cancel`], and some of its work ended with the cancel.
+    fn cut_short(&self) -> bool {
+        self.is_cancelled() && !self.stopped.load(Ordering::Acquire) && self.state.lock().unwrap().cancel_ended
     }
 
     pub(crate) fn task_started(&self) {
@@ -955,7 +1044,7 @@ mod tests {
                         e2.fetch_add(1, Ordering::SeqCst);
                         Ok(())
                     });
-                    cx.spawn(|_cx| async { Err("conn failed".into()) });
+                    cx.spawn(|_cx| async { Err(crate::Error::msg("conn failed")) });
                     Ok(())
                 })
                 .await;
@@ -1029,7 +1118,7 @@ mod tests {
                     assert!(polled.is_pending());
                     poll_fn(move |_| {
                         let _held = &inside;
-                        Poll::Ready(Err("failed holding a link".into()))
+                        Poll::Ready(Err(crate::Error::msg("failed holding a link")))
                     })
                 })
                 .await;
@@ -1037,6 +1126,69 @@ mod tests {
             res
         }));
         assert_eq!(res.unwrap_err().to_string(), "failed holding a link");
+    }
+
+    /// A task that ends with a cancel has not failed: here it waited on
+    /// another region's `Cx`, which was stopped. Its own region keeps
+    /// nothing, is not cancelled, and its joiner hears `Cancelled`.
+    #[test]
+    fn a_task_that_ends_with_a_cancel_does_not_fail_its_region() {
+        let res = block_on(run(|cx| async move {
+            let mut stopped = None;
+            cx.region(|inner| {
+                stopped = Some(inner.clone());
+                inner.cancel();
+                async { Ok(()) }
+            })
+            .await?;
+            let stopped = stopped.unwrap();
+            let task = cx.spawn(move |_cx| async move {
+                // A wrapper's `Cancelled` variant counts too.
+                let (mut a, _b) = crate::pair();
+                use crate::InterfaceExt;
+                a.recv(&stopped).await?;
+                Ok(())
+            });
+            assert!(matches!(task.join(&cx).await, Err(JoinError::Cancelled)));
+            assert!(!cx.is_cancelled());
+            Ok(())
+        }));
+        assert!(res.is_ok(), "{res:?}");
+    }
+
+    /// `region` returns `Ok` when stopped with `Cx::cancel`, and
+    /// `Cancelled` when cut short from outside, whatever error type its
+    /// work used to say so.
+    #[test]
+    fn a_region_says_whether_it_was_stopped_or_cut_short() {
+        let res = block_on(run(|cx| async move {
+            let stopped = cx
+                .region(|inner| async move {
+                    inner.cancel();
+                    inner.sleep(std::time::Duration::from_secs(60)).await?;
+                    Ok(())
+                })
+                .await;
+            assert!(stopped.is_ok(), "{stopped:?}");
+            let outer = cx.clone();
+            let cut = cx
+                .region(|inner| async move {
+                    let (mut a, _b) = crate::pair();
+                    use crate::InterfaceExt;
+                    outer.spawn(move |cx| async move {
+                        cx.sleep(ms(10)).await?;
+                        cx.cancel();
+                        Ok(())
+                    });
+                    a.recv(&inner).await?;
+                    Ok(())
+                })
+                .await;
+            let e = cut.unwrap_err();
+            assert!(e.is::<Cancelled>(), "{e:?}");
+            Ok(())
+        }));
+        assert!(res.is_ok(), "{res:?}");
     }
 
     #[test]
@@ -1048,7 +1200,7 @@ mod tests {
                 Ok(())
             });
             cx.sleep(ms(10)).await?;
-            Err("outer".into())
+            Err(crate::Error::msg("outer"))
         }));
         assert_eq!(res.unwrap_err().to_string(), "outer");
     }

@@ -278,7 +278,8 @@ impl<C: Connection> Io<C> {
 }
 
 /// How a handshake failed, in more detail than [`ConnError`]: what
-/// [`server_detailed`] and [`ClientHello::finish_detailed`] return, for a
+/// [`server_detailed`], [`ClientHello::finish_detailed`] and
+/// [`serve::accept_tls`](crate::stdlib::serve::accept_tls) return, for a
 /// world that logs how each handshake ended.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -289,8 +290,19 @@ pub enum HandshakeError {
     Alert(u8),
     /// The bytes were not TLS, or broke the protocol.
     Failed(String),
-    /// The connection underneath failed.
+    /// There was no config for the name the client asked for, and the
+    /// handshake was refused with `unrecognized_name`. Only from
+    /// `accept_tls`.
+    Rejected,
+    /// The handshake did not finish by its deadline. Only from
+    /// `accept_tls`.
+    TimedOut,
+    /// The connection underneath failed. Never [`ConnError::Cancelled`]:
+    /// a cancel is [`HandshakeError::Cancelled`].
     Conn(ConnError),
+    /// The [region](crate::Cx#regions) of the `Cx` passed to the call was
+    /// cancelled while it waited.
+    Cancelled,
 }
 
 impl std::fmt::Display for HandshakeError {
@@ -299,17 +311,46 @@ impl std::fmt::Display for HandshakeError {
             HandshakeError::Closed => f.write_str("the client closed the connection before the handshake finished"),
             HandshakeError::Alert(a) => write!(f, "the client sent alert {a}"),
             HandshakeError::Failed(why) => f.write_str(why),
+            HandshakeError::Rejected => f.write_str("there is no TLS config for the name the client asked for"),
+            HandshakeError::TimedOut => f.write_str("the handshake did not finish in time"),
             HandshakeError::Conn(e) => write!(f, "{e}"),
+            HandshakeError::Cancelled => f.write_str("the region was cancelled"),
         }
     }
 }
 
-impl std::error::Error for HandshakeError {}
+impl std::error::Error for HandshakeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            HandshakeError::Conn(e) => Some(e),
+            HandshakeError::Cancelled => Some(&fictionet::Cancelled),
+            _ => None,
+        }
+    }
+}
+
+impl From<ConnError> for HandshakeError {
+    /// A connection's error, with a cancel as [`HandshakeError::Cancelled`].
+    fn from(e: ConnError) -> Self {
+        match e {
+            ConnError::Cancelled => HandshakeError::Cancelled,
+            e => HandshakeError::Conn(e),
+        }
+    }
+}
+
+impl From<fictionet::Cancelled> for HandshakeError {
+    fn from(_: fictionet::Cancelled) -> Self {
+        HandshakeError::Cancelled
+    }
+}
 
 impl HandshakeError {
     fn into_conn(self) -> ConnError {
         match self {
             HandshakeError::Conn(e) => e,
+            HandshakeError::Cancelled => ConnError::Cancelled,
+            HandshakeError::TimedOut => ConnError::TimedOut,
             _ => ConnError::Broken,
         }
     }
@@ -324,7 +365,8 @@ impl HandshakeError {
 /// Fails with [`ConnError::Broken`] if the client's first message is not a
 /// TLS hello, or if the client closes the connection before it sent a whole
 /// hello. An error of the connection underneath, such as
-/// [`ConnError::Cancelled`], comes out as it is.
+/// [`ConnError::Cancelled`] when `cx`'s [region](crate::Cx#regions) is
+/// cancelled, comes out as it is.
 pub async fn server<C: Connection>(cx: &Cx, conn: C) -> Result<ClientHello<C>, ConnError> {
     server_detailed(cx, conn).await.map_err(HandshakeError::into_conn)
 }
@@ -351,7 +393,7 @@ pub async fn server_detailed<C: Connection>(cx: &Cx, conn: C) -> Result<ClientHe
             }
             match io.poll_fill(cx, task) {
                 Poll::Ready(Ok(())) => {}
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(HandshakeError::Conn(e))),
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e.into())),
                 Poll::Pending => return Poll::Pending,
             }
         }
@@ -438,7 +480,7 @@ impl<C: Connection> ClientHello<C> {
                 io.take_output(&mut tls);
                 match io.poll_flush(cx, task) {
                     Poll::Ready(Ok(())) => {}
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(HandshakeError::Conn(e))),
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e.into())),
                     Poll::Pending => return Poll::Pending,
                 }
                 if !tls.is_handshaking() {
@@ -453,7 +495,7 @@ impl<C: Connection> ClientHello<C> {
                 }
                 match io.poll_fill(cx, task) {
                     Poll::Ready(Ok(())) => {}
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(HandshakeError::Conn(e))),
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e.into())),
                     Poll::Pending => return Poll::Pending,
                 }
             }
@@ -502,6 +544,10 @@ impl<C: Connection> Connection for TlsConnection<C> {
         task: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<Result<usize, ConnError>> {
+        // A cancel comes first, before plaintext already decrypted.
+        if cx.is_cancelled() {
+            return Poll::Ready(Err(ConnError::Cancelled));
+        }
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }

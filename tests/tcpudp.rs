@@ -42,7 +42,7 @@ where
     let result = within(limit, move || {
         block_on(run(move |cx| async move {
             f(cx).await?;
-            Err(Box::new(Done) as fictionet::Error)
+            Err(fictionet::Error::from(Done))
         }))
     });
     match result {
@@ -772,7 +772,7 @@ fn tcp_through_tokio_io() {
             });
             server.await?;
             client.await?;
-            Err(Box::new(Done) as fictionet::Error)
+            Err(fictionet::Error::from(Done))
         });
         tokio::time::timeout(Duration::from_secs(20), world).await.expect("timed out")
     });

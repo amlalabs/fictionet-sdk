@@ -359,7 +359,8 @@
 //!   `error` or `none`), `addr` and `rcode`;
 //! - `tls.handshake`: every TLS handshake on port 443, with `addr`, `sni`
 //!   and `outcome` (`accepted` with `alpn`, `rejected`, `alert` with
-//!   `alert`, `failed` with `detail`, `closed`, `timed_out` or `aborted`);
+//!   `alert`, `failed` with `detail`, `closed`, `timed_out`, `detached`
+//!   or `cancelled`);
 //! - `http.request`: every HTTP request, with who answered it (`answer`:
 //!   `handler`, `error`, `redirect`, `misdirected`, `no_host` or
 //!   `cancelled`), its status, and how much of the body was sent, also
@@ -899,7 +900,7 @@ async fn forward(client: Arc<ProxyClient>, request: Request<Body>) -> Result<Res
         .extensions()
         .get::<Target>()
         .cloned()
-        .ok_or("web::proxy() serves only requests that web::Sites routed: there is no web::Target")?;
+        .ok_or_else(|| fictionet::Error::msg("web::proxy() serves only requests that web::Sites routed: there is no web::Target"))?;
     let (mut parts, body) = request.into_parts();
     let default_port = (target.scheme == Scheme::HTTP && target.port == 80) || (target.scheme == Scheme::HTTPS && target.port == 443);
     let authority = if default_port { target.host.clone() } else { format!("{}:{}", target.host, target.port) };
