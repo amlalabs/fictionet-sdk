@@ -121,6 +121,10 @@ pub enum Error {
     Date,
     /// Text is not a message ID.
     MessageId,
+    /// The header's terminating blank line has not arrived.
+    Truncated,
+    /// Bytes follow the header's terminating blank line.
+    Trailing,
 }
 
 impl std::fmt::Display for Error {
@@ -137,6 +141,8 @@ impl std::fmt::Display for Error {
             Error::TooManyItems => "too many addresses or message IDs",
             Error::Date => "not a well-formed date and time",
             Error::MessageId => "not a well-formed message ID",
+            Error::Truncated => "IMF header ended before its blank line",
+            Error::Trailing => "bytes follow the IMF header",
         })
     }
 }
@@ -195,30 +201,8 @@ impl Header {
     }
 }
 
-/// Why bytes do not contain exactly one writable header.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ParseError {
-    /// Header fields or their strict encoding were refused.
-    Header(Error),
-    /// The terminating blank line has not arrived.
-    Truncated,
-    /// Bytes follow the terminating blank line.
-    Trailing,
-}
-
-impl core::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Header(e) => e.fmt(f),
-            Self::Truncated => f.write_str("IMF header ended before its blank line"),
-            Self::Trailing => f.write_str("bytes follow the IMF header"),
-        }
-    }
-}
-impl core::error::Error for ParseError {}
-
 impl Wire for Header {
-    type ParseError = ParseError;
+    type ParseError = Error;
     type WriteError = Error;
 
     /// Reads one header through its blank line. Accepts CRLF or LF line
@@ -227,16 +211,14 @@ impl Wire for Header {
     /// that exceed the field, line, or total size limits when written.
     /// Forms that cannot be preserved use [`Error::UnsupportedForm`].
     /// [`Head`] and [`split_message`] also read obsolete field text.
-    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
-        let (header, used) = Self::prefix(bytes)
-            .map_err(ParseError::Header)?
-            .ok_or(ParseError::Truncated)?;
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        let (header, used) = Self::prefix(bytes)?.ok_or(Error::Truncated)?;
         if used != bytes.len() {
-            return Err(ParseError::Trailing);
+            return Err(Error::Trailing);
         }
         header
             .write(&mut Vec::new())
-            .map_err(|_| ParseError::Header(Error::UnsupportedForm))?;
+            .map_err(|_| Error::UnsupportedForm)?;
         Ok(header)
     }
 
@@ -1750,12 +1732,12 @@ mod tests {
         let end = SIMPLE.find("\r\n\r\n").unwrap() + 4;
         for n in 0..end {
             assert_eq!(Head::new().decode(&bytes[..n], false), Ok(Step::Need));
-            assert_eq!(Header::parse(&bytes[..n]), Err(ParseError::Truncated));
+            assert_eq!(Header::parse(&bytes[..n]), Err(Error::Truncated));
             let _ = split_message(&bytes[..n]);
         }
         let header = Header::parse(&bytes[..end]).unwrap();
         assert_eq!(header.fields.len(), 5);
-        assert_eq!(Header::parse(bytes), Err(ParseError::Trailing));
+        assert_eq!(Header::parse(bytes), Err(Error::Trailing));
         let line2 = SIMPLE.find("To:").unwrap();
         let (header, body) = split_message(&bytes[..line2]).unwrap();
         assert_eq!((header.fields.len(), body.len()), (1, 0));
@@ -2263,7 +2245,7 @@ mod tests {
         for (b, e) in cases {
             assert_eq!(
                 Header::parse(b),
-                Err(ParseError::Header(e)),
+                Err(e),
                 "{:?}",
                 String::from_utf8_lossy(b)
             );
@@ -2272,7 +2254,7 @@ mod tests {
         let many = "A: b\r\n".repeat(MAX_FIELDS + 1) + "\r\n";
         assert_eq!(
             Header::parse(many.as_bytes()),
-            Err(ParseError::Header(Error::TooManyFields))
+            Err(Error::TooManyFields)
         );
         let enough = "A: b\r\n".repeat(MAX_FIELDS) + "\r\n";
         assert_eq!(
@@ -2281,7 +2263,7 @@ mod tests {
         );
         // No blank line within the limit.
         let big = format!("A: {}", "b".repeat(MAX_HEADER_BYTES));
-        assert_eq!(Header::parse(big.as_bytes()), Err(ParseError::Header(Error::TooLarge)));
+        assert_eq!(Header::parse(big.as_bytes()), Err(Error::TooLarge));
         assert_eq!(split_message(big.as_bytes()).map(|_| ()), Err(Error::TooLarge));
         // A blank line that ends exactly at the limit.
         let fits = format!("A: {}\r\n\r\n", "b".repeat(MAX_HEADER_BYTES - 7));
@@ -2294,12 +2276,12 @@ mod tests {
         );
         assert_eq!(
             Header::parse(fits.as_bytes()),
-            Err(ParseError::Header(Error::UnsupportedForm))
+            Err(Error::UnsupportedForm)
         );
         let over = format!("A: {}\r\n\r\n", "b".repeat(MAX_HEADER_BYTES - 6));
         assert_eq!(
             Header::parse(over.as_bytes()),
-            Err(ParseError::Header(Error::TooLarge))
+            Err(Error::TooLarge)
         );
         // An empty header section, and a message with no header at all.
         assert_eq!(split_message(b"\r\nbody").unwrap(), (Header::default(), &b"body"[..]));
@@ -3120,7 +3102,7 @@ mod tests {
         assert!(split_message(header.as_bytes()).is_ok());
         assert_eq!(
             Header::parse(header.as_bytes()),
-            Err(ParseError::Header(Error::UnsupportedForm))
+            Err(Error::UnsupportedForm)
         );
         assert_eq!(
             MessageId::parse(b"<\"a b\"@example.test>"),

@@ -5,8 +5,8 @@ use fictionet::stdlib::codec::{
     Decode, Fail, Step, Stream, Wire, contract, test_support::decode_all,
 };
 use fictionet::stdlib::ipp::{
-    Attribute, Error, Head, HeadError, Header, MAX_DOCUMENT, MAX_FIELD, MAX_HEAD, Message,
-    ParseError, Value, tag,
+    Attribute, Error, FrameError, Head, Header, MAX_DOCUMENT, MAX_FIELD, MAX_HEAD, Message,
+    Value, tag,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -20,33 +20,37 @@ fuzz_target!(|data: &[u8]| {
         Ok(message) => {
             assert_eq!((items, failure), (vec![Ok(Header::from(message))], None));
         }
-        Err(ParseError::DocumentTooLong) => {
+        Err(Error::DocumentTooLong) => {
             let Ok(Step::Item(Ok(header), used)) = Head::new().decode(data, false) else {
                 panic!("document limit without a complete head");
             };
             assert!(data.len() - used > MAX_DOCUMENT);
             assert_eq!((items, failure), (vec![Ok(header)], None));
         }
-        Err(ParseError::Truncated) => {
+        Err(Error::Truncated) => {
             assert!(items.is_empty());
             assert_eq!(
                 failure,
                 (!data.is_empty()).then_some(Fail::Truncated { unread: data.len() })
             );
         }
-        Err(ParseError::Head(error @ (Error::Length(_) | Error::TooLong))) => {
+        Err(Error::Trailing) => panic!("a message includes its document"),
+        Err(Error::Length(n)) => {
             assert!(items.is_empty());
-            assert_eq!(failure, Some(Fail::Protocol(error)));
+            assert_eq!(failure, Some(Fail::Protocol(FrameError::Length(n))));
         }
-        Err(ParseError::Head(error)) => {
+        Err(Error::TooLong) => {
+            assert!(items.is_empty());
+            assert_eq!(failure, Some(Fail::Protocol(FrameError::TooLong)));
+        }
+        Err(error) => {
             let fixed = data.first_chunk::<8>().unwrap();
             let request_id = u32::from_be_bytes([fixed[4], fixed[5], fixed[6], fixed[7]]);
             assert_eq!(
                 (items, failure),
-                (vec![Err(HeadError { request_id, error })], None)
+                (vec![Err(Error::BadRequest { request_id, error: Box::new(error) })], None)
             );
         }
-        Err(ParseError::Trailing) => panic!("a message includes its document"),
     }
     let mut stream = Stream::new(Head::new());
     let _ = stream.push(data);
@@ -61,7 +65,7 @@ fuzz_target!(|data: &[u8]| {
                 contract::check_wire::<Header>(&b);
                 header.request_id
             }
-            Some(Ok(Err(error))) => error.request_id,
+            Some(Ok(Err(Error::BadRequest { request_id, .. }))) => request_id,
             _ => {
                 let fixed = stream.unread().first_chunk::<8>().unwrap();
                 u32::from_be_bytes([fixed[4], fixed[5], fixed[6], fixed[7]])

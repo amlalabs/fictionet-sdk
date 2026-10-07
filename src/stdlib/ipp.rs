@@ -664,7 +664,7 @@ impl Value {
 }
 
 /// Why IPP bytes or a value are refused.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Error {
     /// The value cannot be written without changing it.
     Unwritable,
@@ -698,6 +698,21 @@ pub enum Error {
     /// Two attributes in one group have the same name. RFC 8011 calls
     /// such a group malformed and recommends refusing it.
     Duplicate,
+    /// The input ends before the end-of-attributes tag.
+    Truncated,
+    /// Bytes follow the end-of-attributes tag when reading a [`Header`].
+    Trailing,
+    /// A [`Message`] document is longer than [`MAX_DOCUMENT`].
+    DocumentTooLong,
+    /// A complete head's attributes were refused. [`Head`] gives this as
+    /// an item, with the request ID to echo in a
+    /// [`status::CLIENT_ERROR_BAD_REQUEST`] response.
+    BadRequest {
+        /// The ID of the request whose head was refused.
+        request_id: u32,
+        /// Why the attributes were refused.
+        error: Box<Error>,
+    },
 }
 
 impl std::fmt::Display for Error {
@@ -714,11 +729,49 @@ impl std::fmt::Display for Error {
             Error::Collection => f.write_str("a collection is malformed"),
             Error::TooDeep => write!(f, "collections nest deeper than {MAX_DEPTH}"),
             Error::Duplicate => f.write_str("two attributes in one group have the same name"),
+            Error::Truncated => f.write_str("IPP head ended early"),
+            Error::Trailing => f.write_str("bytes follow the IPP head"),
+            Error::DocumentTooLong => write!(f, "document exceeds {MAX_DOCUMENT} bytes"),
+            Error::BadRequest { request_id, error } => write!(f, "IPP request {request_id}: {error}"),
         }
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::BadRequest { error, .. } => Some(&**error),
+            _ => None,
+        }
+    }
+}
+
+/// Why [`Head`] cannot go on: the attribute section's framing is lost.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FrameError {
+    /// The attribute section runs past the head limit.
+    TooLong,
+    /// A name or value length field is above [`MAX_FIELD`], so it is
+    /// negative.
+    Length(u16),
+}
+
+impl std::fmt::Display for FrameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Error::from(*self).fmt(f)
+    }
+}
+
+impl std::error::Error for FrameError {}
+
+impl From<FrameError> for Error {
+    fn from(e: FrameError) -> Error {
+        match e {
+            FrameError::TooLong => Error::TooLong,
+            FrameError::Length(n) => Error::Length(n),
+        }
+    }
+}
 
 impl Message {
     /// A request for `operation`, IPP 1.1, with the two operation
@@ -827,31 +880,6 @@ impl From<Message> for Header {
     }
 }
 
-/// Why bytes do not contain one complete IPP head or message.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ParseError {
-    /// The head was refused.
-    Head(Error),
-    /// The input ends before the end-of-attributes tag.
-    Truncated,
-    /// Bytes follow the end-of-attributes tag when reading a [`Header`].
-    Trailing,
-    /// A [`Message`] document is longer than [`MAX_DOCUMENT`].
-    DocumentTooLong,
-}
-
-impl core::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Head(e) => e.fmt(f),
-            Self::Truncated => f.write_str("IPP head ended early"),
-            Self::Trailing => f.write_str("bytes follow the IPP head"),
-            Self::DocumentTooLong => write!(f, "document exceeds {MAX_DOCUMENT} bytes"),
-        }
-    }
-}
-impl core::error::Error for ParseError {}
-
 impl Header {
     /// Attaches document bytes to this head. Writing the returned message
     /// checks the document against [`MAX_DOCUMENT`].
@@ -867,21 +895,19 @@ impl Header {
 }
 
 impl Wire for Message {
-    type ParseError = ParseError;
+    type ParseError = Error;
     type WriteError = Error;
 
     /// Reads a complete HTTP body: the head and all following document
     /// bytes. Refuses incomplete or invalid heads, heads over [`MAX_HEAD`],
     /// and documents over [`MAX_DOCUMENT`].
-    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
-        let end = scan_head(bytes, &mut 0, MAX_HEAD)
-            .map_err(ParseError::Head)?
-            .ok_or(ParseError::Truncated)?;
-        let (bytes, data) = bytes.split_at_checked(end).ok_or(ParseError::Truncated)?;
-        let (fixed, body) = bytes.split_first_chunk().ok_or(ParseError::Truncated)?;
-        let header = head(fixed, body).map_err(ParseError::Head)?;
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        let end = scan_head(bytes, &mut 0, MAX_HEAD)?.ok_or(Error::Truncated)?;
+        let (bytes, data) = bytes.split_at_checked(end).ok_or(Error::Truncated)?;
+        let (fixed, body) = bytes.split_first_chunk().ok_or(Error::Truncated)?;
+        let header = head(fixed, body)?;
         if data.len() > MAX_DOCUMENT {
-            return Err(ParseError::DocumentTooLong);
+            return Err(Error::DocumentTooLong);
         }
         Ok(header.with_document(data.to_vec()))
     }
@@ -900,21 +926,19 @@ impl Wire for Message {
 }
 
 impl Wire for Header {
-    type ParseError = ParseError;
+    type ParseError = Error;
     type WriteError = Error;
 
     /// Reads one head through its end tag. Refuses trailing document bytes,
     /// incomplete records, negative lengths, invalid attributes, duplicate
     /// names, oversized heads, and collections deeper than [`MAX_DEPTH`].
-    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
-        let end = scan_head(bytes, &mut 0, MAX_HEAD)
-            .map_err(ParseError::Head)?
-            .ok_or(ParseError::Truncated)?;
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        let end = scan_head(bytes, &mut 0, MAX_HEAD)?.ok_or(Error::Truncated)?;
         if end != bytes.len() {
-            return Err(ParseError::Trailing);
+            return Err(Error::Trailing);
         }
-        let (fixed, body) = bytes.split_first_chunk().ok_or(ParseError::Truncated)?;
-        head(fixed, body).map_err(ParseError::Head)
+        let (fixed, body) = bytes.split_first_chunk().ok_or(Error::Truncated)?;
+        head(fixed, body)
     }
 
     /// Appends a complete head. Refuses invalid tags, names, empty value
@@ -1096,22 +1120,6 @@ fn write_value(out: &mut Vec<u8>, name: &[u8], v: &Value, depth: usize) -> Resul
     }
 }
 
-/// A refused complete head, with the request ID needed for an error reply.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HeadError {
-    /// Echo this ID in a client-error-bad-request response.
-    pub request_id: u32,
-    /// Why the attributes were refused.
-    pub error: Error,
-}
-
-impl core::fmt::Display for HeadError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "IPP request {}: {}", self.request_id, self.error)
-    }
-}
-impl core::error::Error for HeadError {}
-
 /// Reads one IPP head item, then returns [`Step::End`] unconditionally.
 ///
 /// All document bytes remain unread for [`fictionet::stdlib::codec::Stream::swap`]
@@ -1122,7 +1130,7 @@ impl core::error::Error for HeadError {}
 /// Incomplete heads return [`Step::Need`], so the stream reports truncation
 /// at EOF. Empty input at EOF is a clean end with no item. Invalid length
 /// fields and over-limit heads end the stream. Attribute errors, including
-/// over-long names, are [`HeadError`] items carrying the request ID; the
+/// over-long names, are [`Error::BadRequest`] items carrying the request ID; the
 /// document boundary remains known. No input bytes are retained.
 ///
 /// After a framing failure or truncation, no head bytes have been consumed.
@@ -1130,7 +1138,7 @@ impl core::error::Error for HeadError {}
 /// [`fictionet::stdlib::codec::Stream::unread`] hold the request ID in big-endian order.
 /// Echo that ID in a [`status::CLIENT_ERROR_BAD_REQUEST`] response, as
 /// RFC 8011 section 4.1.2 requires. For a complete head, use the request ID
-/// in the [`Header`] or [`HeadError`] item instead.
+/// in the [`Header`] or [`Error::BadRequest`] item instead.
 ///
 /// ```
 /// use fictionet::stdlib::{codec::{Collect, Stream, Wire, finish, pump}, ipp::{Head, MAX_DOCUMENT}};
@@ -1195,15 +1203,15 @@ impl Default for Head {
 }
 
 impl Decode for Head {
-    type Item = Result<Header, HeadError>;
-    type Error = Error;
+    type Item = Result<Header, Error>;
+    type Error = FrameError;
     const NAME: &'static str = "IPP";
 
     fn capacity(&self) -> usize {
         self.head_limit
     }
 
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Self::Item>, Error> {
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Self::Item>, FrameError> {
         if self.done {
             return Ok(Step::End);
         }
@@ -1218,7 +1226,7 @@ impl Decode for Head {
         };
         let request_id = u32::from_be_bytes([fixed[4], fixed[5], fixed[6], fixed[7]]);
         self.done = true;
-        let item = head(fixed, body).map_err(|error| HeadError { request_id, error });
+        let item = head(fixed, body).map_err(|error| Error::BadRequest { request_id, error: Box::new(error) });
         Ok(Step::Item(item, end))
     }
 }
@@ -1226,7 +1234,7 @@ impl Decode for Head {
 // Only the scan cursor survives Need. Every complete record is visited once.
 // Reserve space for the end tag. Name validity is checked by head() once
 // the complete attribute section and its document boundary are known.
-fn scan_head(bytes: &[u8], pos: &mut usize, limit: usize) -> Result<Option<usize>, Error> {
+fn scan_head(bytes: &[u8], pos: &mut usize, limit: usize) -> Result<Option<usize>, FrameError> {
     if bytes.len() < HEADER_LEN {
         return Ok(None);
     }
@@ -1236,38 +1244,38 @@ fn scan_head(bytes: &[u8], pos: &mut usize, limit: usize) -> Result<Option<usize
         let Some(&tag) = bytes.get(p) else {
             return Ok(None);
         };
-        let next = p.checked_add(1).ok_or(Error::TooLong)?;
+        let next = p.checked_add(1).ok_or(FrameError::TooLong)?;
         if next > limit {
-            return Err(Error::TooLong);
+            return Err(FrameError::TooLong);
         }
         if tag == tag::END_OF_ATTRIBUTES {
             return Ok(Some(next));
         }
         if tag < 0x10 {
             if next >= limit {
-                return Err(Error::TooLong);
+                return Err(FrameError::TooLong);
             }
             *pos = next;
             continue;
         }
-        let name_start = p.checked_add(3).ok_or(Error::TooLong)?;
+        let name_start = p.checked_add(3).ok_or(FrameError::TooLong)?;
         if name_start >= limit {
-            return Err(Error::TooLong);
+            return Err(FrameError::TooLong);
         }
         let Some(n) = len_at(bytes, next)? else {
             return Ok(None);
         };
-        let at = name_start.checked_add(n).ok_or(Error::TooLong)?;
-        let value_start = at.checked_add(2).ok_or(Error::TooLong)?;
+        let at = name_start.checked_add(n).ok_or(FrameError::TooLong)?;
+        let value_start = at.checked_add(2).ok_or(FrameError::TooLong)?;
         if value_start >= limit {
-            return Err(Error::TooLong);
+            return Err(FrameError::TooLong);
         }
         let Some(v) = len_at(bytes, at)? else {
             return Ok(None);
         };
-        let end = value_start.checked_add(v).ok_or(Error::TooLong)?;
+        let end = value_start.checked_add(v).ok_or(FrameError::TooLong)?;
         if end >= limit {
-            return Err(Error::TooLong);
+            return Err(FrameError::TooLong);
         }
         if bytes.len() < end {
             return Ok(None);
@@ -1277,11 +1285,11 @@ fn scan_head(bytes: &[u8], pos: &mut usize, limit: usize) -> Result<Option<usize
 }
 
 /// Reads a length field at `i`: `None` if its bytes have not come.
-fn len_at(b: &[u8], i: usize) -> Result<Option<usize>, Error> {
+fn len_at(b: &[u8], i: usize) -> Result<Option<usize>, FrameError> {
     match b.get(i..i.saturating_add(2)) {
         Some(&[hi, lo]) => {
             let n = u16::from_be_bytes([hi, lo]);
-            if usize::from(n) > MAX_FIELD { Err(Error::Length(n)) } else { Ok(Some(usize::from(n))) }
+            if usize::from(n) > MAX_FIELD { Err(FrameError::Length(n)) } else { Ok(Some(usize::from(n))) }
         }
         _ => Ok(None),
     }
@@ -1403,8 +1411,8 @@ fn read_value(t: u8, v: &[u8], records: &mut Records<'_>, depth: usize) -> Resul
 }
 
 fn read_one(t: u8, v: &[u8], records: &mut Records<'_>, depth: usize) -> Result<Value, Error> {
-    let bad = Error::BadValue(t);
-    let s = |b: &[u8]| String::from_utf8(b.to_vec()).map_err(|_| bad);
+    let bad = || Error::BadValue(t);
+    let s = |b: &[u8]| String::from_utf8(b.to_vec()).map_err(|_| bad());
     let i32_at = |i: usize| i32::from_be_bytes([v[i], v[i + 1], v[i + 2], v[i + 3]]);
     Ok(match t {
         tag::MEMBER_ATTR_NAME | tag::END_COLLECTION => return Err(Error::Collection),
@@ -1417,20 +1425,20 @@ fn read_one(t: u8, v: &[u8], records: &mut Records<'_>, depth: usize) -> Result<
         0x10..=0x1f => Value::OutOfBand(t),
         tag::INTEGER | tag::ENUM => {
             if v.len() != 4 {
-                return Err(bad);
+                return Err(bad());
             }
             if t == tag::INTEGER { Value::Integer(i32_at(0)) } else { Value::Enum(i32_at(0)) }
         }
         tag::BOOLEAN => match v {
             [0] => Value::Boolean(false),
             [1] => Value::Boolean(true),
-            _ => return Err(bad),
+            _ => return Err(bad()),
         },
         tag::OCTET_STRING => Value::OctetString(v.to_vec()),
         tag::DATE_TIME => {
             let &[y0, y1, month, day, hour, minutes, seconds, deci_seconds, direction, utc_hours, utc_minutes] = v
             else {
-                return Err(bad);
+                return Err(bad());
             };
             Value::DateTime(DateTime {
                 year: u16::from_be_bytes([y0, y1]),
@@ -1447,21 +1455,21 @@ fn read_one(t: u8, v: &[u8], records: &mut Records<'_>, depth: usize) -> Result<
         }
         tag::RESOLUTION => {
             if v.len() != 9 {
-                return Err(bad);
+                return Err(bad());
             }
             Value::Resolution { cross_feed: i32_at(0), feed: i32_at(4), units: v[8] as i8 }
         }
         tag::RANGE_OF_INTEGER => {
             if v.len() != 8 {
-                return Err(bad);
+                return Err(bad());
             }
             Value::Range { lower: i32_at(0), upper: i32_at(4) }
         }
         tag::TEXT_WITH_LANGUAGE | tag::NAME_WITH_LANGUAGE => {
-            let (language, rest) = counted(v).ok_or(bad)?;
-            let (text, rest) = counted(rest).ok_or(bad)?;
+            let (language, rest) = counted(v).ok_or_else(bad)?;
+            let (text, rest) = counted(rest).ok_or_else(bad)?;
             if !rest.is_empty() {
-                return Err(bad);
+                return Err(bad());
             }
             let (language, text) = (s(language)?, s(text)?);
             if t == tag::TEXT_WITH_LANGUAGE {
@@ -1479,7 +1487,7 @@ fn read_one(t: u8, v: &[u8], records: &mut Records<'_>, depth: usize) -> Result<
         tag::NATURAL_LANGUAGE => Value::NaturalLanguage(s(v)?),
         tag::MIME_MEDIA_TYPE => Value::MimeMediaType(s(v)?),
         tag::EXTENSION => {
-            let (&[a, b, c, d], data) = (v.first_chunk::<4>().ok_or(bad)?, &v[4..]);
+            let (&[a, b, c, d], data) = (v.first_chunk::<4>().ok_or_else(bad)?, &v[4..]);
             Value::Extension { tag: u32::from_be_bytes([a, b, c, d]), data: data.to_vec() }
         }
         _ => Value::Unknown { tag: t, data: v.to_vec() },
@@ -1862,15 +1870,15 @@ mod tests {
     fn errors() {
         let hdr = vec![1, 1, 0, 2, 0, 0, 0, 1];
         let with = |parts: Vec<Vec<u8>>| Message::parse(&[vec![hdr.clone()], parts, vec![vec![3]]].concat().concat());
-        assert_eq!(Message::parse(&hdr), Err(ParseError::Truncated));
-        assert_eq!(Message::parse(&[1, 1]), Err(ParseError::Truncated));
+        assert_eq!(Message::parse(&hdr), Err(Error::Truncated));
+        assert_eq!(Message::parse(&[1, 1]), Err(Error::Truncated));
         assert_eq!(
             with(vec![rec(0x44, "a", b"b")]),
-            Err(ParseError::Head(Error::NoGroup))
+            Err(Error::NoGroup)
         );
         assert_eq!(
             with(vec![vec![1], rec(0x44, "", b"b")]),
-            Err(ParseError::Head(Error::NoAttribute))
+            Err(Error::NoAttribute)
         );
         // A new group forgets the last attribute.
         assert_eq!(
@@ -1880,63 +1888,63 @@ mod tests {
                 vec![2],
                 rec(0x44, "", b"b")
             ]),
-            Err(ParseError::Head(Error::NoAttribute))
+            Err(Error::NoAttribute)
         );
         assert_eq!(
             with(vec![vec![1, 0x44, 0x80, 0x00]]),
-            Err(ParseError::Head(Error::Length(0x8000)))
+            Err(Error::Length(0x8000))
         );
         assert_eq!(
             with(vec![vec![1, 0x44, 0, 1, b'a', 0xff, 0xff]]),
-            Err(ParseError::Head(Error::Length(0xffff)))
+            Err(Error::Length(0xffff))
         );
         assert_eq!(
             with(vec![vec![1], rec(0x21, "a", &[0, 0, 1])]),
-            Err(ParseError::Head(Error::BadValue(0x21)))
+            Err(Error::BadValue(0x21))
         );
         assert_eq!(
             with(vec![vec![1], rec(0x23, "a", &[0, 0, 0, 0, 1])]),
-            Err(ParseError::Head(Error::BadValue(0x23)))
+            Err(Error::BadValue(0x23))
         );
         assert_eq!(
             with(vec![vec![1], rec(0x22, "a", &[2])]),
-            Err(ParseError::Head(Error::BadValue(0x22)))
+            Err(Error::BadValue(0x22))
         );
         assert_eq!(
             with(vec![vec![1], rec(0x22, "a", &[])]),
-            Err(ParseError::Head(Error::BadValue(0x22)))
+            Err(Error::BadValue(0x22))
         );
         assert_eq!(
             with(vec![vec![1], rec(0x31, "a", &[0; 10])]),
-            Err(ParseError::Head(Error::BadValue(0x31)))
+            Err(Error::BadValue(0x31))
         );
         assert_eq!(
             with(vec![vec![1], rec(0x32, "a", &[0; 8])]),
-            Err(ParseError::Head(Error::BadValue(0x32)))
+            Err(Error::BadValue(0x32))
         );
         assert_eq!(
             with(vec![vec![1], rec(0x33, "a", &[0; 9])]),
-            Err(ParseError::Head(Error::BadValue(0x33)))
+            Err(Error::BadValue(0x33))
         );
         assert_eq!(
             with(vec![vec![1], rec(0x35, "a", &[0, 2, b'e'])]),
-            Err(ParseError::Head(Error::BadValue(0x35)))
+            Err(Error::BadValue(0x35))
         );
         assert_eq!(
             with(vec![vec![1], rec(0x35, "a", &[0, 0, 0, 0, 9])]),
-            Err(ParseError::Head(Error::BadValue(0x35)))
+            Err(Error::BadValue(0x35))
         );
         assert_eq!(
             with(vec![vec![1], rec(0x36, "a", &[0, 0])]),
-            Err(ParseError::Head(Error::BadValue(0x36)))
+            Err(Error::BadValue(0x36))
         );
         assert_eq!(
             with(vec![vec![1], rec(0x41, "a", &[0xff])]),
-            Err(ParseError::Head(Error::BadValue(0x41)))
+            Err(Error::BadValue(0x41))
         );
         assert_eq!(
             with(vec![vec![1], rec(0x7f, "a", &[0, 0, 1])]),
-            Err(ParseError::Head(Error::BadValue(0x7f)))
+            Err(Error::BadValue(0x7f))
         );
         assert_eq!(
             with(vec![vec![1], rec(0x44, "a!~", b"")]).map(|_| ()),
@@ -1944,28 +1952,28 @@ mod tests {
         );
         assert_eq!(
             with(vec![vec![1, 0x44, 0, 1, 0xc3, 0, 0]]),
-            Err(ParseError::Head(Error::BadName))
+            Err(Error::BadName)
         );
         // Collection errors.
         assert_eq!(
             with(vec![vec![1], rec(0x37, "a", b"")]),
-            Err(ParseError::Head(Error::Collection))
+            Err(Error::Collection)
         );
         assert_eq!(
             with(vec![vec![1], rec(0x4a, "a", b"m")]),
-            Err(ParseError::Head(Error::Collection))
+            Err(Error::Collection)
         );
         assert_eq!(
             with(vec![vec![1], rec(0x34, "a", b"")]),
-            Err(ParseError::Head(Error::Collection))
+            Err(Error::Collection)
         );
         assert_eq!(
             with(vec![vec![1], rec(0x34, "a", b""), vec![2]]),
-            Err(ParseError::Head(Error::Collection))
+            Err(Error::Collection)
         );
         assert_eq!(
             with(vec![vec![1], rec(0x34, "a", b""), rec(0x21, "", &[0; 4])]),
-            Err(ParseError::Head(Error::Collection))
+            Err(Error::Collection)
         );
         assert_eq!(
             with(vec![
@@ -1974,7 +1982,7 @@ mod tests {
                 rec(0x4a, "", b"m"),
                 rec(0x37, "", b"")
             ]),
-            Err(ParseError::Head(Error::Collection))
+            Err(Error::Collection)
         );
         assert_eq!(
             with(vec![
@@ -1983,15 +1991,15 @@ mod tests {
                 rec(0x4a, "", b"m"),
                 rec(0x4a, "", b"n")
             ]),
-            Err(ParseError::Head(Error::Collection))
+            Err(Error::Collection)
         );
         assert_eq!(
             with(vec![vec![1], rec(0x34, "a", b""), rec(0x4a, "x", b"m")]),
-            Err(ParseError::Head(Error::Collection))
+            Err(Error::Collection)
         );
         assert_eq!(
             with(vec![vec![1], rec(0x34, "a", b""), rec(0x4a, "", &[0xff])]),
-            Err(ParseError::Head(Error::BadName))
+            Err(Error::BadName)
         );
         // The head may not run past MAX_HEAD.
         let mut long = hdr.clone();
@@ -1999,10 +2007,10 @@ mod tests {
         while long.len() < MAX_HEAD {
             long.extend(rec(0x30, "a", &[0; 30000]));
         }
-        assert_eq!(Message::parse(&long), Err(ParseError::Head(Error::TooLong)));
+        assert_eq!(Message::parse(&long), Err(Error::TooLong));
         assert_eq!(
             decode_all(Head::new, &long).1,
-            Some(Fail::Protocol(Error::TooLong))
+            Some(Fail::Protocol(FrameError::TooLong))
         );
         contract::check_decode_with_alloc_limit(Head::new, &long, 2 * MAX_HEAD);
         // Every message shows its error.
@@ -2041,16 +2049,16 @@ mod tests {
         // It needs a member with a value before it, and a value after it.
         assert_eq!(
             with(vec![rec(0x34, "c", b""), rec(0x4a, "", b""), rec(0x44, "", b"a"), rec(0x37, "", b"")]),
-            Err(ParseError::Head(Error::Collection))
+            Err(Error::Collection)
         );
         assert_eq!(
             with(vec![rec(0x34, "c", b""), rec(0x4a, "", b"k"), rec(0x4a, "", b""), rec(0x44, "", b"a")]),
-            Err(ParseError::Head(Error::Collection))
+            Err(Error::Collection)
         );
         for after in [rec(0x37, "", b""), rec(0x4a, "", b"n"), rec(0x4a, "", b"")] {
             assert_eq!(
                 with(vec![rec(0x34, "c", b""), rec(0x4a, "", b"k"), rec(0x44, "", b"a"), rec(0x4a, "", b""), after]),
-                Err(ParseError::Head(Error::Collection))
+                Err(Error::Collection)
             );
         }
     }
@@ -2068,15 +2076,12 @@ mod tests {
         .concat();
         assert_eq!(
             Message::parse(&bytes),
-            Err(ParseError::Head(Error::Duplicate))
+            Err(Error::Duplicate)
         );
         assert_eq!(
             decode_all(Head::new, &bytes),
             (
-                vec![Err(HeadError {
-                    request_id: 1,
-                    error: Error::Duplicate
-                })],
+                vec![Err(Error::BadRequest { request_id: 1, error: Box::new(Error::Duplicate) })],
                 None
             )
         );
@@ -2148,7 +2153,7 @@ mod tests {
         bytes.push(3);
         assert_eq!(
             Message::parse(&bytes),
-            Err(ParseError::Head(Error::TooDeep))
+            Err(Error::TooDeep)
         );
         let mut m = Message::request(operation::PRINT_JOB, 1);
         m.add(tag::JOB_ATTRIBUTES, Attribute::new("deep", nested(MAX_DEPTH + 1)));
@@ -2167,7 +2172,7 @@ mod tests {
         bytes.push(3);
         assert_eq!(
             Message::parse(&bytes),
-            Err(ParseError::Head(Error::TooDeep))
+            Err(Error::TooDeep)
         );
     }
 
@@ -2183,12 +2188,12 @@ mod tests {
                 );
                 assert_eq!(
                     Header::parse(&bytes[..n]),
-                    Err(ParseError::Truncated),
+                    Err(Error::Truncated),
                     "{n} bytes"
                 );
                 assert_eq!(
                     Message::parse(&bytes[..n]),
-                    Err(ParseError::Truncated),
+                    Err(Error::Truncated),
                     "{n} bytes"
                 );
                 assert_eq!(Head::new().decode(&bytes[..n], false), Ok(Step::Need));
@@ -2221,10 +2226,7 @@ mod tests {
         assert_eq!(stream.push(&[0, 1, b'a', 0, 0, 3]), 6);
         assert_eq!(
             stream.next(),
-            Some(Ok(Err(HeadError {
-                request_id: 1,
-                error: Error::NoGroup
-            })))
+            Some(Ok(Err(Error::BadRequest { request_id: 1, error: Box::new(Error::NoGroup) })))
         );
         assert_eq!(stream.next(), None);
     }
@@ -2339,11 +2341,11 @@ mod tests {
             .to_bytes()
             .unwrap();
         bytes.extend_from_slice(&message.data);
-        assert_eq!(Message::parse(&bytes), Err(ParseError::DocumentTooLong));
+        assert_eq!(Message::parse(&bytes), Err(Error::DocumentTooLong));
         bytes[8] = 0;
         assert_eq!(
             Message::parse(&bytes),
-            Err(ParseError::Head(Error::ReservedGroup))
+            Err(Error::ReservedGroup)
         );
     }
 
@@ -2433,7 +2435,7 @@ mod tests {
         let mut stream = Stream::new(Head::new());
         assert_eq!(stream.push(&long), MAX_HEAD);
         assert_eq!(stream.push(&long), 0);
-        assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::TooLong))));
+        assert_eq!(stream.next(), Some(Err(Fail::Protocol(FrameError::TooLong))));
         assert_eq!(stream.next(), None);
         contract::check_decode_with_alloc_limit(Head::new, &long, 2 * MAX_HEAD);
         let mut partial = vec![1, 1, 0, 2, 0, 0, 0, 1, 1];
@@ -2466,10 +2468,7 @@ mod tests {
         assert_eq!(stream.push(&bytes), bytes.len());
         assert_eq!(
             stream.next(),
-            Some(Ok(Err(HeadError {
-                request_id: 42,
-                error: Error::BadValue(0x22)
-            })))
+            Some(Ok(Err(Error::BadRequest { request_id: 42, error: Box::new(Error::BadValue(0x22)) })))
         );
         assert_eq!(stream.next(), None);
     }
@@ -2483,7 +2482,7 @@ mod tests {
         for bad in ["x\0y", "a b", "é", &"a".repeat(MAX_NAME + 1)] {
             assert_eq!(
                 with(vec![rec(0x44, bad, b"k")]),
-                Err(ParseError::Head(Error::BadName)),
+                Err(Error::BadName),
                 "{bad:?}"
             );
             assert_eq!(
@@ -2493,7 +2492,7 @@ mod tests {
                     rec(0x21, "", &[0; 4]),
                     rec(0x37, "", b"")
                 ]),
-                Err(ParseError::Head(Error::BadName)),
+                Err(Error::BadName),
                 "{bad:?}"
             );
             // The writer refuses the attribute or member.
@@ -2573,7 +2572,7 @@ mod tests {
             bytes.push(3);
             assert_eq!(
                 Message::parse(&bytes),
-                Err(ParseError::Head(Error::BadValue(v.tag()))),
+                Err(Error::BadValue(v.tag())),
                 "{v:?}"
             );
             // The writer refuses it.
@@ -2617,15 +2616,12 @@ mod tests {
         .concat();
         assert_eq!(
             Message::parse(&bytes),
-            Err(ParseError::Head(Error::ReservedGroup))
+            Err(Error::ReservedGroup)
         );
         assert_eq!(
             decode_all(Head::new, &bytes),
             (
-                vec![Err(HeadError {
-                    request_id: 1,
-                    error: Error::ReservedGroup
-                })],
+                vec![Err(Error::BadRequest { request_id: 1, error: Box::new(Error::ReservedGroup) })],
                 None
             )
         );
@@ -2672,7 +2668,7 @@ mod tests {
         assert_eq!(stream.push(&bytes[8..]), bytes.len() - 8);
         assert_eq!(
             stream.next(),
-            Some(Err(Fail::Protocol(Error::Length(0xffff))))
+            Some(Err(Fail::Protocol(FrameError::Length(0xffff))))
         );
         let fixed = stream.unread().first_chunk::<8>().unwrap();
         let request_id = u32::from_be_bytes([fixed[4], fixed[5], fixed[6], fixed[7]]);
@@ -2693,33 +2689,37 @@ mod tests {
             Ok(message) => {
                 assert_eq!((items, failure), (vec![Ok(Header::from(message))], None));
             }
-            Err(ParseError::DocumentTooLong) => {
+            Err(Error::DocumentTooLong) => {
                 let end = scan_head(data, &mut 0, MAX_HEAD).unwrap().unwrap();
                 assert_eq!(
                     (items, failure),
                     (vec![Ok(Header::parse(&data[..end]).unwrap())], None)
                 );
             }
-            Err(ParseError::Truncated) => {
+            Err(Error::Truncated) => {
                 assert!(items.is_empty());
                 assert_eq!(
                     failure,
                     (!data.is_empty()).then_some(Fail::Truncated { unread: data.len() })
                 );
             }
-            Err(ParseError::Head(error @ (Error::Length(_) | Error::TooLong))) => {
+            Err(Error::Trailing) => panic!("a message includes its document"),
+            Err(Error::Length(n)) => {
                 assert!(items.is_empty());
-                assert_eq!(failure, Some(Fail::Protocol(error)));
+                assert_eq!(failure, Some(Fail::Protocol(FrameError::Length(n))));
             }
-            Err(ParseError::Head(error)) => {
+            Err(Error::TooLong) => {
+                assert!(items.is_empty());
+                assert_eq!(failure, Some(Fail::Protocol(FrameError::TooLong)));
+            }
+            Err(error) => {
                 let fixed = data.first_chunk::<8>().unwrap();
                 let request_id = u32::from_be_bytes([fixed[4], fixed[5], fixed[6], fixed[7]]);
                 assert_eq!(
                     (items, failure),
-                    (vec![Err(HeadError { request_id, error })], None)
+                    (vec![Err(Error::BadRequest { request_id, error: Box::new(error) })], None)
                 );
             }
-            Err(ParseError::Trailing) => panic!("a message includes its document"),
         }
         let mut stream = Stream::new(Head::new());
         let _ = stream.push(data);
@@ -2729,7 +2729,7 @@ mod tests {
             let expected = u32::from_be_bytes([fixed[4], fixed[5], fixed[6], fixed[7]]);
             let request_id = match item {
                 Some(Ok(Ok(header))) => header.request_id,
-                Some(Ok(Err(error))) => error.request_id,
+                Some(Ok(Err(Error::BadRequest { request_id, .. }))) => request_id,
                 _ => {
                     let fixed = stream.unread().first_chunk::<8>().unwrap();
                     u32::from_be_bytes([fixed[4], fixed[5], fixed[6], fixed[7]])

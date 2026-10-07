@@ -559,14 +559,11 @@ fn ipp_attribute_errors_carry_request_ids_and_bad_lengths_end_once() {
     let bytes = b"\x01\x01\0\x02\0\0\0\x07\0\x03document";
     let make = || ipp::Head::with_limit(64);
     check(make, bytes);
-    let error = ipp::HeadError {
-        request_id: 7,
-        error: ipp::Error::ReservedGroup,
-    };
+    let error = ipp::Error::BadRequest { request_id: 7, error: Box::new(ipp::Error::ReservedGroup) };
     for pattern in [&[][..], &[1], &[3, 7]] {
         assert_eq!(
             read_head_and_body(make(), bytes, pattern, ipp::MAX_DOCUMENT),
-            (Err(error), b"document".to_vec())
+            (Err(error.clone()), b"document".to_vec())
         );
     }
     let bytes = b"\x01\x01\0\x02\0\0\0\x07\x01\x41\0\0\x80\0";
@@ -575,12 +572,12 @@ fn ipp_attribute_errors_carry_request_ids_and_bad_lengths_end_once() {
         ipp::Head::new(),
         bytes,
         false,
-        Fail::Protocol(ipp::Error::Length(0x8000)),
+        Fail::Protocol(ipp::FrameError::Length(0x8000)),
     );
 }
 
 #[test]
-fn ipp_overlong_names_are_head_error_items() {
+fn ipp_overlong_names_are_bad_request_items() {
     let mut bytes = b"\x01\x01\0\x02\0\0\0\x07\x01\x41\x01\0".to_vec();
     let mut stream = Stream::new(ipp::Head::new());
     assert_eq!(stream.push(&bytes), bytes.len());
@@ -590,18 +587,15 @@ fn ipp_overlong_names_are_head_error_items() {
     bytes.extend_from_slice(b"\0\x01x\x03");
     assert_eq!(
         <ipp::Header as Wire>::parse(&bytes),
-        Err(ipp::ParseError::Head(ipp::Error::BadName))
+        Err(ipp::Error::BadName)
     );
     check(ipp::Head::new, &bytes);
     bytes.extend_from_slice(b"document");
-    let error = ipp::HeadError {
-        request_id: 7,
-        error: ipp::Error::BadName,
-    };
+    let error = ipp::Error::BadRequest { request_id: 7, error: Box::new(ipp::Error::BadName) };
     for pattern in [&[][..], &[1], &[3, 7]] {
         assert_eq!(
             read_head_and_body(ipp::Head::new(), &bytes, pattern, ipp::MAX_DOCUMENT),
-            (Err(error), b"document".to_vec())
+            (Err(error.clone()), b"document".to_vec())
         );
     }
 }
@@ -621,7 +615,7 @@ fn ipp_limits_are_refused_from_attribute_headers_and_partial_heads_truncate() {
         ipp::Head::with_limit(64),
         value,
         false,
-        Fail::Protocol(ipp::Error::TooLong),
+        Fail::Protocol(ipp::FrameError::TooLong),
     );
     check(|| ipp::Head::with_limit(64), value);
     let truncated = b"\x01\x01\0\x02\0\0\0\x07\x01\x41\0\x01n\0\x03a";
@@ -637,7 +631,7 @@ fn ipp_limits_are_refused_from_attribute_headers_and_partial_heads_truncate() {
     for end in 0..bytes.len() {
         assert_eq!(
             <ipp::Header as Wire>::parse(&bytes[..end]),
-            Err(ipp::ParseError::Truncated)
+            Err(ipp::Error::Truncated)
         );
     }
 }
@@ -730,13 +724,13 @@ fn wire_parsers_require_exact_units() {
     bytes.push(0);
     assert_eq!(
         <imf::Header as Wire>::parse(&bytes),
-        Err(imf::ParseError::Trailing)
+        Err(imf::Error::Trailing)
     );
     let mut bytes = Wire::to_bytes(&print_head()).unwrap();
     bytes.push(0);
     assert_eq!(
         <ipp::Header as Wire>::parse(&bytes),
-        Err(ipp::ParseError::Trailing)
+        Err(ipp::Error::Trailing)
     );
 }
 
