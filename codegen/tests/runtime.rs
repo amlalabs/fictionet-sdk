@@ -83,3 +83,39 @@ fn group_checks_input_before_reserving() {
         Ok(vec![(); 3])
     );
 }
+
+/// A float with a declared range, and one with a range and a finite null.
+#[derive(Debug, PartialEq)]
+struct Ranged(f64, Option<f32>);
+impl __wire::Codec for Ranged {
+    fn read(r: &mut __wire::Reader<'_>, le: bool) -> Result<Self, Error> {
+        Ok(Self(
+            r.ranged(-1.0, 1.0, le)?,
+            r.nullable_range(9.0, -1.0, 1.0, le)?,
+        ))
+    }
+    fn encode(&self, w: &mut __wire::Writer, le: bool) -> Result<(), Error> {
+        w.ranged(self.0, -1.0, 1.0, le)?;
+        w.nullable_range(&self.1, 9.0, -1.0, 1.0, le)
+    }
+    fn sample(_: &mut __wire::Sampler) -> Result<Self, Error> {
+        Ok(Self(0.5, None))
+    }
+}
+
+#[test]
+fn float_ranges_refuse_nan() {
+    let bytes = |a: f64, b: f32| [&a.to_le_bytes()[..], &b.to_le_bytes()].concat();
+    let parse = |a, b| __wire::parse::<Ranged>(&bytes(a, b), true);
+    assert_eq!(parse(0.5, 9.0), Ok(Ranged(0.5, None)));
+    assert_eq!(parse(0.5, -1.0), Ok(Ranged(0.5, Some(-1.0))));
+    for nan in [f64::NAN, -f64::NAN, f64::from_bits(0x7ff0_0000_0000_0001)] {
+        assert_eq!(parse(nan, 9.0), Err(Error::Value));
+        assert_eq!(parse(0.5, nan as f32), Err(Error::Value));
+        for value in [Ranged(nan, None), Ranged(0.5, Some(nan as f32))] {
+            let mut out = vec![7];
+            assert_eq!(__wire::write(&value, &mut out, true), Err(Error::Value));
+            assert_eq!(out, [7]);
+        }
+    }
+}
