@@ -613,7 +613,7 @@ fn member_event(fcx: &Cx, kind: &'static str, member: String, what: &str) {
 #[derive(Default)]
 struct Members {
     /// Address to port.
-    by_addr: HashMap<IpAddr, usize>,
+    by_addr: BTreeMap<IpAddr, usize>,
     /// Port to address.
     by_port: HashMap<usize, IpAddr>,
     /// The gateway's port.
@@ -690,7 +690,7 @@ impl Members {
             return dropped(fcx, &self.on_drop, &packet, why);
         }
         if floods(subnet, dst) {
-            // Every member but the sender. The gateway gets none of it.
+            // Every member but the sender, in address order. The gateway gets none of it.
             let mut sent = 0;
             for &i in self.by_addr.values() {
                 if i != from {
@@ -955,6 +955,40 @@ mod tests {
             Ok(())
         }))
         .unwrap();
+    }
+
+    #[test]
+    fn lan_floods_in_address_order() {
+        struct Receiver(u8, Arc<Mutex<Vec<u8>>>);
+        impl Interface for Receiver {
+            fn poll_recv(&mut self, _: &Cx, _: &mut std::task::Context<'_>) -> Poll<Result<Packet, crate::RecvError>> {
+                Poll::Pending
+            }
+
+            fn send(&mut self, _: Packet) {
+                lock(&self.1).push(self.0);
+            }
+        }
+
+        crate::block_on(crate::run(|fcx| async move {
+            for _ in 0..128 {
+                let sent = Arc::new(Mutex::new(Vec::new()));
+                let mut members = Members::default();
+                let mut ports = Ports::new(Vec::new());
+                for n in [40, 10, 30, 20, 50] {
+                    members.join(&fcx, &mut ports, Join::Member(
+                        Ipv4Addr::new(10, 0, 0, n).into(), Box::new(Receiver(n, sent.clone())),
+                    ));
+                }
+                members.join(&fcx, &mut ports, Join::Gateway(Box::new(Receiver(99, sent.clone()))));
+                for dst in [[255; 4], [10, 0, 0, 255], [224, 0, 0, 1]] {
+                    members.forward(&fcx, &mut ports, "10.0.0.0/24".parse()?, 2, v4([10, 0, 0, 30], dst));
+                    assert_eq!(*lock(&sent), [10, 20, 40, 50]);
+                    lock(&sent).clear();
+                }
+            }
+            Ok(())
+        })).unwrap();
     }
 
     #[test]
