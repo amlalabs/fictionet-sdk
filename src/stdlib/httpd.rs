@@ -1085,12 +1085,12 @@ pub fn http_date(secs: u64) -> String {
 }
 
 impl serve::Service for Http1 {
-    type Decoder = http1::Requests;
+    type Decoder = http1::RequestEvents;
     type State = ();
     type Error = Infallible;
 
-    fn decoder(&self) -> http1::Requests {
-        http1::Requests::with_limits(self.opts.head)
+    fn decoder(&self) -> http1::RequestEvents {
+        http1::RequestEvents::with_limits(self.opts.head)
     }
 
     fn on_open(&mut self, _: &(), ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
