@@ -828,6 +828,8 @@ impl Server {
     }
     /// Takes one client item when it is the client's turn. The caller sends
     /// the next server handshake unit before calling again.
+    // Not an Iterator: None means "not this side's turn", not the end.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(
         &mut self,
     ) -> Option<Result<Result<ClientMessage, Error>, codec::Fail<FrameError>>> {
@@ -971,6 +973,8 @@ impl Client {
     }
     /// Takes one server item when it is the server's turn. Send the next
     /// client handshake unit before calling again when the turn changes.
+    // Not an Iterator: None means "not this side's turn", not the end.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(
         &mut self,
     ) -> Option<Result<Result<ServerMessage, Error>, codec::Fail<FrameError>>> {
