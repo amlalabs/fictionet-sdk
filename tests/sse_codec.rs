@@ -1,5 +1,5 @@
 use fictionet::stdlib::codec::{
-    Decode, Fail, Lcg, Stream, Wire,
+    Decode, Fail, Lcg, Stream, StreamEvent, Wire,
     contract::{check_decode, check_decode_with_held_limit, check_wire, check_wire_value},
     finish, pump,
     test_support::{chunks, decode_all, mutate, random_chunks},
@@ -133,30 +133,50 @@ fn wire_contracts_and_decoded_round_trips() {
 
 #[test]
 fn raw_proxy_retains_comments_and_rewrites_data() {
+    // A proxy forwards raw lines and skipped bytes, and rewrites data
+    // lines with their original ending. A CR that ends a chunk ends its
+    // line at once, and the LF after it comes back as skipped bytes, so a
+    // rewrite that changed the ending would add a blank line.
     let input = b": ping\r\nevent:message\r\ndata:old\r\nX:no colon normalization\r\n\r\n";
-    let mut stream = Stream::new(RawLines::default());
-    let mut out = Vec::new();
-    for chunk in chunks(input, &[1]) {
-        assert_eq!(stream.push(chunk), chunk.len());
-        while let Some(result) = stream.with_next(|line, raw, _| {
-            if matches!(line, Line::Data(_)) {
-                Line::Data("new".into()).write(&mut out).unwrap();
-            } else {
-                out.extend_from_slice(raw);
+    for sizes in [&[1][..], &[input.len()]] {
+        let mut stream = Stream::new(RawLines::default());
+        let mut out = Vec::new();
+        for chunk in chunks(input, sizes) {
+            assert_eq!(stream.push(chunk), chunk.len());
+            loop {
+                let mut skipped = Vec::new();
+                let result = stream.with_next_observed(
+                    |line, raw, _| (line, raw.to_vec()),
+                    |event| {
+                        if let StreamEvent::Skipped { bytes, .. } = event {
+                            skipped.extend_from_slice(bytes);
+                        }
+                    },
+                );
+                out.extend_from_slice(&skipped);
+                let Some(result) = result else { break };
+                let (line, raw) = result.unwrap();
+                if matches!(line, Line::Data(_)) {
+                    let content = raw.trim_ascii_end();
+                    let mut new = Vec::new();
+                    Line::Data("new".into()).write(&mut new).unwrap();
+                    out.extend_from_slice(new.trim_ascii_end());
+                    out.extend_from_slice(&raw[content.len()..]);
+                } else {
+                    out.extend_from_slice(&raw);
+                }
             }
-        }) {
-            result.unwrap();
         }
+        finish(&mut stream, |_| panic!("all lines ended")).unwrap();
+        assert_eq!(
+            out, b": ping\r\nevent:message\r\ndata:new\r\nX:no colon normalization\r\n\r\n",
+            "{sizes:?}"
+        );
+        assert_eq!(
+            decode_all(Events::default, &out),
+            (vec![Event::new("new")], None)
+        );
     }
-    finish(&mut stream, |_| panic!("all lines ended")).unwrap();
-    assert_eq!(
-        out,
-        b": ping\r\nevent:message\r\ndata:new\nX:no colon normalization\r\n\r\n"
-    );
-    assert_eq!(
-        decode_all(Events::default, &out),
-        (vec![Event::new("new")], None)
-    );
 }
 
 #[test]

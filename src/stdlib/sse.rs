@@ -13,7 +13,10 @@
 //! [`Line`] keeps comment text and ignored fields for recorders and proxies.
 //! Its writer normalizes field spacing and endings. To retain the original
 //! spelling, use `codec::Stream::with_next` with [`RawLines`]; the initial
-//! BOM is reported as skipped bytes. An event assembler consumes earlier
+//! BOM is reported as skipped bytes. A CR that ends the input so far ends
+//! its line at once, so an LF that arrives next is reported as skipped
+//! bytes too. A proxy that forwards skipped bytes should keep a rewritten
+//! line's original ending. An event assembler consumes earlier
 //! lines, so its final dispatch step does not carry the whole wire block.
 //!
 //! For MCP's streamable HTTP transport, feed the body of each
