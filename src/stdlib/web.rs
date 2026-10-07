@@ -507,7 +507,7 @@
 //!
 //! Every part of `Sites` is built from public stdlib items, so a world can
 //! also write any part itself. [`Sites::into_net`] gives the
-//! [`Net`](crate::stdlib::net::Net) before it starts, to add hosts with
+//! [`Net`] before it starts, to add hosts with
 //! other services next to the websites. To change how `Sites` turns a site
 //! into a host, copy this file into your crate and edit
 //! [`Site::into_host`]. The copy compiles there as it is, with the same
