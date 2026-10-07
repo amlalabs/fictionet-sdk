@@ -36,7 +36,7 @@ where
         let fut = f(cx);
         async move {
             fut.await;
-            Err::<(), fictionet::Error>("done".into())
+            Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
         }
     }));
     assert_eq!(result.unwrap_err().to_string(), "done", "the world failed on its own");

@@ -128,7 +128,7 @@ pub async fn fetch(https: bool, version: Version) -> Result<Fetched> {
         Ok(()) => return Err(fictionet::Error::msg("the world ended before the request")),
     }
     let fetched = fetched.lock().unwrap().take();
-    fetched.ok_or_else(|| "no response".into())
+    fetched.ok_or_else(|| fictionet::Error::msg("no response"))
 }
 
 /// The page's entry point: [`fetch`] as a JavaScript promise of the
@@ -194,7 +194,7 @@ async fn lookup(cx: &Cx, udp: &udp::Endpoint, name: &str) -> Result<Ipv4Addr> {
             RData::A(a) => Some(a.0),
             _ => None,
         })
-        .ok_or_else(|| format!("no A record for {name}").into())
+        .ok_or_else(|| fictionet::Error::msg(format!("no A record for {name}")))
 }
 
 /// The run's CA, and a certificate for [`NAME`] that it signed.
