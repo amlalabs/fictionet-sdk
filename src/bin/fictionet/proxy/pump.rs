@@ -1,77 +1,18 @@
 //! Moving bytes between a client's TCP socket and a connection into the
 //! world.
 
+use std::future::Future;
 use std::io;
-use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::Poll;
 use std::time::Duration;
 
-use fictionet::Cx;
 use fictionet::stdlib::tcp::TcpConnection;
-use fictionet::stdlib::{ConnError, Connection};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use fictionet::tokio::Compat;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-
-use std::future::Future;
 
 /// Bytes are copied in pieces of up to this many, each way.
 const PIECE: usize = 64 * 1024;
-
-/// A connection into the world, with tokio's `AsyncRead` and `AsyncWrite`.
-/// The same as `fictionet::tokio::Compat`, which needs the crate's `tokio`
-/// feature.
-pub(crate) struct WorldStream {
-    conn: TcpConnection,
-    cx: Cx,
-}
-
-impl WorldStream {
-    pub(crate) fn new(conn: TcpConnection, cx: &Cx) -> WorldStream {
-        WorldStream { conn, cx: cx.clone() }
-    }
-}
-
-fn to_io(e: ConnError) -> io::Error {
-    let kind = match e {
-        ConnError::Cancelled => io::ErrorKind::Interrupted,
-        ConnError::Refused => io::ErrorKind::ConnectionRefused,
-        ConnError::Reset => io::ErrorKind::ConnectionReset,
-        ConnError::TimedOut => io::ErrorKind::TimedOut,
-        ConnError::Closed => io::ErrorKind::BrokenPipe,
-        ConnError::Broken => io::ErrorKind::InvalidData,
-    };
-    io::Error::new(kind, e)
-}
-
-impl AsyncRead for WorldStream {
-    fn poll_read(self: Pin<&mut Self>, task: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        match this.conn.poll_read(&this.cx, task, buf.initialize_unfilled()) {
-            Poll::Ready(Ok(n)) => {
-                buf.advance(n);
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(to_io(e))),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl AsyncWrite for WorldStream {
-    fn poll_write(self: Pin<&mut Self>, task: &mut Context<'_>, data: &[u8]) -> Poll<io::Result<usize>> {
-        let this = self.get_mut();
-        this.conn.poll_write(&this.cx, task, data).map_err(to_io)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _task: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, task: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        this.conn.poll_shutdown(&this.cx, task).map_err(to_io)
-    }
-}
 
 /// Bytes moved, each way.
 #[derive(Clone, Copy, Debug, Default)]
@@ -87,7 +28,7 @@ pub(crate) struct Moved {
 /// on the world's side, or one on the client's side other than a reset.
 /// Clients often close with a reset, such as curl with TLS data it did not
 /// read, so that is an ordinary end.
-pub(crate) async fn tunnel(client: &mut TcpStream, world: &mut WorldStream) -> (Moved, Option<String>) {
+pub(crate) async fn tunnel(client: &mut TcpStream, world: &mut Compat<TcpConnection>) -> (Moved, Option<String>) {
     let (mut cr, mut cw) = client.split();
     let (mut wr, mut ww) = tokio::io::split(world);
     let mut moved = Moved::default();

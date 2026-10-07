@@ -438,9 +438,6 @@ pub(crate) fn parse_attach(args: &[String]) -> Result<Parsed, String> {
             let f = TapFlags { given: &given, vm, netns, ip_addr, gateway, dns, ip_addr_v6, gateway_v6, dns_v6 };
             return parse_tap(world, name, f, mtu, ready_file, world_wait);
         }
-        Some(other @ ("wireguard" | "tailscale")) => {
-            return Err(format!("--type {other} is not implemented yet; tun, tap, https_proxy and socks5 are"));
-        }
         Some(other) => return Err(format!("unknown --type {other:?}")),
         None => return Err("--type is required: tun, tap, https_proxy or socks5".into()),
     };
@@ -911,7 +908,7 @@ mod tests {
         let e = parse_attach(&args(&FULL.replace("unix:/run/w.sock", "tls:example.com:7000"))).unwrap_err();
         assert!(e.contains("expected unix:<path>"), "{e}");
         let e = parse_attach(&args(&FULL.replace("--type tun", "--type wireguard"))).unwrap_err();
-        assert!(e.contains("tun, tap, https_proxy and socks5 are"), "{e}");
+        assert!(e.contains("unknown --type \"wireguard\""), "{e}");
         let long = "x".repeat(256);
         let e = parse_attach(&args(&FULL.replace("--name abc", &format!("--name {long}")))).unwrap_err();
         assert!(e.contains("1 to 255"));

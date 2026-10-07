@@ -1,5 +1,6 @@
 use fictionet::observe::{Decoded, KeyLine, Layer, Observed, Place, Placement, Present, Protocol};
 use fictionet::stdlib::codec::{Decode, Fail, Step};
+use fictionet::stdlib::http1;
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::fmt::Write;
@@ -374,48 +375,11 @@ impl Decode for Http1 {
             let Some(head) = input.get(..end.saturating_add(4)) else {
                 return Ok(Step::Need);
             };
-            let mut headers = [httparse::EMPTY_HEADER; 64];
             let mut methods = self.methods.lock().unwrap_or_else(|e| e.into_inner());
-            let (line, kind, body) = if head.starts_with(b"HTTP/") {
-                let mut r = httparse::Response::new(&mut headers);
-                if !matches!(r.parse(head), Ok(httparse::Status::Complete(_))) {
-                    return Ok(Step::Skip(head.len()));
-                }
-                let code = r.code.unwrap_or(0);
-                let line = format!(
-                    "HTTP/1.{} {code} {}",
-                    r.version.unwrap_or(1),
-                    r.reason.unwrap_or("")
-                );
-                let method = if (100..200).contains(&code) {
-                    None
-                } else {
-                    methods.0.pop_front()
-                };
-                let body = match method {
-                    Some(Method::Connect) if (200..300).contains(&code) => Http1State::Tunnel,
-                    Some(Method::Head) => Http1State::Head,
-                    _ => body_kind(
-                        r.headers,
-                        (100..200).contains(&code) || code == 204 || code == 304,
-                        true,
-                    ),
-                };
-                (line, "response", body)
-            } else {
-                let mut r = httparse::Request::new(&mut headers);
-                if !matches!(r.parse(head), Ok(httparse::Status::Complete(_))) {
-                    return Ok(Step::Skip(head.len()));
-                }
-                let line = format!(
-                    "{} {} HTTP/1.{}",
-                    r.method.unwrap_or("?"),
-                    r.path.unwrap_or("?"),
-                    r.version.unwrap_or(1)
-                );
-                methods.push(r.method.unwrap_or("?"));
-                (line, "request", body_kind(r.headers, false, false))
+            let Some((line, kind, body)) = read_head(head, &mut methods) else {
+                return Ok(Step::Skip(head.len()));
             };
+            drop(methods);
             self.state = body;
             let mut layer = Layer::new("Hypertext Transfer Protocol", 0, (0, head.len()));
             layer.summary.clone_from(&line);
@@ -953,7 +917,7 @@ enum Http1State {
     Tunnel,
 }
 
-fn body_kind(headers: &[httparse::Header<'_>], none: bool, response: bool) -> Http1State {
+fn body_kind(headers: &[http1::Header], none: bool, response: bool) -> Http1State {
     if none {
         return Http1State::Head;
     }
@@ -961,7 +925,7 @@ fn body_kind(headers: &[httparse::Header<'_>], none: bool, response: bool) -> Ht
         headers
             .iter()
             .find(|h| h.name.eq_ignore_ascii_case(name))
-            .map(|h| String::from_utf8_lossy(h.value).to_string())
+            .map(|h| String::from_utf8_lossy(&h.value).to_string())
     };
     if get("transfer-encoding").is_some_and(|v| v.to_ascii_lowercase().contains("chunked")) {
         return Http1State::Chunked {
@@ -979,6 +943,30 @@ fn body_kind(headers: &[httparse::Header<'_>], none: bool, response: bool) -> Ht
         },
         None if response => Http1State::ToClose,
         None => Http1State::Head,
+    }
+}
+
+/// Reads a request or response head: its first line, which it is, and
+/// how its body is framed. The head is read by its syntax alone, with
+/// [`http1`]'s lenient reader: a passive observer must not refuse a head
+/// the endpoints took.
+fn read_head(head: &[u8], methods: &mut Methods) -> Option<(String, &'static str, Http1State)> {
+    if head.starts_with(b"HTTP/") {
+        let (r, _) = http1::ResponseHead::parse_lenient(head).ok().flatten()?;
+        let code = r.status;
+        let line = format!("{} {code} {}", r.version.as_str(), String::from_utf8_lossy(&r.reason));
+        let method = if (100..200).contains(&code) { None } else { methods.0.pop_front() };
+        let body = match method {
+            Some(Method::Connect) if (200..300).contains(&code) => Http1State::Tunnel,
+            Some(Method::Head) => Http1State::Head,
+            _ => body_kind(&r.headers, (100..200).contains(&code) || code == 204 || code == 304, true),
+        };
+        Some((line, "response", body))
+    } else {
+        let (r, _) = http1::RequestHead::parse_lenient(head).ok().flatten()?;
+        let line = format!("{} {} {}", r.method, r.target, r.version.as_str());
+        methods.push(&r.method);
+        Some((line, "request", body_kind(&r.headers, false, false)))
     }
 }
 

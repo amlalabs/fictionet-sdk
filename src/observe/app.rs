@@ -11,6 +11,8 @@
 
 use fictionet::stdlib::http2;
 
+use super::http2 as capture;
+
 use super::decode::Decoded;
 
 use super::protocols;
@@ -57,7 +59,7 @@ fn register_http(registry: &mut Registry) {
         MAX_BUFFER + 1 + 65_535,
         |_| protocols::Http1::pair(),
     );
-    let budget = http2::CaptureBudget::default();
+    let budget = capture::CaptureBudget::default();
     registry.register_with_buffer(
         "http2",
         |s| {
@@ -71,8 +73,8 @@ fn register_http(registry: &mut Registry) {
                 Match::No
             }
         },
-        http2::CAPTURE_READ_AHEAD,
-        move |_| http2::Capture::pair_in(&budget),
+        capture::CAPTURE_READ_AHEAD,
+        move |_| capture::Capture::pair_in(&budget),
     );
 }
 
@@ -282,7 +284,7 @@ mod tests {
     /// direction is not decoded further.
     #[test]
     fn lost_bytes_end_http2_decoding() {
-        let mut session = Observed::new(http2::Capture::default());
+        let mut session = Observed::new(capture::Capture::default());
         let mut packet = Decoded::default();
         session.data(&frame(1, 0x4, 1, &hex(X_OLD)), Place::default(), &mut packet);
         assert!(has(&packet, "x", "old"));

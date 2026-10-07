@@ -173,6 +173,8 @@ fn decode_hello(body: &[u8]) -> Result<Hello, DecodeError> {
     Ok(Hello { version, mtu, kind, name })
 }
 
+pub mod proxy;
+
 /// Unix `SOCK_SEQPACKET` sockets: the local transport.
 pub mod unix {
     use super::*;

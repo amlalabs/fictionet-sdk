@@ -15,7 +15,6 @@ fictionet = { path = "..", features = ["tokio"] }
 http = "1"
 http-body-util = "0.1"
 hyper = { version = "1", default-features = false }
-httparse = "1.10"
 libc = "0.2"
 libfuzzer-sys = "0.4"
 rcgen = "0.13"

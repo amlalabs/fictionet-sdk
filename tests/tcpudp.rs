@@ -742,7 +742,6 @@ fn tcp_syn(src: IpAddr, sport: u16, dst: IpAddr, dport: u16) -> Packet {
 
 /// A connection handed to tokio code with `into_tokio`, served from tokio
 /// tasks on other threads while a tokio runtime polls the run.
-#[cfg(feature = "tokio")]
 #[test]
 fn tcp_through_tokio_io() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

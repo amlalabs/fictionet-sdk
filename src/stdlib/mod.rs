@@ -177,8 +177,9 @@
 //! - **Service**: a type that implements [`serve::Service`], ready for a
 //!   [`net::Host`] port.
 //! - **Observe**: how the dashboard and captures show the protocol.
-//!   `built in` means the default observe registry decodes it. `Present`
-//!   means the module has a presenter you register yourself.
+//!   `built in` means the default observe registry decodes it, with a
+//!   presenter in [`observe`](crate::observe). Presenters live there, not
+//!   in the protocol's module, so a copied module carries no observe code.
 //! - **Fuzz**: the module has a fuzz target in `fuzz/`, which CI runs.
 //! - **Copy**: the copy-and-own fixture compiles the file as a module of a
 //!   separate crate.
@@ -214,10 +215,10 @@
 //! | [`geneve`] | Geneve tunnel headers and their options. | yes |  |  |  |  | yes | yes |
 //! | [`git_protocol`] | The Git wire protocol: pkt-lines, requests, ref advertisements, negotiation and side-band demultiplexing. | yes | yes |  |  |  | yes | yes |
 //! | [`gre`] | GRE headers, PPTP's included. | yes |  |  |  |  | yes | yes |
-//! | [`grpc`] | gRPC over HTTP/2: message framing, status codes, timeouts and the header rules a server follows. | yes | yes |  |  | `Present` | yes | yes |
+//! | [`grpc`] | gRPC over HTTP/2: message framing, status codes, timeouts and the header rules a server follows. | yes | yes |  |  |  | yes | yes |
 //! | [`hpack`] | HPACK header compression for HTTP/2: fields, blocks, the dynamic table and an encoder. | yes |  |  |  |  | yes | yes |
 //! | [`http1`] | HTTP/1.0 and 1.1 request and response heads and bodies, with RFC 9112 framing. | yes | yes |  |  | built in | yes | yes |
-//! | [`http2`] | HTTP/2 frames, per-direction connection state, and the capture decoder the dashboard shows. | yes | yes | `Connection` |  | built in | yes | yes |
+//! | [`http2`] | HTTP/2 frames, per-direction connection state, and the header block reader the dashboard's capture decoder uses. | yes | yes | `Connection` |  | built in | yes | yes |
 //! | [`http3`] | HTTP/3 frames, stream headers, field sections and connection state. | yes | yes | `Connection` |  |  | yes | yes |
 //! | [`httpd`] | HTTP as a service: a router with byte-body handlers, an adapter for any tower service, virtual hosts, and the `Site` a `Net` host serves. |  |  |  | `Http1` |  |  | yes |
 //! | [`huffman`] | The RFC 7541 Huffman code that HPACK and QPACK share. | yes |  |  |  |  | yes | yes |

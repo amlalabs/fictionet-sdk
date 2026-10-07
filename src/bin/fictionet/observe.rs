@@ -131,9 +131,14 @@ pub(crate) fn main(args: &[String]) -> i32 {
         } else {
             out.write_all(&value.bytes).and_then(|()| out.write_all(b"\n"))
         };
-        if written.and_then(|()| out.flush()).is_err() {
-            // stdout closed, such as a pipe into head: stop quietly.
-            return 0;
+        if let Err(e) = written.and_then(|()| out.flush()) {
+            // stdout closed, such as a pipe into head: stop quietly. Any
+            // other error, such as a full disk, is a failure.
+            if e.kind() == std::io::ErrorKind::BrokenPipe {
+                return 0;
+            }
+            eprintln!("fictionet observe: writing to stdout: {e}");
+            return 1;
         }
         if value.end {
             return if !value.binary && value.bytes.starts_with(br#"{"error":"#) { 1 } else { 0 };

@@ -74,6 +74,13 @@ fn observe_prints_json_lines() {
     assert_eq!(out.status.code(), Some(2));
     let out = Command::new(BIN).args(["observe", "--world", "unix:/nonexistent/world.sock"]).output().unwrap();
     assert_eq!(out.status.code(), Some(1));
+
+    // A full disk is a failure, not a quiet stop as a closed pipe is.
+    if let Ok(full) = std::fs::File::create("/dev/full") {
+        let out = Command::new(BIN).args(["observe", "--world", &world, "world"]).stdout(full).output().unwrap();
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("writing to stdout"), "{out:?}");
+    }
 }
 
 #[test]

@@ -3,19 +3,19 @@
 //! resolver would send it under `tun`.
 //!
 //! This module builds the query and reads the answer. The sending, the
-//! retries and the cache are in [`stack`](super::stack).
+//! retries and the cache are in the `fictionet` binary's stack.
 
 use std::net::{Ipv4Addr, SocketAddr};
 
-use fictionet::stdlib::dns::op::{Message, MessageType, Query, ResponseCode};
-use fictionet::stdlib::dns::rr::{Name, RData, RecordType};
+use crate::stdlib::dns::op::{Message, MessageType, Query, ResponseCode};
+use crate::stdlib::dns::rr::{Name, RData, RecordType};
 
 /// Answers are kept at most this long, whatever their TTL.
-pub(crate) const MAX_TTL: u32 = 60;
+pub const MAX_TTL: u32 = 60;
 
 /// Why a name has no address.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Lookup {
+pub enum Lookup {
     /// NXDOMAIN, or an answer with no `A` record.
     NoSuchName,
     /// The server answered with another error, such as SERVFAIL.
@@ -24,7 +24,7 @@ pub(crate) enum Lookup {
 
 /// A name a client asked for, checked and in the form DNS compares:
 /// lowercase, with no trailing dot.
-pub(crate) fn normalize(host: &str) -> Option<String> {
+pub fn normalize(host: &str) -> Option<String> {
     let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
     if host.is_empty() || host.len() > 253 {
         return None;
@@ -38,7 +38,7 @@ pub(crate) fn normalize(host: &str) -> Option<String> {
 }
 
 /// An `A` query for `name` with ID `id`, recursion desired.
-pub(crate) fn query(name: &str, id: u16) -> Option<Vec<u8>> {
+pub fn query(name: &str, id: u16) -> Option<Vec<u8>> {
     let mut m = Message::query();
     m.metadata.id = id;
     m.metadata.recursion_desired = true;
@@ -50,7 +50,7 @@ pub(crate) fn query(name: &str, id: u16) -> Option<Vec<u8>> {
 /// answer to this query (another ID, another question, not from the
 /// server, or not DNS), so the caller keeps waiting. Otherwise the first
 /// address and how long to keep it, or why there is none.
-pub(crate) fn answer(
+pub fn answer(
     bytes: &[u8],
     from: SocketAddr,
     server: SocketAddr,
@@ -88,8 +88,8 @@ pub(crate) fn answer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::dns::rr::Record;
-    use fictionet::stdlib::dns::rr::rdata::{A, CNAME};
+    use crate::stdlib::dns::rr::Record;
+    use crate::stdlib::dns::rr::rdata::{A, CNAME};
 
     const SERVER: &str = "10.0.0.1:53";
 

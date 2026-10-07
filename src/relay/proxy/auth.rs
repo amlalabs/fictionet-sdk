@@ -1,5 +1,5 @@
-//! The sandbox's token: reading it from `--token-file`, and checking what a
-//! client gives against it.
+//! The sandbox's token, and checking what a client gives against it. The
+//! binary reads it from `--token-file`.
 //!
 //! One attach serves one sandbox, so it has one token. The HTTP door takes
 //! it in `Proxy-Authorization` (Basic, with the token as the password, or
@@ -7,16 +7,12 @@
 //! username/password method. The username is not checked: it may be
 //! anything, such as `fictionet` or the sandbox's name.
 
-use std::path::Path;
-
-use crate::world::Failure;
-
 /// The longest token: SOCKS5 carries a password in at most 255 bytes.
-const MAX_TOKEN: usize = 255;
+pub const MAX_TOKEN: usize = 255;
 
 /// The sandbox's token.
 #[derive(Clone)]
-pub(crate) struct Token(Vec<u8>);
+pub struct Token(Vec<u8>);
 
 impl std::fmt::Debug for Token {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -25,15 +21,8 @@ impl std::fmt::Debug for Token {
 }
 
 impl Token {
-    /// Reads the token from `path`: the file's text, without the spaces
-    /// and line ends around it.
-    pub(crate) fn read(path: &Path) -> Result<Token, Failure> {
-        let text = std::fs::read(path)
-            .map_err(|e| Failure::Error(format!("reading the token file {}: {e}", path.display())))?;
-        Token::new(&text).map_err(|e| Failure::Error(format!("the token file {}: {e}", path.display())))
-    }
-
-    pub(crate) fn new(text: &[u8]) -> Result<Token, String> {
+    /// The token in `text`, without the spaces and line ends around it.
+    pub fn new(text: &[u8]) -> Result<Token, String> {
         let token = text.trim_ascii();
         if token.is_empty() {
             return Err("it is empty".into());
@@ -50,7 +39,7 @@ impl Token {
     /// Whether `given` is the token. Takes the same time for every
     /// `given` of the same length, so the time it takes says nothing about
     /// how much of a guess was right.
-    pub(crate) fn matches(&self, given: &[u8]) -> bool {
+    pub fn matches(&self, given: &[u8]) -> bool {
         if given.len() != self.0.len() {
             return false;
         }
@@ -60,7 +49,7 @@ impl Token {
     /// Checks a `Proxy-Authorization` value: `Basic` with the token as the
     /// password (or as the username with an empty password, for clients
     /// that put only one value in the URL), or `Bearer <token>`.
-    pub(crate) fn check_header(&self, value: &[u8]) -> bool {
+    pub fn check_header(&self, value: &[u8]) -> bool {
         let value = value.trim_ascii();
         let Some(space) = value.iter().position(|&b| b == b' ') else { return false };
         let (scheme, rest) = (&value[..space], value[space..].trim_ascii());
@@ -83,7 +72,7 @@ impl Token {
 
 /// Decodes standard base64 (RFC 4648, with `+` and `/`), with or without
 /// `=` padding. `None` if `text` is not base64.
-pub(crate) fn base64_decode(text: &[u8]) -> Option<Vec<u8>> {
+pub fn base64_decode(text: &[u8]) -> Option<Vec<u8>> {
     fn value(c: u8) -> Option<u32> {
         Some(match c {
             b'A'..=b'Z' => c - b'A',

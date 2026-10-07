@@ -10,7 +10,8 @@
 //!   doctest's example impl does not count);
 //! - **State** against the `pub struct` and `pub enum` declarations;
 //! - **Observe** against the built-ins the default registry gets in
-//!   `src/observe/app.rs`, and the `Present` impls in the module;
+//!   `src/observe/app.rs`; no module implements `Present`, which belongs
+//!   in `src/observe/`;
 //! - **Fuzz** against the targets in `fuzz/Cargo.toml`;
 //! - **Copy** against the modules of `tests/copy_and_own/modules.rs`.
 //!
@@ -267,14 +268,8 @@ fn observe_column_matches_the_registry_and_the_presenters() {
     }
     for row in catalog() {
         let code = code(&modules[&row.module]);
-        let present = code.contains("Present for");
-        let expected = if builtins.contains(row.module.as_str()) {
-            "built in"
-        } else if present {
-            "`Present`"
-        } else {
-            ""
-        };
+        assert!(!code.contains("Present for"), "{}: a presenter belongs in src/observe/, not in the protocol's module", row.module);
+        let expected = if builtins.contains(row.module.as_str()) { "built in" } else { "" };
         assert_eq!(row.observe, expected, "{}: the Observe column", row.module);
     }
 }

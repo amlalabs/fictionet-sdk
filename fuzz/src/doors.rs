@@ -1,5 +1,5 @@
-//! The bodies of the proxy fuzz targets. They live in this crate because
-//! the proxy's parsers are `pub(crate)` in the binary they come from.
+//! The bodies of the proxy fuzz targets: the doors' protocol side, in
+//! `fictionet::relay::proxy`.
 
 use std::io;
 use std::pin::Pin;
@@ -8,20 +8,21 @@ use std::task::{Context, Poll};
 use arbitrary::Arbitrary;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::proxy::auth::{Token, base64_decode};
-use crate::proxy::dns;
-use crate::proxy::http::{Target, error_response, forward_head, parse_request, rewrite_response};
-use crate::proxy::socks5::handshake;
-use crate::proxy::stack::Host;
+use fictionet::relay::proxy::auth::{Token, base64_decode};
+use fictionet::relay::proxy::dns;
+use fictionet::relay::proxy::http::{Target, error_response, forward_head, parse_request, rewrite_response};
+use fictionet::relay::proxy::socks5::handshake;
+use fictionet::relay::proxy::Host;
+use fictionet::stdlib::http1::{RequestHead, ResponseHead};
 
 /// The HTTP door: a request head, the token check, and the answer's head.
 pub fn http(data: &[u8]) {
     let token = Token::new(b"s3cret-token").unwrap();
     if let Ok(Some((req, len))) = parse_request(data) {
         assert!(len <= data.len());
-        for (name, value) in &req.headers {
-            if name.eq_ignore_ascii_case("proxy-authorization") {
-                let _ = token.check_header(value);
+        for h in &req.head.headers {
+            if h.name.eq_ignore_ascii_case("proxy-authorization") {
+                let _ = token.check_header(&h.value);
             }
         }
         match &req.target {
@@ -34,10 +35,8 @@ pub fn http(data: &[u8]) {
                 let head = forward_head(&req);
                 let text = String::from_utf8_lossy(&head);
                 assert!(text.ends_with("Connection: close\r\n\r\n"));
-                let mut fields = [httparse::EMPTY_HEADER; 256];
-                let mut again = httparse::Request::new(&mut fields);
-                match again.parse(&head) {
-                    Ok(httparse::Status::Complete(n)) => assert_eq!(n, head.len()),
+                match RequestHead::parse_lenient(&head) {
+                    Ok(Some((_, n))) => assert_eq!(n, head.len()),
                     other => panic!("the forwarded head does not parse: {other:?}\n{text}"),
                 }
             }
@@ -55,9 +54,7 @@ pub fn http(data: &[u8]) {
         }
         // Text from the client reaches a reason only quoted, as `{:?}`.
         let r = error_response(400, &format!("cannot read the URL {s:?}"));
-        let mut fields = [httparse::EMPTY_HEADER; 16];
-        let mut res = httparse::Response::new(&mut fields);
-        assert!(matches!(res.parse(&r), Ok(httparse::Status::Complete(_))), "an error answer does not parse");
+        assert!(matches!(ResponseHead::parse_lenient(&r), Ok(Some(_))), "an error answer does not parse");
     }
 }
 
@@ -108,7 +105,7 @@ pub fn socks5(input: Input) {
     let mut s = Stream { bytes: input.bytes, at: 0, pieces: input.pieces, piece: 0, written: Vec::new() };
     // The stream never waits, so the handshake finishes in one poll.
     let result = fictionet::block_on(handshake(&mut s, &token));
-    if let Ok((_, _)) = result {
+    if result.is_ok() {
         // Only a client that gave the token gets a target: the token must
         // be in what it sent, whatever the door answered.
         assert!(s.bytes.windows(12).any(|w| w == b"s3cret-token"), "a target without the token");

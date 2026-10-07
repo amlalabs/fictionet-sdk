@@ -323,8 +323,6 @@ pub mod recipes;
 pub mod roadmap;
 pub mod stdlib;
 pub mod time;
-#[cfg(feature = "tokio")]
-#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
 pub mod tokio;
 
 /// The extension traits. Import this to call methods such as
@@ -336,8 +334,6 @@ pub mod tokio;
 pub mod prelude {
     pub use crate::InterfaceExt;
     pub use crate::stdlib::ConnectionExt;
-    #[cfg(feature = "tokio")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
     pub use crate::tokio::ConnectionTokioExt;
 }
 

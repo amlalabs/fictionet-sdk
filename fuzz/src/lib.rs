@@ -1,6 +1,6 @@
 //! Helpers that the fuzz targets share: packet builders, an in-memory
-//! [`Connection`], a way to run a world for one input, and the proxy's
-//! modules from the `fictionet` binary.
+//! [`Connection`], a way to run a world for one input, and the bodies of
+//! the proxy door's targets.
 
 use std::future::{Future, poll_fn};
 use std::net::IpAddr;
@@ -11,16 +11,8 @@ use fictionet::stdlib::ip::{self, transport_checksum};
 use fictionet::stdlib::{ConnError, Connection};
 use fictionet::{Cx, block_on, run};
 
-/// The proxy's modules, compiled from the binary's own source files.
-#[allow(dead_code, unused_imports)]
-pub mod proxy;
-
 pub mod doors;
 pub mod web;
-
-#[allow(dead_code)]
-#[path = "../../src/bin/fictionet/world.rs"]
-mod world;
 
 /// Runs a world for one input. `f` gets the world's `Cx`. When `f`
 /// returns, the world is cancelled, and every task in it stops.

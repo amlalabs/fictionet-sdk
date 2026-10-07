@@ -8,6 +8,8 @@ macro_rules! protocols {
     () => {
         #[path = "../../src/observe/protocols.rs"]
         pub mod observe_protocols;
+        #[path = "../../src/observe/http2.rs"]
+        pub mod observe_http2;
         #[path = "../../src/observe/tls.rs"]
         pub mod observe_tls;
         #[path = "../../src/observe/conversation.rs"]

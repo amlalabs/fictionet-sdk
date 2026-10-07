@@ -23,9 +23,9 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 # On by default. tokio itself is always a dependency (hyper and h2 run on
-# it); this feature adds hyper's client, hyper-util and hyper-rustls with
-# webpki-roots, for fictionet::tokio and web::proxy(). Turn default
-# features off to leave those out.
+# it, and fictionet::tokio adapts connections to it); this feature adds
+# hyper's client, hyper-util and hyper-rustls with webpki-roots, for
+# web::proxy(). Turn default features off to leave those out.
 default = ["tokio"]
 tokio = ["dep:hyper-util", "dep:hyper-rustls", "hyper/client"]
 
@@ -40,7 +40,6 @@ hickory-proto = { version = "0.26.3", default-features = false, features = ["std
 http = "1.5.0"
 http-body = "1.1.0"
 http-body-util = "0.1"
-httparse = "1.10"
 hyper = { version = "1.11.1", default-features = false, features = ["http1", "http2", "server"] }
 hyper-rustls = { version = "0.27", optional = true, default-features = false, features = ["http1", "http2", "ring", "tls12", "webpki-roots"] }
 hyper-util = { version = "0.1", optional = true, default-features = false, features = ["client-legacy", "http1", "http2", "tokio"] }

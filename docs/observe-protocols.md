@@ -55,16 +55,20 @@ that name is registered. Other cases use the registry matchers, including
 across split plaintext prefixes. Eight unmatched bytes permanently reject
 plaintext selection in both directions, as in the outer conversation.
 Selection is not retried at each record. User replacements apply inside TLS
-too. HTTP/1 capture parsing remains in observe until a stdlib HTTP/1 module
-is available. Framing for DNS, DHCP, Modbus, HTTP/1, HTTP/2, and TLS uses `Stream`
-and `Present`.
+too. HTTP/1 capture reads each head with `stdlib::http1`'s lenient reader
+(`RequestHead::parse_lenient`), which checks syntax but not the framing
+rules an endpoint applies, and frames bodies itself. Framing for DNS, DHCP,
+Modbus, HTTP/1, HTTP/2, and TLS uses `Stream` and `Present`.
 
 These files can be copied into another crate and edited:
 
 - `src/observe/protocols.rs`: capture decoders and presenters, including
   `ModbusSession`. Register that session through `register_protocol` to stop
   both directions after a framing error, as the built-in does. The file uses
-  public observe and stdlib APIs, plus `hickory-proto` and `httparse`.
+  public observe and stdlib APIs, plus `hickory-proto`.
+- `src/observe/http2.rs`: the HTTP/2 and gRPC presenter, `Capture`, with
+  `CaptureBudget`. It uses public observe and stdlib APIs. Register it
+  through `register_with_buffer`, as below.
 - `src/observe/tls.rs`: `TlsSession`, its key schedule, handshake parsing,
   and record presentation. It uses public observe APIs and `ring`. Register
   it through `register_protocol`, passing the supplied registry to `new`.
@@ -75,23 +79,25 @@ tags. `Decoded::level` and `Decoded::cap_info` expose the summary
 policy. The adapter and registry require cloneable decoder errors so `Stream`
 can retain a terminal error while reporting it once.
 
-HTTP/2 uses `stdlib::http2::Capture` through `register_with_buffer`, with
-`http2::CAPTURE_READ_AHEAD`. Copy `src/stdlib/http2.rs` to customize both
-framing and presentation. The file uses only public SDK APIs.
-The presenter lives here to share the module's private header assembly.
-Strict `Frames` and `Connection` check RFC 9113 framing and directional state.
-`Connection::peer_settings` and `peer_window_update` apply control frames
-from the other direction. `lost` clears state and stops decoding because
-a TCP gap does not identify the next frame boundary.
+HTTP/2 uses `observe::http2::Capture` through `register_with_buffer`, with
+`observe::http2::CAPTURE_READ_AHEAD`. Copy `src/observe/http2.rs` to
+customize presentation; it uses only public SDK APIs. It reads frames with
+`stdlib::http2::Frames::for_observation` and header blocks with
+`stdlib::http2::HeaderBlocks::for_observation`, the same frame parser and
+header assembly that strict `Frames` and `Connection` use, which notes what
+it cannot read instead of failing. Strict `Frames` and `Connection` check
+RFC 9113 framing and directional state. `Connection::peer_settings` and
+`peer_window_update` apply control frames from the other direction. `lost`
+clears state and stops decoding because a TCP gap does not identify the next
+frame boundary.
 
 Capture policy keeps complete frames already present in bounded read-ahead.
 An incomplete oversized frame becomes a header-only item, followed by `Skip`
 for its payload. Header blocks share the stdlib HPACK decoder. Recognized
 gRPC calls use `grpc::Messages` through `codec::Demux`, with an 8 MiB aggregate
 DATA budget shared by every connection from the built-in registry and its
-clones, including nested TLS streams, through `http2::Capture::pair_in`.
+clones, including nested TLS streams, through `Capture::pair_in`.
 Message layers point at payload bytes when one
 contiguous range is available; otherwise they use a reassembly buffer.
-Copy `src/stdlib/grpc.rs` to customize message decoding and its `Present` impl.
-To use that copy in HTTP/2 display, also copy `http2.rs` and change its
-`grpc` import to the copied module.
+To show a copied `src/stdlib/grpc.rs` in HTTP/2 display, also copy
+`src/observe/http2.rs` and change its `grpc` import to the copied module.

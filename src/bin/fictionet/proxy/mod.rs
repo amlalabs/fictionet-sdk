@@ -11,8 +11,6 @@
 //! The sandbox needs no privileges. What keeps the agent in is the
 //! platform: the sandbox may reach attach's port and nothing else.
 
-mod auth;
-mod dns;
 mod http;
 mod link;
 mod pump;
@@ -28,7 +26,7 @@ use tokio::task::JoinHandle;
 
 use crate::args::{ProxyArgs, ProxyKind};
 use crate::world::{self, Failure, Greeting, err};
-use auth::Token;
+use fictionet::relay::proxy::auth::Token;
 use link::Link;
 use stack::Stack;
 
@@ -46,11 +44,18 @@ pub(crate) fn log(line: &str) {
     eprintln!("fictionet attach: {line}");
 }
 
+/// Reads the sandbox's token from `path`: the file's text, without the
+/// spaces and line ends around it.
+fn read_token(path: &std::path::Path) -> Result<Token, Failure> {
+    let text = std::fs::read(path).map_err(|e| Failure::Error(format!("reading the token file {}: {e}", path.display())))?;
+    Token::new(&text).map_err(|e| Failure::Error(format!("the token file {}: {e}", path.display())))
+}
+
 /// Runs a proxy type to the end. `Ok` means the world closed the
 /// connection.
 pub(crate) fn run(args: ProxyArgs) -> Result<(), Failure> {
     world::clear_ready_file(args.ready_file.as_deref());
-    let token = Token::read(&args.token_file)?;
+    let token = read_token(&args.token_file)?;
     // Client connections run on two worker threads, and the stack (inside
     // fictionet::run) on this one. With one thread for all of it, 50
     // downloads of 16 MiB at once took 2.8 to 3.1 s; with two workers,
@@ -156,7 +161,7 @@ async fn busy(mut client: TcpStream, kind: ProxyKind) {
     use tokio::io::AsyncWriteExt;
     log(&format!("more than {MAX_CLIENTS} clients at once; one turned away"));
     if kind == ProxyKind::Http {
-        let _ = client.write_all(&http::error_response(503, "too many connections through this proxy")).await;
+        let _ = client.write_all(&fictionet::relay::proxy::http::error_response(503, "too many connections through this proxy")).await;
     }
     let _ = client.shutdown().await;
 }
