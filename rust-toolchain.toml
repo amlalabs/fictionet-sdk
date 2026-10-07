@@ -1,0 +1,8 @@
+# The toolchain for development and CI. Pinned, so a new stable release with
+# new lints cannot turn CI red by itself: move it forward on purpose, fix
+# what the new lints find, and commit both together. The MSRV (rust-version
+# in Cargo.toml) is checked separately in CI. fuzz/ has its own file, for
+# nightly.
+[toolchain]
+channel = "1.99.0"
+components = ["clippy", "rustfmt"]

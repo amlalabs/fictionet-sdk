@@ -25,9 +25,9 @@ jobs:
             features: "--no-default-features"
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+      # The toolchain pinned in rust-toolchain.toml, with clippy.
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
@@ -50,10 +50,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-          components: clippy
+      - name: Install the pinned toolchain, with the wasm32 target
+        run: |
+          rustup toolchain install
+          rustup target add wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       # ring's C code builds with clang, which on the runner has the wasm32 target.
       - name: Check
@@ -70,8 +70,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.91
       - uses: Swatinem/rust-cache@v2
+      # +1.91 overrides rust-toolchain.toml.
       - name: Check
-        run: cargo check --locked --all-targets
+        run: cargo +1.91 check --locked --workspace --all-targets
 
   fuzz:
     name: fuzz (60 s per target)
@@ -84,13 +85,14 @@ jobs:
           workspaces: fuzz
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
+      # +nightly overrides the stable toolchain pinned in rust-toolchain.toml.
       - name: Build the targets
-        run: cargo fuzz build -O -a
+        run: cargo +nightly fuzz build -O -a
       - name: Run each target for 60 seconds
         run: |
-          for t in $(cargo fuzz list); do
+          for t in $(cargo +nightly fuzz list); do
             echo "::group::$t"
-            cargo fuzz run -O -a "$t" "fuzz/corpus/$t" -- -max_total_time=60 -timeout=20 -rss_limit_mb=4096
+            cargo +nightly fuzz run -O -a "$t" "fuzz/corpus/$t" -- -max_total_time=60 -timeout=20 -rss_limit_mb=4096
             echo "::endgroup::"
           done
       - name: Keep what a target found
