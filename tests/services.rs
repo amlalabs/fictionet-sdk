@@ -1032,6 +1032,7 @@ fn tls_pair(names: &[&str]) -> (Arc<rustls::ServerConfig>, Arc<rustls::RootCertS
 /// A connection whose TLS handshake is cut short by a cancel ends as
 /// cancelled, not as a broken connection.
 #[test]
+#[cfg(feature = "tokio")]
 fn a_cancel_during_the_tls_handshake_is_a_cancel() {
     world(|cx| async move {
         let (config, _roots) = tls_pair(&["a.test"]);
