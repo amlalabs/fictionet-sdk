@@ -187,41 +187,6 @@ pub(crate) fn parse_flat(text: &str) -> Option<std::collections::HashMap<String,
     (p.i == p.b.len()).then_some(out)
 }
 
-/// Whether `text` is exactly one JSON value, with any whitespace around it.
-pub(crate) fn is_value(text: &str) -> bool {
-    let mut p = Parser { b: text.as_bytes(), i: 0 };
-    p.ws();
-    let ok = p.value(0).is_some();
-    p.ws();
-    ok && p.i == p.b.len()
-}
-
-/// `text`, a valid JSON value, with the whitespace between tokens taken
-/// out, so it fits on one line.
-pub(crate) fn compact(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut in_string = false;
-    let mut escaped = false;
-    for c in text.chars() {
-        if in_string {
-            out.push(c);
-            if escaped {
-                escaped = false;
-            } else if c == '\\' {
-                escaped = true;
-            } else if c == '"' {
-                in_string = false;
-            }
-        } else if c == '"' {
-            in_string = true;
-            out.push(c);
-        } else if !c.is_whitespace() {
-            out.push(c);
-        }
-    }
-    out
-}
-
 struct Parser<'a> {
     b: &'a [u8],
     i: usize,
@@ -245,87 +210,6 @@ impl Parser<'_> {
             v
         })
     }
-    /// Skips one value of any kind, nested at most 64 deep.
-    fn value(&mut self, depth: usize) -> Option<()> {
-        if depth > 64 {
-            return None;
-        }
-        match self.peek()? {
-            b'"' => self.string().map(drop),
-            b't' => self.word("true", Scalar::Null).map(drop),
-            b'f' => self.word("false", Scalar::Null).map(drop),
-            b'n' => self.word("null", Scalar::Null).map(drop),
-            open @ (b'{' | b'[') => {
-                let close = if open == b'{' { b'}' } else { b']' };
-                self.i += 1;
-                self.ws();
-                if self.peek()? == close {
-                    self.i += 1;
-                    return Some(());
-                }
-                loop {
-                    self.ws();
-                    if open == b'{' {
-                        self.string()?;
-                        self.ws();
-                        self.eat(b':')?;
-                        self.ws();
-                    }
-                    self.value(depth + 1)?;
-                    self.ws();
-                    match self.peek()? {
-                        b',' => self.i += 1,
-                        c if c == close => {
-                            self.i += 1;
-                            return Some(());
-                        }
-                        _ => return None,
-                    }
-                }
-            }
-            b'-' | b'0'..=b'9' => self.strict_number(),
-            _ => None,
-        }
-    }
-
-    /// Skips a number written as JSON allows: no leading zeros, digits on
-    /// both sides of a point, an optional exponent.
-    fn strict_number(&mut self) -> Option<()> {
-        let digits = |p: &mut Self| {
-            let start = p.i;
-            while matches!(p.peek(), Some(b'0'..=b'9')) {
-                p.i += 1;
-            }
-            p.i - start
-        };
-        if self.peek() == Some(b'-') {
-            self.i += 1;
-        }
-        match self.peek()? {
-            b'0' => self.i += 1,
-            b'1'..=b'9' => {
-                digits(self);
-            }
-            _ => return None,
-        }
-        if self.peek() == Some(b'.') {
-            self.i += 1;
-            if digits(self) == 0 {
-                return None;
-            }
-        }
-        if matches!(self.peek(), Some(b'e' | b'E')) {
-            self.i += 1;
-            if matches!(self.peek(), Some(b'+' | b'-')) {
-                self.i += 1;
-            }
-            if digits(self) == 0 {
-                return None;
-            }
-        }
-        Some(())
-    }
-
     fn number(&mut self) -> Option<f64> {
         let start = self.i;
         while matches!(self.peek(), Some(b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9')) {
@@ -384,19 +268,5 @@ mod parse_tests {
         assert!(parse_flat(r#"{"a":[1]}"#).is_none());
         assert!(parse_flat(r#"{"a":1"#).is_none());
         assert!(parse_flat(r#"{"a":1} x"#).is_none());
-    }
-
-    #[test]
-    fn values_are_checked() {
-        for ok in [r#"{"host":"a","n":[1,2.5e3,{"x":null}],"t":true}"#, " 12 ", r#""s""#, "[]", "{}"] {
-            assert!(is_value(ok), "{ok}");
-        }
-        for bad in ["", "{", r#"{"a":}"#, "[1,]", "1 2", "nul", r#"{"a" 1}"#, "{'a':1}", "01", "1.", ".5", "-", "1e", "\"a\nb\""] {
-            assert!(!is_value(bad), "{bad}");
-        }
-        for ok in ["0", "-0.5", "1e10", "2.5E-3", "[-1,0.0]"] {
-            assert!(is_value(ok), "{ok}");
-        }
-        assert_eq!(compact("{\n  \"a b\": [1, 2],\n  \"c\": \"x \\\" y\"\n}"), r#"{"a b":[1,2],"c":"x \" y"}"#);
     }
 }

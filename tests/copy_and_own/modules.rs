@@ -98,8 +98,6 @@ macro_rules! protocols {
         pub mod ipsec;
         #[path = "../../src/stdlib/itch.rs"]
         pub mod itch;
-        #[path = "../../src/stdlib/journal.rs"]
-        pub mod journal;
         #[path = "../../src/stdlib/json.rs"]
         pub mod json;
         #[path = "../../src/stdlib/json_schema.rs"]

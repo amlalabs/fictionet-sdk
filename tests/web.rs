@@ -19,7 +19,7 @@ use fictionet::prelude::*;
 use fictionet::stdlib::dns::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use fictionet::stdlib::dns::rr::{Name, RData, RecordType};
 use fictionet::stdlib::tls;
-use fictionet::stdlib::journal::{Entry, Fields, Journal};
+use fictionet::events::{Event as Entry, Fields};
 use fictionet::stdlib::{ConnError, Connection, dhcp, ip, tcp, udp, web};
 use fictionet::{Attacher, Cx, End, Interface, Packet, block_on, run};
 use http::{HeaderMap, Request, Response, StatusCode, Version};
@@ -121,7 +121,7 @@ const DUAL_ADDR: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 50);
 const DUAL_ADDR6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0x50, 0, 0, 0, 0, 0x10);
 const V6ONLY_ADDR6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0x50, 0, 0, 0, 0, 0x20);
 
-/// What `events.test` tells the journal about a page, through the
+/// What `events.test` adds to its request's event about a page, through the
 /// response's extensions.
 fn page(kind: &'static str) -> Fields {
     Fields::new().with("page", kind)
@@ -2190,7 +2190,7 @@ fn a_client_that_half_closes_after_its_request_gets_the_response() {
 /// The log of events a test world keeps.
 type Log = Arc<std::sync::Mutex<Vec<Ev>>>;
 
-// The journal's entries, read back into the shape the old `web::Event`
+// The run's events, read back into the shape the old `web::Event`
 // had, so each test states what it checks the same way.
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2323,15 +2323,13 @@ enum Ev {
     Blocked(Blocked),
 }
 
-/// A journal that keeps every entry in `log`, as an [`Ev`].
-fn keeping(log: Log) -> Journal {
-    let journal = Journal::new();
-    journal.subscribe(move |e| {
+/// Keeps every event of `cx`'s run in `log`, as an [`Ev`].
+fn keeping(cx: &Cx, log: Log) {
+    cx.events().subscribe(move |e| {
         if let Some(ev) = ev(e) {
             log.lock().unwrap_or_else(|p| p.into_inner()).push(ev);
         }
     });
-    journal
 }
 
 fn ev(e: &Entry) -> Option<Ev> {
@@ -2341,7 +2339,7 @@ fn ev(e: &Entry) -> Option<Ev> {
     let num = |n: &str| e.u64(n);
     let conn = e.conn.id.unwrap_or(0);
     let local = e.conn.local.unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
-    Some(match (e.event.service, e.event.kind) {
+    Some(match (e.source, e.kind) {
         ("net", "attached") => Ev::Attached { sandbox },
         ("net", "bound") => Ev::Bound { sandbox, by_dhcp: e.get("by_dhcp").and_then(|v| v.as_bool()) == Some(true) },
         ("net", "detached") => Ev::Detached { sandbox },
@@ -2412,7 +2410,7 @@ fn ev(e: &Entry) -> Option<Ev> {
                 sent: num("sent")?,
                 complete: e.get("complete").and_then(|v| v.as_bool()) == Some(true),
                 page: text("page"),
-                extra: e.event.fields.iter().filter(|(n, _)| !standard.contains(n)).count(),
+                extra: e.fields.iter().filter(|(n, _)| !standard.contains(n)).count(),
             })
         }
         ("http", "error") => Ev::HttpError(HttpError {
@@ -2457,9 +2455,9 @@ where
     let result = within(Duration::from_secs(60), move || {
         block_on(run(move |cx| async move {
             let (attacher, attachments) = fictionet::attachments();
-            let mut t = sites(&cx);
+            let t = sites(&cx);
             let keep = log.clone();
-            t.sites = t.sites.journal(keeping(keep));
+            keeping(&cx, keep);
             let env = t.serve_with(&cx, attachments)?;
             f(cx, attacher, env, log).await?;
             Err(Box::new(Done) as fictionet::Error)
@@ -3575,7 +3573,8 @@ where
         block_on(run(move |cx| async move {
             let (attacher, attachments) = fictionet::attachments();
             let keep = log.clone();
-            make().journal(keeping(keep)).serve(&cx, attachments)?;
+            keeping(&cx, keep);
+            make().serve(&cx, attachments)?;
             f(cx, attacher, log).await?;
             Err(Box::new(Done) as fictionet::Error)
         }))

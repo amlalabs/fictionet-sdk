@@ -32,7 +32,7 @@ fn start_world(path: &str) -> fictionet::Listening {
                     let (mut mine, mut theirs) = fictionet::pair();
                     cx.spawn(move |cx| async move {
                         while let Ok(p) = theirs.recv(&cx).await {
-                            cx.event("echo").int("len", p.0.len() as i64).emit();
+                            cx.record(fictionet::events::Event::new("test", "echo").field("len", p.0.len() as u64));
                             theirs.send(p);
                         }
                         Ok(())
@@ -148,7 +148,7 @@ fn an_observer_sees_the_graph_its_changes_events_and_packets() {
             sandbox_edge = sandbox_edge.or_else(|| sandbox_edge_in(&t));
         }
         counters += t.starts_with(r#"{"event":"counters""#) as u32;
-        if t.starts_with(r#"{"event":"note""#) && t.contains(r#""kind":"event","#) && t.contains(r#""name":"echo","data":{"len":28}"#) {
+        if t.starts_with(r#"{"event":"event""#) && t.contains(r#""source":"test","kind":"echo","#) && t.contains(r#""fields":{"len":28}"#) {
             echoes += 1;
         }
         sandbox_edge.is_some() && counters >= 2 && echoes >= 1
@@ -178,6 +178,18 @@ fn an_observer_sees_the_graph_its_changes_events_and_packets() {
         v.id == cancel
     });
     assert!(ended);
+
+    // The world kept its events with no one watching. A late observer
+    // reads them in one call, or replays the log from its start with
+    // `watch`, then follows it.
+    let events = text(&client.call(r#"{"op":"events","after":0,"max":2}"#).unwrap());
+    assert!(events.starts_with(r#"{"events":[{"seq":1,"#) && events.contains(r#""seq":2,"#) && !events.contains(r#""seq":3,"#), "{events}");
+    let replay = client.request(r#"{"op":"watch","after":0}"#).unwrap();
+    let seen = until(&mut client, |v| v.id == replay && text(v).starts_with(r#"{"event":"event""#));
+    assert!(text(&seen[0]).contains(r#""events":[]"#), "{}", text(&seen[0]));
+    assert!(text(seen.last().unwrap()).starts_with(r#"{"event":"event","data":{"seq":1,"#), "{}", text(seen.last().unwrap()));
+    let cancel = client.request(&format!(r#"{{"op":"cancel","id":{replay}}}"#)).unwrap();
+    until(&mut client, |v| v.id == cancel);
 
     // Watch the sandbox's link: its packets come decoded.
     let packets = client.request(&format!(r#"{{"op":"packets","link":"e{edge}"}}"#)).unwrap();

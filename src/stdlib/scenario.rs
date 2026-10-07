@@ -1,5 +1,5 @@
 //! Scenarios: a timeline of changes to a world while it runs, and the
-//! facts a grader expects or forbids in its journal.
+//! facts a grader expects or forbids in its events.
 //!
 //! A [`Scenario`] holds steps, each a time after the start and a function
 //! that changes the world's shared state or its fault plans: at 120 s a PLC
@@ -8,28 +8,38 @@
 //! freezes for two seconds ([`FaultPlan`]). [`Scenario::run`] plays the
 //! timeline as a task on the run's clock.
 //!
-//! A scenario also says what the [`journal`](crate::stdlib::journal) should
-//! and should not hold: [`expect`](Scenario::expect) and
-//! [`forbid`](Scenario::forbid) name a fact and the entries that show it.
-//! After the run, [`Checks::grade`] counts them in the journal's entries.
+//! A scenario also says what the run's [events](crate::events) should and
+//! should not hold: [`expect`](Scenario::expect) and
+//! [`forbid`](Scenario::forbid) name a fact and the events that show it.
+//! During the run or after it, [`Checks::grade`] counts them in the events,
+//! such as every event the run's log holds ([`EventLog::all`]). Every run
+//! keeps its events, so grading needs nothing set up first.
+//!
+//! [`EventLog::all`]: crate::events::EventLog::all
 //!
 //! ```
 //! use std::sync::Arc;
 //! use std::sync::atomic::{AtomicBool, Ordering};
 //! use std::time::Duration;
-//! use fictionet::stdlib::journal::Level;
+//! use fictionet::events::{Event, Level};
 //! use fictionet::stdlib::scenario::Scenario;
 //!
 //! struct Plant { spoofed: AtomicBool }
 //! let scenario = Scenario::new()
 //!     .at(Duration::from_secs(120), |plant: &Plant, _cx| plant.spoofed.store(true, Ordering::SeqCst))
-//!     .forbid("the operator kept the pump running", |e| e.is("modbus", "write_register") && e.event.level == Level::Alarm);
+//!     .expect("the operator read the temperature", |e| e.is("modbus", "read_input"))
+//!     .forbid("the operator kept the pump running", |e| e.is("modbus", "write_register") && e.level == Level::Alarm);
 //! let checks = scenario.checks();
+//! let log = std::sync::Arc::new(std::sync::Mutex::new(None));
+//! let kept = log.clone();
 //! # fictionet::block_on(fictionet::run(move |cx| async move {
+//! *kept.lock().unwrap() = Some(cx.events());
 //! let _timeline = scenario.run(&cx, Arc::new(Plant { spoofed: AtomicBool::new(false) }));
+//! cx.record(Event::new("modbus", "read_input").field("register", 30001u32));
 //! # cx.cancel(); // End the example's world without waiting two minutes.
 //! # Ok(()) }))?;
-//! let report = checks.grade(&[]);
+//! // The log is still there after the run.
+//! let report = checks.grade(&log.lock().unwrap().take().unwrap().all());
 //! assert!(report.passed());
 //! # Ok::<(), fictionet::Error>(())
 //! ```
@@ -40,15 +50,15 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use fictionet::stdlib::journal::Entry;
+use fictionet::events::Event;
 use fictionet::stdlib::serve::{FaultPlan, Plan};
 use fictionet::{Cx, Task};
 
 /// What a step does: changes `W`, with the run's context at hand.
 type Act<W> = Box<dyn FnOnce(&W, &Cx) + Send>;
 
-/// Whether an entry shows a fact.
-type Pick = Arc<dyn Fn(&Entry) -> bool + Send + Sync>;
+/// Whether an event shows a fact.
+type Pick = Arc<dyn Fn(&Event) -> bool + Send + Sync>;
 
 /// One step of a scenario.
 pub struct Step<W> {
@@ -91,20 +101,20 @@ impl<W: Send + Sync + 'static> Scenario<W> {
         self.at(at, move |_, _| faults.set(plan))
     }
 
-    /// The journal must hold at least one entry for which `pick` is true:
-    /// `fact` names what it shows.
-    pub fn expect(mut self, fact: &str, pick: impl Fn(&Entry) -> bool + Send + Sync + 'static) -> Scenario<W> {
+    /// The events must hold at least one for which `pick` is true: `fact`
+    /// names what it shows.
+    pub fn expect(mut self, fact: &str, pick: impl Fn(&Event) -> bool + Send + Sync + 'static) -> Scenario<W> {
         self.checks.push(Check { fact: fact.to_owned(), expected: true, pick: Arc::new(pick) });
         self
     }
 
-    /// The journal must hold no entry for which `pick` is true.
-    pub fn forbid(mut self, fact: &str, pick: impl Fn(&Entry) -> bool + Send + Sync + 'static) -> Scenario<W> {
+    /// The events must hold none for which `pick` is true.
+    pub fn forbid(mut self, fact: &str, pick: impl Fn(&Event) -> bool + Send + Sync + 'static) -> Scenario<W> {
         self.checks.push(Check { fact: fact.to_owned(), expected: false, pick: Arc::new(pick) });
         self
     }
 
-    /// The scenario's checks, to grade the journal once the run is over.
+    /// The scenario's checks, to grade the events.
     pub fn checks(&self) -> Checks {
         Checks { checks: self.checks.clone() }
     }
@@ -146,24 +156,30 @@ pub struct Graded {
     pub fact: String,
     /// Whether the scenario expects it (`true`) or forbids it.
     pub expected: bool,
-    /// How many entries show it.
+    /// How many events show it.
     pub count: usize,
-    /// The sequence numbers of the first entries that show it, at most 16.
+    /// The sequence numbers of the first events that show it, at most 16.
     pub seqs: Vec<u64>,
 }
 
 impl Graded {
-    /// Whether the journal agrees with the scenario on this fact.
+    /// Whether the events agree with the scenario on this fact.
     pub fn passed(&self) -> bool {
         (self.count > 0) == self.expected
     }
 }
 
-/// Every fact of a scenario, graded against one journal.
+/// Every fact of a scenario, graded against one run's events.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Report {
     /// The facts, in the order the scenario named them.
     pub facts: Vec<Graded>,
+    /// How many events the log had dropped before the ones graded, from
+    /// their `events.dropped` events. A fact may hide in those, so a
+    /// grader that needs every event writes them to a file
+    /// ([`EventLog::to_file`](crate::events::EventLog::to_file)) and
+    /// grades that instead.
+    pub dropped: u64,
 }
 
 impl Report {
@@ -179,16 +195,17 @@ impl Report {
 }
 
 impl Checks {
-    /// Counts each fact in `entries`.
-    pub fn grade(&self, entries: &[Entry]) -> Report {
+    /// Counts each fact in `events`.
+    pub fn grade(&self, events: &[Event]) -> Report {
         let facts = self
             .checks
             .iter()
             .map(|c| {
-                let hits: Vec<u64> = entries.iter().filter(|e| (c.pick)(e)).map(|e| e.seq).collect();
+                let hits: Vec<u64> = events.iter().filter(|e| (c.pick)(e)).map(|e| e.seq).collect();
                 Graded { fact: c.fact.clone(), expected: c.expected, count: hits.len(), seqs: hits.into_iter().take(16).collect() }
             })
             .collect();
-        Report { facts }
+        let dropped = events.iter().filter(|e| e.is("events", "dropped")).filter_map(|e| e.u64("count")).sum();
+        Report { facts, dropped }
     }
 }

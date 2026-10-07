@@ -60,9 +60,9 @@ sleep 3
 step "The same API from a shell: fictionet observe"
 vm "fictionet observe --world unix:/run/fictionet/world.sock world"
 vm "fictionet observe --world unix:/run/fictionet/world.sock graph | jq -c '{tasks: [.nodes[] | select(.kind != \"sandbox\")] | length, sandboxes: [.nodes[] | select(.kind == \"sandbox\") | .name], links: (.edges | length)}'"
-note "Custom events, such as web_world's dns_query and http_request, exist only while an"
-note "observer follows the world. The watch request follows it, so it sees them as they happen:"
-vm "{ timeout 4 fictionet observe --world unix:/run/fictionet/world.sock watch || true; } | jq -c 'select(.event == \"note\" and .data.kind == \"event\") | .data | {name, data}' | sed -n 1,4p"
+note "The world keeps a log of events, such as web_world's dns.query and http.request, whether"
+note "or not anyone watches. The watch request shows the latest, then each new one as it happens:"
+vm "{ timeout 4 fictionet observe --world unix:/run/fictionet/world.sock watch || true; } | jq -c 'select(.event == \"event\") | .data | {source, kind, summary}' | sed -n 1,4p"
 
 step "Open the dashboard"
 printf '\n    %shttp://127.0.0.1:%s/%s\n\n' "$bold" "$host_port" "$reset"

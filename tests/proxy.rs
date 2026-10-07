@@ -76,6 +76,14 @@ impl World {
                     .route("/mb", get(|| async { vec![b'x'; 1 << 20] }))
                     .route("/upload", post(upload).layer(DefaultBodyLimit::disable()));
                 let secure = axum::Router::new().route("/", get(|| async { "secure site\n" }));
+                cx.events().subscribe(move |e| {
+                    if e.is("dns", "query")
+                        && e.u64("qtype") == Some(1)
+                        && let Some(name) = e.str("name")
+                    {
+                        *queries2.lock().unwrap().entry(name.to_owned()).or_default() += 1;
+                    }
+                });
                 web::Sites::new(move |host: &str| match host {
                     "plain.test" => Some(web::Site::new(app.clone())),
                     "secure.test" => Some(web::Site::new(secure.clone()).at(SECURE).tls({
@@ -83,18 +91,6 @@ impl World {
                         move |_| c.clone()
                     })),
                     _ => None,
-                })
-                .journal({
-                    let journal = fictionet::stdlib::journal::Journal::new();
-                    journal.subscribe(move |e| {
-                        if e.is("dns", "query")
-                            && e.u64("qtype") == Some(1)
-                            && let Some(name) = e.str("name")
-                        {
-                            *queries2.lock().unwrap().entry(name.to_owned()).or_default() += 1;
-                        }
-                    });
-                    journal
                 })
                 .serve(&cx, attachments)?;
                 while !stop2.load(Ordering::SeqCst) {

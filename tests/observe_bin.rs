@@ -29,7 +29,7 @@ fn start_world(path: &str) -> fictionet::Listening {
             });
             let mut n = 0i64;
             loop {
-                cx.event("tick").int("n", n).emit();
+                cx.record(fictionet::events::Event::new("test", "tick").field("n", n));
                 n += 1;
                 cx.sleep(fictionet::time::ms(50)).await?;
             }
@@ -61,7 +61,7 @@ fn observe_prints_json_lines() {
     let mut child = Command::new(BIN).args(["observe", "--world", &world, "watch"]).stdout(Stdio::piped()).spawn().unwrap();
     let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
     assert!(lines.next().unwrap().unwrap().starts_with(r#"{"event":"snapshot""#));
-    let tick = lines.map(Result::unwrap).find(|l| l.contains(r#""name":"tick""#));
+    let tick = lines.map(Result::unwrap).find(|l| l.contains(r#""source":"test","kind":"tick""#));
     assert!(tick.is_some());
     child.kill().unwrap();
     child.wait().unwrap();
@@ -120,7 +120,7 @@ fn the_dashboard_serves_the_app_and_carries_its_api_calls() {
         }
     }
     assert_eq!(seen[0], "snapshot");
-    assert!(seen.iter().any(|e| e == "note"), "{seen:?}");
+    assert!(seen.iter().any(|e| e == "event"), "{seen:?}");
 
     // A page on another site cannot read it through a name of its own.
     let mut conn = TcpStream::connect(("127.0.0.1", port)).unwrap();

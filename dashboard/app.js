@@ -18,7 +18,7 @@ const state = {
   nodes: new Map(), // id -> task or sandbox, as the world sent it
   edges: new Map(), // id -> link
   groups: new Map(), // id -> { id, name, parent }
-  notes: [],
+  events: [],
   serverT: 0, // the run's clock, in seconds, at the last message
   serverAt: 0, // performance.now() when it came
   startedMs: 0,
@@ -113,7 +113,7 @@ function connect() {
   events.addEventListener('edge', (e) => upsertEdge(JSON.parse(e.data)));
   events.addEventListener('edge_end', (e) => removeEdge(JSON.parse(e.data).id));
   events.addEventListener('counters', (e) => counters(JSON.parse(e.data)));
-  events.addEventListener('note', (e) => addNote(JSON.parse(e.data)));
+  events.addEventListener('event', (e) => addEvent(JSON.parse(e.data)));
   events.addEventListener('ended', (e) => {
     tick(JSON.parse(e.data).t);
     state.ended = true;
@@ -143,7 +143,7 @@ function snapshot(s) {
   for (const id of [...state.edges.keys()]) removeEdge(id);
   for (const id of [...state.nodes.keys()]) removeNode(id);
   state.groups.clear();
-  state.notes = [];
+  state.events = [];
   tick(s.t);
   state.startedMs = s.started;
   state.ended = s.ended;
@@ -159,7 +159,7 @@ function snapshot(s) {
       e.t = s.t;
     }
   }
-  for (const n of s.notes) addNote(n);
+  for (const n of s.events) addEvent(n);
   loadLayout(s.nodes);
   // Fit once the layout is made, dragged places included.
   state.userMoved = false;
@@ -248,10 +248,18 @@ function counters(m) {
   }
 }
 
-function addNote(n) {
-  state.notes.push(n);
+/// The class that colors an event: `bad` for drops, lost routes and
+/// alarms, `good` for kept TLS keys.
+function tone(n) {
+  if (n.kind === 'drop' || n.kind === 'route_removed' || n.level === 'alarm') return 'bad';
+  if (n.source === 'tls' && n.kind === 'keys') return 'good';
+  return '';
+}
+
+function addEvent(n) {
+  state.events.push(n);
   pulse(n);
-  if (state.notes.length > 500) state.notes.shift();
+  if (state.events.length > 500) state.events.shift();
   if (n.kind === 'drop' && n.node) {
     const node = state.nodes.get(n.node);
     if (node) {
@@ -304,7 +312,7 @@ function pulse(n) {
   const ring = el(
     'svg:rect',
     {
-      class: `pulse ${n.kind}`,
+      class: `pulse ${tone(n)}`,
       x: node.x - 3,
       y: node.y - 3,
       width: node.w + 6,
@@ -1661,33 +1669,33 @@ function linkButton(text, onClick) {
   return b;
 }
 
-function notesList(parent, notes) {
-  if (!notes.length) {
-    el('p', { class: 'quiet', text: 'Nothing reported yet. Bottlenecks report the packets they drop, routers the routes they lose, TLS its session keys, and world code its own events.' }, parent);
+function eventsList(parent, events) {
+  if (!events.length) {
+    el('p', { class: 'quiet', text: 'Nothing recorded yet. Services record what they see, bottlenecks and LANs the packets they drop, routers the routes they lose, TLS its session keys, and world code its own events.' }, parent);
     return;
   }
   const ul = el('ul', { class: 'rows' }, parent);
-  for (const n of notes.slice(-60).reverse()) {
-    const li = el('li', { class: 'note' }, ul);
-    el('time', { text: `${n.t.toFixed(1)}s` }, li);
+  for (const n of events.slice(-60).reverse()) {
+    const li = el('li', { class: 'event-row' }, ul);
+    el('time', { text: `${n.at.toFixed(1)}s` }, li);
     const node = state.nodes.get(n.node) || drawnSource(n);
     const head = el('span', {}, li);
-    el('span', { class: `kind ${n.kind}`, text: n.kind === 'event' ? n.name : noteKind(n.kind) }, head);
+    el('span', { class: `kind ${tone(n)}`, text: `${n.source}.${n.kind}` }, head);
     if (n.task || node) {
       head.append(' from ');
       const b = el('button', { class: 'link', type: 'button', text: n.task || node.name }, head);
       b.title = n.file ? `${n.file}:${n.line}` : '';
       b.addEventListener('click', () => {
         if (state.nodes.get(n.node)) focusNode(n.node);
-        else select({ kind: 'ended', id: n.node, note: n });
+        else select({ kind: 'ended', id: n.node, event: n });
       });
     }
-    el('span', { class: 'text', text: n.kind === 'event' ? eventText(n.data) : n.text }, li);
+    el('span', { class: 'text', text: n.summary || eventText(n.fields) }, li);
   }
 }
 
-/// A custom event's payload as `key value` pairs, or as JSON when it is
-/// not a flat object.
+/// An event's fields as `key value` pairs, or as JSON when they are not
+/// an object.
 function eventText(data) {
   if (data && typeof data === 'object' && !Array.isArray(data)) {
     return Object.entries(data)
@@ -1723,10 +1731,6 @@ function focusGroup(gid) {
   if (item) return centerOn(item);
   const f = view.frames.get(gid);
   if (f?.box) centerOn({ tx: f.box.x, ty: f.box.y, w: f.box.w, h: f.box.h });
-}
-
-function noteKind(k) {
-  return { drop: 'Dropped', route_removed: 'Route removed', tls_keys: 'TLS keys' }[k] || k;
 }
 
 /// What group `gid` holds directly: groups, then tasks and sandboxes by
@@ -1806,7 +1810,7 @@ function renderSide() {
     }
     out.push(links);
     const ev = section('Events');
-    notesList(ev, state.notes.filter((x) => x.node === n.id));
+    eventsList(ev, state.events.filter((x) => x.node === n.id));
     out.push(ev);
   } else if (sel && sel.kind === 'group' && state.groups.has(sel.id)) {
     const g = state.groups.get(sel.id);
@@ -1844,7 +1848,7 @@ function renderSide() {
     out.push(m);
   } else if (sel && sel.kind === 'ended') {
     // A task that has ended, known only from the events it sent.
-    const n = sel.note;
+    const n = sel.event;
     const s = el('section');
     el('h3', { class: 'selection-title', text: n.task || 'A task' }, s);
     el('p', { class: 'selection-kind', text: 'A task that has ended' }, s);
@@ -1857,7 +1861,7 @@ function renderSide() {
     }
     out.push(s);
     const ev = section('Events');
-    notesList(ev, state.notes.filter((x) => x.node === sel.id));
+    eventsList(ev, state.events.filter((x) => x.node === sel.id));
     out.push(ev);
   } else if (sel && sel.kind === 'edge' && view.dedges.get(sel.id)) {
     const d = view.dedges.get(sel.id);
@@ -1965,8 +1969,8 @@ function renderSide() {
       el('span', { class: 'count', text: g.count > 1 ? `×${g.count}` : '' }, li);
     }
     out.push(ts);
-    const ev = section('Events', state.notes.length || undefined);
-    notesList(ev, state.notes);
+    const ev = section('Events', state.events.length || undefined);
+    eventsList(ev, state.events);
     out.push(ev);
   }
   side.replaceChildren(...out);

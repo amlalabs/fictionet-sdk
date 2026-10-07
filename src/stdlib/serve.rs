@@ -3,7 +3,7 @@
 //!
 //! A [`Service`] is the server side of one protocol for one connection.
 //! It gets decoded items, appends reply bytes, records facts in the
-//! [`journal`](crate::stdlib::journal), and asks for timers. It reads no
+//! run's [events](crate::events), and asks for timers. It reads no
 //! clock and touches no socket, so it unit-tests with the [`Harness`]
 //! here, fuzzes with the codec's contract tools, and a world copies its
 //! file to change it. It has the shape of a FIX session: items in, bytes
@@ -28,7 +28,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::{Ending, LineError, Lines};
-//! use fictionet::stdlib::journal::Event;
+//! use fictionet::events::Event;
 //! use fictionet::stdlib::serve::{Flow, Harness, Service, ServeCtx};
 //!
 //! struct Echo;
@@ -140,7 +140,7 @@ use fictionet::stdlib::codec::{
     Buffer, ByteFault, Decode, Direction, Fail, FaultDelay, Faults, ItemFault, Lcg, Record, Recorder, RewriteError,
     Rule, Stream, StreamEvent,
 };
-use fictionet::stdlib::journal::{ConnInfo, Event, Journal, Level, Sandbox, Transport};
+use fictionet::events::{ConnInfo, Event, Level, Sandbox, Transport, opt};
 use fictionet::stdlib::tcp::Listener;
 use fictionet::stdlib::tls::{self, HandshakeError, ServerConfig, TlsConnection};
 use fictionet::stdlib::udp::Socket;
@@ -367,7 +367,6 @@ pub struct PendingCtx<'a> {
     events: &'a mut Vec<Event>,
     written: u64,
     conn: &'a ConnInfo,
-    logging: bool,
 }
 
 impl PendingCtx<'_> {
@@ -382,16 +381,9 @@ impl PendingCtx<'_> {
         self.written
     }
 
-    /// Records an event in the journal.
+    /// Records an event, from this connection.
     pub fn log(&mut self, event: Event) {
-        if self.logging {
-            self.events.push(event);
-        }
-    }
-
-    /// Whether events reach anyone.
-    pub fn logging(&self) -> bool {
-        self.logging
+        self.events.push(event);
     }
 
     /// The connection.
@@ -595,17 +587,9 @@ impl ServeCtx<'_> {
         self.timers.iter().find(|(n, _)| *n == name).map(|(_, at)| *at)
     }
 
-    /// Records `event` in the journal, from this connection.
+    /// Records `event` in the run's events, from this connection.
     pub fn log(&mut self, event: Event) {
-        if self.s.logging {
-            self.s.events.push(event);
-        }
-    }
-
-    /// Whether events reach anyone. A service skips building an event that
-    /// would be thrown away.
-    pub fn logging(&self) -> bool {
-        self.s.logging
+        self.s.events.push(event);
     }
 
     /// The connection: its number, sandbox, addresses and transport.
@@ -666,7 +650,6 @@ struct Scratch {
     events: Vec<Event>,
     datagrams: Vec<(SocketAddr, Vec<u8>)>,
     rng: Lcg,
-    logging: bool,
     timers: Vec<(Timer, Option<Duration>)>,
     ordered: Vec<Box<dyn Pending>>,
     keyed: Vec<(u64, Option<Box<dyn Pending>>)>,
@@ -682,7 +665,6 @@ impl Scratch {
             events: Vec::new(),
             datagrams: Vec::new(),
             rng: Lcg::new(seed),
-            logging: true,
             timers: Vec::new(),
             ordered: Vec::new(),
             keyed: Vec::new(),
@@ -877,10 +859,6 @@ pub struct ServeOptions {
     /// while the driver waits for them. Default 10 seconds. `None` waits
     /// forever.
     pub idle: Option<Duration>,
-    /// Where events go. `None` drops them. Whether anyone reads them is
-    /// checked again before each call, so a dashboard attached later sees
-    /// long-lived connections too.
-    pub journal: Option<Journal>,
     /// Records both directions.
     pub record: Option<Transcript>,
     /// Faults on the bytes and items.
@@ -916,7 +894,6 @@ impl Default for ServeOptions {
         ServeOptions {
             max_conns: 64,
             idle: Some(Duration::from_secs(10)),
-            journal: None,
             record: None,
             faults: None,
             tls: None,
@@ -937,7 +914,6 @@ impl std::fmt::Debug for ServeOptions {
         f.debug_struct("ServeOptions")
             .field("max_conns", &self.max_conns)
             .field("idle", &self.idle)
-            .field("journal", &self.journal.is_some())
             .field("record", &self.record.is_some())
             .field("faults", &self.faults)
             .field("tls", &self.tls.is_some())
@@ -950,11 +926,6 @@ impl std::fmt::Debug for ServeOptions {
 }
 
 impl ServeOptions {
-    /// Sends events to `journal`.
-    pub fn journal(self, journal: Journal) -> ServeOptions {
-        ServeOptions { journal: Some(journal), ..self }
-    }
-
     /// Records both directions in `transcript`.
     pub fn record(self, transcript: Transcript) -> ServeOptions {
         ServeOptions { record: Some(transcript), ..self }
@@ -1015,8 +986,8 @@ impl ServeOptions {
 // ---------------------------------------------------------------------------
 // Handing back
 
-/// Why [`serve`] stopped early. The connection was closed, and the journal
-/// has a `conn.error` or `conn.panic` event that says why.
+/// Why [`serve`] stopped early. The connection was closed, and the run's
+/// events have a `conn.error` or `conn.panic` event that says why.
 #[derive(Debug)]
 pub enum ServeError<E> {
     /// The service returned this error.
@@ -1477,13 +1448,13 @@ where
         }
     }
 
-    fn pending_ctx<'a>(cx: Option<&'a Cx>, events: &'a mut Vec<Event>, written: u64, conn: &'a ConnInfo, logging: bool) -> PendingCtx<'a> {
-        PendingCtx { cx, events, written, conn, logging }
+    fn pending_ctx<'a>(cx: Option<&'a Cx>, events: &'a mut Vec<Event>, written: u64, conn: &'a ConnInfo) -> PendingCtx<'a> {
+        PendingCtx { cx, events, written, conn }
     }
 
     fn cancel_work(&mut self, mut work: Work) {
         let mut events = Vec::new();
-        let mut ctx = Self::pending_ctx(self.cx.as_ref(), &mut events, work.written, &self.info, self.s.logging);
+        let mut ctx = Self::pending_ctx(self.cx.as_ref(), &mut events, work.written, &self.info);
         let _ = guarded(|| work.pending.cancel(&mut ctx));
         self.s.events.append(&mut events);
     }
@@ -1789,7 +1760,7 @@ where
         if let Some(work) = self.ordered.front_mut() {
             let mut events = Vec::new();
             let polled = {
-                let mut ctx = PendingCtx { cx: self.cx.as_ref(), events: &mut events, written: work.written, conn: &self.info, logging: self.s.logging };
+                let mut ctx = PendingCtx { cx: self.cx.as_ref(), events: &mut events, written: work.written, conn: &self.info };
                 guarded(|| work.pending.poll_next(&mut ctx, task))
             };
             self.s.events.append(&mut events);
@@ -1824,7 +1795,7 @@ where
             let mut events = Vec::new();
             let polled = {
                 let (_, work) = &mut self.keyed[i];
-                let mut ctx = PendingCtx { cx: self.cx.as_ref(), events: &mut events, written: work.written, conn: &self.info, logging: self.s.logging };
+                let mut ctx = PendingCtx { cx: self.cx.as_ref(), events: &mut events, written: work.written, conn: &self.info };
                 guarded(|| work.pending.poll_next(&mut ctx, task))
             };
             self.s.events.append(&mut events);
@@ -1878,11 +1849,9 @@ fn conn_end(e: ConnError) -> End {
     }
 }
 
-/// Records an event if `journal` takes it.
-fn record(cx: &Cx, journal: Option<&Journal>, info: &ConnInfo, event: Event) {
-    if let Some(j) = journal {
-        j.record(cx, info, event);
-    }
+/// Records an event from the connection `info`.
+fn record(cx: &Cx, info: &ConnInfo, event: Event) {
+    cx.record(event.conn(info));
 }
 
 /// Serves one connection with `service` until it ends: TLS first with
@@ -1910,7 +1879,7 @@ where
     let mut conn: Box<dyn Connection> = Box::new(conn);
     let mut info = info;
     if let Some(select) = &opts.tls {
-        match accept_tls(cx, conn, &info, select, cx.now() + opts.handshake, opts.journal.as_ref(), || false).await {
+        match accept_tls(cx, conn, &info, select, cx.now() + opts.handshake, || false).await {
             Some((tls, i)) => {
                 conn = Box::new(tls);
                 info = i;
@@ -1929,11 +1898,11 @@ where
         };
         let Some(select) = &opts.starttls else {
             let event = Event::new("conn", "error").level(Level::Notice).summary("the service asked for TLS, and there is no TLS config").field("error", "no TLS config for the upgrade");
-            record(cx, opts.journal.as_ref(), &info, event);
+            record(cx, &info, event);
             return Ok(Served::Closed(End::Failed));
         };
         let deadline = cx.now() + opts.handshake;
-        match accept_tls(cx, rest, &info, select, deadline, opts.journal.as_ref(), || false).await {
+        match accept_tls(cx, rest, &info, select, deadline, || false).await {
             Some((tls, i)) => {
                 conn = Box::new(tls);
                 info = i;
@@ -1979,13 +1948,10 @@ where
     C: Connection,
     <S::Decode as Decode>::Error: Clone + Send,
 {
-    let journal = opts.journal.as_ref();
-    let wants = |cx: &Cx| journal.is_some_and(|j| j.wants(cx));
     if first && opts.connection_events {
-        record(cx, journal, &info, Event::new("conn", "open").summary("connection opened"));
+        record(cx, &info, Event::new("conn", "open").summary("connection opened"));
     }
     let mut core: Core<S> = Core::new(Some(cx.clone()), service, info, opts, Some(wake), cx.now());
-    core.s.logging = wants(cx);
     core.open(service, world, cx.now());
     let tag = core.info.id.unwrap_or(0);
     let mut buf = vec![0u8; READ];
@@ -1994,7 +1960,7 @@ where
     loop {
         if !core.s.events.is_empty() {
             for event in std::mem::take(&mut core.s.events) {
-                record(cx, journal, &core.info, event);
+                record(cx, &core.info, event);
             }
         }
         // Write what is out, through the transcript.
@@ -2020,8 +1986,7 @@ where
                 }
             }
         }
-        core.s.logging = wants(cx);
-        let now = cx.now();
+            let now = cx.now();
         let next = core.advance(service, world, now);
         match next {
             Next::Again => {
@@ -2078,10 +2043,10 @@ where
             }
             Next::Upgrade(how) => {
                 for event in std::mem::take(&mut core.s.events) {
-                    record(cx, journal, &core.info, event);
+                    record(cx, &core.info, event);
                 }
                 if opts.connection_events {
-                    record(cx, journal, &core.info, Event::new("conn", "upgrade").summary(format!("connection upgraded: {}", how.as_str())).field("to", how.as_str()));
+                    record(cx, &core.info, Event::new("conn", "upgrade").summary(format!("connection upgraded: {}", how.as_str())).field("to", how.as_str()));
                 }
                 let unread = core.unread();
                 // The service goes on after TLS, with the same handle.
@@ -2092,7 +2057,7 @@ where
             }
             Next::Closed(end) => {
                 for event in std::mem::take(&mut core.s.events) {
-                    record(cx, journal, &core.info, event);
+                    record(cx, &core.info, event);
                 }
                 if end.writable() {
                     let _ = cx.race(Some(cx.now() + Duration::from_secs(5)), conn.shutdown(cx)).await;
@@ -2102,20 +2067,20 @@ where
                 match &failure {
                     Some(Failure::Service(e)) => {
                         let event = Event::new("conn", "error").level(Level::Notice).summary(format!("the service failed: {e}")).field("error", e.to_string()).field("kind", "service");
-                        record(cx, journal, &info, event);
+                        record(cx, &info, event);
                     }
                     Some(Failure::Pending(e)) => {
                         let event = Event::new("conn", "error").level(Level::Notice).summary(format!("deferred work failed: {e}")).field("error", e.to_string()).field("kind", "deferred");
-                        record(cx, journal, &info, event);
+                        record(cx, &info, event);
                     }
                     Some(Failure::Panic(m)) => {
                         let event = Event::new("conn", "panic").level(Level::Alarm).summary(format!("the service panicked: {m}")).field("message", m.as_str());
-                        record(cx, journal, &info, event);
+                        record(cx, &info, event);
                     }
                     None => {}
                 }
                 if opts.connection_events {
-                    record(cx, journal, &info, Event::new("conn", "close").field("end", end.as_str()).summary(format!("connection closed: {}", end.as_str())));
+                    record(cx, &info, Event::new("conn", "close").field("end", end.as_str()).summary(format!("connection closed: {}", end.as_str())));
                 }
                 drop(core);
                 return match failure {
@@ -2171,8 +2136,8 @@ impl TlsOutcome {
 }
 
 /// Shakes hands as a TLS server on `conn`, with the config `select` picks
-/// for the client's SNI, by `deadline`. Records a `tls.handshake` event in
-/// `journal` with the outcome. `aborted` says whether the world itself
+/// for the client's SNI, by `deadline`. Records a `tls.handshake` event
+/// with the outcome. `aborted` says whether the world itself
 /// ended the connection, for a reset that came from the world.
 ///
 /// Returns the TLS connection and `info` with its SNI and ALPN.
@@ -2182,7 +2147,6 @@ pub async fn accept_tls<C: Connection>(
     info: &ConnInfo,
     select: &TlsSelect,
     deadline: Instant,
-    journal: Option<&Journal>,
     aborted: impl Fn() -> bool,
 ) -> Option<(TlsConnection<C>, ConnInfo)> {
     let mut sni: Option<String> = None;
@@ -2230,28 +2194,24 @@ pub async fn accept_tls<C: Connection>(
         Some(_) => TlsOutcome::Closed,
         None => outcome,
     };
-    if let Some(j) = journal
-        && j.wants(cx)
-    {
-        let mut event = Event::new("tls", "handshake")
-            .summary(match &sni {
-                Some(n) => format!("TLS for {n}: {}", outcome.as_str()),
-                None => format!("TLS with no name: {}", outcome.as_str()),
-            })
-            .level(if matches!(outcome, TlsOutcome::Accepted { .. }) { Level::Info } else { Level::Notice })
-            .field("addr", fictionet::stdlib::journal::opt(info.local.map(|a| a.ip().to_string())))
-            .field("sni", fictionet::stdlib::journal::opt(sni.clone()))
-            .field("outcome", outcome.as_str());
-        match &outcome {
-            TlsOutcome::Accepted { alpn } => {
-                event = event.field("alpn", fictionet::stdlib::journal::opt(alpn.as_ref().map(|a| String::from_utf8_lossy(a).into_owned())));
-            }
-            TlsOutcome::Alert(a) => event = event.field("alert", u32::from(*a)),
-            TlsOutcome::Failed(why) => event = event.field("detail", why.as_str()),
-            _ => {}
+    let mut event = Event::new("tls", "handshake")
+        .summary(match &sni {
+            Some(n) => format!("TLS for {n}: {}", outcome.as_str()),
+            None => format!("TLS with no name: {}", outcome.as_str()),
+        })
+        .level(if matches!(outcome, TlsOutcome::Accepted { .. }) { Level::Info } else { Level::Notice })
+        .field("addr", opt(info.local.map(|a| a.ip().to_string())))
+        .field("sni", opt(sni.clone()))
+        .field("outcome", outcome.as_str());
+    match &outcome {
+        TlsOutcome::Accepted { alpn } => {
+            event = event.field("alpn", opt(alpn.as_ref().map(|a| String::from_utf8_lossy(a).into_owned())));
         }
-        j.record(cx, info, event);
+        TlsOutcome::Alert(a) => event = event.field("alert", u32::from(*a)),
+        TlsOutcome::Failed(why) => event = event.field("detail", why.as_str()),
+        _ => {}
     }
+    record(cx, info, event);
     let conn = conn?;
     let info = info.clone().over_tls(sni.as_deref(), conn.alpn());
     Some((conn, info))
@@ -2344,7 +2304,6 @@ where
     S: Service,
     <S::Decode as Decode>::Error: Clone + Send,
 {
-    let journal = opts.journal.as_ref();
     let base = ConnInfo { local: Some(local), transport: Transport::Udp, ..ConnInfo::default() };
     let mut s = Scratch::new(conn_seed(opts.seed, u64::from(local.port())));
     let mut timers: Vec<(Timer, Instant)> = Vec::new();
@@ -2357,24 +2316,23 @@ where
                   info: &ConnInfo,
                   f: &mut dyn FnMut(&mut ServeCtx<'_>) -> Result<Flow, S::Error>|
      -> Result<Flow, String> {
-        s.logging = journal.is_some_and(|j| j.wants(cx));
         let result = {
             let mut ctx = ServeCtx { s: &mut *s, now: cx.now(), conn: info, timers };
             guarded(|| f(&mut ctx))
         };
         for event in std::mem::take(&mut s.events) {
-            record(cx, journal, info, event);
+            record(cx, info, event);
         }
         let flow = match result {
             Err(m) => {
                 s.discard();
                 let event = Event::new("conn", "panic").level(Level::Alarm).summary(format!("the service panicked: {m}")).field("message", m.as_str());
-                record(cx, journal, info, event);
+                record(cx, info, event);
                 return Err(m);
             }
             Ok(Err(e)) => {
                 let event = Event::new("conn", "error").level(Level::Notice).summary(format!("the service failed: {e}")).field("error", e.to_string()).field("kind", "service");
-                record(cx, journal, info, event);
+                record(cx, info, event);
                 Flow::Close
             }
             Ok(Ok(flow)) => flow,
@@ -2571,7 +2529,8 @@ where
     }
 
     /// The same with `opts`: an idle limit, a fault plan, a budget, a
-    /// seed. The journal, TLS and connection cap are not used.
+    /// seed. TLS and the connection cap are not used, and events are kept
+    /// in the harness ([`Harness::events`]), not recorded.
     pub fn with_options(service: S, world: S::World, opts: ServeOptions) -> Harness<S> {
         let info = ConnInfo { id: Some(1), ..ConnInfo::default() };
         let core = Core::new(None, &service, info, &opts, None, Instant::ZERO);

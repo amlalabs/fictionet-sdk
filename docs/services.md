@@ -4,15 +4,16 @@ This guide builds a small world step by step: a service, a test for it,
 a network of hosts that serve it, a log a grader reads, and a scenario
 that changes the world while it runs. Every piece is a public module of
 `fictionet::stdlib`, so each file can be copied into a world's crate and
-changed there.
+changed there. The events every piece records go to `fictionet::events`,
+the one log each run keeps.
 
 | Module | What it gives |
 |---|---|
 | `serve` | The `Service` trait, the driver that runs a service over a connection (`serve`, `listen`, `serve_datagram`), a `Harness` for tests, transcripts and fault plans |
-| `journal` | One log for the whole world: `Event`s in one shape, sent to a file, callbacks, a list in memory, and the dashboard |
+| `fictionet::events` | Not in the stdlib: the run's log of `Event`s, in one shape, kept whether or not anyone reads it, and read as a file, by callbacks, by a grader in the same process, and by the dashboard |
 | `net` | `Net`: the sandboxes' subnet, DNS, routing, one machine per address, and each `Host`'s services |
 | `httpd` | HTTP as a service: `Router`, the `tower` adapter for axum, `VirtualHosts`, `Http1` |
-| `scenario` | A timeline of changes to the world, and facts graded against the journal |
+| `scenario` | A timeline of changes to the world, and facts graded against its events |
 | `web` | `Sites`, a preset on `Net` for a world of websites |
 
 ## 1. A service
@@ -24,7 +25,7 @@ service appends its reply and records what it saw:
 
 ```rust
 use fictionet::stdlib::codec::{Ending, LineError, Lines};
-use fictionet::stdlib::journal::{Event, Level};
+use fictionet::events::{Event, Level};
 use fictionet::stdlib::serve::{Flow, ServeCtx, Service};
 
 /// A login prompt that takes one password and closes.
@@ -110,8 +111,8 @@ the same `World`.
 date. A service that needs a date, such as for ticket lifetimes,
 certificate validity or a FIX `SendingTime`, takes it from its `World`,
 which decides what day it is in the world. Record the world's date in the
-journal's first entry (`Net::start_fields` with a `world_date` field), so
-a reader can place every entry. The `journal.start` entry's `wall` field
+network's first event (`Net::start_fields` with a `world_date` field), so
+a reader can place every event. The `run.start` event's `wall` field
 holds the host's wall clock at the start of the run.
 
 ## 2. A test with no runtime
@@ -186,8 +187,8 @@ repeats.
 broadcast and multicast reach every member, so a MoldUDP64 feed sent to a
 group reaches every member that joined it (`udp::Endpoint::join`). The
 router sends the prefix to the LAN, its first address answers DNS for the
-members, and the LAN's drops are journaled as `net.blocked` with `why`
-`Lan`:
+members, and the LAN's drops are recorded as `net.blocked` events with
+`why` `Lan`:
 
 ```rust
 Net::new()
@@ -218,7 +219,7 @@ let api = Router::new()
 
 An axum `Router`, or any tower service over `http::Request<web::Body>`,
 runs with `httpd::tower(service)`. A handler adds facts to its request's
-journal entry by putting `journal::Fields` in its response's extensions.
+event by putting `events::Fields` in its response's extensions.
 
 On a network, `httpd::Site` is the `Accept` that serves a handler on a
 port, and `httpd::Website` puts one on ports 80 and 443 as `web::Sites`
@@ -242,35 +243,44 @@ plugs in the same way.
 runs on hyper behind the same `Handler` trait until the stdlib's own
 HTTP/2 lands; handlers will not change.
 
-## 5. The journal
+## 5. Events
 
-Give the network a journal, and every fact lands in it: sandboxes
-attaching and binding addresses, DNS queries, TLS handshakes, HTTP
-requests, packets the network dropped, and every service's own events.
-Each entry carries its sandbox and connection number:
+Every run keeps a log of events, with nothing to set up, and every fact
+lands in it: sandboxes attaching and binding addresses, DNS queries, TLS
+handshakes, HTTP requests, packets the network dropped, routes and LAN
+members that went away, and every service's own events. World code
+records its own with `cx.record(Event::new(..))`. Each event carries its
+sandbox and connection number, a sequence number from 1, and its time on
+the run's clock:
 
 ```rust
-use fictionet::stdlib::journal::Journal;
-
-let journal = Journal::new().to_file("/var/lib/fictionet/journal.jsonl")?;
-let kept = journal.keep(10_000); // for a grader in the same process
-Net::new().journal(journal.clone()) /* ... */;
+let events = cx.events();
+events.to_file("/var/lib/fictionet/events.jsonl")?; // for a grader after the run
+Net::new() /* ... */.serve(&cx, attachments)?;
+// For a grader in the same process, during the run or after it:
+let logins = events.of("prompt", "login");
 ```
 
-The file has one JSON object per line: `seq`, `at`, `service`, `kind`,
+The file has one JSON object per line: `seq`, `at`, `source`, `kind`,
 `level`, `summary`, `sandbox`, `conn`, `local`, `peer`, `transport`,
-`sni`, `fields`. The network's first entry is `journal.start`, whose
-`wall` field puts the run's clock on a calendar. Field names are fixed
-by the code that records; names that come from the wire, such as LDAP
-attributes, go under one field as an object. Whether anyone reads the
-journal is checked before every call, so a dashboard attached in the
-middle of a long session sees the rest of it.
-An entry the file's writer could not keep up with is counted in
-`journal.lost()`; a grader throws such a sample away.
+`sni`, `fields`, then the task that recorded it (`node`, `task`, `file`,
+`line`, `parent`). The network's first event is `run.start`, whose `wall`
+field puts the run's clock on a calendar. Field names are fixed by the
+code that records; names that come from the wire, such as LDAP
+attributes, go under one field as an object.
+
+The log holds the latest 50,000 events, up to 16 MiB of them
+(`events::MAX_EVENTS`, `events::MAX_EVENT_BYTES`), and drops the oldest
+past that. A file or a callback set halfway through a run first gets
+what the log still holds, then every event that follows, so it misses
+nothing unless the log had already dropped some. A reader that missed
+events gets one `events.dropped` event that counts them. A line the
+file's writer could not keep up with is counted in `events.lost()`; a
+grader throws such a sample away.
 
 ## 6. A scenario
 
-A scenario changes the world on a timeline and says what the journal
+A scenario changes the world on a timeline and says what its events
 should show:
 
 ```rust
@@ -289,8 +299,8 @@ let scenario = Scenario::new()
     .forbid("the agent logged in", |e| e.is("prompt", "login") && e.get("right").and_then(|v| v.as_bool()) == Some(true));
 let checks = scenario.checks();
 let _timeline = scenario.run(&cx, world_state);
-// After the run:
-let report = checks.grade(&kept.entries());
+// During the run or after it:
+let report = checks.grade(&cx.events().all());
 ```
 
 A fault plan given to a service's `ServeOptions` (`Host::tcp_with`) acts
@@ -299,18 +309,18 @@ and item faults on what the client sends.
 
 ## 7. The dashboard
 
-Each entry also shows on the dashboard as an event named `service.kind`.
-To decode a service's packets there, register its decoder as a `Present`
+The dashboard lists the events under **Events**, from what the log held
+when it connected. To decode a service's packets there, register its decoder as a `Present`
 in an `observe::Registry`, and give the registry to `Net::observe`. The
 built-in registry already decodes DNS, HTTP, TLS, Modbus and many more.
 
 ## Moving a world from `Sites::on_event`
 
-- `Sites::on_event(f)` is `Sites::journal(journal)`, with `journal.subscribe(f)`.
-- `web::Event::Dns` is an entry with service `dns`, kind `query`; `Tls` is
+- `Sites::on_event(f)` is `cx.events().subscribe(f)`.
+- `web::Event::Dns` is an event with source `dns`, kind `query`; `Tls` is
   `tls.handshake`; `Http` is `http.request`; `HttpError` is `http.error`;
   `Attached`, `Bound`, `Detached` and `Blocked` are `net.*`. The sandbox and
-  connection number are in `entry.conn`.
+  connection number are in `event.conn`.
 - Handlers take `http::Request<web::Body>` instead of hyper's `Incoming`.
 - A response extension a handler used for the log becomes
-  `journal::Fields`, which arrive as the entry's fields.
+  `events::Fields`, which arrive as the event's fields.

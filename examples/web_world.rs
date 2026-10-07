@@ -28,9 +28,9 @@
 //!   `upstream` on the world's own network (a container in the Docker test).
 //! - every other name: NXDOMAIN.
 //!
-//! Every HTTP request and DNS query is also sent to observers as a custom
-//! event (`http_request`, `dns_query`). Watch them, and the whole world,
-//! with `fictionet dashboard --world unix:<socket>`: see
+//! The sites record every DNS query, TLS handshake and HTTP request as an
+//! event (`dns.query`, `tls.handshake`, `http.request`). Watch them, and the
+//! whole world, with `fictionet dashboard --world unix:<socket>`: see
 //! [`fictionet::observe`].
 //!
 //! `web_world --upstream <port>` instead runs that real upstream: a tiny
@@ -50,7 +50,6 @@ use axum::Extension;
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
 use fictionet::stdlib::tls;
-use fictionet::stdlib::journal::Journal;
 use fictionet::stdlib::web;
 use fictionet::Result;
 use http::Version;
@@ -141,33 +140,6 @@ fn world(
             format!("plain site {} {} {}\n", t.scheme, t.host, t.port)
         });
 
-        // One custom event per request and per query, for observers, from
-        // the journal of everything the sites do.
-        let journal = Journal::new().dashboard(false);
-        let observer = cx.clone();
-        journal.subscribe(move |e| {
-            let cx = &observer;
-            let sandbox = e.conn.sandbox.as_ref().map_or("", |s| &*s.name);
-            if e.is("http", "request") {
-                cx.event("http_request")
-                    .str("sandbox", sandbox)
-                    .str("method", e.str("method").unwrap_or(""))
-                    .str("host", e.str("host").unwrap_or(""))
-                    .str("path", e.str("path").unwrap_or(""))
-                    .int("status", e.u64("status").unwrap_or(0) as i64)
-                    .int("bytes", e.u64("sent").unwrap_or(0) as i64)
-                    .emit();
-            } else if e.is("dns", "query") {
-                let answer = match e.str("answer") {
-                    Some("addr") => e.str("addr").unwrap_or("").to_owned(),
-                    Some("nodata") => "NoData".into(),
-                    Some("nxdomain") => "NxDomain".into(),
-                    Some("error") => format!("Error({})", e.u64("rcode").unwrap_or(0)),
-                    _ => "None".into(),
-                };
-                cx.event("dns_query").str("sandbox", sandbox).str("name", e.str("name").unwrap_or("")).str("answer", &answer).emit();
-            }
-        });
         web::Sites::new(move |host: &str| {
             println!("lookup {host}");
             match host {
@@ -189,7 +161,6 @@ fn world(
                 _ => None,
             }
         })
-        .journal(journal)
         .serve(cx, attachments)?;
         Ok(())
     }

@@ -1,4 +1,4 @@
-//! The network's journal entries as log lines.
+//! The network's events as log lines.
 //!
 //! Every line names the sandbox it came from. TLS and HTTP lines carry the
 //! connection number, so the eval joins a request to the handshake it rode
@@ -15,7 +15,7 @@
 //! `[password]`, and the log's writer takes the password out of any other
 //! field ([`crate::log`]).
 
-use fictionet::stdlib::journal::Entry;
+use fictionet::events::Event as Entry;
 use fictionet::stdlib::json::Value as J;
 use serde_json::{Value, json};
 
@@ -26,7 +26,10 @@ use crate::scenario::Scenario;
 /// are not logged.
 pub const LOOKUPS: &str = "border-world-lookups";
 
-/// A journal value as JSON for the log.
+/// The sources of the events [`line`] makes lines of.
+pub const LOGGED: [&str; 4] = ["net", "dns", "tls", "http"];
+
+/// An event's field value as JSON for the log.
 fn js(v: Option<&J>) -> Value {
     match v {
         None | Some(J::Null) => Value::Null,
@@ -54,7 +57,7 @@ pub fn line(scenario: &Scenario, e: &Entry) -> Option<Value> {
     let f = |name: &str| js(e.get(name));
     let conn = e.conn.id.unwrap_or(0);
     let local = e.conn.local.map(|a| a.to_string()).unwrap_or_default();
-    match (e.event.service, e.event.kind) {
+    match (e.source, e.kind) {
         ("net", "attached") => Some(json!({"type": "attached", "sandbox": sandbox(e)})),
         ("net", "bound") => Some(json!({"type": "bound", "sandbox": sandbox(e), "by_dhcp": f("by_dhcp")})),
         ("net", "detached") => Some(json!({"type": "detached", "sandbox": sandbox(e)})),

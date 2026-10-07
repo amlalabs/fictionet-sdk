@@ -103,15 +103,11 @@ pub fn serve(cx: &Cx) -> Attacher {
             h if h.ends_with(".wild.test") => Some(web::Site::new(Echo)),
             _ => None,
         }
-    })
-    .journal({
-        // Format each entry, as a world that logs them would.
-        let journal = fictionet::stdlib::journal::Journal::new();
-        journal.subscribe(|e| {
-            let _ = format!("{e:?}");
-            let _ = fictionet::stdlib::codec::Wire::to_bytes(&e.to_json());
-        });
-        journal
+    });
+    // Format each event, as a world that logs them would.
+    cx.events().subscribe(|e| {
+        let _ = format!("{e:?}");
+        let _ = fictionet::stdlib::codec::Wire::to_bytes(&e.to_json());
     });
     let (attacher, attachments) = attachments();
     sites.serve(cx, attachments).unwrap();

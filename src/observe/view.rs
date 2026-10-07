@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use super::json::{self, Object};
 use std::sync::Arc;
 
-use crate::watch::{Graph, GraphState, Group, Note, short_name};
+use crate::watch::{Graph, GraphState, Group, short_name};
 
 /// What one browser has been told.
 #[derive(Default)]
@@ -19,16 +19,21 @@ pub(crate) struct View {
     /// Group id to its JSON.
     groups: BTreeMap<String, String>,
     counters: BTreeMap<String, [u64; 4]>,
-    /// The last note sent.
-    note_seq: u64,
+    /// The number of the last event sent.
+    event_seq: u64,
     ended: bool,
 }
 
 /// One server-sent event: its name and its JSON data.
 pub(crate) type Message = (&'static str, String);
 
-/// How many earlier notes a snapshot carries.
-const SNAPSHOT_NOTES: usize = 200;
+/// How many earlier events a snapshot carries.
+const SNAPSHOT_EVENTS: u64 = 200;
+/// How many events one round of changes carries at most, so a replay of
+/// the whole log goes out in pieces.
+const EVENTS_PER_CHANGE: usize = 1000;
+/// How many events an `events` reply carries unless asked for fewer.
+pub(crate) const EVENTS_PER_REPLY: usize = 1000;
 
 pub(crate) fn task_id(id: u64) -> String {
     format!("t{id}")
@@ -184,27 +189,6 @@ fn build(mut c: Copy) -> View {
     view
 }
 
-fn note_json(n: &Note) -> String {
-    let o = Object::new()
-        .num("seq", n.seq)
-        .secs("t", n.at)
-        .opt_str("node", (n.task != 0).then(|| task_id(n.task)).as_deref())
-        .str("kind", n.kind);
-    let o = match &n.from {
-        Some((name, file, line, parent)) => o
-            .str("task", name)
-            .str("file", file)
-            .num("line", line)
-            .opt_str("parent", (*parent != 0).then(|| task_id(*parent)).as_deref()),
-        None => o,
-    };
-    match &n.event {
-        Some((name, data)) => o.str("name", name).raw("data", data),
-        None => o.str("text", &n.text).bool("packet", n.packet.is_some()),
-    }
-    .done()
-}
-
 /// The `counters` reply: every link's counts now.
 pub(crate) fn counters(graph: &Graph) -> String {
     let c = copy(&mut graph.state());
@@ -212,11 +196,10 @@ pub(crate) fn counters(graph: &Graph) -> String {
     Object::new().secs("t", graph.start.elapsed()).raw("edges", &counters_json(view.counters.iter())).done()
 }
 
-/// The `notes` reply: the notes after number `after`.
-pub(crate) fn notes(graph: &Graph, after: u64) -> String {
-    let s = graph.state();
-    let notes: Vec<String> = s.notes.iter().filter(|n| n.seq > after).map(note_json).collect();
-    Object::new().raw("notes", &json::array(notes)).done()
+/// The `events` reply: at most `max` events after number `after`.
+pub(crate) fn events(graph: &Graph, after: u64, max: usize) -> String {
+    let events: Vec<String> = graph.events.after(after, max).iter().map(|e| e.to_line()).collect();
+    Object::new().raw("events", &json::array(events)).done()
 }
 
 /// The `link` reply: one link's ends, label and counts, if it is shown.
@@ -242,17 +225,25 @@ fn counters_json<'a>(counters: impl Iterator<Item = (&'a String, &'a [u64; 4])>)
     out
 }
 
-/// The whole graph, for a browser that just connected. Returns the view
-/// the browser now has.
-pub(crate) fn snapshot(graph: &Graph) -> (View, Message) {
-    let mut s = graph.state();
-    let c = copy(&mut s);
-    let skip = s.notes.len().saturating_sub(SNAPSHOT_NOTES);
-    let notes: Vec<Note> = s.notes.iter().skip(skip).cloned().collect();
-    drop(s);
+/// The whole graph, for a browser that just connected, with the latest
+/// events, or none if `after` says where the browser's events start. Returns
+/// the view the browser now has.
+pub(crate) fn snapshot(graph: &Graph, after: Option<u64>) -> (View, Message) {
+    let c = copy(&mut graph.state());
     let mut view = build(c);
-    view.note_seq = notes.last().map_or(0, |n| n.seq);
-    let notes: Vec<String> = notes.iter().map(note_json).collect();
+    let events = match after {
+        Some(after) => {
+            view.event_seq = after;
+            Vec::new()
+        }
+        None => {
+            let last = graph.events.last();
+            let events = graph.events.after(last.saturating_sub(SNAPSHOT_EVENTS), SNAPSHOT_EVENTS as usize + 1);
+            view.event_seq = events.last().map_or(last, |e| e.seq);
+            events
+        }
+    };
+    let events: Vec<String> = events.iter().map(|e| e.to_line()).collect();
     let data = Object::new()
         .secs("t", graph.start.elapsed())
         .num("started", graph.start_wall.duration_since(crate::sys::UNIX_EPOCH).map_or(0, |d| d.as_millis()))
@@ -261,21 +252,18 @@ pub(crate) fn snapshot(graph: &Graph) -> (View, Message) {
         .raw("nodes", &json::array(view.nodes.values()))
         .raw("edges", &json::array(view.edges.values()))
         .raw("counters", &counters_json(view.counters.iter()))
-        .raw("notes", &json::array(notes))
+        .raw("events", &json::array(events))
         .done();
     (view, ("snapshot", data))
 }
 
 /// What changed since `old`, which becomes the graph as it is now.
 pub(crate) fn changes(graph: &Graph, old: &mut View) -> Vec<Message> {
-    let mut s = graph.state();
-    let c = copy(&mut s);
-    let notes: Vec<Note> = s.notes.iter().filter(|n| n.seq > old.note_seq).cloned().collect();
-    let note_seq = s.notes.back().map_or(old.note_seq, |n| n.seq.max(old.note_seq));
-    drop(s);
+    let c = copy(&mut graph.state());
+    let events = graph.events.after(old.event_seq, EVENTS_PER_CHANGE);
     let mut new = build(c);
-    new.note_seq = note_seq;
-    let notes: Vec<String> = notes.iter().map(note_json).collect();
+    new.event_seq = events.last().map_or(old.event_seq, |e| e.seq);
+    let events: Vec<String> = events.iter().map(|e| e.to_line()).collect();
 
     let mut out = Vec::new();
     // Edges go first, then nodes, so a browser never holds an edge to a
@@ -312,8 +300,8 @@ pub(crate) fn changes(graph: &Graph, old: &mut View) -> Vec<Message> {
         let data = Object::new().secs("t", graph.start.elapsed()).raw("edges", &counters).done();
         out.push(("counters", data));
     }
-    for note in notes {
-        out.push(("note", note));
+    for event in events {
+        out.push(("event", event));
     }
     if new.ended && !old.ended {
         out.push(("ended", Object::new().secs("t", graph.start.elapsed()).done()));
@@ -366,7 +354,7 @@ mod tests {
                 Ok(())
             });
             cx.sleep(ms(30)).await?;
-            let (_, (_, data)) = snapshot(&g);
+            let (_, (_, data)) = snapshot(&g, None);
             s.lock().unwrap().push(data);
             cx.cancel();
             Ok(())
@@ -390,7 +378,7 @@ mod tests {
     fn groups_come_and_go_with_their_tasks() {
         let graph = Graph::new();
         graph.task_started(1, "world".into(), Location::caller(), None);
-        let (mut view, _) = snapshot(&graph);
+        let (mut view, _) = snapshot(&graph, None);
         let outer = Group::new(graph.next_group(), "outer".into(), None);
         let inner = Group::new(graph.next_group(), "inner".into(), Some(outer.clone()));
         graph.task_started(2, "delay".into(), Location::caller(), Some(inner));
@@ -406,7 +394,7 @@ mod tests {
     fn changes_follow_the_graph() {
         let graph = Graph::new();
         graph.task_started(1, "world".into(), Location::caller(), None);
-        let (mut view, (name, data)) = snapshot(&graph);
+        let (mut view, (name, data)) = snapshot(&graph, None);
         assert_eq!(name, "snapshot");
         assert!(data.contains(r#""id":"t1","kind":"world""#), "{data}");
         assert!(changes(&graph, &mut view).is_empty());
@@ -425,11 +413,11 @@ mod tests {
         graph.task_ended(2);
         assert_eq!(names(&changes(&graph, &mut view)), ["edge_end", "node_end"]);
 
-        // Notes are sent once each.
-        graph.note("drop", "queue full".into(), None);
+        // Events are sent once each.
+        graph.events.push(crate::events::Event::new("bottleneck", "drop").summary("queue full"));
         let m = changes(&graph, &mut view);
-        assert_eq!(names(&m), ["note"]);
-        assert!(m[0].1.contains(r#""kind":"drop","text":"queue full""#));
+        assert_eq!(names(&m), ["event"]);
+        assert!(m[0].1.contains(r#""source":"bottleneck","kind":"drop","level":"info","summary":"queue full""#), "{}", m[0].1);
         assert!(changes(&graph, &mut view).is_empty());
 
         graph.run_ended();

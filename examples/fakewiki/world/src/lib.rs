@@ -16,7 +16,7 @@
 //!   rcgen and signed by the CA that `ca.py` made when the image was built.
 //! - **Ground truth**: `state.json` and `log.jsonl` in `--state-dir`, in
 //!   main.py's formats, and the ready file. The log is written from the
-//!   network's journal ([`events`]).
+//!   network's events ([`events`]).
 
 pub mod content;
 pub mod events;
@@ -103,7 +103,7 @@ pub fn serve(
         configs.insert(host, Arc::new(config));
     }
     let site_hosts = hosts.clone();
-    let journal = events::journal(hosts.clone(), log);
+    events::log_to(cx, hosts.clone(), log);
     web::Sites::new(move |host: &str| {
         let addr = *site_hosts.get(host)?;
         let config = configs.get(host)?.clone();
@@ -112,7 +112,6 @@ pub fn serve(
     // The agent's sandbox has IPv6 off, and the sites keep their real
     // IPv4 addresses only.
     .ipv4_only()
-    .journal(journal)
     .serve(cx, attachments)?;
     Ok(())
 }

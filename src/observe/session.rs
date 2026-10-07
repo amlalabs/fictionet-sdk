@@ -34,7 +34,7 @@ pub(crate) fn start(attacher: Attacher, fd: OwnedFd) {
     });
 }
 
-/// Counts a connected observer, so notes keep their packets.
+/// Counts a connected observer, so links copy packets and TLS keeps keys.
 struct Viewer(Arc<Graph>);
 
 impl Viewer {
@@ -52,7 +52,9 @@ impl Drop for Viewer {
 
 enum Sub {
     /// `watch`: the graph, then what changed.
-    Graph { id: u32, shown: Option<(u64, View, Viewer)>, said_waiting: bool, next: Instant },
+    /// `after` is where the events start, if the request said: the first
+    /// run's events after that number, and every event of a later run.
+    Graph { id: u32, shown: Option<(u64, View, Viewer)>, after: Option<u64>, said_waiting: bool, next: Instant },
     /// `packets`: one link's packets as they are copied.
     Packets { id: u32, watch: Arc<LinkWatch>, cursor: u64, _held: (Subscription, Viewer), next: Instant },
 }
@@ -168,17 +170,18 @@ impl Session {
         match op {
             "world" => self.reply(id, &world(graph.as_deref())),
             "graph" => match graph {
-                Some(g) => self.reply(id, &view::snapshot(&g).1.1),
+                Some(g) => self.reply(id, &view::snapshot(&g, None).1.1),
                 None => self.reply(id, &error("no world is running yet")),
             },
             "counters" => match graph {
                 Some(g) => self.reply(id, &view::counters(&g)),
                 None => self.reply(id, &error("no world is running yet")),
             },
-            "notes" => match graph {
+            "events" => match graph {
                 Some(g) => {
                     let after = req.get("after").and_then(Scalar::as_u64).unwrap_or(0);
-                    self.reply(id, &view::notes(&g, after))
+                    let max = req.get("max").and_then(Scalar::as_u64).map_or(view::EVENTS_PER_REPLY, |m| (m as usize).min(view::EVENTS_PER_REPLY));
+                    self.reply(id, &view::events(&g, after, max))
                 }
                 None => self.reply(id, &error("no world is running yet")),
             },
@@ -190,7 +193,8 @@ impl Session {
                 self.reply(id, &error("this session has too many subscriptions"))
             }
             "watch" => {
-                self.subs.push(Sub::Graph { id, shown: None, said_waiting: false, next: Instant::now() });
+                let after = req.get("after").and_then(Scalar::as_u64);
+                self.subs.push(Sub::Graph { id, shown: None, after, said_waiting: false, next: Instant::now() });
                 Ok(())
             }
             "link" | "packets" | "packet" | "pcap" => {
@@ -255,7 +259,7 @@ impl Session {
         let mut out: Vec<(u32, String, bool)> = Vec::new();
         for sub in &mut self.subs {
             match sub {
-                Sub::Graph { id, shown, said_waiting, next } => {
+                Sub::Graph { id, shown, after, said_waiting, next } => {
                     if *next > now {
                         continue;
                     }
@@ -275,7 +279,9 @@ impl Session {
                             }
                         }
                         (Some(graph), shown) => {
-                            let (view, (name, data)) = view::snapshot(&graph);
+                            let (view, (name, data)) = view::snapshot(&graph, *after);
+                            // A later run's events start from its first.
+                            *after = after.map(|_| 0);
                             out.push((*id, event(name, &data), false));
                             *shown = Some((generation, view, Viewer::new(graph)));
                         }

@@ -350,10 +350,9 @@
 //!
 //! Much of what the agent does never reaches a handler. `Sites` answers DNS,
 //! rejects TLS handshakes, sends redirects and `421`s, and drops packets on
-//! its own. A world that wants to know all of it gives `Sites` a
-//! [`Journal`] with [`journal`](Sites::journal), and gets one entry for each
-//! of these, in the shape every service uses
-//! ([`journal`](crate::stdlib::journal)):
+//! its own. `Sites` records all of it in the run's
+//! [events](crate::events), one event for each of these, in the shape
+//! every service uses:
 //!
 //! - `net.attached`, `net.bound` (field `by_dhcp`, `addr`) and
 //!   `net.detached`: a sandbox attaches, gets an address, or detaches;
@@ -374,7 +373,7 @@
 //!   `why` (see [`BlockedWhy`](crate::stdlib::net::BlockedWhy)),
 //!   `protocol`, `src`, `dst` and `dst_port`.
 //!
-//! Every entry names the sandbox it came from; entries about a connection
+//! Every event names the sandbox it came from; events about a connection
 //! carry its number, from 1, on both ports. A connection's `tls.handshake`
 //! comes before its requests. An event is made when the thing it reports
 //! ends, so HTTP/2 requests on one connection can end in any order; the
@@ -385,31 +384,34 @@
 //!
 #![doc = include_str!("../../docs/diagrams/sites-request.svg")]
 //!
-//! Callbacks set with [`Journal::subscribe`] run inside the task that made
-//! the entry. Every task of a world runs on one thread, so a slow callback
-//! slows the whole world. Hand the entry to a channel that never waits, and
-//! do the work elsewhere, or write the journal to a file with
-//! [`Journal::to_file`], which does that for you:
+//! Callbacks set with [`EventLog::subscribe`](crate::events::EventLog::subscribe)
+//! run inside the task that recorded the event. Every task of a world runs
+//! on one thread, so a slow callback slows the whole world. Hand the event
+//! to a channel that never waits, and do the work elsewhere, or write the
+//! events to a file with
+//! [`EventLog::to_file`](crate::events::EventLog::to_file), which does that
+//! for you:
 //!
 //! ```
-//! # use fictionet::{Attachments, Cx, Result, stdlib::{journal::Journal, web}};
+//! # use fictionet::{Attachments, Cx, Result, stdlib::web};
 //! # fn site_for(_host: &str) -> Option<web::Site> { None }
 //! # fn world(cx: Cx, attachments: Attachments) -> Result {
-//! let journal = Journal::new().to_file("/var/lib/fictionet/journal.jsonl")?;
-//! web::Sites::new(site_for).journal(journal.clone()).serve(&cx, attachments)?;
-//! // At the end of the sample: journal.lost() must be zero.
+//! let events = cx.events();
+//! events.to_file("/var/lib/fictionet/events.jsonl")?;
+//! web::Sites::new(site_for).serve(&cx, attachments)?;
+//! // At the end of the sample: events.lost() must be zero.
 //! # Ok(())
 //! # }
 //! ```
 //!
-//! A handler can add its own fields to its request's entry. It puts
-//! [`Fields`](crate::stdlib::journal::Fields) in the extensions of the
+//! A handler can add its own fields to its request's event. It puts
+//! [`Fields`](crate::events::Fields) in the extensions of the
 //! response it returns. Response extensions are never sent to the agent.
 //! The FakeWiki eval in `examples/fakewiki` puts the kind and stance of
 //! each page there, so one log line holds what the agent asked for and what
 //! it was shown.
 //!
-//! Entries do not hold packets or bodies. A world that wants every packet
+//! Events do not hold packets or bodies. A world that wants every packet
 //! puts a [`filter`](crate::stdlib::filter) between each sandbox and
 //! `Sites`, as [Changing the network around the
 //! sites](#changing-the-network-around-the-sites) shows. The
@@ -518,7 +520,6 @@ use http::{Request, Response};
 
 pub use crate::stdlib::httpd::{Body, Target};
 use crate::stdlib::httpd::{self, Handler, Website};
-use crate::stdlib::journal::Journal;
 use crate::stdlib::net::{Host, Net};
 use crate::stdlib::route::Prefix;
 use crate::stdlib::tls::ServerConfig;
@@ -532,7 +533,6 @@ pub struct Sites {
     subnet_v6: Prefix,
     ipv6: bool,
     max_sites: usize,
-    journal: Option<Journal>,
 }
 
 /// The callback given to [`Sites::new`].
@@ -557,13 +557,7 @@ impl Sites {
             subnet_v6: Prefix { addr: Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0).into(), len: 64 },
             ipv6: true,
             max_sites: crate::stdlib::net::MAX_HOSTS,
-            journal: None,
         }
-    }
-
-    /// Records everything `Sites` does in `journal`. See [Events](self#events).
-    pub fn journal(self, journal: Journal) -> Sites {
-        Sites { journal: Some(journal), ..self }
     }
 
     /// Sets the sandboxes' IPv4 or IPv6 subnet, whichever `subnet` is. The
@@ -618,9 +612,6 @@ impl Sites {
             .resolve(move |name| site_for(name).map(|site| site.into_host(name)));
         if !self.ipv6 {
             net = net.ipv4_only();
-        }
-        if let Some(journal) = self.journal {
-            net = net.journal(journal);
         }
         net
     }

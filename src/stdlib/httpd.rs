@@ -31,7 +31,7 @@
 //! connection: HTTP/2 by ALPN or by the client's preface, else HTTP/1.
 //!
 //! HTTP/2 runs on hyper for now, behind the same [`Handler`] trait and the
-//! same journal events. When the stdlib's own HTTP/2 lands, it becomes a
+//! same events. When the stdlib's own HTTP/2 lands, it becomes a
 //! second `Service` here and [`serve_connection`] picks it; handlers do not
 //! change.
 //!
@@ -73,6 +73,7 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::future::{Future, poll_fn};
 use std::any::Any;
+use std::fmt::Write as _;
 use std::pin::{Pin, pin};
 use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context, Poll};
@@ -85,7 +86,7 @@ use http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode, Versi
 use http_body::{Body as _, Frame, SizeHint};
 
 use fictionet::stdlib::http1::{self, Event as H1, RequestHead};
-use fictionet::stdlib::journal::{ConnInfo, Event, Fields, Journal, Level, float, opt};
+use fictionet::events::{ConnInfo, Event, Fields, Level, float, opt};
 use fictionet::stdlib::json::Value;
 use fictionet::stdlib::net::{Accept, Arrival, ConfigFor, Host, Sni};
 use fictionet::stdlib::serve::{self, Budget, End, Flow, Pending, PendingCtx, Prefixed, ServeCtx, ServeOptions, Timer};
@@ -662,10 +663,7 @@ fn version_name(v: Version) -> &'static str {
 }
 
 impl Tracker {
-    fn new<B>(on: bool, request: &Request<B>, conn: &ConnInfo, started: Instant) -> Tracker {
-        if !on {
-            return Tracker { event: None };
-        }
+    fn new<B>(request: &Request<B>, conn: &ConnInfo, started: Instant) -> Tracker {
         let host = request_host(request);
         let headers: Vec<Value> = request
             .headers()
@@ -673,7 +671,11 @@ impl Tracker {
             .map(|(n, v)| Value::Array(vec![n.as_str().into(), String::from_utf8_lossy(v.as_bytes()).into_owned().into()]))
             .collect();
         let uri = request.uri();
+        // Room for every field, and for the status the summary gets later.
+        let mut summary = String::with_capacity(request.method().as_str().len() + host.as_ref().map_or(1, String::len) + uri.path().len() + 5);
+        let _ = write!(summary, "{} {}{}", request.method(), host.as_deref().unwrap_or("-"), uri.path());
         let event = Event::new("http", "request")
+            .fields(Fields::with_capacity(16))
             .field("scheme", if conn.tls { "https" } else { "http" })
             .field("sni", opt(conn.sni.as_deref()))
             .field("host", opt(host.clone()))
@@ -684,7 +686,7 @@ impl Tracker {
             .field("version", version_name(request.version()))
             .field("headers", Value::Array(headers))
             .field("started", float(started.since_start().as_secs_f64()))
-            .summary(format!("{} {}{}", request.method(), host.as_deref().unwrap_or("-"), uri.path()));
+            .summary(summary);
         Tracker { event: Some(event) }
     }
 
@@ -707,7 +709,7 @@ impl Tracker {
         fields.extend(own);
         event.fields = fields;
         if let Some(s) = status {
-            event.summary = format!("{} {}", event.summary, s.as_u16());
+            let _ = write!(event.summary, " {}", s.as_u16());
             if s.is_server_error() {
                 event.level = Level::Notice;
             }
@@ -821,7 +823,7 @@ impl Http1 {
         let mut request = request;
         request.extensions_mut().insert(ctx.conn().clone());
         let head_only = request.method() == Method::HEAD;
-        let mut tracker = Tracker::new(ctx.logging(), &request, ctx.conn(), self.started);
+        let mut tracker = Tracker::new(&request, ctx.conn(), self.started);
         let now = ctx.now();
         let conn = ctx.conn().clone();
         let reply = {
@@ -1032,16 +1034,13 @@ impl serve::Service for Http1 {
             self.dispatch(ctx, Body::empty(), true);
             return Ok(());
         }
-        if ctx.logging() {
-            let e = error_event(ctx.conn(), "protocol", error.to_string());
-            ctx.log(e);
-        }
+        ctx.log(error_event(ctx.conn(), "protocol", error.to_string()));
         write_simple(ctx.reply(), Version::HTTP_11, StatusCode::BAD_REQUEST);
         Ok(())
     }
 
     fn on_end(&mut self, end: End, _: &(), ctx: &mut ServeCtx<'_>) -> Result<(), Infallible> {
-        if end == End::Conn(ConnError::Broken) && ctx.logging() {
+        if end == End::Conn(ConnError::Broken) {
             let e = error_event(ctx.conn(), "transport", "a TLS record did not decrypt".into());
             ctx.log(e);
         }
@@ -1216,8 +1215,6 @@ pub struct HttpOptions {
     /// with an `http.error` event, cause `timeout`. `None` waits as long as
     /// the HTTP/1 head limit allows.
     pub first_bytes: Option<Duration>,
-    /// Where events go.
-    pub journal: Option<Journal>,
     /// What HTTP/1 connections are charged to ([`ServeOptions::budget`]).
     pub budget: Option<Budget>,
     /// The seed of HTTP/1 connections' randomness ([`ServeOptions::seed`]).
@@ -1251,10 +1248,8 @@ pub async fn serve_connection<C: Connection + Unpin>(cx: &Cx, conn: C, info: Con
             Ok(true) => {}
             Ok(false) | Err(Raced::Cancelled) => return,
             Err(Raced::Deadline) => {
-                if let Some(j) = &opts.journal {
-                    let secs = opts.first_bytes.map_or(0, |d| d.as_secs());
-                    j.record(cx, &info, error_event(&info, "timeout", format!("no bytes within {secs} seconds of connecting")));
-                }
+                let secs = opts.first_bytes.map_or(0, |d| d.as_secs());
+                cx.record(error_event(&info, "timeout", format!("no bytes within {secs} seconds of connecting")).conn(&info));
                 return;
             }
         }
@@ -1262,11 +1257,10 @@ pub async fn serve_connection<C: Connection + Unpin>(cx: &Cx, conn: C, info: Con
     };
     let conn = Prefixed::new(first, conn);
     if h2 {
-        h2::serve(cx, conn, handler, info, opts.journal.clone()).await;
+        h2::serve(cx, conn, handler, info).await;
         return;
     }
     let serve_opts = ServeOptions {
-        journal: opts.journal.clone(),
         idle: None,
         connection_events: false,
         budget: opts.budget.clone(),
@@ -1348,7 +1342,6 @@ impl Accept for Site {
         let opts = HttpOptions {
             h1: self.h1,
             first_bytes: (!arrival.info.tls).then_some(arrival.handshake),
-            journal: arrival.journal,
             budget: arrival.budget,
             seed: arrival.seed,
         };
@@ -1437,10 +1430,10 @@ mod h2 {
     use hyper::body::Incoming;
 
     /// Runs hyper's HTTP/2 server on `conn`.
-    pub(super) async fn serve<C: Connection + Unpin>(cx: &Cx, conn: C, handler: Arc<dyn Handler>, info: ConnInfo, journal: Option<Journal>) {
+    pub(super) async fn serve<C: Connection + Unpin>(cx: &Cx, conn: C, handler: Arc<dyn Handler>, info: ConnInfo) {
         let broke = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let io = Io { cx: cx.clone(), conn, broke: broke.clone(), buf: vec![0; 16 * 1024].into_boxed_slice() };
-        let route = Route { cx: cx.clone(), handler, info: Arc::new(info.clone()), journal: journal.clone() };
+        let route = Route { cx: cx.clone(), handler, info: Arc::new(info.clone()) };
         // In a browser, `std::time::Instant::now` and `SystemTime::now` panic.
         // hyper's timer API is in `Instant`, so there hyper runs without a
         // timer, and it writes no `Date` header, which it takes from
@@ -1454,7 +1447,6 @@ mod h2 {
         // hyper reads all the time on HTTP/2, so a reset ends it on its own.
         let served = builder.serve_connection(io, route);
         let Ok(result) = cx.race(None, served).await else { return };
-        let Some(j) = journal else { return };
         let broke = broke.load(std::sync::atomic::Ordering::Relaxed);
         let cause = match &result {
             Err(e) => match error_cause(e) {
@@ -1466,7 +1458,7 @@ mod h2 {
             Ok(()) => None,
         };
         if let Some((cause, detail)) = cause {
-            j.record(cx, &info, error_event(&info, cause, detail));
+            cx.record(error_event(&info, cause, detail).conn(&info));
         }
     }
 
@@ -1503,7 +1495,6 @@ mod h2 {
         cx: Cx,
         handler: Arc<dyn Handler>,
         info: Arc<ConnInfo>,
-        journal: Option<Journal>,
     }
 
     type Answer = Pin<Box<dyn Future<Output = Result<Response<Counted>, Error>> + Send>>;
@@ -1515,10 +1506,8 @@ mod h2 {
 
         fn call(&self, request: Request<Incoming>) -> Answer {
             let route = self.clone();
-            let on = route.journal.as_ref().is_some_and(|j| j.wants(&route.cx));
             let track = Track {
-                tracker: Tracker::new(on, &request, &route.info, route.cx.now()),
-                journal: route.journal.clone(),
+                tracker: Tracker::new(&request, &route.info, route.cx.now()),
                 cx: route.cx.clone(),
                 info: route.info.clone(),
                 extra: None,
@@ -1576,7 +1565,6 @@ mod h2 {
     /// One request's event, sent when it is dropped.
     struct Track {
         tracker: Tracker,
-        journal: Option<Journal>,
         cx: Cx,
         info: Arc<ConnInfo>,
         extra: Option<Fields>,
@@ -1587,10 +1575,8 @@ mod h2 {
 
     impl Drop for Track {
         fn drop(&mut self) {
-            if let Some(e) = self.tracker.finish(self.extra.take(), self.status, self.sent, self.complete)
-                && let Some(j) = &self.journal
-            {
-                j.record(&self.cx, &self.info, e);
+            if let Some(e) = self.tracker.finish(self.extra.take(), self.status, self.sent, self.complete) {
+                self.cx.record(e.conn(&self.info));
             }
         }
     }

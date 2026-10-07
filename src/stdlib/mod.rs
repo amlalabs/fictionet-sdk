@@ -25,13 +25,13 @@
 //! - **Services.** A [`serve::Service`] is the server side of one protocol
 //!   for one connection, written with no I/O. [`serve::serve`] and
 //!   [`serve::listen`] run it over a connection or a listener. HTTP is one
-//!   ([`httpd`]). Every service records what it sees in one
-//!   [`journal`].
+//!   ([`httpd`]). Every service records what it sees as
+//!   [events](crate::events) in the run's one log.
 //! - **Networks.** [`net::Net`] builds all of the above for you: the
 //!   sandboxes' subnet, DNS, addresses, a router, one machine per address,
 //!   and each host's services. [`web::Sites`] is a preset on it for a world
 //!   of websites. Start there. [`scenario`] changes a running world on a
-//!   timeline and grades its journal.
+//!   timeline and grades its events.
 //!
 //! Every piece is ordinary code built from the same public items, so you
 //! can wire a network by hand when `Sites` does not fit. To put a link in
@@ -238,7 +238,6 @@ pub mod ip;
 pub mod ipp;
 pub mod ipsec;
 pub mod itch;
-pub mod journal;
 pub mod json;
 pub mod json_schema;
 pub mod jsonrpc;
@@ -568,9 +567,9 @@ where
                     if let Some(leaves) = admit(&queues[i], now, packet.0.len()).filter(|_| fits) {
                         queues[i].bytes += cost;
                         queues[i].packets.push_back((leaves, packet));
-                    } else if cx.observed() {
+                    } else {
                         let waiting = queues[i].packets.len();
-                        crate::observe::note_drop(&cx, &packet, waiting);
+                        crate::observe::record_drop(&cx, name, &packet, &format!("the queue was full, {waiting} packets waiting"));
                     }
                 }
                 Event::Timer => {

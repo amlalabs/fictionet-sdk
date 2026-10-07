@@ -578,8 +578,7 @@ svg :focus:not(:focus-visible) {
   animation: pulse 0.9s ease-out forwards;
   pointer-events: none;
 }
-.pulse.drop,
-.pulse.route_removed {
+.pulse.bad {
   stroke: var(--danger);
 }
 @keyframes pulse {
@@ -741,26 +740,25 @@ button.link:hover {
   color: var(--accent-text);
   text-decoration: underline;
 }
-.note {
+.event-row {
   display: grid !important;
   grid-template-columns: 52px 1fr;
   gap: 2px 10px !important;
 }
-.note time {
+.event-row time {
   color: var(--subtle);
   font: 11px var(--mono);
 }
-.note .kind {
+.event-row .kind {
   font-weight: 600;
 }
-.note .kind.drop,
-.note .kind.route_removed {
+.event-row .kind.bad {
   color: var(--danger);
 }
-.note .kind.tls_keys {
+.event-row .kind.good {
   color: var(--success);
 }
-.note .text {
+.event-row .text {
   grid-column: 2;
   color: var(--text);
   overflow-wrap: anywhere;

@@ -92,7 +92,7 @@ $ sudo target/release/fictionet attach --world unix:/run/fictionet/world.sock --
 fictionet attach: agent attached as tun0
 
 # Terminal 3: what the world sees, one line per HTTP request
-$ target/release/fictionet observe --world unix:/run/fictionet/world.sock watch | grep http_request
+$ target/release/fictionet observe --world unix:/run/fictionet/world.sock watch | grep '"kind":"request"'
 
 # Terminal 4: inside the sandbox
 $ sudo ip netns exec agent curl -sS --cacert /run/fictionet/ca.pem -w '%{remote_ip}\n' https://example.test/
@@ -113,13 +113,14 @@ this world, and `1.1.1.1` is not on its network. The `nsswitch.conf` line makes
 programs in the namespace look names up in the world, even on a host where
 `systemd-resolved` would otherwise answer them.
 
-Terminal 3 shows the world's side. `web_world` sends an event for each HTTP request
-and DNS query, and `fictionet observe` prints each event as a line of JSON while it
-watches:
+Terminal 3 shows the world's side. Every world keeps a log of events, and
+`web_world`'s sites record one for each DNS query, TLS handshake and HTTP request.
+`fictionet observe` prints each event as a line of JSON while it watches (cut short
+here):
 
 ```text
-{"event":"note","data":{"seq":4,"t":4.050251,"node":"t32","kind":"event","task":"execute","file":"src/stdlib/web.rs","line":1299,"parent":"t31","name":"http_request","data":{"sandbox":"agent","method":"GET","host":"example.test","path":"/","status":200,"bytes":48}}}
-{"event":"note","data":{"seq":7,"t":4.063997,"node":"t33","kind":"event","task":"net::accept","file":"src/stdlib/net.rs","line":1336,"parent":"t29","name":"http_request","data":{"sandbox":"agent","method":"GET","host":"example.test","path":"/","status":301,"bytes":31}}}
+{"event":"event","data":{"seq":9,"at":4.050251,"source":"http","kind":"request","level":"info","summary":"GET example.test/ 200","sandbox":{"id":1,"name":"agent","addr":"10.0.0.2","addr_v6":"2001:db8::2"},"conn":3,...,"fields":{"scheme":"https","host":"example.test","method":"GET","path":"/","status":200,...},"node":"t32",...}}
+{"event":"event","data":{"seq":12,"at":4.063997,"source":"http","kind":"request","level":"info","summary":"GET example.test/ 301","sandbox":{"id":1,"name":"agent",...},"conn":4,...,"fields":{"scheme":"http","host":"example.test","method":"GET","path":"/","status":301,...},"node":"t33",...}}
 ```
 
 `fictionet dashboard` shows the same world in a browser

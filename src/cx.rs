@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll, Waker};
 
+use crate::events::{Event, EventLog};
 use crate::run::RunShared;
 use crate::watch::Group;
 use crate::time::{Duration, Instant};
@@ -252,12 +253,12 @@ impl Cx {
         Cx { run: self.run.clone(), region: self.region.clone(), group: Some(group) }
     }
 
-    /// Whether an observer is following this world's events right now,
-    /// such as the dashboard or `fictionet observe watch`.
+    /// Whether an observer, such as the dashboard or `fictionet observe
+    /// watch`, is connected to this world right now.
     ///
-    /// Use it to skip work that only an observer would see, like
-    /// formatting a large payload for [`Cx::emit`]. It reads one number,
-    /// so it is cheap to call on every packet.
+    /// Events are recorded either way ([`Cx::record`]). Only packet copies
+    /// and TLS session keys wait for an observer. It reads one number, so
+    /// it is cheap to call on every packet.
     pub fn observed(&self) -> bool {
         self.run.graph.observed()
     }
@@ -270,34 +271,33 @@ impl Cx {
         *self.run.graph.protocols.lock().unwrap_or_else(|e| e.into_inner()) = registry;
     }
 
-    /// Starts a custom event called `name`, which observers see next to
-    /// the task that sent it. Add fields, then call
-    /// [`emit`](crate::observe::Event::emit).
+    /// Records `event` in the run's [event log](crate::events), dated now
+    /// on the run's clock, with the task that records it. Every run keeps
+    /// its events, whether or not anyone reads them.
     ///
     /// ```
     /// # fn handled(cx: &fictionet::Cx) {
-    /// cx.event("http_request").str("host", "example.test").str("path", "/count").int("status", 200).emit();
+    /// use fictionet::events::Event;
+    /// cx.record(Event::new("shop", "order").summary("an order for 3 pumps").field("count", 3u32));
     /// # }
     /// ```
-    ///
-    /// The event carries the task that sent it and the time on this `Cx`'s
-    /// clock. While nothing observes the world, the event is never made at
-    /// all: each call returns immediately. See
-    /// [Custom events](crate::observe#custom-events).
-    pub fn event(&self, name: &str) -> crate::observe::Event<'_> {
-        crate::observe::Event::new(self, name)
+    pub fn record(&self, event: Event) {
+        self.record_at(self.now(), event);
     }
 
-    /// Sends a custom event whose payload is JSON text already, such as the
-    /// output of `serde_json::to_string`.
-    ///
-    /// Fails with [`NotJson`](crate::observe::NotJson) if `payload` is not
-    /// one JSON value. The check runs only while the world is observed:
-    /// with no observer, `emit` returns `Ok(())` immediately and the
-    /// payload is not read. Use [`Cx::observed`] to skip building a payload
-    /// no observer will see, and [`Cx::event`] for flat events.
-    pub fn emit(&self, name: &str, payload: &str) -> Result<(), crate::observe::NotJson> {
-        crate::observe::emit(self, name, payload)
+    /// Records `event` as having happened at `at`, which may be earlier
+    /// than now.
+    pub fn record_at(&self, at: Instant, mut event: Event) {
+        let graph = &self.run.graph;
+        event.at = at;
+        event.origin = graph.origin(crate::watch::current_task());
+        graph.events.push(event);
+    }
+
+    /// The run's [event log](crate::events): what it holds, and readers
+    /// for what comes. The handle stays readable after the run is over.
+    pub fn events(&self) -> EventLog {
+        EventLog::new(self.run.graph.events.clone())
     }
 
     /// Waits until this `Cx`'s [region](Cx#regions) is cancelled.

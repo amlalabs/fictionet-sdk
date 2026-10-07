@@ -1,7 +1,7 @@
 //! The handler of every FakeWiki site: it asks the Python content server
 //! (backend.py, on 127.0.0.1 in the world container) for the page, takes
 //! the headers that carry the log's fields off it, and puts those fields
-//! in the response's extensions, as the journal's fields of an
+//! in the response's extensions, as the event's fields of an
 //! [`events::Page`](crate::events::Page), for the request log.
 
 use std::future::Future;

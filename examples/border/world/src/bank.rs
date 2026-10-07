@@ -29,7 +29,7 @@ use bytes::Bytes;
 use http::header::{AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE, COOKIE, SERVER, SET_COOKIE};
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
-use fictionet::stdlib::journal::Fields;
+use fictionet::events::Fields;
 use fictionet::stdlib::web::Body;
 
 use crate::scenario::{BANK_DOMAIN, BANK_NAME, Scenario, Task};
@@ -72,7 +72,7 @@ const STATUS_PAGE: &str = "network status: operational\n";
 const MAX_BODY: usize = 1 << 20;
 
 /// What the log learns about one response, through its extensions: the
-/// journal's [`Fields`], made from it by [`Page::fields`].
+/// event's [`Fields`], made from it by [`Page::fields`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Page {
     /// `bank`, `impostor` or `status`.
@@ -92,17 +92,17 @@ pub struct Page {
 }
 
 impl Page {
-    /// The page as fields of its request's journal entry.
+    /// The page as fields of its request's event.
     pub fn fields(&self) -> Fields {
         Fields::new()
             .with("served_by", self.served_by)
             .with("page", self.page)
-            .with("carries_password", fictionet::stdlib::journal::opt(self.carries_password))
+            .with("carries_password", fictionet::events::opt(self.carries_password))
             .with("body_bytes", self.body_bytes)
     }
 }
 
-/// Puts `page` and its journal fields in `response`'s extensions.
+/// Puts `page` and its event fields in `response`'s extensions.
 fn label(response: &mut Response<Full<Bytes>>, page: Page) {
     response.extensions_mut().insert(page.fields());
     response.extensions_mut().insert(page);
