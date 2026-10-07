@@ -21,12 +21,12 @@ feeds that module, and the Fuzz column of the module catalog in
 [`src/stdlib/mod.rs`](../src/stdlib/mod.rs) marks every module that has
 one. The rest feed the layers under the stdlib: the relay protocol,
 packets and IP reassembly, the TCP/IP stack, `serve` and `web`, the
-observe decoders and the binary's proxy doors. Each target's source in
+observe decoders and the proxy doors. Each target's source in
 `fuzz_targets/` shows what it builds from the input.
 
-The proxy targets compile the `fictionet` binary's proxy modules from
-their source files (`src/proxy.rs` here), because a binary's modules
-cannot be imported. Code that the targets need from inside the SDK is in
+The proxy targets call the doors' protocol side in
+`fictionet::relay::proxy`, the same code the `fictionet` binary runs over
+its connections. Code that the targets need from inside the SDK is in
 `fictionet::fuzzing`, which exists only when `cargo fuzz` builds with
 `--cfg fuzzing`.
 
