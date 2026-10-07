@@ -45,3 +45,19 @@ impl Host {
         dns::normalize(s).map(Host::Name)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hosts_parse_as_names_and_addresses() {
+        assert_eq!(Host::parse("Example.test"), Some(Host::Name("example.test".into())));
+        assert_eq!(Host::parse("203.0.113.10"), Some(Host::V4(Ipv4Addr::new(203, 0, 113, 10))));
+        assert_eq!(Host::parse("[fd00::1]"), Some(Host::V6("fd00::1".parse().unwrap())));
+        assert_eq!(Host::parse("fd00::1"), None);
+        assert_eq!(Host::parse("[nope]"), None);
+        assert_eq!(Host::parse("a b"), None);
+        assert_eq!(Host::parse("[fd00::1]").unwrap().to_string(), "[fd00::1]");
+    }
+}

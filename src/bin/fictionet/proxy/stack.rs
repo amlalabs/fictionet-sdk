@@ -24,7 +24,8 @@ use fictionet::stdlib::{ConnError, ip, tcp, udp};
 use fictionet::{Cx, End, Interface, Packet, RecvError};
 use tokio::sync::oneshot;
 
-use super::dns::{self, Lookup};
+use fictionet::relay::proxy::Host;
+use fictionet::relay::proxy::dns::{self, Lookup};
 use super::link::Link;
 
 /// How long a connection may take to open before the client is told it
@@ -77,38 +78,6 @@ impl std::fmt::Display for Fail {
             Fail::WorldGone => f.write_str("the world is gone"),
             Fail::BadAddress(why) => f.write_str(why),
         }
-    }
-}
-
-/// Where a client wants to go, as it named it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Host {
-    Name(String),
-    V4(Ipv4Addr),
-    V6(std::net::Ipv6Addr),
-}
-
-impl std::fmt::Display for Host {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Host::Name(n) => f.write_str(n),
-            Host::V4(a) => write!(f, "{a}"),
-            Host::V6(a) => write!(f, "[{a}]"),
-        }
-    }
-}
-
-impl Host {
-    /// Reads a host as it appears in a URL or a CONNECT target: a name, an
-    /// IPv4 address, or an IPv6 address in brackets.
-    pub(crate) fn parse(s: &str) -> Option<Host> {
-        if let Some(inner) = s.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
-            return inner.parse().ok().map(Host::V6);
-        }
-        if let Ok(a) = s.parse::<Ipv4Addr>() {
-            return Some(Host::V4(a));
-        }
-        dns::normalize(s).map(Host::Name)
     }
 }
 
@@ -441,17 +410,6 @@ mod tests {
             assert_eq!(unreachable_about(&p[..n]), None, "{n}");
         }
         assert_eq!(unreachable_about(&[]), None);
-    }
-
-    #[test]
-    fn hosts_parse_as_names_and_addresses() {
-        assert_eq!(Host::parse("Example.test"), Some(Host::Name("example.test".into())));
-        assert_eq!(Host::parse("203.0.113.10"), Some(Host::V4(Ipv4Addr::new(203, 0, 113, 10))));
-        assert_eq!(Host::parse("[fd00::1]"), Some(Host::V6("fd00::1".parse().unwrap())));
-        assert_eq!(Host::parse("fd00::1"), None);
-        assert_eq!(Host::parse("[nope]"), None);
-        assert_eq!(Host::parse("a b"), None);
-        assert_eq!(Host::parse("[fd00::1]").unwrap().to_string(), "[fd00::1]");
     }
 
     #[test]
