@@ -15,11 +15,11 @@
 //! and [`Collect`] cover lines and values that end at EOF. [`Spans`] records
 //! bounded provenance; [`Demux`] shares a budget across keyed streams.
 //!
-//! This module uses only `core` and `alloc`. The planned async `serve`
-//! adapter lives in stdlib next to [`tcp`](super::tcp), outside this module.
-//! No function here performs I/O, reads a clock, or uses global state.
-//! [`Interceptor`], [`Recorder`], and [`Faults`] operate on any decoder's
-//! items and original bytes. Length prefixes are planned.
+//! This module uses only `core` and `alloc`. No function here performs
+//! I/O, reads a clock, or uses global state. The driver that runs a
+//! decoder over a connection is [`serve`](super::serve), outside this
+//! module. [`Interceptor`], [`Recorder`], and [`Faults`] operate on any
+//! decoder's items and original bytes.
 //!
 //! ```
 //! use fictionet::stdlib::codec::{Decode, Step, Stream, pump, finish};

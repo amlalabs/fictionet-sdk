@@ -47,8 +47,10 @@ proxy instead.
 </p>
 
 The standard library covers DNS, IPv4 and IPv6, TCP, UDP, ICMP, TLS under the
-world's own certificate authority (CA), routing, and whole networks of websites with
-`stdlib::web`. The crate is not on crates.io, so build it from this repository.
+world's own certificate authority (CA), routing, whole networks of websites with
+`stdlib::web`, and more than a hundred application protocols, each listed in
+[the catalog](src/stdlib/mod.rs). The crate is not on crates.io, so build it
+from this repository.
 
 ## Try it
 
@@ -162,29 +164,30 @@ is a complete world.
 Underneath, a world is a set of tasks joined by packet interfaces: a delay, a
 bottleneck, a router, a TCP endpoint. The crate docs show each layer.
 
-To customize a protocol, copy its file from `src/stdlib/` into your crate,
-edit it, and plug its `Decode` and `Wire` implementations into `Stream` and
-the codec tools. The file's `fictionet::stdlib::...` imports need no change.
-[`custom_protocol`](examples/custom_protocol) shows this with a Modbus register.
-Run it with `cargo run --example custom_protocol`; it needs no network or root.
+## Hosts, services and protocols
 
-For HTTP/2 outside the web server, use the public
-[`stdlib::http2`](src/stdlib/http2.rs) frame and connection codecs for HTTP/2,
-with the [`stdlib::hpack`](src/stdlib/hpack.rs) block encoder and decoder,
-or [`stdlib::qpack`](src/stdlib/qpack.rs) for HTTP/3 header compression. Both use
-[`stdlib::huffman`](src/stdlib/huffman.rs). HTTP/2 capture presentation uses the
-public observe adapter. gRPC messages use `stdlib::grpc::Messages` through
-`codec::Demux`, with one DATA budget across streams.
+`stdlib::net` builds a network of hosts, each with addresses, DNS names and
+services on its ports. A service is the server side of one protocol for one
+connection, written with no I/O: it gets decoded items and appends reply bytes,
+and one driver runs it over any connection. HTTP is a service
+(`stdlib::httpd`), and `web::Sites` is a preset on `Net` for websites. Every
+service records what it sees in one journal (`stdlib::journal`): a file a
+grader reads after the run, callbacks, or the dashboard. A scenario
+(`stdlib::scenario`) changes the world on a timeline and grades the journal.
+[docs/services.md](docs/services.md) builds a small world this way, step by
+step.
 
-To show your decoder in observe, implement `observe::Present` and register it
-with `observe::Registry`. Built-ins use the same registry. Match by port or
-first bytes, or select a name explicitly. Use `Dissector::with_registry` for
-capture packets, or `cx.observe_protocols` for live world watches. See
+Each protocol is a module written with no I/O: message types that parse and
+write themselves, and a framer that cuts items out of a byte stream. The same
+code runs as a service, in a unit test, in a fuzz target and in the dashboard's
+packet decoder. The [catalog](src/stdlib/mod.rs) in the `stdlib` docs lists
+every protocol module and what each can do, and a test checks the table against
+the code. To change a protocol, copy its file from `src/stdlib/` into your crate
+and edit it. The copy compiles against the public API as it is.
+[`custom_protocol`](examples/custom_protocol) does this with a Modbus register.
+`cargo run --example custom_protocol` needs no network or root. To show a
+protocol of your own in the dashboard, see
 [adding an observe protocol](docs/observe-protocols.md).
-
-[`stdlib::sse`](src/stdlib/sse.rs) reads server-sent events from streaming
-HTTP response bodies. It exposes raw fields and comments for proxies, joins
-dispatched events, and writes edited events for API mocks and MCP transports.
 
 ## Where sandboxes can run
 
@@ -228,7 +231,7 @@ pip install "git+https://github.com/amlalabs/fictionet-sdk#subdirectory=python/i
 The crate docs are the guide. Build them with:
 
 ```console
-$ cargo doc --no-deps --features tokio --open
+$ cargo doc --no-deps --open
 ```
 
 Start at the crate root, which explains the main ideas, then read in this order:
@@ -242,7 +245,11 @@ Start at the crate root, which explains the main ideas, then read in this order:
    addresses and DNS, and how to check that it works.
 4. [`lowering`](src/lowering.rs): how each attach type turns what its sandbox
    sends into IP packets.
-5. [`stdlib::web`](src/stdlib/web.rs): a whole network of websites.
+5. [`stdlib`](src/stdlib/mod.rs): the pieces a world is built from, and the
+   protocol catalog. Then [`stdlib::net`](src/stdlib/net.rs) and
+   [`stdlib::serve`](src/stdlib/serve.rs) for a network of hosts and
+   services, and [`stdlib::web`](src/stdlib/web.rs) for a network of
+   websites.
 6. [`recipes`](src/recipes.rs): a delayed website, a slow or lossy link, a packet
    capture, and a route that changes mid-run.
 7. [`observe`](src/observe.rs): watching a running world, in the dashboard or
@@ -254,15 +261,16 @@ Start at the crate root, which explains the main ideas, then read in this order:
 ## Building and testing
 
 ```console
-$ cargo build --all-targets --features tokio
-$ cargo nextest run --workspace --features tokio
-$ cargo test --doc --workspace --features tokio
-$ cargo clippy --all-targets --features tokio
+$ cargo build --all-targets
+$ cargo nextest run --workspace
+$ cargo test --doc --workspace
+$ cargo clippy --all-targets -- -D warnings
 ```
 
-The Docker tests in `tests/docker/` and the Kubernetes test in `tests/k8s/` each
-have a `run.sh` that builds, checks and cleans up. See
-[CONTRIBUTING.md](CONTRIBUTING.md).
+CI runs the same commands a second time with `--no-default-features`, which
+leaves out the `tokio` feature. The Docker tests in `tests/docker/` and the
+Kubernetes test in `tests/k8s/` each have a `run.sh` that builds, checks and
+cleans up. [CONTRIBUTING.md](CONTRIBUTING.md) lists every check.
 
 ## License
 

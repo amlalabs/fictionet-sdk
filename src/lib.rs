@@ -114,17 +114,9 @@
 //! moves packets but never parses them. Addresses, ports, names, routing,
 //! TCP, TLS and HTTP are all in [`stdlib`], built on these types. For a
 //! whole network of websites in a few lines, see [`stdlib::web`]. The core
-//! also assumes no async runtime:
-//! its futures use only [`std::task::Waker`], so a world runs on tokio or
-//! on Fictionet's own [`block_on`].
-//!
-//! [`stdlib::http2`] provides frames, directional connection state, and capture
-//! presentation. HTTP/2 DATA feeds [`stdlib::grpc::Messages`] through a shared
-//! [`Demux`](stdlib::codec::Demux) budget. To show another protocol in
-//! captures, implement [`observe::Present`] for its items and byte ranges,
-//! then add it to [`observe::Registry`]. Use
-//! [`observe::Dissector::with_registry`] for capture packets or
-//! [`Cx::observe_protocols`] for live watches.
+//! also assumes no async runtime: its futures use only
+//! [`std::task::Waker`], so a world runs on tokio or on Fictionet's own
+//! [`block_on`].
 //!
 //! # Running a world
 //!
@@ -216,6 +208,29 @@
 //! [`stdlib::web::Sites`] is a preset on `Net` for a world of websites. The
 //! guide in `docs/services.md` walks through services, `Net`, the journal
 //! and scenarios step by step.
+//!
+//! # Protocols
+//!
+//! Every protocol in the stdlib is written with no I/O. Its messages are
+//! types that parse from bytes and write themselves back
+//! ([`Wire`](stdlib::codec::Wire)). Its framer cuts items out of a byte
+//! stream ([`Decode`](stdlib::codec::Decode)) and does no reading itself.
+//! So the same code runs as a service on a connection, in a unit test, in
+//! a fuzz target, and in the dashboard's packet decoder. To change a
+//! protocol, copy its file into your crate and edit it: the copy compiles
+//! against the public API as it is. The [catalog](stdlib#the-catalog)
+//! lists every protocol module and what each can do, from DNS, TLS and
+//! HTTP to industrial, financial, mail and directory protocols.
+//!
+//! # Watching a world
+//!
+//! Everything the network and its services do goes to one
+//! [`journal`](stdlib::journal): a file a grader reads after the run,
+//! callbacks, or the dashboard. The world itself can be watched while it
+//! runs, with nothing to turn on in world code ([`observe`]):
+//! `fictionet dashboard` draws its tasks and links and decodes the packets
+//! that cross them, HTTPS included, and `fictionet observe` prints the
+//! graph, its changes and the world's events as lines of JSON for scripts.
 //!
 //! # Where to go next
 //!

@@ -10,7 +10,10 @@ write the code. Security problems go by email, not in issues: see
 
 ## The checks
 
-A pull request must pass the same checks as CI, in both feature sets:
+CI runs these commands on every pull request, in two feature sets: once with the
+default features, and once with `--no-default-features`, which leaves out the
+`tokio` feature (`fictionet::tokio` and `web::proxy`). A pull request must pass
+both. Run them before you push:
 
 ```console
 $ cargo build --all-targets
@@ -18,9 +21,25 @@ $ cargo nextest run --workspace
 $ cargo test --doc --workspace
 $ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 $ cargo clippy --all-targets -- -D warnings
+
+$ cargo build --all-targets --no-default-features
+$ cargo nextest run --workspace --no-default-features
+$ cargo test --doc --workspace --no-default-features
+$ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --no-default-features
+$ cargo clippy --all-targets --no-default-features -- -D warnings
 ```
 
-Then run each command again with `--features tokio`.
+The library also builds for the browser, and CI checks that too. It needs the
+`wasm32-unknown-unknown` target (`rustup target add wasm32-unknown-unknown`) and
+a clang with that target, which compiles ring's C code:
+
+```console
+$ cargo check --lib --no-default-features --target wasm32-unknown-unknown
+$ cargo clippy --lib --no-default-features --target wasm32-unknown-unknown -- -D warnings
+```
+
+CI also checks that the crate builds with Rust 1.91, the minimum version in
+`Cargo.toml`, and runs every fuzz target for a minute.
 
 ## Running the tests
 
@@ -56,6 +75,29 @@ machine the way a fixed time limit would.
 A change to `fictionet attach` or to how a world is reached should also pass the
 Docker tests (`tests/docker/*/run.sh`), and for the Helm chart, the Kubernetes test
 (`tests/k8s/run.sh`). Each script builds what it needs, checks, and cleans up.
+
+## Adding a protocol module
+
+A protocol is one file in `src/stdlib/`, declared with `pub mod` in
+`src/stdlib/mod.rs`. It is written with no I/O, on the tools in
+`stdlib::codec`: its message types implement `Wire`, and its framer implements
+`Decode`. It uses only public `fictionet::` items, so that a world can copy the
+file and edit it. The module's own docs explain the protocol and show how to use
+it, with examples that run as doctests.
+
+A new module is registered in three places, and a test holds each to the code:
+
+- a row in the protocol catalog in `src/stdlib/mod.rs`, which says what the
+  module can do (`tests/stdlib_catalog.rs` checks every column);
+- a fuzz target in `fuzz/fuzz_targets/`, named after the module, with a
+  `[[bin]]` entry in `fuzz/Cargo.toml`;
+- a `#[path]` entry in `tests/copy_and_own/modules.rs`, which compiles the file
+  as a module of a separate crate.
+
+The catalog row and the module docs are where a module is described. The front
+pages (`README.md`, the crate root in `src/lib.rs`, and the top of
+`src/stdlib/mod.rs`) tell one story about the core and do not gain a paragraph
+per protocol.
 
 ## Performance
 
