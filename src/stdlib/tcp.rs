@@ -50,8 +50,8 @@ use smoltcp::socket::tcp::{self as stcp, State as TcpState};
 use smoltcp::wire::{HardwareAddress, IpCidr};
 
 use crate::cx::CancelWait;
-use crate::stdlib::udp::{TCP, ipv4_header_checksum, parse_ip, transport_checksum};
-use crate::stdlib::{ConnError, Connection, wire};
+use crate::stdlib::ip::{Header, protocol::TCP, set_header_checksum, strip_extension_headers, transport_checksum};
+use crate::stdlib::{ConnError, Connection};
 use crate::time::{Duration, Instant};
 use crate::{Cx, Error, Interface, Packet};
 
@@ -678,21 +678,21 @@ impl State {
     /// Feeds one packet from the interface into smoltcp. Returns whether it was
     /// a TCP segment for this endpoint that carried data.
     fn ingress(&mut self, addr: IpAddr, now: smoltcp::time::Instant, packet: Vec<u8>) -> bool {
-        let Some(ip) = parse_ip(&packet) else { return false };
-        if ip.proto != TCP || ip.dst != addr || ip.end - ip.payload < 20 {
+        let Some(ip) = Header::parse_whole(&packet) else { return false };
+        if ip.protocol != TCP || ip.dst != addr || ip.payload.len() < 20 {
             return false;
         }
-        // smoltcp takes TCP only right after the IPv6 header. `parse_ip` has
+        // smoltcp takes TCP only right after the IPv6 header. `parse_whole` has
         // checked the extension headers in between, so they are taken out,
         // as `split_protocols` does before packets get here.
-        if ip.payload != 40 && ip.dst.is_ipv6() {
-            return match wire::strip_ext6(&packet) {
+        if ip.payload.start != 40 && ip.dst.is_ipv6() {
+            return match strip_extension_headers(&packet) {
                 Ok(Some(stripped)) => self.ingress(addr, now, stripped),
                 _ => false,
             };
         }
-        let t = &packet[ip.payload..];
-        let data_len = (ip.end - ip.payload).saturating_sub(((t[12] >> 4) as usize) * 4);
+        let t = &packet[ip.payload.start..];
+        let data_len = ip.payload.len().saturating_sub(((t[12] >> 4) as usize) * 4);
         let data = data_len > 0;
         let src = SocketAddr::new(ip.src, u16::from_be_bytes([t[0], t[1]]));
         let dst = SocketAddr::new(ip.dst, u16::from_be_bytes([t[2], t[3]]));
@@ -876,9 +876,9 @@ impl State {
 ///    (at least one second) instead. A pure ACK with SACK blocks that
 ///    repeats the last acknowledgment is a duplicate (RFC 6675), so its
 ///    window is set back to the last one smoltcp saw.
-fn repair_ack(c: &mut Conn, s: &stcp::Socket<'static>, ip: &crate::stdlib::udp::IpInfo, packet: &mut Vec<u8>) -> Option<Vec<u8>> {
+fn repair_ack(c: &mut Conn, s: &stcp::Socket<'static>, ip: &Header, packet: &mut Vec<u8>) -> Option<Vec<u8>> {
     let irs = c.irs?;
-    let t = &packet[ip.payload..ip.end];
+    let t = &packet[ip.payload.clone()];
     let off = ((t[12] >> 4) as usize) * 4;
     if off < 20 || off > t.len() {
         return None;
@@ -896,21 +896,21 @@ fn repair_ack(c: &mut Conn, s: &stcp::Socket<'static>, ip: &crate::stdlib::udp::
     let last = c.last_fed.replace((ack, win));
     if ahead && last != Some((ack, win)) && intact() {
         // A copy with no data and no FIN, at the expected sequence number.
-        let mut copy = packet[..ip.payload + off].to_vec();
-        let tcp_at = ip.payload;
+        let tcp_at = ip.payload.start;
+        let mut copy = packet[..tcp_at + off].to_vec();
         copy[tcp_at + 4..tcp_at + 8].copy_from_slice(&rcv_nxt.to_be_bytes());
         copy[tcp_at + 13] = 0x10;
-        fix_lengths(&mut copy, ip.payload, ip.src, ip.dst);
+        fix_lengths(&mut copy, tcp_at, ip.src, ip.dst);
         return Some(copy);
     }
     let pure = off == t.len() && !fin;
     if !ahead && pure && let Some((last_ack, last_win)) = last
         && last_ack == ack && last_win != win && has_sack(&t[20..off]) && intact()
     {
-        let tcp_at = ip.payload;
+        let tcp_at = ip.payload.start;
         packet[tcp_at + 14..tcp_at + 16].copy_from_slice(&last_win.to_be_bytes());
-        packet.truncate(ip.end);
-        fix_lengths(packet, ip.payload, ip.src, ip.dst);
+        packet.truncate(ip.payload.end);
+        fix_lengths(packet, tcp_at, ip.src, ip.dst);
         c.last_fed = Some((ack, last_win));
     }
     None
@@ -941,10 +941,8 @@ fn fix_lengths(packet: &mut [u8], tcp_at: usize, src: IpAddr, dst: IpAddr) {
     let len = packet.len();
     if src.is_ipv4() {
         packet[2..4].copy_from_slice(&(len as u16).to_be_bytes());
-        packet[10..12].copy_from_slice(&[0, 0]);
         let ihl = (packet[0] & 15) as usize * 4;
-        let sum = ipv4_header_checksum(&packet[..ihl]);
-        packet[10..12].copy_from_slice(&sum.to_be_bytes());
+        set_header_checksum(&mut packet[..ihl]);
     } else {
         packet[4..6].copy_from_slice(&((len - 40) as u16).to_be_bytes());
     }
@@ -1521,7 +1519,7 @@ mod tests {
         t[14..16].copy_from_slice(&65535u16.to_be_bytes());
         let sum = transport_checksum(src.ip(), dst.ip(), TCP, &t);
         t[16..18].copy_from_slice(&sum.to_be_bytes());
-        crate::stdlib::udp::ip_packet(src.ip(), dst.ip(), TCP, 0, &t)
+        crate::stdlib::ip::packet(src.ip(), dst.ip(), TCP, &t)
     }
 
     /// A burst of handshakes that the peer resets in SYN-RECEIVED leaves
@@ -1539,8 +1537,8 @@ mod tests {
             let mut acks = 0;
             while acks < 250 {
                 let p = raw.recv(&cx).await?;
-                let ip = parse_ip(&p.0).unwrap();
-                let t = &p.0[ip.payload..];
+                let ip = Header::parse_whole(&p.0).unwrap();
+                let t = ip.payload(&p.0);
                 assert_eq!(t[13], 0x12, "a SYN-ACK");
                 let port = u16::from_be_bytes([t[2], t[3]]);
                 let isn = u32::from_be_bytes([t[4], t[5], t[6], t[7]]);

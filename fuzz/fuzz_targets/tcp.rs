@@ -19,7 +19,8 @@ use fictionet::stdlib::ConnError;
 use fictionet::stdlib::tcp::{self, TcpConnection};
 use fictionet::{End, Packet, pair};
 use fictionet::Interface;
-use fictionet_fuzz::{Segment, poll_once, settle, tcp_packet, transport_checksum, world_seeded};
+use fictionet::stdlib::ip::transport_checksum;
+use fictionet_fuzz::{Segment, poll_once, settle, tcp_packet, world_seeded};
 use libfuzzer_sys::fuzz_target;
 
 #[derive(Arbitrary, Debug)]

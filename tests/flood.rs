@@ -57,17 +57,6 @@ fn mib(n: usize) -> f64 {
     n as f64 / (1 << 20) as f64
 }
 
-fn sum16(data: &[u8]) -> u32 {
-    data.chunks(2).map(|c| u16::from_be_bytes([c[0], *c.get(1).unwrap_or(&0)]) as u32).sum()
-}
-
-fn fold(mut s: u32) -> u16 {
-    while s > 0xffff {
-        s = (s & 0xffff) + (s >> 16);
-    }
-    !(s as u16)
-}
-
 /// An IPv4 packet; `frag` is the flags and offset field.
 fn ipv4(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, id: u16, frag: u16, payload: &[u8]) -> Packet {
     let mut p = vec![0x45, 0];
@@ -77,14 +66,9 @@ fn ipv4(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, id: u16, frag: u16, payload: &[
     p.extend_from_slice(&[64, proto, 0, 0]);
     p.extend_from_slice(&src.octets());
     p.extend_from_slice(&dst.octets());
-    let sum = fold(sum16(&p));
-    p[10..12].copy_from_slice(&sum.to_be_bytes());
+    ip::set_header_checksum(&mut p);
     p.extend_from_slice(payload);
     Packet(p)
-}
-
-fn pseudo(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, len: usize) -> u32 {
-    sum16(&src.octets()) + sum16(&dst.octets()) + proto as u32 + len as u32
 }
 
 fn udp(src: Ipv4Addr, sport: u16, dst: Ipv4Addr, dport: u16, data: &[u8]) -> Packet {
@@ -94,7 +78,7 @@ fn udp(src: Ipv4Addr, sport: u16, dst: Ipv4Addr, dport: u16, data: &[u8]) -> Pac
     u.extend_from_slice(&((8 + data.len()) as u16).to_be_bytes());
     u.extend_from_slice(&[0, 0]);
     u.extend_from_slice(data);
-    let sum = fold(pseudo(src, dst, 17, u.len()) + sum16(&u));
+    let sum = ip::transport_checksum(src.into(), dst.into(), 17, &u);
     u[6..8].copy_from_slice(&sum.to_be_bytes());
     ipv4(src, dst, 17, 0, 0x4000, &u)
 }
@@ -108,7 +92,7 @@ fn tcp_seg(src: Ipv4Addr, sport: u16, dst: Ipv4Addr, dport: u16, seq: u32, ack: 
     t.extend_from_slice(&ack.to_be_bytes());
     t.extend_from_slice(&[5 << 4, flags, 0xff, 0xff, 0, 0, 0, 0]);
     t.extend_from_slice(data);
-    let sum = fold(pseudo(src, dst, 6, t.len()) + sum16(&t));
+    let sum = ip::transport_checksum(src.into(), dst.into(), 6, &t);
     t[16..18].copy_from_slice(&sum.to_be_bytes());
     ipv4(src, dst, 6, 0, 0x4000, &t)
 }

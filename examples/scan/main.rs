@@ -220,25 +220,16 @@ mod tests {
 
     const SCANNER: Ipv4Addr = Ipv4Addr::new(10, 0, 9, 2);
 
-    fn sum(data: &[u8]) -> u16 {
-        let mut s: u32 = data.chunks(2).map(|c| u32::from(u16::from_be_bytes([c[0], *c.get(1).unwrap_or(&0)]))).sum();
-        while s > 0xffff {
-            s = (s & 0xffff) + (s >> 16);
-        }
-        !(s as u16)
-    }
-
     fn ping(dst: Ipv4Addr, seq: u16) -> Packet {
         let mut icmp = vec![8, 0, 0, 0, 0x51, 0x52];
         icmp.extend_from_slice(&seq.to_be_bytes());
-        let c = sum(&icmp);
+        let c = ip::checksum(&icmp);
         icmp[2..4].copy_from_slice(&c.to_be_bytes());
         let mut p = vec![0x45, 0, 0, 0, 0, 1, 0, 0, 64, 1, 0, 0];
         p[2..4].copy_from_slice(&((20 + icmp.len()) as u16).to_be_bytes());
         p.extend_from_slice(&SCANNER.octets());
         p.extend_from_slice(&dst.octets());
-        let c = sum(&p);
-        p[10..12].copy_from_slice(&c.to_be_bytes());
+        ip::set_header_checksum(&mut p);
         p.extend_from_slice(&icmp);
         Packet(p)
     }

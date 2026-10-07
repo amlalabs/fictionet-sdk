@@ -12,6 +12,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use fictionet::stdlib::dhcp;
+use fictionet::stdlib::ip::checksum;
 use fictionet::{Interface, Packet, RecvError};
 
 const BIN: &str = env!("CARGO_BIN_EXE_fictionet");
@@ -23,17 +24,6 @@ fn temp_dir() -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("fn-tap-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
-}
-
-fn checksum(bytes: &[u8]) -> u16 {
-    let mut sum = 0u32;
-    for c in bytes.chunks(2) {
-        sum += u16::from_be_bytes([c[0], *c.get(1).unwrap_or(&0)]) as u32;
-    }
-    while sum > 0xffff {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    !(sum as u16)
 }
 
 fn ipv4(src: [u8; 4], dst: [u8; 4], proto: u8, payload: &[u8]) -> Vec<u8> {

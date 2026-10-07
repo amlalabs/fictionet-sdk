@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Poll, Waker};
 
 use crate::events::{self, Level};
-use crate::stdlib::{Event, Ports, wire};
+use crate::stdlib::{Event, Ports, ip};
 use crate::{Cx, Error, Interface, Packet};
 
 /// An address prefix, such as `104.18.32.7/32` or `::/0`.
@@ -217,11 +217,11 @@ pub fn router(cx: &Cx, routes: Vec<(Prefix, Box<dyn Interface>)>) -> Router {
                 .await;
             match event {
                 Event::Packet(_, mut packet) => {
-                    let Some(dst) = wire::destination(&packet.0) else { continue };
+                    let Some(dst) = ip::destination(&packet.0) else { continue };
                     if !keep_ttl
                         && !is_own(addrs, dst)
-                        && !wire::source(&packet.0).is_some_and(|src| is_own(addrs, src))
-                        && wire::hop(&mut packet.0) == wire::Hop::Expired
+                        && !ip::source(&packet.0).is_some_and(|src| is_own(addrs, src))
+                        && ip::hop(&mut packet.0) == ip::Hop::Expired
                     {
                         expired(&cx, addrs, &table, &mut ports, packet);
                         continue;
@@ -250,14 +250,14 @@ pub fn router(cx: &Cx, routes: Vec<(Prefix, Box<dyn Interface>)>) -> Router {
 /// sends the "time exceeded" answer back toward its source, when the router
 /// has an address of its family.
 fn expired(cx: &Cx, addrs: Addrs, table: &Table, ports: &mut Ports, packet: Packet) {
-    let v4 = wire::version(&packet.0) == Some(4);
+    let v4 = ip::version(&packet.0) == Some(4);
     let why = if v4 { "its TTL ran out" } else { "its hop limit ran out" };
     crate::observe::record_drop(cx, "router", &packet, why);
     let (a4, a6) = addrs;
     let from = if v4 { a4.map(IpAddr::V4) } else { a6.map(IpAddr::V6) };
     let answer = from.and_then(|from| crate::stdlib::icmp::time_exceeded(&packet.0, from));
     if let Some(answer) = answer
-        && let Some(src) = wire::source(&packet.0)
+        && let Some(src) = ip::source(&packet.0)
         && let Some(i) = table.best(src)
     {
         ports.send(i, answer);
@@ -684,7 +684,7 @@ impl Members {
     /// Sends `packet`, which arrived on port `from`, where it belongs, or
     /// drops it with an event.
     fn forward(&self, cx: &Cx, ports: &mut Ports, subnet: Prefix, from: usize, packet: Packet) {
-        let Some(dst) = wire::destination(&packet.0) else {
+        let Some(dst) = ip::destination(&packet.0) else {
             return dropped(cx, &self.on_drop, &packet, "not an IP packet");
         };
         if dst.is_ipv4() != subnet.addr.is_ipv4() {
@@ -865,10 +865,10 @@ mod tests {
     }
 
     fn ip(src: &str, dst: &str, ttl: u8) -> Packet {
-        let mut p = crate::stdlib::udp::ip_packet(src.parse().unwrap(), dst.parse().unwrap(), 17, 0, &[0; 8]);
+        let mut p = crate::stdlib::ip::packet(src.parse().unwrap(), dst.parse().unwrap(), 17, &[0; 8]);
         if p.0[0] >> 4 == 4 {
             p.0[8] = ttl;
-            wire::set_v4_checksum(&mut p.0[..20]);
+            ip::set_header_checksum(&mut p.0[..20]);
         } else {
             p.0[7] = ttl;
         }
@@ -906,12 +906,12 @@ mod tests {
             cx.sleep(Duration::from_millis(100)).await?;
 
             let answer = ready(&cx, &mut s4).expect("a time exceeded answer");
-            assert_eq!(wire::source(&answer.0), Some("10.0.0.1".parse()?));
-            assert_eq!((answer.0[9], answer.0[20], answer.0[21]), (wire::PROTO_ICMP, 11, 0));
+            assert_eq!(ip::source(&answer.0), Some("10.0.0.1".parse()?));
+            assert_eq!((answer.0[9], answer.0[20], answer.0[21]), (ip::protocol::ICMP, 11, 0));
             assert!(ready(&cx, &mut s4).is_none());
             let answer = ready(&cx, &mut s6).expect("a time exceeded answer");
-            assert_eq!(wire::source(&answer.0), Some("fd00:1::1".parse()?));
-            assert_eq!((answer.0[6], answer.0[40], answer.0[41]), (wire::PROTO_ICMPV6, 3, 0));
+            assert_eq!(ip::source(&answer.0), Some("fd00:1::1".parse()?));
+            assert_eq!((answer.0[6], answer.0[40], answer.0[41]), (ip::protocol::ICMPV6, 3, 0));
             // r1 forwarded r2's answer: one hop.
             assert_eq!(answer.0[7], 63);
 
@@ -942,7 +942,7 @@ mod tests {
             a.send(ip("10.0.0.2", "10.0.0.3", 64));
             let p = b.recv(&cx).await?;
             assert_eq!(p.0[8], 63);
-            assert_eq!(wire::checksum(0, &p.0[..20]), 0, "the header checksum holds");
+            assert_eq!(ip::checksum(&p.0[..20]), 0, "the header checksum holds");
             // An expired packet for the router itself is still delivered.
             a.send(ip("10.0.0.2", "10.0.0.1", 1));
             assert_eq!(g.recv(&cx).await?.0[8], 1);

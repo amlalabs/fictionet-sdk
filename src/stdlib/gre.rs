@@ -49,6 +49,7 @@
 //! ```
 
 use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::ip::checksum;
 
 /// The IP protocol number that marks a GRE packet.
 pub const IP_PROTOCOL: u8 = 47;
@@ -201,29 +202,6 @@ impl std::fmt::Display for GreError {
 }
 
 impl std::error::Error for GreError {}
-
-/// The Internet checksum of `bytes`, as RFC 1071 defines it: the one's
-/// complement of the one's complement sum of its 16-bit words. An odd last
-/// byte is padded with a zero byte. GRE computes it over the header and
-/// the payload, with the checksum field set to zero.
-pub fn checksum(bytes: &[u8]) -> u16 {
-    !ones_sum(bytes)
-}
-
-/// The one's complement sum of the 16-bit words of `bytes`. It is 0 only
-/// when every word is 0, and 0xffff when a valid checksum is among them.
-fn ones_sum(bytes: &[u8]) -> u16 {
-    let mut sum: u32 = 0;
-    for pair in bytes.chunks(2) {
-        let hi = u32::from(pair[0]) << 8;
-        let lo = pair.get(1).map_or(0, |&b| u32::from(b));
-        sum += hi | lo;
-        if sum > 0xffff {
-            sum -= 0xffff;
-        }
-    }
-    sum as u16
-}
 
 fn be16(b: &[u8], at: usize) -> u16 {
     u16::from_be_bytes([b[at], b[at + 1]])
@@ -384,7 +362,7 @@ impl Header {
         }
         match header {
             Header::Gre(h) => {
-                if h.checksum && ones_sum(b) != 0xffff {
+                if h.checksum && checksum(b) != 0 {
                     return Err(GreError::Checksum);
                 }
                 Ok((header, &b[used..]))

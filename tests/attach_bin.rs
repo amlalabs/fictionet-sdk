@@ -8,6 +8,7 @@
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+use fictionet::stdlib::ip::checksum;
 use fictionet::{Interface, Packet, RecvError};
 
 const BIN: &str = env!("CARGO_BIN_EXE_fictionet");
@@ -98,14 +99,6 @@ fn echo_request(seq: u16) -> Vec<u8> {
     let sum = checksum(&p[20..]);
     p[22..24].copy_from_slice(&sum.to_be_bytes());
     p
-}
-
-fn checksum(bytes: &[u8]) -> u16 {
-    let mut sum: u32 = bytes.chunks(2).map(|c| u16::from_be_bytes([c[0], *c.get(1).unwrap_or(&0)]) as u32).sum();
-    while sum >> 16 != 0 {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    !(sum as u16)
 }
 
 #[test]

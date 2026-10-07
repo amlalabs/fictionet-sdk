@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::task::{Context, Poll};
 
-use crate::{Cancelled, Cx};
+use fictionet::{Cancelled, Cx};
 
 /// Anything that carries a byte stream both ways: TCP, TLS on top of TCP, a
 /// logging middleware, a test pipe.

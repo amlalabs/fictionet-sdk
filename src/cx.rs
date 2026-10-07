@@ -198,9 +198,10 @@ impl Cx {
     }
 
     /// [`Cx::spawn`], with the name observers see for the task. The
-    /// stdlib names its tasks after the function that starts them.
+    /// stdlib names its tasks after the function that starts them, and a
+    /// copy of a stdlib file can do the same.
     #[track_caller]
-    pub(crate) fn spawn_as<F, Fut>(&self, name: impl FnOnce() -> Cow<'static, str>, work: F) -> Task
+    pub fn spawn_as<F, Fut>(&self, name: impl FnOnce() -> Cow<'static, str>, work: F) -> Task
     where
         F: FnOnce(Cx) -> Fut,
         Fut: Future<Output = crate::Result> + Send + 'static,

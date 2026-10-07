@@ -16,6 +16,11 @@ doc = false
 [features]
 tokio = []
 
+# ip.rs checks its reassembly's bookkeeping under `cargo fuzz`, which
+# builds with `--cfg fuzzing`.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
+
 [dependencies]
 bytes = "1"
 fictionet = { path = "../..", default-features = false }

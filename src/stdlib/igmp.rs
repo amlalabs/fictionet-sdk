@@ -102,6 +102,7 @@
 //! ```
 
 use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::ip::checksum;
 
 use std::net::Ipv4Addr;
 
@@ -384,25 +385,6 @@ impl Wire for Code {
         out.push(code);
         Ok(())
     }
-}
-
-/// The Internet checksum of `b`: the ones' complement of the ones'
-/// complement sum of its 16-bit words, with a zero byte added to an odd
-/// length. A message with a correct checksum field sums to 0.
-pub fn checksum(b: &[u8]) -> u16 {
-    // Folding the carry after every word keeps the sum within 17 bits, so
-    // it cannot overflow however long `b` is.
-    let mut sum: u32 = 0;
-    let (words, rest) = b.as_chunks::<2>();
-    for w in words {
-        sum += u32::from(u16::from_be_bytes([w[0], w[1]]));
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    if let [last] = rest {
-        sum += u32::from(*last) << 8;
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    !(sum as u16)
 }
 
 fn known_type(t: u8) -> bool {

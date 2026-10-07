@@ -7,6 +7,7 @@ use std::net::IpAddr;
 use std::pin::pin;
 use std::task::{Context, Poll};
 
+use fictionet::stdlib::ip::{self, transport_checksum};
 use fictionet::stdlib::{ConnError, Connection};
 use fictionet::{Cx, block_on, run};
 
@@ -66,68 +67,6 @@ pub async fn poll_once<F: Future>(fut: F) -> Option<F::Output> {
     .await
 }
 
-fn sum16(mut acc: u32, data: &[u8]) -> u32 {
-    let mut chunks = data.chunks_exact(2);
-    for c in &mut chunks {
-        acc += u16::from_be_bytes([c[0], c[1]]) as u32;
-    }
-    if let [last] = chunks.remainder() {
-        acc += (*last as u32) << 8;
-    }
-    acc
-}
-
-fn fold(mut acc: u32) -> u16 {
-    while acc > 0xffff {
-        acc = (acc & 0xffff) + (acc >> 16);
-    }
-    !(acc as u16)
-}
-
-/// The checksum of a TCP or UDP segment, with its pseudo-header.
-pub fn transport_checksum(src: IpAddr, dst: IpAddr, proto: u8, data: &[u8]) -> u16 {
-    let mut acc = 0;
-    match (src, dst) {
-        (IpAddr::V4(s), IpAddr::V4(d)) => {
-            acc = sum16(acc, &s.octets());
-            acc = sum16(acc, &d.octets());
-        }
-        (IpAddr::V6(s), IpAddr::V6(d)) => {
-            acc = sum16(acc, &s.octets());
-            acc = sum16(acc, &d.octets());
-        }
-        _ => panic!("mixed versions"),
-    }
-    acc += proto as u32 + (data.len() as u32 >> 16) + (data.len() as u32 & 0xffff);
-    fold(sum16(acc, data))
-}
-
-/// An IPv4 or IPv6 packet around `payload`.
-pub fn ip_packet(src: IpAddr, dst: IpAddr, proto: u8, payload: &[u8]) -> Vec<u8> {
-    let mut p = Vec::with_capacity(40 + payload.len());
-    match (src, dst) {
-        (IpAddr::V4(s), IpAddr::V4(d)) => {
-            p.extend_from_slice(&[0x45, 0]);
-            p.extend_from_slice(&((20 + payload.len()) as u16).to_be_bytes());
-            p.extend_from_slice(&[0, 0, 0x40, 0, 64, proto, 0, 0]);
-            p.extend_from_slice(&s.octets());
-            p.extend_from_slice(&d.octets());
-            let sum = fold(sum16(0, &p));
-            p[10..12].copy_from_slice(&sum.to_be_bytes());
-        }
-        (IpAddr::V6(s), IpAddr::V6(d)) => {
-            p.extend_from_slice(&[0x60, 0, 0, 0]);
-            p.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-            p.extend_from_slice(&[proto, 64]);
-            p.extend_from_slice(&s.octets());
-            p.extend_from_slice(&d.octets());
-        }
-        _ => panic!("mixed versions"),
-    }
-    p.extend_from_slice(payload);
-    p
-}
-
 /// The fields of a TCP segment to build.
 #[derive(Clone, Debug)]
 pub struct Segment<'a> {
@@ -166,7 +105,7 @@ pub fn tcp_packet(src: IpAddr, dst: IpAddr, s: &Segment<'_>) -> Vec<u8> {
         sum ^= 0x5a5a;
     }
     t[16..18].copy_from_slice(&sum.to_be_bytes());
-    ip_packet(src, dst, 6, &t)
+    ip::packet(src, dst, 6, &t).0
 }
 
 /// A UDP datagram in an IP packet.
@@ -182,7 +121,7 @@ pub fn udp_packet(src: IpAddr, sport: u16, dst: IpAddr, dport: u16, data: &[u8])
         sum = 0xffff;
     }
     u[6..8].copy_from_slice(&sum.to_be_bytes());
-    ip_packet(src, dst, 17, &u)
+    ip::packet(src, dst, 17, &u).0
 }
 
 /// A [`Connection`] that reads `input` in pieces of the given sizes, then
@@ -236,10 +175,7 @@ pub fn fix_checksums(p: &mut [u8]) {
     let (src, dst, proto, at, end): (IpAddr, IpAddr, u8, usize, usize) = match p.first().map(|b| b >> 4) {
         Some(4) if p.len() >= 20 => {
             let ihl = ((p[0] & 15) as usize * 4).max(20).min(p.len());
-            p[10] = 0;
-            p[11] = 0;
-            let sum = fold(sum16(0, &p[..ihl]));
-            p[10..12].copy_from_slice(&sum.to_be_bytes());
+            ip::set_header_checksum(&mut p[..ihl]);
             let total = (u16::from_be_bytes([p[2], p[3]]) as usize).clamp(ihl, p.len());
             let src = std::net::Ipv4Addr::new(p[12], p[13], p[14], p[15]).into();
             let dst = std::net::Ipv4Addr::new(p[16], p[17], p[18], p[19]).into();
@@ -265,6 +201,6 @@ pub fn fix_checksums(p: &mut [u8]) {
     let t = &mut p[at..end];
     t[at_sum] = 0;
     t[at_sum + 1] = 0;
-    let sum = if proto == 1 { fold(sum16(0, t)) } else { transport_checksum(src, dst, proto, t) };
+    let sum = if proto == 1 { ip::checksum(t) } else { transport_checksum(src, dst, proto, t) };
     t[at_sum..at_sum + 2].copy_from_slice(&sum.to_be_bytes());
 }

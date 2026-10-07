@@ -2032,7 +2032,7 @@ fn udp_packet(src: Ipv4Addr, sport: u16, dst: Ipv4Addr, dport: u16, data: &[u8])
 /// broadcast address or the gateway), its message, or `Some(None)` if it
 /// does not parse. `None` for every other packet.
 fn to_dhcp_server(packet: &[u8], h: &Header, gateway: Ipv4Addr) -> Option<Option<dhcp::Message>> {
-    if h.protocol != PROTO_UDP || h.fragment {
+    if h.protocol != PROTO_UDP || h.fragment.is_some() {
         return None;
     }
     let dst = h.dst;
@@ -2219,7 +2219,7 @@ fn blocked_event(why: BlockedWhy, protocol: Option<u8>, src: Option<IpAddr>, dst
 fn blocked(why: BlockedWhy, p: &[u8]) -> Event {
     match Header::parse_truncated(p) {
         Some(h) => {
-            let port = (h.fragment_offset == 0 && matches!(h.protocol, PROTO_TCP | PROTO_UDP))
+            let port = (h.fragment.is_none_or(|f| f.offset == 0) && matches!(h.protocol, PROTO_TCP | PROTO_UDP))
                 .then(|| h.payload(p))
                 .filter(|t| t.len() >= 4)
                 .map(|t| u16::from_be_bytes([t[2], t[3]]));

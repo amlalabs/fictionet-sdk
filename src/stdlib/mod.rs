@@ -204,7 +204,7 @@
 //! | [`dhcpv6`] | DHCPv6 client, server and relay messages and their options. | yes | yes |  |  |  | yes | yes |
 //! | [`diameter`] | Diameter messages and AVPs. | yes | yes |  |  |  | yes | yes |
 //! | [`dnp3`] | DNP3 link frames, transport segments and application headers. | yes | yes |  |  |  | yes | yes |
-//! | [`dns`] | DNS messages: the `hickory-proto` crate, re-exported. `Net` runs the server. |  |  |  |  | built in | yes |  |
+//! | [`dns`] | DNS messages: the `hickory-proto` crate, re-exported. `Net` runs the server. |  |  |  |  | built in | yes | yes |
 //! | [`dtls`] | DTLS records and handshake messages, with fragment reassembly and no cryptography. | yes |  |  |  |  | yes | yes |
 //! | [`enip`] | EtherNet/IP and CIP: the encapsulation layer, the common packet format and message router messages. | yes | yes |  |  |  | yes | yes |
 //! | [`fast`] | FAST 1.1, the compression of FIX market data: templates, dictionaries, a decoder and an encoder. | yes | yes |  |  |  | yes | yes |
@@ -221,13 +221,13 @@
 //! | [`http3`] | HTTP/3 frames, stream headers, field sections and connection state. | yes | yes | `Connection` |  |  | yes | yes |
 //! | [`httpd`] | HTTP as a service: a router with byte-body handlers, an adapter for any tower service, virtual hosts, and the `Site` a `Net` host serves. |  |  |  | `Http1` |  |  | yes |
 //! | [`huffman`] | The RFC 7541 Huffman code that HPACK and QPACK share. | yes |  |  |  |  | yes | yes |
-//! | [`icmp`] | ICMP echo replies and unreachable messages, for machines built by hand. |  |  |  |  |  |  |  |
+//! | [`icmp`] | ICMP echo replies and error messages, for machines built by hand. |  |  |  |  |  |  | yes |
 //! | [`iec104`] | IEC 60870-5-104 APDUs and ASDU headers. | yes | yes |  |  |  | yes | yes |
 //! | [`igmp`] | IGMP membership queries and reports, versions 1 to 3. | yes |  |  |  |  | yes | yes |
 //! | [`ike`] | IKEv2 message structure and payloads, with no cryptography. | yes |  |  |  |  | yes | yes |
 //! | [`imap`] | IMAP commands and responses. | yes | yes |  |  |  | yes | yes |
 //! | [`imf`] | Internet Message Format mail headers: fields, addresses, dates, message IDs and encoded words. | yes | yes |  |  |  | yes | yes |
-//! | [`ip`] | Sorting IP packets by version and by the protocol they carry, with headers and fragment reassembly. |  |  |  |  |  | yes |  |
+//! | [`ip`] | IP headers read, checked and built, checksums, fragment reassembly, and sorting packets by version and protocol. |  |  |  |  |  | yes | yes |
 //! | [`ipp`] | IPP, the Internet Printing Protocol: requests, responses and their attribute groups. | yes | yes |  |  |  | yes | yes |
 //! | [`ipsec`] | IPsec ESP and AH headers. | yes |  |  |  |  | yes | yes |
 //! | [`itch`] | Nasdaq TotalView-ITCH 5.0: every message, a framer and a bounded order book. | yes | yes | `Book` |  |  | yes | yes |
@@ -301,7 +301,6 @@
 //! | [`thrift`] | Apache Thrift messages and values in the binary and compact protocols, and the framed transport. | yes | yes |  |  |  | yes | yes |
 //! | [`tls`] | The server side of a TLS connection, played by the world with rustls. The world picks the certificate after the client hello. |  |  |  |  | built in | yes |  |
 //! | [`tpkt`] | TPKT packets, the carrier of ISO transport on TCP. | yes | yes |  |  |  | yes | yes |
-//! | `transport` | Which transport an IP packet carries. Hidden from the docs: it serves the `fictionet` binary and may change. |  |  |  |  |  |  |  |
 //! | [`udp`] | UDP sockets for a machine on the simulated network. |  |  |  |  |  |  |  |
 //! | [`urlencoded_form`] | application/x-www-form-urlencoded form bodies and query strings. | yes | yes |  |  |  | yes | yes |
 //! | [`vrrp`] | VRRP virtual router advertisements, versions 2 and 3. | yes |  |  |  |  | yes | yes |
@@ -327,7 +326,6 @@ use crate::cable::PACKET_COST;
 use crate::{Cx, End, Interface, Packet, RecvError};
 
 mod connection;
-mod wire;
 pub mod amqp;
 pub mod asn1;
 pub mod bacnet;
@@ -471,8 +469,6 @@ pub mod tftp;
 pub mod thrift;
 pub mod tls;
 pub mod tpkt;
-#[doc(hidden)]
-pub mod transport;
 pub mod udp;
 pub mod urlencoded_form;
 pub mod vrrp;

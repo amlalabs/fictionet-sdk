@@ -290,9 +290,7 @@ pub async fn bgp_read(cx: &Cx, conn: &mut tcp::TcpConnection, buf: &mut Vec<u8>)
 // ---------------------------------------------------------------------------
 // Raw packets
 
-pub fn checksum(data: &[u8]) -> u16 {
-    border_world::path::checksum(data)
-}
+pub use fictionet::stdlib::ip::checksum;
 
 /// An IPv4 packet with `ttl`.
 pub fn ipv4(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, ttl: u8, payload: &[u8]) -> Packet {
@@ -316,13 +314,7 @@ pub fn udp_probe(src: Ipv4Addr, dst: Ipv4Addr, dport: u16, ttl: u8) -> Packet {
     u.extend_from_slice(&(len as u16).to_be_bytes());
     u.extend_from_slice(&[0, 0]);
     u.extend_from_slice(data);
-    let mut pseudo = Vec::new();
-    pseudo.extend_from_slice(&src.octets());
-    pseudo.extend_from_slice(&dst.octets());
-    pseudo.extend_from_slice(&[0, 17]);
-    pseudo.extend_from_slice(&(len as u16).to_be_bytes());
-    pseudo.extend_from_slice(&u);
-    let sum = checksum(&pseudo);
+    let sum = ip::transport_checksum(src.into(), dst.into(), 17, &u);
     u[6..8].copy_from_slice(&sum.to_be_bytes());
     ipv4(src, dst, 17, ttl, &u)
 }
