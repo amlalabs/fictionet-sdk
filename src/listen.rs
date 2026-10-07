@@ -153,10 +153,11 @@ pub fn listen(socket: WorldSocket, attacher: Attacher) -> std::io::Result<Listen
     });
     let (closed_tx, closed_rx) = mpsc::channel();
     let helper_shared = shared.clone();
+    let helper_attacher = attacher.clone();
     std::thread::Builder::new()
         .name("fictionet-listen".into())
-        .spawn(move || helper(helper_shared, listener, attacher, closed_tx))?;
-    Ok(Listening { shared, path, closed: closed_rx })
+        .spawn(move || helper(helper_shared, listener, helper_attacher, closed_tx))?;
+    Ok(Listening { shared, path, closed: closed_rx, attacher })
 }
 
 fn cvt(n: libc::c_int) -> io::Result<libc::c_int> {
@@ -665,15 +666,33 @@ impl Drop for SocketLink {
 /// A world socket that sandboxes can attach to. Made by [`listen`].
 ///
 /// Dropping it closes the socket. Attachments already made keep working.
+/// When the world's run has ended, dropping it first waits, up to a
+/// second, for observers' streams to send their end, so a world that exits
+/// right after its run tells them it ended.
 pub struct Listening {
     shared: Arc<ListenShared>,
     path: PathBuf,
     /// The helper thread says here that it closed the socket.
     closed: mpsc::Receiver<()>,
+    /// The world's channel, to see whether observers still follow an
+    /// ended run.
+    attacher: Attacher,
 }
+
+/// How long dropping a [`Listening`] waits for observers of an ended run.
+const OBSERVERS_LINGER: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl Drop for Listening {
     fn drop(&mut self) {
+        let deadline = Instant::now() + OBSERVERS_LINGER;
+        while let Some(graph) = self.attacher.graph()
+            && graph.state().ended
+            && graph.observed()
+            && Instant::now() < deadline
+        {
+            drop(graph);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         self.shared.closing.store(true, Ordering::Release);
         self.shared.wake_helper();
         let _ = self.closed.recv_timeout(std::time::Duration::from_secs(5));

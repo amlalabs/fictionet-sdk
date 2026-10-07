@@ -24,6 +24,13 @@ pub(crate) struct View {
     ended: bool,
 }
 
+impl View {
+    /// Whether the world had ended when this view was taken.
+    pub(crate) fn ended(&self) -> bool {
+        self.ended
+    }
+}
+
 /// One server-sent event: its name and its JSON data.
 pub(crate) type Message = (&'static str, String);
 

@@ -27,8 +27,9 @@ Requests:
   keylog                  the world's TLS keys, as an SSLKEYLOGFILE
   '{\"op\":...}'            any request, as JSON
 
-Exit status: 0 when the reply ended, 1 if the world sent an error or could
-not be reached, 2 on bad arguments.";
+Exit status: 0 when the reply ended, including a watch whose world ended,
+1 if the world sent an error, could not be reached or went away while
+running, 2 on bad arguments.";
 
 /// The request for the words after the flags.
 pub(crate) fn request(words: &[String]) -> Result<String, String> {
@@ -107,9 +108,13 @@ pub(crate) fn main(args: &[String]) -> i32 {
         return 1;
     }
     let stdout = std::io::stdout();
+    // A world that exits right after its run ends may close the socket
+    // before its stream's end: that is still a normal end.
+    let mut saw_ended = false;
     loop {
         let value = match client.next_value() {
             Ok(Some(v)) => v,
+            Ok(None) if saw_ended => return 0,
             Ok(None) => {
                 eprintln!("fictionet observe: the world closed the connection");
                 return 1;
@@ -119,6 +124,7 @@ pub(crate) fn main(args: &[String]) -> i32 {
                 return 1;
             }
         };
+        saw_ended |= !value.binary && value.bytes.starts_with(br#"{"event":"ended","#);
         let mut out = stdout.lock();
         let written = if value.binary {
             out.write_all(&value.bytes)

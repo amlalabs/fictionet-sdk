@@ -121,8 +121,10 @@ function connect() {
     state.sideDirty = true;
   });
   events.addEventListener('end', () => {
+    // The stream is over: do not reconnect to a world that has ended.
+    events.close();
+    if (!state.ended) setStatus('ended', 'The world closed');
     state.ended = true;
-    setStatus('ended', 'The world closed');
   });
   events.onerror = () => {
     if (!state.ended) setStatus('connecting', 'Reconnecting');

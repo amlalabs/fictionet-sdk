@@ -273,10 +273,18 @@ impl Session {
                             for (name, data) in view::changes(&graph, view) {
                                 out.push((*id, event(name, &data), false));
                             }
+                            if view.ended() {
+                                out.push((*id, event("end", r#"{"reason":"the world ended"}"#), true));
+                                ended.push(*id);
+                            }
                         }
                         (Some(graph), shown) => {
                             let (view, (name, data)) = view::snapshot(&graph);
                             out.push((*id, event(name, &data), false));
+                            if view.ended() {
+                                out.push((*id, event("end", r#"{"reason":"the world ended"}"#), true));
+                                ended.push(*id);
+                            }
                             *shown = Some((generation, view, Viewer::new(graph)));
                         }
                     }
@@ -298,10 +306,15 @@ impl Session {
                 }
             }
         }
-        self.subs.retain(|s| !ended.contains(&s.id()));
+        // Ended subscriptions let go of the world only once their end is
+        // sent: a world that is exiting waits for that (see `Listening`).
+        let (finished, kept) = std::mem::take(&mut self.subs).into_iter().partition(|s| ended.contains(&s.id()));
+        let finished: Vec<Sub> = finished;
+        self.subs = kept;
         for (id, value, end) in out {
             self.send(id, value.as_bytes(), false, end)?;
         }
+        drop(finished);
         Ok(())
     }
 }

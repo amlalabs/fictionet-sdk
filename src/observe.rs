@@ -321,8 +321,8 @@
 //!
 //! A stream is a series of values, each an object
 //! `{"event":"<name>","data":<data>}`. It ends with
-//! `{"event":"end","data":{"reason":"..."}}` when its link closes or it is
-//! cancelled.
+//! `{"event":"end","data":{"reason":"..."}}` when its link closes, the
+//! world ends (a `watch` sends `ended` first), or it is cancelled.
 //!
 //! An observer finds the world's run the first time the world asks its
 //! [`Attachments`](crate::Attachments) for a sandbox, with
