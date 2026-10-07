@@ -212,7 +212,7 @@ impl core::fmt::Display for CaptureError {
 impl core::error::Error for CaptureError {}
 
 /// HTTP/2 capture decoding through [`Present`] and [`fictionet::observe::Observed`].
-/// Uses the same frame parser and header assembly as [`Connection`](fictionet::stdlib::http2::Connection), with
+/// Uses the same frame parser and header assembly as [`Session`](fictionet::stdlib::http2::Session), with
 /// tolerant HPACK and header-only oversized items followed by `Skip`.
 /// Complete frames already available in bounded read-ahead are displayed.
 /// Missing bytes stop the direction and clear HPACK and DATA state.

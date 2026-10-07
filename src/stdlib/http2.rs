@@ -1,12 +1,12 @@
 //! HTTP/2 frames and directional state (RFC 9113).
 //!
-//! Use [`Connection`] for strict decoding. A capture reads frames with
+//! Use [`Session`] for strict decoding. A capture reads frames with
 //! [`Frames::for_observation`] and header blocks with
 //! [`HeaderBlocks::for_observation`], which report what they cannot read
 //! instead of failing; observe's HTTP/2 presenter is built on them.
 //! Route SETTINGS and WINDOW_UPDATE to the opposite direction's
-//! [`Connection::peer_settings`] and [`Connection::peer_window_update`].
-//! Route RST_STREAM through [`Connection::peer_reset`], then retire both halves.
+//! [`Session::peer_settings`] and [`Session::peer_window_update`].
+//! Route RST_STREAM through [`Session::peer_reset`], then retire both halves.
 //! In-flight DATA on a peer-reset stream still consumes connection credit.
 //! Its headers still update HPACK. Neither produces an event, even after retire.
 //! For GOAWAY, the caller identifies abandoned streams above `last_stream`,
@@ -1069,7 +1069,7 @@ impl BlockRead {
 }
 /// Header block assembly and HPACK decoding for one direction: HEADERS,
 /// PUSH_PROMISE and CONTINUATION fragments joined and decoded.
-/// [`Connection`] uses one strictly. Made with
+/// [`Session`] uses one strictly. Made with
 /// [`for_observation`](Self::for_observation), it reads what a capture
 /// holds: a fragment that breaks the rules, is cut off, or is too long is
 /// noted in the [`BlockRead`] and forgotten, and the next block is read.
@@ -1300,7 +1300,7 @@ struct SettingsUpdate {
 /// returned once and retained by [`failed`](Self::failed). DATA ownership
 /// passes to the caller; route it to a [`fictionet::stdlib::codec::Demux`]
 /// of [`fictionet::stdlib::grpc::Messages`] for gRPC under one shared budget.
-pub struct Connection {
+pub struct Session {
     frames: Stream<Frames>,
     blocks: HeaderBlocks,
     limits: Limits,
@@ -1318,7 +1318,7 @@ pub struct Connection {
     initial_window: u32,
     frame_size: u32,
 }
-impl Connection {
+impl Session {
     /// Starts a client-to-server direction requiring the client preface.
     pub fn client_side(limits: Limits) -> Self {
         Self::new(limits, true)
@@ -1823,7 +1823,7 @@ mod tests {
         raw(4, 0, 0, &[])
     }
     fn run(bytes: &[u8], chunk: usize) -> Vec<Result<Event, Error>> {
-        let mut c = Connection::client_side(Limits::default());
+        let mut c = Session::client_side(Limits::default());
         let mut out = Vec::new();
         for chunk in bytes.chunks(chunk) {
             let mut rest = chunk;
@@ -1844,7 +1844,7 @@ mod tests {
         assert!(c.next().is_none());
         out
     }
-    fn accept(c: &mut Connection, bytes: &[u8]) -> Vec<Event> {
+    fn accept(c: &mut Session, bytes: &[u8]) -> Vec<Event> {
         let mut rest = bytes;
         let mut out = Vec::new();
         loop {
@@ -2033,7 +2033,7 @@ mod tests {
                 ErrorCode::ProtocolError
             );
         }
-        let mut c = Connection::server_side(Limits {
+        let mut c = Session::server_side(Limits {
             max_header_block: 1,
             ..Limits::default()
         });
@@ -2049,7 +2049,7 @@ mod tests {
     }
     #[test]
     fn peer_credit_before_response_headers_and_after_retirement_is_allowed() {
-        let mut c = Connection::server_side(Limits::default());
+        let mut c = Session::server_side(Limits::default());
         accept(&mut c, &settings());
         let update = WindowUpdate {
             stream: 1,
@@ -2068,7 +2068,7 @@ mod tests {
     #[test]
     fn peer_reset_drops_in_flight_data_before_and_after_retire() {
         for retired in [false, true] {
-            let mut c = Connection::client_side(Limits::default());
+            let mut c = Session::client_side(Limits::default());
             accept(&mut c, PREFACE);
             accept(&mut c, &settings());
             accept(&mut c, &raw(1, 4, 1, &[0x82]));
@@ -2091,7 +2091,7 @@ mod tests {
     #[test]
     fn peer_reset_trailers_keep_hpack_in_sync_after_retire() {
         for retired in [false, true] {
-            let mut c = Connection::client_side(Limits::default());
+            let mut c = Session::client_side(Limits::default());
             accept(&mut c, PREFACE);
             accept(&mut c, &settings());
             accept(&mut c, &raw(1, 4, 1, &[0x82]));
@@ -2111,7 +2111,7 @@ mod tests {
 
     #[test]
     fn peer_reset_records_stay_bounded_and_preserve_other_streams() {
-        let mut c = Connection::server_side(Limits {
+        let mut c = Session::server_side(Limits {
             max_streams: 2,
             ..Limits::default()
         });
@@ -2140,7 +2140,7 @@ mod tests {
 
     #[test]
     fn peer_reset_before_headers_keeps_connection_checks() {
-        let mut c = Connection::server_side(Limits::default());
+        let mut c = Session::server_side(Limits::default());
         accept(&mut c, &settings());
         c.peer_reset(1);
         assert!(accept(&mut c, &raw(1, 4, 1, &[0x88])).is_empty());
@@ -2153,7 +2153,7 @@ mod tests {
             ErrorCode::FlowControlError
         );
 
-        let mut c = Connection::server_side(Limits::default());
+        let mut c = Session::server_side(Limits::default());
         accept(&mut c, &settings());
         c.peer_reset(1);
         assert_eq!(c.push(&raw(1, 5, 1, &[0xff])), 10);
@@ -2165,7 +2165,7 @@ mod tests {
 
     #[test]
     fn caller_can_retire_streams_abandoned_by_goaway() {
-        let mut c = Connection::server_side(Limits {
+        let mut c = Session::server_side(Limits {
             max_streams: 4,
             ..Limits::default()
         });
@@ -2190,7 +2190,7 @@ mod tests {
     #[test]
     fn window_reductions_accept_in_flight_data_until_ack() {
         for already_open in [false, true] {
-            let mut c = Connection::client_side(Limits::default());
+            let mut c = Session::client_side(Limits::default());
             if already_open {
                 accept(&mut c, &[PREFACE.as_slice(), &settings()].concat());
                 accept(&mut c, &raw(1, 4, 1, &[0x82]));
@@ -2221,7 +2221,7 @@ mod tests {
 
     #[test]
     fn frame_size_reductions_accept_in_flight_frames_until_ack() {
-        let mut c = Connection::server_side(Limits {
+        let mut c = Session::server_side(Limits {
             max_frame_size: 32_768,
             ..Limits::default()
         });
@@ -2254,7 +2254,7 @@ mod tests {
 
     #[test]
     fn settings_update_opposite_direction_and_padding_spends_credit() {
-        let mut c = Connection::server_side(Limits::default());
+        let mut c = Session::server_side(Limits::default());
         accept(&mut c, &settings());
         accept(&mut c, &raw(1, 4, 1, &[0x88]));
         accept(&mut c, &raw(0, 8, 1, &[2, b'a', 0, 0]));
@@ -2302,7 +2302,7 @@ mod tests {
     }
     #[test]
     fn hpack_settings_increases_do_not_require_a_spurious_reduction() {
-        let mut c = Connection::server_side(Limits::default());
+        let mut c = Session::server_side(Limits::default());
         accept(&mut c, &settings());
         c.peer_settings(&Settings {
             flags: 0,
@@ -2338,7 +2338,7 @@ mod tests {
             (raw(1, 4, 1, &[0xff]), ErrorCode::CompressionError),
             (raw(0, 0, 1, &[0; 2]), ErrorCode::FlowControlError),
         ] {
-            let mut c = Connection::server_side(Limits::default());
+            let mut c = Session::server_side(Limits::default());
             accept(&mut c, &settings());
             accept(&mut c, &raw(1, 4, 1, &[0x88]));
             c.peer_settings(&Settings {
@@ -2354,7 +2354,7 @@ mod tests {
     }
     #[test]
     fn gap_discards_compression_assembly_and_frame_state() {
-        let mut c = Connection::server_side(Limits::default());
+        let mut c = Session::server_side(Limits::default());
         accept(&mut c, &settings());
         accept(&mut c, &raw(1, 0, 1, &[0x40, 1, b'x']));
         assert!(c.held() > 0);
@@ -2367,15 +2367,15 @@ mod tests {
     #[test]
     fn empty_directions_end_cleanly_but_a_preface_requires_settings() {
         for mut c in [
-            Connection::client_side(Limits::default()),
-            Connection::server_side(Limits::default()),
+            Session::client_side(Limits::default()),
+            Session::server_side(Limits::default()),
         ] {
             c.end();
             assert!(c.next().is_none());
             assert!(c.is_done());
             assert!(c.failed().is_none());
         }
-        let mut c = Connection::client_side(Limits::default());
+        let mut c = Session::client_side(Limits::default());
         accept(&mut c, PREFACE);
         c.end();
         assert_eq!(
@@ -2386,7 +2386,7 @@ mod tests {
 
     #[test]
     fn queued_window_reductions_and_increases_follow_ack_order() {
-        let mut c = Connection::server_side(Limits::default());
+        let mut c = Session::server_side(Limits::default());
         accept(&mut c, &settings());
         accept(&mut c, &raw(1, 4, 1, &[0x88]));
         for values in [vec![0], vec![100_000], vec![10, 20]] {

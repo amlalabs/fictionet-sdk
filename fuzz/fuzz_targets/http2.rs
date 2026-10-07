@@ -33,9 +33,9 @@ fuzz_target!(|data: &[u8]| {
     framed.extend_from_slice(bytes);
     for client in [false, true] {
         let mut c = if client {
-            http2::Connection::client_side(Default::default())
+            http2::Session::client_side(Default::default())
         } else {
-            http2::Connection::server_side(Default::default())
+            http2::Session::server_side(Default::default())
         };
         if client {
             let _ = c.push(http2::PREFACE);

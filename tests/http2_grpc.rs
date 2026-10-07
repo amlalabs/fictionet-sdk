@@ -57,7 +57,7 @@ fn data(stream: u32, payload: &[u8], end: bool) -> Vec<u8> {
 }
 struct Stack {
     tcp: tcp_reassembly::Reassembler,
-    h2: [http2::Connection; 2],
+    h2: [http2::Session; 2],
     calls: Demux<(usize, u32), grpc::Messages>,
     messages: Vec<(usize, u32, Vec<u8>)>,
     statuses: Vec<grpc::Status>,
@@ -73,8 +73,8 @@ impl Stack {
                 ..Default::default()
             }),
             h2: [
-                http2::Connection::client_side(Default::default()),
-                http2::Connection::server_side(Default::default()),
+                http2::Session::client_side(Default::default()),
+                http2::Session::server_side(Default::default()),
             ],
             calls: Demux::new(16, 1024, |_| grpc::Messages::with_limit(128)),
             messages: Vec::new(),
