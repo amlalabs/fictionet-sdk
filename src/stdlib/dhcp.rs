@@ -2,8 +2,6 @@
 //! I/O. The DHCP server in [`web::Sites`](fictionet::stdlib::web::Sites) uses
 //! it, and so does the DHCP server that `fictionet attach --type tap` runs
 //! for a VM.
-//!
-//! Hidden from the docs until its API settles.
 
 use std::net::Ipv4Addr;
 
@@ -73,15 +71,25 @@ pub mod opt {
 /// way, ends the options, and pads the message to [`PADDED_LEN`] bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Message {
+    /// [`BOOTREQUEST`] from a client, [`BOOTREPLY`] from a server.
     pub op: u8,
+    /// The hardware address type: 1 for Ethernet.
     pub htype: u8,
+    /// The hardware address length: 6 for Ethernet.
     pub hlen: u8,
+    /// The transaction ID the client picks, copied into the reply.
     pub xid: u32,
+    /// Flags: the top bit asks the server to broadcast its reply.
     pub flags: u16,
+    /// The client's address, when it already has one.
     pub ciaddr: Ipv4Addr,
+    /// "Your" address: the one the server offers or assigns.
     pub yiaddr: Ipv4Addr,
+    /// The next server to use, such as for network boot.
     pub siaddr: Ipv4Addr,
+    /// The relay agent's address, when a relay forwarded the message.
     pub giaddr: Ipv4Addr,
+    /// The client's hardware address, padded with zeros to 16 bytes.
     pub chaddr: [u8; 16],
     /// Options in order, without pad and end. Long options split over
     /// several entries (RFC 3396) are joined.

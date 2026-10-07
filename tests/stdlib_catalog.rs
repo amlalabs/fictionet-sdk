@@ -222,7 +222,7 @@ fn the_catalog_lists_every_module_once_in_order() {
 #[test]
 fn hidden_modules_are_not_linked() {
     let hidden = hidden_modules();
-    assert!(hidden.contains("dhcp"), "the parser found the hidden modules: {hidden:?}");
+    assert_eq!(hidden.len(), MOD_RS.matches("#[doc(hidden)]\npub mod ").count(), "the parser found the hidden modules: {hidden:?}");
     for row in catalog() {
         assert_eq!(
             row.linked,
