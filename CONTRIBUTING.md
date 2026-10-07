@@ -104,17 +104,23 @@ per protocol.
 A protocol module follows these rules. The `stdlib::codec` module docs give
 each with examples.
 
-- **E1.** One `pub enum Error` per module, for every `Wire` and `Decode` impl in it.
+- **E1.** One `pub enum Error` per module, for every `Wire` and `Decode` impl in it. An item fault that carries more than the reason is a struct named for the fault (`fix::FieldFault`).
 - **E2.** `FrameError` only where a decoder yields `Result<Unit, Error>`: it is the fault that ends the stream.
 - **E3.** An error the peer sends keeps the protocol's word (`modbus::Exception`, `grpc::Status`).
 - **E4.** No `DecodeError`, `EncodeError`, `ParseError`, `WireError`, `<Unit>ParseError`, `<Unit>Error`, `<Module>Error`.
-- **E5.** The only wrappers are the codec's (`Fail`, `PipeError`, ...). A wrapper returns its inner error from `source()`.
+- **E5.** The only wrappers are the codec's (`Fail`, `PipeError`, ...). A wrapper returns its inner error from `source()`, and its `Display` says only its own context. `fictionet::ErrorChain` prints the whole chain.
 - **N1.** A `Decode` type is the plural of its item: `Frames` yields `Frame`, `Packets` yields `Packet`.
 - **N2.** A `Wire` type is the specification's word for its unit, with no module prefix (`rtp::Packet`).
 - **N3.** One decoder per direction: the items carry the side (`ClientMessages` yields `ClientMessage`).
-- **N4.** One side of a protocol is `Client` or `Server`, either side is `Session`, and its progress is `Phase`.
+- **N4.** One side of a protocol is `Client` or `Server`, either side is `Session`, and its progress is `Phase`. A session fed bytes uses `push`, `next` and `end`; one fed messages uses `receive`, `send` and `tick`.
 - **N5.** A `Service` is named for what it serves, with `type Decoder` and `type State`.
 - **N6.** `Present` is implemented on the decoder it presents.
+
+All code, not only protocol modules, names its contexts one way:
+
+- **C1.** The Fictionet context is `fcx`: `fcx: &Cx`, `fcx.spawn(|fcx| ..)`, `fn fcx(&self)`. The std task context is `cx`, as in tokio and futures: `cx: &mut Context<'_>`, `poll_fn(|cx| ..)`. `ctx` is not written.
+- **C2.** A `Service` method takes `driver: &mut serve::Driver`, its side of the driver; deferred work takes `driver: &mut serve::PendingDriver`. Both record events with `record`, as `Cx` does.
+- **C3.** A panic in world code is the world's bug. Fictionet does not catch it: it ends the run.
 
 ## Performance
 

@@ -84,7 +84,10 @@
 //!   `WriteError` of each [`Wire`] type, the [`Decode::Error`] of each
 //!   decoder, and the `E` in an `Item = Result<T, E>`. Its variants name
 //!   the clause of the specification. A writer that cannot fail uses
-//!   [`Infallible`](core::convert::Infallible).
+//!   [`Infallible`](core::convert::Infallible). An item fault that must
+//!   carry more than the reason, such as the header a reply needs, is a
+//!   struct named for the fault that holds the module's `Error`
+//!   (`fix::FieldFault`, `diameter::AvpFault`).
 //! - **E2.** A decoder that yields `Result<Unit, Error>`, so a bad unit
 //!   does not end the stream, reports the fault that does end it as
 //!   `FrameError`, its `Decode::Error`. A module without that split has
@@ -99,7 +102,9 @@
 //!   [`CollectError`], [`AssembleError`], [`PipeError`], [`LineError`],
 //!   [`InterceptError`], [`RewriteError`] and [`FaultError`]. A protocol
 //!   module adds none. An error that wraps another returns it from
-//!   [`source`](Error::source).
+//!   [`source`](Error::source), and its `Display` says only its own
+//!   context, never the inner error's text, so
+//!   [`ErrorChain`](crate::ErrorChain) shows each message once.
 //! - **N1.** A [`Decode`] type is the plural of its item: `Frames` yields
 //!   `Frame`, `Packets` yields `Packet`, and a `Result<T, E>` item counts
 //!   as `T`. A raw-bytes item takes the protocol's word for its unit. A
@@ -114,7 +119,9 @@
 //!   for each side (`Frames::client_side()`).
 //! - **N4.** A state machine for one side of a protocol is `Client` or
 //!   `Server`, one that plays either side is `Session`, and its progress
-//!   enum is `Phase`. `Connection` names only the byte-stream trait.
+//!   enum is `Phase`. `Connection` names only the byte-stream trait. A
+//!   session fed bytes uses [`Stream`]'s verbs (`push`, `next`, `end`); one
+//!   fed messages uses `receive`, `send` and `tick`.
 //! - **N5.** A [`Service`](super::serve::Service) is named for what it
 //!   serves, with no suffix. Its associated types are `Decoder` and
 //!   `State`.
