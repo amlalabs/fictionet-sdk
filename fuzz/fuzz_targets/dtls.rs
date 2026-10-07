@@ -4,9 +4,9 @@
 
 use fictionet::stdlib::codec::{Wire, contract};
 use fictionet::stdlib::dtls::{
-    ClientHello, ContentType, Datagram, Fragment, Fragments, Handshake, HelloVerifyRequest,
+    ClientHello, ContentType, Datagram, Error, Fragment, Fragments, Handshake, HelloVerifyRequest,
     MAX_MESSAGE_LEN, MAX_REASSEMBLY_BYTES, MAX_RECORDS_PER_DATAGRAM, PlainRecord, Reassembler,
-    ReassemblyError, Record, Sequence, ServerHello, UnifiedRecord,
+    Record, Sequence, ServerHello, UnifiedRecord,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -105,7 +105,7 @@ fuzz_target!(|data: &[u8]| {
         let next = Handshake { msg_type: cid_len, message_seq: r.next_seq(), body };
         match r.add(&next.to_fragment().unwrap()) {
             Ok(_) => assert!(r.next_message().is_some()),
-            Err(e) => assert_eq!(e, ReassemblyError::Conflict),
+            Err(e) => assert_eq!(e, Error::FragmentConflict),
         }
         assert!(r.buffered() <= MAX_REASSEMBLY_BYTES);
     }

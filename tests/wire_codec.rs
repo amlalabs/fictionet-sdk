@@ -32,7 +32,7 @@ fn complete_units_refuse_a_second_unit() {
     bytes.extend_from_slice(&[0; 4]);
     assert_eq!(
         ntlmssp::AvPairs::parse(&bytes),
-        Err(ntlmssp::ParseError::Trailing)
+        Err(ntlmssp::Error::Trailing)
     );
 
     let record = dtls::Record::Plain(dtls::PlainRecord {
@@ -49,7 +49,7 @@ fn complete_units_refuse_a_second_unit() {
     contract::check_wire_value(&datagram);
     assert_eq!(
         dtls::Record::read(&bytes, 8),
-        Err(dtls::RecordError::Trailing)
+        Err(dtls::Error::RecordTrailing)
     );
 }
 
