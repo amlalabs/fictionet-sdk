@@ -16,7 +16,7 @@ use fictionet::events::{ConnInfo, Event};
 use fictionet::stdlib::codec::{Ending, ItemFault, Lcg, LineError, Lines, Rewrite, Rule, Trigger};
 use fictionet::stdlib::httpd::{self, Body, Exchange, Handler, Http1, HttpOptions, Limits, Reply, Router};
 use fictionet::stdlib::json;
-use fictionet::stdlib::serve::{self, Budget, End, FaultPlan, Flow, Harness, Plan, ServeCtx, ServeOptions, Service};
+use fictionet::stdlib::serve::{self, Budget, Ended, FaultPlan, Flow, Harness, Plan, ServeCtx, ServeOptions, Service};
 use fictionet::stdlib::{Connection, ConnectionExt, ip, tcp};
 use fictionet::{Cx, block_on, pair, run};
 use http_body::Frame;
@@ -141,7 +141,7 @@ fn reply_bytes_count_against_the_budget() {
     let opts = ServeOptions::default().idle(None).budget(Budget::new(256 << 10));
     let mut h = Harness::with_options(Loud { size: 1 << 20 }, (), opts);
     assert_eq!(h.push(b"go\n").unwrap(), b"");
-    assert_eq!(h.end_reason(), Some(End::Budget));
+    assert_eq!(h.end_reason(), Some(Ended::Budget));
 
     // A reply that fits goes out.
     let opts = ServeOptions::default().idle(None).budget(Budget::new(256 << 10));
@@ -157,7 +157,7 @@ fn a_response_body_waiting_to_be_written_counts_against_the_budget() {
     let opts = ServeOptions::default().idle(None).budget(Budget::new(512 << 10));
     let mut h = Harness::with_options(Http1::new(page(1 << 20)), (), opts);
     assert_eq!(h.push(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n").unwrap(), b"");
-    assert_eq!(h.end_reason(), Some(End::Budget));
+    assert_eq!(h.end_reason(), Some(Ended::Budget));
     let request = h.events().iter().find(|e| e.is("http", "request")).expect("an http.request event");
     assert_eq!(request.str("answer"), Some("cancelled"));
     assert_eq!(field_u64(request, "sent"), Some(0));
@@ -231,7 +231,7 @@ fn an_http10_body_of_unknown_length_closes_the_connection() {
     assert!(text.starts_with("HTTP/1.0 200 OK\r\n"), "{text}");
     assert!(!text.contains("content-length") && !text.contains("keep-alive"), "{text}");
     assert!(text.ends_with("\r\n\r\nstreamed\n"), "{text}");
-    assert_eq!(h.end_reason(), Some(End::Closed));
+    assert_eq!(h.end_reason(), Some(Ended::Closed));
 
     // With a known length, the connection stays open.
     let mut h = Harness::new(Http1::new(page(3)), ());

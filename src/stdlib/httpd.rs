@@ -114,7 +114,7 @@ use fictionet::stdlib::http1::{self, Event as H1, RequestHead};
 use fictionet::events::{ConnInfo, Event, Fields, Level, float, opt};
 use fictionet::stdlib::json::Value;
 use fictionet::stdlib::net::{Accept, Arrival, ConfigFor, Host, Sni};
-use fictionet::stdlib::serve::{self, Budget, End, Flow, Pending, PendingCtx, Prefixed, ServeCtx, ServeOptions, Timer};
+use fictionet::stdlib::serve::{self, Budget, Ended, Flow, Pending, PendingCtx, Prefixed, ServeCtx, ServeOptions, Timer};
 use fictionet::stdlib::tls::ServerConfig;
 use fictionet::stdlib::{ConnError, Connection, ConnectionExt};
 use fictionet::time::Instant;
@@ -1165,8 +1165,8 @@ impl serve::Service for Http1 {
         Ok(())
     }
 
-    fn on_end(&mut self, end: End, _: &(), ctx: &mut ServeCtx<'_>) -> Result<(), Infallible> {
-        if end == End::Conn(ConnError::Broken) {
+    fn on_end(&mut self, end: Ended, _: &(), ctx: &mut ServeCtx<'_>) -> Result<(), Infallible> {
+        if end == Ended::Conn(ConnError::Broken) {
             let e = error_event(ctx.conn(), "transport", "a TLS record did not decrypt".into());
             ctx.log(e);
         }

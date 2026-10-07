@@ -30,7 +30,7 @@ use fictionet::stdlib::net::{Accept, Arrival, Net, Sni};
 use fictionet::stdlib::route::Prefix;
 use fictionet::stdlib::scenario::Scenario;
 use fictionet::stdlib::serve::{
-    self, Budget, End as Ended, FaultPlan, Flow, Harness, HarnessError, Pending, PendingCtx, Plan, ServeCtx, ServeOptions, Served,
+    self, Budget, Ended, FaultPlan, Flow, Harness, HarnessError, Pending, PendingCtx, Plan, ServeCtx, ServeOptions, Served,
     Service, Timer, Transcript, Upgrade,
 };
 use fictionet::stdlib::{ConnError, Connection, ip, tcp, udp};

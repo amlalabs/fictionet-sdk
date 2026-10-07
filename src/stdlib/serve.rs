@@ -110,10 +110,10 @@
 //!   ends: concurrent responses, as HTTP/2 streams need.
 //! - **Idle.** With [`ServeOptions::idle`], a connection that sends nothing
 //!   for that long while the driver waits for it is closed, after
-//!   [`Service::on_end`] with [`End::Idle`].
+//!   [`Service::on_end`] with [`Ended::Idle`].
 //! - **Writes.** A write that takes no bytes for
 //!   [`ServeOptions::write_timeout`] ends the connection with
-//!   [`End::Conn`]`(`[`ConnError::TimedOut`]`)`: a client that stops
+//!   [`Ended::Conn`]`(`[`ConnError::TimedOut`]`)`: a client that stops
 //!   reading. A client that resets the connection ends it at once, also
 //!   while a write waits.
 //! - **Budget.** With [`ServeOptions::budget`], the bytes the connection
@@ -121,10 +121,10 @@
 //!   decoder's capacity and held state, the bytes waiting for it,
 //!   [`Service::held`], the reply bytes not yet written, and what deferred
 //!   work holds ([`Pending::held`]). Past it the connection closes with
-//!   [`End::Budget`], and its deferred work is cancelled.
+//!   [`Ended::Budget`], and its deferred work is cancelled.
 //! - **Ends.** [`Service::on_end`] is called once, with why the connection
 //!   ended. Its reply is written when the connection can still take it: the
-//!   client half-closed ([`End::Eof`]), the service closed, the service's
+//!   client half-closed ([`Ended::Eof`]), the service closed, the service's
 //!   decoder failed, the connection sat idle or went over its budget.
 //! - **Upgrades.** A call that returns [`Flow::Upgrade`] says what comes
 //!   next: [`Upgrade::Tls`] shakes hands as a TLS server with
@@ -238,7 +238,7 @@ pub trait Service: Send + 'static {
     }
 
     /// The connection ended, for the reason in `end`. Called once, last.
-    fn on_end(&mut self, _end: End, _state: &Self::State, _ctx: &mut ServeCtx<'_>) -> Result<(), Self::Error> {
+    fn on_end(&mut self, _end: Ended, _state: &Self::State, _ctx: &mut ServeCtx<'_>) -> Result<(), Self::Error> {
         Ok(())
     }
 
@@ -296,7 +296,7 @@ impl Upgrade {
 
 /// Why a connection ended, as [`Service::on_end`] hears it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum End {
+pub enum Ended {
     /// The client sent everything it will send, and every item was handled.
     /// The reply is still written.
     Eof,
@@ -315,10 +315,10 @@ pub enum End {
     Cancelled,
 }
 
-impl End {
+impl Ended {
     /// Whether the connection can still take a last reply.
     pub fn writable(self) -> bool {
-        matches!(self, End::Eof | End::Closed | End::Failed | End::Idle | End::Budget)
+        matches!(self, Ended::Eof | Ended::Closed | Ended::Failed | Ended::Idle | Ended::Budget)
     }
 
     /// The name in a `conn.close` event: `eof`, `closed`, `failed`,
@@ -326,16 +326,16 @@ impl End {
     /// bytes for [`ServeOptions::write_timeout`]), `error` or `cancelled`.
     pub fn as_str(self) -> &'static str {
         match self {
-            End::Eof => "eof",
-            End::Closed => "closed",
-            End::Failed => "failed",
-            End::Idle => "idle",
-            End::Budget => "budget",
-            End::Conn(ConnError::Reset) => "reset",
-            End::Conn(ConnError::Broken) => "broken",
-            End::Conn(ConnError::TimedOut) => "timed_out",
-            End::Conn(_) => "error",
-            End::Cancelled => "cancelled",
+            Ended::Eof => "eof",
+            Ended::Closed => "closed",
+            Ended::Failed => "failed",
+            Ended::Idle => "idle",
+            Ended::Budget => "budget",
+            Ended::Conn(ConnError::Reset) => "reset",
+            Ended::Conn(ConnError::Broken) => "broken",
+            Ended::Conn(ConnError::TimedOut) => "timed_out",
+            Ended::Conn(_) => "error",
+            Ended::Cancelled => "cancelled",
         }
     }
 }
@@ -485,7 +485,7 @@ impl WakeHandle {
 /// held state ([`Decode::capacity`], [`Decode::held`]), the bytes read but
 /// not yet decoded, [`Service::held`], the reply bytes not yet written,
 /// and [`Pending::held`]. A connection that would take the total past the
-/// limit closes with [`End::Budget`]; one that cannot get its first charge
+/// limit closes with [`Ended::Budget`]; one that cannot get its first charge
 /// is closed before the service sees it. Code that holds bytes outside a
 /// service, such as HTTP/2 on hyper, takes a [`Charge`] of its own.
 #[derive(Clone)]
@@ -1101,7 +1101,7 @@ impl<E: core::error::Error> core::error::Error for ServeError<E> {}
 #[derive(Debug)]
 pub enum Served<C> {
     /// The connection is closed, or broken.
-    Closed(End),
+    Closed(Ended),
     /// The service asked for an upgrade the caller performs: the
     /// connection with its unread bytes. [`serve`] performs
     /// [`Upgrade::Tls`] itself and returns only [`Upgrade::Handoff`];
@@ -1380,9 +1380,9 @@ enum Failure<E> {
 enum State {
     Running,
     /// Ending: ordered work drains, then `on_end`, then its work drains.
-    Ending { end: End, called: bool },
+    Ending { end: Ended, called: bool },
     Upgrading(Upgrade),
-    Ended(End),
+    Ended(Ended),
 }
 
 /// The next item from a service's decoder.
@@ -1401,7 +1401,7 @@ enum Next {
     /// Hand the connection on.
     Upgrade(Upgrade),
     /// Done: write what is out if the end allows, then close.
-    Closed(End),
+    Closed(Ended),
 }
 
 /// One connection's state, with no I/O: the decoder and the bytes waiting
@@ -1478,7 +1478,7 @@ where
         if let Some(budget) = self.budget.clone() {
             let mut charge = Charge { budget, now: 0 };
             if !charge.set(self.holding(service)) {
-                self.end_now(End::Budget);
+                self.end_now(Ended::Budget);
                 return;
             }
             self.charge = Some(charge);
@@ -1504,7 +1504,7 @@ where
 
     /// Charges what the connection holds now. Past the budget, nothing
     /// more is written and the deferred work is cancelled; the connection
-    /// ends with [`End::Budget`], and `on_end` may still reply.
+    /// ends with [`Ended::Budget`], and `on_end` may still reply.
     fn recharge(&mut self, service: &S) {
         if self.charge.is_none() || matches!(self.state, State::Ended(_) | State::Upgrading(_)) {
             return;
@@ -1516,9 +1516,9 @@ where
         self.out.clear();
         self.cancel_all(true);
         match self.state {
-            State::Running => self.finish(End::Budget),
-            State::Ending { called: false, .. } => self.state = State::Ending { end: End::Budget, called: false },
-            _ => self.end_now(End::Budget),
+            State::Running => self.finish(Ended::Budget),
+            State::Ending { called: false, .. } => self.state = State::Ending { end: Ended::Budget, called: false },
+            _ => self.end_now(Ended::Budget),
         }
         // What is left, such as the decoder's capacity, still counts.
         let need = self.holding(service);
@@ -1570,7 +1570,7 @@ where
     }
 
     /// The connection broke, or the world is stopping.
-    fn broken(&mut self, end: End) {
+    fn broken(&mut self, end: Ended) {
         self.out.clear();
         self.finish(end);
     }
@@ -1659,7 +1659,7 @@ where
     }
 
     /// Ends at once: no more calls, nothing more written.
-    fn end_now(&mut self, end: End) {
+    fn end_now(&mut self, end: Ended) {
         self.out.clear();
         self.held_flow = None;
         self.s.wake.close();
@@ -1677,7 +1677,7 @@ where
             Err(e) => {
                 self.collect();
                 self.failure.get_or_insert(Failure::Service(e));
-                self.finish(End::Closed);
+                self.finish(Ended::Closed);
             }
             Ok(flow) => {
                 self.collect();
@@ -1690,7 +1690,7 @@ where
 
     /// Starts ending with `end`. A writable end drains ordered work and
     /// writes `on_end`'s reply; any other end cancels the work.
-    fn finish(&mut self, end: End) {
+    fn finish(&mut self, end: Ended) {
         if self.state != State::Running {
             return;
         }
@@ -1706,7 +1706,7 @@ where
     fn apply(&mut self, flow: Flow, service: &S) {
         match flow {
             Flow::Continue => {}
-            Flow::Close => self.finish(End::Closed),
+            Flow::Close => self.finish(Ended::Closed),
             Flow::Upgrade(Upgrade::Decoder) => {
                 let unread = self.stream.unread().to_vec();
                 self.stream = Stream::with_buffer(service.decoder(), self.read_buffer);
@@ -1735,7 +1735,7 @@ where
         if let Err(e) = result {
             self.failure.get_or_insert(Failure::Service(e));
         }
-        self.finish(End::Failed);
+        self.finish(Ended::Failed);
     }
 
     /// Moves bytes from the queue into the decoder, up to a fault delay.
@@ -1810,7 +1810,7 @@ where
             && self.keyed.is_empty()
             && now >= self.idle_from + idle
         {
-            self.finish(End::Idle);
+            self.finish(Ended::Idle);
             return Next::Again;
         }
         loop {
@@ -1832,7 +1832,7 @@ where
             }
             if self.stream.is_done() {
                 if self.eof && self.queue.is_empty() && self.stream.unread().is_empty() {
-                    self.finish(End::Eof);
+                    self.finish(Ended::Eof);
                 } else if self.fresh && self.stream.offset() == 0 {
                     // A fresh decoder that ends before it reads a byte
                     // would end again and again: hand the bytes on.
@@ -1864,7 +1864,7 @@ where
         Next::Wait { read: !self.eof, wake: true, deadline: self.next_deadline() }
     }
 
-    fn ending(&mut self, service: &mut S, state: &S::State, now: Instant, end: End, called: bool) -> Next {
+    fn ending(&mut self, service: &mut S, state: &S::State, now: Instant, end: Ended, called: bool) -> Next {
         if !self.ordered.is_empty() {
             return Next::Wait { read: false, wake: false, deadline: None };
         }
@@ -1925,7 +1925,7 @@ where
                     for work in std::mem::take(&mut self.ordered) {
                         self.cancel_work(work);
                     }
-                    self.finish(End::Closed);
+                    self.finish(Ended::Closed);
                     return true;
                 }
             }
@@ -1976,7 +1976,7 @@ where
         for work in std::mem::take(&mut self.ordered) {
             self.cancel_work(work);
         }
-        self.finish(End::Closed);
+        self.finish(Ended::Closed);
     }
 }
 
@@ -1995,10 +1995,10 @@ struct Woke {
     cancelled: bool,
 }
 
-fn conn_end(e: ConnError) -> End {
+fn conn_end(e: ConnError) -> Ended {
     match e {
-        ConnError::Cancelled => End::Cancelled,
-        e => End::Conn(e),
+        ConnError::Cancelled => Ended::Cancelled,
+        e => Ended::Conn(e),
     }
 }
 
@@ -2010,7 +2010,7 @@ fn record(cx: &Cx, info: &ConnInfo, event: Event) {
 /// Writes all of `data`, unless the client resets the connection, the
 /// world stops, or a write takes no bytes for `stall`: a client that
 /// stopped reading. Returns how the connection ends if it does.
-async fn write_all<C: Connection>(cx: &Cx, conn: &mut C, data: &[u8], stall: Option<Duration>) -> Result<(), End> {
+async fn write_all<C: Connection>(cx: &Cx, conn: &mut C, data: &[u8], stall: Option<Duration>) -> Result<(), Ended> {
     let mut data = data;
     let mut sleep = pin!(stall.map(|d| cx.sleep_until(cx.now() + d)));
     let mut cancelled = pin!(cx.cancelled());
@@ -2018,7 +2018,7 @@ async fn write_all<C: Connection>(cx: &Cx, conn: &mut C, data: &[u8], stall: Opt
         let mut moved = false;
         while !data.is_empty() {
             match conn.poll_write(cx, task, data) {
-                Poll::Ready(Ok(0)) => return Poll::Ready(Err(End::Conn(ConnError::Closed))),
+                Poll::Ready(Ok(0)) => return Poll::Ready(Err(Ended::Conn(ConnError::Closed))),
                 Poll::Ready(Ok(n)) => {
                     data = &data[n..];
                     moved = true;
@@ -2031,17 +2031,17 @@ async fn write_all<C: Connection>(cx: &Cx, conn: &mut C, data: &[u8], stall: Opt
             return Poll::Ready(Ok(()));
         }
         if cancelled.as_mut().poll(task).is_ready() {
-            return Poll::Ready(Err(End::Cancelled));
+            return Poll::Ready(Err(Ended::Cancelled));
         }
         if conn.poll_gone(task).is_ready() {
-            return Poll::Ready(Err(End::Conn(ConnError::Reset)));
+            return Poll::Ready(Err(Ended::Conn(ConnError::Reset)));
         }
         if moved {
             sleep.set(stall.map(|d| cx.sleep_until(cx.now() + d)));
         }
         match sleep.as_mut().as_pin_mut().map(|s| s.poll(task)) {
-            Some(Poll::Ready(Ok(()))) => Poll::Ready(Err(End::Conn(ConnError::TimedOut))),
-            Some(Poll::Ready(Err(_))) => Poll::Ready(Err(End::Cancelled)),
+            Some(Poll::Ready(Ok(()))) => Poll::Ready(Err(Ended::Conn(ConnError::TimedOut))),
+            Some(Poll::Ready(Err(_))) => Poll::Ready(Err(Ended::Cancelled)),
             _ => Poll::Pending,
         }
     })
@@ -2093,7 +2093,7 @@ where
         let Some(select) = &opts.starttls else {
             let event = Event::new("conn", "error").level(Level::Notice).summary("the service asked for TLS, and there is no TLS config").field("error", "no TLS config for the upgrade");
             record(cx, &info, event);
-            return Ok(Served::Closed(End::Failed));
+            return Ok(Served::Closed(Ended::Failed));
         };
         let deadline = cx.now() + opts.handshake;
         match accept_tls(cx, rest, &info, select, deadline, || false).await {
@@ -2108,8 +2108,8 @@ where
 
 /// How a connection whose TLS handshake failed ended: cancelled if `cx`
 /// was, else broken.
-fn tls_failed(cx: &Cx) -> End {
-    if cx.is_cancelled() { End::Cancelled } else { End::Conn(ConnError::Broken) }
+fn tls_failed(cx: &Cx) -> Ended {
+    if cx.is_cancelled() { Ended::Cancelled } else { Ended::Conn(ConnError::Broken) }
 }
 
 /// Serves one connection with `service` until it ends or asks for
@@ -2186,7 +2186,7 @@ where
                 }
                 Out::Delay(d) => {
                     if cx.sleep(d).await.is_err() {
-                        core.broken(End::Cancelled);
+                        core.broken(Ended::Cancelled);
                     }
                 }
             }
@@ -2197,12 +2197,12 @@ where
             Next::Again => {
                 run = (run + 1) % 64;
                 if run == 0 && cx.yield_now().await.is_err() {
-                    core.broken(End::Cancelled);
+                    core.broken(Ended::Cancelled);
                 }
             }
             Next::Sleep(d) => {
                 if cx.sleep(d).await.is_err() {
-                    core.broken(End::Cancelled);
+                    core.broken(Ended::Cancelled);
                 }
             }
             Next::Wait { read, wake, deadline } => {
@@ -2234,7 +2234,7 @@ where
                     .await
                 };
                 if woke.cancelled {
-                    core.broken(End::Cancelled);
+                    core.broken(Ended::Cancelled);
                 }
                 match woke.read {
                     Some(Ok(0)) => core.input_eof(),
@@ -2243,7 +2243,7 @@ where
                     None => {}
                 }
                 if woke.gone {
-                    core.broken(End::Conn(ConnError::Reset));
+                    core.broken(Ended::Conn(ConnError::Reset));
                 }
             }
             Next::Upgrade(how) => {
@@ -2934,7 +2934,7 @@ where
     }
 
     /// How it ended.
-    pub fn end_reason(&self) -> Option<End> {
+    pub fn end_reason(&self) -> Option<Ended> {
         match self.core.state {
             State::Ended(end) => Some(end),
             _ => None,
