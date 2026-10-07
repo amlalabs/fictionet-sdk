@@ -315,6 +315,45 @@ impl Cx {
         .await
     }
 
+    /// Runs `fut` until it finishes, `deadline` passes, or this `Cx`'s
+    /// [region](Cx#regions) is cancelled, whichever comes first. `None`
+    /// waits with no deadline.
+    ///
+    /// To race more than one thing, join them into `fut` with
+    /// [`std::future::poll_fn`]: the first one ready gives the output.
+    ///
+    /// ```
+    /// # fictionet::block_on(fictionet::run(|cx| async move {
+    /// use fictionet::Raced;
+    /// let late = cx.race(Some(cx.now() + std::time::Duration::from_millis(5)), std::future::pending::<()>()).await;
+    /// assert_eq!(late, Err(Raced::Deadline));
+    /// assert_eq!(cx.race(None, async { 7 }).await, Ok(7));
+    /// # Ok(()) }))?;
+    /// # Ok::<(), fictionet::Error>(())
+    /// ```
+    pub async fn race<T>(&self, deadline: Option<Instant>, fut: impl Future<Output = T>) -> Result<T, Raced> {
+        let mut fut = std::pin::pin!(fut);
+        let mut sleep = std::pin::pin!(deadline.map(|d| self.sleep_until(d)));
+        let mut cancelled = std::pin::pin!(self.cancelled());
+        poll_fn(|task| {
+            if let Poll::Ready(v) = fut.as_mut().poll(task) {
+                return Poll::Ready(Ok(v));
+            }
+            if cancelled.as_mut().poll(task).is_ready() {
+                return Poll::Ready(Err(Raced::Cancelled));
+            }
+            if let Some(sleep) = sleep.as_mut().as_pin_mut() {
+                match sleep.poll(task) {
+                    Poll::Ready(Ok(())) => return Poll::Ready(Err(Raced::Deadline)),
+                    Poll::Ready(Err(_)) => return Poll::Ready(Err(Raced::Cancelled)),
+                    Poll::Pending => {}
+                }
+            }
+            Poll::Pending
+        })
+        .await
+    }
+
     /// Whether this `Cx`'s [region](Cx#regions) has been cancelled.
     pub fn is_cancelled(&self) -> bool {
         self.region.is_cancelled()
@@ -441,6 +480,26 @@ impl Cx {
 /// passes the error up with `?`, and so stops.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cancelled;
+
+/// Why [`Cx::race`] ended without its future's output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Raced {
+    /// The deadline passed first.
+    Deadline,
+    /// The region was cancelled first.
+    Cancelled,
+}
+
+impl std::fmt::Display for Raced {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Raced::Deadline => "the deadline passed",
+            Raced::Cancelled => "the region was cancelled",
+        })
+    }
+}
+
+impl std::error::Error for Raced {}
 
 impl std::fmt::Display for Cancelled {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

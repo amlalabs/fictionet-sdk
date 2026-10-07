@@ -327,7 +327,7 @@ pub mod prelude {
 
 pub use attach::{AttachError, Attachment, Attacher, Attachments, attachments};
 pub use cable::{End, pair, pair_with_limit};
-pub use cx::{Cancelled, Cx, Task};
+pub use cx::{Cancelled, Cx, Raced, Task};
 pub use block_on::block_on;
 #[cfg(not(target_arch = "wasm32"))]
 pub use listen::{Listening, ParseWorldSocketError, WorldSocket, listen};

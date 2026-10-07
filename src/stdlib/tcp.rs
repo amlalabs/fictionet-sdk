@@ -373,7 +373,7 @@ struct Conn {
     rx_end: Option<u32>,
     /// Kept until the socket is gone, after the handle is dropped too: see
     /// [`TcpConnection::hold_until_gone`].
-    held: Option<Box<dyn std::any::Any + Send>>,
+    held: Vec<Box<dyn std::any::Any + Send>>,
     /// Woken when a RST arrives or this side aborts, and when the
     /// connection is forgotten: see [`GoneWatch`].
     gone: Vec<Waker>,
@@ -399,7 +399,7 @@ impl Conn {
             read: 0,
             last_fed: None,
             rx_end: None,
-            held: None,
+            held: Vec::new(),
             gone: Vec::new(),
         }
     }
@@ -1322,12 +1322,9 @@ impl TcpConnection {
     /// after this handle is dropped: closing waits for the peer (FIN-WAIT,
     /// LAST-ACK) for up to a minute. Limits that count connections hold
     /// their count here, so a peer that never finishes closing cannot open
-    /// more past the limit.
+    /// more past the limit. Each call keeps one more item.
     pub fn hold_until_gone(&self, item: Box<dyn std::any::Any + Send>) {
-        let mut st = self.shared.state.lock().unwrap();
-        if let Some(c) = st.conns.get_mut(&self.handle) {
-            c.held = Some(item);
-        }
+        self.gone_watch().hold_until_gone(item);
     }
 }
 
@@ -1342,19 +1339,45 @@ pub struct GoneWatch {
 impl GoneWatch {
     /// Ready once the connection was reset, or is gone.
     pub fn poll_gone(&self, task: &mut Context<'_>) -> Poll<()> {
+        poll_gone(&self.shared, self.handle, task)
+    }
+
+    /// Resets the connection, as [`TcpConnection::reset`] does, after the
+    /// connection itself was handed on.
+    pub fn reset(&self) {
         let mut st = self.shared.state.lock().unwrap();
-        if st.stopped {
-            return Poll::Ready(());
+        if st.conns.contains_key(&self.handle) {
+            st.sock(self.handle).abort();
+            st.kick();
         }
+    }
+
+    /// Keeps `item` until the connection's socket is gone: see
+    /// [`TcpConnection::hold_until_gone`]. Works after the connection
+    /// itself was handed on, such as boxed behind TLS.
+    pub fn hold_until_gone(&self, item: Box<dyn std::any::Any + Send>) {
+        let mut st = self.shared.state.lock().unwrap();
         match st.conns.get_mut(&self.handle) {
-            None => Poll::Ready(()),
-            Some(c) if c.rst => Poll::Ready(()),
-            Some(c) => {
-                if !c.gone.iter().any(|w| w.will_wake(task.waker())) {
-                    c.gone.push(task.waker().clone());
-                }
-                Poll::Pending
+            Some(c) => c.held.push(item),
+            None => drop(item),
+        }
+    }
+}
+
+/// Ready once the connection `handle` was reset, or is gone.
+fn poll_gone(shared: &Shared, handle: Id, task: &mut Context<'_>) -> Poll<()> {
+    let mut st = shared.state.lock().unwrap();
+    if st.stopped {
+        return Poll::Ready(());
+    }
+    match st.conns.get_mut(&handle) {
+        None => Poll::Ready(()),
+        Some(c) if c.rst => Poll::Ready(()),
+        Some(c) => {
+            if !c.gone.iter().any(|w| w.will_wake(task.waker())) {
+                c.gone.push(task.waker().clone());
             }
+            Poll::Pending
         }
     }
 }
@@ -1465,6 +1488,9 @@ impl Connection for TcpConnection {
         st.conns.get_mut(&h).unwrap().shut = true;
         st.kick();
         Poll::Ready(Ok(()))
+    }
+    fn poll_gone(&self, task: &mut Context<'_>) -> Poll<()> {
+        poll_gone(&self.shared, self.handle, task)
     }
 }
 

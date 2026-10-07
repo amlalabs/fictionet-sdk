@@ -59,6 +59,16 @@ pub trait Connection: Send + 'static {
     /// Polls to say this side will send nothing more. For TCP this sends a
     /// FIN. For TLS it first sends `close_notify`. Reading still works.
     fn poll_shutdown(&mut self, cx: &Cx, task: &mut Context<'_>) -> Poll<Result<(), ConnError>>;
+
+    /// Ready once the other side has reset the connection, or it is gone,
+    /// without reading from it: for a server that is busy with a request
+    /// and not reading, such as HTTP/1.1 while a handler works. A
+    /// connection that cannot tell, such as a test pipe, is never ready,
+    /// which is the default. Middleware passes it on to the connection
+    /// underneath.
+    fn poll_gone(&self, _task: &mut Context<'_>) -> Poll<()> {
+        Poll::Pending
+    }
 }
 
 impl Connection for Box<dyn Connection> {
@@ -77,6 +87,10 @@ impl Connection for Box<dyn Connection> {
 
     fn poll_shutdown(&mut self, cx: &Cx, task: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
         (**self).poll_shutdown(cx, task)
+    }
+
+    fn poll_gone(&self, task: &mut Context<'_>) -> Poll<()> {
+        (**self).poll_gone(task)
     }
 }
 

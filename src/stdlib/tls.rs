@@ -600,4 +600,8 @@ impl<C: Connection> Connection for TlsConnection<C> {
             other => other,
         }
     }
+
+    fn poll_gone(&self, task: &mut Context<'_>) -> Poll<()> {
+        self.io.conn.poll_gone(task)
+    }
 }
