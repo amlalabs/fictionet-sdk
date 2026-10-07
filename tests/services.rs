@@ -327,7 +327,7 @@ fn a_decoder_failure_is_handed_to_the_service_with_what_it_could_not_read() {
         fn on_item(&mut self, _: Frame, _: &(), _: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
             Ok(Flow::Continue)
         }
-        fn on_fail(&mut self, _: &fictionet::stdlib::codec::Fail<modbus::FrameError>, _: &(), ctx: &mut ServeCtx<'_>) -> Result<(), Infallible> {
+        fn on_fail(&mut self, _: &fictionet::stdlib::codec::Fail<modbus::Error>, _: &(), ctx: &mut ServeCtx<'_>) -> Result<(), Infallible> {
             self.unread = ctx.unread().to_vec();
             ctx.reply().extend_from_slice(b"no");
             Ok(())

@@ -8,7 +8,7 @@ use fictionet::stdlib::codec::{Assembled, Wire, test_support::decode_all};
 use fictionet::stdlib::cotp::{Connect, Data, Parameter, Tpdu, Variable};
 use fictionet::stdlib::cotp::{messages, over_tpkt};
 use fictionet::stdlib::tpkt::{
-    EncodeError, HEADER_LEN, Header, MAX_PACKET, MAX_PAYLOAD, MIN_PACKET, MIN_PAYLOAD, Packet,
+    Error, HEADER_LEN, Header, MAX_PACKET, MAX_PAYLOAD, MIN_PACKET, MIN_PAYLOAD, Packet,
     Packets,
 };
 use libfuzzer_sys::fuzz_target;
@@ -25,7 +25,7 @@ fn built(data: &[u8]) -> Result<()> {
         Ok(bytes) => assert_eq!(<Header as Wire>::parse(&bytes), Ok(header)),
         Err(e) => {
             assert!(usize::from(header.length) < MIN_PACKET);
-            assert_eq!(e, EncodeError::TooShort(header.payload_len()));
+            assert_eq!(e, Error::PayloadTooShort(header.payload_len()));
         }
     }
     let n = u.int_in_range(0..=300usize)?;
@@ -36,7 +36,7 @@ fn built(data: &[u8]) -> Result<()> {
     check_wire_value(&packet);
     match packet.to_bytes() {
         Ok(bytes) => assert_eq!(<Packet as Wire>::parse(&bytes), Ok(packet)),
-        Err(e) => assert_eq!(e, EncodeError::TooShort(n)),
+        Err(e) => assert_eq!(e, Error::PayloadTooShort(n)),
     }
     // A data TPDU a world builds, up to and past what one packet holds: the
     // checked writer takes it exactly when it fits, and then it reads back
@@ -60,7 +60,7 @@ fn built(data: &[u8]) -> Result<()> {
             assert!(!fits);
             assert_eq!(
                 e,
-                over_tpkt::EncodeError::Tpdu(fictionet::stdlib::cotp::EncodeError::Unwritable)
+                fictionet::stdlib::cotp::Error::Unwritable
             );
         }
     }

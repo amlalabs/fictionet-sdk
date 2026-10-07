@@ -2,7 +2,7 @@
 //! world playing a VPN gateway reads them.
 #![no_main]
 
-use fictionet::stdlib::ipsec::{AhPacket, EspPacket, Datagram, IpsecError, Plaintext, MAX_DATAGRAM, MAX_PADDING};
+use fictionet::stdlib::ipsec::{AhPacket, EspPacket, Datagram, Error, Plaintext, MAX_DATAGRAM, MAX_PADDING};
 use fictionet::stdlib::{codec::{Wire, Collect, contract}, ipsec};
 use libfuzzer_sys::fuzz_target;
 
@@ -39,7 +39,7 @@ fuzz_target!(|data: &[u8]| {
                 }
                 Err(e) => {
                     assert!(tag > a.header.icv.len());
-                    assert_eq!(e, IpsecError::Truncated);
+                    assert_eq!(e, Error::Truncated);
                 }
             }
         }
@@ -77,8 +77,8 @@ fuzz_target!(|data: &[u8]| {
                 assert!(plain.has_default_padding());
                 assert_eq!(Plaintext::parse(&plain.to_bytes().unwrap()), Ok(plain));
             }
-            Err(IpsecError::Padding(n)) => assert!(n > MAX_PADDING && block > 64 && block % 4 != 0),
-            Err(e) => assert_eq!(e, IpsecError::TooLong),
+            Err(Error::Padding(n)) => assert!(n > MAX_PADDING && block > 64 && block % 4 != 0),
+            Err(e) => assert_eq!(e, Error::TooLong),
         }
     }
 });

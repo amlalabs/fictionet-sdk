@@ -4,7 +4,7 @@
 
 use fictionet::stdlib::codec::contract::{check_decode, check_wire, check_wire_value};
 use fictionet::stdlib::codec::{Wire, test_support::decode_all};
-use fictionet::stdlib::enip::Frames;
+use fictionet::stdlib::enip::Packets;
 use fictionet::stdlib::enip::{
     Cpf, ForwardCloseRequest, ForwardCloseResponse, ForwardOpenRequest, ForwardOpenResponse,
     Identity, MessageRequest, MessageResponse, Packet, RegisterSession, SendData,
@@ -12,9 +12,9 @@ use fictionet::stdlib::enip::{
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    check_decode(Frames::new, data);
+    check_decode(Packets::new, data);
     check_wire::<Packet>(data);
-    let (packets, _) = decode_all(Frames::new, data);
+    let (packets, _) = decode_all(Packets::new, data);
     let built = Packet {
         command: fictionet::stdlib::enip::Command::Other(u16::from(
             data.first().copied().unwrap_or(0),

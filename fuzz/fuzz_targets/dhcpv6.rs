@@ -3,11 +3,11 @@
 #![no_main]
 
 use fictionet::stdlib::codec::{Wire, contract, test_support::decode_all};
-use fictionet::stdlib::dhcpv6::{DhcpOption, Duid, Frame, Frames, HOP_COUNT_LIMIT, MAX_BUFFERED, MAX_MESSAGE, Message, msg};
+use fictionet::stdlib::dhcpv6::{DhcpOption, Duid, Frame, Messages, HOP_COUNT_LIMIT, MAX_BUFFERED, MAX_MESSAGE, Message, msg};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(Frames::new, data, 2 * MAX_BUFFERED);
+    contract::check_decode_with_alloc_limit(Messages::new, data, 2 * MAX_BUFFERED);
     contract::check_wire::<Duid>(data);
     contract::check_wire::<Message>(data);
     contract::check_wire::<Frame>(data);
@@ -48,7 +48,7 @@ fuzz_target!(|data: &[u8]| {
             Message::relay_forward(&m, m.hop_count.saturating_add(1), m.link_address, m.peer_address).unwrap();
         contract::check_wire_value(&forward);
     }
-    for message in decode_all(Frames::new, data).0.into_iter().flatten() {
+    for message in decode_all(Messages::new, data).0.into_iter().flatten() {
         contract::check_wire_value(&Frame(message));
     }
 });

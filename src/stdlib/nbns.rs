@@ -243,10 +243,10 @@ fn dotted_labels(text: &str) -> Vec<Vec<u8>> {
 
 /// Appends valid labels and the final zero to a name. Refuses empty or
 /// oversized labels and names above [`MAX_NAME_LEN`].
-fn put_labels<'a>(out: &mut Vec<u8>, labels: impl Iterator<Item = &'a [u8]>) -> Result<(), ParseError> {
+fn put_labels<'a>(out: &mut Vec<u8>, labels: impl Iterator<Item = &'a [u8]>) -> Result<(), Error> {
     for label in labels {
         if label.is_empty() || label.len() > MAX_LABEL || out.len() + label.len() + 2 > MAX_NAME_LEN {
-            return Err(ParseError::Unwritable);
+            return Err(Error::Unwritable);
         }
         out.push(label.len() as u8);
         out.extend_from_slice(label);
@@ -612,17 +612,17 @@ impl RData {
     }
 
     /// Appends complete record data. Refuses oversized or ambiguous values.
-    fn write_data(&self, out: &mut Vec<u8>) -> Result<(), ParseError> {
+    fn write_data(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         match self {
             RData::Nb(entries) => {
                 if entries.len() > MAX_NB_ENTRIES {
-                    return Err(ParseError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 for entry in entries { entry.write(out); }
             }
             RData::NodeStatus(status) => {
                 if status.names.len() > MAX_NODE_NAMES || status.statistics.len() > MAX_RDATA {
-                    return Err(ParseError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 out.push(status.names.len() as u8);
                 for name in &status.names {
@@ -634,13 +634,13 @@ impl RData {
             RData::Ns(labels) => put_labels(out, labels.iter().map(Vec::as_slice))?,
             RData::Other { rr_type, data } => {
                 if *rr_type == rr_type::NS || data.len() > MAX_RDATA {
-                    return Err(ParseError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 out.extend_from_slice(data);
             }
         }
         if out.len() > MAX_RDATA {
-            return Err(ParseError::Unwritable);
+            return Err(Error::Unwritable);
         }
         Ok(())
     }
@@ -673,7 +673,7 @@ pub struct Record {
 
 impl Record {
     /// Appends a complete record, using earlier names when possible.
-    fn write_record(&self, out: &mut Vec<u8>, written: &std::collections::HashMap<Vec<u8>, u16>) -> Result<Option<Vec<u8>>, ParseError> {
+    fn write_record(&self, out: &mut Vec<u8>, written: &std::collections::HashMap<Vec<u8>, u16>) -> Result<Option<Vec<u8>>, Error> {
         let full = put_name(out, self.name.to_bytes()?, written);
         let mut data = Vec::new();
         self.data.write_data(&mut data)?;
@@ -709,9 +709,10 @@ fn remember(written: &mut std::collections::HashMap<Vec<u8>, u16>, full: Option<
     }
 }
 
-/// Why a datagram is not an NBNS packet.
+/// Why a datagram is not an NBNS packet, or why a packet is not a request
+/// [`Packet::request`] can read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ParseError {
+pub enum Error {
     /// Bytes follow a complete [`Name`] or [`RrName`].
     Trailing(usize),
     /// The value cannot be written without changing it.
@@ -738,27 +739,41 @@ pub enum ParseError {
     NameTooLong,
     /// The data of an NS record is not exactly one name.
     BadNsData,
+    /// The packet is a response. A server does not answer it.
+    NotRequest,
+    /// The packet lacks one question of the right type and class
+    /// [`CLASS_IN`], or a registration, refresh or release lacks the one
+    /// additional record that says who asks: an NB record for the
+    /// question's name, of class [`CLASS_IN`], with one owner. A server
+    /// may answer [`rcode::FMT_ERR`].
+    BadRequest,
+    /// The opcode is not one this module answers. A server may answer
+    /// [`rcode::IMP_ERR`].
+    Unsupported(Opcode),
 }
 
-impl std::fmt::Display for ParseError {
+impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ParseError::Trailing(n) => write!(f, "{n} bytes after the unit"),
-            ParseError::Unwritable => f.write_str("value cannot be written without changing it"),
-            ParseError::Truncated => f.write_str("packet ends early"),
-            ParseError::ExpansionTooLong => write!(f, "expanded packet exceeds {MAX_PACKET} bytes"),
-            ParseError::TooLong(n) => write!(f, "datagram of {n} bytes, over {MAX_PACKET}"),
-            ParseError::TooManyRecords(n) => write!(f, "section of {n} entries, over {MAX_RECORDS}"),
-            ParseError::BadLabel(b) => write!(f, "label length byte {b:#04x}"),
-            ParseError::BadPointer(p) => write!(f, "pointer to offset {p} goes forward or loops"),
-            ParseError::BadFirstLevel => f.write_str("first label is not a first-level encoded name"),
-            ParseError::NameTooLong => write!(f, "name longer than {MAX_NAME_LEN} bytes"),
-            ParseError::BadNsData => f.write_str("NS record data is not one name"),
+            Error::Trailing(n) => write!(f, "{n} bytes after the unit"),
+            Error::Unwritable => f.write_str("value cannot be written without changing it"),
+            Error::Truncated => f.write_str("packet ends early"),
+            Error::ExpansionTooLong => write!(f, "expanded packet exceeds {MAX_PACKET} bytes"),
+            Error::TooLong(n) => write!(f, "datagram of {n} bytes, over {MAX_PACKET}"),
+            Error::TooManyRecords(n) => write!(f, "section of {n} entries, over {MAX_RECORDS}"),
+            Error::BadLabel(b) => write!(f, "label length byte {b:#04x}"),
+            Error::BadPointer(p) => write!(f, "pointer to offset {p} goes forward or loops"),
+            Error::BadFirstLevel => f.write_str("first label is not a first-level encoded name"),
+            Error::NameTooLong => write!(f, "name longer than {MAX_NAME_LEN} bytes"),
+            Error::BadNsData => f.write_str("NS record data is not one name"),
+            Error::NotRequest => f.write_str("packet is a response"),
+            Error::BadRequest => f.write_str("request lacks its question or NB record"),
+            Error::Unsupported(o) => write!(f, "opcode {} is not supported", o.bits()),
         }
     }
 }
 
-impl std::error::Error for ParseError {}
+impl std::error::Error for Error {}
 
 /// One NBNS packet.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -841,34 +856,6 @@ pub enum Request {
     },
 }
 
-/// Why a packet is not a request [`Packet::request`] can read.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RequestError {
-    /// The packet is a response. A server does not answer it.
-    NotRequest,
-    /// The packet lacks one question of the right type and class
-    /// [`CLASS_IN`], or a registration, refresh or release lacks the one
-    /// additional record that says who asks: an NB record for the
-    /// question's name, of class [`CLASS_IN`], with one owner. A server
-    /// may answer [`rcode::FMT_ERR`].
-    Malformed,
-    /// The opcode is not one this module answers. A server may answer
-    /// [`rcode::IMP_ERR`].
-    Unsupported(Opcode),
-}
-
-impl std::fmt::Display for RequestError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RequestError::NotRequest => f.write_str("packet is a response"),
-            RequestError::Malformed => f.write_str("request lacks its question or NB record"),
-            RequestError::Unsupported(o) => write!(f, "opcode {} is not supported", o.bits()),
-        }
-    }
-}
-
-impl std::error::Error for RequestError {}
-
 impl Request {
     /// The name the request is about: the question's name.
     pub fn name(&self) -> &Name {
@@ -894,13 +881,13 @@ impl Packet {
     }
 
     /// What this packet asks, for a world that answers requests.
-    pub fn request(&self) -> Result<Request, RequestError> {
+    pub fn request(&self) -> Result<Request, Error> {
         if self.response {
-            return Err(RequestError::NotRequest);
+            return Err(Error::NotRequest);
         }
-        let [q] = &self.questions[..] else { return Err(RequestError::Malformed) };
+        let [q] = &self.questions[..] else { return Err(Error::BadRequest) };
         if q.class != CLASS_IN {
-            return Err(RequestError::Malformed);
+            return Err(Error::BadRequest);
         }
         let name = q.name.clone();
         // RFC 1002 sections 4.2.2 to 4.2.4 and 4.2.9: one additional
@@ -909,17 +896,17 @@ impl Packet {
             [r] if q.qtype == rr_type::NB && r.name == q.name && r.class == CLASS_IN => match &r.data {
                 RData::Nb(e) => match &e[..] {
                     [e] => Ok((r.ttl, *e)),
-                    _ => Err(RequestError::Malformed),
+                    _ => Err(Error::BadRequest),
                 },
-                _ => Err(RequestError::Malformed),
+                _ => Err(Error::BadRequest),
             },
-            _ => Err(RequestError::Malformed),
+            _ => Err(Error::BadRequest),
         };
         match self.opcode {
             Opcode::Query => match q.qtype {
                 rr_type::NB => Ok(Request::NameQuery { name }),
                 rr_type::NBSTAT => Ok(Request::NodeStatus { name }),
-                _ => Err(RequestError::Malformed),
+                _ => Err(Error::BadRequest),
             },
             Opcode::Registration if !self.flags.recursion_desired => {
                 nb().map(|(ttl, entry)| Request::Overwrite { name, ttl, entry })
@@ -927,7 +914,7 @@ impl Packet {
             Opcode::Registration => nb().map(|(ttl, entry)| Request::Registration { name, ttl, entry }),
             Opcode::Refresh | Opcode::Other(9) => nb().map(|(ttl, entry)| Request::Refresh { name, ttl, entry }),
             Opcode::Release => nb().map(|(_, entry)| Request::Release { name, entry }),
-            other => Err(RequestError::Unsupported(other)),
+            other => Err(Error::Unsupported(other)),
         }
     }
 
@@ -1078,16 +1065,16 @@ impl Packet {
 
 /// Reads the NetBIOS name at `start` in the packet `msg`, following
 /// pointers. It returns the name and where the bytes after it begin.
-fn read_name(msg: &[u8], start: usize) -> Result<(Name, usize), ParseError> {
+fn read_name(msg: &[u8], start: usize) -> Result<(Name, usize), Error> {
     let (mut labels, after) = read_labels(msg, start)?;
-    let bytes = labels.first().and_then(|l| decode_first_level(l)).ok_or(ParseError::BadFirstLevel)?;
+    let bytes = labels.first().and_then(|l| decode_first_level(l)).ok_or(Error::BadFirstLevel)?;
     labels.remove(0);
     Ok((Name { bytes, scope: labels }, after))
 }
 
 /// Reads the name of a resource record at `start` in the packet `msg`:
 /// a NetBIOS name if its first label is one, and a domain name if not.
-fn read_rr_name(msg: &[u8], start: usize) -> Result<(RrName, usize), ParseError> {
+fn read_rr_name(msg: &[u8], start: usize) -> Result<(RrName, usize), Error> {
     let (mut labels, after) = read_labels(msg, start)?;
     match labels.first().and_then(|l| decode_first_level(l)) {
         Some(bytes) => {
@@ -1100,7 +1087,7 @@ fn read_rr_name(msg: &[u8], start: usize) -> Result<(RrName, usize), ParseError>
 
 /// Reads the labels of the name at `start` in the packet `msg`, following
 /// pointers. It returns them and where the bytes after the name begin.
-fn read_labels(msg: &[u8], start: usize) -> Result<(Vec<Vec<u8>>, usize), ParseError> {
+fn read_labels(msg: &[u8], start: usize) -> Result<(Vec<Vec<u8>>, usize), Error> {
     let mut pos = start;
     let mut after = None;
     let mut hops = 0;
@@ -1108,13 +1095,13 @@ fn read_labels(msg: &[u8], start: usize) -> Result<(Vec<Vec<u8>>, usize), ParseE
     let mut total = 1usize;
     let mut labels = Vec::new();
     loop {
-        let len = *msg.get(pos).ok_or(ParseError::Truncated)?;
+        let len = *msg.get(pos).ok_or(Error::Truncated)?;
         match len & 0xc0 {
             0xc0 => {
-                let low = *msg.get(pos + 1).ok_or(ParseError::Truncated)?;
+                let low = *msg.get(pos + 1).ok_or(Error::Truncated)?;
                 let target = u16::from(len & 0x3f) << 8 | u16::from(low);
                 if usize::from(target) >= pos || hops >= MAX_POINTERS {
-                    return Err(ParseError::BadPointer(target));
+                    return Err(Error::BadPointer(target));
                 }
                 hops += 1;
                 after.get_or_insert(pos + 2);
@@ -1125,13 +1112,13 @@ fn read_labels(msg: &[u8], start: usize) -> Result<(Vec<Vec<u8>>, usize), ParseE
                 let len = usize::from(len);
                 total += 1 + len;
                 if total > MAX_NAME_LEN {
-                    return Err(ParseError::NameTooLong);
+                    return Err(Error::NameTooLong);
                 }
-                let label = msg.get(pos + 1..pos + 1 + len).ok_or(ParseError::Truncated)?;
+                let label = msg.get(pos + 1..pos + 1 + len).ok_or(Error::Truncated)?;
                 labels.push(label.to_vec());
                 pos += 1 + len;
             }
-            _ => return Err(ParseError::BadLabel(len)),
+            _ => return Err(Error::BadLabel(len)),
         }
     }
     Ok((labels, after.unwrap_or(pos + 1)))
@@ -1142,21 +1129,21 @@ fn be16(b: &[u8], i: usize) -> u16 {
 }
 
 impl Wire for Name {
-    type ParseError = ParseError;
-    type WriteError = ParseError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads one complete name. Refuses invalid labels, pointers outside the input and trailing bytes.
-    fn parse(b: &[u8]) -> Result<Name, ParseError> {
+    fn parse(b: &[u8]) -> Result<Name, Error> {
         let (value, used) = read_name(b, 0)?;
         if used != b.len() {
-            return Err(ParseError::Trailing(b.len() - used));
+            return Err(Error::Trailing(b.len() - used));
         }
         Ok(value)
     }
 
     /// Appends the uncompressed name. Refuses empty or oversized scope labels and
     /// names above [`MAX_NAME_LEN`]. Leaves the destination unchanged on error.
-    fn write(&self, dst: &mut Vec<u8>) -> Result<(), ParseError> {
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
         let mut out = Vec::with_capacity(ENCODED_LEN + 2);
         out.push(ENCODED_LEN as u8);
         out.extend_from_slice(&encode_first_level(&self.bytes));
@@ -1167,28 +1154,28 @@ impl Wire for Name {
 }
 
 impl Wire for RrName {
-    type ParseError = ParseError;
-    type WriteError = ParseError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads one complete name. Refuses invalid labels, pointers outside the input and trailing bytes.
-    fn parse(b: &[u8]) -> Result<RrName, ParseError> {
+    fn parse(b: &[u8]) -> Result<RrName, Error> {
         let (value, used) = read_rr_name(b, 0)?;
         if used != b.len() {
-            return Err(ParseError::Trailing(b.len() - used));
+            return Err(Error::Trailing(b.len() - used));
         }
         Ok(value)
     }
 
     /// Appends an uncompressed resource record name. Refuses invalid labels, oversized
     /// names and domain values that would read as NetBIOS names. Leaves the destination unchanged on error.
-    fn write(&self, dst: &mut Vec<u8>) -> Result<(), ParseError> {
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
         let mut out = Vec::new();
         match self {
             RrName::NetBios(n) => n.write(&mut out)?,
             RrName::Domain(labels) => put_labels(&mut out, labels.iter().map(Vec::as_slice))?,
         }
         if Self::parse(&out).as_ref() != Ok(self) {
-            return Err(ParseError::Unwritable);
+            return Err(Error::Unwritable);
         }
         dst.extend_from_slice(&out);
         Ok(())
@@ -1196,24 +1183,24 @@ impl Wire for RrName {
 }
 
 impl Wire for Packet {
-    type ParseError = ParseError;
-    type WriteError = ParseError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads a datagram with compressed names, ignoring bytes after its records.
     /// Refuses invalid records and packets whose expanded encoding exceeds [`MAX_PACKET`].
-    fn parse(b: &[u8]) -> Result<Packet, ParseError> {
+    fn parse(b: &[u8]) -> Result<Packet, Error> {
         if b.len() > MAX_PACKET {
-            return Err(ParseError::TooLong(b.len()));
+            return Err(Error::TooLong(b.len()));
         }
         if b.len() < HEADER_LEN {
-            return Err(ParseError::Truncated);
+            return Err(Error::Truncated);
         }
         let word = be16(b, 2);
         let mut counts = [0usize; 4];
         for (i, c) in counts.iter_mut().enumerate() {
             let n = be16(b, 4 + 2 * i);
             if usize::from(n) > MAX_RECORDS {
-                return Err(ParseError::TooManyRecords(n));
+                return Err(Error::TooManyRecords(n));
             }
             *c = usize::from(n);
         }
@@ -1221,7 +1208,7 @@ impl Wire for Packet {
         let mut questions = Vec::with_capacity(counts[0]);
         for _ in 0..counts[0] {
             let (name, next) = read_name(b, pos)?;
-            let fixed = b.get(next..next + 4).ok_or(ParseError::Truncated)?;
+            let fixed = b.get(next..next + 4).ok_or(Error::Truncated)?;
             questions.push(Question { name, qtype: be16(fixed, 0), class: be16(fixed, 2) });
             pos = next + 4;
         }
@@ -1230,17 +1217,17 @@ impl Wire for Packet {
             section.reserve(count);
             for _ in 0..count {
                 let (name, next) = read_rr_name(b, pos)?;
-                let fixed = b.get(next..next + 10).ok_or(ParseError::Truncated)?;
+                let fixed = b.get(next..next + 10).ok_or(Error::Truncated)?;
                 let len = usize::from(be16(fixed, 8));
                 let start = next + 10;
-                let data = b.get(start..start + len).ok_or(ParseError::Truncated)?;
+                let data = b.get(start..start + len).ok_or(Error::Truncated)?;
                 let rr = be16(fixed, 0);
                 let data = if rr == rr_type::NS {
                     // The name server's name, whose pointers are followed
                     // now, since a writer may move what they point to.
                     match read_labels(b, start) {
                         Ok((labels, end)) if end == start + len => RData::Ns(labels),
-                        _ => return Err(ParseError::BadNsData),
+                        _ => return Err(Error::BadNsData),
                     }
                 } else {
                     RData::parse(rr, data)
@@ -1266,17 +1253,17 @@ impl Wire for Packet {
             authority,
             additional,
         };
-        packet.encode().map_err(|_| ParseError::ExpansionTooLong)?;
+        packet.encode().map_err(|_| Error::ExpansionTooLong)?;
         Ok(packet)
     }
 
     /// Appends every section, compressing repeated names. Refuses oversized fields,
     /// sections or packets, and values that would read as another variant.
     /// Preserves the TC flag. Leaves the destination unchanged on error.
-    fn write(&self, dst: &mut Vec<u8>) -> Result<(), ParseError> {
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
         let out = self.encode()?;
         if Self::parse(&out).as_ref() != Ok(self) {
-            return Err(ParseError::Unwritable);
+            return Err(Error::Unwritable);
         }
         dst.extend_from_slice(&out);
         Ok(())
@@ -1285,9 +1272,9 @@ impl Wire for Packet {
 
 impl Packet {
     /// Stages the complete packet within its byte and record limits.
-    fn encode(&self) -> Result<Vec<u8>, ParseError> {
+    fn encode(&self) -> Result<Vec<u8>, Error> {
         if self.questions.len() > MAX_RECORDS || [&self.answers, &self.authority, &self.additional].iter().any(|s| s.len() > MAX_RECORDS) {
-            return Err(ParseError::Unwritable);
+            return Err(Error::Unwritable);
         }
         let mut out = Vec::new();
         out.extend_from_slice(&self.id.to_be_bytes());
@@ -1303,7 +1290,7 @@ impl Packet {
             out.extend_from_slice(&q.class.to_be_bytes());
             remember(&mut written, full, at);
             if out.len() > MAX_PACKET {
-                return Err(ParseError::Unwritable);
+                return Err(Error::Unwritable);
             }
         }
         for record in self.answers.iter().chain(&self.authority).chain(&self.additional) {
@@ -1311,7 +1298,7 @@ impl Packet {
             let full = record.write_record(&mut out, &written)?;
             remember(&mut written, full, at);
             if out.len() > MAX_PACKET {
-                return Err(ParseError::Unwritable);
+                return Err(Error::Unwritable);
             }
         }
         Ok(out)
@@ -1448,7 +1435,7 @@ mod tests {
         let back = Packet::parse(&bytes).unwrap();
         assert_eq!(back, resp);
         assert_eq!(back.answers[0].data, RData::Nb(owners));
-        assert_eq!(back.request(), Err(RequestError::NotRequest));
+        assert_eq!(back.request(), Err(Error::NotRequest));
     }
 
     #[test]
@@ -1655,10 +1642,10 @@ mod tests {
             data: RData::Other { rr_type: rr_type::NB, data: vec![0, 0, 10, 0, 0, 1] },
         });
         p.opcode = Opcode::Other(5);
-        assert_eq!(p.to_bytes(), Err(ParseError::Unwritable));
+        assert_eq!(p.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&p);
         p.answers[0].data = RData::Nb(vec![owner(1)]);
-        assert_eq!(p.to_bytes(), Err(ParseError::Unwritable));
+        assert_eq!(p.to_bytes(), Err(Error::Unwritable));
         p.opcode = Opcode::Registration;
         contract::check_wire_value(&p);
     }
@@ -1667,10 +1654,10 @@ mod tests {
     fn question_class_must_be_in() {
         let mut p = Packet::parse(&query_bytes()).unwrap();
         p.questions[0].class = 3;
-        assert_eq!(p.request(), Err(RequestError::Malformed));
+        assert_eq!(p.request(), Err(Error::BadRequest));
         let mut reg = Packet::parse(&registration_bytes()).unwrap();
         reg.questions[0].class = 0;
-        assert_eq!(reg.request(), Err(RequestError::Malformed));
+        assert_eq!(reg.request(), Err(Error::BadRequest));
     }
 
     #[test]
@@ -1686,15 +1673,15 @@ mod tests {
 
     #[test]
     fn parse_errors() {
-        assert_eq!(Packet::parse(&[]), Err(ParseError::Truncated));
-        assert_eq!(Packet::parse(&[0; 11]), Err(ParseError::Truncated));
+        assert_eq!(Packet::parse(&[]), Err(Error::Truncated));
+        assert_eq!(Packet::parse(&[0; 11]), Err(Error::Truncated));
         assert!(Packet::parse(&[0; 12]).is_ok());
-        assert_eq!(Packet::parse(&vec![0; MAX_PACKET + 1]), Err(ParseError::TooLong(MAX_PACKET + 1)));
+        assert_eq!(Packet::parse(&vec![0; MAX_PACKET + 1]), Err(Error::TooLong(MAX_PACKET + 1)));
         let mut many = vec![0; 12];
         many[10..12].copy_from_slice(&65u16.to_be_bytes());
-        assert_eq!(Packet::parse(&many), Err(ParseError::TooManyRecords(65)));
+        assert_eq!(Packet::parse(&many), Err(Error::TooManyRecords(65)));
         many[10..12].copy_from_slice(&64u16.to_be_bytes());
-        assert_eq!(Packet::parse(&many), Err(ParseError::Truncated));
+        assert_eq!(Packet::parse(&many), Err(Error::Truncated));
 
         let question = |name: &[u8]| {
             let mut b = vec![0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0];
@@ -1702,17 +1689,17 @@ mod tests {
             b.extend_from_slice(&[0, 0x20, 0, 1]);
             Packet::parse(&b)
         };
-        assert_eq!(question(&[0x40]), Err(ParseError::BadLabel(0x40)));
-        assert_eq!(question(&[0x80]), Err(ParseError::BadLabel(0x80)));
+        assert_eq!(question(&[0x40]), Err(Error::BadLabel(0x40)));
+        assert_eq!(question(&[0x80]), Err(Error::BadLabel(0x80)));
         // A pointer to itself, and one forward.
-        assert_eq!(question(&[0xc0, 12]), Err(ParseError::BadPointer(12)));
-        assert_eq!(question(&[0xc0, 14, 0]), Err(ParseError::BadPointer(14)));
+        assert_eq!(question(&[0xc0, 12]), Err(Error::BadPointer(12)));
+        assert_eq!(question(&[0xc0, 14, 0]), Err(Error::BadPointer(14)));
         // The null name, a short first label, and a bad letter.
-        assert_eq!(question(&[0]), Err(ParseError::BadFirstLevel));
-        assert_eq!(question(b"\x03ABC\x00"), Err(ParseError::BadFirstLevel));
+        assert_eq!(question(&[0]), Err(Error::BadFirstLevel));
+        assert_eq!(question(b"\x03ABC\x00"), Err(Error::BadFirstLevel));
         let mut bad = vec![0x20];
         bad.extend_from_slice(b"EGFCEFEECACACACACACACACACACACACZ\x00");
-        assert_eq!(question(&bad), Err(ParseError::BadFirstLevel));
+        assert_eq!(question(&bad), Err(Error::BadFirstLevel));
         // A scope that runs the name past 255 bytes.
         let mut long = vec![0x20];
         long.extend_from_slice(FRED);
@@ -1721,7 +1708,7 @@ mod tests {
             long.extend_from_slice(&[b'x'; 63]);
         }
         long.push(0);
-        assert_eq!(question(&long), Err(ParseError::NameTooLong));
+        assert_eq!(question(&long), Err(Error::NameTooLong));
 
         // A chain of pointers, each to the one before, ending at a real
         // name at offset 12. Following MAX_POINTERS of them is fine; one
@@ -1737,28 +1724,28 @@ mod tests {
         }
         let end = b.len();
         assert_eq!(read_name(&b, end - 4), Ok((Name::new("FRED", 0x20), end - 2)));
-        assert_eq!(read_name(&b, end - 2), Err(ParseError::BadPointer(12)));
+        assert_eq!(read_name(&b, end - 2), Err(Error::BadPointer(12)));
     }
 
     #[test]
     fn request_errors() {
         let mut p = Packet::parse(&query_bytes()).unwrap();
         p.questions[0].qtype = rr_type::A;
-        assert_eq!(p.request(), Err(RequestError::Malformed));
+        assert_eq!(p.request(), Err(Error::BadRequest));
         p.questions.clear();
-        assert_eq!(p.request(), Err(RequestError::Malformed));
+        assert_eq!(p.request(), Err(Error::BadRequest));
         let mut reg = Packet::parse(&registration_bytes()).unwrap();
         reg.additional[0].data = RData::Nb(vec![]);
-        assert_eq!(reg.request(), Err(RequestError::Malformed));
+        assert_eq!(reg.request(), Err(Error::BadRequest));
         reg.additional.clear();
-        assert_eq!(reg.request(), Err(RequestError::Malformed));
+        assert_eq!(reg.request(), Err(Error::BadRequest));
         let mut reg = Packet::parse(&registration_bytes()).unwrap();
         reg.questions[0].qtype = rr_type::NBSTAT;
-        assert_eq!(reg.request(), Err(RequestError::Malformed));
+        assert_eq!(reg.request(), Err(Error::BadRequest));
         reg.opcode = Opcode::Wack;
-        assert_eq!(reg.request(), Err(RequestError::Unsupported(Opcode::Wack)));
-        assert!(!RequestError::Unsupported(Opcode::Other(9)).to_string().is_empty());
-        assert!(!ParseError::BadPointer(3).to_string().is_empty());
+        assert_eq!(reg.request(), Err(Error::Unsupported(Opcode::Wack)));
+        assert!(!Error::Unsupported(Opcode::Other(9)).to_string().is_empty());
+        assert!(!Error::BadPointer(3).to_string().is_empty());
     }
 
     #[test]
@@ -1766,7 +1753,7 @@ mod tests {
         for s in samples() {
             assert!(Packet::parse(&s).is_ok());
             for n in 0..s.len() {
-                assert_eq!(Packet::parse(&s[..n]), Err(ParseError::Truncated), "{n} of {} bytes", s.len());
+                assert_eq!(Packet::parse(&s[..n]), Err(Error::Truncated), "{n} of {} bytes", s.len());
             }
         }
     }
@@ -1784,7 +1771,7 @@ mod tests {
         bytes.extend_from_slice(&hex("0099 0001 00000000"));
         bytes.extend_from_slice(&(data_len as u16).to_be_bytes());
         bytes.resize(MAX_PACKET, 0);
-        assert_eq!(Packet::parse(&bytes), Err(ParseError::ExpansionTooLong));
+        assert_eq!(Packet::parse(&bytes), Err(Error::ExpansionTooLong));
         contract::check_wire::<Packet>(&bytes);
     }
 
@@ -1802,7 +1789,7 @@ mod tests {
         for scope in [vec![vec![]], vec![vec![b'a'; 100]], vec![vec![b'b'; 63]; 4]] {
             name.scope = scope;
             contract::check_wire_value(&name);
-            assert_eq!(name.to_bytes(), Err(ParseError::Unwritable));
+            assert_eq!(name.to_bytes(), Err(Error::Unwritable));
         }
         let name = Name::new("X", 0);
         for data in [
@@ -1814,16 +1801,16 @@ mod tests {
             let mut packet = Packet::name_query(1, name.clone(), false);
             packet.answers.push(Record { name: name.clone().into(), class: CLASS_IN, ttl: 0, data });
             contract::check_wire_value(&packet);
-            assert_eq!(packet.to_bytes(), Err(ParseError::Unwritable));
+            assert_eq!(packet.to_bytes(), Err(Error::Unwritable));
         }
         let mut packet = Packet::name_query(1, name, false);
         packet.questions = vec![packet.questions[0].clone(); MAX_RECORDS + 1];
         contract::check_wire_value(&packet);
-        assert_eq!(packet.to_bytes(), Err(ParseError::Unwritable));
+        assert_eq!(packet.to_bytes(), Err(Error::Unwritable));
         packet.questions.truncate(1);
         packet.rcode = 0xff;
         contract::check_wire_value(&packet);
-        assert_eq!(packet.to_bytes(), Err(ParseError::Unwritable));
+        assert_eq!(packet.to_bytes(), Err(Error::Unwritable));
     }
 
     #[test]
@@ -1834,16 +1821,16 @@ mod tests {
         assert!(good.request().is_ok());
         let mut other = good.clone();
         other.additional[0].name = Name::new("OTHER", 0x20).into();
-        assert_eq!(other.request(), Err(RequestError::Malformed));
+        assert_eq!(other.request(), Err(Error::BadRequest));
         let mut class = good.clone();
         class.additional[0].class = 3;
-        assert_eq!(class.request(), Err(RequestError::Malformed));
+        assert_eq!(class.request(), Err(Error::BadRequest));
         let mut two = good.clone();
         two.additional[0].data = RData::Nb(vec![owner(1), owner(2)]);
-        assert_eq!(two.request(), Err(RequestError::Malformed));
+        assert_eq!(two.request(), Err(Error::BadRequest));
         let mut rel = Packet::release(2, Name::new("FRED", 0x20), owner(3), false);
         rel.additional[0].name = Name::new("FRED", 0x00).into();
-        assert_eq!(rel.request(), Err(RequestError::Malformed));
+        assert_eq!(rel.request(), Err(Error::BadRequest));
     }
 
     #[test]
@@ -1898,11 +1885,11 @@ mod tests {
         assert!(packet.to_bytes().unwrap().len() > MAX_DATAGRAM);
         assert!(!packet.flags.truncated);
         packet.answers[0].data = RData::Nb(vec![owner(1); MAX_NB_ENTRIES + 1]);
-        assert_eq!(packet.to_bytes(), Err(ParseError::Unwritable));
+        assert_eq!(packet.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&packet);
         let mut many = Packet::name_query(1, Name::new("FRED", 0x20), false);
         many.questions = vec![many.questions[0].clone(); MAX_RECORDS + 1];
-        assert_eq!(many.to_bytes(), Err(ParseError::Unwritable));
+        assert_eq!(many.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&many);
     }
 
@@ -1917,20 +1904,20 @@ mod tests {
         assert_eq!(read_name(&wire, 0).unwrap().0, name);
         let long = Name::new("FRED", 0x20).with_scope(&"x.".repeat(111));
         assert_eq!(long.scope.len(), 111);
-        assert_eq!(long.to_bytes(), Err(ParseError::Unwritable));
+        assert_eq!(long.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&long);
         let huge = Name::new("FRED", 0x20).with_scope(&"a.".repeat(100_000));
-        assert_eq!(huge.to_bytes(), Err(ParseError::Unwritable));
+        assert_eq!(huge.to_bytes(), Err(Error::Unwritable));
         // A label of MAX_LABEL bytes is written; one byte more is refused.
         let name = Name::new("FRED", 0x20).with_scope(&"x".repeat(MAX_LABEL));
         assert_eq!(read_name(&name.to_bytes().unwrap(), 0).unwrap().0, name);
         let wide = Name::new("FRED", 0x20).with_scope(&"x".repeat(MAX_LABEL + 1));
         assert_eq!(wide.scope, vec![vec![b'x'; MAX_LABEL + 1]]);
-        assert_eq!(wide.to_bytes(), Err(ParseError::Unwritable));
+        assert_eq!(wide.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&wide);
         let domain = RrName::domain(&"x".repeat(MAX_LABEL + 1));
         assert_eq!(domain, RrName::Domain(vec![vec![b'x'; MAX_LABEL + 1]]));
-        assert_eq!(domain.to_bytes(), Err(ParseError::Unwritable));
+        assert_eq!(domain.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&domain);
     }
 
@@ -1971,7 +1958,7 @@ mod tests {
         assert_eq!(Packet::parse(&w.to_bytes().unwrap()), Ok(w));
         // Questions still need a NetBIOS name.
         let mut q = hex("0001 0000 0001 0000 0000 0000 00 0020 0001");
-        assert_eq!(Packet::parse(&q), Err(ParseError::BadFirstLevel));
+        assert_eq!(Packet::parse(&q), Err(Error::BadFirstLevel));
         q[5] = 0;
         assert_eq!(Packet::parse(&q), Packet::parse(&q[..HEADER_LEN]));
         assert!(Packet::parse(&q[..HEADER_LEN]).is_ok());
@@ -1993,7 +1980,7 @@ mod tests {
         // NS data that is more than one name is refused.
         let mut bad = b.clone();
         bad[34] = 6;
-        assert_eq!(Packet::parse(&bad), Err(ParseError::BadNsData));
+        assert_eq!(Packet::parse(&bad), Err(Error::BadNsData));
     }
 
     #[test]
@@ -2021,11 +2008,11 @@ mod tests {
         // Opaque NS data with a pointer is refused.
         let mut built = p.clone();
         built.authority[0].data = RData::Other { rr_type: rr_type::NS, data: vec![0xc0, 0x5f] };
-        assert_eq!(built.to_bytes(), Err(ParseError::Unwritable));
+        assert_eq!(built.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&built);
         // Opaque NS data that would read as Ns is also refused.
         built.authority[0].data = RData::Other { rr_type: rr_type::NS, data: b"\x03COM\x00".to_vec() };
-        assert_eq!(built.to_bytes(), Err(ParseError::Unwritable));
+        assert_eq!(built.to_bytes(), Err(Error::Unwritable));
         built.authority[0].data = RData::Ns(vec![b"COM".to_vec()]);
         contract::check_wire_value(&built);
     }

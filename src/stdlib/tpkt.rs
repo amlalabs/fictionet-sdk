@@ -17,8 +17,8 @@
 //! real stacks often do.
 //!
 //! Every reader checks lengths, because the agent can send any bytes it
-//! likes. A stream that breaks the format gives a [`TpktError`], and a
-//! real server closes the connection. Writers return an [`EncodeError`]
+//! likes. A stream that breaks the format gives a [`Error`], and a
+//! real server closes the connection. Writers return an [`Error`]
 //! rather than write a packet a reader would refuse.
 //!
 //! ```
@@ -72,62 +72,22 @@ pub struct Packet {
     pub payload: Vec<u8>,
 }
 
-/// Why a writer refused a value: no packet a reader takes can hold it.
+/// Why bytes are not a TPKT stream or packet, or why a writer refused a
+/// value. After an error from [`Packets`] the connection holds no more
+/// packets a reader can find, and a real server closes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EncodeError {
-    /// A payload shorter than [`MIN_PAYLOAD`], with its length.
-    TooShort(usize),
-    /// A payload longer than [`MAX_PAYLOAD`], with its length.
-    TooLong(usize),
-}
-
-impl core::fmt::Display for EncodeError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            EncodeError::TooShort(n) => write!(f, "TPKT payload of {n} bytes, below {MIN_PAYLOAD}"),
-            EncodeError::TooLong(n) => write!(f, "{n} bytes, more than TPKT may carry"),
-        }
-    }
-}
-
-impl core::error::Error for EncodeError {}
-
-/// Why bytes are not a TPKT stream. Any of them means the connection holds
-/// no more packets a reader can find, and a real server closes it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TpktError {
+pub enum Error {
     /// The first byte was not 3. RDP's fast-path packets look like this.
     Version(u8),
     /// The length field was below [`MIN_PACKET`].
     Length(u16),
     /// The length field was above the reader's size limit.
-    TooLong {
+    OverLimit {
         /// The length field.
         length: u16,
         /// The longest packet the reader takes.
         limit: usize,
     },
-}
-
-impl core::fmt::Display for TpktError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            TpktError::Version(v) => write!(f, "TPKT version {v}, not {VERSION}"),
-            TpktError::Length(n) => write!(f, "TPKT length {n}, below {MIN_PACKET}"),
-            TpktError::TooLong { length, limit } => {
-                write!(f, "TPKT length {length}, above the limit of {limit}")
-            }
-        }
-    }
-}
-
-impl core::error::Error for TpktError {}
-
-/// Why an exact [`Wire`] parse could not read one complete packet.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ParseError {
-    /// The TPKT header was invalid.
-    Header(TpktError),
     /// The slice ended before the packet was complete.
     Incomplete,
     /// Bytes followed the complete packet.
@@ -135,19 +95,29 @@ pub enum ParseError {
         /// Number of bytes after the packet.
         remaining: usize,
     },
+    /// A payload to write is shorter than [`MIN_PAYLOAD`], with its length.
+    PayloadTooShort(usize),
+    /// A payload to write is longer than [`MAX_PAYLOAD`], with its length.
+    PayloadTooLong(usize),
 }
 
-impl core::fmt::Display for ParseError {
+impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Header(e) => e.fmt(f),
-            Self::Incomplete => f.write_str("incomplete TPKT packet"),
-            Self::Trailing { remaining } => write!(f, "{remaining} bytes after TPKT packet"),
+            Error::Version(v) => write!(f, "TPKT version {v}, not {VERSION}"),
+            Error::Length(n) => write!(f, "TPKT length {n}, below {MIN_PACKET}"),
+            Error::OverLimit { length, limit } => {
+                write!(f, "TPKT length {length}, above the limit of {limit}")
+            }
+            Error::Incomplete => f.write_str("incomplete TPKT packet"),
+            Error::Trailing { remaining } => write!(f, "{remaining} bytes after TPKT packet"),
+            Error::PayloadTooShort(n) => write!(f, "TPKT payload of {n} bytes, below {MIN_PAYLOAD}"),
+            Error::PayloadTooLong(n) => write!(f, "{n} bytes, more than TPKT may carry"),
         }
     }
 }
 
-impl core::error::Error for ParseError {}
+impl core::error::Error for Error {}
 
 /// The fields of a TPKT header.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -164,22 +134,22 @@ impl Header {
     /// to [`MAX_PACKET`]. It returns `Ok(None)` if `b` holds only part of
     /// one. A bad version is known from the first byte, before
     /// the rest of the header comes.
-    pub fn parse(b: &[u8], limit: usize) -> Result<Option<Header>, TpktError> {
+    pub fn parse(b: &[u8], limit: usize) -> Result<Option<Header>, Error> {
         let Some(&version) = b.first() else {
             return Ok(None);
         };
         if version != VERSION {
-            return Err(TpktError::Version(version));
+            return Err(Error::Version(version));
         }
         let [_, reserved, hi, lo, ..] = *b else {
             return Ok(None);
         };
         let length = u16::from_be_bytes([hi, lo]);
         if usize::from(length) < MIN_PACKET {
-            return Err(TpktError::Length(length));
+            return Err(Error::Length(length));
         }
         if usize::from(length) > clamp_limit(limit) {
-            return Err(TpktError::TooLong {
+            return Err(Error::OverLimit {
                 length,
                 limit: clamp_limit(limit),
             });
@@ -195,19 +165,18 @@ impl Header {
 }
 
 impl Wire for Header {
-    type ParseError = ParseError;
-    type WriteError = EncodeError;
+    type ParseError = Error;
+    type WriteError = Error;
 
-    /// Reads exactly four header bytes. Returns [`ParseError::Incomplete`]
-    /// for a partial header and [`ParseError::Trailing`] for extra bytes.
+    /// Reads exactly four header bytes. Returns [`Error::Incomplete`]
+    /// for a partial header and [`Error::Trailing`] for extra bytes.
     /// A version other than 3 or a length below [`MIN_PACKET`] returns
-    /// [`ParseError::Header`] with [`TpktError::Version`] or [`TpktError::Length`].
-    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
-        let header = Header::parse(bytes, MAX_PACKET)
-            .map_err(ParseError::Header)?
-            .ok_or(ParseError::Incomplete)?;
+    /// [`Error::Version`] or [`Error::Length`].
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        let header = Header::parse(bytes, MAX_PACKET)?
+            .ok_or(Error::Incomplete)?;
         if bytes.len() != HEADER_LEN {
-            return Err(ParseError::Trailing {
+            return Err(Error::Trailing {
                 remaining: bytes.len().saturating_sub(HEADER_LEN),
             });
         }
@@ -215,10 +184,10 @@ impl Wire for Header {
     }
 
     /// Appends the header. A length below [`MIN_PACKET`] returns
-    /// [`EncodeError::TooShort`] without changing `out`.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+    /// [`Error::PayloadTooShort`] without changing `out`.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         if usize::from(self.length) < MIN_PACKET {
-            return Err(EncodeError::TooShort(self.payload_len()));
+            return Err(Error::PayloadTooShort(self.payload_len()));
         }
         out.extend_from_slice(&[VERSION, self.reserved]);
         out.extend_from_slice(&self.length.to_be_bytes());
@@ -244,7 +213,7 @@ impl Packet {
     /// Reads the packet at the start of `b`. It returns `Ok(None)` if `b`
     /// holds only part of one, and otherwise the packet and how many bytes
     /// of `b` it took. Use [`Wire::parse`] to require exactly one packet.
-    pub fn parse_prefix(b: &[u8]) -> Result<Option<(Packet, usize)>, TpktError> {
+    pub fn parse_prefix(b: &[u8]) -> Result<Option<(Packet, usize)>, Error> {
         Packet::parse_limited(b, MAX_PACKET)
     }
 
@@ -252,7 +221,7 @@ impl Packet {
     /// but refuses one longer than `limit` bytes. A limit below
     /// [`MIN_PACKET`] is taken as that, and one above [`MAX_PACKET`] as
     /// that.
-    pub fn parse_limited(b: &[u8], limit: usize) -> Result<Option<(Packet, usize)>, TpktError> {
+    pub fn parse_limited(b: &[u8], limit: usize) -> Result<Option<(Packet, usize)>, Error> {
         let Some(header) = Header::parse(b, limit)? else {
             return Ok(None);
         };
@@ -271,13 +240,13 @@ impl Packet {
 
     /// The packet's header, or an error if the payload's length is outside
     /// [`MIN_PAYLOAD`] to [`MAX_PAYLOAD`].
-    pub fn header(&self) -> Result<Header, EncodeError> {
+    pub fn header(&self) -> Result<Header, Error> {
         let n = self.payload.len();
         if n < MIN_PAYLOAD {
-            return Err(EncodeError::TooShort(n));
+            return Err(Error::PayloadTooShort(n));
         }
         if n > MAX_PAYLOAD {
-            return Err(EncodeError::TooLong(n));
+            return Err(Error::PayloadTooLong(n));
         }
         // n + HEADER_LEN is at most MAX_PACKET, so it fits in 16 bits.
         Ok(Header {
@@ -288,19 +257,18 @@ impl Packet {
 }
 
 impl Wire for Packet {
-    type ParseError = ParseError;
-    type WriteError = EncodeError;
+    type ParseError = Error;
+    type WriteError = Error;
 
-    /// Reads exactly one packet. Returns [`ParseError::Incomplete`] for
-    /// partial input and [`ParseError::Trailing`] for extra bytes. A version
-    /// other than 3 or a length below [`MIN_PACKET`] returns [`ParseError::Header`]
-    /// with [`TpktError::Version`] or [`TpktError::Length`].
-    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
-        let (packet, used) = Packet::parse_prefix(bytes)
-            .map_err(ParseError::Header)?
-            .ok_or(ParseError::Incomplete)?;
+    /// Reads exactly one packet. Returns [`Error::Incomplete`] for
+    /// partial input and [`Error::Trailing`] for extra bytes. A version
+    /// other than 3 or a length below [`MIN_PACKET`] returns
+    /// [`Error::Version`] or [`Error::Length`].
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        let (packet, used) = Packet::parse_prefix(bytes)?
+            .ok_or(Error::Incomplete)?;
         if used != bytes.len() {
-            return Err(ParseError::Trailing {
+            return Err(Error::Trailing {
                 remaining: bytes.len().saturating_sub(used),
             });
         }
@@ -308,9 +276,9 @@ impl Wire for Packet {
     }
 
     /// Appends one packet. Payloads below [`MIN_PAYLOAD`] return
-    /// [`EncodeError::TooShort`]; those above [`MAX_PAYLOAD`] return
-    /// [`EncodeError::TooLong`]. Errors leave `out` unchanged.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+    /// [`Error::PayloadTooShort`]; those above [`MAX_PAYLOAD`] return
+    /// [`Error::PayloadTooLong`]. Errors leave `out` unchanged.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         self.header()?.write(out)?;
         out.extend_from_slice(&self.payload);
         Ok(())
@@ -356,18 +324,18 @@ impl Packets {
 
 impl Decode for Packets {
     type Item = Packet;
-    type Error = TpktError;
+    type Error = Error;
     const NAME: &'static str = "TPKT";
 
     fn capacity(&self) -> usize {
         self.limit
     }
 
-    /// Reads one packet. Returns [`TpktError::Version`] for a version other
-    /// than 3, [`TpktError::Length`] below [`MIN_PACKET`], or
-    /// [`TpktError::TooLong`] above the configured limit. Partial input
+    /// Reads one packet. Returns [`Error::Version`] for a version other
+    /// than 3, [`Error::Length`] below [`MIN_PACKET`], or
+    /// [`Error::OverLimit`] above the configured limit. Partial input
     /// returns [`Step::Need`], including at EOF.
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Packet>, TpktError> {
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Packet>, Error> {
         Ok(match Packet::parse_limited(input, self.limit)? {
             Some((packet, used)) => Step::Item(packet, used),
             None => Step::Need,
@@ -392,19 +360,19 @@ mod codec_tests {
         for cut in 0..bytes.len() {
             assert_eq!(
                 <Packet as Wire>::parse(&bytes[..cut]),
-                Err(ParseError::Incomplete)
+                Err(Error::Incomplete)
             );
         }
         let mut trailing = bytes.clone();
         trailing.push(0);
         assert_eq!(
             <Packet as Wire>::parse(&trailing),
-            Err(ParseError::Trailing { remaining: 1 })
+            Err(Error::Trailing { remaining: 1 })
         );
         assert_eq!(Packet::parse_prefix(&trailing), Ok(Some((packet, bytes.len()))));
         assert_eq!(
             <Packet as Wire>::parse(&[9]),
-            Err(ParseError::Header(TpktError::Version(9)))
+            Err(Error::Version(9))
         );
 
         for size in [
@@ -443,7 +411,7 @@ mod codec_tests {
         }
         let mut stream = Stream::new(Packets::with_limit(8));
         assert_eq!(stream.push(&[3, 0, 0, 9]), 4);
-        let error = Fail::Protocol(TpktError::TooLong {
+        let error = Fail::Protocol(Error::OverLimit {
             length: 9,
             limit: 8,
         });
@@ -524,7 +492,7 @@ mod tests {
                 reserved: 0,
                 length,
             };
-            assert_eq!(h.to_bytes(), Err(EncodeError::TooShort(h.payload_len())));
+            assert_eq!(h.to_bytes(), Err(Error::PayloadTooShort(h.payload_len())));
         }
         let h = Header {
             reserved: 0,
@@ -566,19 +534,19 @@ mod tests {
     #[test]
     fn parse_errors() {
         // A bad version is known from the first byte.
-        assert_eq!(Packet::parse_prefix(&[0x30]), Err(TpktError::Version(0x30)));
+        assert_eq!(Packet::parse_prefix(&[0x30]), Err(Error::Version(0x30)));
         assert_eq!(
             Packet::parse_prefix(&[2, 0, 0, 7, 1, 2, 3]),
-            Err(TpktError::Version(2))
+            Err(Error::Version(2))
         );
         for n in 0..MIN_PACKET as u16 {
             let b = [3, 0, (n >> 8) as u8, n as u8];
-            assert_eq!(Packet::parse_prefix(&b), Err(TpktError::Length(n)));
+            assert_eq!(Packet::parse_prefix(&b), Err(Error::Length(n)));
         }
         // The limit, as given and as clamped.
         assert_eq!(
             Packet::parse_limited(&[3, 0, 0, 9], 8),
-            Err(TpktError::TooLong {
+            Err(Error::OverLimit {
                 length: 9,
                 limit: 8
             })
@@ -586,7 +554,7 @@ mod tests {
         assert!(Packet::parse_limited(&[3, 0, 0, 8], 8).unwrap().is_none());
         assert_eq!(
             Packet::parse_limited(&[3, 0, 0, 8], 0),
-            Err(TpktError::TooLong {
+            Err(Error::OverLimit {
                 length: 8,
                 limit: MIN_PACKET
             })
@@ -597,9 +565,9 @@ mod tests {
                 .is_none()
         );
         for e in [
-            TpktError::Version(2),
-            TpktError::Length(2),
-            TpktError::TooLong {
+            Error::Version(2),
+            Error::Length(2),
+            Error::OverLimit {
                 length: 9,
                 limit: 8,
             },
@@ -613,17 +581,17 @@ mod tests {
         for n in 0..MIN_PAYLOAD {
             assert_eq!(
                 Packet::new(vec![0; n]).to_bytes(),
-                Err(EncodeError::TooShort(n))
+                Err(Error::PayloadTooShort(n))
             );
         }
         let big = Packet::new(vec![0; MAX_PAYLOAD + 1]);
-        assert_eq!(big.to_bytes(), Err(EncodeError::TooLong(MAX_PAYLOAD + 1)));
+        assert_eq!(big.to_bytes(), Err(Error::PayloadTooLong(MAX_PAYLOAD + 1)));
         let max = Packet::new(vec![7; MAX_PAYLOAD]);
         let bytes = max.to_bytes().unwrap();
         assert_eq!(bytes.len(), MAX_PACKET);
         assert_eq!(&bytes[..4], &[3, 0, 0xff, 0xff]);
         assert_eq!(Packet::parse_prefix(&bytes), Ok(Some((max, MAX_PACKET))));
-        for e in [EncodeError::TooShort(1), EncodeError::TooLong(1)] {
+        for e in [Error::PayloadTooShort(1), Error::PayloadTooLong(1)] {
             assert!(!e.to_string().is_empty());
         }
     }
@@ -652,10 +620,10 @@ mod tests {
         for p in &packets {
             assert_eq!(d.next(), Some(Ok(p.clone())));
         }
-        assert_eq!(d.next(), Some(Err(Fail::Protocol(TpktError::Version(4)))));
+        assert_eq!(d.next(), Some(Err(Fail::Protocol(Error::Version(4)))));
         assert_eq!(d.next(), None);
         assert_eq!(d.push(&[1, 2, 3]), 3);
-        assert_eq!(d.failed(), Some(&Fail::Protocol(TpktError::Version(4))));
+        assert_eq!(d.failed(), Some(&Fail::Protocol(Error::Version(4))));
         assert_eq!(Packets::default().limit(), MAX_PACKET);
     }
 
@@ -670,7 +638,7 @@ mod tests {
         assert_eq!(d.push(&[3, 0, 0, 101]), 4);
         assert_eq!(
             d.next(),
-            Some(Err(Fail::Protocol(TpktError::TooLong {
+            Some(Err(Fail::Protocol(Error::OverLimit {
                 length: 101,
                 limit: 100
             })))
@@ -723,7 +691,7 @@ mod tests {
                 Ok(b) => assert_eq!(Header::parse(&b, MAX_PACKET), Ok(Some(h))),
                 Err(e) => {
                     assert!(usize::from(h.length) < MIN_PACKET);
-                    assert_eq!(e, EncodeError::TooShort(h.payload_len()));
+                    assert_eq!(e, Error::PayloadTooShort(h.payload_len()));
                 }
             }
             // Raw bytes, never panicking.

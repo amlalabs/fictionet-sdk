@@ -37,7 +37,7 @@ fn authentication_composes_with_xdr_and_refuses_changed_values() {
     }
     .write(&mut writer);
     assert_eq!(writer.as_bytes(), prefix);
-    assert_eq!(writer.finish(), Err(onc_rpc::XdrError::Unwritable));
+    assert_eq!(writer.finish(), Err(onc_rpc::Error::Unwritable));
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -47,13 +47,13 @@ enum Request {
 }
 
 fn request_stream() -> impl Decode<
-    Item = Result<(Message, Request), onc_rpc::XdrError>,
-    Error = codec::AssembleError<onc_rpc::RecordError>,
+    Item = Result<(Message, Request), onc_rpc::Error>,
+    Error = codec::AssembleError<onc_rpc::Error>,
 > {
     onc_rpc::messages(RECORD_LIMIT).map(|message| {
         let message = message?;
         let Body::Call(call) = &message.body else {
-            return Err(onc_rpc::XdrError::Discriminant(1));
+            return Err(onc_rpc::Error::Discriminant(1));
         };
         assert_eq!(call.rpc_version, onc_rpc::RPC_VERSION);
         let request = match (call.program, call.version) {
@@ -65,7 +65,7 @@ fn request_stream() -> impl Decode<
                 assert_eq!(portmap::Request::from_call(call), Ok(request.clone()));
                 Request::Portmap(request)
             }
-            _ => return Err(onc_rpc::XdrError::Discriminant(call.program)),
+            _ => return Err(onc_rpc::Error::Discriminant(call.program)),
         };
         Ok((message, request))
     })
@@ -229,7 +229,7 @@ fn bad_rpc_record_does_not_hide_the_next_request() -> Result<(), Box<dyn core::e
     assert_eq!(
         items,
         [
-            Err(onc_rpc::XdrError::Short),
+            Err(onc_rpc::Error::Short),
             Ok((good, Request::Nfs(nfs::Request::Null)))
         ]
     );

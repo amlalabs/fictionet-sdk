@@ -40,7 +40,7 @@
 //! ```
 //!
 //! Every reader checks lengths, because the agent can send any bytes it
-//! likes. A TPDU this module cannot read gives a [`TpduError`] that
+//! likes. A TPDU this module cannot read gives a [`Error`] that
 //! [`ErrorTpdu::rejecting`] turns into the error TPDU a real stack sends.
 //!
 //! ```
@@ -253,7 +253,7 @@ impl Variable {
     }
 
     /// Appends a complete variable header within `room` bytes.
-    fn write(&self, out: &mut Vec<u8>, room: usize) -> Result<(), EncodeError> {
+    fn write(&self, out: &mut Vec<u8>, room: usize) -> Result<(), Error> {
         match self {
             Variable::Parameters(params) => {
                 let mut left = room;
@@ -262,19 +262,19 @@ impl Variable {
                         .value
                         .len()
                         .checked_add(2)
-                        .ok_or(EncodeError::Unwritable)?;
+                        .ok_or(Error::Unwritable)?;
                     if p.value.len() > MAX_PARAMETER || need > left {
-                        return Err(EncodeError::Unwritable);
+                        return Err(Error::Unwritable);
                     }
                     out.push(p.code);
-                    out.push(u8::try_from(p.value.len()).map_err(|_| EncodeError::Unwritable)?);
+                    out.push(u8::try_from(p.value.len()).map_err(|_| Error::Unwritable)?);
                     out.extend_from_slice(&p.value);
                     left -= need;
                 }
             }
             Variable::Raw(bytes) => {
                 if bytes.len() > room || !matches!(Variable::parse(bytes), Variable::Raw(_)) {
-                    return Err(EncodeError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 out.extend_from_slice(bytes);
             }
@@ -549,7 +549,7 @@ impl ErrorTpdu {
     /// The error TPDU that answers the bytes `bad`, which failed to read
     /// with `error`, on the connection the peer calls `dst_ref`. It
     /// carries `bad`'s header, as far as it goes, cut to fit.
-    pub fn rejecting(dst_ref: u16, bad: &[u8], error: &TpduError) -> ErrorTpdu {
+    pub fn rejecting(dst_ref: u16, bad: &[u8], error: &Error) -> ErrorTpdu {
         let header = match bad.first() {
             Some(&li) => &bad[..bad.len().min(usize::from(li) + 1)],
             None => &[][..],
@@ -583,9 +583,11 @@ pub enum Tpdu {
     Error(ErrorTpdu),
 }
 
-/// Why bytes are not a class 0 TPDU this module reads.
+/// Why bytes are not a class 0 TPDU this module reads, why a TPDU or a
+/// message cannot be written, or why a [`Reassembler`] gave up on a
+/// message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TpduError {
+pub enum Error {
     /// There were no bytes.
     Empty,
     /// The length indicator is 255, which is reserved, or does not fit the
@@ -603,100 +605,90 @@ pub enum TpduError {
     Unsupported(u8),
     /// An error TPDU has bytes after its header, which it may not.
     UnexpectedData,
+    /// The TPDU cannot fit in a TPKT payload.
+    TpduTooLong {
+        /// Number of input bytes, greater than [`MAX_TPDU`].
+        length: usize,
+    },
+    /// A field, parameter, header, or payload exceeds its wire limit, or a
+    /// [`Variable::Raw`] value would parse as [`Variable::Parameters`].
+    Unwritable,
+    /// The TPKT packet cannot hold its payload.
+    Packet(tpkt::Error),
+    /// A message to write exceeds [`MAX_MESSAGE`], with its byte length.
+    MessageTooLong(usize),
+    /// A message ran past the longest a [`Reassembler`] takes.
+    OverLimit {
+        /// The longest message the reassembler takes.
+        limit: usize,
+    },
 }
 
-impl TpduError {
+impl Error {
     /// The reject cause an error TPDU gives for this error.
     pub fn reject_cause(&self) -> u8 {
         match self {
-            TpduError::Unsupported(_) => cause::INVALID_TPDU_TYPE,
+            Error::Unsupported(_) => cause::INVALID_TPDU_TYPE,
             _ => cause::NOT_SPECIFIED,
         }
     }
 }
 
-impl core::fmt::Display for TpduError {
+impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            TpduError::Empty => f.write_str("empty TPDU"),
-            TpduError::LengthIndicator(li) => {
+            Error::Empty => f.write_str("empty TPDU"),
+            Error::LengthIndicator(li) => {
                 write!(f, "length indicator {li} does not fit the TPDU")
             }
-            TpduError::Truncated { needed, have } => {
+            Error::Truncated { needed, have } => {
                 write!(f, "TPDU header needs {needed} bytes, has {have}")
             }
-            TpduError::Unsupported(c) => write!(f, "TPDU code {c:#04x} is not class 0"),
-            TpduError::UnexpectedData => f.write_str("error TPDU with data after its header"),
+            Error::Unsupported(c) => write!(f, "TPDU code {c:#04x} is not class 0"),
+            Error::UnexpectedData => f.write_str("error TPDU with data after its header"),
+            Error::TpduTooLong { length } => write!(f, "TPDU of {length} bytes, above {MAX_TPDU}"),
+            Error::Unwritable => f.write_str("value cannot be written without changing it"),
+            Error::Packet(error) => write!(f, "TPKT packet: {error}"),
+            Error::MessageTooLong(length) => {
+                write!(f, "COTP message of {length} bytes, over {MAX_MESSAGE}")
+            }
+            Error::OverLimit { limit } => write!(f, "message longer than {limit} bytes"),
         }
     }
 }
 
-impl core::error::Error for TpduError {}
-
-/// Why an exact, bounded [`Wire`] parse refused a TPDU.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ParseError {
-    /// The TPDU cannot fit in a TPKT payload.
-    TooLong {
-        /// Number of input bytes, greater than [`MAX_TPDU`].
-        length: usize,
-    },
-    /// The TPDU header or body was invalid.
-    Tpdu(TpduError),
-}
-
-impl core::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+impl core::error::Error for Error {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
-            Self::TooLong { length } => write!(f, "TPDU of {length} bytes, above {MAX_TPDU}"),
-            Self::Tpdu(e) => e.fmt(f),
+            Error::Packet(error) => Some(error),
+            _ => None,
         }
     }
 }
-
-impl core::error::Error for ParseError {}
-
-/// A TPDU cannot be written without changing its value.
-///
-/// A field, parameter, header, or payload exceeds its wire limit, or a
-/// [`Variable::Raw`] value would parse as [`Variable::Parameters`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EncodeError {
-    /// A field exceeds its wire limit or would parse as another value.
-    Unwritable,
-}
-
-impl core::fmt::Display for EncodeError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("value cannot be written without changing it")
-    }
-}
-
-impl core::error::Error for EncodeError {}
 
 impl Wire for Tpdu {
-    type ParseError = ParseError;
-    type WriteError = EncodeError;
+    type ParseError = Error;
+    type WriteError = Error;
 
-    /// Reads one TPDU. Input over [`MAX_TPDU`] returns [`ParseError::TooLong`].
+    /// Reads one TPDU. Input over [`MAX_TPDU`] returns [`Error::TpduTooLong`].
     /// Invalid length indicators, short headers, unsupported codes, or an
-    /// unexpected header or data length return [`ParseError::Tpdu`] with
-    /// the corresponding [`TpduError`].
-    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
+    /// unexpected header or data length return the corresponding
+    /// [`Error`].
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         if bytes.len() > MAX_TPDU {
-            return Err(ParseError::TooLong {
+            return Err(Error::TpduTooLong {
                 length: bytes.len(),
             });
         }
-        Tpdu::parse(bytes).map_err(ParseError::Tpdu)
+        Tpdu::parse(bytes)
     }
 
-    /// Appends one TPDU. Returns [`EncodeError::Unwritable`] for credit,
+    /// Appends one TPDU. Returns [`Error::Unwritable`] for credit,
     /// class, or options over 15; a data number over 127; parameters or a
     /// header over their wire limits; or a TPDU over [`MAX_TPDU`]. Raw
     /// parameters that would parse as structured parameters also return it.
     /// Errors leave the destination unchanged.
-    fn write(&self, destination: &mut Vec<u8>) -> Result<(), EncodeError> {
+    fn write(&self, destination: &mut Vec<u8>) -> Result<(), Error> {
         let mut out = vec![0u8];
         let data: &[u8] = match self {
             Tpdu::ConnectionRequest(c) | Tpdu::ConnectionConfirm(c) => {
@@ -705,7 +697,7 @@ impl Wire for Tpdu {
                     _ => code::CONNECTION_CONFIRM,
                 };
                 if c.credit > 15 || c.class > 15 || c.options > 15 {
-                    return Err(EncodeError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 out.push(kind | c.credit);
                 out.extend_from_slice(&c.dst_ref.to_be_bytes());
@@ -724,7 +716,7 @@ impl Wire for Tpdu {
             }
             Tpdu::Data(d) => {
                 if d.number > 127 {
-                    return Err(EncodeError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 out.push(code::DATA);
                 out.push(if d.eot { code::EOT } else { 0 } | d.number);
@@ -748,7 +740,7 @@ impl Wire for Tpdu {
             .checked_add(data.len())
             .is_none_or(|n| n > MAX_TPDU)
         {
-            return Err(EncodeError::Unwritable);
+            return Err(Error::Unwritable);
         }
         out.extend_from_slice(data);
         destination.extend_from_slice(&out);
@@ -761,66 +753,31 @@ impl Wire for Tpdu {
 /// Use [`Wire::write`] on a [`Tpdu`] for strict encoding;
 /// [`over_tpkt::write_message`] uses that writer and the TPKT writer.
 pub mod over_tpkt {
-    use super::{MAX_MESSAGE, Tpdu, TpduError, Wire, segment, tpkt};
+    use super::{Error, MAX_MESSAGE, Tpdu, Wire, segment, tpkt};
     use tpkt::Packet;
 
-    /// Why a TPDU or message could not be written over TPKT.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum EncodeError {
-        /// The TPDU cannot be written without changing it.
-        Tpdu(super::EncodeError),
-        /// The TPKT packet cannot hold its payload.
-        Packet(tpkt::EncodeError),
-        /// A message exceeds [`MAX_MESSAGE`], with its byte length.
-        TooLong(usize),
-    }
-
-    impl core::fmt::Display for EncodeError {
-        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-            match self {
-                Self::Tpdu(error) => write!(f, "COTP TPDU: {error}"),
-                Self::Packet(error) => write!(f, "TPKT packet: {error}"),
-                Self::TooLong(length) => {
-                    write!(f, "COTP message of {length} bytes, over {MAX_MESSAGE}")
-                }
-            }
-        }
-    }
-
-    impl core::error::Error for EncodeError {
-        fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
-            match self {
-                Self::Tpdu(error) => Some(error),
-                Self::Packet(error) => Some(error),
-                Self::TooLong(_) => None,
-            }
-        }
-    }
-
     /// Wraps a strictly encoded TPDU in a TPKT packet.
-    pub fn from_tpdu(tpdu: &Tpdu) -> Result<Packet, EncodeError> {
-        Ok(Packet::new(
-            Wire::to_bytes(tpdu).map_err(EncodeError::Tpdu)?,
-        ))
+    pub fn from_tpdu(tpdu: &Tpdu) -> Result<Packet, Error> {
+        Ok(Packet::new(Wire::to_bytes(tpdu)?))
     }
 
     /// Reads the payload as one COTP TPDU.
-    pub fn tpdu(packet: &Packet) -> Result<Tpdu, TpduError> {
+    pub fn tpdu(packet: &Packet) -> Result<Tpdu, Error> {
         Tpdu::parse(&packet.payload)
     }
 
     /// The packets carrying `message` as data TPDUs, with EOT on the last.
     /// [`segment`] clamps `tpdu_size`, including the TPDU header. A message
     /// longer than [`MAX_MESSAGE`] is refused. Both layers use [`Wire::write`].
-    pub fn write_message(message: &[u8], tpdu_size: usize) -> Result<Vec<u8>, EncodeError> {
+    pub fn write_message(message: &[u8], tpdu_size: usize) -> Result<Vec<u8>, Error> {
         if message.len() > MAX_MESSAGE {
-            return Err(EncodeError::TooLong(message.len()));
+            return Err(Error::MessageTooLong(message.len()));
         }
         let mut out = Vec::new();
         for data in segment(message, tpdu_size) {
             from_tpdu(&Tpdu::Data(data))?
                 .write(&mut out)
-                .map_err(EncodeError::Packet)?;
+                .map_err(Error::Packet)?;
         }
         Ok(out)
     }
@@ -828,12 +785,12 @@ pub mod over_tpkt {
 
 /// One bounded TPDU parse per TPKT packet, composed with [`Map`].
 ///
-/// Items are `Result<Tpdu, TpduError>`. A malformed TPDU is an item error;
+/// Items are `Result<Tpdu, Error>`. A malformed TPDU is an item error;
 /// it does not end framing and can be answered with [`ErrorTpdu::rejecting`].
 /// TPKT already bounds each payload to [`MAX_TPDU`], so only the standalone
-/// [`Wire`] parser needs [`ParseError::TooLong`]. Framing errors are
-/// [`tpkt::TpktError`].
-pub type Tpdus = Map<tpkt::Packets, fn(tpkt::Packet) -> Result<Tpdu, TpduError>>;
+/// [`Wire`] parser needs [`Error::TpduTooLong`]. Framing errors are
+/// [`tpkt::Error`].
+pub type Tpdus = Map<tpkt::Packets, fn(tpkt::Packet) -> Result<Tpdu, Error>>;
 
 /// Creates a TPDU decoder with a TPKT packet limit, including its header.
 /// Clamps `packet_limit` to [`tpkt::MIN_PACKET`] through [`tpkt::MAX_PACKET`].
@@ -847,14 +804,14 @@ pub fn tpdus(packet_limit: usize) -> Tpdus {
 /// Data TPDUs joined into messages by [`Assemble`].
 ///
 /// Items are [`fictionet::stdlib::codec::Assembled`]. Control TPDUs and TPDU parse
-/// errors pass through as `Whole(Result<Tpdu, TpduError>)` items without
+/// errors pass through as `Whole(Result<Tpdu, Error>)` items without
 /// clearing a pending message.
 /// DT payloads join in order until EOT. TPDU numbers are not checked.
 /// EOF before EOT reports [`fictionet::stdlib::codec::AssembleError::Incomplete`], even
 /// for an empty fragment. A torn TPKT reports [`fictionet::stdlib::codec::Fail::Truncated`].
 /// Framing errors and message overflow end the stream.
 pub type Messages =
-    Assemble<Tpdus, fn(Result<Tpdu, TpduError>) -> Fragment<Result<Tpdu, TpduError>>>;
+    Assemble<Tpdus, fn(Result<Tpdu, Error>) -> Fragment<Result<Tpdu, Error>>>;
 
 /// Creates a TPKT, TPDU, and message decoder with separate size limits.
 ///
@@ -880,25 +837,25 @@ pub fn messages(packet_limit: usize, message_limit: usize) -> Messages {
 
 impl Tpdu {
     /// Reads the TPDU in `b`: all of it, as one packet carries.
-    pub fn parse(b: &[u8]) -> Result<Tpdu, TpduError> {
-        let (&li, rest) = b.split_first().ok_or(TpduError::Empty)?;
+    pub fn parse(b: &[u8]) -> Result<Tpdu, Error> {
+        let (&li, rest) = b.split_first().ok_or(Error::Empty)?;
         if usize::from(li) > MAX_HEADER {
-            return Err(TpduError::LengthIndicator(li));
+            return Err(Error::LengthIndicator(li));
         }
         let Some(header) = rest.get(..usize::from(li)) else {
-            return Err(TpduError::Truncated {
+            return Err(Error::Truncated {
                 needed: usize::from(li) + 1,
                 have: b.len(),
             });
         };
         let data = rest.get(usize::from(li)..).unwrap_or_default();
         let Some(&code_byte) = header.first() else {
-            return Err(TpduError::Unsupported(0));
+            return Err(Error::Unsupported(0));
         };
         match code_byte & 0xf0 {
             code::CONNECTION_REQUEST | code::CONNECTION_CONFIRM => {
                 let [_, dst_hi, dst_lo, src_hi, src_lo, class, variable @ ..] = header else {
-                    return Err(TpduError::LengthIndicator(li));
+                    return Err(Error::LengthIndicator(li));
                 };
                 let connect = Connect {
                     credit: code_byte & 0x0f,
@@ -917,7 +874,7 @@ impl Tpdu {
             }
             _ if code_byte == code::DISCONNECT_REQUEST => {
                 let [_, dst_hi, dst_lo, src_hi, src_lo, reason, variable @ ..] = header else {
-                    return Err(TpduError::LengthIndicator(li));
+                    return Err(Error::LengthIndicator(li));
                 };
                 Ok(Tpdu::DisconnectRequest(Disconnect {
                     dst_ref: u16::from_be_bytes([*dst_hi, *dst_lo]),
@@ -931,7 +888,7 @@ impl Tpdu {
                 // Class 0 data has no variable part; a longer header is
                 // another class's format.
                 let [_, flags] = header else {
-                    return Err(TpduError::LengthIndicator(li));
+                    return Err(Error::LengthIndicator(li));
                 };
                 let eot = flags & code::EOT != 0;
                 Ok(Tpdu::Data(Data {
@@ -942,10 +899,10 @@ impl Tpdu {
             }
             _ if code_byte == code::ERROR => {
                 let [_, dst_hi, dst_lo, cause, variable @ ..] = header else {
-                    return Err(TpduError::LengthIndicator(li));
+                    return Err(Error::LengthIndicator(li));
                 };
                 if !data.is_empty() {
-                    return Err(TpduError::UnexpectedData);
+                    return Err(Error::UnexpectedData);
                 }
                 Ok(Tpdu::Error(ErrorTpdu {
                     dst_ref: u16::from_be_bytes([*dst_hi, *dst_lo]),
@@ -953,25 +910,10 @@ impl Tpdu {
                     variable: Variable::parse(variable),
                 }))
             }
-            _ => Err(TpduError::Unsupported(code_byte)),
+            _ => Err(Error::Unsupported(code_byte)),
         }
     }
 }
-
-/// Why a [`Reassembler`] gave up on a message.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MessageTooLong {
-    /// The longest message the reassembler takes.
-    pub limit: usize,
-}
-
-impl core::fmt::Display for MessageTooLong {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "message longer than {} bytes", self.limit)
-    }
-}
-
-impl core::error::Error for MessageTooLong {}
 
 /// Puts a message back together from the data TPDUs that carry it.
 #[derive(Clone, Debug)]
@@ -1006,10 +948,10 @@ impl Reassembler {
 
     /// Adds the next segment. It returns the whole message once its last
     /// segment comes, and `Ok(None)` before then. A message that runs past
-    /// the limit gives [`MessageTooLong`] once; the rest of its segments,
+    /// the limit gives [`Error::OverLimit`] once; the rest of its segments,
     /// up to its last, are dropped. A real stack disconnects instead, and
     /// a world can too.
-    pub fn push(&mut self, segment: &Data) -> Result<Option<Vec<u8>>, MessageTooLong> {
+    pub fn push(&mut self, segment: &Data) -> Result<Option<Vec<u8>>, Error> {
         if self.skipping {
             if segment.eot {
                 self.skipping = false;
@@ -1020,7 +962,7 @@ impl Reassembler {
         if total.is_none_or(|n| n > self.limit) {
             self.buf = Vec::new();
             self.skipping = !segment.eot;
-            return Err(MessageTooLong { limit: self.limit });
+            return Err(Error::OverLimit { limit: self.limit });
         }
         self.buf.extend_from_slice(&segment.data);
         if segment.eot {
@@ -1079,7 +1021,7 @@ mod codec_tests {
     #[test]
     fn over_tpkt_payload_errors() {
         let bad = tpkt::Packet::new(vec![2, 0x10, 0]);
-        assert_eq!(over_tpkt::tpdu(&bad), Err(TpduError::Unsupported(0x10)));
+        assert_eq!(over_tpkt::tpdu(&bad), Err(Error::Unsupported(0x10)));
     }
 
     #[test]
@@ -1101,7 +1043,7 @@ mod codec_tests {
         }
         assert_eq!(
             over_tpkt::write_message(&vec![0; MAX_MESSAGE + 1], 128),
-            Err(over_tpkt::EncodeError::TooLong(MAX_MESSAGE + 1))
+            Err(Error::MessageTooLong(MAX_MESSAGE + 1))
         );
     }
 
@@ -1273,7 +1215,7 @@ mod codec_tests {
         assert_eq!(
             drive(messages(tpkt::MAX_PACKET, 2), &[&wire]),
             vec![
-                Assembled::Whole(Err(TpduError::Unsupported(0x10))),
+                Assembled::Whole(Err(Error::Unsupported(0x10))),
                 Assembled::Message(b"ab".to_vec()),
             ]
         );
@@ -1344,7 +1286,7 @@ mod codec_tests {
         assert_eq!(
             stream.next(),
             Some(Err(Fail::Protocol(AssembleError::Inner(
-                tpkt::TpktError::Version(9)
+                tpkt::Error::Version(9)
             ))))
         );
         assert_eq!(stream.next(), None);
@@ -1395,18 +1337,18 @@ mod codec_tests {
         for value in invalid {
             contract::check_wire_value(&value);
             let mut out = vec![0x55, 0xaa];
-            assert_eq!(value.write(&mut out), Err(EncodeError::Unwritable));
+            assert_eq!(value.write(&mut out), Err(Error::Unwritable));
             assert_eq!(out, [0x55, 0xaa]);
-            assert_eq!(value.to_bytes(), Err(EncodeError::Unwritable));
+            assert_eq!(value.to_bytes(), Err(Error::Unwritable));
         }
         // Packet conversion follows the strict TPDU writer.
         assert!(over_tpkt::from_tpdu(&raw).is_err());
-        assert_eq!(oversized.to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(oversized.to_bytes(), Err(Error::Unwritable));
         let oversized_wire = [vec![2, 0xf0, 0x80], vec![0; MAX_TPDU - 2]].concat();
         assert!(Tpdu::parse(&oversized_wire).is_ok());
         assert_eq!(
             <Tpdu as Wire>::parse(&oversized_wire),
-            Err(ParseError::TooLong {
+            Err(Error::TpduTooLong {
                 length: MAX_TPDU + 1
             })
         );
@@ -1446,7 +1388,7 @@ mod codec_tests {
             Tpdu::DisconnectRequest(disconnect),
         ] {
             let mut out = vec![0x55];
-            assert_eq!(tpdu.write(&mut out), Err(EncodeError::Unwritable));
+            assert_eq!(tpdu.write(&mut out), Err(Error::Unwritable));
             assert_eq!(out, [0x55]);
             contract::check_wire_value(&tpdu);
         }
@@ -1503,15 +1445,15 @@ mod tests {
         assert_eq!(over_tpkt::tpdu(&p), Ok(fits));
         assert_eq!(
             over_tpkt::from_tpdu(&data(MAX_PAYLOAD - 2, 0)),
-            Err(over_tpkt::EncodeError::Tpdu(EncodeError::Unwritable))
+            Err(Error::Unwritable)
         );
         assert_eq!(
             over_tpkt::from_tpdu(&data(65529, 0)),
-            Err(over_tpkt::EncodeError::Tpdu(EncodeError::Unwritable))
+            Err(Error::Unwritable)
         );
         assert_eq!(
             over_tpkt::from_tpdu(&data(0, 0x80)),
-            Err(over_tpkt::EncodeError::Tpdu(EncodeError::Unwritable))
+            Err(Error::Unwritable)
         );
         let connect = |f: &dyn Fn(&mut Connect)| {
             let mut c = Connect::request(7);
@@ -1522,31 +1464,31 @@ mod tests {
         assert!(connect(&|c| c.credit = 15).is_ok());
         assert_eq!(
             connect(&|c| c.credit = 16),
-            Err(over_tpkt::EncodeError::Tpdu(EncodeError::Unwritable))
+            Err(Error::Unwritable)
         );
         assert_eq!(
             connect(&|c| c.class = 16),
-            Err(over_tpkt::EncodeError::Tpdu(EncodeError::Unwritable))
+            Err(Error::Unwritable)
         );
         assert_eq!(
             connect(&|c| c.options = 16),
-            Err(over_tpkt::EncodeError::Tpdu(EncodeError::Unwritable))
+            Err(Error::Unwritable)
         );
         // A parameter longer than its length byte, or more than a header holds.
         assert_eq!(
             connect(&|c| c.variable.set(0xc1, vec![0; 256])),
-            Err(over_tpkt::EncodeError::Tpdu(EncodeError::Unwritable))
+            Err(Error::Unwritable)
         );
         assert_eq!(
             connect(&|c| {
                 c.variable.set(0xc1, vec![0; 200]);
                 c.variable.set(0xc2, vec![0; 200]);
             }),
-            Err(over_tpkt::EncodeError::Tpdu(EncodeError::Unwritable))
+            Err(Error::Unwritable)
         );
         assert_eq!(
             connect(&|c| c.variable = Variable::Raw(vec![0; 249])),
-            Err(over_tpkt::EncodeError::Tpdu(EncodeError::Unwritable))
+            Err(Error::Unwritable)
         );
         // Strict conversion refuses Raw bytes that read back as parameters,
         // including empty Raw. Use Variable::parse to choose the wire form.
@@ -1561,7 +1503,7 @@ mod tests {
     fn tpdu_errors_pass_through() {
         assert_eq!(
             over_tpkt::tpdu(&Packet::new(vec![2, 0x10, 0])),
-            Err(TpduError::Unsupported(0x10))
+            Err(Error::Unsupported(0x10))
         );
         assert!(over_tpkt::tpdu(&Packet::new(vec![9, 0xf0, 0x80])).is_err());
     }
@@ -1668,15 +1610,15 @@ mod tests {
         // Known from the first byte.
         assert_eq!(
             tpkt::Packet::parse_prefix(&[0x30]),
-            Err(tpkt::TpktError::Version(0x30))
+            Err(tpkt::Error::Version(0x30))
         );
         assert_eq!(
             tpkt::Packet::parse_prefix(&[2, 0, 0, 7, 2, 0xf0, 0x80]),
-            Err(tpkt::TpktError::Version(2))
+            Err(tpkt::Error::Version(2))
         );
         for n in 0..tpkt::MIN_PACKET as u16 {
             let b = [3, 0, (n >> 8) as u8, n as u8];
-            assert_eq!(tpkt::Packet::parse_prefix(&b), Err(tpkt::TpktError::Length(n)));
+            assert_eq!(tpkt::Packet::parse_prefix(&b), Err(tpkt::Error::Length(n)));
         }
         // The reserved byte is not checked.
         assert!(
@@ -1684,8 +1626,8 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-        assert!(!tpkt::TpktError::Version(2).to_string().is_empty());
-        assert!(!tpkt::TpktError::Length(2).to_string().is_empty());
+        assert!(!tpkt::Error::Version(2).to_string().is_empty());
+        assert!(!tpkt::Error::Length(2).to_string().is_empty());
     }
 
     #[test]
@@ -1871,7 +1813,7 @@ mod tests {
         assert_eq!(dr.additional_information().map(<[u8]>::len), Some(400));
         assert_eq!(
             Tpdu::DisconnectRequest(dr).to_bytes(),
-            Err(EncodeError::Unwritable)
+            Err(Error::Unwritable)
         );
     }
 
@@ -1964,16 +1906,16 @@ mod tests {
         // Another class's data header.
         assert_eq!(
             Tpdu::parse(&[4, 0xf0, 0, 1, 0x80]),
-            Err(TpduError::LengthIndicator(4))
+            Err(Error::LengthIndicator(4))
         );
-        assert_eq!(Tpdu::parse(&[1, 0xf0]), Err(TpduError::LengthIndicator(1)));
+        assert_eq!(Tpdu::parse(&[1, 0xf0]), Err(Error::LengthIndicator(1)));
         // Data above the packet limit is refused.
         let big = Tpdu::Data(Data {
             eot: true,
             number: 0,
             data: vec![1; tpkt::MAX_PACKET],
         });
-        assert_eq!(big.to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(big.to_bytes(), Err(Error::Unwritable));
         assert!(over_tpkt::from_tpdu(&big).is_err());
     }
 
@@ -1994,7 +1936,7 @@ mod tests {
         ));
         assert_eq!(
             Tpdu::parse(&[5, 0x80, 0, 1, 0, 2]),
-            Err(TpduError::LengthIndicator(5))
+            Err(Error::LengthIndicator(5))
         );
     }
 
@@ -2002,7 +1944,7 @@ mod tests {
     fn error_tpdu() {
         let bad = [2, 0x10, 0x80];
         let e = Tpdu::parse(&bad).unwrap_err();
-        assert_eq!(e, TpduError::Unsupported(0x10));
+        assert_eq!(e, Error::Unsupported(0x10));
         let er = ErrorTpdu::rejecting(7, &bad, &e);
         assert_eq!(er.cause, cause::INVALID_TPDU_TYPE);
         assert_eq!(er.invalid_tpdu(), Some(&bad[..]));
@@ -2012,14 +1954,14 @@ mod tests {
         // No data may follow an error's header.
         assert_eq!(
             Tpdu::parse(&[4, 0x70, 0, 0, 0, 1]),
-            Err(TpduError::UnexpectedData)
+            Err(Error::UnexpectedData)
         );
         assert_eq!(
             Tpdu::parse(&[3, 0x70, 0, 0]),
-            Err(TpduError::LengthIndicator(3))
+            Err(Error::LengthIndicator(3))
         );
         // Rejecting an empty or huge TPDU still writes a valid error.
-        let er = ErrorTpdu::rejecting(0, &[], &TpduError::Empty);
+        let er = ErrorTpdu::rejecting(0, &[], &Error::Empty);
         assert_eq!(er.cause, cause::NOT_SPECIFIED);
         assert!(Tpdu::parse(&Tpdu::Error(er).to_bytes().unwrap()).is_ok());
         let mut huge = vec![254u8; 300];
@@ -2034,34 +1976,34 @@ mod tests {
 
     #[test]
     fn tpdu_errors() {
-        assert_eq!(Tpdu::parse(&[]), Err(TpduError::Empty));
+        assert_eq!(Tpdu::parse(&[]), Err(Error::Empty));
         assert_eq!(
             Tpdu::parse(&[255, 0xf0]),
-            Err(TpduError::LengthIndicator(255))
+            Err(Error::LengthIndicator(255))
         );
-        assert_eq!(Tpdu::parse(&[0]), Err(TpduError::Unsupported(0)));
+        assert_eq!(Tpdu::parse(&[0]), Err(Error::Unsupported(0)));
         assert_eq!(
             Tpdu::parse(&[6, 0xe0, 0]),
-            Err(TpduError::Truncated { needed: 7, have: 3 })
+            Err(Error::Truncated { needed: 7, have: 3 })
         );
         assert_eq!(
             Tpdu::parse(&[5, 0xe0, 0, 0, 0, 0]),
-            Err(TpduError::LengthIndicator(5))
+            Err(Error::LengthIndicator(5))
         );
         // Codes outside class 0: DC, ED, AK, EA, RJ.
         for c in [0xc0, 0x10, 0x61, 0x20, 0x51, 0x81, 0xf1, 0x71] {
             assert_eq!(
                 Tpdu::parse(&[6, c, 0, 0, 0, 0, 0]),
-                Err(TpduError::Unsupported(c)),
+                Err(Error::Unsupported(c)),
                 "{c:#x}"
             );
         }
         for e in [
-            TpduError::Empty,
-            TpduError::LengthIndicator(1),
-            TpduError::Truncated { needed: 2, have: 1 },
-            TpduError::Unsupported(0),
-            TpduError::UnexpectedData,
+            Error::Empty,
+            Error::LengthIndicator(1),
+            Error::Truncated { needed: 2, have: 1 },
+            Error::Unsupported(0),
+            Error::UnexpectedData,
         ] {
             assert!(!e.to_string().is_empty());
         }
@@ -2095,7 +2037,7 @@ mod tests {
             Tpdu::Error(ErrorTpdu::rejecting(
                 3,
                 &[2, 0x10, 0],
-                &TpduError::Unsupported(0x10),
+                &Error::Unsupported(0x10),
             ))
             .to_bytes()
             .map(tpkt::Packet::new)
@@ -2117,11 +2059,11 @@ mod tests {
             for n in 0..tpdu.len() {
                 let r = Tpdu::parse(&tpdu[..n]);
                 if n == 0 {
-                    assert_eq!(r, Err(TpduError::Empty));
+                    assert_eq!(r, Err(Error::Empty));
                 } else if n <= li {
                     assert_eq!(
                         r,
-                        Err(TpduError::Truncated {
+                        Err(Error::Truncated {
                             needed: li + 1,
                             have: n
                         })
@@ -2162,13 +2104,13 @@ mod tests {
         };
         assert_eq!(
             Tpdu::ConnectionRequest(c).to_bytes(),
-            Err(EncodeError::Unwritable)
+            Err(Error::Unwritable)
         );
         let c = Connect::default().with_called_tsap(&[1; 300]);
         assert_eq!(c.called_tsap().map(<[u8]>::len), Some(300));
         assert_eq!(
             Tpdu::ConnectionRequest(c.clone()).to_bytes(),
-            Err(EncodeError::Unwritable)
+            Err(Error::Unwritable)
         );
         let c = Connect {
             variable: Variable::Parameters(vec![Parameter {
@@ -2179,7 +2121,7 @@ mod tests {
         };
         assert_eq!(
             Tpdu::ConnectionRequest(c).to_bytes(),
-            Err(EncodeError::Unwritable)
+            Err(Error::Unwritable)
         );
         let d = Disconnect {
             variable: Variable::Raw(vec![0xff; 400]),
@@ -2187,7 +2129,7 @@ mod tests {
         };
         assert_eq!(
             Tpdu::DisconnectRequest(d).to_bytes(),
-            Err(EncodeError::Unwritable)
+            Err(Error::Unwritable)
         );
         // Adding a parameter to raw bytes replaces them.
         let c = Connect {
@@ -2214,7 +2156,7 @@ mod tests {
         // Past the limit: one error, the rest of the message dropped.
         let mut r = Reassembler::with_limit(4);
         assert_eq!(r.push(&seg(false, b"abc")), Ok(None));
-        assert_eq!(r.push(&seg(false, b"de")), Err(MessageTooLong { limit: 4 }));
+        assert_eq!(r.push(&seg(false, b"de")), Err(Error::OverLimit { limit: 4 }));
         assert_eq!(r.pending(), 0);
         assert_eq!(r.push(&seg(false, b"x")), Ok(None));
         assert_eq!(r.push(&seg(true, b"y")), Ok(None));
@@ -2222,11 +2164,11 @@ mod tests {
         // An over-long last segment ends the message there.
         assert_eq!(
             r.push(&seg(true, b"12345")),
-            Err(MessageTooLong { limit: 4 })
+            Err(Error::OverLimit { limit: 4 })
         );
         assert_eq!(r.push(&seg(true, b"1234")), Ok(Some(b"1234".to_vec())));
         assert_eq!(Reassembler::with_limit(usize::MAX).limit, MAX_MESSAGE);
-        assert!(!MessageTooLong { limit: 4 }.to_string().is_empty());
+        assert!(!Error::OverLimit { limit: 4 }.to_string().is_empty());
     }
 
     #[test]
@@ -2286,7 +2228,7 @@ mod tests {
         pump(&mut stream, &bytes, |packet| got.push(packet.payload)).unwrap();
         assert_eq!(got, [a[4..].to_vec(), b[4..].to_vec()]);
         assert_eq!(stream.push(&[0x44, 0, 0, 7]), 4);
-        let error = Fail::Protocol(tpkt::TpktError::Version(0x44));
+        let error = Fail::Protocol(tpkt::Error::Version(0x44));
         assert_eq!(stream.next(), Some(Err(error.clone())));
         assert_eq!(stream.push(&a), a.len());
         assert_eq!(stream.next(), None);

@@ -4,7 +4,7 @@
 
 use fictionet::stdlib::codec::{Fail, Wire, contract, test_support::decode_all};
 use fictionet::stdlib::grpc::{
-    Code, ContentType, FrameError, HEADER_LEN, MAX_MESSAGE, Message, Messages, MethodPath,
+    Code, ContentType, Error, HEADER_LEN, MAX_MESSAGE, Message, Messages, MethodPath,
     Rejection, Request, Status, Timeout, decode_message, encode_message,
 };
 use libfuzzer_sys::fuzz_target;
@@ -83,7 +83,7 @@ fn check_limit_agreement(data: &[u8], limit: usize) {
         Some([0..=1, a, b, c, d, ..]) => {
             let length = u32::from_be_bytes([*a, *b, *c, *d]);
             if u64::from(length) > limit as u64 {
-                Some(Fail::Protocol(FrameError::TooLarge { length, limit }))
+                Some(Fail::Protocol(Error::TooLarge { length, limit }))
             } else {
                 failure
             }

@@ -26,8 +26,8 @@
 //! data. The Who-Is and I-Am services, which a client uses to find devices,
 //! are read and written in full by [`WhoIs`] and [`IAm`]. Every other
 //! service body is kept as raw bytes. World code walks its fields with
-//! [`ContextValue::read`], [`Tags`] and [`Primitives`]. Repeated application
-//! values can use [`Stream<Primitives>`](fictionet::stdlib::codec::Stream).
+//! [`ContextValue::read`], [`Tags`] and [`Values`]. Repeated application
+//! values can use [`Stream<Values>`](fictionet::stdlib::codec::Stream).
 //!
 //! Nothing here reads a socket. A world that plays a BACnet device reads
 //! each datagram from its UDP socket, passes it to [`Bvlc::parse`], reads
@@ -1897,9 +1897,9 @@ impl Decode for Tags {
 /// A stateless reader of application-tagged primitive values.
 /// Context fields use [`ContextValue::read`]; constructed tags use [`Tags`].
 #[derive(Clone, Copy, Debug, Default)]
-pub struct Primitives;
+pub struct Values;
 
-impl Decode for Primitives {
+impl Decode for Values {
     type Item = Value;
     type Error = Error;
     const NAME: &'static str = "BACnet primitive";
@@ -1956,12 +1956,12 @@ impl<const TYPE: u8> Wire for ContextValue<TYPE> {
 
 /// Application-tagged values in one bounded service body.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct Values(
+pub struct ValueList(
     /// Application values in wire order.
     pub Vec<Value>,
 );
 
-impl Wire for Values {
+impl Wire for ValueList {
     type ParseError = Error;
     type WriteError = Error;
 
@@ -2175,8 +2175,8 @@ mod tests {
             })
         );
         assert_eq!(Value::parse(&hex("63 0102")), Err(Error::Truncated));
-        assert_eq!(Values::parse(&hex("21 01 21")).map(|values| values.0), Err(Error::Truncated));
-        assert_eq!(Values::parse(&hex("21 01 10")).map(|values| values.0), Ok(vec![Value::Unsigned(1), Value::Boolean(false)]));
+        assert_eq!(ValueList::parse(&hex("21 01 21")).map(|values| values.0), Err(Error::Truncated));
+        assert_eq!(ValueList::parse(&hex("21 01 10")).map(|values| values.0), Ok(vec![Value::Unsigned(1), Value::Boolean(false)]));
     }
 
     #[test]
@@ -2279,13 +2279,13 @@ mod tests {
         let tags = [0x3e, 0x3f, 0xf9, 15];
         contract::check_decode_with_alloc_limit(|| Tags, &tags, 2 * Tags.capacity());
         assert_eq!(decode_all(|| Tags, &tags).0.len(), 3);
-        let values = Values(vec![Value::Real(72.3), Value::Unsigned(85)]);
+        let values = ValueList(vec![Value::Real(72.3), Value::Unsigned(85)]);
         let bytes = values.to_bytes().unwrap();
-        contract::check_decode_with_alloc_limit(|| Primitives, &bytes, 2 * Primitives.capacity());
-        assert_eq!(decode_all(|| Primitives, &bytes), (values.0, None));
+        contract::check_decode_with_alloc_limit(|| Values, &bytes, 2 * Values.capacity());
+        assert_eq!(decode_all(|| Values, &bytes), (values.0, None));
         let oversized = [0x65, 255, 0xff, 0xff, 0xff, 0xff];
-        contract::check_decode_with_alloc_limit(|| Primitives, &oversized, 2 * Primitives.capacity());
-        assert!(Primitives.decode(&oversized, false).is_err());
+        contract::check_decode_with_alloc_limit(|| Values, &oversized, 2 * Values.capacity());
+        assert!(Values.decode(&oversized, false).is_err());
     }
 
     #[test]
@@ -2316,7 +2316,7 @@ mod tests {
         let Step::Item(opening, used) = Tags.decode(&data[at..], true).unwrap() else { panic!() };
         assert_eq!(opening, Tag { number: 3, class: Class::Context, content: TagContent::Opening });
         at += used;
-        let Step::Item(value, used) = Primitives.decode(&data[at..], true).unwrap() else { panic!() };
+        let Step::Item(value, used) = Values.decode(&data[at..], true).unwrap() else { panic!() };
         assert_eq!(value, Value::Real(72.3));
         at += used;
         let Step::Item(closing, used) = Tags.decode(&data[at..], true).unwrap() else { panic!() };
@@ -2361,7 +2361,7 @@ mod tests {
         }
         // Error class and code read as values.
         let Apdu::Error { data, .. } = Apdu::parse(&hex("50 09 0C 91 01 91 1F")).unwrap() else { panic!() };
-        assert_eq!(Values::parse(&data).map(|values| values.0), Ok(vec![Value::Enumerated(1), Value::Enumerated(31)]));
+        assert_eq!(ValueList::parse(&data).map(|values| values.0), Ok(vec![Value::Enumerated(1), Value::Enumerated(31)]));
         assert_eq!(Apdu::parse(&[0x80, 0]), Err(Error::PduType(8)));
         assert_eq!(Apdu::parse(&[0xf0]), Err(Error::PduType(15)));
         assert_eq!(Apdu::parse(&hex("20 09 0F 00")), Err(Error::TrailingBytes));
@@ -2703,8 +2703,8 @@ mod tests {
     #[test]
     fn value_lists_are_bounded() {
         // 16 MiB of Null tags would have made 16 million values.
-        assert_eq!(Values::parse(&vec![0; MAX_MESSAGE + 1]).map(|values| values.0), Err(Error::TooLong));
-        assert_eq!(Values::parse(&vec![0; MAX_MESSAGE]).map(|values| values.0).map(|v| v.len()), Ok(MAX_MESSAGE));
+        assert_eq!(ValueList::parse(&vec![0; MAX_MESSAGE + 1]).map(|values| values.0), Err(Error::TooLong));
+        assert_eq!(ValueList::parse(&vec![0; MAX_MESSAGE]).map(|values| values.0).map(|v| v.len()), Ok(MAX_MESSAGE));
     }
 
     #[test]
@@ -2804,7 +2804,7 @@ mod tests {
     fn check(b: &[u8]) {
         contract::check_wire::<Tag>(b);
         contract::check_wire::<Value>(b);
-        contract::check_wire::<Values>(b);
+        contract::check_wire::<ValueList>(b);
         contract::check_wire::<Bvlc>(b);
         contract::check_wire::<Npdu>(b);
         contract::check_wire::<Apdu>(b);
@@ -2820,10 +2820,10 @@ mod tests {
         if let Ok(a) = Apdu::parse(b) {
             assert_eq!(Apdu::parse(&a.to_bytes().unwrap()), Ok(a));
         }
-        if let Ok(values) = Values::parse(b).map(|values| values.0) {
+        if let Ok(values) = ValueList::parse(b).map(|values| values.0) {
             let mut once = Vec::new();
             values.iter().for_each(|v| v.write(&mut once).unwrap());
-            let again = Values::parse(&once).map(|values| values.0).unwrap();
+            let again = ValueList::parse(&once).map(|values| values.0).unwrap();
             let mut twice = Vec::new();
             again.iter().for_each(|v| v.write(&mut twice).unwrap());
             assert_eq!(once, twice);

@@ -633,7 +633,7 @@ mod tests {
         let proxy = Interceptor::new(128);
         assert_eq!(
             proxy.apply(b"", Rewrite::Replace(vec![good.clone(), bad]), &mut out),
-            Err(RewriteError::Write(modbus::EncodeError::EmptyPdu))
+            Err(RewriteError::Write(modbus::Error::EmptyPdu))
         );
         assert_eq!(out, [42]);
         assert_eq!(
@@ -672,7 +672,7 @@ mod tests {
                 Rewrite::<modbus::Frame>::Forward
             }),
             Some(Err(InterceptError::Decode(Fail::Protocol(
-                modbus::FrameError::Protocol(1)
+                modbus::Error::Protocol(1)
             ))))
         ));
         assert_eq!(out, [7]);

@@ -24,7 +24,7 @@
 //! [`Message::answer`], adds the addresses and prefixes it hands out, and
 //! sends [`Message::to_bytes`] back. Which addresses exist and who gets them
 //! is up to world code. For DHCPv6 over TCP, as leasequery uses, a
-//! [`Stream<Frames>`](fictionet::stdlib::codec::Stream) splits the stream into messages.
+//! [`Stream<Messages>`](fictionet::stdlib::codec::Stream) splits the stream into messages.
 //!
 //! Every reader checks lengths and ranges, because the agent can send any
 //! bytes it likes. Options nest at most [`MAX_DEPTH`] deep; deeper ones are
@@ -89,10 +89,10 @@ pub const ALL_DHCP_SERVERS: Ipv6Addr = Ipv6Addr::new(0xff05, 0, 0, 0, 0, 0, 1, 3
 /// it.
 pub const MAX_MESSAGE: usize = 65_527;
 /// The longest message over TCP, where a 2-byte length comes before each
-/// message (RFC 5460, section 5.1). [`Stream<Frames>`](fictionet::stdlib::codec::Stream) reads messages this long,
+/// message (RFC 5460, section 5.1). [`Stream<Messages>`](fictionet::stdlib::codec::Stream) reads messages this long,
 /// and [`Frame`] writes them.
 pub const MAX_TCP_MESSAGE: usize = 65_535;
-/// The most bytes a [`Stream<Frames>`](fictionet::stdlib::codec::Stream) holds that have not been taken out: one
+/// The most bytes a [`Stream<Messages>`](fictionet::stdlib::codec::Stream) holds that have not been taken out: one
 /// whole message over TCP and its length.
 pub const MAX_BUFFERED: usize = 2 + MAX_TCP_MESSAGE;
 /// The length of a client or server message's header: the type and the
@@ -303,21 +303,21 @@ impl Duid {
 }
 
 impl Wire for Duid {
-    type ParseError = ParseError;
-    type WriteError = WriteError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads a DUID. Refuses lengths outside [`MIN_DUID`] through [`MAX_DUID`].
-    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         if !(MIN_DUID..=MAX_DUID).contains(&bytes.len()) {
-            return Err(ParseError::BadOption(opt::CLIENTID));
+            return Err(Error::BadOption(opt::CLIENTID));
         }
         Ok(Self(bytes.to_vec()))
     }
 
     /// Appends a DUID. Refuses invalid lengths. Leaves `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         if !self.is_valid() {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         out.extend_from_slice(&self.0);
         Ok(())
@@ -575,33 +575,41 @@ impl IaPd {
     }
 }
 
-/// Why bytes are not a DHCPv6 message.
+/// Why bytes are not a DHCPv6 message, or why a value cannot be written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ParseError {
+pub enum Error {
     /// The bytes are shorter than the message's header.
     Short,
     /// The bytes are longer than [`MAX_MESSAGE`]; the length is given.
     TooLong(usize),
     /// An option's header or body runs past the end of the bytes that hold
-    /// it.
+    /// it, or a TCP message's length prefix or body ended early.
     Truncated,
     /// The option with this code has a body its definition does not
     /// allow, such as the wrong length.
     BadOption(u16),
+    /// Bytes followed the TCP message.
+    Trailing,
+    /// The value cannot be written without changing it: a field or option
+    /// exceeds its limit, an option changes form when read, or a field
+    /// unused by the message type is nonzero.
+    Unwritable,
 }
 
-impl std::fmt::Display for ParseError {
+impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ParseError::Short => f.write_str("shorter than a DHCPv6 header"),
-            ParseError::TooLong(n) => write!(f, "{n} bytes, longer than a DHCPv6 message may be"),
-            ParseError::Truncated => f.write_str("an option runs past the end of the message"),
-            ParseError::BadOption(c) => write!(f, "option {c} is malformed"),
+            Error::Short => f.write_str("shorter than a DHCPv6 header"),
+            Error::TooLong(n) => write!(f, "{n} bytes, longer than a DHCPv6 message may be"),
+            Error::Truncated => f.write_str("an option or TCP message runs past the end of its bytes"),
+            Error::BadOption(c) => write!(f, "option {c} is malformed"),
+            Error::Trailing => f.write_str("bytes after the DHCPv6 TCP message"),
+            Error::Unwritable => f.write_str("DHCPv6 value cannot be written without changing it"),
         }
     }
 }
 
-impl std::error::Error for ParseError {}
+impl std::error::Error for Error {}
 
 /// One DHCPv6 message. Client and server messages use `transaction`;
 /// relay messages ([`msg::RELAY_FORW`] and [`msg::RELAY_REPL`]) use
@@ -645,7 +653,7 @@ impl Message {
     /// from a client uses hop count 0; one that received a Relay-forward
     /// uses its hop count plus 1.
     ///
-    /// Returns [`WriteError::Unwritable`] when `inner` cannot be written.
+    /// Returns [`Error::Unwritable`] when `inner` cannot be written.
     /// The outer message's [`Wire::write`] refuses it if it does not fit
     /// within [`MAX_MESSAGE`].
     pub fn relay_forward(
@@ -653,7 +661,7 @@ impl Message {
         hop_count: u8,
         link_address: Ipv6Addr,
         peer_address: Ipv6Addr,
-    ) -> Result<Message, WriteError> {
+    ) -> Result<Message, Error> {
         Ok(Message {
             msg_type: msg::RELAY_FORW,
             transaction: 0,
@@ -665,15 +673,15 @@ impl Message {
     }
 
     /// Reads the message in `b`, refusing more than `limit` bytes.
-    fn parse_within(b: &[u8], limit: usize) -> Result<Message, ParseError> {
+    fn parse_within(b: &[u8], limit: usize) -> Result<Message, Error> {
         if b.len() > limit {
-            return Err(ParseError::TooLong(b.len()));
+            return Err(Error::TooLong(b.len()));
         }
-        let &msg_type = b.first().ok_or(ParseError::Short)?;
+        let &msg_type = b.first().ok_or(Error::Short)?;
         let mut m = Message::new(msg_type, 0);
         let rest = if m.is_relay() {
             if b.len() < RELAY_HEADER_LEN {
-                return Err(ParseError::Short);
+                return Err(Error::Short);
             }
             m.hop_count = b[1];
             m.link_address = addr(b, 2);
@@ -681,7 +689,7 @@ impl Message {
             &b[RELAY_HEADER_LEN..]
         } else {
             if b.len() < CLIENT_HEADER_LEN {
-                return Err(ParseError::Short);
+                return Err(Error::Short);
             }
             m.transaction = u32::from_be_bytes([0, b[1], b[2], b[3]]);
             &b[CLIENT_HEADER_LEN..]
@@ -691,7 +699,7 @@ impl Message {
     }
 
     /// The message's bytes, in at most `limit` bytes.
-    fn write_within(&self, limit: usize) -> Result<Vec<u8>, WriteError> {
+    fn write_within(&self, limit: usize) -> Result<Vec<u8>, Error> {
         if (self.is_relay() && self.transaction != 0)
             || (!self.is_relay()
                 && (self.transaction > 0x00ff_ffff
@@ -699,7 +707,7 @@ impl Message {
                     || self.link_address != Ipv6Addr::UNSPECIFIED
                     || self.peer_address != Ipv6Addr::UNSPECIFIED))
         {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         let mut out = Vec::new();
         out.push(self.msg_type);
@@ -711,7 +719,7 @@ impl Message {
             out.extend_from_slice(&self.transaction.to_be_bytes()[1..]);
         }
         let budget = limit - out.len();
-        out.extend_from_slice(&encode_options(&self.options, 0, budget).ok_or(WriteError::Unwritable)?);
+        out.extend_from_slice(&encode_options(&self.options, 0, budget).ok_or(Error::Unwritable)?);
         Ok(out)
     }
 
@@ -778,7 +786,7 @@ impl Message {
     /// again to unwrap it. Each call reads the inner bytes afresh, so a
     /// server should stop after [`HOP_COUNT_LIMIT`] + 1 layers, the most
     /// that relay agents pass on.
-    pub fn relayed(&self) -> Option<Result<Message, ParseError>> {
+    pub fn relayed(&self) -> Option<Result<Message, Error>> {
         if !self.is_relay() {
             return None;
         }
@@ -804,10 +812,10 @@ impl Message {
     /// that sent this Relay-forward. It copies the hop count, the link and
     /// peer addresses, and the Interface-Id option if there is one.
     ///
-    /// Returns [`WriteError::Unwritable`] when `inner` cannot be written.
+    /// Returns [`Error::Unwritable`] when `inner` cannot be written.
     /// The outer message's [`Wire::write`] refuses it if it does not fit
     /// within [`MAX_MESSAGE`].
-    pub fn relay_reply(&self, inner: &Message) -> Result<Message, WriteError> {
+    pub fn relay_reply(&self, inner: &Message) -> Result<Message, Error> {
         let mut options = Vec::new();
         if let Some(id) = self.interface_id() {
             options.push(DhcpOption::InterfaceId(id.to_vec()));
@@ -824,36 +832,18 @@ impl Message {
     }
 }
 
-/// A DHCPv6 value cannot be written without changing it.
-///
-/// A field or option exceeds its limit, an option changes form when read,
-/// or a field unused by the message type is nonzero.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WriteError {
-    /// The value cannot be written without changing it.
-    Unwritable,
-}
-
-impl core::fmt::Display for WriteError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("DHCPv6 value cannot be written without changing it")
-    }
-}
-
-impl core::error::Error for WriteError {}
-
 impl Wire for Message {
-    type ParseError = ParseError;
-    type WriteError = WriteError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads one UDP message. Refuses short headers, malformed options, and messages above [`MAX_MESSAGE`].
-    fn parse(b: &[u8]) -> Result<Message, ParseError> {
+    fn parse(b: &[u8]) -> Result<Message, Error> {
         Message::parse_within(b, MAX_MESSAGE)
     }
 
     /// Appends a UDP message. Refuses unused nonzero fields, invalid options,
     /// excess nesting, and size limits. Leaves `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         out.extend_from_slice(&self.write_within(MAX_MESSAGE)?);
         Ok(())
     }
@@ -869,52 +859,29 @@ pub struct Frame(
     pub Message,
 );
 
-/// Why bytes do not contain exactly one DHCPv6 TCP message.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FrameParseError {
-    /// The message body was refused.
-    Message(ParseError),
-    /// The length prefix or message ended early.
-    Truncated,
-    /// Bytes followed the message.
-    Trailing,
-}
-
-impl core::fmt::Display for FrameParseError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Message(e) => e.fmt(f),
-            Self::Truncated => f.write_str("DHCPv6 TCP message ended early"),
-            Self::Trailing => f.write_str("bytes after the DHCPv6 TCP message"),
-        }
-    }
-}
-
-impl core::error::Error for FrameParseError {}
-
 impl Wire for Frame {
-    type ParseError = FrameParseError;
-    type WriteError = WriteError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads exactly one length-prefixed TCP message.
     /// Refuses malformed messages, short prefixes or bodies, and trailing bytes.
-    fn parse(bytes: &[u8]) -> Result<Self, FrameParseError> {
-        let step = match Frames.decode(bytes, true) {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        let step = match Messages.decode(bytes, true) {
             Ok(step) => step,
             Err(never) => match never {},
         };
         match step {
-            Step::Item(message, used) if used == bytes.len() => message.map(Self).map_err(FrameParseError::Message),
-            Step::Item(_, _) => Err(FrameParseError::Trailing),
-            _ => Err(FrameParseError::Truncated),
+            Step::Item(message, used) if used == bytes.len() => message.map(Self),
+            Step::Item(_, _) => Err(Error::Trailing),
+            _ => Err(Error::Truncated),
         }
     }
 
     /// Appends a TCP message. Refuses unused nonzero fields, invalid options,
     /// excess nesting, and size limits. Leaves `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         let bytes = self.0.write_within(MAX_TCP_MESSAGE)?;
-        let len = u16::try_from(bytes.len()).map_err(|_| WriteError::Unwritable)?;
+        let len = u16::try_from(bytes.len()).map_err(|_| Error::Unwritable)?;
         out.extend_from_slice(&len.to_be_bytes());
         out.extend_from_slice(&bytes);
         Ok(())
@@ -923,36 +890,36 @@ impl Wire for Frame {
 
 /// Reads DHCPv6 TCP messages without retaining input bytes.
 ///
-/// Use with [`Stream<Frames>`](fictionet::stdlib::codec::Stream) for at most [`MAX_BUFFERED`] unread bytes. Each
+/// Use with [`Stream<Messages>`](fictionet::stdlib::codec::Stream) for at most [`MAX_BUFFERED`] unread bytes. Each
 /// two-byte length delimits one item. Malformed messages are error items,
 /// so the next message can still be read. Framing has no protocol errors.
 /// Partial prefixes and bodies return [`Step::Need`], including at EOF;
 /// the driver reports [`Fail::Truncated`](fictionet::stdlib::codec::Fail::Truncated). UDP uses [`Wire`] on [`Message`].
 ///
 /// ```
-/// use fictionet::stdlib::{dhcpv6::{Frame, Frames, Message, msg}, codec::{Stream, Wire}};
+/// use fictionet::stdlib::{dhcpv6::{Frame, Messages, Message, msg}, codec::{Stream, Wire}};
 ///
 /// let message = Message::new(msg::SOLICIT, 7);
 /// let bytes = Wire::to_bytes(&Frame(message.clone()))?;
-/// let mut stream = Stream::new(Frames::new());
+/// let mut stream = Stream::new(Messages::new());
 /// assert_eq!(stream.push(&bytes), bytes.len());
 /// assert_eq!(stream.next(), Some(Ok(Ok(message))));
 /// stream.end();
 /// assert_eq!(stream.next(), None);
-/// # Ok::<(), fictionet::stdlib::dhcpv6::WriteError>(())
+/// # Ok::<(), fictionet::stdlib::dhcpv6::Error>(())
 /// ```
 #[derive(Clone, Copy, Debug, Default)]
-pub struct Frames;
+pub struct Messages;
 
-impl Frames {
+impl Messages {
     /// Creates a TCP message decoder with no retained state.
     pub fn new() -> Self {
         Self
     }
 }
 
-impl Decode for Frames {
-    type Item = Result<Message, ParseError>;
+impl Decode for Messages {
+    type Item = Result<Message, Error>;
     type Error = Infallible;
     const NAME: &'static str = "DHCPv6 over TCP";
 
@@ -974,15 +941,15 @@ fn find_status(options: &[DhcpOption]) -> Option<&StatusCode> {
 }
 
 /// Reads an option list at `depth`.
-fn parse_options(b: &[u8], depth: usize) -> Result<Vec<DhcpOption>, ParseError> {
+fn parse_options(b: &[u8], depth: usize) -> Result<Vec<DhcpOption>, Error> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < b.len() {
-        let head = b.get(i..i + 4).ok_or(ParseError::Truncated)?;
+        let head = b.get(i..i + 4).ok_or(Error::Truncated)?;
         let code = u16::from_be_bytes([head[0], head[1]]);
         let len = usize::from(u16::from_be_bytes([head[2], head[3]]));
         let start = i + 4;
-        let body = b.get(start..start + len).ok_or(ParseError::Truncated)?;
+        let body = b.get(start..start + len).ok_or(Error::Truncated)?;
         out.push(parse_option(code, body, depth)?);
         i = start + len;
     }
@@ -991,8 +958,8 @@ fn parse_options(b: &[u8], depth: usize) -> Result<Vec<DhcpOption>, ParseError> 
 
 /// Reads one option's body. Options that hold options are read only above
 /// [`MAX_DEPTH`]; at it, they are kept as [`DhcpOption::Other`].
-fn parse_option(code: u16, b: &[u8], depth: usize) -> Result<DhcpOption, ParseError> {
-    let bad = ParseError::BadOption(code);
+fn parse_option(code: u16, b: &[u8], depth: usize) -> Result<DhcpOption, Error> {
+    let bad = Error::BadOption(code);
     let fixed = |n: usize| if b.len() == n { Ok(()) } else { Err(bad) };
     let at_least = |n: usize| if b.len() >= n { Ok(()) } else { Err(bad) };
     let nest = depth < MAX_DEPTH;
@@ -1423,7 +1390,7 @@ mod tests {
         for len in [0, MIN_DUID - 1, MIN_DUID, MAX_DUID, MAX_DUID + 1] {
             let bytes = vec![0; len];
             let valid = (MIN_DUID..=MAX_DUID).contains(&len);
-            let expected = if valid { Ok(Duid(bytes.clone())) } else { Err(ParseError::BadOption(opt::CLIENTID)) };
+            let expected = if valid { Ok(Duid(bytes.clone())) } else { Err(Error::BadOption(opt::CLIENTID)) };
             assert_eq!(Duid::parse(&bytes), expected);
             assert_eq!(Duid(bytes.clone()).to_bytes().is_ok(), valid);
             contract::check_wire::<Duid>(&bytes);
@@ -1601,17 +1568,17 @@ mod tests {
 
     #[test]
     fn short_and_long_messages() {
-        assert_eq!(Message::parse(&[]), Err(ParseError::Short));
-        assert_eq!(Message::parse(&[1, 0, 0]), Err(ParseError::Short));
-        assert_eq!(Message::parse(&[12; 33]), Err(ParseError::Short));
-        assert_eq!(Message::parse(&[13; 33]), Err(ParseError::Short));
+        assert_eq!(Message::parse(&[]), Err(Error::Short));
+        assert_eq!(Message::parse(&[1, 0, 0]), Err(Error::Short));
+        assert_eq!(Message::parse(&[12; 33]), Err(Error::Short));
+        assert_eq!(Message::parse(&[13; 33]), Err(Error::Short));
         assert!(Message::parse(&[1, 0, 0, 0]).is_ok());
         assert!(Message::parse(&[12; 34]).is_ok());
         // Message types past 13 are read as client and server messages.
         assert!(Message::parse(&[200, 0, 0, 0]).is_ok());
         let mut long = vec![1, 0, 0, 0];
         long.resize(MAX_MESSAGE + 1, 0);
-        assert_eq!(Message::parse(&long), Err(ParseError::TooLong(MAX_MESSAGE + 1)));
+        assert_eq!(Message::parse(&long), Err(Error::TooLong(MAX_MESSAGE + 1)));
         // An Other option fills the rest exactly.
         long.truncate(MAX_MESSAGE);
         long[4..8].copy_from_slice(&[0, 99, 0xff, 0xef]);
@@ -1623,12 +1590,12 @@ mod tests {
     #[test]
     fn truncated_options() {
         // A header cut short, and a body that runs past the end.
-        assert_eq!(Message::parse(&[1, 0, 0, 0, 0]), Err(ParseError::Truncated));
-        assert_eq!(Message::parse(&[1, 0, 0, 0, 0, 8, 0]), Err(ParseError::Truncated));
-        assert_eq!(Message::parse(&[1, 0, 0, 0, 0, 8, 0, 2, 0]), Err(ParseError::Truncated));
+        assert_eq!(Message::parse(&[1, 0, 0, 0, 0]), Err(Error::Truncated));
+        assert_eq!(Message::parse(&[1, 0, 0, 0, 0, 8, 0]), Err(Error::Truncated));
+        assert_eq!(Message::parse(&[1, 0, 0, 0, 0, 8, 0, 2, 0]), Err(Error::Truncated));
         // Inside an IA_NA, too.
         let ia = [1, 0, 0, 0, 0, 3, 0, 14, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5];
-        assert_eq!(Message::parse(&ia), Err(ParseError::Truncated));
+        assert_eq!(Message::parse(&ia), Err(Error::Truncated));
     }
 
     /// A client message with one option, `code`, holding `body`.
@@ -1643,7 +1610,7 @@ mod tests {
     #[test]
     fn malformed_options() {
         let bad = |code: u16, body: &[u8]| {
-            assert_eq!(Message::parse(&with_option(code, body)), Err(ParseError::BadOption(code)), "{code} {body:?}");
+            assert_eq!(Message::parse(&with_option(code, body)), Err(Error::BadOption(code)), "{code} {body:?}");
         };
         bad(opt::CLIENTID, &[0, 3]);
         bad(opt::SERVERID, &[0; 131]);
@@ -1694,7 +1661,7 @@ mod tests {
         // A bad option inside an IA_NA names the inner option.
         let mut ia = vec![0u8; 12];
         ia.extend_from_slice(&[0, 13, 0, 1, 0]);
-        assert_eq!(Message::parse(&with_option(opt::IA_NA, &ia)), Err(ParseError::BadOption(opt::STATUS_CODE)));
+        assert_eq!(Message::parse(&with_option(opt::IA_NA, &ia)), Err(Error::BadOption(opt::STATUS_CODE)));
         // Bodies just long enough read.
         for (code, n) in [(opt::IA_NA, 12), (opt::IA_TA, 4), (opt::IAADDR, 24), (opt::IA_PD, 12), (opt::IAPREFIX, 25)] {
             assert!(Message::parse(&with_option(code, &vec![0; n])).is_ok(), "{code}");
@@ -1719,7 +1686,7 @@ mod tests {
     fn spec_review_cases() {
         // RFC 8415, section 21.15: a User Class option holds one or more
         // instances, so readers and writers refuse a list with no items.
-        assert_eq!(Message::parse(&with_option(opt::USER_CLASS, &[])), Err(ParseError::BadOption(opt::USER_CLASS)));
+        assert_eq!(Message::parse(&with_option(opt::USER_CLASS, &[])), Err(Error::BadOption(opt::USER_CLASS)));
         assert!(Message::parse(&with_option(opt::USER_CLASS, &[0, 0])).is_ok());
         let mut m = Message::new(msg::SOLICIT, 1);
         m.options.push(DhcpOption::UserClass(vec![]));
@@ -1731,7 +1698,7 @@ mod tests {
         }
         // Section 21.13: a status message is not null-terminated.
         let nul = with_option(opt::STATUS_CODE, &[0, 0, b'o', b'k', 0]);
-        assert_eq!(Message::parse(&nul), Err(ParseError::BadOption(opt::STATUS_CODE)));
+        assert_eq!(Message::parse(&nul), Err(Error::BadOption(opt::STATUS_CODE)));
         assert!(Message::parse(&with_option(opt::STATUS_CODE, &[0, 0, 0, b'k'])).is_ok());
         let mut m = Message::new(msg::REPLY, 1);
         m.options.push(DhcpOption::StatusCode(StatusCode { code: 0, message: "ok\0".into() }));
@@ -1780,10 +1747,10 @@ mod tests {
     #[test]
     fn stream_takes_many_small_messages_in_linear_time() {
         let n = 1_000_000;
-        let mut stream = Stream::new(Frames::new());
+        let mut stream = Stream::new(Messages::new());
         let mut count = 0;
         pump(&mut stream, &vec![0; 2 * n], |m| {
-            assert_eq!(m, Err(ParseError::Short));
+            assert_eq!(m, Err(Error::Short));
             count += 1;
         })
         .unwrap();
@@ -1795,10 +1762,10 @@ mod tests {
 
     #[test]
     fn errors_display() {
-        for e in [ParseError::Short, ParseError::TooLong(70000), ParseError::Truncated, ParseError::BadOption(3)] {
+        for e in [Error::Short, Error::TooLong(70000), Error::Truncated, Error::BadOption(3)] {
             assert!(!e.to_string().is_empty());
         }
-        assert_eq!(ParseError::BadOption(3).to_string(), "option 3 is malformed");
+        assert_eq!(Error::BadOption(3).to_string(), "option 3 is malformed");
     }
 
     #[test]
@@ -1817,19 +1784,19 @@ mod tests {
             for n in 0..full.len() {
                 let r = Message::parse(&full[..n]);
                 if n < header {
-                    assert_eq!(r, Err(ParseError::Short), "{n}");
+                    assert_eq!(r, Err(Error::Short), "{n}");
                 } else if ends.contains(&n) {
                     // Cut between options: a shorter message.
                     assert_eq!(r.unwrap().to_bytes().unwrap(), full[..n], "{n}");
                 } else {
-                    assert_eq!(r, Err(ParseError::Truncated), "{n}");
+                    assert_eq!(r, Err(Error::Truncated), "{n}");
                 }
             }
             // Over TCP, every prefix waits for more.
             let framed = Frame(Message::parse(&full).unwrap().clone()).to_bytes().unwrap();
-            contract::check_decode_with_alloc_limit(Frames::new, &framed, 2 * MAX_BUFFERED);
+            contract::check_decode_with_alloc_limit(Messages::new, &framed, 2 * MAX_BUFFERED);
             for n in 0..framed.len() {
-                assert_eq!(Frames::new().decode(&framed[..n], false), Ok(Step::Need));
+                assert_eq!(Messages::new().decode(&framed[..n], false), Ok(Step::Need));
             }
         }
     }
@@ -1841,10 +1808,10 @@ mod tests {
         let mut bytes = Frame(first.clone()).to_bytes().unwrap();
         bytes.extend_from_slice(&[0, 3, 1, 0, 0]);
         bytes.extend_from_slice(&Frame(second.clone()).to_bytes().unwrap());
-        contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_BUFFERED);
-        assert_eq!(decode_all(Frames::new, &bytes), (vec![Ok(first), Err(ParseError::Short), Ok(second)], None));
-        let (messages, error) = decode_all(Frames::new, &[0, 0, 0, 4, 2, 0, 0, 1]);
-        assert_eq!(messages, [Err(ParseError::Short), Ok(Message::new(2, 1))]);
+        contract::check_decode_with_alloc_limit(Messages::new, &bytes, 2 * MAX_BUFFERED);
+        assert_eq!(decode_all(Messages::new, &bytes), (vec![Ok(first), Err(Error::Short), Ok(second)], None));
+        let (messages, error) = decode_all(Messages::new, &[0, 0, 0, 4, 2, 0, 0, 1]);
+        assert_eq!(messages, [Err(Error::Short), Ok(Message::new(2, 1))]);
         assert_eq!(error, None);
     }
 
@@ -1924,7 +1891,7 @@ mod tests {
                 value.write(&mut out).unwrap();
                 assert_eq!(Message::parse(&out[1..]), Ok(value.clone()));
             } else {
-                assert_eq!(value.write(&mut out), Err(WriteError::Unwritable));
+                assert_eq!(value.write(&mut out), Err(Error::Unwritable));
                 assert_eq!(out, [0x5a]);
             }
             contract::check_wire_value(&value);
@@ -2075,7 +2042,7 @@ mod tests {
                     contract::check_wire_value(&inner);
                 }
             }
-            contract::check_decode_with_alloc_limit(Frames::new, &data, 2 * MAX_BUFFERED);
+            contract::check_decode_with_alloc_limit(Messages::new, &data, 2 * MAX_BUFFERED);
         }
         assert!(accepted > 500, "{accepted}");
     }
@@ -2091,7 +2058,7 @@ mod tests {
         let value = Frame::parse(&frame).unwrap();
         assert_eq!(value.to_bytes().unwrap(), frame);
         assert!(value.0.to_bytes().is_err());
-        contract::check_decode_with_alloc_limit(Frames::new, &frame, 2 * MAX_BUFFERED);
+        contract::check_decode_with_alloc_limit(Messages::new, &frame, 2 * MAX_BUFFERED);
     }
 
     #[test]
@@ -2107,7 +2074,7 @@ mod tests {
     #[test]
     fn review_vendor_and_dns_bodies() {
         let bad = |code: u16, body: &[u8]| {
-            assert_eq!(Message::parse(&with_option(code, body)), Err(ParseError::BadOption(code)), "{code} {body:?}");
+            assert_eq!(Message::parse(&with_option(code, body)), Err(Error::BadOption(code)), "{code} {body:?}");
         };
         // RFC 8415, section 21.16: one or more vendor classes.
         bad(opt::VENDOR_CLASS, &[0, 0, 0, 1]);
@@ -2141,12 +2108,12 @@ mod tests {
 
     #[test]
     fn review_stream_holds_a_bounded_number_of_bytes() {
-        let mut stream = Stream::new(Frames::new());
+        let mut stream = Stream::new(Messages::new());
         assert_eq!(stream.push(&vec![0; 2 * MAX_BUFFERED]), MAX_BUFFERED);
         assert_eq!(stream.buffered(), MAX_BUFFERED);
-        assert_eq!(stream.next(), Some(Ok(Err(ParseError::Short))));
+        assert_eq!(stream.next(), Some(Ok(Err(Error::Short))));
         assert_eq!(stream.push(&[0; 4096]), 2);
-        contract::check_decode_with_alloc_limit(Frames::new, &[0; 4096], 2 * MAX_BUFFERED);
+        contract::check_decode_with_alloc_limit(Messages::new, &[0; 4096], 2 * MAX_BUFFERED);
     }
 
     #[test]
@@ -2155,10 +2122,10 @@ mod tests {
         inner.transaction = 0x0100_0000;
         assert_eq!(
             Message::relay_forward(&inner, 0, Ipv6Addr::UNSPECIFIED, Ipv6Addr::UNSPECIFIED),
-            Err(WriteError::Unwritable)
+            Err(Error::Unwritable)
         );
         let forward = Message::new(msg::RELAY_FORW, 0);
-        assert_eq!(forward.relay_reply(&inner), Err(WriteError::Unwritable));
+        assert_eq!(forward.relay_reply(&inner), Err(Error::Unwritable));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use fictionet::stdlib::codec::{
     Carry, Decode, Demux, Fail, Layered, Pipe, PipeError, Step, Wire, contract, test_support,
 };
-use fictionet::stdlib::grpc::{Code, FrameError, HEADER_LEN, Message, Messages, fail_status};
+use fictionet::stdlib::grpc::{Code, Error, HEADER_LEN, Message, Messages, fail_status};
 use std::collections::BTreeMap;
 
 const MESSAGE_LIMIT: usize = 8;
@@ -12,7 +12,7 @@ const H2_HEADER_LEN: usize = 9;
 
 type Key = (u8, u32);
 type Calls = Demux<Key, Messages>;
-type Results = BTreeMap<Key, Vec<Result<Message, Fail<FrameError>>>>;
+type Results = BTreeMap<Key, Vec<Result<Message, Fail<Error>>>>;
 
 #[test]
 fn partial_message_prefix_ends_the_call_with_internal() {
@@ -128,7 +128,7 @@ fn route(chunk_size: usize) {
             let stream = calls.get_mut(&frame.key).unwrap();
             assert_eq!(
                 stream.failed(),
-                Some(&Fail::Protocol(FrameError::TooLarge {
+                Some(&Fail::Protocol(Error::TooLarge {
                     length: 9,
                     limit: MESSAGE_LIMIT
                 }))
@@ -169,7 +169,7 @@ fn route(chunk_size: usize) {
         ),
         (
             (0, 5),
-            vec![Err(Fail::Protocol(FrameError::TooLarge {
+            vec![Err(Fail::Protocol(Error::TooLarge {
                 length: 9,
                 limit: MESSAGE_LIMIT,
             }))],
@@ -320,7 +320,7 @@ fn pipe_carries_http2_data_across_frames_and_checks_inner_eof() {
         (
             data_bytes(1, &[(&[0, 0], false), (&[0, 0, 9], false)]),
             vec![],
-            Some(Fail::Protocol(FrameError::TooLarge {
+            Some(Fail::Protocol(Error::TooLarge {
                 length: 9,
                 limit: MESSAGE_LIMIT,
             })),

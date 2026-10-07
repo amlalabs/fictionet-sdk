@@ -120,7 +120,7 @@ impl Modbus {
 }
 impl Decode for Modbus {
     type Item = Display;
-    type Error = fictionet::stdlib::modbus::FrameError;
+    type Error = fictionet::stdlib::modbus::Error;
     const NAME: &'static str = "Modbus/TCP";
     fn capacity(&self) -> usize {
         self.frames.capacity()

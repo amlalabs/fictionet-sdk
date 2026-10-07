@@ -65,14 +65,14 @@ use fictionet::stdlib::codec::{self, Decode, Wire};
 
 /// Why the next PROXY header cannot be framed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HeaderError {
+pub enum FrameError {
     /// A signature or fixed header is invalid, or a v1 line exceeds [`V1_MAX_LEN`].
     Protocol(Error),
     /// The declared header exceeds the configured whole-header limit.
     TooLong,
 }
 
-impl core::fmt::Display for HeaderError {
+impl core::fmt::Display for FrameError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Protocol(e) => e.fmt(f),
@@ -80,48 +80,30 @@ impl core::fmt::Display for HeaderError {
         }
     }
 }
-impl core::error::Error for HeaderError {}
-
-/// Why an exact [`Wire`] parse cannot read one PROXY header.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HeaderParseError {
-    /// The header is malformed.
-    Protocol(Error),
-    /// The input ends inside a header.
-    Truncated,
-    /// Bytes follow the header.
-    Trailing,
-    /// The header has a different version from the requested wire type.
-    WrongVersion,
-}
-
-impl core::fmt::Display for HeaderParseError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+impl core::error::Error for FrameError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
-            Self::Protocol(e) => e.fmt(f),
-            Self::Truncated => f.write_str("incomplete PROXY header"),
-            Self::Trailing => f.write_str("bytes after the PROXY header"),
-            Self::WrongVersion => f.write_str("PROXY header has the wrong version"),
+            Self::Protocol(e) => Some(e),
+            Self::TooLong => None,
         }
     }
 }
-impl core::error::Error for HeaderParseError {}
 
 impl Wire for Header {
-    type ParseError = HeaderParseError;
+    type ParseError = Error;
     type WriteError = Error;
 
     /// Reads exactly one header. Refuses incomplete or trailing bytes,
     /// malformed headers and checksums changed by canonical re-encoding.
     /// LOCAL ignores an unreadable address block, but still checks any
     /// checksum TLV it can find, even before a later malformed TLV.
-    fn parse(bytes: &[u8]) -> Result<Self, HeaderParseError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         let (header, used) = Self::parse_prefix(bytes)
-            .map_err(HeaderParseError::Protocol)?.ok_or(HeaderParseError::Truncated)?;
+            ?.ok_or(Error::Truncated)?;
         if used != bytes.len() {
-            return Err(HeaderParseError::Trailing);
+            return Err(Error::Trailing);
         }
-        header.write(&mut Vec::new()).map_err(HeaderParseError::Protocol)?;
+        header.write(&mut Vec::new())?;
         Ok(header)
     }
 
@@ -146,7 +128,7 @@ impl Wire for Header {
 /// complete line or v2 body is one refused item, followed by `End`.
 /// Bad signatures, fixed headers and limits are terminal errors.
 /// A v1 line without a newline within [`V1_MAX_LEN`] fails with
-/// [`Error::V1TooLong`]; a smaller configured limit gives [`HeaderError::TooLong`].
+/// [`Error::V1TooLong`]; a smaller configured limit gives [`FrameError::TooLong`].
 /// In particular, [`Error::NotProxy`] is a terminal `Protocol` error with
 /// no consumption. Use [`codec::Stream::swap`] or
 /// [`codec::Stream::into_parts`] to give every unread byte to the plain
@@ -187,20 +169,20 @@ impl Default for Headers {
 
 impl Decode for Headers {
     type Item = Result<Header, Error>;
-    type Error = HeaderError;
+    type Error = FrameError;
     const NAME: &'static str = "PROXY protocol";
 
     fn capacity(&self) -> usize {
         self.limit
     }
 
-    fn decode(&mut self, input: &[u8], _: bool) -> Result<codec::Step<Self::Item>, HeaderError> {
+    fn decode(&mut self, input: &[u8], _: bool) -> Result<codec::Step<Self::Item>, FrameError> {
         if self.done {
             return Ok(codec::Step::End);
         }
         let used = match detect(input) {
             Detection::NeedMore => return Ok(codec::Step::Need),
-            Detection::NotProxy => return Err(HeaderError::Protocol(Error::NotProxy)),
+            Detection::NotProxy => return Err(FrameError::Protocol(Error::NotProxy)),
             Detection::V1 => {
                 let cap = self.limit.min(V1_MAX_LEN);
                 let end = input.len().min(cap);
@@ -210,13 +192,13 @@ impl Decode for Headers {
                         .scanned
                         .checked_add(n)
                         .and_then(|n| n.checked_add(1))
-                        .ok_or(HeaderError::TooLong)?,
+                        .ok_or(FrameError::TooLong)?,
                     None => {
                         self.scanned = end;
                         return if end == V1_MAX_LEN {
-                            Err(HeaderError::Protocol(Error::V1TooLong))
+                            Err(FrameError::Protocol(Error::V1TooLong))
                         } else if end == cap {
-                            Err(HeaderError::TooLong)
+                            Err(FrameError::TooLong)
                         } else {
                             Ok(codec::Step::Need)
                         };
@@ -227,15 +209,15 @@ impl Decode for Headers {
                 // Validate just the fixed prefix even when a whole body is
                 // available, so header faults always have the same priority.
                 let fixed = input.get(..input.len().min(V2_HEADER_LEN)).unwrap_or_default();
-                Header::parse_prefix(fixed).map_err(HeaderError::Protocol)?;
+                Header::parse_prefix(fixed).map_err(FrameError::Protocol)?;
                 let Some(&[hi, lo]) = input.get(14..16) else {
                     return Ok(codec::Step::Need);
                 };
                 let used = V2_HEADER_LEN
                     .checked_add(usize::from(u16::from_be_bytes([hi, lo])))
-                    .ok_or(HeaderError::TooLong)?;
+                    .ok_or(FrameError::TooLong)?;
                 if used > self.limit {
-                    return Err(HeaderError::TooLong);
+                    return Err(FrameError::TooLong);
                 }
                 used
             }
@@ -491,6 +473,12 @@ pub enum Error {
     TlvLength(u8),
     /// The CRC32C TLV did not match the header, or there was more than one.
     Checksum,
+    /// The input ends inside a header.
+    Truncated,
+    /// Bytes follow the header.
+    Trailing,
+    /// The header has a different version from the requested wire type.
+    WrongVersion,
 }
 
 impl std::fmt::Display for Error {
@@ -509,6 +497,9 @@ impl std::fmt::Display for Error {
             Error::TlvTruncated => f.write_str("PROXY v2 TLV runs past its end"),
             Error::TlvLength(k) => write!(f, "PROXY v2 TLV type {k:#04x} has a value of the wrong length"),
             Error::Checksum => f.write_str("PROXY v2 CRC32C checksum does not match"),
+            Error::Truncated => f.write_str("incomplete PROXY header"),
+            Error::Trailing => f.write_str("bytes after the PROXY header"),
+            Error::WrongVersion => f.write_str("PROXY header has the wrong version"),
         }
     }
 }
@@ -669,16 +660,16 @@ fn same_family(src: SocketAddr, dst: SocketAddr) -> SamePair {
 }
 
 impl Wire for V1 {
-    type ParseError = HeaderParseError;
+    type ParseError = Error;
     type WriteError = Error;
 
     /// Reads exactly one V1 header. Refuses the other version, malformed
     /// addresses or ports, lines longer than `V1_MAX_LEN`, incomplete input
     /// and trailing bytes.
-    fn parse(bytes: &[u8]) -> Result<Self, HeaderParseError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         match Header::parse(bytes)? {
             Header::V1(value) => Ok(value),
-            _ => Err(HeaderParseError::WrongVersion),
+            _ => Err(Error::WrongVersion),
         }
     }
 
@@ -1111,15 +1102,15 @@ impl SslTlv {
 }
 
 impl Wire for V2 {
-    type ParseError = HeaderParseError;
+    type ParseError = Error;
     type WriteError = Error;
 
     /// Reads exactly one V2 header. Refuses the other version, malformed
     /// or incomplete input, trailing bytes and noncanonical checksums.
-    fn parse(bytes: &[u8]) -> Result<Self, HeaderParseError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         match Header::parse(bytes)? {
             Header::V2(value) => Ok(value),
-            _ => Err(HeaderParseError::WrongVersion),
+            _ => Err(Error::WrongVersion),
         }
     }
 
@@ -1259,7 +1250,6 @@ fn crc32c_update(mut crc: u32, data: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use HeaderParseError::Protocol;
     use codec::{
         Lcg, Stream, contract,
         test_support::{chunks, decode_all, mutate},
@@ -1310,7 +1300,7 @@ mod tests {
 
         let h = Header::parse(b"PROXY UNKNOWN\r\n").unwrap();
         assert_eq!(h, Header::V1(V1::Unknown(vec![])));
-        assert_eq!(Header::parse(b"PROXY UNKNOWN\r\nabc"), Err(HeaderParseError::Trailing));
+        assert_eq!(Header::parse(b"PROXY UNKNOWN\r\nabc"), Err(Error::Trailing));
 
         let h = Header::parse(b"PROXY TCP6 2001:db8::1 ::ffff:192.0.2.1 0 80\r\n").unwrap();
         let (s, d) = h.addresses().unwrap();
@@ -1320,7 +1310,7 @@ mod tests {
 
     #[test]
     fn v1_errors() {
-        let e = |b: &[u8]| match Header::parse(b).unwrap_err() { Protocol(e) => e, other => panic!("{other:?}") };
+        let e = |b: &[u8]| Header::parse(b).unwrap_err();
         assert_eq!(e(b"GET / HTTP/1.1\r\n"), Error::NotProxy);
         assert_eq!(e(b"PROXY\r\n"), Error::NotProxy);
         assert_eq!(e(b"PROXY TCP4 1.2.3.4 5.6.7.8 1 2\n"), Error::V1Syntax);
@@ -1440,17 +1430,17 @@ mod tests {
             b[at] = v;
             Header::parse(&b)
         };
-        assert_eq!(with(0, 0x0c), Err(Protocol(Error::NotProxy)));
-        assert_eq!(with(11, 0), Err(Protocol(Error::NotProxy)));
-        assert_eq!(with(12, 0x11), Err(Protocol(Error::Version(1))));
-        assert_eq!(with(12, 0x22), Err(Protocol(Error::Command(2))));
-        assert_eq!(with(13, 0x13), Err(Protocol(Error::Family(0x13))));
-        assert_eq!(with(13, 0x10), Err(Protocol(Error::Family(0x10))));
-        assert_eq!(with(13, 0x01), Err(Protocol(Error::Family(0x01))));
-        assert_eq!(with(15, 11), Err(Protocol(Error::Length(11))));
+        assert_eq!(with(0, 0x0c), Err(Error::NotProxy));
+        assert_eq!(with(11, 0), Err(Error::NotProxy));
+        assert_eq!(with(12, 0x11), Err(Error::Version(1)));
+        assert_eq!(with(12, 0x22), Err(Error::Command(2)));
+        assert_eq!(with(13, 0x13), Err(Error::Family(0x13)));
+        assert_eq!(with(13, 0x10), Err(Error::Family(0x10)));
+        assert_eq!(with(13, 0x01), Err(Error::Family(0x01)));
+        assert_eq!(with(15, 11), Err(Error::Length(11)));
         // Errors in the fixed part show before the rest arrives.
-        assert_eq!(Header::parse(&with_prefix(&[0x31])), Err(Protocol(Error::Version(3))));
-        assert_eq!(Header::parse(&with_prefix(&[0x21, 0x40])), Err(Protocol(Error::Family(0x40))));
+        assert_eq!(Header::parse(&with_prefix(&[0x31])), Err(Error::Version(3)));
+        assert_eq!(Header::parse(&with_prefix(&[0x21, 0x40])), Err(Error::Family(0x40)));
 
         let body = |tlvs: &[u8]| {
             let mut b = V2_SIGNATURE.to_vec();
@@ -1459,26 +1449,26 @@ mod tests {
             b.extend_from_slice(tlvs);
             Header::parse(&b)
         };
-        assert_eq!(body(&[0x01, 0x00]), Err(Protocol(Error::TlvTruncated)));
-        assert_eq!(body(&[0x01, 0x00, 0x02, b'h']), Err(Protocol(Error::TlvTruncated)));
-        assert_eq!(body(&[0x03, 0x00, 0x02, 0, 0]), Err(Protocol(Error::TlvLength(tlv_type::CRC32C))));
-        assert_eq!(body(&[0x20, 0x00, 0x04, 1, 0, 0, 0]), Err(Protocol(Error::TlvLength(tlv_type::SSL))));
-        assert_eq!(body(&[0x20, 0x00, 0x07, 1, 0, 0, 0, 0, 0x21, 0]), Err(Protocol(Error::TlvTruncated)));
+        assert_eq!(body(&[0x01, 0x00]), Err(Error::TlvTruncated));
+        assert_eq!(body(&[0x01, 0x00, 0x02, b'h']), Err(Error::TlvTruncated));
+        assert_eq!(body(&[0x03, 0x00, 0x02, 0, 0]), Err(Error::TlvLength(tlv_type::CRC32C)));
+        assert_eq!(body(&[0x20, 0x00, 0x04, 1, 0, 0, 0]), Err(Error::TlvLength(tlv_type::SSL)));
+        assert_eq!(body(&[0x20, 0x00, 0x07, 1, 0, 0, 0, 0, 0x21, 0]), Err(Error::TlvTruncated));
         let mut uid = vec![0x05, 0x00, 129];
         uid.extend_from_slice(&[0; 129]);
-        assert_eq!(body(&uid), Err(Protocol(Error::TlvLength(tlv_type::UNIQUE_ID))));
-        assert_eq!(body(&[0x03, 0x00, 0x04, 1, 2, 3, 4]), Err(Protocol(Error::Checksum)));
+        assert_eq!(body(&uid), Err(Error::TlvLength(tlv_type::UNIQUE_ID)));
+        assert_eq!(body(&[0x03, 0x00, 0x04, 1, 2, 3, 4]), Err(Error::Checksum));
         // Two checksums, even correct ones, are refused.
         let one = checksum_header(Command::Proxy);
         let mut two = one.clone();
         two.extend_from_slice(&one[16..]);
         two[15] = 14;
-        assert_eq!(Header::parse(&two), Err(Protocol(Error::Checksum)));
+        assert_eq!(Header::parse(&two), Err(Error::Checksum));
         assert!(Header::parse(&one).is_ok());
         // A changed byte breaks the checksum.
         let mut bad = one.clone();
         bad[12] = 0x20;
-        assert_eq!(Header::parse(&bad), Err(Protocol(Error::Checksum)));
+        assert_eq!(Header::parse(&bad), Err(Error::Checksum));
     }
 
     fn with_prefix(tail: &[u8]) -> Vec<u8> {
@@ -1503,11 +1493,11 @@ mod tests {
         assert_eq!(local(0x00, &[0x01, 0x00]), Ok(empty.clone()));
         assert_eq!(local(0x13, &[]).map(|h| reparses(&h)), Ok(empty));
         // A partial LOCAL header with a bad family still needs more.
-        assert_eq!(Header::parse(&with_prefix(&[0x20, 0x45, 0x00, 0x03, 1])), Err(HeaderParseError::Truncated));
+        assert_eq!(Header::parse(&with_prefix(&[0x20, 0x45, 0x00, 0x03, 1])), Err(Error::Truncated));
         // A wrong checksum is still refused.
         let mut one = checksum_header(Command::Local);
         one[19] ^= 1;
-        assert_eq!(Header::parse(&one), Err(Protocol(Error::Checksum)));
+        assert_eq!(Header::parse(&one), Err(Error::Checksum));
     }
 
     #[test]
@@ -1515,7 +1505,7 @@ mod tests {
         // LOCAL: a wrong checksum followed by a truncated TLV. The checksum
         // should be 0x5c5f83af.
         let local = with_prefix(&[0x20, 0x00, 0x00, 0x08, 0x03, 0x00, 0x04, 0, 0, 0, 0, 0xff]);
-        assert_eq!(Header::parse(&local), Err(Protocol(Error::Checksum)));
+        assert_eq!(Header::parse(&local), Err(Error::Checksum));
         // The same header with the right checksum is accepted, as LOCAL.
         let mut right = local.clone();
         right[19..23].copy_from_slice(&0x5c5f_83afu32.to_be_bytes());
@@ -1523,13 +1513,13 @@ mod tests {
         assert_eq!(Header::parse(&right), Ok(empty));
         // A checksum after a TLV whose value is bad is still checked.
         let local = with_prefix(&[0x20, 0x00, 0x00, 0x0a, 0x20, 0x00, 0x00, 0x03, 0x00, 0x04, 0, 0, 0, 0]);
-        assert_eq!(Header::parse(&local), Err(Protocol(Error::Checksum)));
+        assert_eq!(Header::parse(&local), Err(Error::Checksum));
         let mut proxy = local.clone();
         proxy[12] = 0x21;
-        assert_eq!(Header::parse(&proxy), Err(Protocol(Error::Checksum)));
+        assert_eq!(Header::parse(&proxy), Err(Error::Checksum));
         // A CRC32C TLV that cannot be checked is refused under LOCAL too.
         let local = with_prefix(&[0x20, 0x00, 0x00, 0x05, 0x03, 0x00, 0x02, 0, 0]);
-        assert_eq!(Header::parse(&local), Err(Protocol(Error::TlvLength(tlv_type::CRC32C))));
+        assert_eq!(Header::parse(&local), Err(Error::TlvLength(tlv_type::CRC32C)));
     }
 
     #[test]
@@ -1558,8 +1548,8 @@ mod tests {
 
     #[test]
     fn v1_unknown_is_a_word() {
-        assert_eq!(Header::parse(b"PROXY UNKNOWNfoo\r\n"), Err(Protocol(Error::V1Syntax)));
-        assert_eq!(Header::parse(b"PROXY UNKNOWN4 1.2.3.4 5.6.7.8 1 2\r\n"), Err(Protocol(Error::V1Syntax)));
+        assert_eq!(Header::parse(b"PROXY UNKNOWNfoo\r\n"), Err(Error::V1Syntax));
+        assert_eq!(Header::parse(b"PROXY UNKNOWN4 1.2.3.4 5.6.7.8 1 2\r\n"), Err(Error::V1Syntax));
         assert!(Header::parse(b"PROXY UNKNOWN junk\r\n").is_ok());
         // The writer refuses text that would join the word.
         let h = Header::V1(V1::Unknown(b"foo".to_vec()));
@@ -1570,7 +1560,7 @@ mod tests {
     fn v2_short_length_fails_early() {
         // A PROXY header whose length cannot hold its address block fails
         // as soon as the length is read.
-        assert_eq!(Header::parse(&with_prefix(&[0x21, 0x21, 0x00, 0x0c])), Err(Protocol(Error::Length(12))));
+        assert_eq!(Header::parse(&with_prefix(&[0x21, 0x21, 0x00, 0x0c])), Err(Error::Length(12)));
     }
 
     #[test]
@@ -1587,7 +1577,7 @@ mod tests {
         ];
         for h in &headers {
             for n in 0..h.len() {
-                assert_eq!(Header::parse(&h[..n]), Err(HeaderParseError::Truncated), "{n} bytes of {h:?}");
+                assert_eq!(Header::parse(&h[..n]), Err(Error::Truncated), "{n} bytes of {h:?}");
             }
             assert!(Header::parse(h).is_ok());
         }
@@ -1685,7 +1675,7 @@ mod tests {
         assert_eq!(s.push(b"PRO"), 3);
         assert_eq!(s.next(), None);
         assert_eq!(s.push(b"BE x"), 4);
-        assert_eq!(s.next(), Some(Err(codec::Fail::Protocol(HeaderError::Protocol(Error::NotProxy)))));
+        assert_eq!(s.next(), Some(Err(codec::Fail::Protocol(FrameError::Protocol(Error::NotProxy)))));
         assert_eq!(s.next(), None);
         assert_eq!(s.into_parts().0.unread(), b"PROBE x");
         // A payload beyond capacity remains with the caller, without copying or loss.
@@ -1733,9 +1723,9 @@ mod tests {
 
     #[test]
     fn exact_version_readers_report_the_other_version() {
-        assert_eq!(V1::parse(&tcp4().to_bytes().unwrap()), Err(HeaderParseError::WrongVersion));
-        assert_eq!(V2::parse(b"PROXY UNKNOWN\r\n"), Err(HeaderParseError::WrongVersion));
-        assert_eq!(HeaderParseError::WrongVersion.to_string(), "PROXY header has the wrong version");
+        assert_eq!(V1::parse(&tcp4().to_bytes().unwrap()), Err(Error::WrongVersion));
+        assert_eq!(V2::parse(b"PROXY UNKNOWN\r\n"), Err(Error::WrongVersion));
+        assert_eq!(Error::WrongVersion.to_string(), "PROXY header has the wrong version");
     }
 
     #[test]

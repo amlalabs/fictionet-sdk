@@ -9,7 +9,7 @@ use fictionet::stdlib::ospf::{
     ALL_SPF_ROUTERS_V4, ALL_SPF_ROUTERS_V6, AsExternalLsa, AsExternalLsaV3, Auth, Body, DatabaseDescription,
     Endpoints, ExternalRoute, Header, HelloV2, HelloV3, InterAreaPrefixLsa, InterAreaRouterLsa, IntraAreaPrefixLsa,
     LSA_HEADER_LEN, LinkLsa, Lsa, LsaBody, LsaHeader, LsaKey, MAX_LSA, MAX_MESSAGE, MAX_PACKET, NetworkLsa,
-    NetworkLsaV3, OPTION_L_V2, OPTION_L_V3, OspfError, Packet, Prefix, RouterInterface, RouterLink, RouterLsa,
+    NetworkLsaV3, OPTION_L_V2, OPTION_L_V3, Error, Packet, Prefix, RouterInterface, RouterLink, RouterLsa,
     RouterLsaV3, SummaryLsa, TosMetric, Version, checksum, lsa_checksum, lsa_type_v2, lsa_type_v3,
 };
 use fictionet::stdlib::{codec::{Wire, Collect, Decode, contract}, ospf};
@@ -69,7 +69,7 @@ fn check_lsa(data: &[u8], v: Version) {
         };
         match LsaBody::parse(body, v, t) {
             Ok(b) => assert_eq!(b.frame(v, t).and_then(|frame| frame.to_bytes()).as_deref(), Ok(body)),
-            Err(e) => assert!(body.len() <= MAX_LSA - LSA_HEADER_LEN || e == OspfError::TooLong),
+            Err(e) => assert!(body.len() <= MAX_LSA - LSA_HEADER_LEN || e == Error::TooLong),
         }
     }
 }

@@ -3,13 +3,13 @@
 
 use fictionet::stdlib::codec::{Wire, contract, test_support::decode_all};
 use fictionet::stdlib::sip::{
-    CSeq, Contacts, Error, Frames, MAX_BODY, MAX_HEAD, MAX_MESSAGE, Message, NameAddr, Param, Scheme, Uri, Via,
+    CSeq, Contacts, Error, Messages, MAX_BODY, MAX_HEAD, MAX_MESSAGE, Message, NameAddr, Param, Scheme, Uri, Via,
 };
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(Frames::new, data, 2 * MAX_MESSAGE);
-    contract::check_decode_with_held_limit(Frames::new, data, 0);
+    contract::check_decode_with_alloc_limit(Messages::new, data, 2 * MAX_MESSAGE);
+    contract::check_decode_with_held_limit(Messages::new, data, 0);
     contract::check_wire::<Message>(data);
     contract::check_wire::<Uri>(data);
     contract::check_wire::<NameAddr>(data);
@@ -22,10 +22,10 @@ fuzz_target!(|data: &[u8]| {
     contract::check_wire_value(&message);
     if let Ok(bytes) = message.to_bytes() {
         contract::check_wire::<Message>(&bytes);
-        contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_MESSAGE);
+        contract::check_decode_with_alloc_limit(Messages::new, &bytes, 2 * MAX_MESSAGE);
     }
 
-    let (messages, _) = decode_all(Frames::new, data);
+    let (messages, _) = decode_all(Messages::new, data);
     for message in messages.iter().flatten() {
         round_trip(message);
     }

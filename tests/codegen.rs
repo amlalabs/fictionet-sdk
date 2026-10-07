@@ -16,10 +16,10 @@ mod edges;
 
 use fictionet::stdlib::{
     codec::{Decode, Lcg, Step, Wire, contract},
-    onc_rpc::{Reader, Writer, XdrError},
+    onc_rpc::{self, Reader, Writer},
 };
 
-fn dynamic_read(bytes: &[u8]) -> Result<xdr::Record, XdrError> {
+fn dynamic_read(bytes: &[u8]) -> Result<xdr::Record, onc_rpc::Error> {
     let mut r = Reader::new(bytes);
     let unsigned = r.uint()?;
     let signed = r.int()?;
@@ -29,7 +29,7 @@ fn dynamic_read(bytes: &[u8]) -> Result<xdr::Record, XdrError> {
         -1 => xdr::Choice::Negative,
         0 => xdr::Choice::Zero,
         1 => xdr::Choice::Positive,
-        n => return Err(XdrError::Discriminant(n as u32)),
+        n => return Err(onc_rpc::Error::Discriminant(n as u32)),
     };
     let opaque = r.opaque_fixed(4)?.to_vec();
     let entries = r.array(8, Reader::uint)?;

@@ -46,58 +46,56 @@ pub const MAX_FRAME: usize = 292;
 /// The local limit on a reassembled application fragment.
 pub const MAX_FRAGMENT: usize = 64 << 10;
 
-/// Why a link frame cannot be read or written.
+/// Why a link frame, a transport segment or an application fragment
+/// cannot be read or written, or why a segment sequence cannot be used.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FrameError {
+pub enum Error {
     /// The start bytes were not `05 64`.
     Start,
     /// The length field was below five, or user data exceeded 250 bytes.
-    Length,
+    FrameLength,
     /// A CRC failed, at this byte offset in the wire frame.
     Crc(usize),
-}
-
-impl std::fmt::Display for FrameError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Start => f.write_str("DNP3 frame does not start with 05 64"),
-            Self::Length => f.write_str("DNP3 frame length is outside its range"),
-            Self::Crc(at) => write!(f, "DNP3 CRC failed at byte {at}"),
-        }
-    }
-}
-impl std::error::Error for FrameError {}
-
-/// Why an exact [`Wire`] parse did not read one complete frame.
-/// [`Frame::parse_prefix`] reads a prefix and returns the bytes used.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FrameParseError {
-    /// The frame is invalid.
-    Frame(FrameError),
     /// The input ended before a complete frame, including empty input.
     Truncated,
     /// Bytes follow the first complete frame.
     Trailing,
+    /// The link frame does not carry transport data.
+    NotData,
+    /// A segment needs a header and 1 to 249 data bytes.
+    SegmentLength,
+    /// A sequence number is above 63, or does not follow the previous one.
+    Sequence,
+    /// A continuation arrived without a first segment.
+    MissingFirst,
+    /// The application fragment would exceed [`MAX_FRAGMENT`].
+    FragmentTooLong,
+    /// Missing application header bytes, or more than [`MAX_FRAGMENT`].
+    FragmentLength,
+    /// Response functions (bit 7 set) require IIN; requests must omit it.
+    Indications,
 }
 
-impl core::fmt::Display for FrameParseError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Frame(e) => e.fmt(f),
+            Self::Start => f.write_str("DNP3 frame does not start with 05 64"),
+            Self::FrameLength => f.write_str("DNP3 frame length is outside its range"),
+            Self::Crc(at) => write!(f, "DNP3 CRC failed at byte {at}"),
             Self::Truncated => f.write_str("incomplete DNP3 frame"),
             Self::Trailing => f.write_str("bytes follow the DNP3 frame"),
+            Self::NotData => f.write_str("DNP3 link frame does not carry user data"),
+            Self::SegmentLength => f.write_str("DNP3 transport segment length is outside 2..=250"),
+            Self::Sequence => f.write_str("DNP3 transport sequence is invalid"),
+            Self::MissingFirst => f.write_str("DNP3 transport continuation has no first segment"),
+            Self::FragmentTooLong => f.write_str("DNP3 application fragment exceeds the local limit"),
+            Self::FragmentLength => f.write_str("DNP3 application fragment length is outside its range"),
+            Self::Indications => f.write_str("DNP3 internal indications do not match the function"),
         }
     }
 }
 
-impl core::error::Error for FrameParseError {
-    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
-        match self {
-            Self::Frame(e) => Some(e),
-            Self::Truncated | Self::Trailing => None,
-        }
-    }
-}
+impl std::error::Error for Error {}
 
 /// CRC-16/DNP: reflected polynomial `0xa6bc`, initial value zero, complemented
 /// result. A frame sends the result least significant byte first.
@@ -130,16 +128,16 @@ impl Frame {
     /// Reads one frame at the start of `b`, returning its consumed length.
     /// `Ok(None)` means more bytes are needed. Invalid headers and complete
     /// bad CRC blocks are reported as soon as they are available.
-    pub fn parse_prefix(b: &[u8]) -> Result<Option<(Self, usize)>, FrameError> {
+    pub fn parse_prefix(b: &[u8]) -> Result<Option<(Self, usize)>, Error> {
         let n = b.len().min(2);
         if b[..n] != [5, 0x64][..n] {
-            return Err(FrameError::Start);
+            return Err(Error::Start);
         }
         let Some(&length) = b.get(2) else {
             return Ok(None);
         };
         if length < 5 {
-            return Err(FrameError::Length);
+            return Err(Error::FrameLength);
         }
         if b.len() < HEADER_LEN {
             return Ok(None);
@@ -186,37 +184,37 @@ impl Frame {
     }
 
     /// Reads the transport segment of a confirmed or unconfirmed user-data
-    /// frame. Link-only and unknown functions give [`TransportError::NotData`].
-    pub fn segment(&self) -> Result<Segment, TransportError> {
+    /// frame. Link-only and unknown functions give [`Error::NotData`].
+    pub fn segment(&self) -> Result<Segment, Error> {
         if !self.is_primary() || !matches!(self.function(), 3 | 4) {
-            return Err(TransportError::NotData);
+            return Err(Error::NotData);
         }
         Segment::parse(&self.data)
     }
 }
 
 impl Wire for Frame {
-    type ParseError = FrameParseError;
-    type WriteError = FrameError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads exactly one frame. Incomplete input and trailing bytes are errors.
-    /// Returns [`FrameParseError::Truncated`] for an incomplete frame and
-    /// [`FrameParseError::Trailing`] for extra bytes. Bad start bytes, lengths
-    /// and CRCs return [`FrameParseError::Frame`] with [`FrameError::Start`],
-    /// [`FrameError::Length`] or [`FrameError::Crc`].
-    fn parse(b: &[u8]) -> Result<Self, FrameParseError> {
-        match Self::parse_prefix(b).map_err(FrameParseError::Frame)? {
+    /// Returns [`Error::Truncated`] for an incomplete frame and
+    /// [`Error::Trailing`] for extra bytes. Bad start bytes, lengths
+    /// and CRCs return [`Error::Start`],
+    /// [`Error::FrameLength`] or [`Error::Crc`].
+    fn parse(b: &[u8]) -> Result<Self, Error> {
+        match Self::parse_prefix(b)? {
             Some((frame, used)) if used == b.len() => Ok(frame),
-            Some(_) => Err(FrameParseError::Trailing),
-            None => Err(FrameParseError::Truncated),
+            Some(_) => Err(Error::Trailing),
+            None => Err(Error::Truncated),
         }
     }
 
     /// Writes the header and each data block with freshly calculated CRCs.
-    /// Returns [`FrameError::Length`] if data exceeds [`MAX_DATA`].
-    fn write(&self, dst: &mut Vec<u8>) -> Result<(), FrameError> {
+    /// Returns [`Error::FrameLength`] if data exceeds [`MAX_DATA`].
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
         if self.data.len() > MAX_DATA {
-            return Err(FrameError::Length);
+            return Err(Error::FrameLength);
         }
         let mut out = Vec::with_capacity(MAX_FRAME);
         out.extend_from_slice(&[5, 0x64, (self.data.len() + 5) as u8, self.control]);
@@ -249,7 +247,7 @@ impl Frames {
 
 impl Decode for Frames {
     type Item = Frame;
-    type Error = FrameError;
+    type Error = Error;
     const NAME: &'static str = "DNP3";
 
     fn capacity(&self) -> usize {
@@ -257,9 +255,9 @@ impl Decode for Frames {
     }
 
     /// Reads a frame prefix, returning [`Step::Need`] while incomplete.
-    /// Returns [`FrameError::Start`], [`FrameError::Length`] or
-    /// [`FrameError::Crc`] for invalid start bytes, lengths or CRCs.
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, FrameError> {
+    /// Returns [`Error::Start`], [`Error::FrameLength`] or
+    /// [`Error::Crc`] for invalid start bytes, lengths or CRCs.
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, Error> {
         Ok(match Frame::parse_prefix(input)? {
             Some((frame, used)) => Step::Item(frame, used),
             None => Step::Need,
@@ -271,40 +269,13 @@ fn le16(b: &[u8], at: usize) -> u16 {
     u16::from_le_bytes([b[at], b[at + 1]])
 }
 
-fn check_crc(b: &[u8], at: usize, size: usize) -> Result<(), FrameError> {
+fn check_crc(b: &[u8], at: usize, size: usize) -> Result<(), Error> {
     if crc(&b[at..at + size]) == le16(b, at + size) {
         Ok(())
     } else {
-        Err(FrameError::Crc(at + size))
+        Err(Error::Crc(at + size))
     }
 }
-
-/// Why a transport segment or sequence cannot be used.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TransportError {
-    /// The link frame does not carry transport data.
-    NotData,
-    /// A segment needs a header and 1 to 249 data bytes.
-    Length,
-    /// A sequence number is above 63, or does not follow the previous one.
-    Sequence,
-    /// A continuation arrived without a first segment.
-    MissingFirst,
-    /// The application fragment would exceed [`MAX_FRAGMENT`].
-    TooLong,
-}
-impl std::fmt::Display for TransportError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::NotData => "DNP3 link frame does not carry user data",
-            Self::Length => "DNP3 transport segment length is outside 2..=250",
-            Self::Sequence => "DNP3 transport sequence is invalid",
-            Self::MissingFirst => "DNP3 transport continuation has no first segment",
-            Self::TooLong => "DNP3 application fragment exceeds the local limit",
-        })
-    }
-}
-impl std::error::Error for TransportError {}
 
 /// One transport header and its portion of an application fragment.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -319,12 +290,12 @@ pub struct Segment {
     pub data: Vec<u8>,
 }
 impl Segment {
-    fn validate(&self) -> Result<(), TransportError> {
+    fn validate(&self) -> Result<(), Error> {
         if self.sequence > 63 {
-            return Err(TransportError::Sequence);
+            return Err(Error::Sequence);
         }
         if self.data.is_empty() || self.data.len() >= MAX_DATA {
-            return Err(TransportError::Length);
+            return Err(Error::SegmentLength);
         }
         Ok(())
     }
@@ -344,7 +315,7 @@ impl Reassembler {
     }
 
     /// Adds a segment, returning an application fragment at FIN.
-    pub fn push(&mut self, segment: &Segment) -> Result<Option<Vec<u8>>, TransportError> {
+    pub fn push(&mut self, segment: &Segment) -> Result<Option<Vec<u8>>, Error> {
         let result = self.push_inner(segment);
         if result.is_err() {
             *self = Self::new();
@@ -352,14 +323,14 @@ impl Reassembler {
         result
     }
 
-    fn push_inner(&mut self, s: &Segment) -> Result<Option<Vec<u8>>, TransportError> {
+    fn push_inner(&mut self, s: &Segment) -> Result<Option<Vec<u8>>, Error> {
         s.validate()?;
         if s.first {
             self.data.clear();
         } else {
-            let expected = self.next.ok_or(TransportError::MissingFirst)?;
+            let expected = self.next.ok_or(Error::MissingFirst)?;
             if s.sequence != expected {
-                return Err(TransportError::Sequence);
+                return Err(Error::Sequence);
             }
         }
         if self
@@ -368,7 +339,7 @@ impl Reassembler {
             .checked_add(s.data.len())
             .is_none_or(|n| n > MAX_FRAGMENT)
         {
-            return Err(TransportError::TooLong);
+            return Err(Error::FragmentTooLong);
         }
         self.data.extend_from_slice(&s.data);
         self.next = Some((s.sequence + 1) & 63);
@@ -386,24 +357,6 @@ impl Reassembler {
     }
 }
 
-/// Why an application fragment cannot be read or written.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FragmentError {
-    /// Missing application header bytes, or more than [`MAX_FRAGMENT`].
-    Length,
-    /// Response functions (bit 7 set) require IIN; requests must omit it.
-    Indications,
-}
-impl std::fmt::Display for FragmentError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Length => "DNP3 application fragment length is outside its range",
-            Self::Indications => "DNP3 internal indications do not match the function",
-        })
-    }
-}
-impl std::error::Error for FragmentError {}
-
 /// An application fragment, after transport reassembly. Object headers and
 /// values remain opaque; no application-fragment reassembly is performed.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -418,15 +371,15 @@ pub struct Fragment {
     pub objects: Vec<u8>,
 }
 impl Wire for Segment {
-    type ParseError = TransportError;
-    type WriteError = TransportError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads a whole transport segment, without link framing.
-    /// Returns [`TransportError::Length`] unless the input has 2 through
+    /// Returns [`Error::SegmentLength`] unless the input has 2 through
     /// [`MAX_DATA`] bytes.
-    fn parse(b: &[u8]) -> Result<Self, TransportError> {
+    fn parse(b: &[u8]) -> Result<Self, Error> {
         if !(2..=MAX_DATA).contains(&b.len()) {
-            return Err(TransportError::Length);
+            return Err(Error::SegmentLength);
         }
         Ok(Self {
             first: b[0] & 0x40 != 0,
@@ -437,9 +390,9 @@ impl Wire for Segment {
     }
 
     /// Writes a transport header followed by its data.
-    /// Returns [`TransportError::Sequence`] above sequence 63 and
-    /// [`TransportError::Length`] unless data has 1 through 249 bytes.
-    fn write(&self, dst: &mut Vec<u8>) -> Result<(), TransportError> {
+    /// Returns [`Error::Sequence`] above sequence 63 and
+    /// [`Error::SegmentLength`] unless data has 1 through 249 bytes.
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
         self.validate()?;
         let mut out = vec![
             self.sequence
@@ -453,20 +406,20 @@ impl Wire for Segment {
 }
 
 impl Wire for Fragment {
-    type ParseError = FragmentError;
-    type WriteError = FragmentError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads one complete application fragment.
-    /// Returns [`FragmentError::Length`] for a short header, a response
+    /// Returns [`Error::FragmentLength`] for a short header, a response
     /// without its two IIN bytes, or input above [`MAX_FRAGMENT`].
-    fn parse(b: &[u8]) -> Result<Self, FragmentError> {
+    fn parse(b: &[u8]) -> Result<Self, Error> {
         if b.len() < 2 || b.len() > MAX_FRAGMENT {
-            return Err(FragmentError::Length);
+            return Err(Error::FragmentLength);
         }
         let response = b[1] & 0x80 != 0;
         let header = if response { 4 } else { 2 };
         if b.len() < header {
-            return Err(FragmentError::Length);
+            return Err(Error::FragmentLength);
         }
         Ok(Self {
             control: b[0],
@@ -477,16 +430,16 @@ impl Wire for Fragment {
     }
 
     /// Writes an application fragment, requiring IIN exactly for responses.
-    /// Returns [`FragmentError::Indications`] if IIN presence disagrees
-    /// with the response bit. Returns [`FragmentError::Length`] when the
+    /// Returns [`Error::Indications`] if IIN presence disagrees
+    /// with the response bit. Returns [`Error::FragmentLength`] when the
     /// header and objects exceed [`MAX_FRAGMENT`].
-    fn write(&self, dst: &mut Vec<u8>) -> Result<(), FragmentError> {
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
         if (self.function & 0x80 != 0) != self.indications.is_some() {
-            return Err(FragmentError::Indications);
+            return Err(Error::Indications);
         }
         let header = if self.indications.is_some() { 4 } else { 2 };
         if self.objects.len() > MAX_FRAGMENT - header {
-            return Err(FragmentError::Length);
+            return Err(Error::FragmentLength);
         }
         let mut out = vec![self.control, self.function];
         if let Some(iin) = self.indications {
@@ -521,7 +474,7 @@ mod tests {
             }
         );
         assert_eq!(frame.to_bytes().unwrap(), RESET);
-        assert_eq!(frame.segment(), Err(TransportError::NotData));
+        assert_eq!(frame.segment(), Err(Error::NotData));
         for n in 0..RESET.len() {
             assert_eq!(Frame::parse_prefix(&RESET[..n]), Ok(None));
         }
@@ -551,7 +504,7 @@ mod tests {
             source: 0,
             data: vec![0; MAX_DATA + 1],
         };
-        assert_eq!(frame.to_bytes(), Err(FrameError::Length));
+        assert_eq!(frame.to_bytes(), Err(Error::FrameLength));
     }
 
     #[test]
@@ -567,13 +520,13 @@ mod tests {
             let mut bad = bytes.clone();
             bad[at] ^= 1;
             assert!(
-                matches!(Frame::parse_prefix(&bad), Err(FrameError::Crc(_))),
+                matches!(Frame::parse_prefix(&bad), Err(Error::Crc(_))),
                 "offset {at}"
             );
         }
-        assert_eq!(Frame::parse_prefix(&[4]), Err(FrameError::Start));
-        assert_eq!(Frame::parse_prefix(&[5, 0x65]), Err(FrameError::Start));
-        assert_eq!(Frame::parse_prefix(&[5, 0x64, 4]), Err(FrameError::Length));
+        assert_eq!(Frame::parse_prefix(&[4]), Err(Error::Start));
+        assert_eq!(Frame::parse_prefix(&[5, 0x65]), Err(Error::Start));
+        assert_eq!(Frame::parse_prefix(&[5, 0x64, 4]), Err(Error::FrameLength));
     }
 
     #[test]
@@ -593,8 +546,8 @@ mod tests {
         assert_eq!(frames, vec![frame; 10]);
         let mut stream = Stream::new(Frames);
         assert_eq!(stream.push(&vec![0; MAX_FRAME + 1]), MAX_FRAME);
-        assert_eq!(stream.next(), Some(Err(Fail::Protocol(FrameError::Start))));
-        assert_eq!(stream.failed(), Some(&Fail::Protocol(FrameError::Start)));
+        assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::Start))));
+        assert_eq!(stream.failed(), Some(&Fail::Protocol(Error::Start)));
         assert!(stream.next().is_none());
         assert_eq!(stream.push(&[0]), 1);
     }
@@ -614,7 +567,7 @@ mod tests {
         s.sequence = 0;
         s.final_segment = true;
         assert_eq!(r.push(&s), Ok(Some(vec![1, 2, 1, 2])));
-        assert_eq!(r.push(&s), Err(TransportError::MissingFirst));
+        assert_eq!(r.push(&s), Err(Error::MissingFirst));
         s.first = true;
         s.final_segment = false;
         assert_eq!(r.push(&s), Ok(None));
@@ -622,12 +575,12 @@ mod tests {
         assert_eq!(r.pending(), 2);
         s.first = false;
         s.sequence = 2;
-        assert_eq!(r.push(&s), Err(TransportError::Sequence));
+        assert_eq!(r.push(&s), Err(Error::Sequence));
         assert_eq!(r.pending(), 0);
         s.sequence = 64;
-        assert_eq!(s.to_bytes(), Err(TransportError::Sequence));
-        assert_eq!(Segment::parse(&[]), Err(TransportError::Length));
-        assert_eq!(Segment::parse(&[0xc0]), Err(TransportError::Length));
+        assert_eq!(s.to_bytes(), Err(Error::Sequence));
+        assert_eq!(Segment::parse(&[]), Err(Error::SegmentLength));
+        assert_eq!(Segment::parse(&[0xc0]), Err(Error::SegmentLength));
     }
 
     #[test]
@@ -645,7 +598,7 @@ mod tests {
             s.sequence = (s.sequence + 1) & 63;
             match r.push(&s) {
                 Ok(None) => assert!(r.pending() <= MAX_FRAGMENT),
-                Err(TransportError::TooLong) => break,
+                Err(Error::FragmentTooLong) => break,
                 other => panic!("unexpected result {other:?}"),
             }
         }
@@ -665,10 +618,10 @@ mod tests {
             let fragment = Fragment::parse(bytes).unwrap();
             assert_eq!(fragment.to_bytes().unwrap(), bytes);
         }
-        assert_eq!(Fragment::parse(&[0xc0]), Err(FragmentError::Length));
+        assert_eq!(Fragment::parse(&[0xc0]), Err(Error::FragmentLength));
         assert_eq!(
             Fragment::parse(&[0xc0, 0x81, 0]),
-            Err(FragmentError::Length)
+            Err(Error::FragmentLength)
         );
         let mut fragment = Fragment {
             control: 0xc0,
@@ -676,11 +629,11 @@ mod tests {
             indications: Some(0),
             objects: vec![],
         };
-        assert_eq!(fragment.to_bytes(), Err(FragmentError::Indications));
+        assert_eq!(fragment.to_bytes(), Err(Error::Indications));
         fragment.indications = None;
         fragment.objects = vec![0; MAX_FRAGMENT - 2];
         assert!(fragment.to_bytes().is_ok());
         fragment.objects.push(0);
-        assert_eq!(fragment.to_bytes(), Err(FragmentError::Length));
+        assert_eq!(fragment.to_bytes(), Err(Error::FragmentLength));
     }
 }

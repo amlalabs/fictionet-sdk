@@ -200,7 +200,7 @@ impl Group {
 
     /// A range of groups: `address` with its first `mask_len` bits fixed,
     /// and no flags. A mask longer than the address is a
-    /// [`PimError::MaskLen`] when written.
+    /// [`Error::MaskLen`] when written.
     pub fn range(address: IpAddr, mask_len: u8) -> Group {
         Group { address, mask_len, bidirectional: false, zone: false }
     }
@@ -213,12 +213,12 @@ pub struct Source {
     pub address: IpAddr,
     /// How many leading bits of `address` count. RFC 7761 requires the
     /// full length, 32 for IPv4 and 128 for IPv6, and any other value is
-    /// a [`PimError::MaskLen`].
+    /// an [`Error::MaskLen`].
     pub mask_len: u8,
     /// The S bit: the sender is in Sparse Mode. Always set in Sparse Mode.
     pub sparse: bool,
     /// The W bit: a wildcard entry, (*,G), joining the shared tree. It
-    /// needs the R bit too, or the source is a [`PimError::SourceFlags`].
+    /// needs the R bit too, or the source is an [`Error::SourceFlags`].
     pub wildcard: bool,
     /// The R bit: the entry is sent toward the RP.
     pub rpt: bool,
@@ -399,7 +399,7 @@ pub struct CandidateRp {
     /// The candidate RP's address.
     pub rp: IpAddr,
     /// The group ranges it offers to serve. At most 255. RFC 5059 says not
-    /// to send an empty list, so writing one is a [`PimError::Count`], but
+    /// to send an empty list, so writing one is an [`Error::Count`], but
     /// one is read, since a BSR treats one from an older router as every
     /// group: 224.0.0.0/4 or ff00::/8.
     pub groups: Vec<Group>,
@@ -438,7 +438,7 @@ pub enum Message {
 
 /// Why bytes are not a PIM message, or a message cannot be written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum PimError {
+pub enum Error {
     /// The bytes end before the message does.
     Truncated,
     /// Bytes follow the end of the message.
@@ -551,36 +551,36 @@ impl Endpoints {
     }
 }
 
-impl std::fmt::Display for PimError {
+impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PimError::Truncated => write!(f, "the message is cut short"),
-            PimError::Trailing { remaining } => {
+            Error::Truncated => write!(f, "the message is cut short"),
+            Error::Trailing { remaining } => {
                 write!(f, "{remaining} bytes after the PIM message")
             }
-            PimError::TooLong => write!(f, "the message is longer than its IP packet can carry"),
-            PimError::Version(v) => write!(f, "version {v}, not 2"),
-            PimError::Checksum => write!(f, "the checksum is wrong"),
-            PimError::Family(a) => write!(f, "address family {a}, not 1 (IPv4) or 2 (IPv6)"),
-            PimError::Encoding(e) => write!(f, "address encoding type {e}, not 0"),
-            PimError::FamilyMismatch(a) => write!(f, "address family {a}, not the family of the packet"),
-            PimError::MaskLen(m) => write!(f, "mask length {m} does not fit the address"),
-            PimError::SourceFlags => write!(f, "a source with the W bit but not the R bit"),
-            PimError::JoinPruneGroup => write!(f, "a Join/Prune group that is not one multicast group"),
-            PimError::SourceList => {
+            Error::TooLong => write!(f, "the message is longer than its IP packet can carry"),
+            Error::Version(v) => write!(f, "version {v}, not 2"),
+            Error::Checksum => write!(f, "the checksum is wrong"),
+            Error::Family(a) => write!(f, "address family {a}, not 1 (IPv4) or 2 (IPv6)"),
+            Error::Encoding(e) => write!(f, "address encoding type {e}, not 0"),
+            Error::FamilyMismatch(a) => write!(f, "address family {a}, not the family of the packet"),
+            Error::MaskLen(m) => write!(f, "mask length {m} does not fit the address"),
+            Error::SourceFlags => write!(f, "a source with the W bit but not the R bit"),
+            Error::JoinPruneGroup => write!(f, "a Join/Prune group that is not one multicast group"),
+            Error::SourceList => {
                 write!(f, "a Join/Prune group with two (*,G) entries or a source joined and pruned")
             }
-            PimError::Inner => write!(f, "a Register packet without an IP header of the packet's family"),
-            PimError::Zone => write!(f, "an admin scope zone bit or scoped range that breaks RFC 5059"),
-            PimError::OptionLength { kind, len } => write!(f, "Hello option {kind} with a {len}-byte value"),
-            PimError::Unwritable => f.write_str("value cannot be written without changing it"),
-            PimError::Count => write!(f, "a list is longer than its count allows, or empty where it must not be"),
-            PimError::Value => write!(f, "a field is above its largest value"),
+            Error::Inner => write!(f, "a Register packet without an IP header of the packet's family"),
+            Error::Zone => write!(f, "an admin scope zone bit or scoped range that breaks RFC 5059"),
+            Error::OptionLength { kind, len } => write!(f, "Hello option {kind} with a {len}-byte value"),
+            Error::Unwritable => f.write_str("value cannot be written without changing it"),
+            Error::Count => write!(f, "a list is longer than its count allows, or empty where it must not be"),
+            Error::Value => write!(f, "a field is above its largest value"),
         }
     }
 }
 
-impl std::error::Error for PimError {}
+impl std::error::Error for Error {}
 
 fn full_mask(a: IpAddr) -> u8 {
     match a {
@@ -651,18 +651,18 @@ fn checksum_matches(got: u16, want: u16) -> bool {
 
 /// Checks a complete header. Refuses a wrong version, a missing header,
 /// or a payload above `max`, the longest message the packet can carry.
-fn check_header(b: &[u8], max: usize) -> Result<(), PimError> {
+fn check_header(b: &[u8], max: usize) -> Result<(), Error> {
     if let Some(&first) = b.first() {
         let version = first >> 4;
         if version != VERSION {
-            return Err(PimError::Version(version));
+            return Err(Error::Version(version));
         }
     }
     if b.len() > max {
-        return Err(PimError::TooLong);
+        return Err(Error::TooLong);
     }
     if b.len() < HEADER_LEN {
-        return Err(PimError::Truncated);
+        return Err(Error::Truncated);
     }
     Ok(())
 }
@@ -671,30 +671,30 @@ fn check_header(b: &[u8], max: usize) -> Result<(), PimError> {
 /// family whose addresses are `addr_len` bytes: version 4, at least 20
 /// bytes and a header length from 5 words to the packet's length, or
 /// version 6 and at least 40 bytes.
-fn check_inner(p: &[u8], addr_len: usize) -> Result<(), PimError> {
+fn check_inner(p: &[u8], addr_len: usize) -> Result<(), Error> {
     let ok = match (p.first(), addr_len) {
         (Some(&b), 4) => b >> 4 == 4 && p.len() >= 20 && (5..=p.len() / 4).contains(&usize::from(b & 0x0f)),
         (Some(&b), _) => b >> 4 == 6 && p.len() >= 40,
         (None, _) => false,
     };
-    if ok { Ok(()) } else { Err(PimError::Inner) }
+    if ok { Ok(()) } else { Err(Error::Inner) }
 }
 
 /// Checks a multicast group and conflicting Join/Prune entries.
 /// The message limit bounds the number of entries sorted.
-fn check_join_prune_group(g: &JoinPruneGroup) -> Result<(), PimError> {
+fn check_join_prune_group(g: &JoinPruneGroup) -> Result<(), Error> {
     if !g.group.address.is_multicast() || g.group.mask_len != full_mask(g.group.address) {
-        return Err(PimError::JoinPruneGroup);
+        return Err(Error::JoinPruneGroup);
     }
-    let count = g.joins.len().checked_add(g.prunes.len()).ok_or(PimError::TooLong)?;
+    let count = g.joins.len().checked_add(g.prunes.len()).ok_or(Error::TooLong)?;
     // Each encoded source needs at least eight bytes.
-    if count > MAX_MESSAGE / 8 { return Err(PimError::TooLong); }
+    if count > MAX_MESSAGE / 8 { return Err(Error::TooLong); }
     let mut wildcard = false;
     let mut entries = Vec::with_capacity(count);
     for (pruned, list) in [(false, &g.joins), (true, &g.prunes)] {
         for source in list {
             if source.wildcard {
-                if wildcard { return Err(PimError::SourceList); }
+                if wildcard { return Err(Error::SourceList); }
                 wildcard = true;
                 continue;
             }
@@ -708,7 +708,7 @@ fn check_join_prune_group(g: &JoinPruneGroup) -> Result<(), PimError> {
         .windows(2)
         .any(|w| w[0].0 == w[1].0 && w[0].1 == w[1].1 && w[0].2 != w[1].2)
     {
-        return Err(PimError::SourceList);
+        return Err(Error::SourceList);
     }
     Ok(())
 }
@@ -717,9 +717,9 @@ fn check_join_prune_group(g: &JoinPruneGroup) -> Result<(), PimError> {
 /// groups. Only the first group may have the Z bit. If it does and it is
 /// IPv6, every group needs a mask of at least 16 bits and the first
 /// group's scope, the low 4 bits of the address's second byte.
-fn check_scope(groups: &[BootstrapGroup]) -> Result<(), PimError> {
+fn check_scope(groups: &[BootstrapGroup]) -> Result<(), Error> {
     if groups.iter().skip(1).any(|g| g.group.zone) {
-        return Err(PimError::Zone);
+        return Err(Error::Zone);
     }
     if let Some(first) = groups.first()
         && first.group.zone
@@ -729,7 +729,7 @@ fn check_scope(groups: &[BootstrapGroup]) -> Result<(), PimError> {
         for g in groups {
             match g.group.address {
                 IpAddr::V6(b) if g.group.mask_len >= 16 && b.octets()[1] & 0x0f == scope => {}
-                _ => return Err(PimError::Zone),
+                _ => return Err(Error::Zone),
             }
         }
     }
@@ -745,25 +745,25 @@ struct Reader<'a> {
 }
 
 impl<'a> Reader<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8], PimError> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
         if self.b.len() < n {
-            return Err(PimError::Truncated);
+            return Err(Error::Truncated);
         }
         let (head, rest) = self.b.split_at(n);
         self.b = rest;
         Ok(head)
     }
 
-    fn u8(&mut self) -> Result<u8, PimError> {
+    fn u8(&mut self) -> Result<u8, Error> {
         Ok(self.take(1)?[0])
     }
 
-    fn u16(&mut self) -> Result<u16, PimError> {
+    fn u16(&mut self) -> Result<u16, Error> {
         let b = self.take(2)?;
         Ok(u16::from_be_bytes([b[0], b[1]]))
     }
 
-    fn u32(&mut self) -> Result<u32, PimError> {
+    fn u32(&mut self) -> Result<u32, Error> {
         let b = self.take(4)?;
         Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
     }
@@ -772,11 +772,11 @@ impl<'a> Reader<'a> {
         self.b.is_empty()
     }
 
-    fn end(&self) -> Result<(), PimError> {
+    fn end(&self) -> Result<(), Error> {
         if self.b.is_empty() {
             Ok(())
         } else {
-            Err(PimError::Trailing {
+            Err(Error::Trailing {
                 remaining: self.b.len(),
             })
         }
@@ -784,24 +784,24 @@ impl<'a> Reader<'a> {
 
     /// The family and encoding type bytes, checked, and the address
     /// length they give. The family must be the packet's.
-    fn family(&mut self) -> Result<usize, PimError> {
+    fn family(&mut self) -> Result<usize, Error> {
         let fam = self.u8()?;
         let len = match fam {
             family::IPV4 => 4,
             family::IPV6 => 16,
-            f => return Err(PimError::Family(f)),
+            f => return Err(Error::Family(f)),
         };
         if len != self.addr_len {
-            return Err(PimError::FamilyMismatch(fam));
+            return Err(Error::FamilyMismatch(fam));
         }
         let enc = self.u8()?;
         if enc != 0 {
-            return Err(PimError::Encoding(enc));
+            return Err(Error::Encoding(enc));
         }
         Ok(len)
     }
 
-    fn address(&mut self, len: usize) -> Result<IpAddr, PimError> {
+    fn address(&mut self, len: usize) -> Result<IpAddr, Error> {
         let b = self.take(len)?;
         Ok(if len == 4 {
             IpAddr::V4(Ipv4Addr::new(b[0], b[1], b[2], b[3]))
@@ -812,18 +812,18 @@ impl<'a> Reader<'a> {
         })
     }
 
-    fn unicast(&mut self) -> Result<IpAddr, PimError> {
+    fn unicast(&mut self) -> Result<IpAddr, Error> {
         let len = self.family()?;
         self.address(len)
     }
 
     /// A group: its mask length is at most the address length.
-    fn group(&mut self) -> Result<Group, PimError> {
+    fn group(&mut self) -> Result<Group, Error> {
         let len = self.family()?;
         let flags = self.u8()?;
         let mask_len = self.u8()?;
         if usize::from(mask_len) > len * 8 {
-            return Err(PimError::MaskLen(mask_len));
+            return Err(Error::MaskLen(mask_len));
         }
         let address = self.address(len)?;
         Ok(Group { address, mask_len, bidirectional: flags & 0x80 != 0, zone: flags & 0x01 != 0 })
@@ -831,25 +831,25 @@ impl<'a> Reader<'a> {
 
     /// A source: its mask length is the full address length, and the W
     /// bit comes with the R bit.
-    fn source(&mut self) -> Result<Source, PimError> {
+    fn source(&mut self) -> Result<Source, Error> {
         let len = self.family()?;
         let flags = self.u8()?;
         let mask_len = self.u8()?;
         if usize::from(mask_len) != len * 8 {
-            return Err(PimError::MaskLen(mask_len));
+            return Err(Error::MaskLen(mask_len));
         }
         let (wildcard, rpt) = (flags & 0x02 != 0, flags & 0x01 != 0);
         if wildcard && !rpt {
-            return Err(PimError::SourceFlags);
+            return Err(Error::SourceFlags);
         }
         let address = self.address(len)?;
         Ok(Source { address, mask_len, sparse: flags & 0x04 != 0, wildcard, rpt })
     }
 }
 
-fn parse_hello_option(kind: u16, value: &[u8], addr_len: usize) -> Result<HelloOption, PimError> {
+fn parse_hello_option(kind: u16, value: &[u8], addr_len: usize) -> Result<HelloOption, Error> {
     // The value came from a 16-bit length, so its length fits.
-    let bad = || PimError::OptionLength { kind, len: value.len() as u16 };
+    let bad = || Error::OptionLength { kind, len: value.len() as u16 };
     let mut r = Reader { b: value, addr_len };
     let fixed = |n: usize| if value.len() == n { Ok(()) } else { Err(bad()) };
     Ok(match kind {
@@ -917,9 +917,9 @@ impl Message {
     /// The rules on Join/Prune groups, Register packets and Bootstrap
     /// fragments in the module docs are checked too, and a Z bit where it
     /// has no meaning is read as clear.
-    pub fn parse(b: &[u8], endpoints: &Endpoints) -> Result<Message, PimError> {
+    pub fn parse(b: &[u8], endpoints: &Endpoints) -> Result<Message, Error> {
         check_header(b, endpoints.max_message())?;
-        let want = checksum(b, endpoints).ok_or(PimError::Truncated)?;
+        let want = checksum(b, endpoints).ok_or(Error::Truncated)?;
         let got = u16::from_be_bytes([b[2], b[3]]);
         // RFC 7761 sets the IPv6 pseudo-header length of a Register to 8
         // even when the checksum covers the whole message. Some senders
@@ -932,7 +932,7 @@ impl Message {
                         && checksum_matches(got, checksum_over(b, b.len(), endpoints))))
         };
         if !checksum_matches(got, want) && !whole_register() {
-            return Err(PimError::Checksum);
+            return Err(Error::Checksum);
         }
         let mut r = Reader { b: &b[HEADER_LEN..], addr_len: endpoints.address_len() };
         let message = match b[0] & 0x0f {
@@ -989,7 +989,7 @@ impl Message {
                 let priority = r.u8()?;
                 let bsr = r.unicast()?;
                 if hash_mask_len > full_mask(bsr) {
-                    return Err(PimError::MaskLen(hash_mask_len));
+                    return Err(Error::MaskLen(hash_mask_len));
                 }
                 let mut groups: Vec<BootstrapGroup> = Vec::new();
                 while !r.is_empty() {
@@ -1001,7 +1001,7 @@ impl Message {
                     let fragment_count = r.u8()?;
                     let _reserved = r.u16()?;
                     if fragment_count > rp_count {
-                        return Err(PimError::Count);
+                        return Err(Error::Count);
                     }
                     let mut rps = Vec::new();
                     for _ in 0..fragment_count {
@@ -1072,7 +1072,7 @@ impl Message {
     /// cannot be encoded. It does not know the packet, so it does not check
     /// address families, a Register's packet or the IPv4 length limit;
     /// [`Message::frame`] does.
-    pub fn encoded_len(&self) -> Result<usize, PimError> {
+    pub fn encoded_len(&self) -> Result<usize, Error> {
         let mut n = Len(HEADER_LEN);
         match self {
             Message::Hello(options) => {
@@ -1081,7 +1081,7 @@ impl Message {
                         HelloOption::Holdtime(_) => 2,
                         HelloOption::LanPruneDelay { propagation_delay, .. } => {
                             if *propagation_delay > MAX_PROPAGATION_DELAY {
-                                return Err(PimError::Value);
+                                return Err(Error::Value);
                             }
                             4
                         }
@@ -1095,13 +1095,13 @@ impl Message {
                         }
                         HelloOption::Other { kind, value } => {
                             if is_known_option(*kind) {
-                                return Err(PimError::Unwritable);
+                                return Err(Error::Unwritable);
                             }
                             value.len()
                         }
                     };
                     if value > usize::from(u16::MAX) {
-                        return Err(PimError::Count);
+                        return Err(Error::Count);
                     }
                     n.add(4)?;
                     n.add(value)?;
@@ -1118,13 +1118,13 @@ impl Message {
             }
             Message::JoinPrune(jp) => {
                 if jp.groups.len() > usize::from(u8::MAX) {
-                    return Err(PimError::Count);
+                    return Err(Error::Count);
                 }
                 n.add(unicast_len(jp.upstream))?;
                 n.add(4)?;
                 for g in &jp.groups {
                     if g.joins.len() > usize::from(u16::MAX) || g.prunes.len() > usize::from(u16::MAX) {
-                        return Err(PimError::Count);
+                        return Err(Error::Count);
                     }
                     n.add(group_len(&g.group)?)?;
                     no_zone(&g.group)?;
@@ -1137,13 +1137,13 @@ impl Message {
             }
             Message::Bootstrap(bs) => {
                 if bs.hash_mask_len > full_mask(bs.bsr) {
-                    return Err(PimError::MaskLen(bs.hash_mask_len));
+                    return Err(Error::MaskLen(bs.hash_mask_len));
                 }
                 n.add(4)?;
                 n.add(unicast_len(bs.bsr))?;
                 for g in &bs.groups {
                     if g.rps.len() > usize::from(g.rp_count) {
-                        return Err(PimError::Count);
+                        return Err(Error::Count);
                     }
                     n.add(group_len(&g.group)?)?;
                     n.add(4)?;
@@ -1156,7 +1156,7 @@ impl Message {
             }
             Message::Assert(a) => {
                 if a.metric_preference > MAX_METRIC_PREFERENCE {
-                    return Err(PimError::Value);
+                    return Err(Error::Value);
                 }
                 n.add(group_len(&a.group)?)?;
                 no_zone(&a.group)?;
@@ -1167,7 +1167,7 @@ impl Message {
                 // RFC 5059 section 4.2: a C-RP-Adv is never sent with no
                 // groups.
                 if c.groups.is_empty() || c.groups.len() > usize::from(u8::MAX) {
-                    return Err(PimError::Count);
+                    return Err(Error::Count);
                 }
                 n.add(4)?;
                 n.add(unicast_len(c.rp))?;
@@ -1177,7 +1177,7 @@ impl Message {
             }
             Message::Other { kind, body } => {
                 if *kind > MAX_TYPE || is_known_type(*kind) {
-                    return Err(PimError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 n.add(body.len())?;
             }
@@ -1188,7 +1188,7 @@ impl Message {
     /// Checks that every encoded address in the message has the family of
     /// the packet, whose addresses are `addr_len` bytes, and that a
     /// Register carries a packet of that family.
-    fn check_families(&self, addr_len: usize) -> Result<(), PimError> {
+    fn check_families(&self, addr_len: usize) -> Result<(), Error> {
         let f = |a: IpAddr| check_family(a, addr_len);
         match self {
             Message::Register(reg) => check_inner(&reg.packet, addr_len)?,
@@ -1242,10 +1242,10 @@ impl Message {
     /// groups, or the message would be longer than
     /// [`Endpoints::max_message`]. The output is not allocated before
     /// those checks pass.
-    pub fn frame(&self, endpoints: &Endpoints) -> Result<Datagram, PimError> {
+    pub fn frame(&self, endpoints: &Endpoints) -> Result<Datagram, Error> {
         let len = self.encoded_len()?;
         if len > endpoints.max_message() {
-            return Err(PimError::TooLong);
+            return Err(Error::TooLong);
         }
         self.check_families(endpoints.address_len())?;
         let mut out = Vec::with_capacity(len);
@@ -1339,8 +1339,8 @@ impl Message {
 struct Len(usize);
 
 impl Len {
-    fn add(&mut self, n: usize) -> Result<(), PimError> {
-        self.0 = self.0.checked_add(n).filter(|&t| t <= MAX_MESSAGE).ok_or(PimError::TooLong)?;
+    fn add(&mut self, n: usize) -> Result<(), Error> {
+        self.0 = self.0.checked_add(n).filter(|&t| t <= MAX_MESSAGE).ok_or(Error::TooLong)?;
         Ok(())
     }
 }
@@ -1356,29 +1356,29 @@ fn unicast_len(a: IpAddr) -> usize {
     2 + address_len(a)
 }
 
-fn check_mask(a: IpAddr, mask_len: u8) -> Result<usize, PimError> {
+fn check_mask(a: IpAddr, mask_len: u8) -> Result<usize, Error> {
     if mask_len > full_mask(a) {
-        return Err(PimError::MaskLen(mask_len));
+        return Err(Error::MaskLen(mask_len));
     }
     Ok(4 + address_len(a))
 }
 
-fn group_len(g: &Group) -> Result<usize, PimError> {
+fn group_len(g: &Group) -> Result<usize, Error> {
     check_mask(g.address, g.mask_len)
 }
 
 /// Checks that a group outside the Bootstrap mechanism has no Z bit: RFC
 /// 7761 section 4.9.1 says to send it as zero there.
-fn no_zone(g: &Group) -> Result<(), PimError> {
-    if g.zone { Err(PimError::Zone) } else { Ok(()) }
+fn no_zone(g: &Group) -> Result<(), Error> {
+    if g.zone { Err(Error::Zone) } else { Ok(()) }
 }
 
-fn source_len(s: &Source) -> Result<usize, PimError> {
+fn source_len(s: &Source) -> Result<usize, Error> {
     if s.mask_len != full_mask(s.address) {
-        return Err(PimError::MaskLen(s.mask_len));
+        return Err(Error::MaskLen(s.mask_len));
     }
     if s.wildcard && !s.rpt {
-        return Err(PimError::SourceFlags);
+        return Err(Error::SourceFlags);
     }
     Ok(4 + address_len(s.address))
 }
@@ -1391,8 +1391,8 @@ fn family_of(a: IpAddr) -> u8 {
 }
 
 /// Checks that `a` is in the family whose addresses are `addr_len` bytes.
-fn check_family(a: IpAddr, addr_len: usize) -> Result<(), PimError> {
-    if address_len(a) == addr_len { Ok(()) } else { Err(PimError::FamilyMismatch(family_of(a))) }
+fn check_family(a: IpAddr, addr_len: usize) -> Result<(), Error> {
+    if address_len(a) == addr_len { Ok(()) } else { Err(Error::FamilyMismatch(family_of(a))) }
 }
 
 fn put_family(out: &mut Vec<u8>, a: IpAddr) {
@@ -1452,23 +1452,23 @@ pub struct Datagram(
 );
 
 impl Wire for Datagram {
-    type ParseError = PimError;
-    type WriteError = PimError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Copies a complete payload. Refuses more than [`MAX_MESSAGE`] bytes.
     /// Protocol and checksum checks require the contextual parser.
-    fn parse(bytes: &[u8]) -> Result<Self, PimError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         if bytes.len() > MAX_MESSAGE {
-            return Err(PimError::TooLong);
+            return Err(Error::TooLong);
         }
         Ok(Self(bytes.to_vec()))
     }
 
     /// Appends the payload unchanged. Refuses more than [`MAX_MESSAGE`] bytes.
     /// Leaves `out` unchanged on error. Does not compute or check a checksum.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), PimError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         if self.0.len() > MAX_MESSAGE {
-            return Err(PimError::TooLong);
+            return Err(Error::TooLong);
         }
         out.extend_from_slice(&self.0);
         Ok(())
@@ -1483,7 +1483,7 @@ mod tests {
         test_support::{decode_all, mutate},
     };
 
-    fn collect(b: &[u8], e: &Endpoints) -> Result<Message, PimError> {
+    fn collect(b: &[u8], e: &Endpoints) -> Result<Message, Error> {
         use fictionet::stdlib::codec::Decode;
         let make = || Collect::<Datagram>::new(MAX_MESSAGE).map(|d| Message::parse(&d.0, e));
         contract::check_decode_with_alloc_limit(make, b, 2 * (MAX_MESSAGE + 1));
@@ -1572,18 +1572,18 @@ mod tests {
         // family. Here, an IPv6 address in an IPv4 packet.
         let e = v4_ends();
         let mixed = Message::Hello(vec![HelloOption::AddressList(vec![v4(10, 0, 0, 9), v6("2001:db8::1")])]);
-        assert_eq!(mixed.frame(&e).and_then(|frame| frame.to_bytes()), Err(PimError::FamilyMismatch(2)));
+        assert_eq!(mixed.frame(&e).and_then(|frame| frame.to_bytes()), Err(Error::FamilyMismatch(2)));
         let b = fix([&[0x20u8, 0, 0, 0, 0, 24, 0, 18, 2, 0][..], &[0; 16]].concat(), &e);
-        assert_eq!(Message::parse(&b, &e), Err(PimError::FamilyMismatch(2)));
+        assert_eq!(Message::parse(&b, &e), Err(Error::FamilyMismatch(2)));
         // Every message type, written for one family, fails for the other.
         for (ok, bad) in [(v4_ends(), v6_ends()), (v6_ends(), v4_ends())] {
             for m in samples(&ok) {
                 let b = m.frame(&ok).and_then(|frame| frame.to_bytes()).unwrap();
                 let has_addresses = !matches!(m, Message::Register(_) | Message::Other { .. });
                 if has_addresses {
-                    assert!(matches!(m.frame(&bad).and_then(|frame| frame.to_bytes()), Err(PimError::FamilyMismatch(_))), "{m:?}");
+                    assert!(matches!(m.frame(&bad).and_then(|frame| frame.to_bytes()), Err(Error::FamilyMismatch(_))), "{m:?}");
                     let b = fix(b, &bad);
-                    assert!(matches!(Message::parse(&b, &bad), Err(PimError::FamilyMismatch(_))), "{m:?}");
+                    assert!(matches!(Message::parse(&b, &bad), Err(Error::FamilyMismatch(_))), "{m:?}");
                 }
             }
         }
@@ -1597,7 +1597,7 @@ mod tests {
                 prunes: vec![],
             }],
         });
-        assert_eq!(jp.frame(&e).and_then(|frame| frame.to_bytes()), Err(PimError::FamilyMismatch(2)));
+        assert_eq!(jp.frame(&e).and_then(|frame| frame.to_bytes()), Err(Error::FamilyMismatch(2)));
     }
 
     #[test]
@@ -1616,9 +1616,9 @@ mod tests {
         };
         assert!(Message::parse(&jp(4, 32), &e).is_ok());
         assert!(Message::parse(&jp(7, 32), &e).is_ok());
-        assert_eq!(Message::parse(&jp(4, 24), &e), Err(PimError::MaskLen(24)));
-        assert_eq!(Message::parse(&jp(4, 0), &e), Err(PimError::MaskLen(0)));
-        assert_eq!(Message::parse(&jp(6, 32), &e), Err(PimError::SourceFlags));
+        assert_eq!(Message::parse(&jp(4, 24), &e), Err(Error::MaskLen(24)));
+        assert_eq!(Message::parse(&jp(4, 0), &e), Err(Error::MaskLen(0)));
+        assert_eq!(Message::parse(&jp(6, 32), &e), Err(Error::SourceFlags));
         let write = |s: Source| {
             Message::JoinPrune(JoinPrune {
                 upstream: v4(10, 0, 0, 1),
@@ -1627,8 +1627,8 @@ mod tests {
             })
             .frame(&e).and_then(|frame| frame.to_bytes())
         };
-        assert_eq!(write(Source { mask_len: 24, ..Source::single(v4(10, 1, 1, 0)) }), Err(PimError::MaskLen(24)));
-        assert_eq!(write(Source { wildcard: true, ..Source::single(v4(10, 1, 1, 1)) }), Err(PimError::SourceFlags));
+        assert_eq!(write(Source { mask_len: 24, ..Source::single(v4(10, 1, 1, 0)) }), Err(Error::MaskLen(24)));
+        assert_eq!(write(Source { wildcard: true, ..Source::single(v4(10, 1, 1, 1)) }), Err(Error::SourceFlags));
     }
 
     #[test]
@@ -1651,7 +1651,7 @@ mod tests {
         // Any other checksum is not.
         let mut bad = b.clone();
         bad[3] ^= 1;
-        assert_eq!(Message::parse(&bad, &v4_ends()), Err(PimError::Checksum));
+        assert_eq!(Message::parse(&bad, &v4_ends()), Err(Error::Checksum));
         // The B bit is unused: ignored when read, written as zero.
         let mut border = b.clone();
         border[4] |= 0x80;
@@ -1778,7 +1778,7 @@ mod tests {
         // RFC 5059 section 4.2: no groups is never sent, but is read, as
         // a BSR reads one from an older router as every group.
         let empty = Message::CandidateRp(CandidateRp { priority: 0, holdtime: 0, rp: v4(1, 2, 3, 4), groups: vec![] });
-        assert_eq!(empty.frame(&v4_ends()).and_then(|frame| frame.to_bytes()), Err(PimError::Count));
+        assert_eq!(empty.frame(&v4_ends()).and_then(|frame| frame.to_bytes()), Err(Error::Count));
         let b = fix(vec![0x28, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 2, 3, 4], &v4_ends());
         assert_eq!(Message::parse(&b, &v4_ends()), Ok(empty));
     }
@@ -1809,7 +1809,7 @@ mod tests {
         round_trip(&jp, &e);
         assert_eq!(
             Message::RegisterStop { group: Group::range(v4(239, 0, 0, 0), 33), source: v4(1, 1, 1, 1) }.frame(&e).and_then(|frame| frame.to_bytes()),
-            Err(PimError::MaskLen(33))
+            Err(Error::MaskLen(33))
         );
     }
 
@@ -1825,7 +1825,7 @@ mod tests {
         // One more option is too long.
         let Message::Hello(mut more) = m else { unreachable!() };
         more.push(HelloOption::Holdtime(1));
-        assert_eq!(Message::Hello(more).frame(&e).and_then(|frame| frame.to_bytes()), Err(PimError::TooLong));
+        assert_eq!(Message::Hello(more).frame(&e).and_then(|frame| frame.to_bytes()), Err(Error::TooLong));
         // The most sources a Join/Prune can hold, over IPv6.
         let e6 = v6_ends();
         let room = MAX_MESSAGE - HEADER_LEN - 18 - 4 - 20 - 4;
@@ -1883,25 +1883,25 @@ mod tests {
     #[test]
     fn parse_errors() {
         let e = v4_ends();
-        assert_eq!(Message::parse(&[], &e), Err(PimError::Truncated));
-        assert_eq!(Message::parse(&[0x10], &e), Err(PimError::Version(1)));
-        assert_eq!(Message::parse(&[0x20, 0, 0], &e), Err(PimError::Truncated));
-        assert_eq!(Message::parse(&[0x20, 0, 0, 0], &e), Err(PimError::Checksum));
+        assert_eq!(Message::parse(&[], &e), Err(Error::Truncated));
+        assert_eq!(Message::parse(&[0x10], &e), Err(Error::Version(1)));
+        assert_eq!(Message::parse(&[0x20, 0, 0], &e), Err(Error::Truncated));
+        assert_eq!(Message::parse(&[0x20, 0, 0, 0], &e), Err(Error::Checksum));
         assert_eq!(Message::parse(&fix(vec![0x20, 0, 0, 0], &e), &e), Ok(Message::Hello(vec![])));
         // A Register needs its flags word.
-        assert_eq!(Message::parse(&[0x21, 0, 0, 0, 0], &e), Err(PimError::Truncated));
+        assert_eq!(Message::parse(&[0x21, 0, 0, 0, 0], &e), Err(Error::Truncated));
         let mut long = vec![0x26, 0, 0, 0];
         long.resize(MAX_MESSAGE + 1, 0);
-        assert_eq!(Message::parse(&long, &e), Err(PimError::TooLong));
+        assert_eq!(Message::parse(&long, &e), Err(Error::TooLong));
         // Address family and encoding.
         let stop = |rest: &[u8]| fix([&[0x22, 0, 0, 0][..], rest].concat(), &e);
-        assert_eq!(Message::parse(&stop(&[3, 0, 0, 32, 1, 1, 1, 1]), &e), Err(PimError::Family(3)));
-        assert_eq!(Message::parse(&stop(&[1, 1, 0, 32, 1, 1, 1, 1]), &e), Err(PimError::Encoding(1)));
-        assert_eq!(Message::parse(&stop(&[1, 0, 0, 33, 1, 1, 1, 1]), &e), Err(PimError::MaskLen(33)));
-        assert_eq!(Message::parse(&stop(&[1, 0, 0, 32, 1, 1, 1, 1, 1, 0, 1, 1, 1]), &e), Err(PimError::Truncated));
+        assert_eq!(Message::parse(&stop(&[3, 0, 0, 32, 1, 1, 1, 1]), &e), Err(Error::Family(3)));
+        assert_eq!(Message::parse(&stop(&[1, 1, 0, 32, 1, 1, 1, 1]), &e), Err(Error::Encoding(1)));
+        assert_eq!(Message::parse(&stop(&[1, 0, 0, 33, 1, 1, 1, 1]), &e), Err(Error::MaskLen(33)));
+        assert_eq!(Message::parse(&stop(&[1, 0, 0, 32, 1, 1, 1, 1, 1, 0, 1, 1, 1]), &e), Err(Error::Truncated));
         assert_eq!(
             Message::parse(&stop(&[1, 0, 0, 32, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 9]), &e),
-            Err(PimError::Trailing { remaining: 1 })
+            Err(Error::Trailing { remaining: 1 })
         );
         // An IPv6 group may have a 128-bit mask, but no more.
         let e6 = v6_ends();
@@ -1909,22 +1909,22 @@ mod tests {
         let g6 = [&[2u8, 0, 0, 128][..], &[0xff; 16], &[2, 0], &[1; 16]].concat();
         assert!(Message::parse(&stop6(&g6), &e6).is_ok());
         let g6 = [&[2u8, 0, 0, 129][..], &[0xff; 16], &[2, 0], &[1; 16]].concat();
-        assert_eq!(Message::parse(&stop6(&g6), &e6), Err(PimError::MaskLen(129)));
+        assert_eq!(Message::parse(&stop6(&g6), &e6), Err(Error::MaskLen(129)));
         // Hello option lengths.
         let hello = |rest: &[u8]| fix([&[0x20, 0, 0, 0][..], rest].concat(), &e);
-        assert_eq!(Message::parse(&hello(&[0, 1, 0, 3, 0, 0, 0]), &e), Err(PimError::OptionLength { kind: 1, len: 3 }));
-        assert_eq!(Message::parse(&hello(&[0, 19, 0, 2, 0, 0]), &e), Err(PimError::OptionLength { kind: 19, len: 2 }));
-        assert_eq!(Message::parse(&hello(&[0, 1, 0, 3, 0, 0]), &e), Err(PimError::Truncated));
-        assert_eq!(Message::parse(&hello(&[0, 1, 0]), &e), Err(PimError::Truncated));
+        assert_eq!(Message::parse(&hello(&[0, 1, 0, 3, 0, 0, 0]), &e), Err(Error::OptionLength { kind: 1, len: 3 }));
+        assert_eq!(Message::parse(&hello(&[0, 19, 0, 2, 0, 0]), &e), Err(Error::OptionLength { kind: 19, len: 2 }));
+        assert_eq!(Message::parse(&hello(&[0, 1, 0, 3, 0, 0]), &e), Err(Error::Truncated));
+        assert_eq!(Message::parse(&hello(&[0, 1, 0]), &e), Err(Error::Truncated));
         // An address list that ends inside an address.
-        assert_eq!(Message::parse(&hello(&[0, 24, 0, 3, 1, 0, 9]), &e), Err(PimError::Truncated));
+        assert_eq!(Message::parse(&hello(&[0, 24, 0, 3, 1, 0, 9]), &e), Err(Error::Truncated));
         // A Join/Prune whose group count promises more than comes.
         let jp = fix(vec![0x23, 0, 0, 0, 1, 0, 1, 1, 1, 1, 0, 200, 0, 10], &e);
-        assert_eq!(Message::parse(&jp, &e), Err(PimError::Truncated));
+        assert_eq!(Message::parse(&jp, &e), Err(Error::Truncated));
         // A source count of 65535 with no sources.
         let jp =
             fix(vec![0x23, 0, 0, 0, 1, 0, 1, 1, 1, 1, 0, 1, 0, 10, 1, 0, 0, 32, 239, 1, 1, 1, 0xff, 0xff, 0, 0], &e);
-        assert_eq!(Message::parse(&jp, &e), Err(PimError::Truncated));
+        assert_eq!(Message::parse(&jp, &e), Err(Error::Truncated));
         // An Assert with bytes after it.
         let a = Message::Assert(Assert {
             group: Group::single(v4(239, 1, 1, 1)),
@@ -1937,13 +1937,13 @@ mod tests {
         b.push(0);
         assert_eq!(
             Message::parse(&fix(b, &e), &e),
-            Err(PimError::Trailing { remaining: 1 })
+            Err(Error::Trailing { remaining: 1 })
         );
         // The IPv6 checksum covers the pseudo-header, so the endpoints
         // must match.
         let b = samples(&v6_ends())[5].frame(&v6_ends()).and_then(|frame| frame.to_bytes()).unwrap();
         let other = Endpoints::V6 { source: "fe80::3".parse().unwrap(), destination: ALL_PIM_ROUTERS_V6 };
-        assert_eq!(Message::parse(&b, &other), Err(PimError::Checksum));
+        assert_eq!(Message::parse(&b, &other), Err(Error::Checksum));
         assert!(Message::parse(&b, &v6_ends()).is_ok());
     }
 
@@ -1953,39 +1953,39 @@ mod tests {
         let bad_group = Group { address: v4(239, 0, 0, 0), mask_len: 33, bidirectional: false, zone: false };
         assert_eq!(
             Message::RegisterStop { group: bad_group, source: v4(1, 1, 1, 1) }.frame(&e).and_then(|frame| frame.to_bytes()),
-            Err(PimError::MaskLen(33))
+            Err(Error::MaskLen(33))
         );
         let bad_source = Source { mask_len: 129, ..Source::single(v6("::1")) };
         let jp = |groups| Message::JoinPrune(JoinPrune { upstream: v4(1, 1, 1, 1), holdtime: 1, groups });
         let g = Group::single(v4(239, 1, 1, 1));
         assert_eq!(
             jp(vec![JoinPruneGroup { group: g, joins: vec![bad_source], prunes: vec![] }]).frame(&e).and_then(|frame| frame.to_bytes()),
-            Err(PimError::MaskLen(129))
+            Err(Error::MaskLen(129))
         );
         let many = vec![JoinPruneGroup { group: g, joins: vec![], prunes: vec![] }; 256];
-        assert_eq!(jp(many).frame(&e).and_then(|frame| frame.to_bytes()), Err(PimError::Count));
+        assert_eq!(jp(many).frame(&e).and_then(|frame| frame.to_bytes()), Err(Error::Count));
         let lots = vec![Source::single(v4(1, 1, 1, 1)); 65536];
         assert_eq!(
             jp(vec![JoinPruneGroup { group: g, joins: lots, prunes: vec![] }]).frame(&e).and_then(|frame| frame.to_bytes()),
-            Err(PimError::Count)
+            Err(Error::Count)
         );
         let lots = vec![Source::single(v4(1, 1, 1, 1)); 9000];
         assert_eq!(
             jp(vec![JoinPruneGroup { group: g, joins: lots, prunes: vec![] }]).frame(&e).and_then(|frame| frame.to_bytes()),
-            Err(PimError::TooLong)
+            Err(Error::TooLong)
         );
         let a = Assert { group: g, source: v4(1, 1, 1, 1), rpt: false, metric_preference: 0x8000_0000, metric: 0 };
-        assert_eq!(Message::Assert(a).frame(&e).and_then(|frame| frame.to_bytes()), Err(PimError::Value));
+        assert_eq!(Message::Assert(a).frame(&e).and_then(|frame| frame.to_bytes()), Err(Error::Value));
         let lpd = HelloOption::LanPruneDelay { tracking: false, propagation_delay: 0x8000, override_interval: 0 };
-        assert_eq!(Message::Hello(vec![lpd]).frame(&e).and_then(|frame| frame.to_bytes()), Err(PimError::Value));
+        assert_eq!(Message::Hello(vec![lpd]).frame(&e).and_then(|frame| frame.to_bytes()), Err(Error::Value));
         let other = HelloOption::Other { kind: option::HOLDTIME, value: vec![0, 1] };
-        assert_eq!(Message::Hello(vec![other]).frame(&e).and_then(|frame| frame.to_bytes()), Err(PimError::Unwritable));
+        assert_eq!(Message::Hello(vec![other]).frame(&e).and_then(|frame| frame.to_bytes()), Err(Error::Unwritable));
         let big = HelloOption::Other { kind: 65000, value: vec![0; 65536] };
-        assert_eq!(Message::Hello(vec![big]).frame(&e).and_then(|frame| frame.to_bytes()), Err(PimError::Count));
-        assert_eq!(Message::Other { kind: kind::ASSERT, body: vec![] }.frame(&e).and_then(|frame| frame.to_bytes()), Err(PimError::Unwritable));
-        assert_eq!(Message::Other { kind: 16, body: vec![] }.frame(&e).and_then(|frame| frame.to_bytes()), Err(PimError::Unwritable));
+        assert_eq!(Message::Hello(vec![big]).frame(&e).and_then(|frame| frame.to_bytes()), Err(Error::Count));
+        assert_eq!(Message::Other { kind: kind::ASSERT, body: vec![] }.frame(&e).and_then(|frame| frame.to_bytes()), Err(Error::Unwritable));
+        assert_eq!(Message::Other { kind: 16, body: vec![] }.frame(&e).and_then(|frame| frame.to_bytes()), Err(Error::Unwritable));
         let reg = Message::Register(Register { null: false, packet: vec![0x45; MAX_MESSAGE] });
-        assert_eq!(reg.frame(&e).and_then(|frame| frame.to_bytes()), Err(PimError::TooLong));
+        assert_eq!(reg.frame(&e).and_then(|frame| frame.to_bytes()), Err(Error::TooLong));
         let reg = Message::Register(Register { null: false, packet: vec![0x45; MAX_MESSAGE_V4 - 8] });
         assert_eq!(reg.frame(&e).and_then(|frame| frame.to_bytes()).unwrap().len(), MAX_MESSAGE_V4);
         let bs = |rps| Bootstrap {
@@ -1997,16 +1997,16 @@ mod tests {
             groups: vec![BootstrapGroup { group: g, rp_count: 0, rps }],
         };
         let rp = BootstrapRp { address: v4(1, 1, 1, 1), holdtime: 0, priority: 0 };
-        assert_eq!(Message::Bootstrap(bs(vec![rp; 256])).frame(&e).and_then(|frame| frame.to_bytes()), Err(PimError::Count));
+        assert_eq!(Message::Bootstrap(bs(vec![rp; 256])).frame(&e).and_then(|frame| frame.to_bytes()), Err(Error::Count));
         let crp = CandidateRp { priority: 0, holdtime: 0, rp: v4(1, 1, 1, 1), groups: vec![g; 256] };
-        assert_eq!(Message::CandidateRp(crp).frame(&e).and_then(|frame| frame.to_bytes()), Err(PimError::Count));
+        assert_eq!(Message::CandidateRp(crp).frame(&e).and_then(|frame| frame.to_bytes()), Err(Error::Count));
         // Every error has a message.
         for err in [
-            PimError::Truncated,
-            PimError::OptionLength { kind: 1, len: 3 },
-            PimError::Value,
-            PimError::FamilyMismatch(2),
-            PimError::SourceFlags,
+            Error::Truncated,
+            Error::OptionLength { kind: 1, len: 3 },
+            Error::Value,
+            Error::FamilyMismatch(2),
+            Error::SourceFlags,
         ] {
             assert!(!err.to_string().is_empty());
         }
@@ -2055,7 +2055,7 @@ mod tests {
         let b = hex(
             "23 00 d0 ff 01 00 0a 00 00 01 00 01 00 d2 01 00 00 08 ef 00 00 00 00 01 00 00 01 00 04 20 0a 01 01 01",
         );
-        assert_eq!(Message::parse(&b, &e), Err(PimError::JoinPruneGroup));
+        assert_eq!(Message::parse(&b, &e), Err(Error::JoinPruneGroup));
         let jp = |group: Group| {
             Message::JoinPrune(JoinPrune {
                 upstream: v4(10, 0, 0, 1),
@@ -2063,13 +2063,13 @@ mod tests {
                 groups: vec![JoinPruneGroup { group, joins: vec![Source::single(v4(10, 1, 1, 1))], prunes: vec![] }],
             })
         };
-        assert_eq!(jp(Group::range(v4(239, 0, 0, 0), 8)).frame(&e).and_then(|frame| frame.to_bytes()), Err(PimError::JoinPruneGroup));
-        assert_eq!(jp(Group::single(v4(10, 0, 0, 1))).frame(&e).and_then(|frame| frame.to_bytes()), Err(PimError::JoinPruneGroup));
+        assert_eq!(jp(Group::range(v4(239, 0, 0, 0), 8)).frame(&e).and_then(|frame| frame.to_bytes()), Err(Error::JoinPruneGroup));
+        assert_eq!(jp(Group::single(v4(10, 0, 0, 1))).frame(&e).and_then(|frame| frame.to_bytes()), Err(Error::JoinPruneGroup));
         let b = round_trip(&jp(Group::single(v4(239, 0, 0, 1))), &e);
         // The unicast group 10.0.0.1, written by hand.
         let mut unicast = b.clone();
         unicast[18] = 10;
-        assert_eq!(Message::parse(&fix(unicast, &e), &e), Err(PimError::JoinPruneGroup));
+        assert_eq!(Message::parse(&fix(unicast, &e), &e), Err(Error::JoinPruneGroup));
         let e6 = v6_ends();
         let jp6 = |group: Group| {
             Message::JoinPrune(JoinPrune {
@@ -2078,7 +2078,7 @@ mod tests {
                 groups: vec![JoinPruneGroup { group, joins: vec![Source::single(v6("2001:db8::1"))], prunes: vec![] }],
             })
         };
-        assert_eq!(jp6(Group::range(v6("ff3e::"), 64)).frame(&e6).and_then(|frame| frame.to_bytes()), Err(PimError::JoinPruneGroup));
+        assert_eq!(jp6(Group::range(v6("ff3e::"), 64)).frame(&e6).and_then(|frame| frame.to_bytes()), Err(Error::JoinPruneGroup));
         round_trip(&jp6(Group::single(v6("ff3e::1"))), &e6);
     }
 
@@ -2091,7 +2091,7 @@ mod tests {
         let b = hex(
             "23 00 bf c2 01 00 0a 00 00 01 00 01 00 d2 01 00 00 20 ef 01 01 01 00 01 00 01 01 00 04 20 0a 01 01 01 01 00 04 20 0a 01 01 01",
         );
-        assert_eq!(Message::parse(&b, &e), Err(PimError::SourceList));
+        assert_eq!(Message::parse(&b, &e), Err(Error::SourceList));
         let jp = |joins: Vec<Source>, prunes: Vec<Source>| {
             Message::JoinPrune(JoinPrune {
                 upstream: v4(10, 0, 0, 1),
@@ -2102,10 +2102,10 @@ mod tests {
         let s = Source::single(v4(10, 1, 1, 1));
         let rpt = Source { rpt: true, ..s };
         let star = Source::shared_tree(v4(10, 9, 9, 9));
-        assert_eq!(jp(vec![s], vec![s]).frame(&e).and_then(|frame| frame.to_bytes()), Err(PimError::SourceList));
-        assert_eq!(jp(vec![rpt], vec![rpt]).frame(&e).and_then(|frame| frame.to_bytes()), Err(PimError::SourceList));
-        assert_eq!(jp(vec![star], vec![star]).frame(&e).and_then(|frame| frame.to_bytes()), Err(PimError::SourceList));
-        assert_eq!(jp(vec![star, star], vec![]).frame(&e).and_then(|frame| frame.to_bytes()), Err(PimError::SourceList));
+        assert_eq!(jp(vec![s], vec![s]).frame(&e).and_then(|frame| frame.to_bytes()), Err(Error::SourceList));
+        assert_eq!(jp(vec![rpt], vec![rpt]).frame(&e).and_then(|frame| frame.to_bytes()), Err(Error::SourceList));
+        assert_eq!(jp(vec![star], vec![star]).frame(&e).and_then(|frame| frame.to_bytes()), Err(Error::SourceList));
+        assert_eq!(jp(vec![star, star], vec![]).frame(&e).and_then(|frame| frame.to_bytes()), Err(Error::SourceList));
         // Allowed: an (S,G) join with an (S,G,rpt) prune of the same
         // source, a (*,G) join with an (S,G,rpt) prune, and the same entry
         // twice in one list.
@@ -2116,7 +2116,7 @@ mod tests {
         let many: Vec<Source> =
             (0..500u32).map(|i| Source::single(IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + i)))).collect();
         round_trip(&jp(many.clone(), vec![]), &e);
-        assert_eq!(jp(many, vec![Source::single(v4(10, 0, 1, 0))]).frame(&e).and_then(|frame| frame.to_bytes()), Err(PimError::SourceList));
+        assert_eq!(jp(many, vec![Source::single(v4(10, 0, 1, 0))]).frame(&e).and_then(|frame| frame.to_bytes()), Err(Error::SourceList));
     }
 
     #[test]
@@ -2124,28 +2124,28 @@ mod tests {
         // RFC 7761 section 4.9.3: the packet has the family of the PIM
         // packet. An empty Register, checksum worked out by hand.
         let e = v4_ends();
-        assert_eq!(Message::parse(&hex("21 00 de ff 00 00 00 00"), &e), Err(PimError::Inner));
+        assert_eq!(Message::parse(&hex("21 00 de ff 00 00 00 00"), &e), Err(Error::Inner));
         let reg = |packet: Vec<u8>| Message::Register(Register { null: false, packet });
-        assert_eq!(reg(vec![]).frame(&e).and_then(|frame| frame.to_bytes()), Err(PimError::Inner));
+        assert_eq!(reg(vec![]).frame(&e).and_then(|frame| frame.to_bytes()), Err(Error::Inner));
         let v4h = inner_header(false);
         let v6h = inner_header(true);
         round_trip(&reg(v4h.clone()), &e);
         round_trip(&reg(v6h.clone()), &v6_ends());
         // The wrong family, both ways.
-        assert_eq!(reg(v4h.clone()).frame(&v6_ends()).and_then(|frame| frame.to_bytes()), Err(PimError::Inner));
-        assert_eq!(reg(v6h.clone()).frame(&e).and_then(|frame| frame.to_bytes()), Err(PimError::Inner));
+        assert_eq!(reg(v4h.clone()).frame(&v6_ends()).and_then(|frame| frame.to_bytes()), Err(Error::Inner));
+        assert_eq!(reg(v6h.clone()).frame(&e).and_then(|frame| frame.to_bytes()), Err(Error::Inner));
         let wrong = fix([&[0x21u8, 0, 0, 0, 0, 0, 0, 0][..], &v6h].concat(), &e);
-        assert_eq!(Message::parse(&wrong, &e), Err(PimError::Inner));
+        assert_eq!(Message::parse(&wrong, &e), Err(Error::Inner));
         // Too short, or an IPv4 header length out of range.
-        assert_eq!(reg(v4h[..19].to_vec()).frame(&e).and_then(|frame| frame.to_bytes()), Err(PimError::Inner));
-        assert_eq!(reg(v6h[..39].to_vec()).frame(&v6_ends()).and_then(|frame| frame.to_bytes()), Err(PimError::Inner));
+        assert_eq!(reg(v4h[..19].to_vec()).frame(&e).and_then(|frame| frame.to_bytes()), Err(Error::Inner));
+        assert_eq!(reg(v6h[..39].to_vec()).frame(&v6_ends()).and_then(|frame| frame.to_bytes()), Err(Error::Inner));
         let ihl = |b: u8| {
             let mut p = v4h.clone();
             p[0] = b;
             reg(p).frame(&e).and_then(|frame| frame.to_bytes())
         };
-        assert_eq!(ihl(0x44), Err(PimError::Inner));
-        assert_eq!(ihl(0x46), Err(PimError::Inner));
+        assert_eq!(ihl(0x44), Err(Error::Inner));
+        assert_eq!(ihl(0x46), Err(Error::Inner));
         let mut options = v4h.clone();
         options[0] = 0x46;
         options.extend_from_slice(&[1, 1, 1, 0]);
@@ -2160,7 +2160,7 @@ mod tests {
         let b = hex(
             "24 00 f5 f7 00 01 1e 40 01 00 0a 00 00 05 01 00 00 20 ef 01 01 01 00 01 00 00 01 00 0a 00 00 07 00 96 c0 00",
         );
-        assert_eq!(Message::parse(&b, &e), Err(PimError::Count));
+        assert_eq!(Message::parse(&b, &e), Err(Error::Count));
         let rp = BootstrapRp { address: v4(10, 0, 0, 7), holdtime: 150, priority: 192 };
         let bs = |hash_mask_len: u8, bsr: IpAddr, groups: Vec<BootstrapGroup>| {
             Message::Bootstrap(Bootstrap {
@@ -2177,19 +2177,19 @@ mod tests {
             rp_count,
             rps,
         };
-        assert_eq!(bs(30, v4(10, 0, 0, 5), vec![g(0, vec![rp])]).frame(&e).and_then(|frame| frame.to_bytes()), Err(PimError::Count));
-        assert_eq!(bs(30, v4(10, 0, 0, 5), vec![g(1, vec![rp, rp])]).frame(&e).and_then(|frame| frame.to_bytes()), Err(PimError::Count));
+        assert_eq!(bs(30, v4(10, 0, 0, 5), vec![g(0, vec![rp])]).frame(&e).and_then(|frame| frame.to_bytes()), Err(Error::Count));
+        assert_eq!(bs(30, v4(10, 0, 0, 5), vec![g(1, vec![rp, rp])]).frame(&e).and_then(|frame| frame.to_bytes()), Err(Error::Count));
         round_trip(&bs(30, v4(10, 0, 0, 5), vec![g(2, vec![rp, rp]), g(0, vec![])]), &e);
         // RFC 5059 section 4.1 and RFC 7761 section 4.7.2: the hash mask
         // is a mask of the family, so at most 32 or 128 bits.
         round_trip(&bs(32, v4(10, 0, 0, 5), vec![]), &e);
-        assert_eq!(bs(33, v4(10, 0, 0, 5), vec![]).frame(&e).and_then(|frame| frame.to_bytes()), Err(PimError::MaskLen(33)));
-        assert_eq!(bs(255, v4(10, 0, 0, 5), vec![]).frame(&e).and_then(|frame| frame.to_bytes()), Err(PimError::MaskLen(255)));
+        assert_eq!(bs(33, v4(10, 0, 0, 5), vec![]).frame(&e).and_then(|frame| frame.to_bytes()), Err(Error::MaskLen(33)));
+        assert_eq!(bs(255, v4(10, 0, 0, 5), vec![]).frame(&e).and_then(|frame| frame.to_bytes()), Err(Error::MaskLen(255)));
         let b = fix(hex("24 00 00 00 00 01 21 40 01 00 0a 00 00 05"), &e);
-        assert_eq!(Message::parse(&b, &e), Err(PimError::MaskLen(33)));
+        assert_eq!(Message::parse(&b, &e), Err(Error::MaskLen(33)));
         let e6 = v6_ends();
         round_trip(&bs(128, v6("2001:db8::5"), vec![]), &e6);
-        assert_eq!(bs(129, v6("2001:db8::5"), vec![]).frame(&e6).and_then(|frame| frame.to_bytes()), Err(PimError::MaskLen(129)));
+        assert_eq!(bs(129, v6("2001:db8::5"), vec![]).frame(&e6).and_then(|frame| frame.to_bytes()), Err(Error::MaskLen(129)));
     }
 
     #[test]
@@ -2215,18 +2215,18 @@ mod tests {
         };
         let scoped = bs(vec![group("ff05::", 16, true), group("ff15:1::", 32, false)]);
         let b = round_trip(&scoped, &e6);
-        assert_eq!(bs(vec![group("ff05::", 8, true)]).frame(&e6).and_then(|frame| frame.to_bytes()), Err(PimError::Zone));
-        assert_eq!(bs(vec![group("ff05::", 16, true), group("ff08::", 16, false)]).frame(&e6).and_then(|frame| frame.to_bytes()), Err(PimError::Zone));
-        assert_eq!(bs(vec![group("ff05::", 16, true), group("ff05::", 12, false)]).frame(&e6).and_then(|frame| frame.to_bytes()), Err(PimError::Zone));
+        assert_eq!(bs(vec![group("ff05::", 8, true)]).frame(&e6).and_then(|frame| frame.to_bytes()), Err(Error::Zone));
+        assert_eq!(bs(vec![group("ff05::", 16, true), group("ff08::", 16, false)]).frame(&e6).and_then(|frame| frame.to_bytes()), Err(Error::Zone));
+        assert_eq!(bs(vec![group("ff05::", 16, true), group("ff05::", 12, false)]).frame(&e6).and_then(|frame| frame.to_bytes()), Err(Error::Zone));
         // Unscoped fragments have no such rule.
         round_trip(&bs(vec![group("ff00::", 8, false), group("ff05::", 12, false)]), &e6);
         // The first group's mask, cut to 8 bits by hand.
         let mut short = b.clone();
         short[4 + 4 + 18 + 3] = 8;
-        assert_eq!(Message::parse(&fix(short, &e6), &e6), Err(PimError::Zone));
+        assert_eq!(Message::parse(&fix(short, &e6), &e6), Err(Error::Zone));
         // A Z bit on a later group is refused when written and ignored
         // when read.
-        assert_eq!(bs(vec![group("ff00::", 8, false), group("ff05::", 16, true)]).frame(&e6).and_then(|frame| frame.to_bytes()), Err(PimError::Zone));
+        assert_eq!(bs(vec![group("ff00::", 8, false), group("ff05::", 16, true)]).frame(&e6).and_then(|frame| frame.to_bytes()), Err(Error::Zone));
         let plain = bs(vec![group("ff00::", 8, false), group("ff05::", 16, false)]);
         let mut b = plain.frame(&e6).and_then(|frame| frame.to_bytes()).unwrap();
         let second = 4 + 4 + 18 + 20 + 4;
@@ -2242,8 +2242,8 @@ mod tests {
         let e = v4_ends();
         let m = Message::CandidateRp(CandidateRp { priority: 192, holdtime: 150, rp: v4(10, 0, 0, 7), groups: vec![] });
         assert_eq!(Message::parse(&hex("28 00 cb a2 00 c0 00 96 01 00 0a 00 00 07"), &e), Ok(m.clone()));
-        assert_eq!(m.frame(&e).and_then(|frame| frame.to_bytes()), Err(PimError::Count));
-        assert_eq!(m.encoded_len(), Err(PimError::Count));
+        assert_eq!(m.frame(&e).and_then(|frame| frame.to_bytes()), Err(Error::Count));
+        assert_eq!(m.encoded_len(), Err(Error::Count));
     }
 
     #[test]
@@ -2253,13 +2253,13 @@ mod tests {
         let e = v4_ends();
         let zoned = Group { zone: true, ..Group::single(v4(239, 1, 2, 3)) };
         let stop = Message::RegisterStop { group: zoned, source: v4(10, 1, 1, 1) };
-        assert_eq!(stop.frame(&e).and_then(|frame| frame.to_bytes()), Err(PimError::Zone));
+        assert_eq!(stop.frame(&e).and_then(|frame| frame.to_bytes()), Err(Error::Zone));
         let plain = Message::RegisterStop { group: Group::single(v4(239, 1, 2, 3)), source: v4(10, 1, 1, 1) };
         let mut b = plain.frame(&e).and_then(|frame| frame.to_bytes()).unwrap();
         b[6] |= 0x01;
         assert_eq!(Message::parse(&fix(b, &e), &e), Ok(plain));
         let assert = Assert { group: zoned, source: v4(10, 1, 1, 1), rpt: false, metric_preference: 1, metric: 1 };
-        assert_eq!(Message::Assert(assert).frame(&e).and_then(|frame| frame.to_bytes()), Err(PimError::Zone));
+        assert_eq!(Message::Assert(assert).frame(&e).and_then(|frame| frame.to_bytes()), Err(Error::Zone));
         let plain = Message::Assert(Assert { group: Group::single(v4(239, 1, 2, 3)), ..assert });
         let mut b = plain.frame(&e).and_then(|frame| frame.to_bytes()).unwrap();
         b[6] |= 0x01;
@@ -2271,7 +2271,7 @@ mod tests {
                 groups: vec![JoinPruneGroup { group, joins: vec![Source::single(v4(10, 1, 1, 1))], prunes: vec![] }],
             })
         };
-        assert_eq!(jp(zoned).frame(&e).and_then(|frame| frame.to_bytes()), Err(PimError::Zone));
+        assert_eq!(jp(zoned).frame(&e).and_then(|frame| frame.to_bytes()), Err(Error::Zone));
         let plain = jp(Group::single(v4(239, 1, 2, 3)));
         let mut b = plain.frame(&e).and_then(|frame| frame.to_bytes()).unwrap();
         b[16] |= 0x01;
@@ -2290,15 +2290,15 @@ mod tests {
         let e = v4_ends();
         let hello = |n: usize| Message::Hello(vec![HelloOption::Other { kind: 9999, value: vec![0; n] }]);
         assert_eq!(hello(MAX_MESSAGE - 8).encoded_len(), Ok(MAX_MESSAGE));
-        assert_eq!(hello(MAX_MESSAGE - 8).frame(&e).and_then(|frame| frame.to_bytes()), Err(PimError::TooLong));
+        assert_eq!(hello(MAX_MESSAGE - 8).frame(&e).and_then(|frame| frame.to_bytes()), Err(Error::TooLong));
         round_trip(&hello(MAX_MESSAGE - 8), &v6_ends());
         let b = round_trip(&hello(MAX_MESSAGE_V4 - 8), &e);
         assert_eq!(b.len(), MAX_MESSAGE_V4);
         let mut long = vec![0x26, 0, 0, 0];
         long.resize(MAX_MESSAGE_V4 + 1, 0);
         let long = fix(long, &e);
-        assert_eq!(Message::parse(&long, &e), Err(PimError::TooLong));
-        assert_eq!(collect(&long, &e), Err(PimError::TooLong));
+        assert_eq!(Message::parse(&long, &e), Err(Error::TooLong));
+        assert_eq!(collect(&long, &e), Err(Error::TooLong));
         assert!(Message::parse(&fix(long, &v6_ends()), &v6_ends()).is_ok());
         assert_eq!(e.max_message(), MAX_MESSAGE_V4);
         assert_eq!(v6_ends().max_message(), MAX_MESSAGE);
@@ -2387,11 +2387,11 @@ mod tests {
         for m in samples(&e) {
             assert_eq!(collect(&m.frame(&e).unwrap().to_bytes().unwrap(), &e), Ok(m));
         }
-        assert_eq!(collect(&[0x30], &e), Err(PimError::Version(3)));
+        assert_eq!(collect(&[0x30], &e), Err(Error::Version(3)));
         for (e, max) in [(e, MAX_MESSAGE_V4), (v6_ends(), MAX_MESSAGE)] {
             let mut b = vec![0; max + 2];
             b[0] = 0x26;
-            assert_eq!(collect(&b, &e), Err(PimError::TooLong));
+            assert_eq!(collect(&b, &e), Err(Error::TooLong));
         }
     }
 
@@ -2571,7 +2571,7 @@ mod tests {
             if let Message::CandidateRp(CandidateRp { groups, .. }) = m
                 && groups.is_empty()
             {
-                assert_eq!(m.frame(e).and_then(|frame| frame.to_bytes()), Err(PimError::Count));
+                assert_eq!(m.frame(e).and_then(|frame| frame.to_bytes()), Err(Error::Count));
                 return;
             }
             let b = m.frame(e).and_then(|frame| frame.to_bytes()).unwrap();

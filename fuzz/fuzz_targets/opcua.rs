@@ -5,15 +5,15 @@
 use fictionet::stdlib::codec::contract::{check_decode, check_wire, check_wire_value};
 use fictionet::stdlib::codec::{Wire, test_support::decode_all};
 use fictionet::stdlib::opcua::{
-    Binary, Chunk, ChunkType, DataValue, DiagnosticInfo, EncodeError, ExpandedNodeId,
+    Binary, Chunk, ChunkType, DataValue, DiagnosticInfo, Error, ExpandedNodeId,
     ExtensionObject, Limits, LocalizedText, Message, MessageType, NodeId, QualifiedName, Reader,
     ResponseHeader, Service, Variant,
 };
-use fictionet::stdlib::opcua::{Frames, Messages};
+use fictionet::stdlib::opcua::{Chunks, Messages};
 use libfuzzer_sys::fuzz_target;
 
 /// Checks permissive reads, including reserved Variant types that cannot be written.
-fn check_reader<T: Binary + Wire<WriteError = EncodeError> + PartialEq + core::fmt::Debug>(
+fn check_reader<T: Binary + Wire<WriteError = Error> + PartialEq + core::fmt::Debug>(
     data: &[u8],
 ) {
     let mut reader = Reader::new(data);
@@ -22,7 +22,7 @@ fn check_reader<T: Binary + Wire<WriteError = EncodeError> + PartialEq + core::f
     {
         match value.to_bytes() {
             Ok(bytes) => assert_eq!(<T as Wire>::parse(&bytes).unwrap(), value),
-            Err(EncodeError::VariantType) => {}
+            Err(Error::VariantValue) => {}
             Err(error) => panic!("{error}"),
         }
     }
@@ -48,7 +48,7 @@ fuzz_target!(|data: &[u8]| {
         },
     };
 
-    check_decode(|| Frames::with_limits(limits), data);
+    check_decode(|| Chunks::with_limits(limits), data);
     check_wire::<Chunk>(data);
     let chunk = Chunk {
         message_type: match pick % 4 {

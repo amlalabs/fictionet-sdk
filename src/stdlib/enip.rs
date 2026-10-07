@@ -13,7 +13,7 @@
 //!
 //! Nothing here reads a socket. A world that plays a device pushes the
 //! bytes it reads from a [`tcp`](fictionet::stdlib::tcp) connection to a
-//! [`Stream<Frames>`](fictionet::stdlib::codec::Stream), gets [`Packet`]s back,
+//! [`Stream<Packets>`](fictionet::stdlib::codec::Stream), gets [`Packet`]s back,
 //! checks each one with [`Packet::check`], reads its command, and for the
 //! data commands reads the [`SendData`] envelope, its [`Cpf`] items and
 //! the [`MessageRequest`] inside. It writes replies with the same types,
@@ -24,9 +24,9 @@
 //! Every reader checks lengths and bounds, because the agent can send any
 //! bytes it likes. The encapsulation layer accepts any command code and
 //! any length, so [`Packet::parse_prefix`] only ever asks for more bytes and the
-//! stream never loses its place; the CIP readers return a [`DecodeError`]
+//! stream never loses its place; the CIP readers return an [`Error`]
 //! when bytes do not form the structure they name. Every writer returns
-//! an [`EncodeError`] instead of writing a value its reader would refuse
+//! an [`Error`] instead of writing a value its reader would refuse
 //! or read back as something else, so nothing is cut short in silence.
 //!
 //! ```
@@ -86,11 +86,11 @@ pub const MAX_PACKET: usize = u16::MAX as usize;
 /// the header, 65511 bytes. The length field can name more; a packet that
 /// does fails [`Packet::check`].
 pub const MAX_DATA: usize = MAX_PACKET - HEADER_LEN;
-/// The input capacity of [`Frames`]: 65559 bytes, including the header
+/// The input capacity of [`Packets`]: 65559 bytes, including the header
 /// and every data length the 16-bit length field can name.
 /// This exceeds [`MAX_PACKET`] so framing can consume an oversized packet.
 /// [`Packet::check`] then reports the protocol length error.
-pub const FRAMES_CAPACITY: usize = HEADER_LEN + u16::MAX as usize;
+pub const PACKETS_CAPACITY: usize = HEADER_LEN + u16::MAX as usize;
 /// The most items one [`Cpf`] may hold.
 pub const MAX_CPF_ITEMS: usize = 64;
 /// The most bytes one EPATH may hold, set by the word-counted path size.
@@ -225,17 +225,17 @@ impl Packet {
     }
 
     /// Whether a receiver should act on this packet. A packet with more
-    /// than [`MAX_DATA`] bytes of data is [`DecodeError::TooLong`]; a
+    /// than [`MAX_DATA`] bytes of data is [`Error::TooLong`]; a
     /// device may answer it with
     /// [`INVALID_LENGTH`](encap_status::INVALID_LENGTH). A packet whose
-    /// options are not 0 is [`DecodeError::Options`], and the receiver
+    /// options are not 0 is [`Error::Options`], and the receiver
     /// drops it without a reply (Volume 2, section 2-3.7).
-    pub fn check(&self) -> Result<(), DecodeError> {
+    pub fn check(&self) -> Result<(), Error> {
         if self.options != 0 {
-            return Err(DecodeError::Options);
+            return Err(Error::Options);
         }
         if self.data.len() > MAX_DATA {
-            return Err(DecodeError::TooLong);
+            return Err(Error::TooLong);
         }
         Ok(())
     }
@@ -256,39 +256,39 @@ impl Packet {
 }
 
 impl Wire for Packet {
-    type ParseError = DecodeError;
-    type WriteError = EncodeError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads exactly one packet that passes [`Packet::check`].
     /// [`Packet::parse_prefix`] accepts nonzero options and every
     /// length the header can name, so a receiver can apply its own policy.
-    /// Returns [`DecodeError::Truncated`] for an incomplete packet,
-    /// [`DecodeError::Trailing`] for extra bytes, [`DecodeError::Options`]
-    /// for nonzero options, and [`DecodeError::TooLong`] above [`MAX_DATA`].
-    fn parse(b: &[u8]) -> Result<Self, DecodeError> {
-        let (packet, used) = Self::parse_prefix(b).ok_or(DecodeError::Truncated)?;
+    /// Returns [`Error::Truncated`] for an incomplete packet,
+    /// [`Error::Trailing`] for extra bytes, [`Error::Options`]
+    /// for nonzero options, and [`Error::TooLong`] above [`MAX_DATA`].
+    fn parse(b: &[u8]) -> Result<Self, Error> {
+        let (packet, used) = Self::parse_prefix(b).ok_or(Error::Truncated)?;
         if used != b.len() {
-            return Err(DecodeError::Trailing);
+            return Err(Error::Trailing);
         }
         packet.check()?;
         Ok(packet)
     }
 
     /// The packet's bytes: the header, then the data. Data longer than
-    /// [`MAX_DATA`] is [`EncodeError::TooLong`], options other than 0 are
-    /// [`EncodeError::Options`], and a [`Command::Other`] holding a code
-    /// with a name of its own is [`EncodeError::Unwritable`], since it would
+    /// [`MAX_DATA`] is [`Error::TooLong`], options other than 0 are
+    /// [`Error::Options`], and a [`Command::Other`] holding a code
+    /// with a name of its own is [`Error::Unwritable`], since it would
     /// read back as that name.
-    fn write(&self, dst: &mut Vec<u8>) -> Result<(), EncodeError> {
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
         if self.data.len() > MAX_DATA {
-            return Err(EncodeError::TooLong);
+            return Err(Error::TooLong);
         }
         if self.options != 0 {
-            return Err(EncodeError::Options);
+            return Err(Error::Options);
         }
         let code = self.command.code();
         if Command::from_code(code) != self.command {
-            return Err(EncodeError::Unwritable);
+            return Err(Error::Unwritable);
         }
         let mut out = Vec::with_capacity(HEADER_LEN + self.data.len());
         out.extend_from_slice(&code.to_le_bytes());
@@ -307,27 +307,27 @@ impl Wire for Packet {
 ///
 /// Framing accepts every command, option word, and 16-bit data length.
 /// Use [`Packet::check`] to decide whether to act on each packet.
-/// [`Stream::new`](fictionet::stdlib::codec::Stream::new) holds at most [`FRAMES_CAPACITY`]
+/// [`Stream::new`](fictionet::stdlib::codec::Stream::new) holds at most [`PACKETS_CAPACITY`]
 /// bytes (65559), including room for lengths above [`MAX_DATA`].
 /// Partial packets return [`Step::Need`], including at EOF, when the stream
 /// reports truncation.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct Frames;
+pub struct Packets;
 
-impl Frames {
-    /// Creates a packet decoder with capacity [`FRAMES_CAPACITY`] (65559 bytes).
+impl Packets {
+    /// Creates a packet decoder with capacity [`PACKETS_CAPACITY`] (65559 bytes).
     pub fn new() -> Self {
         Self
     }
 }
 
-impl Decode for Frames {
+impl Decode for Packets {
     type Item = Packet;
     type Error = Infallible;
     const NAME: &'static str = "EtherNet/IP";
 
     fn capacity(&self) -> usize {
-        FRAMES_CAPACITY
+        PACKETS_CAPACITY
     }
 
     /// Reads a packet prefix, returning [`Step::Need`] while incomplete.
@@ -341,88 +341,59 @@ impl Decode for Frames {
     }
 }
 
-/// Why bytes do not form the structure a reader named.
+/// Why bytes do not form the structure a reader named, or why a value
+/// cannot be written. A writer returns one of these rather than write
+/// bytes its reader would refuse or read back as another value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum DecodeError {
+pub enum Error {
     /// More bytes were needed than were there.
     Truncated,
-    /// A count or length ran past one of this module's named limits.
+    /// A count or length ran past one of this module's named limits, or
+    /// a list or a byte string to write is longer than its length field
+    /// or one of those limits allows.
     TooLong,
     /// Bytes were left over after a structure that should fill its slice.
     Trailing,
     /// An EPATH segment used a type this module does not read.
     UnknownSegment(u8),
-    /// An EPATH segment was the right type but malformed.
+    /// An EPATH segment was the right type but malformed, or its fields do
+    /// not form a segment of its type.
     BadSegment,
     /// The service code's [`REPLY_FLAG`] bit was set in a request, or clear
-    /// in a reply.
+    /// in a reply. A writer refuses a request or reply whose service code
+    /// has it set; it adds the bit to a reply itself.
     ReplyFlag,
     /// A packet's options were not 0, so the receiver drops it.
     Options,
     /// A [`SendData`] envelope did not start with an address item and a
     /// data item, or a known address item had the wrong length.
     Items,
-}
-
-impl std::fmt::Display for DecodeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            DecodeError::Truncated => f.write_str("ran out of bytes"),
-            DecodeError::TooLong => f.write_str("a count or length is past a limit"),
-            DecodeError::Trailing => f.write_str("bytes left over"),
-            DecodeError::UnknownSegment(t) => write!(f, "EPATH segment type {t:#04x} not read"),
-            DecodeError::BadSegment => f.write_str("malformed EPATH segment"),
-            DecodeError::ReplyFlag => f.write_str("service reply bit does not match the message"),
-            DecodeError::Options => f.write_str("encapsulation options are not zero"),
-            DecodeError::Items => {
-                f.write_str("send-data items are not an address item and a data item")
-            }
-        }
-    }
-}
-
-impl std::error::Error for DecodeError {}
-
-/// Why a value cannot be written. A writer returns one of these rather
-/// than write bytes its reader would refuse or read back as another value.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum EncodeError {
-    /// A list or a byte string is longer than its length field or one of
-    /// this module's named limits allows.
-    TooLong,
     /// Bytes counted in 16-bit words were an odd number.
     OddLength,
-    /// A request's service code had the [`REPLY_FLAG`] bit set, or a
-    /// reply's service code did; the writer adds it to a reply.
-    ReplyFlag,
-    /// A packet's options were not 0.
-    Options,
     /// A [`Command::Other`] held a code that has a name of its own.
     Unwritable,
-    /// An EPATH segment's fields do not form a segment of its type.
-    BadSegment,
-    /// A [`SendData`] envelope did not start with an address item and a
-    /// data item, or a known address item had the wrong length.
-    Items,
 }
 
-impl std::fmt::Display for EncodeError {
+impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            EncodeError::TooLong => f.write_str("a count or length is past a limit"),
-            EncodeError::OddLength => f.write_str("word-counted bytes are an odd number"),
-            EncodeError::ReplyFlag => f.write_str("service code has the reply bit set"),
-            EncodeError::Options => f.write_str("encapsulation options are not zero"),
-            EncodeError::Unwritable => f.write_str("value cannot be written without changing it"),
-            EncodeError::BadSegment => f.write_str("EPATH segment fields do not fit its type"),
-            EncodeError::Items => {
+            Error::Truncated => f.write_str("ran out of bytes"),
+            Error::TooLong => f.write_str("a count or length is past a limit"),
+            Error::Trailing => f.write_str("bytes left over"),
+            Error::UnknownSegment(t) => write!(f, "EPATH segment type {t:#04x} not read"),
+            Error::BadSegment => f.write_str("malformed EPATH segment"),
+            Error::ReplyFlag => f.write_str("service reply bit does not match the message"),
+            Error::Options => f.write_str("encapsulation options are not zero"),
+            Error::Items => {
                 f.write_str("send-data items are not an address item and a data item")
             }
+            Error::OddLength => f.write_str("word-counted bytes are an odd number"),
+            Error::Unwritable => f.write_str("value cannot be written without changing it"),
         }
     }
 }
 
-impl std::error::Error for EncodeError {}
+impl std::error::Error for Error {}
 
 /// The data of a [`RegisterSession`](Command::RegisterSession) request or
 /// reply.
@@ -660,7 +631,7 @@ const NETWORK_WORDS: u8 = 0x10;
 impl PathSegment {
     /// The bytes of this one segment, appended to `out`. Each segment is an
     /// even number of bytes, so a whole path is a whole number of words.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         match self {
             PathSegment::Class(v) => write_logical(out, LOGICAL_CLASS, u32::from(*v)),
             PathSegment::Instance(v) => write_logical(out, LOGICAL_INSTANCE, *v),
@@ -684,7 +655,7 @@ impl PathSegment {
             }
             PathSegment::Port { port, link } => {
                 if link.len() > MAX_LINK_ADDRESS {
-                    return Err(EncodeError::TooLong);
+                    return Err(Error::TooLong);
                 }
                 let extended = link.len() != 1;
                 let nibble = if *port <= 0x0e { *port as u8 } else { 0x0f };
@@ -703,7 +674,7 @@ impl PathSegment {
             }
             PathSegment::Symbol(name) => {
                 if name.len() > MAX_SYMBOL {
-                    return Err(EncodeError::TooLong);
+                    return Err(Error::TooLong);
                 }
                 out.push(ANSI_SYMBOL);
                 out.push(name.len() as u8);
@@ -718,12 +689,12 @@ impl PathSegment {
             }
             PathSegment::Network { segment_type, data } => {
                 if segment_type & 0xe0 != NETWORK {
-                    return Err(EncodeError::BadSegment);
+                    return Err(Error::BadSegment);
                 }
                 out.push(*segment_type);
                 if segment_type & NETWORK_WORDS == 0 {
                     let [byte] = data[..] else {
-                        return Err(EncodeError::BadSegment);
+                        return Err(Error::BadSegment);
                     };
                     out.push(byte);
                 } else {
@@ -737,12 +708,12 @@ impl PathSegment {
 
 /// Appends a word count byte and `data`, which must be a whole number of
 /// words that the count can name.
-fn write_words(out: &mut Vec<u8>, data: &[u8]) -> Result<(), EncodeError> {
+fn write_words(out: &mut Vec<u8>, data: &[u8]) -> Result<(), Error> {
     if !data.len().is_multiple_of(2) {
-        return Err(EncodeError::OddLength);
+        return Err(Error::OddLength);
     }
     if data.len() > MAX_WORD_COUNTED {
-        return Err(EncodeError::TooLong);
+        return Err(Error::TooLong);
     }
     out.push((data.len() / 2) as u8);
     out.extend_from_slice(data);
@@ -769,23 +740,23 @@ fn write_logical(out: &mut Vec<u8>, logical_type: u8, value: u32) {
 
 /// Reads a word count byte at `b[i + 1]` and the words after it, and
 /// returns them and where the segment ends.
-fn read_words(b: &[u8], i: usize) -> Result<(Vec<u8>, usize), DecodeError> {
-    let count = *b.get(i + 1).ok_or(DecodeError::Truncated)?;
+fn read_words(b: &[u8], i: usize) -> Result<(Vec<u8>, usize), Error> {
+    let count = *b.get(i + 1).ok_or(Error::Truncated)?;
     let start = i + 2;
     let end = start + 2 * usize::from(count);
     if end > b.len() {
-        return Err(DecodeError::Truncated);
+        return Err(Error::Truncated);
     }
     Ok((b[start..end].to_vec(), end))
 }
 
 /// Reads a whole EPATH that fills `b`.
-fn parse_path(b: &[u8]) -> Result<Vec<PathSegment>, DecodeError> {
+fn parse_path(b: &[u8]) -> Result<Vec<PathSegment>, Error> {
     let mut segments = Vec::new();
     let mut i = 0;
     while i < b.len() {
         if segments.len() >= MAX_PATH_SEGMENTS {
-            return Err(DecodeError::TooLong);
+            return Err(Error::TooLong);
         }
         let t = b[i];
         match t & 0xe0 {
@@ -793,16 +764,16 @@ fn parse_path(b: &[u8]) -> Result<Vec<PathSegment>, DecodeError> {
                 let logical_type = (t >> 2) & 0x07;
                 if logical_type == LOGICAL_SPECIAL {
                     if t != ELECTRONIC_KEY {
-                        return Err(DecodeError::UnknownSegment(t));
+                        return Err(Error::UnknownSegment(t));
                     }
                     let end = i
                         .checked_add(ELECTRONIC_KEY_LEN)
-                        .ok_or(DecodeError::TooLong)?;
+                        .ok_or(Error::TooLong)?;
                     if end > b.len() {
-                        return Err(DecodeError::Truncated);
+                        return Err(Error::Truncated);
                     }
                     if b[i + 1] != KEY_FORMAT {
-                        return Err(DecodeError::BadSegment);
+                        return Err(Error::BadSegment);
                     }
                     segments.push(PathSegment::ElectronicKey {
                         vendor_id: le16(b, i + 2),
@@ -817,38 +788,38 @@ fn parse_path(b: &[u8]) -> Result<Vec<PathSegment>, DecodeError> {
                 let (value, used) = match t & 0x03 {
                     0 => {
                         if i + 2 > b.len() {
-                            return Err(DecodeError::Truncated);
+                            return Err(Error::Truncated);
                         }
                         (u32::from(b[i + 1]), 2)
                     }
                     1 => {
                         if i + 4 > b.len() {
-                            return Err(DecodeError::Truncated);
+                            return Err(Error::Truncated);
                         }
                         (u32::from(le16(b, i + 2)), 4)
                     }
                     2 => {
                         if i + 6 > b.len() {
-                            return Err(DecodeError::Truncated);
+                            return Err(Error::Truncated);
                         }
                         (le32(b, i + 2), 6)
                     }
-                    _ => return Err(DecodeError::BadSegment),
+                    _ => return Err(Error::BadSegment),
                 };
                 // Class and attribute identifiers have no 32-bit form, so
                 // theirs are 8 or 16 bits and fit a u16.
-                let narrow = || u16::try_from(value).map_err(|_| DecodeError::BadSegment);
+                let narrow = || u16::try_from(value).map_err(|_| Error::BadSegment);
                 let segment = match logical_type {
                     LOGICAL_CLASS => PathSegment::Class(narrow()?),
                     LOGICAL_ATTRIBUTE => PathSegment::Attribute(narrow()?),
                     LOGICAL_INSTANCE => PathSegment::Instance(value),
                     LOGICAL_MEMBER => PathSegment::Member(value),
                     LOGICAL_CONNECTION_POINT => PathSegment::ConnectionPoint(value),
-                    _ => return Err(DecodeError::UnknownSegment(t)),
+                    _ => return Err(Error::UnknownSegment(t)),
                 };
                 if used == 6 && matches!(segment, PathSegment::Class(_) | PathSegment::Attribute(_))
                 {
-                    return Err(DecodeError::BadSegment);
+                    return Err(Error::BadSegment);
                 }
                 segments.push(segment);
                 i += used;
@@ -859,7 +830,7 @@ fn parse_path(b: &[u8]) -> Result<Vec<PathSegment>, DecodeError> {
                 let mut j = i + 1;
                 let link_len = if extended {
                     if j >= b.len() {
-                        return Err(DecodeError::Truncated);
+                        return Err(Error::Truncated);
                     }
                     let n = usize::from(b[j]);
                     j += 1;
@@ -869,7 +840,7 @@ fn parse_path(b: &[u8]) -> Result<Vec<PathSegment>, DecodeError> {
                 };
                 let port = if nibble == 0x0f {
                     if j + 2 > b.len() {
-                        return Err(DecodeError::Truncated);
+                        return Err(Error::Truncated);
                     }
                     let p = le16(b, j);
                     j += 2;
@@ -878,13 +849,13 @@ fn parse_path(b: &[u8]) -> Result<Vec<PathSegment>, DecodeError> {
                     u16::from(nibble)
                 };
                 if j + link_len > b.len() {
-                    return Err(DecodeError::Truncated);
+                    return Err(Error::Truncated);
                 }
                 let link = b[j..j + link_len].to_vec();
                 j += link_len;
                 if (j - i) % 2 != 0 {
                     if j >= b.len() {
-                        return Err(DecodeError::Truncated);
+                        return Err(Error::Truncated);
                     }
                     j += 1;
                 }
@@ -893,7 +864,7 @@ fn parse_path(b: &[u8]) -> Result<Vec<PathSegment>, DecodeError> {
             }
             NETWORK => {
                 if t & NETWORK_WORDS == 0 {
-                    let byte = *b.get(i + 1).ok_or(DecodeError::Truncated)?;
+                    let byte = *b.get(i + 1).ok_or(Error::Truncated)?;
                     segments.push(PathSegment::Network {
                         segment_type: t,
                         data: vec![byte],
@@ -915,32 +886,32 @@ fn parse_path(b: &[u8]) -> Result<Vec<PathSegment>, DecodeError> {
             }
             0x80 if t == ANSI_SYMBOL => {
                 if i + 2 > b.len() {
-                    return Err(DecodeError::Truncated);
+                    return Err(Error::Truncated);
                 }
                 let len = usize::from(b[i + 1]);
                 // The name is padded to a whole number of words.
                 let padded = len + len % 2;
                 let start = i + 2;
                 if start + padded > b.len() {
-                    return Err(DecodeError::Truncated);
+                    return Err(Error::Truncated);
                 }
                 segments.push(PathSegment::Symbol(b[start..start + len].to_vec()));
                 i = start + padded;
             }
-            _ => return Err(DecodeError::UnknownSegment(t)),
+            _ => return Err(Error::UnknownSegment(t)),
         }
     }
     Ok(segments)
 }
 
 /// Writes an EPATH. A path longer than [`MAX_PATH_BYTES`], which the word
-/// count byte cannot name, is [`EncodeError::TooLong`].
-fn write_path(segments: &[PathSegment]) -> Result<Vec<u8>, EncodeError> {
+/// count byte cannot name, is [`Error::TooLong`].
+fn write_path(segments: &[PathSegment]) -> Result<Vec<u8>, Error> {
     let mut out = Vec::new();
     for segment in segments {
         segment.write(&mut out)?;
         if out.len() > MAX_PATH_BYTES {
-            return Err(EncodeError::TooLong);
+            return Err(Error::TooLong);
         }
     }
     Ok(out)
@@ -1144,24 +1115,24 @@ pub struct ForwardCloseResponse {
 const FORWARD_CLOSE_REPLY_FIXED: usize = 10;
 
 // Forward Open and Close end in one byte-counted number of 16-bit words.
-fn word_tail(b: &[u8], fixed: usize, count_at: usize) -> Result<&[u8], DecodeError> {
-    let header = b.get(..fixed).ok_or(DecodeError::Truncated)?;
-    let count = usize::from(*header.get(count_at).ok_or(DecodeError::Truncated)?);
-    let end = fixed.checked_add(count * 2).ok_or(DecodeError::TooLong)?;
-    let tail = b.get(fixed..end).ok_or(DecodeError::Truncated)?;
+fn word_tail(b: &[u8], fixed: usize, count_at: usize) -> Result<&[u8], Error> {
+    let header = b.get(..fixed).ok_or(Error::Truncated)?;
+    let count = usize::from(*header.get(count_at).ok_or(Error::Truncated)?);
+    let end = fixed.checked_add(count * 2).ok_or(Error::TooLong)?;
+    let tail = b.get(fixed..end).ok_or(Error::Truncated)?;
     if end != b.len() {
-        return Err(DecodeError::Trailing);
+        return Err(Error::Trailing);
     }
     Ok(tail)
 }
 
 /// `b`, if it is a whole number of words that a word count byte can name.
-fn check_words(b: &[u8]) -> Result<&[u8], EncodeError> {
+fn check_words(b: &[u8]) -> Result<&[u8], Error> {
     if !b.len().is_multiple_of(2) {
-        return Err(EncodeError::OddLength);
+        return Err(Error::OddLength);
     }
     if b.len() > MAX_WORD_COUNTED {
-        return Err(EncodeError::TooLong);
+        return Err(Error::TooLong);
     }
     Ok(b)
 }
@@ -1175,18 +1146,18 @@ fn le32(b: &[u8], i: usize) -> u32 {
 }
 
 impl Wire for RegisterSession {
-    type ParseError = DecodeError;
+    type ParseError = Error;
     type WriteError = Infallible;
 
     /// Reads a register-session body: a version and options flags.
-    /// Returns [`DecodeError::Truncated`] below four bytes and
-    /// [`DecodeError::Trailing`] above four bytes.
-    fn parse(b: &[u8]) -> Result<RegisterSession, DecodeError> {
+    /// Returns [`Error::Truncated`] below four bytes and
+    /// [`Error::Trailing`] above four bytes.
+    fn parse(b: &[u8]) -> Result<RegisterSession, Error> {
         if b.len() != 4 {
             return Err(if b.len() < 4 {
-                DecodeError::Truncated
+                Error::Truncated
             } else {
-                DecodeError::Trailing
+                Error::Trailing
             });
         }
         Ok(RegisterSession {
@@ -1207,38 +1178,38 @@ impl Wire for RegisterSession {
 }
 
 impl Wire for Cpf {
-    type ParseError = DecodeError;
-    type WriteError = EncodeError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads a common packet format that fills `b`. Extra bytes after the
-    /// last item are a [`DecodeError::Trailing`], and more than
+    /// last item are an [`Error::Trailing`], and more than
     /// [`MAX_DATA`] bytes, which no packet can carry, are a
-    /// [`DecodeError::TooLong`].
-    /// Short headers or item bodies return [`DecodeError::Truncated`].
-    /// More than [`MAX_CPF_ITEMS`] items return [`DecodeError::TooLong`].
-    fn parse(b: &[u8]) -> Result<Cpf, DecodeError> {
+    /// [`Error::TooLong`].
+    /// Short headers or item bodies return [`Error::Truncated`].
+    /// More than [`MAX_CPF_ITEMS`] items return [`Error::TooLong`].
+    fn parse(b: &[u8]) -> Result<Cpf, Error> {
         if b.len() > MAX_DATA {
-            return Err(DecodeError::TooLong);
+            return Err(Error::TooLong);
         }
         if b.len() < 2 {
-            return Err(DecodeError::Truncated);
+            return Err(Error::Truncated);
         }
         let count = usize::from(le16(b, 0));
         if count > MAX_CPF_ITEMS {
-            return Err(DecodeError::TooLong);
+            return Err(Error::TooLong);
         }
         let mut items = Vec::with_capacity(count);
         let mut i = 2;
         for _ in 0..count {
             if i + 4 > b.len() {
-                return Err(DecodeError::Truncated);
+                return Err(Error::Truncated);
             }
             let type_id = le16(b, i);
             let len = usize::from(le16(b, i + 2));
             let start = i + 4;
-            let end = start.checked_add(len).ok_or(DecodeError::TooLong)?;
+            let end = start.checked_add(len).ok_or(Error::TooLong)?;
             if end > b.len() {
-                return Err(DecodeError::Truncated);
+                return Err(Error::Truncated);
             }
             items.push(CpfItem {
                 type_id,
@@ -1247,17 +1218,17 @@ impl Wire for Cpf {
             i = end;
         }
         if i != b.len() {
-            return Err(DecodeError::Trailing);
+            return Err(Error::Trailing);
         }
         Ok(Cpf { items })
     }
 
     /// The bytes of the common packet format. More than [`MAX_CPF_ITEMS`]
     /// items, or more than [`MAX_DATA`] bytes in all, are
-    /// [`EncodeError::TooLong`].
-    fn write(&self, dst: &mut Vec<u8>) -> Result<(), EncodeError> {
+    /// [`Error::TooLong`].
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
         if self.items.len() > MAX_CPF_ITEMS {
-            return Err(EncodeError::TooLong);
+            return Err(Error::TooLong);
         }
         let mut out = Vec::new();
         out.extend_from_slice(&(self.items.len() as u16).to_le_bytes());
@@ -1269,7 +1240,7 @@ impl Wire for Cpf {
                 .and_then(|n| n.checked_add(it.data.len()))
                 .is_none_or(|n| n > MAX_DATA)
             {
-                return Err(EncodeError::TooLong);
+                return Err(Error::TooLong);
             }
             out.extend_from_slice(&it.type_id.to_le_bytes());
             out.extend_from_slice(&(it.data.len() as u16).to_le_bytes());
@@ -1281,30 +1252,30 @@ impl Wire for Cpf {
 }
 
 impl Wire for Identity {
-    type ParseError = DecodeError;
-    type WriteError = EncodeError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads an identity that fills `b`. The eight zero bytes that end the
     /// socket address are not checked. A product name longer than
-    /// [`MAX_PRODUCT_NAME`] is a [`DecodeError::TooLong`].
-    /// Short fields return [`DecodeError::Truncated`]. Bytes after the
-    /// state byte return [`DecodeError::Trailing`].
-    fn parse(b: &[u8]) -> Result<Identity, DecodeError> {
+    /// [`MAX_PRODUCT_NAME`] is an [`Error::TooLong`].
+    /// Short fields return [`Error::Truncated`]. Bytes after the
+    /// state byte return [`Error::Trailing`].
+    fn parse(b: &[u8]) -> Result<Identity, Error> {
         // The fixed part, the name length byte, and the state byte.
         if b.len() < IDENTITY_FIXED + 2 {
-            return Err(DecodeError::Truncated);
+            return Err(Error::Truncated);
         }
         let name_len = usize::from(b[IDENTITY_FIXED]);
         if name_len > MAX_PRODUCT_NAME {
-            return Err(DecodeError::TooLong);
+            return Err(Error::TooLong);
         }
         let name_start = IDENTITY_FIXED + 1;
         let end = name_start + name_len + 1;
         if end > b.len() {
-            return Err(DecodeError::Truncated);
+            return Err(Error::Truncated);
         }
         if end != b.len() {
-            return Err(DecodeError::Trailing);
+            return Err(Error::Trailing);
         }
         Ok(Identity {
             protocol_version: le16(b, 0),
@@ -1324,11 +1295,11 @@ impl Wire for Identity {
     }
 
     /// The bytes of an identity. A product name longer than
-    /// [`MAX_PRODUCT_NAME`] is [`EncodeError::TooLong`].
-    fn write(&self, dst: &mut Vec<u8>) -> Result<(), EncodeError> {
+    /// [`MAX_PRODUCT_NAME`] is [`Error::TooLong`].
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
         let name = &self.product_name;
         if name.len() > MAX_PRODUCT_NAME {
-            return Err(EncodeError::TooLong);
+            return Err(Error::TooLong);
         }
         let mut out = Vec::with_capacity(IDENTITY_FIXED + 2 + name.len());
         out.extend_from_slice(&self.protocol_version.to_le_bytes());
@@ -1351,25 +1322,25 @@ impl Wire for Identity {
 }
 
 impl Wire for SendData {
-    type ParseError = DecodeError;
-    type WriteError = EncodeError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads a send-data envelope that fills `b`. Items that do not start
-    /// with an address item and a data item are a [`DecodeError::Items`].
-    /// Short fields return [`DecodeError::Truncated`], excess bytes return
-    /// [`DecodeError::Trailing`], and excess items or input above [`MAX_DATA`]
-    /// return [`DecodeError::TooLong`]. Known address items must have their
-    /// fixed lengths or parsing returns [`DecodeError::Items`].
-    fn parse(b: &[u8]) -> Result<SendData, DecodeError> {
+    /// with an address item and a data item are an [`Error::Items`].
+    /// Short fields return [`Error::Truncated`], excess bytes return
+    /// [`Error::Trailing`], and excess items or input above [`MAX_DATA`]
+    /// return [`Error::TooLong`]. Known address items must have their
+    /// fixed lengths or parsing returns [`Error::Items`].
+    fn parse(b: &[u8]) -> Result<SendData, Error> {
         if b.len() > MAX_DATA {
-            return Err(DecodeError::TooLong);
+            return Err(Error::TooLong);
         }
         if b.len() < 6 {
-            return Err(DecodeError::Truncated);
+            return Err(Error::Truncated);
         }
         let cpf = Cpf::parse(&b[6..])?;
         if !send_items_ok(&cpf.items) {
-            return Err(DecodeError::Items);
+            return Err(Error::Items);
         }
         Ok(SendData {
             interface_handle: le32(b, 0),
@@ -1379,15 +1350,15 @@ impl Wire for SendData {
     }
 
     /// The bytes of a send-data envelope. Items that do not start with an
-    /// address item and a data item are [`EncodeError::Items`], and an
-    /// envelope longer than [`MAX_DATA`] is [`EncodeError::TooLong`].
-    fn write(&self, dst: &mut Vec<u8>) -> Result<(), EncodeError> {
+    /// address item and a data item are [`Error::Items`], and an
+    /// envelope longer than [`MAX_DATA`] is [`Error::TooLong`].
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
         if !send_items_ok(&self.cpf.items) {
-            return Err(EncodeError::Items);
+            return Err(Error::Items);
         }
         let cpf = self.cpf.to_bytes()?;
         if cpf.len() > MAX_DATA - 6 {
-            return Err(EncodeError::TooLong);
+            return Err(Error::TooLong);
         }
         let mut out = Vec::with_capacity(6 + cpf.len());
         out.extend_from_slice(&self.interface_handle.to_le_bytes());
@@ -1399,31 +1370,31 @@ impl Wire for SendData {
 }
 
 impl Wire for MessageRequest {
-    type ParseError = DecodeError;
-    type WriteError = EncodeError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads a message router request. A service code with the
     /// [`REPLY_FLAG`] bit set is a reply, so it is a
-    /// [`DecodeError::ReplyFlag`]. More than [`MAX_DATA`] bytes is a
-    /// [`DecodeError::TooLong`].
-    /// Short headers or paths return [`DecodeError::Truncated`]. Unsupported
-    /// path types return [`DecodeError::UnknownSegment`]; malformed segments
-    /// return [`DecodeError::BadSegment`]. Path limits return [`DecodeError::TooLong`].
-    fn parse(b: &[u8]) -> Result<MessageRequest, DecodeError> {
+    /// [`Error::ReplyFlag`]. More than [`MAX_DATA`] bytes is a
+    /// [`Error::TooLong`].
+    /// Short headers or paths return [`Error::Truncated`]. Unsupported
+    /// path types return [`Error::UnknownSegment`]; malformed segments
+    /// return [`Error::BadSegment`]. Path limits return [`Error::TooLong`].
+    fn parse(b: &[u8]) -> Result<MessageRequest, Error> {
         if b.len() > MAX_DATA {
-            return Err(DecodeError::TooLong);
+            return Err(Error::TooLong);
         }
         if b.len() < 2 {
-            return Err(DecodeError::Truncated);
+            return Err(Error::Truncated);
         }
         let service = b[0];
         if service & REPLY_FLAG != 0 {
-            return Err(DecodeError::ReplyFlag);
+            return Err(Error::ReplyFlag);
         }
         let path_bytes = usize::from(b[1]) * 2;
-        let end = 2usize.checked_add(path_bytes).ok_or(DecodeError::TooLong)?;
+        let end = 2usize.checked_add(path_bytes).ok_or(Error::TooLong)?;
         if end > b.len() {
-            return Err(DecodeError::Truncated);
+            return Err(Error::Truncated);
         }
         Ok(MessageRequest {
             service,
@@ -1433,17 +1404,17 @@ impl Wire for MessageRequest {
     }
 
     /// The bytes of a message router request. A service code with the
-    /// [`REPLY_FLAG`] bit set is [`EncodeError::ReplyFlag`], and a path or
-    /// a request too long for its length fields is [`EncodeError::TooLong`].
-    /// Malformed path fields return [`EncodeError::BadSegment`]. Odd
-    /// word-counted path data returns [`EncodeError::OddLength`].
-    fn write(&self, dst: &mut Vec<u8>) -> Result<(), EncodeError> {
+    /// [`REPLY_FLAG`] bit set is [`Error::ReplyFlag`], and a path or
+    /// a request too long for its length fields is [`Error::TooLong`].
+    /// Malformed path fields return [`Error::BadSegment`]. Odd
+    /// word-counted path data returns [`Error::OddLength`].
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
         if self.service & REPLY_FLAG != 0 {
-            return Err(EncodeError::ReplyFlag);
+            return Err(Error::ReplyFlag);
         }
         let path = write_path(&self.path)?;
         if self.data.len() > MAX_DATA - 2 - path.len() {
-            return Err(EncodeError::TooLong);
+            return Err(Error::TooLong);
         }
         let mut out = Vec::with_capacity(2 + path.len() + self.data.len());
         out.push(self.service);
@@ -1456,23 +1427,23 @@ impl Wire for MessageRequest {
 }
 
 impl Wire for MessageResponse {
-    type ParseError = DecodeError;
-    type WriteError = EncodeError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads a message router response. A service code without the
     /// [`REPLY_FLAG`] bit is a request, so it is a
-    /// [`DecodeError::ReplyFlag`]. More than [`MAX_DATA`] bytes is a
-    /// [`DecodeError::TooLong`].
-    /// Short headers or additional status words return [`DecodeError::Truncated`].
-    fn parse(b: &[u8]) -> Result<MessageResponse, DecodeError> {
+    /// [`Error::ReplyFlag`]. More than [`MAX_DATA`] bytes is a
+    /// [`Error::TooLong`].
+    /// Short headers or additional status words return [`Error::Truncated`].
+    fn parse(b: &[u8]) -> Result<MessageResponse, Error> {
         if b.len() > MAX_DATA {
-            return Err(DecodeError::TooLong);
+            return Err(Error::TooLong);
         }
         if b.len() < 4 {
-            return Err(DecodeError::Truncated);
+            return Err(Error::Truncated);
         }
         if b[0] & REPLY_FLAG == 0 {
-            return Err(DecodeError::ReplyFlag);
+            return Err(Error::ReplyFlag);
         }
         let service = b[0] & !REPLY_FLAG;
         let status = b[2];
@@ -1480,9 +1451,9 @@ impl Wire for MessageResponse {
         let extra_bytes = extra_words * 2;
         let end = 4usize
             .checked_add(extra_bytes)
-            .ok_or(DecodeError::TooLong)?;
+            .ok_or(Error::TooLong)?;
         if end > b.len() {
-            return Err(DecodeError::Truncated);
+            return Err(Error::Truncated);
         }
         let additional_status = (0..extra_words).map(|w| le16(b, 4 + 2 * w)).collect();
         Ok(MessageResponse {
@@ -1494,19 +1465,19 @@ impl Wire for MessageResponse {
     }
 
     /// The bytes of a message router response, with the reply bit set. A
-    /// service code that already has it is [`EncodeError::ReplyFlag`].
+    /// service code that already has it is [`Error::ReplyFlag`].
     /// More than [`MAX_ADDITIONAL_STATUS`] words of additional status, or
-    /// a response longer than [`MAX_DATA`], is [`EncodeError::TooLong`].
-    fn write(&self, dst: &mut Vec<u8>) -> Result<(), EncodeError> {
+    /// a response longer than [`MAX_DATA`], is [`Error::TooLong`].
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
         if self.service & REPLY_FLAG != 0 {
-            return Err(EncodeError::ReplyFlag);
+            return Err(Error::ReplyFlag);
         }
         let extra = &self.additional_status;
         if extra.len() > MAX_ADDITIONAL_STATUS {
-            return Err(EncodeError::TooLong);
+            return Err(Error::TooLong);
         }
         if self.data.len() > MAX_DATA - 4 - 2 * extra.len() {
-            return Err(EncodeError::TooLong);
+            return Err(Error::TooLong);
         }
         let mut out = Vec::with_capacity(4 + extra.len() * 2 + self.data.len());
         out.push(self.service | REPLY_FLAG);
@@ -1523,15 +1494,15 @@ impl Wire for MessageResponse {
 }
 
 impl Wire for ForwardOpenRequest {
-    type ParseError = DecodeError;
-    type WriteError = EncodeError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads a Forward Open request body.
-    /// Short fields return [`DecodeError::Truncated`]; extra bytes return
-    /// [`DecodeError::Trailing`]. Unsupported path types return
-    /// [`DecodeError::UnknownSegment`], malformed segments return
-    /// [`DecodeError::BadSegment`], and path limits return [`DecodeError::TooLong`].
-    fn parse(b: &[u8]) -> Result<ForwardOpenRequest, DecodeError> {
+    /// Short fields return [`Error::Truncated`]; extra bytes return
+    /// [`Error::Trailing`]. Unsupported path types return
+    /// [`Error::UnknownSegment`], malformed segments return
+    /// [`Error::BadSegment`], and path limits return [`Error::TooLong`].
+    fn parse(b: &[u8]) -> Result<ForwardOpenRequest, Error> {
         let tail = word_tail(b, FORWARD_OPEN_FIXED, 35)?;
         Ok(ForwardOpenRequest {
             priority_time_tick: b[0],
@@ -1553,10 +1524,10 @@ impl Wire for ForwardOpenRequest {
     }
 
     /// The bytes of a Forward Open request body. A connection path too
-    /// long for its word count is [`EncodeError::TooLong`].
-    /// Malformed path fields return [`EncodeError::BadSegment`]. Odd
-    /// word-counted path data returns [`EncodeError::OddLength`].
-    fn write(&self, dst: &mut Vec<u8>) -> Result<(), EncodeError> {
+    /// long for its word count is [`Error::TooLong`].
+    /// Malformed path fields return [`Error::BadSegment`]. Odd
+    /// word-counted path data returns [`Error::OddLength`].
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
         let path = write_path(&self.connection_path)?;
         let mut out = Vec::with_capacity(FORWARD_OPEN_FIXED + path.len());
         out.push(self.priority_time_tick);
@@ -1581,13 +1552,13 @@ impl Wire for ForwardOpenRequest {
 }
 
 impl Wire for ForwardOpenResponse {
-    type ParseError = DecodeError;
-    type WriteError = EncodeError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads a Forward Open reply body.
-    /// Short fields or reply data return [`DecodeError::Truncated`].
-    /// Bytes beyond the word-counted reply return [`DecodeError::Trailing`].
-    fn parse(b: &[u8]) -> Result<ForwardOpenResponse, DecodeError> {
+    /// Short fields or reply data return [`Error::Truncated`].
+    /// Bytes beyond the word-counted reply return [`Error::Trailing`].
+    fn parse(b: &[u8]) -> Result<ForwardOpenResponse, Error> {
         let tail = word_tail(b, FORWARD_OPEN_REPLY_FIXED, 24)?;
         Ok(ForwardOpenResponse {
             o_t_connection_id: le32(b, 0),
@@ -1602,9 +1573,9 @@ impl Wire for ForwardOpenResponse {
     }
 
     /// The bytes of a Forward Open reply body. An application reply of an
-    /// odd number of bytes is [`EncodeError::OddLength`], and one longer
-    /// than [`MAX_WORD_COUNTED`] is [`EncodeError::TooLong`].
-    fn write(&self, dst: &mut Vec<u8>) -> Result<(), EncodeError> {
+    /// odd number of bytes is [`Error::OddLength`], and one longer
+    /// than [`MAX_WORD_COUNTED`] is [`Error::TooLong`].
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
         let reply = check_words(&self.application_reply)?;
         let mut out = Vec::with_capacity(FORWARD_OPEN_REPLY_FIXED + reply.len());
         out.extend_from_slice(&self.o_t_connection_id.to_le_bytes());
@@ -1623,15 +1594,15 @@ impl Wire for ForwardOpenResponse {
 }
 
 impl Wire for ForwardCloseRequest {
-    type ParseError = DecodeError;
-    type WriteError = EncodeError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads a Forward Close request body.
-    /// Short fields return [`DecodeError::Truncated`]; extra bytes return
-    /// [`DecodeError::Trailing`]. Unsupported path types return
-    /// [`DecodeError::UnknownSegment`], malformed segments return
-    /// [`DecodeError::BadSegment`], and path limits return [`DecodeError::TooLong`].
-    fn parse(b: &[u8]) -> Result<ForwardCloseRequest, DecodeError> {
+    /// Short fields return [`Error::Truncated`]; extra bytes return
+    /// [`Error::Trailing`]. Unsupported path types return
+    /// [`Error::UnknownSegment`], malformed segments return
+    /// [`Error::BadSegment`], and path limits return [`Error::TooLong`].
+    fn parse(b: &[u8]) -> Result<ForwardCloseRequest, Error> {
         let tail = word_tail(b, FORWARD_CLOSE_FIXED, 10)?;
         Ok(ForwardCloseRequest {
             priority_time_tick: b[0],
@@ -1644,10 +1615,10 @@ impl Wire for ForwardCloseRequest {
     }
 
     /// The bytes of a Forward Close request body. A connection path too
-    /// long for its word count is [`EncodeError::TooLong`].
-    /// Malformed path fields return [`EncodeError::BadSegment`]. Odd
-    /// word-counted path data returns [`EncodeError::OddLength`].
-    fn write(&self, dst: &mut Vec<u8>) -> Result<(), EncodeError> {
+    /// long for its word count is [`Error::TooLong`].
+    /// Malformed path fields return [`Error::BadSegment`]. Odd
+    /// word-counted path data returns [`Error::OddLength`].
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
         let path = write_path(&self.connection_path)?;
         let mut out = Vec::with_capacity(FORWARD_CLOSE_FIXED + path.len());
         out.push(self.priority_time_tick);
@@ -1664,13 +1635,13 @@ impl Wire for ForwardCloseRequest {
 }
 
 impl Wire for ForwardCloseResponse {
-    type ParseError = DecodeError;
-    type WriteError = EncodeError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads a Forward Close reply body.
-    /// Short fields or reply data return [`DecodeError::Truncated`].
-    /// Bytes beyond the word-counted reply return [`DecodeError::Trailing`].
-    fn parse(b: &[u8]) -> Result<ForwardCloseResponse, DecodeError> {
+    /// Short fields or reply data return [`Error::Truncated`].
+    /// Bytes beyond the word-counted reply return [`Error::Trailing`].
+    fn parse(b: &[u8]) -> Result<ForwardCloseResponse, Error> {
         let tail = word_tail(b, FORWARD_CLOSE_REPLY_FIXED, 8)?;
         Ok(ForwardCloseResponse {
             connection_serial: le16(b, 0),
@@ -1681,9 +1652,9 @@ impl Wire for ForwardCloseResponse {
     }
 
     /// The bytes of a Forward Close reply body. An application reply of an
-    /// odd number of bytes is [`EncodeError::OddLength`], and one longer
-    /// than [`MAX_WORD_COUNTED`] is [`EncodeError::TooLong`].
-    fn write(&self, dst: &mut Vec<u8>) -> Result<(), EncodeError> {
+    /// odd number of bytes is [`Error::OddLength`], and one longer
+    /// than [`MAX_WORD_COUNTED`] is [`Error::TooLong`].
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
         let reply = check_words(&self.application_reply)?;
         let mut out = Vec::with_capacity(FORWARD_CLOSE_REPLY_FIXED + reply.len());
         out.extend_from_slice(&self.connection_serial.to_le_bytes());
@@ -1716,11 +1687,11 @@ mod tests {
         assert_eq!(RegisterSession::parse(&bytes), Ok(rs));
         assert_eq!(
             RegisterSession::parse(&[1, 0, 0]),
-            Err(DecodeError::Truncated)
+            Err(Error::Truncated)
         );
         assert_eq!(
             RegisterSession::parse(&[1, 0, 0, 0, 0]),
-            Err(DecodeError::Trailing)
+            Err(Error::Trailing)
         );
     }
 
@@ -1787,9 +1758,9 @@ mod tests {
         };
         let mut stream = a.to_bytes().unwrap();
         stream.extend_from_slice(&b.to_bytes().unwrap());
-        let mut d = Stream::new(Frames::new());
+        let mut d = Stream::new(Packets::new());
         let mut got = Vec::new();
-        contract::check_decode(Frames::new, &stream);
+        contract::check_decode(Packets::new, &stream);
         pump(&mut d, &stream, |packet| got.push(packet)).unwrap();
         assert_eq!(got, vec![a, b]);
         assert_eq!(d.buffered(), 0);
@@ -1814,7 +1785,7 @@ mod tests {
             .take(one.len() * 200_000)
             .collect();
         let started = std::time::Instant::now();
-        let mut d = Stream::new(Frames::new());
+        let mut d = Stream::new(Packets::new());
         let mut n = 0;
         pump(&mut d, &stream, |_| n += 1).unwrap();
         assert_eq!(n, 200_000);
@@ -1841,20 +1812,20 @@ mod tests {
         // Count 2, null item (type 0, len 0), data item (type 0xB2, len 4).
         assert_eq!(&bytes[..4], &[0x02, 0x00, 0x00, 0x00]);
         assert_eq!(Cpf::parse(&bytes), Ok(cpf));
-        assert_eq!(Cpf::parse(&[0]), Err(DecodeError::Truncated));
+        assert_eq!(Cpf::parse(&[0]), Err(Error::Truncated));
         // Count says 1 item but the item header is cut.
-        assert_eq!(Cpf::parse(&[1, 0, 0, 0, 2]), Err(DecodeError::Truncated));
+        assert_eq!(Cpf::parse(&[1, 0, 0, 0, 2]), Err(Error::Truncated));
         // Item length runs past the end.
         assert_eq!(
             Cpf::parse(&[1, 0, 0, 0, 4, 0, 1, 2]),
-            Err(DecodeError::Truncated)
+            Err(Error::Truncated)
         );
         // Bytes left over after the items.
-        assert_eq!(Cpf::parse(&[0, 0, 9]), Err(DecodeError::Trailing));
+        assert_eq!(Cpf::parse(&[0, 0, 9]), Err(Error::Trailing));
         // Too many items.
         let mut many = ((MAX_CPF_ITEMS + 1) as u16).to_le_bytes().to_vec();
         many.resize(2 + 4 * (MAX_CPF_ITEMS + 1), 0);
-        assert_eq!(Cpf::parse(&many), Err(DecodeError::TooLong));
+        assert_eq!(Cpf::parse(&many), Err(Error::TooLong));
     }
 
     #[test]
@@ -1876,7 +1847,7 @@ mod tests {
         assert_eq!(SendData::parse(&bytes), Ok(send));
         assert_eq!(
             SendData::parse(&[0, 0, 0, 0, 0]),
-            Err(DecodeError::Truncated)
+            Err(Error::Truncated)
         );
     }
 
@@ -1932,34 +1903,34 @@ mod tests {
         // A logical type this module does not read (service ID, type 6).
         assert_eq!(
             parse_path(&[0x38, 0x00]),
-            Err(DecodeError::UnknownSegment(0x38))
+            Err(Error::UnknownSegment(0x38))
         );
         // An ANSI symbol whose name runs past the end, or whose pad byte is
         // missing.
-        assert_eq!(parse_path(&[0x91, 0x04, b'a']), Err(DecodeError::Truncated));
-        assert_eq!(parse_path(&[0x91, 0x01, b'a']), Err(DecodeError::Truncated));
+        assert_eq!(parse_path(&[0x91, 0x04, b'a']), Err(Error::Truncated));
+        assert_eq!(parse_path(&[0x91, 0x01, b'a']), Err(Error::Truncated));
         // A reserved logical format.
-        assert_eq!(parse_path(&[0x23, 0x00]), Err(DecodeError::BadSegment));
+        assert_eq!(parse_path(&[0x23, 0x00]), Err(Error::BadSegment));
         // A segment type this module does not read (symbolic, 0x60).
         assert_eq!(
             parse_path(&[0x60, 0x00]),
-            Err(DecodeError::UnknownSegment(0x60))
+            Err(Error::UnknownSegment(0x60))
         );
         // A network segment cut short.
-        assert_eq!(parse_path(&[0x43]), Err(DecodeError::Truncated));
-        assert_eq!(parse_path(&[0x51, 0x02, 0, 0]), Err(DecodeError::Truncated));
+        assert_eq!(parse_path(&[0x43]), Err(Error::Truncated));
+        assert_eq!(parse_path(&[0x51, 0x02, 0, 0]), Err(Error::Truncated));
         // A logical segment cut short.
-        assert_eq!(parse_path(&[0x20]), Err(DecodeError::Truncated));
-        assert_eq!(parse_path(&[0x21, 0x00, 0x00]), Err(DecodeError::Truncated));
+        assert_eq!(parse_path(&[0x20]), Err(Error::Truncated));
+        assert_eq!(parse_path(&[0x21, 0x00, 0x00]), Err(Error::Truncated));
         // An extended-link port with no size byte.
-        assert_eq!(parse_path(&[0x10]), Err(DecodeError::Truncated));
+        assert_eq!(parse_path(&[0x10]), Err(Error::Truncated));
         // A port with a link that runs past the end.
-        assert_eq!(parse_path(&[0x15, 0x04, 0x01]), Err(DecodeError::Truncated));
+        assert_eq!(parse_path(&[0x15, 0x04, 0x01]), Err(Error::Truncated));
         // Too many segments.
         let many: Vec<u8> = std::iter::repeat_n([0x20u8, 0x00], MAX_PATH_SEGMENTS + 1)
             .flatten()
             .collect();
-        assert_eq!(parse_path(&many), Err(DecodeError::TooLong));
+        assert_eq!(parse_path(&many), Err(Error::TooLong));
     }
 
     #[test]
@@ -1979,11 +1950,11 @@ mod tests {
             data: vec![0x2a, 0x00],
         };
         assert_eq!(MessageRequest::parse(&set.to_bytes().unwrap()), Ok(set));
-        assert_eq!(MessageRequest::parse(&[0x0e]), Err(DecodeError::Truncated));
+        assert_eq!(MessageRequest::parse(&[0x0e]), Err(Error::Truncated));
         // A path size that runs past the end.
         assert_eq!(
             MessageRequest::parse(&[0x0e, 0x04, 0x20, 0x01]),
-            Err(DecodeError::Truncated)
+            Err(Error::Truncated)
         );
     }
 
@@ -2011,12 +1982,12 @@ mod tests {
         assert_eq!(MessageResponse::parse(&bytes), Ok(fail));
         assert_eq!(
             MessageResponse::parse(&[0x8e, 0, 0]),
-            Err(DecodeError::Truncated)
+            Err(Error::Truncated)
         );
         // An additional status count that runs past the end.
         assert_eq!(
             MessageResponse::parse(&[0x8e, 0, 0, 2, 0, 0]),
-            Err(DecodeError::Truncated)
+            Err(Error::Truncated)
         );
     }
 
@@ -2049,7 +2020,7 @@ mod tests {
         assert_eq!(ForwardOpenRequest::parse(&bytes), Ok(req));
         assert_eq!(
             ForwardOpenRequest::parse(&[0; 10]),
-            Err(DecodeError::Truncated)
+            Err(Error::Truncated)
         );
 
         let resp = ForwardOpenResponse {
@@ -2066,7 +2037,7 @@ mod tests {
         assert_eq!(ForwardOpenResponse::parse(&bytes), Ok(resp));
         assert_eq!(
             ForwardOpenResponse::parse(&[0; 20]),
-            Err(DecodeError::Truncated)
+            Err(Error::Truncated)
         );
         // Trailing bytes past the reply.
         let mut extra = ForwardOpenResponse {
@@ -2084,7 +2055,7 @@ mod tests {
         extra.push(0xff);
         assert_eq!(
             ForwardOpenResponse::parse(&extra),
-            Err(DecodeError::Trailing)
+            Err(Error::Trailing)
         );
     }
 
@@ -2108,7 +2079,7 @@ mod tests {
         assert_eq!(ForwardCloseRequest::parse(&bytes), Ok(req));
         assert_eq!(
             ForwardCloseRequest::parse(&[0; 8]),
-            Err(DecodeError::Truncated)
+            Err(Error::Truncated)
         );
 
         let resp = ForwardCloseResponse {
@@ -2121,7 +2092,7 @@ mod tests {
         assert_eq!(ForwardCloseResponse::parse(&bytes), Ok(resp));
         assert_eq!(
             ForwardCloseResponse::parse(&[0; 6]),
-            Err(DecodeError::Truncated)
+            Err(Error::Truncated)
         );
     }
 
@@ -2145,7 +2116,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_holds_at_most_frames_capacity() {
+    fn stream_holds_at_most_packets_capacity() {
         // A stream of empty NOPs far longer than the decoder may hold.
         let one = packet(Command::Nop, 0, Vec::new()).to_bytes().unwrap();
         let stream: Vec<u8> = one
@@ -2154,9 +2125,9 @@ mod tests {
             .cycle()
             .take(one.len() * 500_000)
             .collect();
-        let mut d = Stream::new(Frames::new());
-        assert_eq!(d.push(&stream), FRAMES_CAPACITY);
-        assert_eq!(d.buffered(), FRAMES_CAPACITY);
+        let mut d = Stream::new(Packets::new());
+        assert_eq!(d.push(&stream), PACKETS_CAPACITY);
+        assert_eq!(d.buffered(), PACKETS_CAPACITY);
         // Full, it takes nothing more until packets are taken out.
         assert_eq!(d.push(&stream), 0);
         let mut n = 0;
@@ -2164,18 +2135,18 @@ mod tests {
             packet.unwrap();
             n += 1;
         }
-        pump(&mut d, &stream[FRAMES_CAPACITY..], |_| n += 1).unwrap();
+        pump(&mut d, &stream[PACKETS_CAPACITY..], |_| n += 1).unwrap();
         assert_eq!(n, 500_000);
         assert_eq!(d.buffered(), 0);
         // The longest frame the length field can name still fits whole.
         let mut big = vec![0u8; HEADER_LEN];
         big[2..4].copy_from_slice(&u16::MAX.to_le_bytes());
-        big.resize(FRAMES_CAPACITY, 0);
-        contract::check_decode_with_alloc_limit(Frames::new, &big, 2 * FRAMES_CAPACITY);
-        assert_eq!(d.push(&big), FRAMES_CAPACITY);
+        big.resize(PACKETS_CAPACITY, 0);
+        contract::check_decode_with_alloc_limit(Packets::new, &big, 2 * PACKETS_CAPACITY);
+        assert_eq!(d.push(&big), PACKETS_CAPACITY);
         let p = d.next().unwrap().unwrap();
         assert_eq!(p.data.len(), u16::MAX as usize);
-        assert_eq!(p.check(), Err(DecodeError::TooLong));
+        assert_eq!(p.check(), Err(Error::TooLong));
     }
 
     #[test]
@@ -2185,34 +2156,34 @@ mod tests {
         let back = MessageRequest::parse(&req).unwrap();
         assert_eq!(back.to_bytes().unwrap(), req);
         req.push(0);
-        assert_eq!(MessageRequest::parse(&req), Err(DecodeError::TooLong));
+        assert_eq!(MessageRequest::parse(&req), Err(Error::TooLong));
         let mut resp = vec![0x8e, 0, 0, 0];
         resp.resize(MAX_DATA, 0);
         let back = MessageResponse::parse(&resp).unwrap();
         assert_eq!(back.to_bytes().unwrap(), resp);
         resp.push(0);
-        assert_eq!(MessageResponse::parse(&resp), Err(DecodeError::TooLong));
+        assert_eq!(MessageResponse::parse(&resp), Err(Error::TooLong));
         // Writers refuse what the readers would refuse.
         let too_long = MessageRequest {
             service: 0x4c,
             path: Vec::new(),
             data: vec![0; MAX_DATA - 1],
         };
-        assert_eq!(too_long.to_bytes(), Err(EncodeError::TooLong));
+        assert_eq!(too_long.to_bytes(), Err(Error::TooLong));
         let too_long = MessageResponse {
             service: 0x4c,
             status: 0,
             additional_status: Vec::new(),
             data: vec![0; MAX_DATA - 3],
         };
-        assert_eq!(too_long.to_bytes(), Err(EncodeError::TooLong));
+        assert_eq!(too_long.to_bytes(), Err(Error::TooLong));
         assert_eq!(
             Cpf::parse(&vec![0; MAX_DATA + 1]),
-            Err(DecodeError::TooLong)
+            Err(Error::TooLong)
         );
         assert_eq!(
             SendData::parse(&vec![0; MAX_DATA + 1]),
-            Err(DecodeError::TooLong)
+            Err(Error::TooLong)
         );
     }
 
@@ -2245,13 +2216,13 @@ mod tests {
             path,
             data: Vec::new(),
         };
-        assert_eq!(over.to_bytes(), Err(EncodeError::TooLong));
+        assert_eq!(over.to_bytes(), Err(Error::TooLong));
         // A link address past the limit is refused, not cut.
         let port = vec![PathSegment::Port {
             port: 1,
             link: vec![0; MAX_LINK_ADDRESS + 1],
         }];
-        assert_eq!(write_path(&port), Err(EncodeError::TooLong));
+        assert_eq!(write_path(&port), Err(Error::TooLong));
         let close = ForwardCloseRequest {
             priority_time_tick: 0,
             timeout_ticks: 0,
@@ -2260,7 +2231,7 @@ mod tests {
             originator_serial: 0,
             connection_path: port,
         };
-        assert_eq!(close.to_bytes(), Err(EncodeError::TooLong));
+        assert_eq!(close.to_bytes(), Err(Error::TooLong));
     }
 
     #[test]
@@ -2273,7 +2244,7 @@ mod tests {
                 data: vec![0; u16::MAX as usize],
             },
         ]);
-        assert_eq!(send.to_bytes(), Err(EncodeError::TooLong));
+        assert_eq!(send.to_bytes(), Err(Error::TooLong));
         // The longest that fits writes a packet whose every layer reads.
         let room = MAX_DATA - 6 - 2 - 4 - 4;
         let send = send_data(vec![
@@ -2294,7 +2265,7 @@ mod tests {
                 data: vec![0; room + 1],
             },
         ]);
-        assert_eq!(send.to_bytes(), Err(EncodeError::TooLong));
+        assert_eq!(send.to_bytes(), Err(Error::TooLong));
         // Item headers count toward the limit too.
         let edge = Cpf {
             items: vec![
@@ -2306,7 +2277,7 @@ mod tests {
                 CpfItem::null_address(),
             ],
         };
-        assert_eq!(edge.to_bytes(), Err(EncodeError::TooLong));
+        assert_eq!(edge.to_bytes(), Err(Error::TooLong));
         let fits = Cpf {
             items: vec![CpfItem {
                 type_id: item::UNCONNECTED_DATA,
@@ -2318,9 +2289,9 @@ mod tests {
         let many = Cpf {
             items: vec![CpfItem::null_address(); MAX_CPF_ITEMS + 1],
         };
-        assert_eq!(many.to_bytes(), Err(EncodeError::TooLong));
+        assert_eq!(many.to_bytes(), Err(Error::TooLong));
         let p = packet(Command::SendRRData, 0, vec![0; MAX_DATA + 1]);
-        assert_eq!(p.to_bytes(), Err(EncodeError::TooLong));
+        assert_eq!(p.to_bytes(), Err(Error::TooLong));
     }
 
     #[test]
@@ -2338,8 +2309,8 @@ mod tests {
         over.extend_from_slice(&bytes);
         let (back, used) = Packet::parse_prefix(&over).unwrap();
         assert_eq!(used, 65536);
-        assert_eq!(back.check(), Err(DecodeError::TooLong));
-        assert_eq!(back.to_bytes(), Err(EncodeError::TooLong));
+        assert_eq!(back.check(), Err(Error::TooLong));
+        assert_eq!(back.to_bytes(), Err(Error::TooLong));
         assert_eq!(Packet::parse_prefix(&over[used..]).unwrap().0, longest);
     }
 
@@ -2416,10 +2387,10 @@ mod tests {
             },
         ];
         let want = [
-            EncodeError::OddLength,
-            EncodeError::BadSegment,
-            EncodeError::OddLength,
-            EncodeError::BadSegment,
+            Error::OddLength,
+            Error::BadSegment,
+            Error::OddLength,
+            Error::BadSegment,
         ];
         for (segment, err) in bad.iter().zip(want) {
             assert_eq!(
@@ -2434,11 +2405,11 @@ mod tests {
     fn class_and_attribute_have_no_32_bit_form() {
         assert_eq!(
             parse_path(&[0x22, 0x00, 0x00, 0x00, 0x01, 0x00]),
-            Err(DecodeError::BadSegment)
+            Err(Error::BadSegment)
         );
         assert_eq!(
             parse_path(&[0x32, 0x00, 0x01, 0x00, 0x00, 0x00]),
-            Err(DecodeError::BadSegment)
+            Err(Error::BadSegment)
         );
         // Instance, member and connection point do.
         assert_eq!(
@@ -2468,8 +2439,8 @@ mod tests {
         bytes[20] = 1;
         let (back, _) = Packet::parse_prefix(&bytes).unwrap();
         assert_eq!(back, request);
-        assert_eq!(back.check(), Err(DecodeError::Options));
-        assert_eq!(back.to_bytes(), Err(EncodeError::Options));
+        assert_eq!(back.check(), Err(Error::Options));
+        assert_eq!(back.to_bytes(), Err(Error::Options));
         // A reply sets the options to 0.
         let reply = back.reply(encap_status::SUCCESS, Vec::new());
         assert_eq!(reply.options, 0);
@@ -2478,9 +2449,9 @@ mod tests {
 
     #[test]
     fn send_data_needs_an_address_item_and_a_data_item() {
-        assert_eq!(SendData::parse(&[0; 8]), Err(DecodeError::Items));
+        assert_eq!(SendData::parse(&[0; 8]), Err(Error::Items));
         let one = send_data(vec![CpfItem::null_address()]);
-        assert_eq!(one.to_bytes(), Err(EncodeError::Items));
+        assert_eq!(one.to_bytes(), Err(Error::Items));
         // A null address item carries no bytes.
         let mut bytes = send_data(vec![
             CpfItem::null_address(),
@@ -2493,7 +2464,7 @@ mod tests {
         .unwrap();
         bytes[10] = 1;
         bytes.insert(12, 0xff);
-        assert_eq!(SendData::parse(&bytes), Err(DecodeError::Items));
+        assert_eq!(SendData::parse(&bytes), Err(Error::Items));
         let bad = send_data(vec![
             CpfItem {
                 type_id: item::NULL_ADDRESS,
@@ -2504,7 +2475,7 @@ mod tests {
                 data: vec![1, 2],
             },
         ]);
-        assert_eq!(bad.to_bytes(), Err(EncodeError::Items));
+        assert_eq!(bad.to_bytes(), Err(Error::Items));
         // Data item first is refused; a connected pair reads.
         let swapped = send_data(vec![
             CpfItem {
@@ -2513,7 +2484,7 @@ mod tests {
             },
             CpfItem::null_address(),
         ]);
-        assert_eq!(swapped.to_bytes(), Err(EncodeError::Items));
+        assert_eq!(swapped.to_bytes(), Err(Error::Items));
         let connected = send_data(vec![
             CpfItem {
                 type_id: item::CONNECTED_ADDRESS,
@@ -2536,10 +2507,10 @@ mod tests {
         b.push(33);
         b.extend_from_slice(&[b'A'; 33]);
         b.push(0xff);
-        assert_eq!(Identity::parse(&b), Err(DecodeError::TooLong));
+        assert_eq!(Identity::parse(&b), Err(Error::TooLong));
         let mut id = Identity::parse(&[vec![0u8; IDENTITY_FIXED], vec![0, 0xff]].concat()).unwrap();
         id.product_name = vec![b'A'; 33];
-        assert_eq!(id.to_bytes(), Err(EncodeError::TooLong));
+        assert_eq!(id.to_bytes(), Err(Error::TooLong));
     }
 
     #[test]
@@ -2547,7 +2518,7 @@ mod tests {
         // A named code held in Other would read back as its name.
         assert_eq!(
             packet(Command::Other(0x65), 0, Vec::new()).to_bytes(),
-            Err(EncodeError::Unwritable)
+            Err(Error::Unwritable)
         );
         let other = packet(Command::Other(0x72), 0, Vec::new());
         assert_eq!(Packet::parse_prefix(&other.to_bytes().unwrap()).unwrap().0, other);
@@ -2557,14 +2528,14 @@ mod tests {
             path: vec![PathSegment::Class(1)],
             data: Vec::new(),
         };
-        assert_eq!(req.to_bytes(), Err(EncodeError::ReplyFlag));
+        assert_eq!(req.to_bytes(), Err(Error::ReplyFlag));
         let resp = MessageResponse {
             service: 0x8e,
             status: 0,
             additional_status: Vec::new(),
             data: Vec::new(),
         };
-        assert_eq!(resp.to_bytes(), Err(EncodeError::ReplyFlag));
+        assert_eq!(resp.to_bytes(), Err(Error::ReplyFlag));
         // An odd application reply is refused, not padded.
         let close = ForwardCloseResponse {
             connection_serial: 1,
@@ -2572,7 +2543,7 @@ mod tests {
             originator_serial: 3,
             application_reply: vec![0xaa],
         };
-        assert_eq!(close.to_bytes(), Err(EncodeError::OddLength));
+        assert_eq!(close.to_bytes(), Err(Error::OddLength));
         let close = ForwardCloseResponse {
             application_reply: vec![0xaa, 0xbb],
             ..close
@@ -2591,7 +2562,7 @@ mod tests {
             t_o_api: 0,
             application_reply: vec![0; MAX_WORD_COUNTED + 2],
         };
-        assert_eq!(open.to_bytes(), Err(EncodeError::TooLong));
+        assert_eq!(open.to_bytes(), Err(Error::TooLong));
     }
 
     #[test]
@@ -2599,7 +2570,7 @@ mod tests {
         // 0x8e is a Get_Attribute_Single reply, not a request.
         assert_eq!(
             MessageRequest::parse(&[0x8e, 0x01, 0x20, 0x01]),
-            Err(DecodeError::ReplyFlag)
+            Err(Error::ReplyFlag)
         );
     }
 
@@ -2608,7 +2579,7 @@ mod tests {
         // 0x0e with no reply bit is a request, not a reply.
         assert_eq!(
             MessageResponse::parse(&[0x0e, 0x00, 0x00, 0x00]),
-            Err(DecodeError::ReplyFlag)
+            Err(Error::ReplyFlag)
         );
     }
 
@@ -2643,18 +2614,18 @@ mod tests {
         for n in 1..bytes.len() {
             assert_eq!(
                 parse_path(&bytes[..n]),
-                Err(DecodeError::Truncated),
+                Err(Error::Truncated),
                 "{n} bytes"
             );
         }
         // Another key format.
         let mut other = bytes;
         other[1] = 0x05;
-        assert_eq!(parse_path(&other), Err(DecodeError::BadSegment));
+        assert_eq!(parse_path(&other), Err(Error::BadSegment));
         // A special segment that is not an electronic key.
         assert_eq!(
             parse_path(&[0x35, 0x00]),
-            Err(DecodeError::UnknownSegment(0x35))
+            Err(Error::UnknownSegment(0x35))
         );
     }
 
@@ -2700,7 +2671,7 @@ mod tests {
             }
             assert_eq!(
                 parse_path(&bytes[..n]),
-                Err(DecodeError::Truncated),
+                Err(Error::Truncated),
                 "{n} bytes"
             );
         }
@@ -2716,7 +2687,7 @@ mod tests {
         // A data segment that is neither simple data nor an ANSI symbol.
         assert_eq!(
             parse_path(&[0x81, 0x00]),
-            Err(DecodeError::UnknownSegment(0x81))
+            Err(Error::UnknownSegment(0x81))
         );
         // A name past the limit is refused when written, not cut.
         let long = MessageRequest {
@@ -2724,7 +2695,7 @@ mod tests {
             path: vec![PathSegment::Symbol(vec![b'x'; MAX_SYMBOL + 1])],
             data: Vec::new(),
         };
-        assert_eq!(long.to_bytes(), Err(EncodeError::TooLong));
+        assert_eq!(long.to_bytes(), Err(Error::TooLong));
     }
 
     #[test]
@@ -2766,13 +2737,13 @@ mod tests {
         for n in 0..bytes.len() {
             assert_eq!(
                 Identity::parse(&bytes[..n]),
-                Err(DecodeError::Truncated),
+                Err(Error::Truncated),
                 "{n} bytes"
             );
         }
         let mut extra = bytes.clone();
         extra.push(0);
-        assert_eq!(Identity::parse(&extra), Err(DecodeError::Trailing));
+        assert_eq!(Identity::parse(&extra), Err(Error::Trailing));
         // A name of 32 bytes is the longest an identity may give.
         let longest = Identity {
             product_name: vec![b'n'; MAX_PRODUCT_NAME],
@@ -2985,11 +2956,11 @@ mod tests {
     /// Checks stream contracts, packet validation and nested CIP values.
     fn check(data: &[u8]) {
         assert_eq!(
-            Stream::new(Frames).push(data),
-            data.len().min(FRAMES_CAPACITY)
+            Stream::new(Packets).push(data),
+            data.len().min(PACKETS_CAPACITY)
         );
-        contract::check_decode(Frames::new, data);
-        let (packets, _) = decode_all(Frames::new, data);
+        contract::check_decode(Packets::new, data);
+        let (packets, _) = decode_all(Packets::new, data);
         for p in &packets {
             contract::check_wire_value(p);
             assert_eq!(p.check().is_ok(), p.to_bytes().is_ok());

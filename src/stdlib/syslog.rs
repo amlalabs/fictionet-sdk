@@ -451,19 +451,19 @@ impl Timestamp {
 }
 
 impl Wire for Timestamp {
-    type ParseError = ParseError;
-    type WriteError = WriteError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads an RFC 5424 timestamp, such as `2003-08-24T05:14:15.000003-07:00`.
     /// Requires uppercase `T` and `Z`. Refuses invalid dates, times, fractions,
     /// offsets, and trailing bytes.
-    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
-        Self::parse_prefix(bytes).ok_or(ParseError::Timestamp)
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        Self::parse_prefix(bytes).ok_or(Error::Timestamp)
     }
 
     /// Appends a timestamp. Refuses invalid dates, times, fractions, and offsets.
     /// Leaves `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         if self.year > 9999
             || !(1..=12).contains(&self.month)
             || self.day == 0
@@ -472,7 +472,7 @@ impl Wire for Timestamp {
             || self.minute > 59
             || self.second > 59
         {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         let mut text = format!(
             "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
@@ -480,7 +480,7 @@ impl Wire for Timestamp {
         );
         if let Some(fr) = self.fraction {
             if !(1..=6).contains(&fr.digits) || fr.value >= 10u32.pow(u32::from(fr.digits)) {
-                return Err(WriteError::Unwritable);
+                return Err(Error::Unwritable);
             }
             text.push_str(&format!(".{:0width$}", fr.value, width = usize::from(fr.digits)));
         }
@@ -489,7 +489,7 @@ impl Wire for Timestamp {
             Offset::Unknown => text.push_str("-00:00"),
             Offset::Minutes(m) => {
                 if !(-MAX_OFFSET_MINUTES..=MAX_OFFSET_MINUTES).contains(&m) {
-                    return Err(WriteError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 let sign = if m < 0 { '-' } else { '+' };
                 let a = m.unsigned_abs();
@@ -575,9 +575,12 @@ pub struct Message {
     pub msg: Vec<u8>,
 }
 
-/// Why bytes are not a syslog message.
+/// Why bytes are not a syslog message or frame, or why a value cannot be
+/// written. After [`Error::Length`], [`Error::CountTooLarge`] or
+/// [`Error::Incomplete`] from [`Frames`] a reader cannot find where the
+/// next message starts, and a real collector closes the connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum ParseError {
+pub enum Error {
     /// The bytes are longer than [`MAX_MESSAGE_LEN`].
     TooLong(usize),
     /// The priority is missing, is not 1 to 3 digits in angle brackets,
@@ -585,7 +588,7 @@ pub enum ParseError {
     Priority,
     /// The version is not 1 to 3 digits starting with a nonzero one.
     Version,
-    /// The bytes end before the header does.
+    /// The bytes end before the header does, or hold no complete frame.
     Truncated,
     /// The timestamp is not a valid RFC 5424 timestamp.
     Timestamp,
@@ -608,28 +611,52 @@ pub enum ParseError {
     DuplicateSdId,
     /// The text starts with a byte order mark but is not UTF-8.
     Utf8,
+    /// An octet count's digits were followed by this byte, not a space.
+    Length(u8),
+    /// An octet count too large to hold in a `usize`.
+    CountTooLarge,
+    /// EOF interrupted the tail of an oversized octet-counted message.
+    Incomplete {
+        /// Bytes still required by its count after the retained prefix.
+        remaining: usize,
+    },
+    /// Bytes followed the frame.
+    Trailing,
+    /// The input exceeds [`MAX_BUFFERED`] or its message exceeds
+    /// [`MAX_MESSAGE_LEN`].
+    FrameTooLong,
+    /// The value cannot be written without changing it: invalid fields,
+    /// ambiguous framing, size limits, and truncated frames are refused.
+    /// Writers leave the caller's output unchanged.
+    Unwritable,
 }
 
-impl std::fmt::Display for ParseError {
+impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ParseError::TooLong(n) => write!(f, "message of {n} bytes, over the limit of {MAX_MESSAGE_LEN}"),
-            ParseError::Priority => f.write_str("missing or malformed priority"),
-            ParseError::Version => f.write_str("malformed version"),
-            ParseError::Truncated => f.write_str("message ends inside its header"),
-            ParseError::Timestamp => f.write_str("malformed timestamp"),
-            ParseError::Hostname => f.write_str("malformed host name"),
-            ParseError::AppName => f.write_str("malformed application name"),
-            ParseError::ProcId => f.write_str("malformed process ID"),
-            ParseError::MsgId => f.write_str("malformed message ID"),
-            ParseError::StructuredData => f.write_str("malformed structured data"),
-            ParseError::DuplicateSdId => f.write_str("structured data element ID used twice"),
-            ParseError::Utf8 => f.write_str("text marked as UTF-8 is not UTF-8"),
+            Error::TooLong(n) => write!(f, "message of {n} bytes, over the limit of {MAX_MESSAGE_LEN}"),
+            Error::Priority => f.write_str("missing or malformed priority"),
+            Error::Version => f.write_str("malformed version"),
+            Error::Truncated => f.write_str("message ends inside its header"),
+            Error::Timestamp => f.write_str("malformed timestamp"),
+            Error::Hostname => f.write_str("malformed host name"),
+            Error::AppName => f.write_str("malformed application name"),
+            Error::ProcId => f.write_str("malformed process ID"),
+            Error::MsgId => f.write_str("malformed message ID"),
+            Error::StructuredData => f.write_str("malformed structured data"),
+            Error::DuplicateSdId => f.write_str("structured data element ID used twice"),
+            Error::Utf8 => f.write_str("text marked as UTF-8 is not UTF-8"),
+            Error::Length(c) => write!(f, "octet count followed by byte {c:#04x}, not a space"),
+            Error::CountTooLarge => f.write_str("octet count too large"),
+            Error::Incomplete { remaining } => write!(f, "syslog message needs {remaining} more bytes"),
+            Error::Trailing => f.write_str("bytes after the syslog frame"),
+            Error::FrameTooLong => f.write_str("syslog frame exceeds its wire limit"),
+            Error::Unwritable => f.write_str("syslog value cannot be written without changing it"),
         }
     }
 }
 
-impl std::error::Error for ParseError {}
+impl std::error::Error for Error {}
 
 impl Message {
     /// A version 1 message with this priority, every header field nil, no
@@ -661,34 +688,34 @@ impl Message {
 }
 
 impl Wire for Message {
-    type ParseError = ParseError;
-    type WriteError = WriteError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads one complete message. Refuses invalid protocol fields and messages above [`MAX_MESSAGE_LEN`].
-    fn parse(b: &[u8]) -> Result<Message, ParseError> {
+    fn parse(b: &[u8]) -> Result<Message, Error> {
         if b.len() > MAX_MESSAGE_LEN {
-            return Err(ParseError::TooLong(b.len()));
+            return Err(Error::TooLong(b.len()));
         }
-        let (priority, mut pos) = parse_pri(b).ok_or(ParseError::Priority)?;
+        let (priority, mut pos) = parse_pri(b).ok_or(Error::Priority)?;
         let digits = b[pos..].iter().take(4).take_while(|c| c.is_ascii_digit()).count();
         if digits == 0 || digits > 3 || b[pos] == b'0' {
-            return Err(ParseError::Version);
+            return Err(Error::Version);
         }
-        let version = num(b, pos, digits).ok_or(ParseError::Version)? as u16;
+        let version = num(b, pos, digits).ok_or(Error::Version)? as u16;
         pos += digits;
-        space(b, &mut pos, ParseError::Version)?;
+        space(b, &mut pos, Error::Version)?;
 
         let t = token(b, &mut pos);
         let timestamp = if t == b"-" { None } else { Some(Timestamp::parse(t)?) };
-        space(b, &mut pos, ParseError::Timestamp)?;
-        let hostname = header_field(token(b, &mut pos), MAX_HOSTNAME, ParseError::Hostname)?;
-        space(b, &mut pos, ParseError::Hostname)?;
-        let app_name = header_field(token(b, &mut pos), MAX_APP_NAME, ParseError::AppName)?;
-        space(b, &mut pos, ParseError::AppName)?;
-        let proc_id = header_field(token(b, &mut pos), MAX_PROCID, ParseError::ProcId)?;
-        space(b, &mut pos, ParseError::ProcId)?;
-        let msg_id = header_field(token(b, &mut pos), MAX_MSGID, ParseError::MsgId)?;
-        space(b, &mut pos, ParseError::MsgId)?;
+        space(b, &mut pos, Error::Timestamp)?;
+        let hostname = header_field(token(b, &mut pos), MAX_HOSTNAME, Error::Hostname)?;
+        space(b, &mut pos, Error::Hostname)?;
+        let app_name = header_field(token(b, &mut pos), MAX_APP_NAME, Error::AppName)?;
+        space(b, &mut pos, Error::AppName)?;
+        let proc_id = header_field(token(b, &mut pos), MAX_PROCID, Error::ProcId)?;
+        space(b, &mut pos, Error::ProcId)?;
+        let msg_id = header_field(token(b, &mut pos), MAX_MSGID, Error::MsgId)?;
+        space(b, &mut pos, Error::MsgId)?;
 
         let structured_data = parse_sd(b, &mut pos)?;
         let (bom, msg) = match b.get(pos) {
@@ -697,13 +724,13 @@ impl Wire for Message {
                 let rest = &b[pos + 1..];
                 match rest.strip_prefix(&BOM) {
                     Some(text) => {
-                        std::str::from_utf8(text).map_err(|_| ParseError::Utf8)?;
+                        std::str::from_utf8(text).map_err(|_| Error::Utf8)?;
                         (true, text.to_vec())
                     }
                     None => (false, rest.to_vec()),
                 }
             }
-            Some(_) => return Err(ParseError::StructuredData),
+            Some(_) => return Err(Error::StructuredData),
         };
         Ok(Message { priority, version, timestamp, hostname, app_name, proc_id, msg_id, structured_data, bom, msg })
     }
@@ -711,14 +738,14 @@ impl Wire for Message {
     /// Appends an RFC 5424 message. Refuses invalid headers, timestamps,
     /// structured data, UTF-8 marks, and size limits.
     /// Leaves `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         if !(1..=MAX_VERSION).contains(&self.version)
             || self.structured_data.len() > MAX_SD_ELEMENTS
             || self.msg.len() > MAX_MESSAGE_LEN
             || (self.bom && std::str::from_utf8(&self.msg).is_err())
             || (!self.bom && self.msg.starts_with(&BOM))
         {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         let mut bytes = format!("<{}>{} ", self.priority.value(), self.version).into_bytes();
         match &self.timestamp {
@@ -734,7 +761,7 @@ impl Wire for Message {
             bytes.push(b' ');
             match field {
                 Some(s) if valid_field(s, max, b"") && s != "-" => bytes.extend_from_slice(s.as_bytes()),
-                Some(_) => return Err(WriteError::Unwritable),
+                Some(_) => return Err(Error::Unwritable),
                 None => bytes.push(b'-'),
             }
         }
@@ -745,7 +772,7 @@ impl Wire for Message {
                 || !is_sd_id(&element.id)
                 || !ids.insert(element.id.as_str())
             {
-                return Err(WriteError::Unwritable);
+                return Err(Error::Unwritable);
             }
             write_sd_element(&mut bytes, &element.id, &element.params)?;
         }
@@ -813,21 +840,21 @@ impl BsdTimestamp {
 }
 
 impl Wire for BsdTimestamp {
-    type ParseError = ParseError;
-    type WriteError = WriteError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads one 15-byte BSD timestamp. A one-digit day may have a leading
     /// space or zero. Refuses invalid dates, times, syntax, and trailing bytes.
-    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         if bytes.len() != BSD_TIMESTAMP_LEN {
-            return Err(ParseError::Timestamp);
+            return Err(Error::Timestamp);
         }
-        Self::parse_prefix(bytes).ok_or(ParseError::Timestamp)
+        Self::parse_prefix(bytes).ok_or(Error::Timestamp)
     }
 
     /// Appends a timestamp. Refuses invalid dates and times.
     /// Leaves `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         if !(1..=12).contains(&self.month)
             || self.day == 0
             || self.day > days_in_month(2000, self.month)
@@ -835,7 +862,7 @@ impl Wire for BsdTimestamp {
             || self.minute > 59
             || self.second > 59
         {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         out.extend_from_slice(MONTHS[usize::from(self.month - 1)]);
         out.extend_from_slice(
@@ -894,17 +921,17 @@ impl BsdMessage {
 }
 
 impl Wire for BsdMessage {
-    type ParseError = ParseError;
-    type WriteError = WriteError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads one BSD message. Recognizes a timestamp and host together,
     /// then an optional tag and process ID. Refuses a bad priority or more
     /// than [`MAX_MESSAGE_LEN`] bytes; other unrecognized bytes remain content.
-    fn parse(b: &[u8]) -> Result<BsdMessage, ParseError> {
+    fn parse(b: &[u8]) -> Result<BsdMessage, Error> {
         if b.len() > MAX_MESSAGE_LEN {
-            return Err(ParseError::TooLong(b.len()));
+            return Err(Error::TooLong(b.len()));
         }
-        let (priority, pos) = parse_pri(b).ok_or(ParseError::Priority)?;
+        let (priority, pos) = parse_pri(b).ok_or(Error::Priority)?;
         let mut rest = &b[pos..];
         let mut header = None;
         if let Some(timestamp) = BsdTimestamp::parse_prefix(rest)
@@ -929,14 +956,14 @@ impl Wire for BsdMessage {
     /// Appends a BSD message. Refuses invalid headers, tags, process IDs,
     /// ambiguous content, and size limits.
     /// Leaves `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         if self.content.len() > MAX_MESSAGE_LEN || (self.pid.is_some() && self.tag.is_none()) {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         let mut bytes = format!("<{}>", self.priority.value()).into_bytes();
         if let Some(h) = &self.header {
             if !valid_field(&h.hostname, MAX_HOSTNAME, b"") {
-                return Err(WriteError::Unwritable);
+                return Err(Error::Unwritable);
             }
             h.timestamp.write(&mut bytes)?;
             bytes.push(b' ');
@@ -947,12 +974,12 @@ impl Wire for BsdMessage {
         }
         if let Some(tag) = &self.tag {
             if !valid_field(tag, MAX_TAG, b"[]:") {
-                return Err(WriteError::Unwritable);
+                return Err(Error::Unwritable);
             }
             bytes.extend_from_slice(tag.as_bytes());
             if let Some(pid) = &self.pid {
                 if !valid_field(pid, MAX_PID, b"]") {
-                    return Err(WriteError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 bytes.push(b'[');
                 bytes.extend_from_slice(pid.as_bytes());
@@ -970,7 +997,7 @@ impl Wire for BsdMessage {
         }
         append(&mut bytes, &self.content)?;
         if Self::parse(&bytes).as_ref() != Ok(self) {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         out.extend_from_slice(&bytes);
         Ok(())
@@ -997,18 +1024,18 @@ impl Entry {
 }
 
 impl Wire for Entry {
-    type ParseError = ParseError;
-    type WriteError = WriteError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads an RFC 5424 message when a valid version and message follow
     /// its priority. Otherwise reads BSD, which accepts any bytes after
     /// the priority. Refuses a bad priority or more than [`MAX_MESSAGE_LEN`]
     /// bytes. Use [`Message::parse`] for RFC 5424 field errors.
-    fn parse(b: &[u8]) -> Result<Entry, ParseError> {
+    fn parse(b: &[u8]) -> Result<Entry, Error> {
         if b.len() > MAX_MESSAGE_LEN {
-            return Err(ParseError::TooLong(b.len()));
+            return Err(Error::TooLong(b.len()));
         }
-        let (_, pos) = parse_pri(b).ok_or(ParseError::Priority)?;
+        let (_, pos) = parse_pri(b).ok_or(Error::Priority)?;
         let rest = &b[pos..];
         let digits = rest.iter().take(4).take_while(|c| c.is_ascii_digit()).count();
         if (1..=3).contains(&digits)
@@ -1023,13 +1050,13 @@ impl Wire for Entry {
 
     /// Appends a message. Refuses unwritable fields or a change of format.
     /// Leaves `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         let bytes = match self {
             Self::Rfc5424(message) => message.to_bytes()?,
             Self::Bsd(message) => message.to_bytes()?,
         };
         if Self::parse(&bytes).as_ref() != Ok(self) {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         out.extend_from_slice(&bytes);
         Ok(())
@@ -1067,28 +1094,6 @@ impl Frame {
     }
 }
 
-/// Why a TCP stream cannot be split into syslog frames. A reader cannot
-/// find where the next message starts, and a real collector closes the
-/// connection.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum FrameError {
-    /// An octet count's digits were followed by this byte, not a space.
-    Length(u8),
-    /// An octet count too large to hold in a `usize`.
-    TooLong,
-}
-
-impl std::fmt::Display for FrameError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            FrameError::Length(c) => write!(f, "octet count followed by byte {c:#04x}, not a space"),
-            FrameError::TooLong => f.write_str("octet count too large"),
-        }
-    }
-}
-
-impl std::error::Error for FrameError {}
-
 /// What a decoder throws away before the next frame: the rest of a
 /// message it has truncated.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -1101,29 +1106,6 @@ enum Skip {
     Line,
 }
 
-/// Why the shared syslog decoder cannot continue.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DecodeError {
-    /// An octet count could not be read.
-    Framing(FrameError),
-    /// EOF interrupted the tail of an oversized octet-counted message.
-    Incomplete {
-        /// Bytes still required by its count after the retained prefix.
-        remaining: usize,
-    },
-}
-
-impl core::fmt::Display for DecodeError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Framing(e) => e.fmt(f),
-            Self::Incomplete { remaining } => write!(f, "syslog message needs {remaining} more bytes"),
-        }
-    }
-}
-
-impl core::error::Error for DecodeError {}
-
 /// Reads syslog TCP frames without retaining input bytes.
 ///
 /// Use with [`fictionet::stdlib::codec::Stream`] for at most [`MAX_BUFFERED`] unread
@@ -1133,7 +1115,7 @@ impl core::error::Error for DecodeError {}
 ///
 /// At EOF, a final non-transparent frame needs no newline. A partial
 /// octet-counted frame returns [`Step::Need`] so the driver reports
-/// truncation. EOF in an oversized counted tail is [`DecodeError::Incomplete`].
+/// truncation. EOF in an oversized counted tail is [`Error::Incomplete`].
 /// Invalid octet counts end the stream. Message parse errors can be kept
 /// as items by mapping each frame through [`Entry::parse`].
 ///
@@ -1161,7 +1143,7 @@ impl Frames {
         Self::default()
     }
 
-    fn octet_counted(&mut self, input: &[u8]) -> Result<Step<Frame>, FrameError> {
+    fn octet_counted(&mut self, input: &[u8]) -> Result<Step<Frame>, Error> {
         let mut length = 0usize;
         let mut at = 0usize;
         loop {
@@ -1170,17 +1152,17 @@ impl Frames {
                 break;
             }
             if !byte.is_ascii_digit() {
-                return Err(FrameError::Length(byte));
+                return Err(Error::Length(byte));
             }
             length = length
                 .checked_mul(10)
                 .and_then(|n| n.checked_add(usize::from(byte - b'0')))
-                .ok_or(FrameError::TooLong)?;
-            at = at.checked_add(1).ok_or(FrameError::TooLong)?;
+                .ok_or(Error::CountTooLarge)?;
+            at = at.checked_add(1).ok_or(Error::CountTooLarge)?;
         }
-        let start = at.checked_add(1).ok_or(FrameError::TooLong)?;
+        let start = at.checked_add(1).ok_or(Error::CountTooLarge)?;
         let keep = length.min(MAX_MESSAGE_LEN);
-        let used = start.checked_add(keep).ok_or(FrameError::TooLong)?;
+        let used = start.checked_add(keep).ok_or(Error::CountTooLarge)?;
         let Some(message) = input.get(start..used) else { return Ok(Step::Need) };
         if length > keep {
             self.skip = Skip::Bytes(length - keep);
@@ -1236,18 +1218,18 @@ impl Frames {
 
 impl Decode for Frames {
     type Item = Frame;
-    type Error = DecodeError;
+    type Error = Error;
     const NAME: &'static str = "syslog TCP";
 
     fn capacity(&self) -> usize {
         MAX_BUFFERED
     }
 
-    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Frame>, DecodeError> {
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Frame>, Error> {
         match self.skip {
             Skip::Bytes(remaining) => {
                 if input.is_empty() {
-                    return if eof { Err(DecodeError::Incomplete { remaining }) } else { Ok(Step::Need) };
+                    return if eof { Err(Error::Incomplete { remaining }) } else { Ok(Step::Need) };
                 }
                 let used = remaining.min(input.len());
                 self.skip = if used == remaining { Skip::Nothing } else { Skip::Bytes(remaining - used) };
@@ -1270,86 +1252,41 @@ impl Decode for Frames {
         }
         let Some(&first) = input.first() else { return Ok(Step::Need) };
         if matches!(first, b'1'..=b'9') {
-            self.octet_counted(input).map_err(DecodeError::Framing)
+            self.octet_counted(input)
         } else {
             Ok(self.non_transparent(input, eof))
         }
     }
 }
 
-/// Why bytes do not contain exactly one complete syslog frame.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FrameParseError {
-    /// The frame could not be decoded.
-    Frame(DecodeError),
-    /// No complete frame was present.
-    Truncated,
-    /// Bytes followed the frame.
-    Trailing,
-    /// The input exceeds [`MAX_BUFFERED`] or its message exceeds
-    /// [`MAX_MESSAGE_LEN`].
-    TooLong,
-}
-
-impl core::fmt::Display for FrameParseError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Frame(e) => e.fmt(f),
-            Self::Truncated => f.write_str("no complete syslog frame"),
-            Self::Trailing => f.write_str("bytes after the syslog frame"),
-            Self::TooLong => f.write_str("syslog frame exceeds its wire limit"),
-        }
-    }
-}
-
-impl core::error::Error for FrameParseError {}
-
-/// A syslog value cannot be written without changing it.
-///
-/// Invalid fields, ambiguous framing, size limits, and truncated frames
-/// are refused. Writers leave the caller's output unchanged.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WriteError {
-    /// The value cannot be written without changing it.
-    Unwritable,
-}
-
-impl core::fmt::Display for WriteError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("syslog value cannot be written without changing it")
-    }
-}
-
-impl core::error::Error for WriteError {}
-
 impl Wire for Frame {
-    type ParseError = FrameParseError;
-    type WriteError = WriteError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads exactly one frame. A final non-transparent frame may omit
     /// its newline. Refuses bad counts, oversized frames, missing bodies, and trailing bytes.
-    fn parse(bytes: &[u8]) -> Result<Self, FrameParseError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         if bytes.len() > MAX_BUFFERED {
-            return Err(FrameParseError::TooLong);
+            return Err(Error::FrameTooLong);
         }
-        match Frames::new().decode(bytes, true).map_err(FrameParseError::Frame)? {
-            Step::Item(frame, _) if frame.truncated => Err(FrameParseError::TooLong),
+        match Frames::new().decode(bytes, true)? {
+            Step::Item(frame, _) if frame.truncated => Err(Error::FrameTooLong),
             Step::Item(frame, used) if used == bytes.len() => Ok(frame),
-            Step::Item(_, _) => Err(FrameParseError::Trailing),
-            _ => Err(FrameParseError::Truncated),
+            Step::Item(_, _) => Err(Error::Trailing),
+            _ => Err(Error::Truncated),
         }
     }
 
     /// Appends a frame. Refuses empty, truncated, oversized, or ambiguous messages.
     /// Leaves `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         let msg = &self.message;
         if self.truncated
             || msg.is_empty()
             || msg.len() > MAX_MESSAGE_LEN
             || (self.framing == Framing::NonTransparent && (matches!(msg[0], b'1'..=b'9') || msg.contains(&b'\n')))
         {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         match self.framing {
             Framing::OctetCounting => {
@@ -1393,20 +1330,20 @@ fn token<'a>(b: &'a [u8], pos: &mut usize) -> &'a [u8] {
 }
 
 /// Moves past the space at `pos`. The end of the bytes is
-/// [`ParseError::Truncated`]; anything else is `err`.
-fn space(b: &[u8], pos: &mut usize, err: ParseError) -> Result<(), ParseError> {
+/// [`Error::Truncated`]; anything else is `err`.
+fn space(b: &[u8], pos: &mut usize, err: Error) -> Result<(), Error> {
     match b.get(*pos) {
         Some(b' ') => {
             *pos += 1;
             Ok(())
         }
-        None => Err(ParseError::Truncated),
+        None => Err(Error::Truncated),
         Some(_) => Err(err),
     }
 }
 
 /// An RFC 5424 header field: nil, or 1 to `max` printable ASCII bytes.
-fn header_field(t: &[u8], max: usize, err: ParseError) -> Result<Option<String>, ParseError> {
+fn header_field(t: &[u8], max: usize, err: Error) -> Result<Option<String>, Error> {
     if t.is_empty() {
         // Two spaces in a row, or a space at the very end.
         return Err(err);
@@ -1421,21 +1358,21 @@ fn header_field(t: &[u8], max: usize, err: ParseError) -> Result<Option<String>,
 }
 
 /// Writes `[id name="value" ...]` at the end of `out`. Returns
-/// [`WriteError::Unwritable`] once the message would pass [`MAX_MESSAGE_LEN`].
+/// [`Error::Unwritable`] once the message would pass [`MAX_MESSAGE_LEN`].
 /// The caller stages `out` so a refused message leaves its output unchanged.
 /// In values, `"`, `]` and a backslash are escaped,
 /// except a backslash followed by a character that is none of the three:
 /// that is an invalid escape, which reads back as the same backslash and
 /// is kept as it is (RFC 5424 section 6.3.3).
-fn write_sd_element(out: &mut Vec<u8>, id: &str, params: &[SdParam]) -> Result<(), WriteError> {
+fn write_sd_element(out: &mut Vec<u8>, id: &str, params: &[SdParam]) -> Result<(), Error> {
     if params.len() > MAX_SD_PARAMS {
-        return Err(WriteError::Unwritable);
+        return Err(Error::Unwritable);
     }
     append(out, b"[")?;
     append(out, id.as_bytes())?;
     for p in params {
         if !valid_field(&p.name, MAX_SD_NAME, b"=\"]") {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         append(out, b" ")?;
         append(out, p.name.as_bytes())?;
@@ -1457,9 +1394,9 @@ fn write_sd_element(out: &mut Vec<u8>, id: &str, params: &[SdParam]) -> Result<(
     append(out, b"]")
 }
 
-fn append(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), WriteError> {
+fn append(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), Error> {
     if out.len().checked_add(bytes.len()).is_none_or(|n| n > MAX_MESSAGE_LEN) {
-        return Err(WriteError::Unwritable);
+        return Err(Error::Unwritable);
     }
     out.extend_from_slice(bytes);
     Ok(())
@@ -1471,11 +1408,11 @@ fn valid_field(s: &str, max: usize, forbidden: &[u8]) -> bool {
 
 /// Reads RFC 5424 structured data at `pos`: the nil value or one or more
 /// elements.
-fn parse_sd(b: &[u8], pos: &mut usize) -> Result<Vec<SdElement>, ParseError> {
-    let err = ParseError::StructuredData;
+fn parse_sd(b: &[u8], pos: &mut usize) -> Result<Vec<SdElement>, Error> {
+    let err = Error::StructuredData;
     let mut elements: Vec<SdElement> = Vec::new();
     match b.get(*pos) {
-        None => return Err(ParseError::Truncated),
+        None => return Err(Error::Truncated),
         Some(b'-') => {
             *pos += 1;
             return Ok(elements);
@@ -1493,7 +1430,7 @@ fn parse_sd(b: &[u8], pos: &mut usize) -> Result<Vec<SdElement>, ParseError> {
             return Err(err);
         }
         if elements.iter().any(|e| e.id == id) {
-            return Err(ParseError::DuplicateSdId);
+            return Err(Error::DuplicateSdId);
         }
         let mut params = Vec::new();
         loop {
@@ -1548,11 +1485,11 @@ fn parse_sd(b: &[u8], pos: &mut usize) -> Result<Vec<SdElement>, ParseError> {
 
 /// An SD-NAME at `pos`: 1 to [`MAX_SD_NAME`] printable ASCII bytes other
 /// than `=`, space, `]` and `"`.
-fn sd_name_at(b: &[u8], pos: &mut usize) -> Result<String, ParseError> {
+fn sd_name_at(b: &[u8], pos: &mut usize) -> Result<String, Error> {
     let rest = b.get(*pos..).unwrap_or(&[]);
     let n = rest.iter().take(MAX_SD_NAME + 1).take_while(|&&c| is_sd_name(c)).count();
     if n == 0 || n > MAX_SD_NAME {
-        return Err(ParseError::StructuredData);
+        return Err(Error::StructuredData);
     }
     *pos += n;
     Ok(String::from_utf8_lossy(&rest[..n]).into_owned())
@@ -1739,7 +1676,7 @@ mod tests {
             "2003-10-11T22:14:15ZZ",
             "2003-10-11 22:14:15Z",
         ] {
-            assert_eq!(Timestamp::parse(bad.as_bytes()), Err(ParseError::Timestamp), "{bad}");
+            assert_eq!(Timestamp::parse(bad.as_bytes()), Err(Error::Timestamp), "{bad}");
         }
         // -00:00 is UTC with the local offset not known (RFC 3339 section
         // 4.3), which +00:00 is not, so the two stay apart.
@@ -1817,11 +1754,11 @@ mod tests {
         let m = BsdMessage::parse(b"<13>Oct  5 01:02:03  x").unwrap();
         assert_eq!(m.header, None);
         // Bad dates are not timestamps.
-        assert_eq!(BsdTimestamp::parse(b"Feb 30 01:02:03"), Err(ParseError::Timestamp));
+        assert_eq!(BsdTimestamp::parse(b"Feb 30 01:02:03"), Err(Error::Timestamp));
         assert_eq!(BsdTimestamp::parse(b"Feb 29 01:02:03").unwrap().day, 29);
-        assert_eq!(BsdTimestamp::parse(b"Oct  0 01:02:03"), Err(ParseError::Timestamp));
-        assert_eq!(BsdTimestamp::parse(b"oct  1 01:02:03"), Err(ParseError::Timestamp));
-        assert_eq!(BsdTimestamp::parse(b"Oct  1 24:02:03"), Err(ParseError::Timestamp));
+        assert_eq!(BsdTimestamp::parse(b"Oct  0 01:02:03"), Err(Error::Timestamp));
+        assert_eq!(BsdTimestamp::parse(b"oct  1 01:02:03"), Err(Error::Timestamp));
+        assert_eq!(BsdTimestamp::parse(b"Oct  1 24:02:03"), Err(Error::Timestamp));
     }
 
     #[test]
@@ -1858,60 +1795,60 @@ mod tests {
 
     #[test]
     fn rfc5424_error_paths() {
-        let cases: &[(&[u8], ParseError)] = &[
-            (b"34>1 - - - - - -", ParseError::Priority),
-            (b"<192>1 - - - - - -", ParseError::Priority),
-            (b"<34>0 - - - - - -", ParseError::Version),
-            (b"<34>1000 - - - - - -", ParseError::Version),
-            (b"<34>1x - - - - - -", ParseError::Version),
-            (b"<34>", ParseError::Version),
-            (b"<34>1", ParseError::Truncated),
-            (b"<34>1 - - - - -", ParseError::Truncated),
-            (b"<34>1 - - - - - ", ParseError::Truncated),
-            (b"<34>1 2003-10-11 - - - - -", ParseError::Timestamp),
-            (b"<34>1 - h\x01 - - - -", ParseError::Hostname),
-            (b"<34>1 -  - - - -", ParseError::Hostname),
-            (b"<34>1 - - \xc3\xa9 - - -", ParseError::AppName),
-            (b"<34>1 - - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa - - -", ParseError::AppName),
-            (b"<34>1 - - - p\x7f - -", ParseError::ProcId),
-            (b"<34>1 - - - - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa -", ParseError::MsgId),
-            (b"<34>1 - - - - - x", ParseError::StructuredData),
-            (b"<34>1 - - - - - -x", ParseError::StructuredData),
-            (b"<34>1 - - - - - [a", ParseError::StructuredData),
-            (b"<34>1 - - - - - []", ParseError::StructuredData),
-            (b"<34>1 - - - - - [a b]", ParseError::StructuredData),
-            (b"<34>1 - - - - - [a b=c]", ParseError::StructuredData),
-            (b"<34>1 - - - - - [a b=\"c]", ParseError::StructuredData),
-            (b"<34>1 - - - - - [a b=\"c]\"]", ParseError::StructuredData),
-            (b"<34>1 - - - - - [a b=\"\xff\"]", ParseError::StructuredData),
-            (b"<34>1 - - - - - [a  b=\"c\"]", ParseError::StructuredData),
-            (b"<34>1 - - - - - [a][b]x", ParseError::StructuredData),
-            (b"<34>1 - - - - - [aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa]", ParseError::StructuredData),
-            (b"<34>1 - - - - - [a][a]", ParseError::DuplicateSdId),
-            (b"<34>1 - - - - - - \xef\xbb\xbf\xff", ParseError::Utf8),
+        let cases: &[(&[u8], Error)] = &[
+            (b"34>1 - - - - - -", Error::Priority),
+            (b"<192>1 - - - - - -", Error::Priority),
+            (b"<34>0 - - - - - -", Error::Version),
+            (b"<34>1000 - - - - - -", Error::Version),
+            (b"<34>1x - - - - - -", Error::Version),
+            (b"<34>", Error::Version),
+            (b"<34>1", Error::Truncated),
+            (b"<34>1 - - - - -", Error::Truncated),
+            (b"<34>1 - - - - - ", Error::Truncated),
+            (b"<34>1 2003-10-11 - - - - -", Error::Timestamp),
+            (b"<34>1 - h\x01 - - - -", Error::Hostname),
+            (b"<34>1 -  - - - -", Error::Hostname),
+            (b"<34>1 - - \xc3\xa9 - - -", Error::AppName),
+            (b"<34>1 - - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa - - -", Error::AppName),
+            (b"<34>1 - - - p\x7f - -", Error::ProcId),
+            (b"<34>1 - - - - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa -", Error::MsgId),
+            (b"<34>1 - - - - - x", Error::StructuredData),
+            (b"<34>1 - - - - - -x", Error::StructuredData),
+            (b"<34>1 - - - - - [a", Error::StructuredData),
+            (b"<34>1 - - - - - []", Error::StructuredData),
+            (b"<34>1 - - - - - [a b]", Error::StructuredData),
+            (b"<34>1 - - - - - [a b=c]", Error::StructuredData),
+            (b"<34>1 - - - - - [a b=\"c]", Error::StructuredData),
+            (b"<34>1 - - - - - [a b=\"c]\"]", Error::StructuredData),
+            (b"<34>1 - - - - - [a b=\"\xff\"]", Error::StructuredData),
+            (b"<34>1 - - - - - [a  b=\"c\"]", Error::StructuredData),
+            (b"<34>1 - - - - - [a][b]x", Error::StructuredData),
+            (b"<34>1 - - - - - [aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa]", Error::StructuredData),
+            (b"<34>1 - - - - - [a][a]", Error::DuplicateSdId),
+            (b"<34>1 - - - - - - \xef\xbb\xbf\xff", Error::Utf8),
         ];
         for (raw, want) in cases {
             assert_eq!(Message::parse(raw), Err(*want), "{:?}", String::from_utf8_lossy(raw));
             assert!(!want.to_string().is_empty());
         }
         let long = vec![b'<'; MAX_MESSAGE_LEN + 1];
-        assert_eq!(Message::parse(&long), Err(ParseError::TooLong(MAX_MESSAGE_LEN + 1)));
-        assert_eq!(BsdMessage::parse(&long), Err(ParseError::TooLong(MAX_MESSAGE_LEN + 1)));
-        assert_eq!(Entry::parse(&long), Err(ParseError::TooLong(MAX_MESSAGE_LEN + 1)));
-        assert_eq!(BsdMessage::parse(b"no priority"), Err(ParseError::Priority));
-        assert_eq!(Entry::parse(b""), Err(ParseError::Priority));
+        assert_eq!(Message::parse(&long), Err(Error::TooLong(MAX_MESSAGE_LEN + 1)));
+        assert_eq!(BsdMessage::parse(&long), Err(Error::TooLong(MAX_MESSAGE_LEN + 1)));
+        assert_eq!(Entry::parse(&long), Err(Error::TooLong(MAX_MESSAGE_LEN + 1)));
+        assert_eq!(BsdMessage::parse(b"no priority"), Err(Error::Priority));
+        assert_eq!(Entry::parse(b""), Err(Error::Priority));
         // Too many elements and parameters.
         let mut many = b"<34>1 - - - - - ".to_vec();
         for i in 0..=MAX_SD_ELEMENTS {
             many.extend_from_slice(format!("[e{i}]").as_bytes());
         }
-        assert_eq!(Message::parse(&many), Err(ParseError::StructuredData));
+        assert_eq!(Message::parse(&many), Err(Error::StructuredData));
         let mut many = b"<34>1 - - - - - [e".to_vec();
         for _ in 0..=MAX_SD_PARAMS {
             many.extend_from_slice(b" p=\"\"");
         }
         many.push(b']');
-        assert_eq!(Message::parse(&many), Err(ParseError::StructuredData));
+        assert_eq!(Message::parse(&many), Err(Error::StructuredData));
     }
 
     #[test]
@@ -1954,7 +1891,7 @@ mod tests {
         assert!(matches!(Entry::parse(b"<13>0 x"), Ok(Entry::Bsd(_))));
         assert!(matches!(Entry::parse(b"<13>1234 x"), Ok(Entry::Bsd(_))));
         // Bytes that start like RFC 5424 but do not read as it are BSD.
-        assert_eq!(Message::parse(b"<13>12 x"), Err(ParseError::Timestamp));
+        assert_eq!(Message::parse(b"<13>12 x"), Err(Error::Timestamp));
         let Ok(Entry::Bsd(m)) = Entry::parse(b"<13>12 x") else { panic!("not BSD") };
         assert_eq!(m.content, b"12 x");
         let e = Entry::parse(EX2).unwrap();
@@ -2076,7 +2013,7 @@ mod tests {
     fn frame_errors() {
         let mut d = Stream::new(Frames::new());
         assert_eq!(d.push(b"12x <34>1"), b"12x <34>1".len());
-        assert_eq!(d.next(), Some(Err(Fail::Protocol(DecodeError::Framing(FrameError::Length(b'x'))))));
+        assert_eq!(d.next(), Some(Err(Fail::Protocol(Error::Length(b'x')))));
         assert_eq!(d.push(b"<13>fine\n"), 9);
         assert_eq!(d.next(), None);
 
@@ -2089,7 +2026,7 @@ mod tests {
         assert_eq!(d.next(), None);
         let mut d = Stream::new(Frames::new());
         assert_eq!(d.push(b"99999999999999999999999999"), b"99999999999999999999999999".len());
-        assert_eq!(d.next(), Some(Err(Fail::Protocol(DecodeError::Framing(FrameError::TooLong)))));
+        assert_eq!(d.next(), Some(Err(Fail::Protocol(Error::CountTooLarge))));
 
         // A message without a newline may be MAX_MESSAGE_LEN bytes; past
         // that it is cut.
@@ -2107,12 +2044,12 @@ mod tests {
         assert_eq!(d.buffered(), 0);
         assert_eq!(d.push(b"<<\n<13>x\n"), b"<<\n<13>x\n".len());
         assert_eq!(d.next().unwrap().unwrap().message, b"<13>x");
-        assert!(!FrameError::TooLong.to_string().is_empty());
-        let kinds: std::collections::HashSet<FrameError> = [FrameError::TooLong, FrameError::Length(0)].into();
+        assert!(!Error::CountTooLarge.to_string().is_empty());
+        let kinds: std::collections::HashSet<Error> = [Error::CountTooLarge, Error::Length(0)].into();
         assert_eq!(kinds.len(), 2);
-        let kinds: std::collections::HashSet<ParseError> = [ParseError::Priority, ParseError::Utf8].into();
+        let kinds: std::collections::HashSet<Error> = [Error::Priority, Error::Utf8].into();
         assert_eq!(kinds.len(), 2);
-        assert!(!FrameError::Length(0).to_string().is_empty());
+        assert!(!Error::Length(0).to_string().is_empty());
     }
 
     #[test]
@@ -2165,7 +2102,7 @@ mod tests {
         }
         for bad in ["[a@b@1]", "[a@x]", "[@1]", "[a@]", "[a@1.]", "[a@.1]", "[a@1..2]", "[a@1@2]"] {
             let raw = format!("<34>1 - - - - - {bad}");
-            assert_eq!(Message::parse(raw.as_bytes()), Err(ParseError::StructuredData), "{bad}");
+            assert_eq!(Message::parse(raw.as_bytes()), Err(Error::StructuredData), "{bad}");
         }
         // Parameter names may hold an at-sign.
         assert!(Message::parse(b"<34>1 - - - - - [a@1 b@c=\"\"]").is_ok());
@@ -2335,7 +2272,7 @@ mod tests {
         let bytes = [format!("{} ", usize::MAX).as_bytes(), &vec![b'x'; MAX_MESSAGE_LEN]].concat();
         let (frames, error) = decode_all(Frames::new, &bytes);
         assert_eq!((frames[0].message.len(), frames[0].truncated), (MAX_MESSAGE_LEN, true));
-        assert!(matches!(error, Some(Fail::Protocol(DecodeError::Incomplete { .. }))));
+        assert!(matches!(error, Some(Fail::Protocol(Error::Incomplete { .. }))));
         let mut stream = Stream::new(Frames::new());
         assert_eq!(stream.push(b"1x"), 2);
         assert!(stream.next().unwrap().is_err());

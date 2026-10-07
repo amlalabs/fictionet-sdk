@@ -1319,7 +1319,7 @@ fn dhcp_messages_round_trip() {
     let bytes = m.to_bytes().unwrap();
     assert!(bytes.len() >= 300);
     assert_eq!(dhcp::Message::parse(&bytes), Ok(m));
-    assert_eq!(dhcp::Message::parse(&bytes[..239]), Err(dhcp::ParseError::Short));
+    assert_eq!(dhcp::Message::parse(&bytes[..239]), Err(dhcp::Error::Short));
 }
 
 #[test]

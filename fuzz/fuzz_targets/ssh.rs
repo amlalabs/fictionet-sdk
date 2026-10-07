@@ -4,12 +4,12 @@ use fictionet::stdlib::codec::{contract, test_support::decode_all};
 use fictionet::stdlib::ssh::*;
 use libfuzzer_sys::fuzz_target;
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(Frames::new, data, 2 * MAX_PACKET);
+    contract::check_decode_with_alloc_limit(Packets::new, data, 2 * MAX_PACKET);
     contract::check_decode_with_alloc_limit(Events::new, data, 2 * MAX_PACKET);
     contract::check_decode_with_alloc_limit(Events::after_version, data, 2 * MAX_PACKET);
     contract::check_decode_with_alloc_limit(Lines::new, data, 2 * MAX_BANNER_LINE);
     contract::check_decode_with_alloc_limit(
-        || Frames::with_limit(usize::from(data.first().copied().unwrap_or(0))),
+        || Packets::with_limit(usize::from(data.first().copied().unwrap_or(0))),
         data,
         510,
     );

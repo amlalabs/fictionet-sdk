@@ -110,7 +110,8 @@ pub const DEFAULT_MAX_SYMBOLS: usize = 16_384;
 /// The most symbols a [`Book`] may be configured to track.
 pub const MAX_SYMBOLS: usize = 1 << 20;
 
-/// Why bytes or a value were refused.
+/// Why bytes or a value were refused, or why a [`Book`] refused a
+/// message. A refused message leaves the book unchanged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     /// A message's Length byte disagrees with its bytes, or is shorter
@@ -132,6 +133,23 @@ pub enum Error {
     Price,
     /// A unit longer than the framer's limit, or than [`MAX_UNIT_LENGTH`].
     TooLong,
+    /// A configuration value outside its named limits.
+    Config,
+    /// An execute, reduce, modify or delete names an order not on the book.
+    UnknownOrder(u64),
+    /// An add reuses an Order Id on the book.
+    DuplicateOrder(u64),
+    /// An add with zero shares, or an execute or reduce of more shares
+    /// than the order has.
+    Shares(u64),
+    /// The message's unit differs from the order's.
+    Unit(u64),
+    /// The book holds [`BookConfig::max_orders`] orders.
+    TooManyOrders,
+    /// The book holds [`BookConfig::max_levels`] price levels.
+    TooManyLevels,
+    /// The book holds orders for [`BookConfig::max_symbols`] symbols.
+    TooManySymbols,
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -143,6 +161,14 @@ impl fmt::Display for Error {
             Error::Count => f.write_str("PITCH message count is wrong"),
             Error::Price => f.write_str("PITCH price is invalid"),
             Error::TooLong => f.write_str("PITCH unit is too long"),
+            Error::Config => f.write_str("PITCH book configuration is out of range"),
+            Error::UnknownOrder(id) => write!(f, "PITCH order {id} is not on the book"),
+            Error::DuplicateOrder(id) => write!(f, "PITCH order {id} is already on the book"),
+            Error::Shares(id) => write!(f, "PITCH order {id} share count is invalid"),
+            Error::Unit(id) => write!(f, "PITCH order {id} belongs to another unit"),
+            Error::TooManyOrders => f.write_str("PITCH book order limit reached"),
+            Error::TooManyLevels => f.write_str("PITCH book price level limit reached"),
+            Error::TooManySymbols => f.write_str("PITCH book symbol limit reached"),
         }
     }
 }
@@ -1560,43 +1586,6 @@ impl Default for BookConfig {
     }
 }
 
-/// Why a [`Book`] refused a message. The book is unchanged.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BookError {
-    /// A configuration value outside its named limits.
-    Config,
-    /// An execute, reduce, modify or delete names an order not on the book.
-    UnknownOrder(u64),
-    /// An add reuses an Order Id on the book.
-    DuplicateOrder(u64),
-    /// An add with zero shares, or an execute or reduce of more shares
-    /// than the order has.
-    Shares(u64),
-    /// The message's unit differs from the order's.
-    Unit(u64),
-    /// The book holds [`BookConfig::max_orders`] orders.
-    TooManyOrders,
-    /// The book holds [`BookConfig::max_levels`] price levels.
-    TooManyLevels,
-    /// The book holds orders for [`BookConfig::max_symbols`] symbols.
-    TooManySymbols,
-}
-impl fmt::Display for BookError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            BookError::Config => f.write_str("PITCH book configuration is out of range"),
-            BookError::UnknownOrder(id) => write!(f, "PITCH order {id} is not on the book"),
-            BookError::DuplicateOrder(id) => write!(f, "PITCH order {id} is already on the book"),
-            BookError::Shares(id) => write!(f, "PITCH order {id} share count is invalid"),
-            BookError::Unit(id) => write!(f, "PITCH order {id} belongs to another unit"),
-            BookError::TooManyOrders => f.write_str("PITCH book order limit reached"),
-            BookError::TooManyLevels => f.write_str("PITCH book price level limit reached"),
-            BookError::TooManySymbols => f.write_str("PITCH book symbol limit reached"),
-        }
-    }
-}
-impl std::error::Error for BookError {}
-
 /// A live order on a [`Book`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Order {
@@ -1696,12 +1685,12 @@ pub struct Book {
 }
 impl Book {
     /// An empty book. Refuses limits outside their named ranges.
-    pub fn new(config: BookConfig) -> Result<Self, BookError> {
+    pub fn new(config: BookConfig) -> Result<Self, Error> {
         if !(1..=MAX_ORDERS).contains(&config.max_orders)
             || !(1..=MAX_LEVELS).contains(&config.max_levels)
             || !(1..=MAX_SYMBOLS).contains(&config.max_symbols)
         {
-            return Err(BookError::Config);
+            return Err(Error::Config);
         }
         Ok(Self {
             config,
@@ -1751,7 +1740,7 @@ impl Book {
 
     /// Applies one message that arrived on `unit`. See [`Book`] for which
     /// messages change it.
-    pub fn apply(&mut self, unit: u8, message: &Message) -> Result<Applied, BookError> {
+    pub fn apply(&mut self, unit: u8, message: &Message) -> Result<Applied, Error> {
         let widen = |s: &Symbol6| -> Symbol {
             let mut b = [b' '; 8];
             b[..6].copy_from_slice(s.as_bytes());
@@ -1825,13 +1814,13 @@ impl Book {
         }
     }
 
-    fn live(&self, unit: u8, order_id: u64) -> Result<Order, BookError> {
+    fn live(&self, unit: u8, order_id: u64) -> Result<Order, Error> {
         let order = *self
             .orders
             .get(&order_id)
-            .ok_or(BookError::UnknownOrder(order_id))?;
+            .ok_or(Error::UnknownOrder(order_id))?;
         if order.unit != unit {
-            return Err(BookError::Unit(order_id));
+            return Err(Error::Unit(order_id));
         }
         Ok(order)
     }
@@ -1840,7 +1829,7 @@ impl Book {
     }
     /// Checks that `new` can be placed once `old`, an order the change
     /// takes off the book first, is gone.
-    fn check_place(&self, new: Order, old: Option<Order>) -> Result<(), BookError> {
+    fn check_place(&self, new: Order, old: Option<Order>) -> Result<(), Error> {
         let mut orders = self.orders.len();
         let mut levels = self.levels;
         let mut symbol_empties = false;
@@ -1862,16 +1851,16 @@ impl Book {
             }
         }
         if orders >= self.config.max_orders {
-            return Err(BookError::TooManyOrders);
+            return Err(Error::TooManyOrders);
         }
         if !joins && levels >= self.config.max_levels {
-            return Err(BookError::TooManyLevels);
+            return Err(Error::TooManyLevels);
         }
         let known = self.symbols.contains_key(&new.symbol)
             && !(symbol_empties && old.is_some_and(|o| o.symbol == new.symbol));
         let symbols = self.symbols.len() - usize::from(symbol_empties);
         if !known && symbols >= self.config.max_symbols {
-            return Err(BookError::TooManySymbols);
+            return Err(Error::TooManySymbols);
         }
         Ok(())
     }
@@ -1912,12 +1901,12 @@ impl Book {
         }
         self.orders.remove(&order_id);
     }
-    fn add(&mut self, order_id: u64, order: Order) -> Result<Applied, BookError> {
+    fn add(&mut self, order_id: u64, order: Order) -> Result<Applied, Error> {
         if order.quantity == 0 {
-            return Err(BookError::Shares(order_id));
+            return Err(Error::Shares(order_id));
         }
         if self.orders.contains_key(&order_id) {
-            return Err(BookError::DuplicateOrder(order_id));
+            return Err(Error::DuplicateOrder(order_id));
         }
         self.check_place(order, None)?;
         self.insert(order_id, order);
@@ -1926,12 +1915,12 @@ impl Book {
             side: order.side,
         })
     }
-    fn reduce(&mut self, unit: u8, order_id: u64, shares: u32) -> Result<Applied, BookError> {
+    fn reduce(&mut self, unit: u8, order_id: u64, shares: u32) -> Result<Applied, Error> {
         let old = self.live(unit, order_id)?;
         let left = old
             .quantity
             .checked_sub(shares)
-            .ok_or(BookError::Shares(order_id))?;
+            .ok_or(Error::Shares(order_id))?;
         self.modify(order_id, old, old.price, left)
     }
     /// Sets a live order's price and shares; zero shares removes it.
@@ -1941,7 +1930,7 @@ impl Book {
         old: Order,
         price: Price,
         quantity: u32,
-    ) -> Result<Applied, BookError> {
+    ) -> Result<Applied, Error> {
         let changed = Applied::Changed {
             symbol: old.symbol,
             side: old.side,
@@ -3146,10 +3135,10 @@ mod tests {
         book.apply(1, &add(1, Side::Buy, 100, 10)).unwrap();
         let before = format!("{book:?}");
         let refused = [
-            (1, add(1, Side::Buy, 100, 10), BookError::DuplicateOrder(1)),
-            (1, add(2, Side::Buy, 100, 0), BookError::Shares(2)),
-            (1, delete(9), BookError::UnknownOrder(9)),
-            (2, delete(1), BookError::Unit(1)),
+            (1, add(1, Side::Buy, 100, 10), Error::DuplicateOrder(1)),
+            (1, add(2, Side::Buy, 100, 0), Error::Shares(2)),
+            (1, delete(9), Error::UnknownOrder(9)),
+            (2, delete(1), Error::Unit(1)),
             (
                 1,
                 ReduceSizeLong {
@@ -3159,7 +3148,7 @@ mod tests {
                     extra: Vec::new(),
                 }
                 .into(),
-                BookError::Shares(1),
+                Error::Shares(1),
             ),
             (
                 1,
@@ -3176,7 +3165,7 @@ mod tests {
                     extra: Vec::new(),
                 }
                 .into(),
-                BookError::TooManySymbols,
+                Error::TooManySymbols,
             ),
         ];
         for (unit, m, e) in refused {
@@ -3186,19 +3175,19 @@ mod tests {
         book.apply(1, &add(2, Side::Sell, 100, 10)).unwrap();
         assert_eq!(
             book.apply(1, &add(3, Side::Sell, 101, 10)),
-            Err(BookError::TooManyLevels)
+            Err(Error::TooManyLevels)
         );
         book.apply(1, &add(3, Side::Sell, 100, 10)).unwrap();
         assert_eq!(
             book.apply(1, &add(4, Side::Sell, 100, 10)),
-            Err(BookError::TooManyOrders)
+            Err(Error::TooManyOrders)
         );
         // A modify that empties its level may open another.
         book.apply(1, &modify(1, 90, 5)).unwrap();
         // One that leaves its level behind may not.
         assert_eq!(
             book.apply(1, &modify(2, 70, 5)),
-            Err(BookError::TooManyLevels)
+            Err(Error::TooManyLevels)
         );
         // The last order of a symbol may move to a new symbol's place.
         let mut book = Book::new(BookConfig {
@@ -3215,7 +3204,7 @@ mod tests {
                 ..BookConfig::default()
             })
             .err(),
-            Some(BookError::Config)
+            Some(Error::Config)
         );
     }
 

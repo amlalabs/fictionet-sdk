@@ -42,48 +42,48 @@ fn transport(message: TransportMessage) -> Packet {
 fn refuses(body: Body) {
     let packet = Packet::from(body);
     contract::check_wire_value(&packet);
-    assert_eq!(packet.to_bytes(), Err(EncodeError::Unwritable));
+    assert_eq!(packet.to_bytes(), Err(Error::Unwritable));
 }
 
 #[test]
-fn rtp_rtcp_and_frames_share_the_write_error() {
-    fn framed<P: Wire<WriteError = rtcp::EncodeError>>(packet: &P) -> Result<Vec<u8>, rtcp::EncodeError> {
+fn rtp_and_rtcp_packets_go_in_one_frame_writer() {
+    fn framed<P: Wire>(packet: &P) -> Result<Vec<u8>, rtcp::Error> {
         let frame = rtcp::Frame::from_packet(packet)?;
         let mut bytes = Vec::new();
         frame.write(&mut bytes)?;
         Ok(bytes)
     }
-    let media = rtp::RtpPacket {
+    let media = rtp::Packet {
         marker: false, payload_type: 96, sequence: 1, timestamp: 2, ssrc: 3,
         csrcs: vec![], extension: None, payload: vec![4], padding: 0,
     };
     for (bytes, packet) in [
-        (framed(&media).unwrap(), rtp::Packet::Rtp(media)),
-        (framed(&report()).unwrap(), rtp::Packet::Rtcp(Datagram(vec![report()]))),
+        (framed(&media).unwrap(), rtp::Demux::Rtp(media)),
+        (framed(&report()).unwrap(), rtp::Demux::Rtcp(Datagram(vec![report()]))),
     ] {
         let frame = rtcp::Frame::parse(&bytes).unwrap();
-        assert_eq!(rtp::Packet::parse(&frame.0), Ok(packet.clone()));
+        assert_eq!(rtp::Demux::parse(&frame.0), Ok(packet.clone()));
         assert_eq!(framed(&packet).unwrap(), bytes);
     }
     let mut invalid = report();
     invalid.padding = 1;
-    assert_eq!(framed(&invalid), Err(rtcp::EncodeError::Unwritable));
+    assert_eq!(framed(&invalid), Err(rtcp::Error::Unwritable));
 }
 
 #[test]
 fn rtcp_errors() {
-    assert_eq!(Datagram::parse(&[0x80]), Err(ParseError::Truncated));
+    assert_eq!(Datagram::parse(&[0x80]), Err(Error::Truncated));
     assert_eq!(
         Datagram::parse(&[0x80, 201, 0, 1, 0, 0]),
-        Err(ParseError::Truncated)
+        Err(Error::Truncated)
     );
     assert_eq!(
         Datagram::parse(&[0x40, 201, 0, 0]),
-        Err(ParseError::Version(1))
+        Err(Error::Version(1))
     );
     assert_eq!(
         Datagram::parse(&vec![0; MAX_DATAGRAM + 1]),
-        Err(ParseError::TooLong(MAX_DATAGRAM + 1))
+        Err(Error::TooLong(MAX_DATAGRAM + 1))
     );
     let body = |pt: u8, count: u8, body: &[u8]| {
         let mut b = vec![0x80 | count, pt, 0, (body.len() / 4) as u8];
@@ -91,56 +91,56 @@ fn rtcp_errors() {
         Datagram::parse(&b)
     };
     // Reports shorter than their fixed part or their count.
-    assert_eq!(body(200, 0, &[0; 20]), Err(ParseError::Malformed(200)));
-    assert_eq!(body(200, 1, &[0; 24]), Err(ParseError::Malformed(200)));
-    assert_eq!(body(201, 0, &[]), Err(ParseError::Malformed(201)));
-    assert_eq!(body(201, 2, &[0; 28]), Err(ParseError::Malformed(201)));
+    assert_eq!(body(200, 0, &[0; 20]), Err(Error::Malformed(200)));
+    assert_eq!(body(200, 1, &[0; 24]), Err(Error::Malformed(200)));
+    assert_eq!(body(201, 0, &[]), Err(Error::Malformed(201)));
+    assert_eq!(body(201, 2, &[0; 28]), Err(Error::Malformed(201)));
     assert!(body(201, 1, &[0; 28]).is_ok());
     // SDES: a chunk with no end, an item past the end, an extra word,
     // and a missing chunk.
     assert_eq!(
         body(202, 1, &[0, 0, 0, 1, 1, 2, b'a', b'b']),
-        Err(ParseError::Malformed(202))
+        Err(Error::Malformed(202))
     );
     assert_eq!(
         body(202, 1, &[0, 0, 0, 1, 1, 9, b'a', b'b']),
-        Err(ParseError::Malformed(202))
+        Err(Error::Malformed(202))
     );
     assert_eq!(
         body(202, 1, &[0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0]),
-        Err(ParseError::Malformed(202))
+        Err(Error::Malformed(202))
     );
     assert_eq!(
         body(202, 2, &[0, 0, 0, 1, 0, 0, 0, 0]),
-        Err(ParseError::Malformed(202))
+        Err(Error::Malformed(202))
     );
-    assert_eq!(body(202, 1, &[0, 0, 0, 1]), Err(ParseError::Malformed(202)));
+    assert_eq!(body(202, 1, &[0, 0, 0, 1]), Err(Error::Malformed(202)));
     // BYE: too few sources, a reason past the end, too much after it.
-    assert_eq!(body(203, 2, &[0, 0, 0, 1]), Err(ParseError::Malformed(203)));
+    assert_eq!(body(203, 2, &[0, 0, 0, 1]), Err(Error::Malformed(203)));
     assert_eq!(
         body(203, 0, &[9, b'a', b'b', b'c']),
-        Err(ParseError::Malformed(203))
+        Err(Error::Malformed(203))
     );
     assert_eq!(
         body(203, 0, &[1, b'a', 0, 0, 0, 0, 0, 0]),
-        Err(ParseError::Malformed(203))
+        Err(Error::Malformed(203))
     );
     // APP and feedback shorter than their SSRCs and name.
-    assert_eq!(body(204, 0, &[0, 0, 0, 1]), Err(ParseError::Malformed(204)));
-    assert_eq!(body(205, 1, &[0, 0, 0, 1]), Err(ParseError::Malformed(205)));
-    assert_eq!(body(206, 1, &[0, 0, 0, 1]), Err(ParseError::Malformed(206)));
+    assert_eq!(body(204, 0, &[0, 0, 0, 1]), Err(Error::Malformed(204)));
+    assert_eq!(body(205, 1, &[0, 0, 0, 1]), Err(Error::Malformed(205)));
+    assert_eq!(body(206, 1, &[0, 0, 0, 1]), Err(Error::Malformed(206)));
     // A PLI with FCI, an RPSI with none, an RPSI with too many padding bits.
     assert_eq!(
         body(206, 1, &[0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 0]),
-        Err(ParseError::Malformed(206))
+        Err(Error::Malformed(206))
     );
     assert_eq!(
         body(206, 3, &[0, 0, 0, 1, 0, 0, 0, 2]),
-        Err(ParseError::Malformed(206))
+        Err(Error::Malformed(206))
     );
     assert_eq!(
         body(206, 3, &[0, 0, 0, 1, 0, 0, 0, 2, 17, 96, 0, 0]),
-        Err(ParseError::Malformed(206))
+        Err(Error::Malformed(206))
     );
     assert!(body(206, 3, &[0, 0, 0, 1, 0, 0, 0, 2, 16, 96, 0, 0]).is_ok());
 }
@@ -160,25 +160,25 @@ fn rtp_demux_checks_typed_feedback_and_xr_layouts() {
         let mut bytes = vec![0x80 | fmt, pt, 0, (body.len() / 4) as u8];
         bytes.extend_from_slice(&body);
         assert_eq!(
-            rtp::Packet::parse(&bytes),
-            Err(rtp::PacketError::Rtcp(ParseError::Malformed(pt)))
+            rtp::Demux::parse(&bytes),
+            Err(rtp::Error::Rtcp(Error::Malformed(pt)))
         );
     }
     for padding_bits in [31, 32, 48] {
         let mut bytes = vec![0x83, 206, 0, 4, 0, 0, 0, 1, 0, 0, 0, 2, padding_bits, 96];
         bytes.extend([0; 6]);
-        assert_eq!(rtp::Packet::parse(&bytes).is_ok(), padding_bits < 32);
+        assert_eq!(rtp::Demux::parse(&bytes).is_ok(), padding_bits < 32);
     }
     let mut remb = Packet::from(Body::PayloadFeedback(PayloadFeedback {
         sender_ssrc: 1,
         media_ssrc: 0,
         message: PayloadMessage::Remb(Remb { exponent: 0, mantissa: 1, ssrcs: vec![2] }),
     })).to_bytes().unwrap();
-    assert!(rtp::Packet::parse(&remb).is_ok());
+    assert!(rtp::Demux::parse(&remb).is_ok());
     remb[0] |= 0x20;
     remb[3] += 1;
     remb.extend([0, 0, 0, 4]);
-    assert_eq!(rtp::Packet::parse(&remb), Err(rtp::PacketError::Rtcp(ParseError::Malformed(206))));
+    assert_eq!(rtp::Demux::parse(&remb), Err(rtp::Error::Rtcp(Error::Malformed(206))));
 }
 
 #[test]
@@ -297,7 +297,7 @@ fn feedback_bytes() {
         payload_type: 0xe0,
         data: vec![0xff],
     }));
-    assert_eq!(invalid.to_bytes(), Err(EncodeError::Unwritable));
+    assert_eq!(invalid.to_bytes(), Err(Error::Unwritable));
     let rpsi = payload(PayloadMessage::Rpsi(Rpsi {
         padding_bits: 11,
         payload_type: 96,
@@ -318,7 +318,7 @@ fn feedback_bytes() {
             fci: vec![1, 2, 3, 4]
         })
         .to_bytes(),
-        Err(EncodeError::Unwritable)
+        Err(Error::Unwritable)
     );
 }
 
@@ -374,10 +374,10 @@ fn compound_round_trip_and_truncated_prefixes() {
     assert_eq!(bytes, Datagram(packets.clone()).to_bytes().unwrap());
     assert_eq!(Compound::parse(&bytes), Ok(compound));
     assert_eq!(
-        rtp::Packet::parse(&bytes),
-        Ok(rtp::Packet::Rtcp(Datagram(packets.clone())))
+        rtp::Demux::parse(&bytes),
+        Ok(rtp::Demux::Rtcp(Datagram(packets.clone())))
     );
-    assert_eq!(rtp::Packet::Rtcp(Datagram(packets.clone())).to_bytes(), Ok(bytes.clone()));
+    assert_eq!(rtp::Demux::Rtcp(Datagram(packets.clone())).to_bytes(), Ok(bytes.clone()));
     let mut ends = vec![];
     let mut end = 0;
     for p in &packets {
@@ -386,15 +386,15 @@ fn compound_round_trip_and_truncated_prefixes() {
         ends.push(end);
         assert_eq!(Datagram::parse(&b), Ok(Datagram(vec![p.clone()])));
     }
-    assert_eq!(Datagram::parse(&[]), Err(ParseError::Empty));
+    assert_eq!(Datagram::parse(&[]), Err(Error::Empty));
     for n in 1..bytes.len() {
         if ends.contains(&n) {
             assert!(Datagram::parse(&bytes[..n]).is_ok());
-            assert!(rtp::Packet::parse(&bytes[..n]).is_ok());
+            assert!(rtp::Demux::parse(&bytes[..n]).is_ok());
         } else {
-            assert_eq!(Datagram::parse(&bytes[..n]), Err(ParseError::Truncated));
+            assert_eq!(Datagram::parse(&bytes[..n]), Err(Error::Truncated));
             if n >= 2 {
-                assert_eq!(rtp::Packet::parse(&bytes[..n]), Err(rtp::PacketError::Rtcp(ParseError::Truncated)));
+                assert_eq!(rtp::Demux::parse(&bytes[..n]), Err(rtp::Error::Rtcp(Error::Truncated)));
             }
         }
     }
@@ -407,10 +407,10 @@ fn padding_on_the_last_packet() {
     let bytes = Compound(vec![report(), last.clone()]).to_bytes().unwrap();
     let packets = Compound::parse(&bytes).unwrap();
     assert_eq!(packets.0[1], last);
-    assert_eq!(rtp::Packet::parse(&bytes), Ok(rtp::Packet::Rtcp(Datagram(packets.0))));
+    assert_eq!(rtp::Demux::parse(&bytes), Ok(rtp::Demux::Rtcp(Datagram(packets.0))));
     let mut bad = bytes.clone();
     bad[0] |= 0x20;
-    assert_eq!(rtp::Packet::parse(&bad), Err(rtp::PacketError::Rtcp(ParseError::Padding)));
+    assert_eq!(rtp::Demux::parse(&bad), Err(rtp::Error::Rtcp(Error::Padding)));
 
     // The first packet's padding is valid on its own, but not before SDES.
     let first = Packet::from(Body::ReceiverReport(ReceiverReport {
@@ -419,50 +419,50 @@ fn padding_on_the_last_packet() {
         extension: vec![0, 0, 0, 4],
     }));
     let mut bad = Datagram(vec![first, cname()]).to_bytes().unwrap();
-    assert!(rtp::Packet::parse(&bad).is_ok());
+    assert!(rtp::Demux::parse(&bad).is_ok());
     bad[0] |= 0x20;
     let datagram = Datagram::parse(&bad).unwrap();
     assert_eq!(datagram.0[0].padding, 4);
-    assert_eq!(rtp::Packet::parse(&bad), Err(rtp::PacketError::Rtcp(ParseError::Padding)));
-    let packet = rtp::Packet::Rtcp(datagram);
+    assert_eq!(rtp::Demux::parse(&bad), Err(rtp::Error::Rtcp(Error::Padding)));
+    let packet = rtp::Demux::Rtcp(datagram);
     let mut out = vec![9, 8, 7];
-    assert_eq!(packet.write(&mut out), Err(EncodeError::Unwritable));
+    assert_eq!(packet.write(&mut out), Err(rtp::Error::Unwritable));
     assert_eq!(out, [9, 8, 7]);
     contract::check_wire_value(&packet);
     let mut first = report();
     first.padding = 4;
     assert_eq!(
         Compound(vec![first, cname()]).to_bytes(),
-        Err(EncodeError::Unwritable)
+        Err(Error::Unwritable)
     );
     for count in [0, 6, 24] {
         let mut bad = bytes.clone();
         *bad.last_mut().unwrap() = count;
-        assert_eq!(Datagram::parse(&bad), Err(ParseError::Padding));
+        assert_eq!(Datagram::parse(&bad), Err(Error::Padding));
     }
     assert_eq!(
         Datagram::parse(&[0xa0, 203, 0, 0]),
-        Err(ParseError::Padding)
+        Err(Error::Padding)
     );
     assert_eq!(
         Datagram::parse(&[0xa0, 201, 0, 1, 0, 0, 0, 4]),
-        Err(ParseError::Malformed(201))
+        Err(Error::Malformed(201))
     );
     assert_eq!(
         Datagram::parse(&[0xa0, 201, 0, 1, 0, 0, 0, 0]),
-        Err(ParseError::Padding)
+        Err(Error::Padding)
     );
 }
 
 #[test]
 fn compound_rules_and_cname_order() {
-    assert_eq!(Compound::parse(&[]), Err(ParseError::Empty));
-    assert_eq!(check_compound(&[]), Err(CompoundError::Empty));
+    assert_eq!(Compound::parse(&[]), Err(Error::Empty));
+    assert_eq!(check_compound(&[]), Err(Error::NoPackets));
     assert_eq!(
         check_compound(&[cname(), report()]),
-        Err(CompoundError::FirstNotReport(202))
+        Err(Error::FirstNotReport(202))
     );
-    assert_eq!(check_compound(&[report()]), Err(CompoundError::NoCname));
+    assert_eq!(check_compound(&[report()]), Err(Error::NoCname));
     let no_cname = Packet::from(Body::SourceDescription(vec![SdesChunk {
         ssrc: 1,
         items: vec![SdesItem {
@@ -472,13 +472,13 @@ fn compound_rules_and_cname_order() {
     }]));
     assert_eq!(
         check_compound(&[report(), no_cname.clone()]),
-        Err(CompoundError::NoCname)
+        Err(Error::NoCname)
     );
     let late = vec![report(), payload(PayloadMessage::Pli), cname()];
-    assert_eq!(check_compound(&late), Err(CompoundError::FeedbackOrder));
+    assert_eq!(check_compound(&late), Err(Error::FeedbackOrder));
     assert_eq!(
         Compound::parse(&Datagram(late).to_bytes().unwrap()),
-        Err(ParseError::Compound(CompoundError::FeedbackOrder))
+        Err(Error::FeedbackOrder)
     );
     let app = Packet::from(Body::App(App {
         subtype: 1,
@@ -492,12 +492,12 @@ fn compound_rules_and_cname_order() {
     }));
     for between in [app, bye] {
         let packets = vec![report(), between, cname()];
-        assert_eq!(check_compound(&packets), Err(CompoundError::NoCname));
+        assert_eq!(check_compound(&packets), Err(Error::NoCname));
         assert_eq!(
             Compound::parse(&Datagram(packets.clone()).to_bytes().unwrap()),
-            Err(ParseError::Compound(CompoundError::NoCname))
+            Err(Error::NoCname)
         );
-        assert_eq!(Compound(packets).to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(Compound(packets).to_bytes(), Err(Error::Unwritable));
     }
     let valid = Compound(vec![
         report(),
@@ -511,8 +511,8 @@ fn compound_rules_and_cname_order() {
     for late in [report(), cname()] {
         let packets = vec![report(), cname(), payload(PayloadMessage::Pli), late];
         let bytes = Datagram(packets.clone()).to_bytes().unwrap();
-        assert_eq!(Compound::parse(&bytes), Err(ParseError::Compound(CompoundError::FeedbackOrder)));
-        assert_eq!(Compound(packets).to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(Compound::parse(&bytes), Err(Error::FeedbackOrder));
+        assert_eq!(Compound(packets).to_bytes(), Err(Error::Unwritable));
     }
     let mut chunks = vec![
         SdesChunk {
@@ -534,16 +534,16 @@ fn compound_rules_and_cname_order() {
             Packet::from(Body::SourceDescription(chunks))
         ])
         .to_bytes(),
-        Err(EncodeError::Unwritable)
+        Err(Error::Unwritable)
     );
-    assert_eq!(Compound::parse(&[0x80]), Err(ParseError::Truncated));
+    assert_eq!(Compound::parse(&[0x80]), Err(Error::Truncated));
     assert_eq!(
-        rtp::Packet::parse(&[0x80, 200, 0]),
-        Err(rtp::PacketError::Rtcp(ParseError::Truncated))
+        rtp::Demux::parse(&[0x80, 200, 0]),
+        Err(rtp::Error::Rtcp(Error::Truncated))
     );
     assert_eq!(
-        rtp::Packet::parse(&[0x80, 100, 0]),
-        Err(rtp::PacketError::Rtp(rtp::RtpError::Truncated))
+        rtp::Demux::parse(&[0x80, 100, 0]),
+        Err(rtp::Error::Truncated)
     );
 }
 
@@ -604,7 +604,7 @@ fn rtcp_writers_refuse_clipping() {
             20_000
         ]))
         .to_bytes(),
-        Err(EncodeError::Unwritable)
+        Err(Error::Unwritable)
     );
     assert_eq!(
         payload(PayloadMessage::Rpsi(Rpsi {
@@ -613,7 +613,7 @@ fn rtcp_writers_refuse_clipping() {
             data: vec![]
         }))
         .to_bytes(),
-        Err(EncodeError::Unwritable)
+        Err(Error::Unwritable)
     );
     refuses(Body::Other {
         packet_type: 200,
@@ -626,7 +626,7 @@ fn rtcp_writers_refuse_clipping() {
             fci: vec![0; 4]
         })
         .to_bytes(),
-        Err(EncodeError::Unwritable)
+        Err(Error::Unwritable)
     );
     let big = Packet::from(Body::App(App {
         subtype: 0,
@@ -636,7 +636,7 @@ fn rtcp_writers_refuse_clipping() {
     }));
     assert_eq!(
         Datagram(vec![big.clone(), big, cname()]).to_bytes(),
-        Err(EncodeError::Unwritable)
+        Err(Error::Unwritable)
     );
 }
 
@@ -649,7 +649,7 @@ fn compound_writer_checks_every_packet() {
     }));
     let packets = vec![big, cname()];
     assert_eq!(check_compound(&packets), Ok(()));
-    assert_eq!(Compound(packets).to_bytes(), Err(EncodeError::Unwritable));
+    assert_eq!(Compound(packets).to_bytes(), Err(Error::Unwritable));
     assert_eq!(
         Compound(vec![
             report(),
@@ -657,12 +657,12 @@ fn compound_writer_checks_every_packet() {
             transport(TransportMessage::Nack(vec![]))
         ])
         .to_bytes(),
-        Err(EncodeError::Unwritable)
+        Err(Error::Unwritable)
     );
-    assert_eq!(Compound(vec![]).to_bytes(), Err(EncodeError::Unwritable));
+    assert_eq!(Compound(vec![]).to_bytes(), Err(Error::Unwritable));
     assert_eq!(
         Compound(vec![cname(), report()]).to_bytes(),
-        Err(EncodeError::Unwritable)
+        Err(Error::Unwritable)
     );
 }
 
@@ -672,16 +672,16 @@ fn empty_nack_and_sli_are_rejected() {
         let fmt = if pt == 205 { 1 } else { 2 };
         assert_eq!(
             Datagram::parse(&[0x80 | fmt, pt, 0, 2, 0, 0, 0, 1, 0, 0, 0, 2]),
-            Err(ParseError::Malformed(pt))
+            Err(Error::Malformed(pt))
         );
     }
     assert_eq!(
         transport(TransportMessage::Nack(vec![])).to_bytes(),
-        Err(EncodeError::Unwritable)
+        Err(Error::Unwritable)
     );
     assert_eq!(
         payload(PayloadMessage::Sli(vec![])).to_bytes(),
-        Err(EncodeError::Unwritable)
+        Err(Error::Unwritable)
     );
 }
 
@@ -692,13 +692,13 @@ fn sdes_and_bye_padding_must_be_null() {
         vec![0x81, 203, 0, 2, 0, 0, 0, 1, 2, b'h', b'i', 0],
     ] {
         assert!(Datagram::parse(&bytes).is_ok());
-        assert!(rtp::Packet::parse(&bytes).is_ok());
+        assert!(rtp::Demux::parse(&bytes).is_ok());
     }
     for (pt, bytes) in [
         (202, vec![0x81, 202, 0, 2, 0, 0, 0, 1, 0, 0, 1, 0]),
         (203, vec![0x81, 203, 0, 2, 0, 0, 0, 1, 1, b'a', 1, 0]),
     ] {
-        assert_eq!(Datagram::parse(&bytes), Err(ParseError::Malformed(pt)));
+        assert_eq!(Datagram::parse(&bytes), Err(Error::Malformed(pt)));
     }
 }
 
@@ -724,7 +724,7 @@ fn rpsi_padding_bits_are_zero() {
                 data: vec![0xff; 3]
             }))
             .to_bytes(),
-            Err(EncodeError::Unwritable)
+            Err(Error::Unwritable)
         );
     }
 }
@@ -760,7 +760,7 @@ fn priv_prefix_length_is_checked() {
         vec![0x81, 202, 0, 2, 0, 0, 0, 1, 8, 1, 255, 0],
         vec![0x81, 202, 0, 2, 0, 0, 0, 1, 8, 0, 0, 0],
     ] {
-        assert_eq!(Datagram::parse(&bytes), Err(ParseError::Malformed(202)));
+        assert_eq!(Datagram::parse(&bytes), Err(Error::Malformed(202)));
     }
     for bytes in [
         vec![0x81, 202, 0, 3, 0, 0, 0, 1, 8, 4, 2, b'a', b'b', b'x', 0, 0],

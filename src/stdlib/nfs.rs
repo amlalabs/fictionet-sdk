@@ -50,7 +50,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
-//! use fictionet::stdlib::nfs::{procedure, DirOp, FileHandle, LookupOk, NfsError, Request, Response};
+//! use fictionet::stdlib::nfs::{procedure, DirOp, FileHandle, LookupOk, Status, Request, Response};
 //! use fictionet::stdlib::onc_rpc::{Accept, Body, Message, Reply};
 //!
 //! /// A server whose root directory, handle [1], holds one file: notes.txt.
@@ -61,8 +61,8 @@
 //!             object_attributes: None,
 //!             dir_attributes: None,
 //!         })),
-//!         Request::Lookup(_) => Response::Lookup(Err((NfsError::NoEnt, None))),
-//!         other => Response::failed(other, NfsError::NotSupp),
+//!         Request::Lookup(_) => Response::Lookup(Err((Status::NoEnt, None))),
+//!         other => Response::failed(other, Status::NotSupp),
 //!     }
 //! }
 //!
@@ -89,7 +89,7 @@
 
 use std::num::NonZeroU32;
 
-use fictionet::stdlib::onc_rpc::{Accept, Call, Message, Reader, Reply, Writer, XdrError};
+use fictionet::stdlib::onc_rpc::{Accept, Call, Error, Message, Reader, Reply, Writer};
 
 /// The port NFS listens on, over TCP and UDP.
 pub const PORT: u16 = 2049;
@@ -210,7 +210,7 @@ pub mod fsf {
 /// Why an NFS procedure failed: an nfsstat3 other than NFS3_OK. A
 /// successful result is the `Ok` side of a [`Response`]'s `Result`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum NfsError {
+pub enum Status {
     /// Not the owner (1).
     Perm,
     /// No such file or directory (2).
@@ -272,116 +272,116 @@ pub enum NfsError {
     Other(NonZeroU32),
 }
 
-impl NfsError {
+impl Status {
     /// The nfsstat3 number.
     pub fn code(self) -> u32 {
         match self {
-            NfsError::Perm => 1,
-            NfsError::NoEnt => 2,
-            NfsError::Io => 5,
-            NfsError::Nxio => 6,
-            NfsError::Acces => 13,
-            NfsError::Exist => 17,
-            NfsError::Xdev => 18,
-            NfsError::Nodev => 19,
-            NfsError::NotDir => 20,
-            NfsError::IsDir => 21,
-            NfsError::Inval => 22,
-            NfsError::Fbig => 27,
-            NfsError::Nospc => 28,
-            NfsError::Rofs => 30,
-            NfsError::Mlink => 31,
-            NfsError::NameTooLong => 63,
-            NfsError::NotEmpty => 66,
-            NfsError::Dquot => 69,
-            NfsError::Stale => 70,
-            NfsError::Remote => 71,
-            NfsError::BadHandle => 10001,
-            NfsError::NotSync => 10002,
-            NfsError::BadCookie => 10003,
-            NfsError::NotSupp => 10004,
-            NfsError::TooSmall => 10005,
-            NfsError::ServerFault => 10006,
-            NfsError::BadType => 10007,
-            NfsError::Jukebox => 10008,
-            NfsError::Other(n) => n.get(),
+            Status::Perm => 1,
+            Status::NoEnt => 2,
+            Status::Io => 5,
+            Status::Nxio => 6,
+            Status::Acces => 13,
+            Status::Exist => 17,
+            Status::Xdev => 18,
+            Status::Nodev => 19,
+            Status::NotDir => 20,
+            Status::IsDir => 21,
+            Status::Inval => 22,
+            Status::Fbig => 27,
+            Status::Nospc => 28,
+            Status::Rofs => 30,
+            Status::Mlink => 31,
+            Status::NameTooLong => 63,
+            Status::NotEmpty => 66,
+            Status::Dquot => 69,
+            Status::Stale => 70,
+            Status::Remote => 71,
+            Status::BadHandle => 10001,
+            Status::NotSync => 10002,
+            Status::BadCookie => 10003,
+            Status::NotSupp => 10004,
+            Status::TooSmall => 10005,
+            Status::ServerFault => 10006,
+            Status::BadType => 10007,
+            Status::Jukebox => 10008,
+            Status::Other(n) => n.get(),
         }
     }
 
     /// The error for nfsstat3 `code`, or `None` for 0, NFS3_OK.
-    pub fn from_code(code: u32) -> Option<NfsError> {
+    pub fn from_code(code: u32) -> Option<Status> {
         Some(match code {
-            1 => NfsError::Perm,
-            2 => NfsError::NoEnt,
-            5 => NfsError::Io,
-            6 => NfsError::Nxio,
-            13 => NfsError::Acces,
-            17 => NfsError::Exist,
-            18 => NfsError::Xdev,
-            19 => NfsError::Nodev,
-            20 => NfsError::NotDir,
-            21 => NfsError::IsDir,
-            22 => NfsError::Inval,
-            27 => NfsError::Fbig,
-            28 => NfsError::Nospc,
-            30 => NfsError::Rofs,
-            31 => NfsError::Mlink,
-            63 => NfsError::NameTooLong,
-            66 => NfsError::NotEmpty,
-            69 => NfsError::Dquot,
-            70 => NfsError::Stale,
-            71 => NfsError::Remote,
-            10001 => NfsError::BadHandle,
-            10002 => NfsError::NotSync,
-            10003 => NfsError::BadCookie,
-            10004 => NfsError::NotSupp,
-            10005 => NfsError::TooSmall,
-            10006 => NfsError::ServerFault,
-            10007 => NfsError::BadType,
-            10008 => NfsError::Jukebox,
-            n => NfsError::Other(NonZeroU32::new(n)?),
+            1 => Status::Perm,
+            2 => Status::NoEnt,
+            5 => Status::Io,
+            6 => Status::Nxio,
+            13 => Status::Acces,
+            17 => Status::Exist,
+            18 => Status::Xdev,
+            19 => Status::Nodev,
+            20 => Status::NotDir,
+            21 => Status::IsDir,
+            22 => Status::Inval,
+            27 => Status::Fbig,
+            28 => Status::Nospc,
+            30 => Status::Rofs,
+            31 => Status::Mlink,
+            63 => Status::NameTooLong,
+            66 => Status::NotEmpty,
+            69 => Status::Dquot,
+            70 => Status::Stale,
+            71 => Status::Remote,
+            10001 => Status::BadHandle,
+            10002 => Status::NotSync,
+            10003 => Status::BadCookie,
+            10004 => Status::NotSupp,
+            10005 => Status::TooSmall,
+            10006 => Status::ServerFault,
+            10007 => Status::BadType,
+            10008 => Status::Jukebox,
+            n => Status::Other(NonZeroU32::new(n)?),
         })
     }
 }
 
-impl std::fmt::Display for NfsError {
+impl std::fmt::Display for Status {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let text = match self {
-            NfsError::Perm => "not the owner",
-            NfsError::NoEnt => "no such file or directory",
-            NfsError::Io => "I/O error",
-            NfsError::Nxio => "no such device or address",
-            NfsError::Acces => "permission denied",
-            NfsError::Exist => "file exists",
-            NfsError::Xdev => "link across devices",
-            NfsError::Nodev => "no such device",
-            NfsError::NotDir => "not a directory",
-            NfsError::IsDir => "is a directory",
-            NfsError::Inval => "invalid argument",
-            NfsError::Fbig => "file too large",
-            NfsError::Nospc => "no space left on device",
-            NfsError::Rofs => "read-only file system",
-            NfsError::Mlink => "too many hard links",
-            NfsError::NameTooLong => "name too long",
-            NfsError::NotEmpty => "directory not empty",
-            NfsError::Dquot => "quota exceeded",
-            NfsError::Stale => "stale file handle",
-            NfsError::Remote => "too many levels of remote paths",
-            NfsError::BadHandle => "bad file handle",
-            NfsError::NotSync => "update synchronization mismatch",
-            NfsError::BadCookie => "stale READDIR cookie",
-            NfsError::NotSupp => "operation not supported",
-            NfsError::TooSmall => "buffer or request too small",
-            NfsError::ServerFault => "server fault",
-            NfsError::BadType => "object type not supported",
-            NfsError::Jukebox => "server busy, try again later",
-            NfsError::Other(n) => return write!(f, "NFS error {n}"),
+            Status::Perm => "not the owner",
+            Status::NoEnt => "no such file or directory",
+            Status::Io => "I/O error",
+            Status::Nxio => "no such device or address",
+            Status::Acces => "permission denied",
+            Status::Exist => "file exists",
+            Status::Xdev => "link across devices",
+            Status::Nodev => "no such device",
+            Status::NotDir => "not a directory",
+            Status::IsDir => "is a directory",
+            Status::Inval => "invalid argument",
+            Status::Fbig => "file too large",
+            Status::Nospc => "no space left on device",
+            Status::Rofs => "read-only file system",
+            Status::Mlink => "too many hard links",
+            Status::NameTooLong => "name too long",
+            Status::NotEmpty => "directory not empty",
+            Status::Dquot => "quota exceeded",
+            Status::Stale => "stale file handle",
+            Status::Remote => "too many levels of remote paths",
+            Status::BadHandle => "bad file handle",
+            Status::NotSync => "update synchronization mismatch",
+            Status::BadCookie => "stale READDIR cookie",
+            Status::NotSupp => "operation not supported",
+            Status::TooSmall => "buffer or request too small",
+            Status::ServerFault => "server fault",
+            Status::BadType => "object type not supported",
+            Status::Jukebox => "server busy, try again later",
+            Status::Other(n) => return write!(f, "NFS error {n}"),
         };
         f.write_str(text)
     }
 }
 
-impl std::error::Error for NfsError {}
+impl std::error::Error for Status {}
 
 /// A file handle: bytes the server chose to name a file. The client never
 /// looks inside. At most [`MAX_FH`] bytes. A longer handle makes the writer
@@ -391,7 +391,7 @@ pub struct FileHandle(pub Vec<u8>);
 
 impl FileHandle {
     /// Reads a handle (nfs_fh3, or fhandle3 in MOUNT).
-    pub fn read(r: &mut Reader<'_>) -> Result<FileHandle, XdrError> {
+    pub fn read(r: &mut Reader<'_>) -> Result<FileHandle, Error> {
         Ok(FileHandle(r.opaque(MAX_FH)?.to_vec()))
     }
 
@@ -449,9 +449,9 @@ impl FileType {
     }
 
     /// Reads an ftype3. A value outside 1 to 7 is refused.
-    pub fn read(r: &mut Reader<'_>) -> Result<FileType, XdrError> {
+    pub fn read(r: &mut Reader<'_>) -> Result<FileType, Error> {
         let n = r.uint()?;
-        FileType::from_code(n).ok_or(XdrError::Discriminant(n))
+        FileType::from_code(n).ok_or(Error::Discriminant(n))
     }
 
     /// Writes the ftype3.
@@ -471,7 +471,7 @@ pub struct SpecData {
 
 impl SpecData {
     /// Reads a specdata3.
-    pub fn read(r: &mut Reader<'_>) -> Result<SpecData, XdrError> {
+    pub fn read(r: &mut Reader<'_>) -> Result<SpecData, Error> {
         Ok(SpecData {
             major: r.uint()?,
             minor: r.uint()?,
@@ -495,7 +495,7 @@ pub struct Time {
 
 impl Time {
     /// Reads an nfstime3.
-    pub fn read(r: &mut Reader<'_>) -> Result<Time, XdrError> {
+    pub fn read(r: &mut Reader<'_>) -> Result<Time, Error> {
         Ok(Time {
             seconds: r.uint()?,
             nseconds: r.uint()?,
@@ -541,7 +541,7 @@ pub struct Fattr {
 
 impl Fattr {
     /// Reads an fattr3.
-    pub fn read(r: &mut Reader<'_>) -> Result<Fattr, XdrError> {
+    pub fn read(r: &mut Reader<'_>) -> Result<Fattr, Error> {
         Ok(Fattr {
             kind: FileType::read(r)?,
             mode: r.uint()?,
@@ -589,7 +589,7 @@ pub struct WccAttr {
 
 impl WccAttr {
     /// Reads a wcc_attr.
-    pub fn read(r: &mut Reader<'_>) -> Result<WccAttr, XdrError> {
+    pub fn read(r: &mut Reader<'_>) -> Result<WccAttr, Error> {
         Ok(WccAttr {
             size: r.uhyper()?,
             mtime: Time::read(r)?,
@@ -617,7 +617,7 @@ pub struct WccData {
 
 impl WccData {
     /// Reads a wcc_data.
-    pub fn read(r: &mut Reader<'_>) -> Result<WccData, XdrError> {
+    pub fn read(r: &mut Reader<'_>) -> Result<WccData, Error> {
         Ok(WccData {
             before: r.optional(WccAttr::read)?,
             after: read_post_op(r)?,
@@ -632,7 +632,7 @@ impl WccData {
 }
 
 /// Reads a post_op_attr: attributes a server may leave out.
-pub fn read_post_op(r: &mut Reader<'_>) -> Result<Option<Fattr>, XdrError> {
+pub fn read_post_op(r: &mut Reader<'_>) -> Result<Option<Fattr>, Error> {
     r.optional(Fattr::read)
 }
 
@@ -657,12 +657,12 @@ pub enum SetTime {
 impl SetTime {
     /// Reads a set_atime or set_mtime. A time_how outside 0 to 2 is
     /// refused.
-    pub fn read(r: &mut Reader<'_>) -> Result<SetTime, XdrError> {
+    pub fn read(r: &mut Reader<'_>) -> Result<SetTime, Error> {
         match r.uint()? {
             0 => Ok(SetTime::DontChange),
             1 => Ok(SetTime::ServerTime),
             2 => Ok(SetTime::ClientTime(Time::read(r)?)),
-            n => Err(XdrError::Discriminant(n)),
+            n => Err(Error::Discriminant(n)),
         }
     }
 
@@ -703,7 +703,7 @@ pub struct Sattr {
 
 impl Sattr {
     /// Reads an sattr3.
-    pub fn read(r: &mut Reader<'_>) -> Result<Sattr, XdrError> {
+    pub fn read(r: &mut Reader<'_>) -> Result<Sattr, Error> {
         Ok(Sattr {
             mode: r.optional(Reader::uint)?,
             uid: r.optional(Reader::uint)?,
@@ -745,7 +745,7 @@ pub struct DirOp {
 
 impl DirOp {
     /// Reads a diropargs3.
-    pub fn read(r: &mut Reader<'_>) -> Result<DirOp, XdrError> {
+    pub fn read(r: &mut Reader<'_>) -> Result<DirOp, Error> {
         Ok(DirOp {
             dir: FileHandle::read(r)?,
             name: read_name(r)?,
@@ -774,12 +774,12 @@ pub enum StableHow {
 
 impl StableHow {
     /// Reads a stable_how. A value outside 0 to 2 is refused.
-    pub fn read(r: &mut Reader<'_>) -> Result<StableHow, XdrError> {
+    pub fn read(r: &mut Reader<'_>) -> Result<StableHow, Error> {
         match r.uint()? {
             0 => Ok(StableHow::Unstable),
             1 => Ok(StableHow::DataSync),
             2 => Ok(StableHow::FileSync),
-            n => Err(XdrError::Discriminant(n)),
+            n => Err(Error::Discriminant(n)),
         }
     }
 
@@ -807,12 +807,12 @@ pub enum CreateHow {
 
 impl CreateHow {
     /// Reads a createhow3. A mode outside 0 to 2 is refused.
-    pub fn read(r: &mut Reader<'_>) -> Result<CreateHow, XdrError> {
+    pub fn read(r: &mut Reader<'_>) -> Result<CreateHow, Error> {
         match r.uint()? {
             0 => Ok(CreateHow::Unchecked(Sattr::read(r)?)),
             1 => Ok(CreateHow::Guarded(Sattr::read(r)?)),
             2 => Ok(CreateHow::Exclusive(read_verifier(r)?)),
-            n => Err(XdrError::Discriminant(n)),
+            n => Err(Error::Discriminant(n)),
         }
     }
 
@@ -836,7 +836,7 @@ impl CreateHow {
 
 /// What MKNOD makes (mknoddata3). Only devices, sockets and named pipes
 /// carry attributes. A server answers the other types with
-/// [`NfsError::BadType`].
+/// [`Status::BadType`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MknodData {
     /// A character device.
@@ -880,7 +880,7 @@ impl MknodData {
     }
 
     /// Reads a mknoddata3.
-    pub fn read(r: &mut Reader<'_>) -> Result<MknodData, XdrError> {
+    pub fn read(r: &mut Reader<'_>) -> Result<MknodData, Error> {
         Ok(match FileType::read(r)? {
             FileType::Character => MknodData::Character {
                 attributes: Sattr::read(r)?,
@@ -1079,8 +1079,8 @@ impl Request {
 
     /// Reads the arguments `args` of procedure `procedure`. They must end
     /// where the last field does. A procedure past COMMIT is refused as
-    /// [`XdrError::Discriminant`].
-    pub fn read(procedure: u32, args: &[u8]) -> Result<Request, XdrError> {
+    /// [`Error::Discriminant`].
+    pub fn read(procedure: u32, args: &[u8]) -> Result<Request, Error> {
         let r = &mut Reader::new(args);
         let request = match procedure {
             procedure::NULL => Request::Null,
@@ -1162,7 +1162,7 @@ impl Request {
                 offset: r.uhyper()?,
                 count: r.uint()?,
             },
-            n => return Err(XdrError::Discriminant(n)),
+            n => return Err(Error::Discriminant(n)),
         };
         r.finish()?;
         Ok(request)
@@ -1197,10 +1197,10 @@ impl Request {
     }
 
     /// The call's arguments, which [`Request::read`] always reads back.
-    /// Handles, names, or paths over their limits return [`XdrError::TooLong`].
+    /// Handles, names, or paths over their limits return [`Error::TooLong`].
     /// WRITE data above [`MAX_DATA`], a count that differs from the data
-    /// length, or any field that would read differently returns [`XdrError::Unwritable`].
-    pub fn to_args(&self) -> Result<Vec<u8>, XdrError> {
+    /// length, or any field that would read differently returns [`Error::Unwritable`].
+    pub fn to_args(&self) -> Result<Vec<u8>, Error> {
         let w = &mut Writer::new();
         match self {
             Request::Null => {}
@@ -1244,7 +1244,7 @@ impl Request {
                 data,
             } => {
                 if data.len() > MAX_DATA || usize::try_from(*count).ok() != Some(data.len()) {
-                    return Err(XdrError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 file.write(w);
                 w.uhyper(*offset).uint(*count);
@@ -1311,7 +1311,7 @@ impl Request {
 
     /// A call message that makes this request, with AUTH_NONE. A world
     /// that needs AUTH_SYS sets the call's `cred` afterwards.
-    pub fn call(&self, xid: u32) -> Result<Message, XdrError> {
+    pub fn call(&self, xid: u32) -> Result<Message, Error> {
         let call = Call::new(NFS_PROGRAM, NFS_VERSION, self.procedure(), self.to_args()?);
         Ok(Message {
             xid,
@@ -1322,7 +1322,7 @@ impl Request {
 
 /// What came of an NFS procedure: `Ok` with the successful results, or
 /// `Err` with the error and the results a failure still carries.
-pub type Outcome<T, F> = Result<T, (NfsError, F)>;
+pub type Outcome<T, F> = Result<T, (Status, F)>;
 
 /// The results of a successful LOOKUP.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1555,7 +1555,7 @@ pub enum Response {
     /// To NULL: nothing.
     Null,
     /// To GETATTR: the attributes. A failure carries nothing more.
-    GetAttr(Result<Fattr, NfsError>),
+    GetAttr(Result<Fattr, Status>),
     /// To SETATTR: the file's attributes from before and after.
     SetAttr(Outcome<WccData, WccData>),
     /// To LOOKUP. A failure carries the directory's attributes.
@@ -1605,7 +1605,7 @@ impl Response {
     /// The response that answers `request` with `error`, leaving out
     /// every attribute a failure may carry. NULL cannot fail, so it is
     /// answered with [`Response::Null`].
-    pub fn failed(request: &Request, error: NfsError) -> Response {
+    pub fn failed(request: &Request, error: Status) -> Response {
         let attrs = (error, None);
         let wcc = (error, WccData::default());
         match request {
@@ -1636,8 +1636,8 @@ impl Response {
 
     /// Reads the results `results` of procedure `procedure`, as a client
     /// does. They must end where the last field does. A procedure past
-    /// COMMIT is refused as [`XdrError::Discriminant`].
-    pub fn parse(procedure: u32, results: &[u8]) -> Result<Response, XdrError> {
+    /// COMMIT is refused as [`Error::Discriminant`].
+    pub fn parse(procedure: u32, results: &[u8]) -> Result<Response, Error> {
         let r = &mut Reader::new(results);
         let response = match procedure {
             procedure::NULL => Response::Null,
@@ -1813,7 +1813,7 @@ impl Response {
                 },
                 WccData::read,
             )?),
-            n => return Err(XdrError::Discriminant(n)),
+            n => return Err(Error::Discriminant(n)),
         };
         r.finish()?;
         Ok(response)
@@ -1848,10 +1848,10 @@ impl Response {
     }
 
     /// The results in XDR, which [`Response::parse`] always reads back.
-    /// Fields or lists over their limits return [`XdrError::TooLong`].
+    /// Fields or lists over their limits return [`Error::TooLong`].
     /// Counts that differ from the data length or enum variants that read
-    /// differently return [`XdrError::Unwritable`]. EOF flags are preserved.
-    pub fn to_results(&self) -> Result<Vec<u8>, XdrError> {
+    /// differently return [`Error::Unwritable`]. EOF flags are preserved.
+    pub fn to_results(&self) -> Result<Vec<u8>, Error> {
         let w = &mut Writer::new();
         match self {
             Response::Null => {}
@@ -2031,14 +2031,14 @@ impl Response {
 
     /// An RPC reply that carries these results, with an AUTH_NONE
     /// verifier.
-    pub fn reply(&self) -> Result<Reply, XdrError> {
+    pub fn reply(&self) -> Result<Reply, Error> {
         Ok(Reply::success(self.to_results()?))
     }
 }
 
 /// Why a MOUNT procedure failed: a mountstat3 other than MNT3_OK.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum MountError {
+pub enum MountStatus {
     /// Not the owner (1).
     Perm,
     /// No such file or directory (2).
@@ -2062,59 +2062,59 @@ pub enum MountError {
     Other(NonZeroU32),
 }
 
-impl MountError {
+impl MountStatus {
     /// The mountstat3 number.
     pub fn code(self) -> u32 {
         match self {
-            MountError::Perm => 1,
-            MountError::NoEnt => 2,
-            MountError::Io => 5,
-            MountError::Acces => 13,
-            MountError::NotDir => 20,
-            MountError::Inval => 22,
-            MountError::NameTooLong => 63,
-            MountError::NotSupp => 10004,
-            MountError::ServerFault => 10006,
-            MountError::Other(n) => n.get(),
+            MountStatus::Perm => 1,
+            MountStatus::NoEnt => 2,
+            MountStatus::Io => 5,
+            MountStatus::Acces => 13,
+            MountStatus::NotDir => 20,
+            MountStatus::Inval => 22,
+            MountStatus::NameTooLong => 63,
+            MountStatus::NotSupp => 10004,
+            MountStatus::ServerFault => 10006,
+            MountStatus::Other(n) => n.get(),
         }
     }
 
     /// The error for mountstat3 `code`, or `None` for 0, MNT3_OK.
-    pub fn from_code(code: u32) -> Option<MountError> {
+    pub fn from_code(code: u32) -> Option<MountStatus> {
         Some(match code {
-            1 => MountError::Perm,
-            2 => MountError::NoEnt,
-            5 => MountError::Io,
-            13 => MountError::Acces,
-            20 => MountError::NotDir,
-            22 => MountError::Inval,
-            63 => MountError::NameTooLong,
-            10004 => MountError::NotSupp,
-            10006 => MountError::ServerFault,
-            n => MountError::Other(NonZeroU32::new(n)?),
+            1 => MountStatus::Perm,
+            2 => MountStatus::NoEnt,
+            5 => MountStatus::Io,
+            13 => MountStatus::Acces,
+            20 => MountStatus::NotDir,
+            22 => MountStatus::Inval,
+            63 => MountStatus::NameTooLong,
+            10004 => MountStatus::NotSupp,
+            10006 => MountStatus::ServerFault,
+            n => MountStatus::Other(NonZeroU32::new(n)?),
         })
     }
 }
 
-impl std::fmt::Display for MountError {
+impl std::fmt::Display for MountStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let text = match self {
-            MountError::Perm => "not the owner",
-            MountError::NoEnt => "no such file or directory",
-            MountError::Io => "I/O error",
-            MountError::Acces => "permission denied",
-            MountError::NotDir => "not a directory",
-            MountError::Inval => "invalid argument",
-            MountError::NameTooLong => "path too long",
-            MountError::NotSupp => "operation not supported",
-            MountError::ServerFault => "server fault",
-            MountError::Other(n) => return write!(f, "MOUNT error {n}"),
+            MountStatus::Perm => "not the owner",
+            MountStatus::NoEnt => "no such file or directory",
+            MountStatus::Io => "I/O error",
+            MountStatus::Acces => "permission denied",
+            MountStatus::NotDir => "not a directory",
+            MountStatus::Inval => "invalid argument",
+            MountStatus::NameTooLong => "path too long",
+            MountStatus::NotSupp => "operation not supported",
+            MountStatus::ServerFault => "server fault",
+            MountStatus::Other(n) => return write!(f, "MOUNT error {n}"),
         };
         f.write_str(text)
     }
 }
 
-impl std::error::Error for MountError {}
+impl std::error::Error for MountStatus {}
 
 /// The arguments of a MOUNT version 3 call.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2155,8 +2155,8 @@ impl MountRequest {
     }
 
     /// Reads the arguments `args` of MOUNT procedure `procedure`. A
-    /// procedure past EXPORT is refused as [`XdrError::Discriminant`].
-    pub fn read(procedure: u32, args: &[u8]) -> Result<MountRequest, XdrError> {
+    /// procedure past EXPORT is refused as [`Error::Discriminant`].
+    pub fn read(procedure: u32, args: &[u8]) -> Result<MountRequest, Error> {
         let r = &mut Reader::new(args);
         let request = match procedure {
             mount_procedure::NULL => MountRequest::Null,
@@ -2165,7 +2165,7 @@ impl MountRequest {
             mount_procedure::UMNT => MountRequest::Umnt(read_path(r)?),
             mount_procedure::UMNTALL => MountRequest::UmntAll,
             mount_procedure::EXPORT => MountRequest::Export,
-            n => return Err(XdrError::Discriminant(n)),
+            n => return Err(Error::Discriminant(n)),
         };
         r.finish()?;
         Ok(request)
@@ -2183,8 +2183,8 @@ impl MountRequest {
         }
     }
 
-    /// The call's arguments. Paths above [`MAX_PATH`] return [`XdrError::TooLong`].
-    pub fn to_args(&self) -> Result<Vec<u8>, XdrError> {
+    /// The call's arguments. Paths above [`MAX_PATH`] return [`Error::TooLong`].
+    pub fn to_args(&self) -> Result<Vec<u8>, Error> {
         let mut w = Writer::new();
         if let MountRequest::Mnt(path) | MountRequest::Umnt(path) = self {
             write_opaque(&mut w, path, MAX_PATH);
@@ -2193,7 +2193,7 @@ impl MountRequest {
     }
 
     /// A call message that makes this request, with AUTH_NONE.
-    pub fn call(&self, xid: u32) -> Result<Message, XdrError> {
+    pub fn call(&self, xid: u32) -> Result<Message, Error> {
         let call = Call::new(
             MOUNT_PROGRAM,
             MOUNT_VERSION,
@@ -2249,7 +2249,7 @@ pub enum MountResponse {
     /// To NULL: nothing.
     Null,
     /// To MNT: the handle, or why there is none.
-    Mnt(Result<Mounted, MountError>),
+    Mnt(Result<Mounted, MountStatus>),
     /// To DUMP: the mounts, at most [`MAX_MOUNTS`].
     Dump(Vec<MountEntry>),
     /// To UMNT: nothing.
@@ -2263,12 +2263,12 @@ pub enum MountResponse {
 
 impl MountResponse {
     /// Reads the results `results` of MOUNT procedure `procedure`. A
-    /// procedure past EXPORT is refused as [`XdrError::Discriminant`].
-    pub fn parse(procedure: u32, results: &[u8]) -> Result<MountResponse, XdrError> {
+    /// procedure past EXPORT is refused as [`Error::Discriminant`].
+    pub fn parse(procedure: u32, results: &[u8]) -> Result<MountResponse, Error> {
         let r = &mut Reader::new(results);
         let response = match procedure {
             mount_procedure::NULL => MountResponse::Null,
-            mount_procedure::MNT => MountResponse::Mnt(match MountError::from_code(r.uint()?) {
+            mount_procedure::MNT => MountResponse::Mnt(match MountStatus::from_code(r.uint()?) {
                 None => Ok(Mounted {
                     handle: FileHandle::read(r)?,
                     auth_flavors: r.array(MAX_AUTH_FLAVORS, Reader::uint)?,
@@ -2293,7 +2293,7 @@ impl MountResponse {
                     })
                 })?)
             }
-            n => return Err(XdrError::Discriminant(n)),
+            n => return Err(Error::Discriminant(n)),
         };
         r.finish()?;
         Ok(response)
@@ -2313,9 +2313,9 @@ impl MountResponse {
 
     /// The results in XDR, which [`MountResponse::parse`] always reads
     /// back. Handles, names, paths, and lists over their limits return
-    /// [`XdrError::TooLong`]. Error variants that alias a named status return
-    /// [`XdrError::Unwritable`].
-    pub fn to_results(&self) -> Result<Vec<u8>, XdrError> {
+    /// [`Error::TooLong`]. Error variants that alias a named status return
+    /// [`Error::Unwritable`].
+    pub fn to_results(&self) -> Result<Vec<u8>, Error> {
         let w = &mut Writer::new();
         match self {
             MountResponse::Null | MountResponse::Umnt | MountResponse::UmntAll => {}
@@ -2323,7 +2323,7 @@ impl MountResponse {
                 w.uint(0);
                 m.handle.write(w);
                 if m.auth_flavors.len() > MAX_AUTH_FLAVORS {
-                    return Err(XdrError::TooLong(
+                    return Err(Error::TooLong(
                         u32::try_from(m.auth_flavors.len()).unwrap_or(u32::MAX),
                     ));
                 }
@@ -2359,7 +2359,7 @@ impl MountResponse {
 
     /// An RPC reply that carries these results, with an AUTH_NONE
     /// verifier.
-    pub fn reply(&self) -> Result<Reply, XdrError> {
+    pub fn reply(&self) -> Result<Reply, Error> {
         Ok(Reply::success(self.to_results()?))
     }
 }
@@ -2367,10 +2367,10 @@ impl MountResponse {
 /// Reads a union on nfsstat3: `ok` for NFS3_OK, else the error and `fail`.
 fn read_outcome<'a, T, F>(
     r: &mut Reader<'a>,
-    ok: impl FnOnce(&mut Reader<'a>) -> Result<T, XdrError>,
-    fail: impl FnOnce(&mut Reader<'a>) -> Result<F, XdrError>,
-) -> Result<Outcome<T, F>, XdrError> {
-    match NfsError::from_code(r.uint()?) {
+    ok: impl FnOnce(&mut Reader<'a>) -> Result<T, Error>,
+    fail: impl FnOnce(&mut Reader<'a>) -> Result<F, Error>,
+) -> Result<Outcome<T, F>, Error> {
+    match Status::from_code(r.uint()?) {
         None => Ok(Ok(ok(r)?)),
         Some(e) => Ok(Err((e, fail(r)?))),
     }
@@ -2406,13 +2406,13 @@ fn read_list<'a, T>(
     r: &mut Reader<'a>,
     max: usize,
     max_bytes: usize,
-    mut item: impl FnMut(&mut Reader<'a>) -> Result<T, XdrError>,
-) -> Result<Vec<T>, XdrError> {
+    mut item: impl FnMut(&mut Reader<'a>) -> Result<T, Error>,
+) -> Result<Vec<T>, Error> {
     let start = r.position();
     let mut out = Vec::new();
     while r.bool()? {
         if out.len() >= max {
-            return Err(XdrError::TooLong(
+            return Err(Error::TooLong(
                 u32::try_from(out.len())
                     .unwrap_or(u32::MAX)
                     .saturating_add(1),
@@ -2421,7 +2421,7 @@ fn read_list<'a, T>(
         out.push(item(r)?);
         let used = r.position() - start;
         if used > max_bytes {
-            return Err(XdrError::TooLong(u32::try_from(used).unwrap_or(u32::MAX)));
+            return Err(Error::TooLong(u32::try_from(used).unwrap_or(u32::MAX)));
         }
     }
     Ok(out)
@@ -2438,7 +2438,7 @@ fn write_list<'a, T: 'a>(
     let mut used = 0usize;
     for (written, value) in items.into_iter().enumerate() {
         if written >= max {
-            w.reject(XdrError::TooLong(
+            w.reject(Error::TooLong(
                 u32::try_from(written).unwrap_or(u32::MAX),
             ));
             return;
@@ -2454,7 +2454,7 @@ fn write_list<'a, T: 'a>(
             }
         };
         let Some(total) = used.checked_add(one.len()).filter(|n| *n <= max_bytes) else {
-            w.reject(XdrError::TooLong(
+            w.reject(Error::TooLong(
                 u32::try_from(max_bytes).unwrap_or(u32::MAX),
             ));
             return;
@@ -2467,15 +2467,15 @@ fn write_list<'a, T: 'a>(
 
 /// Reads variable-length data of at most [`MAX_DATA`] bytes, which must be
 /// `count` bytes long.
-fn read_data(r: &mut Reader<'_>, count: u32) -> Result<Vec<u8>, XdrError> {
+fn read_data(r: &mut Reader<'_>, count: u32) -> Result<Vec<u8>, Error> {
     let data = r.opaque(MAX_DATA)?;
     if data.len() != count as usize {
-        return Err(XdrError::TooLong(count.max(data.len() as u32)));
+        return Err(Error::TooLong(count.max(data.len() as u32)));
     }
     Ok(data.to_vec())
 }
 
-fn read_create_ok(r: &mut Reader<'_>) -> Result<CreateOk, XdrError> {
+fn read_create_ok(r: &mut Reader<'_>) -> Result<CreateOk, Error> {
     Ok(CreateOk {
         object: r.optional(FileHandle::read)?,
         attributes: read_post_op(r)?,
@@ -2483,47 +2483,47 @@ fn read_create_ok(r: &mut Reader<'_>) -> Result<CreateOk, XdrError> {
     })
 }
 
-fn read_rename_wcc(r: &mut Reader<'_>) -> Result<RenameWcc, XdrError> {
+fn read_rename_wcc(r: &mut Reader<'_>) -> Result<RenameWcc, Error> {
     Ok(RenameWcc {
         from_dir: WccData::read(r)?,
         to_dir: WccData::read(r)?,
     })
 }
 
-fn read_link_wcc(r: &mut Reader<'_>) -> Result<LinkWcc, XdrError> {
+fn read_link_wcc(r: &mut Reader<'_>) -> Result<LinkWcc, Error> {
     Ok(LinkWcc {
         attributes: read_post_op(r)?,
         dir_wcc: WccData::read(r)?,
     })
 }
 
-fn read_verifier(r: &mut Reader<'_>) -> Result<[u8; VERIFIER_LEN], XdrError> {
+fn read_verifier(r: &mut Reader<'_>) -> Result<[u8; VERIFIER_LEN], Error> {
     let b = r.opaque_fixed(VERIFIER_LEN)?;
     let mut v = [0; VERIFIER_LEN];
     v.copy_from_slice(b);
     Ok(v)
 }
 
-fn read_name(r: &mut Reader<'_>) -> Result<Vec<u8>, XdrError> {
+fn read_name(r: &mut Reader<'_>) -> Result<Vec<u8>, Error> {
     Ok(r.opaque(MAX_NAME)?.to_vec())
 }
 
-fn read_path(r: &mut Reader<'_>) -> Result<Vec<u8>, XdrError> {
+fn read_path(r: &mut Reader<'_>) -> Result<Vec<u8>, Error> {
     Ok(r.opaque(MAX_PATH)?.to_vec())
 }
 
-fn read_symlink(r: &mut Reader<'_>) -> Result<Vec<u8>, XdrError> {
+fn read_symlink(r: &mut Reader<'_>) -> Result<Vec<u8>, Error> {
     Ok(r.opaque(MAX_SYMLINK)?.to_vec())
 }
 
-fn read_mount_name(r: &mut Reader<'_>) -> Result<String, XdrError> {
+fn read_mount_name(r: &mut Reader<'_>) -> Result<String, Error> {
     Ok(r.string(MAX_MOUNT_NAME)?.to_owned())
 }
 
 /// Appends a bounded opaque field, or records a writer error.
 fn write_opaque(w: &mut Writer, bytes: &[u8], max: usize) {
     if bytes.len() > max {
-        w.reject(XdrError::TooLong(
+        w.reject(Error::TooLong(
             u32::try_from(bytes.len()).unwrap_or(u32::MAX),
         ));
     } else {
@@ -2751,61 +2751,61 @@ mod tests {
         vec![
             Response::Null,
             Response::GetAttr(Ok(attrs())),
-            Response::GetAttr(Err(NfsError::Stale)),
+            Response::GetAttr(Err(Status::Stale)),
             Response::SetAttr(Ok(wcc())),
-            Response::SetAttr(Err((NfsError::NotSync, wcc()))),
+            Response::SetAttr(Err((Status::NotSync, wcc()))),
             Response::Lookup(Ok(LookupOk {
                 object: fh(&[2]),
                 object_attributes: Some(attrs()),
                 dir_attributes: None,
             })),
-            Response::Lookup(Err((NfsError::NoEnt, Some(attrs())))),
+            Response::Lookup(Err((Status::NoEnt, Some(attrs())))),
             Response::Access(Ok(AccessOk {
                 attributes: None,
                 access: access::READ,
             })),
-            Response::Access(Err((NfsError::Acces, None))),
+            Response::Access(Err((Status::Acces, None))),
             Response::ReadLink(Ok(ReadLinkOk {
                 attributes: Some(attrs()),
                 target: "../x".into(),
             })),
-            Response::ReadLink(Err((NfsError::Inval, None))),
+            Response::ReadLink(Err((Status::Inval, None))),
             Response::Read(Ok(ReadOk {
                 attributes: Some(attrs()),
                 count: 5,
                 eof: true,
                 data: b"hello".to_vec(),
             })),
-            Response::Read(Err((NfsError::IsDir, None))),
+            Response::Read(Err((Status::IsDir, None))),
             Response::Write(Ok(WriteOk {
                 wcc: wcc(),
                 count: 5,
                 committed: StableHow::Unstable,
                 verf: [7; 8],
             })),
-            Response::Write(Err((NfsError::Nospc, WccData::default()))),
+            Response::Write(Err((Status::Nospc, WccData::default()))),
             Response::Create(Ok(create.clone())),
-            Response::Create(Err((NfsError::Exist, wcc()))),
+            Response::Create(Err((Status::Exist, wcc()))),
             Response::Mkdir(Ok(bare.clone())),
-            Response::Mkdir(Err((NfsError::Rofs, WccData::default()))),
+            Response::Mkdir(Err((Status::Rofs, WccData::default()))),
             Response::Symlink(Ok(create)),
-            Response::Symlink(Err((NfsError::NotSupp, WccData::default()))),
+            Response::Symlink(Err((Status::NotSupp, WccData::default()))),
             Response::Mknod(Ok(bare)),
-            Response::Mknod(Err((NfsError::BadType, WccData::default()))),
+            Response::Mknod(Err((Status::BadType, WccData::default()))),
             Response::Remove(Ok(wcc())),
-            Response::Remove(Err((NfsError::NoEnt, WccData::default()))),
+            Response::Remove(Err((Status::NoEnt, WccData::default()))),
             Response::Rmdir(Ok(WccData::default())),
-            Response::Rmdir(Err((NfsError::NotEmpty, wcc()))),
+            Response::Rmdir(Err((Status::NotEmpty, wcc()))),
             Response::Rename(Ok(RenameWcc {
                 from_dir: wcc(),
                 to_dir: WccData::default(),
             })),
-            Response::Rename(Err((NfsError::Xdev, RenameWcc::default()))),
+            Response::Rename(Err((Status::Xdev, RenameWcc::default()))),
             Response::Link(Ok(LinkWcc {
                 attributes: Some(attrs()),
                 dir_wcc: wcc(),
             })),
-            Response::Link(Err((NfsError::Mlink, LinkWcc::default()))),
+            Response::Link(Err((Status::Mlink, LinkWcc::default()))),
             Response::ReadDir(Ok(ReadDirOk {
                 attributes: None,
                 cookieverf: [1; 8],
@@ -2829,7 +2829,7 @@ mod tests {
                 entries: vec![],
                 eof: false,
             })),
-            Response::ReadDir(Err((NfsError::BadCookie, None))),
+            Response::ReadDir(Err((Status::BadCookie, None))),
             Response::ReadDirPlus(Ok(ReadDirPlusOk {
                 attributes: Some(attrs()),
                 cookieverf: [2; 8],
@@ -2851,7 +2851,7 @@ mod tests {
                 ],
                 eof: false,
             })),
-            Response::ReadDirPlus(Err((NfsError::TooSmall, Some(attrs())))),
+            Response::ReadDirPlus(Err((Status::TooSmall, Some(attrs())))),
             Response::FsStat(Ok(FsStatOk {
                 attributes: None,
                 tbytes: 1 << 40,
@@ -2862,7 +2862,7 @@ mod tests {
                 afiles: 800,
                 invarsec: 0,
             })),
-            Response::FsStat(Err((NfsError::Io, None))),
+            Response::FsStat(Err((Status::Io, None))),
             Response::FsInfo(Ok(FsInfoOk {
                 attributes: Some(attrs()),
                 rtmax: 1 << 20,
@@ -2879,7 +2879,7 @@ mod tests {
                 },
                 properties: fsf::LINK | fsf::SYMLINK | fsf::HOMOGENEOUS | fsf::CANSETTIME,
             })),
-            Response::FsInfo(Err((NfsError::ServerFault, None))),
+            Response::FsInfo(Err((Status::ServerFault, None))),
             Response::PathConf(Ok(PathConfOk {
                 attributes: None,
                 linkmax: 32000,
@@ -2890,14 +2890,14 @@ mod tests {
                 case_preserving: true,
             })),
             Response::PathConf(Err((
-                NfsError::Other(NonZeroU32::new(12345).unwrap()),
+                Status::Other(NonZeroU32::new(12345).unwrap()),
                 None,
             ))),
             Response::Commit(Ok(CommitOk {
                 wcc: wcc(),
                 verf: [3; 8],
             })),
-            Response::Commit(Err((NfsError::Jukebox, wcc()))),
+            Response::Commit(Err((Status::Jukebox, wcc()))),
         ]
     }
 
@@ -2919,7 +2919,7 @@ mod tests {
                 handle: fh(&[1; 32]),
                 auth_flavors: vec![0, 1],
             })),
-            MountResponse::Mnt(Err(MountError::Acces)),
+            MountResponse::Mnt(Err(MountStatus::Acces)),
             MountResponse::Dump(vec![]),
             MountResponse::Dump(vec![
                 MountEntry {
@@ -3071,7 +3071,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            MountResponse::Mnt(Err(MountError::NoEnt))
+            MountResponse::Mnt(Err(MountStatus::NoEnt))
                 .to_results()
                 .unwrap(),
             [0, 0, 0, 2]
@@ -3102,7 +3102,7 @@ mod tests {
             longer.extend_from_slice(&[0; 4]);
             assert_eq!(
                 Request::read(req.procedure(), &longer),
-                Err(XdrError::Trailing(4))
+                Err(Error::Trailing(4))
             );
         }
         for req in mount_requests() {
@@ -3119,7 +3119,7 @@ mod tests {
             longer.extend_from_slice(&[0; 4]);
             assert_eq!(
                 MountRequest::read(req.procedure(), &longer),
-                Err(XdrError::Trailing(4))
+                Err(Error::Trailing(4))
             );
         }
     }
@@ -3174,7 +3174,7 @@ mod tests {
             longer.push(0);
             assert_eq!(
                 Response::parse(resp.procedure(), &longer),
-                Err(XdrError::Trailing(1))
+                Err(Error::Trailing(1))
             );
         }
         for resp in mount_responses() {
@@ -3197,7 +3197,7 @@ mod tests {
     #[test]
     fn failed_answers_every_request() {
         for req in requests() {
-            let resp = Response::failed(&req, NfsError::Perm);
+            let resp = Response::failed(&req, Status::Perm);
             assert_eq!(resp.procedure(), req.procedure());
             let b = resp.to_results().unwrap();
             if req != Request::Null {
@@ -3232,7 +3232,7 @@ mod tests {
         assert_eq!(Request::parse(&c), Err(Accept::GarbageArgs));
         c.args.clear();
         assert_eq!(Request::parse(&c), Err(Accept::GarbageArgs));
-        assert_eq!(Request::read(22, &[]), Err(XdrError::Discriminant(22)));
+        assert_eq!(Request::read(22, &[]), Err(Error::Discriminant(22)));
 
         let mut m = Call::new(
             MOUNT_PROGRAM,
@@ -3255,9 +3255,9 @@ mod tests {
         m.procedure = mount_procedure::EXPORT;
         m.args = vec![0; 4];
         assert_eq!(MountRequest::parse(&m), Err(Accept::GarbageArgs));
-        assert_eq!(MountRequest::read(6, &[]), Err(XdrError::Discriminant(6)));
-        assert_eq!(Response::parse(22, &[]), Err(XdrError::Discriminant(22)));
-        assert_eq!(MountResponse::parse(6, &[]), Err(XdrError::Discriminant(6)));
+        assert_eq!(MountRequest::read(6, &[]), Err(Error::Discriminant(6)));
+        assert_eq!(Response::parse(22, &[]), Err(Error::Discriminant(22)));
+        assert_eq!(MountResponse::parse(6, &[]), Err(Error::Discriminant(6)));
     }
 
     #[test]
@@ -3267,7 +3267,7 @@ mod tests {
         b.extend_from_slice(&[0; 68]);
         assert_eq!(
             Request::read(procedure::GETATTR, &b),
-            Err(XdrError::TooLong(65))
+            Err(Error::TooLong(65))
         );
         // A name over 255 bytes.
         let long = "n".repeat(256);
@@ -3275,26 +3275,26 @@ mod tests {
         w.opaque(&[1]).string(&long);
         assert_eq!(
             Request::read(procedure::LOOKUP, w.as_bytes()),
-            Err(XdrError::TooLong(256))
+            Err(Error::TooLong(256))
         );
         // Padding that is not zero.
         assert_eq!(
             Request::read(procedure::GETATTR, &[0, 0, 0, 1, 1, 0, 0, 1]),
-            Err(XdrError::Padding)
+            Err(Error::Padding)
         );
         // stable_how 3.
         let mut w = Writer::new();
         w.opaque(&[1]).uhyper(0).uint(0).uint(3).opaque(&[]);
         assert_eq!(
             Request::read(procedure::WRITE, w.as_bytes()),
-            Err(XdrError::Discriminant(3))
+            Err(Error::Discriminant(3))
         );
         // createmode 3.
         let mut args = Request::Lookup(op(&[1], "a")).to_args().unwrap();
         args.extend_from_slice(&[0, 0, 0, 3]);
         assert_eq!(
             Request::read(procedure::CREATE, &args),
-            Err(XdrError::Discriminant(3))
+            Err(Error::Discriminant(3))
         );
         // time_how 3, in an sattr3 with nothing else set.
         let mut args = Request::Lookup(op(&[1], "a")).to_args().unwrap();
@@ -3302,20 +3302,20 @@ mod tests {
         args.extend_from_slice(&[0, 0, 0, 3, 0, 0, 0, 0]);
         assert_eq!(
             Request::read(procedure::MKDIR, &args),
-            Err(XdrError::Discriminant(3))
+            Err(Error::Discriminant(3))
         );
         // ftype3 0 and 8.
         let mut args = Request::Lookup(op(&[1], "a")).to_args().unwrap();
         args.extend_from_slice(&[0, 0, 0, 8]);
         assert_eq!(
             Request::read(procedure::MKNOD, &args),
-            Err(XdrError::Discriminant(8))
+            Err(Error::Discriminant(8))
         );
         let mut b = vec![0, 0, 0, 0];
         b.extend_from_slice(&[0; 84]);
         assert_eq!(
             Response::parse(procedure::GETATTR, &b),
-            Err(XdrError::Discriminant(0))
+            Err(Error::Discriminant(0))
         );
         // A boolean of 2 for a guard.
         let mut w = Writer::new();
@@ -3324,7 +3324,7 @@ mod tests {
         w.uint(2);
         assert_eq!(
             Request::read(procedure::SETATTR, w.as_bytes()),
-            Err(XdrError::Bool(2))
+            Err(Error::Bool(2))
         );
         // Data over MAX_DATA in WRITE, refused by its length alone.
         let mut w = Writer::new();
@@ -3335,7 +3335,7 @@ mod tests {
             .uint(MAX_DATA as u32 + 1);
         assert_eq!(
             Request::read(procedure::WRITE, w.as_bytes()),
-            Err(XdrError::TooLong(MAX_DATA as u32 + 1))
+            Err(Error::TooLong(MAX_DATA as u32 + 1))
         );
         // A symlink target over MAX_SYMLINK.
         let mut w = Writer::new();
@@ -3344,21 +3344,21 @@ mod tests {
         w.string(&"t".repeat(MAX_SYMLINK + 1));
         assert_eq!(
             Request::read(procedure::SYMLINK, w.as_bytes()),
-            Err(XdrError::TooLong(4097))
+            Err(Error::TooLong(4097))
         );
         // Too many auth flavors.
         let mut w = Writer::new();
         w.uint(0).opaque(&[1]).uint(17);
         assert_eq!(
             MountResponse::parse(mount_procedure::MNT, w.as_bytes()),
-            Err(XdrError::TooLong(17))
+            Err(Error::TooLong(17))
         );
         // A mount host name over MAX_MOUNT_NAME.
         let mut w = Writer::new();
         w.bool(true).string(&"h".repeat(256));
         assert_eq!(
             MountResponse::parse(mount_procedure::DUMP, w.as_bytes()),
-            Err(XdrError::TooLong(256))
+            Err(Error::TooLong(256))
         );
     }
 
@@ -3388,14 +3388,14 @@ mod tests {
         w.uint(0).bool(false).string(&"x".repeat(MAX_SYMLINK + 1));
         assert_eq!(
             Response::parse(procedure::READLINK, w.as_bytes()),
-            Err(XdrError::TooLong(4097))
+            Err(Error::TooLong(4097))
         );
         // A MOUNT dirpath keeps its MNTPATHLEN bound.
         let mut w = Writer::new();
         w.string(&"p".repeat(MAX_PATH + 1));
         assert_eq!(
             MountRequest::read(mount_procedure::MNT, w.as_bytes()),
-            Err(XdrError::TooLong(1025))
+            Err(Error::TooLong(1025))
         );
     }
 
@@ -3415,7 +3415,7 @@ mod tests {
         assert!(Response::parse(procedure::READDIR, &entries(most)).is_ok());
         assert_eq!(
             Response::parse(procedure::READDIR, &entries(most + 1)),
-            Err(XdrError::TooLong((28 * (most + 1)) as u32))
+            Err(Error::TooLong((28 * (most + 1)) as u32))
         );
         let groups = |n: usize| {
             let mut w = Writer::new();
@@ -3429,25 +3429,25 @@ mod tests {
         assert!(MountResponse::parse(mount_procedure::EXPORT, &groups(MAX_GROUPS)).is_ok());
         assert_eq!(
             MountResponse::parse(mount_procedure::EXPORT, &groups(MAX_GROUPS + 1)),
-            Err(XdrError::TooLong(MAX_GROUPS as u32 + 1))
+            Err(Error::TooLong(MAX_GROUPS as u32 + 1))
         );
     }
 
     #[test]
     fn errors_and_codes() {
-        assert_eq!(NfsError::from_code(0), None);
-        assert_eq!(MountError::from_code(0), None);
+        assert_eq!(Status::from_code(0), None);
+        assert_eq!(MountStatus::from_code(0), None);
         for code in (1..=100).chain(10_000..=10_010).chain([u32::MAX]) {
-            assert_eq!(NfsError::from_code(code).unwrap().code(), code);
-            assert_eq!(MountError::from_code(code).unwrap().code(), code);
+            assert_eq!(Status::from_code(code).unwrap().code(), code);
+            assert_eq!(MountStatus::from_code(code).unwrap().code(), code);
         }
-        assert_eq!(NfsError::from_code(70), Some(NfsError::Stale));
-        assert_eq!(NfsError::from_code(10008), Some(NfsError::Jukebox));
-        assert_eq!(MountError::from_code(13), Some(MountError::Acces));
-        assert_eq!(NfsError::NoEnt.to_string(), "no such file or directory");
-        assert_eq!(NfsError::from_code(3).unwrap().to_string(), "NFS error 3");
+        assert_eq!(Status::from_code(70), Some(Status::Stale));
+        assert_eq!(Status::from_code(10008), Some(Status::Jukebox));
+        assert_eq!(MountStatus::from_code(13), Some(MountStatus::Acces));
+        assert_eq!(Status::NoEnt.to_string(), "no such file or directory");
+        assert_eq!(Status::from_code(3).unwrap().to_string(), "NFS error 3");
         assert_eq!(
-            MountError::from_code(3).unwrap().to_string(),
+            MountStatus::from_code(3).unwrap().to_string(),
             "MOUNT error 3"
         );
         for code in 0..10 {
@@ -3462,7 +3462,7 @@ mod tests {
         let resp = Response::parse(procedure::GETATTR, &b).unwrap();
         assert_eq!(
             resp,
-            Response::GetAttr(Err(NfsError::Other(NonZeroU32::new(99).unwrap())))
+            Response::GetAttr(Err(Status::Other(NonZeroU32::new(99).unwrap())))
         );
         assert_eq!(resp.to_results().unwrap(), b);
     }
@@ -3628,13 +3628,13 @@ mod tests {
         w.uint(0).bool(false).uint(2).bool(true).opaque(b"x");
         assert_eq!(
             Response::parse(procedure::READ, w.as_bytes()),
-            Err(XdrError::TooLong(2))
+            Err(Error::TooLong(2))
         );
         let mut w = Writer::new();
         w.opaque(&[1]).uhyper(0).uint(2).uint(0).opaque(b"xyz");
         assert_eq!(
             Request::read(procedure::WRITE, w.as_bytes()),
-            Err(XdrError::TooLong(3))
+            Err(Error::TooLong(3))
         );
         let request = Request::Write {
             file: fh(&[1]),
@@ -3696,7 +3696,7 @@ mod tests {
         assert!(b.len() > MAX_EXPORT_BYTES);
         assert!(matches!(
             MountResponse::parse(mount_procedure::EXPORT, &b),
-            Err(XdrError::TooLong(_))
+            Err(Error::TooLong(_))
         ));
         assert!(MountResponse::Export(exports.clone()).to_results().is_err());
         let response = MountResponse::Export(exports[..15].to_vec());
@@ -4013,7 +4013,7 @@ mod tests {
                             }
                         })
                         .expect("a name or handle must exceed its limit");
-                    assert_eq!(error, XdrError::TooLong(length as u32));
+                    assert_eq!(error, Error::TooLong(length as u32));
                 }
             }
             let req = Request::SetAttr {
@@ -4043,7 +4043,7 @@ mod tests {
                         unreachable!()
                     };
                     assert!(object.0.len() > MAX_FH);
-                    assert_eq!(error, XdrError::TooLong(object.0.len() as u32));
+                    assert_eq!(error, Error::TooLong(object.0.len() as u32));
                 }
             }
         }

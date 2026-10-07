@@ -116,7 +116,7 @@ fn mqtt_broker_round_trip_and_terminal_errors() {
         mqtt::Packet::PingReq,
     ];
     let bytes: Vec<u8> = packets.iter().flat_map(encoded).collect();
-    let make = || mqtt::Frames::with_limit(64);
+    let make = || mqtt::Packets::with_limit(64);
     check(make, &bytes);
     let (got, error) = decode_all(make, &bytes);
     assert_eq!((got.clone(), error), (packets.clone(), None));
@@ -193,14 +193,14 @@ fn dhcpv6_tcp_recovers_messages_and_replies() {
     bytes.extend(encoded(&dhcpv6::Frame(request.clone())));
     bytes.extend_from_slice(&[0, 5, 1, 0, 0, 1, 0]); // Torn option inside a whole message.
     bytes.extend(encoded(&dhcpv6::Frame(request.clone())));
-    check(dhcpv6::Frames::new, &bytes);
+    check(dhcpv6::Messages::new, &bytes);
     let expected = vec![
-        Err(dhcpv6::ParseError::Short),
+        Err(dhcpv6::Error::Short),
         Ok(request.clone()),
-        Err(dhcpv6::ParseError::Truncated),
+        Err(dhcpv6::Error::Truncated),
         Ok(request.clone()),
     ];
-    let (items, error) = decode_all(dhcpv6::Frames::new, &bytes);
+    let (items, error) = decode_all(dhcpv6::Messages::new, &bytes);
     assert_eq!(error, None);
     assert_eq!(items, expected);
     let mut replies = Vec::new();
@@ -208,7 +208,7 @@ fn dhcpv6_tcp_recovers_messages_and_replies() {
         let answer = message.answer(dhcpv6::msg::ADVERTISE, &dhcpv6::Duid::en(32473, b"server"));
         let bytes = encoded(&dhcpv6::Frame(answer.clone()));
         assert_eq!(
-            decode_all(dhcpv6::Frames::new, &bytes),
+            decode_all(dhcpv6::Messages::new, &bytes),
             (vec![Ok(answer.clone())], None)
         );
         replies.push(answer);
@@ -278,7 +278,7 @@ fn partial_units_and_header_faults() {
         decode_all(amqp::Frames::server, b"NOT AMQP"),
         (
             vec![],
-            Some(Fail::Protocol(amqp::FrameError::ProtocolHeader(
+            Some(Fail::Protocol(amqp::Error::ProtocolHeader(
                 *b"NOT AMQP"
             )))
         )
@@ -290,7 +290,7 @@ fn partial_units_and_header_faults() {
         decode_all(make, &oversized),
         (
             vec![],
-            Some(Fail::Protocol(amqp::FrameError::TooLarge {
+            Some(Fail::Protocol(amqp::Error::FrameTooLarge {
                 size: 4096,
                 frame_max: amqp::FRAME_MIN_SIZE
             }))
@@ -298,9 +298,9 @@ fn partial_units_and_header_faults() {
     );
 
     for bytes in [&[0x30][..], &[0x30, 3, 0][..], &[0x30, 0x80][..]] {
-        check(mqtt::Frames::new, bytes);
+        check(mqtt::Packets::new, bytes);
         assert_eq!(
-            decode_all(mqtt::Frames::new, bytes),
+            decode_all(mqtt::Packets::new, bytes),
             (
                 vec![],
                 Some(Fail::Truncated {
@@ -309,7 +309,7 @@ fn partial_units_and_header_faults() {
             )
         );
     }
-    let make = || mqtt::Frames::with_limit(0);
+    let make = || mqtt::Packets::with_limit(0);
     let bytes = [0x30, 0x80, 0x80, 0x80, 0x00];
     check(make, &bytes);
     assert_eq!(make().capacity(), 5);
@@ -341,9 +341,9 @@ fn partial_units_and_header_faults() {
     );
 
     for bytes in [&[0][..], &[0, 4, 1][..]] {
-        check(dhcpv6::Frames::new, bytes);
+        check(dhcpv6::Messages::new, bytes);
         assert_eq!(
-            decode_all(dhcpv6::Frames::new, bytes),
+            decode_all(dhcpv6::Messages::new, bytes),
             (
                 vec![],
                 Some(Fail::Truncated {
@@ -368,9 +368,7 @@ fn partial_units_and_header_faults() {
         decode_all(syslog::Frames::new, b"12x"),
         (
             vec![],
-            Some(Fail::Protocol(syslog::DecodeError::Framing(
-                syslog::FrameError::Length(b'x')
-            )))
+            Some(Fail::Protocol(syslog::Error::Length(b'x')))
         )
     );
     check(syslog::Frames::new, b"999999999999999999999999999999 ");
@@ -383,11 +381,11 @@ fn exact_parsers_and_transactional_writers() {
     bytes.push(0);
     assert_eq!(
         <amqp::Frame as Wire>::parse(&bytes),
-        Err(amqp::FrameParseError::Trailing)
+        Err(amqp::Error::Trailing)
     );
     assert_eq!(
         <amqp::Frame as Wire>::parse(&[]),
-        Err(amqp::FrameParseError::Truncated)
+        Err(amqp::Error::Truncated)
     );
     refuses(&amqp::Frame {
         channel: 1,
@@ -413,7 +411,7 @@ fn exact_parsers_and_transactional_writers() {
     let mut frame = coap::Frame::new(coap::Code::GET);
     assert_eq!(
         <coap::Frame as Wire>::parse(&[0, 1, 0]),
-        Err(coap::FrameParseError::Trailing)
+        Err(coap::Error::Trailing)
     );
     frame.token = vec![0; coap::MAX_TOKEN + 1];
     refuses(&frame);
@@ -456,11 +454,11 @@ fn exact_parsers_and_transactional_writers() {
     refuses(&message); // It would read as Preference, not Other.
     assert_eq!(
         <dhcpv6::Frame as Wire>::parse(&[0]),
-        Err(dhcpv6::FrameParseError::Truncated)
+        Err(dhcpv6::Error::Truncated)
     );
     assert_eq!(
         <dhcpv6::Frame as Wire>::parse(&[0, 4, 1, 0, 0, 1, 0]),
-        Err(dhcpv6::FrameParseError::Trailing)
+        Err(dhcpv6::Error::Trailing)
     );
 
     for frame in [
@@ -484,11 +482,11 @@ fn exact_parsers_and_transactional_writers() {
     }
     assert_eq!(
         <syslog::Frame as Wire>::parse(b"one\ntwo\n"),
-        Err(syslog::FrameParseError::Trailing)
+        Err(syslog::Error::Trailing)
     );
     assert_eq!(
         <syslog::Frame as Wire>::parse(b"4 abc"),
-        Err(syslog::FrameParseError::Truncated)
+        Err(syslog::Error::Truncated)
     );
     encoded(&syslog::Frame::new(
         syslog::Framing::NonTransparent,
@@ -508,19 +506,19 @@ fn dhcpv6_tcp_limit_and_stream_backpressure() {
     let frame = dhcpv6::Frame(message.clone());
     let bytes = encoded(&frame);
     assert_eq!(bytes.len(), dhcpv6::MAX_BUFFERED);
-    check(dhcpv6::Frames::new, &bytes);
+    check(dhcpv6::Messages::new, &bytes);
     assert_eq!(
-        decode_all(dhcpv6::Frames::new, &bytes),
+        decode_all(dhcpv6::Messages::new, &bytes),
         (vec![Ok(message.clone())], None)
     );
     let mut batch = bytes.clone();
     batch.extend_from_slice(&[0, 0]);
-    let mut stream = Stream::new(dhcpv6::Frames);
+    let mut stream = Stream::new(dhcpv6::Messages);
     assert_eq!(stream.push(&batch), dhcpv6::MAX_BUFFERED);
     assert_eq!(stream.push(&[0]), 0);
     assert_eq!(stream.next(), Some(Ok(Ok(message))));
     assert_eq!(stream.push(batch.get(bytes.len()..).unwrap()), 2);
-    assert_eq!(stream.next(), Some(Ok(Err(dhcpv6::ParseError::Short))));
+    assert_eq!(stream.next(), Some(Ok(Err(dhcpv6::Error::Short))));
     assert_eq!(stream.buffered(), 0);
 }
 
@@ -562,7 +560,7 @@ fn syslog_overlong_frames_skip_tails_and_detect_incomplete_counts() {
     assert!(items[0].truncated);
     assert_eq!(
         error,
-        Some(Fail::Protocol(syslog::DecodeError::Incomplete {
+        Some(Fail::Protocol(syslog::Error::Incomplete {
             remaining: 7
         }))
     );
@@ -589,9 +587,7 @@ fn stream_errors_end_once_and_partial_counts_fail_at_eof() {
     assert_eq!(stream.push(b"1x"), 2);
     assert_eq!(
         stream.next(),
-        Some(Err(Fail::Protocol(syslog::DecodeError::Framing(
-            syslog::FrameError::Length(b'x')
-        ))))
+        Some(Err(Fail::Protocol(syslog::Error::Length(b'x'))))
     );
     assert_eq!(stream.next(), None);
     assert_eq!(stream.push(b"next\n"), 5);
@@ -602,11 +598,11 @@ fn stream_errors_end_once_and_partial_counts_fail_at_eof() {
 #[test]
 fn decoders_have_bounded_capacity_and_no_held_input() {
     for limit in [0, 1, 2, 5, 4096, usize::MAX] {
-        let decoder = mqtt::Frames::with_limit(limit);
+        let decoder = mqtt::Packets::with_limit(limit);
         assert!((5..=mqtt::MAX_PACKET).contains(&decoder.capacity()));
         assert_eq!(decoder.held(), 0);
         check(
-            || mqtt::Frames::with_limit(limit),
+            || mqtt::Packets::with_limit(limit),
             &[0x30, 0x80, 0x80, 0x80, 0x80],
         );
     }
@@ -616,11 +612,11 @@ fn decoders_have_bounded_capacity_and_no_held_input() {
         assert_eq!(decoder.held(), 0);
     }
     assert_eq!(coap::Frames.capacity(), coap::MAX_BUFFERED);
-    assert_eq!(dhcpv6::Frames.capacity(), dhcpv6::MAX_BUFFERED);
+    assert_eq!(dhcpv6::Messages.capacity(), dhcpv6::MAX_BUFFERED);
     assert_eq!(syslog::Frames::new().capacity(), syslog::MAX_BUFFERED);
     assert_eq!(amqp::Frames::new().decode(&[], true), Ok(Step::Need));
-    assert_eq!(mqtt::Frames::new().decode(&[], true), Ok(Step::Need));
+    assert_eq!(mqtt::Packets::new().decode(&[], true), Ok(Step::Need));
     assert_eq!(coap::Frames.decode(&[], true), Ok(Step::Need));
-    assert_eq!(dhcpv6::Frames.decode(&[], true), Ok(Step::Need));
+    assert_eq!(dhcpv6::Messages.decode(&[], true), Ok(Step::Need));
     assert_eq!(syslog::Frames::new().decode(&[], true), Ok(Step::Need));
 }

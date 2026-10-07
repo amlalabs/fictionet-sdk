@@ -73,14 +73,14 @@ fn resp_limits_and_terminal_errors() {
     assert_eq!(commands.push(&bytes), limits.frame);
     assert_eq!(
         commands.next(),
-        Some(Err(Fail::Protocol(resp::ParseError::FrameTooLarge)))
+        Some(Err(Fail::Protocol(resp::Error::FrameTooLarge)))
     );
     assert!(commands.next().is_none());
     let mut values = Stream::new(resp::Values::with_limits(limits));
     assert_eq!(values.push(&bytes), limits.frame);
     assert_eq!(
         values.next(),
-        Some(Err(Fail::Protocol(resp::ParseError::FrameTooLarge)))
+        Some(Err(Fail::Protocol(resp::Error::FrameTooLarge)))
     );
     assert!(values.next().is_none());
     for bytes in [&b"+OK\r\n$9\r\nabc"[..], b"+OK\r\n:bad\r\n+later\r\n"] {
@@ -96,7 +96,7 @@ fn resp_limits_and_terminal_errors() {
             Some(if bytes.ends_with(b"abc") {
                 Fail::Truncated { unread: 7 }
             } else {
-                Fail::Protocol(resp::ParseError::Malformed(b':'))
+                Fail::Protocol(resp::Error::Malformed(b':'))
             })
         );
     }
@@ -110,7 +110,7 @@ fn resp_limits_and_terminal_errors() {
         decode_all(resp::Commands::new, bytes),
         (
             vec![resp::Command::new(["PING"])],
-            Some(Fail::Protocol(resp::ParseError::ExpectedBulk(b'+'))),
+            Some(Fail::Protocol(resp::Error::ExpectedBulk(b'+'))),
         )
     );
     for limit in [0, 1, 2, 3, 4, 16, usize::MAX] {
@@ -172,7 +172,7 @@ fn resp_strict_writers_preserve_types_and_roll_back() {
         let mut out = b"prefix".to_vec();
         assert_eq!(
             Wire::write(&value, &mut out),
-            Err(resp::WireError::Unwritable)
+            Err(resp::Error::Unwritable)
         );
         assert_eq!(out, b"prefix");
     }
@@ -180,23 +180,23 @@ fn resp_strict_writers_preserve_types_and_roll_back() {
     for _ in 0..resp::MAX_DEPTH + 1 {
         deep = resp::Value::Array(vec![deep]);
     }
-    assert_eq!(Wire::to_bytes(&deep), Err(resp::WireError::Unwritable));
+    assert_eq!(Wire::to_bytes(&deep), Err(resp::Error::Unwritable));
     let command = resp::Command {
         args: vec![vec![0; resp::MAX_BULK_LEN + 1]],
     };
     contract::check_wire_value(&command);
-    assert_eq!(Wire::to_bytes(&command), Err(resp::WireError::Unwritable));
+    assert_eq!(Wire::to_bytes(&command), Err(resp::Error::Unwritable));
     assert_eq!(
         <resp::Value as Wire>::parse(b"+OK\r\n+more\r\n"),
-        Err(resp::WireError::Trailing)
+        Err(resp::Error::Trailing)
     );
     assert_eq!(
         <resp::Value as Wire>::parse(b"+OK\r"),
-        Err(resp::WireError::Incomplete)
+        Err(resp::Error::Incomplete)
     );
     assert_eq!(
         <resp::Command as Wire>::parse(b"PING\nGET x\n"),
-        Err(resp::WireError::Trailing)
+        Err(resp::Error::Trailing)
     );
     contract::check_wire::<resp::Command>(b"\r\n");
     // NaN is not reflexive under Value's existing PartialEq. Its wire form is.

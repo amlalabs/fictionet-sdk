@@ -3,7 +3,7 @@
 #![no_main]
 
 use fictionet::stdlib::nfs::{
-    DirOp, FileHandle, MAX_FH, MAX_NAME, MountRequest, MountResponse, NfsError, Request, Response,
+    DirOp, FileHandle, MAX_FH, MAX_NAME, MountRequest, MountResponse, Status, Request, Response,
     procedure,
 };
 use fictionet::stdlib::onc_rpc::{Body, Message};
@@ -104,7 +104,7 @@ fuzz_target!(|data: &[u8]| {
             };
             assert_eq!(Request::parse(&c), Ok(req.clone()));
             // A failure for it reads back.
-            let failed = Response::failed(&req, NfsError::Io);
+            let failed = Response::failed(&req, Status::Io);
             assert_eq!(
                 Response::parse(req.procedure(), &failed.to_results().unwrap()),
                 Ok(failed)

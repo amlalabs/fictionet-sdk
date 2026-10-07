@@ -31,7 +31,7 @@
 //! world code. SRTCP encryption is not handled here.
 //!
 //! Every reader checks lengths and ranges, because the agent can send any
-//! bytes it likes. Writers return an [`EncodeError`] rather than write
+//! bytes it likes. Writers return an [`Error`] rather than write
 //! bytes a reader would refuse or read back as something else.
 //!
 //! ```
@@ -616,16 +616,16 @@ impl XrBlock {
     }
 
     /// A DLRR block holding `items`. Refuses a block that cannot fit in a packet.
-    pub fn dlrr(items: &[DlrrItem]) -> Result<XrBlock, EncodeError> {
-        let len = items.len().checked_mul(12).ok_or(EncodeError::Unwritable)?;
+    pub fn dlrr(items: &[DlrrItem]) -> Result<XrBlock, Error> {
+        let len = items.len().checked_mul(12).ok_or(Error::Unwritable)?;
         // Include the RTCP header, SSRC, and block header.
-        let packet_len = len.checked_add(12).ok_or(EncodeError::Unwritable)?;
+        let packet_len = len.checked_add(12).ok_or(Error::Unwritable)?;
         if packet_len > MAX_PACKET {
-            return Err(EncodeError::Unwritable);
+            return Err(Error::Unwritable);
         }
         let mut data = Vec::new();
         data.try_reserve_exact(len)
-            .map_err(|_| EncodeError::Unwritable)?;
+            .map_err(|_| Error::Unwritable)?;
         for i in items {
             data.extend_from_slice(&i.ssrc.to_be_bytes());
             data.extend_from_slice(&i.last_rr.to_be_bytes());
@@ -655,15 +655,17 @@ impl XrBlock {
     }
 }
 
-/// Why bytes are not RTCP packets this module can read.
+/// Why bytes are not RTCP packets this module can read, why packets break
+/// a rule for compound packets, or why a value cannot be written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ParseError {
+pub enum Error {
     /// The datagram held no bytes.
     Empty,
     /// The datagram was longer than [`MAX_DATAGRAM`], or a header gave a
     /// packet longer than [`MAX_PACKET`]. Holds that length.
     TooLong(usize),
-    /// A header, or the length it gives, ran past the end of the datagram.
+    /// A header, or the length it gives, ran past the end of the datagram,
+    /// or the input ended before a complete RFC 4571 envelope.
     Truncated,
     /// The version was not 2; holds what it was.
     Version(u8),
@@ -673,72 +675,60 @@ pub enum ParseError {
     Padding,
     /// A packet's contents do not fit its type; holds the packet type.
     Malformed(u8),
-    /// The packets read, but break a rule for compound packets.
-    Compound(CompoundError),
-}
-
-impl std::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ParseError::Empty => f.write_str("an empty RTCP datagram"),
-            ParseError::TooLong(n) => write!(f, "a {n}-byte datagram or packet, longer than UDP holds"),
-            ParseError::Truncated => f.write_str("an RTCP packet runs past the end of the datagram"),
-            ParseError::Version(v) => write!(f, "RTP version {v}, not 2"),
-            ParseError::Padding => f.write_str("a padding count of 0 or more than the packet holds"),
-            ParseError::Malformed(t) => write!(f, "contents that do not fit RTCP packet type {t}"),
-            ParseError::Compound(e) => write!(f, "not a valid compound packet: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for ParseError {}
-
-/// A rule of RFC 3550 for compound packets that a list of packets breaks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CompoundError {
-    /// There are no packets.
-    Empty,
-    /// The first packet is not a sender or receiver report; holds its
-    /// packet type.
+    /// A compound packet has no packets.
+    NoPackets,
+    /// The first packet of a compound packet is not a sender or receiver
+    /// report; holds its packet type.
     FirstNotReport(u8),
-    /// No SDES chunk right after the reports carries a CNAME item.
+    /// No SDES chunk right after the reports of a compound packet carries
+    /// a CNAME item.
     NoCname,
-    /// A packet other than the last carries padding.
-    Padding,
+    /// A packet other than the last of a compound packet carries padding.
+    EarlyPadding,
     /// A feedback packet (RTPFB or PSFB) comes before a sender report,
     /// receiver report or SDES packet. RFC 4585 puts feedback after them.
     FeedbackOrder,
-}
-
-impl std::fmt::Display for CompoundError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CompoundError::Empty => f.write_str("no packets"),
-            CompoundError::FirstNotReport(t) => write!(f, "the first packet is type {t}, not SR or RR"),
-            CompoundError::NoCname => f.write_str("no SDES CNAME item"),
-            CompoundError::Padding => f.write_str("padding on a packet other than the last"),
-            CompoundError::FeedbackOrder => f.write_str("a feedback packet before a report or SDES packet"),
-        }
-    }
-}
-
-impl std::error::Error for CompoundError {}
-
-/// Why a writer refused a value: its bytes would break the specification,
-/// or a reader would read them back as something else.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EncodeError {
+    /// Bytes follow the first packet or RFC 4571 envelope.
+    Trailing,
+    /// An RFC 4571 length prefix exceeds the configured payload limit.
+    OverLimit {
+        /// The declared payload length.
+        length: usize,
+        /// The maximum accepted payload length.
+        limit: usize,
+    },
     /// The value cannot be written without changing it.
     Unwritable,
 }
 
-impl std::fmt::Display for EncodeError {
+impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("value cannot be written without changing it")
+        match self {
+            Error::Empty => f.write_str("an empty RTCP datagram"),
+            Error::TooLong(n) => write!(f, "a {n}-byte datagram or packet, longer than UDP holds"),
+            Error::Truncated => f.write_str("an RTCP packet runs past the end of the datagram"),
+            Error::Version(v) => write!(f, "RTP version {v}, not 2"),
+            Error::Padding => f.write_str("a padding count of 0 or more than the packet holds"),
+            Error::Malformed(t) => write!(f, "contents that do not fit RTCP packet type {t}"),
+            Error::NoPackets => f.write_str("not a valid compound packet: no packets"),
+            Error::FirstNotReport(t) => {
+                write!(f, "not a valid compound packet: the first packet is type {t}, not SR or RR")
+            }
+            Error::NoCname => f.write_str("not a valid compound packet: no SDES CNAME item"),
+            Error::EarlyPadding => {
+                f.write_str("not a valid compound packet: padding on a packet other than the last")
+            }
+            Error::FeedbackOrder => {
+                f.write_str("not a valid compound packet: a feedback packet before a report or SDES packet")
+            }
+            Error::Trailing => f.write_str("bytes follow the RTCP packet or RFC 4571 envelope"),
+            Error::OverLimit { length, limit } => write!(f, "RFC 4571 payload of {length} bytes, over {limit}"),
+            Error::Unwritable => f.write_str("value cannot be written without changing it"),
+        }
     }
 }
 
-impl std::error::Error for EncodeError {}
+impl std::error::Error for Error {}
 
 impl Body {
     /// The packet type this body is written with.
@@ -763,8 +753,8 @@ impl Body {
 
     /// Reads contents `c`, padding left out, of a packet of type `pt` with
     /// count field `count`.
-    fn parse(pt: u8, count: u8, c: &[u8]) -> Result<Body, ParseError> {
-        let bad = ParseError::Malformed(pt);
+    fn parse(pt: u8, count: u8, c: &[u8]) -> Result<Body, Error> {
+        let bad = Error::Malformed(pt);
         let typed = (packet_type::SR..=packet_type::XR).contains(&pt);
         if typed && !c.len().is_multiple_of(4) {
             return Err(bad);
@@ -959,7 +949,7 @@ impl Body {
     }
 
     /// The count field and contents this body is written with.
-    fn encode(&self) -> Result<(u8, Vec<u8>), EncodeError> {
+    fn encode(&self) -> Result<(u8, Vec<u8>), Error> {
         let mut out = Vec::new();
         let count = match self {
             Body::SenderReport(sr) => {
@@ -976,19 +966,19 @@ impl Body {
             }
             Body::SourceDescription(chunks) => {
                 if chunks.len() > MAX_COUNT {
-                    return Err(EncodeError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 for chunk in chunks {
                     out.extend_from_slice(&chunk.ssrc.to_be_bytes());
                     for item in &chunk.items {
                         if item.kind == sdes::END {
-                            return Err(EncodeError::Unwritable);
+                            return Err(Error::Unwritable);
                         }
                         if item.text.len() > MAX_TEXT {
-                            return Err(EncodeError::Unwritable);
+                            return Err(Error::Unwritable);
                         }
                         if !item.layout_ok() {
-                            return Err(EncodeError::Unwritable);
+                            return Err(Error::Unwritable);
                         }
                         check_size(out.len() + 2 + item.text.len())?;
                         out.push(item.kind);
@@ -1002,14 +992,14 @@ impl Body {
             }
             Body::Bye(bye) => {
                 if bye.sources.len() > MAX_COUNT {
-                    return Err(EncodeError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 for s in &bye.sources {
                     out.extend_from_slice(&s.to_be_bytes());
                 }
                 if let Some(reason) = &bye.reason {
                     if reason.len() > MAX_TEXT {
-                        return Err(EncodeError::Unwritable);
+                        return Err(Error::Unwritable);
                     }
                     out.push(reason.len() as u8);
                     out.extend_from_slice(reason);
@@ -1019,7 +1009,7 @@ impl Body {
             }
             Body::App(app) => {
                 if usize::from(app.subtype) > MAX_COUNT {
-                    return Err(EncodeError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 words(&app.data)?;
                 check_size(8usize.saturating_add(app.data.len()))?;
@@ -1050,7 +1040,7 @@ impl Body {
                         check_size(out.len().saturating_add(items.len().saturating_mul(8)))?;
                         for i in items {
                             if i.exponent > 63 || i.mantissa >= 1 << 17 || i.overhead >= 1 << 9 {
-                                return Err(EncodeError::Unwritable);
+                                return Err(Error::Unwritable);
                             }
                             out.extend_from_slice(&i.ssrc.to_be_bytes());
                             let v = u32::from(i.exponent) << 26 | i.mantissa << 9 | u32::from(i.overhead);
@@ -1060,10 +1050,10 @@ impl Body {
                     }
                     TransportMessage::Other { fmt, fci } => {
                         if usize::from(*fmt) > MAX_COUNT {
-                            return Err(EncodeError::Unwritable);
+                            return Err(Error::Unwritable);
                         }
                         if matches!(*fmt, rtpfb::NACK | rtpfb::TMMBR | rtpfb::TMMBN) {
-                            return Err(EncodeError::Unwritable);
+                            return Err(Error::Unwritable);
                         }
                         words(fci)?;
                         check_size(out.len().saturating_add(fci.len()))?;
@@ -1082,7 +1072,7 @@ impl Body {
                         check_size(out.len().saturating_add(entries.len().saturating_mul(4)))?;
                         for e in entries {
                             if e.first >= 1 << 13 || e.number >= 1 << 13 || e.picture_id >= 1 << 6 {
-                                return Err(EncodeError::Unwritable);
+                                return Err(Error::Unwritable);
                             }
                             let v = u32::from(e.first) << 19 | u32::from(e.number) << 6 | u32::from(e.picture_id);
                             out.extend_from_slice(&v.to_be_bytes());
@@ -1092,10 +1082,10 @@ impl Body {
                     PayloadMessage::Rpsi(r) => {
                         check_size(out.len().saturating_add(2).saturating_add(r.data.len()))?;
                         if r.payload_type > 127 || !rpsi_padding_ok(r.padding_bits, &r.data) {
-                            return Err(EncodeError::Unwritable);
+                            return Err(Error::Unwritable);
                         }
                         if (2 + r.data.len()) % 4 != 0 {
-                            return Err(EncodeError::Unwritable);
+                            return Err(Error::Unwritable);
                         }
                         out.push(r.padding_bits);
                         out.push(r.payload_type);
@@ -1116,10 +1106,10 @@ impl Body {
                         unused_media_ssrc(fb.media_ssrc)?;
                         nonempty(&remb.ssrcs)?;
                         if remb.ssrcs.len() > MAX_REMB_SSRCS {
-                            return Err(EncodeError::Unwritable);
+                            return Err(Error::Unwritable);
                         }
                         if remb.exponent > 63 || remb.mantissa >= 1 << 18 {
-                            return Err(EncodeError::Unwritable);
+                            return Err(Error::Unwritable);
                         }
                         out.extend_from_slice(REMB_ID);
                         let v = (remb.ssrcs.len() as u32) << 24 | u32::from(remb.exponent) << 18 | remb.mantissa;
@@ -1132,7 +1122,7 @@ impl Body {
                     PayloadMessage::Afb(data) => {
                         words(data)?;
                         if data.starts_with(REMB_ID) {
-                            return Err(EncodeError::Unwritable);
+                            return Err(Error::Unwritable);
                         }
                         check_size(out.len().saturating_add(data.len()))?;
                         out.extend_from_slice(data);
@@ -1140,10 +1130,10 @@ impl Body {
                     }
                     PayloadMessage::Other { fmt, fci } => {
                         if usize::from(*fmt) > MAX_COUNT {
-                            return Err(EncodeError::Unwritable);
+                            return Err(Error::Unwritable);
                         }
                         if matches!(*fmt, psfb::PLI | psfb::SLI | psfb::RPSI | psfb::FIR | psfb::AFB) {
-                            return Err(EncodeError::Unwritable);
+                            return Err(Error::Unwritable);
                         }
                         words(fci)?;
                         check_size(out.len().saturating_add(fci.len()))?;
@@ -1158,9 +1148,9 @@ impl Body {
                     words(&b.data)?;
                     if !xr_layout_ok(b.block_type, b.data.len()) || (xr_reserved(b.block_type) && b.type_specific != 0)
                     {
-                        return Err(EncodeError::Unwritable);
+                        return Err(Error::Unwritable);
                     }
-                    let n = u16::try_from(b.data.len() / 4).map_err(|_| EncodeError::Unwritable)?;
+                    let n = u16::try_from(b.data.len() / 4).map_err(|_| Error::Unwritable)?;
                     check_size(out.len().saturating_add(4).saturating_add(b.data.len()))?;
                     out.extend_from_slice(&[b.block_type, b.type_specific]);
                     out.extend_from_slice(&n.to_be_bytes());
@@ -1170,10 +1160,10 @@ impl Body {
             }
             Body::Other { packet_type, count, data } => {
                 if (packet_type::SR..=packet_type::XR).contains(packet_type) {
-                    return Err(EncodeError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 if usize::from(*count) > MAX_COUNT {
-                    return Err(EncodeError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 words(data)?;
                 check_size(data.len())?;
@@ -1189,26 +1179,26 @@ impl Packet {
     /// Reads the packet at the start of `b`, and returns it and how many
     /// bytes of `b` it took. A packet longer than [`MAX_PACKET`] is an
     /// error, as no datagram holds one.
-    fn parse_prefix(b: &[u8]) -> Result<(Packet, usize), ParseError> {
+    fn parse_prefix(b: &[u8]) -> Result<(Packet, usize), Error> {
         if b.len() < HEADER_LEN {
-            return Err(ParseError::Truncated);
+            return Err(Error::Truncated);
         }
         let version = b[0] >> 6;
         if version != VERSION {
-            return Err(ParseError::Version(version));
+            return Err(Error::Version(version));
         }
         let padded = b[0] & 0x20 != 0;
         let count = b[0] & 0x1f;
         let pt = b[1];
         let len = 4 * (usize::from(be16(b, 2)) + 1);
         if len > MAX_PACKET {
-            return Err(ParseError::TooLong(len));
+            return Err(Error::TooLong(len));
         }
-        let body = b.get(HEADER_LEN..len).ok_or(ParseError::Truncated)?;
+        let body = b.get(HEADER_LEN..len).ok_or(Error::Truncated)?;
         let padding = if padded {
             match body.last() {
                 Some(&n) if n != 0 && n % 4 == 0 && usize::from(n) <= body.len() => n,
-                _ => return Err(ParseError::Padding),
+                _ => return Err(Error::Padding),
             }
         } else {
             0
@@ -1216,25 +1206,25 @@ impl Packet {
         let content = &body[..body.len() - usize::from(padding)];
         let body = Body::parse(pt, count, content)?;
         if padding != 0 && body.is_remb() {
-            return Err(ParseError::Malformed(pt));
+            return Err(Error::Malformed(pt));
         }
         Ok((Packet { body, padding }, len))
     }
 
     /// The packet's bytes. A packet [`Packet::parse`] would refuse, or read
     /// back as another packet, is an error.
-    fn encode(&self) -> Result<Vec<u8>, EncodeError> {
+    fn encode(&self) -> Result<Vec<u8>, Error> {
         let (count, content) = self.body.encode()?;
         let pad = usize::from(self.padding);
         if !pad.is_multiple_of(4) || !content.len().is_multiple_of(4) {
-            return Err(EncodeError::Unwritable);
+            return Err(Error::Unwritable);
         }
         if pad > 0 && self.body.is_remb() {
-            return Err(EncodeError::Unwritable);
+            return Err(Error::Unwritable);
         }
         let total = HEADER_LEN + content.len() + pad;
         if total > MAX_PACKET {
-            return Err(EncodeError::Unwritable);
+            return Err(Error::Unwritable);
         }
         let mut out = Vec::with_capacity(total);
         let flag = if pad > 0 { 0x20 } else { 0 };
@@ -1250,36 +1240,16 @@ impl Packet {
     }
 }
 
-/// Why an exact [`Wire`] parse did not read one RTCP packet.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PacketParseError {
-    /// The packet header or body is invalid or incomplete.
-    Packet(ParseError),
-    /// Bytes follow the first packet.
-    Trailing,
-}
-
-impl core::fmt::Display for PacketParseError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Packet(e) => e.fmt(f),
-            Self::Trailing => f.write_str("bytes follow the RTCP packet"),
-        }
-    }
-}
-
-impl core::error::Error for PacketParseError {}
-
 impl Wire for Packet {
-    type ParseError = PacketParseError;
-    type WriteError = EncodeError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads exactly one packet. Refuses invalid headers, bodies, padding,
     /// oversized packets, incomplete packets, and trailing bytes.
-    fn parse(bytes: &[u8]) -> Result<Self, PacketParseError> {
-        let (packet, used) = Packet::parse_prefix(bytes).map_err(PacketParseError::Packet)?;
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        let (packet, used) = Packet::parse_prefix(bytes)?;
         if used != bytes.len() {
-            return Err(PacketParseError::Trailing);
+            return Err(Error::Trailing);
         }
         Ok(packet)
     }
@@ -1287,10 +1257,10 @@ impl Wire for Packet {
     /// Appends the packet. Refuses out-of-range fields, variant aliases,
     /// invalid alignment or padding, empty required lists, and oversize values.
     /// Leaves `out` unchanged on refusal.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         let bytes = self.encode()?;
         out.try_reserve(bytes.len())
-            .map_err(|_| EncodeError::Unwritable)?;
+            .map_err(|_| Error::Unwritable)?;
         out.extend_from_slice(&bytes);
         Ok(())
     }
@@ -1300,12 +1270,12 @@ impl Wire for Packet {
 /// packet's header, length, padding and contents, and that the lengths add
 /// up to the datagram's, but not the rules for compound packets; see
 /// [`Compound::parse`].
-fn parse_datagram(b: &[u8]) -> Result<Vec<Packet>, ParseError> {
+fn parse_datagram(b: &[u8]) -> Result<Vec<Packet>, Error> {
     if b.is_empty() {
-        return Err(ParseError::Empty);
+        return Err(Error::Empty);
     }
     if b.len() > MAX_DATAGRAM {
-        return Err(ParseError::TooLong(b.len()));
+        return Err(Error::TooLong(b.len()));
     }
     let mut packets = Vec::new();
     let mut rest = b;
@@ -1325,14 +1295,14 @@ fn parse_datagram(b: &[u8]) -> Result<Vec<Packet>, ParseError> {
 /// section 3.1). RFC 5506
 /// lets two ends agree to send packets without these rules; such a world
 /// uses [`Datagram::parse`] and [`Datagram::write`] instead.
-pub fn check_compound(packets: &[Packet]) -> Result<(), CompoundError> {
-    let (last, _) = packets.split_last().ok_or(CompoundError::Empty)?;
+pub fn check_compound(packets: &[Packet]) -> Result<(), Error> {
+    let (last, _) = packets.split_last().ok_or(Error::NoPackets)?;
     let first = &packets[0];
     if !matches!(first.body, Body::SenderReport(_) | Body::ReceiverReport(_)) {
-        return Err(CompoundError::FirstNotReport(first.body.packet_type()));
+        return Err(Error::FirstNotReport(first.body.packet_type()));
     }
     if packets.iter().any(|p| p.padding != 0 && !std::ptr::eq(p, last)) {
-        return Err(CompoundError::Padding);
+        return Err(Error::EarlyPadding);
     }
     let feedback = packets.iter().position(|p| matches!(p.body, Body::TransportFeedback(_) | Body::PayloadFeedback(_)));
     if let Some(at) = feedback {
@@ -1341,7 +1311,7 @@ pub fn check_compound(packets: &[Packet]) -> Result<(), CompoundError> {
             .iter()
             .any(|p| matches!(p.body, Body::SenderReport(_) | Body::ReceiverReport(_) | Body::SourceDescription(_)))
         {
-            return Err(CompoundError::FeedbackOrder);
+            return Err(Error::FeedbackOrder);
         }
     }
     let cname = packets
@@ -1353,7 +1323,7 @@ pub fn check_compound(packets: &[Packet]) -> Result<(), CompoundError> {
         })
         .any(|chunks| chunks.iter().any(|c| c.items.iter().any(|i| i.kind == sdes::CNAME)));
     if !cname {
-        return Err(CompoundError::NoCname);
+        return Err(Error::NoCname);
     }
     Ok(())
 }
@@ -1372,58 +1342,58 @@ pub struct Compound(
     pub Vec<Packet>,
 );
 
-fn write_datagram(packets: &[Packet], out: &mut Vec<u8>) -> Result<(), EncodeError> {
+fn write_datagram(packets: &[Packet], out: &mut Vec<u8>) -> Result<(), Error> {
     nonempty(packets)?;
     let mut bytes = Vec::new();
     for packet in packets {
         let encoded = packet.to_bytes()?;
         if encoded.len() > MAX_DATAGRAM.saturating_sub(bytes.len()) {
-            return Err(EncodeError::Unwritable);
+            return Err(Error::Unwritable);
         }
         bytes
             .try_reserve(encoded.len())
-            .map_err(|_| EncodeError::Unwritable)?;
+            .map_err(|_| Error::Unwritable)?;
         bytes.extend_from_slice(&encoded);
     }
     out.try_reserve(bytes.len())
-        .map_err(|_| EncodeError::Unwritable)?;
+        .map_err(|_| Error::Unwritable)?;
     out.extend_from_slice(&bytes);
     Ok(())
 }
 
 impl Wire for Datagram {
-    type ParseError = ParseError;
-    type WriteError = EncodeError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads a complete datagram. Refuses empty or oversized input and
     /// packets with invalid headers, bodies, lengths, or padding.
-    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         parse_datagram(bytes).map(Self)
     }
 
     /// Appends every packet. Refuses an empty or oversized datagram and
     /// any packet its writer refuses. Leaves `out` unchanged on failure.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         write_datagram(&self.0, out)
     }
 }
 
 impl Wire for Compound {
-    type ParseError = ParseError;
-    type WriteError = EncodeError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads a complete compound datagram. Refuses invalid packets and
     /// violations of the report, CNAME, feedback order, or padding rules.
-    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         let Datagram(packets) = Datagram::parse(bytes)?;
-        check_compound(&packets).map_err(ParseError::Compound)?;
+        check_compound(&packets)?;
         Ok(Self(packets))
     }
 
     /// Appends the compound datagram. Refuses invalid packets, size excess,
     /// or compound rule violations without changing `out`.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
-        check_compound(&self.0).map_err(|_| EncodeError::Unwritable)?;
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        check_compound(&self.0).map_err(|_| Error::Unwritable)?;
         // The datagram writer owns the shared size and transaction checks.
         write_datagram(&self.0, out)
     }
@@ -1469,7 +1439,7 @@ pub fn classify(b: &[u8]) -> Demux {
 /// [`Wire`] includes the prefix. Payloads are opaque and bounded by
 /// [`MAX_FRAME`]. An empty payload is a null frame. For RTCP, map nonempty
 /// payloads through [`Datagram::parse`] or [`Compound::parse`]. For RTP, use
-/// [`fictionet::stdlib::rtp::RtpPacket::parse`]. A payload parse error leaves framing intact.
+/// [`fictionet::stdlib::rtp::Packet::parse`]. A payload parse error leaves framing intact.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Frame(
     /// Datagram bytes, or an empty vector for a null frame.
@@ -1479,82 +1449,38 @@ pub struct Frame(
 impl Frame {
     /// Places a packet in an RFC 4571 envelope. Refuses values its writer
     /// refuses and payloads longer than [`MAX_FRAME`].
-    pub fn from_packet<P: Wire<WriteError = EncodeError>>(packet: &P) -> Result<Self, EncodeError> {
-        let bytes = packet.to_bytes()?;
+    pub fn from_packet<P: Wire>(packet: &P) -> Result<Self, Error> {
+        let bytes = packet.to_bytes().map_err(|_| Error::Unwritable)?;
         if bytes.len() > MAX_FRAME {
-            return Err(EncodeError::Unwritable);
+            return Err(Error::Unwritable);
         }
         Ok(Self(bytes))
     }
 }
 
-/// An RFC 4571 length prefix exceeds the configured payload limit.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FrameError {
-    /// The declared payload length.
-    pub length: usize,
-    /// The maximum accepted payload length.
-    pub limit: usize,
-}
-
-impl core::fmt::Display for FrameError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(
-            f,
-            "RFC 4571 payload of {} bytes, over {}",
-            self.length, self.limit
-        )
-    }
-}
-
-impl core::error::Error for FrameError {}
-
-/// Why an exact RFC 4571 envelope parse failed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FrameParseError {
-    /// The payload length exceeds its limit.
-    Frame(FrameError),
-    /// The input ended before a complete envelope.
-    Truncated,
-    /// Bytes follow the first envelope.
-    Trailing,
-}
-
-impl core::fmt::Display for FrameParseError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Frame(e) => e.fmt(f),
-            Self::Truncated => f.write_str("incomplete RFC 4571 envelope"),
-            Self::Trailing => f.write_str("bytes follow the RFC 4571 envelope"),
-        }
-    }
-}
-
-impl core::error::Error for FrameParseError {}
-
 impl Wire for Frame {
-    type ParseError = FrameParseError;
-    type WriteError = EncodeError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads exactly one RFC 4571 frame. Refuses truncated frames and
     /// trailing bytes. An empty payload is a valid null frame.
-    fn parse(bytes: &[u8]) -> Result<Self, FrameParseError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         match Frames::new()
             .decode(bytes, true)
-            .map_err(FrameParseError::Frame)?
+?
         {
             Step::Item(frame, used) if used == bytes.len() => Ok(frame),
-            Step::Item(_, _) => Err(FrameParseError::Trailing),
-            _ => Err(FrameParseError::Truncated),
+            Step::Item(_, _) => Err(Error::Trailing),
+            _ => Err(Error::Truncated),
         }
     }
 
     /// Appends the length and exact payload. Refuses payloads longer than
     /// [`MAX_FRAME`] and allocation failure without changing `out`.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
-        let length = u16::try_from(self.0.len()).map_err(|_| EncodeError::Unwritable)?;
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        let length = u16::try_from(self.0.len()).map_err(|_| Error::Unwritable)?;
         out.try_reserve(2 + self.0.len())
-            .map_err(|_| EncodeError::Unwritable)?;
+            .map_err(|_| Error::Unwritable)?;
         out.extend_from_slice(&length.to_be_bytes());
         out.extend_from_slice(&self.0);
         Ok(())
@@ -1601,20 +1527,20 @@ impl Default for Frames {
 
 impl Decode for Frames {
     type Item = Frame;
-    type Error = FrameError;
+    type Error = Error;
     const NAME: &'static str = "RTP/RTCP RFC 4571";
 
     fn capacity(&self) -> usize {
         2usize.saturating_add(self.limit)
     }
 
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, FrameError> {
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, Error> {
         let Some(&[hi, lo]) = input.get(..2) else {
             return Ok(Step::Need);
         };
         let length = usize::from(u16::from_be_bytes([hi, lo]));
         if length > self.limit {
-            return Err(FrameError {
+            return Err(Error::OverLimit {
                 length,
                 limit: self.limit,
             });
@@ -1649,9 +1575,9 @@ fn report_blocks(b: &[u8], n: usize) -> Vec<ReportBlock> {
 }
 
 /// Writes report blocks and an extension, and returns the count field.
-fn write_reports(out: &mut Vec<u8>, reports: &[ReportBlock], extension: &[u8]) -> Result<u8, EncodeError> {
+fn write_reports(out: &mut Vec<u8>, reports: &[ReportBlock], extension: &[u8]) -> Result<u8, Error> {
     if reports.len() > MAX_COUNT {
-        return Err(EncodeError::Unwritable);
+        return Err(Error::Unwritable);
     }
     words(extension)?;
     check_size(
@@ -1661,7 +1587,7 @@ fn write_reports(out: &mut Vec<u8>, reports: &[ReportBlock], extension: &[u8]) -
     )?;
     for r in reports {
         if !(MIN_CUMULATIVE_LOST..=MAX_CUMULATIVE_LOST).contains(&r.cumulative_lost) {
-            return Err(EncodeError::Unwritable);
+            return Err(Error::Unwritable);
         }
         out.extend_from_slice(&r.ssrc.to_be_bytes());
         let lost = (r.cumulative_lost as u32) & 0xff_ffff;
@@ -1754,11 +1680,11 @@ fn split_bitrate(bps: u64, bits: u32) -> (u8, u32) {
 
 /// Checks the media SSRC of a message that does not use it, which RFC
 /// 5104 and the REMB draft set to 0.
-fn unused_media_ssrc(ssrc: u32) -> Result<(), EncodeError> {
+fn unused_media_ssrc(ssrc: u32) -> Result<(), Error> {
     if ssrc == 0 {
         Ok(())
     } else {
-        Err(EncodeError::Unwritable)
+        Err(Error::Unwritable)
     }
 }
 
@@ -1811,18 +1737,18 @@ fn pad_words(out: &mut Vec<u8>) {
 }
 
 /// Checks that `b` is whole 32-bit words.
-fn words(b: &[u8]) -> Result<(), EncodeError> {
+fn words(b: &[u8]) -> Result<(), Error> {
     if b.len().is_multiple_of(4) {
         Ok(())
     } else {
-        Err(EncodeError::Unwritable)
+        Err(Error::Unwritable)
     }
 }
 
 /// Checks that a list that may not be empty is not.
-fn nonempty<T>(v: &[T]) -> Result<(), EncodeError> {
+fn nonempty<T>(v: &[T]) -> Result<(), Error> {
     if v.is_empty() {
-        Err(EncodeError::Unwritable)
+        Err(Error::Unwritable)
     } else {
         Ok(())
     }
@@ -1830,9 +1756,9 @@ fn nonempty<T>(v: &[T]) -> Result<(), EncodeError> {
 
 /// Checks that contents of `n` bytes fit in one packet, before writing
 /// them.
-fn check_size(n: usize) -> Result<(), EncodeError> {
+fn check_size(n: usize) -> Result<(), Error> {
     if n > MAX_PACKET - HEADER_LEN {
-        Err(EncodeError::Unwritable)
+        Err(Error::Unwritable)
     } else {
         Ok(())
     }
@@ -1958,13 +1884,13 @@ mod tests {
         bad[15] = 1;
         assert_eq!(
             Packet::parse(&bad),
-            Err(PacketParseError::Packet(ParseError::Malformed(202)))
+            Err(Error::Malformed(202))
         );
         let mut bad = b.clone();
         bad[0] = 0x81;
         assert_eq!(
             Packet::parse(&bad),
-            Err(PacketParseError::Packet(ParseError::Malformed(202)))
+            Err(Error::Malformed(202))
         );
     }
 
@@ -1981,20 +1907,20 @@ mod tests {
         // A reason longer than the packet, and junk after it.
         assert_eq!(
             Packet::parse(&[0x80, 203, 0, 1, 9, 0, 0, 0]),
-            Err(PacketParseError::Packet(ParseError::Malformed(203)))
+            Err(Error::Malformed(203))
         );
         assert_eq!(
             Packet::parse(&[0x80, 203, 0, 1, 0, 0, 1, 0]),
-            Err(PacketParseError::Packet(ParseError::Malformed(203)))
+            Err(Error::Malformed(203))
         );
         assert_eq!(
             Packet::parse(&[0x80, 203, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0]),
-            Err(PacketParseError::Packet(ParseError::Malformed(203)))
+            Err(Error::Malformed(203))
         );
         // A count past the contents.
         assert_eq!(
             Packet::parse(&[0x82, 203, 0, 1, 0, 0, 0, 7]),
-            Err(PacketParseError::Packet(ParseError::Malformed(203)))
+            Err(Error::Malformed(203))
         );
     }
 
@@ -2003,7 +1929,7 @@ mod tests {
         let p = Packet::from(Body::App(App { subtype: 3, ssrc: 1, name: *b"TEST", data: vec![9; 8] }));
         let b = round_trip(&p);
         assert_eq!(&b[..12], &[0x83, 204, 0, 4, 0, 0, 0, 1, b'T', b'E', b'S', b'T']);
-        assert_eq!(Packet::parse(&[0x80, 204, 0, 1, 0, 0, 0, 1]), Err(PacketParseError::Packet(ParseError::Malformed(204))));
+        assert_eq!(Packet::parse(&[0x80, 204, 0, 1, 0, 0, 0, 1]), Err(Error::Malformed(204)));
     }
 
     // RFC 4585 section 6.2.1.
@@ -2020,7 +1946,7 @@ mod tests {
         // A NACK with no entries.
         assert_eq!(
             Packet::parse(&[0x81, 205, 0, 2, 0, 0, 0, 1, 0, 0, 0, 2]),
-            Err(PacketParseError::Packet(ParseError::Malformed(205)))
+            Err(Error::Malformed(205))
         );
     }
 
@@ -2049,11 +1975,11 @@ mod tests {
         // A TMMBR with no entries, and one with half an entry.
         assert_eq!(
             Packet::parse(&[0x83, 205, 0, 2, 0, 0, 0, 1, 0, 0, 0, 0]),
-            Err(PacketParseError::Packet(ParseError::Malformed(205)))
+            Err(Error::Malformed(205))
         );
         assert_eq!(
             Packet::parse(&[0x84, 205, 0, 3, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0]),
-            Err(PacketParseError::Packet(ParseError::Malformed(205)))
+            Err(Error::Malformed(205))
         );
         assert_eq!(Tmmb { ssrc: 0, exponent: 63, mantissa: 0x1_ffff, overhead: 0 }.bitrate(), u64::MAX);
     }
@@ -2095,7 +2021,7 @@ mod tests {
         ] {
             assert_eq!(
                 Packet::parse(&bad),
-                Err(PacketParseError::Packet(ParseError::Malformed(206))),
+                Err(Error::Malformed(206)),
                 "{bad:?}"
             );
         }
@@ -2122,7 +2048,7 @@ mod tests {
         afb[16] = 2;
         assert_eq!(
             Packet::parse(&afb),
-            Err(PacketParseError::Packet(ParseError::Malformed(206)))
+            Err(Error::Malformed(206))
         );
     }
 
@@ -2151,11 +2077,11 @@ mod tests {
         // A block whose length runs past the packet, and a cut-off header.
         assert_eq!(
             Packet::parse(&[0x80, 207, 0, 2, 0, 0, 0, 7, 4, 0, 0, 2]),
-            Err(PacketParseError::Packet(ParseError::Malformed(207)))
+            Err(Error::Malformed(207))
         );
         assert_eq!(
             Packet::parse(&[0x80, 207, 0, 0]),
-            Err(PacketParseError::Packet(ParseError::Malformed(207)))
+            Err(Error::Malformed(207))
         );
     }
 
@@ -2171,7 +2097,7 @@ mod tests {
         }));
         assert_eq!(round_trip(&packet).len(), MAX_PACKET);
         items.push(item);
-        assert_eq!(XrBlock::dlrr(&items), Err(EncodeError::Unwritable));
+        assert_eq!(XrBlock::dlrr(&items), Err(Error::Unwritable));
     }
 
     #[test]
@@ -2181,7 +2107,7 @@ mod tests {
         assert_eq!(b, [0xa4, 210, 0, 2, 1, 2, 3, 4, 0, 0, 0, 4]);
         let other = |packet_type| Packet::from(Body::Other { packet_type, count: 0, data: vec![] });
         for t in 200..=207 {
-            assert_eq!(other(t).to_bytes(), Err(EncodeError::Unwritable));
+            assert_eq!(other(t).to_bytes(), Err(Error::Unwritable));
         }
         let fb = |fmt| {
             Packet::from(Body::TransportFeedback(TransportFeedback {
@@ -2190,8 +2116,8 @@ mod tests {
                 message: TransportMessage::Other { fmt, fci: vec![] },
             }))
         };
-        assert_eq!(fb(1).to_bytes(), Err(EncodeError::Unwritable));
-        assert_eq!(fb(32).to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(fb(1).to_bytes(), Err(Error::Unwritable));
+        assert_eq!(fb(32).to_bytes(), Err(Error::Unwritable));
         round_trip(&fb(15));
         let ps = |fmt| {
             Packet::from(Body::PayloadFeedback(PayloadFeedback {
@@ -2200,14 +2126,14 @@ mod tests {
                 message: PayloadMessage::Other { fmt, fci: vec![0; 4] },
             }))
         };
-        assert_eq!(ps(15).to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(ps(15).to_bytes(), Err(Error::Unwritable));
         round_trip(&ps(5));
         let afb = Packet::from(Body::PayloadFeedback(PayloadFeedback {
             sender_ssrc: 0,
             media_ssrc: 0,
             message: PayloadMessage::Afb(b"REMB\0\0\0\0".to_vec()),
         }));
-        assert_eq!(afb.to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(afb.to_bytes(), Err(Error::Unwritable));
     }
 
     // RFC 3550 section 6.4.1: padding, with the count in the last byte.
@@ -2222,74 +2148,74 @@ mod tests {
                 ..rr(1)
             }
             .to_bytes(),
-            Err(EncodeError::Unwritable)
+            Err(Error::Unwritable)
         );
         // A count of 0, and one past the packet.
         assert_eq!(
             Packet::parse(&[0xa0, 201, 0, 1, 0, 0, 0, 0]),
-            Err(PacketParseError::Packet(ParseError::Padding))
+            Err(Error::Padding)
         );
         assert_eq!(
             Packet::parse(&[0xa0, 201, 0, 1, 0, 0, 0, 5]),
-            Err(PacketParseError::Packet(ParseError::Padding))
+            Err(Error::Padding)
         );
         assert_eq!(
             Packet::parse(&[0xa0, 210, 0, 0]),
-            Err(PacketParseError::Packet(ParseError::Padding))
+            Err(Error::Padding)
         );
         // A count that is not a multiple of four.
         assert_eq!(
             Packet::parse(&[0xa0, 201, 0, 1, 0, 0, 0, 3]),
-            Err(PacketParseError::Packet(ParseError::Padding))
+            Err(Error::Padding)
         );
     }
 
     #[test]
     fn parse_errors() {
-        assert_eq!(Datagram::parse(&[]).map(|p| p.0), Err(ParseError::Empty));
+        assert_eq!(Datagram::parse(&[]).map(|p| p.0), Err(Error::Empty));
         assert_eq!(
             Datagram::parse(&vec![0x80; MAX_DATAGRAM + 1]).map(|p| p.0),
-            Err(ParseError::TooLong(MAX_DATAGRAM + 1))
+            Err(Error::TooLong(MAX_DATAGRAM + 1))
         );
         assert_eq!(
             Datagram::parse(&[0x80, 201, 0]).map(|p| p.0),
-            Err(ParseError::Truncated)
+            Err(Error::Truncated)
         );
         assert_eq!(
             Datagram::parse(&[0x80, 201, 0, 1, 0, 0]).map(|p| p.0),
-            Err(ParseError::Truncated)
+            Err(Error::Truncated)
         );
         assert_eq!(
             Datagram::parse(&[0x40, 201, 0, 0]).map(|p| p.0),
-            Err(ParseError::Version(1))
+            Err(Error::Version(1))
         );
         assert_eq!(
             Datagram::parse(&[0x80, 200, 0, 1, 0, 0, 0, 0]).map(|p| p.0),
-            Err(ParseError::Malformed(200))
+            Err(Error::Malformed(200))
         );
         assert_eq!(
             Datagram::parse(&[0x81, 201, 0, 1, 0, 0, 0, 0]).map(|p| p.0),
-            Err(ParseError::Malformed(201))
+            Err(Error::Malformed(201))
         );
         assert_eq!(
             Datagram::parse(&[0x80, 201, 0, 0]).map(|p| p.0),
-            Err(ParseError::Malformed(201))
+            Err(Error::Malformed(201))
         );
         assert_eq!(
             Datagram::parse(&[0x81, 202, 0, 0]).map(|p| p.0),
-            Err(ParseError::Malformed(202))
+            Err(Error::Malformed(202))
         );
         assert_eq!(
             Datagram::parse(&[0x80, 205, 0, 1, 0, 0, 0, 0]).map(|p| p.0),
-            Err(ParseError::Malformed(205))
+            Err(Error::Malformed(205))
         );
         assert_eq!(
             Datagram::parse(&[0x81, 206, 0, 1, 0, 0, 0, 0]).map(|p| p.0),
-            Err(ParseError::Malformed(206))
+            Err(Error::Malformed(206))
         );
         // A typed packet whose contents are not whole words.
-        assert_eq!(Datagram::parse(&[0x80, 204, 0, 1, 0, 0, 0, 1]).map(|p| p.0), Err(ParseError::Malformed(204)));
-        for e in [ParseError::Empty, ParseError::Compound(CompoundError::NoCname), ParseError::Version(0)] {
+        assert_eq!(Datagram::parse(&[0x80, 204, 0, 1, 0, 0, 0, 1]).map(|p| p.0), Err(Error::Malformed(204)));
+        for e in [Error::Empty, Error::NoCname, Error::Version(0)] {
             assert!(!e.to_string().is_empty());
         }
     }
@@ -2300,27 +2226,27 @@ mod tests {
         let good = vec![rr(1), cname(1, b"x")];
         let bytes = Compound(good.to_vec()).to_bytes().unwrap();
         assert_eq!(Compound::parse(&bytes).map(|p| p.0), Ok(good.clone()));
-        assert_eq!(check_compound(&[]), Err(CompoundError::Empty));
-        assert_eq!(check_compound(&[cname(1, b"x"), rr(1)]), Err(CompoundError::FirstNotReport(202)));
-        assert_eq!(check_compound(&[rr(1)]), Err(CompoundError::NoCname));
+        assert_eq!(check_compound(&[]), Err(Error::NoPackets));
+        assert_eq!(check_compound(&[cname(1, b"x"), rr(1)]), Err(Error::FirstNotReport(202)));
+        assert_eq!(check_compound(&[rr(1)]), Err(Error::NoCname));
         let no_cname = Packet::from(Body::SourceDescription(vec![SdesChunk {
             ssrc: 1,
             items: vec![SdesItem { kind: sdes::NAME, text: vec![] }],
         }]));
-        assert_eq!(check_compound(&[rr(1), no_cname]), Err(CompoundError::NoCname));
+        assert_eq!(check_compound(&[rr(1), no_cname]), Err(Error::NoCname));
         let padded = vec![Packet { padding: 4, ..rr(1) }, cname(1, b"x")];
-        assert_eq!(check_compound(&padded), Err(CompoundError::Padding));
+        assert_eq!(check_compound(&padded), Err(Error::EarlyPadding));
         assert_eq!(
             Compound(padded.to_vec()).to_bytes(),
-            Err(EncodeError::Unwritable)
+            Err(Error::Unwritable)
         );
         let bytes = Datagram(padded.to_vec()).to_bytes().unwrap();
         assert_eq!(Datagram::parse(&bytes).map(|p| p.0), Ok(padded));
-        assert_eq!(Compound::parse(&bytes).map(|p| p.0), Err(ParseError::Compound(CompoundError::Padding)));
+        assert_eq!(Compound::parse(&bytes).map(|p| p.0), Err(Error::EarlyPadding));
         let last = vec![rr(1), Packet { padding: 8, ..cname(1, b"x") }];
         assert_eq!(Compound::parse(&Compound(last.to_vec()).to_bytes().unwrap()).map(|p| p.0), Ok(last));
-        assert_eq!(Compound([].to_vec()).to_bytes(), Err(EncodeError::Unwritable));
-        assert_eq!(Datagram([].to_vec()).to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(Compound([].to_vec()).to_bytes(), Err(Error::Unwritable));
+        assert_eq!(Datagram([].to_vec()).to_bytes(), Err(Error::Unwritable));
     }
 
     // RFC 4585 section 6.3.3.2: the bit before the payload type is set to
@@ -2355,13 +2281,13 @@ mod tests {
             message: TransportMessage::Nack(vec![Nack { pid: 1, blp: 0 }]),
         }));
         assert_eq!(check_compound(&[rr(1), cname(1, b"x"), pli.clone(), nack.clone()]), Ok(()));
-        assert_eq!(check_compound(&[rr(1), pli.clone(), cname(1, b"x")]), Err(CompoundError::FeedbackOrder));
-        assert_eq!(check_compound(&[rr(1), nack.clone(), rr(2), cname(1, b"x")]), Err(CompoundError::FeedbackOrder));
+        assert_eq!(check_compound(&[rr(1), pli.clone(), cname(1, b"x")]), Err(Error::FeedbackOrder));
+        assert_eq!(check_compound(&[rr(1), nack.clone(), rr(2), cname(1, b"x")]), Err(Error::FeedbackOrder));
         let bytes = Datagram([rr(1), pli.clone(), cname(1, b"x")].to_vec()).to_bytes().unwrap();
-        assert_eq!(Compound::parse(&bytes).map(|p| p.0), Err(ParseError::Compound(CompoundError::FeedbackOrder)));
+        assert_eq!(Compound::parse(&bytes).map(|p| p.0), Err(Error::FeedbackOrder));
         assert_eq!(
             Compound([rr(1), nack, cname(1, b"x")].to_vec()).to_bytes(),
-            Err(EncodeError::Unwritable)
+            Err(Error::Unwritable)
         );
     }
 
@@ -2374,16 +2300,16 @@ mod tests {
         b[..4].copy_from_slice(&[0x80, 210, 0xff, 0xff]);
         assert_eq!(
             Packet::parse(&b),
-            Err(PacketParseError::Packet(ParseError::TooLong(4 * 65536)))
+            Err(Error::TooLong(4 * 65536))
         );
         let mut b = vec![0u8; MAX_PACKET + 4];
         let words = (MAX_PACKET / 4) as u16;
         b[..4].copy_from_slice(&[0x80, 210, (words >> 8) as u8, words as u8]);
         assert_eq!(
             Packet::parse(&b),
-            Err(PacketParseError::Packet(ParseError::TooLong(
+            Err(Error::TooLong(
                 MAX_PACKET + 4
-            )))
+            ))
         );
         // The longest packet reads and writes back.
         let words = (MAX_PACKET / 4 - 1) as u16;
@@ -2436,50 +2362,50 @@ mod tests {
         };
         assert_eq!(
             rrb(vec![block(1); 32], vec![]).to_bytes(),
-            Err(EncodeError::Unwritable)
+            Err(Error::Unwritable)
         );
         assert_eq!(
             rrb(vec![too_lost], vec![]).to_bytes(),
-            Err(EncodeError::Unwritable)
+            Err(Error::Unwritable)
         );
         assert_eq!(
             rrb(vec![], vec![0; 3]).to_bytes(),
-            Err(EncodeError::Unwritable)
+            Err(Error::Unwritable)
         );
         assert_eq!(
             rrb(vec![], vec![0; MAX_PACKET]).to_bytes(),
-            Err(EncodeError::Unwritable)
+            Err(Error::Unwritable)
         );
         let sd = |chunks| Packet::from(Body::SourceDescription(chunks));
-        assert_eq!(sd(vec![SdesChunk { ssrc: 0, items: vec![] }; 32]).to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(sd(vec![SdesChunk { ssrc: 0, items: vec![] }; 32]).to_bytes(), Err(Error::Unwritable));
         let item = |kind, n| vec![SdesChunk { ssrc: 0, items: vec![SdesItem { kind, text: vec![b'a'; n] }] }];
-        assert_eq!(sd(item(0, 1)).to_bytes(), Err(EncodeError::Unwritable));
-        assert_eq!(sd(item(1, 256)).to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(sd(item(0, 1)).to_bytes(), Err(Error::Unwritable));
+        assert_eq!(sd(item(1, 256)).to_bytes(), Err(Error::Unwritable));
         round_trip(&sd(item(1, 255)));
         let bye = |sources: Vec<u32>, reason| Packet::from(Body::Bye(Bye { sources, reason }));
-        assert_eq!(bye(vec![0; 32], None).to_bytes(), Err(EncodeError::Unwritable));
-        assert_eq!(bye(vec![], Some(vec![0; 256])).to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(bye(vec![0; 32], None).to_bytes(), Err(Error::Unwritable));
+        assert_eq!(bye(vec![], Some(vec![0; 256])).to_bytes(), Err(Error::Unwritable));
         let app = |subtype, n| Packet::from(Body::App(App { subtype, ssrc: 0, name: *b"abcd", data: vec![0; n] }));
-        assert_eq!(app(32, 0).to_bytes(), Err(EncodeError::Unwritable));
-        assert_eq!(app(0, 2).to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(app(32, 0).to_bytes(), Err(Error::Unwritable));
+        assert_eq!(app(0, 2).to_bytes(), Err(Error::Unwritable));
         let tf = |message| {
             Packet::from(Body::TransportFeedback(TransportFeedback { sender_ssrc: 0, media_ssrc: 0, message }))
         };
-        assert_eq!(tf(TransportMessage::Nack(vec![])).to_bytes(), Err(EncodeError::Unwritable));
-        assert_eq!(tf(TransportMessage::Tmmbr(vec![])).to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(tf(TransportMessage::Nack(vec![])).to_bytes(), Err(Error::Unwritable));
+        assert_eq!(tf(TransportMessage::Tmmbr(vec![])).to_bytes(), Err(Error::Unwritable));
         let t = Tmmb { ssrc: 0, exponent: 64, mantissa: 0, overhead: 0 };
-        assert_eq!(tf(TransportMessage::Tmmbn(vec![t])).to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(tf(TransportMessage::Tmmbn(vec![t])).to_bytes(), Err(Error::Unwritable));
         let t = Tmmb { exponent: 0, mantissa: 1 << 17, ..t };
-        assert_eq!(tf(TransportMessage::Tmmbn(vec![t])).to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(tf(TransportMessage::Tmmbn(vec![t])).to_bytes(), Err(Error::Unwritable));
         let t = Tmmb { mantissa: 0, overhead: 512, ..t };
-        assert_eq!(tf(TransportMessage::Tmmbn(vec![t])).to_bytes(), Err(EncodeError::Unwritable));
-        assert_eq!(tf(TransportMessage::Other { fmt: 2, fci: vec![0] }).to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(tf(TransportMessage::Tmmbn(vec![t])).to_bytes(), Err(Error::Unwritable));
+        assert_eq!(tf(TransportMessage::Other { fmt: 2, fci: vec![0] }).to_bytes(), Err(Error::Unwritable));
         let nacks = vec![Nack { pid: 0, blp: 0 }; MAX_PACKET / 4];
-        assert_eq!(tf(TransportMessage::Nack(nacks)).to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(tf(TransportMessage::Nack(nacks)).to_bytes(), Err(Error::Unwritable));
         let pf =
             |message| Packet::from(Body::PayloadFeedback(PayloadFeedback { sender_ssrc: 0, media_ssrc: 0, message }));
-        assert_eq!(pf(PayloadMessage::Sli(vec![])).to_bytes(), Err(EncodeError::Unwritable));
-        assert_eq!(pf(PayloadMessage::Fir(vec![])).to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(pf(PayloadMessage::Sli(vec![])).to_bytes(), Err(Error::Unwritable));
+        assert_eq!(pf(PayloadMessage::Fir(vec![])).to_bytes(), Err(Error::Unwritable));
         for s in [
             Sli { first: 8192, number: 0, picture_id: 0 },
             Sli { first: 0, number: 8192, picture_id: 0 },
@@ -2487,24 +2413,24 @@ mod tests {
         ] {
             assert_eq!(
                 pf(PayloadMessage::Sli(vec![s])).to_bytes(),
-                Err(EncodeError::Unwritable)
+                Err(Error::Unwritable)
             );
         }
         let rp =
             |payload_type, padding_bits, n| PayloadMessage::Rpsi(Rpsi { payload_type, padding_bits, data: vec![0; n] });
-        assert_eq!(pf(rp(128, 0, 2)).to_bytes(), Err(EncodeError::Unwritable));
-        assert_eq!(pf(rp(0, 17, 2)).to_bytes(), Err(EncodeError::Unwritable));
-        assert_eq!(pf(rp(0, 0, 3)).to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(pf(rp(128, 0, 2)).to_bytes(), Err(Error::Unwritable));
+        assert_eq!(pf(rp(0, 17, 2)).to_bytes(), Err(Error::Unwritable));
+        assert_eq!(pf(rp(0, 0, 3)).to_bytes(), Err(Error::Unwritable));
         let remb = |exponent, mantissa, n| PayloadMessage::Remb(Remb { exponent, mantissa, ssrcs: vec![0; n] });
-        assert_eq!(pf(remb(64, 0, 1)).to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(pf(remb(64, 0, 1)).to_bytes(), Err(Error::Unwritable));
         assert_eq!(
             pf(remb(0, 1 << 18, 1)).to_bytes(),
-            Err(EncodeError::Unwritable)
+            Err(Error::Unwritable)
         );
-        assert_eq!(pf(remb(0, 0, 256)).to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(pf(remb(0, 0, 256)).to_bytes(), Err(Error::Unwritable));
         assert_eq!(
             pf(PayloadMessage::Afb(vec![0; 5])).to_bytes(),
-            Err(EncodeError::Unwritable)
+            Err(Error::Unwritable)
         );
         assert_eq!(
             pf(PayloadMessage::Other {
@@ -2512,7 +2438,7 @@ mod tests {
                 fci: vec![]
             })
             .to_bytes(),
-            Err(EncodeError::Unwritable)
+            Err(Error::Unwritable)
         );
         let x = |data| {
             Packet::from(Body::ExtendedReport(ExtendedReport {
@@ -2520,23 +2446,23 @@ mod tests {
                 blocks: vec![XrBlock { block_type: 1, type_specific: 0, data }],
             }))
         };
-        assert_eq!(x(vec![0; 2]).to_bytes(), Err(EncodeError::Unwritable));
-        assert_eq!(x(vec![0; 4 * 65536]).to_bytes(), Err(EncodeError::Unwritable));
-        assert_eq!(x(vec![0; MAX_PACKET]).to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(x(vec![0; 2]).to_bytes(), Err(Error::Unwritable));
+        assert_eq!(x(vec![0; 4 * 65536]).to_bytes(), Err(Error::Unwritable));
+        assert_eq!(x(vec![0; MAX_PACKET]).to_bytes(), Err(Error::Unwritable));
         let o = |count| Packet::from(Body::Other { packet_type: 0, count, data: vec![] });
-        assert_eq!(o(32).to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(o(32).to_bytes(), Err(Error::Unwritable));
         // A datagram past the limit.
         let big = rrb(vec![], vec![0; 32000]);
         assert_eq!(
             Datagram([big.clone(), big.clone(), big].to_vec()).to_bytes(),
-            Err(EncodeError::Unwritable)
+            Err(Error::Unwritable)
         );
         assert_eq!(
             Frame(vec![0; MAX_FRAME + 1]).to_bytes(),
-            Err(EncodeError::Unwritable)
+            Err(Error::Unwritable)
         );
         assert_eq!(
-            EncodeError::Unwritable.to_string(),
+            Error::Unwritable.to_string(),
             "value cannot be written without changing it"
         );
     }
@@ -2613,8 +2539,8 @@ mod tests {
             let r = Datagram::parse(&bytes[..i]).map(|p| p.0);
             match ends.iter().position(|&e| e == i) {
                 Some(k) => assert_eq!(r, Ok(packets[..=k].to_vec())),
-                None if i == 0 => assert_eq!(r, Err(ParseError::Empty)),
-                None => assert_eq!(r, Err(ParseError::Truncated), "{i}"),
+                None if i == 0 => assert_eq!(r, Err(Error::Empty)),
+                None => assert_eq!(r, Err(Error::Truncated), "{i}"),
             }
             // A single packet cut short never reads.
             if i < ends[0] {
@@ -2662,7 +2588,7 @@ mod tests {
         for b in bodies {
             assert_eq!(
                 b.encode(),
-                Err(EncodeError::Unwritable),
+                Err(Error::Unwritable),
                 "{}",
                 b.packet_type()
             );
@@ -2685,7 +2611,7 @@ mod tests {
             psfb(2, remb()),
             psfb(2, fir()),
         ] {
-            assert_eq!(p.to_bytes(), Err(EncodeError::Unwritable), "{p:?}");
+            assert_eq!(p.to_bytes(), Err(Error::Unwritable), "{p:?}");
         }
         // Read, a nonzero media SSRC is ignored.
         for p in [tf(0, TransportMessage::Tmmbr(vec![tmmb])), psfb(0, remb()), psfb(0, fir())] {
@@ -2721,10 +2647,10 @@ mod tests {
             }
             for &n in bad {
                 let p = xr(t, 0, n);
-                assert_eq!(p.to_bytes(), Err(EncodeError::Unwritable), "{t} {n}");
+                assert_eq!(p.to_bytes(), Err(Error::Unwritable), "{t} {n}");
                 let words = (2 + n / 4) as u8;
                 let b = [&[0x80, 207, 0, words, 0, 0, 0, 1, t, 0, 0, (n / 4) as u8][..], &vec![0; n]].concat();
-                assert_eq!(Packet::parse(&b), Err(PacketParseError::Packet(ParseError::Malformed(207))), "{t} {n}");
+                assert_eq!(Packet::parse(&b), Err(Error::Malformed(207)), "{t} {n}");
             }
         }
         for t in [xr::RECEIVER_REFERENCE_TIME, xr::DLRR, xr::VOIP_METRICS] {
@@ -2733,7 +2659,7 @@ mod tests {
             } else {
                 12 * usize::from(t == xr::DLRR) + 8 * usize::from(t != xr::DLRR)
             };
-            assert_eq!(xr(t, 1, n).to_bytes(), Err(EncodeError::Unwritable));
+            assert_eq!(xr(t, 1, n).to_bytes(), Err(Error::Unwritable));
             let mut b = round_trip(&xr(t, 0, n));
             b[9] = 0xff;
             assert_eq!(Packet::parse(&b), Ok(xr(t, 0, n)));
@@ -2753,19 +2679,19 @@ mod tests {
         round_trip(&rp(31, vec![0x80, 0, 0, 0, 0, 0]));
         assert_eq!(
             rp(4, vec![0, 0xff]).to_bytes(),
-            Err(EncodeError::Unwritable)
+            Err(Error::Unwritable)
         );
         assert_eq!(
             rp(9, vec![0xff, 0x01]).to_bytes(),
-            Err(EncodeError::Unwritable)
+            Err(Error::Unwritable)
         );
-        assert_eq!(rp(32, vec![0; 6]).to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(rp(32, vec![0; 6]).to_bytes(), Err(Error::Unwritable));
         let head = [0x83, 206, 0, 3, 0, 0, 0, 1, 0, 0, 0, 2];
         for bad in [[4, 96, 0, 0x0f], [32, 96, 0, 0]] {
             let b = [&head[..], &bad].concat();
             assert_eq!(
                 Packet::parse(&b),
-                Err(PacketParseError::Packet(ParseError::Malformed(206))),
+                Err(Error::Malformed(206)),
                 "{bad:?}"
             );
         }
@@ -2776,10 +2702,10 @@ mod tests {
     #[test]
     fn remb_rules() {
         let remb = |ssrcs| PayloadMessage::Remb(Remb { exponent: 1, mantissa: 2, ssrcs });
-        assert_eq!(Packet { padding: 4, ..psfb(0, remb(vec![9])) }.to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(Packet { padding: 4, ..psfb(0, remb(vec![9])) }.to_bytes(), Err(Error::Unwritable));
         let b = [0xaf, 206, 0, 5, 0, 0, 0, 1, 0, 0, 0, 0, b'R', b'E', b'M', b'B', 1, 0, 0, 0, 0, 0, 0, 4];
-        assert_eq!(Packet::parse(&b), Err(PacketParseError::Packet(ParseError::Malformed(206))));
-        assert_eq!(psfb(0, remb(vec![])).to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(Packet::parse(&b), Err(Error::Malformed(206)));
+        assert_eq!(psfb(0, remb(vec![])).to_bytes(), Err(Error::Unwritable));
         // `REMB` with a count that does not match, or no SSRCs, is a bad
         // REMB, not other application layer feedback.
         let head = [0x8f, 206, 0, 4, 0, 0, 0, 1, 0, 0, 0, 0];
@@ -2787,16 +2713,16 @@ mod tests {
             let b = [&head[..], &fci].concat();
             assert_eq!(
                 Packet::parse(&b),
-                Err(PacketParseError::Packet(ParseError::Malformed(206))),
+                Err(Error::Malformed(206)),
                 "{fci:?}"
             );
         }
         let b = [0x8f, 206, 0, 3, 0, 0, 0, 1, 0, 0, 0, 0, b'R', b'E', b'M', b'B'];
-        assert_eq!(Packet::parse(&b), Err(PacketParseError::Packet(ParseError::Malformed(206))));
-        assert_eq!(psfb(0, PayloadMessage::Afb(b"REMB".to_vec())).to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(Packet::parse(&b), Err(Error::Malformed(206)));
+        assert_eq!(psfb(0, PayloadMessage::Afb(b"REMB".to_vec())).to_bytes(), Err(Error::Unwritable));
         assert_eq!(
             psfb(0, PayloadMessage::Afb(b"REMB\x02\0\0\0\0\0\0\x01".to_vec())).to_bytes(),
-            Err(EncodeError::Unwritable)
+            Err(Error::Unwritable)
         );
         round_trip(&psfb(0, PayloadMessage::Afb(b"REMX\x02\0\0\0".to_vec())));
     }
@@ -2813,13 +2739,13 @@ mod tests {
         };
         round_trip(&sd(b"\x01ab"));
         round_trip(&sd(b"\x00"));
-        assert_eq!(sd(b"\x03a").to_bytes(), Err(EncodeError::Unwritable));
-        assert_eq!(sd(b"").to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(sd(b"\x03a").to_bytes(), Err(Error::Unwritable));
+        assert_eq!(sd(b"").to_bytes(), Err(Error::Unwritable));
         for item in [[8, 2, 3, b'a'], [8, 0, 0, 0]] {
             let b = [&[0x81, 202, 0, 3, 0, 0, 0, 1][..], &item, &[0, 0, 0, 0]].concat();
             assert_eq!(
                 Packet::parse(&b),
-                Err(PacketParseError::Packet(ParseError::Malformed(202))),
+                Err(Error::Malformed(202)),
                 "{item:?}"
             );
         }
@@ -2829,12 +2755,12 @@ mod tests {
     // for every packet type.
     #[test]
     fn padding_is_whole_words() {
-        assert_eq!(Packet::parse(&[0xa4, 210, 0, 1, 1, 2, 3, 1]), Err(PacketParseError::Packet(ParseError::Padding)));
-        assert_eq!(Packet::parse(&[0xa4, 210, 0, 1, 1, 2, 3, 3]), Err(PacketParseError::Packet(ParseError::Padding)));
+        assert_eq!(Packet::parse(&[0xa4, 210, 0, 1, 1, 2, 3, 1]), Err(Error::Padding));
+        assert_eq!(Packet::parse(&[0xa4, 210, 0, 1, 1, 2, 3, 3]), Err(Error::Padding));
         let p = Packet { body: Body::Other { packet_type: 210, count: 4, data: vec![1, 2, 3] }, padding: 1 };
-        assert_eq!(p.to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(p.to_bytes(), Err(Error::Unwritable));
         let p = Packet { body: Body::Other { packet_type: 210, count: 4, data: vec![1, 2, 3] }, padding: 0 };
-        assert_eq!(p.to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(p.to_bytes(), Err(Error::Unwritable));
         round_trip(&Packet { body: Body::Other { packet_type: 210, count: 4, data: vec![1, 2, 3, 4] }, padding: 4 });
     }
 

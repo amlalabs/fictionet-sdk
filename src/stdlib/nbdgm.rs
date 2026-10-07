@@ -216,29 +216,29 @@ impl Name {
     /// Reads the name at the start of `b`, and how many bytes it took.
     /// Names in datagram packets are written out in full, so a pointer to
     /// an earlier name, as DNS uses, is refused.
-    fn parse_prefix(b: &[u8]) -> Result<(Name, usize), ParseError> {
-        let first = *b.first().ok_or(ParseError::Truncated)?;
+    fn parse_prefix(b: &[u8]) -> Result<(Name, usize), Error> {
+        let first = *b.first().ok_or(Error::Truncated)?;
         if usize::from(first) != ENCODED_LEN {
-            return Err(ParseError::Name);
+            return Err(Error::Name);
         }
-        let label = b.get(1..1 + ENCODED_LEN).ok_or(ParseError::Truncated)?;
-        let bytes = decode_first_level(label).ok_or(ParseError::Name)?;
+        let label = b.get(1..1 + ENCODED_LEN).ok_or(Error::Truncated)?;
+        let bytes = decode_first_level(label).ok_or(Error::Name)?;
         let mut at = 1 + ENCODED_LEN;
         let mut scope = Vec::new();
         loop {
-            let len = usize::from(*b.get(at).ok_or(ParseError::Truncated)?);
+            let len = usize::from(*b.get(at).ok_or(Error::Truncated)?);
             if len == 0 {
                 at += 1;
                 break;
             }
             if len > MAX_LABEL {
-                return Err(ParseError::Name);
+                return Err(Error::Name);
             }
             // The label, its length byte, and the final zero must fit.
             if at + 1 + len + 1 > MAX_NAME_LEN {
-                return Err(ParseError::Name);
+                return Err(Error::Name);
             }
-            let label = b.get(at + 1..at + 1 + len).ok_or(ParseError::Truncated)?;
+            let label = b.get(at + 1..at + 1 + len).ok_or(Error::Truncated)?;
             scope.push(label.to_vec());
             at += 1 + len;
         }
@@ -466,7 +466,7 @@ pub struct Packet {
 
 /// Why bytes are not a datagram service packet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ParseError {
+pub enum Error {
     /// The value cannot be written without changing it.
     Unwritable,
     /// The packet ended before a field it needs.
@@ -477,7 +477,7 @@ pub enum ParseError {
     MsgType(u8),
     /// A datagram's length field does not match the bytes after the
     /// offset field: it says `field`, and there are `actual` (more than
-    /// `field`; fewer reads as [`ParseError::Truncated`]).
+    /// `field`; fewer reads as [`Error::Truncated`]).
     Length {
         /// What the length field says.
         field: u16,
@@ -492,23 +492,23 @@ pub enum ParseError {
     Trailing(usize),
 }
 
-impl std::fmt::Display for ParseError {
+impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ParseError::Unwritable => f.write_str("value cannot be written without changing it"),
-            ParseError::Truncated => f.write_str("packet ends early"),
-            ParseError::TooLong(n) => write!(f, "packet of {n} bytes, over {MAX_PACKET}"),
-            ParseError::MsgType(t) => write!(f, "unknown message type {t:#04x}"),
-            ParseError::Length { field, actual } => {
+            Error::Unwritable => f.write_str("value cannot be written without changing it"),
+            Error::Truncated => f.write_str("packet ends early"),
+            Error::TooLong(n) => write!(f, "packet of {n} bytes, over {MAX_PACKET}"),
+            Error::MsgType(t) => write!(f, "unknown message type {t:#04x}"),
+            Error::Length { field, actual } => {
                 write!(f, "length field {field}, but {actual} bytes follow the offset")
             }
-            ParseError::Name => f.write_str("malformed NetBIOS name"),
-            ParseError::Trailing(n) => write!(f, "{n} bytes after the end of the packet"),
+            Error::Name => f.write_str("malformed NetBIOS name"),
+            Error::Trailing(n) => write!(f, "{n} bytes after the end of the packet"),
         }
     }
 }
 
-impl std::error::Error for ParseError {}
+impl std::error::Error for Error {}
 
 impl Packet {
     /// A datagram sent whole, from a B node.
@@ -568,14 +568,14 @@ impl Packet {
     /// The fragment size is limited to what fits with the names, and at least one.
     /// Offsets start at zero. Refuses data above [`MAX_REASSEMBLED`] or invalid names.
     /// Non-datagram packets come back as one packet.
-    pub fn split(&self, max_data: usize) -> Result<Vec<Packet>, ParseError> {
+    pub fn split(&self, max_data: usize) -> Result<Vec<Packet>, Error> {
         let Body::Datagram(d) = &self.body else { return Ok(vec![self.clone()]) };
         let (source, destination) = (d.source.to_bytes()?, d.destination.to_bytes()?);
         let names = source.len() + destination.len();
         let room = MAX_PACKET - DATAGRAM_HEADER_LEN - names;
         let size = max_data.clamp(1, room);
         if d.data.len() > MAX_REASSEMBLED {
-            return Err(ParseError::Unwritable);
+            return Err(Error::Unwritable);
         }
         let data = &d.data;
         let chunks: Vec<&[u8]> = if data.is_empty() { vec![data] } else { data.chunks(size).collect() };
@@ -696,35 +696,35 @@ fn be16(b: &[u8], i: usize) -> u16 {
 }
 
 impl Wire for Name {
-    type ParseError = ParseError;
-    type WriteError = ParseError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads one uncompressed NetBIOS name and scope. Refuses pointers, invalid
     /// first-level labels, oversized names and trailing bytes.
-    fn parse(b: &[u8]) -> Result<Name, ParseError> {
+    fn parse(b: &[u8]) -> Result<Name, Error> {
         let (value, used) = Self::parse_prefix(b)?;
         if used != b.len() {
-            return Err(ParseError::Trailing(b.len() - used));
+            return Err(Error::Trailing(b.len() - used));
         }
         Ok(value)
     }
 
     /// Appends the uncompressed name. Refuses empty or oversized scope labels and
     /// names above [`MAX_NAME_LEN`]. Leaves the destination unchanged on error.
-    fn write(&self, dst: &mut Vec<u8>) -> Result<(), ParseError> {
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
         let mut out = Vec::with_capacity(ENCODED_LEN + 2);
         out.push(ENCODED_LEN as u8);
         out.extend_from_slice(&encode_first_level(&self.bytes));
         for label in &self.scope {
             if label.len() > MAX_LABEL {
-                return Err(ParseError::Unwritable);
+                return Err(Error::Unwritable);
             }
             if label.is_empty() {
-                return Err(ParseError::Unwritable);
+                return Err(Error::Unwritable);
             }
             // The label, its length byte, and the final zero must fit.
             if out.len() + 1 + label.len() + 1 > MAX_NAME_LEN {
-                return Err(ParseError::Unwritable);
+                return Err(Error::Unwritable);
             }
             out.push(label.len() as u8);
             out.extend_from_slice(label);
@@ -737,21 +737,21 @@ impl Wire for Name {
 }
 
 impl Wire for Packet {
-    type ParseError = ParseError;
-    type WriteError = ParseError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads the packet in `b`, which must be one whole UDP datagram.
     /// Refuses malformed or trailing input.
-    fn parse(b: &[u8]) -> Result<Packet, ParseError> {
+    fn parse(b: &[u8]) -> Result<Packet, Error> {
         if b.len() > MAX_PACKET {
-            return Err(ParseError::TooLong(b.len()));
+            return Err(Error::TooLong(b.len()));
         }
-        let ty = *b.first().ok_or(ParseError::Truncated)?;
+        let ty = *b.first().ok_or(Error::Truncated)?;
         if !(msg_type::DIRECT_UNIQUE..=msg_type::NEGATIVE_QUERY_RESPONSE).contains(&ty) {
-            return Err(ParseError::MsgType(ty));
+            return Err(Error::MsgType(ty));
         }
         if b.len() < HEADER_LEN {
-            return Err(ParseError::Truncated);
+            return Err(Error::Truncated);
         }
         let flags = Flags::from_byte(b[1]);
         let id = be16(b, 2);
@@ -766,17 +766,17 @@ impl Wire for Packet {
                     _ => DatagramKind::Broadcast,
                 };
                 if rest.len() < 4 {
-                    return Err(ParseError::Truncated);
+                    return Err(Error::Truncated);
                 }
                 let field = be16(rest, 0);
                 let offset = be16(rest, 2);
                 let after = &rest[4..];
                 let want = usize::from(field);
                 if after.len() < want {
-                    return Err(ParseError::Truncated);
+                    return Err(Error::Truncated);
                 }
                 if after.len() > want {
-                    return Err(ParseError::Length { field, actual: after.len() });
+                    return Err(Error::Length { field, actual: after.len() });
                 }
                 let (source, used) = Name::parse_prefix(after)?;
                 let (destination, used2) = Name::parse_prefix(&after[used..])?;
@@ -784,16 +784,16 @@ impl Wire for Packet {
                 Body::Datagram(Datagram { kind, offset, source, destination, data })
             }
             msg_type::ERROR => {
-                let (&code, extra) = rest.split_first().ok_or(ParseError::Truncated)?;
+                let (&code, extra) = rest.split_first().ok_or(Error::Truncated)?;
                 if !extra.is_empty() {
-                    return Err(ParseError::Trailing(extra.len()));
+                    return Err(Error::Trailing(extra.len()));
                 }
                 Body::Error(ErrorCode::from_code(code))
             }
             _ => {
                 let (name, used) = Name::parse_prefix(rest)?;
                 if used < rest.len() {
-                    return Err(ParseError::Trailing(rest.len() - used));
+                    return Err(Error::Trailing(rest.len() - used));
                 }
                 match ty {
                     msg_type::QUERY_REQUEST => Body::QueryRequest(name),
@@ -807,7 +807,7 @@ impl Wire for Packet {
 
     /// Appends the complete datagram. Refuses invalid names, oversized data and
     /// values that would change on reading. Leaves the destination unchanged on error.
-    fn write(&self, dst: &mut Vec<u8>) -> Result<(), ParseError> {
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
         let mut out = Vec::with_capacity(DATAGRAM_HEADER_LEN + 2 * (ENCODED_LEN + 2));
         out.push(self.body.msg_type());
         out.push(self.flags.to_byte());
@@ -821,7 +821,7 @@ impl Wire for Packet {
                 // Names are at most 255 bytes each, so there is always room.
                 let room = MAX_PACKET - DATAGRAM_HEADER_LEN - source.len() - destination.len();
                 if d.data.len() > room {
-                    return Err(ParseError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 let data = &d.data;
                 let length = source.len() + destination.len() + data.len();
@@ -838,7 +838,7 @@ impl Wire for Packet {
             }
         }
         if Self::parse(&out).as_ref() != Ok(self) {
-            return Err(ParseError::Unwritable);
+            return Err(Error::Unwritable);
         }
         dst.extend_from_slice(&out);
         Ok(())
@@ -974,30 +974,30 @@ mod tests {
     #[test]
     fn errors() {
         let good = sample_datagram().to_bytes().unwrap();
-        assert_eq!(Packet::parse(&[]), Err(ParseError::Truncated));
-        assert_eq!(Packet::parse(&[0x17]), Err(ParseError::MsgType(0x17)));
-        assert_eq!(Packet::parse(&[0x0f, 0, 0]), Err(ParseError::MsgType(0x0f)));
-        assert_eq!(Packet::parse(&vec![0x10; MAX_PACKET + 1]), Err(ParseError::TooLong(MAX_PACKET + 1)));
+        assert_eq!(Packet::parse(&[]), Err(Error::Truncated));
+        assert_eq!(Packet::parse(&[0x17]), Err(Error::MsgType(0x17)));
+        assert_eq!(Packet::parse(&[0x0f, 0, 0]), Err(Error::MsgType(0x0f)));
+        assert_eq!(Packet::parse(&vec![0x10; MAX_PACKET + 1]), Err(Error::TooLong(MAX_PACKET + 1)));
         // Extra bytes after a datagram's length.
         let mut long = good.clone();
         long.push(0);
-        assert_eq!(Packet::parse(&long), Err(ParseError::Length { field: 78, actual: 79 }));
+        assert_eq!(Packet::parse(&long), Err(Error::Length { field: 78, actual: 79 }));
         // A bad first label: wrong length, then a letter past P.
         let mut b = good.clone();
         b[14] = 31;
-        assert_eq!(Packet::parse(&b), Err(ParseError::Name));
+        assert_eq!(Packet::parse(&b), Err(Error::Name));
         let mut b = good.clone();
         b[15] = b'Z';
-        assert_eq!(Packet::parse(&b), Err(ParseError::Name));
+        assert_eq!(Packet::parse(&b), Err(Error::Name));
         // A pointer where the destination's scope would start.
         let mut b = good.clone();
         b[47 + 34] = 0xc0;
-        assert_eq!(Packet::parse(&b), Err(ParseError::Name));
+        assert_eq!(Packet::parse(&b), Err(Error::Name));
         // Trailing bytes after an error and a query.
         let e = sample_datagram().error(ip(), 1, ErrorCode::Other(9)).to_bytes().unwrap();
         let mut e2 = e.clone();
         e2.extend_from_slice(&[1, 2]);
-        assert_eq!(Packet::parse(&e2), Err(ParseError::Trailing(2)));
+        assert_eq!(Packet::parse(&e2), Err(Error::Trailing(2)));
         let q = Packet {
             flags: Flags::whole(),
             id: 1,
@@ -1007,7 +1007,7 @@ mod tests {
         };
         let mut qb = q.to_bytes().unwrap();
         qb.push(0);
-        assert_eq!(Packet::parse(&qb), Err(ParseError::Trailing(1)));
+        assert_eq!(Packet::parse(&qb), Err(Error::Trailing(1)));
         // A name past MAX_NAME_LEN on the wire.
         let mut n = vec![32];
         n.extend_from_slice(&[b'A'; 32]);
@@ -1016,13 +1016,13 @@ mod tests {
             n.extend_from_slice(&[b'x'; 63]);
         }
         n.push(0);
-        assert_eq!(Name::parse(&n), Err(ParseError::Name));
+        assert_eq!(Name::parse(&n), Err(Error::Name));
         // A label longer than 63 (and not a pointer).
         let mut n = vec![32];
         n.extend_from_slice(&[b'A'; 32]);
         n.push(64);
-        assert_eq!(Name::parse(&n), Err(ParseError::Name));
-        for e in [ParseError::Truncated, ParseError::Name, ParseError::Length { field: 1, actual: 2 }] {
+        assert_eq!(Name::parse(&n), Err(Error::Name));
+        for e in [Error::Truncated, Error::Name, Error::Length { field: 1, actual: 2 }] {
             assert!(!e.to_string().is_empty());
         }
     }
@@ -1059,7 +1059,7 @@ mod tests {
         let mut over = n.clone();
         over.insert(n.len() - 1, b'y');
         over[n.len() - 30] = 29;
-        assert_eq!(Name::parse(&over), Err(ParseError::Name));
+        assert_eq!(Name::parse(&over), Err(Error::Name));
         // The flags bits: M is 0x01, F is 0x02, SNT is 0x0c.
         assert_eq!(Flags { more: true, first: false, node_type: NodeType::M }.to_byte(), 0x09);
         // A length field that ends inside the names refuses the packet.
@@ -1074,7 +1074,7 @@ mod tests {
         for s in samples() {
             assert!(Packet::parse(&s).is_ok());
             for n in 0..s.len() {
-                assert_eq!(Packet::parse(&s[..n]), Err(ParseError::Truncated), "{n} of {}", s.len());
+                assert_eq!(Packet::parse(&s[..n]), Err(Error::Truncated), "{n} of {}", s.len());
             }
         }
     }
@@ -1082,16 +1082,16 @@ mod tests {
     #[test]
     fn writers_refuse_values_that_would_change() {
         let name = Name { bytes: Name::new("A", 0).bytes, scope: vec![vec![b'x'; 100]; 10] };
-        assert_eq!(name.to_bytes(), Err(ParseError::Unwritable));
+        assert_eq!(name.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&name);
         let mut p = sample_datagram();
         if let Body::Datagram(d) = &mut p.body {
             d.data = vec![7; 70_000];
         }
-        assert_eq!(p.to_bytes(), Err(ParseError::Unwritable));
+        assert_eq!(p.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&p);
         let n = Name { bytes: [b'A'; 16], scope: vec![vec![], b"x".to_vec()] };
-        assert_eq!(n.to_bytes(), Err(ParseError::Unwritable));
+        assert_eq!(n.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&n);
     }
 
@@ -1099,11 +1099,11 @@ mod tests {
     fn name_writer_refuses_each_limit_on_its_own() {
         // One label a byte past MAX_LABEL, in a short name.
         let wide = Name { bytes: [b'A'; 16], scope: vec![vec![b'x'; MAX_LABEL + 1]] };
-        assert_eq!(wide.to_bytes(), Err(ParseError::Unwritable));
+        assert_eq!(wide.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&wide);
         // Five legal labels that make a 354-byte name.
         let long = Name { bytes: [b'A'; 16], scope: vec![vec![b'x'; MAX_LABEL]; 5] };
-        assert_eq!(long.to_bytes(), Err(ParseError::Unwritable));
+        assert_eq!(long.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&long);
         // A name of exactly MAX_NAME_LEN bytes is written and reads back.
         let mut scope = vec![vec![b'x'; MAX_LABEL]; 3];
@@ -1116,7 +1116,7 @@ mod tests {
         // One more byte in the last label passes it.
         let mut over = full;
         over.scope[3].push(b'y');
-        assert_eq!(over.to_bytes(), Err(ParseError::Unwritable));
+        assert_eq!(over.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&over);
     }
 
@@ -1208,7 +1208,7 @@ mod tests {
         assert!(p.as_datagram().is_some());
         assert!(sample_datagram().error(ip(), 1, ErrorCode::Other(1)).as_datagram().is_none());
         if let Body::Datagram(d) = &mut p.body { d.data.push(0); }
-        assert_eq!(p.split(1), Err(ParseError::Unwritable));
+        assert_eq!(p.split(1), Err(Error::Unwritable));
     }
 
     fn check(data: &[u8], r: &mut Reassembler) {

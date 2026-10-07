@@ -17,7 +17,7 @@
 //! datagram it receives to [`Message::parse`], answers the [`Pdu`] inside
 //! from its own MIB, and sends the bytes of [`Message::response`] back.
 //! Which objects exist, what they hold, and which communities may read or
-//! write them is up to world code. Over TCP (RFC 3430), [`Stream<Frames>`](fictionet::stdlib::codec::Stream)
+//! write them is up to world code. Over TCP (RFC 3430), [`Stream<Messages>`](fictionet::stdlib::codec::Stream)
 //! splits the stream into messages first. Body errors are items; invalid
 //! BER envelopes end the stream.
 //!
@@ -142,7 +142,8 @@ pub mod tag {
     pub const HIGH_NUMBER: u8 = 0x1f;
 }
 
-/// Why bytes are not an SNMP message, or not BER this module reads.
+/// Why bytes are not an SNMP message, or not BER this module reads, or
+/// why arcs or text are not an object identifier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     /// The value cannot be written without changing it.
@@ -168,6 +169,15 @@ pub enum Error {
     /// The version field names a version other than 1 or 2c. SNMPv3
     /// messages carry 3.
     Unsupported(i32),
+    /// Fewer than 2 arcs in an object identifier.
+    TooFewArcs,
+    /// More than [`MAX_OID_ARCS`] arcs in an object identifier.
+    TooManyArcs,
+    /// The first arc is above 2, or the second is 40 or more under a
+    /// first arc of 0 or 1.
+    FirstArcs,
+    /// Text that is not a number from 0 to 4294967295 between the dots.
+    OidText,
 }
 
 impl fmt::Display for Error {
@@ -184,6 +194,10 @@ impl fmt::Display for Error {
             Error::Oid => f.write_str("malformed object identifier"),
             Error::Value(t) => write!(f, "wrong size for a value of tag 0x{t:02x}"),
             Error::Unsupported(v) => write!(f, "SNMP version field {v}, not 0 (v1) or 1 (v2c)"),
+            Error::TooFewArcs => f.write_str("an object identifier needs at least 2 arcs"),
+            Error::TooManyArcs => write!(f, "more than {MAX_OID_ARCS} arcs"),
+            Error::FirstArcs => f.write_str("first two arcs out of range"),
+            Error::OidText => f.write_str("not dotted decimal numbers"),
         }
     }
 }
@@ -474,41 +488,14 @@ impl Wire for Element {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Oid(Vec<u32>);
 
-/// Why arcs or text are not an object identifier.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OidError {
-    /// Fewer than 2 arcs.
-    TooShort,
-    /// More than [`MAX_OID_ARCS`] arcs.
-    TooLong,
-    /// The first arc is above 2, or the second is 40 or more under a
-    /// first arc of 0 or 1.
-    FirstArcs,
-    /// Text that is not a number from 0 to 4294967295 between the dots.
-    Syntax,
-}
-
-impl fmt::Display for OidError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            OidError::TooShort => f.write_str("an object identifier needs at least 2 arcs"),
-            OidError::TooLong => write!(f, "more than {MAX_OID_ARCS} arcs"),
-            OidError::FirstArcs => f.write_str("first two arcs out of range"),
-            OidError::Syntax => f.write_str("not dotted decimal numbers"),
-        }
-    }
-}
-
-impl std::error::Error for OidError {}
-
 impl Oid {
     /// The object identifier with these arcs, if it is one.
-    pub fn from_arcs(arcs: &[u32]) -> Result<Oid, OidError> {
+    pub fn from_arcs(arcs: &[u32]) -> Result<Oid, Error> {
         if arcs.len() < 2 {
-            return Err(OidError::TooShort);
+            return Err(Error::TooFewArcs);
         }
         if arcs.len() > MAX_OID_ARCS {
-            return Err(OidError::TooLong);
+            return Err(Error::TooManyArcs);
         }
         let ok = match arcs[0] {
             0 | 1 => arcs[1] < 40,
@@ -516,7 +503,7 @@ impl Oid {
             _ => false,
         };
         if !ok {
-            return Err(OidError::FirstArcs);
+            return Err(Error::FirstArcs);
         }
         Ok(Oid(arcs.to_vec()))
     }
@@ -640,20 +627,20 @@ impl fmt::Display for Oid {
 }
 
 impl FromStr for Oid {
-    type Err = OidError;
+    type Err = Error;
 
     /// Reads dotted decimal, with or without a leading dot.
-    fn from_str(s: &str) -> Result<Oid, OidError> {
+    fn from_str(s: &str) -> Result<Oid, Error> {
         let s = s.strip_prefix('.').unwrap_or(s);
         let mut arcs = Vec::new();
         for part in s.split('.') {
             if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
-                return Err(OidError::Syntax);
+                return Err(Error::OidText);
             }
             if arcs.len() >= MAX_OID_ARCS {
-                return Err(OidError::TooLong);
+                return Err(Error::TooManyArcs);
             }
-            arcs.push(part.parse::<u32>().map_err(|_| OidError::Syntax)?);
+            arcs.push(part.parse::<u32>().map_err(|_| Error::OidText)?);
         }
         Oid::from_arcs(&arcs)
     }
@@ -1546,11 +1533,11 @@ const MAX_BER_HEADER: usize = 128;
 /// truncation. Redundant long-form BER lengths are accepted. Message bodies
 /// must use SNMP v1 or v2c.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Frames {
+pub struct Messages {
     limit: usize,
 }
 
-impl Frames {
+impl Messages {
     /// Creates a framer with [`MAX_MESSAGE`] as its whole-message limit.
     pub fn new() -> Self {
         Self::with_limit(MAX_MESSAGE)
@@ -1570,13 +1557,13 @@ impl Frames {
     }
 }
 
-impl Default for Frames {
+impl Default for Messages {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Decode for Frames {
+impl Decode for Messages {
     type Item = Result<Message, Error>;
     type Error = Error;
     const NAME: &'static str = "SNMP/TCP";
@@ -1748,17 +1735,17 @@ mod tests {
         let o = oid("1.3.6.1.2.1.1.1.0");
         assert_eq!(o.to_string(), "1.3.6.1.2.1.1.1.0");
         assert_eq!(".1.3.6".parse::<Oid>(), Ok(oid("1.3.6")));
-        assert_eq!("1".parse::<Oid>(), Err(OidError::TooShort));
-        assert_eq!("".parse::<Oid>(), Err(OidError::Syntax));
-        assert_eq!("1..3".parse::<Oid>(), Err(OidError::Syntax));
-        assert_eq!("1.3.".parse::<Oid>(), Err(OidError::Syntax));
-        assert_eq!("1.+3".parse::<Oid>(), Err(OidError::Syntax));
-        assert_eq!("1.3.4294967296".parse::<Oid>(), Err(OidError::Syntax));
-        assert_eq!("3.1".parse::<Oid>(), Err(OidError::FirstArcs));
-        assert_eq!("1.40".parse::<Oid>(), Err(OidError::FirstArcs));
+        assert_eq!("1".parse::<Oid>(), Err(Error::TooFewArcs));
+        assert_eq!("".parse::<Oid>(), Err(Error::OidText));
+        assert_eq!("1..3".parse::<Oid>(), Err(Error::OidText));
+        assert_eq!("1.3.".parse::<Oid>(), Err(Error::OidText));
+        assert_eq!("1.+3".parse::<Oid>(), Err(Error::OidText));
+        assert_eq!("1.3.4294967296".parse::<Oid>(), Err(Error::OidText));
+        assert_eq!("3.1".parse::<Oid>(), Err(Error::FirstArcs));
+        assert_eq!("1.40".parse::<Oid>(), Err(Error::FirstArcs));
         assert!("2.4294967295".parse::<Oid>().is_ok());
         let long = vec!["1"; MAX_OID_ARCS + 1].join(".");
-        assert_eq!(long.parse::<Oid>(), Err(OidError::TooLong));
+        assert_eq!(long.parse::<Oid>(), Err(Error::TooManyArcs));
         let max = vec!["1"; MAX_OID_ARCS].join(".");
         let max = max.parse::<Oid>().unwrap();
         assert_eq!(max.child(1), None);
@@ -1960,7 +1947,7 @@ mod tests {
                 assert_eq!(Element::parse(&b[..n]), Err(Error::Truncated));
                 let len = message_len(&b[..n]).unwrap();
                 assert!(len.is_none() || len == Some(b.len()));
-                let mut d = Stream::new(Frames::new());
+                let mut d = Stream::new(Messages::new());
                 assert_eq!(d.push(&b[..n]), n);
                 assert_eq!(d.next(), None);
             }
@@ -2047,7 +2034,7 @@ mod tests {
         for e in all {
             assert!(!e.to_string().is_empty());
         }
-        for e in [OidError::TooShort, OidError::TooLong, OidError::FirstArcs, OidError::Syntax] {
+        for e in [Error::TooFewArcs, Error::TooManyArcs, Error::FirstArcs, Error::OidText] {
             assert!(!e.to_string().is_empty());
         }
     }
@@ -2171,7 +2158,7 @@ mod tests {
         assert_eq!(m.pdu.bindings().len(), 2);
         let e = Element::parse(&GET_SYS_DESCR).unwrap();
         assert_eq!(e.tag(), tag::SEQUENCE);
-        let mut d = Stream::new(Frames::new());
+        let mut d = Stream::new(Messages::new());
         assert_eq!(d.push(&GET_SYS_DESCR[..10]), 10);
         assert!(d.next().is_none());
         assert_eq!(d.push(&GET_SYS_DESCR[10..]), 33);
@@ -2182,7 +2169,7 @@ mod tests {
     fn stream_takes_many_small_messages_in_linear_time() {
         let count = 2_000_000;
         let bytes = [0x30, 0].repeat(count);
-        let mut stream = Stream::new(Frames::new());
+        let mut stream = Stream::new(Messages::new());
         let mut got = 0;
         let started = std::time::Instant::now();
         pump(&mut stream, &bytes, |item| {
@@ -2326,7 +2313,7 @@ mod tests {
         longest.push(0x29);
         longest.extend_from_slice(&GET_SYS_DESCR[2..]);
         assert_eq!(Message::parse(&longest), Message::parse(&GET_SYS_DESCR));
-        let mut d = Stream::new(Frames::new());
+        let mut d = Stream::new(Messages::new());
         assert_eq!(d.push(&longest), longest.len());
         assert_eq!(d.next(), Some(Ok(Message::parse(&longest))));
     }
@@ -2334,11 +2321,11 @@ mod tests {
     #[test]
     fn stream_holds_at_most_capacity() {
         let bytes = GET_SYS_DESCR.repeat(10_000);
-        let mut stream = Stream::new(Frames::new());
+        let mut stream = Stream::new(Messages::new());
         assert_eq!(stream.push(&bytes), MAX_MESSAGE);
         assert_eq!(stream.push(&bytes), 0);
-        contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_MESSAGE);
-        let (items, failure) = decode_all(Frames::new, &bytes);
+        contract::check_decode_with_alloc_limit(Messages::new, &bytes, 2 * MAX_MESSAGE);
+        let (items, failure) = decode_all(Messages::new, &bytes);
         assert_eq!(items.len(), 10_000);
         assert!(items.iter().all(Result::is_ok));
         assert_eq!(failure, None);
@@ -2360,16 +2347,16 @@ mod tests {
             .iter()
             .flat_map(|m| m.to_bytes().unwrap())
             .collect();
-        contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_MESSAGE);
+        contract::check_decode_with_alloc_limit(Messages::new, &bytes, 2 * MAX_MESSAGE);
         assert_eq!(
-            decode_all(Frames::new, &bytes),
+            decode_all(Messages::new, &bytes),
             (messages.into_iter().map(Ok).collect(), None)
         );
         for (bytes, error) in [
             (&[0x31, 0][..], Error::UnexpectedTag(0x31)),
             (&[0x30, 0x83, 1, 0, 0][..], Error::TooLong(0x10000)),
         ] {
-            let mut stream = Stream::new(Frames::new());
+            let mut stream = Stream::new(Messages::new());
             assert_eq!(stream.push(bytes), bytes.len());
             assert_eq!(stream.next(), Some(Err(Fail::Protocol(error))));
             assert_eq!(stream.next(), None);
@@ -2405,7 +2392,7 @@ mod tests {
         if let Ok(o) = Oid::parse(data) {
             assert_eq!(Oid::parse(&o.to_bytes().unwrap()), Ok(o));
         }
-        contract::check_decode_with_alloc_limit(Frames::new, data, 2 * MAX_MESSAGE);
+        contract::check_decode_with_alloc_limit(Messages::new, data, 2 * MAX_MESSAGE);
         contract::check_wire::<Message>(data);
         contract::check_wire::<Element>(data);
         contract::check_wire::<Oid>(data);

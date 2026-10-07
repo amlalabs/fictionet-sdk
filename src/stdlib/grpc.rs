@@ -111,11 +111,14 @@ pub struct Message {
     pub data: Vec<u8>,
 }
 
-/// Why bytes are not a gRPC message stream. After any of these the stream
-/// holds no more messages a reader can find. A server ends the call with
-/// the status [`FrameError::code`] gives.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum FrameError {
+/// Why bytes are not a gRPC message stream, trailers do not give a call's
+/// status, a `grpc-timeout` value cannot be read, or headers cannot be
+/// written. After an error from [`Messages`] the stream holds no more
+/// messages a reader can find, and a server ends the call with the status
+/// [`Error::code`] gives. [`Status::from_trailers`] turns a trailer error
+/// into a status, as a client must.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Error {
     /// The compressed flag was neither 0 nor 1.
     Flag(u8),
     /// The length prefix was over the limit.
@@ -125,86 +128,104 @@ pub enum FrameError {
         /// The limit it broke.
         limit: usize,
     },
-}
-
-impl FrameError {
-    /// The status code a server ends the call with: `RESOURCE_EXHAUSTED`
-    /// for a message over the limit, and `INTERNAL` otherwise.
-    pub fn code(self) -> Code {
-        match self {
-            FrameError::TooLarge { .. } => Code::ResourceExhausted,
-            FrameError::Flag(_) => Code::Internal,
-        }
-    }
-
-    /// The status a server ends the call with, with this error as its
-    /// message.
-    pub fn to_status(self) -> Status {
-        Status::new(self.code(), &self.to_string())
-    }
-}
-
-impl fmt::Display for FrameError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            FrameError::Flag(b) => write!(f, "compressed flag {b}, not 0 or 1"),
-            FrameError::TooLarge { length, limit } => {
-                write!(f, "message of {length} bytes, over the limit of {limit}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for FrameError {}
-
-/// The status a server sends when a message stream fails.
-/// Protocol failures use [`FrameError::to_status`]. A truncated message,
-/// including a partial length prefix, a stalled decoder, or refused input
-/// gives `INTERNAL`.
-pub fn fail_status(fail: &codec::Fail<FrameError>) -> Status {
-    match fail {
-        codec::Fail::Protocol(error) => error.to_status(),
-        codec::Fail::Truncated { .. } | codec::Fail::Stuck { .. } | codec::Fail::Refused { .. } => {
-            Status::new(Code::Internal, &fail.to_string())
-        }
-    }
-}
-
-/// Why an exact [`Wire`] parse did not contain one complete [`Message`].
-/// The inherent [`Message::parse_prefix`] reads a prefix.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum MessageParseError {
     /// Input ended before a complete message.
     Truncated {
         /// Number of available bytes.
         unread: usize,
     },
-    /// Invalid framing.
-    Frame(FrameError),
     /// Bytes followed the first complete message.
     Trailing {
         /// The number of bytes after the message.
         remaining: usize,
     },
+    /// There was no `grpc-status`.
+    MissingStatus,
+    /// `grpc-status` was not a decimal number without leading zeros, or
+    /// came twice.
+    BadStatus,
+    /// `:status` was not 200. A `:status` that is not a number reads as 0.
+    HttpStatus(u16),
+    /// The block has a `:status`, so it is a trailers-only response, but
+    /// its content-type is missing or not gRPC.
+    ContentType,
+    /// `grpc-status-details-bin` came with `grpc-status` 0, where the
+    /// specification does not allow it, or holds a status code that is
+    /// not the one `grpc-status` gives.
+    BadDetails,
+    /// A `grpc-timeout` number was missing, had more than 8 digits, or
+    /// held something other than digits.
+    TimeoutValue,
+    /// A `grpc-timeout` unit was missing or not one of `HMSmun`.
+    TimeoutUnit,
+    /// A metadata name is not one or more of `0-9 a-z _ - .`, or is one
+    /// the request writes itself (`te`, `content-type`, `grpc-timeout`,
+    /// `grpc-encoding`), or one HTTP/2 forbids, such as `connection`.
+    Name(String),
+    /// A value gRPC does not allow, in the header named: an authority that
+    /// is not one or more visible ASCII characters, an encoding that is
+    /// not a token, a metadata value that is not printable ASCII or starts
+    /// or ends with a space, or a `-bin` value that is not base64.
+    Value(String),
+    /// The headers come to more than [`MAX_HEADER_LIST`] bytes, counted
+    /// as [`Request::parse`] counts them.
+    HeadersTooLarge(usize),
 }
 
-impl fmt::Display for MessageParseError {
+impl Error {
+    /// The status code a server ends the call with: `RESOURCE_EXHAUSTED`
+    /// for a message over the limit, and `INTERNAL` otherwise.
+    pub fn code(&self) -> Code {
+        match self {
+            Error::TooLarge { .. } => Code::ResourceExhausted,
+            _ => Code::Internal,
+        }
+    }
+
+    /// The status a server ends the call with, with this error as its
+    /// message.
+    pub fn to_status(&self) -> Status {
+        Status::new(self.code(), &self.to_string())
+    }
+}
+
+impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Truncated { unread } => write!(f, "message ended after {unread} bytes"),
-            Self::Frame(e) => e.fmt(f),
-            Self::Trailing { remaining } => {
+            Error::Flag(b) => write!(f, "compressed flag {b}, not 0 or 1"),
+            Error::TooLarge { length, limit } => {
+                write!(f, "message of {length} bytes, over the limit of {limit}")
+            }
+            Error::Truncated { unread } => write!(f, "message ended after {unread} bytes"),
+            Error::Trailing { remaining } => {
                 write!(f, "trailing bytes after the message: {remaining}")
+            }
+            Error::MissingStatus => f.write_str("no grpc-status"),
+            Error::BadStatus => f.write_str("malformed grpc-status"),
+            Error::HttpStatus(s) => write!(f, "HTTP status {s}, not 200"),
+            Error::ContentType => f.write_str("content-type is not gRPC"),
+            Error::BadDetails => f.write_str("grpc-status-details-bin contradicts grpc-status"),
+            Error::TimeoutValue => f.write_str("grpc-timeout value is not 1 to 8 digits"),
+            Error::TimeoutUnit => f.write_str("grpc-timeout unit is not one of HMSmun"),
+            Error::Name(n) => write!(f, "header name {n:?} is not allowed in gRPC metadata"),
+            Error::Value(n) => write!(f, "value of header {n:?} is not allowed"),
+            Error::HeadersTooLarge(n) => {
+                write!(f, "request headers of {n} bytes, over {MAX_HEADER_LIST}")
             }
         }
     }
 }
 
-impl core::error::Error for MessageParseError {
-    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
-        match self {
-            Self::Frame(e) => Some(e),
-            Self::Truncated { .. } | Self::Trailing { .. } => None,
+impl std::error::Error for Error {}
+
+/// The status a server sends when a message stream fails.
+/// Protocol failures use [`Error::to_status`]. A truncated message,
+/// including a partial length prefix, a stalled decoder, or refused input
+/// gives `INTERNAL`.
+pub fn fail_status(fail: &codec::Fail<Error>) -> Status {
+    match fail {
+        codec::Fail::Protocol(error) => error.to_status(),
+        codec::Fail::Truncated { .. } | codec::Fail::Stuck { .. } | codec::Fail::Refused { .. } => {
+            Status::new(Code::Internal, &fail.to_string())
         }
     }
 }
@@ -214,7 +235,7 @@ impl Message {
     /// [`MAX_MESSAGE`] bytes of body. It returns `Ok(None)` if `b` holds
     /// only part of one, and otherwise the message and how many bytes of
     /// `b` it took.
-    pub fn parse_prefix(b: &[u8]) -> Result<Option<(Message, usize)>, FrameError> {
+    pub fn parse_prefix(b: &[u8]) -> Result<Option<(Message, usize)>, Error> {
         parse_message(b, MAX_MESSAGE)
     }
 
@@ -238,32 +259,32 @@ impl Message {
 }
 
 impl Wire for Message {
-    type ParseError = MessageParseError;
-    type WriteError = FrameError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads exactly one message with at most [`MAX_MESSAGE`] body bytes.
-    /// Returns [`MessageParseError::Truncated`] for incomplete input and
-    /// [`MessageParseError::Trailing`] for extra bytes. A flag other than
-    /// 0 or 1 or a body above the limit returns [`MessageParseError::Frame`]
-    /// with [`FrameError::Flag`] or [`FrameError::TooLarge`]. Compressed
+    /// Returns [`Error::Truncated`] for incomplete input and
+    /// [`Error::Trailing`] for extra bytes. A flag other than
+    /// 0 or 1 or a body above the limit returns [`Error::Flag`] or
+    /// [`Error::TooLarge`]. Compressed
     /// bodies remain flagged bytes.
     fn parse(b: &[u8]) -> Result<Self, Self::ParseError> {
-        match Message::parse_prefix(b).map_err(MessageParseError::Frame)? {
+        match Message::parse_prefix(b)? {
             Some((message, used)) if used == b.len() => Ok(message),
-            Some((_, used)) => Err(MessageParseError::Trailing {
+            Some((_, used)) => Err(Error::Trailing {
                 remaining: b.len().saturating_sub(used),
             }),
-            None => Err(MessageParseError::Truncated { unread: b.len() }),
+            None => Err(Error::Truncated { unread: b.len() }),
         }
     }
 
     /// Appends a header and at most [`MAX_MESSAGE`] body bytes.
-    /// A longer body returns [`FrameError::TooLarge`] without changing `out`.
+    /// A longer body returns [`Error::TooLarge`] without changing `out`.
     /// Its `length` is the body length, capped at `u32::MAX`. The error's
-    /// [`code`](FrameError::code) is [`Code::ResourceExhausted`]. A stream
+    /// [`code`](Error::code) is [`Code::ResourceExhausted`]. A stream
     /// accepts the output when its body fits the stream's own limit.
     /// No compression is performed.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), FrameError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         let length = message_length(self.data.len())?;
         out.push(u8::from(self.compressed));
         out.extend_from_slice(&length.to_be_bytes());
@@ -291,7 +312,7 @@ impl Wire for Message {
 /// finish(&mut stream, |m| messages.push(m))?;
 /// assert_eq!(messages.len(), 1);
 /// assert_eq!(messages.first().map(|m| m.data.as_slice()), Some(&[7, 8][..]));
-/// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::grpc::FrameError>>(())
+/// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::grpc::Error>>(())
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Messages {
@@ -326,7 +347,7 @@ impl Default for Messages {
 
 impl codec::Decode for Messages {
     type Item = Message;
-    type Error = FrameError;
+    type Error = Error;
     const NAME: &'static str = "gRPC";
 
     /// The header length plus the configured body limit.
@@ -335,10 +356,10 @@ impl codec::Decode for Messages {
     }
 
     /// Reads one message or waits for more bytes. A flag other than 0 or 1
-    /// returns [`FrameError::Flag`]; a declared body above the configured
-    /// limit returns [`FrameError::TooLarge`]. Partial input returns
+    /// returns [`Error::Flag`]; a declared body above the configured
+    /// limit returns [`Error::TooLarge`]. Partial input returns
     /// [`Step::Need`], including at EOF.
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Message>, FrameError> {
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Message>, Error> {
         Ok(match parse_message(input, self.limit)? {
             Some((message, used)) => Step::Item(message, used),
             None => Step::Need,
@@ -347,12 +368,12 @@ impl codec::Decode for Messages {
 }
 
 // Shared prefix parsing. Only a complete, bounded body is copied.
-fn parse_message(b: &[u8], limit: usize) -> Result<Option<(Message, usize)>, FrameError> {
+fn parse_message(b: &[u8], limit: usize) -> Result<Option<(Message, usize)>, Error> {
     let Some(&flag) = b.first() else {
         return Ok(None);
     };
     if flag > 1 {
-        return Err(FrameError::Flag(flag));
+        return Err(Error::Flag(flag));
     }
     let Some(&[_, n0, n1, n2, n3]) = b.get(..HEADER_LEN) else {
         return Ok(None);
@@ -360,11 +381,11 @@ fn parse_message(b: &[u8], limit: usize) -> Result<Option<(Message, usize)>, Fra
     let length = u32::from_be_bytes([n0, n1, n2, n3]);
     let len = match usize::try_from(length) {
         Ok(n) if n <= limit => n,
-        _ => return Err(FrameError::TooLarge { length, limit }),
+        _ => return Err(Error::TooLarge { length, limit }),
     };
     let end = HEADER_LEN
         .checked_add(len)
-        .ok_or(FrameError::TooLarge { length, limit })?;
+        .ok_or(Error::TooLarge { length, limit })?;
     Ok(b.get(HEADER_LEN..end).map(|data| {
         (
             Message {
@@ -376,14 +397,14 @@ fn parse_message(b: &[u8], limit: usize) -> Result<Option<(Message, usize)>, Fra
     }))
 }
 
-fn message_length(len: usize) -> Result<u32, FrameError> {
+fn message_length(len: usize) -> Result<u32, Error> {
     match u32::try_from(len) {
         Ok(n) if len <= MAX_MESSAGE => Ok(n),
-        Ok(n) => Err(FrameError::TooLarge {
+        Ok(n) => Err(Error::TooLarge {
             length: n,
             limit: MAX_MESSAGE,
         }),
-        Err(_) => Err(FrameError::TooLarge {
+        Err(_) => Err(Error::TooLarge {
             length: u32::MAX,
             limit: MAX_MESSAGE,
         }),
@@ -521,42 +542,6 @@ pub struct Status {
     pub message: String,
 }
 
-/// Why trailers do not give a call's status. [`Status::from_trailers`]
-/// turns each of these into a status, as a client must.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum TrailerError {
-    /// There was no `grpc-status`.
-    MissingStatus,
-    /// `grpc-status` was not a decimal number without leading zeros, or
-    /// came twice.
-    BadStatus,
-    /// `:status` was not 200. A `:status` that is not a number reads as 0.
-    HttpStatus(u16),
-    /// The block has a `:status`, so it is a trailers-only response, but
-    /// its content-type is missing or not gRPC.
-    ContentType,
-    /// `grpc-status-details-bin` came with `grpc-status` 0, where the
-    /// specification does not allow it, or holds a status code that is
-    /// not the one `grpc-status` gives.
-    BadDetails,
-}
-
-impl fmt::Display for TrailerError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            TrailerError::MissingStatus => f.write_str("no grpc-status"),
-            TrailerError::BadStatus => f.write_str("malformed grpc-status"),
-            TrailerError::HttpStatus(s) => write!(f, "HTTP status {s}, not 200"),
-            TrailerError::ContentType => f.write_str("content-type is not gRPC"),
-            TrailerError::BadDetails => {
-                f.write_str("grpc-status-details-bin contradicts grpc-status")
-            }
-        }
-    }
-}
-
-impl std::error::Error for TrailerError {}
-
 impl Status {
     /// A status with this code and message. A message longer than
     /// [`MAX_STATUS_MESSAGE`] bytes is cut at a character boundary.
@@ -583,7 +568,7 @@ impl Status {
     /// The trailers that end a call: `grpc-status`, then `grpc-message`
     /// if the message is not empty. Custom metadata may follow them. A
     /// message longer than [`MAX_STATUS_MESSAGE`] bytes returns an error.
-    pub fn to_trailers(&self) -> Result<Vec<(String, String)>, HeaderError> {
+    pub fn to_trailers(&self) -> Result<Vec<(String, String)>, Error> {
         let mut out = vec![("grpc-status".to_string(), self.code.number().to_string())];
         if !self.message.is_empty() {
             out.push(("grpc-message".to_string(), encode_message(&self.message)?));
@@ -597,7 +582,7 @@ impl Status {
     pub fn trailers_only(
         &self,
         content_type: &ContentType,
-    ) -> Result<Vec<(String, String)>, HeaderError> {
+    ) -> Result<Vec<(String, String)>, Error> {
         let mut out = response_headers(content_type);
         out.extend(self.to_trailers()?);
         Ok(out)
@@ -610,7 +595,7 @@ impl Status {
     /// match `grpc-status`; details that are not base64 of a protobuf
     /// message cannot be checked and are ignored. Other headers are
     /// ignored.
-    pub fn parse_trailers<I, N, V>(headers: I) -> Result<Status, TrailerError>
+    pub fn parse_trailers<I, N, V>(headers: I) -> Result<Status, Error>
     where
         I: IntoIterator<Item = (N, V)>,
         N: AsRef<[u8]>,
@@ -619,10 +604,10 @@ impl Status {
         let t = TrailerScan::new(headers);
         if let Some(h) = t.http {
             if h != 200 {
-                return Err(TrailerError::HttpStatus(h));
+                return Err(Error::HttpStatus(h));
             }
             if !t.grpc_type {
-                return Err(TrailerError::ContentType);
+                return Err(Error::ContentType);
             }
         }
         t.status()
@@ -654,11 +639,11 @@ impl Status {
         match (t.status(), t.http) {
             (_, Some(h)) if !t.grpc_type && h != 200 => from_http(h),
             (_, Some(_)) if !t.grpc_type => {
-                Status::new(Code::Unknown, &TrailerError::ContentType.to_string())
+                Status::new(Code::Unknown, &Error::ContentType.to_string())
             }
             (Ok(s), _) => s,
-            (Err(TrailerError::MissingStatus), Some(h)) if h != 200 => from_http(h),
-            (Err(e @ TrailerError::BadDetails), _) => Status::new(Code::Internal, &e.to_string()),
+            (Err(Error::MissingStatus), Some(h)) if h != 200 => from_http(h),
+            (Err(e @ Error::BadDetails), _) => Status::new(Code::Internal, &e.to_string()),
             (Err(e), _) => Status::new(Code::Unknown, &e.to_string()),
         }
     }
@@ -743,15 +728,15 @@ impl TrailerScan {
     }
 
     /// The status from `grpc-status` and `grpc-message` alone.
-    fn status(&self) -> Result<Status, TrailerError> {
+    fn status(&self) -> Result<Status, Error> {
         if self.bad {
-            return Err(TrailerError::BadStatus);
+            return Err(Error::BadStatus);
         }
-        let n = self.code.ok_or(TrailerError::MissingStatus)?;
+        let n = self.code.ok_or(Error::MissingStatus)?;
         // protobuf's int32 keeps the low 32 bits of the varint, as here.
         let contradicts = self.details_code.is_some_and(|d| d as u32 != n);
         if self.details && (n == 0 || contradicts || self.details_mixed) {
-            return Err(TrailerError::BadDetails);
+            return Err(Error::BadDetails);
         }
         let code = Code::from_number(n).unwrap_or(Code::Unknown);
         Ok(Status {
@@ -789,10 +774,10 @@ pub fn response_headers(content_type: &ContentType) -> Vec<(String, String)> {
 /// space to `~` stay as they are, except `%`. Every other byte of the
 /// UTF-8 becomes `%` and two capital hex digits. Text longer than
 /// [`MAX_STATUS_MESSAGE`] bytes returns an error.
-pub fn encode_message(text: &str) -> Result<String, HeaderError> {
+pub fn encode_message(text: &str) -> Result<String, Error> {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     if text.len() > MAX_STATUS_MESSAGE {
-        return Err(HeaderError::Value("grpc-message".into()));
+        return Err(Error::Value("grpc-message".into()));
     }
     let mut out = String::with_capacity(text.len());
     for &b in text.as_bytes() {
@@ -902,27 +887,6 @@ pub struct Timeout {
     unit: TimeoutUnit,
 }
 
-/// Why a `grpc-timeout` value cannot be read.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum TimeoutError {
-    /// The number was missing, had more than 8 digits, or held something
-    /// other than digits.
-    Value,
-    /// The unit was missing or not one of `HMSmun`.
-    Unit,
-}
-
-impl fmt::Display for TimeoutError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            TimeoutError::Value => f.write_str("grpc-timeout value is not 1 to 8 digits"),
-            TimeoutError::Unit => f.write_str("grpc-timeout unit is not one of HMSmun"),
-        }
-    }
-}
-
-impl std::error::Error for TimeoutError {}
-
 impl Timeout {
     /// A timeout of `value` units, or `None` if `value` is over
     /// [`MAX_TIMEOUT_VALUE`].
@@ -961,15 +925,15 @@ impl Timeout {
     /// Reads a `grpc-timeout` value, such as `100m`. The specification
     /// asks for a positive number, but this reads `0` too, as gRPC's Go
     /// server does: the deadline has already passed.
-    pub fn parse(value: &[u8]) -> Result<Timeout, TimeoutError> {
+    pub fn parse(value: &[u8]) -> Result<Timeout, Error> {
         let Some((&letter, digits)) = value.split_last() else {
-            return Err(TimeoutError::Value);
+            return Err(Error::TimeoutValue);
         };
         if digits.is_empty() || digits.len() > 8 || !digits.iter().all(u8::is_ascii_digit) {
-            return Err(TimeoutError::Value);
+            return Err(Error::TimeoutValue);
         }
-        let unit = TimeoutUnit::from_letter(letter).ok_or(TimeoutError::Unit)?;
-        let value = parse_decimal(digits).ok_or(TimeoutError::Value)?;
+        let unit = TimeoutUnit::from_letter(letter).ok_or(Error::TimeoutUnit)?;
+        let value = parse_decimal(digits).ok_or(Error::TimeoutValue)?;
         Ok(Timeout { value, unit })
     }
 
@@ -1145,38 +1109,6 @@ impl Scheme {
     }
 }
 
-/// Why [`Request::to_headers`] cannot write a request. Each names the
-/// header at fault.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum HeaderError {
-    /// A metadata name is not one or more of `0-9 a-z _ - .`, or is one
-    /// the request writes itself (`te`, `content-type`, `grpc-timeout`,
-    /// `grpc-encoding`), or one HTTP/2 forbids, such as `connection`.
-    Name(String),
-    /// A value gRPC does not allow: an authority that is not one or more
-    /// visible ASCII characters, an encoding that is not a token, a
-    /// metadata value that is not printable ASCII or starts or ends with
-    /// a space, or a `-bin` value that is not base64.
-    Value(String),
-    /// The headers come to more than [`MAX_HEADER_LIST`] bytes, counted
-    /// as [`Request::parse`] counts them.
-    TooLarge(usize),
-}
-
-impl fmt::Display for HeaderError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            HeaderError::Name(n) => write!(f, "header name {n:?} is not allowed in gRPC metadata"),
-            HeaderError::Value(n) => write!(f, "value of header {n:?} is not allowed"),
-            HeaderError::TooLarge(n) => {
-                write!(f, "request headers of {n} bytes, over {MAX_HEADER_LIST}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for HeaderError {}
-
 /// A call's request headers, checked.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Request {
@@ -1217,11 +1149,11 @@ impl Rejection {
     /// The header block that answers the request and ends the stream. An
     /// HTTP status outside 400 to 599 returns an error. A status message
     /// above [`MAX_STATUS_MESSAGE`] also returns an error.
-    pub fn to_headers(&self) -> Result<Vec<(String, String)>, HeaderError> {
+    pub fn to_headers(&self) -> Result<Vec<(String, String)>, Error> {
         match self {
             Rejection::Http(s) => {
                 if !(400..=599).contains(s) {
-                    return Err(HeaderError::Value(":status".into()));
+                    return Err(Error::Value(":status".into()));
                 }
                 Ok(vec![(":status".to_string(), s.to_string())])
             }
@@ -1391,8 +1323,8 @@ impl Request {
     /// [`Request::parse`] reads what this writes back as the same request,
     /// with `te_trailers` set. It writes nothing it would have to change:
     /// a header gRPC or HTTP/2 does not allow, or a block over
-    /// [`MAX_HEADER_LIST`], is a [`HeaderError`].
-    pub fn to_headers(&self) -> Result<Vec<(String, String)>, HeaderError> {
+    /// [`MAX_HEADER_LIST`], is a [`Error`].
+    pub fn to_headers(&self) -> Result<Vec<(String, String)>, Error> {
         let mut out = vec![
             (":method".to_string(), "POST".to_string()),
             (":scheme".to_string(), self.scheme.as_str().to_string()),
@@ -1400,7 +1332,7 @@ impl Request {
         ];
         if let Some(a) = &self.authority {
             if a.is_empty() || !a.bytes().all(|c| c.is_ascii_graphic()) {
-                return Err(HeaderError::Value(":authority".to_string()));
+                return Err(Error::Value(":authority".to_string()));
             }
             out.push((":authority".to_string(), a.clone()));
         }
@@ -1411,7 +1343,7 @@ impl Request {
         out.push(("content-type".to_string(), self.content_type.to_header()));
         if let Some(e) = &self.encoding {
             if !is_coding(e) {
-                return Err(HeaderError::Value("grpc-encoding".to_string()));
+                return Err(Error::Value("grpc-encoding".to_string()));
             }
             out.push(("grpc-encoding".to_string(), e.clone()));
         }
@@ -1419,7 +1351,7 @@ impl Request {
             let reserved =
                 ["te", "content-type", "grpc-timeout", "grpc-encoding"].contains(&name.as_str());
             if !is_metadata_name(name) || reserved || is_connection_header(name) {
-                return Err(HeaderError::Name(name.clone()));
+                return Err(Error::Name(name.clone()));
             }
             let ok = if name.ends_with("-bin") {
                 value.split(|&c| c == b',').all(is_base64)
@@ -1431,7 +1363,7 @@ impl Request {
             // Every byte checked above is ASCII.
             match std::str::from_utf8(value) {
                 Ok(v) if ok => out.push((name.clone(), v.to_string())),
-                _ => return Err(HeaderError::Value(name.clone())),
+                _ => return Err(Error::Value(name.clone())),
             }
         }
         let size = out.iter().fold(0usize, |n, (k, v)| {
@@ -1440,7 +1372,7 @@ impl Request {
                 .saturating_add(32)
         });
         if size > MAX_HEADER_LIST {
-            return Err(HeaderError::TooLarge(size));
+            return Err(Error::HeadersTooLarge(size));
         }
         Ok(out)
     }
@@ -1679,7 +1611,7 @@ mod tests {
         for flag in 2..=255 {
             assert_eq!(
                 Messages::new().decode(&[flag], false),
-                Err(FrameError::Flag(flag))
+                Err(Error::Flag(flag))
             );
         }
         for (limit, header, length) in [
@@ -1694,7 +1626,7 @@ mod tests {
                 assert_eq!(stream.held(), 0);
             }
             assert_eq!(stream.push(header.get(4..).unwrap()), 1);
-            let fail = Fail::Protocol(FrameError::TooLarge { length, limit });
+            let fail = Fail::Protocol(Error::TooLarge { length, limit });
             assert_eq!(stream.next(), Some(Err(fail.clone())));
             assert_eq!(stream.buffered(), HEADER_LEN);
             assert_eq!(stream.held(), 0);
@@ -1782,7 +1714,7 @@ mod tests {
         for cut in 0..bytes.len() {
             assert_eq!(
                 <Message as Wire>::parse(bytes.get(..cut).unwrap()),
-                Err(MessageParseError::Truncated { unread: cut })
+                Err(Error::Truncated { unread: cut })
             );
         }
         for tail in [&[0xff][..], &[0, 0, 0, 0, 0]] {
@@ -1793,15 +1725,15 @@ mod tests {
             );
             assert_eq!(
                 <Message as Wire>::parse(&joined),
-                Err(MessageParseError::Trailing {
+                Err(Error::Trailing {
                     remaining: tail.len()
                 })
             );
         }
-        let error = MessageParseError::Frame(FrameError::Flag(2));
-        assert_eq!(<Message as Wire>::parse(&[2]), Err(error));
-        assert!(core::error::Error::source(&error).is_some());
-        let trailing = MessageParseError::Trailing { remaining: 1 };
+        let error = Error::Flag(2);
+        assert_eq!(<Message as Wire>::parse(&[2]), Err(error.clone()));
+        assert!(core::error::Error::source(&error).is_none());
+        let trailing = Error::Trailing { remaining: 1 };
         assert!(core::error::Error::source(&trailing).is_none());
         assert_eq!(trailing.to_string(), "trailing bytes after the message: 1");
     }
@@ -1829,7 +1761,7 @@ mod tests {
         let mut out = prefix.to_vec();
         assert_eq!(
             too_large.write(&mut out),
-            Err(FrameError::TooLarge {
+            Err(Error::TooLarge {
                 length: MAX_MESSAGE as u32 + 1,
                 limit: MAX_MESSAGE
             })
@@ -2003,20 +1935,20 @@ mod tests {
 
     #[test]
     fn frame_errors() {
-        assert_eq!(Message::parse_prefix(&[2]), Err(FrameError::Flag(2)));
-        assert_eq!(Message::parse_prefix(&[0xff, 0, 0]), Err(FrameError::Flag(0xff)));
+        assert_eq!(Message::parse_prefix(&[2]), Err(Error::Flag(2)));
+        assert_eq!(Message::parse_prefix(&[0xff, 0, 0]), Err(Error::Flag(0xff)));
         let big = (MAX_MESSAGE as u32 + 1).to_be_bytes();
         let b = [0, big[0], big[1], big[2], big[3]];
         assert_eq!(
             Message::parse_prefix(&b),
-            Err(FrameError::TooLarge {
+            Err(Error::TooLarge {
                 length: MAX_MESSAGE as u32 + 1,
                 limit: MAX_MESSAGE
             })
         );
         assert_eq!(
             Message::parse_prefix(&[0, 0xff, 0xff, 0xff, 0xff]),
-            Err(FrameError::TooLarge {
+            Err(Error::TooLarge {
                 length: u32::MAX,
                 limit: MAX_MESSAGE
             })
@@ -2024,24 +1956,24 @@ mod tests {
         // Exactly the limit is allowed, and waits for its bytes.
         let at = (MAX_MESSAGE as u32).to_be_bytes();
         assert_eq!(Message::parse_prefix(&[0, at[0], at[1], at[2], at[3]]), Ok(None));
-        assert_eq!(FrameError::Flag(2).code(), Code::Internal);
+        assert_eq!(Error::Flag(2).code(), Code::Internal);
         assert_eq!(
-            FrameError::TooLarge {
+            Error::TooLarge {
                 length: 9,
                 limit: 1
             }
             .code(),
             Code::ResourceExhausted
         );
-        assert_eq!(FrameError::Flag(2).to_status().code, Code::Internal);
+        assert_eq!(Error::Flag(2).to_status().code, Code::Internal);
         for error in [
-            FrameError::Flag(2),
-            FrameError::TooLarge {
+            Error::Flag(2),
+            Error::TooLarge {
                 length: 9,
                 limit: 1,
             },
         ] {
-            assert_eq!(fail_status(&Fail::Protocol(error)), error.to_status());
+            assert_eq!(fail_status(&Fail::Protocol(error.clone())), error.to_status());
         }
         assert_eq!(
             fail_status(&Fail::Stuck {
@@ -2052,7 +1984,7 @@ mod tests {
             Code::Internal
         );
         assert!(
-            FrameError::TooLarge {
+            Error::TooLarge {
                 length: 9,
                 limit: 1
             }
@@ -2077,7 +2009,7 @@ mod tests {
         assert_eq!(stream.push(&ok.to_bytes().unwrap()), 8);
         assert_eq!(stream.next(), Some(Ok(ok)));
         assert_eq!(stream.push(&over[..5]), 5);
-        let error = Fail::Protocol(FrameError::TooLarge {
+        let error = Fail::Protocol(Error::TooLarge {
             length: 4,
             limit: 3,
         });
@@ -2102,7 +2034,7 @@ mod tests {
         );
         assert_eq!(
             stream.next(),
-            Some(Err(Fail::Protocol(FrameError::Flag(7))))
+            Some(Err(Fail::Protocol(Error::Flag(7))))
         );
         assert_eq!(stream.next(), None);
     }
@@ -2134,7 +2066,7 @@ mod tests {
         let e = m.to_bytes().unwrap_err();
         assert_eq!(
             e,
-            FrameError::TooLarge {
+            Error::TooLarge {
                 length: MAX_MESSAGE as u32 + 1,
                 limit: MAX_MESSAGE
             }
@@ -2263,13 +2195,13 @@ mod tests {
         }
         let max = Timeout::parse(b"99999999H").unwrap();
         assert_eq!(max.as_duration(), Duration::from_secs(99_999_999 * 3600));
-        assert_eq!(Timeout::parse(b""), Err(TimeoutError::Value));
-        assert_eq!(Timeout::parse(b"S"), Err(TimeoutError::Value));
-        assert_eq!(Timeout::parse(b"123456789S"), Err(TimeoutError::Value));
-        assert_eq!(Timeout::parse(b"-1S"), Err(TimeoutError::Value));
-        assert_eq!(Timeout::parse(b"1 S"), Err(TimeoutError::Value));
-        assert_eq!(Timeout::parse(b"10"), Err(TimeoutError::Unit));
-        assert_eq!(Timeout::parse(b"10s"), Err(TimeoutError::Unit));
+        assert_eq!(Timeout::parse(b""), Err(Error::TimeoutValue));
+        assert_eq!(Timeout::parse(b"S"), Err(Error::TimeoutValue));
+        assert_eq!(Timeout::parse(b"123456789S"), Err(Error::TimeoutValue));
+        assert_eq!(Timeout::parse(b"-1S"), Err(Error::TimeoutValue));
+        assert_eq!(Timeout::parse(b"1 S"), Err(Error::TimeoutValue));
+        assert_eq!(Timeout::parse(b"10"), Err(Error::TimeoutUnit));
+        assert_eq!(Timeout::parse(b"10s"), Err(Error::TimeoutUnit));
         assert_eq!(
             Timeout::new(MAX_TIMEOUT_VALUE + 1, TimeoutUnit::Nanos),
             None
@@ -2431,31 +2363,31 @@ mod tests {
     fn trailer_errors_and_synthesis() {
         assert_eq!(
             Status::parse_trailers([("x", "y")]),
-            Err(TrailerError::MissingStatus)
+            Err(Error::MissingStatus)
         );
         assert_eq!(
             Status::parse_trailers([("grpc-status", "")]),
-            Err(TrailerError::BadStatus)
+            Err(Error::BadStatus)
         );
         assert_eq!(
             Status::parse_trailers([("grpc-status", "abc")]),
-            Err(TrailerError::BadStatus)
+            Err(Error::BadStatus)
         );
         assert_eq!(
             Status::parse_trailers([("grpc-status", "99999999999")]),
-            Err(TrailerError::BadStatus)
+            Err(Error::BadStatus)
         );
         assert_eq!(
             Status::parse_trailers([("grpc-status", "1"), ("grpc-status", "1")]),
-            Err(TrailerError::BadStatus)
+            Err(Error::BadStatus)
         );
         assert_eq!(
             Status::parse_trailers([(":status", "503")]),
-            Err(TrailerError::HttpStatus(503))
+            Err(Error::HttpStatus(503))
         );
         assert_eq!(
             Status::parse_trailers([(":status", "x"), ("grpc-status", "0")]),
-            Err(TrailerError::HttpStatus(0))
+            Err(Error::HttpStatus(0))
         );
         // Unknown numbers read as UNKNOWN; names match any case.
         assert_eq!(
@@ -2486,8 +2418,8 @@ mod tests {
             Status::from_trailers([("grpc-status", "5")]).code,
             Code::NotFound
         );
-        assert!(TrailerError::HttpStatus(1).to_string().contains('1'));
-        assert!(TrailerError::BadDetails.to_string().contains("details"));
+        assert!(Error::HttpStatus(1).to_string().contains('1'));
+        assert!(Error::BadDetails.to_string().contains("details"));
     }
 
     #[test]
@@ -2552,7 +2484,7 @@ mod tests {
     fn status_header_name_any_case() {
         assert_eq!(
             Status::parse_trailers([(":STATUS", "503")]),
-            Err(TrailerError::HttpStatus(503))
+            Err(Error::HttpStatus(503))
         );
     }
 
@@ -2611,7 +2543,7 @@ mod tests {
         ] {
             assert_eq!(
                 bad_name(name),
-                Err(HeaderError::Name(name.to_string())),
+                Err(Error::Name(name.to_string())),
                 "{name:?}"
             );
         }
@@ -2637,7 +2569,7 @@ mod tests {
             } else {
                 assert_eq!(
                     got,
-                    Err(HeaderError::Value(name.to_string())),
+                    Err(Error::Value(name.to_string())),
                     "{name} {value:?}"
                 );
             }
@@ -2648,25 +2580,25 @@ mod tests {
         a.authority = Some("a\nb".to_string());
         assert_eq!(
             a.to_headers(),
-            Err(HeaderError::Value(":authority".to_string()))
+            Err(Error::Value(":authority".to_string()))
         );
         a.authority = Some(String::new());
         assert_eq!(
             a.to_headers(),
-            Err(HeaderError::Value(":authority".to_string()))
+            Err(Error::Value(":authority".to_string()))
         );
         let mut e = r.clone();
         e.encoding = Some(String::new());
         assert_eq!(
             e.to_headers(),
-            Err(HeaderError::Value("grpc-encoding".to_string()))
+            Err(Error::Value("grpc-encoding".to_string()))
         );
         // Too many headers is an error, and nothing is left out.
         let mut big = Request::new(MethodPath::new("s", "m").unwrap(), ContentType::plain());
         big.metadata.push(("x-pad".to_string(), vec![b'v'; 7900]));
         big.metadata
             .push(("authorization".to_string(), b"Bearer x".to_vec()));
-        assert!(matches!(big.to_headers(), Err(HeaderError::TooLarge(n)) if n > MAX_HEADER_LIST));
+        assert!(matches!(big.to_headers(), Err(Error::HeadersTooLarge(n)) if n > MAX_HEADER_LIST));
         big.metadata[0].1.truncate(7000);
         let back = Request::parse(strings(&big.to_headers().unwrap())).unwrap();
         assert_eq!(back, big);
@@ -2681,8 +2613,8 @@ mod tests {
         let filler = "v".repeat(MAX_HEADER_LIST - used - 32 - "x-filler".len());
         near.push(("x-filler", Box::leak(filler.into_boxed_str())));
         let r = Request::parse(near).unwrap();
-        assert!(matches!(r.to_headers(), Err(HeaderError::TooLarge(_))));
-        assert!(HeaderError::TooLarge(9000).to_string().contains("9000"));
+        assert!(matches!(r.to_headers(), Err(Error::HeadersTooLarge(_))));
+        assert!(Error::HeadersTooLarge(9000).to_string().contains("9000"));
     }
 
     #[test]
@@ -2712,11 +2644,11 @@ mod tests {
     fn status_details_must_agree_with_grpc_status() {
         // "CA4" is base64 for 08 0e: a google.rpc.Status with code 14.
         let t = [("grpc-status", "5"), ("grpc-status-details-bin", "CA4")];
-        assert_eq!(Status::parse_trailers(t), Err(TrailerError::BadDetails));
+        assert_eq!(Status::parse_trailers(t), Err(Error::BadDetails));
         assert_eq!(Status::from_trailers(t).code, Code::Internal);
         // Details are not allowed with OK.
         let ok = [("grpc-status", "0"), ("grpc-status-details-bin", "")];
-        assert_eq!(Status::parse_trailers(ok), Err(TrailerError::BadDetails));
+        assert_eq!(Status::parse_trailers(ok), Err(Error::BadDetails));
         // Matching details, padded or not, and details with no code, pass.
         for d in ["CA4", "CA4=", "CA4,CA4", "EgF4"] {
             let t = [("grpc-status", "14"), ("grpc-status-details-bin", d)];
@@ -2728,7 +2660,7 @@ mod tests {
         }
         // The last code field wins, as protobuf reads it: 08 05 08 0e.
         let t = [("grpc-status", "5"), ("grpc-status-details-bin", "CAUIDg")];
-        assert_eq!(Status::parse_trailers(t), Err(TrailerError::BadDetails));
+        assert_eq!(Status::parse_trailers(t), Err(Error::BadDetails));
         // Details that are not base64 or not protobuf cannot be checked.
         for d in ["!!", "CA", "/w"] {
             let t = [("grpc-status", "5"), ("grpc-status-details-bin", d)];
@@ -2753,10 +2685,10 @@ mod tests {
             ("content-type", "text/html"),
             ("grpc-status", "0"),
         ];
-        assert_eq!(Status::parse_trailers(html), Err(TrailerError::ContentType));
+        assert_eq!(Status::parse_trailers(html), Err(Error::ContentType));
         assert_eq!(Status::from_trailers(html).code, Code::Unknown);
         let none = [(":status", "200"), ("grpc-status", "0")];
-        assert_eq!(Status::parse_trailers(none), Err(TrailerError::ContentType));
+        assert_eq!(Status::parse_trailers(none), Err(Error::ContentType));
         let html503 = [
             (":status", "503"),
             ("content-type", "text/html"),
@@ -2792,7 +2724,7 @@ mod tests {
         for v in ["00", "05", "014"] {
             assert_eq!(
                 Status::parse_trailers([("grpc-status", v)]),
-                Err(TrailerError::BadStatus),
+                Err(Error::BadStatus),
                 "{v}"
             );
             assert_eq!(

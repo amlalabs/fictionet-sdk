@@ -6,7 +6,7 @@ use fictionet::stdlib::codec::contract::{
     check_decode, check_decode_with_held_limit, check_wire, check_wire_value,
 };
 use fictionet::stdlib::codec::{Wire, test_support::decode_all};
-use fictionet::stdlib::cotp::{ErrorTpdu, MAX_MESSAGE, ParseError, Reassembler, Tpdu, segment};
+use fictionet::stdlib::cotp::{Error, ErrorTpdu, MAX_MESSAGE, Reassembler, Tpdu, segment};
 use fictionet::stdlib::{cotp, tpkt};
 use libfuzzer_sys::fuzz_target;
 
@@ -45,11 +45,11 @@ fuzz_target!(|data: &[u8]| {
                     _ => {}
                 }
             }
-            Err(ParseError::Tpdu(e)) => {
+            Err(Error::TpduTooLong { .. }) => {}
+            Err(e) => {
                 let er = Tpdu::Error(ErrorTpdu::rejecting(0, tpdu, &e));
                 assert_eq!(<Tpdu as Wire>::parse(&er.to_bytes().unwrap()), Ok(er));
             }
-            Err(ParseError::TooLong { .. }) => {}
         }
     }
     // Any bytes cut into segments read back as the same data TPDUs, and

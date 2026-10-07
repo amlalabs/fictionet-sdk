@@ -23,7 +23,7 @@
 //! Every reader checks lengths and ranges, because the agent can send any
 //! bytes it likes. A request that breaks the specification becomes an
 //! [`Exception`] the world can send back, as a real device would. Writers
-//! return an [`EncodeError`] rather than write bytes a reader would refuse
+//! return an [`Error`] rather than write bytes a reader would refuse
 //! or read back as something else.
 //!
 //! ```
@@ -117,10 +117,13 @@ pub struct Frame {
     pub pdu: Vec<u8>,
 }
 
-/// Why a writer refused a value: its bytes would break the specification,
-/// or a reader would read them back as something else.
+/// Why bytes are not a Modbus/TCP frame or a response this module can
+/// read, or why a writer refused a value: its bytes would break the
+/// specification, or a reader would read them back as something else.
+/// After an error from [`Frames`] the connection holds no more frames a
+/// reader can find, and a real server closes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EncodeError {
+pub enum Error {
     /// A frame with an empty PDU, which has no function code.
     EmptyPdu,
     /// More bytes than one PDU holds, or more values than one request or
@@ -136,97 +139,60 @@ pub enum EncodeError {
     /// or a code this module reads as a typed request or response given to
     /// an `Other` variant.
     Function(u8),
-}
-
-impl std::fmt::Display for EncodeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            EncodeError::EmptyPdu => f.write_str("a frame needs a PDU of at least a function code"),
-            EncodeError::TooLong => f.write_str("more than one Modbus PDU may carry"),
-            EncodeError::Quantity => f.write_str("a quantity outside what the function allows"),
-            EncodeError::Address => f.write_str("a range of addresses past 65535"),
-            EncodeError::Function(c) => write!(f, "function code {c} does not go with this value"),
-        }
-    }
-}
-
-impl std::error::Error for EncodeError {}
-
-/// Why bytes are not a Modbus/TCP frame. Either way, the connection holds
-/// no more frames a reader can find, and a real server closes it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FrameError {
     /// The protocol identifier was not 0, so this is not Modbus.
     Protocol(u16),
     /// The length field was below 2 (a unit and a function code) or above
     /// what a frame may hold.
     Length(u16),
-}
-
-impl std::fmt::Display for FrameError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            FrameError::Protocol(p) => write!(f, "protocol identifier {p}, not 0 (Modbus)"),
-            FrameError::Length(n) => write!(f, "length field {n}, outside 2..=254"),
-        }
-    }
-}
-
-impl std::error::Error for FrameError {}
-
-/// Why an exact [`Wire`] parse did not read one complete frame.
-/// [`Frame::parse_prefix`] keeps its separate prefix parsing behavior.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FrameParseError {
-    /// The MBAP header is invalid.
-    Frame(FrameError),
     /// The input ended before a complete frame, including empty input.
     Truncated,
     /// Bytes follow the first complete frame.
     Trailing,
+    /// A PDU is not a response this module can read.
+    BadResponse,
 }
 
-impl std::fmt::Display for FrameParseError {
+impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Frame(e) => e.fmt(f),
-            Self::Truncated => f.write_str("input ended before a complete Modbus frame"),
-            Self::Trailing => f.write_str("bytes follow the Modbus frame"),
+            Error::EmptyPdu => f.write_str("a frame needs a PDU of at least a function code"),
+            Error::TooLong => f.write_str("more than one Modbus PDU may carry"),
+            Error::Quantity => f.write_str("a quantity outside what the function allows"),
+            Error::Address => f.write_str("a range of addresses past 65535"),
+            Error::Function(c) => write!(f, "function code {c} does not go with this value"),
+            Error::Protocol(p) => write!(f, "protocol identifier {p}, not 0 (Modbus)"),
+            Error::Length(n) => write!(f, "length field {n}, outside 2..=254"),
+            Error::Truncated => f.write_str("input ended before a complete Modbus frame"),
+            Error::Trailing => f.write_str("bytes follow the Modbus frame"),
+            Error::BadResponse => f.write_str("not a well-formed Modbus response"),
         }
     }
 }
 
-impl std::error::Error for FrameParseError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Frame(e) => Some(e),
-            Self::Truncated | Self::Trailing => None,
-        }
-    }
-}
+impl std::error::Error for Error {}
 
 impl Frame {
     /// Reads the frame at the start of `b`. It returns `Ok(None)` if `b`
     /// holds only part of one, and otherwise the frame and how many bytes
     /// of `b` it took.
-    pub fn parse_prefix(b: &[u8]) -> Result<Option<(Frame, usize)>, FrameError> {
+    pub fn parse_prefix(b: &[u8]) -> Result<Option<(Frame, usize)>, Error> {
         if b.len() < HEADER_LEN {
             // A bad protocol identifier is known before the rest comes.
             if b.len() >= 4 {
                 let protocol = be16(b, 2);
                 if protocol != 0 {
-                    return Err(FrameError::Protocol(protocol));
+                    return Err(Error::Protocol(protocol));
                 }
             }
             return Ok(None);
         }
         let protocol = be16(b, 2);
         if protocol != 0 {
-            return Err(FrameError::Protocol(protocol));
+            return Err(Error::Protocol(protocol));
         }
         let length = be16(b, 4);
         if length < 2 || usize::from(length) > MAX_PDU + 1 {
-            return Err(FrameError::Length(length));
+            return Err(Error::Length(length));
         }
         let end = 6 + usize::from(length);
         if b.len() < end {
@@ -248,7 +214,7 @@ impl Frame {
 
     // CUSTOM EDIT: serve holding register 42 with the planted value 0xc0de.
     /// Answers a read of register 42; other requests get a protocol exception.
-    pub fn planted_reply(&self) -> Result<Frame, EncodeError> {
+    pub fn planted_reply(&self) -> Result<Frame, Error> {
         let pdu = match Request::parse(&self.pdu) {
             Ok(Request::ReadHoldingRegisters { address: 42, quantity: 1 }) => {
                 Response::Registers(vec![0xc0de]).to_pdu(function::READ_HOLDING_REGISTERS)?
@@ -274,31 +240,31 @@ impl Frame {
 }
 
 impl Wire for Frame {
-    type ParseError = FrameParseError;
-    type WriteError = EncodeError;
+    type ParseError = Error;
+    type WriteError = Error;
 
-    /// Reads exactly one frame. Returns [`FrameParseError::Truncated`] for
-    /// incomplete input and [`FrameParseError::Trailing`] for trailing bytes.
+    /// Reads exactly one frame. Returns [`Error::Truncated`] for
+    /// incomplete input and [`Error::Trailing`] for trailing bytes.
     /// A nonzero protocol ID or length outside 2..=254 returns
-    /// [`FrameParseError::Frame`] with [`FrameError::Protocol`] or [`FrameError::Length`].
-    fn parse(b: &[u8]) -> Result<Self, FrameParseError> {
-        match Self::parse_prefix(b).map_err(FrameParseError::Frame)? {
+    /// [`Error::Protocol`] or [`Error::Length`].
+    fn parse(b: &[u8]) -> Result<Self, Error> {
+        match Self::parse_prefix(b)? {
             Some((frame, used)) if used == b.len() => Ok(frame),
-            Some(_) => Err(FrameParseError::Trailing),
-            None => Err(FrameParseError::Truncated),
+            Some(_) => Err(Error::Trailing),
+            None => Err(Error::Truncated),
         }
     }
 
-    /// Appends one frame. An empty PDU returns [`EncodeError::EmptyPdu`];
-    /// a PDU over [`MAX_PDU`] bytes returns [`EncodeError::TooLong`].
+    /// Appends one frame. An empty PDU returns [`Error::EmptyPdu`];
+    /// a PDU over [`MAX_PDU`] bytes returns [`Error::TooLong`].
     /// Errors leave `out` unchanged.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         let pdu = &self.pdu[..];
         if pdu.is_empty() {
-            return Err(EncodeError::EmptyPdu);
+            return Err(Error::EmptyPdu);
         }
         if pdu.len() > MAX_PDU {
-            return Err(EncodeError::TooLong);
+            return Err(Error::TooLong);
         }
         out.extend_from_slice(&self.transaction.to_be_bytes());
         out.extend_from_slice(&[0, 0]);
@@ -329,24 +295,24 @@ impl Wire for Frame {
 /// })?;
 /// finish(&mut requests, |_| unreachable!())?;
 /// assert_eq!(count, 1);
-/// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::modbus::FrameError>>(())
+/// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::modbus::Error>>(())
 /// ```
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Frames;
 
 impl Decode for Frames {
     type Item = Frame;
-    type Error = FrameError;
+    type Error = Error;
     const NAME: &'static str = "Modbus/TCP";
 
     fn capacity(&self) -> usize {
         MAX_FRAME
     }
 
-    /// Reads one frame. A nonzero protocol ID returns [`FrameError::Protocol`].
-    /// A length outside 2..=254 returns [`FrameError::Length`]. Partial input
+    /// Reads one frame. A nonzero protocol ID returns [`Error::Protocol`].
+    /// A length outside 2..=254 returns [`Error::Length`]. Partial input
     /// returns [`Step::Need`], including at EOF.
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, FrameError> {
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, Error> {
         Ok(match Frame::parse_prefix(input)? {
             Some((frame, used)) => Step::Item(frame, used),
             None => Step::Need,
@@ -581,7 +547,7 @@ impl Request {
     /// function's limit, a range past address 65535, or an
     /// [`Request::Other`] with a function code this module reads, 0, the
     /// exception flag, or more data than a PDU holds.
-    pub fn to_pdu(&self) -> Result<Vec<u8>, EncodeError> {
+    pub fn to_pdu(&self) -> Result<Vec<u8>, Error> {
         let mut out = vec![self.function()];
         match self {
             Request::ReadCoils { address, quantity }
@@ -624,7 +590,7 @@ impl Request {
             Request::Other { function, data } => {
                 check_other(*function)?;
                 if data.len() > MAX_PDU - 1 {
-                    return Err(EncodeError::TooLong);
+                    return Err(Error::TooLong);
                 }
                 out.extend_from_slice(data);
             }
@@ -657,30 +623,18 @@ pub enum Response {
     Other(Vec<u8>),
 }
 
-/// Why a PDU is not a response this module can read.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ResponseError;
-
-impl std::fmt::Display for ResponseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("not a well-formed Modbus response")
-    }
-}
-
-impl std::error::Error for ResponseError {}
-
 impl Response {
     /// Reads the response in `pdu`, and the function code it answers. A
     /// PDU longer than [`MAX_PDU`], function code 0, or a count, quantity
     /// or range the specification does not allow for the function is an
     /// error.
-    pub fn parse(pdu: &[u8]) -> Result<(u8, Response), ResponseError> {
+    pub fn parse(pdu: &[u8]) -> Result<(u8, Response), Error> {
         if pdu.len() > MAX_PDU {
-            return Err(ResponseError);
+            return Err(Error::BadResponse);
         }
-        let (&code, data) = pdu.split_first().ok_or(ResponseError)?;
+        let (&code, data) = pdu.split_first().ok_or(Error::BadResponse)?;
         if code & function::EXCEPTION_FLAG != 0 {
-            let [e] = data else { return Err(ResponseError) };
+            let [e] = data else { return Err(Error::BadResponse) };
             return Ok((
                 code & !function::EXCEPTION_FLAG,
                 Response::Exception(Exception::from_code(*e)),
@@ -688,10 +642,10 @@ impl Response {
         }
         // A read's byte count: 1 to 250, which is 2000 bits or 125
         // registers.
-        let counted = || -> Result<&[u8], ResponseError> {
-            let (&n, rest) = data.split_first().ok_or(ResponseError)?;
+        let counted = || -> Result<&[u8], Error> {
+            let (&n, rest) = data.split_first().ok_or(Error::BadResponse)?;
             if n == 0 || usize::from(n) > MAX_READ_BYTES || rest.len() != usize::from(n) {
-                return Err(ResponseError);
+                return Err(Error::BadResponse);
             }
             Ok(rest)
         };
@@ -699,11 +653,11 @@ impl Response {
             if data.len() == 4 {
                 Ok((be16(data, 0), be16(data, 2)))
             } else {
-                Err(ResponseError)
+                Err(Error::BadResponse)
             }
         };
         let response = match code {
-            0 => return Err(ResponseError),
+            0 => return Err(Error::BadResponse),
             function::READ_COILS | function::READ_DISCRETE_INPUTS => {
                 let bytes = counted()?;
                 Response::Bits(
@@ -715,7 +669,7 @@ impl Response {
             function::READ_HOLDING_REGISTERS | function::READ_INPUT_REGISTERS => {
                 let bytes = counted()?;
                 if bytes.len() % 2 != 0 {
-                    return Err(ResponseError);
+                    return Err(Error::BadResponse);
                 }
                 Response::Registers(
                     bytes
@@ -731,7 +685,7 @@ impl Response {
                 let value = match raw {
                     0xff00 => true,
                     0x0000 => false,
-                    _ => return Err(ResponseError),
+                    _ => return Err(Error::BadResponse),
                 };
                 Response::WriteSingleCoil { address, value }
             }
@@ -746,7 +700,7 @@ impl Response {
                 } else {
                     MAX_WRITE_REGISTERS
                 };
-                check_quantity(address, usize::from(quantity), max).map_err(|_| ResponseError)?;
+                check_quantity(address, usize::from(quantity), max).map_err(|_| Error::BadResponse)?;
                 Response::WriteMultiple { address, quantity }
             }
             _ => Response::Other(data.to_vec()),
@@ -761,8 +715,8 @@ impl Response {
     /// read but 0), with 1 to 2000 bits, 1 to 125 registers, or a
     /// quantity and range a write may have. An exception can answer any
     /// function and is never an error.
-    pub fn to_pdu(&self, function: u8) -> Result<Vec<u8>, EncodeError> {
-        let wrong = Err(EncodeError::Function(function));
+    pub fn to_pdu(&self, function: u8) -> Result<Vec<u8>, Error> {
+        let wrong = Err(Error::Function(function));
         let mut out = vec![function];
         match self {
             Response::Bits(bits) => {
@@ -773,7 +727,7 @@ impl Response {
                     return wrong;
                 }
                 if bits.is_empty() || bits.len() > usize::from(MAX_READ_BITS) {
-                    return Err(EncodeError::Quantity);
+                    return Err(Error::Quantity);
                 }
                 let bytes = pack_bits(bits);
                 out.push(bytes.len() as u8);
@@ -787,7 +741,7 @@ impl Response {
                     return wrong;
                 }
                 if regs.is_empty() || regs.len() > usize::from(MAX_READ_REGISTERS) {
-                    return Err(EncodeError::Quantity);
+                    return Err(Error::Quantity);
                 }
                 out.push((2 * regs.len()) as u8);
                 for r in regs {
@@ -822,7 +776,7 @@ impl Response {
             Response::Other(data) => {
                 check_other(function)?;
                 if data.len() > MAX_PDU - 1 {
-                    return Err(EncodeError::TooLong);
+                    return Err(Error::TooLong);
                 }
                 out.extend_from_slice(data);
             }
@@ -836,19 +790,19 @@ const MAX_READ_BYTES: usize = 250;
 
 /// Checks `n` items from `address` against a function's limit, and gives
 /// `n` as the quantity a PDU carries.
-fn check_quantity(address: u16, n: usize, max: u16) -> Result<u16, EncodeError> {
+fn check_quantity(address: u16, n: usize, max: u16) -> Result<u16, Error> {
     let quantity = match u16::try_from(n) {
         Ok(q) if q != 0 && q <= max => q,
-        _ => return Err(EncodeError::Quantity),
+        _ => return Err(Error::Quantity),
     };
-    in_range(address, quantity).map_err(|_| EncodeError::Address)?;
+    in_range(address, quantity).map_err(|_| Error::Address)?;
     Ok(quantity)
 }
 
 /// Checks a function code an `Other` request or response is written with:
 /// not 0, without the exception flag, and not one this module reads as a
 /// typed value.
-fn check_other(function: u8) -> Result<(), EncodeError> {
+fn check_other(function: u8) -> Result<(), Error> {
     let known = matches!(
         function,
         function::READ_COILS
@@ -861,7 +815,7 @@ fn check_other(function: u8) -> Result<(), EncodeError> {
             | function::WRITE_MULTIPLE_REGISTERS
     );
     if known || function == 0 || function & function::EXCEPTION_FLAG != 0 {
-        Err(EncodeError::Function(function))
+        Err(Error::Function(function))
     } else {
         Ok(())
     }
@@ -1093,7 +1047,7 @@ mod tests {
             Response::parse(&[0x83, 0x02]).unwrap(),
             (3, Response::Exception(Exception::IllegalDataAddress))
         );
-        assert_eq!(Response::parse(&[0x83]), Err(ResponseError));
+        assert_eq!(Response::parse(&[0x83]), Err(Error::BadResponse));
         for c in 0..=255u8 {
             assert_eq!(Exception::from_code(c).code(), c);
         }
@@ -1120,15 +1074,15 @@ mod tests {
             assert_eq!(Frame::parse_prefix(&bytes[..n]), Ok(None), "{n} bytes");
         }
         // Not Modbus, known from the first four bytes.
-        assert_eq!(Frame::parse_prefix(&[0, 1, 0, 5]), Err(FrameError::Protocol(5)));
+        assert_eq!(Frame::parse_prefix(&[0, 1, 0, 5]), Err(Error::Protocol(5)));
         // Lengths out of range.
         assert_eq!(
             Frame::parse_prefix(&[0, 1, 0, 0, 0, 1, 1]),
-            Err(FrameError::Length(1))
+            Err(Error::Length(1))
         );
         assert_eq!(
             Frame::parse_prefix(&[0, 1, 0, 0, 0, 255, 1]),
-            Err(FrameError::Length(255))
+            Err(Error::Length(255))
         );
         assert!(matches!(Frame::parse_prefix(&[0, 1, 0, 0, 0, 254, 1]), Ok(None)));
     }
@@ -1148,7 +1102,7 @@ mod tests {
                 let prefix = bytes.get(..cut).unwrap();
                 assert_eq!(
                     <Frame as Wire>::parse(prefix),
-                    Err(FrameParseError::Truncated)
+                    Err(Error::Truncated)
                 );
                 assert_eq!(Frame::parse_prefix(prefix), Ok(None));
             }
@@ -1157,7 +1111,7 @@ mod tests {
                 trailing.extend_from_slice(suffix);
                 assert_eq!(
                     <Frame as Wire>::parse(&trailing),
-                    Err(FrameParseError::Trailing)
+                    Err(Error::Trailing)
                 );
                 assert_eq!(
                     Frame::parse_prefix(&trailing),
@@ -1166,16 +1120,16 @@ mod tests {
             }
         }
         for (bytes, error) in [
-            (&[0, 1, 0, 5][..], FrameError::Protocol(5)),
-            (&[0, 1, 0, 0, 0, 1, 1][..], FrameError::Length(1)),
+            (&[0, 1, 0, 5][..], Error::Protocol(5)),
+            (&[0, 1, 0, 0, 0, 1, 1][..], Error::Length(1)),
             (
                 &[0, 1, 0, 0, 0xff, 0xff, 1][..],
-                FrameError::Length(u16::MAX),
+                Error::Length(u16::MAX),
             ),
         ] {
             assert_eq!(
                 <Frame as Wire>::parse(bytes),
-                Err(FrameParseError::Frame(error))
+                Err(error)
             );
         }
     }
@@ -1193,8 +1147,8 @@ mod tests {
             let mut out = prefix.to_vec();
             let result = frame.write(&mut out);
             match length {
-                0 => assert_eq!(result, Err(EncodeError::EmptyPdu)),
-                n if n > MAX_PDU => assert_eq!(result, Err(EncodeError::TooLong)),
+                0 => assert_eq!(result, Err(Error::EmptyPdu)),
+                n if n > MAX_PDU => assert_eq!(result, Err(Error::TooLong)),
                 _ => {
                     assert_eq!(result, Ok(()));
                     assert_eq!(out.get(..prefix.len()), Some(prefix.as_slice()));
@@ -1299,10 +1253,10 @@ mod tests {
             Ok(Step::Item(frame, bytes.len()))
         );
         for (bad, error) in [
-            (&[0, 1, 0, 5][..], FrameError::Protocol(5)),
-            (&[0, 1, 0, 0, 0, 0, 1][..], FrameError::Length(0)),
-            (&[0, 1, 0, 0, 0, 1, 1][..], FrameError::Length(1)),
-            (&[0, 1, 0, 0, 0, 255, 1][..], FrameError::Length(255)),
+            (&[0, 1, 0, 5][..], Error::Protocol(5)),
+            (&[0, 1, 0, 0, 0, 0, 1][..], Error::Length(0)),
+            (&[0, 1, 0, 0, 0, 1, 1][..], Error::Length(1)),
+            (&[0, 1, 0, 0, 0, 255, 1][..], Error::Length(255)),
         ] {
             contract::check_decode(|| Frames, bad);
             let mut stream = Stream::new(Frames);
@@ -1492,11 +1446,11 @@ mod tests {
         assert_eq!(d.buffered(), 0);
         // A broken stream stays broken.
         assert_eq!(d.push(&[0, 3, 0, 9, 0, 6, 1, 3, 0, 0, 0, 1]), 12);
-        assert_eq!(d.next(), Some(Err(Fail::Protocol(FrameError::Protocol(9)))));
+        assert_eq!(d.next(), Some(Err(Fail::Protocol(Error::Protocol(9)))));
         // Bytes after the break are taken and dropped.
         assert_eq!(d.push(&a), a.len());
         assert_eq!(d.next(), None);
-        assert_eq!(d.failed(), Some(&Fail::Protocol(FrameError::Protocol(9))));
+        assert_eq!(d.failed(), Some(&Fail::Protocol(Error::Protocol(9))));
     }
 
     #[test]
@@ -1544,7 +1498,7 @@ mod tests {
         let took = d.push(&zeros);
         assert!(took <= MAX_FRAME);
         assert!(d.buffered() <= MAX_FRAME);
-        assert_eq!(d.next(), Some(Err(Fail::Protocol(FrameError::Length(0)))));
+        assert_eq!(d.next(), Some(Err(Fail::Protocol(Error::Length(0)))));
         // Many longest frames pushed in one go come out the same as in
         // other chunk sizes, and the buffer never grows past the bound.
         let mut stream = Vec::new();
@@ -1578,7 +1532,7 @@ mod tests {
         let mut long = vec![0x41];
         long.resize(MAX_PDU + 1, 0);
         assert_eq!(Request::parse(&long), Err(Exception::IllegalDataValue));
-        assert_eq!(Response::parse(&long), Err(ResponseError));
+        assert_eq!(Response::parse(&long), Err(Error::BadResponse));
         // One byte shorter is a PDU a frame can carry, and reads.
         assert!(Request::parse(&long[..MAX_PDU]).is_ok());
         assert!(Response::parse(&long[..MAX_PDU]).is_ok());
@@ -1590,15 +1544,15 @@ mod tests {
             address: 0,
             values: vec![1; 124],
         };
-        assert_eq!(req.to_pdu(), Err(EncodeError::Quantity));
+        assert_eq!(req.to_pdu(), Err(Error::Quantity));
         let req = Request::WriteMultipleCoils {
             address: 0,
             values: vec![true; 1969],
         };
-        assert_eq!(req.to_pdu(), Err(EncodeError::Quantity));
+        assert_eq!(req.to_pdu(), Err(Error::Quantity));
         assert_eq!(
             Response::Registers(vec![7; 126]).to_pdu(3),
-            Err(EncodeError::Quantity)
+            Err(Error::Quantity)
         );
         assert_eq!(
             Request::Other {
@@ -1606,18 +1560,18 @@ mod tests {
                 data: vec![0; MAX_PDU]
             }
             .to_pdu(),
-            Err(EncodeError::TooLong)
+            Err(Error::TooLong)
         );
         assert_eq!(
             Response::Other(vec![0; MAX_PDU]).to_pdu(0x41),
-            Err(EncodeError::TooLong)
+            Err(Error::TooLong)
         );
         let frame = Frame {
             transaction: 0,
             unit: 0,
             pdu: vec![0; 1000],
         };
-        assert_eq!(frame.to_bytes(), Err(EncodeError::TooLong));
+        assert_eq!(frame.to_bytes(), Err(Error::TooLong));
         // The longest of each still fits and reads back whole.
         let req = Request::WriteMultipleRegisters {
             address: 0,
@@ -1649,7 +1603,7 @@ mod tests {
                 quantity: 0
             }
             .to_pdu(),
-            Err(EncodeError::Quantity)
+            Err(Error::Quantity)
         );
         assert_eq!(
             Request::ReadInputRegisters {
@@ -1657,7 +1611,7 @@ mod tests {
                 quantity: 126
             }
             .to_pdu(),
-            Err(EncodeError::Quantity)
+            Err(Error::Quantity)
         );
         assert_eq!(
             Request::ReadCoils {
@@ -1665,7 +1619,7 @@ mod tests {
                 quantity: 2001
             }
             .to_pdu(),
-            Err(EncodeError::Quantity)
+            Err(Error::Quantity)
         );
         assert_eq!(
             Request::ReadHoldingRegisters {
@@ -1673,7 +1627,7 @@ mod tests {
                 quantity: 2
             }
             .to_pdu(),
-            Err(EncodeError::Address)
+            Err(Error::Address)
         );
         assert_eq!(
             Request::WriteMultipleRegisters {
@@ -1681,7 +1635,7 @@ mod tests {
                 values: vec![]
             }
             .to_pdu(),
-            Err(EncodeError::Quantity)
+            Err(Error::Quantity)
         );
         assert_eq!(
             Request::WriteMultipleCoils {
@@ -1689,7 +1643,7 @@ mod tests {
                 values: vec![]
             }
             .to_pdu(),
-            Err(EncodeError::Quantity)
+            Err(Error::Quantity)
         );
         assert_eq!(
             Request::WriteMultipleCoils {
@@ -1697,7 +1651,7 @@ mod tests {
                 values: vec![true; 2]
             }
             .to_pdu(),
-            Err(EncodeError::Address)
+            Err(Error::Address)
         );
         let last = Request::ReadDiscreteInputs {
             address: 65535,
@@ -1713,8 +1667,8 @@ mod tests {
             unit: 1,
             pdu: vec![],
         };
-        assert_eq!(frame.to_bytes(), Err(EncodeError::EmptyPdu));
-        assert_eq!(frame.reply(vec![]).to_bytes(), Err(EncodeError::EmptyPdu));
+        assert_eq!(frame.to_bytes(), Err(Error::EmptyPdu));
+        assert_eq!(frame.reply(vec![]).to_bytes(), Err(Error::EmptyPdu));
         let one = Frame {
             transaction: 0,
             unit: 1,
@@ -1727,11 +1681,11 @@ mod tests {
     fn review_response_writers_check_the_function() {
         assert_eq!(
             Response::Bits(vec![true]).to_pdu(3),
-            Err(EncodeError::Function(3))
+            Err(Error::Function(3))
         );
         assert_eq!(
             Response::Registers(vec![1]).to_pdu(1),
-            Err(EncodeError::Function(1))
+            Err(Error::Function(1))
         );
         assert_eq!(
             Response::WriteSingleCoil {
@@ -1739,7 +1693,7 @@ mod tests {
                 value: true
             }
             .to_pdu(6),
-            Err(EncodeError::Function(6))
+            Err(Error::Function(6))
         );
         assert_eq!(
             Response::WriteSingleRegister {
@@ -1747,7 +1701,7 @@ mod tests {
                 value: 1
             }
             .to_pdu(5),
-            Err(EncodeError::Function(5))
+            Err(Error::Function(5))
         );
         assert_eq!(
             Response::WriteMultiple {
@@ -1755,11 +1709,11 @@ mod tests {
                 quantity: 1
             }
             .to_pdu(3),
-            Err(EncodeError::Function(3))
+            Err(Error::Function(3))
         );
         assert_eq!(
             Response::Bits(vec![true]).to_pdu(0x81),
-            Err(EncodeError::Function(0x81))
+            Err(Error::Function(0x81))
         );
         // An exception answers any function.
         assert_eq!(
@@ -1771,39 +1725,39 @@ mod tests {
     #[test]
     fn review_responses_check_counts_ranges_and_function() {
         // Empty reads.
-        assert_eq!(Response::parse(&[0x01, 0x00]), Err(ResponseError));
-        assert_eq!(Response::parse(&[0x03, 0x00]), Err(ResponseError));
+        assert_eq!(Response::parse(&[0x01, 0x00]), Err(Error::BadResponse));
+        assert_eq!(Response::parse(&[0x03, 0x00]), Err(Error::BadResponse));
         // More than 2000 coils or 125 registers.
         let mut bits = vec![0x01, 251];
         bits.resize(253, 0);
-        assert_eq!(Response::parse(&bits), Err(ResponseError));
+        assert_eq!(Response::parse(&bits), Err(Error::BadResponse));
         let mut regs = vec![0x03, 252];
         regs.resize(254, 0);
-        assert_eq!(Response::parse(&regs), Err(ResponseError));
+        assert_eq!(Response::parse(&regs), Err(Error::BadResponse));
         // Write acknowledgements of 0, too many, or past address 65535.
-        assert_eq!(Response::parse(&[0x10, 0, 0, 0, 0]), Err(ResponseError));
-        assert_eq!(Response::parse(&[0x10, 0, 0, 0, 124]), Err(ResponseError));
+        assert_eq!(Response::parse(&[0x10, 0, 0, 0, 0]), Err(Error::BadResponse));
+        assert_eq!(Response::parse(&[0x10, 0, 0, 0, 124]), Err(Error::BadResponse));
         assert_eq!(
             Response::parse(&[0x0f, 0, 0, 0x07, 0xb1]),
-            Err(ResponseError)
+            Err(Error::BadResponse)
         );
         assert_eq!(
             Response::parse(&[0x10, 0xff, 0xff, 0, 2]),
-            Err(ResponseError)
+            Err(Error::BadResponse)
         );
         assert!(Response::parse(&[0x0f, 0, 0, 0x07, 0xb0]).is_ok());
         // Function code 0.
-        assert_eq!(Response::parse(&[0x00]), Err(ResponseError));
-        assert_eq!(Response::parse(&[0x00, 1, 2]), Err(ResponseError));
+        assert_eq!(Response::parse(&[0x00]), Err(Error::BadResponse));
+        assert_eq!(Response::parse(&[0x00, 1, 2]), Err(Error::BadResponse));
         // The writers keep to the same limits.
         assert_eq!(
             Response::Bits(vec![false; 2001]).to_pdu(1),
-            Err(EncodeError::Quantity)
+            Err(Error::Quantity)
         );
-        assert_eq!(Response::Bits(vec![]).to_pdu(1), Err(EncodeError::Quantity));
+        assert_eq!(Response::Bits(vec![]).to_pdu(1), Err(Error::Quantity));
         assert_eq!(
             Response::Registers(vec![]).to_pdu(3),
-            Err(EncodeError::Quantity)
+            Err(Error::Quantity)
         );
         assert_eq!(
             Response::WriteMultiple {
@@ -1811,7 +1765,7 @@ mod tests {
                 quantity: 0
             }
             .to_pdu(16),
-            Err(EncodeError::Quantity)
+            Err(Error::Quantity)
         );
         assert_eq!(
             Response::WriteMultiple {
@@ -1819,7 +1773,7 @@ mod tests {
                 quantity: 124
             }
             .to_pdu(16),
-            Err(EncodeError::Quantity)
+            Err(Error::Quantity)
         );
         assert_eq!(
             Response::WriteMultiple {
@@ -1827,11 +1781,11 @@ mod tests {
                 quantity: 2
             }
             .to_pdu(15),
-            Err(EncodeError::Address)
+            Err(Error::Address)
         );
         assert_eq!(
             Response::Other(vec![1]).to_pdu(0),
-            Err(EncodeError::Function(0))
+            Err(Error::Function(0))
         );
         let pdu = Response::Bits(vec![true; 2000]).to_pdu(2).unwrap();
         assert_eq!(
@@ -1846,14 +1800,14 @@ mod tests {
             function: 3,
             data: vec![0, 0, 0, 1],
         };
-        assert_eq!(req.to_pdu(), Err(EncodeError::Function(3)));
+        assert_eq!(req.to_pdu(), Err(Error::Function(3)));
         assert_eq!(
             Request::Other {
                 function: 0,
                 data: vec![]
             }
             .to_pdu(),
-            Err(EncodeError::Function(0))
+            Err(Error::Function(0))
         );
         assert_eq!(
             Request::Other {
@@ -1861,15 +1815,15 @@ mod tests {
                 data: vec![2]
             }
             .to_pdu(),
-            Err(EncodeError::Function(0x83))
+            Err(Error::Function(0x83))
         );
         assert_eq!(
             Response::Other(vec![2, 0, 1]).to_pdu(3),
-            Err(EncodeError::Function(3))
+            Err(Error::Function(3))
         );
         assert_eq!(
             Response::Other(vec![2]).to_pdu(0x83),
-            Err(EncodeError::Function(0x83))
+            Err(Error::Function(0x83))
         );
         // An exception's code is what makes it, so `Other(1)` reads back
         // equal.

@@ -11,13 +11,13 @@ fuzz_target!(|data: &[u8]| {
         514,
     );
     contract::check_decode_with_alloc_limit(
-        || rtcp::Frames::new().map(|frame| Packet::parse(&frame.0)),
+        || rtcp::Frames::new().map(|frame| Demux::parse(&frame.0)),
         data,
         2 * (MAX_PACKET + 2),
     );
     contract::check_wire::<rtcp::Frame>(data);
-    contract::check_wire::<RtpPacket>(data);
     contract::check_wire::<Packet>(data);
+    contract::check_wire::<Demux>(data);
     contract::check_wire::<rtcp::Datagram>(data);
     contract::check_wire::<rtcp::Compound>(data);
     let payload = &data[..data.len().min(MAX_PACKET + 1)];
@@ -41,7 +41,7 @@ fuzz_target!(|data: &[u8]| {
             data: payload.to_vec(),
         }),
     ] {
-        let packet = RtpPacket {
+        let packet = Packet {
             marker: data.len() % 2 == 0,
             payload_type: data.first().copied().unwrap_or(0),
             sequence: 0,
@@ -53,6 +53,6 @@ fuzz_target!(|data: &[u8]| {
             padding: data.get(3).copied().unwrap_or(0),
         };
         contract::check_wire_value(&packet);
-        contract::check_wire_value(&Packet::Rtp(packet));
+        contract::check_wire_value(&Demux::Rtp(packet));
     }
 });

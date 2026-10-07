@@ -3,7 +3,7 @@
 
 use fictionet::stdlib::codec::{Wire, contract, test_support::decode_all};
 use fictionet::stdlib::rtsp::{
-    Error, Frames, Interleaved, Item, MAX_BODY, MAX_HEAD, MAX_INTERLEAVED, MAX_MESSAGE, Message, Range, Session, Transport,
+    Error, Frames, Interleaved, Frame, MAX_BODY, MAX_HEAD, MAX_INTERLEAVED, MAX_MESSAGE, Message, Range, Session, Transport,
     Transports, Version,
 };
 use libfuzzer_sys::fuzz_target;
@@ -12,7 +12,7 @@ fuzz_target!(|data: &[u8]| {
     contract::check_decode_with_alloc_limit(Frames::new, data, 2 * MAX_MESSAGE);
     contract::check_decode_with_held_limit(Frames::new, data, 0);
     contract::check_wire::<Message>(data);
-    contract::check_wire::<Item>(data);
+    contract::check_wire::<Frame>(data);
     contract::check_wire::<Interleaved>(data);
     contract::check_wire::<Session>(data);
     contract::check_wire::<Range>(data);
@@ -54,9 +54,9 @@ fuzz_target!(|data: &[u8]| {
     writers(data);
 });
 
-fn round_trip(item: &Item) {
+fn round_trip(item: &Frame) {
     contract::check_wire_value(item);
-    if let Item::Interleaved(frame) = item {
+    if let Frame::Interleaved(frame) = item {
         frame.to_bytes().unwrap();
         return;
     }
@@ -64,7 +64,7 @@ fn round_trip(item: &Item) {
         assert!(matches!(error, Error::TooLong | Error::TooMany), "{error:?} for {item:?}");
         return;
     }
-    if let Item::Message(message) = item {
+    if let Frame::Message(message) = item {
         if let Ok(value) = message.session() {
             contract::check_wire_value(&value);
             value.to_bytes().unwrap();

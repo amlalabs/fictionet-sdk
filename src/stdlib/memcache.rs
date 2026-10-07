@@ -18,7 +18,7 @@
 //! and writes each [`Response`] back. A client uses
 //! [`Stream<Responses>`](fictionet::stdlib::codec::Stream). Headers accept CRLF or
 //! bare LF; counted data blocks require CRLF. Binary connections use
-//! [`Stream<Frames>`](fictionet::stdlib::codec::Stream). [`UdpFrame`] describes each
+//! [`Stream<Packets>`](fictionet::stdlib::codec::Stream). [`UdpFrame`] describes each
 //! datagram. Cache contents and expiration belong to world code.
 //!
 //! Every reader checks keys, line lengths, numbers and data lengths,
@@ -98,14 +98,14 @@ pub const MAX_DECLARED: usize = i32::MAX as usize - 2;
 /// The most flags one meta command or meta reply may carry.
 pub const MAX_META_FLAGS: usize = 24;
 
-/// Why a text protocol line, or a data block after it, cannot be read or
-/// written.
+/// Why a text protocol line, a data block after it, a binary packet or a
+/// UDP frame cannot be read or written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     /// A writer's line exceeds [`MAX_LINE`], or [`MAX_GET_LINE`] for `get`
     /// or `gets`, including CRLF. Also returned by [`Wire::parse`] for
     /// input beyond [`MAX_TEXT_UNIT`]. Stream readers report overlong
-    /// lines as [`TextFrameError::LineTooLong`].
+    /// lines as [`FrameError::LineTooLong`].
     LineTooLong,
     /// The first word was not a command, or not a reply, this module
     /// knows. An empty line is one too. A command with too few or too many
@@ -139,15 +139,64 @@ pub enum Error {
     /// after its fields pass the writer's checks. The stream readers
     /// ([`Commands`] and [`Responses`]) never yield this.
     Unwritable,
+    /// The text unit ended early.
+    Incomplete,
+    /// Bytes followed the text unit or binary packet.
+    Trailing,
+    /// A binary packet's first byte was neither magic byte. It breaks the
+    /// stream: a reader cannot find where the next packet starts.
+    Magic(u8),
+    /// A binary packet's key was longer than [`MAX_KEY`].
+    KeyLength(usize),
+    /// A binary packet's extras were longer than 255 bytes. Only a writer
+    /// gives this.
+    ExtrasLength(usize),
+    /// A binary packet's body was longer than [`MAX_BODY`], or shorter
+    /// than its extras and key.
+    BodyLength(usize),
+    /// An extras payload has the wrong length.
+    Extras {
+        /// Required bytes for this extras type.
+        expected: usize,
+        /// Bytes supplied by the caller.
+        actual: usize,
+    },
+    /// A datagram was shorter than the 8-byte UDP frame header, by its length.
+    Short(usize),
+    /// A UDP frame's reserved field was not 0.
+    Reserved(u16),
+    /// A UDP frame's total was 0, or its sequence number not below it.
+    Sequence {
+        /// The sequence number.
+        sequence: u16,
+        /// The total.
+        total: u16,
+    },
+    /// A UDP payload was longer than [`MAX_UDP_PAYLOAD`], or a message too
+    /// long to split into 65535 datagrams.
+    PayloadTooLong(usize),
 }
 
 impl Error {
     /// The reply memcached sends a client for this protocol error.
-    /// [`Error::Unwritable`] maps to the generic `ERROR` reply.
+    /// [`Error::Unwritable`], and the errors that only a writer, a binary
+    /// packet or a UDP frame gives, map to the generic `ERROR` reply.
     pub fn reply(self) -> Response {
         match self {
             Error::LineTooLong => Response::ClientError(b"line too long".to_vec()),
-            Error::UnknownCommand | Error::Unwritable => Response::Error,
+            Error::UnknownCommand
+            | Error::Unwritable
+            | Error::Incomplete
+            | Error::Trailing
+            | Error::Magic(_)
+            | Error::KeyLength(_)
+            | Error::ExtrasLength(_)
+            | Error::BodyLength(_)
+            | Error::Extras { .. }
+            | Error::Short(_)
+            | Error::Reserved(_)
+            | Error::Sequence { .. }
+            | Error::PayloadTooLong(_) => Response::Error,
             Error::Format | Error::Key => Response::ClientError(b"bad command line format".to_vec()),
             Error::Delta => Response::ClientError(b"invalid numeric delta argument".to_vec()),
             Error::Exptime => Response::ClientError(b"invalid exptime argument".to_vec()),
@@ -169,6 +218,17 @@ impl std::fmt::Display for Error {
             Error::TooLarge(n) => write!(f, "data block of {n} bytes exceeds the configured limit"),
             Error::Unwritable => f.write_str("value cannot be written without changing it"),
             Error::BadDataChunk => f.write_str("data block not ended by CR LF"),
+            Error::Incomplete => f.write_str("incomplete memcache unit"),
+            Error::Trailing => f.write_str("bytes after memcache unit"),
+            Error::Magic(m) => write!(f, "magic byte {m:#04x}, not 0x80 or 0x81"),
+            Error::KeyLength(n) => write!(f, "key of {n} bytes, over {MAX_KEY}"),
+            Error::ExtrasLength(n) => write!(f, "extras of {n} bytes, over 255"),
+            Error::BodyLength(n) => write!(f, "body length {n}, over {MAX_BODY} or short of extras and key"),
+            Error::Extras { expected, actual } => write!(f, "extras require {expected} bytes, got {actual}"),
+            Error::Short(n) => write!(f, "datagram of {n} bytes, shorter than the {UDP_HEADER_LEN}-byte header"),
+            Error::Reserved(r) => write!(f, "reserved field {r}, not 0"),
+            Error::Sequence { sequence, total } => write!(f, "sequence {sequence} of {total} datagrams"),
+            Error::PayloadTooLong(n) => write!(f, "{n} bytes, too many for UDP"),
         }
     }
 }
@@ -1105,7 +1165,7 @@ pub const RESPONSE_MAGIC: u8 = 0x81;
 /// The longest binary body: the most extras, the longest key and the
 /// longest value.
 pub const MAX_BODY: usize = 255 + MAX_KEY + MAX_VALUE;
-/// The input capacity of [`Frames`]: one packet of the longest
+/// The input capacity of [`Packets`]: one packet of the longest
 /// body, with its header.
 pub const MAX_BINARY_BUFFERED: usize = BINARY_HEADER_LEN + MAX_BODY;
 
@@ -1289,34 +1349,6 @@ impl Status {
     }
 }
 
-/// Why bytes are not a binary packet. Each one breaks the stream: a
-/// reader cannot find where the next packet starts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BinaryError {
-    /// The first byte was neither magic byte.
-    Magic(u8),
-    /// The key was longer than [`MAX_KEY`].
-    KeyLength(usize),
-    /// The extras were longer than 255 bytes. Only a writer gives this.
-    ExtrasLength(usize),
-    /// The body was longer than [`MAX_BODY`], or shorter than its extras
-    /// and key.
-    BodyLength(usize),
-}
-
-impl std::fmt::Display for BinaryError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            BinaryError::Magic(m) => write!(f, "magic byte {m:#04x}, not 0x80 or 0x81"),
-            BinaryError::KeyLength(n) => write!(f, "key of {n} bytes, over {MAX_KEY}"),
-            BinaryError::ExtrasLength(n) => write!(f, "extras of {n} bytes, over 255"),
-            BinaryError::BodyLength(n) => write!(f, "body length {n}, over {MAX_BODY} or short of extras and key"),
-        }
-    }
-}
-
-impl std::error::Error for BinaryError {}
-
 /// One binary protocol packet: the header's fields and the body. The
 /// lengths in the header are worked out from the body, so none is kept.
 /// Reading and writing a packet checks only its framing, not whether its
@@ -1351,9 +1383,9 @@ impl Packet {
     /// Reads the packet at the start of `b`. It returns `Ok(None)` if `b`
     /// holds only part of one, and otherwise the packet and how many bytes
     /// of `b` it took. A bad magic byte is known from the first byte.
-    fn parse_prefix(b: &[u8]) -> Result<Option<(Packet, usize)>, BinaryError> {
+    fn parse_prefix(b: &[u8]) -> Result<Option<(Packet, usize)>, Error> {
         let Some(&m) = b.first() else { return Ok(None) };
-        let magic = Magic::from_byte(m).ok_or(BinaryError::Magic(m))?;
+        let magic = Magic::from_byte(m).ok_or(Error::Magic(m))?;
         if b.len() < BINARY_HEADER_LEN {
             return Ok(None);
         }
@@ -1361,10 +1393,10 @@ impl Packet {
         let extras_len = usize::from(b[4]);
         let body = usize::try_from(be32(b, 8)).unwrap_or(usize::MAX);
         if key_len > MAX_KEY {
-            return Err(BinaryError::KeyLength(key_len));
+            return Err(Error::KeyLength(key_len));
         }
         if body > MAX_BODY || key_len + extras_len > body {
-            return Err(BinaryError::BodyLength(body));
+            return Err(Error::BodyLength(body));
         }
         let end = BINARY_HEADER_LEN + body;
         if b.len() < end {
@@ -1403,21 +1435,6 @@ impl Packet {
     }
 }
 
-/// An extras payload has the wrong length.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ExtrasError {
-    /// Required bytes for this extras type.
-    pub expected: usize,
-    /// Bytes supplied by the caller.
-    pub actual: usize,
-}
-impl core::fmt::Display for ExtrasError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "extras require {} bytes, got {}", self.expected, self.actual)
-    }
-}
-impl core::error::Error for ExtrasError {}
-
 /// The extras of a set, add or replace request: the client's flags and
 /// the expiration time. A get response's extras are the flags alone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1429,12 +1446,12 @@ pub struct StoreExtras {
 }
 
 impl Wire for StoreExtras {
-    type ParseError = ExtrasError;
+    type ParseError = Error;
     type WriteError = core::convert::Infallible;
 
     /// Reads exactly 8 bytes. Refuses every other length.
-    fn parse(extras: &[u8]) -> Result<Self, ExtrasError> {
-        let [a, b, c, d, e, f, g, h] = *extras else { return Err(ExtrasError { expected: 8, actual: extras.len() }) };
+    fn parse(extras: &[u8]) -> Result<Self, Error> {
+        let [a, b, c, d, e, f, g, h] = *extras else { return Err(Error::Extras { expected: 8, actual: extras.len() }) };
         Ok(StoreExtras { flags: u32::from_be_bytes([a, b, c, d]), expiration: u32::from_be_bytes([e, f, g, h]) })
     }
 
@@ -1461,13 +1478,13 @@ pub struct CounterExtras {
 }
 
 impl Wire for CounterExtras {
-    type ParseError = ExtrasError;
+    type ParseError = Error;
     type WriteError = core::convert::Infallible;
 
     /// Reads exactly 20 bytes. Refuses every other length.
-    fn parse(extras: &[u8]) -> Result<Self, ExtrasError> {
+    fn parse(extras: &[u8]) -> Result<Self, Error> {
         if extras.len() != 20 {
-            return Err(ExtrasError { expected: 20, actual: extras.len() });
+            return Err(Error::Extras { expected: 20, actual: extras.len() });
         }
         let u64_at = |i: usize| {
             let mut b = [0; 8];
@@ -1511,70 +1528,38 @@ pub struct UdpFrame {
     pub payload: Vec<u8>,
 }
 
-/// Why a datagram is not a memcached UDP frame.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum UdpError {
-    /// Shorter than the 8-byte header, by its length.
-    Short(usize),
-    /// The reserved field was not 0.
-    Reserved(u16),
-    /// The total was 0, or the sequence number not below it.
-    Sequence {
-        /// The sequence number.
-        sequence: u16,
-        /// The total.
-        total: u16,
-    },
-    /// The payload was longer than [`MAX_UDP_PAYLOAD`], or a message too
-    /// long to split into 65535 datagrams.
-    TooLong(usize),
-}
-
-impl std::fmt::Display for UdpError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            UdpError::Short(n) => write!(f, "datagram of {n} bytes, shorter than the {UDP_HEADER_LEN}-byte header"),
-            UdpError::Reserved(r) => write!(f, "reserved field {r}, not 0"),
-            UdpError::Sequence { sequence, total } => write!(f, "sequence {sequence} of {total} datagrams"),
-            UdpError::TooLong(n) => write!(f, "{n} bytes, too many for UDP"),
-        }
-    }
-}
-
-impl std::error::Error for UdpError {}
-
 impl Wire for UdpFrame {
-    type ParseError = UdpError;
-    type WriteError = UdpError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads a complete datagram. Refuses short headers, nonzero reserved
     /// fields, invalid sequence counts, and payloads over [`MAX_UDP_PAYLOAD`].
-    fn parse(datagram: &[u8]) -> Result<Self, UdpError> {
+    fn parse(datagram: &[u8]) -> Result<Self, Error> {
         if datagram.len() < UDP_HEADER_LEN {
-            return Err(UdpError::Short(datagram.len()));
+            return Err(Error::Short(datagram.len()));
         }
         let (sequence, total, reserved) = (be16(datagram, 2), be16(datagram, 4), be16(datagram, 6));
         if reserved != 0 {
-            return Err(UdpError::Reserved(reserved));
+            return Err(Error::Reserved(reserved));
         }
         if sequence >= total {
-            return Err(UdpError::Sequence { sequence, total });
+            return Err(Error::Sequence { sequence, total });
         }
         let payload = &datagram[UDP_HEADER_LEN..];
         if payload.len() > MAX_UDP_PAYLOAD {
-            return Err(UdpError::TooLong(payload.len()));
+            return Err(Error::PayloadTooLong(payload.len()));
         }
         Ok(UdpFrame { request_id: be16(datagram, 0), sequence, total, payload: payload.to_vec() })
     }
 
     /// Appends one datagram. Refuses invalid sequence counts and payloads
     /// over [`MAX_UDP_PAYLOAD`], leaving `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), UdpError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         if self.sequence >= self.total {
-            return Err(UdpError::Sequence { sequence: self.sequence, total: self.total });
+            return Err(Error::Sequence { sequence: self.sequence, total: self.total });
         }
         if self.payload.len() > MAX_UDP_PAYLOAD {
-            return Err(UdpError::TooLong(self.payload.len()));
+            return Err(Error::PayloadTooLong(self.payload.len()));
         }
         out.extend_from_slice(&self.request_id.to_be_bytes());
         out.extend_from_slice(&self.sequence.to_be_bytes());
@@ -1589,10 +1574,10 @@ impl UdpFrame {
     /// A message split into datagrams of at most [`UDP_MAX_DATAGRAM`]
     /// bytes, numbered in order. An empty message takes one datagram.
     /// Refuses messages that need more than 65535 datagrams.
-    pub fn split(request_id: u16, message: &[u8]) -> Result<Vec<UdpFrame>, UdpError> {
+    pub fn split(request_id: u16, message: &[u8]) -> Result<Vec<UdpFrame>, Error> {
         let chunk = UDP_MAX_DATAGRAM - UDP_HEADER_LEN;
         let count = message.len().div_ceil(chunk).max(1);
-        let total = u16::try_from(count).map_err(|_| UdpError::TooLong(message.len()))?;
+        let total = u16::try_from(count).map_err(|_| Error::PayloadTooLong(message.len()))?;
         let mut frames = Vec::with_capacity(count);
         for sequence in 0..total {
             let from = usize::from(sequence) * chunk;
@@ -1618,13 +1603,13 @@ pub const MAX_TEXT_UNIT: usize = MAX_GET_LINE + MAX_VALUE + 2;
 
 /// A terminal text framing fault.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TextFrameError {
+pub enum FrameError {
     /// A line exceeded its named limit.
     LineTooLong,
     /// EOF interrupted a line, counted block, or skipped block.
     Incomplete,
 }
-impl core::fmt::Display for TextFrameError {
+impl core::fmt::Display for FrameError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match self {
             Self::LineTooLong => "memcache text line too long",
@@ -1632,76 +1617,7 @@ impl core::fmt::Display for TextFrameError {
         })
     }
 }
-impl core::error::Error for TextFrameError {}
-
-/// Why bytes do not contain exactly one complete memcache command.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CommandParseError {
-    /// A text unit was refused.
-    Text(Error),
-    /// Text framing failed.
-    Framing(TextFrameError),
-    /// The unit ended early.
-    Incomplete,
-    /// Bytes followed the unit.
-    Trailing,
-}
-impl core::fmt::Display for CommandParseError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Text(e) => e.fmt(f),
-            Self::Framing(e) => e.fmt(f),
-            Self::Incomplete => f.write_str("incomplete memcache command"),
-            Self::Trailing => f.write_str("bytes after memcache command"),
-        }
-    }
-}
-impl core::error::Error for CommandParseError {}
-
-/// Why bytes do not contain exactly one complete memcache response.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ResponseParseError {
-    /// A text unit was refused.
-    Text(Error),
-    /// Text framing failed.
-    Framing(TextFrameError),
-    /// The unit ended early.
-    Incomplete,
-    /// Bytes followed the unit.
-    Trailing,
-}
-impl core::fmt::Display for ResponseParseError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Text(e) => e.fmt(f),
-            Self::Framing(e) => e.fmt(f),
-            Self::Incomplete => f.write_str("incomplete memcache response"),
-            Self::Trailing => f.write_str("bytes after memcache response"),
-        }
-    }
-}
-impl core::error::Error for ResponseParseError {}
-
-/// Why bytes do not contain exactly one complete memcache packet.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PacketParseError {
-    /// A binary header was refused.
-    Binary(BinaryError),
-    /// The unit ended early.
-    Incomplete,
-    /// Bytes followed the unit.
-    Trailing,
-}
-impl core::fmt::Display for PacketParseError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Binary(e) => e.fmt(f),
-            Self::Incomplete => f.write_str("incomplete memcache packet"),
-            Self::Trailing => f.write_str("bytes after memcache packet"),
-        }
-    }
-}
-impl core::error::Error for PacketParseError {}
+impl core::error::Error for FrameError {}
 
 struct TextUnits<T> {
     lines: codec::Lines,
@@ -1761,14 +1677,14 @@ impl<T> TextUnits<T> {
         head: Head<T>,
         attach: fn(&mut T, Vec<u8>),
         quiet_block: fn(&T) -> bool,
-    ) -> Result<Step<Result<T, Error>>, TextFrameError> {
+    ) -> Result<Step<Result<T, Error>>, FrameError> {
         if self.skip != 0 {
             let n = usize::try_from(self.skip)
                 .unwrap_or(usize::MAX)
                 .min(input.len());
             if n == 0 {
                 return if eof {
-                    Err(TextFrameError::Incomplete)
+                    Err(FrameError::Incomplete)
                 } else {
                     Ok(Step::Need)
                 };
@@ -1782,7 +1698,7 @@ impl<T> TextUnits<T> {
                 let n = remaining.min(input.len());
                 if n == 0 {
                     return if eof {
-                        Err(TextFrameError::Incomplete)
+                        Err(FrameError::Incomplete)
                     } else {
                         Ok(Step::Need)
                     };
@@ -1793,13 +1709,13 @@ impl<T> TextUnits<T> {
             }
             let Some(tail) = input.get(..2) else {
                 return if eof {
-                    Err(TextFrameError::Incomplete)
+                    Err(FrameError::Incomplete)
                 } else {
                     Ok(Step::Need)
                 };
             };
             let Some((mut item, _)) = self.pending.take() else {
-                return Err(TextFrameError::Incomplete);
+                return Err(FrameError::Incomplete);
             };
             self.head_bytes = 0;
             self.quiet = tail != b"\r\n" && quiet_block(&item);
@@ -1854,9 +1770,9 @@ impl<T> TextUnits<T> {
                 }
             }
             Step::Item(Err(codec::LineError::TooLong { .. }), _) => {
-                Err(TextFrameError::LineTooLong)
+                Err(FrameError::LineTooLong)
             }
-            Step::Item(Err(_), _) => Err(TextFrameError::Incomplete),
+            Step::Item(Err(_), _) => Err(FrameError::Incomplete),
             Step::Skip(n) => Ok(Step::Skip(n)),
             Step::Need if self.long_line && input.len() >= MAX_LINE => {
                 // A multiget may span several bounded input windows. Only
@@ -1870,13 +1786,13 @@ impl<T> TextUnits<T> {
                     .len()
                     .saturating_sub(usize::from(input.last() == Some(&b'\r')))
                     .min(remaining);
-                let part = input.get(..n).ok_or(TextFrameError::LineTooLong)?;
+                let part = input.get(..n).ok_or(FrameError::LineTooLong)?;
                 self.partial_line.extend_from_slice(part);
                 self.lines =
                     codec::Lines::new(remaining.saturating_sub(n), codec::Ending::LfOrCrlf);
                 Ok(Step::Skip(n))
             }
-            Step::Need if eof && !self.partial_line.is_empty() => Err(TextFrameError::Incomplete),
+            Step::Need if eof && !self.partial_line.is_empty() => Err(FrameError::Incomplete),
             Step::Need => Ok(Step::Need),
             Step::End => Ok(Step::End),
         }
@@ -1898,7 +1814,7 @@ fn quiet_command(command: &Command) -> bool {
 /// windows under [`MAX_GET_LINE`].
 /// A parsed header supplies its body's exact count. The assembler consumes
 /// that many bytes without interpreting their content. No session mode or
-/// text/binary switch is inferred; choose [`Frames`] for binary streams.
+/// text/binary switch is inferred; choose [`Packets`] for binary streams.
 ///
 /// Bad lines and blocks are error items. Oversized blocks and malformed
 /// meta storage blocks are skipped by their declared count, as memcached
@@ -1948,7 +1864,7 @@ impl Default for Commands {
 
 impl Decode for Commands {
     type Item = Result<Command, Error>;
-    type Error = TextFrameError;
+    type Error = FrameError;
     const NAME: &'static str = "memcache text commands";
     fn capacity(&self) -> usize {
         self.inner.capacity()
@@ -1956,7 +1872,7 @@ impl Decode for Commands {
     fn held(&self) -> usize {
         self.inner.held()
     }
-    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Self::Item>, TextFrameError> {
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Self::Item>, FrameError> {
         self.inner
             .decode(input, eof, parse_command, attach_command, quiet_command)
     }
@@ -2004,7 +1920,7 @@ impl Default for Responses {
 }
 impl Decode for Responses {
     type Item = Result<Response, Error>;
-    type Error = TextFrameError;
+    type Error = FrameError;
     const NAME: &'static str = "memcache text replies";
     fn capacity(&self) -> usize {
         self.inner.capacity()
@@ -2012,62 +1928,54 @@ impl Decode for Responses {
     fn held(&self) -> usize {
         self.inner.held()
     }
-    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Self::Item>, TextFrameError> {
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Self::Item>, FrameError> {
         self.inner
             .decode(input, eof, parse_response, attach_response, |_| false)
     }
 }
 
 /// Reads one text unit under its size limit and refuses trailing bytes.
-fn exact_text<D, T, E>(
-    mut decoder: D,
-    mut bytes: &[u8],
-    text_error: impl Fn(Error) -> E,
-    framing_error: impl Fn(TextFrameError) -> E,
-    incomplete: E,
-    trailing: E,
-) -> Result<T, E>
+fn exact_text<D, T>(mut decoder: D, mut bytes: &[u8]) -> Result<T, Error>
 where
-    D: Decode<Item = Result<T, Error>, Error = TextFrameError>,
+    D: Decode<Item = Result<T, Error>, Error = FrameError>,
 {
     if bytes.len() > MAX_TEXT_UNIT {
-        return Err(text_error(Error::LineTooLong));
+        return Err(Error::LineTooLong);
     }
     loop {
-        match decoder.decode(bytes, true).map_err(&framing_error)? {
-            Step::Item(Err(e), _) => return Err(text_error(e)),
+        match decoder.decode(bytes, true).map_err(|e| match e {
+            FrameError::LineTooLong => Error::LineTooLong,
+            FrameError::Incomplete => Error::Incomplete,
+        })? {
+            Step::Item(Err(e), _) => return Err(e),
             Step::Item(Ok(item), used) if used == bytes.len() => return Ok(item),
-            Step::Item(_, _) => return Err(trailing),
+            Step::Item(_, _) => return Err(Error::Trailing),
             Step::Skip(used) => match bytes.get(used..) {
                 Some(rest) => bytes = rest,
-                None => return Err(incomplete),
+                None => return Err(Error::Incomplete),
             },
-            Step::Need | Step::End => return Err(incomplete),
+            Step::Need | Step::End => return Err(Error::Incomplete),
         }
     }
 }
 
-fn exact_command(bytes: &[u8]) -> Result<Command, CommandParseError> {
+fn exact_command(bytes: &[u8]) -> Result<Command, Error> {
     exact_text(
         Commands::new(),
         bytes,
-        CommandParseError::Text,
-        CommandParseError::Framing,
-        CommandParseError::Incomplete,
-        CommandParseError::Trailing,
     )
 }
 
 impl Wire for Command {
-    type ParseError = CommandParseError;
+    type ParseError = Error;
     type WriteError = Error;
 
     /// Reads exactly one command under the named line and body limits.
     /// Incomplete input and trailing bytes are errors. Re-encodes the value
     /// and refuses commands that do not round trip.
-    fn parse(bytes: &[u8]) -> Result<Self, CommandParseError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         let item = exact_command(bytes)?;
-        item.to_bytes().map_err(CommandParseError::Text)?;
+        item.to_bytes()?;
         Ok(item)
     }
 
@@ -2165,27 +2073,23 @@ impl Wire for Command {
     }
 }
 
-fn exact_response(bytes: &[u8]) -> Result<Response, ResponseParseError> {
+fn exact_response(bytes: &[u8]) -> Result<Response, Error> {
     exact_text(
         Responses::new(),
         bytes,
-        ResponseParseError::Text,
-        ResponseParseError::Framing,
-        ResponseParseError::Incomplete,
-        ResponseParseError::Trailing,
     )
 }
 
 impl Wire for Response {
-    type ParseError = ResponseParseError;
+    type ParseError = Error;
     type WriteError = Error;
 
     /// Reads exactly one response under the named line and body limits.
     /// Incomplete input and trailing bytes are errors. Re-encodes the value
     /// and refuses responses that do not round trip.
-    fn parse(bytes: &[u8]) -> Result<Self, ResponseParseError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         let item = exact_response(bytes)?;
-        item.to_bytes().map_err(ResponseParseError::Text)?;
+        item.to_bytes()?;
         Ok(item)
     }
 
@@ -2262,10 +2166,10 @@ impl Wire for Response {
 /// errors are terminal. Partial packets return
 /// [`Step::Need`], so [`codec::Stream`] reports truncation at EOF.
 #[derive(Clone, Copy, Debug)]
-pub struct Frames {
+pub struct Packets {
     limit: usize,
 }
-impl Frames {
+impl Packets {
     /// Creates a reader with a body limit of [`MAX_BODY`].
     pub fn new() -> Self {
         Self::with_limit(MAX_BODY)
@@ -2281,30 +2185,30 @@ impl Frames {
         self.limit
     }
 }
-impl Default for Frames {
+impl Default for Packets {
     fn default() -> Self {
         Self::new()
     }
 }
-impl Decode for Frames {
+impl Decode for Packets {
     type Item = Packet;
-    type Error = BinaryError;
+    type Error = Error;
     const NAME: &'static str = "memcache binary";
     fn capacity(&self) -> usize {
         BINARY_HEADER_LEN.saturating_add(self.limit)
     }
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Packet>, BinaryError> {
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Packet>, Error> {
         if let Some(&m) = input.first() {
-            Magic::from_byte(m).ok_or(BinaryError::Magic(m))?;
+            Magic::from_byte(m).ok_or(Error::Magic(m))?;
         }
         if let Some(header) = input.get(..BINARY_HEADER_LEN) {
             let key_len = usize::from(be16(header, 2));
             if key_len > MAX_KEY {
-                return Err(BinaryError::KeyLength(key_len));
+                return Err(Error::KeyLength(key_len));
             }
             let body = usize::try_from(be32(header, 8)).unwrap_or(usize::MAX);
             if body > self.limit {
-                return Err(BinaryError::BodyLength(body));
+                return Err(Error::BodyLength(body));
             }
         }
         Ok(match Packet::parse_prefix(input)? {
@@ -2314,32 +2218,32 @@ impl Decode for Frames {
     }
 }
 impl Wire for Packet {
-    type ParseError = PacketParseError;
-    type WriteError = BinaryError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads one binary packet. Refuses invalid magic, keys above
     /// [`MAX_KEY`], bodies above [`MAX_BODY`], a key and extras that exceed
     /// the declared body, incomplete input, and trailing bytes.
-    fn parse(bytes: &[u8]) -> Result<Self, PacketParseError> {
-        match Packet::parse_prefix(bytes).map_err(PacketParseError::Binary)? {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        match Packet::parse_prefix(bytes)? {
             Some((packet, used)) if used == bytes.len() => Ok(packet),
-            Some(_) => Err(PacketParseError::Trailing),
-            None => Err(PacketParseError::Incomplete),
+            Some(_) => Err(Error::Trailing),
+            None => Err(Error::Incomplete),
         }
     }
     /// Appends one binary packet. Refuses keys above [`MAX_KEY`], extras
     /// above 255 bytes, and bodies above [`MAX_BODY`]. Leaves `out`
     /// unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), BinaryError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         if self.key.len() > MAX_KEY {
-            return Err(BinaryError::KeyLength(self.key.len()));
+            return Err(Error::KeyLength(self.key.len()));
         }
-        let extras_len = u8::try_from(self.extras.len()).map_err(|_| BinaryError::ExtrasLength(self.extras.len()))?;
+        let extras_len = u8::try_from(self.extras.len()).map_err(|_| Error::ExtrasLength(self.extras.len()))?;
         let body = self.extras.len().checked_add(self.key.len())
             .and_then(|n| n.checked_add(self.value.len()))
-            .ok_or(BinaryError::BodyLength(usize::MAX))?;
+            .ok_or(Error::BodyLength(usize::MAX))?;
         if body > MAX_BODY {
-            return Err(BinaryError::BodyLength(body));
+            return Err(Error::BodyLength(body));
         }
         out.push(self.magic.byte());
         out.push(self.opcode);
@@ -2660,7 +2564,7 @@ mod tests {
             for end in 1..bytes.len() {
                 assert!(Command::parse(&bytes[..end]).is_err());
                 assert_eq!(decode_all(Commands::new, &bytes[..end]), (
-                    vec![], Some(codec::Fail::Protocol(TextFrameError::Incomplete)),
+                    vec![], Some(codec::Fail::Protocol(FrameError::Incomplete)),
                 ));
             }
         }
@@ -2670,7 +2574,7 @@ mod tests {
             for end in 1..bytes.len() {
                 assert!(Response::parse(&bytes[..end]).is_err());
                 assert_eq!(decode_all(Responses::new, &bytes[..end]), (
-                    vec![], Some(codec::Fail::Protocol(TextFrameError::Incomplete)),
+                    vec![], Some(codec::Fail::Protocol(FrameError::Incomplete)),
                 ));
             }
         }
@@ -2803,15 +2707,15 @@ mod tests {
         assert_eq!(stream.push(&vec![b'a'; MAX_LINE - 1]), MAX_LINE - 1);
         assert_eq!(stream.next(), None);
         assert_eq!(stream.push(b"a"), 1);
-        assert_eq!(stream.next(), Some(Err(codec::Fail::Protocol(TextFrameError::LineTooLong))));
+        assert_eq!(stream.next(), Some(Err(codec::Fail::Protocol(FrameError::LineTooLong))));
         assert_eq!(stream.push(b"version\r\n"), 9);
         assert_eq!(stream.next(), None);
-        assert_eq!(stream.failed(), Some(&codec::Fail::Protocol(TextFrameError::LineTooLong)));
+        assert_eq!(stream.failed(), Some(&codec::Fail::Protocol(FrameError::LineTooLong)));
         let line = [b"stats ".as_slice(), &vec![b'k'; MAX_LINE - 8], b"\r\n"].concat();
         assert!(commands(&line)[0].is_ok());
         let bare = [line[..line.len() - 2].to_vec(), b"k\n".to_vec()].concat();
-        assert_eq!(decode_all(Commands::new, &bare).1, Some(codec::Fail::Protocol(TextFrameError::LineTooLong)));
-        assert_eq!(decode_all(Responses::new, &vec![b'1'; MAX_LINE]).1, Some(codec::Fail::Protocol(TextFrameError::LineTooLong)));
+        assert_eq!(decode_all(Commands::new, &bare).1, Some(codec::Fail::Protocol(FrameError::LineTooLong)));
+        assert_eq!(decode_all(Responses::new, &vec![b'1'; MAX_LINE]).1, Some(codec::Fail::Protocol(FrameError::LineTooLong)));
     }
 
     #[test]
@@ -2911,7 +2815,7 @@ mod tests {
         assert_eq!(resp.to_bytes().unwrap(), GET_RESPONSE);
         assert_eq!(Packet::parse(&GET_RESPONSE).unwrap(), resp);
         for n in 0..GET_REQUEST.len() {
-            assert_eq!(Frames::new().decode(&GET_REQUEST[..n], false), Ok(Step::Need), "{n} bytes");
+            assert_eq!(Packets::new().decode(&GET_REQUEST[..n], false), Ok(Step::Need), "{n} bytes");
         }
     }
 
@@ -2920,11 +2824,11 @@ mod tests {
         let s = StoreExtras { flags: 0xdeadbeef, expiration: 0xe10 };
         assert_eq!(s.to_bytes().unwrap(), [0xde, 0xad, 0xbe, 0xef, 0, 0, 0x0e, 0x10]);
         assert_eq!(StoreExtras::parse(&s.to_bytes().unwrap()), Ok(s));
-        assert_eq!(StoreExtras::parse(&[0; 7]), Err(ExtrasError { expected: 8, actual: 7 }));
+        assert_eq!(StoreExtras::parse(&[0; 7]), Err(Error::Extras { expected: 8, actual: 7 }));
         let c = CounterExtras { delta: 1, initial: 0, expiration: 0xe10 };
         assert_eq!(c.to_bytes().unwrap()[7], 1);
         assert_eq!(CounterExtras::parse(&c.to_bytes().unwrap()), Ok(c));
-        assert_eq!(CounterExtras::parse(&[0; 21]), Err(ExtrasError { expected: 20, actual: 21 }));
+        assert_eq!(CounterExtras::parse(&[0; 21]), Err(Error::Extras { expected: 20, actual: 21 }));
         for code in 0..=u16::MAX {
             assert_eq!(Status::from_code(code).code(), code);
         }
@@ -2932,30 +2836,30 @@ mod tests {
 
     #[test]
     fn binary_errors() {
-        assert_eq!(Packet::parse(&[0x82]), Err(PacketParseError::Binary(BinaryError::Magic(0x82))));
+        assert_eq!(Packet::parse(&[0x82]), Err(Error::Magic(0x82)));
         let mut h = GET_REQUEST;
         h[2..4].copy_from_slice(&251u16.to_be_bytes());
         h[8..12].copy_from_slice(&300u32.to_be_bytes());
-        assert_eq!(Packet::parse(&h), Err(PacketParseError::Binary(BinaryError::KeyLength(251))));
+        assert_eq!(Packet::parse(&h), Err(Error::KeyLength(251)));
         let mut h = GET_REQUEST;
         h[4] = 1; // extras and key past the body
-        assert_eq!(Packet::parse(&h), Err(PacketParseError::Binary(BinaryError::BodyLength(5))));
+        assert_eq!(Packet::parse(&h), Err(Error::BodyLength(5)));
         let mut h = GET_REQUEST;
         h[8..12].copy_from_slice(&u32::MAX.to_be_bytes());
-        assert_eq!(Packet::parse(&h), Err(PacketParseError::Binary(BinaryError::BodyLength(u32::MAX as usize))));
+        assert_eq!(Packet::parse(&h), Err(Error::BodyLength(u32::MAX as usize)));
         let mut p = Packet::parse(&GET_REQUEST).unwrap();
         p.extras = vec![0; 256];
-        assert_eq!(p.to_bytes(), Err(BinaryError::ExtrasLength(256)));
+        assert_eq!(p.to_bytes(), Err(Error::ExtrasLength(256)));
         p.extras = vec![];
         p.key = vec![0; MAX_KEY + 1];
-        assert_eq!(p.to_bytes(), Err(BinaryError::KeyLength(MAX_KEY + 1)));
+        assert_eq!(p.to_bytes(), Err(Error::KeyLength(MAX_KEY + 1)));
         p.key = vec![];
         p.value = vec![0; MAX_BODY + 1];
-        assert_eq!(p.to_bytes(), Err(BinaryError::BodyLength(MAX_BODY + 1)));
+        assert_eq!(p.to_bytes(), Err(Error::BodyLength(MAX_BODY + 1)));
         p.value = vec![0; MAX_BODY];
         assert!(Packet::parse(&p.to_bytes().unwrap()).is_ok());
         for e in
-            [BinaryError::Magic(0), BinaryError::KeyLength(1), BinaryError::ExtrasLength(1), BinaryError::BodyLength(1)]
+            [Error::Magic(0), Error::KeyLength(1), Error::ExtrasLength(1), Error::BodyLength(1)]
         {
             assert!(!e.to_string().is_empty());
         }
@@ -2964,16 +2868,16 @@ mod tests {
     #[test]
     fn binary_decoder() {
         let bytes = [GET_REQUEST.as_slice(), GET_RESPONSE.as_slice()].concat();
-        let (packets, failure) = decode_all(Frames::new, &bytes);
+        let (packets, failure) = decode_all(Packets::new, &bytes);
         assert_eq!(failure, None);
         assert_eq!(packets.iter().map(|p| p.magic).collect::<Vec<_>>(), [Magic::Request, Magic::Response]);
-        contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_BINARY_BUFFERED);
-        let mut stream = Stream::new(Frames::new());
+        contract::check_decode_with_alloc_limit(Packets::new, &bytes, 2 * MAX_BINARY_BUFFERED);
+        let mut stream = Stream::new(Packets::new());
         assert_eq!(stream.push(&[0]), 1);
-        assert_eq!(stream.next(), Some(Err(codec::Fail::Protocol(BinaryError::Magic(0)))));
+        assert_eq!(stream.next(), Some(Err(codec::Fail::Protocol(Error::Magic(0)))));
         assert_eq!(stream.push(&GET_REQUEST), GET_REQUEST.len());
         assert!(stream.next().is_none());
-        assert_eq!(stream.failed(), Some(&codec::Fail::Protocol(BinaryError::Magic(0))));
+        assert_eq!(stream.failed(), Some(&codec::Fail::Protocol(Error::Magic(0))));
     }
 
     #[test]
@@ -2982,18 +2886,18 @@ mod tests {
         assert_eq!(f, UdpFrame { request_id: 7, sequence: 0, total: 1, payload: b"get a\r\n".to_vec() });
         assert_eq!(f.to_bytes().unwrap(), b"\x00\x07\x00\x00\x00\x01\x00\x00get a\r\n");
         for n in 0..UDP_HEADER_LEN {
-            assert_eq!(UdpFrame::parse(&[0; 8][..n]), Err(UdpError::Short(n)));
+            assert_eq!(UdpFrame::parse(&[0; 8][..n]), Err(Error::Short(n)));
         }
-        assert_eq!(UdpFrame::parse(&[0, 0, 0, 0, 0, 1, 0, 1]), Err(UdpError::Reserved(1)));
-        assert_eq!(UdpFrame::parse(&[0, 0, 0, 1, 0, 1, 0, 0]), Err(UdpError::Sequence { sequence: 1, total: 1 }));
-        assert_eq!(UdpFrame::parse(&[0; 8]), Err(UdpError::Sequence { sequence: 0, total: 0 }));
+        assert_eq!(UdpFrame::parse(&[0, 0, 0, 0, 0, 1, 0, 1]), Err(Error::Reserved(1)));
+        assert_eq!(UdpFrame::parse(&[0, 0, 0, 1, 0, 1, 0, 0]), Err(Error::Sequence { sequence: 1, total: 1 }));
+        assert_eq!(UdpFrame::parse(&[0; 8]), Err(Error::Sequence { sequence: 0, total: 0 }));
         let mut long = vec![0, 0, 0, 0, 0, 1, 0, 0];
         long.extend(vec![0; MAX_UDP_PAYLOAD + 1]);
-        assert_eq!(UdpFrame::parse(&long), Err(UdpError::TooLong(MAX_UDP_PAYLOAD + 1)));
+        assert_eq!(UdpFrame::parse(&long), Err(Error::PayloadTooLong(MAX_UDP_PAYLOAD + 1)));
         let bad = UdpFrame { request_id: 0, sequence: 2, total: 2, payload: vec![] };
-        assert_eq!(bad.to_bytes(), Err(UdpError::Sequence { sequence: 2, total: 2 }));
+        assert_eq!(bad.to_bytes(), Err(Error::Sequence { sequence: 2, total: 2 }));
         let bad = UdpFrame { request_id: 0, sequence: 0, total: 1, payload: vec![0; MAX_UDP_PAYLOAD + 1] };
-        assert_eq!(bad.to_bytes(), Err(UdpError::TooLong(MAX_UDP_PAYLOAD + 1)));
+        assert_eq!(bad.to_bytes(), Err(Error::PayloadTooLong(MAX_UDP_PAYLOAD + 1)));
         // A reply split and put back together.
         let message: Vec<u8> = (0..5000u32).map(|i| i as u8).collect();
         let frames = UdpFrame::split(9, &message).unwrap();
@@ -3009,10 +2913,10 @@ mod tests {
         assert_eq!(back, message);
         assert_eq!(UdpFrame::split(1, b"").unwrap().len(), 1);
         for e in [
-            UdpError::Short(1),
-            UdpError::Reserved(1),
-            UdpError::Sequence { sequence: 1, total: 0 },
-            UdpError::TooLong(1),
+            Error::Short(1),
+            Error::Reserved(1),
+            Error::Sequence { sequence: 1, total: 0 },
+            Error::PayloadTooLong(1),
         ] {
             assert!(!e.to_string().is_empty());
         }
@@ -3088,12 +2992,12 @@ mod tests {
         let mut rng = Lcg::new(2);
         for _ in 0..4000 {
             let bytes = fuzz_buffer(&mut rng, &pieces);
-            contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_BINARY_BUFFERED);
+            contract::check_decode_with_alloc_limit(Packets::new, &bytes, 2 * MAX_BINARY_BUFFERED);
             contract::check_wire::<Packet>(&bytes);
             contract::check_wire::<UdpFrame>(&bytes);
             contract::check_wire::<StoreExtras>(&bytes);
             contract::check_wire::<CounterExtras>(&bytes);
-            for packet in decode_all(Frames::new, &bytes).0 {
+            for packet in decode_all(Packets::new, &bytes).0 {
                 contract::check_wire_value(&packet);
                 contract::check_wire::<StoreExtras>(&packet.extras);
                 contract::check_wire::<CounterExtras>(&packet.extras);
@@ -3113,12 +3017,12 @@ mod tests {
         assert_eq!(stream.push(&bytes), MAX_LINE);
         assert_eq!(stream.push(&bytes), 0);
         assert_eq!(commands(&bytes).len(), MAX_LINE);
-        contract::check_decode_with_alloc_limit(Frames::new, &[0; 4096], 2 * MAX_BINARY_BUFFERED);
+        contract::check_decode_with_alloc_limit(Packets::new, &[0; 4096], 2 * MAX_BINARY_BUFFERED);
         let mut packet = Packet::parse(&GET_REQUEST).unwrap();
         packet.value = vec![0; MAX_BODY - packet.key.len()];
         let bytes = packet.to_bytes().unwrap();
-        assert_eq!(decode_all(Frames::new, &bytes), (vec![packet], None));
-        contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_BINARY_BUFFERED);
+        assert_eq!(decode_all(Packets::new, &bytes), (vec![packet], None));
+        contract::check_decode_with_alloc_limit(Packets::new, &bytes, 2 * MAX_BINARY_BUFFERED);
     }
 
     /// The loop of the module's example: replies for every command, until
@@ -3344,10 +3248,10 @@ mod tests {
         // than 100 spaces, and one past MAX_GET_LINE.
         let mut far = format!("{}get", " ".repeat(101)).into_bytes();
         far.extend_from_slice(&bytes[3..]);
-        assert_eq!(decode_all(Commands::new, &far).1, Some(codec::Fail::Protocol(TextFrameError::LineTooLong)));
+        assert_eq!(decode_all(Commands::new, &far).1, Some(codec::Fail::Protocol(FrameError::LineTooLong)));
         let mut gat = b"gat 0".to_vec();
         gat.extend_from_slice(&bytes[3..]);
-        assert_eq!(decode_all(Commands::new, &gat).1, Some(codec::Fail::Protocol(TextFrameError::LineTooLong)));
+        assert_eq!(decode_all(Commands::new, &gat).1, Some(codec::Fail::Protocol(FrameError::LineTooLong)));
         let huge = vec![vec![b'k'; MAX_KEY]; MAX_GET_LINE / MAX_KEY];
         assert_eq!(Command::Get { keys: huge.clone(), cas: false }.to_bytes(), Err(Error::LineTooLong));
         let mut line = b"get".to_vec();
@@ -3356,8 +3260,8 @@ mod tests {
             line.extend_from_slice(k);
         }
         line.extend_from_slice(b"\r\n");
-        assert_eq!(decode_all(Commands::new, &line).1, Some(codec::Fail::Protocol(TextFrameError::LineTooLong)));
+        assert_eq!(decode_all(Commands::new, &line).1, Some(codec::Fail::Protocol(FrameError::LineTooLong)));
         // Replies are held to MAX_LINE.
-        assert_eq!(decode_all(Responses::new, &bytes).1, Some(codec::Fail::Protocol(TextFrameError::LineTooLong)));
+        assert_eq!(decode_all(Responses::new, &bytes).1, Some(codec::Fail::Protocol(FrameError::LineTooLong)));
     }
 }

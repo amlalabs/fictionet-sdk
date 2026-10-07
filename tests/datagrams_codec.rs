@@ -100,7 +100,7 @@ fn geneve_datagram() {
     header.push(0);
     assert_eq!(
         geneve::Header::parse(&header),
-        Err(geneve::GeneveError::Trailing { remaining: 1 })
+        Err(geneve::Error::Trailing { remaining: 1 })
     );
     parse_failure::<geneve::Header>(&header, geneve::MAX_HEADER_LEN);
     parse_failure::<geneve::Packet>(&[], geneve::MAX_DATAGRAM);
@@ -112,7 +112,7 @@ fn geneve_datagram() {
 #[test]
 fn gre_packets_and_exact_pptp_boundary() {
     let packet = gre::Packet {
-        header: gre::Header::Gre(gre::GreHeader {
+        header: gre::Header::Gre(gre::PlainHeader {
             protocol: gre::protocol::IPV4,
             checksum: true,
             key: Some(7),
@@ -133,7 +133,7 @@ fn gre_packets_and_exact_pptp_boundary() {
     padded.extend_from_slice(&[0, 0]);
     assert_eq!(
         <gre::Packet as Wire>::parse(&padded),
-        Err(gre::GreError::Trailing { remaining: 2 })
+        Err(gre::Error::Trailing { remaining: 2 })
     );
     parse_failure::<gre::Packet>(&padded, gre::MAX_PACKET);
     parse_failure::<gre::Packet>(&[], gre::MAX_PACKET);
@@ -191,7 +191,7 @@ fn igmp_versions_auxiliary_data_and_exact_boundary() {
         igmp_checksum(&mut padded);
         assert_eq!(
             <igmp::Message as Wire>::parse(&padded),
-            Err(igmp::IgmpError::Trailing { remaining: 4 })
+            Err(igmp::Error::Trailing { remaining: 4 })
         );
         parse_failure::<igmp::Message>(&padded, igmp::MAX_MESSAGE);
     }
@@ -234,7 +234,7 @@ fn ipsec_carriers() {
     header.push(0);
     assert_eq!(
         ipsec::AhHeader::parse(&header),
-        Err(ipsec::IpsecError::Trailing { remaining: 1 })
+        Err(ipsec::Error::Trailing { remaining: 1 })
     );
     parse_failure::<ipsec::AhHeader>(&header, ipsec::MAX_AH_LEN);
     let plain = ipsec::Plaintext::padded(vec![1, 2, 3], 4, 8).unwrap();
@@ -353,7 +353,7 @@ fn ospf_context_stays_in_the_mapping() {
         *bytes.get_mut(12).unwrap() ^= 1;
         assert_eq!(
             ospf::Packet::parse(&bytes, &endpoints),
-            Err(ospf::OspfError::Checksum)
+            Err(ospf::Error::Checksum)
         );
         context_round_trip::<ospf::Datagram, _, _>(&bytes, ospf::MAX_MESSAGE, |b| {
             ospf::Packet::parse(b, &endpoints)
@@ -389,7 +389,7 @@ fn pim_context_stays_in_the_mapping() {
         *bytes.get_mut(2).unwrap() ^= 1;
         assert_eq!(
             pim::Message::parse(&bytes, &endpoints),
-            Err(pim::PimError::Checksum)
+            Err(pim::Error::Checksum)
         );
         context_round_trip::<pim::Datagram, _, _>(&bytes, pim::MAX_MESSAGE, |b| {
             pim::Message::parse(b, &endpoints)
@@ -455,7 +455,7 @@ fn vrrp_context_stays_in_the_mapping() {
         *bytes.get_mut(6).unwrap() ^= 1;
         assert_eq!(
             vrrp::Advertisement::parse(&bytes, &endpoints),
-            Err(vrrp::VrrpError::Checksum)
+            Err(vrrp::Error::Checksum)
         );
         context_round_trip::<vrrp::Datagram, _, _>(&bytes, vrrp::MAX_MESSAGE, |b| {
             vrrp::Advertisement::parse(b, &endpoints)
@@ -463,7 +463,7 @@ fn vrrp_context_stays_in_the_mapping() {
         bytes.push(0);
         assert_eq!(
             vrrp::Advertisement::parse(&bytes, &endpoints),
-            Err(vrrp::VrrpError::Trailing { remaining: 1 })
+            Err(vrrp::Error::Trailing { remaining: 1 })
         );
         context_round_trip::<vrrp::Datagram, _, _>(&bytes, vrrp::MAX_MESSAGE, |b| {
             vrrp::Advertisement::parse(b, &endpoints)
@@ -496,12 +496,12 @@ fn wake_on_lan_payload_and_exact_packet() {
         let mut payload = b"prefix".to_vec();
         payload.extend_from_slice(&bytes);
         contract::check_decode_with_alloc_limit(
-            wol::Packets::new,
+            wol::MagicPackets::new,
             &payload,
-            2 * wol::Packets::new().capacity(),
+            2 * wol::MagicPackets::new().capacity(),
         );
         assert!(<wol::MagicPacket as Wire>::parse(&payload).is_err());
-        let mut stream = Stream::new(wol::Packets::new());
+        let mut stream = Stream::new(wol::MagicPackets::new());
         pump(&mut stream, &payload, |_| panic!("packet before EOF")).unwrap();
         let mut got = Vec::new();
         finish(&mut stream, |p| got.push(p)).unwrap();
@@ -517,18 +517,18 @@ fn wake_on_lan_payload_and_exact_packet() {
         payload.extend(vec![7; tail]);
         assert!(<wol::MagicPacket as Wire>::parse(&payload).is_err());
         assert_eq!(
-            decode_all(wol::Packets::new, &payload),
+            decode_all(wol::MagicPackets::new, &payload),
             (vec![(0, wol::MagicPacket::new(MAC))], None)
         );
     }
     contract::check_decode_with_alloc_limit(
-        wol::Packets::new,
+        wol::MagicPackets::new,
         b"no packet",
-        2 * wol::Packets::new().capacity(),
+        2 * wol::MagicPackets::new().capacity(),
     );
     assert_eq!(
-        decode_all(wol::Packets::new, b"no packet"),
-        (vec![], Some(Fail::Protocol(wol::ParseError::NotFound)))
+        decode_all(wol::MagicPackets::new, b"no packet"),
+        (vec![], Some(Fail::Protocol(wol::Error::NotFound)))
     );
 }
 
@@ -537,7 +537,7 @@ fn wake_on_lan_rejects_oversize_payload() {
     let mut payload = vec![0; wol::MAX_PAYLOAD - wol::PACKET_LEN];
     payload.extend(wol::MagicPacket::new(MAC).to_bytes().unwrap());
     assert_eq!(
-        decode_all(wol::Packets::new, &payload),
+        decode_all(wol::MagicPackets::new, &payload),
         (
             vec![(
                 wol::MAX_PAYLOAD - wol::PACKET_LEN,
@@ -547,18 +547,18 @@ fn wake_on_lan_rejects_oversize_payload() {
         )
     );
     payload.push(0);
-    let mut stream = Stream::new(wol::Packets::new());
+    let mut stream = Stream::new(wol::MagicPackets::new());
     assert_eq!(stream.decoder().capacity(), wol::MAX_PAYLOAD + 1);
     assert_eq!(stream.push(&payload), wol::MAX_PAYLOAD + 1);
     assert_eq!(
         stream.next(),
-        Some(Err(Fail::Protocol(wol::ParseError::TooLong)))
+        Some(Err(Fail::Protocol(wol::Error::TooLong)))
     );
     assert!(stream.next().is_none());
     contract::check_decode_with_alloc_limit(
-        wol::Packets::new,
+        wol::MagicPackets::new,
         &payload,
-        2 * wol::Packets::new().capacity(),
+        2 * wol::MagicPackets::new().capacity(),
     );
 }
 
@@ -576,15 +576,15 @@ fn wake_on_lan_contracts_on_mutated_payloads() {
         let end = rng.index(bytes.len() + 1);
         bytes.truncate(end);
         contract::check_decode_with_alloc_limit(
-            wol::Packets::new,
+            wol::MagicPackets::new,
             &bytes,
-            2 * wol::Packets::new().capacity(),
+            2 * wol::MagicPackets::new().capacity(),
         );
         // Adapter consistency: the decoder finds the packet as `find` does.
         let expected = match wol::MagicPacket::find(&bytes) {
             Ok(packet) => (vec![packet], None),
             Err(e) => (vec![], Some(Fail::Protocol(e))),
         };
-        assert_eq!(decode_all(wol::Packets::new, &bytes), expected);
+        assert_eq!(decode_all(wol::MagicPackets::new, &bytes), expected);
     }
 }

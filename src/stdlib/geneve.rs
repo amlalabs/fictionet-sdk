@@ -120,12 +120,12 @@ impl GeneveOption {
 
     /// Checks that the option can be written: its type fits in 7 bits and
     /// its data is a multiple of 4 bytes, at most [`MAX_OPTION_DATA`].
-    pub fn check(&self) -> Result<(), GeneveError> {
+    pub fn check(&self) -> Result<(), Error> {
         if self.kind > MAX_OPTION_KIND {
-            return Err(GeneveError::OptionType(self.kind));
+            return Err(Error::OptionType(self.kind));
         }
         if self.data.len() > MAX_OPTION_DATA || !self.data.len().is_multiple_of(4) {
-            return Err(GeneveError::OptionData(self.data.len()));
+            return Err(Error::OptionData(self.data.len()));
         }
         Ok(())
     }
@@ -150,7 +150,7 @@ pub struct Header {
 
 /// Why bytes are not a Geneve packet, or why a packet cannot be written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum GeneveError {
+pub enum Error {
     /// The bytes end before the header and its options do.
     Truncated,
     /// Bytes follow a standalone header.
@@ -180,46 +180,46 @@ pub enum GeneveError {
     OptionsLength(usize),
 }
 
-impl std::fmt::Display for GeneveError {
+impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            GeneveError::Trailing { remaining } => {
+            Error::Trailing { remaining } => {
                 write!(f, "{remaining} bytes after the Geneve header")
             }
-            GeneveError::Truncated => f.write_str("bytes end inside the Geneve header"),
-            GeneveError::Version(v) => write!(f, "Geneve version {v}, not 0"),
-            GeneveError::OptionOverrun(at) => {
+            Error::Truncated => f.write_str("bytes end inside the Geneve header"),
+            Error::Version(v) => write!(f, "Geneve version {v}, not 0"),
+            Error::OptionOverrun(at) => {
                 write!(f, "option at offset {at} runs past the option length")
             }
-            GeneveError::CriticalBit(true) => f.write_str("C bit set, but no option is critical"),
-            GeneveError::CriticalBit(false) => f.write_str("a critical option, but the C bit is clear"),
-            GeneveError::TooLong => write!(f, "datagram longer than {MAX_DATAGRAM} bytes"),
-            GeneveError::Vni(v) => write!(f, "VNI {v} does not fit in 24 bits"),
-            GeneveError::OptionType(t) => write!(f, "option type {t} does not fit in 7 bits"),
-            GeneveError::OptionData(n) => {
+            Error::CriticalBit(true) => f.write_str("C bit set, but no option is critical"),
+            Error::CriticalBit(false) => f.write_str("a critical option, but the C bit is clear"),
+            Error::TooLong => write!(f, "datagram longer than {MAX_DATAGRAM} bytes"),
+            Error::Vni(v) => write!(f, "VNI {v} does not fit in 24 bits"),
+            Error::OptionType(t) => write!(f, "option type {t} does not fit in 7 bits"),
+            Error::OptionData(n) => {
                 write!(f, "option data of {n} bytes, not a multiple of 4 up to {MAX_OPTION_DATA}")
             }
-            GeneveError::OptionsLength(n) => {
+            Error::OptionsLength(n) => {
                 write!(f, "options of {n} bytes, more than {MAX_OPTIONS_LEN}")
             }
         }
     }
 }
 
-impl std::error::Error for GeneveError {}
+impl std::error::Error for Error {}
 
 impl Header {
     /// Reads the header at the start of `b`. It returns `Ok(None)` if `b`
     /// holds only part of one, and otherwise the header and how many bytes
     /// of `b` it took. An error is returned as soon as the bytes so far
     /// show it, so a longer `b` with the same start gives the same error.
-    pub fn parse_prefix(b: &[u8]) -> Result<Option<(Header, usize)>, GeneveError> {
+    pub fn parse_prefix(b: &[u8]) -> Result<Option<(Header, usize)>, Error> {
         let Some(&first) = b.first() else {
             return Ok(None);
         };
         let version = first >> 6;
         if version != VERSION {
-            return Err(GeneveError::Version(version));
+            return Err(Error::Version(version));
         }
         let Some(&flags) = b.get(1) else {
             return Ok(None);
@@ -237,20 +237,20 @@ impl Header {
             };
             let next = at + OPTION_HEADER_LEN + usize::from(h[3] & 0x1f) * 4;
             if next > end {
-                return Err(GeneveError::OptionOverrun(at));
+                return Err(Error::OptionOverrun(at));
             }
             if h[2] & 0x80 != 0 {
                 // A critical option under a clear C bit shows here, before
                 // the options after it come.
                 if !c_bit {
-                    return Err(GeneveError::CriticalBit(false));
+                    return Err(Error::CriticalBit(false));
                 }
                 any_critical = true;
             }
             at = next;
         }
         if any_critical != c_bit {
-            return Err(GeneveError::CriticalBit(c_bit));
+            return Err(Error::CriticalBit(c_bit));
         }
         let Some(fixed) = b.get(..BASE_HEADER_LEN) else {
             return Ok(None);
@@ -264,7 +264,7 @@ impl Header {
             let n = usize::from(len & 0x1f) * 4;
             let Some((data, after)) = tail.split_at_checked(n) else {
                 // The walk above already checked every length.
-                return Err(GeneveError::OptionOverrun(end - rest.len()));
+                return Err(Error::OptionOverrun(end - rest.len()));
             };
             options.push(GeneveOption {
                 class: u16::from_be_bytes([*c0, *c1]),
@@ -285,12 +285,12 @@ impl Header {
 
     /// Reads the header at the start of `b` and returns it with the bytes
     /// after it: the inner payload. A `b` too short for the header is
-    /// [`GeneveError::Truncated`], and one longer than [`MAX_DATAGRAM`]
-    /// is [`GeneveError::TooLong`].
-    pub fn split(b: &[u8]) -> Result<(Header, &[u8]), GeneveError> {
+    /// [`Error::Truncated`], and one longer than [`MAX_DATAGRAM`]
+    /// is [`Error::TooLong`].
+    pub fn split(b: &[u8]) -> Result<(Header, &[u8]), Error> {
         match Header::parse_prefix(b)? {
-            None => Err(GeneveError::Truncated),
-            Some(_) if b.len() > MAX_DATAGRAM => Err(GeneveError::TooLong),
+            None => Err(Error::Truncated),
+            Some(_) if b.len() > MAX_DATAGRAM => Err(Error::TooLong),
             Some((header, used)) => Ok((header, b.get(used..).unwrap_or(&[]))),
         }
     }
@@ -325,16 +325,16 @@ impl Header {
     /// Checks that the header can be written: the VNI fits in 24 bits,
     /// each option passes [`GeneveOption::check`], and the options fit in
     /// [`MAX_OPTIONS_LEN`].
-    pub fn check(&self) -> Result<(), GeneveError> {
+    pub fn check(&self) -> Result<(), Error> {
         if self.vni > MAX_VNI {
-            return Err(GeneveError::Vni(self.vni));
+            return Err(Error::Vni(self.vni));
         }
         for o in &self.options {
             o.check()?;
         }
         let n = self.options_len();
         if n > MAX_OPTIONS_LEN {
-            return Err(GeneveError::OptionsLength(n));
+            return Err(Error::OptionsLength(n));
         }
         Ok(())
     }
@@ -365,23 +365,23 @@ impl Packet {
 }
 
 impl Wire for Packet {
-    type ParseError = GeneveError;
-    type WriteError = GeneveError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads a whole datagram and copies the payload after the header.
     /// Refuses an invalid header or a datagram above [`MAX_DATAGRAM`].
-    fn parse(b: &[u8]) -> Result<Self, GeneveError> {
+    fn parse(b: &[u8]) -> Result<Self, Error> {
         let (header, payload) = Header::split(b)?;
         Ok(Packet { header, payload: payload.to_vec() })
     }
 
     /// Appends a datagram after [`Header::check`]. Refuses a datagram above
     /// [`MAX_DATAGRAM`]. Leaves `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), GeneveError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         self.header.check()?;
         let total = self.header.len().saturating_add(self.payload.len());
         if total > MAX_DATAGRAM {
-            return Err(GeneveError::TooLong);
+            return Err(Error::TooLong);
         }
         out.reserve(total);
         self.header.write(out)?;
@@ -391,15 +391,15 @@ impl Wire for Packet {
 }
 
 impl Wire for Header {
-    type ParseError = GeneveError;
-    type WriteError = GeneveError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads a standalone header. Refuses truncation, invalid options,
     /// an unsupported version, and bytes after the header.
-    fn parse(b: &[u8]) -> Result<Self, GeneveError> {
-        let (header, used) = Self::parse_prefix(b)?.ok_or(GeneveError::Truncated)?;
+    fn parse(b: &[u8]) -> Result<Self, Error> {
+        let (header, used) = Self::parse_prefix(b)?.ok_or(Error::Truncated)?;
         if used != b.len() {
-            return Err(GeneveError::Trailing { remaining: b.len() - used });
+            return Err(Error::Trailing { remaining: b.len() - used });
         }
         Ok(header)
     }
@@ -407,7 +407,7 @@ impl Wire for Header {
     /// Appends the header after [`Header::check`]. Refuses a VNI, option
     /// type, option length, or total option size that cannot fit its field.
     /// Leaves `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), GeneveError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         self.check()?;
         // check() bounds the options to 252 bytes, so this is at most 63.
         let words = (self.options_len() / 4) as u8;
@@ -436,7 +436,7 @@ mod tests {
         test_support::{decode_all, mutate},
     };
 
-    fn collect(b: &[u8]) -> Result<Packet, GeneveError> {
+    fn collect(b: &[u8]) -> Result<Packet, Error> {
         let make = || Collect::<Packet>::new(MAX_DATAGRAM);
         contract::check_decode_with_alloc_limit(make, b, 2 * (MAX_DATAGRAM + 1));
         contract::check_wire::<Packet>(b);
@@ -550,9 +550,9 @@ mod tests {
     fn bad_version() {
         for v in 1..4u8 {
             let b = [v << 6, 0, 0x65, 0x58, 0, 0, 0, 0];
-            assert_eq!(Packet::parse(&b), Err(GeneveError::Version(v)));
+            assert_eq!(Packet::parse(&b), Err(Error::Version(v)));
             // Known from the first byte.
-            assert_eq!(Header::parse_prefix(&b[..1]), Err(GeneveError::Version(v)));
+            assert_eq!(Header::parse_prefix(&b[..1]), Err(Error::Version(v)));
         }
     }
 
@@ -560,27 +560,27 @@ mod tests {
     fn option_overrun() {
         // Opt Len 1 word, but the option says it has 1 word of data.
         let b = [0x01, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0x01, 0, 0, 0, 0];
-        assert_eq!(Packet::parse(&b), Err(GeneveError::OptionOverrun(8)));
+        assert_eq!(Packet::parse(&b), Err(Error::OptionOverrun(8)));
         // Known from the option's header, before its data.
-        assert_eq!(Header::parse_prefix(&b[..12]), Err(GeneveError::OptionOverrun(8)));
+        assert_eq!(Header::parse_prefix(&b[..12]), Err(Error::OptionOverrun(8)));
         // The second option overruns.
         let b = [0x02, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0x1f];
-        assert_eq!(Packet::parse(&b), Err(GeneveError::OptionOverrun(12)));
+        assert_eq!(Packet::parse(&b), Err(Error::OptionOverrun(12)));
     }
 
     #[test]
     fn critical_bit_must_match() {
         // A critical option with the C bit clear.
         let b = [0x01, 0x00, 0, 0, 0, 0, 0, 0, 0, 1, 0x81, 0];
-        assert_eq!(Packet::parse(&b), Err(GeneveError::CriticalBit(false)));
+        assert_eq!(Packet::parse(&b), Err(Error::CriticalBit(false)));
         // The C bit with no critical option.
         let b = [0x01, 0x40, 0, 0, 0, 0, 0, 0, 0, 1, 0x01, 0];
-        assert_eq!(Packet::parse(&b), Err(GeneveError::CriticalBit(true)));
+        assert_eq!(Packet::parse(&b), Err(Error::CriticalBit(true)));
         // The C bit with no options at all, known from the second byte.
         let b = [0x00, 0x40, 0, 0, 0, 0, 0, 0];
-        assert_eq!(Packet::parse(&b), Err(GeneveError::CriticalBit(true)));
-        assert_eq!(Header::parse_prefix(&b[..2]), Err(GeneveError::CriticalBit(true)));
-        assert!(GeneveError::CriticalBit(true).to_string().contains("C bit"));
+        assert_eq!(Packet::parse(&b), Err(Error::CriticalBit(true)));
+        assert_eq!(Header::parse_prefix(&b[..2]), Err(Error::CriticalBit(true)));
+        assert!(Error::CriticalBit(true).to_string().contains("C bit"));
     }
 
     #[test]
@@ -588,12 +588,12 @@ mod tests {
         // Opt Len 2 words and the C bit clear. The first option header is
         // critical, so the error shows before the second option comes.
         let b = [0x02, 0x00, 0, 0, 0, 0, 0, 0, 0, 1, 0x81, 0, 0, 1, 0x01, 0];
-        assert_eq!(Header::parse_prefix(&b[..12]), Err(GeneveError::CriticalBit(false)));
-        assert_eq!(Packet::parse(&b), Err(GeneveError::CriticalBit(false)));
+        assert_eq!(Header::parse_prefix(&b[..12]), Err(Error::CriticalBit(false)));
+        assert_eq!(Packet::parse(&b), Err(Error::CriticalBit(false)));
         // Even when a later option overruns, the earlier error stands.
         let b = [0x02, 0x00, 0, 0, 0, 0, 0, 0, 0, 1, 0x81, 0, 0, 1, 0x01, 1];
-        assert_eq!(Packet::parse(&b), Err(GeneveError::CriticalBit(false)));
-        assert_eq!(collect(&b), Err(GeneveError::CriticalBit(false)));
+        assert_eq!(Packet::parse(&b), Err(Error::CriticalBit(false)));
+        assert_eq!(collect(&b), Err(Error::CriticalBit(false)));
     }
 
     /// Every prefix of `b` reads as incomplete or as the error the whole
@@ -627,8 +627,8 @@ mod tests {
     fn too_long() {
         let mut b = vec![0, 0, 0x65, 0x58, 0, 0, 0, 0];
         b.resize(MAX_DATAGRAM + 1, 0);
-        assert_eq!(Packet::parse(&b), Err(GeneveError::TooLong));
-        assert_eq!(collect(&b), Err(GeneveError::TooLong));
+        assert_eq!(Packet::parse(&b), Err(Error::TooLong));
+        assert_eq!(collect(&b), Err(Error::TooLong));
         b.pop();
         assert!(Packet::parse(&b).is_ok());
     }
@@ -643,9 +643,9 @@ mod tests {
         let header_len = p.header.len();
         for n in 0..header_len {
             assert_eq!(Header::parse_prefix(&b[..n]), Ok(None), "prefix {n}");
-            assert_eq!(Packet::parse(&b[..n]), Err(GeneveError::Truncated), "prefix {n}");
-            assert_eq!(Header::split(&b[..n]), Err(GeneveError::Truncated));
-            assert_eq!(collect(&b[..n]), Err(GeneveError::Truncated));
+            assert_eq!(Packet::parse(&b[..n]), Err(Error::Truncated), "prefix {n}");
+            assert_eq!(Header::split(&b[..n]), Err(Error::Truncated));
+            assert_eq!(collect(&b[..n]), Err(Error::Truncated));
         }
         // From the end of the header on, the rest is payload.
         for n in header_len..=b.len() {
@@ -663,7 +663,7 @@ mod tests {
         assert_eq!(Header::parse_prefix(&b[..p.header.len() - 1]), Ok(None));
         assert_eq!(Header::parse_prefix(&b[..p.header.len()]), Ok(Some((p.header.clone(), p.header.len()))));
         assert_eq!(collect(&b), Ok(p));
-        assert_eq!(collect(&[]), Err(GeneveError::Truncated));
+        assert_eq!(collect(&[]), Err(Error::Truncated));
     }
 
     // Error paths when writing.
@@ -672,30 +672,30 @@ mod tests {
     fn writer_refuses_what_readers_would() {
         let mut h = header(vec![]);
         h.vni = MAX_VNI + 1;
-        assert_eq!(h.to_bytes(), Err(GeneveError::Vni(MAX_VNI + 1)));
+        assert_eq!(h.to_bytes(), Err(Error::Vni(MAX_VNI + 1)));
         h.vni = MAX_VNI;
         assert!(h.to_bytes().is_ok());
 
         let h = header(vec![opt(1, 0x80, false, &[])]);
-        assert_eq!(h.to_bytes(), Err(GeneveError::OptionType(0x80)));
+        assert_eq!(h.to_bytes(), Err(Error::OptionType(0x80)));
 
         let h = header(vec![opt(1, 1, false, &[1, 2, 3])]);
-        assert_eq!(h.to_bytes(), Err(GeneveError::OptionData(3)));
+        assert_eq!(h.to_bytes(), Err(Error::OptionData(3)));
         let h = header(vec![opt(1, 1, false, &[0; 128])]);
-        assert_eq!(h.to_bytes(), Err(GeneveError::OptionData(128)));
+        assert_eq!(h.to_bytes(), Err(Error::OptionData(128)));
 
         // Two full options are 256 bytes, over the 252 a header holds.
         let h = header(vec![opt(1, 1, false, &[0; 124]), opt(1, 2, false, &[0; 124])]);
-        assert_eq!(h.to_bytes(), Err(GeneveError::OptionsLength(256)));
-        assert_eq!(Packet { header: h, payload: vec![] }.to_bytes(), Err(GeneveError::OptionsLength(256)));
+        assert_eq!(h.to_bytes(), Err(Error::OptionsLength(256)));
+        assert_eq!(Packet { header: h, payload: vec![] }.to_bytes(), Err(Error::OptionsLength(256)));
 
         let p = Packet { header: header(vec![opt(1, 1, false, &[0; 4])]), payload: vec![0; MAX_PAYLOAD - 7] };
-        assert_eq!(p.to_bytes(), Err(GeneveError::TooLong));
+        assert_eq!(p.to_bytes(), Err(Error::TooLong));
 
         // On an error, write leaves the buffer alone.
         let mut out = vec![1, 2];
         let h = header(vec![opt(1, 1, false, &[1])]);
-        assert_eq!(h.write(&mut out), Err(GeneveError::OptionData(1)));
+        assert_eq!(h.write(&mut out), Err(Error::OptionData(1)));
         assert_eq!(out, [1, 2]);
     }
 
@@ -708,7 +708,7 @@ mod tests {
         assert_eq!(Header::parse_prefix(&b), Ok(Some((h.clone(), MAX_HEADER_LEN))));
         h.options.push(opt(63, 1, false, &[]));
         let mut out = vec![1, 2];
-        assert_eq!(h.write(&mut out), Err(GeneveError::OptionsLength(256)));
+        assert_eq!(h.write(&mut out), Err(Error::OptionsLength(256)));
         assert_eq!(out, [1, 2]);
     }
 
@@ -750,7 +750,7 @@ mod tests {
                 Ok(()) => assert_eq!(Packet::parse(&out[1..]), Ok(p)),
                 Err(e) => {
                     assert_eq!(out, [0xee]);
-                    assert_eq!(p.header.check().err().unwrap_or(GeneveError::TooLong), e);
+                    assert_eq!(p.header.check().err().unwrap_or(Error::TooLong), e);
                 }
             }
         }
@@ -767,10 +767,10 @@ mod tests {
         // On an error, the buffer is left alone.
         let big = Packet { header: header(vec![]), payload: vec![0; MAX_PAYLOAD + 1] };
         let mut out = vec![1, 2];
-        assert_eq!(big.write(&mut out), Err(GeneveError::TooLong));
+        assert_eq!(big.write(&mut out), Err(Error::TooLong));
         assert_eq!(out, [1, 2]);
         let bad = Packet { header: header(vec![opt(1, 1, false, &[1])]), payload: vec![] };
-        assert_eq!(bad.write(&mut out), Err(GeneveError::OptionData(1)));
+        assert_eq!(bad.write(&mut out), Err(Error::OptionData(1)));
         assert_eq!(out, [1, 2]);
     }
 
@@ -786,23 +786,23 @@ mod tests {
     fn huge_push_is_bounded() {
         let mut b = vec![0, 0, 0x65, 0x58, 0, 0, 0, 0];
         b.resize(3 * MAX_DATAGRAM, 0);
-        assert_eq!(collect(&b), Err(GeneveError::TooLong));
+        assert_eq!(collect(&b), Err(Error::TooLong));
     }
 
     #[test]
     fn errors_display() {
         let all = [
-            GeneveError::Truncated,
-            GeneveError::Trailing { remaining: 1 },
-            GeneveError::Version(1),
-            GeneveError::OptionOverrun(8),
-            GeneveError::CriticalBit(true),
-            GeneveError::CriticalBit(false),
-            GeneveError::TooLong,
-            GeneveError::Vni(1 << 24),
-            GeneveError::OptionType(0x80),
-            GeneveError::OptionData(3),
-            GeneveError::OptionsLength(256),
+            Error::Truncated,
+            Error::Trailing { remaining: 1 },
+            Error::Version(1),
+            Error::OptionOverrun(8),
+            Error::CriticalBit(true),
+            Error::CriticalBit(false),
+            Error::TooLong,
+            Error::Vni(1 << 24),
+            Error::OptionType(0x80),
+            Error::OptionData(3),
+            Error::OptionsLength(256),
         ];
         for e in all {
             assert!(!e.to_string().is_empty());

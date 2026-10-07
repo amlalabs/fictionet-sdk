@@ -96,20 +96,8 @@ impl Limits {
     }
 }
 
-/// A value cannot be written without changing it or exceeding a wire limit.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Unwritable {
-    /// The refused part of the value.
-    pub reason: &'static str,
-}
-impl fmt::Display for Unwritable {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "unwritable SSE value: {}", self.reason)
-    }
-}
-impl std::error::Error for Unwritable {}
-
-/// A terminal stream limit or an invalid complete wire value.
+/// A terminal stream limit, an invalid complete wire value, or a value
+/// that cannot be written without changing it or exceeding a wire limit.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
     /// A raw or UTF-8-decoded line exceeded its content limit.
@@ -128,8 +116,12 @@ pub enum Error {
     ExpectedEvent,
     /// Storage for a bounded buffer could not be allocated.
     Allocation,
-    /// The parsed value has no context-free wire representation.
-    Unwritable(Unwritable),
+    /// The value has no context-free wire representation: it cannot be
+    /// written without changing it or exceeding a wire limit.
+    Unwritable {
+        /// The refused part of the value.
+        reason: &'static str,
+    },
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -139,7 +131,7 @@ impl fmt::Display for Error {
             Self::ExpectedLine => f.write_str("expected one complete SSE line"),
             Self::ExpectedEvent => f.write_str("expected one complete SSE event"),
             Self::Allocation => f.write_str("SSE allocation failed"),
-            Self::Unwritable(e) => e.fmt(f),
+            Self::Unwritable { reason } => write!(f, "unwritable SSE value: {reason}"),
         }
     }
 }
@@ -156,7 +148,7 @@ impl std::error::Error for Error {}
 /// Line::Comment(" keepalive".into()).write(&mut body)?;
 /// Line::Retry("3000".into()).write(&mut body)?;
 /// assert_eq!(body, b": keepalive\nretry:3000\n");
-/// # Ok::<(), fictionet::stdlib::sse::Unwritable>(())
+/// # Ok::<(), fictionet::stdlib::sse::Error>(())
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Line {
@@ -213,7 +205,7 @@ impl Line {
             Self::Ignored { name, value } => Some((name, value)),
         }
     }
-    fn encoded_len(&self) -> Result<usize, Unwritable> {
+    fn encoded_len(&self) -> Result<usize, Error> {
         let size = match self {
             Self::Empty => return Ok(1),
             Self::Comment(v) => {
@@ -273,7 +265,7 @@ impl Line {
 }
 impl Wire for Line {
     type ParseError = Error;
-    type WriteError = Unwritable;
+    type WriteError = Error;
 
     /// Reads exactly one terminated line with default limits. Refuses a
     /// missing line, trailing bytes, and values the writer cannot represent.
@@ -286,7 +278,7 @@ impl Wire for Line {
                     bytes = bytes.get(n..).ok_or(Error::ExpectedLine)?;
                 }
                 Step::Item(line, n) if n == bytes.len() => {
-                    line.encoded_len().map_err(Error::Unwritable)?;
+                    line.encoded_len()?;
                     return Ok(line);
                 }
                 _ => return Err(Error::ExpectedLine),
@@ -299,7 +291,7 @@ impl Wire for Line {
     /// `Retry` digits, falsely classified `Ignored` fields, and lines above
     /// [`MAX_LINE`]. `Ignored` can preserve a server's invalid ID or retry.
     /// Allocation failure is also a refusal. Leaves `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), Unwritable> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         reserve(out, self.encoded_len()?)?;
         self.append(out);
         Ok(())
@@ -327,7 +319,7 @@ impl Event {
             id: String::new(),
         }
     }
-    fn encoded_len(&self, limits: Limits) -> Result<usize, Unwritable> {
+    fn encoded_len(&self, limits: Limits) -> Result<usize, Error> {
         if self.event.is_empty() || newline(&self.event) {
             return Err(unwritable("event type is empty or contains CR or LF"));
         }
@@ -338,7 +330,7 @@ impl Event {
             return Err(unwritable("data contains CR"));
         }
         let mut size = 1usize; // Dispatching blank line.
-        let mut field = |name: &str, value: &str| -> Result<(), Unwritable> {
+        let mut field = |name: &str, value: &str| -> Result<(), Error> {
             let n = field_len(name, value).ok_or(unwritable("event size overflow"))?;
             if n > limits.line {
                 return Err(unwritable("line limit"));
@@ -364,7 +356,7 @@ impl Event {
 }
 impl Wire for Event {
     type ParseError = Error;
-    type WriteError = Unwritable;
+    type WriteError = Error;
 
     /// Reads one dispatched event from a fresh stream with default limits.
     /// Refuses missing dispatch, a partial final event, extra events, or any
@@ -393,7 +385,7 @@ impl Wire for Event {
     /// line. Refuses an empty event type, CR/LF in the type or ID, NULL in
     /// the ID, CR in data, line/event limit excess, size overflow, or failed
     /// allocation. Leaves `out` unchanged on every refusal.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), Unwritable> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         reserve(out, self.encoded_len(Limits::default())?)?;
         if self.event != "message" {
             append_field(out, "event", &self.event);
@@ -583,7 +575,7 @@ impl Events {
         // Inherited IDs and canonical field spelling can add bytes. Check
         // them before publishing an event so default-decoded events write.
         if let Err(error) = event.encoded_len(self.limits) {
-            return Err(if error.reason == "line limit" {
+            return Err(if error == (Error::Unwritable { reason: "line limit" }) {
                 Error::LineTooLong {
                     limit: self.limits.line,
                 }
@@ -684,8 +676,8 @@ fn digits(value: &str) -> bool {
 fn newline(value: &str) -> bool {
     value.contains(['\r', '\n'])
 }
-fn unwritable(reason: &'static str) -> Unwritable {
-    Unwritable { reason }
+fn unwritable(reason: &'static str) -> Error {
+    Error::Unwritable { reason }
 }
 fn field_len(name: &str, value: &str) -> Option<usize> {
     name.len()
@@ -702,7 +694,7 @@ fn append_field(out: &mut Vec<u8>, name: &str, value: &str) {
     out.extend_from_slice(value.as_bytes());
     out.push(b'\n');
 }
-fn reserve(out: &mut Vec<u8>, size: usize) -> Result<(), Unwritable> {
+fn reserve(out: &mut Vec<u8>, size: usize) -> Result<(), Error> {
     out.len()
         .checked_add(size)
         .ok_or(unwritable("output size overflow"))?;
@@ -1082,7 +1074,7 @@ mod tests {
         );
     }
 
-    fn refuses<T: Wire<WriteError = Unwritable>>(value: T) {
+    fn refuses<T: Wire<WriteError = Error>>(value: T) {
         let mut out = b"prefix".to_vec();
         assert!(value.write(&mut out).is_err());
         assert_eq!(out, b"prefix");

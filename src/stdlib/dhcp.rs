@@ -145,12 +145,14 @@ impl Message {
     }
 }
 
-/// Why bytes are not a DHCP message.
+/// Why bytes are not a DHCP message, or why a message cannot be written
+/// as it is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ParseError {
+pub enum Error {
     /// Shorter than [`MIN_MESSAGE`].
     Short,
-    /// Longer than [`MAX_MESSAGE`]; the length is given.
+    /// Longer than [`MAX_MESSAGE`], or would be when written; the length
+    /// is given.
     TooLong(usize),
     /// The magic cookie is not [`MAGIC`].
     Magic,
@@ -158,59 +160,42 @@ pub enum ParseError {
     Truncated,
     /// A byte other than padding follows the end option, at this offset.
     Trailing(usize),
-}
-
-impl std::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ParseError::Short => f.write_str("shorter than a DHCP message"),
-            ParseError::TooLong(n) => write!(f, "{n} bytes, longer than a DHCP message may be"),
-            ParseError::Magic => f.write_str("no DHCP magic cookie"),
-            ParseError::Truncated => f.write_str("an option runs past the end of the message"),
-            ParseError::Trailing(at) => write!(f, "byte {at} follows the end option and is not padding"),
-        }
-    }
-}
-
-impl std::error::Error for ParseError {}
-
-/// Why a DHCP message cannot be written as it is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WriteError {
     /// An option has code [`opt::PAD`] or [`opt::END`], which carry no
     /// value.
     Reserved(u8),
     /// Two options have this code. They would read back as one.
     Duplicate(u8),
-    /// The message would be longer than [`MAX_MESSAGE`].
-    TooLong,
 }
 
-impl std::fmt::Display for WriteError {
+impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            WriteError::Reserved(c) => write!(f, "option code {c} is padding or the end, not an option"),
-            WriteError::Duplicate(c) => write!(f, "option {c} appears twice"),
-            WriteError::TooLong => f.write_str("longer than a DHCP message may be"),
+            Error::Short => f.write_str("shorter than a DHCP message"),
+            Error::TooLong(n) => write!(f, "{n} bytes, longer than a DHCP message may be"),
+            Error::Magic => f.write_str("no DHCP magic cookie"),
+            Error::Truncated => f.write_str("an option runs past the end of the message"),
+            Error::Trailing(at) => write!(f, "byte {at} follows the end option and is not padding"),
+            Error::Reserved(c) => write!(f, "option code {c} is padding or the end, not an option"),
+            Error::Duplicate(c) => write!(f, "option {c} appears twice"),
         }
     }
 }
 
-impl std::error::Error for WriteError {}
+impl std::error::Error for Error {}
 
 impl Wire for Message {
-    type ParseError = ParseError;
-    type WriteError = WriteError;
+    type ParseError = Error;
+    type WriteError = Error;
 
-    fn parse(b: &[u8]) -> Result<Message, ParseError> {
+    fn parse(b: &[u8]) -> Result<Message, Error> {
         if b.len() > MAX_MESSAGE {
-            return Err(ParseError::TooLong(b.len()));
+            return Err(Error::TooLong(b.len()));
         }
         if b.len() < MIN_MESSAGE {
-            return Err(ParseError::Short);
+            return Err(Error::Short);
         }
         if b[236..240] != MAGIC {
-            return Err(ParseError::Magic);
+            return Err(Error::Magic);
         }
         let ip = |at: usize| Ipv4Addr::new(b[at], b[at + 1], b[at + 2], b[at + 3]);
         let mut m = Message {
@@ -233,13 +218,13 @@ impl Wire for Message {
                 opt::PAD => at += 1,
                 opt::END => {
                     if let Some(i) = b[at + 1..].iter().position(|x| *x != opt::PAD) {
-                        return Err(ParseError::Trailing(at + 1 + i));
+                        return Err(Error::Trailing(at + 1 + i));
                     }
                     break;
                 }
                 _ => {
-                    let len = *b.get(at + 1).ok_or(ParseError::Truncated)? as usize;
-                    let value = b.get(at + 2..at + 2 + len).ok_or(ParseError::Truncated)?;
+                    let len = *b.get(at + 1).ok_or(Error::Truncated)? as usize;
+                    let value = b.get(at + 2..at + 2 + len).ok_or(Error::Truncated)?;
                     match m.options.iter_mut().find(|(c, _)| *c == code) {
                         Some((_, v)) => v.extend_from_slice(value),
                         None => m.options.push((code, value.to_vec())),
@@ -251,20 +236,20 @@ impl Wire for Message {
         Ok(m)
     }
 
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         let mut len = MIN_MESSAGE + 1;
         for (i, (code, value)) in self.options.iter().enumerate() {
             if matches!(*code, opt::PAD | opt::END) {
-                return Err(WriteError::Reserved(*code));
+                return Err(Error::Reserved(*code));
             }
             if self.options[..i].iter().any(|(c, _)| c == code) {
-                return Err(WriteError::Duplicate(*code));
+                return Err(Error::Duplicate(*code));
             }
             // Two bytes of code and length for every entry of up to 255.
             len += value.len() + 2 * value.len().div_ceil(255).max(1);
         }
         if len > MAX_MESSAGE {
-            return Err(WriteError::TooLong);
+            return Err(Error::TooLong(len));
         }
         let start = out.len();
         out.resize(start + MIN_MESSAGE, 0);
@@ -352,26 +337,26 @@ mod tests {
     #[test]
     fn bad_messages_are_refused() {
         let bytes = discover().to_bytes().unwrap();
-        assert_eq!(Message::parse(&bytes[..239]), Err(ParseError::Short));
+        assert_eq!(Message::parse(&bytes[..239]), Err(Error::Short));
         let mut magic = bytes.clone();
         magic[236] = 0;
-        assert_eq!(Message::parse(&magic), Err(ParseError::Magic));
+        assert_eq!(Message::parse(&magic), Err(Error::Magic));
         // An option cut short, in its length or its value.
-        assert_eq!(Message::parse(&[&bytes[..MIN_MESSAGE], &[53]].concat()), Err(ParseError::Truncated));
-        assert_eq!(Message::parse(&[&bytes[..MIN_MESSAGE], &[53, 2, 1]].concat()), Err(ParseError::Truncated));
+        assert_eq!(Message::parse(&[&bytes[..MIN_MESSAGE], &[53]].concat()), Err(Error::Truncated));
+        assert_eq!(Message::parse(&[&bytes[..MIN_MESSAGE], &[53, 2, 1]].concat()), Err(Error::Truncated));
         // No end option is allowed; anything but padding after it is not.
         assert!(Message::parse(&[&bytes[..MIN_MESSAGE], &[53, 1, 1]].concat()).is_ok());
         let mut trailing = bytes.clone();
         trailing[299] = 7;
-        assert_eq!(Message::parse(&trailing), Err(ParseError::Trailing(299)));
+        assert_eq!(Message::parse(&trailing), Err(Error::Trailing(299)));
         let long = [&bytes[..], &vec![0; MAX_MESSAGE]].concat();
-        assert_eq!(Message::parse(&long), Err(ParseError::TooLong(long.len())));
+        assert_eq!(Message::parse(&long), Err(Error::TooLong(long.len())));
     }
 
     #[test]
     fn messages_that_would_read_back_otherwise_are_not_written() {
         let mut out = vec![1, 2, 3];
-        for (code, err) in [(opt::PAD, WriteError::Reserved(0)), (opt::END, WriteError::Reserved(255)), (53, WriteError::Duplicate(53))] {
+        for (code, err) in [(opt::PAD, Error::Reserved(0)), (opt::END, Error::Reserved(255)), (53, Error::Duplicate(53))] {
             let mut m = discover();
             m.push(code, [1]);
             assert_eq!(m.write(&mut out), Err(err));
@@ -379,7 +364,7 @@ mod tests {
         }
         let mut m = discover();
         m.push(77, vec![0; MAX_MESSAGE]);
-        assert_eq!(m.write(&mut out), Err(WriteError::TooLong));
+        assert!(matches!(m.write(&mut out), Err(Error::TooLong(_))));
         assert_eq!(out, [1, 2, 3]);
         // The longest message that fits is written.
         let mut m = Message::new(BOOTREPLY, 1);

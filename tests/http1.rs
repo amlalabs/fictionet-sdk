@@ -1,6 +1,6 @@
 use fictionet::stdlib::codec::{Stream, Wire, contract, test_support};
 use fictionet::stdlib::http1::{
-    Header, Limits, Request, RequestMessages, Response, ResponseMessages,
+    Header, Limits, Request, Requests, Response, Responses,
 };
 
 const FIRST: &[u8] = b"POST /tools HTTP/1.1\r\nHost: api.test\r\nTransfer-Encoding: chunked\r\nX-Raw:\t keep \t\r\n\r\n01\r\n{\r\n1\r\n}\r\n000\r\n\r\n";
@@ -14,7 +14,7 @@ fn keep_alive_requests_decode_and_round_trip_at_each_chunking() {
         Request::parse(SECOND).unwrap(),
     ];
     for sizes in [&[input.len()][..], &[1], &[3, 7, 2]] {
-        let mut stream = Stream::new(RequestMessages::default());
+        let mut stream = Stream::new(Requests::default());
         let mut requests = Vec::new();
         for part in test_support::chunks(&input, sizes) {
             assert_eq!(stream.push(part), part.len());
@@ -39,11 +39,11 @@ fn keep_alive_requests_decode_and_round_trip_at_each_chunking() {
             request.write(&mut output).unwrap();
         }
         assert_eq!(
-            test_support::decode_all(RequestMessages::default, &output),
+            test_support::decode_all(Requests::default, &output),
             (requests, None)
         );
     }
-    contract::check_decode(RequestMessages::default, &input);
+    contract::check_decode(Requests::default, &input);
 }
 
 #[test]
@@ -56,7 +56,7 @@ fn next_span_covers_each_complete_request_at_each_chunking() {
         (Request::parse(SECOND).unwrap(), boundary..end),
     ];
     for sizes in [&[input.len()][..], &[1], &[3, 7, 2]] {
-        let mut stream = Stream::new(RequestMessages::default());
+        let mut stream = Stream::new(Requests::default());
         let mut items = Vec::new();
         for part in test_support::chunks(&input, sizes) {
             assert_eq!(stream.push(part), part.len());
@@ -91,7 +91,7 @@ fn with_next_preserves_chunk_framing_and_message_ranges_at_each_chunking() {
         ),
     ];
     for sizes in [&[input.len()][..], &[1], &[3, 7, 2]] {
-        let mut stream = Stream::new(RequestMessages::default());
+        let mut stream = Stream::new(Requests::default());
         let mut items = Vec::new();
         for part in test_support::chunks(&input, sizes) {
             assert_eq!(stream.push(part), part.len());
@@ -115,7 +115,7 @@ fn with_next_preserves_chunk_framing_and_message_ranges_at_each_chunking() {
 #[test]
 fn edited_bodies_and_duplicate_requests_round_trip_through_wire() {
     let input = [FIRST, SECOND].concat();
-    let mut stream = Stream::new(RequestMessages::default());
+    let mut stream = Stream::new(Requests::default());
     assert_eq!(stream.push(&input), input.len());
     let mut expected = Vec::new();
     let mut output = Vec::new();
@@ -143,7 +143,7 @@ fn edited_bodies_and_duplicate_requests_round_trip_through_wire() {
     assert_eq!(expected[1], expected[2]);
     assert_eq!(expected[1].head.target, "/next");
     assert_eq!(
-        test_support::decode_all(RequestMessages::default, &output),
+        test_support::decode_all(Requests::default, &output),
         (expected, None)
     );
 }
@@ -151,7 +151,7 @@ fn edited_bodies_and_duplicate_requests_round_trip_through_wire() {
 #[test]
 fn queued_head_and_get_responses_preserve_framing_after_edits() {
     let make = || {
-        let mut decoder = ResponseMessages::default();
+        let mut decoder = Responses::default();
         decoder.expect_method("HEAD").unwrap();
         decoder.expect_method("GET").unwrap();
         decoder
@@ -203,7 +203,7 @@ fn queued_head_and_get_responses_preserve_framing_after_edits() {
 #[test]
 fn copied_message_decoders_preserve_bytes_and_share_wire_traits() {
     use fictionet_copy_modules::http1 as copied;
-    let mut stream = Stream::new(copied::RequestMessages::default());
+    let mut stream = Stream::new(copied::Requests::default());
     let input = [FIRST, SECOND].concat();
     assert_eq!(stream.push(&input), input.len());
     let mut raw = Vec::new();
@@ -221,7 +221,7 @@ fn copied_message_decoders_preserve_bytes_and_share_wire_traits() {
     assert_eq!(raw, input);
     assert_eq!(expected.len(), 2);
     assert_eq!(
-        test_support::decode_all(copied::RequestMessages::default, &output),
+        test_support::decode_all(copied::Requests::default, &output),
         (expected, None)
     );
     let response = copied::Response::json(b"{}").unwrap();
@@ -230,14 +230,14 @@ fn copied_message_decoders_preserve_bytes_and_share_wire_traits() {
         b"{}"
     );
     contract::check_decode(
-        copied::ResponseMessages::new,
+        copied::Responses::new,
         b"HTTP/1.1 204 \r\n\r\n",
     );
 }
 
 #[test]
 fn message_buffer_bounds_do_not_change_between_messages() {
-    let mut stream = Stream::new(RequestMessages::with_limits(Limits { body: 2, message: FIRST.len(), ..Limits::default() }));
+    let mut stream = Stream::new(Requests::with_limits(Limits { body: 2, message: FIRST.len(), ..Limits::default() }));
     let capacity = FIRST.len().checked_add(1).unwrap();
     let input = [FIRST, SECOND, FIRST, SECOND].concat();
     let mut rest = input.as_slice();

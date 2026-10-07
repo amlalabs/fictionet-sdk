@@ -3,7 +3,7 @@
 #![no_main]
 
 use fictionet::stdlib::codec::{Wire, contract};
-use fictionet::stdlib::snmp::Frames;
+use fictionet::stdlib::snmp::Messages;
 use fictionet::stdlib::snmp::{
     BasicPdu, Element, Error, ErrorStatus, MAX_MESSAGE, Message, Oid, Pdu, Value, VarBind,
     Version,
@@ -11,9 +11,9 @@ use fictionet::stdlib::snmp::{
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(Frames::new, data, 2 * MAX_MESSAGE);
+    contract::check_decode_with_alloc_limit(Messages::new, data, 2 * MAX_MESSAGE);
     contract::check_decode_with_alloc_limit(
-        || Frames::with_limit(usize::from(data.first().copied().unwrap_or(0))),
+        || Messages::with_limit(usize::from(data.first().copied().unwrap_or(0))),
         data,
         510,
     );

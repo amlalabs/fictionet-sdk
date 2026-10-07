@@ -45,63 +45,50 @@ pub const ASDU_HEADER_LEN: usize = 6;
 /// Largest information object address.
 pub const MAX_ADDRESS: u32 = 0x00ff_ffff;
 
-/// Why an APDU cannot be read or written.
+/// Why an APDU or an ASDU cannot be read or written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FrameError {
+pub enum Error {
     /// The frame did not start with 0x68.
     Start,
     /// Invalid APDU length, or an S/U frame carrying extra bytes.
-    Length,
+    ApduLength,
     /// Reserved control bits, or an unknown or combined U function.
     Control,
     /// A send or receive sequence number exceeded 32767.
     Sequence,
-    /// An I frame's ASDU is shorter than its header or exceeds its limit.
+    /// An I frame's ASDU is shorter than its header or exceeds its limit,
+    /// or an ASDU header is truncated, or the ASDU exceeds 249 bytes.
     AsduLength,
-}
-impl std::fmt::Display for FrameError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Start => "IEC 104 frame does not start with 0x68",
-            Self::Length => "IEC 104 APDU length is invalid",
-            Self::Control => "IEC 104 control field is invalid",
-            Self::Sequence => "IEC 104 sequence number exceeds 32767",
-            Self::AsduLength => "IEC 104 ASDU length is outside 6..=249",
-        })
-    }
-}
-impl std::error::Error for FrameError {}
-
-/// Why an exact [`Wire`] parse did not read one complete frame.
-/// [`Frame::parse_prefix`] reads a prefix and returns the bytes used.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FrameParseError {
-    /// The frame is invalid.
-    Frame(FrameError),
     /// The input ended before a complete frame, including empty input.
     Truncated,
     /// Bytes follow the first complete frame.
     Trailing,
+    /// A count exceeds 127 or a cause exceeds 63.
+    Field,
+    /// Object count, width and encoded data length disagree, or width is zero.
+    Objects,
+    /// An explicit or implied information object address exceeds 24 bits.
+    Address,
 }
 
-impl core::fmt::Display for FrameParseError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Frame(e) => e.fmt(f),
-            Self::Truncated => f.write_str("incomplete IEC 104 frame"),
-            Self::Trailing => f.write_str("bytes follow the IEC 104 frame"),
-        }
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Start => "IEC 104 frame does not start with 0x68",
+            Self::ApduLength => "IEC 104 APDU length is invalid",
+            Self::Control => "IEC 104 control field is invalid",
+            Self::Sequence => "IEC 104 sequence number exceeds 32767",
+            Self::AsduLength => "IEC 104 ASDU length is outside 6..=249",
+            Self::Truncated => "incomplete IEC 104 frame",
+            Self::Trailing => "bytes follow the IEC 104 frame",
+            Self::Field => "IEC 104 ASDU count or cause is out of range",
+            Self::Objects => "IEC 104 information objects do not match their count and width",
+            Self::Address => "IEC 104 information object address exceeds 24 bits",
+        })
     }
 }
 
-impl core::error::Error for FrameParseError {
-    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
-        match self {
-            Self::Frame(e) => Some(e),
-            Self::Truncated | Self::Trailing => None,
-        }
-    }
-}
+impl std::error::Error for Error {}
 
 /// The six U-format control functions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,7 +120,7 @@ impl UFunction {
     }
 
     /// Reads a complete first control byte.
-    pub fn from_code(code: u8) -> Result<Self, FrameError> {
+    pub fn from_code(code: u8) -> Result<Self, Error> {
         match code {
             0x07 => Ok(Self::StartDtAct),
             0x0b => Ok(Self::StartDtCon),
@@ -141,7 +128,7 @@ impl UFunction {
             0x23 => Ok(Self::StopDtCon),
             0x43 => Ok(Self::TestFrAct),
             0x83 => Ok(Self::TestFrCon),
-            _ => Err(FrameError::Control),
+            _ => Err(Error::Control),
         }
     }
 }
@@ -171,15 +158,15 @@ impl Frame {
     /// Reads one APDU at the start of `b` and returns its consumed length.
     /// `Ok(None)` means it needs more bytes. S and U frames must have
     /// exactly four control bytes and no ASDU.
-    pub fn parse_prefix(b: &[u8]) -> Result<Option<(Self, usize)>, FrameError> {
+    pub fn parse_prefix(b: &[u8]) -> Result<Option<(Self, usize)>, Error> {
         if b.first().is_some_and(|&x| x != 0x68) {
-            return Err(FrameError::Start);
+            return Err(Error::Start);
         }
         let Some(&length) = b.get(1) else {
             return Ok(None);
         };
         if !(4..=253).contains(&length) {
-            return Err(FrameError::Length);
+            return Err(Error::ApduLength);
         }
         if b.len() < HEADER_LEN {
             return Ok(None);
@@ -187,10 +174,10 @@ impl Frame {
         let end = usize::from(length) + 2;
         let frame = if b[2] & 1 == 0 {
             if b[4] & 1 != 0 {
-                return Err(FrameError::Control);
+                return Err(Error::Control);
             }
             if end < HEADER_LEN + ASDU_HEADER_LEN {
-                return Err(FrameError::AsduLength);
+                return Err(Error::AsduLength);
             }
             if b.len() < end {
                 return Ok(None);
@@ -202,18 +189,18 @@ impl Frame {
             }
         } else {
             if length != 4 {
-                return Err(FrameError::Length);
+                return Err(Error::ApduLength);
             }
             if b[2] == 1 {
                 if b[3] != 0 || b[4] & 1 != 0 {
-                    return Err(FrameError::Control);
+                    return Err(Error::Control);
                 }
                 Self::Supervisory {
                     receive: le16(b, 4) >> 1,
                 }
             } else {
                 if b[3..6] != [0, 0, 0] {
-                    return Err(FrameError::Control);
+                    return Err(Error::Control);
                 }
                 Self::Unnumbered(UFunction::from_code(b[2])?)
             }
@@ -223,27 +210,27 @@ impl Frame {
 }
 
 impl Wire for Frame {
-    type ParseError = FrameParseError;
-    type WriteError = FrameError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads exactly one frame. Incomplete input and trailing bytes are errors.
-    /// Returns [`FrameParseError::Truncated`] for an incomplete APDU and
-    /// [`FrameParseError::Trailing`] for extra bytes. Invalid start bytes,
-    /// lengths, control fields or ASDU lengths return [`FrameParseError::Frame`]
-    /// with [`FrameError::Start`], [`FrameError::Length`],
-    /// [`FrameError::Control`] or [`FrameError::AsduLength`].
-    fn parse(b: &[u8]) -> Result<Self, FrameParseError> {
-        match Self::parse_prefix(b).map_err(FrameParseError::Frame)? {
+    /// Returns [`Error::Truncated`] for an incomplete APDU and
+    /// [`Error::Trailing`] for extra bytes. Invalid start bytes,
+    /// lengths, control fields or ASDU lengths return
+    /// [`Error::Start`], [`Error::ApduLength`],
+    /// [`Error::Control`] or [`Error::AsduLength`].
+    fn parse(b: &[u8]) -> Result<Self, Error> {
+        match Self::parse_prefix(b)? {
             Some((frame, used)) if used == b.len() => Ok(frame),
-            Some(_) => Err(FrameParseError::Trailing),
-            None => Err(FrameParseError::Truncated),
+            Some(_) => Err(Error::Trailing),
+            None => Err(Error::Truncated),
         }
     }
 
     /// Writes an APDU, refusing out-of-range sequence numbers or ASDUs.
-    /// Returns [`FrameError::Sequence`] above sequence 32767 and
-    /// [`FrameError::AsduLength`] unless an I-frame ASDU has 6 through 249 bytes.
-    fn write(&self, dst: &mut Vec<u8>) -> Result<(), FrameError> {
+    /// Returns [`Error::Sequence`] above sequence 32767 and
+    /// [`Error::AsduLength`] unless an I-frame ASDU has 6 through 249 bytes.
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
         let mut out = vec![0x68, 4];
         match self {
             Self::Information {
@@ -252,10 +239,10 @@ impl Wire for Frame {
                 asdu,
             } => {
                 if *send > 0x7fff || *receive > 0x7fff {
-                    return Err(FrameError::Sequence);
+                    return Err(Error::Sequence);
                 }
                 if !(ASDU_HEADER_LEN..=MAX_ASDU).contains(&asdu.len()) {
-                    return Err(FrameError::AsduLength);
+                    return Err(Error::AsduLength);
                 }
                 out[1] = (4 + asdu.len()) as u8;
                 out.extend_from_slice(&(send << 1).to_le_bytes());
@@ -264,7 +251,7 @@ impl Wire for Frame {
             }
             Self::Supervisory { receive } => {
                 if *receive > 0x7fff {
-                    return Err(FrameError::Sequence);
+                    return Err(Error::Sequence);
                 }
                 out.extend_from_slice(&[1, 0]);
                 out.extend_from_slice(&(receive << 1).to_le_bytes());
@@ -293,7 +280,7 @@ impl Frames {
 
 impl Decode for Frames {
     type Item = Frame;
-    type Error = FrameError;
+    type Error = Error;
     const NAME: &'static str = "IEC 104";
 
     fn capacity(&self) -> usize {
@@ -302,9 +289,9 @@ impl Decode for Frames {
 
     /// Reads an APDU prefix, returning [`Step::Need`] while incomplete.
     /// Invalid start bytes, lengths, control fields or ASDU lengths return
-    /// [`FrameError::Start`], [`FrameError::Length`], [`FrameError::Control`]
-    /// or [`FrameError::AsduLength`].
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, FrameError> {
+    /// [`Error::Start`], [`Error::ApduLength`], [`Error::Control`]
+    /// or [`Error::AsduLength`].
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, Error> {
         Ok(match Frame::parse_prefix(input)? {
             Some((frame, used)) => Step::Item(frame, used),
             None => Step::Need,
@@ -318,30 +305,6 @@ fn le16(b: &[u8], at: usize) -> u16 {
 fn le24(b: &[u8]) -> u32 {
     u32::from(b[0]) | u32::from(b[1]) << 8 | u32::from(b[2]) << 16
 }
-
-/// Why an ASDU or its information objects are malformed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AsduError {
-    /// A header is truncated, or the ASDU exceeds 249 bytes.
-    Length,
-    /// A count exceeds 127 or a cause exceeds 63.
-    Field,
-    /// Object count, width and encoded data length disagree, or width is zero.
-    Objects,
-    /// An explicit or implied information object address exceeds 24 bits.
-    Address,
-}
-impl std::fmt::Display for AsduError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Length => "IEC 104 ASDU length is outside 6..=249",
-            Self::Field => "IEC 104 ASDU count or cause is out of range",
-            Self::Objects => "IEC 104 information objects do not match their count and width",
-            Self::Address => "IEC 104 information object address exceeds 24 bits",
-        })
-    }
-}
-impl std::error::Error for AsduError {}
 
 /// An ASDU header followed by opaque information object bytes. Unknown
 /// type IDs and causes are preserved. Object layout is checked separately
@@ -378,12 +341,12 @@ pub struct Object {
 }
 
 impl Asdu {
-    fn validate(&self) -> Result<(), AsduError> {
+    fn validate(&self) -> Result<(), Error> {
         if self.count > 127 || self.cause > 63 {
-            return Err(AsduError::Field);
+            return Err(Error::Field);
         }
         if self.data.len() > MAX_ASDU - ASDU_HEADER_LEN {
-            return Err(AsduError::Length);
+            return Err(Error::AsduLength);
         }
         Ok(())
     }
@@ -392,10 +355,10 @@ impl Asdu {
     /// bytes per value, excluding its address, and must be positive. Both
     /// SQ layouts require exactly the declared number of objects and no
     /// trailing data. Sequential addresses must not overflow 24 bits.
-    pub fn objects(&self, width: usize) -> Result<Vec<Object>, AsduError> {
+    pub fn objects(&self, width: usize) -> Result<Vec<Object>, Error> {
         self.validate()?;
         if width == 0 || width > MAX_ASDU {
-            return Err(AsduError::Objects);
+            return Err(Error::Objects);
         }
         let count = usize::from(self.count);
         let expected = if self.sequence {
@@ -404,14 +367,14 @@ impl Asdu {
             count * (width + 3)
         };
         if self.data.len() != expected {
-            return Err(AsduError::Objects);
+            return Err(Error::Objects);
         }
         if count == 0 {
             return Ok(Vec::new());
         }
         let first = le24(&self.data);
         if self.sequence && first + count as u32 - 1 > MAX_ADDRESS {
-            return Err(AsduError::Address);
+            return Err(Error::Address);
         }
         let mut out = Vec::with_capacity(count);
         let mut at = if self.sequence { 3 } else { 0 };
@@ -435,28 +398,28 @@ impl Asdu {
     /// Replaces the data and count with equal-width objects in the chosen
     /// SQ layout. Sequential addresses must be consecutive. On error, the
     /// ASDU is unchanged. Value bytes are not interpreted.
-    pub fn set_objects(&mut self, objects: &[Object], sequence: bool) -> Result<(), AsduError> {
+    pub fn set_objects(&mut self, objects: &[Object], sequence: bool) -> Result<(), Error> {
         if objects.len() > 127 {
-            return Err(AsduError::Field);
+            return Err(Error::Field);
         }
         let mut data = Vec::new();
         let width = objects.first().map_or(0, |o| o.value.len());
         for (i, object) in objects.iter().enumerate() {
             if object.address > MAX_ADDRESS {
-                return Err(AsduError::Address);
+                return Err(Error::Address);
             }
             if width == 0 || object.value.len() != width {
-                return Err(AsduError::Objects);
+                return Err(Error::Objects);
             }
             if sequence && object.address != objects[0].address + i as u32 {
-                return Err(AsduError::Address);
+                return Err(Error::Address);
             }
             let address_len = if !sequence || i == 0 { 3 } else { 0 };
             if width
                 .checked_add(address_len + data.len())
                 .is_none_or(|n| n > MAX_ASDU - ASDU_HEADER_LEN)
             {
-                return Err(AsduError::Length);
+                return Err(Error::AsduLength);
             }
             if address_len != 0 {
                 data.extend_from_slice(&object.address.to_le_bytes()[..3]);
@@ -471,15 +434,15 @@ impl Asdu {
 }
 
 impl Wire for Asdu {
-    type ParseError = AsduError;
-    type WriteError = AsduError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads one complete ASDU with IEC 104's fixed field sizes.
-    /// Returns [`AsduError::Length`] unless input has 6 through 249 bytes.
+    /// Returns [`Error::AsduLength`] unless input has 6 through 249 bytes.
     /// Object layout is checked separately by [`Asdu::objects`].
-    fn parse(b: &[u8]) -> Result<Self, AsduError> {
+    fn parse(b: &[u8]) -> Result<Self, Error> {
         if !(ASDU_HEADER_LEN..=MAX_ASDU).contains(&b.len()) {
-            return Err(AsduError::Length);
+            return Err(Error::AsduLength);
         }
         Ok(Self {
             type_id: b[0],
@@ -496,9 +459,9 @@ impl Wire for Asdu {
 
     /// Writes the ASDU header and opaque data. Use [`Asdu::set_objects`]
     /// to construct data whose object count and addresses are consistent.
-    /// Returns [`AsduError::Field`] above count 127 or cause 63, and
-    /// [`AsduError::Length`] if the header and data exceed [`MAX_ASDU`].
-    fn write(&self, dst: &mut Vec<u8>) -> Result<(), AsduError> {
+    /// Returns [`Error::Field`] above count 127 or cause 63, and
+    /// [`Error::AsduLength`] if the header and data exceed [`MAX_ASDU`].
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
         self.validate()?;
         let mut out = vec![
             self.type_id,
@@ -581,10 +544,10 @@ mod tests {
         }
         let mut bytes = INTERROGATION.to_vec();
         bytes[4] = 1;
-        assert_eq!(Frame::parse_prefix(&bytes), Err(FrameError::Control));
+        assert_eq!(Frame::parse_prefix(&bytes), Err(Error::Control));
         assert_eq!(
             Frame::Supervisory { receive: 32768 }.to_bytes(),
-            Err(FrameError::Sequence)
+            Err(Error::Sequence)
         );
         assert_eq!(
             Frame::Information {
@@ -593,7 +556,7 @@ mod tests {
                 asdu: vec![0; 6]
             }
             .to_bytes(),
-            Err(FrameError::Sequence)
+            Err(Error::Sequence)
         );
         for n in [0, 5, MAX_ASDU + 1] {
             assert_eq!(
@@ -603,7 +566,7 @@ mod tests {
                     asdu: vec![0; n]
                 }
                 .to_bytes(),
-                Err(FrameError::AsduLength)
+                Err(Error::AsduLength)
             );
         }
     }
@@ -624,8 +587,8 @@ mod tests {
         assert_eq!(frames, vec![frame; 7]);
         let mut stream = Stream::new(Frames);
         assert_eq!(stream.push(&vec![0; MAX_FRAME + 1]), MAX_FRAME);
-        assert_eq!(stream.next(), Some(Err(Fail::Protocol(FrameError::Start))));
-        assert_eq!(stream.failed(), Some(&Fail::Protocol(FrameError::Start)));
+        assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::Start))));
+        assert_eq!(stream.failed(), Some(&Fail::Protocol(Error::Start)));
         assert!(stream.next().is_none());
         assert_eq!(stream.push(&[0]), 1);
     }
@@ -640,14 +603,14 @@ mod tests {
         assert_eq!(asdu.common_address, 0xcafe);
         assert_eq!(asdu.objects(1), Ok(vec![]));
         for n in [0, 5, MAX_ASDU + 1] {
-            assert_eq!(Asdu::parse(&vec![0; n]), Err(AsduError::Length));
+            assert_eq!(Asdu::parse(&vec![0; n]), Err(Error::AsduLength));
         }
         let mut asdu = asdu;
         asdu.cause = 64;
-        assert_eq!(asdu.to_bytes(), Err(AsduError::Field));
+        assert_eq!(asdu.to_bytes(), Err(Error::Field));
         asdu.cause = 1;
         asdu.count = 128;
-        assert_eq!(asdu.to_bytes(), Err(AsduError::Field));
+        assert_eq!(asdu.to_bytes(), Err(Error::Field));
     }
 
     #[test]
@@ -671,7 +634,7 @@ mod tests {
             let back = Asdu::parse(&asdu.to_bytes().unwrap()).unwrap();
             assert_eq!(back.objects(2), Ok(objects.clone()));
             for width in [0, 1, 3, usize::MAX] {
-                assert_eq!(back.objects(width), Err(AsduError::Objects));
+                assert_eq!(back.objects(width), Err(Error::Objects));
             }
         }
         asdu.set_objects(&[], true).unwrap();
@@ -734,12 +697,12 @@ mod tests {
                 value: vec![0; 240],
             },
         ];
-        assert_eq!(asdu.set_objects(&objects, false), Err(AsduError::Length));
+        assert_eq!(asdu.set_objects(&objects, false), Err(Error::AsduLength));
         asdu.sequence = true;
         asdu.count = 2;
         asdu.data = vec![255, 255, 255, 0, 0];
-        assert_eq!(asdu.objects(1), Err(AsduError::Address));
+        assert_eq!(asdu.objects(1), Err(Error::Address));
         asdu.data = vec![0, 0, 0, 0];
-        assert_eq!(asdu.objects(1), Err(AsduError::Objects));
+        assert_eq!(asdu.objects(1), Err(Error::Objects));
     }
 }

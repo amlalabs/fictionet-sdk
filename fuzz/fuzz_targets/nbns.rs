@@ -4,7 +4,7 @@
 
 use fictionet::stdlib::codec::{Wire, contract};
 use fictionet::stdlib::nbns::{
-    MAX_DATAGRAM, MAX_PACKET, Name, NbEntry, NodeName, NodeType, Packet, ParseError, RrName,
+    MAX_DATAGRAM, MAX_PACKET, Name, NbEntry, NodeName, NodeType, Packet, Error, RrName,
     decode_first_level, rcode,
 };
 use libfuzzer_sys::fuzz_target;
@@ -86,7 +86,7 @@ fuzz_target!(|data: &[u8]| {
         let q = Packet::name_query(1, name.clone(), false);
         match q.to_bytes() {
             Ok(bytes) => assert_eq!(Packet::parse(&bytes).unwrap().questions[0].name, name),
-            Err(e) => assert_eq!(e, ParseError::Unwritable),
+            Err(e) => assert_eq!(e, Error::Unwritable),
         }
     }
 });
