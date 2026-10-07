@@ -137,7 +137,7 @@ spec:
           {{- end }}
           volumeMounts:
             - name: fictionet
-              mountPath: /run/fictionet
+              mountPath: /run/relay
             {{- range $svc.shared }}
             - name: shared-{{ .name }}
               mountPath: {{ .mountPath | quote }}
@@ -191,7 +191,7 @@ spec:
           {{- end }}
           volumeMounts:
             - name: fictionet
-              mountPath: /run/fictionet
+              mountPath: /run/relay
             {{- if $proxy }}
             - name: token
               mountPath: /run/fictionet-token

@@ -100,7 +100,7 @@ check "the API server ($api) is unreachable" "Couldn't connect to server" agent 
 # 6. No way back.
 check "ip link set eth0 up is refused" 'Operation not permitted' agent ip link set eth0 up
 check "ip route add is refused" 'Operation not permitted' agent ip route add 1.1.1.1 dev eth0
-check "the world's socket is not in the agent's container" 'No such file or directory' agent ls /run/fictionet
+check "the world's socket is not in the agent's container" 'No such file or directory' agent ls /run/relay
 
 # 7. Order: the agent started after attach was ready.
 attach_ready="$(kubectl get pod "$pod" -o jsonpath='{.status.initContainerStatuses[?(@.name=="attach")].state.running.startedAt}')"

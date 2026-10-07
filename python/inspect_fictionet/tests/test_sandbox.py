@@ -1,7 +1,9 @@
 """Unit tests for the compose file and the Helm values."""
 
-import filecmp
 import os
+import shutil
+import subprocess
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -19,7 +21,7 @@ from inspect_fictionet import (
 )
 
 REPO = Path(__file__).resolve().parents[3]
-WEB = dict(world_args=["/run/fictionet/world.sock", "/run/ca/ca.pem"], world_ca="/run/ca/ca.pem")
+WEB = dict(world_args=["/run/relay/relay.sock", "/run/ca/ca.pem"], world_ca="/run/ca/ca.pem")
 BRANCH_ATTACH = "fictionet-attach:dev"
 
 
@@ -38,7 +40,7 @@ def test_tun_services_and_order(tmp_path):
     assert world["image"] == WEB_WORLD_IMAGE
     assert world["network_mode"] == "none"
     assert world["volumes"] == [
-        {"type": "volume", "source": "sock", "target": "/run/fictionet"},
+        {"type": "volume", "source": "sock", "target": "/run/relay"},
         {"type": "volume", "source": "ca", "target": "/run/ca"},
     ]
     assert world["command"] == WEB["world_args"]
@@ -47,17 +49,17 @@ def test_tun_services_and_order(tmp_path):
     assert attach["image"] == ATTACH_IMAGE
     assert attach["depends_on"] == {"world": {"condition": "service_started"}}
     assert attach["command"] == [
-        "attach", "--world", "unix:/run/fictionet/world.sock", "--name", "agent", "--type", "tun",
+        "attach", "--world", "unix:/run/relay/relay.sock", "--name", "agent", "--type", "tun",
         "--ip-addr=10.0.0.2/24", "--gateway=10.0.0.1", "--dns=10.0.0.1",
         "--no-ip-addr-v6", "--no-gateway-v6", "--no-dns-v6",
-        "--ready-file=/run/fictionet/attach.ready", "--world-wait=60",
+        "--ready-file=/run/relay/attach.ready", "--world-wait=60",
     ]  # fmt: skip
-    assert attach["healthcheck"]["test"] == ["CMD", "/fictionet", "ready", "/run/fictionet/attach.ready"]
+    assert attach["healthcheck"]["test"] == ["CMD", "/fictionet", "ready", "/run/relay/attach.ready"]
     assert attach["network_mode"] == "none"
     assert attach["devices"] == ["/dev/net/tun"]
     assert attach["cap_drop"] == ["ALL"]
     assert set(attach["cap_add"]) == {"NET_ADMIN", "DAC_OVERRIDE"}
-    assert attach["volumes"] == [{"type": "volume", "source": "sock", "target": "/run/fictionet"}]
+    assert attach["volumes"] == [{"type": "volume", "source": "sock", "target": "/run/relay"}]
 
     # The agent: in attach's namespace, after attach is ready, CA read-only.
     assert agent["network_mode"] == "service:attach"
@@ -78,8 +80,8 @@ def test_agent_never_sees_the_socket(tmp_path):
 
 
 def test_world_healthcheck(tmp_path):
-    c = compose(tmp_path, WEB_WORLD_IMAGE, world_healthcheck=["test", "-S", "/run/fictionet/world.sock"])
-    assert c["services"]["world"]["healthcheck"]["test"] == ["CMD", "test", "-S", "/run/fictionet/world.sock"]
+    c = compose(tmp_path, WEB_WORLD_IMAGE, world_healthcheck=["test", "-S", "/run/relay/relay.sock"])
+    assert c["services"]["world"]["healthcheck"]["test"] == ["CMD", "test", "-S", "/run/relay/relay.sock"]
     assert c["services"]["attach"]["depends_on"]["world"]["condition"] == "service_healthy"
 
 
@@ -166,11 +168,11 @@ def test_build_and_cargo_example(tmp_path):
         (dict(attach="https_proxy", attach_image=BRANCH_ATTACH, ip_addr_v6="fd00::2/64"), "takes no ip_addr_v6"),
         (dict(attach="https_proxy", attach_image=BRANCH_ATTACH, ip_addr=None), "needs ip_addr and dns"),
         (dict(dns=None, dns_v6=None), "give dns or dns_v6"),
-        (dict(world_ca="/run/fictionet/ca.pem"), "must not be /run/fictionet"),
-        (dict(world_ca="//run/fictionet/ca.pem"), "must not be /run/fictionet"),
-        (dict(world_ca="/var/../run/fictionet/ca.pem"), "must not be /run/fictionet"),
-        (dict(world_ca="/run/./fictionet//x/ca.pem"), "must not be /run/fictionet"),
-        (dict(world_ca="/run/ca.pem"), "must not be /run/fictionet"),
+        (dict(world_ca="/run/relay/ca.pem"), "must not be /run/relay"),
+        (dict(world_ca="//run/relay/ca.pem"), "must not be /run/relay"),
+        (dict(world_ca="/var/../run/relay/ca.pem"), "must not be /run/relay"),
+        (dict(world_ca="/run/./relay//x/ca.pem"), "must not be /run/relay"),
+        (dict(world_ca="/run/ca.pem"), "must not be /run/relay"),
         (dict(world_ca="/run/fictionet-token/ca.pem"), "must not be /run/fictionet-token"),
         (dict(world_ca="/ca.pem"), "absolute path"),
         (dict(agent_limits=Limits(memory="lots")), "agent_limits: memory must be"),
@@ -237,15 +239,20 @@ def test_k8s_proxy(tmp_path):
 
 
 @pytest.mark.skipif(not (REPO / "charts" / "fictionet-sandbox").is_dir(), reason="not in the repository")
-def test_chart_copy_matches_the_repository():
-    """The chart inside the package must be the repository's chart. After
-    changing charts/fictionet-sandbox, copy it again:
-    cp -r charts/fictionet-sandbox python/inspect_fictionet/src/inspect_fictionet/chart/"""
-    ours, theirs = chart_path(), REPO / "charts" / "fictionet-sandbox"
-    files = sorted(str(p.relative_to(theirs)) for p in theirs.rglob("*") if p.is_file())
-    assert sorted(str(p.relative_to(ours)) for p in ours.rglob("*") if p.is_file()) == files
-    match, mismatch, errors = filecmp.cmpfiles(theirs, ours, files, shallow=False)
-    assert not mismatch and not errors, (mismatch, errors)
+def test_the_wheel_holds_the_chart(tmp_path):
+    """A wheel built from the sdist, as `uv build` makes it, holds every
+    file of charts/fictionet-sandbox, unchanged."""
+    if shutil.which("uv") is None:
+        pytest.skip("needs uv")
+    package = Path(__file__).resolve().parents[1]
+    subprocess.run(["uv", "build", "--quiet", "--out-dir", str(tmp_path), str(package)], check=True)
+    [wheel] = tmp_path.glob("*.whl")
+    chart = REPO / "charts" / "fictionet-sandbox"
+    prefix = "inspect_fictionet/chart/fictionet-sandbox/"
+    with zipfile.ZipFile(wheel) as z:
+        got = {n[len(prefix) :]: z.read(n) for n in z.namelist() if n.startswith(prefix)}
+    want = {str(p.relative_to(chart)): p.read_bytes() for p in chart.rglob("*") if p.is_file()}
+    assert got == want
 
 
 def test_cache_dir_default(monkeypatch, tmp_path):
@@ -399,8 +406,8 @@ def test_ca_dir_follows_posix_rules_on_any_host(monkeypatch):
     from inspect_fictionet import _sandbox
 
     monkeypatch.setattr(_sandbox, "Path", pathlib.PureWindowsPath)
-    with pytest.raises(ValueError, match="must not be /run/fictionet"):
-        fictionet_sandbox(WEB_WORLD_IMAGE, world_ca="/run/fictionet/ca.pem")
+    with pytest.raises(ValueError, match="must not be /run/relay"):
+        fictionet_sandbox(WEB_WORLD_IMAGE, world_ca="/run/relay/ca.pem")
 
 
 def test_k8s_tiny_cpu_limit(tmp_path):

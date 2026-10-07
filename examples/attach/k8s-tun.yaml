@@ -26,4 +26,4 @@ services:
     world:
       image: fictionet-web-world:dev
       imagePullPolicy: Never
-      args: [/run/fictionet/world.sock, /run/ca/ca.pem]
+      args: [/run/relay/relay.sock, /run/ca/ca.pem]

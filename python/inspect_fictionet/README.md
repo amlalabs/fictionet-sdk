@@ -50,7 +50,7 @@ def fetch():
         scorer=includes(),
         sandbox=fictionet_sandbox(
             WEB_WORLD_IMAGE,
-            world_args=["/run/fictionet/world.sock", "/run/ca/ca.pem"],
+            world_args=["/run/relay/relay.sock", "/run/ca/ca.pem"],
             world_ca="/run/ca/ca.pem",
         ),
     )
@@ -97,7 +97,7 @@ accuracy  1.000
 
 | Option | Default | What it does |
 |---|---|---|
-| `world` | required | An image name, a `Build`, or a `CargoExample`. The world must listen on `/run/fictionet/world.sock` (`WORLD_SOCKET`). |
+| `world` | required | An image name, a `Build`, or a `CargoExample`. The world must listen on `/run/relay/relay.sock` (`WORLD_SOCKET`). |
 | `world_args` | none | The world's arguments: its image's CMD. |
 | `world_env` | none | The world's environment. |
 | `world_ca` | none | Where the world writes its CA certificate, such as `/run/ca/ca.pem`. See [The world's CA](#the-worlds-ca). |
@@ -198,7 +198,7 @@ fictionet_sandbox(Build(here / "world.Dockerfile", context=here), agent_image=..
 
 # A cargo example: built with musl on rust:1.92-alpine, and run alone on scratch.
 fictionet_sandbox(CargoExample("web_world", crate=here / "..", features=["tokio"]),
-                  world_args=["/run/fictionet/world.sock", "/run/ca/ca.pem"], ...)
+                  world_args=["/run/relay/relay.sock", "/run/ca/ca.pem"], ...)
 ```
 
 The agent's image can be a `Build` too. Give absolute paths, as above: the
@@ -336,8 +336,7 @@ order:
              +-----------------------+
              | world                 |  network_mode: none
              | listens on            |  volumes: sock (rw), ca (rw)
-             | /run/fictionet/       |
-             |   world.sock          |
+             | /run/relay/relay.sock |
              +-----------+-----------+
                          |  Unix socket, on the `sock` volume
                          |  (attach retries for --world-wait seconds)
@@ -358,7 +357,7 @@ order:
 ```
 
 1. **The world** starts first, with no network at all. Its only way in is
-   the socket at `/run/fictionet/world.sock`, on a volume that only attach
+   the socket at `/run/relay/relay.sock`, on a volume that only attach
    also mounts.
 2. **Attach** starts next and connects to the socket. It retries for up to
    `world_wait` seconds, because the world may still be starting. With
@@ -417,11 +416,11 @@ the first lines name the flag. The compose file's path is in the spec
 only `tun`.
 
 **`dependency failed to start: container ... attach-1 exited (1)`.** The
-world never listened on `/run/fictionet/world.sock`, and attach gave up after
+world never listened on `/run/relay/relay.sock`, and attach gave up after
 `world_wait` seconds. Attach's log says so:
 
 ```text
-fictionet attach: connecting to the world at /run/fictionet/world.sock: No such file or directory (os error 2), after waiting 5 s
+fictionet attach: connecting to the world at /run/relay/relay.sock: No such file or directory (os error 2), after waiting 5 s
 ```
 
 Check the world's logs, and that `world_args` gives the world that path.
@@ -472,10 +471,8 @@ and does not pull it again. Remove the old one with `docker image rm`.
 $ uv run --extra k8s pytest
 ```
 
-The unit tests check the compose file and the Helm values, and that the
-chart inside the package matches [`charts/fictionet-sandbox`](../../charts/fictionet-sandbox).
-After changing the chart, copy it again:
-
-```console
-$ cp -r charts/fictionet-sandbox python/inspect_fictionet/src/inspect_fictionet/chart/
-```
+The unit tests check the compose file and the Helm values, and build the
+package to check that its wheel holds the chart. The package's
+`chart/fictionet-sandbox` is a symbolic link to
+[`charts/fictionet-sandbox`](../../charts/fictionet-sandbox), and the build
+copies the files it points to into the package.

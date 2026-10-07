@@ -159,7 +159,7 @@ check "the kubelet on the pod's node ($node_ip) is unreachable" "Couldn't connec
 gateway="$(agent ip -4 route show default | awk '{print $3}')"
 check "the kubelet at the pod's gateway ($gateway) is unreachable" "Couldn't connect|timed out|Failed to connect" \
     agent curl -sS --noproxy '*' -m 5 -k "https://$gateway:10250/healthz"
-check "the world's socket is not in the agent's container" 'No such file or directory' agent ls /run/fictionet
+check "the world's socket is not in the agent's container" 'No such file or directory' agent ls /run/relay
 
 # 4. Tokens, and the world's edge.
 check "a wrong token gets 407" 'response 407' agent curl -sS -x http://fictionet:wrong@127.0.0.1:8080 https://example.test/

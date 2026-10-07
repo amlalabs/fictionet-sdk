@@ -1,7 +1,7 @@
 <div style="overflow-x:auto;margin:1.25em 0">
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 400" role="img" aria-labelledby="fn-pod-t fn-pod-d" style="display:block;width:100%;max-width:720px;min-width:480px;height:auto">
 <title id="fn-pod-t">A tun sandbox in a Kubernetes pod</title>
-<desc id="fn-pod-d">One pod, with one network namespace shared by its three containers. The agent's container comes first. It has every capability dropped, and its programs send their IP packets to tun0, which has the address 10.0.0.2/24. The native sidecar attach made tun0 and relays its packets to the native sidecar world, over the Unix socket /run/fictionet/world.sock in an emptyDir that only those two mount. Attach has NET_ADMIN and MKNOD. The pod's eth0, from the CNI, is down, with no address and no route: attach took it down before it made tun0. The pod's dnsConfig names the world's DNS server, 10.0.0.1. The agent's container starts once attach's startup probe passes.</desc>
+<desc id="fn-pod-d">One pod, with one network namespace shared by its three containers. The agent's container comes first. It has every capability dropped, and its programs send their IP packets to tun0, which has the address 10.0.0.2/24. The native sidecar attach made tun0 and relays its packets to the native sidecar world, over the Unix socket /run/relay/relay.sock in an emptyDir that only those two mount. Attach has NET_ADMIN and MKNOD. The pod's eth0, from the CNI, is down, with no address and no route: attach took it down before it made tun0. The pod's dnsConfig names the world's DNS server, 10.0.0.1. The agent's container starts once attach's startup probe passes.</desc>
 <defs><marker id="fn-pod-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
 <g fill="none" stroke="currentColor" stroke-width="1.25">
 <rect x="10" y="10" width="580" height="330" rx="10" stroke-dasharray="2 4"/>
@@ -30,7 +30,7 @@
 <text x="525" y="194" font-size="11.5">an emptyDir</text>
 <text x="465" y="266" text-anchor="middle">native sidecar “world”</text>
 <text x="465" y="284" text-anchor="middle" font-size="11.5">the world process</text>
-<text x="465" y="302" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="11">/run/fictionet/world.sock</text>
+<text x="465" y="302" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="11">/run/relay/relay.sock</text>
 <text x="135" y="266" text-anchor="middle" font-family="'Source Code Pro',monospace">eth0</text>
 <text x="135" y="284" text-anchor="middle" font-size="11.5">from the CNI; taken down</text>
 <text x="135" y="302" text-anchor="middle" font-size="11.5">by attach: no address, no route</text>

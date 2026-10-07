@@ -401,7 +401,7 @@
 //!   including `NET_RAW` and `NET_ADMIN`.
 //! - **`world`** is a native sidecar: an init container with
 //!   `restartPolicy: Always`, which keeps running beside the agent. It
-//!   listens on `/run/fictionet/world.sock`, in an `emptyDir` that only it
+//!   listens on `/run/relay/relay.sock`, in an `emptyDir` that only it
 //!   and attach mount.
 //! - **`attach`** is a native sidecar too, started after the world. It is
 //!   the only container with `NET_ADMIN`.
@@ -449,8 +449,8 @@
 //!   sandbox.
 //!
 //! **The agent starts last.** Attach writes `--ready-file
-//! /run/fictionet/attach.ready` once the world has accepted it. Attach's
-//! startup probe runs `fictionet ready /run/fictionet/attach.ready`, which
+//! /run/relay/attach.ready` once the world has accepted it. Attach's
+//! startup probe runs `fictionet ready /run/relay/attach.ready`, which
 //! exits with status 0 once the file exists. (The attach image has no
 //! shell, so it cannot run `test -f`.) Kubernetes starts the next container
 //! only after a native sidecar's startup probe passes. So by the time the
@@ -469,7 +469,9 @@
 //!
 #![cfg_attr(doc, doc = concat!("```yaml\n", include_str!("../examples/attach/k8s-tun.yaml"), "```"))]
 //!
-//! The world's socket must be `/run/fictionet/world.sock`. The `attach`
+//! The world's socket must be `/run/relay/relay.sock`. The agent shares
+//! the pod's network namespace, so it can list that socket in
+//! `/proc/net/unix`, and the path names nothing. The `attach`
 //! value sets attach's flags for every service. `ipAddr`, `gateway` and
 //! `dns` default to `10.0.0.2/24`, `10.0.0.1` and `10.0.0.1`, and an empty
 //! value means the flag's `--no-` form. `ipAddrV6`, `gatewayV6` and
@@ -578,8 +580,8 @@
 //! ;; communications error to 10.96.0.10#53: timed out
 //! $ ip link set eth0 up
 //! RTNETLINK answers: Operation not permitted
-//! $ ls /run/fictionet
-//! ls: cannot access '/run/fictionet': No such file or directory
+//! $ ls /run/relay
+//! ls: cannot access '/run/relay': No such file or directory
 //! ```
 //!
 //! `10.96.0.10` is the cluster's DNS service. `ping` fails too, with

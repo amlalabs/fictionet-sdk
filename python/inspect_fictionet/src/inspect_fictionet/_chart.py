@@ -5,6 +5,7 @@ from pathlib import Path
 
 def chart_path() -> Path:
     """The directory of the fictionet-sandbox chart that ships with this
-    package. It is a copy of `charts/fictionet-sandbox` in the repository,
-    so it works wherever the package is installed."""
+    package. In the repository it is a symbolic link to
+    `charts/fictionet-sandbox`, and a build copies the chart's files into
+    the package, so it works wherever the package is installed."""
     return Path(__file__).parent / "chart" / "fictionet-sandbox"
