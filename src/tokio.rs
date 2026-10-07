@@ -1,5 +1,5 @@
 //! Hands stdlib connections to tokio-based libraries such as hyper and
-//! axum. Needs the `tokio` feature, which is on by default.
+//! axum.
 //!
 //! Read this page when a world serves a connection with a library that
 //! expects tokio's `AsyncRead` and `AsyncWrite`. Fictionet's own
@@ -8,21 +8,23 @@
 //! in a [`Compat`], which implements tokio's traits. Nothing in the core
 //! depends on this module.
 //!
-//! The world must then run on a tokio runtime, as it must for any
-//! tokio-based library: [`block_on`](crate::block_on) is not a tokio
-//! runtime. Await [`run`](crate::run) inside `#[tokio::main]` instead.
+//! A library that spawns tasks or sets timers on tokio needs the world to
+//! run on a tokio runtime: [`block_on`](crate::block_on) is not one. Await
+//! [`run`](crate::run) inside `#[tokio::main]` instead.
 //!
-//! Here a TLS connection is finished and handed to hyper:
+//! Here a TLS connection is finished and written to with tokio's
+//! `AsyncWriteExt`:
 //!
 //! ```
 //! use fictionet::prelude::*;
+//! use tokio::io::AsyncWriteExt;
 //! # use std::sync::Arc;
 //! # use fictionet::{Cx, Result, stdlib::{tcp, tls}};
 //! # async fn serve(cx: Cx, hello: tls::ClientHello<tcp::TcpConnection>, config: Arc<rustls::ServerConfig>) -> Result {
 //!
 //! let conn = hello.finish(&cx, config).await?;
-//! let io = hyper_util::rt::TokioIo::new(conn.into_tokio(&cx));
-//! # drop(io);
+//! let mut io = conn.into_tokio(&cx);
+//! io.write_all(b"HTTP/1.1 204 No Content\r\n\r\n").await?;
 //! # Ok(())
 //! # }
 //! ```

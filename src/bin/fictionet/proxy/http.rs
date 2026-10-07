@@ -24,8 +24,11 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use super::auth::Token;
+use fictionet::stdlib::tcp::TcpConnection;
+use fictionet::tokio::{Compat, ConnectionTokioExt};
+
 use super::log;
-use super::pump::{self, WorldStream};
+use super::pump;
 use super::stack::{Fail, Host, Stack};
 
 /// The most bytes a request head, or an answer's head, may take.
@@ -372,7 +375,7 @@ pub(crate) async fn serve(mut client: TcpStream, stack: Stack, token: Token) {
             return answer(&mut client, status, &fail.to_string()).await;
         }
     };
-    let mut world = WorldStream::new(conn, stack.cx());
+    let mut world = conn.into_tokio(stack.cx());
     let rest = buf.split_off(len);
     match req.target {
         Target::Connect { .. } => {
@@ -398,7 +401,7 @@ pub(crate) async fn serve(mut client: TcpStream, stack: Stack, token: Token) {
 /// Sends a plain-HTTP request on and passes the answer back.
 async fn forward(
     client: TcpStream,
-    world: WorldStream,
+    world: Compat<TcpConnection>,
     req: &Request,
     body_start: Vec<u8>,
     what: &str,

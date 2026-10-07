@@ -987,7 +987,6 @@ fn a_tower_service_runs_as_a_handler() {
 // TLS by name
 
 /// A server config for `names`, and roots that trust it.
-#[cfg(feature = "tokio")]
 fn tls_pair(names: &[&str]) -> (Arc<rustls::ServerConfig>, Arc<rustls::RootCertStore>) {
     let mut ca = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
     ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -1011,7 +1010,6 @@ fn tls_pair(names: &[&str]) -> (Arc<rustls::ServerConfig>, Arc<rustls::RootCertS
 /// A connection whose TLS handshake is cut short by a cancel ends as
 /// cancelled, not as a broken connection.
 #[test]
-#[cfg(feature = "tokio")]
 fn a_cancel_during_the_tls_handshake_is_a_cancel() {
     world(|cx| async move {
         let (config, _roots) = tls_pair(&["a.test"]);
@@ -1048,7 +1046,6 @@ fn a_cancel_during_the_tls_handshake_is_a_cancel() {
 }
 
 #[test]
-#[cfg(feature = "tokio")]
 fn net_routes_tls_by_name_to_each_service() {
     /// Answers each line in upper case.
     struct Upper;
@@ -1284,7 +1281,6 @@ fn the_harness_resumes_after_starttls() {
 }
 
 #[test]
-#[cfg(feature = "tokio")]
 fn net_performs_starttls_for_a_service_that_asks() {
     let (config, roots) = tls_pair(&["mail.test"]);
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
@@ -2180,7 +2176,6 @@ fn net_records_connections_on_a_tcp_port() {
 /// A STARTTLS handshake has the network's handshake limit. Before, it had
 /// the service's default of 10 seconds.
 #[test]
-#[cfg(feature = "tokio")]
 fn net_limits_a_starttls_handshake() {
     let (config, _roots) = tls_pair(&["mail.test"]);
     world(move |cx| async move {

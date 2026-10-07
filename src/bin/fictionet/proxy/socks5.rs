@@ -14,8 +14,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use super::auth::Token;
+use fictionet::tokio::ConnectionTokioExt;
+
 use super::log;
-use super::pump::{self, WorldStream};
+use super::pump;
 use super::stack::{Fail, Host, Stack};
 
 /// The greeting, the login and the request must all arrive within this.
@@ -187,7 +189,7 @@ pub(crate) async fn serve(mut client: TcpStream, stack: Stack, token: Token) {
         }
     };
     let bound = conn.local_addr();
-    let mut world = WorldStream::new(conn, stack.cx());
+    let mut world = conn.into_tokio(stack.cx());
     if client.write_all(&reply_bytes(reply::SUCCEEDED, Some(bound))).await.is_err() {
         return log(&format!("{what} ({}) reply 0, but the client closed the connection first", IpAddr::V4(addr)));
     }
