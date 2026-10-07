@@ -409,7 +409,7 @@ fn websocket_wire_refuses_invalid_close_payloads_transactionally() {
         for mask in [None, Some([1, 2, 3, 4])] {
             let frame = frame(true, ws::Opcode::Close, payload, mask);
             let mut out = vec![7, 8];
-            assert_eq!(frame.write(&mut out), Err(ws::WriteError::Unwritable));
+            assert_eq!(frame.write(&mut out), Err(ws::Error::Unwritable));
             assert_eq!(out, [7, 8]);
             contract::check_wire_value(&frame);
             // A malformed fixture must bypass the strict writer.
@@ -424,7 +424,7 @@ fn websocket_wire_refuses_invalid_close_payloads_transactionally() {
             }
             assert_eq!(
                 <ws::Frame as Wire>::parse(&bytes),
-                Err(ws::FrameParseError::Close(error))
+                Err(error)
             );
             contract::check_wire::<ws::Frame>(&bytes);
         }
@@ -551,17 +551,17 @@ fn websocket_close_interrupts_assembly_and_pump_accounts_for_unaccepted_tail() {
 #[test]
 fn websocket_framing_errors_end_the_stream_once() {
     let cases = [
-        (vec![0x83], ws::Error::Frame(ws::FrameError::ReservedOpcode(3))),
-        (vec![0xc2], ws::Error::Frame(ws::FrameError::ReservedBits(4))),
-        (vec![0x09], ws::Error::Frame(ws::FrameError::FragmentedControl)),
-        (vec![0x89, 126], ws::Error::Frame(ws::FrameError::ControlTooLong)),
-        (vec![0x82, 126, 0, 1], ws::Error::Frame(ws::FrameError::NonMinimalLength)),
+        (vec![0x83], ws::Error::ReservedOpcode(3)),
+        (vec![0xc2], ws::Error::ReservedBits(4)),
+        (vec![0x09], ws::Error::FragmentedControl),
+        (vec![0x89, 126], ws::Error::ControlTooLong),
+        (vec![0x82, 126, 0, 1], ws::Error::NonMinimalLength),
         (vec![0x80, 0], ws::Error::UnexpectedContinuation),
         (vec![0x01, 0, 0x81, 0], ws::Error::ExpectedContinuation),
         (vec![0x81, 1, 0xff], ws::Error::InvalidUtf8),
         (vec![0x01, 1, 0xc3, 0x80, 1, b'x'], ws::Error::InvalidUtf8),
-        (vec![0x88, 1, 0], ws::Error::Close(ws::CloseError::Short)),
-        (vec![0x88, 2, 0x03, 0xee], ws::Error::Close(ws::CloseError::Code(1006))),
+        (vec![0x88, 1, 0], ws::Error::CloseShort),
+        (vec![0x88, 2, 0x03, 0xee], ws::Error::CloseCode(1006)),
         (vec![0x82, 0x80, 0, 0, 0, 0], ws::Error::Masked),
     ];
     for (mut bytes, error) in cases {
@@ -624,8 +624,8 @@ fn websocket_wire_refuses_loss_and_requires_exact_input() {
         assert!(frame.write(&mut out).is_err());
         assert_eq!(out, [1, 2]);
     }
-    assert_eq!(<ws::Frame as Wire>::parse(&[0x82]), Err(ws::FrameParseError::Truncated));
-    assert_eq!(<ws::Frame as Wire>::parse(&[0x82, 0, 0]), Err(ws::FrameParseError::Trailing));
+    assert_eq!(<ws::Frame as Wire>::parse(&[0x82]), Err(ws::Error::Truncated));
+    assert_eq!(<ws::Frame as Wire>::parse(&[0x82, 0, 0]), Err(ws::Error::Trailing));
     for length in [0, 1, 125, 126, 65535, 65536] {
         contract::check_wire_value(&frame(true, ws::Opcode::Binary, &vec![7; length], Some([1, 2, 3, 4])));
     }

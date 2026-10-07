@@ -187,10 +187,14 @@ impl Opcode {
     }
 }
 
-/// Why bytes are not a WebSocket frame. Each one is found from the header
-/// alone, before the payload arrives.
+/// Why WebSocket bytes, a handshake, or a value to write are not valid.
+///
+/// A frame or message reader stops at the first one. A real endpoint then
+/// sends a close frame with [`Error::close_code`] and drops the
+/// connection. A server that refuses an opening handshake answers with
+/// [`Error::status_code`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FrameError {
+pub enum Error {
     /// One of the three reserved bits was set, and no extension that uses
     /// them was agreed. The value holds the three bits.
     ReservedBits(u8),
@@ -205,25 +209,141 @@ pub enum FrameError {
     NonMinimalLength,
     /// The most significant bit of a 64-bit length was set.
     LengthHighBit,
-    /// The payload was longer than [`MAX_PAYLOAD`].
-    TooLarge(u64),
+    /// A frame's payload was longer than [`MAX_PAYLOAD`].
+    PayloadTooLarge(u64),
+    /// A close frame's payload was shorter than the two-byte code.
+    CloseShort,
+    /// A close frame's payload was longer than a control frame may carry.
+    CloseTooLong,
+    /// The close code may not be sent in a close frame.
+    CloseCode(u16),
+    /// The close reason was not UTF-8.
+    CloseUtf8,
+    /// A server read a frame that was not masked.
+    Unmasked,
+    /// A client read a frame that was masked.
+    Masked,
+    /// A continuation frame came with no message in progress.
+    UnexpectedContinuation,
+    /// A new text or binary frame came before the last message ended.
+    ExpectedContinuation,
+    /// A text message was not UTF-8.
+    InvalidUtf8,
+    /// A message was longer than the decoder's limit.
+    TooBig,
+    /// The bytes ended before the frame did.
+    Truncated,
+    /// Bytes followed the frame.
+    Trailing,
+    /// The value cannot be written without changing it.
+    Unwritable,
+    /// The output could not be allocated.
+    Allocation,
+    /// There were more than [`MAX_HEADERS`] header fields.
+    TooManyHeaders,
+    /// A field the handshake reads had a value longer than
+    /// [`MAX_FIELD_LEN`] bytes. A server answers `431 Request Header
+    /// Fields Too Large`.
+    FieldTooLong,
+    /// The request had no `Host` field, more than one, or one that is not
+    /// a host with an optional port (RFC 3986 section 3.2).
+    MissingHost,
+    /// The request had more than one `Origin` field (RFC 6454 section
+    /// 7.3).
+    Origin,
+    /// A request's `Upgrade` did not list `websocket`, or a response's
+    /// `Upgrade` held anything other than `websocket` alone.
+    Upgrade,
+    /// `Connection` did not list `Upgrade`.
+    Connection,
+    /// `Sec-WebSocket-Version` named a version other than 13. A server
+    /// answers `426 Upgrade Required` with `Sec-WebSocket-Version: 13`, so
+    /// the client can retry.
+    Version,
+    /// `Sec-WebSocket-Version` was missing or repeated. The request is
+    /// malformed, and a server answers `400 Bad Request`.
+    MissingVersion,
+    /// `Sec-WebSocket-Key` was missing, repeated, or not base64 for 16
+    /// bytes.
+    Key,
+    /// `Sec-WebSocket-Accept` was missing or did not match the key.
+    Accept,
+    /// `Sec-WebSocket-Protocol` held something other than tokens, no
+    /// name at all, too many of them, a name twice, or, in a response,
+    /// one the client did not offer.
+    Protocol,
+    /// `Sec-WebSocket-Extensions` did not follow the grammar of RFC 6455
+    /// section 9.1, held no extension at all, or too many of them; or a
+    /// response held the field at all, since this module offers none.
+    Extension,
 }
 
-impl std::fmt::Display for FrameError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Error {
+    /// The close code a real endpoint sends for this error: 1007 for bad
+    /// text, 1009 for a message or frame too big, and 1002 for the rest.
+    pub fn close_code(self) -> u16 {
         match self {
-            FrameError::ReservedBits(b) => write!(f, "reserved bits {b:#05b} set with no extension agreed"),
-            FrameError::ReservedOpcode(o) => write!(f, "reserved opcode {o:#x}"),
-            FrameError::FragmentedControl => write!(f, "control frame without the final bit"),
-            FrameError::ControlTooLong => write!(f, "control frame payload over {MAX_CONTROL_PAYLOAD} bytes"),
-            FrameError::NonMinimalLength => write!(f, "payload length not in its shortest form"),
-            FrameError::LengthHighBit => write!(f, "64-bit payload length with its top bit set"),
-            FrameError::TooLarge(n) => write!(f, "payload of {n} bytes is over the {MAX_PAYLOAD}-byte limit"),
+            Error::InvalidUtf8 | Error::CloseUtf8 => close_code::INVALID_DATA,
+            Error::TooBig | Error::PayloadTooLarge(_) => close_code::MESSAGE_TOO_BIG,
+            _ => close_code::PROTOCOL_ERROR,
+        }
+    }
+
+    /// The HTTP status a server answers a request it refuses with: 426
+    /// (with `Sec-WebSocket-Version: 13`) for [`Error::Version`], 431 for
+    /// [`Error::FieldTooLong`], and 400 for the rest. The errors only
+    /// [`check_response`] gives have no status, since a client answers
+    /// nothing; they get 400 too.
+    pub fn status_code(self) -> u16 {
+        match self {
+            Error::Version => 426,
+            Error::FieldTooLong => 431,
+            _ => 400,
         }
     }
 }
 
-impl std::error::Error for FrameError {}
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::ReservedBits(b) => write!(f, "reserved bits {b:#05b} set with no extension agreed"),
+            Error::ReservedOpcode(o) => write!(f, "reserved opcode {o:#x}"),
+            Error::FragmentedControl => write!(f, "control frame without the final bit"),
+            Error::ControlTooLong => write!(f, "control frame payload over {MAX_CONTROL_PAYLOAD} bytes"),
+            Error::NonMinimalLength => write!(f, "payload length not in its shortest form"),
+            Error::LengthHighBit => write!(f, "64-bit payload length with its top bit set"),
+            Error::PayloadTooLarge(n) => write!(f, "payload of {n} bytes is over the {MAX_PAYLOAD}-byte limit"),
+            Error::CloseShort => write!(f, "close payload shorter than 2 bytes"),
+            Error::CloseTooLong => write!(f, "close payload over {MAX_CONTROL_PAYLOAD} bytes"),
+            Error::CloseCode(c) => write!(f, "close code {c} may not be sent"),
+            Error::CloseUtf8 => write!(f, "close reason is not UTF-8"),
+            Error::Unmasked => write!(f, "client frame not masked"),
+            Error::Masked => write!(f, "server frame masked"),
+            Error::UnexpectedContinuation => write!(f, "continuation frame with no message in progress"),
+            Error::ExpectedContinuation => write!(f, "new message before the last one ended"),
+            Error::InvalidUtf8 => write!(f, "text message is not UTF-8"),
+            Error::TooBig => write!(f, "message over the decoder's size limit"),
+            Error::Truncated => f.write_str("incomplete WebSocket frame"),
+            Error::Trailing => f.write_str("bytes after WebSocket frame"),
+            Error::Unwritable => f.write_str("value cannot be written without changing it"),
+            Error::Allocation => f.write_str("WebSocket output allocation failed"),
+            Error::TooManyHeaders => f.write_str("too many header fields"),
+            Error::FieldTooLong => f.write_str("header field value too long"),
+            Error::MissingHost => f.write_str("no single, valid Host field"),
+            Error::Origin => f.write_str("more than one Origin field"),
+            Error::Upgrade => f.write_str("Upgrade does not list websocket"),
+            Error::Connection => f.write_str("Connection does not list Upgrade"),
+            Error::Version => f.write_str("Sec-WebSocket-Version is not 13"),
+            Error::MissingVersion => f.write_str("no single Sec-WebSocket-Version field"),
+            Error::Key => f.write_str("Sec-WebSocket-Key is missing or not 16 bytes of base64"),
+            Error::Accept => f.write_str("Sec-WebSocket-Accept does not match the key"),
+            Error::Protocol => f.write_str("bad Sec-WebSocket-Protocol"),
+            Error::Extension => f.write_str("bad Sec-WebSocket-Extensions"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
 
 /// A frame header: everything before the payload.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -244,28 +364,28 @@ impl Header {
     /// Reads the header at the start of `b`. It returns `Ok(None)` when `b`
     /// ends before the header does. An error depends only on the bytes it
     /// has seen, so it shows up as soon as the bad byte arrives.
-    pub fn parse(b: &[u8]) -> Result<Option<Header>, FrameError> {
+    pub fn parse(b: &[u8]) -> Result<Option<Header>, Error> {
         let Some(&b0) = b.first() else { return Ok(None) };
         let rsv = (b0 >> 4) & 0x07;
         if rsv != 0 {
-            return Err(FrameError::ReservedBits(rsv));
+            return Err(Error::ReservedBits(rsv));
         }
-        let opcode = Opcode::from_u8(b0 & 0x0f).ok_or(FrameError::ReservedOpcode(b0 & 0x0f))?;
+        let opcode = Opcode::from_u8(b0 & 0x0f).ok_or(Error::ReservedOpcode(b0 & 0x0f))?;
         let fin = b0 & 0x80 != 0;
         if opcode.is_control() && !fin {
-            return Err(FrameError::FragmentedControl);
+            return Err(Error::FragmentedControl);
         }
         let Some(&b1) = b.get(1) else { return Ok(None) };
         let short = b1 & 0x7f;
         if opcode.is_control() && usize::from(short) > MAX_CONTROL_PAYLOAD {
-            return Err(FrameError::ControlTooLong);
+            return Err(Error::ControlTooLong);
         }
         let (len, mut at) = match short {
             126 => {
                 let Some(x) = b.get(2..4) else { return Ok(None) };
                 let n = u16::from_be_bytes([x[0], x[1]]);
                 if n < 126 {
-                    return Err(FrameError::NonMinimalLength);
+                    return Err(Error::NonMinimalLength);
                 }
                 (u64::from(n), 4)
             }
@@ -275,10 +395,10 @@ impl Header {
                 a.copy_from_slice(x);
                 let n = u64::from_be_bytes(a);
                 if n >> 63 != 0 {
-                    return Err(FrameError::LengthHighBit);
+                    return Err(Error::LengthHighBit);
                 }
                 if n <= 0xffff {
-                    return Err(FrameError::NonMinimalLength);
+                    return Err(Error::NonMinimalLength);
                 }
                 (n, 10)
             }
@@ -286,7 +406,7 @@ impl Header {
         };
         let len = match usize::try_from(len) {
             Ok(n) if n <= MAX_PAYLOAD => n,
-            _ => return Err(FrameError::TooLarge(len)),
+            _ => return Err(Error::PayloadTooLarge(len)),
         };
         let mask = if b1 & 0x80 != 0 {
             let Some(x) = b.get(at..at + 4) else { return Ok(None) };
@@ -350,32 +470,6 @@ pub fn apply_mask(data: &mut [u8], key: [u8; 4], offset: usize) {
     }
 }
 
-/// Why a close frame's payload is not valid.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CloseError {
-    /// The payload was shorter than the two-byte code.
-    Short,
-    /// The payload was longer than a control frame may carry.
-    TooLong,
-    /// The code may not be sent in a close frame.
-    Code(u16),
-    /// The reason was not UTF-8.
-    Utf8,
-}
-
-impl std::fmt::Display for CloseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CloseError::Short => write!(f, "close payload shorter than 2 bytes"),
-            CloseError::TooLong => write!(f, "close payload over {MAX_CONTROL_PAYLOAD} bytes"),
-            CloseError::Code(c) => write!(f, "close code {c} may not be sent"),
-            CloseError::Utf8 => write!(f, "close reason is not UTF-8"),
-        }
-    }
-}
-
-impl std::error::Error for CloseError {}
-
 /// The code and reason a close frame carries.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Close {
@@ -393,7 +487,7 @@ impl Close {
 }
 
 /// Reads an optional close code and reason; empty payloads carry neither.
-fn parse_close(payload: &[u8]) -> Result<Option<Close>, CloseError> {
+fn parse_close(payload: &[u8]) -> Result<Option<Close>, Error> {
     if payload.is_empty() {
         Ok(None)
     } else {
@@ -402,22 +496,22 @@ fn parse_close(payload: &[u8]) -> Result<Option<Close>, CloseError> {
 }
 
 impl Wire for Close {
-    type ParseError = CloseError;
-    type WriteError = WriteError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads a close payload with a code. Refuses fewer than two bytes,
     /// more than [`MAX_CONTROL_PAYLOAD`] bytes, reserved codes, and invalid
     /// UTF-8. An empty close frame is represented by [`Message::Close`].
-    fn parse(payload: &[u8]) -> Result<Self, CloseError> {
+    fn parse(payload: &[u8]) -> Result<Self, Error> {
         match payload {
-            [] | [_] => Err(CloseError::Short),
-            _ if payload.len() > MAX_CONTROL_PAYLOAD => Err(CloseError::TooLong),
+            [] | [_] => Err(Error::CloseShort),
+            _ if payload.len() > MAX_CONTROL_PAYLOAD => Err(Error::CloseTooLong),
             [hi, lo, rest @ ..] => {
                 let code = u16::from_be_bytes([*hi, *lo]);
                 if !close_code::is_sendable(code) {
-                    return Err(CloseError::Code(code));
+                    return Err(Error::CloseCode(code));
                 }
-                let reason = std::str::from_utf8(rest).map_err(|_| CloseError::Utf8)?;
+                let reason = std::str::from_utf8(rest).map_err(|_| Error::CloseUtf8)?;
                 Ok(Close {
                     code,
                     reason: reason.to_string(),
@@ -428,12 +522,12 @@ impl Wire for Close {
 
     /// Writes the code and UTF-8 reason. Refuses reserved codes and reasons
     /// over [`MAX_CLOSE_REASON`] bytes without changing `out`.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         if !close_code::is_sendable(self.code) || self.reason.len() > MAX_CLOSE_REASON {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
-        let size = self.reason.len().checked_add(2).ok_or(WriteError::Unwritable)?;
-        out.try_reserve(size).map_err(|_| WriteError::Allocation)?;
+        let size = self.reason.len().checked_add(2).ok_or(Error::Unwritable)?;
+        out.try_reserve(size).map_err(|_| Error::Allocation)?;
         out.extend_from_slice(&self.code.to_be_bytes());
         out.extend_from_slice(self.reason.as_bytes());
         Ok(())
@@ -472,7 +566,7 @@ impl Message {
     /// Builds one final frame, masked when `mask` is present. Refuses data
     /// over [`MAX_MESSAGE`], control payloads over [`MAX_CONTROL_PAYLOAD`],
     /// reserved close codes, and reasons over [`MAX_CLOSE_REASON`].
-    pub fn to_frame(&self, mask: Option<[u8; 4]>) -> Result<Frame, WriteError> {
+    pub fn to_frame(&self, mask: Option<[u8; 4]>) -> Result<Frame, Error> {
         let data: &[u8] = match self {
             Self::Text(text) => text.as_bytes(),
             Self::Binary(data) | Self::Ping(data) | Self::Pong(data) => data,
@@ -495,12 +589,12 @@ impl Message {
             MAX_MESSAGE
         };
         if data.len() > limit {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         let mut payload = Vec::new();
         payload
             .try_reserve_exact(data.len())
-            .map_err(|_| WriteError::Allocation)?;
+            .map_err(|_| Error::Allocation)?;
         payload.extend_from_slice(data);
         Ok(Frame {
             fin: true,
@@ -515,7 +609,7 @@ impl Message {
     /// refuses. Control messages stay in one frame. Text may split inside a
     /// character; readers validate the whole message. Clients should use
     /// [`Self::to_masked_frames`] for a fresh key per frame.
-    pub fn to_frames(&self, max_fragment: usize, mask: Option<[u8; 4]>) -> Result<Vec<Frame>, WriteError> {
+    pub fn to_frames(&self, max_fragment: usize, mask: Option<[u8; 4]>) -> Result<Vec<Frame>, Error> {
         let frame = self.to_frame(mask)?;
         let size = max_fragment.clamp(1, MAX_PAYLOAD);
         if frame.opcode.is_control() || frame.payload.len() <= size {
@@ -523,7 +617,7 @@ impl Message {
         }
         let count = frame.payload.len().div_ceil(size);
         let mut frames = Vec::new();
-        frames.try_reserve_exact(count).map_err(|_| WriteError::Allocation)?;
+        frames.try_reserve_exact(count).map_err(|_| Error::Allocation)?;
         for (i, chunk) in frame.payload.chunks(size).enumerate() {
             frames.push(Frame {
                 fin: i.saturating_add(1) == count,
@@ -542,7 +636,7 @@ impl Message {
         &self,
         max_fragment: usize,
         mut next_key: impl FnMut() -> [u8; 4],
-    ) -> Result<Vec<Frame>, WriteError> {
+    ) -> Result<Vec<Frame>, Error> {
         let mut frames = self.to_frames(max_fragment, None)?;
         for frame in &mut frames {
             frame.mask = Some(next_key());
@@ -560,57 +654,6 @@ pub enum Role {
     Client,
 }
 
-/// Why a stream of frames cannot be read any further. A real endpoint
-/// sends a close frame with [`Error::close_code`] and drops the connection.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Error {
-    /// A frame's header was not valid.
-    Frame(FrameError),
-    /// A server read a frame that was not masked.
-    Unmasked,
-    /// A client read a frame that was masked.
-    Masked,
-    /// A continuation frame came with no message in progress.
-    UnexpectedContinuation,
-    /// A new text or binary frame came before the last message ended.
-    ExpectedContinuation,
-    /// A text message was not UTF-8.
-    InvalidUtf8,
-    /// A message was longer than the decoder's limit.
-    TooBig,
-    /// A close frame's payload was not valid.
-    Close(CloseError),
-}
-
-impl Error {
-    /// The close code a real endpoint sends for this error: 1007 for bad
-    /// text, 1009 for a message or frame too big, and 1002 for the rest.
-    pub fn close_code(self) -> u16 {
-        match self {
-            Error::InvalidUtf8 | Error::Close(CloseError::Utf8) => close_code::INVALID_DATA,
-            Error::TooBig | Error::Frame(FrameError::TooLarge(_)) => close_code::MESSAGE_TOO_BIG,
-            _ => close_code::PROTOCOL_ERROR,
-        }
-    }
-}
-
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Frame(e) => write!(f, "bad frame: {e}"),
-            Error::Unmasked => write!(f, "client frame not masked"),
-            Error::Masked => write!(f, "server frame masked"),
-            Error::UnexpectedContinuation => write!(f, "continuation frame with no message in progress"),
-            Error::ExpectedContinuation => write!(f, "new message before the last one ended"),
-            Error::InvalidUtf8 => write!(f, "text message is not UTF-8"),
-            Error::TooBig => write!(f, "message over the decoder's size limit"),
-            Error::Close(e) => write!(f, "bad close frame: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
-
 /// A text or binary message whose last frame has not come yet.
 #[derive(Clone, Debug)]
 struct Partial {
@@ -620,73 +663,25 @@ struct Partial {
     checked: usize,
 }
 
-/// Why a byte slice is not exactly one frame.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FrameParseError {
-    /// The frame header is invalid.
-    Frame(FrameError),
-    /// A close frame's payload is invalid.
-    Close(CloseError),
-    /// The frame is incomplete.
-    Truncated,
-    /// Bytes follow the frame.
-    Trailing,
-}
-
-impl core::fmt::Display for FrameParseError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Frame(e) => e.fmt(f),
-            Self::Close(e) => e.fmt(f),
-            Self::Truncated => f.write_str("incomplete WebSocket frame"),
-            Self::Trailing => f.write_str("bytes after WebSocket frame"),
-        }
-    }
-}
-
-impl core::error::Error for FrameParseError {}
-
-/// Why a WebSocket value cannot be written.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WriteError {
-    /// The value cannot be written without changing it.
-    Unwritable,
-    /// The output could not be allocated.
-    Allocation,
-}
-
-impl core::fmt::Display for WriteError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(match self {
-            Self::Unwritable => "value cannot be written without changing it",
-            Self::Allocation => "WebSocket output allocation failed",
-        })
-    }
-}
-
-impl core::error::Error for WriteError {}
-
 impl Wire for Frame {
-    type ParseError = FrameParseError;
-    type WriteError = WriteError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads exactly one frame and unmasks its payload. Refuses incomplete
     /// or trailing bytes, invalid headers, and invalid close payloads.
     /// [`Frames`] checks mask direction; [`Messages`] also checks continuation
     /// order and text. A fragment may end inside a UTF-8 character.
-    fn parse(bytes: &[u8]) -> Result<Self, FrameParseError> {
-        let header = Header::parse(bytes)
-            .map_err(FrameParseError::Frame)?
-            .ok_or(FrameParseError::Truncated)?;
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        let header = Header::parse(bytes)?.ok_or(Error::Truncated)?;
         match Self::from_header(bytes, header) {
             Some(frame) if header.frame_len() == bytes.len() => {
                 if frame.opcode == Opcode::Close {
-                    parse_close(&frame.payload).map_err(FrameParseError::Close)?;
+                    parse_close(&frame.payload)?;
                 }
                 Ok(frame)
             }
-            Some(_) => Err(FrameParseError::Trailing),
-            None => Err(FrameParseError::Truncated),
+            Some(_) => Err(Error::Trailing),
+            None => Err(Error::Truncated),
         }
     }
 
@@ -694,19 +689,19 @@ impl Wire for Frame {
     /// non-final control frames, oversized payloads, and invalid close
     /// payloads without changing `out`. A frame carries at most [`MAX_PAYLOAD`]
     /// bytes, or [`MAX_CONTROL_PAYLOAD`] for a control frame.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         let payload = &self.payload;
         if payload.len() > MAX_PAYLOAD
             || self.opcode.is_control() && (!self.fin || payload.len() > MAX_CONTROL_PAYLOAD)
             || self.opcode == Opcode::Close && parse_close(payload).is_err()
         {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         let size = payload
             .len()
             .checked_add(MAX_HEADER_LEN)
-            .ok_or(WriteError::Unwritable)?;
-        out.try_reserve(size).map_err(|_| WriteError::Allocation)?;
+            .ok_or(Error::Unwritable)?;
+        out.try_reserve(size).map_err(|_| Error::Allocation)?;
         out.push(if self.fin { 0x80 } else { 0 } | self.opcode.to_u8());
         let masked = if self.mask.is_some() { 0x80 } else { 0 };
         match payload.len() {
@@ -772,7 +767,7 @@ impl Frames {
     }
 
     fn header(&self, input: &[u8]) -> Result<Option<Header>, Error> {
-        let Some(h) = Header::parse(input).map_err(Error::Frame)? else { return Ok(None) };
+        let Some(h) = Header::parse(input)? else { return Ok(None) };
         match (self.role, h.mask.is_some()) {
             (Role::Server, false) => return Err(Error::Unmasked),
             (Role::Client, true) => return Err(Error::Masked),
@@ -803,7 +798,7 @@ impl codec::Decode for Frames {
             return Ok(Step::Need);
         };
         if h.opcode == Opcode::Close {
-            parse_close(&frame.payload).map_err(Error::Close)?;
+            parse_close(&frame.payload)?;
             self.closed = true;
         }
         Ok(Step::Item(frame, h.frame_len()))
@@ -826,7 +821,7 @@ impl codec::Decode for Frames {
 /// [`codec::AssembleError::Incomplete`] for EOF between fragments. A message
 /// over the limit, in one frame or several, gives `Inner(Error::TooBig)`,
 /// whose [`Error::close_code`] is [`close_code::MESSAGE_TOO_BIG`]. The
-/// `TooLong` and `Allocation` variants are not returned by this decoder.
+/// handshake and write variants are not returned by this decoder.
 ///
 /// ```
 /// use fictionet::stdlib::{codec::{Stream, Wire}, websocket::{Messages, Frame, Opcode, Role}};
@@ -893,7 +888,7 @@ impl codec::Decode for Messages {
             return Ok(Step::End);
         }
         if let Some(h) = self.frames.header(input).map_err(|error| match error {
-            Error::Frame(FrameError::TooLarge(_)) => Inner(Error::TooBig),
+            Error::PayloadTooLarge(_) => Inner(Error::TooBig),
             other => Inner(other),
         })? {
             match (&self.partial, h.opcode) {
@@ -918,7 +913,7 @@ impl codec::Decode for Messages {
             Opcode::Ping => return Ok(Step::Item(Message::Ping(frame.payload), used)),
             Opcode::Pong => return Ok(Step::Item(Message::Pong(frame.payload), used)),
             Opcode::Close => {
-                let close = parse_close(&frame.payload).map_err(|e| Inner(Error::Close(e)))?;
+                let close = parse_close(&frame.payload).map_err(Inner)?;
                 self.partial = None;
                 return Ok(Step::Item(Message::Close(close), used));
             }
@@ -955,84 +950,6 @@ impl codec::Decode for Messages {
     }
 }
 
-/// Why an opening handshake is not valid.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HandshakeError {
-    /// There were more than [`MAX_HEADERS`] header fields.
-    TooManyHeaders,
-    /// A field the handshake reads had a value longer than
-    /// [`MAX_FIELD_LEN`] bytes. A server answers `431 Request Header
-    /// Fields Too Large`.
-    FieldTooLong,
-    /// The request had no `Host` field, more than one, or one that is not
-    /// a host with an optional port (RFC 3986 section 3.2).
-    MissingHost,
-    /// The request had more than one `Origin` field (RFC 6454 section
-    /// 7.3).
-    Origin,
-    /// A request's `Upgrade` did not list `websocket`, or a response's
-    /// `Upgrade` held anything other than `websocket` alone.
-    Upgrade,
-    /// `Connection` did not list `Upgrade`.
-    Connection,
-    /// `Sec-WebSocket-Version` named a version other than 13. A server
-    /// answers `426 Upgrade Required` with `Sec-WebSocket-Version: 13`, so
-    /// the client can retry.
-    Version,
-    /// `Sec-WebSocket-Version` was missing or repeated. The request is
-    /// malformed, and a server answers `400 Bad Request`.
-    MissingVersion,
-    /// `Sec-WebSocket-Key` was missing, repeated, or not base64 for 16
-    /// bytes.
-    Key,
-    /// `Sec-WebSocket-Accept` was missing or did not match the key.
-    Accept,
-    /// `Sec-WebSocket-Protocol` held something other than tokens, no
-    /// name at all, too many of them, a name twice, or, in a response,
-    /// one the client did not offer.
-    Protocol,
-    /// `Sec-WebSocket-Extensions` did not follow the grammar of RFC 6455
-    /// section 9.1, held no extension at all, or too many of them; or a
-    /// response held the field at all, since this module offers none.
-    Extension,
-}
-
-impl std::fmt::Display for HandshakeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            HandshakeError::TooManyHeaders => "too many header fields",
-            HandshakeError::FieldTooLong => "header field value too long",
-            HandshakeError::MissingHost => "no single, valid Host field",
-            HandshakeError::Origin => "more than one Origin field",
-            HandshakeError::Upgrade => "Upgrade does not list websocket",
-            HandshakeError::Connection => "Connection does not list Upgrade",
-            HandshakeError::Version => "Sec-WebSocket-Version is not 13",
-            HandshakeError::MissingVersion => "no single Sec-WebSocket-Version field",
-            HandshakeError::Key => "Sec-WebSocket-Key is missing or not 16 bytes of base64",
-            HandshakeError::Accept => "Sec-WebSocket-Accept does not match the key",
-            HandshakeError::Protocol => "bad Sec-WebSocket-Protocol",
-            HandshakeError::Extension => "bad Sec-WebSocket-Extensions",
-        };
-        f.write_str(s)
-    }
-}
-
-impl HandshakeError {
-    /// The HTTP status a server answers a request it refuses with: 426
-    /// (with `Sec-WebSocket-Version: 13`) for [`HandshakeError::Version`],
-    /// 431 for [`HandshakeError::FieldTooLong`], and 400 for the rest. The errors only [`check_response`] gives have
-    /// no status, since a client answers nothing; they get 400 too.
-    pub fn status_code(self) -> u16 {
-        match self {
-            HandshakeError::Version => 426,
-            HandshakeError::FieldTooLong => 431,
-            _ => 400,
-        }
-    }
-}
-
-impl std::error::Error for HandshakeError {}
-
 /// A valid client upgrade request, as [`check_request`] reads it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Upgrade {
@@ -1055,17 +972,17 @@ impl Upgrade {
     /// invalid key, an accept value that does not match it, or a selected
     /// protocol that is invalid or was not offered. The caller writes the
     /// HTTP response using these fields.
-    pub fn response_headers(&self, protocol: Option<&str>) -> Result<Vec<(String, String)>, WriteError> {
+    pub fn response_headers(&self, protocol: Option<&str>) -> Result<Vec<(String, String)>, Error> {
         if self.key.len() != 24
             || base64_decode(&self.key).is_none_or(|bytes| bytes.len() != KEY_LEN)
             || self.accept != accept_key(&self.key)
         {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         if let Some(protocol) = protocol
             && (!is_token(protocol) || protocol.len() > MAX_FIELD_LEN || !self.protocols.iter().any(|p| p == protocol))
         {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
         let mut out = vec![
             ("Upgrade".to_string(), "websocket".to_string()),
@@ -1094,41 +1011,41 @@ pub fn key_from_bytes(nonce: [u8; KEY_LEN]) -> String {
 /// and value pairs, and works out the accept value. Names are matched
 /// without regard to case. The caller checks the request line itself: a
 /// `GET` with HTTP/1.1 or later.
-pub fn check_request<N: AsRef<str>, V: AsRef<str>>(headers: &[(N, V)]) -> Result<Upgrade, HandshakeError> {
+pub fn check_request<N: AsRef<str>, V: AsRef<str>>(headers: &[(N, V)]) -> Result<Upgrade, Error> {
     if headers.len() > MAX_HEADERS {
-        return Err(HandshakeError::TooManyHeaders);
+        return Err(Error::TooManyHeaders);
     }
     check_lengths(headers)?;
     let mut hosts = fields(headers, "host");
     match (hosts.next(), hosts.next()) {
         (Some(h), None) if is_authority(h) => {}
-        _ => return Err(HandshakeError::MissingHost),
+        _ => return Err(Error::MissingHost),
     }
     if !field_list(headers, "upgrade").iter().any(|t| t.eq_ignore_ascii_case("websocket")) {
-        return Err(HandshakeError::Upgrade);
+        return Err(Error::Upgrade);
     }
     check_connection(headers)?;
     let mut versions = fields(headers, "sec-websocket-version");
     match (versions.next(), versions.next()) {
         (Some(v), None) if v == VERSION => {}
-        (Some(_), None) => return Err(HandshakeError::Version),
-        _ => return Err(HandshakeError::MissingVersion),
+        (Some(_), None) => return Err(Error::Version),
+        _ => return Err(Error::MissingVersion),
     }
     let mut keys = fields(headers, "sec-websocket-key");
     let key = match (keys.next(), keys.next()) {
         (Some(k), None) if k.len() == 24 && base64_decode(k).is_some_and(|b| b.len() == KEY_LEN) => k,
-        _ => return Err(HandshakeError::Key),
+        _ => return Err(Error::Key),
     };
     let mut protocols = Vec::new();
     for value in fields(headers, "sec-websocket-protocol") {
         // Section 4.1: the field is 1#token, so it holds at least one.
         let items = split_list(value);
         if items.is_empty() {
-            return Err(HandshakeError::Protocol);
+            return Err(Error::Protocol);
         }
         for item in items {
             if !is_token(item) || protocols.len() >= MAX_PROTOCOLS || protocols.iter().any(|p| p == item) {
-                return Err(HandshakeError::Protocol);
+                return Err(Error::Protocol);
             }
             protocols.push(item.to_string());
         }
@@ -1138,19 +1055,19 @@ pub fn check_request<N: AsRef<str>, V: AsRef<str>>(headers: &[(N, V)]) -> Result
         // Section 9.1: the field is 1#extension.
         let items = split_list(value);
         if items.is_empty() {
-            return Err(HandshakeError::Extension);
+            return Err(Error::Extension);
         }
         for item in items {
             match extension_name(item) {
                 Some(name) if extensions.len() < MAX_EXTENSIONS => extensions.push(name.to_string()),
-                _ => return Err(HandshakeError::Extension),
+                _ => return Err(Error::Extension),
             }
         }
     }
     let mut origins = fields(headers, "origin");
     let origin = origins.next().map(str::to_string);
     if origins.next().is_some() {
-        return Err(HandshakeError::Origin);
+        return Err(Error::Origin);
     }
     Ok(Upgrade { key: key.to_string(), accept: accept_key(key), protocols, extensions, origin })
 }
@@ -1164,19 +1081,19 @@ pub fn request_headers(
     host: &str,
     nonce: [u8; KEY_LEN],
     protocols: &[&str],
-) -> Result<Vec<(String, String)>, WriteError> {
+) -> Result<Vec<(String, String)>, Error> {
     if host.len() > MAX_FIELD_LEN || !is_authority(host) || protocols.len() > MAX_PROTOCOLS {
-        return Err(WriteError::Unwritable);
+        return Err(Error::Unwritable);
     }
     let mut len = 0usize;
     for (i, &protocol) in protocols.iter().enumerate() {
         let add = protocol
             .len()
             .checked_add(if i == 0 { 0 } else { 2 })
-            .ok_or(WriteError::Unwritable)?;
-        len = len.checked_add(add).ok_or(WriteError::Unwritable)?;
+            .ok_or(Error::Unwritable)?;
+        len = len.checked_add(add).ok_or(Error::Unwritable)?;
         if len > MAX_FIELD_LEN || !is_token(protocol) || protocols[..i].contains(&protocol) {
-            return Err(WriteError::Unwritable);
+            return Err(Error::Unwritable);
         }
     }
     let mut out = vec![
@@ -1200,33 +1117,33 @@ pub fn check_response<N: AsRef<str>, V: AsRef<str>>(
     headers: &[(N, V)],
     key: &str,
     offered: &[&str],
-) -> Result<Option<String>, HandshakeError> {
+) -> Result<Option<String>, Error> {
     if headers.len() > MAX_HEADERS {
-        return Err(HandshakeError::TooManyHeaders);
+        return Err(Error::TooManyHeaders);
     }
     check_lengths(headers)?;
     // Section 4.1: the reply's Upgrade field holds "websocket" and nothing
     // else.
     match field_list(headers, "upgrade")[..] {
         [t] if t.eq_ignore_ascii_case("websocket") => {}
-        _ => return Err(HandshakeError::Upgrade),
+        _ => return Err(Error::Upgrade),
     }
     check_connection(headers)?;
     let mut accepts = fields(headers, "sec-websocket-accept");
     match (accepts.next(), accepts.next()) {
         (Some(a), None) if a == accept_key(key.trim_matches(OWS)) => {}
-        _ => return Err(HandshakeError::Accept),
+        _ => return Err(Error::Accept),
     }
     // Section 4.1: the client offered no extensions, so the reply may
     // name none, and an empty field is not valid either.
     if fields(headers, "sec-websocket-extensions").next().is_some() {
-        return Err(HandshakeError::Extension);
+        return Err(Error::Extension);
     }
     let mut protocols = fields(headers, "sec-websocket-protocol");
     match (protocols.next(), protocols.next()) {
         (None, _) => Ok(None),
         (Some(p), None) if offered.contains(&p) => Ok(Some(p.to_string())),
-        _ => Err(HandshakeError::Protocol),
+        _ => Err(Error::Protocol),
     }
 }
 
@@ -1248,11 +1165,11 @@ fn field_list<'a, N: AsRef<str>, V: AsRef<str>>(headers: &'a [(N, V)], name: &'a
 }
 
 /// Checks that the `Connection` field both sides send lists `Upgrade`.
-fn check_connection<N: AsRef<str>, V: AsRef<str>>(headers: &[(N, V)]) -> Result<(), HandshakeError> {
+fn check_connection<N: AsRef<str>, V: AsRef<str>>(headers: &[(N, V)]) -> Result<(), Error> {
     if field_list(headers, "connection").iter().any(|t| t.eq_ignore_ascii_case("upgrade")) {
         Ok(())
     } else {
-        Err(HandshakeError::Connection)
+        Err(Error::Connection)
     }
 }
 
@@ -1271,10 +1188,10 @@ const READ_FIELDS: [&str; 9] = [
 
 /// Checks that no field a handshake check reads is longer than
 /// [`MAX_FIELD_LEN`], so what the check holds stays small.
-fn check_lengths<N: AsRef<str>, V: AsRef<str>>(headers: &[(N, V)]) -> Result<(), HandshakeError> {
+fn check_lengths<N: AsRef<str>, V: AsRef<str>>(headers: &[(N, V)]) -> Result<(), Error> {
     let read = |n: &str| READ_FIELDS.iter().any(|r| n.eq_ignore_ascii_case(r));
     if headers.iter().any(|(n, v)| v.as_ref().len() > MAX_FIELD_LEN && read(n.as_ref())) {
-        return Err(HandshakeError::FieldTooLong);
+        return Err(Error::FieldTooLong);
     }
     Ok(())
 }
@@ -1661,7 +1578,7 @@ mod tests {
         assert_eq!(u.origin.as_deref(), Some("http://example.com"));
         let reply = u.response_headers(Some("chat")).unwrap();
         assert_eq!(check_response(&reply, &u.key, &["chat", "superchat"]), Ok(Some("chat".to_string())));
-        assert_eq!(u.response_headers(Some("other")), Err(WriteError::Unwritable));
+        assert_eq!(u.response_headers(Some("other")), Err(Error::Unwritable));
         let reply = u.response_headers(None).unwrap();
         assert_eq!(check_response(&reply, &u.key, &["chat"]), Ok(None));
     }
@@ -1687,51 +1604,51 @@ mod tests {
 
     #[test]
     fn handshake_request_errors() {
-        assert_eq!(check_request(&without("Host")), Err(HandshakeError::MissingHost));
-        assert_eq!(check_request(&without("Upgrade")), Err(HandshakeError::Upgrade));
-        assert_eq!(check_request(&with("Upgrade", "h2c")), Err(HandshakeError::Upgrade));
-        assert_eq!(check_request(&without("Connection")), Err(HandshakeError::Connection));
-        assert_eq!(check_request(&with("Connection", "keep-alive")), Err(HandshakeError::Connection));
-        assert_eq!(check_request(&without("Sec-WebSocket-Version")), Err(HandshakeError::MissingVersion));
-        assert_eq!(check_request(&with("Sec-WebSocket-Version", "8")), Err(HandshakeError::Version));
-        assert_eq!(check_request(&without("Sec-WebSocket-Key")), Err(HandshakeError::Key));
-        assert_eq!(check_request(&with("Sec-WebSocket-Key", "not base64!")), Err(HandshakeError::Key));
+        assert_eq!(check_request(&without("Host")), Err(Error::MissingHost));
+        assert_eq!(check_request(&without("Upgrade")), Err(Error::Upgrade));
+        assert_eq!(check_request(&with("Upgrade", "h2c")), Err(Error::Upgrade));
+        assert_eq!(check_request(&without("Connection")), Err(Error::Connection));
+        assert_eq!(check_request(&with("Connection", "keep-alive")), Err(Error::Connection));
+        assert_eq!(check_request(&without("Sec-WebSocket-Version")), Err(Error::MissingVersion));
+        assert_eq!(check_request(&with("Sec-WebSocket-Version", "8")), Err(Error::Version));
+        assert_eq!(check_request(&without("Sec-WebSocket-Key")), Err(Error::Key));
+        assert_eq!(check_request(&with("Sec-WebSocket-Key", "not base64!")), Err(Error::Key));
         // Fifteen bytes, then seventeen.
-        assert_eq!(check_request(&with("Sec-WebSocket-Key", "AAAAAAAAAAAAAAAAAAAA")), Err(HandshakeError::Key));
-        assert_eq!(check_request(&with("Sec-WebSocket-Key", "AAAAAAAAAAAAAAAAAAAAAAA=")), Err(HandshakeError::Key));
+        assert_eq!(check_request(&with("Sec-WebSocket-Key", "AAAAAAAAAAAAAAAAAAAA")), Err(Error::Key));
+        assert_eq!(check_request(&with("Sec-WebSocket-Key", "AAAAAAAAAAAAAAAAAAAAAAA=")), Err(Error::Key));
         let mut twice = rfc_request();
         twice.push(("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="));
-        assert_eq!(check_request(&twice), Err(HandshakeError::Key));
-        assert_eq!(check_request(&with("Sec-WebSocket-Protocol", "a b")), Err(HandshakeError::Protocol));
+        assert_eq!(check_request(&twice), Err(Error::Key));
+        assert_eq!(check_request(&with("Sec-WebSocket-Protocol", "a b")), Err(Error::Protocol));
         let many = vec!["p"; MAX_PROTOCOLS + 1].join(",");
         let mut h: Vec<(&str, &str)> = without("Sec-WebSocket-Protocol");
         h.push(("Sec-WebSocket-Protocol", &many));
-        assert_eq!(check_request(&h), Err(HandshakeError::Protocol));
-        assert_eq!(check_request(&with("Sec-WebSocket-Extensions", "a/b")), Err(HandshakeError::Extension));
-        assert_eq!(check_request(&with("Sec-WebSocket-Extensions", "; x=1")), Err(HandshakeError::Extension));
+        assert_eq!(check_request(&h), Err(Error::Protocol));
+        assert_eq!(check_request(&with("Sec-WebSocket-Extensions", "a/b")), Err(Error::Extension));
+        assert_eq!(check_request(&with("Sec-WebSocket-Extensions", "; x=1")), Err(Error::Extension));
         let many = vec!["e"; MAX_EXTENSIONS + 1].join(",");
         let mut h: Vec<(&str, &str)> = rfc_request();
         h.push(("Sec-WebSocket-Extensions", &many));
-        assert_eq!(check_request(&h), Err(HandshakeError::Extension));
+        assert_eq!(check_request(&h), Err(Error::Extension));
         let mut h = rfc_request();
         h.extend(std::iter::repeat_n(("X", "y"), MAX_HEADERS));
-        assert_eq!(check_request(&h), Err(HandshakeError::TooManyHeaders));
-        assert_eq!(check_response(&h, "k", &[]), Err(HandshakeError::TooManyHeaders));
+        assert_eq!(check_request(&h), Err(Error::TooManyHeaders));
+        assert_eq!(check_response(&h, "k", &[]), Err(Error::TooManyHeaders));
     }
 
     #[test]
     fn subprotocols_offered_must_be_unique() {
         // Section 4.1: the protocol names a client offers "MUST all be
         // unique strings".
-        assert_eq!(check_request(&with("Sec-WebSocket-Protocol", "chat, chat")), Err(HandshakeError::Protocol));
+        assert_eq!(check_request(&with("Sec-WebSocket-Protocol", "chat, chat")), Err(Error::Protocol));
         let mut h = rfc_request();
         h.push(("Sec-WebSocket-Protocol", "chat"));
-        assert_eq!(check_request(&h), Err(HandshakeError::Protocol));
+        assert_eq!(check_request(&h), Err(Error::Protocol));
         // Names differing in case are different strings.
         assert!(check_request(&with("Sec-WebSocket-Protocol", "chat, Chat")).is_ok());
         assert_eq!(
             request_headers("example.com", [1; KEY_LEN], &["a", "b", "a"]),
-            Err(WriteError::Unwritable)
+            Err(Error::Unwritable)
         );
     }
 
@@ -1746,7 +1663,7 @@ mod tests {
                 ("Connection", "Upgrade"),
                 ("Sec-WebSocket-Accept", "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="),
             ];
-            assert_eq!(check_response(&h, key, &[]), Err(HandshakeError::Upgrade), "{upgrade}");
+            assert_eq!(check_response(&h, key, &[]), Err(Error::Upgrade), "{upgrade}");
         }
         let h = [
             ("Upgrade", " WebSocket"),
@@ -1762,11 +1679,11 @@ mod tests {
     fn host_must_be_present_once_and_not_empty() {
         // Section 4.1: the Host field's value holds the host, and HTTP
         // allows one Host field per request.
-        assert_eq!(check_request(&with("Host", "")), Err(HandshakeError::MissingHost));
-        assert_eq!(check_request(&with("Host", "   ")), Err(HandshakeError::MissingHost));
+        assert_eq!(check_request(&with("Host", "")), Err(Error::MissingHost));
+        assert_eq!(check_request(&with("Host", "   ")), Err(Error::MissingHost));
         let mut h = rfc_request();
         h.push(("Host", "other.example.com"));
-        assert_eq!(check_request(&h), Err(HandshakeError::MissingHost));
+        assert_eq!(check_request(&h), Err(Error::MissingHost));
     }
 
     #[test]
@@ -1775,10 +1692,10 @@ mod tests {
         // is not the Host field.
         let mut h = without("Host");
         h.push(("Host ", "server.example.com"));
-        assert_eq!(check_request(&h), Err(HandshakeError::MissingHost));
+        assert_eq!(check_request(&h), Err(Error::MissingHost));
         let mut h = without("Sec-WebSocket-Key");
         h.push((" Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="));
-        assert_eq!(check_request(&h), Err(HandshakeError::Key));
+        assert_eq!(check_request(&h), Err(Error::Key));
     }
 
     #[test]
@@ -1790,19 +1707,19 @@ mod tests {
             ("Sec-WebSocket-Accept", "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="),
         ];
         assert_eq!(check_response(&good, key, &[]), Ok(None));
-        assert_eq!(check_response(&good, "AAAAAAAAAAAAAAAAAAAAAA==", &[]), Err(HandshakeError::Accept));
-        assert_eq!(check_response(&good[..2], key, &[]), Err(HandshakeError::Accept));
-        assert_eq!(check_response(&good[1..], key, &[]), Err(HandshakeError::Upgrade));
-        assert_eq!(check_response(&[good[0], good[2]], key, &[]), Err(HandshakeError::Connection));
+        assert_eq!(check_response(&good, "AAAAAAAAAAAAAAAAAAAAAA==", &[]), Err(Error::Accept));
+        assert_eq!(check_response(&good[..2], key, &[]), Err(Error::Accept));
+        assert_eq!(check_response(&good[1..], key, &[]), Err(Error::Upgrade));
+        assert_eq!(check_response(&[good[0], good[2]], key, &[]), Err(Error::Connection));
         let mut h = good.to_vec();
         h.push(("Sec-WebSocket-Extensions", "permessage-deflate"));
-        assert_eq!(check_response(&h, key, &[]), Err(HandshakeError::Extension));
+        assert_eq!(check_response(&h, key, &[]), Err(Error::Extension));
         let mut h = good.to_vec();
         h.push(("Sec-WebSocket-Protocol", "chat"));
-        assert_eq!(check_response(&h, key, &["superchat"]), Err(HandshakeError::Protocol));
+        assert_eq!(check_response(&h, key, &["superchat"]), Err(Error::Protocol));
         assert_eq!(check_response(&h, key, &["chat"]), Ok(Some("chat".to_string())));
         h.push(("Sec-WebSocket-Protocol", "chat"));
-        assert_eq!(check_response(&h, key, &["chat"]), Err(HandshakeError::Protocol));
+        assert_eq!(check_response(&h, key, &["chat"]), Err(Error::Protocol));
     }
 
     #[test]
@@ -1811,13 +1728,13 @@ mod tests {
         for bad in ["example.com\r\nX-Evil: 1", "", " example.com", "a/b"] {
             assert_eq!(
                 request_headers(bad, [0; KEY_LEN], &[]),
-                Err(WriteError::Unwritable),
+                Err(Error::Unwritable),
                 "{bad:?}"
             );
         }
         assert_eq!(
             request_headers("example.com:8080", [0; KEY_LEN], &["chat", "bad token", "v2"]),
-            Err(WriteError::Unwritable)
+            Err(Error::Unwritable)
         );
         let h = request_headers("example.com:8080", *b"the sample nonce", &["chat", "v2"]).unwrap();
         assert_eq!(h[0].1, "example.com:8080");
@@ -1873,37 +1790,36 @@ mod tests {
                 assert_eq!(Frame::parse(&bytes).unwrap(), f);
             }
         }
-        assert_eq!(Header::parse(&[0x82, 126, 0, 125]), Err(FrameError::NonMinimalLength));
-        assert_eq!(Header::parse(&[0x82, 126, 0, 0]), Err(FrameError::NonMinimalLength));
-        assert_eq!(Header::parse(&[0x82, 127, 0, 0, 0, 0, 0, 0, 0xff, 0xff]), Err(FrameError::NonMinimalLength));
-        assert_eq!(Header::parse(&[0x82, 127, 0x80, 0, 0, 0, 0, 0, 0, 0]), Err(FrameError::LengthHighBit));
-        assert_eq!(Header::parse(&[0x82, 127, 0, 0, 0, 0, 1, 0, 0, 1]), Err(FrameError::TooLarge((1 << 24) + 1)));
+        assert_eq!(Header::parse(&[0x82, 126, 0, 125]), Err(Error::NonMinimalLength));
+        assert_eq!(Header::parse(&[0x82, 126, 0, 0]), Err(Error::NonMinimalLength));
+        assert_eq!(Header::parse(&[0x82, 127, 0, 0, 0, 0, 0, 0, 0xff, 0xff]), Err(Error::NonMinimalLength));
+        assert_eq!(Header::parse(&[0x82, 127, 0x80, 0, 0, 0, 0, 0, 0, 0]), Err(Error::LengthHighBit));
+        assert_eq!(Header::parse(&[0x82, 127, 0, 0, 0, 0, 1, 0, 0, 1]), Err(Error::PayloadTooLarge((1 << 24) + 1)));
         assert!(Header::parse(&[0x82, 127, 0, 0, 0, 0, 1, 0, 0, 0]).unwrap().is_some());
     }
 
     #[test]
     fn frame_errors() {
-        assert_eq!(Header::parse(&[0xc1]), Err(FrameError::ReservedBits(4)));
-        assert_eq!(Header::parse(&[0x91]), Err(FrameError::ReservedBits(1)));
+        assert_eq!(Header::parse(&[0xc1]), Err(Error::ReservedBits(4)));
+        assert_eq!(Header::parse(&[0x91]), Err(Error::ReservedBits(1)));
         for op in [3, 4, 5, 6, 7, 0xb, 0xc, 0xd, 0xe, 0xf] {
-            assert_eq!(Header::parse(&[0x80 | op]), Err(FrameError::ReservedOpcode(op)));
+            assert_eq!(Header::parse(&[0x80 | op]), Err(Error::ReservedOpcode(op)));
             assert_eq!(Opcode::from_u8(op), None);
         }
-        assert_eq!(Header::parse(&[0x09]), Err(FrameError::FragmentedControl));
-        assert_eq!(Header::parse(&[0x88, 126]), Err(FrameError::ControlTooLong));
-        assert_eq!(Header::parse(&[0x8a, 0xff]), Err(FrameError::ControlTooLong));
+        assert_eq!(Header::parse(&[0x09]), Err(Error::FragmentedControl));
+        assert_eq!(Header::parse(&[0x88, 126]), Err(Error::ControlTooLong));
+        assert_eq!(Header::parse(&[0x8a, 0xff]), Err(Error::ControlTooLong));
         assert!(Header::parse(&[0x89, 125]).unwrap().is_some());
         for e in [
-            FrameError::ReservedBits(1),
-            FrameError::ReservedOpcode(3),
-            FrameError::FragmentedControl,
-            FrameError::ControlTooLong,
-            FrameError::NonMinimalLength,
-            FrameError::LengthHighBit,
-            FrameError::TooLarge(1),
+            Error::ReservedBits(1),
+            Error::ReservedOpcode(3),
+            Error::FragmentedControl,
+            Error::ControlTooLong,
+            Error::NonMinimalLength,
+            Error::LengthHighBit,
+            Error::PayloadTooLarge(1),
         ] {
             assert!(!e.to_string().is_empty());
-            assert!(!Error::Frame(e).to_string().is_empty());
         }
         for op in 0..16u8 {
             if let Some(o) = Opcode::from_u8(op) {
@@ -1929,13 +1845,13 @@ mod tests {
             for n in 0..valid.len() {
                 assert_eq!(
                     Frame::parse(&valid[..n]),
-                    Err(FrameParseError::Truncated),
+                    Err(Error::Truncated),
                     "{n} bytes of {valid:?}"
                 );
             }
         }
         for n in (0..longer.len()).step_by(997).chain([longer.len() - 1]) {
-            assert_eq!(Frame::parse(&longer[..n]), Err(FrameParseError::Truncated));
+            assert_eq!(Frame::parse(&longer[..n]), Err(Error::Truncated));
         }
         // The decoder too, for a masked stream.
         let stream: Vec<u8> = [&HELLO_MASKED[..], &long, &close].concat();
@@ -2012,19 +1928,19 @@ mod tests {
         );
         assert_eq!(
             decode(Role::Client, &[0xc1, 0]).1,
-            failure(Error::Frame(FrameError::ReservedBits(4)))
+            failure(Error::ReservedBits(4))
         );
         assert_eq!(
             decode(Role::Client, &[0x88, 0x01, 0x03]).1,
-            failure(Error::Close(CloseError::Short))
+            failure(Error::CloseShort)
         );
         assert_eq!(
             decode(Role::Client, &[0x88, 0x02, 0x03, 0xed]).1,
-            failure(Error::Close(CloseError::Code(1005)))
+            failure(Error::CloseCode(1005))
         );
         assert_eq!(
             decode(Role::Client, &[0x88, 0x03, 0x03, 0xe8, 0xff]).1,
-            failure(Error::Close(CloseError::Utf8))
+            failure(Error::CloseUtf8)
         );
         // A broken stream reports its error once and keeps unread bytes for handoff.
         let mut d = Stream::new(Messages::new(Role::Server));
@@ -2039,16 +1955,16 @@ mod tests {
         assert_eq!(d.unread(), HELLO);
         // Close codes for each error.
         assert_eq!(Error::InvalidUtf8.close_code(), 1007);
-        assert_eq!(Error::Close(CloseError::Utf8).close_code(), 1007);
+        assert_eq!(Error::CloseUtf8.close_code(), 1007);
         assert_eq!(Error::TooBig.close_code(), 1009);
-        assert_eq!(Error::Frame(FrameError::TooLarge(1 << 30)).close_code(), 1009);
+        assert_eq!(Error::PayloadTooLarge(1 << 30).close_code(), 1009);
         for e in [
             Error::Unmasked,
             Error::Masked,
             Error::UnexpectedContinuation,
             Error::ExpectedContinuation,
-            Error::Frame(FrameError::NonMinimalLength),
-            Error::Close(CloseError::Short),
+            Error::NonMinimalLength,
+            Error::CloseShort,
         ] {
             assert_eq!(e.close_code(), 1002);
             assert!(!e.to_string().is_empty());
@@ -2133,22 +2049,22 @@ mod tests {
         // Section 4.2.2: a version the server does not speak gets 426 with
         // Sec-WebSocket-Version: 13. Section 4.2.1: a request without the
         // field, or with it twice, is malformed and gets 400.
-        assert_eq!(check_request(&with("Sec-WebSocket-Version", "8")), Err(HandshakeError::Version));
-        assert_eq!(HandshakeError::Version.status_code(), 426);
-        assert_eq!(check_request(&without("Sec-WebSocket-Version")), Err(HandshakeError::MissingVersion));
+        assert_eq!(check_request(&with("Sec-WebSocket-Version", "8")), Err(Error::Version));
+        assert_eq!(Error::Version.status_code(), 426);
+        assert_eq!(check_request(&without("Sec-WebSocket-Version")), Err(Error::MissingVersion));
         let mut twice = rfc_request();
         twice.push(("Sec-WebSocket-Version", "13"));
-        assert_eq!(check_request(&twice), Err(HandshakeError::MissingVersion));
+        assert_eq!(check_request(&twice), Err(Error::MissingVersion));
         for e in [
-            HandshakeError::TooManyHeaders,
-            HandshakeError::MissingHost,
-            HandshakeError::Origin,
-            HandshakeError::Upgrade,
-            HandshakeError::Connection,
-            HandshakeError::MissingVersion,
-            HandshakeError::Key,
-            HandshakeError::Protocol,
-            HandshakeError::Extension,
+            Error::TooManyHeaders,
+            Error::MissingHost,
+            Error::Origin,
+            Error::Upgrade,
+            Error::Connection,
+            Error::MissingVersion,
+            Error::Key,
+            Error::Protocol,
+            Error::Extension,
         ] {
             assert_eq!(e.status_code(), 400, "{e:?}");
         }
@@ -2175,14 +2091,14 @@ mod tests {
         assert_eq!(c, Close { code: 1000, reason: "bye".into() });
         assert_eq!(c.to_bytes().unwrap(), p);
         contract::check_wire::<Close>(&p);
-        assert_eq!(Close::parse(&[]), Err(CloseError::Short));
-        assert_eq!(Close::parse(&[3]), Err(CloseError::Short));
-        assert_eq!(Close::parse(&[0x03, 0xe8, 0xc3]), Err(CloseError::Utf8));
-        assert_eq!(Close::parse(&[0x03; 126]), Err(CloseError::TooLong));
+        assert_eq!(Close::parse(&[]), Err(Error::CloseShort));
+        assert_eq!(Close::parse(&[3]), Err(Error::CloseShort));
+        assert_eq!(Close::parse(&[0x03, 0xe8, 0xc3]), Err(Error::CloseUtf8));
+        assert_eq!(Close::parse(&[0x03; 126]), Err(Error::CloseTooLong));
         for code in [0u16, 999, 1004, 1005, 1006, 1015, 1016, 2999, 5000, 65535] {
             assert!(!close_code::is_sendable(code));
-            assert_eq!(Close::parse(&code.to_be_bytes()), Err(CloseError::Code(code)));
-            assert_eq!(Close::new(code).to_bytes(), Err(WriteError::Unwritable));
+            assert_eq!(Close::parse(&code.to_be_bytes()), Err(Error::CloseCode(code)));
+            assert_eq!(Close::new(code).to_bytes(), Err(Error::Unwritable));
             contract::check_wire_value(&Close::new(code));
         }
         for code in [1000u16, 1001, 1002, 1003, 1007, 1011, 1012, 1014, 3000, 4999] {
@@ -2197,7 +2113,7 @@ mod tests {
             contract::check_wire_value(&close);
             assert_eq!(close.to_bytes().is_ok(), valid);
         }
-        for e in [CloseError::Short, CloseError::TooLong, CloseError::Code(1), CloseError::Utf8] {
+        for e in [Error::CloseShort, Error::CloseTooLong, Error::CloseCode(1), Error::CloseUtf8] {
             assert!(!e.to_string().is_empty());
         }
     }
@@ -2215,7 +2131,7 @@ mod tests {
             Frame::new(Opcode::Binary, vec![0; MAX_PAYLOAD + 5]),
         ] {
             let mut out = vec![7];
-            assert_eq!(frame.write(&mut out), Err(WriteError::Unwritable));
+            assert_eq!(frame.write(&mut out), Err(Error::Unwritable));
             assert_eq!(out, [7]);
             contract::check_wire_value(&frame);
         }
@@ -2231,11 +2147,11 @@ mod tests {
                 reason: "é".repeat(100),
             })),
         ] {
-            assert_eq!(message.to_frame(None), Err(WriteError::Unwritable));
-            assert_eq!(message.to_frames(1, None), Err(WriteError::Unwritable));
+            assert_eq!(message.to_frame(None), Err(Error::Unwritable));
+            assert_eq!(message.to_frames(1, None), Err(Error::Unwritable));
             assert_eq!(
                 message.to_masked_frames(1, || panic!("key requested for refused value")),
-                Err(WriteError::Unwritable)
+                Err(Error::Unwritable)
             );
         }
         assert_eq!(Message::Binary(vec![1, 2, 3]).to_frames(0, None).unwrap().len(), 3);
@@ -2288,18 +2204,18 @@ mod tests {
         assert_eq!(&d, b"Hello");
         assert!(Opcode::Close.is_control() && !Opcode::Continuation.is_control());
         for e in [
-            HandshakeError::TooManyHeaders,
-            HandshakeError::MissingHost,
-            HandshakeError::Origin,
-            HandshakeError::Upgrade,
-            HandshakeError::Connection,
-            HandshakeError::Version,
-            HandshakeError::FieldTooLong,
-            HandshakeError::MissingVersion,
-            HandshakeError::Key,
-            HandshakeError::Accept,
-            HandshakeError::Protocol,
-            HandshakeError::Extension,
+            Error::TooManyHeaders,
+            Error::MissingHost,
+            Error::Origin,
+            Error::Upgrade,
+            Error::Connection,
+            Error::Version,
+            Error::FieldTooLong,
+            Error::MissingVersion,
+            Error::Key,
+            Error::Accept,
+            Error::Protocol,
+            Error::Extension,
         ] {
             assert!(!e.to_string().is_empty());
         }
@@ -2467,10 +2383,10 @@ mod tests {
         for (name, value) in [("Connection", &commas), ("Sec-WebSocket-Key", &key), ("Origin", &origin)] {
             let mut h = without(name);
             h.push((name, value));
-            assert_eq!(check_request(&h), Err(HandshakeError::FieldTooLong), "{name}");
-            assert_eq!(check_response(&h, "k", &[]), Err(HandshakeError::FieldTooLong), "{name}");
+            assert_eq!(check_request(&h), Err(Error::FieldTooLong), "{name}");
+            assert_eq!(check_response(&h, "k", &[]), Err(Error::FieldTooLong), "{name}");
         }
-        assert_eq!(HandshakeError::FieldTooLong.status_code(), 431);
+        assert_eq!(Error::FieldTooLong.status_code(), 431);
         // Exactly the limit is read, and fields the check does not read
         // may be longer.
         let origin = "o".repeat(MAX_FIELD_LEN);
@@ -2479,20 +2395,20 @@ mod tests {
         h.push(("Cookie", &cookie));
         assert_eq!(check_request(&h).unwrap().origin.as_deref(), Some(&origin[..]));
         // A key of the wrong length is refused before it is decoded.
-        assert_eq!(check_request(&with("Sec-WebSocket-Key", &key[..MAX_FIELD_LEN])), Err(HandshakeError::Key));
+        assert_eq!(check_request(&with("Sec-WebSocket-Key", &key[..MAX_FIELD_LEN])), Err(Error::Key));
         // The field builder refuses a protocol list over the limit.
         let long = "p".repeat(MAX_FIELD_LEN / 3);
         let names: Vec<String> = (0..4).map(|i| format!("{long}{i}")).collect();
         let names: Vec<&str> = names.iter().map(String::as_str).collect();
         assert_eq!(
             request_headers("example.com", [2; KEY_LEN], &names),
-            Err(WriteError::Unwritable)
+            Err(Error::Unwritable)
         );
         let h = request_headers("example.com", [2; KEY_LEN], &names[..2]).unwrap();
         assert_eq!(check_request(&h).unwrap().protocols, names[..2]);
         assert_eq!(
             request_headers("x", [0; KEY_LEN], &vec!["p"; MAX_PROTOCOLS + 1]),
-            Err(WriteError::Unwritable)
+            Err(Error::Unwritable)
         );
     }
 
@@ -2510,13 +2426,13 @@ mod tests {
             ",",
             " , ,",
         ] {
-            assert_eq!(check_request(&with("Sec-WebSocket-Extensions", bad)), Err(HandshakeError::Extension), "{bad:?}");
+            assert_eq!(check_request(&with("Sec-WebSocket-Extensions", bad)), Err(Error::Extension), "{bad:?}");
         }
         for good in ["x; a", "x;a=b", "x ; a = b", "x; a=\"b\"", "x; a=\"\\b\"", "a, b; c=1,, d"] {
             assert!(check_request(&with("Sec-WebSocket-Extensions", good)).is_ok(), "{good:?}");
         }
         for bad in ["", ",", " , "] {
-            assert_eq!(check_request(&with("Sec-WebSocket-Protocol", bad)), Err(HandshakeError::Protocol), "{bad:?}");
+            assert_eq!(check_request(&with("Sec-WebSocket-Protocol", bad)), Err(Error::Protocol), "{bad:?}");
         }
         let key = "dGhlIHNhbXBsZSBub25jZQ==";
         let h = [
@@ -2525,7 +2441,7 @@ mod tests {
             ("Sec-WebSocket-Accept", "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="),
             ("Sec-WebSocket-Extensions", ""),
         ];
-        assert_eq!(check_response(&h, key, &[]), Err(HandshakeError::Extension));
+        assert_eq!(check_response(&h, key, &[]), Err(Error::Extension));
     }
 
     #[test]
@@ -2542,7 +2458,7 @@ mod tests {
             "%4",
             "a:1:2",
         ] {
-            assert_eq!(check_request(&with("Host", bad)), Err(HandshakeError::MissingHost), "{bad:?}");
+            assert_eq!(check_request(&with("Host", bad)), Err(Error::MissingHost), "{bad:?}");
         }
         for good in ["example.com", "example.com:8080", "example.com:", "[::1]:443", "[::1]", "127.0.0.1", "%41b", "[v1.x:y]", "a-b_c~d!$&'()*+,;="] {
             assert!(check_request(&with("Host", good)).is_ok(), "{good:?}");
@@ -2553,21 +2469,21 @@ mod tests {
     fn response_fields_refuse_invalid_values() {
         let mut upgrade = check_request(&rfc_request()).unwrap();
         upgrade.accept.clear();
-        assert_eq!(upgrade.response_headers(None), Err(WriteError::Unwritable));
+        assert_eq!(upgrade.response_headers(None), Err(Error::Unwritable));
         upgrade.accept = accept_key(&upgrade.key);
         upgrade.protocols.push("a\r\nb".to_string());
-        assert_eq!(upgrade.response_headers(Some("a\r\nb")), Err(WriteError::Unwritable));
+        assert_eq!(upgrade.response_headers(Some("a\r\nb")), Err(Error::Unwritable));
         upgrade.key = "bad key".into();
         upgrade.accept = accept_key(&upgrade.key);
-        assert_eq!(upgrade.response_headers(None), Err(WriteError::Unwritable));
+        assert_eq!(upgrade.response_headers(None), Err(Error::Unwritable));
     }
 
     #[test]
     fn review_origin_appears_once() {
         let mut h = rfc_request();
         h.push(("Origin", "https://other.example"));
-        assert_eq!(check_request(&h), Err(HandshakeError::Origin));
-        assert_eq!(HandshakeError::Origin.status_code(), 400);
+        assert_eq!(check_request(&h), Err(Error::Origin));
+        assert_eq!(Error::Origin.status_code(), 400);
     }
 
     #[test]
