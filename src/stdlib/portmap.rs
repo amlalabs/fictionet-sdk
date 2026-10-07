@@ -47,13 +47,13 @@
 //! Every reader checks lengths, because the agent can send any bytes it
 //! likes. Strings, opaque data and lists have limits, given below as
 //! constants. Lists are read in a loop, never by recursion. Writers return
-//! an [`EncodeError`] rather than write bytes a reader would refuse.
+//! an [`Error`] rather than write bytes a reader would refuse.
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
 //! use fictionet::stdlib::onc_rpc::{Accept, Body, Call, Message, Reply, silent_on_failure};
 //! use fictionet::stdlib::portmap::{
-//!     format_uaddr, parse_uaddr, procedure, ParseError, PmapRequest, PmapResult, Request, Rpcb,
+//!     format_uaddr, parse_uaddr, procedure, Error, PmapRequest, PmapResult, Request, Rpcb,
 //!     RpcbRequest, RpcbResult, IPPROTO_TCP,
 //! };
 //! use std::net::SocketAddr;
@@ -77,7 +77,7 @@
 //!             Ok(Vec::new())
 //!         }
 //!         // The wrong RPC version is refused, even for CALLIT.
-//!         Err(e @ ParseError::RpcVersion(_)) => return Some(e.reply()),
+//!         Err(e @ Error::RpcVersion(_)) => return Some(e.reply()),
 //!         // Forward nothing: a CALLIT that fails gets no reply.
 //!         _ if silent_on_failure(call) => return None,
 //!         // Register nothing and list nothing.
@@ -118,8 +118,8 @@
 use std::net::{IpAddr, SocketAddr};
 
 use fictionet::stdlib::onc_rpc::{
-    Accept, Body, Call, MAX_RPCB_STRING, Message, PMAP_PROGRAM, PMAP_VERSION, RPC_VERSION,
-    RPCB_VERSION_HIGH, RPCB_VERSION_LOW, Reader, Reject, Reply, Writer, XdrError,
+    self, Accept, Body, Call, MAX_RPCB_STRING, Message, PMAP_PROGRAM, PMAP_VERSION, RPC_VERSION,
+    RPCB_VERSION_HIGH, RPCB_VERSION_LOW, Reader, Reject, Reply, Writer,
 };
 pub use fictionet::stdlib::onc_rpc::{IPPROTO_TCP, IPPROTO_UDP, Mapping, PORT, Rpcb};
 
@@ -206,38 +206,13 @@ pub mod semantics {
     pub const RAW: u32 = 4;
 }
 
-/// Why a writer refused a value: a reader would refuse its bytes.
+/// Why a call is not a request this module reads, results are not what
+/// the procedure returns, or a writer refused a value because a reader
+/// would refuse its bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EncodeError {
-    /// A string, opaque data or a transport address over its limit.
-    TooLong,
-    /// A list of more than [`MAX_LIST`] entries.
-    TooMany,
-    /// An rpcbind request for a version that does not have it: a version
-    /// other than 3 or 4, or a version 4 procedure for version 3.
-    Version(u32),
-}
-
-impl std::fmt::Display for EncodeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            EncodeError::TooLong => f.write_str("a string or opaque value over its limit"),
-            EncodeError::TooMany => write!(f, "a list of more than {MAX_LIST} entries"),
-            EncodeError::Version(v) => {
-                write!(f, "rpcbind version {v} does not have this procedure")
-            }
-        }
-    }
-}
-
-impl std::error::Error for EncodeError {}
-
-/// Why a call is not a request this module reads, or results are not what
-/// the procedure returns.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ParseError {
+pub enum Error {
     /// The call's RPC version is not 2. A server refuses it with
-    /// RPC_MISMATCH: see [`ParseError::reply`].
+    /// RPC_MISMATCH: see [`Error::reply`].
     RpcVersion(u32),
     /// The call is for another program than 100000.
     Program(u32),
@@ -246,33 +221,43 @@ pub enum ParseError {
     /// The version has no procedure with this number.
     Procedure(u32),
     /// The arguments or results do not read.
-    Xdr(XdrError),
+    Xdr(onc_rpc::Error),
+    /// A string, opaque data or a transport address to write is over its
+    /// limit.
+    TooLong,
+    /// A list to write has more than [`MAX_LIST`] entries.
+    TooMany,
+    /// An rpcbind request to write is for a version that does not have
+    /// it: a version other than 3 or 4, or a version 4 procedure for
+    /// version 3.
+    RequestVersion(u32),
 }
 
-impl ParseError {
+impl Error {
     /// The status a portmapper replies with when a call fails this way.
     /// A call with the wrong RPC version is not accepted at all, so for
-    /// [`ParseError::RpcVersion`] this is GARBAGE_ARGS, and the reply to
-    /// send is [`ParseError::reply`].
+    /// [`Error::RpcVersion`] this is GARBAGE_ARGS, and the reply to
+    /// send is [`Error::reply`]. The errors only a writer gives are
+    /// GARBAGE_ARGS too.
     pub fn status(&self) -> Accept {
         match self {
-            ParseError::RpcVersion(_) => Accept::GarbageArgs,
-            ParseError::Program(_) => Accept::ProgUnavail,
-            ParseError::Version(_) => Accept::ProgMismatch {
+            Error::RpcVersion(_) => Accept::GarbageArgs,
+            Error::Program(_) => Accept::ProgUnavail,
+            Error::Version(_) => Accept::ProgMismatch {
                 low: PMAP_VERSION,
                 high: RPCB_VERSION_HIGH,
             },
-            ParseError::Procedure(_) => Accept::ProcUnavail,
-            ParseError::Xdr(_) => Accept::GarbageArgs,
+            Error::Procedure(_) => Accept::ProcUnavail,
+            Error::Xdr(_) | Error::TooLong | Error::TooMany | Error::RequestVersion(_) => Accept::GarbageArgs,
         }
     }
 
     /// The reply a portmapper sends when a call fails this way: RPC_MISMATCH
     /// for the wrong RPC version (RFC 5531, section 9), and otherwise
-    /// [`ParseError::status`].
+    /// [`Error::status`].
     pub fn reply(&self) -> Reply {
         match self {
-            ParseError::RpcVersion(_) => Reply::Denied(Reject::RpcMismatch {
+            Error::RpcVersion(_) => Reply::Denied(Reject::RpcMismatch {
                 low: RPC_VERSION,
                 high: RPC_VERSION,
             }),
@@ -281,25 +266,37 @@ impl ParseError {
     }
 }
 
-impl From<XdrError> for ParseError {
-    fn from(e: XdrError) -> ParseError {
-        ParseError::Xdr(e)
+impl From<onc_rpc::Error> for Error {
+    fn from(e: onc_rpc::Error) -> Error {
+        Error::Xdr(e)
     }
 }
 
-impl std::fmt::Display for ParseError {
+impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ParseError::RpcVersion(v) => write!(f, "RPC version {v}, not 2"),
-            ParseError::Program(p) => write!(f, "program {p}, not the portmapper (100000)"),
-            ParseError::Version(v) => write!(f, "portmapper version {v}, not 2, 3 or 4"),
-            ParseError::Procedure(p) => write!(f, "no portmapper procedure {p} in this version"),
-            ParseError::Xdr(e) => write!(f, "portmapper arguments or results: {e}"),
+            Error::RpcVersion(v) => write!(f, "RPC version {v}, not 2"),
+            Error::Program(p) => write!(f, "program {p}, not the portmapper (100000)"),
+            Error::Version(v) => write!(f, "portmapper version {v}, not 2, 3 or 4"),
+            Error::Procedure(p) => write!(f, "no portmapper procedure {p} in this version"),
+            Error::Xdr(e) => write!(f, "portmapper arguments or results: {e}"),
+            Error::TooLong => f.write_str("a string or opaque value over its limit"),
+            Error::TooMany => write!(f, "a list of more than {MAX_LIST} entries"),
+            Error::RequestVersion(v) => {
+                write!(f, "rpcbind version {v} does not have this procedure")
+            }
         }
     }
 }
 
-impl std::error::Error for ParseError {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Xdr(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 /// The arguments of a forwarded call: the portmapper's CALLIT (call_args)
 /// and rpcbind's CALLIT, BCAST and INDIRECT (rpcb_rmtcallargs) have the
@@ -317,7 +314,7 @@ pub struct CallArgs {
 }
 
 impl CallArgs {
-    fn read(r: &mut Reader<'_>) -> Result<CallArgs, XdrError> {
+    fn read(r: &mut Reader<'_>) -> Result<CallArgs, onc_rpc::Error> {
         Ok(CallArgs {
             program: r.uint()?,
             version: r.uint()?,
@@ -326,7 +323,7 @@ impl CallArgs {
         })
     }
 
-    fn write(&self, w: &mut Writer) -> Result<(), EncodeError> {
+    fn write(&self, w: &mut Writer) -> Result<(), Error> {
         w.uint(self.program).uint(self.version).uint(self.procedure);
         opaque(w, &self.args, MAX_CALL_DATA)
     }
@@ -371,10 +368,10 @@ pub struct Netbuf {
 }
 
 impl Netbuf {
-    fn read(r: &mut Reader<'_>) -> Result<Netbuf, XdrError> {
+    fn read(r: &mut Reader<'_>) -> Result<Netbuf, onc_rpc::Error> {
         let maxlen = r.uint()?;
         if maxlen > MAX_NETBUF_MAXLEN {
-            return Err(XdrError::TooLong(maxlen));
+            return Err(onc_rpc::Error::TooLong(maxlen));
         }
         let max = usize::try_from(maxlen)
             .unwrap_or(usize::MAX)
@@ -385,11 +382,11 @@ impl Netbuf {
         })
     }
 
-    fn write(&self, w: &mut Writer) -> Result<(), EncodeError> {
+    fn write(&self, w: &mut Writer) -> Result<(), Error> {
         if self.maxlen > MAX_NETBUF_MAXLEN
             || !u32::try_from(self.buf.len()).is_ok_and(|n| n <= self.maxlen)
         {
-            return Err(EncodeError::TooLong);
+            return Err(Error::TooLong);
         }
         w.uint(self.maxlen);
         opaque(w, &self.buf, MAX_NETBUF)
@@ -414,7 +411,7 @@ pub struct RpcbEntry {
 }
 
 impl RpcbEntry {
-    fn read(r: &mut Reader<'_>) -> Result<RpcbEntry, XdrError> {
+    fn read(r: &mut Reader<'_>) -> Result<RpcbEntry, onc_rpc::Error> {
         Ok(RpcbEntry {
             maddr: r.string(MAX_STRING)?.to_string(),
             netid: r.string(MAX_STRING)?.to_string(),
@@ -424,7 +421,7 @@ impl RpcbEntry {
         })
     }
 
-    fn write(&self, w: &mut Writer) -> Result<(), EncodeError> {
+    fn write(&self, w: &mut Writer) -> Result<(), Error> {
         string(w, &self.maddr)?;
         string(w, &self.netid)?;
         w.uint(self.semantics);
@@ -484,7 +481,7 @@ pub struct RpcbStat {
 }
 
 impl RpcbStat {
-    fn read(r: &mut Reader<'_>) -> Result<RpcbStat, XdrError> {
+    fn read(r: &mut Reader<'_>) -> Result<RpcbStat, onc_rpc::Error> {
         let mut info = [0; STAT_PROCEDURES];
         for n in &mut info {
             *n = r.int()?;
@@ -520,7 +517,7 @@ impl RpcbStat {
         })
     }
 
-    fn write(&self, w: &mut Writer) -> Result<(), EncodeError> {
+    fn write(&self, w: &mut Writer) -> Result<(), Error> {
         for n in self.info {
             w.int(n);
         }
@@ -568,7 +565,7 @@ pub enum PmapRequest {
 impl PmapRequest {
     /// Reads the request for `procedure` from a call's arguments, which
     /// must end where the request does.
-    pub fn parse(procedure: u32, args: &[u8]) -> Result<PmapRequest, ParseError> {
+    pub fn parse(procedure: u32, args: &[u8]) -> Result<PmapRequest, Error> {
         let mut r = Reader::new(args);
         let request = match procedure {
             procedure::NULL => PmapRequest::Null,
@@ -577,7 +574,7 @@ impl PmapRequest {
             procedure::GETPORT => PmapRequest::GetPort(Mapping::read(&mut r)?),
             procedure::DUMP => PmapRequest::Dump,
             procedure::CALLIT => PmapRequest::CallIt(CallArgs::read(&mut r)?),
-            p => return Err(ParseError::Procedure(p)),
+            p => return Err(Error::Procedure(p)),
         };
         r.finish()?;
         Ok(request)
@@ -596,7 +593,7 @@ impl PmapRequest {
     }
 
     /// The call's arguments.
-    pub fn to_args(&self) -> Result<Vec<u8>, EncodeError> {
+    pub fn to_args(&self) -> Result<Vec<u8>, Error> {
         let mut w = Writer::new();
         match self {
             PmapRequest::Null | PmapRequest::Dump => {}
@@ -605,7 +602,7 @@ impl PmapRequest {
             }
             PmapRequest::CallIt(c) => c.write(&mut w)?,
         }
-        w.finish().map_err(|_| EncodeError::TooLong)
+        w.finish().map_err(|_| Error::TooLong)
     }
 }
 
@@ -627,7 +624,7 @@ pub enum PmapResult {
 impl PmapResult {
     /// Reads the results of `procedure`, which must be the whole of
     /// `results`.
-    pub fn parse(procedure: u32, results: &[u8]) -> Result<PmapResult, ParseError> {
+    pub fn parse(procedure: u32, results: &[u8]) -> Result<PmapResult, Error> {
         let mut r = Reader::new(results);
         let result = match procedure {
             procedure::NULL => PmapResult::Null,
@@ -638,7 +635,7 @@ impl PmapResult {
                 port: r.uint()?,
                 results: r.opaque(MAX_CALL_DATA)?.to_vec(),
             }),
-            p => return Err(ParseError::Procedure(p)),
+            p => return Err(Error::Procedure(p)),
         };
         r.finish()?;
         Ok(result)
@@ -657,7 +654,7 @@ impl PmapResult {
     }
 
     /// The results' bytes, for [`Reply::success`](fictionet::stdlib::onc_rpc::Reply::success).
-    pub fn to_bytes(&self) -> Result<Vec<u8>, EncodeError> {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
         let mut w = Writer::new();
         match self {
             PmapResult::Null => {}
@@ -676,7 +673,7 @@ impl PmapResult {
                 opaque(&mut w, &c.results, MAX_CALL_DATA)?;
             }
         }
-        w.finish().map_err(|_| EncodeError::TooLong)
+        w.finish().map_err(|_| Error::TooLong)
     }
 }
 
@@ -727,12 +724,12 @@ pub enum RpcbRequest {
 impl RpcbRequest {
     /// Reads the request for `procedure` of rpcbind `version` from a call's
     /// arguments, which must end where the request does.
-    pub fn parse(version: u32, procedure: u32, args: &[u8]) -> Result<RpcbRequest, ParseError> {
+    pub fn parse(version: u32, procedure: u32, args: &[u8]) -> Result<RpcbRequest, Error> {
         if !(RPCB_VERSION_LOW..=RPCB_VERSION_HIGH).contains(&version) {
-            return Err(ParseError::Version(version));
+            return Err(Error::Version(version));
         }
         if version == RPCB_VERSION_LOW && procedure > procedure::TADDR2UADDR {
-            return Err(ParseError::Procedure(procedure));
+            return Err(Error::Procedure(procedure));
         }
         let mut r = Reader::new(args);
         let request = match procedure {
@@ -749,7 +746,7 @@ impl RpcbRequest {
             procedure::INDIRECT => RpcbRequest::Indirect(CallArgs::read(&mut r)?),
             procedure::GETADDRLIST => RpcbRequest::GetAddrList(Rpcb::read(&mut r)?),
             procedure::GETSTAT => RpcbRequest::GetStat,
-            p => return Err(ParseError::Procedure(p)),
+            p => return Err(Error::Procedure(p)),
         };
         r.finish()?;
         Ok(request)
@@ -784,7 +781,7 @@ impl RpcbRequest {
     }
 
     /// The call's arguments.
-    pub fn to_args(&self) -> Result<Vec<u8>, EncodeError> {
+    pub fn to_args(&self) -> Result<Vec<u8>, Error> {
         let mut w = Writer::new();
         match self {
             RpcbRequest::Null | RpcbRequest::Dump | RpcbRequest::GetTime | RpcbRequest::GetStat => {
@@ -798,7 +795,7 @@ impl RpcbRequest {
             RpcbRequest::Uaddr2Taddr(s) => string(&mut w, s)?,
             RpcbRequest::Taddr2Uaddr(n) => n.write(&mut w)?,
         }
-        w.finish().map_err(|_| EncodeError::TooLong)
+        w.finish().map_err(|_| Error::TooLong)
     }
 }
 
@@ -831,7 +828,7 @@ impl RpcbResult {
     /// Reads the results of `procedure`, which must be the whole of
     /// `results`. The procedures of version 4 are read whatever the
     /// version.
-    pub fn parse(procedure: u32, results: &[u8]) -> Result<RpcbResult, ParseError> {
+    pub fn parse(procedure: u32, results: &[u8]) -> Result<RpcbResult, Error> {
         let mut r = Reader::new(results);
         let result = match procedure {
             procedure::NULL => RpcbResult::Null,
@@ -852,7 +849,7 @@ impl RpcbResult {
                 RpcbStat::read(&mut r)?,
                 RpcbStat::read(&mut r)?,
             ])),
-            p => return Err(ParseError::Procedure(p)),
+            p => return Err(Error::Procedure(p)),
         };
         r.finish()?;
         Ok(result)
@@ -876,7 +873,7 @@ impl RpcbResult {
     }
 
     /// The results' bytes, for [`Reply::success`](fictionet::stdlib::onc_rpc::Reply::success).
-    pub fn to_bytes(&self) -> Result<Vec<u8>, EncodeError> {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
         let mut w = Writer::new();
         match self {
             RpcbResult::Null => {}
@@ -900,7 +897,7 @@ impl RpcbResult {
                 }
             }
         }
-        w.finish().map_err(|_| EncodeError::TooLong)
+        w.finish().map_err(|_| Error::TooLong)
     }
 }
 
@@ -920,17 +917,17 @@ pub enum Request {
 
 impl Request {
     /// Reads the request a call makes. When the call is not one, the
-    /// error's [`ParseError::status`] is what a portmapper replies with,
+    /// error's [`Error::status`] is what a portmapper replies with,
     /// unless [`silent_on_failure`](fictionet::stdlib::onc_rpc::silent_on_failure)
     /// says it sends no reply. A call whose RPC version is not 2 is
-    /// [`ParseError::RpcVersion`], whose reply is
-    /// [`ParseError::reply`]. The credentials are not checked.
-    pub fn from_call(call: &Call) -> Result<Request, ParseError> {
+    /// [`Error::RpcVersion`], whose reply is
+    /// [`Error::reply`]. The credentials are not checked.
+    pub fn from_call(call: &Call) -> Result<Request, Error> {
         if call.rpc_version != RPC_VERSION {
-            return Err(ParseError::RpcVersion(call.rpc_version));
+            return Err(Error::RpcVersion(call.rpc_version));
         }
         if call.program != PMAP_PROGRAM {
-            return Err(ParseError::Program(call.program));
+            return Err(Error::Program(call.program));
         }
         Self::read(call.version, call.procedure, &call.args)
     }
@@ -938,7 +935,7 @@ impl Request {
     /// Reads the complete arguments for a procedure of version 2, 3, or 4.
     /// The caller checks the RPC version, program, and credentials. Use
     /// [`Self::from_call`] to check the RPC version and program as well.
-    pub fn read(version: u32, procedure: u32, args: &[u8]) -> Result<Request, ParseError> {
+    pub fn read(version: u32, procedure: u32, args: &[u8]) -> Result<Request, Error> {
         if version == PMAP_VERSION {
             return Ok(Request::Pmap(PmapRequest::parse(procedure, args)?));
         }
@@ -964,12 +961,12 @@ impl Request {
 
     /// The call that makes this request, with AUTH_NONE. An rpcbind
     /// version that does not have the procedure is refused.
-    pub fn to_call(&self) -> Result<Call, EncodeError> {
+    pub fn to_call(&self) -> Result<Call, Error> {
         let args = match self {
             Request::Pmap(p) => p.to_args()?,
             Request::Rpcb { version, request } => {
                 if !(request.min_version()..=RPCB_VERSION_HIGH).contains(version) {
-                    return Err(EncodeError::Version(*version));
+                    return Err(Error::RequestVersion(*version));
                 }
                 request.to_args()?
             }
@@ -983,7 +980,7 @@ impl Request {
     }
 
     /// A call message that makes this request, with AUTH_NONE.
-    pub fn call(&self, xid: u32) -> Result<Message, EncodeError> {
+    pub fn call(&self, xid: u32) -> Result<Message, Error> {
         Ok(Message {
             xid,
             body: Body::Call(self.to_call()?),
@@ -1026,18 +1023,18 @@ fn port_byte(s: &str) -> Option<u8> {
 }
 
 /// Writes a string of at most [`MAX_STRING`] bytes.
-fn string(w: &mut Writer, s: &str) -> Result<(), EncodeError> {
+fn string(w: &mut Writer, s: &str) -> Result<(), Error> {
     if s.len() > MAX_STRING {
-        return Err(EncodeError::TooLong);
+        return Err(Error::TooLong);
     }
     w.string(s);
     Ok(())
 }
 
 /// Writes opaque data of at most `max` bytes.
-fn opaque(w: &mut Writer, data: &[u8], max: usize) -> Result<(), EncodeError> {
+fn opaque(w: &mut Writer, data: &[u8], max: usize) -> Result<(), Error> {
     if data.len() > max {
-        return Err(EncodeError::TooLong);
+        return Err(Error::TooLong);
     }
     w.opaque(data);
     Ok(())
@@ -1045,7 +1042,7 @@ fn opaque(w: &mut Writer, data: &[u8], max: usize) -> Result<(), EncodeError> {
 
 /// Writes a registration whose strings are each at most [`MAX_STRING`]
 /// bytes, as [`Rpcb::read`] reads them.
-fn write_rpcb(w: &mut Writer, b: &Rpcb) -> Result<(), EncodeError> {
+fn write_rpcb(w: &mut Writer, b: &Rpcb) -> Result<(), Error> {
     w.uint(b.program).uint(b.version);
     string(w, &b.netid)?;
     string(w, &b.addr)?;
@@ -1057,12 +1054,12 @@ fn write_rpcb(w: &mut Writer, b: &Rpcb) -> Result<(), EncodeError> {
 /// list never deepens the stack.
 fn read_list<'a, T>(
     r: &mut Reader<'a>,
-    mut item: impl FnMut(&mut Reader<'a>) -> Result<T, XdrError>,
-) -> Result<Vec<T>, XdrError> {
+    mut item: impl FnMut(&mut Reader<'a>) -> Result<T, onc_rpc::Error>,
+) -> Result<Vec<T>, onc_rpc::Error> {
     let mut out = Vec::new();
     while r.bool()? {
         if out.len() >= MAX_LIST {
-            return Err(XdrError::TooLong(
+            return Err(onc_rpc::Error::TooLong(
                 u32::try_from(MAX_LIST)
                     .unwrap_or(u32::MAX)
                     .saturating_add(1),
@@ -1077,10 +1074,10 @@ fn read_list<'a, T>(
 fn write_list<T>(
     w: &mut Writer,
     items: &[T],
-    mut item: impl FnMut(&mut Writer, &T) -> Result<(), EncodeError>,
-) -> Result<(), EncodeError> {
+    mut item: impl FnMut(&mut Writer, &T) -> Result<(), Error>,
+) -> Result<(), Error> {
     if items.len() > MAX_LIST {
-        return Err(EncodeError::TooMany);
+        return Err(Error::TooMany);
     }
     for i in items {
         w.bool(true);
@@ -1409,19 +1406,19 @@ mod tests {
     #[test]
     fn from_call_errors() {
         let call = Call::new(100_003, 2, 0, vec![]);
-        assert_eq!(Request::from_call(&call), Err(ParseError::Program(100_003)));
-        assert_eq!(ParseError::Program(1).status(), Accept::ProgUnavail);
+        assert_eq!(Request::from_call(&call), Err(Error::Program(100_003)));
+        assert_eq!(Error::Program(1).status(), Accept::ProgUnavail);
         let call = Call::new(PMAP_PROGRAM, 5, 0, vec![]);
-        assert_eq!(Request::from_call(&call), Err(ParseError::Version(5)));
+        assert_eq!(Request::from_call(&call), Err(Error::Version(5)));
         assert_eq!(
-            ParseError::Version(5).status(),
+            Error::Version(5).status(),
             Accept::ProgMismatch { low: 2, high: 4 }
         );
         let call = Call::new(PMAP_PROGRAM, 1, 0, vec![]);
-        assert_eq!(Request::from_call(&call), Err(ParseError::Version(1)));
+        assert_eq!(Request::from_call(&call), Err(Error::Version(1)));
         let call = Call::new(PMAP_PROGRAM, 2, 6, vec![]);
-        assert_eq!(Request::from_call(&call), Err(ParseError::Procedure(6)));
-        assert_eq!(ParseError::Procedure(6).status(), Accept::ProcUnavail);
+        assert_eq!(Request::from_call(&call), Err(Error::Procedure(6)));
+        assert_eq!(Error::Procedure(6).status(), Accept::ProcUnavail);
         // Version 3 has no procedure 9; version 4 does.
         let call = Call::new(
             PMAP_PROGRAM,
@@ -1429,60 +1426,60 @@ mod tests {
             9,
             RpcbRequest::GetVersAddr(nfs_rpcb()).to_args().unwrap(),
         );
-        assert_eq!(Request::from_call(&call), Err(ParseError::Procedure(9)));
+        assert_eq!(Request::from_call(&call), Err(Error::Procedure(9)));
         let call = Call { version: 4, ..call };
         assert!(Request::from_call(&call).is_ok());
         let call = Call::new(PMAP_PROGRAM, 4, 13, vec![]);
-        assert_eq!(Request::from_call(&call), Err(ParseError::Procedure(13)));
+        assert_eq!(Request::from_call(&call), Err(Error::Procedure(13)));
         // Trailing bytes and short arguments.
         let call = Call::new(PMAP_PROGRAM, 2, 0, vec![0, 0, 0, 0]);
         assert_eq!(
             Request::from_call(&call),
-            Err(ParseError::Xdr(XdrError::Trailing(4)))
+            Err(Error::Xdr(onc_rpc::Error::Trailing(4)))
         );
         assert_eq!(
-            ParseError::Xdr(XdrError::Short).status(),
+            Error::Xdr(onc_rpc::Error::Short).status(),
             Accept::GarbageArgs
         );
         let call = Call::new(PMAP_PROGRAM, 2, 3, vec![0, 0, 0]);
         assert_eq!(
             Request::from_call(&call),
-            Err(ParseError::Xdr(XdrError::Short))
+            Err(Error::Xdr(onc_rpc::Error::Short))
         );
-        assert_eq!(RpcbRequest::parse(2, 0, &[]), Err(ParseError::Version(2)));
+        assert_eq!(RpcbRequest::parse(2, 0, &[]), Err(Error::Version(2)));
     }
 
     #[test]
     fn parse_errors() {
-        assert_eq!(PmapResult::parse(6, &[]), Err(ParseError::Procedure(6)));
-        assert_eq!(RpcbResult::parse(13, &[]), Err(ParseError::Procedure(13)));
+        assert_eq!(PmapResult::parse(6, &[]), Err(Error::Procedure(6)));
+        assert_eq!(RpcbResult::parse(13, &[]), Err(Error::Procedure(13)));
         assert_eq!(
             PmapResult::parse(1, &[0, 0, 0, 2]),
-            Err(ParseError::Xdr(XdrError::Bool(2)))
+            Err(Error::Xdr(onc_rpc::Error::Bool(2)))
         );
         // A string over the limit.
         let mut b = vec![0, 0, 1, 0];
         b.extend_from_slice(&[b'a'; 256]);
         assert_eq!(
             RpcbResult::parse(3, &b),
-            Err(ParseError::Xdr(XdrError::TooLong(256)))
+            Err(Error::Xdr(onc_rpc::Error::TooLong(256)))
         );
         // Not UTF-8.
         assert_eq!(
             RpcbResult::parse(3, &[0, 0, 0, 1, 0xff, 0, 0, 0]),
-            Err(ParseError::Xdr(XdrError::Utf8))
+            Err(Error::Xdr(onc_rpc::Error::Utf8))
         );
         // Nonzero padding.
         assert_eq!(
             RpcbResult::parse(3, &[0, 0, 0, 1, b'a', 1, 0, 0]),
-            Err(ParseError::Xdr(XdrError::Padding))
+            Err(Error::Xdr(onc_rpc::Error::Padding))
         );
         // Call data over the limit.
         let mut b = vec![0, 0, 0, 0];
         b.extend_from_slice(&(MAX_CALL_DATA as u32 + 1).to_be_bytes());
         assert!(matches!(
             PmapResult::parse(5, &b),
-            Err(ParseError::Xdr(XdrError::TooLong(_)))
+            Err(Error::Xdr(onc_rpc::Error::TooLong(_)))
         ));
         // A list one entry too long.
         let list = vec![
@@ -1501,23 +1498,23 @@ mod tests {
         ]);
         assert_eq!(
             PmapResult::parse(4, &b),
-            Err(ParseError::Xdr(XdrError::TooLong(MAX_LIST as u32 + 1)))
+            Err(Error::Xdr(onc_rpc::Error::TooLong(MAX_LIST as u32 + 1)))
         );
         // A list bool that is not 0 or 1.
         assert_eq!(
             RpcbResult::parse(4, &[0, 0, 0, 7]),
-            Err(ParseError::Xdr(XdrError::Bool(7)))
+            Err(Error::Xdr(onc_rpc::Error::Bool(7)))
         );
         assert_eq!(
             RpcbResult::parse(0, &[0]),
-            Err(ParseError::Xdr(XdrError::Trailing(1)))
+            Err(Error::Xdr(onc_rpc::Error::Trailing(1)))
         );
         for e in [
-            ParseError::RpcVersion(3),
-            ParseError::Program(1),
-            ParseError::Version(1),
-            ParseError::Procedure(1),
-            ParseError::Xdr(XdrError::Short),
+            Error::RpcVersion(3),
+            Error::Program(1),
+            Error::Version(1),
+            Error::Procedure(1),
+            Error::Xdr(onc_rpc::Error::Short),
         ] {
             assert!(!e.to_string().is_empty());
         }
@@ -1528,7 +1525,7 @@ mod tests {
         let long = "x".repeat(MAX_STRING + 1);
         assert_eq!(
             RpcbResult::Addr(long.clone()).to_bytes(),
-            Err(EncodeError::TooLong)
+            Err(Error::TooLong)
         );
         assert_eq!(
             RpcbResult::Addr("x".repeat(MAX_STRING))
@@ -1540,10 +1537,10 @@ mod tests {
             owner: long.clone(),
             ..nfs_rpcb()
         };
-        assert_eq!(RpcbRequest::Set(b).to_args(), Err(EncodeError::TooLong));
+        assert_eq!(RpcbRequest::Set(b).to_args(), Err(Error::TooLong));
         assert_eq!(
             RpcbRequest::Uaddr2Taddr(long).to_args(),
-            Err(EncodeError::TooLong)
+            Err(Error::TooLong)
         );
         let c = CallArgs {
             program: 1,
@@ -1551,26 +1548,26 @@ mod tests {
             procedure: 1,
             args: vec![0; MAX_CALL_DATA + 1],
         };
-        assert_eq!(PmapRequest::CallIt(c).to_args(), Err(EncodeError::TooLong));
+        assert_eq!(PmapRequest::CallIt(c).to_args(), Err(Error::TooLong));
         let n = Netbuf {
             maxlen: u32::MAX,
             buf: vec![0; MAX_NETBUF + 1],
         };
         assert_eq!(
             RpcbRequest::Taddr2Uaddr(n.clone()).to_args(),
-            Err(EncodeError::TooLong)
+            Err(Error::TooLong)
         );
-        assert_eq!(RpcbResult::Netbuf(n).to_bytes(), Err(EncodeError::TooLong));
+        assert_eq!(RpcbResult::Netbuf(n).to_bytes(), Err(Error::TooLong));
         let r = RmtCallResult {
             addr: String::new(),
             results: vec![0; MAX_CALL_DATA + 1],
         };
-        assert_eq!(RpcbResult::CallIt(r).to_bytes(), Err(EncodeError::TooLong));
+        assert_eq!(RpcbResult::CallIt(r).to_bytes(), Err(Error::TooLong));
         let r = CallResult {
             port: 0,
             results: vec![0; MAX_CALL_DATA + 1],
         };
-        assert_eq!(PmapResult::CallIt(r).to_bytes(), Err(EncodeError::TooLong));
+        assert_eq!(PmapResult::CallIt(r).to_bytes(), Err(Error::TooLong));
         let list = vec![
             Mapping {
                 program: 0,
@@ -1580,10 +1577,10 @@ mod tests {
             };
             MAX_LIST + 1
         ];
-        assert_eq!(PmapResult::Dump(list).to_bytes(), Err(EncodeError::TooMany));
+        assert_eq!(PmapResult::Dump(list).to_bytes(), Err(Error::TooMany));
         assert_eq!(
             RpcbResult::AddrList(vec![RpcbEntry::default(); MAX_LIST + 1]).to_bytes(),
-            Err(EncodeError::TooMany)
+            Err(Error::TooMany)
         );
         let s = RpcbStat {
             rmtinfo: vec![RmtCallStat::default(); MAX_LIST + 1],
@@ -1592,27 +1589,27 @@ mod tests {
         let stats = Box::new([RpcbStat::default(), RpcbStat::default(), s]);
         assert_eq!(
             RpcbResult::Stat(stats).to_bytes(),
-            Err(EncodeError::TooMany)
+            Err(Error::TooMany)
         );
         let r = Request::Rpcb {
             version: 3,
             request: RpcbRequest::GetStat,
         };
-        assert_eq!(r.call(1), Err(EncodeError::Version(3)));
+        assert_eq!(r.call(1), Err(Error::RequestVersion(3)));
         let r = Request::Rpcb {
             version: 2,
             request: RpcbRequest::Null,
         };
-        assert_eq!(r.to_call(), Err(EncodeError::Version(2)));
+        assert_eq!(r.to_call(), Err(Error::RequestVersion(2)));
         let r = Request::Rpcb {
             version: 5,
             request: RpcbRequest::Null,
         };
-        assert_eq!(r.to_call(), Err(EncodeError::Version(5)));
+        assert_eq!(r.to_call(), Err(Error::RequestVersion(5)));
         for e in [
-            EncodeError::TooLong,
-            EncodeError::TooMany,
-            EncodeError::Version(3),
+            Error::TooLong,
+            Error::TooMany,
+            Error::RequestVersion(3),
         ] {
             assert!(!e.to_string().is_empty());
         }
@@ -1636,11 +1633,11 @@ mod tests {
         let over = [0, 0, 0, 3, 0, 0, 0, 4, 1, 2, 3, 4];
         assert_eq!(
             RpcbResult::parse(procedure::UADDR2TADDR, &over),
-            Err(ParseError::Xdr(XdrError::TooLong(4)))
+            Err(Error::Xdr(onc_rpc::Error::TooLong(4)))
         );
         assert_eq!(
             RpcbRequest::parse(3, procedure::TADDR2UADDR, &over),
-            Err(ParseError::Xdr(XdrError::TooLong(4)))
+            Err(Error::Xdr(onc_rpc::Error::TooLong(4)))
         );
         let n = Netbuf {
             maxlen: 3,
@@ -1648,9 +1645,9 @@ mod tests {
         };
         assert_eq!(
             RpcbRequest::Taddr2Uaddr(n.clone()).to_args(),
-            Err(EncodeError::TooLong)
+            Err(Error::TooLong)
         );
-        assert_eq!(RpcbResult::Netbuf(n).to_bytes(), Err(EncodeError::TooLong));
+        assert_eq!(RpcbResult::Netbuf(n).to_bytes(), Err(Error::TooLong));
     }
 
     /// RFC 5531, section 9: a call whose RPC version is not 2 is refused
@@ -1663,7 +1660,7 @@ mod tests {
                 ..Call::new(PMAP_PROGRAM, 2, procedure::NULL, vec![])
             };
             let e = Request::from_call(&call).unwrap_err();
-            assert_eq!(e, ParseError::RpcVersion(v));
+            assert_eq!(e, Error::RpcVersion(v));
             assert_eq!(
                 e.reply(),
                 Reply::Denied(fictionet::stdlib::onc_rpc::Reject::RpcMismatch { low: 2, high: 2 })
@@ -1671,9 +1668,9 @@ mod tests {
             assert!(!e.to_string().is_empty());
             // Before the program is checked.
             let call = Call { program: 7, ..call };
-            assert_eq!(Request::from_call(&call), Err(ParseError::RpcVersion(v)));
+            assert_eq!(Request::from_call(&call), Err(Error::RpcVersion(v)));
         }
-        let e = ParseError::Procedure(99);
+        let e = Error::Procedure(99);
         assert_eq!(e.reply(), Reply::accepted(Accept::ProcUnavail));
     }
 
@@ -1692,20 +1689,20 @@ mod tests {
         };
         assert_eq!(
             RpcbResult::Netbuf(over.clone()).to_bytes(),
-            Err(EncodeError::TooLong)
+            Err(Error::TooLong)
         );
         assert_eq!(
             RpcbRequest::Taddr2Uaddr(over).to_args(),
-            Err(EncodeError::TooLong)
+            Err(Error::TooLong)
         );
         let bytes = [0, 0, 0x23, 0x29, 0, 0, 0, 0];
         assert_eq!(
             RpcbResult::parse(procedure::UADDR2TADDR, &bytes),
-            Err(ParseError::Xdr(XdrError::TooLong(9001)))
+            Err(Error::Xdr(onc_rpc::Error::TooLong(9001)))
         );
         assert_eq!(
             RpcbRequest::parse(4, procedure::TADDR2UADDR, &bytes),
-            Err(ParseError::Xdr(XdrError::TooLong(9001)))
+            Err(Error::Xdr(onc_rpc::Error::TooLong(9001)))
         );
     }
 
@@ -1797,7 +1794,7 @@ mod tests {
         }
         assert_eq!(
             RpcbResult::Dump(vec![rpcb; MAX_LIST + 1]).to_bytes(),
-            Err(EncodeError::TooMany)
+            Err(Error::TooMany)
         );
         let s = RpcbStat {
             addrinfo: vec![AddrStat::default(); MAX_LIST + 1],
@@ -1805,7 +1802,7 @@ mod tests {
         };
         assert_eq!(
             RpcbResult::Stat(Box::new([RpcbStat::default(), s, RpcbStat::default()])).to_bytes(),
-            Err(EncodeError::TooMany)
+            Err(Error::TooMany)
         );
     }
 
@@ -1967,15 +1964,15 @@ mod tests {
     fn arguments_keep_version_and_procedure_errors() {
         assert_eq!(
             Request::read(1, procedure::NULL, &[]),
-            Err(ParseError::Version(1))
+            Err(Error::Version(1))
         );
         assert_eq!(
             Request::read(3, procedure::GETSTAT, &[]),
-            Err(ParseError::Procedure(procedure::GETSTAT))
+            Err(Error::Procedure(procedure::GETSTAT))
         );
         assert_eq!(
             Request::read(2, procedure::GETTIME, &[]),
-            Err(ParseError::Procedure(procedure::GETTIME))
+            Err(Error::Procedure(procedure::GETTIME))
         );
         assert_eq!(
             Request::read(4, procedure::GETSTAT, &[]),
@@ -1986,7 +1983,7 @@ mod tests {
         );
         assert_eq!(
             Request::read(2, procedure::NULL, &[1]),
-            Err(ParseError::Xdr(XdrError::Trailing(1)))
+            Err(Error::Xdr(onc_rpc::Error::Trailing(1)))
         );
     }
 

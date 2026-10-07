@@ -5,7 +5,7 @@
 use arbitrary::{Result, Unstructured};
 use fictionet::stdlib::onc_rpc::{Body, Call, Message, PMAP_PROGRAM};
 use fictionet::stdlib::portmap::{
-    AddrStat, CallArgs, CallResult, MAX_UADDR, Mapping, Netbuf, ParseError, PmapRequest, PmapResult, Request,
+    AddrStat, CallArgs, CallResult, MAX_UADDR, Mapping, Netbuf, Error, PmapRequest, PmapResult, Request,
     RmtCallResult, RmtCallStat, Rpcb, RpcbEntry, RpcbRequest, RpcbResult, RpcbStat, format_uaddr,
     parse_uaddr,
 };
@@ -252,7 +252,7 @@ fuzz_target!(|data: &[u8]| {
                 Err(e) => {
                     // Only RPC version 2 is read; any other is refused.
                     if call.rpc_version != 2 {
-                        assert_eq!(e, ParseError::RpcVersion(call.rpc_version));
+                        assert_eq!(e, Error::RpcVersion(call.rpc_version));
                     }
                     let _ = msg.reply(e.reply()).to_bytes();
                 }
