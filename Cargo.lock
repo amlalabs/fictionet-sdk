@@ -251,6 +251,7 @@ dependencies = [
 name = "fictionet-copy-modules"
 version = "0.0.0"
 dependencies = [
+ "axum",
  "bytes",
  "fictionet",
  "h2",

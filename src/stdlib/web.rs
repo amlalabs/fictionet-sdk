@@ -506,9 +506,15 @@
 //! mid-run, and show what the sandbox sees.
 //!
 //! Every part of `Sites` is built from public stdlib items, so a world can
-//! also write any part itself. To change something inside the network,
-//! such as how addresses are bound or how DNS answers, copy the code of
-//! `serve` and change that part.
+//! also write any part itself. [`Sites::into_net`] gives the
+//! [`Net`](crate::stdlib::net::Net) before it starts, to add hosts with
+//! other services next to the websites. To change how `Sites` turns a site
+//! into a host, copy this file into your crate and edit
+//! [`Site::into_host`]. The copy compiles there as it is, with the same
+//! `fictionet::` imports, and the fixture in `tests/copy_and_own` checks
+//! that it does. What the network does around the hosts, such as how
+//! addresses are bound or how DNS answers, is
+//! [`net`](crate::stdlib::net)'s, and a copy of that file changes it.
 
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -516,13 +522,13 @@ use std::sync::Arc;
 
 use http::{Request, Response};
 
-pub use crate::stdlib::httpd::{Body, Target};
-use crate::stdlib::httpd::{self, Handler, Website};
-use crate::stdlib::journal::Journal;
-use crate::stdlib::net::{Host, Net};
-use crate::stdlib::route::Prefix;
-use crate::stdlib::tls::ServerConfig;
-use crate::{Attachments, Cx, Error};
+pub use fictionet::stdlib::httpd::{Body, Target};
+use fictionet::stdlib::httpd::{self, Handler, Website};
+use fictionet::stdlib::journal::Journal;
+use fictionet::stdlib::net::{Host, Net};
+use fictionet::stdlib::route::Prefix;
+use fictionet::stdlib::tls::ServerConfig;
+use fictionet::{Attachments, Cx, Error};
 
 /// Websites by hostname, and the network around them. See the
 /// [module docs](self).
@@ -556,7 +562,7 @@ impl Sites {
             subnet: Prefix { addr: Ipv4Addr::new(10, 0, 0, 0).into(), len: 24 },
             subnet_v6: Prefix { addr: Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0).into(), len: 64 },
             ipv6: true,
-            max_sites: crate::stdlib::net::MAX_HOSTS,
+            max_sites: fictionet::stdlib::net::MAX_HOSTS,
             journal: None,
         }
     }

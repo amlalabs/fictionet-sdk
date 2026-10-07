@@ -242,6 +242,8 @@ macro_rules! protocols {
         pub mod vxlan;
         #[path = "../../src/stdlib/wake_on_lan.rs"]
         pub mod wake_on_lan;
+        #[path = "../../src/stdlib/web.rs"]
+        pub mod web;
         #[path = "../../src/stdlib/websocket.rs"]
         pub mod websocket;
         #[path = "../../src/stdlib/whois.rs"]
