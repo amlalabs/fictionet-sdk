@@ -8,7 +8,7 @@
 //!
 //! # Attach types for remote sandboxes and tailnets
 //!
-//! `fictionet attach` has four types now: `tun`, `tap`, `https_proxy` and
+//! `fictionet attach` has four types now: `tun`, `tap`, `http_proxy` and
 //! `socks5` (see [`attaching`](crate::attaching)). Two more are planned.
 //! Each still hands the world plain IP packets, so world code does not
 //! change.

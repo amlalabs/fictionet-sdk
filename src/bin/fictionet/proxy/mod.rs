@@ -1,4 +1,4 @@
-//! `fictionet attach --type https_proxy` and `--type socks5`: one proxy
+//! `fictionet attach --type http_proxy` and `--type socks5`: one proxy
 //! engine with two doors.
 //!
 //! Attach runs next to the world, not in the sandbox. It listens on a TCP

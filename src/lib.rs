@@ -56,7 +56,7 @@
 //! virtual machine attaches through its network card instead
 //! (`--type tap`). A sandbox that cannot have a network device, because it
 //! has no privileges at all, can attach through a proxy (`--type
-//! https_proxy` or `--type socks5`). [`attaching`] covers every setup: a
+//! http_proxy` or `--type socks5`). [`attaching`] covers every setup: a
 //! namespace on the host, Docker Compose, Kubernetes, hosted sandboxes, the
 //! proxy and VMs. Whatever the type, the world receives IP packets:
 //! [`lowering`] shows how each type turns what its sandbox sends into

@@ -125,7 +125,7 @@ relay    the relay protocol: socketpair sends, and an echo through listen
 sites    HTTP/1.1 and HTTP/2 over TLS to a Sites site, from 1 and 10 sandboxes
 observe  the cost of an observer watching the graph and ten sandbox links
 graph    HTTP/2 latency with 1,000 sites while an observer watches the graph
-proxy    fictionet attach --type https_proxy: DNS queries for cold and missing names
+proxy    fictionet attach --type http_proxy: DNS queries for cold and missing names
 ```
 
 Each run of a case repeats three times by default (`--reps`). Rates and times are

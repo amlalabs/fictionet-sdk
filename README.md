@@ -199,7 +199,7 @@ protocol of your own in the dashboard, see
 | Docker Compose: the agent shares the network namespace of an `attach` container | `tun` | `tests/docker/web`, and the examples below |
 | Kubernetes: `world` and `attach` as native sidecars, from the Helm chart in [`charts/fictionet-sandbox`](charts/fictionet-sandbox), which the k8s sandbox of [Inspect](https://inspect.aisi.org.uk/), a framework for running AI evals, accepts | `tun`, under runc and gVisor | `tests/k8s/run.sh` on kind |
 | Daytona and E2B: the Compose setup inside one hosted sandbox | `tun` | [`examples/hosted`](examples/hosted) |
-| A sandbox with no privileges and no `tun`, where the platform blocks all other egress, including a pod under Pod Security "restricted" | `https_proxy` or `socks5` | `tests/docker/proxy`, `tests/k8s/proxy.sh` |
+| A sandbox with no privileges and no `tun`, where the platform blocks all other egress, including a pod under Pod Security "restricted" | `http_proxy` or `socks5` | `tests/docker/proxy`, `tests/k8s/proxy.sh` |
 | A virtual machine: QEMU over its stream socket, with no root; Firecracker, Cloud Hypervisor or QEMU on a TAP device | `tap` | `tests/vm/run.sh`, and `tests/vm/nested.sh` under nested KVM |
 
 Attach takes each sandbox's addresses as flags, and hands a VM its addresses by DHCP.

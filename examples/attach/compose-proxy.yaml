@@ -1,4 +1,4 @@
-# One sandbox behind `fictionet attach --type https_proxy`, under Docker
+# One sandbox behind `fictionet attach --type http_proxy`, under Docker
 # Compose. The world is the web_world example, with no network. Attach
 # reaches it through the socket volume, and listens as an HTTP proxy on
 # the sandbox's network, which is internal: the agent can reach attach,
@@ -26,7 +26,7 @@ services:
     image: fictionet-attach:dev
     command: [attach,
               --world, unix:/run/fictionet/world.sock, --world-wait, "30",
-              --name, agent, --type, https_proxy,
+              --name, agent, --type, http_proxy,
               --listen, 0.0.0.0:8080, --token-file, /run/secrets/token,
               --ip-addr, 10.0.0.2, --dns, 10.0.0.1,
               --ready-file, /run/fictionet/attach.ready]

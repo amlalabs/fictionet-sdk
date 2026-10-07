@@ -17,8 +17,8 @@
 {{- if not $dns }}
 {{- fail (printf "fictionet-sandbox: service %s needs attach.dns or attach.dnsV6: the pod's only nameserver is the world" $name) }}
 {{- end }}
-{{- if not (has $attach.type (list "tun" "https_proxy" "socks5")) }}
-{{- fail (printf "fictionet-sandbox: service %s: attach.type must be tun, https_proxy or socks5, not %v" $name $attach.type) }}
+{{- if not (has $attach.type (list "tun" "http_proxy" "socks5")) }}
+{{- fail (printf "fictionet-sandbox: service %s: attach.type must be tun, http_proxy or socks5, not %v" $name $attach.type) }}
 {{- end }}
 {{- $proxy := ne $attach.type "tun" }}
 {{- $secret := include "fictionet.tokenSecret" (dict "root" $ "service" $name) }}
@@ -256,7 +256,7 @@ spec:
           {{- /* The proxy variables, with the token from the Secret. */}}
           {{- $port := include "fictionet.proxyPort" $attach }}
           {{- $env = append $env (dict "name" "FICTIONET_TOKEN" "valueFrom" (dict "secretKeyRef" (dict "name" $secret "key" "token"))) }}
-          {{- if eq $attach.type "https_proxy" }}
+          {{- if eq $attach.type "http_proxy" }}
           {{- $url := printf "http://fictionet:$(FICTIONET_TOKEN)@127.0.0.1:%s" $port }}
           {{- range list "HTTP_PROXY" "http_proxy" "HTTPS_PROXY" "https_proxy" }}
           {{- $env = append $env (dict "name" . "value" $url) }}

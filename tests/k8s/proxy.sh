@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The Kubernetes proxy test: charts/fictionet-sandbox with attach.type
-# https_proxy and socks5, on a kind cluster, in a namespace that enforces
+# http_proxy and socks5, on a kind cluster, in a namespace that enforces
 # Pod Security "restricted".
 #
 #   tests/k8s/proxy.sh

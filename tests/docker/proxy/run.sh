@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The proxy test: `fictionet attach --type https_proxy` and `--type
+# The proxy test: `fictionet attach --type http_proxy` and `--type
 # socks5` with real clients, under Docker Compose.
 #
 #   tests/docker/proxy/run.sh

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# demos/proxy: a sandbox with no privileges reaches the world through https_proxy and socks5.
+# demos/proxy: a sandbox with no privileges reaches the world through http_proxy and socks5.
 #
 # One command, no root: it boots the Fictionet VM if it is not running
 # (vm/run up), runs demos/guest/proxy.sh inside it, and cleans up. See

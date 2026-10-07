@@ -48,7 +48,7 @@
 //! |---|---|---|
 //! | `tun` | `--mtu`, 1500 by default, at least 1280 | sets it as `tun0`'s MTU, so the sandbox's kernel sends no larger packet. Attach writes packets from the world to `tun0` without checking their size. |
 //! | `tap` | `--mtu`, 1500 by default, at least 1280 | tells the VM in the DHCP lease (option 26) and the router advertisement, when attach hands out that family's address, and with `--vm tap:` sets it on attach's own TAP device. Attach drops frames from the VM longer than the MTU plus the 14-byte Ethernet header, and packets from the world longer than the MTU. |
-//! | `https_proxy`, `socks5` | always 1500 | nothing to set: attach's own TCP sends packets of at most 1,500 bytes. `--mtu` is refused. |
+//! | `http_proxy`, `socks5` | always 1500 | nothing to set: attach's own TCP sends packets of at most 1,500 bytes. `--mtu` is refused. |
 //!
 //! When the socket is full, the types differ in one way. Packets from the
 //! world wait in a queue inside the world, with a budget of 32 MiB (see
@@ -257,7 +257,7 @@
 //! then a DHCP request carries the VM's MAC inside it, as DHCP always
 //! does.
 //!
-//! # `https_proxy` and `socks5`: a TCP/IP stack inside attach
+//! # `http_proxy` and `socks5`: a TCP/IP stack inside attach
 //!
 //! **What the sandbox sends.** Nothing at the IP level. The sandbox has no
 //! device of Fictionet's. A program in it, told by `HTTPS_PROXY` or
@@ -270,7 +270,7 @@
 //!
 //! **Where attach picks it up.** Attach accepts the connection on tokio,
 //! reads the request and checks the token: `http::serve` does this for
-//! `https_proxy`, and `socks5::serve` for `socks5`. Each gives a host, as a
+//! `http_proxy`, and `socks5::serve` for `socks5`. Each gives a host, as a
 //! name or an IPv4 address, and a port.
 //!
 //! **The lowering.** Attach runs a TCP/IP stack of its own, the same one
@@ -459,14 +459,14 @@
 //! IPv6 the VM sent came from its link-local address, which attach keeps
 //! on the link.
 //!
-//! ## `https_proxy`
+//! ## `http_proxy`
 //!
 //! Attach runs on the host as an HTTP proxy, as
 //! [`attaching`](crate::attaching#running-the-proxy) shows, and curl uses
 //! it. `$TOKEN` holds the contents of the token file:
 //!
 //! ```text
-//! $ fictionet attach --world unix:/run/fictionet/world.sock --name agent --type https_proxy \
+//! $ fictionet attach --world unix:/run/fictionet/world.sock --name agent --type http_proxy \
 //!     --listen 127.0.0.1:8080 --token-file /run/fictionet/token --ip-addr 10.0.0.2 --dns 10.0.0.1
 //! $ curl -sS --cacert /run/fictionet/ca.pem -x http://fictionet:$TOKEN@127.0.0.1:8080 https://example.test/
 //! hello from https example.test 443 over HTTP/2.0
@@ -534,7 +534,7 @@
 //!
 //! # What survives the lowering
 //!
-//! | | `tun` | `tap` | `https_proxy`, `socks5` |
+//! | | `tun` | `tap` | `http_proxy`, `socks5` |
 //! |---|---|---|---|
 //! | IP packets the world gets | the sandbox kernel's, byte for byte | the VM kernel's, byte for byte, without Ethernet | attach's, made by its own stack |
 //! | TCP behavior the world sees | the sandbox kernel's | the VM kernel's | attach's (smoltcp): MSS 1460, `WS=8`, no timestamps |

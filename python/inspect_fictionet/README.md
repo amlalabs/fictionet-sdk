@@ -119,7 +119,7 @@ accuracy  1.000
 
 | Option | Default | What it does |
 |---|---|---|
-| `attach` | `"tun"` | `"tun"`, `"https_proxy"` or `"socks5"`. See [Proxy types](#proxy-types). |
+| `attach` | `"tun"` | `"tun"`, `"http_proxy"` or `"socks5"`. See [Proxy types](#proxy-types). |
 | `name` | `"agent"` | The name attach gives the world for this sandbox. |
 | `ip_addr`, `gateway`, `dns` | `10.0.0.2/24`, `10.0.0.1`, `10.0.0.1` | The sandbox's IPv4 settings. These fit a world built on `web::Sites`. `None` turns a setting off. |
 | `ip_addr_v6`, `gateway_v6`, `dns_v6` | `None` | The sandbox's IPv6 settings, off by default. |
@@ -227,13 +227,13 @@ are two ways to give the agent the CA:
 
 ### Proxy types
 
-With `attach="https_proxy"` or `attach="socks5"`, attach does not make a
+With `attach="http_proxy"` or `attach="socks5"`, attach does not make a
 `tun0` device. It listens as a proxy on 127.0.0.1 in the network namespace
 the agent shares. On Docker, that namespace has only loopback, so the proxy
 is the agent's only way out. The agent gets:
 
 - the proxy variables: `HTTP_PROXY`, `HTTPS_PROXY` and their lowercase forms
-  for `https_proxy`, or `ALL_PROXY` for `socks5`, with an empty `NO_PROXY`;
+  for `http_proxy`, or `ALL_PROXY` for `socks5`, with an empty `NO_PROXY`;
 - the proxy token in those URLs, and in a file named by
   `FICTIONET_TOKEN_FILE` (`/run/fictionet-token/token`);
 - no capabilities at all (`cap_drop: [ALL]`).
@@ -268,7 +268,7 @@ $ docker build -f deploy/Dockerfile --target attach -t fictionet-attach:dev .
 ```
 
 ```python
-fictionet_sandbox(WEB_WORLD_IMAGE, attach="https_proxy", attach_image="fictionet-attach:dev",
+fictionet_sandbox(WEB_WORLD_IMAGE, attach="http_proxy", attach_image="fictionet-attach:dev",
                   agent_user="1000:1000", ...)
 ```
 

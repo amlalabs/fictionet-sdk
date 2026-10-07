@@ -379,11 +379,11 @@ tests_list() {
     cat <<'EOF'
 netns            fictionet attach --type tun into an `ip netns` namespace (vm/guest/tests/netns.sh)
 docker-web       tests/docker/web/run.sh: web::Sites under Docker Compose, attach --type tun
-docker-proxy     tests/docker/proxy/run.sh: attach --type https_proxy and socks5 under Docker Compose
+docker-proxy     tests/docker/proxy/run.sh: attach --type http_proxy and socks5 under Docker Compose
 docker-ping      tests/docker/ping/run.sh
 docker-tcpudp    tests/docker/tcpudp/run.sh
 k8s              tests/k8s/run.sh: the Helm chart on kind, attach --type tun
-k8s-proxy        tests/k8s/proxy.sh: the Helm chart on kind, https_proxy and socks5 under Pod Security "restricted"
+k8s-proxy        tests/k8s/proxy.sh: the Helm chart on kind, http_proxy and socks5 under Pod Security "restricted"
 border-world     cargo test in examples/border/world
 border-scripted  border_scripted, lab and home settings (Inspect, mockllm)
 border-probes    border_probes, lab and home settings (Inspect, mockllm)

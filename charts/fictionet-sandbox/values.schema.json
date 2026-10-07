@@ -78,7 +78,7 @@
           "type": "string",
           "enum": [
             "tun",
-            "https_proxy",
+            "http_proxy",
             "socks5"
           ]
         },
@@ -251,7 +251,7 @@
                 "type": "string",
                 "enum": [
                   "tun",
-                  "https_proxy",
+                  "http_proxy",
                   "socks5"
                 ]
               },
@@ -425,7 +425,7 @@
               "type": "string",
               "enum": [
                 "tun",
-                "https_proxy",
+                "http_proxy",
                 "socks5"
               ]
             },

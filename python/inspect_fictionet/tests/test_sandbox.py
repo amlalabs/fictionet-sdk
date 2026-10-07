@@ -73,7 +73,7 @@ def test_tun_services_and_order(tmp_path):
 
 
 def test_agent_never_sees_the_socket(tmp_path):
-    for attach in ("tun", "https_proxy", "socks5"):
+    for attach in ("tun", "http_proxy", "socks5"):
         c = compose(tmp_path, WEB_WORLD_IMAGE, attach=attach, attach_image=BRANCH_ATTACH, **WEB)
         mounts = c["services"]["default"].get("volumes", [])
         assert not any(m["source"] == "sock" for m in mounts), attach
@@ -101,7 +101,7 @@ def test_addresses(tmp_path):
 @pytest.mark.parametrize(
     ("kind", "port", "variables", "scheme"),
     [
-        ("https_proxy", 8080, ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"], "http"),
+        ("http_proxy", 8080, ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"], "http"),
         ("socks5", 1080, ["ALL_PROXY", "all_proxy"], "socks5h"),
     ],
 )
@@ -165,8 +165,8 @@ def test_build_and_cargo_example(tmp_path):
     [
         (dict(attach="tap"), "attach must be"),
         (dict(attach="socks5"), "has tun only"),
-        (dict(attach="https_proxy", attach_image=BRANCH_ATTACH, ip_addr_v6="fd00::2/64"), "takes no ip_addr_v6"),
-        (dict(attach="https_proxy", attach_image=BRANCH_ATTACH, ip_addr=None), "needs ip_addr and dns"),
+        (dict(attach="http_proxy", attach_image=BRANCH_ATTACH, ip_addr_v6="fd00::2/64"), "takes no ip_addr_v6"),
+        (dict(attach="http_proxy", attach_image=BRANCH_ATTACH, ip_addr=None), "needs ip_addr and dns"),
         (dict(dns=None, dns_v6=None), "give dns or dns_v6"),
         (dict(world_ca="/run/relay/ca.pem"), "must not be /run/relay"),
         (dict(world_ca="//run/relay/ca.pem"), "must not be /run/relay"),

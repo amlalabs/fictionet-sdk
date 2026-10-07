@@ -119,7 +119,7 @@ const GROUPS: &[Group] = &[
     ("sites", "HTTP/1.1 and HTTP/2 over TLS to a Sites site, from 1 and 10 sandboxes", sites),
     ("observe", "the cost of an observer watching the graph and ten sandbox links", observe),
     ("graph", "HTTP/2 latency with 1,000 sites while an observer watches the graph", graph),
-    ("proxy", "fictionet attach --type https_proxy: DNS queries for cold and missing names", proxy),
+    ("proxy", "fictionet attach --type http_proxy: DNS queries for cold and missing names", proxy),
 ];
 
 fn main() {
@@ -1391,7 +1391,7 @@ fn proxy_run(burst: usize, sequential: usize) -> ((u64, f64), (u64, f64)) {
         })
     };
     let mut child = std::process::Command::new(fictionet_bin())
-        .args(["attach", "--world", &format!("unix:{}", path.display()), "--name", "agent", "--type", "https_proxy"])
+        .args(["attach", "--world", &format!("unix:{}", path.display()), "--name", "agent", "--type", "http_proxy"])
         .args(["--listen", "127.0.0.1:0", "--token-file", token.to_str().unwrap(), "--ip-addr", "10.0.0.2", "--dns", "10.0.0.1"])
         .stderr(std::process::Stdio::piped())
         .spawn()

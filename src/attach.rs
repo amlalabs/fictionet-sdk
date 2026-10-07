@@ -17,7 +17,7 @@ use crate::{Cancelled, Cx, End, Interface, Packet, RecvError};
 /// whatever the sandbox sends comes out of it. Every attach type delivers
 /// plain IP packets here. A `tun` attachment reads them from a TUN device
 /// inside the sandbox. A `tap` attachment takes them out of a virtual
-/// machine's Ethernet frames. For an `https_proxy` or `socks5` attachment,
+/// machine's Ethernet frames. For an `http_proxy` or `socks5` attachment,
 /// `fictionet attach` plays the part of the sandbox's kernel: its own TCP/IP
 /// stack turns each proxied connection into packets, so even a proxy client
 /// shows up here as packets. The world is not told which attach type it

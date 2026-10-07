@@ -29,7 +29,7 @@
 //! | [Docker Compose](#in-docker-compose) | the agent runs in a container | `tun` |
 //! | [Kubernetes](#on-kubernetes) | the agent runs in a pod, for example through Inspect's k8s sandbox, and the cluster lets one container have `NET_ADMIN` | `tun` |
 //! | [Hosted: Daytona and E2B](#hosted-sandboxes) | the agent runs in a provider's sandbox that can run Docker inside it | `tun`, through Docker Compose |
-//! | [No privileges: a proxy](#behind-a-proxy-https_proxy-and-socks5) | the sandbox may not have `NET_ADMIN` or `/dev/net/tun` (for example, under Kubernetes Pod Security "restricted"), and the agent's traffic is HTTP, HTTPS or other TCP | `https_proxy` or `socks5` |
+//! | [No privileges: a proxy](#behind-a-proxy-http_proxy-and-socks5) | the sandbox may not have `NET_ADMIN` or `/dev/net/tun` (for example, under Kubernetes Pod Security "restricted"), and the agent's traffic is HTTP, HTTPS or other TCP | `http_proxy` or `socks5` |
 //! | [A virtual machine](#a-virtual-machine-with-tap) | the agent runs in a VM of your own, under QEMU, Firecracker or Cloud Hypervisor | `tap` |
 //!
 //! Attaching remote sandboxes and tailnets is on the
@@ -44,7 +44,7 @@
 //!   sockets. Attach needs `NET_ADMIN` in the sandbox's network namespace
 //!   to make the device. The agent needs no privileges, and runs without
 //!   `NET_ADMIN`, so it cannot change its own network.
-//! - **`https_proxy` and `socks5`** give the sandbox nothing new. Attach
+//! - **`http_proxy` and `socks5`** give the sandbox nothing new. Attach
 //!   runs outside the sandbox as a proxy, and the agent's programs connect
 //!   through it. Attach turns each proxied connection into IP packets from
 //!   the sandbox's address, made by its own TCP/IP stack. This needs no
@@ -407,7 +407,7 @@
 //!   the only container with `NET_ADMIN`.
 //!
 //! This section covers `attach.type: tun`, the default. If your cluster
-//! enforces Pod Security "baseline" or "restricted", use `https_proxy` or
+//! enforces Pod Security "baseline" or "restricted", use `http_proxy` or
 //! `socks5` instead: no container then needs a privilege. See
 //! [The proxy on Kubernetes](#the-proxy-on-kubernetes).
 //!
@@ -615,7 +615,7 @@
 //! the API server's own config, which managed clusters (GKE, EKS, AKS) do
 //! not let you edit.
 //!
-//! Where none of that is possible, use `attach.type: https_proxy` or
+//! Where none of that is possible, use `attach.type: http_proxy` or
 //! `socks5`. No container then needs a capability, and the pod passes
 //! "restricted". See [The proxy on Kubernetes](#the-proxy-on-kubernetes).
 //!
@@ -811,7 +811,7 @@
 //!   blocked HTTPS and UDP DNS to 8.8.8.8 and 1.1.1.1. `deny_out` and
 //!   `allow_out` by IP address worked.
 //!
-//! # Behind a proxy: `https_proxy` and `socks5`
+//! # Behind a proxy: `http_proxy` and `socks5`
 //!
 //! Use this setup when the sandbox gets no privileges at all: no
 //! `NET_ADMIN`, no `/dev/net/tun`, no root. Examples are a pod under Pod
@@ -822,7 +822,7 @@
 //!
 //! There are two proxy types:
 //!
-//! - **`--type https_proxy`** is an HTTP proxy. It serves
+//! - **`--type http_proxy`** is an HTTP proxy. It serves
 //!   `CONNECT host:port`, which clients send for `https://` URLs, and
 //!   plain-HTTP requests in absolute form (`GET http://host/path`), which
 //!   they send for `http://` URLs.
@@ -845,7 +845,7 @@
 //!
 //! 1. It reads the sandbox's token from `--token-file`.
 //! 2. It listens on `--listen`. If the port is taken, attach stops here.
-//! 3. It connects to the world, sends `hello` with the type `https_proxy`
+//! 3. It connects to the world, sends `hello` with the type `http_proxy`
 //!    or `socks5`, and waits for `accept`, as `tun` does. `--world-wait`
 //!    works the same way.
 //! 4. It writes the `--ready-file`, if you give one.
@@ -866,7 +866,7 @@
 //! ```sh
 //! od -An -tx1 -N24 /dev/urandom | tr -d ' \n' > /run/fictionet/token
 //! fictionet attach --world unix:/run/fictionet/world.sock --name agent \
-//!     --type https_proxy --listen 0.0.0.0:8080 --token-file /run/fictionet/token \
+//!     --type http_proxy --listen 0.0.0.0:8080 --token-file /run/fictionet/token \
 //!     --ip-addr 10.0.0.2 --dns 10.0.0.1 --ready-file /run/fictionet/attach.ready
 //! ```
 //!
@@ -905,7 +905,7 @@
 //! IPv6 flags. The proxy types are IPv4 only. For example:
 //!
 //! ```text
-//! fictionet attach: --type https_proxy takes no --gateway: attach makes the packets itself, and there are no routes to set
+//! fictionet attach: --type http_proxy takes no --gateway: attach makes the packets itself, and there are no routes to set
 //! ```
 //!
 //! **The token** stops other clients from using this sandbox's proxy. One
@@ -955,7 +955,7 @@
 //! These programs were run through both proxy types with the `web_world`
 //! example (the Docker test in `tests/docker/proxy`):
 //!
-//! | Program | `https_proxy` | `socks5` |
+//! | Program | `http_proxy` | `socks5` |
 //! |---|---|---|
 //! | curl 7.88 | yes: `https_proxy`, `http_proxy` | yes: `ALL_PROXY=socks5h://` |
 //! | wget 1.21 | yes: `https_proxy`, `http_proxy` | no: wget has no SOCKS support |
@@ -999,7 +999,7 @@
 //! it knows. The HTTP proxy puts the reason in an `X-Fictionet-Error`
 //! header and in the body. The SOCKS5 proxy answers with a reply code:
 //!
-//! | In the world | `https_proxy` | `socks5` reply |
+//! | In the world | `http_proxy` | `socks5` reply |
 //! |---|---|---|
 //! | the name does not exist (NXDOMAIN), or has no IPv4 address | 502 | 4, host unreachable |
 //! | the DNS server fails, or does not answer in 7 s | 502 | 4 |
@@ -1166,7 +1166,7 @@
 //!
 //! ## The proxy on Kubernetes
 //!
-//! The `fictionet-sandbox` chart takes `attach.type: https_proxy` or
+//! The `fictionet-sandbox` chart takes `attach.type: http_proxy` or
 //! `socks5`, for every service or per service. The pod has the same three
 //! containers as with `tun`, and one more, with these changes:
 //!
@@ -1805,7 +1805,7 @@
 //! | Kubernetes, the `fictionet-sandbox` chart | the kubelet, from the pod's `dnsConfig`; attach has `--no-resolv-conf` |
 //! | any `tun` setup with `--no-resolv-conf` | the harness |
 //! | a VM on `tap` | the VM, from DHCP, DHCPv6 and router advertisements: sent by attach with `--dns` and `--dns-v6`, or by the world when a family has none of its address flags |
-//! | behind a proxy (`https_proxy`, `socks5`) | no file: attach looks names up at `--dns` |
+//! | behind a proxy (`http_proxy`, `socks5`) | no file: attach looks names up at `--dns` |
 //!
 //! ## `--resolv-conf` and `--no-resolv-conf`
 //!
@@ -1877,14 +1877,14 @@
 //! |---|---|---|
 //! | `--world unix:<path>` | all | the world's socket |
 //! | `--name <name>` | all | the sandbox's name, which the world sees as [`Attachment::name`](crate::Attachment::name) |
-//! | `--type <type>` | all | `tun`, `tap`, `https_proxy` or `socks5`: see [Choose your setup](#choose-your-setup) |
+//! | `--type <type>` | all | `tun`, `tap`, `http_proxy` or `socks5`: see [Choose your setup](#choose-your-setup) |
 //! | `--world-wait <seconds>` | all | keep trying to connect for that long, for a world that is still starting; without it, attach tries once ([How `tun` works](#how-tun-works)) |
 //! | `--ready-file <path>` | all | create this file once the world has accepted the sandbox ([How `tun` works](#how-tun-works)) |
 //! | `--ip-addr`, `--gateway`, `--dns`, and the same with `-v6` | `tun`, `tap` | the sandbox's addresses, each given a value or turned off with its `--no-` form ([Addresses](#addresses), [The VM's addresses](#the-vms-addresses)) |
-//! | `--ip-addr <ip>`, `--dns <ip>` | `https_proxy`, `socks5` | the address attach sends from, as the sandbox, and the world's DNS server ([Running the proxy](#running-the-proxy)) |
+//! | `--ip-addr <ip>`, `--dns <ip>` | `http_proxy`, `socks5` | the address attach sends from, as the sandbox, and the world's DNS server ([Running the proxy](#running-the-proxy)) |
 //! | `--netns <path>` | `tun`, and `tap` with `--vm tap:` | the network namespace to work in, instead of attach's own ([How `tun` works](#how-tun-works)) |
 //! | `--mtu <n>` | `tun`, `tap` | the MTU, 1500 by default and at least 1280 |
 //! | `--down-link <ifname>` | `tun` | take another link out of the way first: delete its routes and addresses, and set it down; give it once per link ([On Kubernetes](#on-kubernetes)) |
 //! | `--resolv-conf <path>`, `--no-resolv-conf` | `tun` | where to write the DNS servers, or write nothing ([`--resolv-conf` and `--no-resolv-conf`](#--resolv-conf-and---no-resolv-conf)) |
 //! | `--vm qemu:<path>`, `--vm tap:<ifname>` | `tap` | how the VM's frames reach attach ([A virtual machine](#a-virtual-machine-with-tap)) |
-//! | `--listen <ip:port>`, `--token-file <path>` | `https_proxy`, `socks5` | where the proxy listens, and the file with the sandbox's token ([Running the proxy](#running-the-proxy)) |
+//! | `--listen <ip:port>`, `--token-file <path>` | `http_proxy`, `socks5` | where the proxy listens, and the file with the sandbox's token ([Running the proxy](#running-the-proxy)) |

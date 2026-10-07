@@ -1,5 +1,5 @@
 # The proxy test: the web_world example, one attach with --type
-# https_proxy and one with --type socks5, and a sandbox whose only network
+# http_proxy and one with --type socks5, and a sandbox whose only network
 # is an internal one shared with the two attaches. Run it with ./run.sh,
 # which makes a token, checks the results and cleans up.
 name: fictionet-proxy
@@ -57,7 +57,7 @@ services:
       - >-
         printf '%s\n' "$$TOKEN" > /run/token &&
         exec fictionet attach --world unix:/run/fictionet/world.sock --name agent-http
-        --type https_proxy --listen 0.0.0.0:8080 --token-file /run/token
+        --type http_proxy --listen 0.0.0.0:8080 --token-file /run/token
         --ip-addr 10.0.0.2 --dns 10.0.0.1 --ready-file /run/attach.ready
 
   attach-socks:

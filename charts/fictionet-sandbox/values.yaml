@@ -6,7 +6,7 @@
 #   2. attach  (native sidecar). With attach.type tun (the default), it
 #      takes the pod's eth0 down, makes tun0 with a default route, and
 #      relays its packets to the world. It is the only container with
-#      NET_ADMIN. With https_proxy or socks5, it listens on 127.0.0.1 in
+#      NET_ADMIN. With http_proxy or socks5, it listens on 127.0.0.1 in
 #      the pod as a proxy instead, with no privileges, and the agent gets
 #      the proxy variables. The NetworkPolicy is then what keeps the agent
 #      in.
@@ -74,7 +74,7 @@ attach:
   # from deploy/Dockerfile (target attach). Required.
   image: ""
   imagePullPolicy: IfNotPresent
-  # tun, https_proxy or socks5. tun needs NET_ADMIN and MKNOD in attach's
+  # tun, http_proxy or socks5. tun needs NET_ADMIN and MKNOD in attach's
   # container. The proxy types need no privileges in any container.
   type: tun
   # The name attach gives the world. Empty: the service's name.
@@ -95,7 +95,7 @@ attach:
   dnsV6: ""
   mtu: 1500
   # Proxy types: the port attach listens on, at 127.0.0.1 in the pod. 0:
-  # 8080 for https_proxy, 1080 for socks5.
+  # 8080 for http_proxy, 1080 for socks5.
   port: 0
   # Proxy types: the user attach runs as. It must be allowed to open the
   # world's socket, so the world's user: 65532 in the images that

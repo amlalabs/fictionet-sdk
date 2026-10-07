@@ -1,5 +1,5 @@
 //! The `fictionet` command. Its subcommands: `attach`, with the types
-//! `tun`, `tap`, `https_proxy` and `socks5`; `ready`, a probe for attach's ready
+//! `tun`, `tap`, `http_proxy` and `socks5`; `ready`, a probe for attach's ready
 //! file; `wait-blocked`, which waits until a pod's NetworkPolicy blocks its
 //! direct traffic; `observe`, the observe API from a shell; and `dashboard`, which
 //! serves the dashboard app. See the crate docs, `fictionet::attaching`
@@ -29,7 +29,7 @@ mod tun;
 mod world;
 
 const USAGE: &str = "\
-usage: fictionet attach --world unix:<path> --name <name> --type tun|tap|https_proxy|socks5 [flags]
+usage: fictionet attach --world unix:<path> --name <name> --type tun|tap|http_proxy|socks5 [flags]
        fictionet ready <path>
        fictionet wait-blocked [--api-server] [--timeout <seconds>] [<ip:port>...]
        fictionet observe --world unix:<path> [<request>]

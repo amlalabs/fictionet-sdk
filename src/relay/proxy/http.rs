@@ -1,4 +1,4 @@
-//! The HTTP door, `--type https_proxy`: an HTTP/1.1 proxy.
+//! The HTTP door, `--type http_proxy`: an HTTP/1.1 proxy.
 //!
 //! - **`CONNECT host:port`**, which `HTTPS_PROXY` clients send for
 //!   `https://` URLs: attach opens the connection and answers `200`, then

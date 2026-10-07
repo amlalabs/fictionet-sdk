@@ -36,13 +36,13 @@ id agent >/dev/null 2>&1 || useradd --uid 2000 --no-create-home --shell /bin/bas
 vm 'ip netns add agent && ip -n agent link set lo up'
 
 step "Start two proxies inside the sandbox's namespace"
-note "fictionet attach with --type https_proxy and --type socks5 makes no device. It listens"
+note "fictionet attach with --type http_proxy and --type socks5 makes no device. It listens"
 note "on the sandbox's own 127.0.0.1 and turns each proxied connection into packets from the"
 note "sandbox's address in the world. Clients must give a token as the proxy password."
 printf '%s\n' "$token" >/run/proxy-token
 chmod 600 /run/proxy-token
 ip netns exec agent fictionet attach --world unix:/run/fictionet/world.sock --name agent-http \
-    --type https_proxy --listen 127.0.0.1:8080 --token-file /run/proxy-token \
+    --type http_proxy --listen 127.0.0.1:8080 --token-file /run/proxy-token \
     --ip-addr 10.0.0.2 --dns 10.0.0.1 --ready-file /run/attach-http.ready >/run/attach-http.log 2>&1 &
 http_pid=$!
 ip netns exec agent fictionet attach --world unix:/run/fictionet/world.sock --name agent-socks \

@@ -36,7 +36,7 @@ pub(crate) struct Greeting<'a> {
     pub(crate) world: &'a str,
     /// How long to keep trying while the socket is missing.
     pub(crate) world_wait: Duration,
-    /// The attach type, such as `tun` or `https_proxy`.
+    /// The attach type, such as `tun` or `http_proxy`.
     pub(crate) kind: &'a str,
     pub(crate) name: &'a str,
     pub(crate) mtu: u16,

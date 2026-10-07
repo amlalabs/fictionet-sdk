@@ -1,7 +1,7 @@
 <div style="overflow-x:auto;margin:1.25em 0">
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 270" role="img" aria-labelledby="fn-proxy-t fn-proxy-d" style="display:block;width:100%;max-width:768px;min-width:480px;height:auto">
-<title id="fn-proxy-t">An agent behind a proxy, attached with https_proxy</title>
-<desc id="fn-proxy-d">fictionet attach --type https_proxy (socks5 is the same with ALL_PROXY). In the sandbox, curl runs with HTTPS_PROXY=http://fictionet:TOKEN@attach:8080. The sandbox gets no new interface and no privileges, and its resolv.conf is not used for these requests. curl opens a TCP connection to fictionet attach --type https_proxy --listen 0.0.0.0:8080, gives the token, and asks for en.wikipedia.org:443. Attach plays the sandbox's kernel: it sends a DNS query to the --dns server inside the world, then opens a TCP connection from the --ip-addr address, 10.0.0.2, to the address it got. The world process sees IP packets, the same as from a tun sandbox. The platform blocks every other way out of the sandbox.</desc>
+<title id="fn-proxy-t">An agent behind a proxy, attached with http_proxy</title>
+<desc id="fn-proxy-d">fictionet attach --type http_proxy (socks5 is the same with ALL_PROXY). In the sandbox, curl runs with HTTPS_PROXY=http://fictionet:TOKEN@attach:8080. The sandbox gets no new interface and no privileges, and its resolv.conf is not used for these requests. curl opens a TCP connection to fictionet attach --type http_proxy --listen 0.0.0.0:8080, gives the token, and asks for en.wikipedia.org:443. Attach plays the sandbox's kernel: it sends a DNS query to the --dns server inside the world, then opens a TCP connection from the --ip-addr address, 10.0.0.2, to the address it got. The world process sees IP packets, the same as from a tun sandbox. The platform blocks every other way out of the sandbox.</desc>
 <defs><marker id="fn-proxy-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
 <g fill="none" stroke="currentColor" stroke-width="1.25">
 <rect x="10" y="10" width="240" height="172" rx="10" stroke-dasharray="2 4"/>
@@ -23,7 +23,7 @@
 <text x="320" y="96" text-anchor="middle" font-size="11.5">asking for</text>
 <text x="320" y="111" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="10.5">en.wikipedia.org:443</text>
 <text x="510" y="56" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="12">fictionet attach</text>
-<text x="510" y="73" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="11">--type https_proxy</text>
+<text x="510" y="73" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="11">--type http_proxy</text>
 <text x="510" y="89" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="11">--listen 0.0.0.0:8080</text>
 <text x="510" y="107" text-anchor="middle" font-size="11.5">plays the sandbox’s kernel</text>
 <text x="500" y="142" text-anchor="end" font-size="11.5">IP packets: a DNS query to --dns,</text>

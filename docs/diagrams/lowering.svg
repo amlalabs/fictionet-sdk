@@ -1,7 +1,7 @@
 <div style="overflow-x:auto;margin:1.25em 0">
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 476" role="img" aria-labelledby="fn-low-t fn-low-d" style="display:block;width:100%;max-width:816px;min-width:480px;height:auto">
 <title id="fn-low-t">How each attach type becomes IP packets</title>
-<desc id="fn-low-d">Four rows, one per attach type, read left to right: what the sandbox sends, what reaches fictionet attach, how attach turns it into IP packets, the world socket, and the world's Attachment. tun: the sandbox kernel's IP stack sends IP packets through tun0; attach reads them from the tun file descriptor and relays each one unchanged. tap: a VM's kernel sends Ethernet frames through its card; they reach attach over QEMU's stream socket, or through a TAP device and a traffic-control redirect; attach strips the Ethernet header and answers ARP, neighbor discovery, DHCP and router solicitations itself. https_proxy and socks5: a program such as curl sends a CONNECT request and then bytes over a TCP connection to attach; attach's own TCP/IP stack, the stdlib's, at the sandbox's address, sends a DNS query to the world's DNS server and opens one TCP connection into the world for each request. Every IP packet then crosses the world socket as one packet message, and the world's Attachment receives IP packets, whatever the type.</desc>
+<desc id="fn-low-d">Four rows, one per attach type, read left to right: what the sandbox sends, what reaches fictionet attach, how attach turns it into IP packets, the world socket, and the world's Attachment. tun: the sandbox kernel's IP stack sends IP packets through tun0; attach reads them from the tun file descriptor and relays each one unchanged. tap: a VM's kernel sends Ethernet frames through its card; they reach attach over QEMU's stream socket, or through a TAP device and a traffic-control redirect; attach strips the Ethernet header and answers ARP, neighbor discovery, DHCP and router solicitations itself. http_proxy and socks5: a program such as curl sends a CONNECT request and then bytes over a TCP connection to attach; attach's own TCP/IP stack, the stdlib's, at the sandbox's address, sends a DNS query to the world's DNS server and opens one TCP connection into the world for each request. Every IP packet then crosses the world socket as one packet message, and the world's Attachment receives IP packets, whatever the type.</desc>
 <defs><marker id="fn-low-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
 <g fill="none" stroke="currentColor" stroke-width="1.25">
 <rect x="10" y="40" width="160" height="412" rx="10" stroke-dasharray="2 4"/>
@@ -56,7 +56,7 @@
 <text x="426" y="192" text-anchor="middle" font-size="10.5">strips Ethernet; answers</text>
 <text x="426" y="206" text-anchor="middle" font-size="10.5">ARP and neighbor discovery,</text>
 <text x="426" y="220" text-anchor="middle" font-size="10.5">and DHCP if given addresses</text>
-<text x="90" y="269" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="12">https_proxy</text>
+<text x="90" y="269" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="12">http_proxy</text>
 <text x="90" y="290" text-anchor="middle" font-size="11">curl, told by</text>
 <text x="90" y="308" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="10.5">HTTPS_PROXY</text>
 <text x="257" y="277" text-anchor="middle" font-size="11.5">CONNECT host:443,</text>

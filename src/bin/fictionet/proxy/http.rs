@@ -1,4 +1,4 @@
-//! The HTTP door, `--type https_proxy`, served over a client's TCP
+//! The HTTP door, `--type http_proxy`, served over a client's TCP
 //! connection. What it reads and answers is in
 //! [`fictionet::relay::proxy::http`].
 

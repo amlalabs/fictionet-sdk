@@ -68,7 +68,7 @@ in `.vm/test-<name>.log`.
 |---|---|
 | `netns` | `vm/guest/tests/netns.sh`: the README's quick start, checked. A network namespace named `agent`, attached with `--type tun --netns`. |
 | `docker-web` | `tests/docker/web/run.sh`: `web::Sites` under Docker Compose, attached with `--type tun`. |
-| `docker-proxy` | `tests/docker/proxy/run.sh`: `--type https_proxy` and `--type socks5` under Docker Compose. |
+| `docker-proxy` | `tests/docker/proxy/run.sh`: `--type http_proxy` and `--type socks5` under Docker Compose. |
 | `docker-ping`, `docker-tcpudp` | `tests/docker/ping/run.sh` and `tests/docker/tcpudp/run.sh`. |
 | `k8s` | `tests/k8s/run.sh`: the Helm chart on kind, attached with `--type tun`. |
 | `k8s-proxy` | `tests/k8s/proxy.sh`: the Helm chart on kind with the proxy types, under Pod Security "restricted". |

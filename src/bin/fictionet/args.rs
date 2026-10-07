@@ -79,13 +79,13 @@ impl ProxyKind {
     /// The type's name, as `--type` takes it and `hello` carries it.
     pub(crate) fn name(self) -> &'static str {
         match self {
-            ProxyKind::Http => "https_proxy",
+            ProxyKind::Http => "http_proxy",
             ProxyKind::Socks5 => "socks5",
         }
     }
 }
 
-/// The flags of `--type https_proxy` and `--type socks5`.
+/// The flags of `--type http_proxy` and `--type socks5`.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ProxyArgs {
     pub(crate) kind: ProxyKind,
@@ -171,7 +171,7 @@ usage: fictionet attach --world unix:<path> --name <name> --type tun
            [--ip-addr <cidr> --gateway <ip> --dns <ip> | --no-ip-addr]
            [--ip-addr-v6 <cidr> --gateway-v6 <ip> --dns-v6 <ip> | --no-ip-addr-v6]
            [--mtu <n>] [--ready-file <path>] [--world-wait <seconds>]
-       fictionet attach --world unix:<path> --name <name> --type https_proxy|socks5
+       fictionet attach --world unix:<path> --name <name> --type http_proxy|socks5
            --listen <ip:port> --token-file <path> --ip-addr <ip> --dns <ip>
            [--ready-file <path>] [--world-wait <seconds>]
 
@@ -194,7 +194,7 @@ IPv6) and sets it down. Give it once per link.
 that long, for a world that starts at the same time as attach. Without it,
 attach tries once.
 
---type https_proxy and --type socks5 make no device. Attach listens on
+--type http_proxy and --type socks5 make no device. Attach listens on
 --listen as an HTTP proxy or a SOCKS5 proxy, and turns each proxied
 connection into packets from --ip-addr (a plain address, such as
 10.0.0.2). It looks names up with the world's DNS server, --dns. Clients
@@ -432,14 +432,14 @@ pub(crate) fn parse_attach(args: &[String]) -> Result<Parsed, String> {
     }
     let proxy = match kind.as_deref() {
         Some("tun") => None,
-        Some("https_proxy") => Some(ProxyKind::Http),
+        Some("http_proxy") => Some(ProxyKind::Http),
         Some("socks5") => Some(ProxyKind::Socks5),
         Some("tap") => {
             let f = TapFlags { given: &given, vm, netns, ip_addr, gateway, dns, ip_addr_v6, gateway_v6, dns_v6 };
             return parse_tap(world, name, f, mtu, ready_file, world_wait);
         }
         Some(other) => return Err(format!("unknown --type {other:?}")),
-        None => return Err("--type is required: tun, tap, https_proxy or socks5".into()),
+        None => return Err("--type is required: tun, tap, http_proxy or socks5".into()),
     };
     if let Some(kind) = proxy {
         let flags = ProxyFlags { given: &given, ip_addr, dns, listen, token_file };
@@ -450,7 +450,7 @@ pub(crate) fn parse_attach(args: &[String]) -> Result<Parsed, String> {
     }
     for flag in ["--listen", "--token-file"] {
         if given.iter().any(|g| g == flag) {
-            return Err(format!("{flag} is only for --type https_proxy and --type socks5"));
+            return Err(format!("{flag} is only for --type http_proxy and --type socks5"));
         }
     }
     let ip_addr = Pending {
@@ -537,7 +537,7 @@ fn parse_tap(
     let refused: [(&[&str], &str); 3] = [
         (&["--down-link"], "attach changes no link"),
         (&["--resolv-conf", "--no-resolv-conf"], "the VM writes its own resolv.conf, from the DNS server it gets by DHCP"),
-        (&["--listen", "--token-file"], "those are for --type https_proxy and --type socks5"),
+        (&["--listen", "--token-file"], "those are for --type http_proxy and --type socks5"),
     ];
     for (flags, why) in refused {
         if let Some(flag) = f.given.iter().find(|g| flags.contains(&g.as_str())) {
@@ -914,7 +914,7 @@ mod tests {
         assert!(e.contains("1 to 255"));
     }
 
-    const PROXY: &str = "--world unix:/run/w.sock --name m3 --type https_proxy --listen 127.0.0.1:8080 \
+    const PROXY: &str = "--world unix:/run/w.sock --name m3 --type http_proxy --listen 127.0.0.1:8080 \
                          --token-file /run/token --ip-addr 10.0.0.2 --dns 10.0.0.1";
 
     fn parse_proxy(line: &str) -> Result<ProxyArgs, String> {
@@ -934,7 +934,7 @@ mod tests {
         assert_eq!(p.ip_addr, Ipv4Addr::new(10, 0, 0, 2));
         assert_eq!(p.dns, Ipv4Addr::new(10, 0, 0, 1));
         assert_eq!(p.ready_file, None);
-        let p = parse_proxy(&format!("{} --ready-file /r --world-wait 5", PROXY.replace("https_proxy", "socks5"))).unwrap();
+        let p = parse_proxy(&format!("{} --ready-file /r --world-wait 5", PROXY.replace("http_proxy", "socks5"))).unwrap();
         assert_eq!(p.kind, ProxyKind::Socks5);
         assert_eq!(p.ready_file, Some(PathBuf::from("/r")));
         assert_eq!(p.world_wait, std::time::Duration::from_secs(5));
@@ -946,7 +946,7 @@ mod tests {
     fn proxy_types_refuse_tun_flags() {
         let bad = |extra: &str| parse_proxy(&format!("{PROXY} {extra}")).unwrap_err();
         let e = bad("--gateway 10.0.0.1");
-        assert_eq!(e, "--type https_proxy takes no --gateway: attach makes the packets itself, and there are no routes to set");
+        assert_eq!(e, "--type http_proxy takes no --gateway: attach makes the packets itself, and there are no routes to set");
         assert!(bad("--no-gateway").contains("takes no --no-gateway"));
         assert!(bad("--netns /run/netns/a").contains("takes no --netns"));
         assert!(bad("--down-link eth0").contains("takes no --down-link"));
@@ -955,7 +955,7 @@ mod tests {
         assert!(bad("--resolv-conf /x").contains("takes no --resolv-conf"));
         assert!(bad("--no-ip-addr-v6").contains("IPv4 only"));
         assert!(bad("--dns-v6 fd00::1").contains("IPv4 only"));
-        let e = parse_proxy(&format!("{} --gateway 10.0.0.1", PROXY.replace("https_proxy", "socks5"))).unwrap_err();
+        let e = parse_proxy(&format!("{} --gateway 10.0.0.1", PROXY.replace("http_proxy", "socks5"))).unwrap_err();
         assert!(e.starts_with("--type socks5 takes no --gateway"), "{e}");
     }
 
@@ -983,7 +983,7 @@ mod tests {
     #[test]
     fn tun_refuses_proxy_flags() {
         let e = parse_attach(&args(&format!("{FULL} --listen 127.0.0.1:1"))).unwrap_err();
-        assert!(e.contains("--listen is only for --type https_proxy"), "{e}");
+        assert!(e.contains("--listen is only for --type http_proxy"), "{e}");
         let e = parse_attach(&args(&format!("{FULL} --token-file /t"))).unwrap_err();
         assert!(e.contains("--token-file is only for"), "{e}");
     }
@@ -1068,6 +1068,6 @@ mod tests {
         let e = parse_attach(&args(&format!("{FULL} --vm qemu:/x"))).unwrap_err();
         assert_eq!(e, "--vm is only for --type tap");
         let e = parse_proxy(&format!("{PROXY} --vm qemu:/x")).unwrap_err();
-        assert!(e.starts_with("--type https_proxy takes no --vm"), "{e}");
+        assert!(e.starts_with("--type http_proxy takes no --vm"), "{e}");
     }
 }

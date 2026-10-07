@@ -1,12 +1,12 @@
 # Values for charts/fictionet-sandbox: two sandboxes, `default` behind
-# attach --type https_proxy and `socks` behind --type socks5. No container
+# attach --type http_proxy and `socks` behind --type socks5. No container
 # has a capability or runs as root, so the pods pass Pod Security
 # "restricted". The images are the ones k8s-tun.yaml uses.
 # tests/k8s/proxy.sh installs these values.
 attach:
   image: fictionet-attach:dev
   imagePullPolicy: Never
-  type: https_proxy
+  type: http_proxy
 podSecurityContext:
   runAsNonRoot: true
   seccompProfile:

@@ -32,7 +32,7 @@ WEB_WORLD_IMAGE = "ghcr.io/amlalabs/fictionet-web-world:4903de4"
 #: list the world's socket in /proc/net/unix. The path names nothing.
 WORLD_SOCKET = "/run/relay/relay.sock"
 
-AttachType = Literal["tun", "https_proxy", "socks5"]
+AttachType = Literal["tun", "http_proxy", "socks5"]
 Backend = Literal["docker", "k8s"]
 
 _SOCKET_DIR = "/run/relay"
@@ -178,7 +178,7 @@ def fictionet_sandbox(
         `AGENT_LIMITS`, 2 GiB, 1 CPU and 1024 processes.
       world_limits: The world's limits. Default: `WORLD_LIMITS`, 2 GiB and
         1024 processes. Attach always gets `ATTACH_LIMITS`.
-      attach: `"tun"`, `"https_proxy"` or `"socks5"`. With tun the agent's
+      attach: `"tun"`, `"http_proxy"` or `"socks5"`. With tun the agent's
         only interface is tun0. With a proxy type the agent has only
         loopback, where attach listens, and gets the proxy variables.
       name: The name attach gives the world for this sandbox.
@@ -187,7 +187,7 @@ def fictionet_sandbox(
         (without its prefix) and dns only.
       mtu: tun0's MTU. Default: attach's, 1500.
       proxy_port: The proxy's port on 127.0.0.1. Default: 8080 for
-        https_proxy, 1080 for socks5.
+        http_proxy, 1080 for socks5.
       world_wait: Seconds attach waits for the world's socket.
       attach_image: The attach image. It must have the binary at
         `/fictionet`.
@@ -288,8 +288,8 @@ class _Config:
         return posixpath.dirname(self.world_ca) if self.world_ca else None
 
     def check(self) -> None:
-        if self.attach not in ("tun", "https_proxy", "socks5"):
-            raise ValueError(f"attach must be 'tun', 'https_proxy' or 'socks5', not {self.attach!r}")
+        if self.attach not in ("tun", "http_proxy", "socks5"):
+            raise ValueError(f"attach must be 'tun', 'http_proxy' or 'socks5', not {self.attach!r}")
         if not 1 <= len(self.name.encode()) <= 255:
             raise ValueError("name must be 1 to 255 bytes")
         if not self.dns and not self.dns_v6:
@@ -361,7 +361,7 @@ class _Config:
 
     def proxy_env(self, token: str) -> dict[str, str]:
         """The agent's proxy variables, with the token in the URL."""
-        if self.attach == "https_proxy":
+        if self.attach == "http_proxy":
             url = f"http://{_PROXY_USER}:{token}@127.0.0.1:{self.port}"
             env = {k: url for k in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy")}
             env["NODE_USE_ENV_PROXY"] = "1"
