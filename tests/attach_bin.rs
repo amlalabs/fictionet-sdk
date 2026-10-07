@@ -432,6 +432,10 @@ fn ready_exits_0_only_when_the_file_exists() {
     assert_eq!(run(&[file.to_str().unwrap()]).status.code(), Some(0));
     assert_eq!(run(&[]).status.code(), Some(2));
     assert_eq!(run(&["a", "b"]).status.code(), Some(2));
+    // Help goes to stdout and exits 0, as every other subcommand's does.
+    let help = run(&["--help"]);
+    assert_eq!(help.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&help.stdout).contains("usage: fictionet ready"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

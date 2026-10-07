@@ -40,8 +40,11 @@ for the requests an observer can make.
 `fictionet ready <path>` exits 0 if <path> exists, and 1 if not. Use it as
 a probe on attach's --ready-file, in an image with no shell.
 `fictionet wait-blocked` exits 0 once the addresses stop answering, such as
-when a NetworkPolicy takes effect. Run `fictionet wait-blocked --help`.
-`fictionet --world` (running a world) is not implemented in this binary yet.";
+when a NetworkPolicy takes effect. Run `fictionet wait-blocked --help`.";
+
+const READY_USAGE: &str = "usage: fictionet ready <path>
+
+Exits 0 if <path> exists, and 1 if not.";
 
 static READY_FILE: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
 
@@ -192,6 +195,7 @@ fn main() {
             }
         }
         Some("ready") => match &argv[1..] {
+            [flag] if flag == "-h" || flag == "--help" => println!("{READY_USAGE}"),
             [path] if !path.starts_with('-') => {
                 if std::fs::symlink_metadata(path).is_err() {
                     eprintln!("fictionet ready: {path} does not exist");
@@ -199,7 +203,7 @@ fn main() {
                 }
             }
             _ => {
-                eprintln!("usage: fictionet ready <path>");
+                eprintln!("{READY_USAGE}");
                 std::process::exit(2);
             }
         },
