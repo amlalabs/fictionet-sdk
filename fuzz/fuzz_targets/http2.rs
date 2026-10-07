@@ -23,7 +23,7 @@ fuzz_target!(|data: &[u8]| {
     contract::check_wire::<http2::Continuation>(bytes);
     contract::check_wire::<http2::Unknown>(bytes);
     // Capture checks stay below the oversized read-ahead policy threshold.
-    contract::check_decode(|| http2::Capture::new(4096), bytes);
+    contract::check_decode(|| fictionet::observe::http2::Capture::new(4096), bytes);
     let mut framed = http2::Settings {
         flags: 0,
         entries: vec![],

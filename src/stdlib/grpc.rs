@@ -345,19 +345,6 @@ impl codec::Decode for Messages {
     }
 }
 
-impl fictionet::observe::Present for Messages {
-    /// Describes the encoded body without decompressing it.
-    fn summary(item: &Message) -> String {
-        format!("{} bytes{}", item.data.len(), if item.compressed { ", compressed" } else { "" })
-    }
-    /// Places the compressed flag, length prefix, and encoded body.
-    fn fields(item: &Message, bytes: &[u8], layer: &mut fictionet::observe::Layer) {
-        layer.field("Compressed", item.compressed.to_string(), (0, 1));
-        layer.field("Length", item.data.len().to_string(), (1, HEADER_LEN));
-        layer.field("Message", format!("{} bytes", item.data.len()), (HEADER_LEN, bytes.len()));
-    }
-}
-
 // Shared prefix parsing. Only a complete, bounded body is copied.
 fn parse_message(b: &[u8], limit: usize) -> Result<Option<(Message, usize)>, FrameError> {
     let Some(&flag) = b.first() else {

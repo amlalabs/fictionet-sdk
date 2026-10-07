@@ -1,5 +1,5 @@
 use fictionet::{
-    observe::{Decoded, Match, Observed, Place, Registry, Selection, Transport},
+    observe::{Decoded, Match, Observed, Place, Registry, Selection, Transport, http2 as capture},
     stdlib::{codec::Wire, grpc, hpack, http2},
 };
 
@@ -187,7 +187,7 @@ fn registry_connections_share_the_capture_data_budget() {
 
 #[test]
 fn frames_and_grpc_fields_keep_their_packet_byte_ranges() {
-    let mut observed = Observed::new(http2::Capture::default());
+    let mut observed = Observed::new(capture::Capture::default());
     let head = headers();
     let message = grpc::Message {
         compressed: false,
@@ -249,7 +249,7 @@ fn frames_and_grpc_fields_keep_their_packet_byte_ranges() {
 }
 #[test]
 fn frames_split_between_packets_and_messages_split_between_frames_get_buffers() {
-    let mut observed = Observed::new(http2::Capture::default());
+    let mut observed = Observed::new(capture::Capture::default());
     let head = headers();
     let message = grpc::Message {
         compressed: false,
@@ -306,12 +306,12 @@ fn frames_split_between_packets_and_messages_split_between_frames_get_buffers() 
 fn copied_capture_replaces_the_builtin_through_the_same_registry() {
     let mut builtin = Registry::default();
     let mut copied = Registry::default();
-    let budget = fictionet_copy_modules::http2::CaptureBudget::default();
+    let budget = fictionet_copy_modules::observe_http2::CaptureBudget::default();
     copied.register_with_buffer(
         "http2",
         |_| Match::Yes,
-        http2::CAPTURE_READ_AHEAD,
-        move |_| fictionet_copy_modules::http2::Capture::pair_in(&budget),
+        capture::CAPTURE_READ_AHEAD,
+        move |_| fictionet_copy_modules::observe_http2::Capture::pair_in(&budget),
     );
     assert!(builtin.choose(Transport::Tcp, "http2"));
     let selection = Selection {
@@ -344,14 +344,10 @@ fn copied_capture_replaces_the_builtin_through_the_same_registry() {
         packets.push((packet.info.clone(), packet.layers_json()));
     }
     assert_eq!(packets[0], packets[1]);
-    let mut copied_grpc = Observed::new(fictionet_copy_modules::grpc::Messages::with_limit(32));
-    let mut packet = Decoded::default();
-    copied_grpc.data(&[0, 0, 0, 0, 0], Place::default(), &mut packet);
-    assert_eq!(packet.layers[0].name, "gRPC");
 }
 #[test]
 fn eof_reports_a_grpc_truncation() {
-    let mut observed = Observed::new(http2::Capture::default());
+    let mut observed = Observed::new(capture::Capture::default());
     let mut packet = Decoded::default();
     observed.data(&headers(), Place::default(), &mut packet);
     observed.data(&data(&[0, 0], 0), Place::default(), &mut packet);
@@ -369,7 +365,7 @@ fn eof_reports_a_grpc_truncation() {
 
 #[test]
 fn eof_header_error_names_http2_once() {
-    let mut observed = Observed::new(http2::Capture::default());
+    let mut observed = Observed::new(capture::Capture::default());
     let mut packet = Decoded::default();
     let mut head = headers();
     head[4] = 0; // HEADERS without END_HEADERS.
@@ -403,7 +399,7 @@ fn refused_frames_are_malformed_and_explain_why() {
         .unwrap();
         bytes.extend(body);
         let error = http2::Frame::parse(&bytes).unwrap_err();
-        let mut observed = Observed::new(http2::Capture::default());
+        let mut observed = Observed::new(capture::Capture::default());
         let mut packet = Decoded::default();
         observed.data(&bytes, Place::default(), &mut packet);
         assert!(packet.tags.contains(&"malformed"));
@@ -422,7 +418,7 @@ fn refused_frames_are_malformed_and_explain_why() {
 
 #[test]
 fn batched_grpc_messages_report_the_display_limit() {
-    let mut observed = Observed::new(http2::Capture::default());
+    let mut observed = Observed::new(capture::Capture::default());
     let mut packet = Decoded::default();
     observed.data(&headers(), Place::default(), &mut packet);
     packet = Decoded::default();
@@ -439,7 +435,7 @@ fn batched_grpc_messages_report_the_display_limit() {
 
 #[test]
 fn incomplete_grpc_at_trailers_and_gaps_do_not_join_stale_bytes() {
-    let mut observed = Observed::new(http2::Capture::default());
+    let mut observed = Observed::new(capture::Capture::default());
     let mut packet = Decoded::default();
     observed.data(&headers(), Place::default(), &mut packet);
     observed.data(&data(&[0, 0], 0), Place::default(), &mut packet);
