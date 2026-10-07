@@ -1123,7 +1123,7 @@ impl Messages {
     pub fn new() -> Self {
         Self::with_limits(Limits::default())
     }
-    /// Sets the JSON limits. [`Limits::size`] is also the line's content
+    /// Sets the JSON limits. The `size` field is also the line's content
     /// limit, clamped to [`MAX_LINE`]; the other caps are clamped by
     /// [`json::parse_with`]. A zero size accepts only empty content,
     /// reported as a blank-line error.

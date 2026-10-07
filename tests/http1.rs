@@ -230,7 +230,7 @@ fn copied_message_decoders_preserve_bytes_and_share_wire_traits() {
         b"{}"
     );
     contract::check_decode(
-        || copied::ResponseMessages::new(),
+        copied::ResponseMessages::new,
         b"HTTP/1.1 204 \r\n\r\n",
     );
 }
