@@ -45,17 +45,17 @@ where
 #[test]
 fn postgres_frontend_and_backend_round_trips() {
     let frontend = vec![
-        pg::Frontend::Startup(pg::Startup::new("alice", "mail")),
-        pg::Frontend::Query("select 1".into()),
-        pg::Frontend::Bind(pg::Bind::default()),
-        pg::Frontend::Sync,
-        pg::Frontend::Terminate,
+        pg::FrontendMessage::Startup(pg::Startup::new("alice", "mail")),
+        pg::FrontendMessage::Query("select 1".into()),
+        pg::FrontendMessage::Bind(pg::Bind::default()),
+        pg::FrontendMessage::Sync,
+        pg::FrontendMessage::Terminate,
     ];
     let mut bytes = Vec::new();
     for message in &frontend {
         message.write(&mut bytes).unwrap();
         contract::check_wire_value(message);
-        contract::check_wire::<pg::Frontend>(&Wire::to_bytes(message).unwrap());
+        contract::check_wire::<pg::FrontendMessage>(&Wire::to_bytes(message).unwrap());
     }
     check(pg::FrontendMessages::new, &bytes);
     assert_eq!(
@@ -64,24 +64,24 @@ fn postgres_frontend_and_backend_round_trips() {
     );
 
     let backend = vec![
-        pg::Backend::Authentication(pg::Authentication::Ok),
-        pg::Backend::ParameterStatus {
+        pg::BackendMessage::Authentication(pg::Authentication::Ok),
+        pg::BackendMessage::ParameterStatus {
             name: "client_encoding".into(),
             value: "UTF8".into(),
         },
-        pg::Backend::DataRow(vec![Some(b"1".to_vec()), None]),
-        pg::Backend::CommandComplete("SELECT 1".into()),
-        pg::Backend::ReadyForQuery(pg::TransactionStatus::Idle),
+        pg::BackendMessage::DataRow(vec![Some(b"1".to_vec()), None]),
+        pg::BackendMessage::CommandComplete("SELECT 1".into()),
+        pg::BackendMessage::ReadyForQuery(pg::TransactionStatus::Idle),
     ];
     let mut bytes = Vec::new();
     for message in &backend {
         message.write(&mut bytes).unwrap();
         contract::check_wire_value(message);
-        contract::check_wire::<pg::Backend>(&Wire::to_bytes(message).unwrap());
+        contract::check_wire::<pg::BackendMessage>(&Wire::to_bytes(message).unwrap());
     }
-    check(pg::BackendMessages::new, &bytes);
+    check(pg::BackendEvents::new, &bytes);
     assert_eq!(
-        read(pg::BackendMessages::new(), &bytes),
+        read(pg::BackendEvents::new(), &bytes),
         backend
             .iter()
             .cloned()
@@ -93,8 +93,8 @@ fn postgres_frontend_and_backend_round_trips() {
 #[test]
 fn postgres_encryption_requests_end_with_exact_unread_transport_bytes() {
     for (request, reply) in [
-        (pg::Frontend::SslRequest, pg::EncryptionReply::Ssl),
-        (pg::Frontend::GssEncRequest, pg::EncryptionReply::Gss),
+        (pg::FrontendMessage::SslRequest, pg::EncryptionReply::Ssl),
+        (pg::FrontendMessage::GssEncRequest, pg::EncryptionReply::Gss),
     ] {
         let trailing = b"\x16\x03\x03\0\x08\0\xffhello!";
         let mut bytes = Wire::to_bytes(&request).unwrap();
@@ -111,7 +111,7 @@ fn postgres_encryption_requests_end_with_exact_unread_transport_bytes() {
         assert_eq!(buffer.unread(), trailing);
         assert_eq!(buffer.offset(), boundary as u64);
         decoder.start_encryption();
-        let startup = pg::Frontend::Startup(pg::Startup::new("u", "d"));
+        let startup = pg::FrontendMessage::Startup(pg::Startup::new("u", "d"));
         assert_eq!(
             read(decoder, &Wire::to_bytes(&startup).unwrap()),
             [Ok(startup)]
@@ -119,7 +119,7 @@ fn postgres_encryption_requests_end_with_exact_unread_transport_bytes() {
 
         // On the client, only the one-byte acceptance belongs to PostgreSQL.
         let make = || {
-            let mut decoder = pg::BackendMessages::new();
+            let mut decoder = pg::BackendEvents::new();
             decoder.expect_encryption();
             decoder
         };
@@ -143,11 +143,11 @@ fn postgres_encryption_requests_end_with_exact_unread_transport_bytes() {
 #[test]
 fn postgres_refusal_resumes_startup_then_typed_messages() {
     let messages = vec![
-        pg::Frontend::SslRequest,
-        pg::Frontend::GssEncRequest,
-        pg::Frontend::Startup(pg::Startup::new("u", "d")),
-        pg::Frontend::Query("select 1".into()),
-        pg::Frontend::Sync,
+        pg::FrontendMessage::SslRequest,
+        pg::FrontendMessage::GssEncRequest,
+        pg::FrontendMessage::Startup(pg::Startup::new("u", "d")),
+        pg::FrontendMessage::Query("select 1".into()),
+        pg::FrontendMessage::Sync,
     ];
     let mut bytes = Vec::new();
     for message in &messages {
@@ -165,7 +165,7 @@ fn postgres_refusal_resumes_startup_then_typed_messages() {
                     let message = item.unwrap().unwrap();
                     if matches!(
                         message,
-                        pg::Frontend::SslRequest | pg::Frontend::GssEncRequest
+                        pg::FrontendMessage::SslRequest | pg::FrontendMessage::GssEncRequest
                     ) {
                         if after_end {
                             assert_eq!(stream.next(), None);
@@ -190,10 +190,10 @@ fn postgres_refusal_resumes_startup_then_typed_messages() {
     }
 
     let mut backend = Wire::to_bytes(&pg::EncryptionReply::Refused).unwrap();
-    let ready = pg::Backend::ReadyForQuery(pg::TransactionStatus::Idle);
+    let ready = pg::BackendMessage::ReadyForQuery(pg::TransactionStatus::Idle);
     ready.write(&mut backend).unwrap();
     let make = || {
-        let mut d = pg::BackendMessages::new();
+        let mut d = pg::BackendEvents::new();
         d.expect_encryption();
         d
     };
@@ -209,7 +209,7 @@ fn postgres_refusal_resumes_startup_then_typed_messages() {
 
 #[test]
 fn postgres_repeated_negotiation_and_direct_tls_keep_bytes() {
-    let request = Wire::to_bytes(&pg::Frontend::SslRequest).unwrap();
+    let request = Wire::to_bytes(&pg::FrontendMessage::SslRequest).unwrap();
     let bytes = [request.as_slice(), request.as_slice()].concat();
     let mut stream = Stream::new(pg::FrontendMessages::new());
     assert_eq!(stream.push(&bytes), bytes.len());
@@ -217,7 +217,7 @@ fn postgres_repeated_negotiation_and_direct_tls_keep_bytes() {
     stream.decoder().refuse_encryption();
     assert_eq!(
         stream.next(),
-        Some(Err(Fail::Protocol(pg::Error::UnsupportedProtocol(
+        Some(Err(Fail::Protocol(pg::FrameError::UnsupportedProtocol(
             pg::SSL_REQUEST_CODE
         ))))
     );
@@ -229,14 +229,14 @@ fn postgres_repeated_negotiation_and_direct_tls_keep_bytes() {
     assert_eq!(stream.push(hello), hello.len());
     assert_eq!(
         stream.next(),
-        Some(Err(Fail::Protocol(pg::Error::DirectTls)))
+        Some(Err(Fail::Protocol(pg::FrameError::DirectTls)))
     );
     let (buffer, mut decoder) = stream.into_parts();
     assert_eq!(buffer.unread(), hello);
     decoder.start_encryption();
     assert_eq!(
         decoder.decode(&request, false),
-        Ok(Step::Item(Ok(pg::Frontend::SslRequest), request.len()))
+        Ok(Step::Item(Ok(pg::FrontendMessage::SslRequest), request.len()))
     );
 }
 
@@ -245,14 +245,14 @@ fn postgres_cancel_and_terminate_end_at_the_item_boundary() {
     for (decoder, message) in [
         (
             pg::FrontendMessages::new(),
-            pg::Frontend::CancelRequest {
+            pg::FrontendMessage::CancelRequest {
                 process_id: 1,
                 secret_key: vec![2; 4],
             },
         ),
         (
             pg::FrontendMessages::established(64),
-            pg::Frontend::Terminate,
+            pg::FrontendMessage::Terminate,
         ),
     ] {
         let mut bytes = Wire::to_bytes(&message).unwrap();
@@ -269,48 +269,42 @@ fn postgres_cancel_and_terminate_end_at_the_item_boundary() {
 #[test]
 fn postgres_body_errors_are_items_and_framing_errors_end_once() {
     let mut bytes = b"Q\0\0\0\x05x".to_vec(); // Missing string terminator.
-    pg::Frontend::Sync.write(&mut bytes).unwrap();
+    pg::FrontendMessage::Sync.write(&mut bytes).unwrap();
     check(|| pg::FrontendMessages::established(64), &bytes);
     assert_eq!(
         read(pg::FrontendMessages::established(64), &bytes),
         [
-            Err(pg::Error::Malformed {
-                tag: b'Q',
-                reason: pg::Malformed::UnterminatedString
-            }),
-            Ok(pg::Frontend::Sync),
+            Err(pg::Error::UnterminatedString { tag: b'Q' }),
+            Ok(pg::FrontendMessage::Sync),
         ]
     );
     let mut bytes = b"Z\0\0\0\x05?".to_vec();
-    pg::Backend::BindComplete.write(&mut bytes).unwrap();
-    check(|| pg::BackendMessages::with_limit(64), &bytes);
+    pg::BackendMessage::BindComplete.write(&mut bytes).unwrap();
+    check(|| pg::BackendEvents::with_limit(64), &bytes);
     assert_eq!(
-        read(pg::BackendMessages::with_limit(64), &bytes),
+        read(pg::BackendEvents::with_limit(64), &bytes),
         [
-            Err(pg::Error::Malformed {
-                tag: b'Z',
-                reason: pg::Malformed::BadStatus(b'?')
-            }),
-            Ok(pg::BackendEvent::Message(pg::Backend::BindComplete)),
+            Err(pg::Error::BadStatus { tag: b'Z', status: b'?' }),
+            Ok(pg::BackendEvent::Message(pg::BackendMessage::BindComplete)),
         ]
     );
     failure(
         pg::FrontendMessages::established(64),
         b"?",
         false,
-        Fail::Protocol(pg::Error::UnknownType(b'?')),
+        Fail::Protocol(pg::FrameError::UnknownType(b'?')),
     );
     failure(
-        pg::BackendMessages::new(),
+        pg::BackendEvents::new(),
         b"Z\0\0\0\x03",
         false,
-        Fail::Protocol(pg::Error::BadLength(3)),
+        Fail::Protocol(pg::FrameError::BadLength(3)),
     );
     failure(
         pg::FrontendMessages::new(),
         b"\0\0\0\x07",
         false,
-        Fail::Protocol(pg::Error::BadLength(7)),
+        Fail::Protocol(pg::FrameError::BadLength(7)),
     );
 }
 
@@ -321,14 +315,14 @@ fn postgres_limits_are_refused_from_headers_and_partial_units_truncate() {
         pg::FrontendMessages::new(),
         &startup,
         false,
-        Fail::Protocol(pg::Error::TooLong {
+        Fail::Protocol(pg::FrameError::TooLong {
             length: pg::MAX_STARTUP as u32 + 5,
             max: pg::MAX_STARTUP + 4,
         }),
     );
     for frontend in [true, false] {
         let bytes = b"d\0\0\0\x41";
-        let expected = Fail::Protocol(pg::Error::TooLong {
+        let expected = Fail::Protocol(pg::FrameError::TooLong {
             length: 65,
             max: 64,
         });
@@ -341,8 +335,8 @@ fn postgres_limits_are_refused_from_headers_and_partial_units_truncate() {
             );
             check(|| pg::FrontendMessages::established(64), bytes);
         } else {
-            failure(pg::BackendMessages::with_limit(64), bytes, false, expected);
-            check(|| pg::BackendMessages::with_limit(64), bytes);
+            failure(pg::BackendEvents::with_limit(64), bytes, false, expected);
+            check(|| pg::BackendEvents::with_limit(64), bytes);
         }
     }
     failure(
@@ -358,7 +352,7 @@ fn postgres_limits_are_refused_from_headers_and_partial_units_truncate() {
         Fail::Truncated { unread: 7 },
     );
     failure(
-        pg::BackendMessages::with_limit(64),
+        pg::BackendEvents::with_limit(64),
         b"Z\0\0\0",
         true,
         Fail::Truncated { unread: 4 },
@@ -372,18 +366,18 @@ fn postgres_modes_and_minimum_limit_are_explicit() {
     assert_eq!(frontend.phase(), pg::Phase::Messages);
     assert_eq!(
         read(frontend.clone(), b"S\0\0\0\x04"),
-        [Ok(pg::Frontend::Sync)]
+        [Ok(pg::FrontendMessage::Sync)]
     );
     failure(
         frontend,
         b"C\0\0\0\x06",
         false,
-        Fail::Protocol(pg::Error::TooLong { length: 6, max: 4 }),
+        Fail::Protocol(pg::FrameError::TooLong { length: 6, max: 4 }),
     );
 
-    let mut backend = pg::BackendMessages::new();
+    let mut backend = pg::BackendEvents::new();
     backend.expect_encryption();
-    let reply = pg::Backend::ErrorResponse(pg::Diagnostic::fatal(
+    let reply = pg::BackendMessage::ErrorResponse(pg::Diagnostic::fatal(
         pg::sqlstate::PROTOCOL_VIOLATION,
         "SSL unsupported",
     ));
@@ -391,7 +385,7 @@ fn postgres_modes_and_minimum_limit_are_explicit() {
         backend,
         &Wire::to_bytes(&reply).unwrap(),
         false,
-        Fail::Protocol(pg::Error::UnknownType(b'E')),
+        Fail::Protocol(pg::FrameError::UnknownType(b'E')),
     );
 }
 
@@ -673,8 +667,8 @@ fn swapped_document_collection_enforces_its_limit() {
 fn strict_writers_reject_lossy_values_without_changing_the_destination() {
     let mut out = b"prefix".to_vec();
     for value in [
-        pg::Frontend::Query("a\0b".into()),
-        pg::Frontend::CancelRequest {
+        pg::FrontendMessage::Query("a\0b".into()),
+        pg::FrontendMessage::CancelRequest {
             process_id: 1,
             secret_key: vec![],
         },
@@ -683,7 +677,7 @@ fn strict_writers_reject_lossy_values_without_changing_the_destination() {
         assert!(value.write(&mut out).is_err());
         assert_eq!(out, b"prefix");
     }
-    let backend = pg::Backend::ParameterStatus {
+    let backend = pg::BackendMessage::ParameterStatus {
         name: "a\0b".into(),
         value: "v".into(),
     };
@@ -718,12 +712,12 @@ fn strict_writers_reject_lossy_values_without_changing_the_destination() {
 
 #[test]
 fn wire_parsers_require_exact_units() {
-    for message in [pg::Frontend::SslRequest, pg::Frontend::Query("q".into())] {
+    for message in [pg::FrontendMessage::SslRequest, pg::FrontendMessage::Query("q".into())] {
         let mut bytes = Wire::to_bytes(&message).unwrap();
         bytes.push(0);
         assert_eq!(
-            <pg::Frontend as Wire>::parse(&bytes),
-            Err(pg::ParseError::Trailing)
+            <pg::FrontendMessage as Wire>::parse(&bytes),
+            Err(pg::Error::Trailing)
         );
     }
     let mut bytes = Wire::to_bytes(&mail_header()).unwrap();
@@ -819,17 +813,16 @@ fn exact_and_minimum_header_limits_make_progress() {
 #[test]
 fn malformed_startup_body_ends_the_stream_once() {
     let mut bytes = b"\0\0\0\x09\0\x03\0\0x".to_vec();
-    let startup = pg::Frontend::Startup(pg::Startup::new("u", "d"));
+    let startup = pg::FrontendMessage::Startup(pg::Startup::new("u", "d"));
     startup.write(&mut bytes).unwrap();
     check(pg::FrontendMessages::new, &bytes);
     failure(
         pg::FrontendMessages::new(),
         &bytes,
         false,
-        Fail::Protocol(pg::Error::Malformed {
-            tag: 0,
-            reason: pg::Malformed::UnterminatedString,
-        }),
+        Fail::Protocol(pg::FrameError::Startup(
+            pg::Error::UnterminatedString { tag: 0 },
+        )),
     );
 }
 
@@ -875,11 +868,11 @@ fn malformed_startup_requests_end_the_stream_once() {
     let mut cases = vec![
         (
             b"\0\0\0\x09\x04\xd2\x16\x2f\0".to_vec(),
-            pg::Malformed::TrailingBytes,
+            pg::Error::TrailingBytes { tag: 0 },
         ),
         (
             b"\0\0\0\x09\x04\xd2\x16\x30\0".to_vec(),
-            pg::Malformed::TrailingBytes,
+            pg::Error::TrailingBytes { tag: 0 },
         ),
     ];
     for length in [0, pg::MAX_SECRET_KEY + 1] {
@@ -887,17 +880,17 @@ fn malformed_startup_requests_end_the_stream_once() {
         bytes.extend_from_slice(&pg::CANCEL_REQUEST_CODE.to_be_bytes());
         bytes.extend_from_slice(&1u32.to_be_bytes());
         bytes.resize(12 + length, 0);
-        cases.push((bytes, pg::Malformed::BadKeyLength(length)));
+        cases.push((bytes, pg::Error::BadKeyLength { tag: 0, length }));
     }
-    for (mut bytes, reason) in cases {
-        pg::Frontend::Startup(pg::Startup::new("u", "d"))
+    for (mut bytes, error) in cases {
+        pg::FrontendMessage::Startup(pg::Startup::new("u", "d"))
             .write(&mut bytes)
             .unwrap();
         failure(
             pg::FrontendMessages::new(),
             &bytes,
             false,
-            Fail::Protocol(pg::Error::Malformed { tag: 0, reason }),
+            Fail::Protocol(pg::FrameError::Startup(error)),
         );
     }
 }
