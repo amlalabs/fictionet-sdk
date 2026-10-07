@@ -28,7 +28,7 @@ CHECKS = [
     ("dig +short example.test", "203.0.113.10"),
     ("curl -sS -m 5 http://1.1.1.1/ || echo unreachable", "unreachable"),
     ("ip link set eth0 up 2>&1 || true", "Operation not permitted"),
-    ("ls /run/fictionet 2>&1 || true", "No such file or directory"),
+    ("ls /run/relay 2>&1 || true", "No such file or directory"),
 ]
 
 

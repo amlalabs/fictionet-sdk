@@ -75,7 +75,7 @@ def web(backend: str = "docker", agent_image: str | None = None) -> Task:
         scorer=contains(),
         sandbox=fictionet_sandbox(
             WEB_WORLD_IMAGE,
-            world_args=["/run/fictionet/world.sock", "/run/ca/ca.pem"],
+            world_args=["/run/relay/relay.sock", "/run/ca/ca.pem"],
             world_ca="/run/ca/ca.pem",
             agent_image=agent_image or Build(Path(__file__).parent / "agent.Dockerfile"),
             backend=backend,

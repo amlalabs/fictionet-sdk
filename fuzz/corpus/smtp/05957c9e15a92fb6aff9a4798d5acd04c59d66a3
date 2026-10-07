@@ -1,8 +1,0 @@
-en.teBs
-MAIL FROM:<`> RCPs
-MAIL FROM:<`> T s=0
-RCPT > 7
-T
-:
-RCPT > 7
-T

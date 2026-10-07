@@ -16,144 +16,17 @@ cargo +nightly fuzz list
 
 ## The targets
 
-| Target | What it feeds | Code it reaches |
-|---|---|---|
-| `json_schema` | Byte-split schema/instance pairs; document entry pointers, dialects, format assertions and generation, dependentSchemas, unsupported keywords, error caps, deterministic examples | `stdlib::json_schema`: reachable compilation, local refs, exact decimals, bounded validation and generation; generated JSON wire contracts |
-| `observe_modbus` | Capture bytes with codec contract checks for chunking, EOF, and bounds | `observe::protocols::Modbus` |
-| `observe_dns` | Capture bytes with codec contract checks for chunking, EOF, and bounds | `observe::protocols::Dns` |
-| `observe_dhcp` | Capture bytes with codec contract checks for chunking, EOF, and bounds | `observe::protocols::Dhcp` |
-| `observe_http1` | Capture bytes with codec contract checks for chunking, EOF, and bounds | `observe::protocols::Http1` |
-| `observe_tls` | Capture bytes with codec contract checks for chunking, EOF, and bounds | `observe::protocols::TlsRecords` |
-| `codec_tools` | arbitrary Modbus/TCP, JSON, and line streams, byte edits, and seeded item plans | `codec`: one-pass recording with Forward and empty fault plans equals consumed input for JSON, Lines, Modbus, and Pipe; transactional replacement, recorder bounds, skip and failure events, and repeatable fault output |
-| `codec_tools` / Hold | every 11th item held for two later items, then EOF flush | held count and byte limits, release order, transactional flush |
-| `codec_tools` / Split | every 17th byte call split at offset 2 with a delay | two pushes with a delay marker at their boundary |
-| `codec_tools` / range Drop | every 19th byte call removes bytes 1..4 | clamped range edits and retained prefix/suffix |
-| `codec_tools` / range Repeat | every 23rd byte call repeats bytes 1..3 three times | range repetition under the output limit |
-| `codec_tools` / delayed Raw | item calls 2..=3 replace bytes with a delay | combined action, call window, raw replacement |
-| `codegen_ir` | Generated recursive IR values and length-prefixed streams | `Node`, `NodeFrames`, Wire and Decode contracts |
-| `relay` | relay messages | `relay::decode` |
-| `packets` | whole packets | `ip::split_protocols`'s sorting, `icmp::echo_reply`, `dhcp::Message::parse` |
-| `ip_reassembly` | IPv4 and IPv6 fragments, with timing | fragment reassembly in `ip::split_protocols` |
-| `stack` | packets, with checksums made right or not | a machine: `split_protocols`, `tcp::endpoint`, `udp::endpoint`, ping replies, over IPv4 and IPv6 |
-| `tcp` | TCP segments and the world's own calls, structured | `tcp::endpoint`: smoltcp's state machine and the stdlib's code around it |
-| `tcp_stream` | arbitrary segment directions, sequence numbers, flags, payloads, and limits; checks byte accounting, placement, event order, and buffer bounds | `stdlib::tcp_stream::Reassembler`: captured TCP reassembly |
-| `tls` | the client's bytes | `tls::server` (the ClientHello and SNI), `ClientHello::finish`, `TlsConnection` |
-| `dns` | DNS messages | hickory-proto's parser, and attach's resolver reading an answer |
-| `web` | packets, DNS queries, DHCP messages, TCP segments | `web::Sites`: the filter, DHCP, DNS over UDP and TCP, routing, the machines |
-| `web_http` | HTTP/1.1 and HTTP/2 bytes, plain or over TLS | `web::Sites` serving HTTP through hyper and h2 |
-| `proxy_http` | a request head | the HTTP proxy door of `fictionet attach`: CONNECT and absolute URIs, `Proxy-Authorization` |
-| `proxy_socks5` | a SOCKS5 client's bytes | the SOCKS5 door: greeting, login and request |
-| `fix` | arbitrary and constructed tag=value messages, corrupt lengths and envelopes followed by valid frames, malformed field items, SOH-bearing data, caller group layouts, and timed sessions | `stdlib::fix`: exact wire and allocation contracts, resynchronization, BodyLength/CheckSum, data pairs, groups, typed views, Logon, bounded resend retries, field Rejects, deferred Logout, and liveness |
-| `modbus` | TCP bytes, standalone PDUs, and constructed frames, requests, and responses | `modbus`: stream chunking and EOF, MBAP and PDU limits, exception replies, value round trips, and transactional frame writes |
-| `sbe` | XML schemas, arbitrary and mutated car messages, and constructed value trees | `stdlib::sbe`: bounded XML and refs, both byte orders, schema-defined headers, primitive ranges/nulls, enums, sets, arrays, nested groups, variable data, versions, exact wire round trips, transactional writes, and stream allocation/chunking contracts |
-| `dnp3` | arbitrary and constructed CRC-protected frames; checks chunking, CRCs, transport reassembly, application fragments and write rollback | `stdlib::dnp3`: framing, transport reassembly and application headers |
-| `iec104` | arbitrary APDUs and constructed frames/ASDUs; checks chunking, sequence ranges, both object address layouts and write rollback | `stdlib::iec104`: I/S/U frames and sequential or explicit object addresses |
-| `rdp` | bounded arbitrary transport and plaintext bytes plus constructed values; checks chunking, TPKT/COTP composition, GCC/MCS fields, body limits and write rollback | `stdlib::rdp`: codec contracts, X.224, GCC and MCS |
-| `smtp` | command and reply streams, DATA bodies, and constructed values | `stdlib::smtp`: commands, multiline replies, dot-stuffing and bounded decoders |
-| `amqp` | bytes and constructed values, checked with codec contracts | `stdlib::amqp`: AMQP 0-9-1 |
-| `asn1` | BER/DER elements and writer scripts; checks framing, value readers, DER copies, bounds, and transactional writes | `stdlib::asn1`: ASN.1 BER and DER |
-| `pop3` | commands, replies, AUTH lines, expectations, and listings | `stdlib::pop3`: strict wire values and bounded codec contracts |
-| `bacnet` | wire units, service prefix readers, bounded decoder allocations and strict writers | `stdlib::bacnet`: BACnet/IP |
-| `cotp` | TPKT streams, standalone TPDUs, and input bytes segmented as messages | `cotp`: chunking and EOF, bounded message assembly, class 0 negotiation, error replies, strict TPDU writes, and segmentation round trips |
-| `dhcpv6` | bytes and constructed values, checked with codec contracts | `stdlib::dhcpv6`: DHCPv6 |
-| `enip` | arbitrary packet streams and CIP bodies plus constructed packets; checks chunking, packet policy, nested body round trips and write rollback | `stdlib::enip`: EtherNet/IP and CIP |
-| `coap` | datagrams, TCP streams, and constructed values, checked with codec contracts | `stdlib::coap`: CoAP and block transfers |
-| `fast` | bounded arbitrary bytes, original templates, parsed XML templates, and constructed values | `stdlib::fast`: stop-bit and nullable wire contracts, block framing and blocks piped into messages, presence maps, all operators, dictionary resets, template-driven framing, chunking, EOF, allocation limits, and transactional encoding |
-| `fastcgi` | arbitrary bytes and constructed values | `stdlib::fastcgi`: exact wire values, request and response state, and bounded codec contracts |
-| `bgp` | arbitrary bytes and constructed values | `stdlib::bgp`: exact frames, session context, UPDATE handling, and bounded codec contracts |
-| `ftp` | control streams, address tokens, and constructed commands and replies | `stdlib::ftp`: strict wire values and bounded codec contracts |
-| `geneve` | datagrams and constructed headers; bounded collection and wire contracts | `stdlib::geneve`: Geneve |
-| `git_protocol` | arbitrary bytes and typed values; wire, chunking, EOF, and allocation contracts | `stdlib::git_protocol`: The Git wire protocol |
-| `grpc` | Framed messages with input-selected limits, constructed payloads, header values, and zero-separated header blocks | `grpc`: chunking and EOF, message limits and transactional writes, compression flags, request and rejection round trips, trailers, timeouts, and paths |
-| `imap` | commands, responses, literals, raw lines, and refusal decisions | `stdlib::imap`: strict wire values and bounded codec contracts |
-| `imf` | headers and structured field values | `stdlib::imf`: `Head`, named wire types, and bounded-allocation codec contracts |
-| `json` | wire values and streams checked with bounded codec contracts | `stdlib::json`: JSON |
-| `jsonrpc_body` | single bodies and batches, malformed entries, selected JSON limits, and edited responses | `stdlib::jsonrpc`: strict body and server JSON Collect contracts, Incoming batch recovery, public JSON error conversion, writable error replies, and write/decode round trips |
-| `jsonrpc_lines` | LF/CRLF message streams with selected line and JSON limits, recoverable errors, and edited envelopes | `stdlib::jsonrpc`: Lines composition, codec contracts, transactional writes, writable error replies, and write/decode round trips |
-| `kafka` | arbitrary bytes and constructed values | `stdlib::kafka`: exact wire values, versioned messages, and bounded codec contracts |
-| `kerberos` | DER/BER messages, TCP records, and METHOD-DATA; checks record bounds, request-body slices, round trips, and write refusal | `stdlib::kerberos`: Kerberos V5 |
-| `ldap` | BER messages, CLDAP datagrams, filters, and DN text; checks stream limits, text round trips, and constructed search writes | `stdlib::ldap`: LDAP |
-| `ipp` | heads, documents, and attribute values | `stdlib::ipp`: `Head`, `Header`, `Message`, and bounded-allocation codec contracts |
-| `gre` | GRE and PPTP packets; exact payload boundaries and wire contracts | `stdlib::gre`: GRE |
-| `igmp` | messages and checksum-corrected inputs; bounded collection and wire contracts | `stdlib::igmp`: IGMP |
-| `ipsec` | ESP, AH, NAT-T, and plaintext values; bounded collection and wire contracts | `stdlib::ipsec`: IPsec |
-| `memcache` | text streams, binary packets, UDP datagrams, and constructed values | `stdlib::memcache`: strict wire values and bounded codec contracts |
-| `mime_multipart` | wire values and streams checked with bounded codec contracts | `stdlib::mime_multipart`: MIME multipart bodies |
-| `mongodb` | arbitrary bytes and typed values; wire, chunking, EOF, and allocation contracts | `stdlib::mongodb`: MongoDB |
-| `mqtt` | bytes and constructed values, checked with codec contracts | `stdlib::mqtt`: MQTT 3.1.1 |
-| `mysql` | arbitrary bytes and typed values; wire, chunking, EOF, and allocation contracts | `stdlib::mysql`: MySQL |
-| `http3` | bounded frame and stream contracts, field validation, connection routing, and QPACK pause/resume | `stdlib::http3`: HTTP/3 |
-| `http1_requests` | request stream and Collect contracts, head limits, chunk framing, and transactional constructed writers | `stdlib::http1`: Requests, Request, RequestHead, Chunk |
-| `http1_responses` | response stream and Collect contracts, queued HEAD/CONNECT methods, method-aware parse/write symmetry, body framing, and transactional writers | `stdlib::http1`: Responses, Response, ResponseHead |
-| `http1_request_messages` | whole-message contracts, bounded body and wire storage, pipelined requests, exact raw forwarding, and Wire round trips | `stdlib::http1`: RequestMessages |
-| `http1_response_messages` | whole-message contracts, queued GET/HEAD/CONNECT methods, interim close handling, body and wire bounds, and exact forwarding | `stdlib::http1`: ResponseMessages |
-| `nbns` | wire units, constructed values, protocol helpers and shared codec contracts | `stdlib::nbns`: NetBIOS Name Service |
-| `nfs` | Procedure-selected NFS and MOUNT arguments and results, RPC streams, and constructed handles and names | `nfs`: argument and result round trips, handle and name limits, failure replies, RPC framing and EOF, and envelope writes |
-| `ntp` | wire units, constructed values, protocol helpers and shared codec contracts | `stdlib::ntp`: NTP |
-| `ocsp` | DER requests and responses, GET paths, and constructed values; checks framing, nonce bounds, signed slices, and round trips | `stdlib::ocsp`: OCSP |
-| `onc_rpc` | TCP record bytes, UDP messages, AUTH_SYS bodies, and XDR arrays | `onc_rpc`: chunking and EOF, record and assembly bounds, fragmented record round trips, exact RPC writes, authentication, and array allocation limits |
-| `opcua` | arbitrary chunks under selected limits and constructed chunks; checks assembly bounds, sequence rules, binary values, reserved-type reads and write rollback | `stdlib::opcua`: OPC UA over TCP |
-| `portmap` | Arguments and results for every procedure and version, RPC streams, universal addresses, and constructed values | `portmap`: version refusal, XDR round trips, string and list limits, address conversion, RPC framing and EOF, and reply writes |
-| `postgres` | startup, authentication, and typed messages | `stdlib::postgres`: frontend and backend decoders, wire types, and bounded-allocation codec contracts |
-| `protobuf` | wire values and streams checked with bounded codec contracts | `stdlib::protobuf`: Protocol Buffers |
-| `proxy_protocol` | exact wire values, header handoff and bounded codec contracts | `stdlib::proxy_protocol`: The PROXY protocol |
-| `hpack` | wire contracts, complete blocks, settings limits, table recovery, and encode/decode round trips | `stdlib::hpack`: HTTP/2 header compression |
-| `http2` | Frame and preface contracts, every Wire frame type, capture framing, and directional connection EOF and gap handling | `stdlib::http2` |
-| `huffman` | wire contracts, EOS and padding refusal, byte round trips | `stdlib::huffman`: the RFC 7541 code shared by HPACK and QPACK |
-| `qpack` | wire values, bounded instruction contracts, tables, blocked sections, and acknowledgments | `stdlib::qpack`: QPACK, the header compression of HTTP/3 |
-| `quic` | datagram and payload wire contracts, every short-header ID length, and reassembly | `stdlib::quic`: QUIC |
-| `resp` | arbitrary bytes, bounded stream contracts, and strict value and command writers | `stdlib::resp`: RESP, the Redis protocol |
-| `rfb` | exact wire values, session modes and bounded codec contracts | `stdlib::rfb`: RFB, the remote framebuffer protocol behind VNC |
-| `rtp` | datagrams, RFC 4571 streams, strict values, and codec contracts | `stdlib::rtp`: RTP and multiplexed RTCP |
-| `rtsp` | message streams, interleaved frames, header values, and constructed messages | `stdlib::rtsp`: strict wire values and bounded codec contracts |
-| `sdp` | arbitrary bodies, bounded EOF decoding, strict writing, and typed attributes | `stdlib::sdp`: SDP |
-| `sftp` | arbitrary bytes and typed values; wire, chunking, EOF, and allocation contracts | `stdlib::sftp`: SFTP version 3 |
-| `sip` | message streams, UDP datagrams, header values, and constructed values | `stdlib::sip`: strict wire values and bounded codec contracts |
-| `snmp` | BER messages, object identifiers, strict values, and codec contracts | `stdlib::snmp`: SNMP v1 and v2c |
-| `socks` | exact wire values, session modes and bounded codec contracts | `stdlib::socks`: SOCKS4, SOCKS4a and SOCKS5 |
-| `spnego` | Bare and GSS-wrapped tokens plus constructed wrappers; checks framing, mechanism rules, round trips, and write refusal | `stdlib::spnego`: SPNEGO |
-| `ssh` | version lines, cleartext packets, messages, and codec contracts | `stdlib::ssh`: The SSH transport layer before encryption |
-| `sse_lines` | arbitrary lines and constructed fields; chunking, split CRLF, BOM, UTF-8 replacement, limits, write rollback and decode/write round trips | `stdlib::sse`: raw fields, comments, retry and ignored fields |
-| `sse_events` | arbitrary event streams and constructed events; dispatch, ID state, EOF discard, block limits, codec contracts and decode/write round trips | `stdlib::sse`: bounded event assembly and strict event writing |
-| `stun` | TCP streams, UDP datagrams, standalone attributes, and constructed messages | `stun`: chunking and EOF, exact raw frame spans, strict attribute writes, canonical padding and fingerprints, Binding replies, and transaction IDs |
-| `syslog` | bytes and constructed values, checked with codec contracts | `stdlib::syslog`: Syslog |
-| `tds` | arbitrary bytes and typed values; wire, chunking, EOF, and allocation contracts | `stdlib::tds`: SQL Server TDS |
-| `telnet` | events, binary mode changes, strict writers, and bounded codec contracts | `stdlib::telnet`: Telnet |
-| `openvpn` | wrapped control packets, TCP envelopes, and codec contracts | `stdlib::openvpn`: plain, tls-auth, and tls-crypt layouts |
-| `rtcp` | control datagrams, compound rules, strict values, and codec contracts | `stdlib::rtcp`: reports, feedback, and XR blocks |
-| `tftp` | wire units, constructed values, protocol helpers and shared codec contracts | `stdlib::tftp`: TFTP and bounded netascii text decoding |
-| `tpkt` | TCP bytes with limits selected from the input, plus constructed headers, packets, and COTP messages | `tpkt` and `cotp::over_tpkt`: chunking and EOF, exact headers and packets, size limits, TPDU round trips, and segmented message assembly |
-| `thrift` | arbitrary bytes and constructed values | `stdlib::thrift`: framed and unframed messages, typed values, and bounded codec contracts |
-| `urlencoded_form` | wire values and streams checked with bounded codec contracts | `stdlib::urlencoded_form`: application/x-www-form-urlencoded |
-| `ospf` | packets and LSAs; contextual parsing and bounded payload contracts | `stdlib::ospf`: OSPFv2 and OSPFv3 |
-| `pim` | messages and checksum-corrected inputs; contextual parsing and bounded payload contracts | `stdlib::pim`: PIMv2 |
-| `rip` | RIP and RIPng routes and authentication; bounded collection and wire contracts | `stdlib::rip`: RIP |
-| `vrrp` | advertisements, checksum oracles, and constructed values; bounded payload contracts | `stdlib::vrrp`: VRRP |
-| `vxlan` | wire units, constructed values, protocol helpers and shared codec contracts | `stdlib::vxlan`: VXLAN and VXLAN-GPE |
-| `websocket` | frames, messages, close payloads, handshake fields, and bounded codec contracts | `stdlib::websocket`: WebSocket (RFC 6455) |
-| `x509` | DER certificates, CRLs, extensions, and PEM bundles; checks signed-byte preservation, text framing, limits, and constructed writes | `stdlib::x509`: X.509 certificates and CRLs |
-| `xml` | wire values and streams checked with bounded codec contracts | `stdlib::xml`: XML 1.0 |
-| `zabbix` | arbitrary bytes and constructed values | `stdlib::zabbix`: exact headers, packets, JSON messages, and bounded codec contracts |
-| `wake_on_lan` | arbitrary payloads, bounded EOF decoding, exact packet writing, and password checks | `stdlib::wake_on_lan`: Wake-on-LAN |
-| `whois` | query streams, EOF responses, fields, and constructed values | `stdlib::whois`: strict wire values and bounded codec contracts |
-| `dtls` | every runtime CID length, record and datagram construction, handshake rules and wire contracts | `stdlib::dtls`: Datagram TLS |
-| `ike` | wire units, constructed values, protocol helpers and shared codec contracts | `stdlib::ike`: IKEv2 and NAT-T |
-| `l2tp` | wire units, constructed values, protocol helpers and shared codec contracts | `stdlib::l2tp`: L2TPv2 and L2TPv3 |
-| `nbdgm` | wire units, constructed values, protocol helpers and shared codec contracts | `stdlib::nbdgm`: NetBIOS datagrams |
-| `ntlmssp` | wire units, constructed values, protocol helpers and shared codec contracts | `stdlib::ntlmssp`: NTLMSSP tokens and fields |
-| `pcp` | wire units, constructed values, protocol helpers and shared codec contracts | `stdlib::pcp`: PCP and NAT-PMP |
-| `wireguard` | wire units, constructed values, protocol helpers and shared codec contracts | `stdlib::wireguard`: WireGuard messages and replay windows |
-| `soupbintcp` | TCP bytes framed at the default and a small limit, and the frames fed to logged-in and fresh sessions | `stdlib::soupbintcp`: packets, framing, client and server sessions |
-| `cme_mdp3` | single SBE messages, whole packets, and size-prefixed message streams | `stdlib::cme_mdp3`: generated message layouts, header checks, block extension, groups, ranges and nulls, packet framing, transactional writes |
-| `moldudp64` | datagrams, message blocks, and forged headers fed to a receiver whose requests a bounded store answers | `stdlib::moldudp64`: packets, blocks, gap recovery, re-request answers |
-| `itch` | single messages, length-prefixed message files, and the messages that parse fed to a bounded order book | `stdlib::itch`: ITCH 5.0 messages, framing, order book |
-| `ouch` | inbound and outbound messages, and inbound pieces driving an exchange whose answers the input steers | `stdlib::ouch`: OUCH 5.0 messages, appendages, exchange state machine |
-| `cboe_pitch` | sequenced units, single PITCH and GRP/spin messages, a TCP unit stream, and the units that parse fed to a gap detector and a bounded book | `stdlib::cboe_pitch`: Multicast PITCH units, messages, gap detection, order book |
-| `cboe_boe` | inbound and outbound messages, both framers, and inbound pieces driving a logged-in server and an exchange whose answers the input steers | `stdlib::cboe_boe`: BOE messages, optional fields, sessions, exchange |
+`cargo +nightly fuzz list` names them. A target named for a stdlib module
+feeds that module, and the Fuzz column of the module catalog in
+[`src/stdlib/mod.rs`](../src/stdlib/mod.rs) marks every module that has
+one. The rest feed the layers under the stdlib: the relay protocol,
+packets and IP reassembly, the TCP/IP stack, `serve` and `web`, the
+observe decoders and the proxy doors. Each target's source in
+`fuzz_targets/` shows what it builds from the input.
 
-The proxy targets compile the `fictionet` binary's proxy modules from
-their source files (`src/proxy.rs` here), because a binary's modules
-cannot be imported. Code that the targets need from inside the SDK is in
+The proxy targets call the doors' protocol side in
+`fictionet::relay::proxy`, the same code the `fictionet` binary runs over
+its connections. Code that the targets need from inside the SDK is in
 `fictionet::fuzzing`, which exists only when `cargo fuzz` builds with
 `--cfg fuzzing`.
 
@@ -210,11 +83,19 @@ milliseconds in all:
 FICTIONET_FUZZ_SLEEP_MS=30 cargo +nightly fuzz run -O -a tcp fuzz/corpus/tcp
 ```
 
-The corpora here are small seeds. Shrink a corpus before you commit it:
+The corpora here are seeds, cut down to the fewest inputs that reach every
+edge the larger corpus reached. Cut a corpus down the same way before you
+commit it: merge it into an empty directory with libFuzzer's set cover,
+counting edges only, and commit the result.
 
 ```sh
-cargo +nightly fuzz cmin -O -a tcp fuzz/corpus/tcp
+mkdir /tmp/tcp
+cargo +nightly fuzz run -O -a tcp /tmp/tcp fuzz/corpus/tcp -- -set_cover_merge=1 -use_counters=0
 ```
+
+`stack`, `tcp`, `web`, `web_http` and `ip_reassembly` run timers and
+threads, so the edges an input reaches vary from run to run, and a cut
+loses some. Their corpora are kept whole.
 
 Each bug a target found has a regression test in the SDK's own tests, so
 `cargo test` keeps it fixed without a fuzzer.

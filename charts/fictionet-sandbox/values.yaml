@@ -122,7 +122,7 @@ attach:
 #     command: [tail, -f, /dev/null]
 #     world:
 #       image: registry.example/my-world:1
-#       args: [/run/fictionet/world.sock]
+#       args: [/run/relay/relay.sock]
 services: {}
 
 serviceDefaults:
@@ -167,8 +167,10 @@ serviceDefaults:
   shared: []
   #   - name: ca
   #     mountPath: /run/ca
-  # The world. Its socket must be /run/fictionet/world.sock: the
-  # emptyDir /run/fictionet is shared with attach, and only with attach.
+  # The world. Its socket must be /run/relay/relay.sock: the
+  # emptyDir /run/relay is shared with attach, and only with attach. The
+  # agent shares the pod's network namespace, so it can list the socket
+  # in /proc/net/unix. The path names nothing.
   world:
     image: ""
     imagePullPolicy: ""

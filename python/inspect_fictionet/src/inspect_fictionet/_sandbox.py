@@ -28,13 +28,15 @@ ATTACH_IMAGE = "ghcr.io/amlalabs/fictionet-attach:4903de4"
 WEB_WORLD_IMAGE = "ghcr.io/amlalabs/fictionet-web-world:4903de4"
 
 #: Where the world must listen. The directory is shared with attach only.
-WORLD_SOCKET = "/run/fictionet/world.sock"
+#: On Kubernetes the agent shares the pod's network namespace, so it can
+#: list the world's socket in /proc/net/unix. The path names nothing.
+WORLD_SOCKET = "/run/relay/relay.sock"
 
 AttachType = Literal["tun", "https_proxy", "socks5"]
 Backend = Literal["docker", "k8s"]
 
-_SOCKET_DIR = "/run/fictionet"
-_READY_FILE = "/run/fictionet/attach.ready"
+_SOCKET_DIR = "/run/relay"
+_READY_FILE = "/run/relay/attach.ready"
 _TOKEN_DIR = "/run/fictionet-token"
 _TOKEN_FILE = f"{_TOKEN_DIR}/token"
 _PROXY_USER = "fictionet"
@@ -157,7 +159,7 @@ def fictionet_sandbox(
 
     Args:
       world: The world: an image, a `Build`, or a `CargoExample`. It must
-        listen on `/run/fictionet/world.sock` (`WORLD_SOCKET`).
+        listen on `/run/relay/relay.sock` (`WORLD_SOCKET`).
       world_args: The world's arguments (its image's CMD).
       world_env: The world's environment.
       world_ca: Where the world writes its CA certificate, such as

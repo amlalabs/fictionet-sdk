@@ -1,7 +1,0 @@
-LO clM:<> SIZE=0ent.tst
-MAIL FROM:<> St
-MAIL FROM:<> SIZE=0
-RCPTi
-MAIL FROM:<> SIZE=0ent.test
-MAIL FROM:<> SSub
-@

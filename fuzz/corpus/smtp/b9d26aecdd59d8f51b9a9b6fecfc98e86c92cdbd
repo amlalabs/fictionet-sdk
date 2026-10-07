@@ -1,11 +1,0 @@
-LO clM:<> SIZE=0t.test
-MAIL FROM:<> St
-MAIL FROM:<> SIZE
-RCPTi
-MAIL FROM:<> SIZE=0ent
-MAIL FROM:<> St
-MAIL FROM:<> OAIS=0
-
-MAIL FROM:<> St
-MAIL FROM:RCPT TO:|PientOM:<Aostmaster>
-DATA

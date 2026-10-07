@@ -76,7 +76,7 @@ in `.vm/test-<name>.log`.
 | `border-scripted` | Border's `border_scripted` task, lab and home settings, with Inspect's mock model. |
 | `border-probes` | Border's `border_probes` task, lab and home settings. |
 | `fakewiki-probes` | FakeWiki's `fakewiki_probes` task, and its leak checker's negative control. |
-| `cargo` | `cargo test --features tokio`, with `FICTIONET_TUN_TEST=1`, so the tests that need root and a tun device run too. |
+| `cargo` | `cargo test --features tokio`, then `tests/tun_linux.rs` with `--ignored`, since it needs root and a tun device. |
 
 The Docker and Inspect suites build their images inside the VM, from the
 examples' own Dockerfiles, the first time. Docker keeps those images and its

@@ -46,7 +46,7 @@ dict with "attach" (the config) and "service" (the service's name).
 {{- $a := .attach -}}
 - attach
 - --world
-- unix:/run/fictionet/world.sock
+- unix:/run/relay/relay.sock
 - --name
 - {{ default .service $a.name | quote }}
 - --type
@@ -56,7 +56,7 @@ dict with "attach" (the config) and "service" (the service's name).
 - --token-file=/run/fictionet-token/token
 - {{ printf "--ip-addr=%s" (first (splitList "/" (required "attach.ipAddr is required for the proxy types" $a.ipAddr))) | quote }}
 - {{ printf "--dns=%s" (required "attach.dns is required for the proxy types" $a.dns) | quote }}
-- --ready-file=/run/fictionet/attach.ready
+- --ready-file=/run/relay/attach.ready
 - {{ printf "--world-wait=%v" (int $a.worldWait) | quote }}
 {{- else }}
 {{- range list "ip-addr:ipAddr" "gateway:gateway" "dns:dns" "ip-addr-v6:ipAddrV6" "gateway-v6:gatewayV6" "dns-v6:dnsV6" }}
@@ -71,7 +71,7 @@ dict with "attach" (the config) and "service" (the service's name).
 {{- end }}
 - {{ printf "--mtu=%v" (int $a.mtu) | quote }}
 - --no-resolv-conf
-- --ready-file=/run/fictionet/attach.ready
+- --ready-file=/run/relay/attach.ready
 - {{ printf "--world-wait=%v" (int $a.worldWait) | quote }}
 {{- range $a.downLinks }}
 {{- if . }}
@@ -87,7 +87,7 @@ dict with "attach" (the config) and "service" (the service's name).
 {{/* The exec probe on attach's ready file. */}}
 {{- define "fictionet.readyProbe" -}}
 exec:
-  command: [/fictionet, ready, /run/fictionet/attach.ready]
+  command: [/fictionet, ready, /run/relay/attach.ready]
 {{- end -}}
 
 {{/* The port a proxy type listens on, from a merged attach config. */}}

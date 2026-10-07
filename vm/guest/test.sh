@@ -78,7 +78,10 @@ case "$name" in
         ! grep -qE 'judged as altered_(one|all) *: +0 leak' <<<"$out"
         ;;
     cargo)
-        CARGO_TARGET_DIR=/cache/target/test FICTIONET_TUN_TEST=1 cargo test --locked --features tokio
+        export CARGO_TARGET_DIR=/cache/target/test
+        cargo test --locked --features tokio
+        # Ignored elsewhere: it needs root and a tun device, which the VM has.
+        cargo test --locked --features tokio --test tun_linux -- --ignored
         ;;
     *)
         echo "test.sh: no suite named $name" >&2

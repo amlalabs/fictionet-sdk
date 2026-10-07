@@ -1,5 +1,0 @@
-EHLO cli
-MAIL FROM:<> SIZE=0ent.test
-MAIL FROM:<> SIZE=0
-RCPT TO:<Pienr>
-DATA
