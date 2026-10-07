@@ -2178,8 +2178,9 @@ fn canceled(token: Token, quantity: u32, reason: u8, now: u64) -> Outbound {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
+        Lcg,
         contract::{check_wire, check_wire_value},
-        test_support::{Lcg, mutate},
+        test_support::mutate,
     };
 
     fn alpha<const N: usize>(s: &str) -> Alpha<N> {

@@ -1988,9 +1988,9 @@ fn level(price: Price, a: &Aggregate) -> Level {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
-        Fail,
+        Fail, Lcg,
         contract::{check_decode, check_decode_with_alloc_limit, check_wire, check_wire_value},
-        test_support::{Lcg, decode_all, mutate},
+        test_support::{decode_all, mutate},
     };
 
     /// Bytes from the specification's hexadecimal examples.
