@@ -1159,7 +1159,7 @@ impl serve::Service for Http1 {
             self.dispatch(driver, Body::empty(), true);
             return Ok(());
         }
-        driver.log(error_event(driver.conn(), "protocol", error.to_string()));
+        driver.record(error_event(driver.conn(), "protocol", error.to_string()));
         let date = date_header(self.date, driver.now());
         write_simple(driver.reply(), Version::HTTP_11, StatusCode::BAD_REQUEST, date);
         Ok(())
@@ -1168,7 +1168,7 @@ impl serve::Service for Http1 {
     fn on_end(&mut self, end: Ended, _: &(), driver: &mut Driver<'_>) -> Result<(), Infallible> {
         if end == Ended::Conn(ConnError::Broken) {
             let e = error_event(driver.conn(), "transport", "a TLS record did not decrypt".into());
-            driver.log(e);
+            driver.record(e);
         }
         Ok(())
     }
@@ -1266,7 +1266,7 @@ impl Streaming {
         }
         self.finished = true;
         if let Some(e) = self.tracker.finish(self.extra.take(), self.status, self.body_sent, complete) {
-            driver.log(e);
+            driver.record(e);
         }
     }
 

@@ -42,7 +42,7 @@
 //!         if line == b"quit" {
 //!             return Ok(Flow::Close);
 //!         }
-//!         driver.log(Event::new("echo", "line").field("bytes", line.len() as u64));
+//!         driver.record(Event::new("echo", "line").field("bytes", line.len() as u64));
 //!         driver.reply().extend_from_slice(&line);
 //!         driver.reply().push(b'\n');
 //!         Ok(Flow::Continue)
@@ -413,7 +413,7 @@ impl PendingDriver<'_> {
     }
 
     /// Records an event, from this connection.
-    pub fn log(&mut self, event: Event) {
+    pub fn record(&mut self, event: Event) {
         self.events.push(event);
     }
 
@@ -643,7 +643,7 @@ impl Driver<'_> {
     }
 
     /// Records `event` in the run's events, from this connection.
-    pub fn log(&mut self, event: Event) {
+    pub fn record(&mut self, event: Event) {
         self.s.events.push(event);
     }
 

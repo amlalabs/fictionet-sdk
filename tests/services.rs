@@ -125,7 +125,7 @@ impl Service for Echo {
             driver.reply().extend_from_slice(b"too long\n");
             return Ok(Flow::Continue);
         };
-        driver.log(Event::new("echo", "line").summary(String::from_utf8_lossy(&line)).field("bytes", line.len() as u64));
+        driver.record(Event::new("echo", "line").summary(String::from_utf8_lossy(&line)).field("bytes", line.len() as u64));
         match line.as_slice() {
             b"quit" => {
                 driver.reply().extend_from_slice(b"bye\n");
@@ -169,7 +169,7 @@ impl Pending for Later {
         match self.step {
             2 => Poll::Ready(Some(Ok(b"la".to_vec()))),
             3 => {
-                driver.log(Event::new("echo", "later").field("written", driver.written()));
+                driver.record(Event::new("echo", "later").field("written", driver.written()));
                 Poll::Ready(Some(Ok(b"ter\n".to_vec())))
             }
             _ => Poll::Ready(None),
@@ -236,7 +236,7 @@ impl Service for Plc {
         let pdu = match MbRequest::parse(&frame.pdu) {
             Ok(MbRequest::ReadHoldingRegisters { address, quantity }) => {
                 let (a, n) = (usize::from(address), usize::from(quantity));
-                driver.log(Event::new("modbus", "read").field("address", u32::from(address)).field("quantity", u32::from(quantity)));
+                driver.record(Event::new("modbus", "read").field("address", u32::from(address)).field("quantity", u32::from(quantity)));
                 match registers.get(a..a + n) {
                     Some(values) => MbResponse::Registers(values.to_vec()).to_pdu(3).unwrap(),
                     None => Exception::IllegalDataAddress.to_pdu(3),
@@ -246,7 +246,7 @@ impl Service for Plc {
                 Some(r) => {
                     *r = value;
                     let unsafe_write = address == 0 && value > plant.limit;
-                    driver.log(
+                    driver.record(
                         Event::new("modbus", "write_register")
                             .summary(format!("register {address} = {value}"))
                             .level(if unsafe_write { Level::Alarm } else { Level::Info })
@@ -854,7 +854,7 @@ fn net_serves_udp_services_and_trusted_sandboxes() {
                 Lines::new(64, Ending::LfOrCrlf)
             }
             fn on_item(&mut self, _: Result<Vec<u8>, LineError>, n: &AtomicUsize, driver: &mut Driver<'_>) -> Result<Flow, Infallible> {
-                driver.log(Event::new("udp", "datagram"));
+                driver.record(Event::new("udp", "datagram"));
                 driver.reply().extend_from_slice(format!("{}\n", n.fetch_add(1, Ordering::SeqCst) + 1).as_bytes());
                 Ok(Flow::Continue)
             }

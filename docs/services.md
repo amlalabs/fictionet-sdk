@@ -48,7 +48,7 @@ impl Service for Prompt {
     fn on_item(&mut self, line: Result<Vec<u8>, LineError>, password: &String, driver: &mut Driver<'_>) -> Result<Flow, Self::Error> {
         let line = line.unwrap_or_default();
         let right = line == password.as_bytes();
-        driver.log(
+        driver.record(
             Event::new("prompt", "login")
                 .summary(if right { "login" } else { "wrong password" })
                 .level(if right { Level::Alarm } else { Level::Info })
