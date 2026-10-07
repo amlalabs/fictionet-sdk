@@ -36,7 +36,7 @@
   ],
   "streams": [
     {
-      "name": "NodeFrames",
+      "name": "Nodes",
       "item": "Node",
       "prefix": "u32",
       "byte_order": "big",

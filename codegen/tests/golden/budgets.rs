@@ -932,8 +932,8 @@ impl fictionet::stdlib::codec::Wire for Bag {
 
 /// Frames of [`Bag`], with fixed magic and a body-length prefix.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct BagFrames;
-impl BagFrames {
+pub struct Bags;
+impl Bags {
     const MAGIC: &'static [u8] = b"";
 
     /// Appends a complete frame. Refuses invalid bodies and prefix overflow.
@@ -942,10 +942,10 @@ impl BagFrames {
         __wire::write_frame(value, out, Self::MAGIC, 1, false, false)
     }
 }
-impl fictionet::stdlib::codec::Decode for BagFrames {
+impl fictionet::stdlib::codec::Decode for Bags {
     type Item = Bag;
     type Error = Error;
-    const NAME: &'static str = "BagFrames";
+    const NAME: &'static str = "Bags";
 
     fn capacity(&self) -> usize {
         MAX_MESSAGE + 1
@@ -977,7 +977,7 @@ mod generated_tests {
             __wire::check::<Value>()?;
         }
         {
-            use super::BagFrames as Frames;
+            use super::Bags as Frames;
             __wire::check_stream(|| Frames, Frames::write, 1);
         }
         Ok(())

@@ -34,7 +34,7 @@
   ],
   "streams": [
     {
-      "name": "BagFrames",
+      "name": "Bags",
       "item": "Bag",
       "prefix": "u8"
     }

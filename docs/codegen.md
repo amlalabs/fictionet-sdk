@@ -157,7 +157,7 @@ optional number, and a stream decoder:
   ],
   "streams": [
     {
-      "name": "OrderFrames",
+      "name": "Orders",
       "item": "Order",
       "prefix": "u32",
       "byte_order": "big",
@@ -291,6 +291,8 @@ a terminating optional field or group has no finite value and is refused.
 Every generated read and write has a depth guard.
 
 A stream requires `name`, `item`, and `prefix`. `item` names a type.
+Name the stream as the plural of its item (`Orders` yields `Order`), the
+rule the stdlib's decoders follow.
 Optional `magic` is an array of bytes. Optional `byte_order` controls the
 length prefix and defaults to big-endian. Body fields retain the schema
 order. The prefix measures only body bytes. Generated framers retain no

@@ -923,8 +923,8 @@ impl fictionet::stdlib::codec::Wire for Node {
 
 /// Frames of [`Node`], with fixed magic and a body-length prefix.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct NodeFrames;
-impl NodeFrames {
+pub struct Nodes;
+impl Nodes {
     const MAGIC: &'static [u8] = b"FN";
 
     /// Appends a complete frame. Refuses invalid bodies and prefix overflow.
@@ -933,10 +933,10 @@ impl NodeFrames {
         __wire::write_frame(value, out, Self::MAGIC, 4, false, false)
     }
 }
-impl fictionet::stdlib::codec::Decode for NodeFrames {
+impl fictionet::stdlib::codec::Decode for Nodes {
     type Item = Node;
     type Error = Error;
-    const NAME: &'static str = "NodeFrames";
+    const NAME: &'static str = "Nodes";
 
     fn capacity(&self) -> usize {
         MAX_MESSAGE + 6
@@ -964,7 +964,7 @@ mod generated_tests {
             __wire::check::<Value>()?;
         }
         {
-            use super::NodeFrames as Frames;
+            use super::Nodes as Frames;
             __wire::check_stream(|| Frames, Frames::write, 6);
         }
         Ok(())

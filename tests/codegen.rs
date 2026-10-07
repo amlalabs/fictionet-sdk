@@ -111,7 +111,7 @@ fn xdr_differential_examples_generated_values_and_mutated_inputs() {
 }
 #[test]
 fn recursive_depth_and_transactional_errors() {
-    use recursive::{Error, Node, NodeFrames};
+    use recursive::{Error, Node, Nodes};
     let mut value = Node {
         value: 1,
         children: Vec::new(),
@@ -126,8 +126,8 @@ fn recursive_depth_and_transactional_errors() {
     }
     contract::check_wire_value(&value);
     let mut framed = Vec::new();
-    NodeFrames::write(&value, &mut framed).unwrap();
-    let mut decoder = NodeFrames;
+    Nodes::write(&value, &mut framed).unwrap();
+    let mut decoder = Nodes;
     assert_eq!(
         decoder.decode(&framed, false).unwrap(),
         Step::Item(value.clone(), framed.len())
@@ -153,7 +153,7 @@ fn recursive_depth_and_transactional_errors() {
     let mut out = vec![0xaa, 0xbb];
     assert_eq!(value.write(&mut out), Err(Error::Depth));
     assert_eq!(out, [0xaa, 0xbb]);
-    assert_eq!(NodeFrames::write(&value, &mut out), Err(Error::Depth));
+    assert_eq!(Nodes::write(&value, &mut out), Err(Error::Depth));
     assert_eq!(out, [0xaa, 0xbb]);
     // A chain encoded directly must fail at the same depth.
     let mut bytes = Vec::new();
@@ -163,7 +163,7 @@ fn recursive_depth_and_transactional_errors() {
     bytes.extend_from_slice(&[0, 0, 0, 1, 0, 0]);
     assert_eq!(Node::parse(&bytes), Err(Error::Depth));
     contract::check_decode_with_alloc_limit(
-        || NodeFrames,
+        || Nodes,
         &bytes,
         2 * (recursive::MAX_MESSAGE + 6),
     );
@@ -236,7 +236,7 @@ fn arbitrary_input_contracts() {
         contract::check_wire::<groups::Batch>(&bytes);
         contract::check_wire::<recursive::Node>(&bytes);
         contract::check_decode_with_alloc_limit(
-            || recursive::NodeFrames,
+            || recursive::Nodes,
             &bytes,
             2 * (recursive::MAX_MESSAGE + 6),
         );
