@@ -83,7 +83,9 @@
 //! - **Budgets.** What every connection from one sandbox holds is charged
 //!   to that sandbox's [`Budget`], 256 MiB unless
 //!   [`Limits::sandbox_budget`] says otherwise: a connection that would pass
-//!   it is closed.
+//!   it is closed. A sandbox has one budget for both its addresses, from
+//!   when it attaches until it detaches. A trusted sandbox
+//!   ([`Net::route`]) has none.
 //! - **Every link** inside the network holds at most 4 MiB of packets each
 //!   way; past that, packets are dropped, as on a congested link.
 //! - **Events.** The network records every fact in the run's
@@ -95,7 +97,8 @@
 //!   and, for a connection, its number (from 1, on every port of every
 //!   machine).
 //! - **Errors.** A host that cannot be served as declared, such as one at
-//!   an address a host cannot have, two services on one port, or a port
+//!   an address a host cannot have, two services on one port (one with
+//!   TLS and one without count as two), or a port
 //!   that cannot be listened on, makes [`Net::serve`] fail.
 //!
 //! The limits and rules are those [`web::Sites`](crate::stdlib::web::Sites)
@@ -186,8 +189,8 @@ pub struct Limits {
     /// closing. Default 256.
     pub connections_per_peer: usize,
     /// How long a client has, from connecting, to finish its TLS handshake,
-    /// or on an HTTP port without TLS to send its first bytes. Default 10
-    /// seconds.
+    /// or on an HTTP port without TLS to send its first bytes; and from a
+    /// service's STARTTLS, to finish that handshake. Default 10 seconds.
     pub handshake: Duration,
     /// How long a DNS-over-TCP connection may sit idle between queries (RFC
     /// 7766, section 6.2.3). Default 10 seconds.
@@ -232,7 +235,8 @@ pub struct Arrival {
     /// The TCP socket underneath, to keep a count until it is gone
     /// ([`tcp::GoneWatch::hold_until_gone`]) or to reset it.
     pub socket: tcp::GoneWatch,
-    /// The budget of the sandbox it came from.
+    /// The budget of the sandbox it came from. `None` if it came from no
+    /// attached sandbox, such as a trusted one ([`Net::route`]).
     pub budget: Option<Budget>,
     /// [`Limits::handshake`]: how long a client has to send its first
     /// bytes.
@@ -302,6 +306,7 @@ where
         if opts.budget.is_none() {
             opts.budget = arrival.budget;
         }
+        opts.handshake = arrival.handshake;
         opts.seed ^= arrival.seed;
         let (conn, info) = (arrival.conn, arrival.info);
         Box::pin(async move {
@@ -402,20 +407,22 @@ impl Host {
     }
 
     /// Serves TCP `port` with a [`Service`] made by `make` for each
-    /// connection, sharing `world`. Connections are numbered, and the
-    /// service's events name the sandbox each came from.
+    /// connection, sharing `world`, with the default [`ServeOptions`].
+    /// Connections are numbered, `conn.open` and `conn.close` events record
+    /// each, and the service's events name the sandbox each came from.
     pub fn tcp<S, M>(self, port: u16, world: Arc<S::World>, make: M) -> Host
     where
         S: Service,
         M: Fn() -> S + Send + Sync + 'static,
         <S::Decode as Decode>::Error: Clone + Send,
     {
-        self.tcp_with(port, world, make, ServeOptions::default().connection_events(false))
+        self.tcp_with(port, world, make, ServeOptions::default())
     }
 
     /// The same with these options: a transcript, a fault plan, an idle
     /// limit, a connection cap, a STARTTLS config. The sandbox's budget
-    /// applies when `opts` has none.
+    /// applies when `opts` has none. A STARTTLS handshake has
+    /// [`Limits::handshake`], whatever `opts` says.
     pub fn tcp_with<S, M>(self, port: u16, world: Arc<S::World>, make: M, opts: ServeOptions) -> Host
     where
         S: Service,
@@ -426,8 +433,9 @@ impl Host {
     }
 
     /// Serves TCP `port` with TLS for the names `sni` gives, then a
-    /// [`Service`] made by `make`. Several `tls` calls on one port route
-    /// by SNI; a name with no entry is rejected with `unrecognized_name`.
+    /// [`Service`] made by `make`, with the default [`ServeOptions`], as
+    /// [`tcp`](Self::tcp). Several `tls` calls on one port route by SNI; a
+    /// name with no entry is rejected with `unrecognized_name`.
     pub fn tls<S, M>(
         self,
         port: u16,
@@ -441,7 +449,7 @@ impl Host {
         M: Fn() -> S + Send + Sync + 'static,
         <S::Decode as Decode>::Error: Clone + Send,
     {
-        let accept = ServiceAccept::new(world, make, ServeOptions::default().connection_events(false));
+        let accept = ServiceAccept::new(world, make, ServeOptions::default());
         self.tls_accept(port, sni, config_for, accept)
     }
 
@@ -712,7 +720,6 @@ impl Net {
             fixed: routes.iter().map(|(_, p)| *p).collect(),
             limits: self.limits,
             seed: self.seed,
-            budgets: Mutex::default(),
             lans,
         });
         start_gateway(&shared)?;
@@ -764,8 +771,8 @@ struct Hooks {
     by_addr: Mutex<HashMap<IpAddr, Sandbox>>,
     /// The last connection number given out.
     conns: AtomicU64,
-    /// The ids of the sandboxes attached now.
-    attached: Mutex<HashSet<u64>>,
+    /// The sandboxes attached now, by id, each with its budget.
+    attached: Mutex<HashMap<u64, Budget>>,
 }
 
 impl Hooks {
@@ -785,7 +792,12 @@ impl Hooks {
     }
 
     fn is_attached(&self, id: u64) -> bool {
-        lock(&self.attached).contains(&id)
+        lock(&self.attached).contains_key(&id)
+    }
+
+    /// The budget of the sandbox with id `id`, while it is attached.
+    fn budget(&self, id: u64) -> Option<Budget> {
+        lock(&self.attached).get(&id).cloned()
     }
 
     fn next_conn(&self) -> u64 {
@@ -1009,8 +1021,6 @@ struct Shared {
     fixed: Vec<Prefix>,
     limits: Limits,
     seed: u64,
-    /// Each sandbox's budget, by its address.
-    budgets: Mutex<HashMap<IpAddr, Budget>>,
     /// The LANs, by name.
     lans: HashMap<String, LanSeg>,
 }
@@ -1232,30 +1242,27 @@ impl Shared {
     }
 
     /// A member sandbox attached: it joins its LAN at its address, with no
-    /// filter, and events know it by that address.
-    fn join_lan(&self, cx: &Cx, name: &str, lan: &str, addr: IpAddr, sandbox: Attachment) {
+    /// filter, and events know it by that address. It detaches as any
+    /// sandbox does when the LAN lets its interface go: when it closes,
+    /// when another takes its address, or when it could not join.
+    fn join_lan(self: &Arc<Self>, cx: &Cx, name: &str, lan: &str, addr: IpAddr, sandbox: Attachment) {
         let Some(seg) = self.lans.get(lan) else { return };
-        let owner = lock(&self.leases).new_owner();
+        let attached = Arc::new(Attached::new(self, cx, Arc::from(name), Some(addr)));
         let hooks = &self.hooks;
         let me = Sandbox {
-            id: owner,
+            id: attached.owner,
             name: Arc::from(name),
             addr: if let IpAddr::V4(a) = addr { Some(a) } else { None },
             addr_v6: if let IpAddr::V6(a) = addr { Some(a) } else { None },
         };
         lock(&hooks.by_addr).insert(addr, me.clone());
-        lock(&hooks.attached).insert(owner);
-        let joined = seg.lan.add(addr, Box::new(sandbox));
+        let member = Member { sandbox, _attached: attached.clone() };
+        let joined = seg.lan.add(addr, Box::new(member));
         let event = match joined {
             Ok(()) => Event::new("net", "attached").summary(format!("sandbox {name} joined LAN {lan} at {addr}")),
             Err(e) => Event::new("net", "error").level(Level::Notice).summary(format!("sandbox {name} could not join LAN {lan}: {e}")).field("error", e.to_string()),
         };
         hooks.record(cx, &sandbox_only(me), event.field("lan", lan).field("addr", addr.to_string()));
-    }
-
-    /// The budget of the sandbox at `peer`.
-    fn budget(&self, peer: IpAddr) -> Budget {
-        lock(&self.budgets).entry(peer).or_insert_with(|| Budget::new(self.limits.sandbox_budget)).clone()
     }
 }
 // ---------------------------------------------------------------------------
@@ -1409,6 +1416,9 @@ impl Machine {
                 }
                 PortSpec::Tcp(accept) => {
                     let port = self.port(*number)?;
+                    if !port.tls.read().unwrap_or_else(|e| e.into_inner()).is_empty() {
+                        return Err(format!("TCP port {number} at {addr} serves TLS, and cannot serve without it too"));
+                    }
                     let mut plain = port.plain.write().unwrap_or_else(|e| e.into_inner());
                     match &*plain {
                         None => {
@@ -1424,6 +1434,9 @@ impl Machine {
                 }
                 PortSpec::Tls { sni, config, accept } => {
                     let port = self.port(*number)?;
+                    if port.plain.read().unwrap_or_else(|e| e.into_inner()).is_some() {
+                        return Err(format!("TCP port {number} at {addr} serves without TLS, and cannot serve TLS too"));
+                    }
                     let names: Vec<String> = match sni {
                         Sni::Any => vec![String::new()],
                         Sni::Name(n) => vec![n.clone()],
@@ -1519,12 +1532,13 @@ async fn accept(cx: Cx, mut listener: tcp::Listener, machine: Arc<Machine>, port
 async fn connection(cx: Cx, conn: tcp::TcpConnection, info: ConnInfo, accepted: Instant, port: Arc<Port>, shared: Arc<Shared>) {
     let hooks = shared.hooks.clone();
     let socket = conn.gone_watch();
-    let peer = conn.peer_addr().ip();
+    let sandbox_id = info.sandbox.as_ref().map(|s| s.id);
+    let budget = sandbox_id.and_then(|id| hooks.budget(id));
     let arrival = |conn: Box<dyn Connection>, info: ConnInfo| Arrival {
         conn,
         info,
         socket: socket.clone(),
-        budget: Some(shared.budget(peer)),
+        budget: budget.clone(),
         handshake: shared.limits.handshake,
         seed: shared.seed,
     };
@@ -1546,7 +1560,6 @@ async fn connection(cx: Cx, conn: tcp::TcpConnection, info: ConnInfo, accepted: 
         *lock(&pick) = Some(name);
         Some(config)
     });
-    let sandbox_id = info.sandbox.as_ref().map(|s| s.id);
     let detached = || sandbox_id.is_some_and(|id| !hooks.is_attached(id));
     let deadline = accepted + shared.limits.handshake;
     let Some((tls, info)) = serve::accept_tls(&cx, conn, &info, &select, deadline, detached).await else {
@@ -2034,22 +2047,39 @@ fn to_dhcp_server(packet: &[u8], h: &Header, gateway: Ipv4Addr) -> Option<Option
     Some(dhcp::Message::parse(&u[8..len]))
 }
 
-/// Frees an attachment's address when its filter ends.
-struct Release {
+/// One attachment's time on the network, the same for a sandbox behind a
+/// filter and a LAN member. Made when it attaches, which gives it an id
+/// and its budget. Dropped when it detaches, which resets its connections,
+/// frees its addresses and its budget, and records `net.detached`.
+struct Attached {
     shared: Arc<Shared>,
     owner: u64,
     cx: Cx,
     name: Arc<str>,
+    /// A LAN member's address. A filtered sandbox's are its leases.
+    fixed: Option<IpAddr>,
 }
 
-impl Drop for Release {
+impl Attached {
+    fn new(shared: &Arc<Shared>, cx: &Cx, name: Arc<str>, fixed: Option<IpAddr>) -> Attached {
+        let owner = lock(&shared.leases).new_owner();
+        lock(&shared.hooks.attached).insert(owner, Budget::new(shared.limits.sandbox_budget));
+        Attached { shared: shared.clone(), owner, cx: cx.clone(), name, fixed }
+    }
+}
+
+impl Drop for Attached {
     fn drop(&mut self) {
         let shared = &self.shared;
         lock(&shared.hooks.attached).remove(&self.owner);
-        let (bound, bound6) = {
-            let leases = lock(&shared.leases);
-            let v4 = leases.of(self.owner).and_then(|(a, bound)| bound.then_some(a));
-            (v4, leases.by_owner6.get(&self.owner).copied())
+        let (bound, bound6) = match self.fixed {
+            Some(IpAddr::V4(a)) => (Some(a), None),
+            Some(IpAddr::V6(a)) => (None, Some(a)),
+            None => {
+                let leases = lock(&shared.leases);
+                let v4 = leases.of(self.owner).and_then(|(a, bound)| bound.then_some(a));
+                (v4, leases.by_owner6.get(&self.owner).copied())
+            }
         };
         let addrs: Vec<IpAddr> = bound.map(IpAddr::V4).into_iter().chain(bound6.map(IpAddr::V6)).collect();
         if !addrs.is_empty() {
@@ -2072,14 +2102,35 @@ impl Drop for Release {
     }
 }
 
+/// A LAN member's attachment, which holds its [`Attached`]: the member
+/// detaches when the LAN drops this.
+struct Member {
+    sandbox: Attachment,
+    _attached: Arc<Attached>,
+}
+
+impl Interface for Member {
+    fn poll_recv(&mut self, cx: &Cx, task: &mut std::task::Context<'_>) -> Poll<Result<Packet, fictionet::RecvError>> {
+        self.sandbox.poll_recv(cx, task)
+    }
+
+    fn send(&mut self, packet: Packet) {
+        self.sandbox.send(packet);
+    }
+
+    fn observe_link(&self) -> Option<fictionet::observe::LinkHandle> {
+        self.sandbox.observe_link()
+    }
+}
+
 /// One sandbox's filter, between its attachment and the router.
 async fn filter(cx: Cx, sandbox: Attachment, shared: Arc<Shared>) -> fictionet::Result {
     let name: Arc<str> = Arc::from(sandbox.name());
-    let owner = lock(&shared.leases).new_owner();
+    let attached = Attached::new(&shared, &cx, name.clone(), None);
     let mut f = Filter {
         shared: shared.clone(),
-        owner,
-        name: name.clone(),
+        owner: attached.owner,
+        name,
         ports: Ports::new(vec![Box::new(sandbox) as Box<dyn Interface>]),
         bound: None,
         bound6: None,
@@ -2087,10 +2138,10 @@ async fn filter(cx: Cx, sandbox: Attachment, shared: Arc<Shared>) -> fictionet::
         route6: None,
         reassembly: Reassembly::default(),
     };
-    lock(&shared.hooks.attached).insert(owner);
-    let event = Event::new("net", "attached").summary(format!("sandbox {name} attached"));
+    let event = Event::new("net", "attached").summary(format!("sandbox {} attached", f.name));
     shared.hooks.record(&cx, &sandbox_only(f.me()), event);
-    let _release = Release { shared, owner, cx: cx.clone(), name };
+    // Detaches before the filter's links close.
+    let _attached = attached;
     loop {
         let deadline = f.reassembly.next_expiry();
         match f.ports.next(&cx, deadline, |_| Poll::Pending).await {
@@ -2350,12 +2401,7 @@ impl Shared {
     /// port is not served there. `None` if it will be delivered.
     fn refused(&self, p: &[u8]) -> Option<BlockedWhy> {
         let dst = ip::destination(p)?;
-        let port = transport(p);
-        let closed = |open: &dyn Fn(u8, u16) -> bool| match port {
-            Some((PROTO_TCP, port, rst)) => !open(PROTO_TCP, port) && !rst,
-            Some((proto, port, _)) => !open(proto, port),
-            None => false,
-        };
+        let closed = |open: &dyn Fn(u8, u16) -> bool| answered_closed(p, open);
         if self.is_gateway(dst) {
             return closed(&|_, p| p == 53).then_some(BlockedWhy::ClosedPort);
         }
@@ -2371,26 +2417,26 @@ impl Shared {
     }
 }
 
-/// The protocol, destination port, and whether it is a TCP RST, of a whole
-/// TCP or UDP packet with a good checksum.
-fn transport(p: &[u8]) -> Option<(u8, u16, bool)> {
-    let h = Header::parse_whole(p)?;
+/// Whether `p`, a whole TCP or UDP packet, is for a port that `open` says
+/// is closed, and will be answered as such: it is not a TCP RST, and its
+/// checksum is good. The port is looked up first, so only a packet for a
+/// closed port has its checksum checked.
+fn answered_closed(p: &[u8], open: impl Fn(u8, u16) -> bool) -> bool {
+    let Some(h) = Header::parse_whole(p) else { return false };
     if !matches!(h.protocol, PROTO_TCP | PROTO_UDP) {
-        return None;
+        return false;
     }
     let t = h.payload(p);
-    if t.len() < 8 {
-        return None;
+    if t.len() < 8 || open(h.protocol, u16::from_be_bytes([t[2], t[3]])) {
+        return false;
     }
-    let good = match h.protocol {
+    if h.protocol == PROTO_TCP && t.get(13).is_some_and(|flags| flags & 0x04 != 0) {
+        return false;
+    }
+    match h.protocol {
         PROTO_UDP => ip::udp_checksum_ok(h.src, h.dst, t),
         _ => ip::transport_checksum(h.src, h.dst, h.protocol, t) == 0,
-    };
-    if !good {
-        return None;
     }
-    let rst = h.protocol == PROTO_TCP && t.get(13).is_some_and(|flags| flags & 0x04 != 0);
-    Some((h.protocol, u16::from_be_bytes([t[2], t[3]]), rst))
 }
 
 #[cfg(test)]
@@ -2464,6 +2510,43 @@ mod tests {
         for bad in ["::", "::1", "ff02::1", "fe80::1", "::ffff:1.2.3.4", "2001:db8::5"] {
             assert!(!may_serve_v6(bad.parse().unwrap(), &s), "{bad}");
         }
+    }
+
+    /// A packet for an open port is let through without its checksum being
+    /// checked; only one for a closed port has it checked. Before, every
+    /// forwarded packet was checksummed first, and a bad one was never
+    /// looked up.
+    #[test]
+    fn the_port_is_looked_up_before_the_checksum() {
+        let (src, dst) = (Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(10, 40, 0, 1));
+        let good = udp_packet(src, 5000, dst, 9, b"hello").0;
+        let mut bad = good.clone();
+        *bad.last_mut().unwrap() ^= 0xff;
+        let looked = AtomicUsize::new(0);
+        let open = |is_open: bool| {
+            let looked = &looked;
+            move |_: u8, _: u16| {
+                looked.fetch_add(1, Ordering::Relaxed);
+                is_open
+            }
+        };
+        assert!(!answered_closed(&bad, open(true)));
+        assert_eq!(looked.load(Ordering::Relaxed), 1, "the port of a packet with a bad checksum is looked up");
+        assert!(!answered_closed(&good, open(true)));
+        assert!(answered_closed(&good, open(false)));
+        assert!(!answered_closed(&bad, open(false)), "a bad checksum to a closed port is dropped, not answered");
+        // A TCP SYN to a closed port is answered; a RST is not.
+        let tcp = |flags: u8| {
+            let mut t = vec![0u8; 20];
+            t[2..4].copy_from_slice(&80u16.to_be_bytes());
+            t[12] = 5 << 4;
+            t[13] = flags;
+            let sum = ip::transport_checksum(src.into(), dst.into(), PROTO_TCP, &t);
+            t[16..18].copy_from_slice(&sum.to_be_bytes());
+            ip::packet(src.into(), dst.into(), PROTO_TCP, &t).0
+        };
+        assert!(answered_closed(&tcp(0x02), open(false)));
+        assert!(!answered_closed(&tcp(0x04), open(false)));
     }
 
     #[test]

@@ -7,7 +7,8 @@
 use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::future::Future;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::task::{Context, Poll};
@@ -25,11 +26,11 @@ use fictionet::stdlib::httpd::{self, Http1, Router};
 use fictionet::events::{ConnInfo, Event, Fields, Level};
 use fictionet::stdlib::json;
 use fictionet::stdlib::modbus::{self, Exception, Frame, Request as MbRequest, Response as MbResponse};
-use fictionet::stdlib::net::Net;
+use fictionet::stdlib::net::{Accept, Arrival, Net, Sni};
 use fictionet::stdlib::route::Prefix;
 use fictionet::stdlib::scenario::Scenario;
 use fictionet::stdlib::serve::{
-    self, End as Ended, FaultPlan, Flow, Harness, HarnessError, Pending, PendingCtx, Plan, ServeCtx, ServeOptions, Served,
+    self, Budget, End as Ended, FaultPlan, Flow, Harness, HarnessError, Pending, PendingCtx, Plan, ServeCtx, ServeOptions, Served,
     Service, Timer, Transcript, Upgrade,
 };
 use fictionet::stdlib::{ConnError, Connection, ip, tcp, udp};
@@ -746,9 +747,10 @@ struct Sandbox {
     _icmp: End,
 }
 
-fn sandbox(cx: &Cx, end: impl Interface, addr: Ipv4Addr) -> Sandbox {
+fn sandbox(cx: &Cx, end: impl Interface, addr: impl Into<IpAddr>) -> Sandbox {
+    let addr = addr.into();
     let (t, u, i, _o) = ip::split_protocols(cx, end);
-    Sandbox { tcp: tcp::endpoint(cx, t, addr.into()), udp: udp::endpoint(cx, u, addr.into()), _icmp: i }
+    Sandbox { tcp: tcp::endpoint(cx, t, addr), udp: udp::endpoint(cx, u, addr), _icmp: i }
 }
 
 async fn lookup(cx: &Cx, s: &Sandbox, name: &str) -> Option<Ipv4Addr> {
@@ -1714,28 +1716,31 @@ fn an_error_closes_only_its_connection_and_a_panic_ends_the_run() {
     assert_eq!(panic.downcast_ref::<&str>(), Some(&"the service fell over"));
 }
 
+/// Says hello, then takes lines up to 40 KiB: a decoder that holds up to
+/// that much, charged to the connection's budget.
+struct Wide;
+
+impl Service for Wide {
+    type Decode = Lines;
+    type World = ();
+    type Error = Infallible;
+    fn decoder(&self) -> Lines {
+        Lines::new(40 << 10, Ending::LfOrCrlf)
+    }
+    fn on_open(&mut self, _: &(), ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
+        ctx.reply().extend_from_slice(b"hello\n");
+        Ok(Flow::Continue)
+    }
+    fn on_item(&mut self, _: Result<Vec<u8>, LineError>, _: &(), _: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
+        Ok(Flow::Continue)
+    }
+}
+
 /// Net counts each service's connections against its cap, and charges
 /// every connection from a sandbox to that sandbox's budget. Before, Net
 /// read neither.
 #[test]
 fn net_caps_connections_per_service_and_bytes_per_sandbox() {
-    /// Echo on lines up to 40 KiB: a decoder that holds up to that much.
-    struct Wide;
-    impl Service for Wide {
-        type Decode = Lines;
-        type World = ();
-        type Error = Infallible;
-        fn decoder(&self) -> Lines {
-            Lines::new(40 << 10, Ending::LfOrCrlf)
-        }
-        fn on_open(&mut self, _: &(), ctx: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
-            ctx.reply().extend_from_slice(b"hello\n");
-            Ok(Flow::Continue)
-        }
-        fn on_item(&mut self, _: Result<Vec<u8>, LineError>, _: &(), _: &mut ServeCtx<'_>) -> Result<Flow, Infallible> {
-            Ok(Flow::Continue)
-        }
-    }
     world(|cx| async move {
         let (attacher, attachments) = fictionet::attachments();
         let kept = cx.events();
@@ -1787,6 +1792,14 @@ fn net_refuses_a_host_it_cannot_serve() {
         assert!(bad.as_deref().is_some_and(|e| e.contains("224.0.0.1")), "{bad:?}");
         let udp = fail(Net::new().host("c", |h| h.at(Ipv4Addr::new(10, 40, 0, 2)).udp(9, Arc::new(()), || Echo).udp(9, Arc::new(()), || Echo)));
         assert!(udp.is_some(), "{udp:?}");
+        // TLS and plain on one port, in either order. Before, the port
+        // served only TLS.
+        let config = |_: &Cx| -> Arc<fictionet::stdlib::tls::ServerConfig> { unreachable!("no handshake happens") };
+        let at = Ipv4Addr::new(10, 40, 0, 3);
+        let tls_first = fail(Net::new().host("d", |h| h.at(at).tls_accept(443, Sni::Any, config, Spy::default()).tcp(443, Arc::new(()), || Echo)));
+        assert!(tls_first.as_deref().is_some_and(|e| e.contains("serves TLS")), "{tls_first:?}");
+        let plain_first = fail(Net::new().host("e", |h| h.at(at).tcp(443, Arc::new(()), || Echo).tls_accept(443, Sni::Any, config, Spy::default())));
+        assert!(plain_first.as_deref().is_some_and(|e| e.contains("serves without TLS")), "{plain_first:?}");
         Ok(())
     });
 }
@@ -2010,6 +2023,185 @@ fn net_refuses_lans_that_overlap() {
         assert!(fail(Net::new().lan("a", p("192.168.0.0/16")).lan("b", p("192.168.56.0/24"))).is_some_and(|e| e.contains("overlaps LAN a")));
         assert!(fail(Net::new().lan("a", p("192.168.56.0/24")).member("vm", "a", "192.168.56.1".parse().unwrap())).is_some());
         assert!(fail(Net::new().lan("a", p("192.168.56.0/24")).host("x", |h| h.at(Ipv4Addr::new(192, 168, 56, 5)))).is_some_and(|e| e.contains("Host::on")));
+        Ok(())
+    });
+}
+
+/// Keeps the budget each connection arrives with, and closes it.
+#[derive(Default)]
+struct Spy(Arc<Mutex<Vec<Option<Budget>>>>);
+
+impl Accept for Spy {
+    fn serve(&self, _: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        self.0.lock().unwrap().push(arrival.budget);
+        Box::pin(async {})
+    }
+}
+
+/// What `spy` has kept, once it has kept `n`.
+async fn spied(cx: &Cx, spy: &Mutex<Vec<Option<Budget>>>, n: usize) -> Vec<Option<Budget>> {
+    for _ in 0..200 {
+        let kept = spy.lock().unwrap().clone();
+        if kept.len() >= n {
+            return kept;
+        }
+        let _ = cx.sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the spy kept fewer than {n} budgets");
+}
+
+/// A sandbox has one budget for its IPv4 and IPv6 addresses, and a new
+/// attachment at the same address gets a new one. Before, budgets were
+/// kept by address: each family had its own, and an address kept its
+/// budget after its sandbox detached.
+#[test]
+fn net_keeps_one_budget_per_attachment() {
+    world(|cx| async move {
+        let kept = cx.events();
+        let (attacher, attachments) = fictionet::attachments();
+        let (addr, addr6) = (Ipv4Addr::new(10, 40, 0, 3), "2001:2::3".parse::<Ipv6Addr>()?);
+        let me6: Ipv6Addr = "2001:db8::2".parse()?;
+        let spy = Spy::default();
+        let budgets = spy.0.clone();
+        Net::new()
+            .host("svc", |h| h.at(addr).at(addr6).tcp(8, Arc::new(()), || Wide).accept(9, spy))
+            .serve(&cx, attachments)?;
+
+        // One sandbox on both families: a connection over IPv4 is charged
+        // to the budget a connection over IPv6 gets.
+        let first = budgets.clone();
+        let first_attacher = &attacher;
+        let _ = cx
+            .region(|cx| async move {
+                let (v4, v6, _other) = ip::split_versions(&cx, first_attacher.attach("a")?);
+                let (a4, a6) = (sandbox(&cx, v4, ME), sandbox(&cx, v6, me6));
+                let mut wide = a4.tcp.connect(&cx, SocketAddr::new(addr.into(), 8)).await?;
+                assert_eq!(read_some(&cx, &mut wide, 6).await, b"hello\n");
+                let _spied4 = a4.tcp.connect(&cx, SocketAddr::new(addr.into(), 9)).await?;
+                let _spied6 = a6.tcp.connect(&cx, SocketAddr::new(addr6.into(), 9)).await?;
+                let got = spied(&cx, &first, 2).await;
+                let (b4, b6) = (got[0].clone().expect("a budget"), got[1].clone().expect("a budget"));
+                assert!(b4.used() >= 40 << 10, "{b4:?}");
+                assert_eq!(b6.used(), b4.used(), "IPv6 has its own budget");
+                // Leaving the region detaches the sandbox.
+                Err(Box::new(Done) as fictionet::Error)
+            })
+            .await;
+        kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("net", "detached")).await;
+        let a = budgets.lock().unwrap()[0].clone().expect("a budget");
+
+        // Another sandbox at the same address: its own budget.
+        let b = sandbox(&cx, attacher.attach("b")?, ME);
+        let mut wide = b.tcp.connect(&cx, SocketAddr::new(addr.into(), 8)).await?;
+        assert_eq!(read_some(&cx, &mut wide, 6).await, b"hello\n");
+        let _spied = b.tcp.connect(&cx, SocketAddr::new(addr.into(), 9)).await?;
+        let got = spied(&cx, &budgets, 3).await;
+        let b_budget = got[2].clone().expect("a budget");
+        assert!(b_budget.used() >= 40 << 10, "{b_budget:?}");
+        for _ in 0..200 {
+            if a.used() == 0 {
+                break;
+            }
+            cx.sleep(Duration::from_millis(10)).await?;
+        }
+        assert_eq!(a.used(), 0, "the sandbox that detached still has charges: {a:?}");
+        Ok(())
+    });
+}
+
+/// A LAN member detaches as any sandbox does: its connections are reset
+/// and `net.detached` is recorded, and it can attach again. Before, a
+/// member was never detached.
+#[test]
+fn a_lan_member_detaches_like_any_sandbox() {
+    world(|cx| async move {
+        let kept = cx.events();
+        let (attacher, attachments) = fictionet::attachments();
+        let dc: Ipv4Addr = "192.168.56.10".parse()?;
+        let ws: Ipv4Addr = "192.168.56.31".parse()?;
+        Net::new()
+            .ipv4_only()
+            .lan("corp", "192.168.56.0/24".parse()?)
+            .host("dc01", |h| h.on("corp").at(dc).tcp(389, Arc::new(()), || Echo))
+            .member("ws01", "corp", ws.into())
+            .serve(&cx, attachments)?;
+
+        let to = SocketAddr::new(dc.into(), 389);
+        let first_attacher = &attacher;
+        let _ = cx
+            .region(|cx| async move {
+                let vm = sandbox(&cx, first_attacher.attach("ws01")?, ws);
+                let mut conn = vm.tcp.connect(&cx, to).await?;
+                assert_eq!(read_some(&cx, &mut conn, 6).await, b"hello\n");
+                // Leaving the region takes the VM away without a word to
+                // the server.
+                Err(Box::new(Done) as fictionet::Error)
+            })
+            .await;
+        let detached = kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("net", "detached")).await;
+        let first = detached[0].conn.sandbox.clone().expect("a sandbox");
+        assert_eq!((&*first.name, first.addr), ("ws01", Some(ws)));
+        // The server's side of the connection was reset.
+        let closed = kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("conn", "close")).await;
+        assert_eq!(closed[0].conn.sandbox.as_ref().map(|s| s.id), Some(first.id));
+
+        // The member attaches again, as a new sandbox.
+        let vm = sandbox(&cx, attacher.attach("ws01")?, ws);
+        let mut conn = vm.tcp.connect(&cx, to).await?;
+        assert_eq!(read_some(&cx, &mut conn, 6).await, b"hello\n");
+        let attached = kept.of("net", "attached");
+        assert_eq!(attached.len(), 2, "{attached:?}");
+        assert_ne!(attached[1].conn.sandbox.as_ref().map(|s| s.id), Some(first.id));
+        Ok(())
+    });
+}
+
+/// `Host::tcp` records each connection's opening and closing, as
+/// `Host::tcp_with` does by default. Before, `tcp` turned them off.
+#[test]
+fn net_records_connections_on_a_tcp_port() {
+    world(|cx| async move {
+        let kept = cx.events();
+        let (attacher, attachments) = fictionet::attachments();
+        let addr = Ipv4Addr::new(10, 40, 0, 1);
+        Net::new().ipv4_only().host("svc", |h| h.at(addr).tcp(7, Arc::new(()), || Echo)).serve(&cx, attachments)?;
+        let s = sandbox(&cx, attacher.attach("agent")?, ME);
+        let mut conn = s.tcp.connect(&cx, SocketAddr::new(addr.into(), 7)).await?;
+        conn.write_all(&cx, b"quit\n").await?;
+        assert_eq!(read_some(&cx, &mut conn, 10).await, b"hello\nbye\n");
+        let closed = kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("conn", "close")).await;
+        let opened = kept.of("conn", "open");
+        assert_eq!(opened.len(), 1, "{opened:?}");
+        assert_eq!((opened[0].conn.id, closed[0].conn.id), (Some(1), Some(1)));
+        Ok(())
+    });
+}
+
+/// A STARTTLS handshake has the network's handshake limit. Before, it had
+/// the service's default of 10 seconds.
+#[test]
+#[cfg(feature = "tokio")]
+fn net_limits_a_starttls_handshake() {
+    let (config, _roots) = tls_pair(&["mail.test"]);
+    world(move |cx| async move {
+        let kept = cx.events();
+        let (attacher, attachments) = fictionet::attachments();
+        let addr = Ipv4Addr::new(10, 40, 0, 25);
+        let limits = fictionet::stdlib::net::Limits { handshake: Duration::from_millis(200), ..Default::default() };
+        let opts = ServeOptions::default().starttls(config);
+        Net::new()
+            .ipv4_only()
+            .limits(limits)
+            .host("mail", |h| h.at(addr).tcp_with(25, Arc::new(()), || Mail { tls: false }, opts))
+            .serve(&cx, attachments)?;
+        let s = sandbox(&cx, attacher.attach("agent")?, ME);
+        let mut conn = s.tcp.connect(&cx, SocketAddr::new(addr.into(), 25)).await?;
+        assert_eq!(read_some(&cx, &mut conn, 16).await, b"220 mail ready\r\n");
+        conn.write_all(&cx, b"STARTTLS\r\n").await?;
+        assert_eq!(read_some(&cx, &mut conn, 14).await, b"220 go ahead\r\n");
+        // The client never starts its handshake.
+        let handshake = kept.wait(&cx, 1, Duration::from_secs(2), |e| e.is("tls", "handshake")).await;
+        assert_ne!(handshake[0].str("outcome"), Some("accepted"));
         Ok(())
     });
 }
