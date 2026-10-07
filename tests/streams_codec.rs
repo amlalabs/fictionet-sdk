@@ -149,7 +149,7 @@ fn openvpn_packet_errors_and_framing_errors() {
     refused_header(
         || openvpn::Frames::with_limit(16),
         &[0, 17],
-        openvpn::StreamError::TooLong {
+        openvpn::Error::OverLimit {
             length: 17,
             limit: 16,
         },
@@ -157,7 +157,7 @@ fn openvpn_packet_errors_and_framing_errors() {
     refused_header(
         openvpn::Frames::new,
         &[0, 0],
-        openvpn::StreamError::ZeroLength,
+        openvpn::Error::ZeroLength,
     );
 }
 
@@ -198,16 +198,16 @@ fn openvpn_wire_is_exact_and_transactional() {
     bytes.push(0);
     assert_eq!(
         <openvpn::Frame as Wire>::parse(&bytes),
-        Err(openvpn::FrameParseError::Trailing)
+        Err(openvpn::Error::Trailing)
     );
     assert_eq!(
         <openvpn::Frame as Wire>::parse(&[0, 2, 1]),
-        Err(openvpn::FrameParseError::Truncated)
+        Err(openvpn::Error::Truncated)
     );
 }
 
-fn media_packet() -> rtp::RtpPacket {
-    rtp::RtpPacket {
+fn media_packet() -> rtp::Packet {
+    rtp::Packet {
         marker: true,
         payload_type: 96,
         sequence: 17,
@@ -252,7 +252,7 @@ fn rtp_chunked_rfc4571_round_trip() {
                 if frame.0.is_empty() {
                     Ok(None)
                 } else {
-                    rtp::RtpPacket::parse(&frame.0).map(Some)
+                    rtp::Packet::parse(&frame.0).map(Some)
                 }
             })
         },
@@ -267,14 +267,14 @@ fn rtp_body_error_keeps_stream_and_limit_error_ends_it() {
     let mut bytes = wire_bytes(&rtcp::Frame(vec![0, 0]));
     rtcp::Frame(wire_bytes(&packet)).write(&mut bytes).unwrap();
     round_trip(
-        || rtcp::Frames::new().map(|frame| rtp::RtpPacket::parse(&frame.0)),
+        || rtcp::Frames::new().map(|frame| rtp::Packet::parse(&frame.0)),
         &bytes,
-        &[Err(rtp::RtpError::Version(0)), Ok(packet)],
+        &[Err(rtp::Error::Version(0)), Ok(packet)],
     );
     refused_header(
         || rtcp::Frames::with_limit(12),
         &[0, 13],
-        rtcp::FrameError {
+        rtcp::Error::OverLimit {
             length: 13,
             limit: 12,
         },
@@ -406,14 +406,14 @@ fn rtcp_body_error_keeps_stream_and_limit_error_ends_it() {
         || rtcp::Frames::new().map(|frame| rtcp::Datagram::parse(&frame.0).map(|value| value.0)),
         &bytes,
         &[
-            Err(rtcp::ParseError::Malformed(rtcp::packet_type::RR)),
+            Err(rtcp::Error::Malformed(rtcp::packet_type::RR)),
             Ok(vec![packet]),
         ],
     );
     refused_header(
         || rtcp::Frames::with_limit(8),
         &[0, 9],
-        rtcp::FrameError {
+        rtcp::Error::OverLimit {
             length: 9,
             limit: 8,
         },
@@ -426,7 +426,7 @@ fn rtcp_wire_is_exact_and_transactional() {
     let bytes = wire_bytes(&packet);
     assert_eq!(
         <rtcp::Packet as Wire>::parse(&[bytes.clone(), bytes.clone()].concat()),
-        Err(rtcp::PacketParseError::Trailing)
+        Err(rtcp::Error::Trailing)
     );
     assert!(<rtcp::Packet as Wire>::parse(&bytes[..bytes.len() - 1]).is_err());
     let mut bad = packet.clone();
@@ -446,11 +446,11 @@ fn rtcp_wire_is_exact_and_transactional() {
     refuses_value(&rtcp::Frame(vec![0; rtcp::MAX_FRAME + 1]));
     assert_eq!(
         <rtcp::Frame as Wire>::parse(&[0, 0, 0]),
-        Err(rtcp::FrameParseError::Trailing)
+        Err(rtcp::Error::Trailing)
     );
     assert_eq!(
         <rtcp::Frame as Wire>::parse(&[0]),
-        Err(rtcp::FrameParseError::Truncated)
+        Err(rtcp::Error::Truncated)
     );
 }
 
@@ -480,38 +480,38 @@ fn ssh_chunked_cleartext_round_trip() {
     for packet in &packets {
         let encoded = wire_bytes(packet);
         assert_eq!(encoded, packet.to_bytes().unwrap());
-        truncated(ssh::Frames::new, &encoded);
+        truncated(ssh::Packets::new, &encoded);
         packet.write(&mut bytes).unwrap();
     }
-    round_trip(ssh::Frames::new, &bytes, &packets);
+    round_trip(ssh::Packets::new, &bytes, &packets);
 }
 
 #[test]
 fn ssh_header_errors_end_the_stream() {
     refused_header(
-        ssh::Frames::new,
+        ssh::Packets::new,
         &(ssh::MAX_PACKET_LENGTH + 1).to_be_bytes(),
-        ssh::StreamError::PacketLength(ssh::MAX_PACKET_LENGTH + 1),
+        ssh::Error::PacketLength(ssh::MAX_PACKET_LENGTH + 1),
     );
     refused_header(
-        || ssh::Frames::with_limit(16),
+        || ssh::Packets::with_limit(16),
         &20u32.to_be_bytes(),
-        ssh::StreamError::PacketLength(20),
+        ssh::Error::PacketLength(20),
     );
     refused_header(
-        ssh::Frames::new,
+        ssh::Packets::new,
         &[0, 0, 0, 12, 3],
-        ssh::StreamError::Padding(3),
+        ssh::Error::Padding(3),
     );
     // Packet errors remain terminal even when the declared boundary is available.
     let mut bytes = vec![0, 0, 0, 12, 3];
     bytes.resize(16, 0);
     ssh_packet(vec![21]).write(&mut bytes).unwrap();
-    let mut stream = Stream::new(ssh::Frames::new());
+    let mut stream = Stream::new(ssh::Packets::new());
     assert_eq!(stream.push(&bytes), bytes.len());
     assert_eq!(
         stream.next(),
-        Some(Err(Fail::Protocol(ssh::StreamError::Padding(3))))
+        Some(Err(Fail::Protocol(ssh::Error::Padding(3))))
     );
     assert_eq!(stream.next(), None);
     assert_eq!(stream.offset(), 0);
@@ -524,11 +524,11 @@ fn ssh_wire_refuses_padding_changes_and_trailing_bytes() {
     bytes.push(0);
     assert_eq!(
         <ssh::Packet as Wire>::parse(&bytes),
-        Err(ssh::PacketParseError::Trailing)
+        Err(ssh::Error::Trailing)
     );
     assert_eq!(
         <ssh::Packet as Wire>::parse(&[0, 0, 0]),
-        Err(ssh::PacketParseError::Truncated)
+        Err(ssh::Error::Truncated)
     );
     for bad in [
         ssh::Packet {
@@ -581,7 +581,7 @@ fn ssh_version_limits_and_terminal_errors() {
     assert_eq!(stream.push(&too_long), too_long.len());
     assert_eq!(
         stream.next(),
-        Some(Err(Fail::Protocol(ssh::StreamError::LineTooLong)))
+        Some(Err(Fail::Protocol(ssh::Error::LineTooLong)))
     );
     assert_eq!(stream.unread(), too_long);
     assert_eq!(stream.next(), None);
@@ -613,10 +613,10 @@ fn snmp_chunked_ber_round_trip() {
     let mut bytes = Vec::new();
     for message in [&request, &response] {
         let encoded = wire_bytes(message);
-        truncated(snmp::Frames::new, &encoded);
+        truncated(snmp::Messages::new, &encoded);
         message.write(&mut bytes).unwrap();
     }
-    round_trip(snmp::Frames::new, &bytes, &[Ok(request), Ok(response)]);
+    round_trip(snmp::Messages::new, &bytes, &[Ok(request), Ok(response)]);
 }
 
 #[test]
@@ -625,22 +625,22 @@ fn snmp_body_error_keeps_stream_and_framing_error_ends_it() {
     let mut bytes = vec![0x30, 0]; // A complete TLV with no message fields.
     message.write(&mut bytes).unwrap();
     round_trip(
-        snmp::Frames::new,
+        snmp::Messages::new,
         &bytes,
         &[Err(snmp::Error::Truncated), Ok(message)],
     );
     refused_header(
-        snmp::Frames::new,
+        snmp::Messages::new,
         &[0x30, 0x82, 0xff, 0xff],
         snmp::Error::TooLong(snmp::MAX_MESSAGE + 4),
     );
     refused_header(
-        || snmp::Frames::with_limit(16),
+        || snmp::Messages::with_limit(16),
         &[0x30, 17],
         snmp::Error::TooLong(19),
     );
-    refused_header(snmp::Frames::new, &[0x30, 0x80], snmp::Error::Length);
-    refused_header(snmp::Frames::new, &[0x04], snmp::Error::UnexpectedTag(0x04));
+    refused_header(snmp::Messages::new, &[0x30, 0x80], snmp::Error::Length);
+    refused_header(snmp::Messages::new, &[0x04], snmp::Error::UnexpectedTag(0x04));
 }
 
 #[test]
@@ -653,13 +653,13 @@ fn snmp_accepts_redundant_long_form_ber_lengths() {
     bytes.push(canonical[1]);
     bytes.extend_from_slice(&canonical[2..]);
     contract::check_wire::<snmp::Message>(&bytes);
-    round_trip(snmp::Frames::new, &bytes, &[Ok(message)]);
+    round_trip(snmp::Messages::new, &bytes, &[Ok(message)]);
     refused_header(
-        || snmp::Frames::with_limit(16),
+        || snmp::Messages::with_limit(16),
         &bytes[..128],
         snmp::Error::TooLong(bytes.len()),
     );
-    contract::check_decode_with_alloc_limit(|| snmp::Frames::with_limit(0), &[0x30, 0xfe], 256);
+    contract::check_decode_with_alloc_limit(|| snmp::Messages::with_limit(0), &[0x30, 0xfe], 256);
 }
 
 #[test]
@@ -693,13 +693,13 @@ fn configured_limits_and_maximum_envelopes() {
         rtcp::MAX_FRAME
     );
     assert_eq!(rtcp::Frames::with_limit(0).capacity(), 2);
-    assert_eq!(ssh::Frames::with_limit(usize::MAX).limit(), ssh::MAX_PACKET);
-    assert_eq!(ssh::Frames::with_limit(0).limit(), ssh::MIN_PACKET);
+    assert_eq!(ssh::Packets::with_limit(usize::MAX).limit(), ssh::MAX_PACKET);
+    assert_eq!(ssh::Packets::with_limit(0).limit(), ssh::MIN_PACKET);
     assert_eq!(
-        snmp::Frames::with_limit(usize::MAX).limit(),
+        snmp::Messages::with_limit(usize::MAX).limit(),
         snmp::MAX_MESSAGE
     );
-    assert_eq!(snmp::Frames::with_limit(0).capacity(), 128);
+    assert_eq!(snmp::Messages::with_limit(0).capacity(), 128);
     round_trip(
         || rtcp::Frames::with_limit(0),
         &[0, 0, 0, 0],
@@ -708,7 +708,7 @@ fn configured_limits_and_maximum_envelopes() {
     refused_header(
         || openvpn::Frames::with_limit(0),
         &[0, 1],
-        openvpn::StreamError::TooLong {
+        openvpn::Error::OverLimit {
             length: 1,
             limit: 0,
         },
@@ -720,7 +720,7 @@ fn configured_limits_and_maximum_envelopes() {
     let frame = rtcp::Frame(vec![7; rtcp::MAX_FRAME]);
     round_trip(rtcp::Frames::new, &wire_bytes(&frame), &[frame]);
     let packet = ssh_packet(vec![7; ssh::MAX_PAYLOAD]);
-    round_trip(ssh::Frames::new, &wire_bytes(&packet), &[packet]);
+    round_trip(ssh::Packets::new, &wire_bytes(&packet), &[packet]);
 }
 
 #[test]
@@ -741,18 +741,18 @@ fn deterministic_contract_inputs_cover_all_framers() {
                 2 * (rtp::MAX_PACKET + 2),
             );
             contract::check_decode_with_alloc_limit(
-                ssh::Frames::new,
+                ssh::Packets::new,
                 &bytes,
                 2 * (ssh::MAX_PACKET),
             );
             contract::check_decode_with_alloc_limit(
-                snmp::Frames::new,
+                snmp::Messages::new,
                 &bytes,
                 2 * (snmp::MAX_MESSAGE),
             );
             contract::check_wire::<openvpn::Frame>(&bytes);
             contract::check_wire::<rtcp::Frame>(&bytes);
-            contract::check_wire::<rtp::RtpPacket>(&bytes);
+            contract::check_wire::<rtp::Packet>(&bytes);
             contract::check_wire::<rtcp::Packet>(&bytes);
             contract::check_wire::<ssh::Packet>(&bytes);
             contract::check_wire::<snmp::Message>(&bytes);

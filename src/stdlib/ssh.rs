@@ -21,7 +21,7 @@
 //!
 //! Nothing here reads a socket. A world pushes TCP bytes through
 //! [`Stream<Events>`](fictionet::stdlib::codec::Stream) for the version exchange and
-//! numbered packets, or [`Stream<Frames>`](fictionet::stdlib::codec::Stream) after it.
+//! numbered packets, or [`Stream<Packets>`](fictionet::stdlib::codec::Stream) after it.
 //! It reads payloads with [`Message::parse`] and builds replies with
 //! [`Identification::new`] and [`Packet::from_message`]. Which
 //! algorithms the world offers, and what its software line says, is up to
@@ -131,10 +131,12 @@ pub mod msg {
     pub const NEWKEYS: u8 = 21;
 }
 
-/// Why a byte stream is not SSH. After any of these the stream cannot be
-/// read any further, and a real peer closes the connection.
+/// Why bytes are not SSH, or not the data or message expected, or why a
+/// value cannot be written as it stands. After an error from [`Lines`],
+/// [`Packets`] or [`Events`] the stream cannot be read any further, and a
+/// real peer closes the connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StreamError {
+pub enum Error {
     /// A line ran past [`MAX_BANNER_LINE`] bytes, or a version line past
     /// [`MAX_VERSION_LINE`], without ending.
     LineTooLong,
@@ -152,29 +154,51 @@ pub enum StreamError {
     Padding(u8),
     /// A packet's payload was longer than [`MAX_PAYLOAD`].
     PayloadTooLong(u32),
-    /// An exact line read ended before LF.
+    /// The bytes ended before a line's LF, a whole binary packet, or a
+    /// field.
     Truncated,
-    /// Bytes follow the first line.
+    /// Bytes follow the first line or packet, or the last field.
     Trailing,
+    /// The payload was empty, so it had no message number.
+    Empty,
+    /// A string, text or name-list was longer than its limit, or a payload
+    /// longer than [`MAX_PAYLOAD`].
+    FieldTooLong,
+    /// A text field was not UTF-8.
+    Utf8,
+    /// A name-list held an empty name, a name longer than [`MAX_NAME`], a
+    /// name with a byte outside printable US-ASCII, or a name whose `@`
+    /// is repeated or has no text on one side.
+    Name,
+    /// An mpint had a leading 0x00 or 0xff byte it did not need.
+    Mpint,
+    /// A field, variant, or length cannot be written without changing it.
+    Unwritable,
 }
 
-impl std::fmt::Display for StreamError {
+impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            StreamError::Truncated => f.write_str("incomplete SSH line"),
-            StreamError::Trailing => f.write_str("bytes follow the SSH line"),
-            StreamError::LineTooLong => f.write_str("line too long"),
-            StreamError::Nul => f.write_str("NUL byte in a line"),
-            StreamError::BadVersion => f.write_str("malformed SSH version line"),
-            StreamError::TooManyLines => f.write_str("too many lines before the version line"),
-            StreamError::PacketLength(n) => write!(f, "packet length {n} not allowed"),
-            StreamError::Padding(n) => write!(f, "padding length {n} not allowed"),
-            StreamError::PayloadTooLong(n) => write!(f, "payload of {n} bytes, over {MAX_PAYLOAD}"),
+            Error::LineTooLong => f.write_str("line too long"),
+            Error::Nul => f.write_str("NUL byte in a line"),
+            Error::BadVersion => f.write_str("malformed SSH version line"),
+            Error::TooManyLines => f.write_str("too many lines before the version line"),
+            Error::PacketLength(n) => write!(f, "packet length {n} not allowed"),
+            Error::Padding(n) => write!(f, "padding length {n} not allowed"),
+            Error::PayloadTooLong(n) => write!(f, "payload of {n} bytes, over {MAX_PAYLOAD}"),
+            Error::Truncated => f.write_str("SSH line, packet or field cut short"),
+            Error::Trailing => f.write_str("bytes follow the SSH line, packet or last field"),
+            Error::Empty => f.write_str("empty payload"),
+            Error::FieldTooLong => f.write_str("field too long"),
+            Error::Utf8 => f.write_str("text is not UTF-8"),
+            Error::Name => f.write_str("malformed name-list"),
+            Error::Mpint => f.write_str("mpint not in its shortest form"),
+            Error::Unwritable => f.write_str("value cannot be written without changing it"),
         }
     }
 }
 
-impl std::error::Error for StreamError {}
+impl std::error::Error for Error {}
 
 /// The version line: `SSH-protoversion-softwareversion`, then optionally
 /// a space and comments. Both versions are printable US-ASCII with no
@@ -191,24 +215,24 @@ pub struct Identification {
 impl Identification {
     /// A version line, if the parts are allowed and fit in
     /// [`MAX_VERSION_LINE`] bytes. Otherwise it gives
-    /// [`StreamError::BadVersion`] or [`StreamError::LineTooLong`].
+    /// [`Error::BadVersion`] or [`Error::LineTooLong`].
     pub fn new(
         proto: &str,
         software: &str,
         comments: Option<&str>,
-    ) -> Result<Identification, StreamError> {
+    ) -> Result<Identification, Error> {
         // Everything is checked before anything is copied, so a long part
         // costs no allocation.
         if !version_part(proto.as_bytes()) || !version_part(software.as_bytes()) {
-            return Err(StreamError::BadVersion);
+            return Err(Error::BadVersion);
         }
         if let Some(c) = comments
             && c.bytes().any(|b| matches!(b, b'\r' | b'\n' | 0))
         {
-            return Err(StreamError::BadVersion);
+            return Err(Error::BadVersion);
         }
         if line_len(proto, software, comments) > MAX_VERSION_LINE {
-            return Err(StreamError::LineTooLong);
+            return Err(Error::LineTooLong);
         }
         Ok(Identification {
             proto: proto.to_string(),
@@ -218,18 +242,18 @@ impl Identification {
     }
 
     /// Reads a version line's text, without its line ending.
-    fn parse_text(line: &[u8]) -> Result<Identification, StreamError> {
-        let rest = line.strip_prefix(b"SSH-").ok_or(StreamError::BadVersion)?;
+    fn parse_text(line: &[u8]) -> Result<Identification, Error> {
+        let rest = line.strip_prefix(b"SSH-").ok_or(Error::BadVersion)?;
         let dash = rest
             .iter()
             .position(|&b| b == b'-')
-            .ok_or(StreamError::BadVersion)?;
+            .ok_or(Error::BadVersion)?;
         let (proto, rest) = (&rest[..dash], &rest[dash + 1..]);
         let (software, comments) = match rest.iter().position(|&b| b == b' ') {
             Some(sp) => (&rest[..sp], Some(&rest[sp + 1..])),
             None => (rest, None),
         };
-        let text = |b: &[u8]| String::from_utf8(b.to_vec()).map_err(|_| StreamError::BadVersion);
+        let text = |b: &[u8]| String::from_utf8(b.to_vec()).map_err(|_| Error::BadVersion);
         let comments = match comments {
             Some(c) => Some(text(c)?),
             None => None,
@@ -319,7 +343,7 @@ pub enum Line {
 /// ending in LF alone is accepted, as RFC 4253 suggests for old software.
 /// Errors are found as soon as the bytes that cause them arrive, so the
 /// result does not depend on how the stream was split.
-fn parse_line(b: &[u8]) -> Result<Option<(Line, usize)>, StreamError> {
+fn parse_line(b: &[u8]) -> Result<Option<(Line, usize)>, Error> {
     let limit = if b.starts_with(b"SSH-") {
         MAX_VERSION_LINE
     } else {
@@ -328,7 +352,7 @@ fn parse_line(b: &[u8]) -> Result<Option<(Line, usize)>, StreamError> {
     for (i, &c) in b.iter().enumerate() {
         let len = i + 1;
         if c == 0 {
-            return Err(StreamError::Nul);
+            return Err(Error::Nul);
         }
         if c == b'\n' {
             let text = &b[..i];
@@ -341,30 +365,30 @@ fn parse_line(b: &[u8]) -> Result<Option<(Line, usize)>, StreamError> {
             return Ok(Some((line, len)));
         }
         if len >= limit {
-            return Err(StreamError::LineTooLong);
+            return Err(Error::LineTooLong);
         }
     }
     Ok(None)
 }
 
 impl Wire for Identification {
-    type ParseError = StreamError;
-    type WriteError = EncodeError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads one complete identification line. Refuses banners, invalid parts,
     /// excess length, truncation, and bytes after the line ending.
-    fn parse(bytes: &[u8]) -> Result<Self, StreamError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         match Line::parse(bytes)? {
             Line::Version(id) => Ok(id),
-            Line::Banner(_) => Err(StreamError::BadVersion),
+            Line::Banner(_) => Err(Error::BadVersion),
         }
     }
 
     /// Appends the identification with CR LF. Refuses allocation failure.
     /// Construction already checks its fields and length.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         out.try_reserve_exact(self.len())
-            .map_err(|_| EncodeError::Unwritable)?;
+            .map_err(|_| Error::Unwritable)?;
         out.extend_from_slice(b"SSH-");
         out.extend_from_slice(self.proto.as_bytes());
         out.push(b'-');
@@ -379,22 +403,22 @@ impl Wire for Identification {
 }
 
 impl Wire for Line {
-    type ParseError = StreamError;
-    type WriteError = EncodeError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads exactly one line. Accepts LF or CR LF. Refuses NUL, invalid
     /// identification fields, excess length, truncation, and trailing bytes.
-    fn parse(bytes: &[u8]) -> Result<Self, StreamError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         match parse_line(bytes)? {
             Some((line, used)) if used == bytes.len() => Ok(line),
-            Some(_) => Err(StreamError::Trailing),
-            None => Err(StreamError::Truncated),
+            Some(_) => Err(Error::Trailing),
+            None => Err(Error::Truncated),
         }
     }
 
     /// Appends one line. Refuses LF or NUL inside a banner, an `SSH-` banner,
     /// and lengths over the line limit. Uses LF alone for a full-length banner.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         match self {
             Self::Version(id) => id.write(out),
             Self::Banner(text) => {
@@ -402,17 +426,17 @@ impl Wire for Line {
                     || text.starts_with(b"SSH-")
                     || text.iter().any(|b| matches!(b, 0 | b'\n'))
                 {
-                    return Err(EncodeError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 let ending: &[u8] = if text.len() + 2 <= MAX_BANNER_LINE {
                     b"\r\n"
                 } else if text.last() != Some(&b'\r') {
                     b"\n"
                 } else {
-                    return Err(EncodeError::Unwritable);
+                    return Err(Error::Unwritable);
                 };
                 out.try_reserve_exact(text.len() + ending.len())
-                    .map_err(|_| EncodeError::Unwritable)?;
+                    .map_err(|_| Error::Unwritable)?;
                 out.extend_from_slice(text);
                 out.extend_from_slice(ending);
                 Ok(())
@@ -436,12 +460,12 @@ impl Lines {
 
 impl Decode for Lines {
     type Item = Line;
-    type Error = StreamError;
+    type Error = Error;
     const NAME: &'static str = "SSH lines";
     fn capacity(&self) -> usize {
         MAX_BANNER_LINE
     }
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Line>, StreamError> {
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Line>, Error> {
         if line_pending(input, self.scanned) {
             self.scanned = input.len();
             return Ok(Step::Need);
@@ -478,7 +502,7 @@ impl Packet {
     }
 
     /// Builds a packet around a message. Refuses values its message writer refuses.
-    pub fn from_message(message: &Message) -> Result<Self, EncodeError> {
+    pub fn from_message(message: &Message) -> Result<Self, Error> {
         Ok(Self::new(message.to_bytes()?))
     }
 
@@ -486,7 +510,7 @@ impl Packet {
     /// holds only part of one, and otherwise the packet and how many bytes
     /// of `b` it took. A bad length is known from the first 4 bytes, and a
     /// bad padding length from the fifth.
-    fn parse_prefix(b: &[u8]) -> Result<Option<(Packet, usize)>, StreamError> {
+    fn parse_prefix(b: &[u8]) -> Result<Option<(Packet, usize)>, Error> {
         let Some(head) = b.get(..4) else {
             return Ok(None);
         };
@@ -495,17 +519,17 @@ impl Packet {
             || length > MAX_PACKET_LENGTH
             || !(length as usize + 4).is_multiple_of(BLOCK)
         {
-            return Err(StreamError::PacketLength(length));
+            return Err(Error::PacketLength(length));
         }
         let Some(&pad) = b.get(4) else {
             return Ok(None);
         };
         if pad < MIN_PADDING || u32::from(pad) >= length {
-            return Err(StreamError::Padding(pad));
+            return Err(Error::Padding(pad));
         }
         let payload_len = length - 1 - u32::from(pad);
         if payload_len as usize > MAX_PAYLOAD {
-            return Err(StreamError::PayloadTooLong(payload_len));
+            return Err(Error::PayloadTooLong(payload_len));
         }
         let end = 4 + length as usize;
         let Some(body) = b.get(5..end) else {
@@ -522,76 +546,38 @@ impl Packet {
     }
 }
 
-/// Why an exact [`Wire`] parse did not read one cleartext binary packet.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PacketParseError {
-    /// A binary packet header is invalid.
-    Packet(StreamError),
-    /// The input ended before a complete packet.
-    Truncated,
-    /// Bytes follow the first packet.
-    Trailing,
-}
-
-impl core::fmt::Display for PacketParseError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Packet(e) => e.fmt(f),
-            Self::Truncated => f.write_str("incomplete SSH binary packet"),
-            Self::Trailing => f.write_str("bytes follow the SSH binary packet"),
-        }
-    }
-}
-
-impl core::error::Error for PacketParseError {}
-
-/// Why an SSH value cannot be written as it stands.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EncodeError {
-    /// A field, variant, or length cannot be written without changing it.
-    Unwritable,
-}
-
-impl core::fmt::Display for EncodeError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("value cannot be written without changing it")
-    }
-}
-
-impl core::error::Error for EncodeError {}
-
 impl Wire for Packet {
-    type ParseError = PacketParseError;
-    type WriteError = EncodeError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads exactly one binary packet. Refuses invalid length or padding,
     /// excess payload, truncation, and trailing bytes.
-    fn parse(bytes: &[u8]) -> Result<Self, PacketParseError> {
-        match Packet::parse_prefix(bytes).map_err(PacketParseError::Packet)? {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        match Packet::parse_prefix(bytes)? {
             Some((packet, used)) if used == bytes.len() => Ok(packet),
-            Some(_) => Err(PacketParseError::Trailing),
-            None => Err(PacketParseError::Truncated),
+            Some(_) => Err(Error::Trailing),
+            None => Err(Error::Truncated),
         }
     }
 
     /// Appends the packet with its exact padding. Refuses padding outside
     /// 4 to 255 bytes, a total not divisible by 8, and oversized payloads.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
-        let pad = u8::try_from(self.padding.len()).map_err(|_| EncodeError::Unwritable)?;
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        let pad = u8::try_from(self.padding.len()).map_err(|_| Error::Unwritable)?;
         let total = 5usize
             .checked_add(self.payload.len())
             .and_then(|n| n.checked_add(self.padding.len()))
-            .ok_or(EncodeError::Unwritable)?;
+            .ok_or(Error::Unwritable)?;
         if self.payload.len() > MAX_PAYLOAD
             || pad < MIN_PADDING
             || !(MIN_PACKET..=MAX_PACKET).contains(&total)
             || !total.is_multiple_of(BLOCK)
         {
-            return Err(EncodeError::Unwritable);
+            return Err(Error::Unwritable);
         }
-        let length = u32::try_from(total.saturating_sub(4)).map_err(|_| EncodeError::Unwritable)?;
+        let length = u32::try_from(total.saturating_sub(4)).map_err(|_| Error::Unwritable)?;
         out.try_reserve_exact(total)
-            .map_err(|_| EncodeError::Unwritable)?;
+            .map_err(|_| Error::Unwritable)?;
         out.extend_from_slice(&length.to_be_bytes());
         out.push(pad);
         out.extend_from_slice(&self.payload);
@@ -610,11 +596,11 @@ impl Wire for Packet {
 /// Stop using this framer when keys take effect. It performs no encryption
 /// or MAC processing. Payload messages are parsed separately by [`Message::parse`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Frames {
+pub struct Packets {
     limit: usize,
 }
 
-impl Frames {
+impl Packets {
     /// Creates a framer with [`MAX_PACKET`] as its total packet limit.
     pub fn new() -> Self {
         Self::with_limit(MAX_PACKET)
@@ -634,27 +620,27 @@ impl Frames {
     }
 }
 
-impl Default for Frames {
+impl Default for Packets {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Decode for Frames {
+impl Decode for Packets {
     type Item = Packet;
-    type Error = StreamError;
+    type Error = Error;
     const NAME: &'static str = "SSH cleartext packets";
 
     fn capacity(&self) -> usize {
         self.limit
     }
 
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Packet>, StreamError> {
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Packet>, Error> {
         if let Some(&[a, b, c, d]) = input.get(..4) {
             let length = u32::from_be_bytes([a, b, c, d]);
             let total = usize::try_from(length).ok().and_then(|n| n.checked_add(4));
             if total.is_none_or(|n| n > self.limit) {
-                return Err(StreamError::PacketLength(length));
+                return Err(Error::PacketLength(length));
             }
         }
         Ok(match Packet::parse_prefix(input)? {
@@ -716,12 +702,12 @@ impl Events {
 
 impl Decode for Events {
     type Item = Event;
-    type Error = StreamError;
+    type Error = Error;
     const NAME: &'static str = "SSH";
     fn capacity(&self) -> usize {
         MAX_PACKET
     }
-    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Event>, StreamError> {
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Event>, Error> {
         if self.packets {
             return Ok(match Packet::parse_prefix(input)? {
                 Some((packet, used)) => {
@@ -739,7 +725,7 @@ impl Decode for Events {
             }
             Step::Item(Line::Banner(text), used) => {
                 if self.count >= MAX_BANNER_LINES {
-                    return Err(StreamError::TooManyLines);
+                    return Err(Error::TooManyLines);
                 }
                 self.count += 1;
                 Step::Item(Event::Banner(text), used)
@@ -748,44 +734,6 @@ impl Decode for Events {
         })
     }
 }
-
-/// Why bytes are not the data or message expected.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DecodeError {
-    /// The payload was empty, so it had no message number.
-    Empty,
-    /// The bytes ended before a field did.
-    Truncated,
-    /// Bytes were left after the last field.
-    Trailing,
-    /// A string, text or name-list was longer than its limit, or a payload
-    /// longer than [`MAX_PAYLOAD`].
-    TooLong,
-    /// A text field was not UTF-8.
-    Utf8,
-    /// A name-list held an empty name, a name longer than [`MAX_NAME`], a
-    /// name with a byte outside printable US-ASCII, or a name whose `@`
-    /// is repeated or has no text on one side.
-    Name,
-    /// An mpint had a leading 0x00 or 0xff byte it did not need.
-    Mpint,
-}
-
-impl std::fmt::Display for DecodeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            DecodeError::Empty => "empty payload",
-            DecodeError::Truncated => "field cut short",
-            DecodeError::Trailing => "bytes after the last field",
-            DecodeError::TooLong => "field too long",
-            DecodeError::Utf8 => "text is not UTF-8",
-            DecodeError::Name => "malformed name-list",
-            DecodeError::Mpint => "mpint not in its shortest form",
-        })
-    }
-}
-
-impl std::error::Error for DecodeError {}
 
 /// A multiple-precision integer, in two's complement, big-endian, in its
 /// shortest form: zero has no bytes, and there is no leading 0x00 or 0xff
@@ -797,24 +745,24 @@ impl Mpint {
     /// The integer whose two's complement bytes, most significant first,
     /// are `b`. Extra sign bytes are removed. Refuses more than
     /// [`MAX_PAYLOAD`] significant bytes.
-    pub fn from_signed_bytes(b: &[u8]) -> Result<Mpint, EncodeError> {
+    pub fn from_signed_bytes(b: &[u8]) -> Result<Mpint, Error> {
         let bytes = shortest(b);
         if bytes.len() > MAX_PAYLOAD {
-            return Err(EncodeError::Unwritable);
+            return Err(Error::Unwritable);
         }
         Ok(Mpint(bytes.to_vec()))
     }
 
     /// The non-negative integer whose bytes, most significant first, are
     /// `b`. Refuses more than [`MAX_PAYLOAD`] significant bytes, including a sign byte.
-    pub fn from_unsigned_bytes(b: &[u8]) -> Result<Mpint, EncodeError> {
+    pub fn from_unsigned_bytes(b: &[u8]) -> Result<Mpint, Error> {
         let start = b.iter().position(|&x| x != 0).unwrap_or(b.len());
         let b = &b[start..];
         let size = b
             .len()
             .saturating_add(usize::from(b.first().is_some_and(|&x| x >= 0x80)));
         if size > MAX_PAYLOAD {
-            return Err(EncodeError::Unwritable);
+            return Err(Error::Unwritable);
         }
         let mut out = Vec::with_capacity(size);
         if b.first().is_some_and(|&x| x >= 0x80) {
@@ -877,9 +825,9 @@ impl<'a> Reader<'a> {
     }
 
     /// The next `n` bytes.
-    pub fn take(&mut self, n: usize) -> Result<&'a [u8], DecodeError> {
+    pub fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
         if self.rest.len() < n {
-            return Err(DecodeError::Truncated);
+            return Err(Error::Truncated);
         }
         let (head, rest) = self.rest.split_at(n);
         self.rest = rest;
@@ -887,51 +835,51 @@ impl<'a> Reader<'a> {
     }
 
     /// A `byte`.
-    pub fn byte(&mut self) -> Result<u8, DecodeError> {
+    pub fn byte(&mut self) -> Result<u8, Error> {
         Ok(self.take(1)?[0])
     }
 
     /// A `boolean`: any byte but 0 is true.
-    pub fn boolean(&mut self) -> Result<bool, DecodeError> {
+    pub fn boolean(&mut self) -> Result<bool, Error> {
         Ok(self.byte()? != 0)
     }
 
     /// A `uint32`, most significant byte first.
-    pub fn uint32(&mut self) -> Result<u32, DecodeError> {
+    pub fn uint32(&mut self) -> Result<u32, Error> {
         let b = self.take(4)?;
         Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
     }
 
     /// A `uint64`, most significant byte first.
-    pub fn uint64(&mut self) -> Result<u64, DecodeError> {
+    pub fn uint64(&mut self) -> Result<u64, Error> {
         let mut a = [0u8; 8];
         a.copy_from_slice(self.take(8)?);
         Ok(u64::from_be_bytes(a))
     }
 
     /// A `string`: a `uint32` length, then that many bytes.
-    pub fn string(&mut self) -> Result<&'a [u8], DecodeError> {
+    pub fn string(&mut self) -> Result<&'a [u8], Error> {
         let n = self.uint32()?;
-        self.take(usize::try_from(n).map_err(|_| DecodeError::Truncated)?)
+        self.take(usize::try_from(n).map_err(|_| Error::Truncated)?)
     }
 
     /// A `string` holding UTF-8 text of at most `max` bytes, bounded by [`MAX_PAYLOAD`].
-    pub fn text(&mut self, max: usize) -> Result<String, DecodeError> {
+    pub fn text(&mut self, max: usize) -> Result<String, Error> {
         let b = self.string()?;
         if b.len() > max.min(MAX_PAYLOAD) {
-            return Err(DecodeError::TooLong);
+            return Err(Error::FieldTooLong);
         }
-        String::from_utf8(b.to_vec()).map_err(|_| DecodeError::Utf8)
+        String::from_utf8(b.to_vec()).map_err(|_| Error::Utf8)
     }
 
     /// An `mpint` in its shortest form, with at most [`MAX_PAYLOAD`] content bytes.
-    pub fn mpint(&mut self) -> Result<Mpint, DecodeError> {
+    pub fn mpint(&mut self) -> Result<Mpint, Error> {
         let b = self.string()?;
         if b.len() > MAX_PAYLOAD {
-            return Err(DecodeError::TooLong);
+            return Err(Error::FieldTooLong);
         }
         if shortest(b).len() != b.len() {
-            return Err(DecodeError::Mpint);
+            return Err(Error::Mpint);
         }
         Ok(Mpint(b.to_vec()))
     }
@@ -940,15 +888,15 @@ impl<'a> Reader<'a> {
     /// empty string is an empty list. Each name must follow the RFC 4251
     /// rules for algorithm names: 1 to [`MAX_NAME`] bytes of printable
     /// US-ASCII, and at most one `@`, with text on both sides of it.
-    pub fn name_list(&mut self, max: usize) -> Result<Vec<String>, DecodeError> {
+    pub fn name_list(&mut self, max: usize) -> Result<Vec<String>, Error> {
         self.list(max, is_name)
     }
 
     /// A name-list whose names pass `ok`.
-    fn list(&mut self, max: usize, ok: fn(&[u8]) -> bool) -> Result<Vec<String>, DecodeError> {
+    fn list(&mut self, max: usize, ok: fn(&[u8]) -> bool) -> Result<Vec<String>, Error> {
         let b = self.string()?;
         if b.len() > max.min(MAX_PAYLOAD) {
-            return Err(DecodeError::TooLong);
+            return Err(Error::FieldTooLong);
         }
         if b.is_empty() {
             return Ok(Vec::new());
@@ -956,9 +904,9 @@ impl<'a> Reader<'a> {
         b.split(|&c| c == b',')
             .map(|name| {
                 if ok(name) {
-                    String::from_utf8(name.to_vec()).map_err(|_| DecodeError::Name)
+                    String::from_utf8(name.to_vec()).map_err(|_| Error::Name)
                 } else {
-                    Err(DecodeError::Name)
+                    Err(Error::Name)
                 }
             })
             .collect()
@@ -970,11 +918,11 @@ impl<'a> Reader<'a> {
     }
 
     /// Checks that every byte has been read.
-    pub fn finish(&self) -> Result<(), DecodeError> {
+    pub fn finish(&self) -> Result<(), Error> {
         if self.rest.is_empty() {
             Ok(())
         } else {
-            Err(DecodeError::Trailing)
+            Err(Error::Trailing)
         }
     }
 }
@@ -1012,12 +960,12 @@ fn put_string(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(bytes);
 }
 
-fn list_len(names: &[String], ok: fn(&[u8]) -> bool) -> Result<usize, EncodeError> {
+fn list_len(names: &[String], ok: fn(&[u8]) -> bool) -> Result<usize, Error> {
     let mut size = names.len().saturating_sub(1);
     for name in names {
         size = size.saturating_add(name.len());
         if size > MAX_NAME_LIST || !ok(name.as_bytes()) {
-            return Err(EncodeError::Unwritable);
+            return Err(Error::Unwritable);
         }
     }
     Ok(size)
@@ -1039,19 +987,19 @@ macro_rules! scalar_wire {
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         pub struct $name(#[doc = "The field's value."] pub $value);
         impl Wire for $name {
-            type ParseError = DecodeError;
-            type WriteError = EncodeError;
+            type ParseError = Error;
+            type WriteError = Error;
             /// Reads one field. Refuses short input and trailing bytes.
-            fn parse(bytes: &[u8]) -> Result<Self, DecodeError> {
+            fn parse(bytes: &[u8]) -> Result<Self, Error> {
                 let mut reader = Reader::new(bytes);
                 let value = reader.$read()?;
                 reader.finish()?;
                 Ok(Self(value))
             }
             /// Appends the field. Refuses allocation failure.
-            fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+            fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
                 out.try_reserve_exact($size)
-                    .map_err(|_| EncodeError::Unwritable)?;
+                    .map_err(|_| Error::Unwritable)?;
                 out.extend_from_slice(&($bytes)(self.0));
                 Ok(())
             }
@@ -1092,47 +1040,47 @@ pub struct SshString(
 );
 
 impl Wire for SshString {
-    type ParseError = DecodeError;
-    type WriteError = EncodeError;
+    type ParseError = Error;
+    type WriteError = Error;
     /// Reads one string. Refuses truncation, trailing bytes, and excess content.
-    fn parse(bytes: &[u8]) -> Result<Self, DecodeError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         let mut r = Reader::new(bytes);
         let value = r.string()?;
         if value.len() > MAX_PAYLOAD {
-            return Err(DecodeError::TooLong);
+            return Err(Error::FieldTooLong);
         }
         r.finish()?;
         Ok(Self(value.to_vec()))
     }
     /// Appends one string. Refuses content over [`MAX_PAYLOAD`] bytes.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         write_string(&self.0, out)
     }
 }
 
-fn write_string(bytes: &[u8], out: &mut Vec<u8>) -> Result<(), EncodeError> {
+fn write_string(bytes: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
     if bytes.len() > MAX_PAYLOAD {
-        return Err(EncodeError::Unwritable);
+        return Err(Error::Unwritable);
     }
     out.try_reserve_exact(4 + bytes.len())
-        .map_err(|_| EncodeError::Unwritable)?;
+        .map_err(|_| Error::Unwritable)?;
     put_string(out, bytes);
     Ok(())
 }
 
 impl Wire for Mpint {
-    type ParseError = DecodeError;
-    type WriteError = EncodeError;
+    type ParseError = Error;
+    type WriteError = Error;
     /// Reads one signed integer. Refuses nonminimal encoding, excess content,
     /// truncation, and trailing bytes.
-    fn parse(bytes: &[u8]) -> Result<Self, DecodeError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         let mut r = Reader::new(bytes);
         let value = r.mpint()?;
         r.finish()?;
         Ok(value)
     }
     /// Appends one integer. Refuses content over [`MAX_PAYLOAD`] bytes.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         write_string(&self.0, out)
     }
 }
@@ -1145,21 +1093,21 @@ pub struct NameList(
 );
 
 impl Wire for NameList {
-    type ParseError = DecodeError;
-    type WriteError = EncodeError;
+    type ParseError = Error;
+    type WriteError = Error;
     /// Reads one list. Refuses invalid names, excess length, truncation,
     /// and bytes after the list.
-    fn parse(bytes: &[u8]) -> Result<Self, DecodeError> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         let mut r = Reader::new(bytes);
         let names = r.name_list(MAX_NAME_LIST)?;
         r.finish()?;
         Ok(Self(names))
     }
     /// Appends one list. Refuses invalid names and lengths over [`MAX_NAME_LIST`].
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         let len = list_len(&self.0, is_name)?;
         out.try_reserve_exact(4 + len)
-            .map_err(|_| EncodeError::Unwritable)?;
+            .map_err(|_| Error::Unwritable)?;
         write_list(out, &self.0, len);
         Ok(())
     }
@@ -1385,16 +1333,16 @@ impl Message {
 }
 
 impl Wire for Message {
-    type ParseError = DecodeError;
-    type WriteError = EncodeError;
+    type ParseError = Error;
+    type WriteError = Error;
 
     /// Reads the message in a packet's payload. Refuses excess length,
     /// incomplete fields, trailing bytes, invalid UTF-8, and malformed lists.
-    fn parse(payload: &[u8]) -> Result<Message, DecodeError> {
+    fn parse(payload: &[u8]) -> Result<Message, Error> {
         if payload.len() > MAX_PAYLOAD {
-            return Err(DecodeError::TooLong);
+            return Err(Error::FieldTooLong);
         }
-        let (&number, data) = payload.split_first().ok_or(DecodeError::Empty)?;
+        let (&number, data) = payload.split_first().ok_or(Error::Empty)?;
         let mut r = Reader::new(data);
         let m = match number {
             msg::DISCONNECT => Message::Disconnect {
@@ -1444,10 +1392,10 @@ impl Wire for Message {
 
     /// Appends the payload. Refuses oversized fields or lists, invalid names,
     /// known-number `Other` variants, and values exceeding [`MAX_PAYLOAD`].
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         let (size, list_lengths) = self.encoded_lengths()?;
         out.try_reserve_exact(size)
-            .map_err(|_| EncodeError::Unwritable)?;
+            .map_err(|_| Error::Unwritable)?;
         out.push(self.number());
         match self {
             Self::Disconnect {
@@ -1490,7 +1438,7 @@ impl Wire for Message {
 
 impl Message {
     /// Checks the payload size and all ten KEXINIT list lengths before writing.
-    fn encoded_lengths(&self) -> Result<(usize, [usize; 10]), EncodeError> {
+    fn encoded_lengths(&self) -> Result<(usize, [usize; 10]), Error> {
         let mut list_lengths = [0; 10];
         let size = match self {
             Self::Disconnect {
@@ -1502,7 +1450,7 @@ impl Message {
                     || description.len() > MAX_TEXT
                     || language.len() > MAX_TEXT
                 {
-                    return Err(EncodeError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 DISCONNECT_FIXED
                     .saturating_add(description.len())
@@ -1512,7 +1460,7 @@ impl Message {
                 message, language, ..
             } => {
                 if message.len() > MAX_TEXT || language.len() > MAX_TEXT {
-                    return Err(EncodeError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 DEBUG_FIXED
                     .saturating_add(message.len())
@@ -1522,7 +1470,7 @@ impl Message {
             Self::Unimplemented(_) => 5,
             Self::ServiceRequest(name) | Self::ServiceAccept(name) => {
                 if name.len() > MAX_NAME {
-                    return Err(EncodeError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 5 + name.len()
             }
@@ -1537,13 +1485,13 @@ impl Message {
             Self::NewKeys => 1,
             Self::Other { number, data } => {
                 if is_known(*number) {
-                    return Err(EncodeError::Unwritable);
+                    return Err(Error::Unwritable);
                 }
                 1usize.saturating_add(data.len())
             }
         };
         if size > MAX_PAYLOAD {
-            Err(EncodeError::Unwritable)
+            Err(Error::Unwritable)
         } else {
             Ok((size, list_lengths))
         }
@@ -1700,7 +1648,7 @@ mod tests {
             &[0, 0, 0, 2, 0, 0x7f],
             &[0, 0, 0, 2, 0xff, 0x80],
         ] {
-            assert_eq!(Reader::new(wire).mpint(), Err(DecodeError::Mpint));
+            assert_eq!(Reader::new(wire).mpint(), Err(Error::Mpint));
         }
     }
 
@@ -1728,27 +1676,27 @@ mod tests {
         assert_eq!(r.uint64(), Ok(0x0102030405060708));
         assert_eq!(r.string(), Ok(&b"testing"[..]));
         assert_eq!(r.finish(), Ok(()));
-        assert_eq!(r.byte(), Err(DecodeError::Truncated));
+        assert_eq!(r.byte(), Err(Error::Truncated));
         // Any byte but 0 is true.
         assert_eq!(Reader::new(&[0x42]).boolean(), Ok(true));
         // A length past the end, and the largest length.
         assert_eq!(
             Reader::new(&[0, 0, 0, 5, 1]).string(),
-            Err(DecodeError::Truncated)
+            Err(Error::Truncated)
         );
         assert_eq!(
             Reader::new(&[0xff, 0xff, 0xff, 0xff]).string(),
-            Err(DecodeError::Truncated)
+            Err(Error::Truncated)
         );
         assert_eq!(
             Reader::new(&[0, 0, 0, 1, 0xff]).text(10),
-            Err(DecodeError::Utf8)
+            Err(Error::Utf8)
         );
         assert_eq!(
             Reader::new(&[0, 0, 0, 2, b'a', b'b']).text(1),
-            Err(DecodeError::TooLong)
+            Err(Error::FieldTooLong)
         );
-        assert_eq!(Reader::new(&[1]).finish(), Err(DecodeError::Trailing));
+        assert_eq!(Reader::new(&[1]).finish(), Err(Error::Trailing));
         // Every truncated prefix of each type.
         for n in 0..out.len() {
             let mut r = Reader::new(&out[..n]);
@@ -1761,7 +1709,7 @@ mod tests {
                 r.string()?;
                 Ok(())
             })();
-            assert_eq!(got, Err(DecodeError::Truncated), "{n}");
+            assert_eq!(got, Err(Error::Truncated), "{n}");
         }
     }
 
@@ -1806,41 +1754,41 @@ mod tests {
 
     #[test]
     fn message_errors() {
-        assert_eq!(Message::parse(&[]), Err(DecodeError::Empty));
-        assert_eq!(Message::parse(&[21, 0]), Err(DecodeError::Trailing));
+        assert_eq!(Message::parse(&[]), Err(Error::Empty));
+        assert_eq!(Message::parse(&[21, 0]), Err(Error::Trailing));
         assert_eq!(
             Message::parse(&[3, 0, 0, 0, 1, 9]),
-            Err(DecodeError::Trailing)
+            Err(Error::Trailing)
         );
         assert_eq!(
             Message::parse(&[5, 0, 0, 0, 1, 0xff]),
-            Err(DecodeError::Utf8)
+            Err(Error::Utf8)
         );
         assert_eq!(
             Message::parse(&vec![50; MAX_PAYLOAD + 1]),
-            Err(DecodeError::TooLong)
+            Err(Error::FieldTooLong)
         );
         let mut long = vec![5];
         SshString([b'a'; MAX_NAME + 1].to_vec())
             .write(&mut long)
             .unwrap();
-        assert_eq!(Message::parse(&long), Err(DecodeError::TooLong));
+        assert_eq!(Message::parse(&long), Err(Error::FieldTooLong));
         let mut long = vec![1, 0, 0, 0, 1];
         SshString(vec![b'a'; MAX_TEXT + 1])
             .write(&mut long)
             .unwrap();
         SshString((b"").to_vec()).write(&mut long).unwrap();
-        assert_eq!(Message::parse(&long), Err(DecodeError::TooLong));
+        assert_eq!(Message::parse(&long), Err(Error::FieldTooLong));
         let mut kex = vec![20];
         kex.extend_from_slice(&[0; 16]);
         SshString((b"a,,b").to_vec()).write(&mut kex).unwrap();
-        assert_eq!(Message::parse(&kex), Err(DecodeError::Name));
+        assert_eq!(Message::parse(&kex), Err(Error::Name));
         let mut kex = vec![20];
         kex.extend_from_slice(&[0; 16]);
         SshString(vec![b'a'; MAX_NAME_LIST + 1])
             .write(&mut kex)
             .unwrap();
-        assert_eq!(Message::parse(&kex), Err(DecodeError::TooLong));
+        assert_eq!(Message::parse(&kex), Err(Error::FieldTooLong));
         // A boolean other than 0 or 1 still reads as true.
         let mut k = Message::KexInit(KexInit::default()).to_bytes().unwrap();
         let flag = k.len() - 5;
@@ -1916,7 +1864,7 @@ mod tests {
         SshString((b"en,,fr").to_vec()).write(&mut kex).unwrap();
         SshString((b"").to_vec()).write(&mut kex).unwrap();
         kex.extend_from_slice(&[0; 5]);
-        assert_eq!(Message::parse(&kex), Err(DecodeError::Name));
+        assert_eq!(Message::parse(&kex), Err(Error::Name));
     }
 
     #[test]
@@ -1970,14 +1918,14 @@ mod tests {
             b"@",
         ] {
             let wire = SshString(bad.to_vec()).to_bytes().unwrap();
-            assert_eq!(NameList::parse(&wire), Err(DecodeError::Name));
+            assert_eq!(NameList::parse(&wire), Err(Error::Name));
         }
         let wire = SshString(b"abcdef".to_vec()).to_bytes().unwrap();
-        assert_eq!(Reader::new(&wire).name_list(5), Err(DecodeError::TooLong));
+        assert_eq!(Reader::new(&wire).name_list(5), Err(Error::FieldTooLong));
         for bad in ["", "b c", "d,e", &"x".repeat(65), "a@b@c", "@z"] {
             assert_eq!(
                 NameList(names(&["a", bad, "f"])).to_bytes(),
-                Err(EncodeError::Unwritable)
+                Err(Error::Unwritable)
             );
         }
         let valid = NameList(names(&["aes@x.org", "b", "x@y"]));
@@ -1985,7 +1933,7 @@ mod tests {
         contract::check_wire_value(&valid);
         assert_eq!(
             NameList(vec!["a".repeat(MAX_NAME); 600]).to_bytes(),
-            Err(EncodeError::Unwritable)
+            Err(Error::Unwritable)
         );
     }
 
@@ -2001,7 +1949,7 @@ mod tests {
         assert_eq!(id.to_bytes().unwrap(), bytes);
         let mut trailing = bytes.to_vec();
         trailing.extend_from_slice(b"rest");
-        assert_eq!(Identification::parse(&trailing), Err(StreamError::Trailing));
+        assert_eq!(Identification::parse(&trailing), Err(Error::Trailing));
         let id = Identification::parse(b"SSH-1.99-Cisco1.25\n").unwrap();
         assert!(id.is_v2());
         assert!(!Identification::new("1.5", "x", None).unwrap().is_v2());
@@ -2017,7 +1965,7 @@ mod tests {
             b"SSH-2.0-x a\rb\r\n",
             b"SSH-2.0-x \xff\r\n",
         ] {
-            assert_eq!(Line::parse(bad), Err(StreamError::BadVersion), "{bad:?}");
+            assert_eq!(Line::parse(bad), Err(Error::BadVersion), "{bad:?}");
         }
         for (extra, valid) in [(0, true), (1, false)] {
             let software = "a".repeat(MAX_VERSION_LINE - 10 + extra);
@@ -2034,7 +1982,7 @@ mod tests {
         ] {
             assert_eq!(
                 Identification::new(proto, software, comments),
-                Err(StreamError::BadVersion)
+                Err(Error::BadVersion)
             );
         }
         let id = Identification::new("2.0", "x", Some("")).unwrap();
@@ -2052,10 +2000,10 @@ mod tests {
         assert_eq!(line.to_bytes().unwrap(), b"Welcome to the tank farm\r\n");
         contract::check_wire_value(&line);
         assert_eq!(Line::parse(b"\n"), Ok(Line::Banner(vec![])));
-        assert_eq!(Line::parse(b"a\0b\n"), Err(StreamError::Nul));
+        assert_eq!(Line::parse(b"a\0b\n"), Err(Error::Nul));
         assert_eq!(
             Line::parse(&[b'x'; MAX_BANNER_LINE]),
-            Err(StreamError::LineTooLong)
+            Err(Error::LineTooLong)
         );
         let longest = [vec![b'x'; MAX_BANNER_LINE - 1], vec![b'\n']].concat();
         contract::check_wire::<Line>(&longest);
@@ -2067,7 +2015,7 @@ mod tests {
         ] {
             assert_eq!(
                 Line::Banner(bad.to_vec()).to_bytes(),
-                Err(EncodeError::Unwritable)
+                Err(Error::Unwritable)
             );
         }
         for text in [
@@ -2079,7 +2027,7 @@ mod tests {
         }
         let line = b"SSH-2.0-OpenSSH_9.6 c\r\n";
         for n in 0..line.len() {
-            assert_eq!(Line::parse(&line[..n]), Err(StreamError::Truncated));
+            assert_eq!(Line::parse(&line[..n]), Err(Error::Truncated));
         }
         contract::check_decode_with_alloc_limit(Lines::new, line, 2 * MAX_BANNER_LINE);
     }
@@ -2091,7 +2039,7 @@ mod tests {
         assert_eq!(bytes, [0, 0, 0, 12, 10, 21, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(Packet::parse(&bytes), Ok(packet));
         for n in 0..bytes.len() {
-            assert_eq!(Packet::parse(&bytes[..n]), Err(PacketParseError::Truncated));
+            assert_eq!(Packet::parse(&bytes[..n]), Err(Error::Truncated));
         }
         let exact = Packet {
             payload: vec![1, 2, 3],
@@ -2105,37 +2053,37 @@ mod tests {
                     padding: vec![9; padding]
                 }
                 .to_bytes(),
-                Err(EncodeError::Unwritable)
+                Err(Error::Unwritable)
             );
         }
         for length in [4u32, 13, 35004, u32::MAX] {
             assert_eq!(
                 Packet::parse(&length.to_be_bytes()),
-                Err(PacketParseError::Packet(StreamError::PacketLength(length)))
+                Err(Error::PacketLength(length))
             );
         }
         assert_eq!(
             Packet::parse(&[0, 0, 0x88, 0xb4]),
-            Err(PacketParseError::Truncated)
+            Err(Error::Truncated)
         );
         for pad in [3, 12] {
             assert_eq!(
                 Packet::parse(&[0, 0, 0, 12, pad]),
-                Err(PacketParseError::Packet(StreamError::Padding(pad)))
+                Err(Error::Padding(pad))
             );
         }
         assert_eq!(
             Packet::parse(&[0, 0, 0, 12, 11]),
-            Err(PacketParseError::Truncated)
+            Err(Error::Truncated)
         );
         assert_eq!(
             Packet::parse(&[0, 0, 0x88, 0xb4, 4]),
-            Err(PacketParseError::Packet(StreamError::PayloadTooLong(34991)))
+            Err(Error::PayloadTooLong(34991))
         );
         contract::check_wire_value(&Packet::new(vec![2; MAX_PAYLOAD]));
         assert_eq!(
             Packet::new(vec![2; MAX_PAYLOAD + 100]).to_bytes(),
-            Err(EncodeError::Unwritable)
+            Err(Error::Unwritable)
         );
     }
 
@@ -2153,9 +2101,9 @@ mod tests {
                     continue;
                 }
                 let error = if n == 0 {
-                    DecodeError::Empty
+                    Error::Empty
                 } else {
-                    DecodeError::Truncated
+                    Error::Truncated
                 };
                 assert_eq!(Message::parse(&payload[..n]), Err(error));
             }
@@ -2206,20 +2154,20 @@ mod tests {
                 data: vec![0; MAX_PAYLOAD],
             },
         ] {
-            assert_eq!(m.to_bytes(), Err(EncodeError::Unwritable));
+            assert_eq!(m.to_bytes(), Err(Error::Unwritable));
             contract::check_wire_value(&m);
         }
         assert_eq!(
             SshString(vec![0; MAX_PAYLOAD + 1]).to_bytes(),
-            Err(EncodeError::Unwritable)
+            Err(Error::Unwritable)
         );
         assert_eq!(
             Mpint::from_signed_bytes(&vec![1; MAX_PAYLOAD + 1]),
-            Err(EncodeError::Unwritable)
+            Err(Error::Unwritable)
         );
         assert_eq!(
             Mpint::from_unsigned_bytes(&vec![0xff; MAX_PAYLOAD]),
-            Err(EncodeError::Unwritable)
+            Err(Error::Unwritable)
         );
     }
 
@@ -2286,13 +2234,13 @@ mod tests {
         assert!(matches!(stream.next(), Some(Ok(Event::Version(_)))));
         assert_eq!(
             stream.next(),
-            Some(Err(Fail::Protocol(StreamError::PacketLength(5))))
+            Some(Err(Fail::Protocol(Error::PacketLength(5))))
         );
         assert!(stream.next().is_none());
         assert_eq!(stream.push(b"more"), 4);
         let (items, failure) = decode_all(Events::new, &b"x\r\n".repeat(MAX_BANNER_LINES + 1));
         assert_eq!(items.len(), MAX_BANNER_LINES);
-        assert_eq!(failure, Some(Fail::Protocol(StreamError::TooManyLines)));
+        assert_eq!(failure, Some(Fail::Protocol(Error::TooManyLines)));
         let big = Packet::from_message(&Message::Ignore(vec![1; MAX_DATA]))
             .unwrap()
             .to_bytes()
@@ -2304,16 +2252,16 @@ mod tests {
         contract::check_decode_with_alloc_limit(Events::new, &long_line, 2 * MAX_PACKET);
         assert_eq!(
             decode_all(Events::new, &long_line).1,
-            Some(Fail::Protocol(StreamError::LineTooLong))
+            Some(Fail::Protocol(Error::LineTooLong))
         );
         contract::check_decode_with_alloc_limit(
-            Frames::new,
+            Packets::new,
             &[0, 0, 0x88, 0xb4, 4],
             2 * MAX_PACKET,
         );
         assert_eq!(
             decode_all(Events::after_version, &[0, 0, 0x88, 0xb4, 4]).1,
-            Some(Fail::Protocol(StreamError::PayloadTooLong(34_991)))
+            Some(Fail::Protocol(Error::PayloadTooLong(34_991)))
         );
     }
 
@@ -2390,7 +2338,7 @@ mod tests {
             mutate(&mut g, &mut bytes);
             contract::check_decode_with_alloc_limit(Events::new, &bytes, 2 * MAX_PACKET);
             contract::check_decode_with_alloc_limit(Events::after_version, &bytes, 2 * MAX_PACKET);
-            contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_PACKET);
+            contract::check_decode_with_alloc_limit(Packets::new, &bytes, 2 * MAX_PACKET);
             contract::check_decode_with_alloc_limit(Lines::new, &bytes, 2 * MAX_BANNER_LINE);
             contract::check_wire::<Message>(&bytes);
             contract::check_wire::<Packet>(&bytes);
