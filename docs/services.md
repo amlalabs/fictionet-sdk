@@ -63,9 +63,56 @@ impl Service for Prompt {
 world a directory, a process model or an order book. The service itself
 is made fresh for each connection.
 
-A service can also ask for a timer (`ctx.wake_in`, then `on_tick`), hand
-over async work (`ctx.defer`, which the tower adapter uses), and hand the
-connection back with its unread bytes (`Flow::Upgrade`, for STARTTLS).
+A service can also:
+
+- **Run timers.** `ctx.set_timer("heartbeat", d)` arms a named timer and
+  `on_timer` hears which one went off. A FIX session has four (heartbeat,
+  TestRequest, logon, logout), each armed and cancelled on its own. A due
+  timer is handled before more input is read, so a client that never
+  stops sending cannot starve it.
+- **Be woken.** `ctx.wake_handle()` gives a handle the world keeps, such
+  as next to an order in the book. When another trader's order fills it,
+  that connection calls `handle.wake()`, and this connection's `on_wake`
+  writes the execution report. SMB2 oplock breaks, LDAP persistent search
+  and MCP notifications work the same way.
+- **Hand over async work.** `ctx.defer(work)` runs work whose bytes are
+  written in order before the next item (an HTTP/1 response from a tower
+  service). `ctx.defer_keyed(key, work)` runs work beside the reads and
+  the other keyed work, each writing whole frames, and `on_done` hears
+  when one ends: concurrent responses, as HTTP/2 streams need.
+- **Upgrade the connection.** `Flow::Upgrade(Upgrade::Tls)` shakes hands
+  as a TLS server with `ServeOptions::starttls` and calls `on_open` again
+  over TLS (`ctx.conn().tls` is then true): STARTTLS in SMTP, IMAP and
+  LDAP, and Postgres's `SSLRequest`. `Upgrade::Decoder` goes on with a
+  fresh decoder; `Upgrade::Handoff` hands the connection and its unread
+  bytes back to whoever called `serve`.
+- **Say what it holds.** `Service::held` reports bytes the service keeps
+  for the connection, such as a request body, so they count against the
+  sandbox's budget with the decoder's own.
+
+A panic in a call closes that connection, records `conn.panic`, and the
+rest of the world goes on. An error the service returns closes it and
+records `conn.error`.
+
+### One protocol, two framings
+
+Kerberos frames a message with a four-byte length over TCP, and sends one
+message per datagram over UDP. `Service::Decode` is one type, so write
+two thin services over one core of your own: each picks its decoder and
+hands the message to the shared code. `ctx.conn().transport` says which
+one the call came over, so the KDC can answer `KRB_ERR_RESPONSE_TOO_BIG`
+on UDP. Serve them with `Host::tcp(88, ..)` and `Host::udp(88, ..)` and
+the same `World`.
+
+### Dates belong to the world
+
+`ctx.now()` is the run's clock: time since the run started, with no
+date. A service that needs a date, such as for ticket lifetimes,
+certificate validity or a FIX `SendingTime`, takes it from its `World`,
+which decides what day it is in the world. Record the world's date in the
+journal's first entry (`Net::start_fields` with a `world_date` field), so
+a reader can place every entry. The `journal.start` entry's `wall` field
+holds the host's wall clock at the start of the run.
 
 ## 2. A test with no runtime
 
@@ -82,6 +129,10 @@ assert!(h.closed());
 assert_eq!(h.events()[0].kind, "login");
 ```
 
+The harness runs the same state machine as the driver: `advance` moves
+its clock and fires timers in order, `poll` runs deferred work and wakes,
+and `resume` goes on after an upgrade.
+
 ## 3. A network
 
 `Net` builds the network around its hosts. Each host has addresses (given
@@ -93,14 +144,14 @@ use std::sync::Arc;
 use fictionet::stdlib::net::Net;
 
 let password = Arc::new("hunter2".to_owned());
+let at: std::net::Ipv4Addr = "10.20.0.5".parse()?;
 Net::new()
-    .host("vault")
-        .at("10.20.0.5".parse::<std::net::Ipv4Addr>()?)
-        .dns_name("vault.corp.test")
-        .tcp(2323, password.clone(), || Prompt)
-        .done()
+    .host("vault", |h| h.at(at).dns_name("vault.corp.test").tcp(2323, password.clone(), || Prompt))
     .serve(&cx, attachments)?;
 ```
+
+`serve` fails if a host cannot be served as declared: an address a host
+cannot have, two services on one port, or a port that cannot be opened.
 
 Every sandbox that attaches joins `10.0.0.0/24` (and `2001:db8::/64`),
 gets its address by DHCP or by its first packet, and asks the gateway at
@@ -109,15 +160,25 @@ address with no host answers "host unreachable", and a closed port a RST.
 
 Other kinds of port:
 
-- `udp(port, world, make)`: one datagram at a time, as DNS and Modbus over
-  UDP frame their messages.
+- `tcp_with(port, world, make, opts)`: the same with `ServeOptions`: a
+  connection cap, an idle limit, a fault plan, a STARTTLS config.
+- `udp(port, world, make)`: one service for the port, which gets every
+  datagram, each decoded on its own as DNS and Modbus over UDP frame their
+  messages. It can send several datagrams to anyone (`ctx.send_to`) and
+  run timers, as a MoldUDP64 server does for retransmissions and
+  heartbeats.
 - `tls(port, sni, config, world, make)`: TLS first, picked by the name the
-  client sends; several calls on one port route by SNI.
-- `http(port, handler)` and `https(port, config, handler)`: HTTP sites.
-  Hosts at one address share the port, and each request goes to the host
-  it names.
-- `web(site)`: a website on ports 80 and 443, as `web::Sites` serves one.
-- `accept(port, accept)`: a connection handler of the world's own.
+  client sends (`Sni::Any`, `Sni::Names` for the host's DNS names, or one
+  name); several calls on one port route by SNI.
+- `accept(port, accept)` and `tls_accept(port, sni, config, accept)`: an
+  `Accept` of the world's own. HTTP is one: `httpd::Site`, below.
+
+Each sandbox may hold 256 connections at once to one machine, and the
+bytes its connections hold together are charged to its budget (256 MiB);
+`Net::limits` changes these and the handshake and DNS timers. Tests set
+small ones. `Net::seed` seeds every service's randomness, mixed with each
+connection's number, so a run whose connections arrive in the same order
+repeats.
 
 `Net::route(name, prefix)` wires a trusted sandbox, such as a real
 container that plays one of the hosts, straight to the router at a fixed
@@ -142,6 +203,24 @@ An axum `Router`, or any tower service over `http::Request<web::Body>`,
 runs with `httpd::tower(service)`. A handler adds facts to its request's
 journal entry by putting `journal::Fields` in its response's extensions.
 
+On a network, `httpd::Site` is the `Accept` that serves a handler on a
+port, and `httpd::Website` puts one on ports 80 and 443 as `web::Sites`
+does:
+
+```rust
+use fictionet::stdlib::httpd::{Site, Website};
+
+Net::new()
+    .host("intranet", |h| h.dns_name("intranet.corp.test").accept(80, Site::new(api.clone())))
+    .add_host(Website::new(api).tls(move |_| config.clone()).on(Host::new("www").dns_name("www.corp.test")))
+    /* ... */;
+```
+
+Sites of several hosts at one address share the port as virtual hosts:
+the first host's `Site` takes in the others through `Accept::share`. `Net`
+itself knows nothing of HTTP, so a copy of `httpd` with its own handlers
+plugs in the same way.
+
 `Http1` speaks HTTP/1.0 and 1.1 on the stdlib's `http1` decoder. HTTP/2
 runs on hyper behind the same `Handler` trait until the stdlib's own
 HTTP/2 lands; handlers will not change.
@@ -162,7 +241,13 @@ Net::new().journal(journal.clone()) /* ... */;
 ```
 
 The file has one JSON object per line: `seq`, `at`, `service`, `kind`,
-`level`, `summary`, `sandbox`, `conn`, `local`, `peer`, `sni`, `fields`.
+`level`, `summary`, `sandbox`, `conn`, `local`, `peer`, `transport`,
+`sni`, `fields`. The network's first entry is `journal.start`, whose
+`wall` field puts the run's clock on a calendar. Field names are fixed
+by the code that records; names that come from the wire, such as LDAP
+attributes, go under one field as an object. Whether anyone reads the
+journal is checked before every call, so a dashboard attached in the
+middle of a long session sees the rest of it.
 An entry the file's writer could not keep up with is counted in
 `journal.lost()`; a grader throws such a sample away.
 
