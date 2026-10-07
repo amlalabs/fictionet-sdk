@@ -732,7 +732,7 @@ impl std::fmt::Display for Error {
             Error::Truncated => f.write_str("IPP head ended early"),
             Error::Trailing => f.write_str("bytes follow the IPP head"),
             Error::DocumentTooLong => write!(f, "document exceeds {MAX_DOCUMENT} bytes"),
-            Error::BadRequest { request_id, error } => write!(f, "IPP request {request_id}: {error}"),
+            Error::BadRequest { request_id, .. } => write!(f, "IPP request {request_id} is malformed"),
         }
     }
 }

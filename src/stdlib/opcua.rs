@@ -400,7 +400,7 @@ impl std::fmt::Display for Error {
             Error::TooLarge { size, limit } => {
                 write!(f, "chunk size {size} is over the limit of {limit}")
             }
-            Error::Decode(t, e) => write!(f, "{t:?} chunk: {e}"),
+            Error::Decode(t, _) => write!(f, "malformed {t:?} chunk"),
             Error::Interleaved => f.write_str("chunks of two messages were interleaved"),
             Error::Mismatch => f.write_str("a chunk named another channel or token"),
             Error::Sequence { expected, got } => {

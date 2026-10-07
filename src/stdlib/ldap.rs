@@ -117,7 +117,7 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::Ber(e) => write!(f, "malformed BER: {e}"),
+            Error::Ber(_) => f.write_str("malformed BER"),
             Error::TooLarge(n) => write!(f, "message of {n} bytes is over the limit"),
             Error::Operation(t) => write!(f, "{t} is not an LDAP operation"),
             Error::Range(what) => write!(f, "{what} out of range"),

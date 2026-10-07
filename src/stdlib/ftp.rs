@@ -1273,7 +1273,7 @@ impl core::fmt::Display for FrameError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Incomplete => f.write_str("incomplete FTP control unit"),
-            Self::Reply(e) => e.fmt(f),
+            Self::Reply(_) => f.write_str("malformed FTP reply"),
         }
     }
 }

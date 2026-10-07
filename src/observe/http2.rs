@@ -852,7 +852,7 @@ impl Present for Capture {
         packet.info = match error {
             Fail::Protocol(error @ CaptureError::GrpcTruncated { .. }) => error.to_string(),
             Fail::Protocol(CaptureError::Http2(error)) => error.to_string(),
-            _ => format!("HTTP/2: {error}"),
+            _ => format!("HTTP/2: {}", fictionet::ErrorChain(error)),
         };
     }
     /// Bounds decoded headers by the packet's remaining display room.

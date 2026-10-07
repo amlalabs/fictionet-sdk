@@ -37,7 +37,7 @@ pub enum Fail<E> {
 impl<E: fmt::Display> fmt::Display for Fail<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Protocol(e) => write!(f, "decoder error: {e}"),
+            Self::Protocol(_) => f.write_str("the decoder failed"),
             Self::Truncated { unread } => write!(f, "input ended with {unread} unread bytes"),
             Self::Stuck { unread, capacity } => write!(
                 f,
@@ -388,8 +388,8 @@ pub enum PumpError<E, H> {
 impl<E: fmt::Display, H: fmt::Display> fmt::Display for PumpError<E, H> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Decode(e) => e.fmt(f),
-            Self::Handler(e) => write!(f, "item handler: {e}"),
+            Self::Decode(_) => f.write_str("decoding failed"),
+            Self::Handler(_) => f.write_str("the item handler failed"),
         }
     }
 }

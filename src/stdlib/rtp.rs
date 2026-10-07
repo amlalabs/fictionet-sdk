@@ -156,7 +156,7 @@ impl std::fmt::Display for Error {
             Error::TooLong(n) => write!(f, "RTP packet of {n} bytes, over {MAX_PACKET}"),
             Error::Padding => f.write_str("RTP padding count is 0 or runs into the header"),
             Error::Extension => f.write_str("RTP header extension element runs past its end"),
-            Error::Rtcp(e) => e.fmt(f),
+            Error::Rtcp(_) => f.write_str("malformed RTCP packet"),
             Error::Unwritable => f.write_str("value cannot be written without changing it"),
         }
     }

@@ -69,7 +69,7 @@ impl<E: fmt::Display> fmt::Display for CollectError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::TooLong { limit } => write!(f, "collection exceeds {limit} bytes"),
-            Self::Parse(e) => write!(f, "collection parse: {e}"),
+            Self::Parse(_) => f.write_str("the collected bytes did not parse"),
         }
     }
 }
@@ -288,7 +288,7 @@ pub enum AssembleError<E> {
 impl<E: fmt::Display> fmt::Display for AssembleError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Inner(e) => write!(f, "fragment decoder: {e}"),
+            Self::Inner(_) => f.write_str("the fragment decoder failed"),
             Self::TooLong { limit } => write!(f, "assembly exceeds {limit} bytes"),
             Self::Allocation => f.write_str("assembly allocation failed"),
             Self::Incomplete { held } => write!(f, "incomplete assembly of {held} bytes"),

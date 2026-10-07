@@ -178,7 +178,7 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::Unwritable => f.write_str("value cannot be written without changing it"),
-            Error::Asn1(e) => write!(f, "OCSP DER: {e}"),
+            Error::Asn1(_) => f.write_str("malformed OCSP DER"),
             Error::TooLong => write!(f, "OCSP message longer than {MAX_MESSAGE} bytes"),
             Error::TooMany => f.write_str("OCSP list longer than its limit"),
             Error::ExplicitDefault => f.write_str("DEFAULT value written out (DER)"),

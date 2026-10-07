@@ -550,7 +550,7 @@ impl std::fmt::Display for RaceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             RaceError::Deadline => "the deadline passed",
-            RaceError::Cancelled => "the region was cancelled",
+            RaceError::Cancelled => "the race stopped",
         })
     }
 }
@@ -599,8 +599,8 @@ pub enum JoinError {
 impl std::fmt::Display for JoinError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            JoinError::Failed(e) => write!(f, "the task failed: {e}"),
-            JoinError::Cancelled => f.write_str("the region was cancelled"),
+            JoinError::Failed(_) => f.write_str("the task failed"),
+            JoinError::Cancelled => f.write_str("the join stopped"),
         }
     }
 }

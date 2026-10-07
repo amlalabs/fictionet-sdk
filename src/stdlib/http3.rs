@@ -227,9 +227,9 @@ impl std::fmt::Display for Error {
         match self {
             Self::Unwritable => f.write_str("value cannot be written without changing it"),
             Self::Message(s) => f.write_str(s),
-            Self::Qpack(e) => write!(f, "QPACK: {e}"),
-            Self::QpackEncoderStream(e) => write!(f, "QPACK encoder stream: {e}"),
-            Self::QpackDecoderStream(e) => write!(f, "QPACK decoder stream: {e}"),
+            Self::Qpack(_) => f.write_str("malformed QPACK field section"),
+            Self::QpackEncoderStream(_) => f.write_str("malformed QPACK encoder stream"),
+            Self::QpackDecoderStream(_) => f.write_str("malformed QPACK decoder stream"),
             Self::Truncated => f.write_str("input ended before a complete HTTP/3 value"),
             Self::Trailing => f.write_str("bytes follow the HTTP/3 value"),
             _ => write!(f, "HTTP/3: {self:?}"),

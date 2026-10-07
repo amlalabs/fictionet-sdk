@@ -48,7 +48,7 @@ pub enum RewriteError<E> {
 impl<E: fmt::Display> fmt::Display for RewriteError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Write(e) => write!(f, "replacement writer: {e}"),
+            Self::Write(_) => f.write_str("the replacement writer failed"),
             Self::TooLong { limit } => write!(f, "replacement exceeds {limit} output bytes"),
             Self::Allocation => f.write_str("replacement allocation failed"),
             Self::Capacity { buffered, limit } => {
@@ -77,8 +77,8 @@ pub enum InterceptError<D, W> {
 impl<D: fmt::Display, W: fmt::Display> fmt::Display for InterceptError<D, W> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Decode(e) => e.fmt(f),
-            Self::Rewrite(e) => e.fmt(f),
+            Self::Decode(_) => f.write_str("the decoder failed"),
+            Self::Rewrite(_) => f.write_str("the rewrite failed"),
         }
     }
 }

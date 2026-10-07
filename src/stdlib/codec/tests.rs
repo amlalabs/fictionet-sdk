@@ -1224,7 +1224,7 @@ fn contract_alloc_limit_rejects_large_buffer() {
     contract::check_decode_with_alloc_limit(|| Frames, &[7, 1, 2, 3, 4, 5, 6, 7], 4);
 }
 #[test]
-fn wrappers_chain_to_their_source_and_display_it() {
+fn wrappers_chain_to_their_source_and_display_only_their_own_context() {
     use alloc::string::ToString;
     use core::error::Error as _;
     fn chained(e: &dyn core::error::Error) -> bool {
@@ -1249,7 +1249,7 @@ fn wrappers_chain_to_their_source_and_display_it() {
     assert!(chained(&InterceptError::<TestError, _>::Rewrite(
         RewriteError::Write(TestError)
     )));
-    assert!(fail.to_string().contains(&TestError.to_string()));
+    assert!(!fail.to_string().contains(&TestError.to_string()));
     for verdict in [
         Fail::<TestError>::Truncated { unread: 2 },
         Fail::Stuck {

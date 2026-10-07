@@ -313,8 +313,8 @@ impl std::fmt::Display for HandshakeError {
             HandshakeError::Failed(why) => f.write_str(why),
             HandshakeError::Rejected => f.write_str("there is no TLS config for the name the client asked for"),
             HandshakeError::TimedOut => f.write_str("the handshake did not finish in time"),
-            HandshakeError::Conn(e) => write!(f, "{e}"),
-            HandshakeError::Cancelled => f.write_str("the region was cancelled"),
+            HandshakeError::Conn(_) => f.write_str("the connection failed during the handshake"),
+            HandshakeError::Cancelled => f.write_str("the handshake stopped"),
         }
     }
 }

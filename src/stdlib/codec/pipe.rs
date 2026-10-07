@@ -222,8 +222,8 @@ pub enum PipeError<OE, IE> {
 impl<OE: fmt::Display, IE: fmt::Display> fmt::Display for PipeError<OE, IE> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Outer(e) => write!(f, "outer decoder: {e}"),
-            Self::Inner(e) => write!(f, "inner stream: {e}"),
+            Self::Outer(_) => f.write_str("the outer decoder failed"),
+            Self::Inner(_) => f.write_str("the inner stream failed"),
             Self::PayloadTooLong { limit } => write!(f, "payload exceeds {limit} bytes"),
         }
     }

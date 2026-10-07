@@ -130,8 +130,8 @@ impl std::fmt::Display for Error {
             Self::Limit(s) => write!(f, "RDP limit exceeded: {s}"),
             Self::Unsupported(s) => write!(f, "unsupported RDP {s}"),
             Self::Unwritable => f.write_str("value cannot be written without changing it"),
-            Self::Tpkt(e) => e.fmt(f),
-            Self::Cotp(e) => e.fmt(f),
+            Self::Tpkt(_) => f.write_str("malformed TPKT packet"),
+            Self::Cotp(_) => f.write_str("malformed COTP TPDU"),
         }
     }
 }

@@ -1159,7 +1159,7 @@ impl serve::Service for Http1 {
             self.dispatch(driver, Body::empty(), true);
             return Ok(());
         }
-        driver.record(error_event(driver.conn(), "protocol", error.to_string()));
+        driver.record(error_event(driver.conn(), "protocol", fictionet::ErrorChain(error).to_string()));
         let date = date_header(self.date, driver.now());
         write_simple(driver.reply(), Version::HTTP_11, StatusCode::BAD_REQUEST, date);
         Ok(())

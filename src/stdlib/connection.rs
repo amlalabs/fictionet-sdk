@@ -176,7 +176,7 @@ impl std::fmt::Display for ConnError {
             ConnError::TimedOut => "connection timed out",
             ConnError::Closed => "the connection's carrier stopped",
             ConnError::Broken => "the connection got bytes it could not understand",
-            ConnError::Cancelled => "the region was cancelled",
+            ConnError::Cancelled => "the connection's wait stopped",
         })
     }
 }

@@ -291,7 +291,8 @@ fn join_returns_what_the_work_returned() {
     assert_eq!(e.downcast_ref::<Boom>().map(|b| b.0), Some("bad"));
     assert!(std::ptr::addr_eq(&*e, &*out));
     let joined = JoinError::Failed(e);
-    assert_eq!(joined.to_string(), "the task failed: bad");
+    assert_eq!(joined.to_string(), "the task failed");
+    assert_eq!(fictionet::ErrorChain(&joined).to_string(), "the task failed: bad");
     assert!(std::error::Error::source(&joined).is_some_and(|s| s.is::<Boom>()));
 }
 
@@ -665,7 +666,7 @@ fn dropping_the_run_ends_waits_outside_it() {
     std::thread::sleep(Duration::from_millis(50));
     drop(future);
     let res = rx.recv_timeout(Duration::from_secs(5)).expect("a wait outside the run did not end");
-    assert_eq!(res, Err("the region was cancelled".to_owned()));
+    assert_eq!(res, Err("the join stopped".to_owned()));
 }
 
 #[test]

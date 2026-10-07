@@ -347,8 +347,9 @@ impl fmt::Display for Error {
             write!(f, "batch entry {index}: ")?;
         }
         match &self.kind {
-            ErrorKind::Json(e) | ErrorKind::Limit(e) => write!(f, "JSON: {e}"),
-            ErrorKind::Line(e) => write!(f, "{e}"),
+            ErrorKind::Json(_) => f.write_str("malformed JSON"),
+            ErrorKind::Limit(_) => f.write_str("JSON over a limit"),
+            ErrorKind::Line(_) => f.write_str("JSON-RPC line framing failed"),
             ErrorKind::BlankLine => f.write_str("blank JSON-RPC line"),
             ErrorKind::Object => f.write_str("JSON-RPC envelope is not an object"),
             ErrorKind::Missing(key) => write!(f, "missing {key}"),

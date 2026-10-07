@@ -529,7 +529,7 @@ impl std::fmt::Display for Error {
             Error::Syntax { reason, .. } => write!(f, "IMAP syntax error: {reason}"),
             Error::LiteralTooLarge { size, .. } => write!(f, "literal of {size} bytes is too large"),
             Error::TooLong => write!(f, "IMAP command or response is too long"),
-            Error::Framing(e) => e.fmt(f),
+            Error::Framing(_) => f.write_str("IMAP framing failed"),
             Error::Incomplete => f.write_str("incomplete IMAP value"),
             Error::Trailing => f.write_str("bytes after IMAP value"),
             Error::Unwritable => f.write_str("IMAP value cannot be written without changing it"),
@@ -952,7 +952,7 @@ pub enum FrameError {
 impl core::fmt::Display for FrameError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Line(e) => e.fmt(f),
+            Self::Line(_) => f.write_str("IMAP line framing failed"),
             Self::TooLong => f.write_str("IMAP command or response is too long"),
             Self::LiteralTooLarge { size, .. } => write!(f, "literal of {size} bytes is too large"),
             Self::Allocation => f.write_str("IMAP assembly allocation failed"),

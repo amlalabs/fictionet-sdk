@@ -96,7 +96,7 @@ impl std::fmt::Display for Error {
             Self::ReplyMismatch => "SMTP multiline reply changed its code",
             Self::ReplyLines => "SMTP reply line count is outside its limit",
             Self::TooMuchData => "SMTP DATA exceeds the local size limit",
-            Self::Framing(e) => return e.fmt(f),
+            Self::Framing(_) => "SMTP framing failed",
             Self::Incomplete => "incomplete SMTP value",
             Self::Trailing => "bytes after SMTP value",
             Self::Unwritable => "SMTP value cannot be written without changing it",
@@ -573,7 +573,7 @@ impl FrameError {
 impl core::fmt::Display for FrameError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Line(e) => e.fmt(f),
+            Self::Line(_) => f.write_str("SMTP line framing failed"),
             Self::LineTooLong => Error::LineTooLong.fmt(f),
             Self::TooMuchData => Error::TooMuchData.fmt(f),
             Self::ReplyLines => Error::ReplyLines.fmt(f),

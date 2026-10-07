@@ -341,7 +341,7 @@ pub mod prelude {
 pub use attach::{AttachError, Attachment, Attacher, Attachments, attachments};
 pub use cable::{End, pair, pair_with_limit};
 pub use cx::{Cancelled, Cx, JoinError, RaceError, Task};
-pub use error::Error;
+pub use error::{Error, ErrorChain};
 pub use block_on::block_on;
 #[cfg(not(target_arch = "wasm32"))]
 pub use listen::{Listening, ParseWorldSocketError, WorldSocket, listen};
@@ -500,7 +500,7 @@ impl std::fmt::Display for RecvError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RecvError::Closed => f.write_str("the other end of the interface is gone"),
-            RecvError::Cancelled => f.write_str("the region was cancelled"),
+            RecvError::Cancelled => f.write_str("the receive stopped"),
         }
     }
 }

@@ -265,7 +265,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Unwritable => f.write_str("value cannot be written without changing it"),
-            Error::Asn1(e) => write!(f, "DER: {e}"),
+            Error::Asn1(_) => f.write_str("malformed DER"),
             Error::TooLong => f.write_str("input longer than its limit"),
             Error::TooMany => f.write_str("list longer than its limit"),
             Error::Version => f.write_str("unknown version, or a field the version does not allow"),

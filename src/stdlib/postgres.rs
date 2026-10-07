@@ -1190,7 +1190,7 @@ impl std::fmt::Display for FrameError {
             FrameError::UnknownType(t) => write!(f, "invalid message type {}", show_tag(*t)),
             FrameError::BadLength(n) => write!(f, "invalid message length {n}"),
             FrameError::TooLong { length, max } => write!(f, "message length {length} is over the limit of {max}"),
-            FrameError::Startup(e) => e.fmt(f),
+            FrameError::Startup(_) => f.write_str("malformed startup-phase message"),
         }
     }
 }
@@ -3345,7 +3345,8 @@ mod tests {
             let _: &dyn std::error::Error = &e;
         }
         let startup = FrameError::Startup(Error::BadKeyLength { tag: 0, length: 0 });
-        assert_eq!(startup.to_string(), "invalid startup packet: invalid cancel key length 0");
+        assert_eq!(startup.to_string(), "malformed startup-phase message");
+        assert_eq!(fictionet::ErrorChain(&startup).to_string(), "malformed startup-phase message: invalid startup packet: invalid cancel key length 0");
         assert!(std::error::Error::source(&startup).is_some());
     }
 

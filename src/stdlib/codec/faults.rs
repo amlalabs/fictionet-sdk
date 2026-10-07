@@ -126,7 +126,7 @@ pub enum FaultError<E> {
 impl<E: fmt::Display> fmt::Display for FaultError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Rewrite(error) => error.fmt(f),
+            Self::Rewrite(_) => f.write_str("the fault plan's rewrite failed"),
             Self::HeldLimit { limit } => write!(f, "fault plan exceeds {limit} held items"),
         }
     }

@@ -648,7 +648,7 @@ impl core::fmt::Display for Error {
             Error::UnexpectedData => f.write_str("error TPDU with data after its header"),
             Error::TpduTooLong { length } => write!(f, "TPDU of {length} bytes, above {MAX_TPDU}"),
             Error::Unwritable => f.write_str("value cannot be written without changing it"),
-            Error::Packet(error) => write!(f, "TPKT packet: {error}"),
+            Error::Packet(_) => f.write_str("malformed TPKT packet"),
             Error::MessageTooLong(length) => {
                 write!(f, "COTP message of {length} bytes, over {MAX_MESSAGE}")
             }

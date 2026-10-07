@@ -165,7 +165,7 @@ impl std::fmt::Display for Error {
             Error::BadStatus => "status is not +OK or -ERR",
             Error::BadBodyLine => "body line requires CRLF without embedded CR",
             Error::Listing => "invalid POP3 listing",
-            Error::Framing(e) => return e.fmt(f),
+            Error::Framing(_) => "POP3 framing failed",
             Error::Incomplete => "incomplete POP3 value",
             Error::Trailing => "bytes after POP3 value",
             Error::Unwritable => "POP3 value cannot be written without changing it",
@@ -684,7 +684,7 @@ pub enum FrameError {
 impl core::fmt::Display for FrameError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Line(e) => e.fmt(f),
+            Self::Line(_) => f.write_str("POP3 line framing failed"),
             Self::BodyTooLong => f.write_str("POP3 body exceeds its limit"),
             Self::Allocation => f.write_str("POP3 body allocation failed"),
             Self::Incomplete => f.write_str("incomplete POP3 body"),

@@ -63,7 +63,7 @@ pub trait Present: Decode {
     /// Reports a terminal framing error. The driver calls this once.
     fn error(error: &Fail<Self::Error>, packet: &mut Decoded) {
         packet.tag("malformed");
-        packet.info = format!("{}: {error}", Self::NAME);
+        packet.info = format!("{}: {}", Self::NAME, crate::ErrorChain(error));
     }
 
     /// Supplies the packet's remaining display budget before decoding the
@@ -497,7 +497,7 @@ mod tests {
             &mut packet,
         );
         assert_eq!(packet.tags, ["malformed"]);
-        assert!(packet.info.starts_with("Refused: decoder error:"));
+        assert!(packet.info.starts_with("Refused: the decoder failed: "));
         assert!(observed.failed().is_some());
         assert!(!observed.waiting());
         let mut later = Decoded::default();

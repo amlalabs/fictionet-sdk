@@ -279,7 +279,7 @@ impl std::fmt::Display for Error {
             Error::Program(p) => write!(f, "program {p}, not the portmapper (100000)"),
             Error::Version(v) => write!(f, "portmapper version {v}, not 2, 3 or 4"),
             Error::Procedure(p) => write!(f, "no portmapper procedure {p} in this version"),
-            Error::Xdr(e) => write!(f, "portmapper arguments or results: {e}"),
+            Error::Xdr(_) => f.write_str("malformed portmapper arguments or results"),
             Error::TooLong => f.write_str("a string or opaque value over its limit"),
             Error::TooMany => write!(f, "a list of more than {MAX_LIST} entries"),
             Error::RequestVersion(v) => {

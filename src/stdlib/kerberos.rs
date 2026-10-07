@@ -368,7 +368,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Unwritable => f.write_str("value cannot be written without changing it"),
-            Error::Asn1(e) => write!(f, "ASN.1: {e}"),
+            Error::Asn1(_) => f.write_str("malformed ASN.1"),
             Error::UnknownMessage(n) => write!(f, "not a Kerberos message (tag {n})"),
             Error::Version(v) => write!(f, "protocol version {v}, not 5"),
             Error::MessageType { expected, found } => {

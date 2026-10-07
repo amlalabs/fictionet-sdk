@@ -75,7 +75,7 @@ pub enum FrameError {
 impl core::fmt::Display for FrameError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Protocol(e) => e.fmt(f),
+            Self::Protocol(_) => f.write_str("malformed PROXY header"),
             Self::TooLong => f.write_str("PROXY header exceeds its limit"),
         }
     }

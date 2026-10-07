@@ -161,7 +161,7 @@ use fictionet::stdlib::tls::{self, HandshakeError, ServerConfig, TlsConnection};
 use fictionet::stdlib::udp::Socket;
 use fictionet::stdlib::{ConnError, Connection, ConnectionExt};
 use fictionet::time::Instant;
-use fictionet::{Cancelled, Cx, RaceError, RecvError, Task};
+use fictionet::{Cancelled, Cx, ErrorChain, RaceError, RecvError, Task};
 
 // ---------------------------------------------------------------------------
 // The service
@@ -1104,9 +1104,9 @@ pub enum ServeError<E> {
 impl<E: core::fmt::Display> core::fmt::Display for ServeError<E> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            ServeError::Service(e) => write!(f, "service: {e}"),
-            ServeError::Pending(e) => write!(f, "deferred work: {e}"),
-            ServeError::Cancelled => f.write_str("the region was cancelled"),
+            ServeError::Service(_) => f.write_str("the service failed"),
+            ServeError::Pending(_) => f.write_str("deferred work failed"),
+            ServeError::Cancelled => f.write_str("serving stopped"),
         }
     }
 }
@@ -2311,10 +2311,12 @@ where
                 let failure = core.failure.take();
                 match &failure {
                     Some(Failure::Service(e)) => {
+                        let e = ErrorChain(e);
                         let event = Event::new("conn", "error").level(Level::Notice).summary(format!("the service failed: {e}")).field("error", e.to_string()).field("kind", "service");
                         record(fcx, &info, event);
                     }
                     Some(Failure::Pending(e)) => {
+                        let e = ErrorChain(&**e);
                         let event = Event::new("conn", "error").level(Level::Notice).summary(format!("deferred work failed: {e}")).field("error", e.to_string()).field("kind", "deferred");
                         record(fcx, &info, event);
                     }
@@ -2570,6 +2572,7 @@ where
         }
         let flow = match result {
             Err(e) => {
+                let e = ErrorChain(&e);
                 let event = Event::new("conn", "error").level(Level::Notice).summary(format!("the service failed: {e}")).field("error", e.to_string()).field("kind", "service");
                 record(fcx, info, event);
                 Flow::Close
@@ -2704,8 +2707,8 @@ impl<D: core::fmt::Display, S: core::fmt::Display> core::fmt::Display for Harnes
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             HarnessError::Decode(e) => write!(f, "decoder: {e}"),
-            HarnessError::Service(e) => write!(f, "service: {e}"),
-            HarnessError::Pending(e) => write!(f, "deferred work: {e}"),
+            HarnessError::Service(_) => f.write_str("the service failed"),
+            HarnessError::Pending(_) => f.write_str("deferred work failed"),
             HarnessError::Closed => f.write_str("the connection is closed"),
             HarnessError::Upgraded(u) => write!(f, "the service asked for an upgrade: {}", u.as_str()),
         }

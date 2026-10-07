@@ -89,6 +89,41 @@ impl From<Error> for Box<dyn std::error::Error + Send + Sync + 'static> {
     }
 }
 
+/// An error and every [`source`](std::error::Error::source) under it, on
+/// one line: `the service failed: IMAP framing failed: line too long`.
+///
+/// An error's own text names only its own context, and the error it wraps
+/// comes through `source`, so a log or a screen that shows an error shows
+/// it this way.
+///
+/// ```
+/// let e = fictionet::JoinError::Failed(fictionet::Error::msg("bad"));
+/// assert_eq!(e.to_string(), "the task failed");
+/// assert_eq!(fictionet::ErrorChain(&e).to_string(), "the task failed: bad");
+/// ```
+#[derive(Clone, Copy)]
+pub struct ErrorChain<'a>(pub &'a (dyn std::error::Error + 'static));
+
+impl Display for ErrorChain<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut first = true;
+        for e in std::iter::successors(Some(self.0), |e| e.source()) {
+            if !first {
+                f.write_str(": ")?;
+            }
+            first = false;
+            Display::fmt(e, f)?;
+        }
+        Ok(())
+    }
+}
+
+impl Debug for ErrorChain<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Display::fmt(self, f)
+    }
+}
+
 /// An [`Error`] as a [`std::error::Error`], for its conversion into a
 /// `Box<dyn Error>`. It says what the error inside says, and gives it as
 /// its source.
