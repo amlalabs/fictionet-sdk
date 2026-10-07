@@ -1029,6 +1029,44 @@ fn tls_pair(names: &[&str]) -> (Arc<rustls::ServerConfig>, Arc<rustls::RootCertS
     (Arc::new(config), Arc::new(roots))
 }
 
+/// A connection whose TLS handshake is cut short by a cancel ends as
+/// cancelled, not as a broken connection.
+#[test]
+fn a_cancel_during_the_tls_handshake_is_a_cancel() {
+    world(|cx| async move {
+        let (config, _roots) = tls_pair(&["a.test"]);
+        let (server, _su, client, _cu) = two_machines(&cx);
+        let mut listener = server.listen(443)?;
+        let (tx, rx) = mpsc::channel();
+        cx.spawn(move |cx| async move {
+            let conn = listener.accept(&cx).await?;
+            let _ = cx
+                .region(|rcx| async move {
+                    let stopper = rcx.clone();
+                    rcx.spawn(move |cx| async move {
+                        cx.sleep(Duration::from_millis(50)).await?;
+                        stopper.cancel();
+                        Ok(())
+                    });
+                    let opts = ServeOptions::default().tls(config);
+                    let served = serve::serve(&rcx, conn, ConnInfo::default(), &mut Echo, &(), &opts).await;
+                    let _ = tx.send(match served {
+                        Ok(Served::Closed(end)) => Some(end),
+                        _ => None,
+                    });
+                    Ok(())
+                })
+                .await;
+            Ok(())
+        });
+        // The client connects and never says hello.
+        let _conn = client.connect(&cx, SocketAddr::new(SERVER.into(), 443)).await?;
+        cx.sleep(Duration::from_millis(200)).await?;
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), Some(Ended::Cancelled));
+        Ok(())
+    });
+}
+
 #[test]
 #[cfg(feature = "tokio")]
 fn net_routes_tls_by_name_to_each_service() {

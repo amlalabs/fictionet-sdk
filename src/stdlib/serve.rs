@@ -1915,7 +1915,7 @@ where
                 conn = Box::new(tls);
                 info = i;
             }
-            None => return Ok(Served::Closed(End::Conn(ConnError::Broken))),
+            None => return Ok(Served::Closed(tls_failed(cx))),
         }
     }
     let mut first = true;
@@ -1938,9 +1938,15 @@ where
                 conn = Box::new(tls);
                 info = i;
             }
-            None => return Ok(Served::Closed(End::Conn(ConnError::Broken))),
+            None => return Ok(Served::Closed(tls_failed(cx))),
         }
     }
+}
+
+/// How a connection whose TLS handshake failed ended: cancelled if `cx`
+/// was, else broken.
+fn tls_failed(cx: &Cx) -> End {
+    if cx.is_cancelled() { End::Cancelled } else { End::Conn(ConnError::Broken) }
 }
 
 /// Serves one connection with `service` until it ends or asks for

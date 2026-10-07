@@ -1992,7 +1992,12 @@ mod h2 {
         fn sleep(&self, duration: Duration) -> Pin<Box<dyn hyper::rt::Sleep>> {
             let cx = self.cx.clone();
             Box::pin(CxSleep(Box::pin(async move {
-                let _ = cx.sleep(duration).await;
+                // A cancelled sleep never fires: hyper's sleeps cannot say
+                // they were cancelled, and firing would run every one of
+                // its timeouts at once. The connection ends by the cancel.
+                if cx.sleep(duration).await.is_err() {
+                    std::future::pending::<()>().await;
+                }
             })))
         }
 
@@ -2018,4 +2023,38 @@ mod h2 {
     }
 
     impl hyper::rt::Sleep for CxSleep {}
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use hyper::rt::Timer;
+
+        /// A hyper sleep on a cancelled `Cx` stays pending instead of
+        /// firing.
+        #[test]
+        fn a_cancelled_sleep_never_fires() {
+            fictionet::block_on(fictionet::run(|cx| async move {
+                let slot: Arc<Mutex<Option<Cx>>> = Arc::default();
+                let s = slot.clone();
+                let _ = cx
+                    .region(|inner| async move {
+                        *s.lock().unwrap() = Some(inner.clone());
+                        inner.cancel();
+                        Ok(())
+                    })
+                    .await;
+                let inner = slot.lock().unwrap().take().unwrap();
+                assert!(inner.is_cancelled());
+                let mut sleep = CxTimer { cx: inner }.sleep(Duration::from_secs(5));
+                let pending = |sleep: &mut Pin<Box<dyn hyper::rt::Sleep>>| {
+                    sleep.as_mut().poll(&mut Context::from_waker(std::task::Waker::noop())).is_pending()
+                };
+                assert!(pending(&mut sleep));
+                cx.sleep(Duration::from_millis(5)).await?;
+                assert!(pending(&mut sleep));
+                Ok(())
+            }))
+            .unwrap();
+        }
+    }
 }
