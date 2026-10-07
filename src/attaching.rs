@@ -1815,6 +1815,11 @@
 //!   makes its directory if needed.
 //! - **`--no-resolv-conf`** writes no file. DNS is then up to the harness.
 //!
+//! Attach runs as root, so it never writes through a link: a `resolv.conf`
+//! path that is a symlink, or a file with other hard links, is an error.
+//! The `--ready-file` is always made new, replacing whatever was at its
+//! path.
+//!
 //! For example, a harness might start the agent with runc, in the namespace
 //! `/run/netns/agent`, and give it the host directory `/srv/agent/etc` as
 //! its `/etc`. Then attach should write the file there:

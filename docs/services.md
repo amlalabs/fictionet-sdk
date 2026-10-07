@@ -115,6 +115,14 @@ network's first event (`Net::start_fields` with a `world_date` field), so
 a reader can place every event. The `run.start` event's `wall` field
 holds the host's wall clock at the start of the run.
 
+HTTP follows the same rule. `httpd` sends a `Date` header only when the
+world gave its date at the start of the run (`Sites::date`, `Site::date`,
+`Website::date`, `Http1::date` or `HttpOptions::date`), and the header is
+that date plus `ctx.now()`. With no world date, responses carry no `Date`
+header at all, as RFC 9110 allows for a server without a clock: a world
+that never says what day it is never leaks the host's. A `Date` a handler
+sets itself goes out as it is.
+
 ## 2. A test with no runtime
 
 `Harness` runs a service with no I/O: push the client's bytes, get the

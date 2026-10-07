@@ -142,13 +142,32 @@ fn mask(addr: IpAddr, len: u8) -> IpAddr {
 ///
 /// A route's prefix is compared with its address bits past the length
 /// cleared. A packet that is neither IPv4 nor IPv6, or too short to hold a
-/// destination address, is dropped. The router does not change packets: it
-/// does not lower the TTL or hop limit. A packet whose best route is the
+/// destination address, is dropped. A packet whose best route is the
 /// interface it came in on goes back out on that interface, as on a real
 /// router.
+///
+/// Like a real router, it lowers each packet's TTL or hop limit by one,
+/// and changes nothing else (the IPv4 header checksum follows the TTL). A
+/// packet that arrives with a TTL or hop limit of 0 or 1 is dropped, so a
+/// loop of routes, such as two routers whose default routes point at each
+/// other, cannot carry a packet forever. The drop is recorded as a
+/// `router.drop` [event](crate::events). Once the router has an [address](Router::address) of the
+/// packet's family, it also answers the sender with an ICMP "time
+/// exceeded" ([`icmp::time_exceeded`](crate::stdlib::icmp::time_exceeded)),
+/// which is what `traceroute` reads. Packets to or from the router's own
+/// addresses are its own, not forwarded, and keep their TTL. A router
+/// told to [`keep_ttl`](Router::keep_ttl) changes no packet.
 #[track_caller]
 pub fn router(cx: &Cx, routes: Vec<(Prefix, Box<dyn Interface>)>) -> Router {
-    let shared = Arc::new(Mutex::new(Shared { adds: routes, waker: None, handles_gone: false, stopped: false }));
+    let shared = Arc::new(Mutex::new(Shared {
+        adds: routes,
+        waker: None,
+        handles_gone: false,
+        stopped: false,
+        addrs: (None, None),
+        keep_ttl: false,
+        settings_changed: false,
+    }));
     let router = Router { handle: Arc::new(Handle { shared: shared.clone() }) };
     cx.spawn_as(|| "router".into(), move |cx| async move {
         // However the task ends, later routes are dropped immediately.
@@ -158,10 +177,13 @@ pub fn router(cx: &Cx, routes: Vec<(Prefix, Box<dyn Interface>)>) -> Router {
         let mut table = Table::default();
         let mut handles_gone = false;
         loop {
-            // Take routes added since the last turn.
-            let (adds, gone) = {
+            // Take routes and addresses given since the last turn. Packets
+            // to and from the router's own addresses are its own, not
+            // forwarded, so their TTL stays as it is.
+            let (adds, gone, addrs, keep_ttl) = {
                 let mut s = lock(&shared);
-                (std::mem::take(&mut s.adds), s.handles_gone)
+                s.settings_changed = false;
+                (std::mem::take(&mut s.adds), s.handles_gone, s.addrs, s.keep_ttl)
             };
             handles_gone = handles_gone || gone;
             for (prefix, interface) in adds {
@@ -183,7 +205,7 @@ pub fn router(cx: &Cx, routes: Vec<(Prefix, Box<dyn Interface>)>) -> Router {
             let event = ports
                 .next(&cx, None, |task| {
                     let mut s = lock(&shared);
-                    if !s.adds.is_empty() || (s.handles_gone && !handles_gone) {
+                    if !s.adds.is_empty() || s.settings_changed || (s.handles_gone && !handles_gone) {
                         return Poll::Ready(());
                     }
                     match &s.waker {
@@ -194,8 +216,16 @@ pub fn router(cx: &Cx, routes: Vec<(Prefix, Box<dyn Interface>)>) -> Router {
                 })
                 .await;
             match event {
-                Event::Packet(_, packet) => {
+                Event::Packet(_, mut packet) => {
                     let Some(dst) = wire::destination(&packet.0) else { continue };
+                    if !keep_ttl
+                        && !is_own(addrs, dst)
+                        && !wire::source(&packet.0).is_some_and(|src| is_own(addrs, src))
+                        && wire::hop(&mut packet.0) == wire::Hop::Expired
+                    {
+                        expired(&cx, addrs, &table, &mut ports, packet);
+                        continue;
+                    }
                     if let Some(i) = table.best(dst) {
                         ports.send(i, packet);
                     }
@@ -214,6 +244,35 @@ pub fn router(cx: &Cx, routes: Vec<(Prefix, Box<dyn Interface>)>) -> Router {
         }
     });
     router
+}
+
+/// Drops a packet whose TTL or hop limit ran out, records the drop, and
+/// sends the "time exceeded" answer back toward its source, when the router
+/// has an address of its family.
+fn expired(cx: &Cx, addrs: Addrs, table: &Table, ports: &mut Ports, packet: Packet) {
+    let v4 = wire::version(&packet.0) == Some(4);
+    let why = if v4 { "its TTL ran out" } else { "its hop limit ran out" };
+    crate::observe::record_drop(cx, "router", &packet, why);
+    let (a4, a6) = addrs;
+    let from = if v4 { a4.map(IpAddr::V4) } else { a6.map(IpAddr::V6) };
+    let answer = from.and_then(|from| crate::stdlib::icmp::time_exceeded(&packet.0, from));
+    if let Some(answer) = answer
+        && let Some(src) = wire::source(&packet.0)
+        && let Some(i) = table.best(src)
+    {
+        ports.send(i, answer);
+    }
+}
+
+/// A router's own IPv4 and IPv6 addresses.
+type Addrs = (Option<Ipv4Addr>, Option<Ipv6Addr>);
+
+/// Whether `addr` is one of the router's own.
+fn is_own(addrs: Addrs, addr: IpAddr) -> bool {
+    match addr {
+        IpAddr::V4(a) => addrs.0 == Some(a),
+        IpAddr::V6(a) => addrs.1 == Some(a),
+    }
 }
 
 /// A router's routes. Finding the best route costs one hash lookup per
@@ -273,6 +332,12 @@ struct Shared {
     handles_gone: bool,
     /// The task has ended.
     stopped: bool,
+    /// The router's own addresses, which its ICMP answers come from.
+    addrs: Addrs,
+    /// The router does not lower TTLs ([`Router::keep_ttl`]).
+    keep_ttl: bool,
+    /// `addrs` or `keep_ttl` changed since the task last read them.
+    settings_changed: bool,
 }
 
 /// Marks the router stopped when its task ends, and drops routes added
@@ -346,6 +411,43 @@ impl Router {
     /// If the router has stopped, `interface` is dropped.
     pub fn add(&self, prefix: Prefix, interface: Box<dyn Interface>) {
         self.handle.add(prefix, interface);
+    }
+
+    /// Gives the router an address of `addr`'s family, replacing the one it
+    /// had. Its ICMP "time exceeded" answers come from it. A router has no
+    /// address at first, and then drops expired packets without an answer.
+    pub fn address(&self, addr: IpAddr) {
+        let waker = {
+            let mut s = lock(&self.handle.shared);
+            match addr {
+                IpAddr::V4(a) => s.addrs.0 = Some(a),
+                IpAddr::V6(a) => s.addrs.1 = Some(a),
+            }
+            s.settings_changed = true;
+            s.waker.take()
+        };
+        if let Some(w) = waker {
+            w.wake();
+        }
+    }
+
+    /// Makes the router a private one, invisible to the packets it
+    /// forwards: from now on it leaves their TTL and hop limit as they are,
+    /// and never drops a packet for running out. A network that should look
+    /// like one hop, such as [`Net`](crate::stdlib::net::Net), uses this.
+    /// Such a router can carry a packet around a loop of routes forever, so
+    /// use it only where every way back to it passes something that lowers
+    /// the TTL itself, such as a sandbox's kernel.
+    pub fn keep_ttl(&self) {
+        let waker = {
+            let mut s = lock(&self.handle.shared);
+            s.keep_ttl = true;
+            s.settings_changed = true;
+            s.waker.take()
+        };
+        if let Some(w) = waker {
+            w.wake();
+        }
     }
 }
 
@@ -751,6 +853,110 @@ mod tests {
         p.extend_from_slice(&src.octets());
         p.extend_from_slice(&dst.octets());
         Packet(p)
+    }
+
+    /// The packet waiting on `iface`, if any, without waiting.
+    fn ready(cx: &Cx, iface: &mut crate::End) -> Option<Packet> {
+        let mut task = std::task::Context::from_waker(Waker::noop());
+        match iface.poll_recv(cx, &mut task) {
+            Poll::Ready(Ok(p)) => Some(p),
+            _ => None,
+        }
+    }
+
+    fn ip(src: &str, dst: &str, ttl: u8) -> Packet {
+        let mut p = crate::stdlib::udp::ip_packet(src.parse().unwrap(), dst.parse().unwrap(), 17, 0, &[0; 8]);
+        if p.0[0] >> 4 == 4 {
+            p.0[8] = ttl;
+            wire::set_v4_checksum(&mut p.0[..20]);
+        } else {
+            p.0[7] = ttl;
+        }
+        p
+    }
+
+    /// Two routers whose default routes point at each other: the packet
+    /// dies when its TTL or hop limit runs out, the router that drops it
+    /// says so, and the sender hears "time exceeded".
+    #[test]
+    fn a_routing_loop_ends_when_the_ttl_runs_out() {
+        crate::block_on(crate::run(|cx| async move {
+            let (r1_s4, mut s4) = crate::pair();
+            let (r1_s6, mut s6) = crate::pair();
+            let (r1_r2, r2_r1) = crate::pair();
+            let (r1_r2_6, r2_r1_6) = crate::pair();
+            let r1 = router(&cx, vec![
+                ("10.0.0.2/32".parse()?, Box::new(r1_s4) as Box<dyn Interface>),
+                ("fd00::2/128".parse()?, Box::new(r1_s6)),
+                ("0.0.0.0/0".parse()?, Box::new(r1_r2)),
+                ("::/0".parse()?, Box::new(r1_r2_6)),
+            ]);
+            r1.address("10.0.0.1".parse()?);
+            let r2 = router(&cx, vec![
+                ("0.0.0.0/0".parse()?, Box::new(r2_r1) as Box<dyn Interface>),
+                ("::/0".parse()?, Box::new(r2_r1_6)),
+            ]);
+            r2.address("fd00:1::1".parse()?);
+
+            // TTL 5: r1 sends it on with 4, r2 with 3, r1 with 2, r2 with
+            // 1, and r1 drops it.
+            s4.send(ip("10.0.0.2", "192.0.2.1", 5));
+            // Hop limit 4: r1, r2, r1, and r2 drops it.
+            s6.send(ip("fd00::2", "2001:db8::1", 4));
+            cx.sleep(Duration::from_millis(100)).await?;
+
+            let answer = ready(&cx, &mut s4).expect("a time exceeded answer");
+            assert_eq!(wire::source(&answer.0), Some("10.0.0.1".parse()?));
+            assert_eq!((answer.0[9], answer.0[20], answer.0[21]), (wire::PROTO_ICMP, 11, 0));
+            assert!(ready(&cx, &mut s4).is_none());
+            let answer = ready(&cx, &mut s6).expect("a time exceeded answer");
+            assert_eq!(wire::source(&answer.0), Some("fd00:1::1".parse()?));
+            assert_eq!((answer.0[6], answer.0[40], answer.0[41]), (wire::PROTO_ICMPV6, 3, 0));
+            // r1 forwarded r2's answer: one hop.
+            assert_eq!(answer.0[7], 63);
+
+            let drops: Vec<String> = cx.events().of("router", "drop").into_iter().map(|e| e.summary).collect();
+            assert_eq!(drops.len(), 2, "{drops:?}");
+            assert!(drops.iter().any(|d| d.starts_with("10.0.0.2:0 → 192.0.2.1:0") && d.ends_with("its TTL ran out")), "{drops:?}");
+            assert!(drops.iter().any(|d| d.ends_with("its hop limit ran out")), "{drops:?}");
+            cx.cancel();
+            Ok(())
+        }))
+        .unwrap();
+    }
+
+    /// A forwarded packet loses one from its TTL, with a checksum that still
+    /// holds. The router's own packets keep theirs.
+    #[test]
+    fn forwarding_lowers_the_ttl() {
+        crate::block_on(crate::run(|cx| async move {
+            let (ra, mut a) = crate::pair();
+            let (rb, mut b) = crate::pair();
+            let (rg, mut g) = crate::pair();
+            let r = router(&cx, vec![
+                ("10.0.0.2/32".parse()?, Box::new(ra) as Box<dyn Interface>),
+                ("10.0.0.3/32".parse()?, Box::new(rb)),
+                ("10.0.0.1/32".parse()?, Box::new(rg)),
+            ]);
+            r.address("10.0.0.1".parse()?);
+            a.send(ip("10.0.0.2", "10.0.0.3", 64));
+            let p = b.recv(&cx).await?;
+            assert_eq!(p.0[8], 63);
+            assert_eq!(wire::checksum(0, &p.0[..20]), 0, "the header checksum holds");
+            // An expired packet for the router itself is still delivered.
+            a.send(ip("10.0.0.2", "10.0.0.1", 1));
+            assert_eq!(g.recv(&cx).await?.0[8], 1);
+            g.send(ip("10.0.0.1", "10.0.0.2", 64));
+            assert_eq!(a.recv(&cx).await?.0[8], 64);
+            // A private router changes nothing, and forwards even TTL 1.
+            r.keep_ttl();
+            cx.sleep(Duration::from_millis(1)).await?;
+            a.send(ip("10.0.0.2", "10.0.0.3", 1));
+            assert_eq!(b.recv(&cx).await?.0[8], 1);
+            cx.cancel();
+            Ok(())
+        }))
+        .unwrap();
     }
 
     #[test]

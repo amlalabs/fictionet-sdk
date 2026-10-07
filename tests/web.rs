@@ -780,6 +780,51 @@ fn https_with_http2_and_http11() {
     });
 }
 
+/// `Date` headers come from the world's date, over HTTP/1.1 and HTTP/2,
+/// and never from the host's clock: without a world date there is none.
+#[test]
+fn dates_come_from_the_world() {
+    // 2019-06-01T00:00:00Z.
+    let june_2019 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_559_347_200);
+    for date in [Some(june_2019), None] {
+        let result = within(Duration::from_secs(60), move || {
+            block_on(run(move |cx| async move {
+                let (attacher, attachments) = fictionet::attachments();
+                let site = axum::Router::new()
+                    .route("/own", axum::routing::get(|| async { ([("date", "Mon, 01 Jan 2001 00:00:00 GMT")], "own") }))
+                    .fallback(|| async { "hello" });
+                let mut sites = web::Sites::new(move |name: &str| (name == "dated.test").then(|| web::Site::new(site.clone())));
+                if let Some(date) = date {
+                    sites = sites.date(date);
+                }
+                sites.serve(&cx, attachments)?;
+                let m = machine(&cx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+                let addr = lookup(&cx, &m, "dated.test").await;
+                for h2 in [false, true] {
+                    let conn = m.tcp.connect(&cx, SocketAddr::new(addr.into(), 80)).await.unwrap();
+                    let mut client = Client::new(&cx, conn, h2).await;
+                    let got = client.get("http", "dated.test", "/").await;
+                    assert_eq!(got.body, "hello");
+                    assert_eq!(got.version, if h2 { Version::HTTP_2 } else { Version::HTTP_11 });
+                    let header = got.headers.get("date").map(|v| v.to_str().unwrap().to_owned());
+                    match date {
+                        Some(_) => {
+                            let header = header.expect("a Date header");
+                            assert!(header.starts_with("Sat, 01 Jun 2019 00:0"), "h2 {h2}: {header}");
+                        }
+                        None => assert_eq!(header, None, "h2 {h2}: no world date, so no Date"),
+                    }
+                    // A Date the handler sets is kept.
+                    let got = client.get("http", "dated.test", "/own").await;
+                    assert_eq!(got.headers.get_all("date").iter().collect::<Vec<_>>(), ["Mon, 01 Jan 2001 00:00:00 GMT"]);
+                }
+                Err(Box::new(Done) as fictionet::Error)
+            }))
+        });
+        assert!(result.is_err_and(|e| e.downcast_ref::<Done>().is_some()));
+    }
+}
+
 #[test]
 fn port_80_redirects_tls_sites_and_serves_the_others() {
     world(|cx, attacher, _env| async move {
@@ -1385,6 +1430,85 @@ async fn the_proxy_answers_502_when_the_real_site_cannot_be_reached() {
             let got = client.get("http", "nowhere.invalid", "/").await;
             assert_eq!(got.status, StatusCode::BAD_GATEWAY, "{}", got.body);
             assert!(got.body.contains("nowhere.invalid"), "{}", got.body);
+            Err(Box::new(Done) as fictionet::Error)
+        }),
+    )
+    .await
+    .expect("timed out");
+    assert!(result.unwrap_err().downcast_ref::<Done>().is_some());
+}
+
+/// An axum handler that echoes WebSocket text messages.
+#[cfg(feature = "tokio")]
+fn echo_socket() -> axum::Router {
+    use axum::extract::ws::{Message as Ws, WebSocketUpgrade};
+    axum::Router::new().route(
+        "/echo",
+        axum::routing::get(|ws: WebSocketUpgrade| async move {
+            ws.on_upgrade(|mut socket| async move {
+                while let Some(Ok(message)) = socket.recv().await {
+                    if let Ws::Text(t) = message {
+                        let _ = socket.send(Ws::Text(format!("echo: {}", t.as_str()).into())).await;
+                    }
+                }
+            })
+        }),
+    )
+}
+
+/// Makes a client's WebSocket handshake on `conn` for `host`, then sends
+/// `text` and returns the first message back.
+#[cfg(feature = "tokio")]
+async fn websocket_echo<C: Connection>(cx: &Cx, conn: &mut C, host: &str, text: &str) -> fictionet::stdlib::websocket::Message {
+    use fictionet::stdlib::codec::{Stream, Wire};
+    use fictionet::stdlib::websocket::{Message as Ws, Messages, Role};
+    let request = format!(
+        "GET /echo HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    );
+    conn.write_all(cx, request.as_bytes()).await.unwrap();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    let head_end = loop {
+        if let Some(i) = got.windows(4).position(|w| w == b"\r\n\r\n") {
+            break i + 4;
+        }
+        let n = conn.read(cx, &mut buf).await.unwrap();
+        assert!(n > 0, "the server closed during the handshake: {:?}", String::from_utf8_lossy(&got));
+        got.extend_from_slice(&buf[..n]);
+    };
+    let head = String::from_utf8_lossy(&got[..head_end]).to_lowercase();
+    assert!(head.starts_with("http/1.1 101"), "{head}");
+    assert!(head.contains("sec-websocket-accept: s3pplmbitxaq9kygzzhzrbk+xoo="), "{head}");
+    let frame = Ws::Text(text.to_owned()).to_frame(Some([1, 2, 3, 4])).unwrap();
+    conn.write_all(cx, &frame.to_bytes().unwrap()).await.unwrap();
+    let mut stream = Stream::new(Messages::new(Role::Client));
+    assert_eq!(stream.push(&got[head_end..]), got.len() - head_end);
+    loop {
+        if let Some(m) = stream.next() {
+            return m.unwrap();
+        }
+        let n = conn.read(cx, &mut buf).await.unwrap();
+        assert!(n > 0, "the server closed the WebSocket");
+        assert_eq!(stream.push(&buf[..n]), n);
+    }
+}
+
+/// An axum `WebSocketUpgrade` handler on `web::Sites`: the handshake, then
+/// messages both ways.
+#[cfg(feature = "tokio")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn websockets_work_through_sites() {
+    let result = tokio::time::timeout(
+        Duration::from_secs(30),
+        run(|cx| async move {
+            let (attacher, attachments) = fictionet::attachments();
+            web::Sites::new(|h| (h == "ws.test").then(|| web::Site::new(echo_socket()))).serve(&cx, attachments)?;
+            let m = machine(&cx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+            let addr = lookup(&cx, &m, "ws.test").await;
+            let mut conn = m.tcp.connect(&cx, SocketAddr::new(addr.into(), 80)).await.unwrap();
+            let reply = websocket_echo(&cx, &mut conn, "ws.test", "hello").await;
+            assert_eq!(reply, fictionet::stdlib::websocket::Message::Text("echo: hello".into()));
             Err(Box::new(Done) as fictionet::Error)
         }),
     )

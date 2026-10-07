@@ -537,6 +537,7 @@ pub struct Sites {
     subnet_v6: Prefix,
     ipv6: bool,
     max_sites: usize,
+    date: Option<std::time::SystemTime>,
 }
 
 /// The callback given to [`Sites::new`].
@@ -561,7 +562,16 @@ impl Sites {
             subnet_v6: Prefix { addr: Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0).into(), len: 64 },
             ipv6: true,
             max_sites: fictionet::stdlib::net::MAX_HOSTS,
+            date: None,
         }
+    }
+
+    /// Sets the world's date and time at the start of the run. Every site
+    /// then sends a `Date` header: this date plus the run's clock. Without
+    /// it, responses have no `Date` header; the host's clock is never used.
+    /// See [`httpd`'s Dates](crate::stdlib::httpd#dates).
+    pub fn date(self, start: std::time::SystemTime) -> Sites {
+        Sites { date: Some(start), ..self }
     }
 
     /// Sets the sandboxes' IPv4 or IPv6 subnet, whichever `subnet` is. The
@@ -608,12 +618,20 @@ impl Sites {
     /// with other services next to the websites.
     pub fn into_net(self) -> Net {
         let site_for = self.site_for;
+        let date = self.date;
         let mut net = Net::new()
             .group("web::Sites")
             .subnet(self.subnet)
             .subnet(self.subnet_v6)
             .max_hosts(self.max_sites)
-            .resolve(move |name| site_for(name).map(|site| site.into_host(name)));
+            .resolve(move |name| {
+                site_for(name).map(|mut site| {
+                    if let Some(date) = date {
+                        site.website = site.website.date(date);
+                    }
+                    site.into_host(name)
+                })
+            });
         if !self.ipv6 {
             net = net.ipv4_only();
         }
@@ -799,7 +817,10 @@ impl Site {
 ///
 /// The world checks the real site's certificate against the Mozilla root
 /// store (`webpki-roots`). Hop-by-hop headers (`Connection`, `Keep-Alive`,
-/// `Transfer-Encoding` and the like) are not passed on in either direction.
+/// `Transfer-Encoding` and the like) are not passed on in either direction,
+/// so it carries no protocol upgrades: a WebSocket handshake reaches the
+/// real site as a plain `GET`. A world that wants WebSockets serves them
+/// itself, with a handler on the site (see [`httpd`'s upgrades](crate::stdlib::httpd)).
 /// If the real site cannot be reached, the agent gets `502 Bad Gateway`.
 #[cfg(feature = "tokio")]
 #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]

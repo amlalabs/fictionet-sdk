@@ -30,6 +30,27 @@
 //! request's head and on its body. [`serve_connection`] picks the version for a
 //! connection: HTTP/2 by ALPN or by the client's preface, else HTTP/1.
 //!
+//! A request that asks to switch protocols (`Connection: upgrade` with an
+//! `Upgrade` field, as a WebSocket handshake does) makes [`Http1`] hand
+//! the connection back ([`Upgrade::Handoff`](serve::Upgrade::Handoff)),
+//! and [`serve_connection`] serves the rest of it on hyper's HTTP/1, which
+//! carries out upgrades. The handler sees hyper's `OnUpgrade` in the
+//! request's extensions, so an axum `WebSocketUpgrade` handler, or one that
+//! calls `hyper::upgrade::on`, works on a [`Site`] as it does on hyper.
+//! axum runs the socket in a tokio task, so that world needs a tokio
+//! runtime.
+//!
+//! # Dates
+//!
+//! The world owns its dates. A response carries a `Date` header only when
+//! the world gave the date it was at the start of the run, with
+//! [`Http1::date`], [`HttpOptions::date`], [`Site::date`] or
+//! [`Website::date`]: the header is then that date plus the run's clock.
+//! Without one, responses have no `Date` header (RFC 9110 lets a server
+//! with no clock leave it out). The host's clock is never used, so a world
+//! set in 2019 never sends a date from the year it runs in. A `Date` the
+//! handler sets itself is sent as it is.
+//!
 //! HTTP/2 runs on hyper for now, behind the same [`Handler`] trait and the
 //! same events. When the stdlib's own HTTP/2 lands, it becomes a
 //! second `Service` here and [`serve_connection`] picks it; handlers do not
@@ -77,10 +98,10 @@ use std::fmt::Write as _;
 use std::pin::{Pin, pin};
 use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use bytes::{Buf, Bytes};
-use http::header::{CONTENT_LENGTH, HOST, LOCATION};
+use http::header::{CONTENT_LENGTH, DATE, HOST, LOCATION};
 use http::uri::{Authority, Scheme};
 use http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode, Version};
 use http_body::{Body as _, Frame, SizeHint};
@@ -780,6 +801,11 @@ const BODY: Timer = "body";
 pub struct Http1 {
     handler: Arc<dyn Handler>,
     opts: Http1Options,
+    /// The world's date at the start of the run, for `Date` headers.
+    date: Option<SystemTime>,
+    /// The head of a request that asked for a protocol upgrade, as bytes,
+    /// once the connection is handed over for it.
+    handoff: Option<Vec<u8>>,
     head: Option<RequestHead>,
     body: Vec<u8>,
     too_big: bool,
@@ -794,7 +820,25 @@ impl Http1 {
 
     /// Answers with `handler` and `opts`.
     pub fn with(handler: Arc<dyn Handler>, opts: Http1Options) -> Http1 {
-        Http1 { handler, opts, head: None, body: Vec::new(), too_big: false, started: Instant::ZERO }
+        Http1 { handler, opts, date: None, handoff: None, head: None, body: Vec::new(), too_big: false, started: Instant::ZERO }
+    }
+
+    /// The head of the request that asked for a protocol upgrade, such as
+    /// a WebSocket handshake, after the service handed the connection back
+    /// for it ([`Upgrade::Handoff`](serve::Upgrade::Handoff)): its bytes,
+    /// to be read again in front of the connection's unread ones.
+    /// [`serve_connection`] serves such a connection on hyper's HTTP/1,
+    /// which carries out the upgrade.
+    pub fn take_handoff(&mut self) -> Option<Vec<u8>> {
+        self.handoff.take()
+    }
+
+    /// Sends a `Date` header with each response: `start`, the world's date
+    /// and time at the start of the run, plus the run's clock. See
+    /// [Dates](self#dates).
+    pub fn date(mut self, start: SystemTime) -> Http1 {
+        self.date = Some(start);
+        self
     }
 
     fn respond(&mut self, ctx: &mut ServeCtx<'_>) -> Flow {
@@ -816,7 +860,8 @@ impl Http1 {
         let request = match to_request(&head, version, body) {
             Some(r) => r,
             None => {
-                write_simple(ctx.reply(), version, StatusCode::BAD_REQUEST);
+                let date = date_header(self.date, ctx.now());
+                write_simple(ctx.reply(), version, StatusCode::BAD_REQUEST, date);
                 return Flow::Close;
             }
         };
@@ -835,7 +880,8 @@ impl Http1 {
             Reply::Now(response) if response.body().bytes().is_some() => {
                 let bytes = response.body().bytes().unwrap_or_default();
                 let len = Some(bytes.len() as u64);
-                let close = encode(ctx.reply(), version, &response, len, head_only, close);
+                let date = date_header(self.date, now);
+                let close = encode(ctx.reply(), version, &response, len, head_only, close, date);
                 let bodiless = head_only || no_body(response.status());
                 if !bodiless {
                     ctx.reply().extend_from_slice(&bytes);
@@ -848,11 +894,11 @@ impl Http1 {
                 self.after(ctx, close)
             }
             Reply::Now(response) => {
-                ctx.defer(Streaming::new(None, Some(response), version, head_only, close, tracker));
+                ctx.defer(Streaming::new(None, Some(response), version, head_only, close, tracker).dated(self.date, now));
                 self.after(ctx, close)
             }
             Reply::Later(work) => {
-                ctx.defer(Streaming::new(Some(work), None, version, head_only, close, tracker));
+                ctx.defer(Streaming::new(Some(work), None, version, head_only, close, tracker).dated(self.date, now));
                 self.after(ctx, close)
             }
         }
@@ -866,6 +912,16 @@ impl Http1 {
         ctx.set_timer(HEAD, self.opts.header_timeout);
         Flow::Continue
     }
+}
+
+/// Whether an HTTP/1.1 request asks to switch protocols (RFC 9110 section
+/// 7.8): it has an `Upgrade` field and names `upgrade` in `Connection`.
+fn asks_upgrade(head: &RequestHead) -> bool {
+    let has = |name: &str| head.headers.iter().any(|h| h.name.eq_ignore_ascii_case(name));
+    let connection_upgrade = head.headers.iter().any(|h| {
+        h.name.eq_ignore_ascii_case("connection") && h.value.split(|b| *b == b',').any(|t| t.trim_ascii().eq_ignore_ascii_case(b"upgrade"))
+    });
+    head.version == http1::Version::Http11 && head.method != "CONNECT" && has("upgrade") && connection_upgrade
 }
 
 /// The head at the start of `unread`, read with an empty Host field added
@@ -924,7 +980,16 @@ fn no_body(status: StatusCode) -> bool {
 /// Writes a response head. `len` is the body's length if known. Returns
 /// whether the connection must close after the body: a body of unknown
 /// length to an HTTP/1.0 client ends with the connection.
-fn encode(out: &mut Vec<u8>, version: Version, response: &Response<Body>, len: Option<u64>, head_only: bool, close: bool) -> bool {
+/// `date` is the `Date` header to send if the response has none.
+fn encode(
+    out: &mut Vec<u8>,
+    version: Version,
+    response: &Response<Body>,
+    len: Option<u64>,
+    head_only: bool,
+    close: bool,
+    date: Option<HeaderValue>,
+) -> bool {
     let status = response.status();
     let v10 = version == Version::HTTP_10;
     let mut close = close;
@@ -941,6 +1006,11 @@ fn encode(out: &mut Vec<u8>, version: Version, response: &Response<Body>, len: O
         out.extend_from_slice(name.as_str().as_bytes());
         out.extend_from_slice(b": ");
         out.extend_from_slice(value.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    if let Some(date) = date.filter(|_| !response.headers().contains_key(DATE)) {
+        out.extend_from_slice(b"date: ");
+        out.extend_from_slice(date.as_bytes());
         out.extend_from_slice(b"\r\n");
     }
     if !no_body(status) {
@@ -962,8 +1032,50 @@ fn encode(out: &mut Vec<u8>, version: Version, response: &Response<Body>, len: O
     close
 }
 
-fn write_simple(out: &mut Vec<u8>, version: Version, status: StatusCode) {
-    encode(out, version, &status_only(status), Some(0), false, true);
+fn write_simple(out: &mut Vec<u8>, version: Version, status: StatusCode, date: Option<HeaderValue>) {
+    encode(out, version, &status_only(status), Some(0), false, true, date);
+}
+
+/// The `Date` header at `now` on the run's clock, in a world whose date at
+/// the start of the run was `start`. `None` without a world date.
+pub fn date_header(start: Option<SystemTime>, now: Instant) -> Option<HeaderValue> {
+    let secs = start?.checked_add(now.since_start())?.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_secs();
+    HeaderValue::from_str(&http_date(secs)).ok()
+}
+
+/// An IMF-fixdate (RFC 9110 section 5.6.7), such as
+/// `Sun, 06 Nov 1994 08:49:37 GMT`, for `secs` since the Unix epoch.
+///
+/// ```
+/// use fictionet::stdlib::httpd::http_date;
+/// assert_eq!(http_date(0), "Thu, 01 Jan 1970 00:00:00 GMT");
+/// assert_eq!(http_date(784_111_777), "Sun, 06 Nov 1994 08:49:37 GMT");
+/// assert_eq!(http_date(951_782_400), "Tue, 29 Feb 2000 00:00:00 GMT");
+/// assert_eq!(http_date(1_559_347_200), "Sat, 01 Jun 2019 00:00:00 GMT");
+/// ```
+pub fn http_date(secs: u64) -> String {
+    const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let days = (secs / 86_400) as i64;
+    let rest = secs % 86_400;
+    // Days to a civil date (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{}, {day:02} {} {year:04} {:02}:{:02}:{:02} GMT",
+        DAYS[(days % 7) as usize],
+        MONTHS[(month - 1) as usize],
+        rest / 3600,
+        rest / 60 % 60,
+        rest % 60
+    )
 }
 
 impl serve::Service for Http1 {
@@ -984,6 +1096,13 @@ impl serve::Service for Http1 {
         match item {
             H1::Head(head) => {
                 ctx.cancel_timer(HEAD);
+                if asks_upgrade(&head) {
+                    let mut bytes = Vec::new();
+                    if fictionet::stdlib::codec::Wire::write(&head, &mut bytes).is_ok() {
+                        self.handoff = Some(bytes);
+                        return Ok(Flow::Upgrade(serve::Upgrade::Handoff));
+                    }
+                }
                 ctx.set_timer(BODY, self.opts.body_timeout);
                 if head.expects_continue() {
                     ctx.reply().extend_from_slice(b"HTTP/1.1 100 Continue\r\n\r\n");
@@ -1035,7 +1154,8 @@ impl serve::Service for Http1 {
             return Ok(());
         }
         ctx.log(error_event(ctx.conn(), "protocol", error.to_string()));
-        write_simple(ctx.reply(), Version::HTTP_11, StatusCode::BAD_REQUEST);
+        let date = date_header(self.date, ctx.now());
+        write_simple(ctx.reply(), Version::HTTP_11, StatusCode::BAD_REQUEST, date);
         Ok(())
     }
 
@@ -1076,6 +1196,10 @@ struct Streaming {
     /// Body bytes handed to the connection.
     body_sent: u64,
     finished: bool,
+    /// The world's date at the start of the run, and when the request was
+    /// answered, for the `Date` header.
+    date: Option<SystemTime>,
+    asked: Instant,
 }
 
 impl Streaming {
@@ -1095,7 +1219,15 @@ impl Streaming {
             status: None,
             body_sent: 0,
             finished: false,
+            date: None,
+            asked: Instant::ZERO,
         }
+    }
+
+    /// Dates the response from `date`, the world's date at the start of
+    /// the run, when it is made; `asked` is the time without a [`Cx`].
+    fn dated(self, date: Option<SystemTime>, asked: Instant) -> Streaming {
+        Streaming { date, asked, ..self }
     }
 
     fn end(&mut self, ctx: &mut PendingCtx<'_>, complete: bool) {
@@ -1145,7 +1277,8 @@ impl Pending for Streaming {
                 let response = Response::from_parts(parts, Body::empty());
                 let len = body.size_hint().exact();
                 let mut head = Vec::new();
-                let close = encode(&mut head, self.version, &response, len, self.head_only, self.close);
+                let now = ctx.cx().map_or(self.asked, Cx::now);
+                let close = encode(&mut head, self.version, &response, len, self.head_only, self.close, date_header(self.date, now));
                 self.close = close;
                 self.status = Some(response.status());
                 self.extra = response.extensions().get::<Fields>().cloned();
@@ -1219,6 +1352,9 @@ pub struct HttpOptions {
     pub budget: Option<Budget>,
     /// The seed of HTTP/1 connections' randomness ([`ServeOptions::seed`]).
     pub seed: u64,
+    /// The world's date and time at the start of the run, for `Date`
+    /// headers. `None`: no `Date` header. See [Dates](self#dates).
+    pub date: Option<SystemTime>,
 }
 
 /// What an HTTP/2 client sends first, with no TLS ("prior knowledge").
@@ -1257,7 +1393,7 @@ pub async fn serve_connection<C: Connection + Unpin>(cx: &Cx, conn: C, info: Con
     };
     let conn = Prefixed::new(first, conn);
     if h2 {
-        h2::serve(cx, conn, handler, info).await;
+        h2::serve(cx, conn, handler, info, opts.date).await;
         return;
     }
     let serve_opts = ServeOptions {
@@ -1267,8 +1403,16 @@ pub async fn serve_connection<C: Connection + Unpin>(cx: &Cx, conn: C, info: Con
         seed: opts.seed,
         ..ServeOptions::default()
     };
-    let mut service = Http1::with(handler, opts.h1);
-    let _ = serve::serve(cx, conn, info, &mut service, &(), &serve_opts).await;
+    let mut service = Http1::with(handler.clone(), opts.h1);
+    service.date = opts.date;
+    let served = serve::serve(cx, conn, info.clone(), &mut service, &(), &serve_opts).await;
+    if let Ok(serve::Served::Upgraded(serve::Upgrade::Handoff, rest)) = served
+        && let Some(head) = service.take_handoff()
+    {
+        // A request that asks for an upgrade: hyper's HTTP/1 reads it again
+        // and carries the upgrade out.
+        h2::serve_upgrade(cx, Prefixed::new(head, rest), handler, info, opts.date).await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1293,6 +1437,7 @@ pub struct Site {
     vhost: VHost,
     default_host: bool,
     h1: Http1Options,
+    date: Option<SystemTime>,
     vhosts: VirtualHosts,
 }
 
@@ -1304,7 +1449,13 @@ impl Site {
 
     /// The same, from a shared handler.
     pub fn shared(handler: Arc<dyn Handler>) -> Site {
-        Site { vhost: VHost { handler, https: false, plain_http: false }, default_host: false, h1: Http1Options::default(), vhosts: VirtualHosts::new() }
+        Site {
+            vhost: VHost { handler, https: false, plain_http: false },
+            default_host: false,
+            h1: Http1Options::default(),
+            date: None,
+            vhosts: VirtualHosts::new(),
+        }
     }
 
     /// The site is served over HTTPS: on a TLS port it answers, and on a
@@ -1334,6 +1485,14 @@ impl Site {
         self.h1 = h1;
         self
     }
+
+    /// Sends `Date` headers: `start` is the world's date and time at the
+    /// start of the run. See [Dates](self#dates). Sites that share a port
+    /// use the first one's.
+    pub fn date(mut self, start: SystemTime) -> Site {
+        self.date = Some(start);
+        self
+    }
 }
 
 impl Accept for Site {
@@ -1344,6 +1503,7 @@ impl Accept for Site {
             first_bytes: (!arrival.info.tls).then_some(arrival.handshake),
             budget: arrival.budget,
             seed: arrival.seed,
+            date: self.date,
         };
         let (conn, info) = (arrival.conn, arrival.info);
         Box::pin(async move { serve_connection(&cx, conn, info, handler, &opts).await })
@@ -1376,6 +1536,7 @@ pub struct Website {
     tls: Option<ConfigFor>,
     plain_http: bool,
     default_host: bool,
+    date: Option<SystemTime>,
 }
 
 impl Website {
@@ -1386,7 +1547,7 @@ impl Website {
 
     /// The same, from a shared handler.
     pub fn shared(handler: Arc<dyn Handler>) -> Website {
-        Website { handler, tls: None, plain_http: false, default_host: false }
+        Website { handler, tls: None, plain_http: false, default_host: false, date: None }
     }
 
     /// Serves it over HTTPS on port 443, with the config `config_for`
@@ -1405,18 +1566,26 @@ impl Website {
         Website { default_host: true, ..self }
     }
 
+    /// Sends `Date` headers: `start` is the world's date and time at the
+    /// start of the run. See [Dates](self#dates).
+    pub fn date(self, start: SystemTime) -> Website {
+        Website { date: Some(start), ..self }
+    }
+
     /// `host`, serving this website.
     pub fn on(self, host: Host) -> Host {
         let mut plain = Site::shared(self.handler.clone());
         plain.vhost.https = self.tls.is_some();
         plain.vhost.plain_http = self.plain_http;
         plain.default_host = self.default_host;
+        plain.date = self.date;
         let host = host.accept(80, plain);
         match self.tls {
             None => host,
             Some(config) => {
                 let mut secure = Site::shared(self.handler).https();
                 secure.default_host = self.default_host;
+                secure.date = self.date;
                 host.tls_accept(443, Sni::Names, move |cx| config(cx), secure)
             }
         }
@@ -1430,23 +1599,62 @@ mod h2 {
     use hyper::body::Incoming;
 
     /// Runs hyper's HTTP/2 server on `conn`.
-    pub(super) async fn serve<C: Connection + Unpin>(cx: &Cx, conn: C, handler: Arc<dyn Handler>, info: ConnInfo) {
+    pub(super) async fn serve<C: Connection + Unpin>(
+        cx: &Cx,
+        conn: C,
+        handler: Arc<dyn Handler>,
+        info: ConnInfo,
+        date: Option<SystemTime>,
+    ) {
         let broke = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let io = Io { cx: cx.clone(), conn, broke: broke.clone(), buf: vec![0; 16 * 1024].into_boxed_slice() };
-        let route = Route { cx: cx.clone(), handler, info: Arc::new(info.clone()) };
-        // In a browser, `std::time::Instant::now` and `SystemTime::now` panic.
-        // hyper's timer API is in `Instant`, so there hyper runs without a
-        // timer, and it writes no `Date` header, which it takes from
-        // `SystemTime`.
+        let route = Route { cx: cx.clone(), handler, info: Arc::new(info.clone()), date };
+        // In a browser, `std::time::Instant::now` panics. hyper's timer API
+        // is in `Instant`, so there hyper runs without a timer. hyper never
+        // writes a `Date` header, which it would take from the host's
+        // clock: the route writes the world's.
         let browser = cfg!(target_arch = "wasm32");
         let mut builder = hyper::server::conn::http2::Builder::new(Executor { cx: cx.clone() });
-        builder.auto_date_header(!browser);
+        builder.auto_date_header(false);
         if !browser {
             builder.timer(CxTimer { cx: cx.clone() });
         }
         // hyper reads all the time on HTTP/2, so a reset ends it on its own.
         let served = builder.serve_connection(io, route);
         let Ok(result) = cx.race(None, served).await else { return };
+        report(cx, &info, &broke, result);
+    }
+
+    /// Runs hyper's HTTP/1 server on `conn`, with upgrades: where
+    /// [`Http1`] hands over a connection whose request asks for a protocol
+    /// upgrade, such as a WebSocket handshake. The request carries hyper's
+    /// `OnUpgrade`, so `hyper::upgrade::on` and axum's `WebSocketUpgrade`
+    /// work, and the connection goes to whatever awaits it once the `101`
+    /// is sent. Other requests on the connection are answered as usual.
+    pub(super) async fn serve_upgrade<C: Connection + Unpin + Send + 'static>(
+        cx: &Cx,
+        conn: C,
+        handler: Arc<dyn Handler>,
+        info: ConnInfo,
+        date: Option<SystemTime>,
+    ) {
+        let broke = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let io = Io { cx: cx.clone(), conn, broke: broke.clone(), buf: vec![0; 16 * 1024].into_boxed_slice() };
+        let route = Route { cx: cx.clone(), handler, info: Arc::new(info.clone()), date };
+        let mut builder = hyper::server::conn::http1::Builder::new();
+        builder.auto_date_header(false);
+        if cfg!(target_arch = "wasm32") {
+            builder.header_read_timeout(None);
+        } else {
+            builder.timer(CxTimer { cx: cx.clone() });
+        }
+        let served = builder.serve_connection(io, route).with_upgrades();
+        let Ok(result) = cx.race(None, served).await else { return };
+        report(cx, &info, &broke, result);
+    }
+
+    /// Records how a connection hyper served ended, if in an error.
+    fn report(cx: &Cx, info: &ConnInfo, broke: &std::sync::atomic::AtomicBool, result: Result<(), hyper::Error>) {
         let broke = broke.load(std::sync::atomic::Ordering::Relaxed);
         let cause = match &result {
             Err(e) => match error_cause(e) {
@@ -1458,7 +1666,7 @@ mod h2 {
             Ok(()) => None,
         };
         if let Some((cause, detail)) = cause {
-            cx.record(error_event(&info, cause, detail).conn(&info));
+            cx.record(error_event(info, cause, detail).conn(info));
         }
     }
 
@@ -1495,6 +1703,7 @@ mod h2 {
         cx: Cx,
         handler: Arc<dyn Handler>,
         info: Arc<ConnInfo>,
+        date: Option<SystemTime>,
     }
 
     type Answer = Pin<Box<dyn Future<Output = Result<Response<Counted>, Error>> + Send>>;
@@ -1539,6 +1748,11 @@ mod h2 {
                     }
                 };
                 let (mut parts, body) = response.into_parts();
+                if !parts.headers.contains_key(DATE)
+                    && let Some(date) = date_header(route.date, route.cx.now())
+                {
+                    parts.headers.insert(DATE, date);
+                }
                 track.extra = parts.extensions.get::<Fields>().cloned();
                 track.status = Some(parts.status);
                 let bodiless = head_only || no_body(parts.status);
@@ -1762,7 +1976,12 @@ mod h2 {
         fn sleep(&self, duration: Duration) -> Pin<Box<dyn hyper::rt::Sleep>> {
             let cx = self.cx.clone();
             Box::pin(CxSleep(Box::pin(async move {
-                let _ = cx.sleep(duration).await;
+                // A cancelled sleep never fires: hyper's sleeps cannot say
+                // they were cancelled, and firing would run every one of
+                // its timeouts at once. The connection ends by the cancel.
+                if cx.sleep(duration).await.is_err() {
+                    std::future::pending::<()>().await;
+                }
             })))
         }
 
@@ -1788,4 +2007,38 @@ mod h2 {
     }
 
     impl hyper::rt::Sleep for CxSleep {}
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use hyper::rt::Timer;
+
+        /// A hyper sleep on a cancelled `Cx` stays pending instead of
+        /// firing.
+        #[test]
+        fn a_cancelled_sleep_never_fires() {
+            fictionet::block_on(fictionet::run(|cx| async move {
+                let slot: Arc<Mutex<Option<Cx>>> = Arc::default();
+                let s = slot.clone();
+                let _ = cx
+                    .region(|inner| async move {
+                        *s.lock().unwrap() = Some(inner.clone());
+                        inner.cancel();
+                        Ok(())
+                    })
+                    .await;
+                let inner = slot.lock().unwrap().take().unwrap();
+                assert!(inner.is_cancelled());
+                let mut sleep = CxTimer { cx: inner }.sleep(Duration::from_secs(5));
+                let pending = |sleep: &mut Pin<Box<dyn hyper::rt::Sleep>>| {
+                    sleep.as_mut().poll(&mut Context::from_waker(std::task::Waker::noop())).is_pending()
+                };
+                assert!(pending(&mut sleep));
+                cx.sleep(Duration::from_millis(5)).await?;
+                assert!(pending(&mut sleep));
+                Ok(())
+            }))
+            .unwrap();
+        }
+    }
 }

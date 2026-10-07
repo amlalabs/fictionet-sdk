@@ -242,3 +242,50 @@ fn the_dashboard_merges_the_packets_of_several_links() {
     assert!(sections >= 2, "{sections} section headers");
     drop(child);
 }
+
+/// A watch on a world that ends normally exits 0, after printing `ended`
+/// and the stream's end.
+#[test]
+fn a_watch_exits_0_when_the_world_ends() {
+    let path = temp_socket();
+    let world = format!("unix:{path}");
+    let (attacher, mut attachments) = fictionet::attachments();
+    let listening = fictionet::listen(fictionet::WorldSocket::UnixSocket(path.clone().into()), attacher).unwrap();
+    let mut child = Command::new(BIN).args(["observe", "--world", &world, "watch"]).stdout(Stdio::piped()).spawn().unwrap();
+    // The world runs a while, then returns; its socket closes as a world
+    // binary's would when `main` returns.
+    let world_thread = std::thread::spawn(move || {
+        let _ = fictionet::block_on(fictionet::run(move |cx| async move {
+            cx.spawn(move |cx| async move {
+                while let Some(a) = attachments.next(&cx).await {
+                    drop(a);
+                }
+                Ok(())
+            });
+            cx.sleep(fictionet::time::ms(1500)).await?;
+            // Ends the run, with the task above.
+            cx.cancel();
+            Ok(())
+        }));
+        drop(listening);
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if std::time::Instant::now() > deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    world_thread.join().unwrap();
+    let mut out = String::new();
+    child.stdout.take().unwrap().read_to_string(&mut out).unwrap();
+    let status = status.expect("the watch should exit when the world ends");
+    assert_eq!(status.code(), Some(0), "{out}");
+    assert!(out.contains(r#"{"event":"ended","#), "{out}");
+    assert!(out.trim_end().ends_with(r#"{"event":"end","data":{"reason":"the world ended"}}"#), "{out}");
+}

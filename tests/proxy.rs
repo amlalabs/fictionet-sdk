@@ -64,7 +64,10 @@ impl World {
             let (attacher, attachments) = fictionet::attachments();
             let listening = fictionet::listen(fictionet::WorldSocket::UnixSocket(sock2.clone().into()), attacher).unwrap();
             ready_tx.send(()).unwrap();
-            let _ = fictionet::block_on(fictionet::run(move |cx| async move {
+            // A tokio runtime polls the world: axum runs WebSockets in tokio
+            // tasks.
+            let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+            let _ = rt.block_on(fictionet::run(move |cx| async move {
                 let config = Arc::new(
                     tls::config_builder(&cx, SystemTime::now(), rustls::crypto::ring::default_provider())
                         .with_safe_default_protocol_versions()?
@@ -84,8 +87,20 @@ impl World {
                         *queries2.lock().unwrap().entry(name.to_owned()).or_default() += 1;
                     }
                 });
+                let ws = axum::Router::new().route(
+                    "/echo",
+                    get(|ws: axum::extract::ws::WebSocketUpgrade| async move {
+                        ws.on_upgrade(|mut socket| async move {
+                            while let Some(Ok(axum::extract::ws::Message::Text(t))) = socket.recv().await {
+                                let reply = format!("echo: {}", t.as_str());
+                                let _ = socket.send(axum::extract::ws::Message::Text(reply.into())).await;
+                            }
+                        })
+                    }),
+                );
                 web::Sites::new(move |host: &str| match host {
                     "plain.test" => Some(web::Site::new(app.clone())),
+                    "ws.test" => Some(web::Site::new(ws.clone())),
                     "secure.test" => Some(web::Site::new(secure.clone()).at(SECURE).tls({
                         let c = config.clone();
                         move |_| c.clone()
@@ -411,6 +426,42 @@ fn https_through_both_doors_with_curl() {
     assert!(run(socks.clone(), "https://nope.test/", None).contains("(4)"));
     assert!(run(format!("http://{}", h.addr), "https://secure.test/", None).contains("response 407"));
     assert!(run(format!("socks5h://fictionet:wrong@{}", s.addr), "https://secure.test/", None).contains("rejected"));
+}
+
+/// An axum WebSocket handler in the world, through the HTTP door with a
+/// plain `ws://` request: the upgrade passes through, then messages go
+/// both ways.
+#[test]
+fn websockets_pass_through_the_http_door() {
+    use fictionet::stdlib::codec::{Stream, Wire};
+    use fictionet::stdlib::websocket::{Message, Messages, Role};
+    let world = World::start();
+    let a = Attach::start(&world, "https_proxy", "ws1", "10.0.0.2");
+    let mut s = a.connect();
+    write!(
+        s,
+        "GET http://ws.test/echo HTTP/1.1\r\nHost: ws.test\r\nProxy-Authorization: {BASIC}\r\nUpgrade: websocket\r\n\
+         Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    )
+    .unwrap();
+    let head = read_head(&mut s).to_lowercase();
+    assert!(head.starts_with("http/1.1 101 "), "{head}");
+    assert!(head.contains("\r\nupgrade: websocket\r\n"), "{head}");
+    assert!(head.contains("sec-websocket-accept: s3pplmbitxaq9kygzzhzrbk+xoo="), "{head}");
+    let frame = Message::Text("hello".into()).to_frame(Some([9, 8, 7, 6])).unwrap();
+    s.write_all(&frame.to_bytes().unwrap()).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut stream = Stream::new(Messages::new(Role::Client));
+    let mut buf = [0u8; 1024];
+    let reply = loop {
+        if let Some(m) = stream.next() {
+            break m.unwrap();
+        }
+        let n = s.read(&mut buf).unwrap();
+        assert!(n > 0, "the WebSocket closed");
+        assert_eq!(stream.push(&buf[..n]), n);
+    };
+    assert_eq!(reply, Message::Text("echo: hello".into()));
 }
 
 #[test]

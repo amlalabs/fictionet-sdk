@@ -67,6 +67,9 @@
 //!   (IPv6). Hosts with the same address share one machine.
 //! - **A router** with one route per machine. A packet for any other
 //!   address gets ICMP "host unreachable" (ICMPv6 "address unreachable").
+//!   The router is private ([`Router::keep_ttl`](super::route::Router::keep_ttl)):
+//!   it leaves TTLs as they are, so every machine is one hop from the
+//!   sandbox.
 //! - **LANs.** [`Net::lan`] adds an IP subnet that hosts join with
 //!   [`Host::on`] and attached virtual machines with [`Net::member`], as
 //!   machines on one Ethernet: broadcast and multicast reach every member.
@@ -675,6 +678,8 @@ impl Net {
         let caller = cx.clone();
         let cx = &cx.group(self.group.clone());
         let router = route::router(cx, Vec::new());
+        // Every host is one hop from the sandbox: the router is private.
+        router.keep_ttl();
 
         // Everything without a better route: answered with "host unreachable".
         let (router_side, unreachable_side) = link();

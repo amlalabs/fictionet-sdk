@@ -245,6 +245,64 @@ impl<'a> V6<'a> {
     }
 }
 
+/// What a router hop did to a packet's TTL or hop limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Hop {
+    /// Lowered by one: forward the packet.
+    Forward,
+    /// It was 0 or 1, so the packet must not be forwarded (RFC 1812
+    /// 5.3.1, RFC 8200 section 3).
+    Expired,
+    /// Neither IPv4 nor IPv6, or too short to hold the field.
+    NotIp,
+}
+
+/// Lowers the TTL (IPv4, updating the header checksum as RFC 1624 does) or
+/// the hop limit (IPv6) of `packet` by one, as a router does for each hop.
+/// An expired packet is left as it was.
+pub(crate) fn hop(packet: &mut [u8]) -> Hop {
+    match version(packet) {
+        Some(4) if packet.len() >= 20 => {
+            let ttl = packet[8];
+            if ttl <= 1 {
+                return Hop::Expired;
+            }
+            let old = u16::from_be_bytes([ttl, packet[9]]);
+            let new = u16::from_be_bytes([ttl - 1, packet[9]]);
+            packet[8] = ttl - 1;
+            // HC' = ~(~HC + ~m + m')
+            let hc = u16::from_be_bytes([packet[10], packet[11]]);
+            let mut sum = u32::from(!hc) + u32::from(!old) + u32::from(new);
+            while sum > 0xffff {
+                sum = (sum & 0xffff) + (sum >> 16);
+            }
+            packet[10..12].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+            Hop::Forward
+        }
+        Some(6) if packet.len() >= 40 => {
+            if packet[7] <= 1 {
+                return Hop::Expired;
+            }
+            packet[7] -= 1;
+            Hop::Forward
+        }
+        _ => Hop::NotIp,
+    }
+}
+
+/// The source address of an IPv4 or IPv6 packet.
+pub(crate) fn source(packet: &[u8]) -> Option<IpAddr> {
+    match version(packet)? {
+        4 if packet.len() >= 20 => Some(IpAddr::V4(Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]))),
+        6 if packet.len() >= 40 => {
+            let mut a = [0u8; 16];
+            a.copy_from_slice(&packet[8..24]);
+            Some(IpAddr::V6(Ipv6Addr::from(a)))
+        }
+        _ => None,
+    }
+}
+
 /// The destination address of an IPv4 or IPv6 packet.
 pub(crate) fn destination(packet: &[u8]) -> Option<IpAddr> {
     match version(packet)? {

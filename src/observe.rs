@@ -187,7 +187,9 @@
 //!   queue drops (`bottleneck.drop`), and the dashboard counts them on its
 //!   node.
 //! - A [router](crate::stdlib::route::router) records a route it removes
-//!   because the route's interface closed (`router.route_removed`).
+//!   because the route's interface closed (`router.route_removed`), and
+//!   each packet it drops because its TTL or hop limit ran out
+//!   (`router.drop`).
 //! - A [LAN](crate::stdlib::route::lan) records each packet it drops
 //!   (`lan.drop`) and each member replaced or gone (`lan.member_replaced`,
 //!   `lan.member_removed`).
@@ -314,8 +316,8 @@
 //!
 //! A stream is a series of values, each an object
 //! `{"event":"<name>","data":<data>}`. It ends with
-//! `{"event":"end","data":{"reason":"..."}}` when its link closes or it is
-//! cancelled.
+//! `{"event":"end","data":{"reason":"..."}}` when its link closes, the
+//! world ends (a `watch` sends `ended` first), or it is cancelled.
 //!
 //! An observer finds the world's run the first time the world asks its
 //! [`Attachments`](crate::Attachments) for a sandbox, with
