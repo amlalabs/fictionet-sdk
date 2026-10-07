@@ -1264,9 +1264,9 @@ mod tests {
         assert_eq!(frames, [frame]);
         assert_eq!(error, None);
         assert!(matches!(decode_all(grpc::Messages::new, &[2]).1,
-            Some(Fail::Protocol(grpc::FrameError::Flag(2)))));
+            Some(Fail::Protocol(grpc::Error::Flag(2)))));
         assert!(matches!(decode_all(grpc::Messages::new, &[0, 0x00, 0x40, 0x00, 0x01]).1,
-            Some(Fail::Protocol(grpc::FrameError::TooLarge { .. }))));
+            Some(Fail::Protocol(grpc::Error::TooLarge { .. }))));
         assert!(matches!(decode_all(grpc::Messages::new, &[0, 0x00, 0x40, 0x00, 0x00]).1,
             Some(Fail::Truncated { .. })));
     }
