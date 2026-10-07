@@ -19,16 +19,13 @@ jobs:
       fail-fast: false
       matrix:
         # The default features (tokio) and none at all. Every step below
-        # runs once per entry. The second builds the fictionet package
-        # alone: with --workspace, fictionet-codegen's dev-dependency on
-        # fictionet turns the default features back on, and both entries
-        # would build the same thing.
+        # runs once per entry, on the whole workspace. fictionet-codegen's
+        # dev-dependency on fictionet turns off its default features, so
+        # the second entry builds without tokio.
         include:
           - name: default features
-            packages: "--workspace"
             features: ""
           - name: no default features
-            packages: "-p fictionet"
             features: "--no-default-features"
     steps:
       - uses: actions/checkout@v4
@@ -40,17 +37,17 @@ jobs:
         with:
           tool: cargo-nextest
       - name: Build
-        run: cargo build --locked ${{ matrix.packages }} --all-targets ${{ matrix.features }}
+        run: cargo build --locked --workspace --all-targets ${{ matrix.features }}
       - name: Test
-        run: cargo nextest run --locked ${{ matrix.packages }} ${{ matrix.features }}
+        run: cargo nextest run --locked --workspace ${{ matrix.features }}
       - name: Doctests
-        run: cargo test --locked --doc ${{ matrix.packages }} ${{ matrix.features }}
+        run: cargo test --locked --doc --workspace ${{ matrix.features }}
       - name: Docs
-        run: cargo doc --locked ${{ matrix.packages }} --no-deps ${{ matrix.features }}
+        run: cargo doc --locked --workspace --no-deps ${{ matrix.features }}
         env:
           RUSTDOCFLAGS: -D warnings
       - name: Clippy
-        run: cargo clippy --locked ${{ matrix.packages }} --all-targets ${{ matrix.features }} -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets ${{ matrix.features }} -- -D warnings
 
   wasm:
     name: wasm32 (browser)

@@ -7,7 +7,9 @@ description = "Bounded, copy-and-own Fictionet protocol generation"
 license = "MIT OR Apache-2.0"
 
 [dev-dependencies]
-fictionet = { path = ".." }
+# No default features, so `--workspace --no-default-features` builds
+# fictionet without its tokio feature. The tests need none of them.
+fictionet = { path = "..", default-features = false }
 
 [lints.rust]
 missing_docs = "deny"
