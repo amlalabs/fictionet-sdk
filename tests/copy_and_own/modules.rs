@@ -349,3 +349,30 @@ fn copied_transports<S, M>(
     fn send_future(_: impl std::future::Future + Send) {}
     send_future(serve_datagram(fcx, socket, local, service, &state, &opts));
 }
+
+// A copied TCP connection also enters the connection and TLS drivers directly.
+fn copied_connection<S>(
+    fcx: &fictionet::Cx,
+    conn: tcp::TcpConnection,
+    info: fictionet::events::ConnInfo,
+    service: &mut S,
+    state: &S::State,
+) where
+    S: fictionet::stdlib::serve::Service,
+    <S::Decoder as fictionet::stdlib::codec::Decode>::Error: Clone + Send,
+{
+    use fictionet::stdlib::serve::{serve, ServeOptions};
+    drop(serve(fcx, conn, info, service, state, &ServeOptions::default()));
+}
+
+fn copied_tls(fcx: &fictionet::Cx, conn: tcp::TcpConnection) {
+    drop(fictionet::stdlib::tls::server(fcx, conn));
+}
+
+fn copied_tls_server(fcx: &fictionet::Cx, conn: tcp::TcpConnection) {
+    drop(tls::server(fcx, conn));
+}
+
+fn copied_router<I: fictionet::Interface>(fcx: &fictionet::Cx, interface: I) {
+    let _ = route::router(fcx, vec![("10.0.0.0/24".parse().unwrap(), interface)]);
+}

@@ -10,6 +10,10 @@ test = false
 doctest = false
 doc = false
 
+[[bench]]
+name = "tcp"
+harness = false
+
 [[bin]]
 name = "fictionet-copy-stdlib"
 path = "stdlib.rs"

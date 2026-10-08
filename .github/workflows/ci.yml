@@ -114,6 +114,19 @@ jobs:
         env:
           RUSTFLAGS: --cfg fuzzing
 
+  # Bulk TCP through the copied module must keep pace with the built-in one.
+  copy-tcp:
+    name: copied TCP performance
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Compare TCP implementations in release
+        run: cargo bench --locked -p fictionet-copy-modules --bench tcp
+
   wasm:
     name: wasm32 (browser)
     runs-on: ubuntu-latest

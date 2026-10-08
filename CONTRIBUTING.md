@@ -41,6 +41,8 @@ $ cargo clippy --lib --no-default-features --target wasm32-unknown-unknown -- -D
 CI also checks that the crate builds with Rust 1.91, the minimum version in
 `Cargo.toml`, and runs every fuzz target for a minute.
 
+CI runs `cargo bench --locked -p fictionet-copy-modules --bench tcp` in release to compare copied TCP throughput and allocation counts with the built-in module.
+
 ## Running the tests
 
 The tests run under [cargo-nextest](https://nexte.st), installed with
