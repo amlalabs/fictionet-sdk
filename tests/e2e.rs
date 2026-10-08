@@ -4,58 +4,29 @@
 //! rustls client. Every byte crosses as IP packets through both splits, the
 //! router and a delayed link.
 
+mod common;
+#[path = "common/done.rs"]
+mod done;
+#[path = "common/world.rs"]
+mod world;
+#[path = "common/certs.rs"]
+mod certs;
+
+use certs::certs;
+use world::world;
+
 use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime};
 
 use fictionet::prelude::*;
 use fictionet::stdlib::tls::{self, ServerConfig};
 use fictionet::stdlib::{ConnError, Connection, delay, ip, route, tcp};
-use fictionet::{Cx, Interface, Packet, RecvError, block_on, pair, run};
-use rcgen::{BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
-use rustls::{ClientConfig, ClientConnection, RootCertStore};
-
-/// Runs `f` on its own thread and fails the test if it takes longer than
-/// `limit`, instead of hanging.
-fn within<T: Send + 'static>(limit: Duration, f: impl FnOnce() -> T + Send + 'static) -> T {
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(f());
-    });
-    rx.recv_timeout(limit).expect("timed out")
-}
-
-/// The world returns this error once the test is done, which cancels the
-/// endpoints, router and splits, so the run ends.
-#[derive(Debug)]
-struct Done;
-impl std::fmt::Display for Done {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("done")
-    }
-}
-impl std::error::Error for Done {}
-
-fn world<F, Fut>(limit: Duration, f: F)
-where
-    F: FnOnce(Cx) -> Fut + Send + 'static,
-    Fut: Future<Output = fictionet::Result> + Send + 'static,
-{
-    let result = within(limit, move || {
-        block_on(run(move |fcx| async move {
-            f(fcx).await?;
-            Err(fictionet::Error::from(Done))
-        }))
-    });
-    match result {
-        Err(e) if e.downcast_ref::<Done>().is_some() => {}
-        Err(e) => panic!("the world failed: {e}"),
-        Ok(()) => panic!("the world should end with Done"),
-    }
-}
+use fictionet::{Cx, Interface, Packet, RecvError, pair};
+use rustls::pki_types::ServerName;
+use rustls::{ClientConfig, ClientConnection};
 
 // ---------------------------------------------------------------------------
 // A rustls client over any Connection.
@@ -162,30 +133,6 @@ impl<C: Connection> Client<C> {
 // ---------------------------------------------------------------------------
 // Certificates: a world CA and a leaf for the server.
 
-struct Certs {
-    roots: RootCertStore,
-    chain: Vec<CertificateDer<'static>>,
-    key: PrivateKeyDer<'static>,
-}
-
-fn certs(name: &str) -> Certs {
-    let mut ca = CertificateParams::new(Vec::<String>::new()).unwrap();
-    ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    let ca_key = KeyPair::generate().unwrap();
-    let ca = ca.self_signed(&ca_key).unwrap();
-    let mut leaf = CertificateParams::new(vec![name.to_owned()]).unwrap();
-    leaf.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-    let leaf_key = KeyPair::generate().unwrap();
-    let leaf = leaf.signed_by(&leaf_key, &ca, &ca_key).unwrap();
-    let mut roots = RootCertStore::empty();
-    roots.add(ca.der().clone()).unwrap();
-    Certs {
-        roots,
-        chain: vec![leaf.der().clone()],
-        key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der())),
-    }
-}
-
 fn pattern(len: usize, seed: u64) -> Vec<u8> {
     let mut x = seed | 1;
     (0..len)
@@ -218,7 +165,7 @@ fn https_through_a_router(server_addr: &str, client_addr: &str, server_prefix: &
     let server_prefix: route::Prefix = server_prefix.parse().unwrap();
     let client_prefix: route::Prefix = client_prefix.parse().unwrap();
     world(Duration::from_secs(60), move |fcx| async move {
-        let certs = certs(NAME);
+        let certs = certs(&[NAME]);
 
         // Two cables into the router. The client's link has 5 ms of delay
         // each way.

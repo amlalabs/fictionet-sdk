@@ -3,11 +3,19 @@
 //! same limits, budget and seed as HTTP/1, and request events that say
 //! what the connection took.
 
+#[path = "common/done.rs"]
+mod done;
+#[path = "common/world.rs"]
+mod world;
+mod common;
+
+use world::world;
+
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -18,42 +26,12 @@ use fictionet::stdlib::httpd::{self, Body, Exchange, Handler, Http1, HttpOptions
 use fictionet::stdlib::json;
 use fictionet::stdlib::serve::{self, Budget, Ended, FaultPlan, Flow, Harness, Plan, Driver, ServeOptions, Service};
 use fictionet::stdlib::{Connection, ConnectionExt, ip, tcp};
-use fictionet::{Cx, block_on, pair, run};
+use fictionet::{Cx, pair};
 use http_body::Frame;
 use http_body_util::{BodyExt, Full};
 
 // ---------------------------------------------------------------------------
 // Running a world in a test
-
-#[derive(Debug)]
-struct Done;
-impl std::fmt::Display for Done {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("done")
-    }
-}
-impl std::error::Error for Done {}
-
-/// Runs `f` as a world, which ends with `Done`, within 60 seconds.
-fn world<F, Fut>(f: F)
-where
-    F: FnOnce(Cx) -> Fut + Send + 'static,
-    Fut: Future<Output = fictionet::Result> + Send + 'static,
-{
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let r = block_on(run(move |fcx| async move {
-            f(fcx).await?;
-            Err(fictionet::Error::from(Done))
-        }));
-        let _ = tx.send(r);
-    });
-    match rx.recv_timeout(Duration::from_secs(60)).expect("timed out") {
-        Err(e) if e.downcast_ref::<Done>().is_some() => {}
-        Err(e) => panic!("the world failed: {e}"),
-        Ok(()) => panic!("the world should end with Done"),
-    }
-}
 
 const SERVER: Ipv4Addr = Ipv4Addr::new(10, 9, 0, 1);
 
@@ -166,7 +144,7 @@ fn a_response_body_waiting_to_be_written_counts_against_the_budget() {
 /// Before, the driver waited for ever on a client that stopped reading.
 #[test]
 fn a_client_that_stops_reading_times_out() {
-    world(|fcx| async move {
+    world(Duration::from_secs(60), |fcx| async move {
         let (server, client) = two_machines(&fcx);
         let kept = fcx.events();
         let opts = ServeOptions::default().idle(None).write_timeout(Some(Duration::from_millis(300)));
@@ -245,7 +223,7 @@ fn an_http10_body_of_unknown_length_closes_the_connection() {
 /// before reading it.
 #[test]
 fn a_response_cut_off_by_a_reset_is_logged_incomplete() {
-    world(|fcx| async move {
+    world(Duration::from_secs(60), |fcx| async move {
         let (server, client) = two_machines(&fcx);
         let kept = fcx.events();
         let size = 8 << 20;
@@ -286,7 +264,7 @@ fn a_response_cut_off_by_a_reset_is_logged_incomplete() {
 /// once: 100, not hyper's 200.
 #[test]
 fn http2_caps_the_streams_a_connection_opens() {
-    world(|fcx| async move {
+    world(Duration::from_secs(60), |fcx| async move {
         let (server, client) = two_machines(&fcx);
         serve_http(&fcx, &server, 80, Arc::new(page(2)), HttpOptions::default())?;
         let mut conn = client.connect(&fcx, SocketAddr::new(SERVER.into(), 80)).await?;
@@ -313,7 +291,7 @@ fn http2_caps_the_streams_a_connection_opens() {
 /// the run's own randomness.
 #[test]
 fn http2_has_the_limits_budget_and_seed_of_http1() {
-    world(|fcx| async move {
+    world(Duration::from_secs(60), |fcx| async move {
         let (server, client) = two_machines(&fcx);
         let kept = fcx.events();
         let router = Router::new()

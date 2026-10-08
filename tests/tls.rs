@@ -1,6 +1,10 @@
 //! TLS: the world as a TLS server, with a rustls client over an in-memory
 //! connection, all under `run`.
 
+mod common;
+
+use common::within;
+
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Read, Write};
 use std::sync::{Arc, Mutex, mpsc};
@@ -14,16 +18,6 @@ use fictionet::{Cx, block_on, run};
 use rcgen::{BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::{AlertDescription, ClientConfig, ClientConnection, RootCertStore};
-
-/// Runs `f` on its own thread and fails the test if it takes longer than
-/// `limit`, instead of hanging.
-fn within<T: Send + 'static>(limit: Duration, f: impl FnOnce() -> T + Send + 'static) -> T {
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(f());
-    });
-    rx.recv_timeout(limit).expect("timed out")
-}
 
 // ---------------------------------------------------------------------------
 // An in-memory connection pair.

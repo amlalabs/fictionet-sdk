@@ -5,11 +5,17 @@
 //! are not allowed, they print a note and pass. The Docker test in
 //! `tests/docker/ping` covers the same ground with real containers.
 
+#[path = "common/logged.rs"]
+mod logged;
+
+use logged::logged;
+
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use fictionet::stdlib::ip::checksum;
 use fictionet::{Interface, Packet, RecvError};
+
 
 const BIN: &str = env!("CARGO_BIN_EXE_fictionet");
 
@@ -370,20 +376,20 @@ fn world_wait_waits_for_a_late_world() {
     }
     let dir = temp_dir();
     let sock = dir.join("w.sock").to_str().unwrap().to_owned();
-    let late = unshare("-rn", &format!("exec {BIN} attach --world unix:{sock} --name late --type tun {V4_ONLY} --world-wait 20"));
+    let mut late = unshare("-rn", &format!("exec {BIN} attach --world unix:{sock} --name late --type tun {V4_ONLY} --world-wait 20"));
     let started = std::time::Instant::now();
     let never = unshare(
         "-rn",
         &format!("exec {BIN} attach --world unix:{}/none.sock --name n --type tun {V4_ONLY} --world-wait 1", dir.display()),
     );
-    std::thread::sleep(Duration::from_millis(1500));
+    let log = logged(late.stderr.take().unwrap(), "waiting up to 20 s for the world");
     let (attacher, attachments) = fictionet::attachments();
     let listening = fictionet::listen(fictionet::WorldSocket::UnixSocket(sock.clone().into()), attacher).unwrap();
     std::fs::write(dir.join("done"), "").unwrap();
     hold_until(attachments, "late", dir.join("done"));
     let out = late.wait_with_output().unwrap();
     drop(listening);
-    let err = String::from_utf8_lossy(&out.stderr);
+    let err = log.join().unwrap();
     assert_eq!(out.status.code(), Some(0), "{err}");
     assert!(err.contains("waiting up to 20 s for the world"), "{err}");
     assert!(err.contains("late attached as tun0"), "{err}");
@@ -455,14 +461,13 @@ fn wait_blocked_waits_while_an_address_answers_and_exits_0_once_it_stops() {
 
     // It exits 0 soon after the address stops answering.
     let mut child = Command::new(BIN).args(["wait-blocked", "--timeout", "20", &open]).stderr(Stdio::piped()).spawn().unwrap();
-    std::thread::sleep(Duration::from_millis(1500));
+    let log = logged(child.stderr.take().unwrap(), "still reachable; waiting");
     assert!(child.try_wait().unwrap().is_none(), "exited while the address still answered");
     drop(listener);
-    let started = std::time::Instant::now();
     let out = child.wait_with_output().unwrap();
-    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
-    assert!(started.elapsed() < Duration::from_secs(5));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("still reachable; waiting"));
+    let err = log.join().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert!(err.contains("still reachable; waiting"));
 
     assert_eq!(run(&[]).status.code(), Some(2));
     assert_eq!(run(&["example.com:443"]).status.code(), Some(2));

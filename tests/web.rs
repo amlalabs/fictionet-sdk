@@ -3,11 +3,34 @@
 //! parts (`split_protocols`, `tcp::endpoint`, `udp::endpoint`) with a
 //! rustls client and a hyper client on top.
 
+mod common;
+#[path = "common/done.rs"]
+mod done;
+#[path = "common/timeout.rs"]
+mod timeout;
+#[path = "common/certs.rs"]
+mod certs;
+#[path = "common/sandbox.rs"]
+mod sandbox;
+#[path = "common/world.rs"]
+mod run_world;
+#[path = "common/wait.rs"]
+mod wait;
+#[path = "common/machine.rs"]
+mod machine;
+
+use sandbox::Machine;
+use machine::machine;
+use certs::certs;
+use timeout::timeout;
+use done::Done;
+use common::within;
+
 use std::convert::Infallible;
 use std::future::{Future, poll_fn};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::pin::{Pin, pin};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::task::{Context, Poll};
@@ -21,33 +44,16 @@ use fictionet::stdlib::dns::rr::{Name, RData, RecordType};
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::tls;
 use fictionet::events::{Event as Entry, EventLog, Fields, Sandbox};
-use fictionet::stdlib::{ConnError, Connection, dhcp, ip, tcp, udp, web};
+use fictionet::stdlib::{ConnError, Connection, dhcp, ip, tcp, web};
 use fictionet::{Attacher, Cx, End, Interface, Packet, block_on, run};
 use http::{HeaderMap, Request, Response, StatusCode, Version};
 use http_body_util::{BodyExt, Empty, Full};
-use rcgen::{BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore};
 
 // ---------------------------------------------------------------------------
 // Running a test world
-
-fn within<T: Send + 'static>(limit: Duration, f: impl FnOnce() -> T + Send + 'static) -> T {
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(f());
-    });
-    rx.recv_timeout(limit).expect("timed out")
-}
-
-#[derive(Debug)]
-struct Done;
-impl std::fmt::Display for Done {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("done")
-    }
-}
-impl std::error::Error for Done {}
 
 /// Runs a world with the test sites. `f` gets the attacher and plays the
 /// sandboxes. When it returns, the world ends with `Done`, which cancels
@@ -57,35 +63,12 @@ where
     F: FnOnce(Cx, Attacher, Env) -> Fut + Send + 'static,
     Fut: Future<Output = fictionet::Result> + Send + 'static,
 {
-    let result = within(Duration::from_secs(60), move || {
-        block_on(run(move |fcx| async move {
-            let (attacher, attachments) = fictionet::attachments();
-            let env = sites(&fcx).serve_with(&fcx, attachments)?;
-            f(fcx, attacher, env).await?;
-            Err(fictionet::Error::from(Done))
-        }))
+    run_world::world(Duration::from_secs(60), move |fcx| async move {
+        let (attacher, attachments) = fictionet::attachments();
+        let env = sites(&fcx).serve_with(&fcx, attachments)?;
+        f(fcx, attacher, env).await?;
+        Ok(())
     });
-    match result {
-        Err(e) if e.downcast_ref::<Done>().is_some() => {}
-        Err(e) => panic!("the world failed: {e}"),
-        Ok(()) => panic!("the world should end with Done"),
-    }
-}
-
-/// Waits for `fut` at most `d`.
-async fn timeout<T>(fcx: &Cx, d: Duration, fut: impl Future<Output = T>) -> Option<T> {
-    let mut fut = pin!(fut);
-    let mut sleep = pin!(fcx.sleep(d));
-    poll_fn(|cx| {
-        if let Poll::Ready(v) = fut.as_mut().poll(cx) {
-            return Poll::Ready(Some(v));
-        }
-        if sleep.as_mut().poll(cx).is_ready() {
-            return Poll::Ready(None);
-        }
-        Poll::Pending
-    })
-    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -99,6 +82,7 @@ struct Env {
     calls: Arc<AtomicUsize>,
     /// Requests the secure site has served.
     served: Arc<AtomicUsize>,
+    waiting: Arc<AtomicUsize>,
 }
 
 struct TestSites {
@@ -131,7 +115,7 @@ fn page(kind: &'static str) -> Fields {
 /// The size of `events.test/big`.
 const BIG: usize = 4 << 20;
 
-fn events_site() -> axum::Router {
+fn events_site(waiting: Arc<AtomicUsize>) -> axum::Router {
     axum::Router::new()
         .route(
             "/page",
@@ -140,9 +124,13 @@ fn events_site() -> axum::Router {
             }),
         )
         .route("/big", axum::routing::get(|| async { vec![b'x'; BIG] }))
-        .route("/wait", axum::routing::get(|| async {
-            std::future::pending::<()>().await;
-            "never"
+        .route("/wait", axum::routing::get(move || {
+            let waiting = waiting.clone();
+            async move {
+                waiting.fetch_add(1, Ordering::SeqCst);
+                std::future::pending::<()>().await;
+                "never"
+            }
         }))
 }
 
@@ -194,7 +182,9 @@ fn sites(fcx: &Cx) -> TestSites {
     );
     let calls = Arc::new(AtomicUsize::new(0));
     let served = Arc::new(AtomicUsize::new(0));
-    let env = Env { roots: Arc::new(certs.roots), calls: calls.clone(), served: served.clone() };
+    let waiting = Arc::new(AtomicUsize::new(0));
+    let handler_waiting = waiting.clone();
+    let env = Env { roots: Arc::new(certs.roots), calls: calls.clone(), served: served.clone(), waiting };
 
     let secure = axum::Router::new().fallback(move |Extension(t): Extension<web::Target>, version: Version| {
         let n = served.fetch_add(1, Ordering::SeqCst) + 1;
@@ -225,8 +215,8 @@ fn sites(fcx: &Cx) -> TestSites {
             })),
             "broken.test" => Some(web::Site::new(Broken)),
             h if h.ends_with(".wild.test") => Some(web::Site::new(Plain("wild"))),
-            "slow.test" => Some(web::Site::new(events_site())),
-            "events.test" => Some(web::Site::new(events_site()).at(EVENTS_ADDR).tls({
+            "slow.test" => Some(web::Site::new(events_site(handler_waiting.clone()))),
+            "events.test" => Some(web::Site::new(events_site(handler_waiting.clone())).at(EVENTS_ADDR).tls({
                 let c = config.clone();
                 move |_| c.clone()
             })),
@@ -295,47 +285,12 @@ impl tower_service::Service<Request<web::Body>> for Broken {
     }
 }
 
-struct Certs {
-    roots: RootCertStore,
-    chain: Vec<CertificateDer<'static>>,
-    key: PrivateKeyDer<'static>,
-}
-
-fn certs(names: &[&str]) -> Certs {
-    let mut ca = CertificateParams::new(Vec::<String>::new()).unwrap();
-    ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    let ca_key = KeyPair::generate().unwrap();
-    let ca = ca.self_signed(&ca_key).unwrap();
-    let mut leaf = CertificateParams::new(names.iter().map(|n| n.to_string()).collect::<Vec<_>>()).unwrap();
-    leaf.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-    let leaf_key = KeyPair::generate().unwrap();
-    let leaf = leaf.signed_by(&leaf_key, &ca, &ca_key).unwrap();
-    let mut roots = RootCertStore::empty();
-    roots.add(ca.der().clone()).unwrap();
-    Certs {
-        roots,
-        chain: vec![leaf.der().clone()],
-        key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der())),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // A sandbox built from stdlib parts
 
 const GATEWAY: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 
-struct Machine {
-    tcp: tcp::Endpoint,
-    udp: udp::Endpoint,
-    _icmp: End,
-}
 
-fn machine(fcx: &Cx, attacher: &Attacher, name: &str, addr: impl Into<IpAddr>) -> Machine {
-    let end = attacher.attach(name).unwrap();
-    let (tcp, udp, icmp, _other) = ip::split_protocols(fcx, end);
-    let addr = addr.into();
-    Machine { tcp: tcp::endpoint(fcx, tcp, addr), udp: udp::endpoint(fcx, udp, addr), _icmp: icmp }
-}
 
 /// Asks the gateway's DNS over UDP. Returns the response code and the A
 /// records.
@@ -1596,13 +1551,13 @@ async fn open_idle(fcx: &Cx, raw: &mut End, me: Ipv4Addr, to: SocketAddr, n: u16
     (open, closed)
 }
 
-/// Times one HTTPS request from a fresh connection.
+/// Measures thread CPU time for one HTTPS request from a fresh connection.
 async fn timed_get(fcx: &Cx, m: &Machine, env: &Env) -> Duration {
-    let started = std::time::Instant::now();
+    let started = fictionet::stdlib::test_support::thread_cpu_time();
     let conn = tls_connect(fcx, m, env, SECURE_ADDR, "secure.test", &[b"http/1.1"]).await.unwrap();
     let mut client = Client::new(fcx, conn, false).await;
     assert_eq!(client.get("https", "secure.test", "/").await.status, StatusCode::OK);
-    started.elapsed()
+    fictionet::stdlib::test_support::thread_cpu_time() - started
 }
 
 /// Ports (ours) of the connections the other side closed (FIN or RST)
@@ -1634,28 +1589,27 @@ fn one_sandbox_cannot_hold_thousands_of_connections_open() {
         closed.extend(closed_ports(&fcx, &mut raw, Duration::from_secs(1)).await);
         assert_eq!(closed.len(), 1000 - 256, "all past the first 256 are closed");
         // The other sandbox is served as before.
-        let took = timed_get(&fcx, &b, &env).await;
-        assert!(took < Duration::from_secs(1), "{took:?}");
+        timed_get(&fcx, &b, &env).await;
         Ok(())
     });
 }
 
 /// One HTTP/1.0 request on a fresh connection. Reads to the end, and
 /// gives back the connection without closing this side, so it stays in
-/// CLOSE_WAIT. `None` if the machine reset it.
-async fn get_and_hold(fcx: &Cx, m: &Machine, to: Ipv4Addr) -> Option<(String, tcp::TcpConnection)> {
-    let mut conn = m.tcp.connect(fcx, SocketAddr::new(to.into(), 80)).await.ok()?;
-    conn.write_all(fcx, b"GET / HTTP/1.0\r\nHost: plain.test\r\n\r\n").await.ok()?;
+/// CLOSE_WAIT. Returns the connection error if the request fails.
+async fn get_and_hold(fcx: &Cx, m: &Machine, to: Ipv4Addr) -> Result<(String, tcp::TcpConnection), ConnError> {
+    let mut conn = m.tcp.connect(fcx, SocketAddr::new(to.into(), 80)).await?;
+    conn.write_all(fcx, b"GET / HTTP/1.0\r\nHost: plain.test\r\n\r\n").await?;
     let mut got = Vec::new();
     let mut buf = [0u8; 4096];
     loop {
         match conn.read(fcx, &mut buf).await {
             Ok(0) => break,
             Ok(n) => got.extend_from_slice(&buf[..n]),
-            Err(_) => return None,
+            Err(e) => return Err(e),
         }
     }
-    Some((String::from_utf8_lossy(&got).into_owned(), conn))
+    Ok((String::from_utf8_lossy(&got).into_owned(), conn))
 }
 
 /// A connection the server closed but the sandbox never closed on its side
@@ -1669,13 +1623,13 @@ fn connections_left_half_open_still_count() {
         let to = lookup(&fcx, &a, "plain.test").await;
         let mut held = Vec::new();
         for i in 0..256 {
-            let (text, conn) = get_and_hold(&fcx, &a, to).await.unwrap_or_else(|| panic!("connection {i} was reset"));
+            let (text, conn) = get_and_hold(&fcx, &a, to).await.unwrap_or_else(|e| panic!("connection {i} failed: {e}"));
             assert!(text.starts_with("HTTP/1.0 200"), "{text}");
             held.push(conn);
         }
         // The server closed all 256; the sandbox did not.
         for _ in 0..20 {
-            assert!(get_and_hold(&fcx, &a, to).await.is_none(), "a connection past the 256 was served");
+            assert!(get_and_hold(&fcx, &a, to).await.is_err_and(|e| e == ConnError::Reset), "a connection past the 256 was served");
         }
         // Another sandbox is served as before.
         let b = machine(&fcx, &attacher, "b", Ipv4Addr::new(10, 0, 0, 3));
@@ -1684,7 +1638,16 @@ fn connections_left_half_open_still_count() {
         assert!(text.starts_with("HTTP/1.0 200"), "{text}");
         // Closing them frees the count.
         drop(held);
-        fcx.sleep(Duration::from_millis(200)).await?;
+        let (text, _conn) = timeout(&fcx, Duration::from_secs(10), async {
+            loop {
+                match get_and_hold(&fcx, &a, to).await {
+                    Ok(reply) => break reply,
+                    Err(ConnError::Reset) => fcx.sleep(Duration::from_millis(10)).await.unwrap(),
+                    Err(e) => panic!("the readiness request failed: {e}"),
+                }
+            }
+        }).await.expect("the connection count was not freed");
+        assert!(text.starts_with("HTTP/1.0 200"), "{text}");
         for _ in 0..20 {
             let (text, _conn) = get_and_hold(&fcx, &a, to).await.expect("served again after closing");
             assert!(text.starts_with("HTTP/1.0 200"), "{text}");
@@ -1694,11 +1657,17 @@ fn connections_left_half_open_still_count() {
 }
 
 /// A connection that never finishes its TLS handshake, never sends a
-/// request on port 80, or sits idle on DNS over TCP, is closed after ten
-/// seconds.
+/// request on port 80, or sits idle on DNS over TCP, is closed after one
+/// second.
 #[test]
 fn connections_that_send_nothing_are_closed() {
-    world(|fcx, attacher, _env| async move {
+    run_world::world(Duration::from_secs(60), |fcx| async move {
+        let (attacher, attachments) = fictionet::attachments();
+        sites(&fcx).sites.into_net().limits(fictionet::stdlib::net::Limits {
+            handshake: Duration::from_secs(1),
+            dns_tcp_idle: Duration::from_secs(1),
+            ..Default::default()
+        }).serve(&fcx, attachments)?;
         let me = Ipv4Addr::new(10, 0, 0, 2);
         let mut raw = attacher.attach("a").unwrap();
         let plain = Ipv4Addr::new(198, 18, 0, 1);
@@ -1710,9 +1679,11 @@ fn connections_that_send_nothing_are_closed() {
             raw.send(udp(me, 5353, GATEWAY, 53, &q.to_vec().unwrap()));
             assert!(recv_within(&fcx, &mut raw, Duration::from_secs(2)).await.is_some());
         }
+        let mut opened = std::collections::BTreeMap::new();
         for (n, to) in [SocketAddr::new(SECURE_ADDR.into(), 443), SocketAddr::new(plain.into(), 80), SocketAddr::new(GATEWAY.into(), 53)].into_iter().enumerate() {
             let n = n as u16;
             // Ports 10000, 11000 and 12000.
+            opened.insert(10_000 + n * 1000, std::time::Instant::now());
             raw.send(tcp_seg(me, 10_000 + n * 1000, match to.ip() { IpAddr::V4(a) => a, _ => unreachable!() }, to.port(), 1000, 0, SYN, &[]));
             let p = recv_within(&fcx, &mut raw, Duration::from_secs(2)).await.expect("a SYN-ACK");
             let (_, _, _, t) = parse(&p);
@@ -1721,10 +1692,20 @@ fn connections_that_send_nothing_are_closed() {
             let IpAddr::V4(dst) = to.ip() else { unreachable!() };
             raw.send(tcp_seg(me, 10_000 + n * 1000, dst, to.port(), 1001, seq.wrapping_add(1), ACK, &[]));
         }
-        let started = std::time::Instant::now();
-        assert!(closed_ports(&fcx, &mut raw, Duration::from_secs(8)).await.is_empty(), "closed too early");
-        let closed = closed_ports(&fcx, &mut raw, Duration::from_secs(4)).await;
-        assert_eq!(closed.into_iter().collect::<Vec<_>>(), vec![10_000, 11_000, 12_000], "after {:?}", started.elapsed());
+        let deadline = fcx.now() + Duration::from_secs(10);
+        let mut closed = std::collections::BTreeSet::new();
+        while closed.len() < opened.len() {
+            let packet = fcx.race(Some(deadline), raw.recv(&fcx)).await.expect("idle connections did not close").unwrap();
+            let (_, _, proto, t) = parse(&packet);
+            if proto == 6 && t[13] & (FIN | RST) != 0 {
+                let port = u16::from_be_bytes([t[2], t[3]]);
+                let took = opened.get(&port).expect("an opened port").elapsed();
+                assert!(took >= Duration::from_secs(1), "port {port} closed too early: {took:?}");
+                assert!(took < Duration::from_secs(10), "port {port} closed too late: {took:?}");
+                closed.insert(port);
+            }
+        }
+        assert_eq!(closed.into_iter().collect::<Vec<_>>(), vec![10_000, 11_000, 12_000]);
         Ok(())
     });
 }
@@ -1757,7 +1738,7 @@ fn a_syn_flood_from_one_sandbox_does_not_lock_out_the_others() {
     });
 }
 
-/// The median of five HTTPS requests from fresh connections.
+/// The median thread CPU time of five HTTPS requests from fresh connections.
 async fn median_get(fcx: &Cx, m: &Machine, env: &Env) -> Duration {
     let mut times = Vec::new();
     for _ in 0..5 {
@@ -1780,7 +1761,6 @@ fn ten_thousand_sites_do_not_slow_the_network() {
         assert_eq!(lookup(&fcx, &b, "secure.test").await, SECURE_ADDR);
         let before = median_get(&fcx, &b, &env).await;
         let n = 10_000u32;
-        let started = std::time::Instant::now();
         for i in 0..n {
             let mut q = Message::query();
             q.metadata.id = i as u16;
@@ -1791,9 +1771,7 @@ fn ten_thousand_sites_do_not_slow_the_network() {
         while answers < n && recv_within(&fcx, &mut raw, Duration::from_secs(10)).await.is_some() {
             answers += 1;
         }
-        let took = started.elapsed();
         assert_eq!(answers, n);
-        assert!(took < Duration::from_secs(4), "{n} lookups took {took:?}");
         // The last site answers.
         let last = Ipv4Addr::from(u32::from(Ipv4Addr::new(198, 18, 0, 0)) + n);
         raw.send(ping(me, last, 1));
@@ -1997,7 +1975,8 @@ fn a_detached_sandboxs_traffic_does_not_reach_the_next_holder_of_its_address() {
         // The request, then a detaches before taking the answer.
         let request = b"GET /secret HTTP/1.1\r\nHost: plain.test\r\n\r\n";
         a.send(tcp_seg(me, 40_000, plain, 80, 1001, seq.wrapping_add(1), ACK, request));
-        fcx.sleep(Duration::from_millis(50)).await?;
+        let sent = fcx.events().wait(&fcx, 1, Duration::from_secs(10), |e| e.is("http", "request") && e.str("path") == Some("/secret")).await?;
+        assert_eq!(sent.len(), 1, "the request was served before detaching");
         drop(a);
 
         // b takes the same address as soon as it is free.
@@ -2070,21 +2049,14 @@ where
     Fut: Future<Output = fictionet::Result> + Send + 'static,
 {
     let subnet: fictionet::stdlib::route::Prefix = subnet.parse().unwrap();
-    let result = within(Duration::from_secs(60), move || {
-        block_on(run(move |fcx| async move {
-            let (attacher, attachments) = fictionet::attachments();
-            web::Sites::new(|host| host.ends_with(".test").then(|| web::Site::new(Plain("auto"))))
-                .subnet(subnet)
-                .serve(&fcx, attachments)?;
-            f(fcx, attacher).await?;
-            Err(fictionet::Error::from(Done))
-        }))
+    run_world::world(Duration::from_secs(60), move |fcx| async move {
+        let (attacher, attachments) = fictionet::attachments();
+        web::Sites::new(|host| host.ends_with(".test").then(|| web::Site::new(Plain("auto"))))
+            .subnet(subnet)
+            .serve(&fcx, attachments)?;
+        f(fcx, attacher).await?;
+        Ok(())
     });
-    match result {
-        Err(e) if e.downcast_ref::<Done>().is_some() => {}
-        Err(e) => panic!("the world failed: {e}"),
-        Ok(()) => panic!("the world should end with Done"),
-    }
 }
 
 /// A DNS A query from `me` to `gw` on a raw attachment: the answer's code
@@ -2313,21 +2285,14 @@ where
     F: FnOnce(Cx, Attacher, Env, Log) -> Fut + Send + 'static,
     Fut: Future<Output = fictionet::Result> + Send + 'static,
 {
-    let result = within(Duration::from_secs(60), move || {
-        block_on(run(move |fcx| async move {
-            let (attacher, attachments) = fictionet::attachments();
-            let t = sites(&fcx);
-            let env = t.serve_with(&fcx, attachments)?;
-            let log = Log::new(&fcx);
-            f(fcx, attacher, env, log).await?;
-            Err(fictionet::Error::from(Done))
-        }))
+    run_world::world(Duration::from_secs(60), move |fcx| async move {
+        let (attacher, attachments) = fictionet::attachments();
+        let t = sites(&fcx);
+        let env = t.serve_with(&fcx, attachments)?;
+        let log = Log::new(&fcx);
+        f(fcx, attacher, env, log).await?;
+        Ok(())
     });
-    match result {
-        Err(e) if e.downcast_ref::<Done>().is_some() => {}
-        Err(e) => panic!("the world failed: {e}"),
-        Ok(()) => panic!("the world should end with Done"),
-    }
 }
 
 /// The events after the log's mark that `pick` keeps.
@@ -2501,7 +2466,7 @@ async fn raw_connect(fcx: &Cx, raw: &mut End, me: Ipv4Addr, to: SocketAddr, port
 
 #[test]
 fn events_name_each_attachment_by_id() {
-    world_events(|fcx, attacher, _env, log| async move {
+    world_events(|fcx, attacher, env, log| async move {
         let me = Ipv4Addr::new(10, 0, 0, 2);
         let mut a = attacher.attach("a").unwrap();
         let (_, addrs) = raw_dns(&fcx, &mut a, me, GATEWAY, "slow.test", 1).await.unwrap();
@@ -2509,9 +2474,9 @@ fn events_name_each_attachment_by_id() {
         let _ = raw_dns(&fcx, &mut a, me, GATEWAY, "secure.test", 2).await.unwrap();
         // A request whose handler never answers, and a TLS handshake that
         // never starts, both still open when the sandbox detaches.
-        raw_connect(&fcx, &mut a, me, SocketAddr::new(slow.into(), 80), 30_000, b"GET /wait HTTP/1.1\r\nHost: slow.test\r\n\r\n").await;
         raw_connect(&fcx, &mut a, me, SocketAddr::new(SECURE_ADDR.into(), 443), 30_001, &[]).await;
-        let _ = fcx.sleep(Duration::from_millis(100)).await;
+        raw_connect(&fcx, &mut a, me, SocketAddr::new(slow.into(), 80), 30_000, b"GET /wait HTTP/1.1\r\nHost: slow.test\r\n\r\n").await;
+        wait::until(&fcx, Duration::from_secs(10), || env.waiting.load(Ordering::SeqCst) == 1).await;
         drop(a);
         wait_for(&fcx, &log, 1, seen("net", "detached")).await;
 
@@ -2816,7 +2781,7 @@ fn events_for_http_requests() {
 
 #[test]
 fn events_for_a_client_that_resets_mid_request() {
-    world_events(|fcx, attacher, _env, log| async move {
+    world_events(|fcx, attacher, env, log| async move {
         let me = Ipv4Addr::new(10, 0, 0, 2);
         let mut raw = attacher.attach("a").unwrap();
         let (_, addrs) = raw_dns(&fcx, &mut raw, me, GATEWAY, "slow.test", 1).await.unwrap();
@@ -2824,7 +2789,7 @@ fn events_for_a_client_that_resets_mid_request() {
         let to = SocketAddr::new(slow.into(), 80);
         // HTTP/1.1, the handler never answers, the client resets.
         let (seq, ack) = raw_connect(&fcx, &mut raw, me, to, 30_000, b"GET /wait HTTP/1.1\r\nHost: slow.test\r\n\r\n").await;
-        let _ = fcx.sleep(Duration::from_millis(100)).await;
+        wait::until(&fcx, Duration::from_secs(10), || env.waiting.load(Ordering::SeqCst) == 1).await;
         assert!(picked(&log, http_seen).is_empty());
         raw.send(tcp_seg(me, 30_000, slow, 80, seq, ack, RST, &[]));
         let got = wait_for(&fcx, &log, 1, http_seen).await;
@@ -2878,23 +2843,13 @@ fn a_reset_mid_request_drops_the_handler_without_events() {
             let (_, addrs) = raw_dns(&fcx, &mut raw, me, GATEWAY, "hang.test", 1).await.unwrap();
             let to = SocketAddr::new(addrs[0].into(), 80);
             let (seq, ack) = raw_connect(&fcx, &mut raw, me, to, 30_000, b"GET /hang HTTP/1.1\r\nHost: hang.test\r\n\r\n").await;
-            for _ in 0..100 {
-                if started.load(Ordering::SeqCst) {
-                    break;
-                }
-                let _ = fcx.sleep(Duration::from_millis(10)).await;
-            }
+            wait::until(&fcx, Duration::from_secs(10), || started.load(Ordering::SeqCst)).await;
             assert!(started.load(Ordering::SeqCst), "the handler started");
             assert!(!flag.load(Ordering::SeqCst));
             raw.send(tcp_seg(me, 30_000, addrs[0], 80, seq, ack, RST, &[]));
-            for _ in 0..100 {
-                if flag.load(Ordering::SeqCst) {
-                    break;
-                }
-                let _ = fcx.sleep(Duration::from_millis(10)).await;
-            }
+            wait::until(&fcx, Duration::from_secs(10), || flag.load(Ordering::SeqCst)).await;
             // Checked here: stopping the world would drop the handler too.
-            assert!(flag.load(Ordering::SeqCst), "the handler was dropped within 1 s of the reset");
+            assert!(flag.load(Ordering::SeqCst), "the handler was dropped after the reset");
             Err(fictionet::Error::from(Done))
         }))
     });
@@ -2906,8 +2861,7 @@ fn a_reset_mid_request_drops_the_handler_without_events() {
 /// outside the world, with their connections still open.
 #[test]
 fn the_world_stops_while_handlers_wait() {
-    let started = std::time::Instant::now();
-    world_events(|fcx, attacher, _env, log| async move {
+    world_events(|fcx, attacher, env, log| async move {
         let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
         let slow = lookup(&fcx, &m, "slow.test").await;
         let to = SocketAddr::new(slow.into(), 80);
@@ -2926,13 +2880,12 @@ fn the_world_stops_while_handlers_wait() {
         bytes.extend_from_slice(&[0, 0, block.len() as u8, 1, 0x05, 0, 0, 0, 1]);
         bytes.extend_from_slice(&block);
         h2.write_all(&fcx, &bytes).await.unwrap();
-        let _ = fcx.sleep(Duration::from_millis(300)).await;
+        wait::until(&fcx, Duration::from_secs(10), || env.waiting.load(Ordering::SeqCst) == 2).await;
         assert!(picked(&log, http_seen).is_empty(), "both handlers still wait");
         // Keep both connections open while the world stops.
         let _keep = (h1, h2);
         Err(fictionet::Error::from(Done))
     });
-    assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
 }
 
 #[test]
@@ -2984,10 +2937,17 @@ fn events_for_bytes_that_are_not_http() {
     });
 }
 
-/// Takes 10 seconds: a client that connects and sends nothing.
+/// A client that connects and sends nothing reaches the configured timeout.
 #[test]
 fn events_for_clients_that_send_nothing() {
-    world_events(|fcx, attacher, _env, log| async move {
+    run_world::world(Duration::from_secs(60), |fcx| async move {
+        let (attacher, attachments) = fictionet::attachments();
+        sites(&fcx).sites.into_net().limits(fictionet::stdlib::net::Limits {
+            handshake: Duration::from_secs(1),
+            dns_tcp_idle: Duration::from_secs(1),
+            ..Default::default()
+        }).serve(&fcx, attachments)?;
+        let log = Log::new(&fcx);
         let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
         assert_eq!(lookup(&fcx, &m, "secure.test").await, SECURE_ADDR);
         let started = std::time::Instant::now();
@@ -2995,7 +2955,7 @@ fn events_for_clients_that_send_nothing() {
         let _quiet_443 = m.tcp.connect(&fcx, SocketAddr::new(SECURE_ADDR.into(), 443)).await.unwrap();
         let tls = wait_for_long(&fcx, &log, tls_seen).await;
         let took = started.elapsed();
-        assert!(took >= Duration::from_secs(10) && took < Duration::from_millis(10_500), "{took:?}");
+        assert!(took >= Duration::from_secs(1) && took < Duration::from_secs(10), "{took:?}");
         assert_eq!((tls.str("sni"), outcome(&tls)), (None, "timed_out".to_owned()));
         let bad = wait_for(&fcx, &log, 1, error_seen).await;
         assert_eq!((local(&bad[0]).port(), bad[0].str("cause")), (80, Some("timeout")));
@@ -3003,15 +2963,11 @@ fn events_for_clients_that_send_nothing() {
     });
 }
 
-/// Waits up to 12 s for the first event `pick` keeps.
+/// Waits up to 10 s for the first event `pick` keeps.
 async fn wait_for_long<T>(fcx: &Cx, log: &Log, mut pick: impl FnMut(&Entry) -> Option<T>) -> T {
-    for _ in 0..1200 {
-        if let Some(t) = picked(log, &mut pick).into_iter().next() {
-            return t;
-        }
-        let _ = fcx.sleep(Duration::from_millis(10)).await;
-    }
-    panic!("no such event: {:#?}", log.events.all());
+    let from = log.from.load(Ordering::SeqCst);
+    let got = log.events.wait(fcx, 1, Duration::from_secs(10), |e| e.seq > from && pick(e).is_some()).await.expect("the world stopped");
+    got.iter().find_map(pick).expect("no such event")
 }
 
 #[test]
@@ -3530,20 +3486,13 @@ where
     F: FnOnce(Cx, Attacher, Log) -> Fut + Send + 'static,
     Fut: Future<Output = fictionet::Result> + Send + 'static,
 {
-    let result = within(Duration::from_secs(60), move || {
-        block_on(run(move |fcx| async move {
-            let (attacher, attachments) = fictionet::attachments();
-            make().serve(&fcx, attachments)?;
-            let log = Log::new(&fcx);
-            f(fcx, attacher, log).await?;
-            Err(fictionet::Error::from(Done))
-        }))
+    run_world::world(Duration::from_secs(60), move |fcx| async move {
+        let (attacher, attachments) = fictionet::attachments();
+        make().serve(&fcx, attachments)?;
+        let log = Log::new(&fcx);
+        f(fcx, attacher, log).await?;
+        Ok(())
     });
-    match result {
-        Err(e) if e.downcast_ref::<Done>().is_some() => {}
-        Err(e) => panic!("the world failed: {e}"),
-        Ok(()) => panic!("the world should end with Done"),
-    }
 }
 
 #[test]

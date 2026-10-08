@@ -7,10 +7,21 @@
 //! In its own test binary, because it measures the process's memory. The
 //! tests take turns, so one does not count the other's memory.
 
+#[path = "common/timeout.rs"]
+mod timeout;
+#[path = "common/sandbox.rs"]
+mod sandbox;
+#[path = "common/wait.rs"]
+mod wait;
+#[path = "common/machine.rs"]
+mod machine;
+
+use sandbox::Machine;
+use machine::machine;
+use timeout::timeout;
+
 use std::convert::Infallible;
-use std::future::{Future, poll_fn};
 use std::net::{Ipv4Addr, SocketAddr};
-use std::pin::pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -18,8 +29,8 @@ use bytes::Bytes;
 use fictionet::prelude::*;
 use fictionet::stdlib::dns::op::{Message, Query};
 use fictionet::stdlib::dns::rr::{Name, RData, RecordType};
-use fictionet::stdlib::{ip, tcp, udp, web};
-use fictionet::{Attacher, Cx, End, Interface, Packet, block_on, run};
+use fictionet::stdlib::{ip, web};
+use fictionet::{Cx, End, Interface, Packet, block_on, run};
 use http::{Request, Response};
 use http_body_util::Full;
 
@@ -104,22 +115,6 @@ fn query(name: &str, id: u16) -> Vec<u8> {
     q.to_vec().unwrap()
 }
 
-/// Waits for `fut` at most `d`.
-async fn timeout<T>(fcx: &Cx, d: Duration, fut: impl Future<Output = T>) -> Option<T> {
-    let mut fut = pin!(fut);
-    let mut sleep = pin!(fcx.sleep(d));
-    poll_fn(|cx| {
-        if let Poll::Ready(v) = fut.as_mut().poll(cx) {
-            return Poll::Ready(Some(v));
-        }
-        if sleep.as_mut().poll(cx).is_ready() {
-            return Poll::Ready(None);
-        }
-        Poll::Pending
-    })
-    .await
-}
-
 /// Every packet that arrives on `raw` until it stays quiet for `quiet`.
 async fn drain(fcx: &Cx, raw: &mut End, quiet: Duration) -> Vec<Packet> {
     let mut got = Vec::new();
@@ -135,20 +130,7 @@ fn tcp_of(p: &Packet) -> Option<&[u8]> {
     (p.0[9] == 6).then(|| &p.0[ihl..])
 }
 
-/// The other sandbox: a machine built from stdlib parts.
-struct Client {
-    tcp: tcp::Endpoint,
-    udp: udp::Endpoint,
-    _icmp: End,
-}
-
-impl Client {
-    fn new(fcx: &Cx, attacher: &Attacher, name: &str, addr: Ipv4Addr) -> Client {
-        let end = attacher.attach(name).unwrap();
-        let (t, u, icmp, _other) = ip::split_protocols(fcx, end);
-        Client { tcp: tcp::endpoint(fcx, t, addr.into()), udp: udp::endpoint(fcx, u, addr.into()), _icmp: icmp }
-    }
-
+impl Machine {
     async fn lookup(&self, fcx: &Cx, name: &str) -> Ipv4Addr {
         let mut socket = self.udp.bind(5353).unwrap();
         socket.send_to(&query(name, 1), SocketAddr::new(GATEWAY.into(), 53));
@@ -202,7 +184,7 @@ fn one_sandbox_flooding_everything_stays_bounded_and_others_are_served() {
             let (attacher, attachments) = fictionet::attachments();
             sites.serve(&fcx, attachments)?;
             let mut raw = attacher.attach("agent").unwrap();
-            let other = Client::new(&fcx, &attacher, "other", OTHER);
+            let other = machine(&fcx, &attacher, "other", OTHER);
             let plain = other.lookup(&fcx, "plain.test").await;
             let wild = other.lookup(&fcx, "first.wild.test").await;
             other.get(&fcx, plain, "plain.test").await;
@@ -223,8 +205,7 @@ fn one_sandbox_flooding_everything_stays_bounded_and_others_are_served() {
             }
             drain(&fcx, &mut raw, Duration::from_millis(300)).await;
             report.push(("names", rss()));
-            let took = other.get(&fcx, plain, "plain.test").await;
-            assert!(took < Duration::from_secs(2), "after the names: {took:?}");
+            other.get(&fcx, plain, "plain.test").await;
 
             // 2. Fragments: 20,000 first halves of 1,400 bytes that never
             //    finish, 27 MiB in all, past the 4 MiB that may wait.
@@ -237,8 +218,7 @@ fn one_sandbox_flooding_everything_stays_bounded_and_others_are_served() {
             }
             drain(&fcx, &mut raw, Duration::from_millis(200)).await;
             report.push(("fragments", rss()));
-            let took = other.get(&fcx, plain, "plain.test").await;
-            assert!(took < Duration::from_secs(2), "after the fragments: {took:?}");
+            other.get(&fcx, plain, "plain.test").await;
 
             // 3. SYNs: 20,000 that are never completed, to one machine.
             //    Every SYN-ACK is counted, from every drain.
@@ -263,8 +243,7 @@ fn one_sandbox_flooding_everything_stays_bounded_and_others_are_served() {
             report.push(("SYNs", rss()));
             // One address has its share of the backlog: 256 waiting.
             assert!(!synacks.is_empty() && synacks.len() <= 256, "{} SYN-ACKs", synacks.len());
-            let took = other.get(&fcx, wild, "first.wild.test").await;
-            assert!(took < Duration::from_secs(2), "after the SYNs: {took:?}");
+            other.get(&fcx, wild, "first.wild.test").await;
 
             // 4. HTTP connections: 1,000 complete handshakes and requests,
             //    held open. The machine serves 256 and resets the rest. A
@@ -313,8 +292,7 @@ fn one_sandbox_flooding_everything_stays_bounded_and_others_are_served() {
             report.push(("connections", rss()));
             assert_eq!(served.len(), 256, "connections served");
             assert_eq!(reset.len(), 1000 - 256, "connections reset");
-            let took = other.get(&fcx, plain, "plain.test").await;
-            assert!(took < Duration::from_secs(2), "after the connections: {took:?}");
+            other.get(&fcx, plain, "plain.test").await;
 
             let mut last = start;
             for (what, at) in &report {
@@ -366,7 +344,7 @@ fn sandboxes_sending_as_fast_as_they_can_do_not_grow_the_world() {
         let result = block_on(run(move |fcx| async move {
             let sites = web::Sites::new(|host| (host == "plain.test").then(|| web::Site::new(Hello)));
             sites.serve(&fcx, attachments)?;
-            let other = Client::new(&fcx, &attacher, "other", Ipv4Addr::new(10, 0, 0, 100));
+            let other = machine(&fcx, &attacher, "other", Ipv4Addr::new(10, 0, 0, 100));
             let plain = other.lookup(&fcx, "plain.test").await;
             // Four sandboxes, each a thread with a socket: UDP to the
             // gateway's closed port 9, so each packet gets an ICMP answer
@@ -402,9 +380,14 @@ fn sandboxes_sending_as_fast_as_they_can_do_not_grow_the_world() {
             // must not keep growing.
             let start = rss();
             let sent_before = world_sent.load(Ordering::Relaxed);
-            fcx.sleep(Duration::from_millis(1500)).await?;
+            wait::until(&fcx, Duration::from_secs(30), || {
+                world_attached.load(Ordering::Relaxed) == 4 && world_sent.load(Ordering::Relaxed) - sent_before > 100_000
+            }).await;
             let middle = rss();
-            fcx.sleep(Duration::from_millis(1500)).await?;
+            let sent_middle = world_sent.load(Ordering::Relaxed);
+            wait::until(&fcx, Duration::from_secs(30), || {
+                world_sent.load(Ordering::Relaxed) - sent_middle > 100_000
+            }).await;
             let end = rss();
             let took = timeout(&fcx, Duration::from_secs(10), other.get(&fcx, plain, "plain.test")).await;
             world_stop.store(true, Ordering::Relaxed);

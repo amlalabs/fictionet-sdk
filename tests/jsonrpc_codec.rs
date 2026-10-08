@@ -359,7 +359,6 @@ fn lines_take_one_byte_at_a_time_in_linear_time() {
     bytes.push(b'\n');
     bytes.extend(vec![b'x'; jsonrpc::MAX_LINE + 100]);
     bytes.extend_from_slice(b"\n{\"jsonrpc\":\"2.0\",\"method\":\"ok\"}\n");
-    let started = std::time::Instant::now();
     let mut stream = Stream::new(Messages::new());
     let mut items = Vec::new();
     for part in chunks(&bytes, &[1]) {
@@ -373,11 +372,16 @@ fn lines_take_one_byte_at_a_time_in_linear_time() {
         ErrorKind::Line(fictionet::stdlib::codec::LineError::TooLong { .. })
     ));
     assert!(items[2].is_ok());
-    assert!(
-        started.elapsed().as_secs() < 10,
-        "took {:?}",
-        started.elapsed()
-    );
+    fictionet::stdlib::test_support::assert_linear("JSON-RPC bytewise lines", jsonrpc::MAX_LINE / 8, |n| {
+        let bytes = format!("{{\"jsonrpc\":\"2.0\",\"method\":\"{}\"}}\n", "x".repeat(n));
+        let mut stream = Stream::new(Messages::new());
+        let mut count = 0;
+        for byte in bytes.as_bytes().chunks(1) {
+            pump(&mut stream, byte, |item| { item.unwrap(); count += 1; }).unwrap();
+        }
+        finish(&mut stream, |item| { item.unwrap(); count += 1; }).unwrap();
+        assert_eq!(count, 1);
+    });
 }
 
 #[test]

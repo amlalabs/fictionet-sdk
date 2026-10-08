@@ -4,6 +4,23 @@
 //! that speaks Modbus/TCP and a web server, on one `Net`, with the
 //! dashboard's decoder reading both from the packets.
 
+#[path = "common/done.rs"]
+mod done;
+#[path = "common/world.rs"]
+mod world;
+mod common;
+#[path = "common/sandbox.rs"]
+mod sandbox;
+#[path = "common/timeout.rs"]
+mod timeout;
+#[path = "common/wait.rs"]
+mod wait;
+
+use timeout::timeout;
+use sandbox::{Machine, sandbox};
+use world::world;
+use done::Done;
+
 use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::future::Future;
@@ -33,44 +50,10 @@ use fictionet::stdlib::serve::{
     Service, Timer, Transcript, Upgrade,
 };
 use fictionet::stdlib::{ConnError, Connection, ip, tcp, udp};
-use fictionet::{Cx, End, Interface, block_on, pair, run};
+use fictionet::{Cx, block_on, pair, run};
 
 // ---------------------------------------------------------------------------
 // Running a world in a test
-
-#[derive(Debug)]
-struct Done;
-impl std::fmt::Display for Done {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("done")
-    }
-}
-impl std::error::Error for Done {}
-
-/// Runs `f` as a world, which ends with `Done`, within 60 seconds.
-fn world<F, Fut>(f: F)
-where
-    F: FnOnce(Cx) -> Fut + Send + 'static,
-    Fut: Future<Output = fictionet::Result> + Send + 'static,
-{
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let r = block_on(run(move |fcx| async move {
-            f(fcx).await?;
-            Err(fictionet::Error::from(Done))
-        }));
-        let _ = tx.send(r);
-    });
-    match rx.recv_timeout(Duration::from_secs(60)).expect("timed out") {
-        Err(e) if e.downcast_ref::<Done>().is_some() => {}
-        Err(e) => panic!("the world failed: {e}"),
-        Ok(()) => panic!("the world should end with Done"),
-    }
-}
-
-async fn timeout<T>(fcx: &Cx, d: Duration, fut: impl Future<Output = T>) -> Option<T> {
-    fcx.race(Some(fcx.now() + d), fut).await.ok()
-}
 
 /// Two machines joined by a cable: a server at 10.9.0.1 and a client at
 /// 10.9.0.2.
@@ -533,7 +516,7 @@ fn virtual_hosts_pick_a_site_by_host() {
 
 #[test]
 fn listen_serves_each_connection_and_records_it() {
-    world(|fcx| async move {
+    world(Duration::from_secs(60), |fcx| async move {
         let (server, _su, client, _cu) = two_machines(&fcx);
         let kept = fcx.events();
         let transcript = Transcript::new(100, 1 << 16);
@@ -567,7 +550,7 @@ fn listen_serves_each_connection_and_records_it() {
 
 #[test]
 fn timers_tick_and_idle_connections_close() {
-    world(|fcx| async move {
+    world(Duration::from_secs(60), |fcx| async move {
         let (server, _su, client, _cu) = two_machines(&fcx);
         serve::listen(&fcx, server.listen(1)?, Arc::new(()), || Ticker { ticks: 0 }, ServeOptions::default());
         let mut conn = client.connect(&fcx, SocketAddr::new(SERVER.into(), 1)).await?;
@@ -589,7 +572,7 @@ fn timers_tick_and_idle_connections_close() {
 
 #[test]
 fn a_handoff_returns_the_connection_with_its_unread_bytes() {
-    world(|fcx| async move {
+    world(Duration::from_secs(60), |fcx| async move {
         let (server, _su, client, _cu) = two_machines(&fcx);
         let mut listener = server.listen(25)?;
         let (tx, rx) = mpsc::channel();
@@ -613,7 +596,7 @@ fn a_handoff_returns_the_connection_with_its_unread_bytes() {
 
 #[test]
 fn fault_plans_change_bytes_and_items_both_ways() {
-    world(|fcx| async move {
+    world(Duration::from_secs(60), |fcx| async move {
         let (server, _su, client, _cu) = two_machines(&fcx);
         // The first item from the client is dropped, and every write to it
         // has its first byte replaced.
@@ -646,7 +629,7 @@ fn fault_plans_change_bytes_and_items_both_ways() {
 
 #[test]
 fn a_connection_cap_resets_connections_past_it() {
-    world(|fcx| async move {
+    world(Duration::from_secs(60), |fcx| async move {
         let (server, _su, client, _cu) = two_machines(&fcx);
         serve::listen(&fcx, server.listen(7)?, Arc::new(()), || Echo, ServeOptions::default().max_conns(2));
         let to = SocketAddr::new(SERVER.into(), 7);
@@ -679,7 +662,7 @@ fn serve_datagram_answers_each_datagram() {
             Ok(Flow::Continue)
         }
     }
-    world(|fcx| async move {
+    world(Duration::from_secs(60), |fcx| async move {
         let (_s, server, _c, client) = two_machines(&fcx);
         let socket = server.bind(9)?;
         fcx.spawn(move |fcx| async move {
@@ -704,7 +687,7 @@ fn serve_datagram_answers_each_datagram() {
 fn every_run_keeps_its_events_and_writes_them_as_json_lines() {
     let path = std::env::temp_dir().join(format!("fictionet-events-{}.jsonl", std::process::id()));
     let p = path.clone();
-    world(move |fcx| async move {
+    world(Duration::from_secs(60), move |fcx| async move {
         let events = fcx.events();
         let conn = ConnInfo::new(9, "10.0.0.1:80".parse().unwrap(), "10.0.0.2:4000".parse().unwrap());
         for i in 0..3u64 {
@@ -717,7 +700,9 @@ fn every_run_keeps_its_events_and_writes_them_as_json_lines() {
         let layer = events.all()[1].layer();
         assert_eq!(layer.name, "test.n");
         assert_eq!(layer.summary, "n=1");
-        fcx.sleep(Duration::from_millis(100)).await?;
+        wait::until(&fcx, Duration::from_secs(10), || {
+            std::fs::read_to_string(&p).unwrap().lines().count() == 3
+        }).await;
         assert_eq!(events.lost(), 0);
         Ok(())
     });
@@ -740,19 +725,7 @@ const ME: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
 const GATEWAY: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 const PLC_ADDR: Ipv4Addr = Ipv4Addr::new(10, 30, 0, 5);
 
-struct Sandbox {
-    tcp: tcp::Endpoint,
-    udp: udp::Endpoint,
-    _icmp: End,
-}
-
-fn sandbox(fcx: &Cx, end: impl Interface, addr: impl Into<IpAddr>) -> Sandbox {
-    let addr = addr.into();
-    let (t, u, i, _o) = ip::split_protocols(fcx, end);
-    Sandbox { tcp: tcp::endpoint(fcx, t, addr), udp: udp::endpoint(fcx, u, addr), _icmp: i }
-}
-
-async fn lookup(fcx: &Cx, s: &Sandbox, name: &str) -> Option<Ipv4Addr> {
+async fn lookup(fcx: &Cx, s: &Machine, name: &str) -> Option<Ipv4Addr> {
     let mut socket = s.udp.bind(40000 + (fcx.random_u64() % 20000) as u16).ok()?;
     let mut q = Message::query();
     q.metadata.id = 5;
@@ -768,7 +741,7 @@ async fn lookup(fcx: &Cx, s: &Sandbox, name: &str) -> Option<Ipv4Addr> {
 
 #[test]
 fn a_plc_and_a_web_server_on_one_net_with_observe_decoding_both() {
-    world(|fcx| async move {
+    world(Duration::from_secs(60), |fcx| async move {
         let kept = fcx.events();
         let plant = Arc::new(Plant { limit: 1000, ..Plant::default() });
         plant.registers.lock().unwrap()[3] = 451;
@@ -840,7 +813,7 @@ fn a_plc_and_a_web_server_on_one_net_with_observe_decoding_both() {
 
 #[test]
 fn net_serves_udp_services_and_trusted_sandboxes() {
-    world(|fcx| async move {
+    world(Duration::from_secs(60), |fcx| async move {
         let kept = fcx.events();
         let counter = Arc::new(AtomicUsize::new(0));
         /// Counts datagrams.
@@ -901,7 +874,7 @@ fn net_serves_udp_services_and_trusted_sandboxes() {
 
 #[test]
 fn a_tower_service_runs_as_a_handler() {
-    world(|fcx| async move {
+    world(Duration::from_secs(60), |fcx| async move {
         let app = axum::Router::new()
             .route("/", axum::routing::get(|| async { "from axum\n" }))
             .route("/len", axum::routing::post(|body: Bytes| async move { format!("{}\n", body.len()) }));
@@ -956,7 +929,7 @@ fn tls_pair(names: &[&str]) -> (Arc<rustls::ServerConfig>, Arc<rustls::RootCertS
 /// cancelled, not as a broken connection.
 #[test]
 fn a_cancel_during_the_tls_handshake_is_a_cancel() {
-    world(|fcx| async move {
+    world(Duration::from_secs(60), |fcx| async move {
         let (config, _roots) = tls_pair(&["a.test"]);
         let (server, _su, client, _cu) = two_machines(&fcx);
         let mut listener = server.listen(443)?;
@@ -981,9 +954,17 @@ fn a_cancel_during_the_tls_handshake_is_a_cancel() {
         });
         // The client connects and never says hello.
         let _conn = client.connect(&fcx, SocketAddr::new(SERVER.into(), 443)).await?;
-        fcx.sleep(Duration::from_millis(200)).await?;
+        let mut result = None;
+        let slot = &mut result;
+        wait::until(&fcx, Duration::from_secs(10), move || {
+            match rx.try_recv() {
+                Ok(value) => { *slot = Some(value); true }
+                Err(mpsc::TryRecvError::Empty) => false,
+                Err(e) => panic!("the handshake task stopped: {e}"),
+            }
+        }).await;
         // Not a closed connection, nor a broken one: the one cancel.
-        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), "Err(Cancelled)");
+        assert_eq!(result.unwrap(), "Err(Cancelled)");
         let tls = fcx.events().wait(&fcx, 1, Duration::from_secs(2), |e| e.is("tls", "handshake")).await?;
         assert_eq!(tls[0].str("outcome"), Some("cancelled"));
         Ok(())
@@ -1142,7 +1123,7 @@ fn a_decoder_that_skips_a_long_line_keeps_the_connection_open() {
     let mut h = Harness::new(Short, ());
     assert_eq!(h.push(&input).unwrap(), b"long\nok\n");
     assert!(!h.closed());
-    world(move |fcx| async move {
+    world(Duration::from_secs(60), move |fcx| async move {
         let (server, _su, client, _cu) = two_machines(&fcx);
         let kept = fcx.events();
         serve::listen(&fcx, server.listen(7)?, Arc::new(()), || Short, ServeOptions::default());
@@ -1319,7 +1300,7 @@ fn another_connection_wakes_a_service_to_push_a_fill() {
     h.wake_handle().wake();
     assert_eq!(h.poll().unwrap(), b"execution 7@100\n");
 
-    world(|fcx| async move {
+    world(Duration::from_secs(60), |fcx| async move {
         let (server, _su, client, _cu) = two_machines(&fcx);
         serve::listen(&fcx, server.listen(9000)?, Arc::new(Book::default()), || Trader { inbox: Arc::default() }, ServeOptions::default());
         let to = SocketAddr::new(SERVER.into(), 9000);
@@ -1358,8 +1339,8 @@ impl Service for Session {
         self.lines += 1;
         if line.as_deref() == Ok(b"slow") {
             // Work that takes a while, so the client's bytes pile up.
-            let started = std::time::Instant::now();
-            while started.elapsed() < Duration::from_micros(50) {}
+            let started = fictionet::stdlib::test_support::thread_cpu_time();
+            while fictionet::stdlib::test_support::thread_cpu_time() - started < Duration::from_micros(50) {}
         }
         if line.as_deref() == Ok(b"logon") {
             driver.cancel_timer("logon");
@@ -1412,7 +1393,7 @@ fn named_timers_run_side_by_side() {
 /// were there and only then looked at its one timer.
 #[test]
 fn continuous_input_cannot_starve_a_timer() {
-    world(|fcx| async move {
+    world(Duration::from_secs(60), |fcx| async move {
         let (server, _su, client, _cu) = two_machines(&fcx);
         serve::listen(&fcx, server.listen(7)?, Arc::new(()), || Session { lines: 0, beats: 0 }, ServeOptions::default());
         let mut conn = client.connect(&fcx, SocketAddr::new(SERVER.into(), 7)).await?;
@@ -1421,12 +1402,20 @@ fn continuous_input_cannot_starve_a_timer() {
             flood.extend_from_slice(b"slow\n");
         }
         flood.extend_from_slice(b"end\n");
-        let started = std::time::Instant::now();
         conn.write_all(&fcx, &flood).await?;
-        let reply = String::from_utf8(read_some(&fcx, &mut conn, 1 << 10).await).unwrap();
+        let reply = String::from_utf8(timeout(&fcx, Duration::from_secs(30), async {
+            let mut reply = Vec::new();
+            let mut bytes = [0; 1024];
+            loop {
+                let n = conn.read(&fcx, &mut bytes).await?;
+                if n == 0 { break; }
+                reply.extend_from_slice(&bytes[..n]);
+            }
+            Ok::<_, ConnError>(reply)
+        }).await.expect("the service did not finish").unwrap()).unwrap();
         // The work took at least 500 ms: a 10 ms heartbeat that is never
         // starved beats nearly every 10 ms of it.
-        let expected = started.elapsed().as_millis().min(500) as u64 / 10;
+        let expected = 50;
         let beats: u64 = reply.rsplit("beats=").next().unwrap().trim().parse().unwrap();
         assert!(reply.contains("end lines=10002"), "{reply}");
         assert!(beats >= expected * 7 / 10, "{reply}, expected about {expected}");
@@ -1521,7 +1510,7 @@ fn keyed_work_interleaves_two_responses_while_reads_go_on() {
     interleaved(&out);
     assert_eq!(h.pending(), (0, 0));
 
-    world(|fcx| async move {
+    world(Duration::from_secs(60), |fcx| async move {
         let (server, _su, client, _cu) = two_machines(&fcx);
         let baton = Arc::new(Mutex::new(Baton::default()));
         let shared = baton.clone();
@@ -1573,7 +1562,7 @@ fn datagram_services_send_several_datagrams_and_tick() {
             Ok(Flow::Continue)
         }
     }
-    world(|fcx| async move {
+    world(Duration::from_secs(60), |fcx| async move {
         let (_s, server, _c, client) = two_machines(&fcx);
         let socket = server.bind(9)?;
         let subscriber = SocketAddr::new(Ipv4Addr::new(10, 9, 0, 2).into(), 4001);
@@ -1627,7 +1616,7 @@ fn an_error_closes_only_its_connection_and_a_panic_ends_the_run() {
 
     let addr = Ipv4Addr::new(10, 40, 0, 9);
     let to = SocketAddr::new(addr.into(), 7);
-    world(move |fcx| async move {
+    world(Duration::from_secs(60), move |fcx| async move {
         let (attacher, attachments) = fictionet::attachments();
         let kept = fcx.events();
         Net::new().ipv4_only().host("svc", |h| h.at(addr).tcp(7, Arc::new(()), || Fragile)).serve(&fcx, attachments)?;
@@ -1682,7 +1671,7 @@ impl Service for Wide {
 /// read neither.
 #[test]
 fn net_caps_connections_per_service_and_bytes_per_sandbox() {
-    world(|fcx| async move {
+    world(Duration::from_secs(60), |fcx| async move {
         let (attacher, attachments) = fictionet::attachments();
         let kept = fcx.events();
         let addr = Ipv4Addr::new(10, 40, 0, 3);
@@ -1722,7 +1711,7 @@ fn net_caps_connections_per_service_and_bytes_per_sandbox() {
 /// was dropped without a word.
 #[test]
 fn net_refuses_a_host_it_cannot_serve() {
-    world(|fcx| async move {
+    world(Duration::from_secs(60), |fcx| async move {
         let fail = |net: Net| {
             let (_attacher, attachments) = fictionet::attachments();
             net.ipv4_only().serve(&fcx, attachments).err().map(|e| e.to_string())
@@ -1749,7 +1738,7 @@ fn net_refuses_a_host_it_cannot_serve() {
 /// earlier events, and its later ones.
 #[test]
 fn a_reader_added_mid_connection_sees_its_events() {
-    world(|fcx| async move {
+    world(Duration::from_secs(60), |fcx| async move {
         let (server, _su, client, _cu) = two_machines(&fcx);
         serve::listen(&fcx, server.listen(7)?, Arc::new(()), || Echo, ServeOptions::default());
         let mut conn = client.connect(&fcx, SocketAddr::new(SERVER.into(), 7)).await?;
@@ -1797,7 +1786,7 @@ impl Service for Dice {
 fn a_seeded_run_repeats_its_randomness() {
     let draws = |seed: u64| {
         let (tx, rx) = mpsc::channel();
-        world(move |fcx| async move {
+        world(Duration::from_secs(60), move |fcx| async move {
             let (server, _su, client, _cu) = two_machines(&fcx);
             serve::listen(&fcx, server.listen(7)?, Arc::new(()), || Dice, ServeOptions::default().seed(seed));
             let mut got = Vec::new();
@@ -1820,7 +1809,7 @@ fn a_seeded_run_repeats_its_randomness() {
 /// calendar.
 #[test]
 fn a_net_starts_its_events_with_a_wall_clock_anchor() {
-    world(|fcx| async move {
+    world(Duration::from_secs(60), |fcx| async move {
         let kept = fcx.events();
         let (_attacher, attachments) = fictionet::attachments();
         let date = Fields::new().with("world_date", "2026-10-06");
@@ -1851,7 +1840,7 @@ fn http1_closes_a_request_whose_body_never_finishes() {
 /// count dropped when the service ended.
 #[test]
 fn a_connection_counts_until_its_socket_is_gone() {
-    world(|fcx| async move {
+    world(Duration::from_secs(60), |fcx| async move {
         let (server, _su, client, _cu) = two_machines(&fcx);
         serve::listen(&fcx, server.listen(7)?, Arc::new(()), || Echo, ServeOptions::default().max_conns(1));
         let to = SocketAddr::new(SERVER.into(), 7);
@@ -1895,7 +1884,7 @@ fn hosts_and_members_share_a_lan_on_the_net() {
             Ok(Flow::Continue)
         }
     }
-    world(|fcx| async move {
+    world(Duration::from_secs(60), |fcx| async move {
         let kept = fcx.events();
         let (attacher, attachments) = fictionet::attachments();
         let lan: Prefix = "192.168.56.0/24".parse()?;
@@ -1960,7 +1949,7 @@ fn hosts_and_members_share_a_lan_on_the_net() {
 
 #[test]
 fn net_refuses_lans_that_overlap() {
-    world(|fcx| async move {
+    world(Duration::from_secs(60), |fcx| async move {
         let fail = |net: Net| {
             let (_attacher, attachments) = fictionet::attachments();
             net.ipv4_only().serve(&fcx, attachments).err().map(|e| e.to_string())
@@ -2003,7 +1992,7 @@ async fn spied(fcx: &Cx, spy: &Mutex<Vec<Option<Budget>>>, n: usize) -> Vec<Opti
 /// budget after its sandbox detached.
 #[test]
 fn net_keeps_one_budget_per_attachment() {
-    world(|fcx| async move {
+    world(Duration::from_secs(60), |fcx| async move {
         let kept = fcx.events();
         let (attacher, attachments) = fictionet::attachments();
         let (addr, addr6) = (Ipv4Addr::new(10, 40, 0, 3), "2001:2::3".parse::<Ipv6Addr>()?);
@@ -2061,7 +2050,7 @@ fn net_keeps_one_budget_per_attachment() {
 /// member was never detached.
 #[test]
 fn a_lan_member_detaches_like_any_sandbox() {
-    world(|fcx| async move {
+    world(Duration::from_secs(60), |fcx| async move {
         let kept = fcx.events();
         let (attacher, attachments) = fictionet::attachments();
         let dc: Ipv4Addr = "192.168.56.10".parse()?;
@@ -2107,7 +2096,7 @@ fn a_lan_member_detaches_like_any_sandbox() {
 /// `Host::tcp_with` does by default. Before, `tcp` turned them off.
 #[test]
 fn net_records_connections_on_a_tcp_port() {
-    world(|fcx| async move {
+    world(Duration::from_secs(60), |fcx| async move {
         let kept = fcx.events();
         let (attacher, attachments) = fictionet::attachments();
         let addr = Ipv4Addr::new(10, 40, 0, 1);
@@ -2129,7 +2118,7 @@ fn net_records_connections_on_a_tcp_port() {
 #[test]
 fn net_limits_a_starttls_handshake() {
     let (config, _roots) = tls_pair(&["mail.test"]);
-    world(move |fcx| async move {
+    world(Duration::from_secs(60), move |fcx| async move {
         let kept = fcx.events();
         let (attacher, attachments) = fictionet::attachments();
         let addr = Ipv4Addr::new(10, 40, 0, 25);
@@ -2182,7 +2171,7 @@ where
 /// connection read through tokio's traits.
 #[test]
 fn every_serving_wait_reports_a_cancel() {
-    world(|fcx| async move {
+    world(Duration::from_secs(60), |fcx| async move {
         let (server, server_udp, client, _cu) = two_machines(&fcx);
         let mut listener = server.listen(7)?;
 

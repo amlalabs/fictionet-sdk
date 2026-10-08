@@ -1,24 +1,18 @@
 //! Putting things between sandboxes and the world: `Attachments::map` and
 //! `stdlib::filter`.
 
+mod common;
+
+use common::within;
+
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc};
 use std::time::Duration;
 
 use fictionet::prelude::*;
 use fictionet::stdlib::{self, Direction};
 use fictionet::time::ms;
 use fictionet::{Interface, Packet, RecvError, attachments, block_on, run};
-
-/// Runs `f` on its own thread and fails the test if it takes longer than
-/// `limit`, instead of hanging.
-fn within<T: Send + 'static>(limit: Duration, f: impl FnOnce() -> T + Send + 'static) -> T {
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(f());
-    });
-    rx.recv_timeout(limit).expect("timed out")
-}
 
 #[test]
 fn map_wraps_each_sandbox_and_keeps_its_name() {
@@ -84,9 +78,11 @@ fn a_sandbox_that_detached_before_it_was_taken_is_skipped() {
         let (attacher, attachments) = attachments();
         block_on(run(move |fcx| async move {
             let mut mapped = attachments.map(&fcx, |fcx, sandbox| stdlib::filter(fcx, sandbox, |_, _, _| true));
-            // Let the map task wrap the first one, then detach it.
+            // Taking the barrier puts the first sandbox in the mapped queue.
             let first = attacher.attach("agent").unwrap();
-            fcx.sleep(ms(10)).await?;
+            let barrier = attacher.attach("barrier").unwrap();
+            drop(mapped.get(&fcx, "barrier").await?);
+            drop(barrier);
             drop(first);
             let mut second = attacher.attach("agent").unwrap();
             let mut world = mapped.get(&fcx, "agent").await?;

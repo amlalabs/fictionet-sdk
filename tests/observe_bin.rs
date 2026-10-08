@@ -1,10 +1,19 @@
 //! `fictionet observe` and `fictionet dashboard`, run as the binary against
 //! a world in this process.
 
+#[path = "common/poll.rs"]
+mod poll;
+#[path = "common/logged.rs"]
+mod logged;
+
+use logged::logged;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::process::{Command, Stdio};
 use std::time::Duration;
+
+use fictionet::InterfaceExt;
 
 const BIN: &str = env!("CARGO_BIN_EXE_fictionet");
 
@@ -205,8 +214,11 @@ fn the_dashboard_merges_the_packets_of_several_links() {
     assert_eq!(get(port, "/groups.js").0, "HTTP/1.1 200 OK");
 
     // The two links, and the group their echo tasks are in.
-    std::thread::sleep(Duration::from_millis(200));
-    let (_, graph) = get(port, "/api/graph");
+    let mut graph = String::new();
+    poll::until(Duration::from_secs(10), || {
+        graph = get(port, "/api/graph").1;
+        graph.contains(r#""name":"lan","parent":null"#) && graph.matches(r#"{"id":"e"#).count() == 2
+    });
     assert!(graph.contains(r#""name":"lan","parent":null"#), "{graph}");
     let links: Vec<String> =
         graph.split(r#"{"id":"e"#).skip(1).map(|r| format!("e{}", r.split('"').next().unwrap())).collect();
@@ -259,8 +271,8 @@ fn a_watch_exits_0_when_the_world_ends() {
     let (attacher, mut attachments) = fictionet::attachments();
     let listening = fictionet::listen(fictionet::WorldSocket::UnixSocket(path.clone().into()), attacher).unwrap();
     let mut child = Command::new(BIN).args(["observe", "--world", &world, "watch"]).stdout(Stdio::piped()).spawn().unwrap();
-    // The world runs a while, then returns; its socket closes as a world
-    // binary's would when `main` returns.
+    // The world returns once the observer has its snapshot.
+    let (stop, mut stopped) = fictionet::pair();
     let world_thread = std::thread::spawn(move || {
         let _ = fictionet::block_on(fictionet::run(move |fcx| async move {
             fcx.spawn(move |fcx| async move {
@@ -269,13 +281,15 @@ fn a_watch_exits_0_when_the_world_ends() {
                 }
                 Ok(())
             });
-            fcx.sleep(fictionet::time::ms(1500)).await?;
+            assert_eq!(stopped.recv(&fcx).await, Err(fictionet::RecvError::Closed));
             // Ends the run, with the task above.
             fcx.cancel();
             Ok(())
         }));
         drop(listening);
     });
+    let log = logged(child.stdout.take().unwrap(), r#""event":"snapshot""#);
+    drop(stop);
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
@@ -289,8 +303,7 @@ fn a_watch_exits_0_when_the_world_ends() {
         std::thread::sleep(Duration::from_millis(20));
     };
     world_thread.join().unwrap();
-    let mut out = String::new();
-    child.stdout.take().unwrap().read_to_string(&mut out).unwrap();
+    let out = log.join().unwrap();
     let status = status.expect("the watch should exit when the world ends");
     assert_eq!(status.code(), Some(0), "{out}");
     assert!(out.contains(r#"{"event":"ended","#), "{out}");

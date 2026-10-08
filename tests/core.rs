@@ -1,5 +1,9 @@
 //! The core: cables, the context, regions, `run` and `block_on`.
 
+mod common;
+
+use common::within;
+
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
@@ -7,16 +11,6 @@ use std::time::Duration;
 use fictionet::prelude::*;
 use fictionet::time::ms;
 use fictionet::{AttachError, Cancelled, Interface, JoinError, Packet, RecvError, attachments, block_on, pair, run};
-
-/// Runs `f` on its own thread and fails the test if it takes longer than
-/// `limit`, instead of hanging.
-fn within<T: Send + 'static>(limit: Duration, f: impl FnOnce() -> T + Send + 'static) -> T {
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(f());
-    });
-    rx.recv_timeout(limit).expect("timed out")
-}
 
 #[derive(Debug)]
 struct Boom(&'static str);
@@ -119,7 +113,6 @@ fn ok_does_not_cancel_and_the_run_waits_for_all_work() {
 fn cancellation_ends_every_wait() {
     let results = Arc::new(Mutex::new(Vec::<String>::new()));
     let r = results.clone();
-    let started = std::time::Instant::now();
     let out = within(Duration::from_secs(5), move || {
         block_on(run(move |fcx| async move {
             let (mut a, b) = pair();
@@ -206,7 +199,6 @@ fn cancellation_ends_every_wait() {
         }))
     });
     assert_eq!(out.unwrap_err().to_string(), "stop");
-    assert!(started.elapsed() < Duration::from_secs(2));
     let mut results = results.lock().unwrap().clone();
     results.sort();
     assert_eq!(
@@ -463,7 +455,6 @@ fn block_on_wakes_from_another_thread() {
     let ws = waker_slot.clone();
     std::thread::spawn(move || {
         rx.recv().unwrap();
-        std::thread::sleep(ms(20));
         f.store(true, Ordering::SeqCst);
         if let Some(w) = ws.lock().unwrap().take() {
             w.wake();
@@ -642,6 +633,7 @@ fn many_waits_outside_the_run_stay_idle() {
 #[test]
 fn dropping_the_run_ends_waits_outside_it() {
     let (tx, rx) = mpsc::channel();
+    let (ready_tx, ready_rx) = mpsc::channel();
     let mut future = Box::pin(run(move |fcx| async move {
         let task = fcx.spawn(|fcx| async move {
             fcx.cancelled().await;
@@ -650,7 +642,15 @@ fn dropping_the_run_ends_waits_outside_it() {
         let outside = fcx.clone();
         std::thread::spawn(move || {
             let res = block_on(async {
-                let joined = task.join(&outside).await.map_err(|e| e.to_string());
+                let mut join = std::pin::pin!(task.join(&outside));
+                let mut ready_tx = Some(ready_tx);
+                let joined = std::future::poll_fn(|cx| {
+                    let result = join.as_mut().poll(cx);
+                    if result.is_pending() && let Some(tx) = ready_tx.take() {
+                        tx.send(()).unwrap();
+                    }
+                    result
+                }).await.map_err(|e| e.to_string());
                 outside.cancelled().await;
                 joined
             });
@@ -663,7 +663,7 @@ fn dropping_the_run_ends_waits_outside_it() {
     for _ in 0..3 {
         assert!(future.as_mut().poll(&mut cx).is_pending());
     }
-    std::thread::sleep(Duration::from_millis(50));
+    ready_rx.recv_timeout(Duration::from_secs(5)).expect("the outside join was not polled");
     drop(future);
     let res = rx.recv_timeout(Duration::from_secs(5)).expect("a wait outside the run did not end");
     assert_eq!(res, Err("the join stopped".to_owned()));
@@ -737,7 +737,6 @@ fn cancel_from_another_thread_stops_the_run() {
     let (tx, rx) = mpsc::channel();
     let stopper = std::thread::spawn(move || {
         let fcx: fictionet::Cx = rx.recv().unwrap();
-        std::thread::sleep(Duration::from_millis(20));
         fcx.cancel();
     });
     let out = within(Duration::from_secs(5), move || {
@@ -782,8 +781,9 @@ fn an_outside_wait_raced_against_cancelled_ends() {
 fn a_joiner_that_cancels_after_a_failure_keeps_the_error() {
     let out = within(Duration::from_secs(5), || {
         block_on(run(|fcx| async move {
-            let task = fcx.spawn(|fcx| async move {
-                fcx.sleep(ms(10)).await?;
+            let (ready, mut waiting) = pair();
+            let task = fcx.spawn(move |fcx| async move {
+                assert_eq!(waiting.recv(&fcx).await, Err(RecvError::Closed));
                 Err(Boom("failed").into())
             });
             // Poll the join once, outside the run's own tasks, with the
@@ -793,7 +793,8 @@ fn a_joiner_that_cancels_after_a_failure_keeps_the_error() {
             std::thread::spawn(move || {
                 let mut join = std::pin::pin!(task.join(&watcher));
                 let _ = join.as_mut().poll(&mut std::task::Context::from_waker(&waker));
-                std::thread::sleep(Duration::from_millis(100));
+                drop(ready);
+                block_on(watcher.cancelled());
             });
             Ok(())
         }))

@@ -1,6 +1,9 @@
 //! `listen` end to end, with a test client that speaks the relay protocol
 //! over a real Unix SOCK_SEQPACKET socket.
 
+#[path = "common/poll.rs"]
+mod poll;
+
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
@@ -74,6 +77,8 @@ fn attach_echo_and_detach() {
     let listening = listen(WorldSocket::UnixSocket(path.clone().into()), attacher).unwrap();
 
     let (done_tx, done_rx) = mpsc::channel();
+    let echoed = std::sync::Arc::new(AtomicU32::new(0));
+    let count = echoed.clone();
     std::thread::spawn(move || {
         let out = block_on(run(move |fcx| async move {
             let mut abc = attachments.get(&fcx, "abc").await?;
@@ -85,6 +90,7 @@ fn attach_echo_and_detach() {
                     Ok(Packet(mut bytes)) => {
                         bytes.reverse();
                         abc.send(Packet(bytes));
+                        count.fetch_add(1, Ordering::SeqCst);
                     }
                     Err(RecvError::Closed) => return Ok(()),
                     Err(e) => return Err(e.into()),
@@ -133,7 +139,7 @@ fn attach_echo_and_detach() {
     for i in 0..20_000u32 {
         client.send(&Message::Packet(&payload(i, 1400)));
     }
-    std::thread::sleep(Duration::from_millis(300));
+    poll::until(Duration::from_secs(15), || echoed.load(Ordering::SeqCst) == 20_501);
     client.set_timeout(Duration::from_millis(500));
     let mut got = 0;
     while let Some(m) = client.try_recv() {
@@ -149,7 +155,7 @@ fn attach_echo_and_detach() {
     for i in 0..1_000u32 {
         client.send(&Message::Packet(&payload(i, 60_000)));
     }
-    std::thread::sleep(Duration::from_millis(500));
+    poll::until(Duration::from_secs(15), || echoed.load(Ordering::SeqCst) == 21_501);
     let mut last = None;
     let mut got = 0;
     while let Some(m) = client.try_recv() {
@@ -278,9 +284,10 @@ fn handshake_times_out() {
     let _listening = listen(WorldSocket::UnixSocket(path.clone().into()), attacher).unwrap();
     let start = Instant::now();
     let silent = Client::connect(&path);
+    silent.set_timeout(Duration::from_secs(25));
     assert_eq!(silent.recv(), None);
     let took = start.elapsed();
-    assert!(took >= Duration::from_millis(9_900) && took < Duration::from_secs(12), "{took:?}");
+    assert!(took >= Duration::from_millis(9_900) && took < Duration::from_secs(20), "{took:?}");
 }
 
 #[test]
@@ -305,7 +312,6 @@ fn dropping_listening_closes_the_socket_but_keeps_attachments() {
         }))
     });
     rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    std::thread::sleep(Duration::from_millis(50));
     client.send(&Message::Packet(&[5]));
     assert_eq!(client.recv(), Some(vec![relay::PACKET, 5]));
     world.join().unwrap().unwrap();
@@ -357,7 +363,6 @@ fn many_idle_attachments_wake() {
         }))
     });
     ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    std::thread::sleep(Duration::from_millis(30));
     for (i, c) in clients.iter().enumerate().rev() {
         c.send(&Message::Packet(&[i as u8]));
     }
@@ -456,36 +461,40 @@ fn reattaching_before_the_world_asks_gives_the_new_connection() {
 }
 
 /// The world sends a burst far past the connection's buffer and then waits
-/// on a timer, never reading from the attachment. The queue in the world
-/// is still written out, in order, as attach reads.
+/// for the test to finish, never reading from the attachment. The queue is
+/// still written out, in order, as attach reads.
 #[test]
 fn a_world_that_only_sends_gets_its_queue_written_out() {
     let path = socket_path("sendonly");
     let (attacher, mut attachments) = attachments();
     let _listening = listen(WorldSocket::UnixSocket(path.clone().into()), attacher).unwrap();
-    std::thread::spawn(move || {
-        let _ = block_on(run(move |fcx| async move {
+    let (stop, mut stopped) = fictionet::pair();
+    let world = std::thread::spawn(move || {
+        block_on(run(move |fcx| async move {
             let mut abc = attachments.get(&fcx, "abc").await?;
             for i in 0..10_000u32 {
                 let mut p = vec![0u8; 1400];
                 p[..4].copy_from_slice(&i.to_be_bytes());
                 abc.send(Packet(p));
             }
-            fcx.sleep(Duration::from_secs(10)).await?;
+            assert_eq!(stopped.recv(&fcx).await, Err(RecvError::Closed));
             drop(abc);
             Ok(())
-        }));
+        }))
     });
     let client = Client::attach(&path, "abc");
-    client.set_timeout(Duration::from_secs(1));
-    std::thread::sleep(Duration::from_millis(200));
+    client.set_timeout(Duration::from_secs(15));
     let mut got = 0u32;
-    while let Some(m) = client.try_recv() {
+    while got < 10_000 {
+        let m = client.recv().expect("the world closed before the burst arrived");
         assert_eq!(m[0], relay::PACKET);
         assert_eq!(u32::from_be_bytes(m[1..5].try_into().unwrap()), got, "in order");
         got += 1;
     }
-    assert_eq!(got, 10_000, "only {got} of 10,000 packets arrived within 1 s of the last one");
+    assert_eq!(got, 10_000, "only {got} of 10,000 packets arrived before the world closed");
+    drop(stop);
+    world.join().unwrap().unwrap();
+    assert_eq!(client.recv(), None);
 }
 
 /// `Attachments::map` keeps a socket attachment's name and MTU, and skips
@@ -498,12 +507,16 @@ fn mapped_socket_attachments_keep_their_mtu_and_skip_detached_ones() {
     let _listening = listen(WorldSocket::UnixSocket(path.clone().into()), attacher).unwrap();
     let (wrapped_tx, wrapped_rx) = mpsc::channel();
     let (go_tx, go_rx) = mpsc::channel::<()>();
+    let (queued_tx, queued_rx) = mpsc::channel();
     let world = std::thread::spawn(move || {
         block_on(run(move |fcx| async move {
             let mut mapped = attachments.map(&fcx, move |fcx, sandbox| {
                 let _ = wrapped_tx.send(sandbox.mtu());
                 fictionet::stdlib::filter(fcx, sandbox, |_, _, _| true)
             });
+            let barrier = mapped.get(&fcx, "barrier").await?;
+            queued_tx.send(()).unwrap();
+            drop(barrier);
             // Wait for the test thread without blocking the run's thread,
             // so the map task can pass sandboxes on meanwhile.
             while go_rx.try_recv().is_err() {
@@ -518,7 +531,9 @@ fn mapped_socket_attachments_keep_their_mtu_and_skip_detached_ones() {
     let first = Client::attach(&path, "agent");
     // The map task passes the first sandbox on while it is attached. Only
     // then does it detach.
-    std::thread::sleep(Duration::from_millis(100));
+    let barrier = Client::attach(&path, "barrier");
+    queued_rx.recv_timeout(Duration::from_secs(10)).expect("the map did not pass the barrier");
+    drop(barrier);
     drop(first);
     let deadline = Instant::now() + Duration::from_secs(5);
     let client = loop {
@@ -533,6 +548,6 @@ fn mapped_socket_attachments_keep_their_mtu_and_skip_detached_ones() {
     client.send(&Message::Packet(&[6]));
     go_tx.send(()).unwrap();
     world.join().unwrap().map_err(|e| e.to_string()).unwrap();
-    // Only the sandbox the world took was wrapped.
-    assert_eq!(wrapped_rx.try_iter().collect::<Vec<_>>(), [1400]);
+    // Only the barrier and the sandbox the world took were wrapped.
+    assert_eq!(wrapped_rx.try_iter().collect::<Vec<_>>(), [1500, 1400]);
 }

@@ -1,6 +1,9 @@
 //! `listen` when the process runs out of file descriptors. In its own test
 //! binary, because it lowers the process's descriptor limit.
 
+#[path = "common/poll.rs"]
+mod poll;
+
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::time::Duration;
 
@@ -47,13 +50,10 @@ fn running_out_of_descriptors_does_not_spin_the_helper() {
     let _listening = listen(WorldSocket::UnixSocket(path.clone().into()), attacher).unwrap();
     // A new thread sets its own name, so it may not have one yet.
     let mut stats = thread_stats("fictionet-liste");
-    for _ in 0..100 {
-        if !stats.is_empty() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
+    poll::until(Duration::from_secs(10), || {
         stats = thread_stats("fictionet-liste");
-    }
+        !stats.is_empty()
+    });
     assert_eq!(stats.len(), 1);
 
     // Use up every descriptor, keeping one back for the client.
@@ -70,7 +70,6 @@ fn running_out_of_descriptors_does_not_spin_the_helper() {
     let client = unix::connect(&path).unwrap();
     // The table is full: the world cannot accept the connection.
 
-    std::thread::sleep(Duration::from_millis(100));
     let before = ticks(&stats);
     std::thread::sleep(Duration::from_millis(1000));
     let used = ticks(&stats) - before;

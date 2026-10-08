@@ -2,6 +2,9 @@
 //! In its own test binary, because it measures the CPU time of Fictionet's
 //! threads.
 
+#[path = "common/poll.rs"]
+mod poll;
+
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -110,13 +113,10 @@ fn many_attachments_lose_nothing_and_idle_costs_nothing() {
     ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
     // A new thread sets its own name, so it may not have one yet.
     let mut stats = thread_stats(&["world", "fictionet-"]);
-    for _ in 0..100 {
-        if stats.len() >= 3 {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
+    poll::until(Duration::from_secs(10), || {
         stats = thread_stats(&["world", "fictionet-"]);
-    }
+        stats.len() >= 3
+    });
     assert!(stats.len() >= 3, "{:?}", stats.iter().map(|s| &s.0).collect::<Vec<_>>());
 
     let started = Instant::now();
@@ -155,7 +155,13 @@ fn many_attachments_lose_nothing_and_idle_costs_nothing() {
 
     // Everyone attached and idle, with a timer pending: no thread of
     // Fictionet may use the CPU.
-    std::thread::sleep(Duration::from_millis(100));
+    let mut settled = None;
+    poll::until(Duration::from_secs(10), || {
+        let now = ticks(&stats);
+        let ready = settled.as_ref() == Some(&now);
+        settled = Some(now);
+        ready
+    });
     let idle_start = ticks(&stats);
     std::thread::sleep(Duration::from_millis(1500));
     let idle_end = ticks(&stats);

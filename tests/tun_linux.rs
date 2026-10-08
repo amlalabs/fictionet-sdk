@@ -6,6 +6,11 @@
 //! The container's kernel is the client: it has 10.9.0.1/24 and fd09::1/64
 //! on the tun device, and the endpoints are 10.9.0.2 and fd09::2.
 
+#[path = "common/done.rs"]
+mod done;
+
+use done::Done;
+
 use std::future::poll_fn;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream, UdpSocket};
@@ -18,15 +23,6 @@ use std::time::{Duration, Instant};
 use fictionet::prelude::*;
 use fictionet::stdlib::{tcp, udp};
 use fictionet::{Cx, End, Interface, Packet, RecvError, block_on, pair, run};
-
-#[derive(Debug)]
-struct Done;
-impl std::fmt::Display for Done {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("done")
-    }
-}
-impl std::error::Error for Done {}
 
 /// The world's side of the tun device: packets the kernel sends come out of
 /// `rx` (fed by a reading thread), and `send` writes to the device.

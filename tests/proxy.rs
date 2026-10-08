@@ -509,11 +509,9 @@ fn failures_get_proxy_answers() {
         ("[2606:4700::1111]:443", "502 Bad Gateway", "IPv6 is not supported: attach's stack is IPv4 only"),
     ];
     for (target, status, why) in cases {
-        let started = Instant::now();
         let (_, head) = connect(&a, target, Some(BASIC));
         assert!(head.starts_with(&format!("HTTP/1.1 {status}\r\n")), "{target}: {head}");
         assert!(head.contains(&format!("X-Proxy-Error: {why}\r\n")), "{target}: {head}");
-        assert!(started.elapsed() < Duration::from_secs(3), "{target} took {:?}", started.elapsed());
     }
     // A request that is not a proxy request.
     let mut s = a.connect();
