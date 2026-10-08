@@ -2208,9 +2208,8 @@ mod tests {
         out
     }
     fn roundtrip(frame: &Frame) {
-        let bytes = frame.to_bytes().unwrap();
+        let bytes = contract::check_written(frame);
         assert!(bytes.len() <= MAX_FRAME);
-        assert_eq!(Frame::parse(&bytes), Ok(frame.clone()));
     }
     fn messages(side: MessageSide, frames: &[Frame]) -> (Vec<Event>, Result<(), Error>) {
         let mut state = RequestStream::new(0, side, false).unwrap();

@@ -6,7 +6,6 @@ use fictionet::stdlib::codec::{
     Decode, Fail, Stream, Wire, finish, pump,
 };
 use fictionet::stdlib::test_support::contract;
-use fictionet::stdlib::test_support::chunks;
 use fictionet::stdlib::{asn1, kerberos, ldap, ocsp, spnego, x509};
 
 fn round_trip<D: Decode>(make: impl Fn() -> D, bytes: &[u8], expected: &[D::Item])
@@ -14,67 +13,14 @@ where
     D::Item: Debug + PartialEq,
     D::Error: Clone + Debug + PartialEq,
 {
-    contract::check_decode(&make, bytes);
-    for pattern in [&[1][..], &[1, 2, 5, 3, 127], &[7, 1, 64], &[]] {
-        let mut stream = Stream::new(make());
-        let mut got = Vec::new();
-        for part in chunks(bytes, pattern) {
-            assert_eq!(
-                pump(&mut stream, part, |item| got.push(item)),
-                Ok(part.len())
-            );
-        }
-        assert_eq!(finish(&mut stream, |item| got.push(item)), Ok(()));
-        assert_eq!(got, expected);
-        assert_eq!(stream.buffered(), 0);
-        assert_eq!(stream.held(), 0);
-        assert!(stream.failed().is_none());
-    }
-}
-
-fn truncated<D: Decode>(make: impl Fn() -> D, bytes: &[u8])
-where
-    D::Item: Debug + PartialEq,
-    D::Error: Clone + Debug + PartialEq,
-{
-    contract::check_decode(&make, bytes);
+    let (items, failure) = contract::check_decode_with_held_limit(&make, bytes, 0);
+    assert_eq!(items, expected);
+    assert_eq!(failure, None);
     let mut stream = Stream::new(make());
-    for part in chunks(bytes, &[1]) {
-        assert_eq!(
-            pump(&mut stream, part, |_| panic!(
-                "partial unit produced an item"
-            )),
-            Ok(part.len())
-        );
-    }
-    assert!(matches!(
-        finish(&mut stream, |_| panic!("partial unit produced an item")),
-        Err(Fail::Truncated { .. })
-    ));
-    assert_eq!(stream.next(), None);
-}
-
-fn refused<D: Decode>(make: impl Fn() -> D, bytes: &[u8], error: D::Error)
-where
-    D::Item: Debug + PartialEq,
-    D::Error: Clone + Debug + PartialEq,
-{
-    contract::check_decode(&make, bytes);
-    for pattern in [&[1][..], &[]] {
-        let mut stream = Stream::new(make());
-        let mut result = Ok(0);
-        for part in chunks(bytes, pattern) {
-            result = pump(&mut stream, part, |_| {
-                panic!("oversized unit produced an item")
-            });
-            if result.is_err() {
-                break;
-            }
-        }
-        assert_eq!(result, Err(Fail::Protocol(error.clone())));
-        assert_eq!(stream.next(), None);
-        assert_eq!(stream.failed(), Some(&Fail::Protocol(error.clone())));
-    }
+    assert_eq!(pump(&mut stream, bytes, |_| {}), Ok(bytes.len()));
+    assert_eq!(finish(&mut stream, |_| {}), Ok(()));
+    assert_eq!(stream.buffered(), 0);
+    assert_eq!(stream.held(), 0);
 }
 
 #[test]
@@ -102,14 +48,10 @@ fn asn1_elements_round_trip() -> Result<(), Box<dyn core::error::Error>> {
         &der,
         core::slice::from_ref(&der),
     );
-    truncated(
-        || asn1::Elements::new(asn1::Rules::Ber),
-        ber.get(..ber.len() - 1).unwrap(),
-    );
-    refused(
-        || asn1::Elements::new(asn1::Rules::Der),
-        &[0x04, 0x83, 0x10, 0, 0],
-        asn1::Error::TooLong,
+    contract::check_truncated(|| asn1::Elements::new(asn1::Rules::Ber), &ber);
+    assert_eq!(
+        contract::check_decode(|| asn1::Elements::new(asn1::Rules::Der), &[0x04, 0x83, 0x10, 0, 0]),
+        (vec![], Some(Fail::Protocol(asn1::Error::TooLong)))
     );
     Ok(())
 }
@@ -139,11 +81,10 @@ fn ldap_messages_round_trip() -> Result<(), Box<dyn core::error::Error>> {
         &both,
         &[Ok(request.clone()), Ok(request)],
     );
-    truncated(Frames::<ldap::Message>::new, bytes.get(..bytes.len() - 1).unwrap());
-    refused(
-        || Frames::<ldap::Message>::with_limit(8),
-        &[0x30, 9],
-        ldap::Error::TooLarge(11),
+    contract::check_truncated(Frames::<ldap::Message>::new, &bytes);
+    assert_eq!(
+        contract::check_decode(|| Frames::<ldap::Message>::with_limit(8), &[0x30, 9]),
+        (vec![], Some(Fail::Protocol(ldap::Error::TooLarge(11))))
     );
     Ok(())
 }
@@ -174,11 +115,10 @@ fn ocsp_requests_and_responses_round_trip() -> Result<(), Box<dyn core::error::E
         &both,
         &[Ok(response.clone()), Ok(response)],
     );
-    truncated(ocsp::Frames::new, bytes.get(..bytes.len() - 1).unwrap());
-    refused(
-        ocsp::Frames::new,
-        &[0x30, 0x83, 1, 0, 0],
-        ocsp::Error::TooLong,
+    contract::check_truncated(ocsp::Frames::new, &bytes);
+    assert_eq!(
+        contract::check_decode(ocsp::Frames::new, &[0x30, 0x83, 1, 0, 0]),
+        (vec![], Some(Fail::Protocol(ocsp::Error::TooLong)))
     );
     Ok(())
 }
@@ -208,11 +148,10 @@ fn spnego_tokens_round_trip() -> Result<(), Box<dyn core::error::Error>> {
         &bytes,
         &[Ok(init), Ok(response)],
     );
-    truncated(spnego::Frames::new, bytes.get(..first_len - 1).unwrap());
-    refused(
-        spnego::Frames::new,
-        &[0x60, 0x83, 1, 0, 0],
-        spnego::Error::TooLong,
+    contract::check_truncated(spnego::Frames::new, &bytes[..first_len]);
+    assert_eq!(
+        contract::check_decode(spnego::Frames::new, &[0x60, 0x83, 1, 0, 0]),
+        (vec![], Some(Fail::Protocol(spnego::Error::TooLong)))
     );
     Ok(())
 }
@@ -272,11 +211,12 @@ fn x509_pem_blocks_round_trip() -> Result<(), Box<dyn core::error::Error>> {
         .windows(b"-----END".len())
         .position(|w| w == b"-----END")
         .unwrap();
-    truncated(x509::PemBlocks::new, bytes.get(..cut).unwrap());
-    refused(
-        || x509::PemBlocks::with_limit(32),
-        &bytes,
-        x509::Error::TooLong,
+    let (items, failure) = contract::check_decode(x509::PemBlocks::new, bytes.get(..cut).unwrap());
+    assert!(items.is_empty());
+    assert!(matches!(failure, Some(Fail::Truncated { .. })));
+    assert_eq!(
+        contract::check_decode(|| x509::PemBlocks::with_limit(32), &bytes),
+        (vec![], Some(Fail::Protocol(x509::Error::TooLong)))
     );
     Ok(())
 }
@@ -298,7 +238,9 @@ fn x509_pem_trailing_text_at_eof() -> Result<(), Box<dyn core::error::Error>> {
         let expected = x509::pem_decode(input.as_bytes())?;
         round_trip(x509::PemBlocks::new, input.as_bytes(), &expected);
     }
-    truncated(x509::PemBlocks::new, b"-----BEGIN TEST-----\nAQID");
+    let (items, failure) = contract::check_decode(x509::PemBlocks::new, b"-----BEGIN TEST-----\nAQID");
+    assert!(items.is_empty());
+    assert!(matches!(failure, Some(Fail::Truncated { .. })));
     Ok(())
 }
 
@@ -318,10 +260,9 @@ fn x509_pem_text_lines_have_their_own_limit() -> Result<(), Box<dyn core::error:
         input.as_bytes(),
         &x509::pem_decode(input.as_bytes())?,
     );
-    refused(
-        || x509::PemBlocks::with_limit(limit - 1),
-        text.as_bytes(),
-        x509::Error::TooLong,
+    assert_eq!(
+        contract::check_decode(|| x509::PemBlocks::with_limit(limit - 1), text.as_bytes()),
+        (vec![], Some(Fail::Protocol(x509::Error::TooLong)))
     );
 
     let mut line = vec![b'#'; x509::MAX_PEM_LINE];
@@ -329,16 +270,14 @@ fn x509_pem_text_lines_have_their_own_limit() -> Result<(), Box<dyn core::error:
     line.push(b'\n');
     round_trip(|| x509::PemBlocks::with_limit(0), &line, &[]);
     *line.last_mut().unwrap() = b'#';
-    refused(
-        || x509::PemBlocks::with_limit(0),
-        &line,
-        x509::Error::TooLong,
+    assert_eq!(
+        contract::check_decode(|| x509::PemBlocks::with_limit(0), &line),
+        (vec![], Some(Fail::Protocol(x509::Error::TooLong)))
     );
     line.push(b'\n');
-    refused(
-        || x509::PemBlocks::with_limit(0),
-        &line,
-        x509::Error::TooLong,
+    assert_eq!(
+        contract::check_decode(|| x509::PemBlocks::with_limit(0), &line),
+        (vec![], Some(Fail::Protocol(x509::Error::TooLong)))
     );
     Ok(())
 }
@@ -346,34 +285,29 @@ fn x509_pem_text_lines_have_their_own_limit() -> Result<(), Box<dyn core::error:
 #[test]
 fn frame_limits_refuse_lengths_before_bodies() {
     for limit in [0, 1, 2, 15, 16, 32] {
-        refused(
-            || ocsp::Frames::with_limit(limit),
-            &[0x30, 0x81, 0x80],
-            ocsp::Error::TooLong,
+        assert_eq!(
+            contract::check_decode(|| ocsp::Frames::with_limit(limit), &[0x30, 0x81, 0x80]),
+            (vec![], Some(Fail::Protocol(ocsp::Error::TooLong)))
         );
-        refused(
-            || spnego::Frames::with_limit(limit),
-            &[0xa1, 0x81, 0x80],
-            spnego::Error::TooLong,
+        assert_eq!(
+            contract::check_decode(|| spnego::Frames::with_limit(limit), &[0xa1, 0x81, 0x80]),
+            (vec![], Some(Fail::Protocol(spnego::Error::TooLong)))
         );
-        refused(
-            || kerberos::Frames::with_limit(limit),
-            &[0, 0, 0, 128],
-            kerberos::Error::LengthTooLong(128),
+        assert_eq!(
+            contract::check_decode(|| kerberos::Frames::with_limit(limit), &[0, 0, 0, 128]),
+            (vec![], Some(Fail::Protocol(kerberos::Error::LengthTooLong(128))))
         );
         assert_eq!(ocsp::Frames::with_limit(limit).capacity(), limit.max(16));
         assert_eq!(spnego::Frames::with_limit(limit).capacity(), limit.max(16));
         assert_eq!(kerberos::Frames::with_limit(limit).capacity(), limit + 4);
     }
-    refused(
-        || ocsp::Frames::with_limit(0),
-        &[0x30, 0],
-        ocsp::Error::TooLong,
+    assert_eq!(
+        contract::check_decode(|| ocsp::Frames::with_limit(0), &[0x30, 0]),
+        (vec![], Some(Fail::Protocol(ocsp::Error::TooLong)))
     );
-    refused(
-        || spnego::Frames::with_limit(0),
-        &[0xa1, 0],
-        spnego::Error::TooLong,
+    assert_eq!(
+        contract::check_decode(|| spnego::Frames::with_limit(0), &[0xa1, 0]),
+        (vec![], Some(Fail::Protocol(spnego::Error::TooLong)))
     );
     round_trip(|| ocsp::Frames::with_limit(2), &[0x30, 0], &[vec![0x30, 0]]);
     round_trip(
@@ -423,12 +357,11 @@ fn kerberos_tcp_messages_round_trip() -> Result<(), Box<dyn core::error::Error>>
         &both,
         &[Ok(message.clone()), Ok(message)],
     );
-    truncated(kerberos::Frames::new, bytes.get(..bytes.len() - 1).unwrap());
+    contract::check_truncated(kerberos::Frames::new, &bytes);
     let length = kerberos::MAX_MESSAGE as u32 + 1;
-    refused(
-        kerberos::Frames::new,
-        &length.to_be_bytes(),
-        kerberos::Error::LengthTooLong(length),
+    assert_eq!(
+        contract::check_decode(kerberos::Frames::new, &length.to_be_bytes()),
+        (vec![], Some(Fail::Protocol(kerberos::Error::LengthTooLong(length))))
     );
     Ok(())
 }

@@ -1780,9 +1780,8 @@ mod tests {
 
     /// Writes a packet and checks it reads back the same.
     fn round_trip(p: &Packet) -> Vec<u8> {
-        let bytes = p.to_bytes().unwrap();
+        let bytes = contract::check_written(p);
         assert_eq!(bytes.len() % 4, 0);
-        assert_eq!(Packet::parse(&bytes), Ok(p.clone()));
         bytes
     }
 

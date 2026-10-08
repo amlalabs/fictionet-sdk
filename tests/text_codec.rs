@@ -9,29 +9,12 @@ use fictionet::stdlib::test_support::{decode_all, mutate};
 use fictionet::stdlib::{ftp, memcache, whois};
 use std::fmt::Debug;
 
-fn written<T: Wire + Debug + PartialEq>(items: &[T]) -> Vec<u8>
-where
-    T::WriteError: Debug,
-{
-    let mut bytes = Vec::new();
-    for item in items {
-        contract::check_wire_value(item);
-        let start = bytes.len();
-        item.write(&mut bytes).unwrap();
-        contract::check_wire::<T>(&bytes[start..]);
-    }
-    bytes
-}
-
-fn round_trip<D: Decode>(make: impl Fn() -> D, bytes: &[u8], expected: &[D::Item])
+fn check<D: Decode>(make: impl Fn() -> D, bytes: &[u8]) -> (Vec<D::Item>, Option<Fail<D::Error>>)
 where
     D::Item: Debug + PartialEq,
     D::Error: Clone + Debug + PartialEq,
 {
-    contract::check_decode_with_alloc_limit(&make, bytes, 2 * make().capacity());
-    let (items, failure) = decode_all(make, bytes);
-    assert_eq!(failure, None);
-    assert_eq!(items, expected);
+    contract::check_decode_with_alloc_limit(&make, bytes, 2 * make().capacity())
 }
 
 #[test]
@@ -41,8 +24,8 @@ fn ftp_commands_and_multiline_replies_round_trip() {
         ftp::Command::new("RETR", Some("a\r\nb\rc")),
         ftp::Command::new("NOOP", None),
     ];
-    let bytes = written(&commands);
-    round_trip(ftp::Commands::new, &bytes, &commands.map(Ok));
+    let bytes = commands.iter().flat_map(contract::check_written).collect::<Vec<_>>();
+    assert_eq!(check(ftp::Commands::new, &bytes), (commands.map(Ok).to_vec(), None));
     let replies = [
         ftp::Reply {
             code: ftp::code::READY,
@@ -50,8 +33,8 @@ fn ftp_commands_and_multiline_replies_round_trip() {
         },
         ftp::Reply::new(ftp::code::OK, "Done"),
     ];
-    let bytes = written(&replies);
-    round_trip(ftp::Replies::new, &bytes, &replies.map(Ok));
+    let bytes = replies.iter().flat_map(contract::check_written).collect::<Vec<_>>();
+    assert_eq!(check(ftp::Replies::new, &bytes), (replies.map(Ok).to_vec(), None));
 }
 
 #[test]
@@ -75,21 +58,25 @@ fn ftp_wire_preserves_numeric_middle_lines() {
 
 #[test]
 fn ftp_line_errors_recover_and_accept_bare_lf() {
-    round_trip(
-        ftp::Commands::new,
-        b"123 bad\r\nNOOP\n",
-        &[
-            Err(ftp::Error::Verb),
-            Ok(ftp::Command::new("NOOP", None)),
-        ],
+    assert_eq!(
+        check(ftp::Commands::new, b"123 bad\r\nNOOP\n"),
+        (
+            vec![
+                Err(ftp::Error::Verb),
+                Ok(ftp::Command::new("NOOP", None)),
+            ],
+            None,
+        )
     );
-    round_trip(
-        ftp::Replies::new,
-        b"999 bad\r\n220 ready\n",
-        &[
-            Err(ftp::Error::Syntax),
-            Ok(ftp::Reply::new(ftp::code::READY, "ready")),
-        ],
+    assert_eq!(
+        check(ftp::Replies::new, b"999 bad\r\n220 ready\n"),
+        (
+            vec![
+                Err(ftp::Error::Syntax),
+                Ok(ftp::Reply::new(ftp::code::READY, "ready")),
+            ],
+            None,
+        )
     );
     // Semantic validation remains a separate layer, as in the RPC stacks.
     let commands = || ftp::Commands::new().map(|item| item.map(|c| ftp::Request::from_command(&c)));
@@ -100,13 +87,15 @@ fn ftp_line_errors_recover_and_accept_bare_lf() {
 fn ftp_line_limits_escape_boundaries_and_eof() {
     let mut too_long = vec![b'a'; ftp::MAX_LINE];
     too_long.extend_from_slice(b"\r\0\nignored\r\nNOOP\r\n");
-    round_trip(
-        ftp::Commands::new,
-        &too_long,
-        &[
-            Err(ftp::Error::LineTooLong),
-            Ok(ftp::Command::new("NOOP", None)),
-        ],
+    assert_eq!(
+        check(ftp::Commands::new, &too_long),
+        (
+            vec![
+                Err(ftp::Error::LineTooLong),
+                Ok(ftp::Command::new("NOOP", None)),
+            ],
+            None,
+        )
     );
     // Several escaped physical lines still share one logical line limit.
     let escaped = [
@@ -115,13 +104,15 @@ fn ftp_line_limits_escape_boundaries_and_eof() {
         b"\r\nNOOP\n",
     ]
     .concat();
-    round_trip(
-        ftp::Commands::new,
-        &escaped,
-        &[
-            Err(ftp::Error::LineTooLong),
-            Ok(ftp::Command::new("NOOP", None)),
-        ],
+    assert_eq!(
+        check(ftp::Commands::new, &escaped),
+        (
+            vec![
+                Err(ftp::Error::LineTooLong),
+                Ok(ftp::Command::new("NOOP", None)),
+            ],
+            None,
+        )
     );
     for input in [b"NOOP\r".as_slice(), b"RETR a\r\0\n"] {
         contract::check_decode(ftp::Commands::new, input);
@@ -158,13 +149,15 @@ fn ftp_reply_count_limit_recovers_at_matching_code() {
         bytes.extend_from_slice(b" x\r\n");
     }
     bytes.extend_from_slice(b"220 done\r\n200 OK\r\n");
-    round_trip(
-        ftp::Replies::new,
-        &bytes,
-        &[
-            Err(ftp::Error::TooManyLines),
-            Ok(ftp::Reply::new(ftp::code::OK, "OK")),
-        ],
+    assert_eq!(
+        check(ftp::Replies::new, &bytes),
+        (
+            vec![
+                Err(ftp::Error::TooManyLines),
+                Ok(ftp::Reply::new(ftp::code::OK, "OK")),
+            ],
+            None,
+        )
     );
     contract::check_decode_with_held_limit(ftp::Replies::new, &bytes, ftp::MAX_REPLY_BYTES);
 }
@@ -237,8 +230,8 @@ fn ftp_strict_reply_accepts_full_size_verbatim_text() {
             code: ftp::code::OK,
             lines,
         };
-        let bytes = written(std::slice::from_ref(&reply));
-        round_trip(ftp::Replies::new, &bytes, &[Ok(reply)]);
+        let bytes = contract::check_written(&reply);
+        assert_eq!(check(ftp::Replies::new, &bytes), (vec![Ok(reply)], None));
     }
 }
 
@@ -248,17 +241,19 @@ fn whois_queries_and_eof_response_round_trip() {
         whois::Query::new("example.test").unwrap(),
         whois::Query::new("-T inetnum 192.0.2.1").unwrap(),
     ];
-    let bytes = written(&queries);
-    round_trip(whois::Queries::new, &bytes, &queries.map(Ok));
+    let bytes = queries.iter().flat_map(contract::check_written).collect::<Vec<_>>();
+    assert_eq!(check(whois::Queries::new, &bytes), (queries.map(Ok).to_vec(), None));
     let response = whois::Response::new(b"domain: example.test\r\nstatus: active\r\n").unwrap();
-    let bytes = written(std::slice::from_ref(&response));
-    round_trip(
-        whois::CollectedResponses::new,
-        &bytes,
-        &[whois::CollectedResponse {
-            response,
-            truncated: false,
-        }],
+    let bytes = contract::check_written(&response);
+    assert_eq!(
+        check(whois::CollectedResponses::new, &bytes),
+        (
+            vec![whois::CollectedResponse {
+                response,
+                truncated: false,
+            }],
+            None,
+        )
     );
     let mut stream = Stream::new(whois::CollectedResponses::new());
     pump(&mut stream, &bytes, |_| panic!("response before EOF")).unwrap();
@@ -271,23 +266,27 @@ fn whois_queries_and_eof_response_round_trip() {
 
 #[test]
 fn whois_errors_limits_and_query_truncation() {
-    round_trip(
-        whois::Queries::new,
-        b"bad\0query\r\ngood\n",
-        &[
-            Err(whois::Error::Control('\0')),
-            Ok(whois::Query::new("good").unwrap()),
-        ],
+    assert_eq!(
+        check(whois::Queries::new, b"bad\0query\r\ngood\n"),
+        (
+            vec![
+                Err(whois::Error::Control('\0')),
+                Ok(whois::Query::new("good").unwrap()),
+            ],
+            None,
+        )
     );
     let mut bytes = vec![b'x'; whois::MAX_QUERY + 2];
     bytes.extend_from_slice(b"\nnext\r\n");
-    round_trip(
-        whois::Queries::new,
-        &bytes,
-        &[
-            Err(whois::Error::QueryTooLong),
-            Ok(whois::Query::new("next").unwrap()),
-        ],
+    assert_eq!(
+        check(whois::Queries::new, &bytes),
+        (
+            vec![
+                Err(whois::Error::QueryTooLong),
+                Ok(whois::Query::new("next").unwrap()),
+            ],
+            None,
+        )
     );
     let mut stream = Stream::new(whois::Queries::new());
     assert_eq!(stream.push(&bytes), whois::MAX_QUERY + 2);
@@ -315,16 +314,18 @@ fn whois_response_limit_reports_truncation() {
             response: whois::Response::new(&bytes[..bytes.len().min(3)]).unwrap(),
             truncated,
         };
-        round_trip(|| whois::CollectedResponses::with_limit(3), bytes, &[expected]);
+        assert_eq!(check(|| whois::CollectedResponses::with_limit(3), bytes), (vec![expected], None));
         contract::check_decode_with_held_limit(|| whois::CollectedResponses::with_limit(3), bytes, 3);
     }
-    round_trip(
-        || whois::CollectedResponses::with_limit(0),
-        b"x",
-        &[whois::CollectedResponse {
-            response: whois::Response::default(),
-            truncated: true,
-        }],
+    assert_eq!(
+        check(|| whois::CollectedResponses::with_limit(0), b"x"),
+        (
+            vec![whois::CollectedResponse {
+                response: whois::Response::default(),
+                truncated: true,
+            }],
+            None,
+        )
     );
     for size in [whois::MAX_RESPONSE, whois::MAX_RESPONSE + 1] {
         let bytes = vec![b'x'; size];
@@ -378,8 +379,8 @@ fn memcache_text_and_binary_round_trips() {
         },
         memcache::Command::Version,
     ];
-    let bytes = written(&commands);
-    round_trip(memcache::Commands::new, &bytes, &commands.map(Ok));
+    let bytes = commands.iter().flat_map(contract::check_written).collect::<Vec<_>>();
+    assert_eq!(check(memcache::Commands::new, &bytes), (commands.map(Ok).to_vec(), None));
     let responses = [
         memcache::Response::Value {
             key: b"key".to_vec(),
@@ -393,48 +394,52 @@ fn memcache_text_and_binary_round_trips() {
             data: vec![],
         },
     ];
-    let bytes = written(&responses);
-    round_trip(memcache::Responses::new, &bytes, &responses.map(Ok));
+    let bytes = responses.iter().flat_map(contract::check_written).collect::<Vec<_>>();
+    assert_eq!(check(memcache::Responses::new, &bytes), (responses.map(Ok).to_vec(), None));
     let packets = [cache_packet(b"a\0\r\nb"), cache_packet(b"second")];
-    let bytes = written(&packets);
-    round_trip(Frames::<memcache::Packet>::new, &bytes, &packets);
+    let bytes = packets.iter().flat_map(contract::check_written).collect::<Vec<_>>();
+    assert_eq!(check(Frames::<memcache::Packet>::new, &bytes), (packets.to_vec(), None));
 }
 
 #[test]
 fn memcache_recoverable_lines_and_bad_counted_trailer() {
-    round_trip(
-        memcache::Commands::new,
-        b"unknown\r\nversion\n",
-        &[
-            Err(memcache::Error::UnknownCommand),
-            Ok(memcache::Command::Version),
-        ],
+    assert_eq!(
+        check(memcache::Commands::new, b"unknown\r\nversion\n"),
+        (
+            vec![
+                Err(memcache::Error::UnknownCommand),
+                Ok(memcache::Command::Version),
+            ],
+            None,
+        )
     );
-    round_trip(
-        memcache::Responses::new,
-        b"unknown\r\nEND\n",
-        &[
-            Err(memcache::Error::UnknownCommand),
-            Ok(memcache::Response::End),
-        ],
+    assert_eq!(
+        check(memcache::Responses::new, b"unknown\r\nEND\n"),
+        (
+            vec![
+                Err(memcache::Error::UnknownCommand),
+                Ok(memcache::Response::End),
+            ],
+            None,
+        )
     );
-    round_trip(
-        memcache::Commands::new,
-        b"set key 0 0 3\nabcXXversion\r\n",
-        &[
-            Err(memcache::Error::BadDataChunk),
-            Ok(memcache::Command::Version),
-        ],
+    assert_eq!(
+        check(memcache::Commands::new, b"set key 0 0 3\nabcXXversion\r\n"),
+        (
+            vec![
+                Err(memcache::Error::BadDataChunk),
+                Ok(memcache::Command::Version),
+            ],
+            None,
+        )
     );
-    round_trip(
-        memcache::Responses::new,
-        b"VALUE key x 3\r\nabc\r\nEND\r\n",
-        &[Err(memcache::Error::Format), Ok(memcache::Response::End)],
+    assert_eq!(
+        check(memcache::Responses::new, b"VALUE key x 3\r\nabc\r\nEND\r\n"),
+        (vec![Err(memcache::Error::Format), Ok(memcache::Response::End)], None)
     );
-    round_trip(
-        memcache::Commands::new,
-        b"ms key 3 Z\r\nabc\r\nversion\r\n",
-        &[Err(memcache::Error::Format), Ok(memcache::Command::Version)],
+    assert_eq!(
+        check(memcache::Commands::new, b"ms key 3 Z\r\nabc\r\nversion\r\n"),
+        (vec![Err(memcache::Error::Format), Ok(memcache::Command::Version)], None)
     );
 }
 
@@ -466,21 +471,25 @@ fn memcache_limits_are_checked_before_body_assembly() {
     })
     .unwrap();
     finish(&mut stream, |_| panic!("unexpected item")).unwrap();
-    round_trip(
-        || memcache::Commands::with_limit(3),
-        b"set key 0 0 4\r\ndata\r\nversion\r\n",
-        &[
-            Err(memcache::Error::TooLarge(4)),
-            Ok(memcache::Command::Version),
-        ],
+    assert_eq!(
+        check(|| memcache::Commands::with_limit(3), b"set key 0 0 4\r\ndata\r\nversion\r\n"),
+        (
+            vec![
+                Err(memcache::Error::TooLarge(4)),
+                Ok(memcache::Command::Version),
+            ],
+            None,
+        )
     );
-    round_trip(
-        || memcache::Responses::with_limit(3),
-        b"VALUE key 0 4\r\ndata\r\nEND\r\n",
-        &[
-            Err(memcache::Error::TooLarge(4)),
-            Ok(memcache::Response::End),
-        ],
+    assert_eq!(
+        check(|| memcache::Responses::with_limit(3), b"VALUE key 0 4\r\ndata\r\nEND\r\n"),
+        (
+            vec![
+                Err(memcache::Error::TooLarge(4)),
+                Ok(memcache::Response::End),
+            ],
+            None,
+        )
     );
     let mut bytes = vec![b'x'; memcache::MAX_LINE];
     bytes.extend_from_slice(b"\r\nversion\r\n");
@@ -544,7 +553,7 @@ fn memcache_eof_inside_headers_bodies_trailers_and_skips() {
         decode_all(|| memcache::Commands::with_limit(3), bytes).1,
         Some(Fail::Protocol(memcache::FrameError::Incomplete))
     );
-    let bytes = written(&[cache_packet(b"body")]);
+    let bytes = contract::check_written(&cache_packet(b"body"));
     for cut in [1, 23, 24, bytes.len() - 1] {
         contract::check_decode(Frames::<memcache::Packet>::new, &bytes[..cut]);
         let (items, failure) = decode_all(Frames::<memcache::Packet>::new, &bytes[..cut]);
@@ -559,9 +568,9 @@ fn memcache_multiget_uses_its_own_line_limit() {
         keys: vec![b"key".to_vec(); memcache::MAX_LINE / 2],
         cas: true,
     };
-    let bytes = written(std::slice::from_ref(&command));
+    let bytes = contract::check_written(&command);
     assert!(bytes.len() > memcache::MAX_LINE);
-    round_trip(memcache::Commands::new, &bytes, &[Ok(command)]);
+    assert_eq!(check(memcache::Commands::new, &bytes), (vec![Ok(command)], None));
     let mut long = b"get ".to_vec();
     long.resize(memcache::MAX_GET_LINE, b'x');
     contract::check_decode(memcache::Commands::new, &long);
@@ -591,7 +600,7 @@ fn memcache_wire_exactness_and_transactional_refusal() {
     assert_eq!(out, b"prefix");
     assert!(<memcache::Command as Wire>::parse(b"version\r\nextra").is_err());
     assert!(<memcache::Response as Wire>::parse(b"END\r\nextra").is_err());
-    let mut bytes = written(&[cache_packet(b"data")]);
+    let mut bytes = contract::check_written(&cache_packet(b"data"));
     bytes.push(0);
     assert!(<memcache::Packet as Wire>::parse(&bytes).is_err());
     contract::check_wire::<memcache::Command>(b"  version\n");
@@ -678,20 +687,22 @@ fn decoder_capacity_and_empty_eof() {
         Frames::<memcache::Packet>::with_limit(0).decode(&[], true),
         Ok(Step::Need)
     );
-    round_trip(ftp::Commands::new, b"", &[]);
-    round_trip(ftp::Replies::new, b"", &[]);
-    round_trip(whois::Queries::new, b"", &[]);
-    round_trip(
-        whois::CollectedResponses::new,
-        b"",
-        &[whois::CollectedResponse {
-            response: whois::Response::default(),
-            truncated: false,
-        }],
+    assert_eq!(check(ftp::Commands::new, b""), (vec![], None));
+    assert_eq!(check(ftp::Replies::new, b""), (vec![], None));
+    assert_eq!(check(whois::Queries::new, b""), (vec![], None));
+    assert_eq!(
+        check(whois::CollectedResponses::new, b""),
+        (
+            vec![whois::CollectedResponse {
+                response: whois::Response::default(),
+                truncated: false,
+            }],
+            None,
+        )
     );
-    round_trip(memcache::Commands::new, b"", &[]);
-    round_trip(memcache::Responses::new, b"", &[]);
-    round_trip(Frames::<memcache::Packet>::new, b"", &[]);
+    assert_eq!(check(memcache::Commands::new, b""), (vec![], None));
+    assert_eq!(check(memcache::Responses::new, b""), (vec![], None));
+    assert_eq!(check(Frames::<memcache::Packet>::new, b""), (vec![], None));
 }
 
 #[test]
@@ -700,10 +711,10 @@ fn memcache_long_line_crlf_crosses_the_input_window() {
         keys: vec![b"a".to_vec(); 4094],
         cas: false,
     };
-    let bytes = written(std::slice::from_ref(&command));
+    let bytes = contract::check_written(&command);
     assert_eq!(bytes.len(), memcache::MAX_LINE + 1);
     assert_eq!(bytes[memcache::MAX_LINE - 1], b'\r');
-    round_trip(memcache::Commands::new, &bytes, &[Ok(command)]);
+    assert_eq!(check(memcache::Commands::new, &bytes), (vec![Ok(command)], None));
     contract::check_decode_with_held_limit(
         memcache::Commands::new,
         &bytes,

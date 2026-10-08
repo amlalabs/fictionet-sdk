@@ -6,40 +6,15 @@ use fictionet::stdlib::codec::{
     Decode, Fail, Lcg, Stream, Wire,
 };
 use fictionet::stdlib::test_support::contract;
-use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::{openvpn, rtcp, rtp, snmp, ssh};
 
-fn round_trip<D>(make: impl Fn() -> D, bytes: &[u8], expected: &[D::Item])
+fn check<D: Decode>(make: impl Fn() -> D, bytes: &[u8]) -> (Vec<D::Item>, Option<Fail<D::Error>>)
 where
-    D: Decode,
     D::Item: Debug + PartialEq,
     D::Error: Clone + Debug + PartialEq,
 {
-    contract::check_decode_with_alloc_limit(&make, bytes, 2 * make().capacity());
     contract::check_decode_with_held_limit(&make, bytes, 0);
-    let (items, failure) = decode_all(make, bytes);
-    assert_eq!(items, expected);
-    assert_eq!(failure, None);
-}
-
-fn truncated<D>(make: impl Fn() -> D, bytes: &[u8])
-where
-    D: Decode,
-    D::Item: Debug + PartialEq,
-    D::Error: Clone + Debug + PartialEq,
-{
-    // Every nonempty proper prefix of one valid unit ends in truncation.
-    for cut in 1..bytes.len() {
-        let mut stream = Stream::new(make());
-        assert_eq!(stream.push(&bytes[..cut]), cut);
-        assert_eq!(stream.next(), None);
-        stream.end();
-        let error = Fail::Truncated { unread: cut };
-        assert_eq!(stream.next(), Some(Err(error.clone())));
-        assert_eq!(stream.failed(), Some(&error));
-        assert!(stream.is_done());
-        assert_eq!(stream.next(), None);
-    }
+    contract::check_decode_with_alloc_limit(&make, bytes, 2 * make().capacity())
 }
 
 fn refused_header<D>(make: impl Fn() -> D, header: &[u8], expected: D::Error)
@@ -48,33 +23,19 @@ where
     D::Item: Debug + PartialEq,
     D::Error: Clone + Debug + PartialEq,
 {
-    contract::check_decode_with_alloc_limit(&make, header, 2 * make().capacity());
+    assert_eq!(
+        contract::check_decode_with_alloc_limit(&make, header, 2 * make().capacity()),
+        (vec![], Some(Fail::Protocol(expected.clone())))
+    );
     let mut stream = Stream::new(make());
     assert_eq!(stream.push(header), header.len());
     let error = Fail::Protocol(expected);
     assert_eq!(stream.next(), Some(Err(error.clone())));
-    assert_eq!(stream.failed(), Some(&error));
-    assert!(stream.is_done());
     assert_eq!(stream.offset(), 0);
     assert_eq!(stream.unread(), header);
     assert_eq!(stream.held(), 0);
-    assert_eq!(stream.next(), None);
     assert_eq!(stream.push(b"discarded after failure"), 23);
-    assert_eq!(stream.next(), None);
     assert_eq!(stream.unread(), header);
-}
-
-fn wire_bytes<T: Wire + Debug + PartialEq>(value: &T) -> Vec<u8> {
-    contract::check_wire_value(value);
-    let bytes = Wire::to_bytes(value).unwrap();
-    contract::check_wire::<T>(&bytes);
-    assert_eq!(&T::parse(&bytes).unwrap(), value);
-    bytes
-}
-
-fn refuses_value<T: Wire + Debug + PartialEq>(value: &T) {
-    contract::check_wire_value(value);
-    contract::check_refused(value);
 }
 
 fn vpn_control() -> openvpn::Packet {
@@ -111,7 +72,7 @@ fn openvpn_chunked_tcp_round_trip() {
     let mut bytes = Vec::new();
     for packet in &packets {
         let frame = openvpn::Frame(packet.to_bytes().unwrap());
-        let encoded = wire_bytes(&frame);
+        let encoded = contract::check_written(&frame);
         assert_eq!(
             encoded,
             openvpn::Frame::from_packet(packet)
@@ -119,33 +80,37 @@ fn openvpn_chunked_tcp_round_trip() {
                 .to_bytes()
                 .unwrap()
         );
-        truncated(Frames::<openvpn::Frame>::new, &encoded);
+        contract::check_truncated(Frames::<openvpn::Frame>::new, &encoded);
         Wire::write(&frame, &mut bytes).unwrap();
     }
-    round_trip(
-        || {
-            Frames::<openvpn::Frame>::new()
-                .map(|frame| openvpn::Packet::parse_with(&frame.0, openvpn::Wrapping::None))
-        },
-        &bytes,
-        &packets.into_iter().map(Ok).collect::<Vec<_>>(),
+    assert_eq!(
+        check(
+            || {
+                Frames::<openvpn::Frame>::new()
+                    .map(|frame| openvpn::Packet::parse_with(&frame.0, openvpn::Wrapping::None))
+            },
+            &bytes,
+        ),
+        (packets.into_iter().map(Ok).collect::<Vec<_>>().to_vec(), None)
     );
 }
 
 #[test]
 fn openvpn_packet_errors_and_framing_errors() {
     let packet = vpn_control();
-    let mut bytes = wire_bytes(&openvpn::Frame(vec![0])); // Unknown opcode, valid envelope.
+    let mut bytes = contract::check_written(&openvpn::Frame(vec![0])); // Unknown opcode, valid envelope.
     openvpn::Frame(packet.to_bytes().unwrap())
         .write(&mut bytes)
         .unwrap();
-    round_trip(
-        || {
-            Frames::<openvpn::Frame>::new()
-                .map(|frame| openvpn::Packet::parse_with(&frame.0, openvpn::Wrapping::None))
-        },
-        &bytes,
-        &[Err(openvpn::Error::Opcode(0)), Ok(packet)],
+    assert_eq!(
+        check(
+            || {
+                Frames::<openvpn::Frame>::new()
+                    .map(|frame| openvpn::Packet::parse_with(&frame.0, openvpn::Wrapping::None))
+            },
+            &bytes,
+        ),
+        (vec![Err(openvpn::Error::Opcode(0)), Ok(packet)], None)
     );
     refused_header(
         || Frames::<openvpn::Frame>::with_limit(16),
@@ -177,25 +142,27 @@ fn openvpn_wrapping_stays_explicit() {
         packet_id: 7,
         net_time: 8,
     });
-    let bytes = wire_bytes(
+    let bytes = contract::check_written(
         &openvpn::Frame::from_packet(&openvpn::Authenticated::<20>(packet.clone())).unwrap(),
     );
-    round_trip(
-        || {
-            Frames::<openvpn::Frame>::new().map(|frame| {
-                openvpn::Packet::parse_with(&frame.0, openvpn::Wrapping::TlsAuth { hmac_len: 20 })
-            })
-        },
-        &bytes,
-        &[Ok(packet)],
+    assert_eq!(
+        check(
+            || {
+                Frames::<openvpn::Frame>::new().map(|frame| {
+                    openvpn::Packet::parse_with(&frame.0, openvpn::Wrapping::TlsAuth { hmac_len: 20 })
+                })
+            },
+            &bytes,
+        ),
+        (vec![Ok(packet)], None)
     );
 }
 
 #[test]
 fn openvpn_wire_is_exact_and_transactional() {
-    refuses_value(&openvpn::Frame(vec![]));
-    refuses_value(&openvpn::Frame(vec![1; openvpn::MAX_PACKET + 1]));
-    let mut bytes = wire_bytes(&openvpn::Frame(vec![1]));
+    contract::check_refused(&openvpn::Frame(vec![]));
+    contract::check_refused(&openvpn::Frame(vec![1; openvpn::MAX_PACKET + 1]));
+    let mut bytes = contract::check_written(&openvpn::Frame(vec![1]));
     bytes.push(0);
     assert_eq!(
         <openvpn::Frame as Wire>::parse(&bytes),
@@ -241,36 +208,37 @@ fn rtp_chunked_rfc4571_round_trip() {
         profile: 0x4321,
         data: vec![1; 4],
     });
-    let mut bytes = wire_bytes(&rtcp::Frame::default());
+    let mut bytes = contract::check_written(&rtcp::Frame::default());
     for packet in [&a, &b, &c] {
-        let encoded = wire_bytes(&rtcp::Frame(wire_bytes(packet)));
-        truncated(Frames::<rtcp::Frame>::new, &encoded);
+        let encoded = contract::check_written(&rtcp::Frame(contract::check_written(packet)));
+        contract::check_truncated(Frames::<rtcp::Frame>::new, &encoded);
         bytes.extend(encoded);
     }
-    round_trip(
-        || {
-            Frames::<rtcp::Frame>::new().map(|frame| {
-                if frame.0.is_empty() {
-                    Ok(None)
-                } else {
-                    rtp::Packet::parse(&frame.0).map(Some)
-                }
-            })
-        },
-        &bytes,
-        &[Ok(None), Ok(Some(a)), Ok(Some(b)), Ok(Some(c))],
+    assert_eq!(
+        check(
+            || {
+                Frames::<rtcp::Frame>::new().map(|frame| {
+                    if frame.0.is_empty() {
+                        Ok(None)
+                    } else {
+                        rtp::Packet::parse(&frame.0).map(Some)
+                    }
+                })
+            },
+            &bytes,
+        ),
+        (vec![Ok(None), Ok(Some(a)), Ok(Some(b)), Ok(Some(c))], None)
     );
 }
 
 #[test]
 fn rtp_body_error_keeps_stream_and_limit_error_ends_it() {
     let packet = media_packet();
-    let mut bytes = wire_bytes(&rtcp::Frame(vec![0, 0]));
-    rtcp::Frame(wire_bytes(&packet)).write(&mut bytes).unwrap();
-    round_trip(
-        || Frames::<rtcp::Frame>::new().map(|frame| rtp::Packet::parse(&frame.0)),
-        &bytes,
-        &[Err(rtp::Error::Version(0)), Ok(packet)],
+    let mut bytes = contract::check_written(&rtcp::Frame(vec![0, 0]));
+    rtcp::Frame(contract::check_written(&packet)).write(&mut bytes).unwrap();
+    assert_eq!(
+        check(|| Frames::<rtcp::Frame>::new().map(|frame| rtp::Packet::parse(&frame.0)), &bytes),
+        (vec![Err(rtp::Error::Version(0)), Ok(packet)], None)
     );
     refused_header(
         || Frames::<rtcp::Frame>::with_limit(12),
@@ -287,13 +255,13 @@ fn rtp_strict_writer_refuses_clipping_and_extension_aliases() {
     let good = media_packet();
     let mut bad = good.clone();
     bad.payload_type = 128;
-    refuses_value(&bad);
+    contract::check_refused(&bad);
     bad = good.clone();
     bad.csrcs = vec![0; rtp::MAX_CSRCS + 1];
-    refuses_value(&bad);
+    contract::check_refused(&bad);
     bad = good.clone();
     bad.payload = vec![0; rtp::MAX_PACKET];
-    refuses_value(&bad);
+    contract::check_refused(&bad);
     for extension in [
         rtp::HeaderExtension::OneByte(vec![rtp::Element {
             id: 0,
@@ -325,7 +293,7 @@ fn rtp_strict_writer_refuses_clipping_and_extension_aliases() {
     ] {
         bad = good.clone();
         bad.extension = Some(extension);
-        refuses_value(&bad);
+        contract::check_refused(&bad);
     }
 }
 
@@ -368,48 +336,55 @@ fn rtcp_chunked_compound_round_trip() {
     let packets = reports();
     let mut datagram = Vec::new();
     for packet in &packets {
-        wire_bytes(packet);
+        contract::check_written(packet);
         packet.write(&mut datagram).unwrap();
     }
     assert_eq!(
         rtcp::Compound::parse(&datagram),
         Ok(rtcp::Compound(packets.clone()))
     );
-    let encoded = wire_bytes(&rtcp::Frame(datagram));
-    truncated(Frames::<rtcp::Frame>::new, &encoded);
+    let encoded = contract::check_written(&rtcp::Frame(datagram));
+    contract::check_truncated(Frames::<rtcp::Frame>::new, &encoded);
     let bytes = [
         encoded.clone(),
-        wire_bytes(&rtcp::Frame::default()),
+        contract::check_written(&rtcp::Frame::default()),
         encoded,
     ]
     .concat();
-    round_trip(
-        || {
-            Frames::<rtcp::Frame>::new().map(|frame| {
-                if frame.0.is_empty() {
-                    Ok(None)
-                } else {
-                    rtcp::Compound::parse(&frame.0).map(|value| Some(value.0))
-                }
-            })
-        },
-        &bytes,
-        &[Ok(Some(packets.clone())), Ok(None), Ok(Some(packets))],
+    assert_eq!(
+        check(
+            || {
+                Frames::<rtcp::Frame>::new().map(|frame| {
+                    if frame.0.is_empty() {
+                        Ok(None)
+                    } else {
+                        rtcp::Compound::parse(&frame.0).map(|value| Some(value.0))
+                    }
+                })
+            },
+            &bytes,
+        ),
+        (vec![Ok(Some(packets.clone())), Ok(None), Ok(Some(packets))], None)
     );
 }
 
 #[test]
 fn rtcp_body_error_keeps_stream_and_limit_error_ends_it() {
     let packet = reports().remove(0);
-    let mut bytes = wire_bytes(&rtcp::Frame(vec![0x80, rtcp::packet_type::RR, 0, 0]));
-    rtcp::Frame(wire_bytes(&packet)).write(&mut bytes).unwrap();
-    round_trip(
-        || Frames::<rtcp::Frame>::new().map(|frame| rtcp::Datagram::parse(&frame.0).map(|value| value.0)),
-        &bytes,
-        &[
-            Err(rtcp::Error::Malformed(rtcp::packet_type::RR)),
-            Ok(vec![packet]),
-        ],
+    let mut bytes = contract::check_written(&rtcp::Frame(vec![0x80, rtcp::packet_type::RR, 0, 0]));
+    rtcp::Frame(contract::check_written(&packet)).write(&mut bytes).unwrap();
+    assert_eq!(
+        check(
+            || Frames::<rtcp::Frame>::new().map(|frame| rtcp::Datagram::parse(&frame.0).map(|value| value.0)),
+            &bytes,
+        ),
+        (
+            vec![
+                Err(rtcp::Error::Malformed(rtcp::packet_type::RR)),
+                Ok(vec![packet]),
+            ],
+            None,
+        )
     );
     refused_header(
         || Frames::<rtcp::Frame>::with_limit(8),
@@ -424,7 +399,7 @@ fn rtcp_body_error_keeps_stream_and_limit_error_ends_it() {
 #[test]
 fn rtcp_wire_is_exact_and_transactional() {
     let packet = reports().remove(0);
-    let bytes = wire_bytes(&packet);
+    let bytes = contract::check_written(&packet);
     assert_eq!(
         <rtcp::Packet as Wire>::parse(&[bytes.clone(), bytes.clone()].concat()),
         Err(rtcp::Error::Trailing)
@@ -432,19 +407,19 @@ fn rtcp_wire_is_exact_and_transactional() {
     assert!(<rtcp::Packet as Wire>::parse(&bytes[..bytes.len() - 1]).is_err());
     let mut bad = packet.clone();
     bad.padding = 1;
-    refuses_value(&bad);
-    refuses_value(&rtcp::Packet::from(rtcp::Body::Other {
+    contract::check_refused(&bad);
+    contract::check_refused(&rtcp::Packet::from(rtcp::Body::Other {
         packet_type: rtcp::packet_type::RR,
         count: 0,
         data: vec![0; 4],
     }));
-    refuses_value(&rtcp::Packet::from(rtcp::Body::App(rtcp::App {
+    contract::check_refused(&rtcp::Packet::from(rtcp::Body::App(rtcp::App {
         subtype: 0,
         ssrc: 1,
         name: *b"test",
         data: vec![0; rtcp::MAX_PACKET],
     })));
-    refuses_value(&rtcp::Frame(vec![0; rtcp::MAX_FRAME + 1]));
+    contract::check_refused(&rtcp::Frame(vec![0; rtcp::MAX_FRAME + 1]));
     assert_eq!(
         <rtcp::Frame as Wire>::parse(&[0, 0, 0]),
         Err(rtcp::Error::Trailing)
@@ -479,12 +454,12 @@ fn ssh_chunked_cleartext_round_trip() {
     ];
     let mut bytes = Vec::new();
     for packet in &packets {
-        let encoded = wire_bytes(packet);
+        let encoded = contract::check_written(packet);
         assert_eq!(encoded, packet.to_bytes().unwrap());
-        truncated(Frames::<ssh::Packet>::new, &encoded);
+        contract::check_truncated(Frames::<ssh::Packet>::new, &encoded);
         packet.write(&mut bytes).unwrap();
     }
-    round_trip(Frames::<ssh::Packet>::new, &bytes, &packets);
+    assert_eq!(check(Frames::<ssh::Packet>::new, &bytes), (packets.to_vec(), None));
 }
 
 #[test]
@@ -521,7 +496,7 @@ fn ssh_header_errors_end_the_stream() {
 #[test]
 fn ssh_wire_refuses_padding_changes_and_trailing_bytes() {
     let packet = ssh_packet(vec![21]);
-    let mut bytes = wire_bytes(&packet);
+    let mut bytes = contract::check_written(&packet);
     bytes.push(0);
     assert_eq!(
         <ssh::Packet as Wire>::parse(&bytes),
@@ -549,7 +524,7 @@ fn ssh_wire_refuses_padding_changes_and_trailing_bytes() {
             padding: vec![0; 4],
         },
     ] {
-        refuses_value(&bad);
+        contract::check_refused(&bad);
     }
 }
 
@@ -613,11 +588,11 @@ fn snmp_chunked_ber_round_trip() {
         .unwrap();
     let mut bytes = Vec::new();
     for message in [&request, &response] {
-        let encoded = wire_bytes(message);
-        truncated(Frames::<snmp::Message>::new, &encoded);
+        let encoded = contract::check_written(message);
+        contract::check_truncated(Frames::<snmp::Message>::new, &encoded);
         message.write(&mut bytes).unwrap();
     }
-    round_trip(Frames::<snmp::Message>::new, &bytes, &[Ok(request), Ok(response)]);
+    assert_eq!(check(Frames::<snmp::Message>::new, &bytes), (vec![Ok(request), Ok(response)], None));
 }
 
 #[test]
@@ -625,11 +600,7 @@ fn snmp_body_error_keeps_stream_and_framing_error_ends_it() {
     let message = snmp_message();
     let mut bytes = vec![0x30, 0]; // A complete TLV with no message fields.
     message.write(&mut bytes).unwrap();
-    round_trip(
-        Frames::<snmp::Message>::new,
-        &bytes,
-        &[Err(snmp::Error::Truncated), Ok(message)],
-    );
+    assert_eq!(check(Frames::<snmp::Message>::new, &bytes), (vec![Err(snmp::Error::Truncated), Ok(message)], None));
     refused_header(
         Frames::<snmp::Message>::new,
         &[0x30, 0x82, 0xff, 0xff],
@@ -647,14 +618,14 @@ fn snmp_body_error_keeps_stream_and_framing_error_ends_it() {
 #[test]
 fn snmp_accepts_redundant_long_form_ber_lengths() {
     let message = snmp_message();
-    let canonical = wire_bytes(&message);
+    let canonical = contract::check_written(&message);
     assert!(canonical[1] < 128);
     let mut bytes = vec![0x30, 0xfe]; // 126 length bytes, most of them zero.
     bytes.extend([0; 125]);
     bytes.push(canonical[1]);
     bytes.extend_from_slice(&canonical[2..]);
     contract::check_wire::<snmp::Message>(&bytes);
-    round_trip(Frames::<snmp::Message>::new, &bytes, &[Ok(message)]);
+    assert_eq!(check(Frames::<snmp::Message>::new, &bytes), (vec![Ok(message)], None));
     refused_header(
         || Frames::<snmp::Message>::with_limit(16),
         &bytes[..128],
@@ -671,7 +642,7 @@ fn snmp_wire_is_exact_and_transactional() {
         Err(snmp::Error::TrailingBytes)
     );
     let message = snmp_message();
-    let mut bytes = wire_bytes(&message);
+    let mut bytes = contract::check_written(&message);
     bytes.push(0);
     assert_eq!(
         <snmp::Message as Wire>::parse(&bytes),
@@ -679,7 +650,7 @@ fn snmp_wire_is_exact_and_transactional() {
     );
     let mut bad = message;
     bad.community = vec![0; snmp::MAX_MESSAGE];
-    refuses_value(&bad);
+    contract::check_refused(&bad);
 }
 
 #[test]
@@ -701,10 +672,9 @@ fn configured_limits_and_maximum_envelopes() {
         snmp::MAX_MESSAGE
     );
     assert_eq!(Frames::<snmp::Message>::with_limit(0).capacity(), 128);
-    round_trip(
-        || Frames::<rtcp::Frame>::with_limit(0),
-        &[0, 0, 0, 0],
-        &[rtcp::Frame::default(), rtcp::Frame::default()],
+    assert_eq!(
+        check(|| Frames::<rtcp::Frame>::with_limit(0), &[0, 0, 0, 0]),
+        (vec![rtcp::Frame::default(), rtcp::Frame::default()], None)
     );
     refused_header(
         || Frames::<openvpn::Frame>::with_limit(0),
@@ -716,12 +686,12 @@ fn configured_limits_and_maximum_envelopes() {
     );
     for length in [1, openvpn::MAX_PACKET] {
         let frame = openvpn::Frame(vec![7; length]);
-        round_trip(Frames::<openvpn::Frame>::new, &wire_bytes(&frame), &[frame]);
+        assert_eq!(check(Frames::<openvpn::Frame>::new, &contract::check_written(&frame)), (vec![frame], None));
     }
     let frame = rtcp::Frame(vec![7; rtcp::MAX_FRAME]);
-    round_trip(Frames::<rtcp::Frame>::new, &wire_bytes(&frame), &[frame]);
+    assert_eq!(check(Frames::<rtcp::Frame>::new, &contract::check_written(&frame)), (vec![frame], None));
     let packet = ssh_packet(vec![7; ssh::MAX_PAYLOAD]);
-    round_trip(Frames::<ssh::Packet>::new, &wire_bytes(&packet), &[packet]);
+    assert_eq!(check(Frames::<ssh::Packet>::new, &contract::check_written(&packet)), (vec![packet], None));
 }
 
 #[test]

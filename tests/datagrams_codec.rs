@@ -18,11 +18,12 @@ where
     M::ParseError: Clone + Debug + PartialEq,
     M::WriteError: Debug,
 {
-    contract::check_wire_value(value);
-    let bytes = Wire::to_bytes(value).unwrap();
+    let bytes = contract::check_written(value);
     assert!(bytes.len() <= limit);
-    contract::check_wire::<M>(&bytes);
-    contract::check_decode_with_alloc_limit(|| Collect::<M>::new(limit), &bytes, 2 * (limit + 1));
+    assert_eq!(
+        contract::check_decode_with_alloc_limit(|| Collect::<M>::new(limit), &bytes, 2 * (limit + 1)),
+        (vec![value.clone()], None)
+    );
 
     let mut stream = Stream::new(Collect::<M>::new(limit));
     for chunk in chunks(&bytes, &[1, 7, 2, 31]) {
@@ -35,24 +36,17 @@ where
     let (decoded, span) = stream.next_span().unwrap().unwrap();
     assert_eq!(&decoded, value);
     assert_eq!(span, 0..bytes.len() as u64);
-    let mut out = vec![0xa5];
-    Wire::write(&decoded, &mut out).unwrap();
-    assert_eq!(out.first(), Some(&0xa5));
-    assert_eq!(M::parse(out.get(1..).unwrap()).as_ref(), Ok(value));
-    assert_eq!(stream.next(), None);
-    assert!(stream.is_done());
-    assert_eq!(stream.failed(), None);
-
     // The collection's configured limit fails before EOF, once.
     if !bytes.is_empty() {
         let small = bytes.len() - 1;
-        contract::check_decode_with_alloc_limit(|| Collect::<M>::new(small), &bytes, 2 * (small + 1));
+        assert_eq!(
+            contract::check_decode_with_alloc_limit(|| Collect::<M>::new(small), &bytes, 2 * (small + 1)),
+            (vec![], Some(Fail::Protocol(CollectError::TooLong { limit: small })))
+        );
         let mut stream = Stream::new(Collect::<M>::new(small));
         assert_eq!(stream.push(&bytes), bytes.len());
         let error = Fail::Protocol(CollectError::TooLong { limit: small });
-        assert_eq!(stream.next(), Some(Err(error.clone())));
-        assert_eq!(stream.failed(), Some(&error));
-        assert_eq!(stream.next(), None);
+        assert_eq!(stream.next(), Some(Err(error)));
     }
     bytes
 }
@@ -63,20 +57,16 @@ where
     M::ParseError: Clone + Debug + PartialEq,
 {
     let expected = M::parse(bytes).unwrap_err();
-    contract::check_decode_with_alloc_limit(|| Collect::<M>::new(limit), bytes, 2 * (limit + 1));
+    assert_eq!(
+        contract::check_decode_with_alloc_limit(|| Collect::<M>::new(limit), bytes, 2 * (limit + 1)),
+        (vec![], Some(Fail::Protocol(CollectError::Parse(expected.clone()))))
+    );
     let mut stream = Stream::new(Collect::<M>::new(limit));
     assert_eq!(stream.push(bytes), bytes.len());
     assert!(stream.next().is_none());
     stream.end();
     let error = Fail::Protocol(CollectError::Parse(expected));
     assert_eq!(stream.next(), Some(Err(error.clone())));
-    assert_eq!(stream.failed(), Some(&error));
-    assert_eq!(stream.next(), None);
-}
-
-fn refused<M: Wire + Debug + PartialEq>(value: &M) {
-    contract::check_refused(value);
-    contract::check_wire_value(value);
 }
 
 #[test]
@@ -106,7 +96,7 @@ fn geneve_datagram() {
     parse_failure::<geneve::Packet>(&[], geneve::MAX_DATAGRAM);
     let mut bad = packet;
     bad.header.vni = geneve::MAX_VNI + 1;
-    refused(&bad);
+    contract::check_refused(&bad);
 }
 
 #[test]
@@ -137,7 +127,7 @@ fn gre_packets_and_exact_pptp_boundary() {
     );
     parse_failure::<gre::Packet>(&padded, gre::MAX_PACKET);
     parse_failure::<gre::Packet>(&[], gre::MAX_PACKET);
-    refused(&gre::Packet {
+    contract::check_refused(&gre::Packet {
         payload: vec![],
         ..pptp
     });
@@ -155,7 +145,7 @@ fn igmp_checksum(bytes: &mut [u8]) {
 #[test]
 fn igmp_versions_auxiliary_data_and_exact_boundary() {
     round_trip(&igmp::Code(992), 1);
-    refused(&igmp::Code(1000));
+    contract::check_refused(&igmp::Code(1000));
     let group = Ipv4Addr::new(239, 1, 2, 3);
     let messages = [
         igmp::Message::Query {
@@ -211,7 +201,7 @@ fn igmp_versions_auxiliary_data_and_exact_boundary() {
         2 * (igmp::MAX_MESSAGE + 1),
     );
     parse_failure::<igmp::Message>(&[], igmp::MAX_MESSAGE);
-    refused(&igmp::Message::Query {
+    contract::check_refused(&igmp::Message::Query {
         max_resp_time: 0,
         group,
     });
@@ -249,10 +239,10 @@ fn ipsec_carriers() {
     parse_failure::<ipsec::EspPacket>(&[], ipsec::MAX_PACKET);
     parse_failure::<ipsec::AhPacket>(&[], ipsec::MAX_PACKET);
     parse_failure::<ipsec::Datagram>(&[], ipsec::MAX_DATAGRAM);
-    refused(&ipsec::EspPacket { spi: 0, ..esp });
+    contract::check_refused(&ipsec::EspPacket { spi: 0, ..esp });
     let mut bad = ah;
     bad.header.icv.push(0);
-    refused(&bad);
+    contract::check_refused(&bad);
 }
 
 #[test]
@@ -291,7 +281,7 @@ fn rip_and_ripng_messages() {
         command: rip::Command::Response,
         entries: rip::NgEntries::Entries(vec![rip::NgEntry::NextHop(Ipv6Addr::LOCALHOST)]),
     };
-    refused(&ng); // The parser normalizes this next hop to ::.
+    contract::check_refused(&ng); // The parser normalizes this next hop to ::.
     parse_failure::<rip::Message>(&[], rip::MAX_MESSAGE);
     parse_failure::<rip::NgMessage>(&[], rip::MAX_NG_MESSAGE);
 }
@@ -309,8 +299,7 @@ where
     assert_eq!(round_trip(&raw, limit), bytes);
     let make =
         || Collect::<D>::new(limit).map(|datagram| parse(&Wire::to_bytes(&datagram).unwrap()));
-    contract::check_decode_with_alloc_limit(make, bytes, 2 * (limit + 1));
-    let (items, failure) = decode_all(make, bytes);
+    let (items, failure) = contract::check_decode_with_alloc_limit(make, bytes, 2 * (limit + 1));
     assert_eq!(items, vec![parse(bytes)]);
     assert_eq!(failure, None);
 }
@@ -363,7 +352,7 @@ fn ospf_context_stays_in_the_mapping() {
             ospf::Packet::parse(b, &endpoints)
         });
     }
-    refused(&ospf::Datagram(vec![0; ospf::MAX_MESSAGE + 1]));
+    contract::check_refused(&ospf::Datagram(vec![0; ospf::MAX_MESSAGE + 1]));
     parse_failure::<ospf::Datagram>(&vec![0; ospf::MAX_MESSAGE + 1], ospf::MAX_MESSAGE + 1);
 }
 
@@ -398,7 +387,7 @@ fn pim_context_stays_in_the_mapping() {
             pim::Message::parse(b, &endpoints)
         });
     }
-    refused(&pim::Datagram(vec![0; pim::MAX_MESSAGE + 1]));
+    contract::check_refused(&pim::Datagram(vec![0; pim::MAX_MESSAGE + 1]));
     parse_failure::<pim::Datagram>(&vec![0; pim::MAX_MESSAGE + 1], pim::MAX_MESSAGE + 1);
 }
 
@@ -469,7 +458,7 @@ fn vrrp_context_stays_in_the_mapping() {
             vrrp::Advertisement::parse(b, &endpoints)
         });
     }
-    refused(&vrrp::Datagram(vec![0; vrrp::MAX_MESSAGE + 1]));
+    contract::check_refused(&vrrp::Datagram(vec![0; vrrp::MAX_MESSAGE + 1]));
     parse_failure::<vrrp::Datagram>(&vec![0; vrrp::MAX_MESSAGE + 1], vrrp::MAX_MESSAGE + 1);
 }
 

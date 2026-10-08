@@ -2557,11 +2557,6 @@ mod tests {
         assert_eq!(d.push(b), b.len());
     }
 
-    fn round_trip(m: &Message) {
-        let bytes = m.to_bytes().unwrap();
-        assert_eq!(Message::parse(&bytes).as_ref(), Ok(m), "{bytes:02x?}");
-    }
-
     fn eq(attribute: &str, value: &str) -> Filter {
         Filter::Equal {
             attribute: attribute.into(),
@@ -2645,7 +2640,7 @@ mod tests {
                 0x04, 0x02, 1, 2
             ]
         );
-        round_trip(&m);
+        contract::check_written(&m);
     }
 
     #[test]
@@ -2782,7 +2777,7 @@ mod tests {
             }),
         ];
         for (i, op) in ops.into_iter().enumerate() {
-            round_trip(&msg(i as u32, op));
+            contract::check_written(&msg(i as u32, op));
         }
     }
 
@@ -2816,7 +2811,7 @@ mod tests {
                 "{text} -> {again}"
             );
             let m = msg(1, Op::SearchRequest(search(f)));
-            round_trip(&m);
+            contract::check_written(&m);
         }
         assert_eq!(
             Filter::parse_text("(cn=Babs Jensen)"),
@@ -2987,7 +2982,7 @@ mod tests {
             contents: vec![1],
         };
         assert!(matches!(other.to_text(), Err(Error::Unwritable(_))));
-        round_trip(&msg(1, Op::SearchRequest(search(other))));
+        contract::check_written(&msg(1, Op::SearchRequest(search(other))));
         let other_low = Filter::Other {
             number: 7,
             constructed: false,
@@ -3035,7 +3030,7 @@ mod tests {
             };
             assert!(matches!(f.to_text(), Err(Error::Unwritable(_))), "{f:?}");
             // The BER form still holds it.
-            round_trip(&msg(1, Op::SearchRequest(search(f))));
+            contract::check_written(&msg(1, Op::SearchRequest(search(f))));
         }
     }
 
@@ -3076,7 +3071,7 @@ mod tests {
                 critical: true,
                 value: Some(vec![1]),
             });
-            round_trip(&m);
+            contract::check_written(&m);
             let mut d = Stream::new(Frames::<Message>::new());
             put(&mut d, &m.to_bytes().unwrap());
             assert_eq!(d.next(), Some(Ok(m)));
@@ -3532,7 +3527,7 @@ mod tests {
             msg(1, other(3)).to_bytes(),
             Err(Error::Unwritable(_))
         ));
-        round_trip(&msg(1, other(u32::MAX)));
+        contract::check_written(&msg(1, other(u32::MAX)));
         // Too large: the writer stops at MAX_MESSAGE.
         let big = msg(1, Op::DelRequest("x".repeat(MAX_MESSAGE)));
         assert!(matches!(big.to_bytes(), Err(Error::TooLarge(_))));
@@ -3549,7 +3544,7 @@ mod tests {
         assert_eq!(ResultCode(9).to_string(), "result code 9");
         assert_eq!(ResultCode::OTHER.name(), Some("other"));
         for c in [0u32, 1, 80, 4000, u32::MAX] {
-            round_trip(&msg(1, Op::DelResponse(LdapResult::new(ResultCode(c)))));
+            contract::check_written(&msg(1, Op::DelResponse(LdapResult::new(ResultCode(c)))));
         }
         for n in 0..4 {
             assert_eq!(DerefAliases::from_code(n).map(DerefAliases::code), Some(n));
@@ -3853,7 +3848,7 @@ mod tests {
         ];
         assert!(Message::parse(&empty_referral).is_err());
         // A search result entry's attribute may have none.
-        round_trip(&msg(
+        contract::check_written(&msg(
             1,
             Op::SearchResultEntry(SearchResultEntry {
                 dn: "cn=x".into(),
@@ -3890,7 +3885,7 @@ mod tests {
             assert!(matches!(m.to_bytes(), Err(Error::Unwritable(_))));
         }
         s.scope = Scope::Other(3);
-        round_trip(&msg(1, Op::SearchRequest(s)));
+        contract::check_written(&msg(1, Op::SearchRequest(s)));
     }
 
     #[test]
@@ -4256,7 +4251,7 @@ mod tests {
             assert!(t.len() <= text.len());
             assert_eq!(Filter::parse_text(&t), Ok(f.clone()), "{text:?} -> {t:?}");
             let m = msg(1, Op::SearchRequest(search(f)));
-            round_trip(&m);
+            contract::check_written(&m);
         }
         if let Ok(dn) = Dn::parse(text) {
             let t = dn.to_text().unwrap();

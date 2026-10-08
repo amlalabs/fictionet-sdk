@@ -713,10 +713,9 @@ mod tests {
     }
 
     fn round_trip(m: &Message) -> Vec<u8> {
-        let b = m.to_bytes().unwrap();
+        let b = contract::check_written(m);
         assert_eq!(b.len(), m.encoded_len().unwrap());
         assert_eq!(checksum(&b), 0);
-        assert_eq!(Message::parse(&b).as_ref(), Ok(m));
         assert_eq!(collect(&b).as_ref(), Ok(m));
         b
     }

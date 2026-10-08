@@ -18,9 +18,6 @@ where
 {
     let allocation = 2 * make().capacity();
     contract::check_decode_with_alloc_limit(&make, input, allocation);
-    for cut in 0..=input.len().min(256) {
-        contract::check_decode_with_alloc_limit(&make, &input[..cut], allocation);
-    }
 }
 
 #[test]

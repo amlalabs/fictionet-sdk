@@ -1146,11 +1146,6 @@ mod tests {
         String::from_utf8(value.to_bytes().unwrap()).unwrap()
     }
 
-    fn round_trip(v: &Value) {
-        let text = written_text(v);
-        assert_eq!(&Value::parse(text.as_bytes()).unwrap(), v, "{text}");
-    }
-
     // RFC 8259, section 13.
 
     #[test]
@@ -1181,7 +1176,7 @@ mod tests {
         assert_eq!(ids, [116, 943, 234, 38793]);
         let keys: Vec<&str> = image.as_object().unwrap().iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(keys, ["Width", "Height", "Title", "Thumbnail", "Animated", "IDs"]);
-        round_trip(&v);
+        String::from_utf8(contract::check_written(&v)).unwrap();
     }
 
     #[test]
@@ -1217,7 +1212,7 @@ mod tests {
         assert_eq!(lon.text(), "-122.026020");
         assert_eq!(lon.as_f64(), -122.02602);
         assert_eq!(items[0].get("Address").and_then(Value::as_str), Some(""));
-        round_trip(&v);
+        String::from_utf8(contract::check_written(&v)).unwrap();
     }
 
     #[test]
@@ -1278,9 +1273,9 @@ mod tests {
         // The writer escapes only what it must.
         let w = written_text(&s("q\"b\\/\n\u{1}\u{7f}é😀"));
         assert_eq!(w, "\"q\\\"b\\\\/\\n\\u0001\u{7f}é😀\"");
-        round_trip(&s("q\"b\\/\n\u{1}\u{1f}\u{7f}é😀\u{2028}"));
+        String::from_utf8(contract::check_written(&s("q\"b\\/\n\u{1}\u{1f}\u{7f}é😀\u{2028}"))).unwrap();
         for c in 0..0x20u32 {
-            round_trip(&Value::String(char::from_u32(c).unwrap().to_string()));
+            String::from_utf8(contract::check_written(&Value::String(char::from_u32(c).unwrap().to_string()))).unwrap();
         }
     }
 
@@ -1344,7 +1339,7 @@ mod tests {
     fn limits() {
         let at = format!("{}{}", "[".repeat(MAX_DEPTH), "]".repeat(MAX_DEPTH));
         let v = Value::parse(at.as_bytes()).unwrap();
-        round_trip(&v);
+        String::from_utf8(contract::check_written(&v)).unwrap();
         let tight = Limits { depth: 2, size: 20, elements: 4 };
         assert!(parse_with(b"[[1]]", &tight).is_ok());
         assert_eq!(parse_with(b"[[[]]]", &tight).unwrap_err(), Error::at(ErrorKind::TooDeep, 2));
@@ -1388,7 +1383,7 @@ mod tests {
         let Value::Array(inner) = &mut deep else {
             panic!()
         };
-        round_trip(&inner.pop().unwrap());
+        String::from_utf8(contract::check_written(&inner.pop().unwrap())).unwrap();
         let big = Value::String("x".repeat(MAX_SIZE));
         assert_eq!(big.to_bytes().unwrap_err().kind, ErrorKind::TooLarge);
         assert!(Value::String("x".repeat(MAX_SIZE - 2)).to_bytes().is_ok());
@@ -1400,7 +1395,7 @@ mod tests {
             ErrorKind::TooManyElements
         );
         let ok = Value::Array(vec![Value::Null; MAX_ELEMENTS - 1]);
-        round_trip(&ok);
+        String::from_utf8(contract::check_written(&ok)).unwrap();
         let tight = Limits { depth: 1, size: 10, elements: 3 };
         assert_eq!(Value::Array(vec![Value::Array(vec![])]).validate(&tight).unwrap_err(), Error::at(ErrorKind::TooDeep, 1));
         assert_eq!(s("0123456789").validate(&tight).unwrap_err().kind, ErrorKind::TooLarge);
@@ -1418,7 +1413,7 @@ mod tests {
             ("a".into(), Value::Array(vec![Value::Array(vec![]), Value::Object(vec![]), true.into()])),
             ("n".into(), Value::from("again")),
         ]);
-        round_trip(&v);
+        String::from_utf8(contract::check_written(&v)).unwrap();
         let text = written_text(&v);
         assert_eq!(written_text(&Value::parse(text.as_bytes()).unwrap()), text);
         // Whitespace anywhere it may go.

@@ -322,7 +322,19 @@ fn every_implementation_file_is_copied() {
                 && path.file_name().is_some_and(|name| name != "mod.rs" && name != "tests.rs")
             {
                 let relative = path.strip_prefix(root).unwrap().to_str().unwrap();
-                assert!(COPY_MODULES.contains(&format!("\"../../{relative}\"")), "{relative}: missing from the copy fixture");
+                let direct = COPY_MODULES.contains(&format!("\"../../{relative}\""));
+                let parent = path.with_file_name("mod.rs");
+                let parent_relative = parent.strip_prefix(root).unwrap().to_str().unwrap();
+                let nested = if COPY_MODULES.contains(&format!("\"../../{parent_relative}\"")) {
+                    let name = path.file_stem().unwrap().to_str().unwrap();
+                    fs::read_to_string(&parent).unwrap().lines().any(|line| {
+                        let line = line.trim();
+                        line == format!("pub mod {name};") || line == format!("mod {name};")
+                    })
+                } else {
+                    false
+                };
+                assert!(direct || nested, "{relative}: missing from the copy fixture");
             }
         }
     }

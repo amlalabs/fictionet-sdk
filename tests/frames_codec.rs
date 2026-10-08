@@ -7,7 +7,6 @@ use fictionet::stdlib::codec::{
     Decode, Fail, Stream, Wire, finish, pump,
 };
 use fictionet::stdlib::test_support::contract;
-use fictionet::stdlib::test_support::{chunks, decode_all};
 use fictionet::stdlib::{bgp, fastcgi, kafka, thrift, zabbix};
 
 fn stack<D>(make: impl Fn() -> D, bytes: &[u8], expected: &[D::Item])
@@ -16,18 +15,13 @@ where
     D::Item: PartialEq + Debug,
     D::Error: Clone + PartialEq + Debug,
 {
-    contract::check_decode_with_alloc_limit(&make, bytes, 2 * make().capacity());
+    let (items, failure) = contract::check_decode_with_alloc_limit(&make, bytes, 2 * make().capacity());
+    assert_eq!(items, expected);
+    assert_eq!(failure, None);
     contract::check_decode_with_held_limit(&make, bytes, 0);
-    let (items, error) = decode_all(&make, bytes);
-    assert_eq!(error, None);
-    assert_eq!(items, expected);
     let mut stream = Stream::new(make());
-    let mut items = Vec::new();
-    for chunk in chunks(bytes, &[1, 7, 2, 31]) {
-        assert_eq!(pump(&mut stream, chunk, |item| items.push(item)).unwrap(), chunk.len());
-    }
-    finish(&mut stream, |item| items.push(item)).unwrap();
-    assert_eq!(items, expected);
+    assert_eq!(pump(&mut stream, bytes, |_| {}).unwrap(), bytes.len());
+    finish(&mut stream, |_| {}).unwrap();
     assert_eq!(stream.offset(), bytes.len() as u64);
 }
 
@@ -39,18 +33,7 @@ where
 {
     let mut bytes = Vec::new();
     for value in values {
-        contract::check_wire_value(value);
-        let encoded = Wire::to_bytes(value).unwrap();
-        contract::check_wire::<D::Item>(&encoded);
-        assert_eq!(<D::Item as Wire>::parse(&encoded).unwrap(), *value);
-        // Exact parsing refuses partial and trailing input.
-        for end in 0..encoded.len() {
-            assert!(<D::Item as Wire>::parse(encoded.get(..end).unwrap()).is_err());
-        }
-        let mut trailing = encoded.clone();
-        trailing.push(0);
-        assert!(<D::Item as Wire>::parse(&trailing).is_err());
-        value.write(&mut bytes).unwrap();
+        bytes.extend_from_slice(&contract::check_exact(value));
     }
     stack(&make, &bytes, values);
 
@@ -63,12 +46,11 @@ where
     let unread = stream.buffered();
     assert!(unread > 0);
     let error = Fail::Truncated { unread };
+    assert_eq!(contract::check_decode(&make, partial), (items, Some(error.clone())));
     assert_eq!(
         finish(&mut stream, |_| panic!("partial frame emitted")),
         Err(error.clone())
     );
-    assert_eq!(stream.failed(), Some(&error));
-    assert!(stream.next().is_none());
     bytes
 }
 
@@ -78,14 +60,11 @@ where
     D::Item: PartialEq + Debug,
     D::Error: Clone + PartialEq + Debug,
 {
-    contract::check_decode_with_alloc_limit(&make, header, 2 * make().capacity());
+    assert_eq!(
+        contract::check_decode_with_alloc_limit(&make, header, 2 * make().capacity()),
+        (vec![], Some(Fail::Protocol(error.clone())))
+    );
     let capacity = make().capacity();
-    let mut stream = Stream::new(make());
-    assert_eq!(stream.push(header), header.len());
-    assert_eq!(stream.next(), Some(Err(Fail::Protocol(error.clone()))));
-    assert_eq!(stream.failed(), Some(&Fail::Protocol(error.clone())));
-    assert!(stream.next().is_none());
-    assert_eq!(stream.push(&[0; 3]), 3);
 
     // Even an input larger than capacity holds only the named limit.
     let mut oversized = vec![0; capacity + 1];
@@ -348,14 +327,9 @@ fn zabbix_rejects_oversize_at_named_limit() {
     }
 }
 
-fn refuses<M: Wire + PartialEq + Debug>(value: &M) {
-    contract::check_wire_value(value);
-    contract::check_refused(value);
-}
-
 #[test]
 fn strict_writers_are_transactional() {
-    refuses(&bgp::Frame {
+    contract::check_refused(&bgp::Frame {
         kind: 255,
         body: vec![0; bgp::MAX_BODY_LEN + 1],
     });
@@ -365,16 +339,16 @@ fn strict_writers_are_transactional() {
         content: vec![0; fastcgi::MAX_CONTENT + 1],
         padding: 255,
     };
-    refuses(&record);
-    refuses(&kafka::Frame(vec![0; kafka::MAX_FRAME + 1]));
-    refuses(&thrift::Frame(vec![0; thrift::MAX_FRAME + 1]));
+    contract::check_refused(&record);
+    contract::check_refused(&kafka::Frame(vec![0; kafka::MAX_FRAME + 1]));
+    contract::check_refused(&thrift::Frame(vec![0; thrift::MAX_FRAME + 1]));
     let packet = zabbix::Packet {
         flags: 0xff,
         reserved: u64::MAX,
         data: vec![1, 2],
     };
-    refuses(&packet);
-    refuses(&zabbix::Packet {
+    contract::check_refused(&packet);
+    contract::check_refused(&zabbix::Packet {
         flags: zabbix::flags::PROTOCOL,
         ..packet.clone()
     });

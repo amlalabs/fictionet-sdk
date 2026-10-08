@@ -1,28 +1,12 @@
 use fictionet::stdlib::codec::{
-    Decode, Fail, Lcg, Stream, StreamEvent, Wire,
-    finish, pump,
+    Lcg, Stream, StreamEvent, Wire,
+    finish,
 };
-use fictionet::stdlib::test_support::contract::{check_decode, check_decode_with_held_limit, check_wire, check_wire_value};
-use fictionet::stdlib::test_support::{chunks, decode_all, mutate, random_chunks};
+use fictionet::stdlib::test_support::contract::{
+    check_decode, check_decode_with_held_limit, check_wire, check_wire_value, check_written,
+};
+use fictionet::stdlib::test_support::{chunks, decode_all, mutate};
 use fictionet::stdlib::sse::{Event, Events, Limits, Line, RawLines};
-
-fn run<'a, D: Decode>(
-    decoder: D,
-    chunks: impl Iterator<Item = &'a [u8]>,
-) -> (Vec<D::Item>, Option<Fail<D::Error>>)
-where
-    D::Error: Clone,
-{
-    let mut stream = Stream::new(decoder);
-    let mut items = Vec::new();
-    for chunk in chunks {
-        if let Err(error) = pump(&mut stream, chunk, |v| items.push(v)) {
-            return (items, Some(error));
-        }
-    }
-    let error = finish(&mut stream, |v| items.push(v)).err();
-    (items, error)
-}
 
 #[test]
 fn decoder_contracts_and_chunking() {
@@ -49,24 +33,6 @@ fn decoder_contracts_and_chunking() {
             bytes,
             limits.event + 2 * limits.line,
         );
-        let expected = decode_all(|| Events::with_limits(limits), bytes);
-        assert_eq!(run(Events::with_limits(limits), chunks(bytes, &[1])), expected);
-        let raw = decode_all(|| RawLines::with_limit(limits.line), bytes);
-        assert_eq!(run(RawLines::with_limit(limits.line), chunks(bytes, &[1])), raw);
-        for seed in 0..16 {
-            let mut rng = Lcg::new(seed);
-            assert_eq!(
-                run(Events::with_limits(limits), random_chunks(bytes, &mut rng, 17)),
-                expected
-            );
-            assert_eq!(
-                run(
-                    RawLines::with_limit(limits.line),
-                    random_chunks(bytes, &mut rng, 17)
-                ),
-                raw
-            );
-        }
     }
     // Zero and tiny limits still recognize a split BOM and make progress.
     for line in 0..8 {
@@ -100,15 +66,11 @@ fn wire_contracts_and_decoded_round_trips() {
         },
     ];
     for value in values {
-        check_wire_value(&value);
-        let bytes = value.to_bytes().unwrap();
-        check_wire::<Event>(&bytes);
-        assert_eq!(decode_all(Events::default, &bytes), (vec![value], None));
+        let bytes = check_written(&value);
+        assert_eq!(check_decode(Events::default, &bytes), (vec![value], None));
         for line in decode_all(RawLines::default, &bytes).0 {
-            check_wire_value(&line);
-            let bytes = line.to_bytes().unwrap();
-            check_wire::<Line>(&bytes);
-            assert_eq!(decode_all(RawLines::default, &bytes), (vec![line], None));
+            let bytes = check_written(&line);
+            assert_eq!(check_decode(RawLines::default, &bytes), (vec![line], None));
         }
     }
     for bytes in [

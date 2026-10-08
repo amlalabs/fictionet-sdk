@@ -1469,12 +1469,6 @@ mod tests {
         Pdu::new(7, Body::Request { alloc_hint: stub.len() as u32, context_id: 0, opnum: 3, object: None, stub })
     }
 
-    fn round_trip(p: &Pdu) -> Vec<u8> {
-        let bytes = p.to_bytes().unwrap();
-        assert_eq!(Pdu::parse(&bytes), Ok(p.clone()), "{p:?}");
-        bytes
-    }
-
     fn all_bodies() -> Vec<Pdu> {
         let ack = BindAck {
             max_xmit_frag: 4280,
@@ -1591,10 +1585,10 @@ mod tests {
     #[test]
     fn every_body_round_trips_in_both_byte_orders() {
         for mut p in all_bodies() {
-            round_trip(&p);
+            contract::check_written(&p);
             p.drep = DataRep::BIG_ENDIAN;
             p.version_minor = 1;
-            let bytes = round_trip(&p);
+            let bytes = contract::check_written(&p);
             for n in 0..bytes.len() {
                 assert_eq!(Pdu::parse(&bytes[..n]), Err(Error::Incomplete));
             }
@@ -1607,7 +1601,7 @@ mod tests {
                 context_id: 3,
                 value: vec![0xaa; 16],
             });
-            let bytes = round_trip(&p);
+            let bytes = contract::check_written(&p);
             for n in 0..bytes.len() {
                 assert_eq!(Pdu::parse(&bytes[..n]), Err(Error::Incomplete));
             }
@@ -1624,11 +1618,11 @@ mod tests {
             1,
             Body::Bind(Bind { max_xmit_frag: 0, max_recv_frag: 0, assoc_group: 0, contexts: vec![context(v)] }),
         );
-        let b = round_trip(&p);
+        let b = contract::check_written(&p);
         assert_eq!(b[48..52], [3, 0, 1, 0]);
         // Big-endian, the u32 0x0001_0003 puts the minor version first.
         p.drep = DataRep::BIG_ENDIAN;
-        let b = round_trip(&p);
+        let b = contract::check_written(&p);
         assert_eq!(b[48..52], [0, 1, 0, 3]);
         let mut be = b.clone();
         be[48..52].copy_from_slice(&[0, 0, 0, 2]);
@@ -1654,7 +1648,7 @@ mod tests {
                 results: vec![ContextResult::accept(NDR)],
             }),
         );
-        let b = round_trip(&p);
+        let b = contract::check_written(&p);
         assert_eq!(b.len(), 60);
         assert_eq!(b[24..30], [4, 0, b'1', b'3', b'5', 0]);
         // Two bytes of padding to a multiple of 4, then one result.
@@ -1665,7 +1659,7 @@ mod tests {
 
     #[test]
     fn request_and_response_layout() {
-        let b = round_trip(&request(vec![0xde, 0xad]));
+        let b = contract::check_written(&request(vec![0xde, 0xad]));
         assert_eq!(b, [5, 0, 0, 3, 0x10, 0, 0, 0, 26, 0, 0, 0, 7, 0, 0, 0, 2, 0, 0, 0, 0, 0, 3, 0, 0xde, 0xad]);
         // The object UUID follows the opnum, in the data representation's
         // byte order.
@@ -1673,7 +1667,7 @@ mod tests {
         let p =
             Pdu::new(1, Body::Request { alloc_hint: 0, context_id: 0, opnum: 0, object: Some(object), stub: vec![] });
         assert_eq!(p.flags & flags::OBJECT_UUID, flags::OBJECT_UUID);
-        let b = round_trip(&p);
+        let b = contract::check_written(&p);
         assert_eq!(b[24..40], [4, 3, 2, 1, 6, 5, 8, 7, 9, 10, 11, 12, 13, 14, 15, 16]);
         let fault = Pdu::new(
             7,
@@ -1686,7 +1680,7 @@ mod tests {
                 stub: vec![],
             },
         );
-        let b = round_trip(&fault);
+        let b = contract::check_written(&fault);
         assert_eq!(b.len(), 32);
         assert_eq!(b[24..28], [3, 0, 1, 0x1c]);
         // A fault without the reserved word still reads.
@@ -1704,7 +1698,7 @@ mod tests {
             context_id: 0,
             value: vec![7; 16],
         });
-        let b = round_trip(&p);
+        let b = contract::check_written(&p);
         // Stub of 3 padded to 16, then the trailer and the 16-byte token.
         assert_eq!(b.len(), 24 + 16 + 8 + 16);
         assert_eq!(b[10..12], [16, 0]);
@@ -1712,13 +1706,13 @@ mod tests {
         // A bind's trailer is aligned to 4 from the PDU's start.
         let mut p = bind();
         p.auth = Some(Auth { kind: auth_type::WINNT, level: auth_level::CONNECT, context_id: 0, value: vec![1; 40] });
-        let b = round_trip(&p);
+        let b = contract::check_written(&p);
         assert_eq!(b.len(), 72 + 8 + 40);
         assert_eq!(b[74], 0);
         // Auth3 carries 4 bytes of padding before the trailer.
         let mut p = Pdu::new(3, Body::Auth3);
         p.auth = Some(Auth { kind: 0x0a, level: 2, context_id: 0, value: vec![1, 2] });
-        let b = round_trip(&p);
+        let b = contract::check_written(&p);
         assert_eq!(b.len(), 20 + 8 + 2);
     }
 
@@ -1809,7 +1803,7 @@ mod tests {
         assert_eq!(p.to_bytes(), Err(Error::Unwritable));
         assert_eq!(request(vec![0; MAX_FRAG]).to_bytes(), Err(Error::Unwritable));
         // The longest request fits exactly.
-        round_trip(&request(vec![0; MAX_FRAG - 24]));
+        contract::check_written(&request(vec![0; MAX_FRAG - 24]));
         assert_eq!(request(vec![0; MAX_FRAG - 23]).to_bytes(), Err(Error::Unwritable));
         let mut b = match bind().body {
             Body::Bind(b) => b,
@@ -1846,7 +1840,7 @@ mod tests {
         assert_eq!(parts[9].flags, flags::LAST_FRAG);
         let mut r = Reassembler::default();
         for (i, p) in parts.iter().enumerate() {
-            let bytes = round_trip(p);
+            let bytes = contract::check_written(p);
             assert!(bytes.len() <= 124);
             let got = r.push(p.clone()).unwrap();
             if i < 9 {
@@ -2122,8 +2116,8 @@ mod tests {
             )
         };
         assert_eq!(ack(b"135").to_bytes(), Err(Error::Unwritable));
-        round_trip(&ack(b"135\0"));
-        round_trip(&ack(b""));
+        contract::check_written(&ack(b"135\0"));
+        contract::check_written(&ack(b""));
         let mut b = ack(b"135\0").to_bytes().unwrap();
         b[29] = b'6';
         assert_eq!(Pdu::parse(&b), Err(Error::Address));
@@ -2144,7 +2138,7 @@ mod tests {
                 stub: vec![1, 2, 3, 4],
             },
         );
-        let b = round_trip(&p);
+        let b = contract::check_written(&p);
         assert_eq!(b[23], 1);
     }
 

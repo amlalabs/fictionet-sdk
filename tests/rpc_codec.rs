@@ -9,6 +9,21 @@ use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::test_support::{decode_all, mutate};
 use fictionet::stdlib::{dcerpc, diameter, nbss, radius, smb2};
 
+fn check_frames<D, T>(make: impl Fn() -> D, values: &[T], expected: &[D::Item]) -> Vec<u8>
+where
+    D: Decode,
+    D::Item: Clone + PartialEq + Debug,
+    D::Error: Clone + PartialEq + Debug,
+    T: Wire + PartialEq + Debug,
+{
+    let bytes: Vec<u8> = values.iter().flat_map(contract::check_exact).collect();
+    assert_eq!(
+        contract::check_decode_with_alloc_limit(&make, &bytes, 2 * make().capacity()),
+        (expected.to_vec(), None)
+    );
+    bytes
+}
+
 #[test]
 fn migrated_public_docs_do_not_reference_internal_design_sections() {
     for (module, source) in [
@@ -35,54 +50,19 @@ fn migrated_public_docs_do_not_reference_internal_design_sections() {
     }
 }
 
-fn round_trip<M, D>(make: impl Fn() -> D, values: &[M], expected: &[D::Item]) -> Vec<u8>
-where
-    M: Wire + PartialEq + Debug,
-    D: Decode,
-    D::Item: PartialEq + Debug,
-    D::Error: Clone + PartialEq + Debug,
-{
-    let mut bytes = Vec::new();
-    for value in values {
-        contract::check_wire_value(value);
-        let start = bytes.len();
-        value.write(&mut bytes).unwrap();
-        let encoded = &bytes[start..];
-        assert_eq!(&M::parse(encoded).unwrap(), value);
-        contract::check_wire::<M>(encoded);
-        assert!(M::parse(&[]).is_err());
-        assert!(M::parse(&encoded[..encoded.len() - 1]).is_err());
-        let mut trailing = encoded.to_vec();
-        trailing.push(0);
-        assert!(M::parse(&trailing).is_err());
-    }
-    contract::check_decode_with_alloc_limit(&make, &bytes, 2 * make().capacity());
-    let (items, error) = decode_all(make, &bytes);
-    assert_eq!(items, expected);
-    assert_eq!(error, None);
-    bytes
-}
-
 fn truncations<D>(make: impl Fn() -> D, bytes: &[u8])
 where
     D: Decode,
     D::Item: PartialEq + Debug,
     D::Error: Clone + PartialEq + Debug,
 {
+    contract::check_truncated(&make, bytes);
     for cut in 1..bytes.len() {
         let mut stream = Stream::new(make());
-        for byte in &bytes[..cut] {
-            assert_eq!(stream.push(core::slice::from_ref(byte)), 1);
-            assert_eq!(stream.next(), None);
-        }
+        assert_eq!(stream.push(&bytes[..cut]), cut);
         stream.end();
-        let failure = Fail::Truncated { unread: cut };
-        assert_eq!(stream.next(), Some(Err(failure.clone())));
-        assert_eq!(stream.failed(), Some(&failure));
+        stream.next().unwrap().unwrap_err();
         assert_eq!(stream.buffered(), cut);
-        assert_eq!(stream.next(), None);
-        assert_eq!(stream.push(bytes), bytes.len());
-        assert_eq!(stream.next(), None);
     }
 }
 
@@ -93,26 +73,14 @@ where
     D::Error: Clone + PartialEq + Debug,
 {
     assert_eq!(make().decode(bytes, false), Err(error.clone()));
-    contract::check_decode_with_alloc_limit(&make, bytes, 2 * make().capacity());
+    assert_eq!(
+        contract::check_decode_with_alloc_limit(&make, bytes, 2 * make().capacity()),
+        (vec![], Some(Fail::Protocol(error)))
+    );
     let mut stream = Stream::new(make());
-    let failure = Fail::Protocol(error);
-    for byte in &bytes[..bytes.len() - 1] {
-        assert_eq!(stream.push(core::slice::from_ref(byte)), 1);
-        assert_eq!(stream.next(), None);
-    }
-    assert_eq!(stream.push(&bytes[bytes.len() - 1..]), 1);
-    assert_eq!(stream.next(), Some(Err(failure.clone())));
-    assert_eq!(stream.failed(), Some(&failure));
-    assert!(stream.is_done());
+    assert_eq!(stream.push(bytes), bytes.len());
+    stream.next().unwrap().unwrap_err();
     assert_eq!(stream.offset(), 0);
-    assert_eq!(stream.next(), None);
-    assert_eq!(stream.push(b"after failure"), 13);
-    assert_eq!(stream.next(), None);
-}
-
-fn refused<M: Wire + PartialEq + Debug>(value: &M) {
-    contract::check_refused(value);
-    contract::check_wire_value(value);
 }
 
 fn rpc_request() -> dcerpc::Pdu {
@@ -135,7 +103,7 @@ fn dcerpc_chunked_round_trip() {
     response.drep = dcerpc::DataRep::BIG_ENDIAN;
     let values = [request, response, dcerpc::Pdu::new(9, dcerpc::Body::Shutdown)];
     let expected = values.iter().cloned().map(Ok).collect::<Vec<_>>();
-    round_trip(|| Frames::<dcerpc::Pdu>::with_limit(80), &values, &expected);
+    check_frames(|| Frames::<dcerpc::Pdu>::with_limit(80), &values, &expected);
     truncations(Frames::<dcerpc::Pdu>::new, &Wire::to_bytes(&values[0]).unwrap());
 }
 
@@ -197,18 +165,18 @@ fn dcerpc_writer_is_transactional() {
     contract::check_wire_value(&valid);
     let mut invalid = valid.clone();
     invalid.flags |= dcerpc::flags::OBJECT_UUID;
-    refused(&invalid);
+    contract::check_refused(&invalid);
     invalid = valid.clone();
     invalid.version_minor = 2;
-    refused(&invalid);
+    contract::check_refused(&invalid);
     invalid = valid.clone();
     invalid.auth = Some(dcerpc::Auth { kind: 1, level: 1, context_id: 0, value: vec![] });
-    refused(&invalid);
+    contract::check_refused(&invalid);
     invalid = valid;
     if let dcerpc::Body::Request { stub, .. } = &mut invalid.body {
         *stub = vec![0; dcerpc::MAX_FRAG];
     }
-    refused(&invalid);
+    contract::check_refused(&invalid);
 }
 
 #[test]
@@ -229,7 +197,7 @@ fn dcerpc_wire_bounds_canonical_padding() {
         <dcerpc::Pdu as Wire>::parse(&bytes),
         Err(dcerpc::Error::Unwritable)
     );
-    refused(&received);
+    contract::check_refused(&received);
     assert_eq!(Frames::<dcerpc::Pdu>::new().decode(&bytes, false), Ok(Step::Item(Ok(received), bytes.len())));
     contract::check_wire::<dcerpc::Pdu>(&bytes);
 }
@@ -248,7 +216,7 @@ fn smb2_chunked_round_trip() {
         smb2::Frame { payload: b"\xffSMBopaque".to_vec() },
         smb2::Frame { payload: packet.to_bytes().unwrap() },
     ];
-    let bytes = round_trip(|| Frames::<smb2::Frame>::with_limit(80), &values, &values);
+    let bytes = check_frames(|| Frames::<smb2::Frame>::with_limit(80), &values, &values);
     let make = || Frames::<smb2::Frame>::new().map(|frame| smb2::Packet::parse(&frame.payload));
     contract::check_decode_with_alloc_limit(make, &bytes, 2 * Frames::<smb2::Frame>::new().capacity());
     let (got, error) = decode_all(make, &bytes);
@@ -293,7 +261,7 @@ fn smb2_refuses_length_from_header_and_writer_rolls_back() {
         Ok(Step::Item(smb2::Frame { payload: vec![] }, 4))
     );
     terminal(|| Frames::<smb2::Frame>::with_limit(0), &[0, 0, 0, 1], smb2::Error::Length { length: 1, limit: 0 });
-    refused(&smb2::Frame {
+    contract::check_refused(&smb2::Frame {
         payload: vec![0; length],
     });
 }
@@ -302,7 +270,7 @@ fn smb2_refuses_length_from_header_and_writer_rolls_back() {
 fn smb2_compound_padding_is_part_of_the_value() {
     let first = smb2::Request::Echo.message(1).unwrap();
     let last = smb2::Request::Echo.message(2).unwrap();
-    refused(&smb2::Packet::Smb2(vec![first.clone(), last.clone()]));
+    contract::check_refused(&smb2::Packet::Smb2(vec![first.clone(), last.clone()]));
     let packet = smb2::Packet::compound(vec![first.clone(), last.clone()]).unwrap();
     let smb2::Packet::Smb2(messages) = &packet else { panic!("compound packet") };
     assert_eq!(messages[0].body, [first.body, vec![0; 4]].concat());
@@ -338,7 +306,7 @@ fn standalone_wire_units_are_exact_and_transactional() {
     let mut bytes = attribute.to_bytes().unwrap();
     bytes.push(0);
     assert!(radius::Attribute::parse(&bytes).is_err());
-    refused(&radius::Attribute { kind: 1, value: vec![0; radius::MAX_VALUE + 1] });
+    contract::check_refused(&radius::Attribute { kind: 1, value: vec![0; radius::MAX_VALUE + 1] });
 
     let mut vsa = radius::Vsa { vendor: 9, data: vec![0; radius::MAX_VALUE - 4] };
     contract::check_wire_value(&vsa);
@@ -346,14 +314,14 @@ fn standalone_wire_units_are_exact_and_transactional() {
     bytes.push(0);
     assert!(radius::Vsa::parse(&bytes).is_err());
     vsa.data.push(0);
-    refused(&vsa);
+    contract::check_refused(&vsa);
     let mut evs = radius::Evs { vendor: 9, evs_type: 1, data: vec![0; radius::MAX_LONG_EXTENDED_VALUE - 5] };
     contract::check_wire_value(&evs);
     let mut bytes = evs.to_bytes().unwrap();
     bytes.push(0);
     assert!(radius::Evs::parse(&bytes).is_err());
     evs.data.push(0);
-    refused(&evs);
+    contract::check_refused(&evs);
 
     let avp = diameter::Avp::new(1, &diameter::Value::OctetString(vec![42])).unwrap();
     contract::check_wire_value(&avp);
@@ -362,7 +330,7 @@ fn standalone_wire_units_are_exact_and_transactional() {
     assert!(diameter::Avp::parse_list(&bytes[..9]).is_err());
     bytes.push(0);
     assert_eq!(diameter::Avp::parse(&bytes), Err(diameter::Error::Trailing { remaining: 1 }));
-    refused(&diameter::Address::Other { family: diameter::Address::IPV4, bytes: vec![0; 4] });
+    contract::check_refused(&diameter::Address::Other { family: diameter::Address::IPV4, bytes: vec![0; 4] });
 }
 
 fn session_request() -> nbss::Packet {
@@ -382,7 +350,7 @@ fn nbss_chunked_round_trip() {
         nbss::Packet::Negative(nbss::NegativeCode::Other(7)),
         nbss::Packet::Retarget { address: [192, 0, 2, 1], port: 139 },
     ];
-    round_trip(|| Frames::<nbss::Packet>::with_limit(128), &values, &values);
+    check_frames(|| Frames::<nbss::Packet>::with_limit(128), &values, &values);
     truncations(Frames::<nbss::Packet>::new, &Wire::to_bytes(&values[0]).unwrap());
 }
 
@@ -407,9 +375,9 @@ fn nbss_errors_end_stream_and_writes_are_transactional() {
     let mut bad = session_request().to_bytes().unwrap();
     bad[5] = b'Z';
     terminal(Frames::<nbss::Packet>::new, &bad, nbss::Error::Body(nbss::kind::REQUEST));
-    refused(&nbss::Packet::Negative(nbss::NegativeCode::Other(0x80)));
-    refused(&nbss::Packet::Message(vec![0; nbss::MAX_LENGTH + 1]));
-    refused(&nbss::Packet::Request {
+    contract::check_refused(&nbss::Packet::Negative(nbss::NegativeCode::Other(0x80)));
+    contract::check_refused(&nbss::Packet::Message(vec![0; nbss::MAX_LENGTH + 1]));
+    contract::check_refused(&nbss::Packet::Request {
         called: nbss::Name { scope: vec![vec![]], ..nbss::Name::new("X", 0) },
         calling: nbss::Name::new("Y", 0),
     });
@@ -429,7 +397,7 @@ fn radius_chunked_round_trip() {
     let request = radius_request();
     let reply = request.reply(radius::Code::AccessAccept);
     let values = [request, reply, radius::Packet::new(radius::Code::Other(240), 8, [0; 16])];
-    round_trip(|| Frames::<radius::Packet>::with_limit(64), &values, &values);
+    check_frames(|| Frames::<radius::Packet>::with_limit(64), &values, &values);
     truncations(Frames::<radius::Packet>::new, &Wire::to_bytes(&values[0]).unwrap());
 }
 
@@ -474,10 +442,10 @@ fn radius_wire_is_exact_and_transactional() {
     assert_eq!(<radius::Packet as Wire>::parse(&bytes), Err(radius::Error::Trailing { remaining: 2 }));
     let mut invalid = packet.clone();
     invalid.attributes.push(radius::Attribute { kind: 1, value: vec![0; radius::MAX_VALUE + 1] });
-    refused(&invalid);
+    contract::check_refused(&invalid);
     invalid = packet;
     invalid.attributes = vec![radius::Attribute { kind: 0, value: vec![] }; radius::MAX_ATTRIBUTES + 1];
-    refused(&invalid);
+    contract::check_refused(&invalid);
 }
 
 fn diameter_request() -> diameter::Message {
@@ -496,7 +464,7 @@ fn diameter_chunked_round_trip() {
     reply.avps.push(diameter::Avp::new(diameter::avp::RESULT_CODE, &diameter::Value::Unsigned32(2001)).unwrap());
     let values = [request, reply, diameter::Message::request(280, 0, 10, 11)];
     let expected = values.iter().cloned().map(Ok).collect::<Vec<_>>();
-    round_trip(|| Frames::<diameter::Message>::with_limit(64), &values, &expected);
+    check_frames(|| Frames::<diameter::Message>::with_limit(64), &values, &expected);
     truncations(Frames::<diameter::Message>::new, &Wire::to_bytes(&values[0]).unwrap());
 }
 
@@ -603,13 +571,13 @@ fn diameter_wire_preserves_values_that_semantic_checks_refuse() {
 fn diameter_strict_writer_refuses_clipping_transactionally() {
     let mut message = diameter_request();
     message.command = 0x0100_0000;
-    refused(&message);
+    contract::check_refused(&message);
     message = diameter_request();
     message.avps = vec![message.avps[0].clone(); diameter::MAX_AVPS + 1];
-    refused(&message);
+    contract::check_refused(&message);
     message = diameter_request();
     message.avps[0].data = vec![0; diameter::MAX_MESSAGE];
-    refused(&message);
+    contract::check_refused(&message);
 }
 
 #[test]

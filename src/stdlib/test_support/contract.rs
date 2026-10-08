@@ -262,18 +262,26 @@ where
 }
 
 /// Checks all observable decoder rules on this input and bounded prefixes.
+/// Returns the whole-input items and terminal failure.
 /// Uses no inferred held-state limit; use [`check_decode_with_held_limit`]
 /// when the protocol defines one. Panics on a contract violation.
-pub fn check_decode<D: Decode>(make: impl Fn() -> D, data: &[u8])
+pub fn check_decode<D: Decode>(
+    make: impl Fn() -> D,
+    data: &[u8],
+) -> (Vec<D::Item>, Option<Fail<D::Error>>)
 where
     D::Item: PartialEq + Debug,
     D::Error: Clone + PartialEq + Debug,
 {
-    check_decode_with_held_limit(make, data, usize::MAX);
+    check_decode_with_held_limit(make, data, usize::MAX)
 }
 /// Like [`check_decode`], also checking the protocol's named held-byte limit
 /// initially and after every decode call.
-pub fn check_decode_with_held_limit<D: Decode>(make: impl Fn() -> D, data: &[u8], held_limit: usize)
+pub fn check_decode_with_held_limit<D: Decode>(
+    make: impl Fn() -> D,
+    data: &[u8],
+    held_limit: usize,
+) -> (Vec<D::Item>, Option<Fail<D::Error>>)
 where
     D::Item: PartialEq + Debug,
     D::Error: Clone + PartialEq + Debug,
@@ -285,7 +293,7 @@ where
             held: held_limit,
             alloc: usize::MAX,
         },
-    );
+    )
 }
 /// Like [`check_decode`], also checking that the stream's input buffer
 /// never has more than `alloc_limit` bytes allocated, measured by
@@ -296,7 +304,8 @@ pub fn check_decode_with_alloc_limit<D: Decode>(
     make: impl Fn() -> D,
     data: &[u8],
     alloc_limit: usize,
-) where
+) -> (Vec<D::Item>, Option<Fail<D::Error>>)
+where
     D::Item: PartialEq + Debug,
     D::Error: Clone + PartialEq + Debug,
 {
@@ -307,9 +316,13 @@ pub fn check_decode_with_alloc_limit<D: Decode>(
             held: usize::MAX,
             alloc: alloc_limit,
         },
-    );
+    )
 }
-fn check_limits<D: Decode>(make: impl Fn() -> D, data: &[u8], limits: Limits)
+fn check_limits<D: Decode>(
+    make: impl Fn() -> D,
+    data: &[u8],
+    limits: Limits,
+) -> (Vec<D::Item>, Option<Fail<D::Error>>)
 where
     D::Item: PartialEq + Debug,
     D::Error: Clone + PartialEq + Debug,
@@ -338,7 +351,67 @@ where
             limits,
         );
     }
+    (whole.items, whole.failure)
 }
+/// Checks that every nonempty strict prefix of a complete unit is truncated.
+/// Empty input must end cleanly.
+///
+/// ```
+/// use fictionet::stdlib::{codec::Frames, test_support::contract, tpkt};
+/// let bytes = [3, 0, 0, 7, 2, 0xf0, 0x80];
+/// contract::check_truncated(Frames::<tpkt::Packet>::new, &bytes);
+/// ```
+pub fn check_truncated<D: Decode>(make: impl Fn() -> D, unit: &[u8])
+where
+    D::Item: PartialEq + Debug,
+    D::Error: Clone + PartialEq + Debug,
+{
+    assert_eq!(check_decode(&make, &[]), (Vec::new(), None));
+    for cut in 1..unit.len() {
+        assert_eq!(
+            check_decode(&make, &unit[..cut]),
+            (Vec::new(), Some(Fail::Truncated { unread: cut })),
+            "prefix {cut}"
+        );
+    }
+}
+
+/// Checks successful writing and wire round trips. Returns the written bytes.
+///
+/// ```
+/// use fictionet::stdlib::{smtp, test_support::contract};
+/// let value = smtp::Request::Helo("example.com".into());
+/// assert_eq!(contract::check_written(&value), b"HELO example.com\r\n");
+/// ```
+pub fn check_written<M: Wire + PartialEq + Debug>(value: &M) -> Vec<u8> {
+    let bytes = value.to_bytes().expect("test value must write");
+    let parsed = M::parse(&bytes).expect("writer output does not parse");
+    assert_eq!(&parsed, value, "wire round trip changed value");
+    check_wire_value(value);
+    check_wire::<M>(&bytes);
+    bytes
+}
+
+/// Checks writing and exact parsing, including strict prefixes and trailing bytes.
+///
+/// ```
+/// use fictionet::stdlib::{smtp, test_support::contract};
+/// let value = smtp::Request::Helo("example.com".into());
+/// assert_eq!(contract::check_exact(&value), b"HELO example.com\r\n");
+/// ```
+pub fn check_exact<M: Wire + PartialEq + Debug>(value: &M) -> Vec<u8> {
+    let bytes = check_written(value);
+    for cut in 0..bytes.len() {
+        assert!(M::parse(&bytes[..cut]).is_err(), "prefix {cut}");
+    }
+    for tail in [0x00, 0xff] {
+        let mut trailing = bytes.clone();
+        trailing.push(tail);
+        assert!(M::parse(&trailing).is_err(), "trailing byte {tail}");
+    }
+    bytes
+}
+
 /// Checks that a test value refuses writing without changing the destination.
 /// Also checks that writing into a new vector fails. Returns the write error.
 ///

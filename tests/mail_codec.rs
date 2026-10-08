@@ -3,7 +3,7 @@
 use fictionet::stdlib::{
     codec::{
         self, Decode, Fail, Step, Stream, Wire,
-    }, test_support::contract, test_support::{chunks, decode_all},
+    }, test_support::contract,
     imap, pop3, smtp,
 };
 
@@ -59,35 +59,8 @@ where
     D::Item: PartialEq + core::fmt::Debug,
     D::Error: Clone + PartialEq,
 {
-    contract::check_decode(&make, bytes);
-    let (items, failure) = decode_all(&make, bytes);
-    let expected: Vec<_> = items.into_iter().map(Ok).chain(failure.map(Err)).collect();
-    // Preserve the boundary schedules from the protocol and mode-switch cases.
-    for pattern in [
-        &[][..],
-        &[1],
-        &[255, 257],
-        &[11, 5, 2],
-        &[255, 1, 7],
-        &[511, 1, 7],
-        &[3, 7, 1],
-    ] {
-        let mut stream = Stream::new(make());
-        let mut items = Vec::new();
-        for part in chunks(bytes, pattern) {
-            if let Err(error) = codec::pump(&mut stream, part, |item| items.push(Ok(item))) {
-                items.push(Err(error));
-                break;
-            }
-        }
-        if let Err(error) = codec::finish(&mut stream, |item| items.push(Ok(item))) {
-            items.push(Err(error));
-        }
-        assert_eq!(items, expected, "chunk pattern {pattern:?}");
-        assert!(stream.is_done());
-        assert!(stream.next().is_none());
-    }
-    expected
+    let (items, failure) = contract::check_decode(make, bytes);
+    items.into_iter().map(Ok).chain(failure.map(Err)).collect()
 }
 
 fn read_with<D: Decode>(
@@ -563,32 +536,28 @@ fn exact_wire_and_transactional_writers() {
     assert!(<imap::Command as Wire>::parse(b"a NOOP\r\nb NOOP\r\n").is_err());
     assert!(<imap::Response as Wire>::parse(b"a OK x\r\nb OK y\r\n").is_err());
 
-    fn refused<T: Wire + core::fmt::Debug + PartialEq>(value: &T) {
-        contract::check_refused(value);
-        contract::check_wire_value(value);
-    }
-    refused(&smtp::Command::new("noop", None));
-    refused(&smtp::Reply {
+    contract::check_refused(&smtp::Command::new("noop", None));
+    contract::check_refused(&smtp::Reply {
         code: 250,
         lines: vec!["valid".into(), "invalid\n".into()],
     });
-    refused(&pop3::Command {
+    contract::check_refused(&pop3::Command {
         keyword: "noop".into(),
         argument: None,
     });
-    refused(&pop3::Command {
+    contract::check_refused(&pop3::Command {
         keyword: "NOOP".into(),
         argument: Some(String::new()),
     });
-    refused(&pop3::Reply::ok("x").with_body(b"bare\n".to_vec()));
-    refused(&pop3::Reply::ok("x\r"));
-    refused(&imap::Command::new("bad tag", "NOOP", vec![]));
-    refused(&imap::Command::new(
+    contract::check_refused(&pop3::Reply::ok("x").with_body(b"bare\n".to_vec()));
+    contract::check_refused(&pop3::Reply::ok("x\r"));
+    contract::check_refused(&imap::Command::new("bad tag", "NOOP", vec![]));
+    contract::check_refused(&imap::Command::new(
         "a",
         "X",
         vec![imap::Value::Quoted(b"x\ny".to_vec())],
     ));
-    refused(&imap::Command::new(
+    contract::check_refused(&imap::Command::new(
         "a",
         "X",
         vec![imap::Value::Literal {
@@ -596,8 +565,8 @@ fn exact_wire_and_transactional_writers() {
             non_sync: true,
         }],
     ));
-    refused(&imap::Response::tagged("a", imap::Status::Bye, "bye"));
-    refused(&imap::Response::greeting("bad\ntext"));
+    contract::check_refused(&imap::Response::tagged("a", imap::Status::Bye, "bye"));
+    contract::check_refused(&imap::Response::greeting("bad\ntext"));
 }
 
 #[test]

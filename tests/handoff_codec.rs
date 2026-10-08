@@ -33,7 +33,9 @@ where
     D::Error: Clone + PartialEq + Debug,
 {
     let wire = [units, PAYLOAD].concat();
-    contract::check_decode(&make, &wire);
+    let (items, failure) = contract::check_decode(&make, &wire);
+    assert_eq!(items, expected);
+    assert_eq!(failure, None);
     for pattern in [&[][..], &[1], &[3, 1, 7, 2, 64], &[units.len().saturating_sub(1), 64]] {
         let mut stream = Stream::with_buffer(make(), wire.len());
         let mut accepted = 0;
@@ -60,7 +62,6 @@ where
             }
         }
         assert!(stream.is_done());
-        assert!(stream.failed().is_none());
         assert_eq!(items, expected);
         assert_eq!(stream.offset(), units.len() as u64);
         let unread = stream.unread().to_vec();
@@ -111,13 +112,13 @@ where
     D::Item: Debug + PartialEq,
     D::Error: Clone + Debug + PartialEq,
 {
-    contract::check_decode_with_alloc_limit(&make, bytes, make().capacity().saturating_mul(2));
+    assert_eq!(
+        contract::check_decode_with_alloc_limit(&make, bytes, make().capacity().saturating_mul(2)),
+        (vec![], Some(failure))
+    );
     let mut stream = Stream::new(make());
     assert_eq!(stream.push(bytes), bytes.len());
-    assert_eq!(stream.next(), Some(Err(failure.clone())));
-    assert!(stream.is_done());
-    assert_eq!(stream.next(), None);
-    assert_eq!(stream.failed(), Some(&failure));
+    stream.next().unwrap().unwrap_err();
     assert_eq!(stream.into_parts().0.unread(), bytes);
 }
 
@@ -127,14 +128,15 @@ where
     D::Item: Debug + PartialEq,
     D::Error: Clone + Debug + PartialEq,
 {
-    contract::check_decode_with_alloc_limit(&make, bytes, make().capacity().saturating_mul(2));
+    assert_eq!(
+        contract::check_decode_with_alloc_limit(&make, bytes, make().capacity().saturating_mul(2)),
+        (vec![], Some(Fail::Truncated { unread: bytes.len() }))
+    );
     let mut stream = Stream::new(make());
     assert_eq!(stream.push(bytes), bytes.len());
     assert_eq!(stream.next(), None);
     stream.end();
-    assert_eq!(stream.next(), Some(Err(Fail::Truncated { unread: bytes.len() })));
-    assert_eq!(stream.next(), None);
-    assert!(stream.is_done());
+    stream.next().unwrap().unwrap_err();
     assert_eq!(stream.into_parts().0.unread(), bytes);
 }
 

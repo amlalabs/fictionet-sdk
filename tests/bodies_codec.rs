@@ -5,26 +5,17 @@ use fictionet::stdlib::codec::{
 };
 use fictionet::stdlib::test_support::contract;
 
-use fictionet::stdlib::test_support::{chunks, decode_all};
+use fictionet::stdlib::test_support::chunks;
 use fictionet::stdlib::{imf, ipp, postgres as pg};
 
-fn read<D: Decode + Clone>(decoder: D, bytes: &[u8]) -> Vec<D::Item>
-where
-    D::Error: Clone + core::fmt::Debug,
-{
-    let (items, failure) = decode_all(|| decoder.clone(), bytes);
-    assert!(failure.is_none(), "{failure:?}");
-    items
-}
-
-fn check<D: Decode>(make: impl Fn() -> D, bytes: &[u8])
+fn check<D: Decode>(make: impl Fn() -> D, bytes: &[u8]) -> (Vec<D::Item>, Option<Fail<D::Error>>)
 where
     D::Error: Clone + PartialEq + core::fmt::Debug,
     D::Item: PartialEq + core::fmt::Debug,
 {
     let capacity = make().capacity();
     contract::check_decode_with_held_limit(&make, bytes, 0);
-    contract::check_decode_with_alloc_limit(make, bytes, 2 * capacity);
+    contract::check_decode_with_alloc_limit(make, bytes, 2 * capacity)
 }
 
 fn failure<D: Decode>(decoder: D, bytes: &[u8], eof: bool, expected: Fail<D::Error>)
@@ -55,15 +46,9 @@ fn postgres_frontend_and_backend_round_trips() {
     ];
     let mut bytes = Vec::new();
     for message in &frontend {
-        message.write(&mut bytes).unwrap();
-        contract::check_wire_value(message);
-        contract::check_wire::<pg::FrontendMessage>(&Wire::to_bytes(message).unwrap());
+        bytes.extend_from_slice(&contract::check_written(message));
     }
-    check(pg::FrontendMessages::new, &bytes);
-    assert_eq!(
-        read(pg::FrontendMessages::new(), &bytes),
-        frontend.iter().cloned().map(Ok).collect::<Vec<_>>()
-    );
+    assert_eq!(check(pg::FrontendMessages::new, &bytes), (frontend.iter().cloned().map(Ok).collect::<Vec<_>>(), None));
 
     let backend = vec![
         pg::BackendMessage::Authentication(pg::Authentication::Ok),
@@ -77,18 +62,18 @@ fn postgres_frontend_and_backend_round_trips() {
     ];
     let mut bytes = Vec::new();
     for message in &backend {
-        message.write(&mut bytes).unwrap();
-        contract::check_wire_value(message);
-        contract::check_wire::<pg::BackendMessage>(&Wire::to_bytes(message).unwrap());
+        bytes.extend_from_slice(&contract::check_written(message));
     }
-    check(pg::BackendEvents::new, &bytes);
     assert_eq!(
-        read(pg::BackendEvents::new(), &bytes),
-        backend
-            .iter()
-            .cloned()
-            .map(|m| Ok(pg::BackendEvent::Message(m)))
-            .collect::<Vec<_>>()
+        check(pg::BackendEvents::new, &bytes),
+        (
+            backend
+                .iter()
+                .cloned()
+                .map(|m| Ok(pg::BackendEvent::Message(m)))
+                .collect::<Vec<_>>(),
+            None,
+        )
     );
 }
 
@@ -114,10 +99,7 @@ fn postgres_encryption_requests_end_with_exact_unread_transport_bytes() {
         assert_eq!(buffer.offset(), boundary as u64);
         decoder.start_encryption();
         let startup = pg::FrontendMessage::Startup(pg::Startup::new("u", "d"));
-        assert_eq!(
-            read(decoder, &Wire::to_bytes(&startup).unwrap()),
-            [Ok(startup)]
-        );
+        assert_eq!(check(|| decoder.clone(), &Wire::to_bytes(&startup).unwrap()), (vec![Ok(startup)], None));
 
         // On the client, only the one-byte acceptance belongs to PostgreSQL.
         let make = || {
@@ -199,13 +181,15 @@ fn postgres_refusal_resumes_startup_then_typed_messages() {
         d.expect_encryption();
         d
     };
-    check(make, &backend);
     assert_eq!(
-        read(make(), &backend),
-        [
-            Ok(pg::BackendEvent::Encryption(pg::EncryptionReply::Refused)),
-            Ok(pg::BackendEvent::Message(ready)),
-        ]
+        check(make, &backend),
+        (
+            vec![
+                Ok(pg::BackendEvent::Encryption(pg::EncryptionReply::Refused)),
+                Ok(pg::BackendEvent::Message(ready)),
+            ],
+            None,
+        )
     );
 }
 
@@ -272,23 +256,27 @@ fn postgres_cancel_and_terminate_end_at_the_item_boundary() {
 fn postgres_body_errors_are_items_and_framing_errors_end_once() {
     let mut bytes = b"Q\0\0\0\x05x".to_vec(); // Missing string terminator.
     pg::FrontendMessage::Sync.write(&mut bytes).unwrap();
-    check(|| pg::FrontendMessages::established(64), &bytes);
     assert_eq!(
-        read(pg::FrontendMessages::established(64), &bytes),
-        [
-            Err(pg::Error::UnterminatedString { tag: b'Q' }),
-            Ok(pg::FrontendMessage::Sync),
-        ]
+        check(|| pg::FrontendMessages::established(64), &bytes),
+        (
+            vec![
+                Err(pg::Error::UnterminatedString { tag: b'Q' }),
+                Ok(pg::FrontendMessage::Sync),
+            ],
+            None,
+        )
     );
     let mut bytes = b"Z\0\0\0\x05?".to_vec();
     pg::BackendMessage::BindComplete.write(&mut bytes).unwrap();
-    check(|| pg::BackendEvents::with_limit(64), &bytes);
     assert_eq!(
-        read(pg::BackendEvents::with_limit(64), &bytes),
-        [
-            Err(pg::Error::BadStatus { tag: b'Z', status: b'?' }),
-            Ok(pg::BackendEvent::Message(pg::BackendMessage::BindComplete)),
-        ]
+        check(|| pg::BackendEvents::with_limit(64), &bytes),
+        (
+            vec![
+                Err(pg::Error::BadStatus { tag: b'Z', status: b'?' }),
+                Ok(pg::BackendEvent::Message(pg::BackendMessage::BindComplete)),
+            ],
+            None,
+        )
     );
     failure(
         pg::FrontendMessages::established(64),
@@ -366,10 +354,7 @@ fn postgres_modes_and_minimum_limit_are_explicit() {
     let frontend = pg::FrontendMessages::established(0);
     assert_eq!(frontend.limit(), 4);
     assert_eq!(frontend.phase(), pg::Phase::Messages);
-    assert_eq!(
-        read(frontend.clone(), b"S\0\0\0\x04"),
-        [Ok(pg::FrontendMessage::Sync)]
-    );
+    assert_eq!(check(|| frontend.clone(), b"S\0\0\0\x04"), (vec![Ok(pg::FrontendMessage::Sync)], None));
     failure(
         frontend,
         b"C\0\0\0\x06",
@@ -475,10 +460,7 @@ fn imf_header_and_collected_body_round_trip() {
             (Ok(header.clone()), body.clone())
         );
     }
-    assert_eq!(
-        read(make(), &Wire::to_bytes(&header).unwrap()),
-        [Ok(header)]
-    );
+    assert_eq!(check(make, &Wire::to_bytes(&header).unwrap()), (vec![Ok(header)], None));
 }
 
 #[test]
@@ -544,10 +526,7 @@ fn ipp_head_and_collected_document_round_trip() {
             (Ok(head.clone()), document.clone())
         );
     }
-    assert_eq!(
-        read(make(), &Wire::to_bytes(&head).unwrap()),
-        [Ok(head)]
-    );
+    assert_eq!(check(make, &Wire::to_bytes(&head).unwrap()), (vec![Ok(head)], None));
 }
 
 #[test]
@@ -783,13 +762,11 @@ fn exact_and_minimum_header_limits_make_progress() {
     let header = mail_header();
     let bytes = Wire::to_bytes(&header).unwrap();
     let make = || imf::Head::with_limit(bytes.len());
-    check(make, &bytes);
-    assert_eq!(read(make(), &bytes), [Ok(header)]);
+    assert_eq!(check(make, &bytes), (vec![Ok(header)], None));
     let head = print_head();
     let bytes = Wire::to_bytes(&head).unwrap();
     let make = || ipp::Head::with_limit(bytes.len());
-    check(make, &bytes);
-    assert_eq!(read(make(), &bytes), [Ok(head)]);
+    assert_eq!(check(make, &bytes), (vec![Ok(head)], None));
     check(|| imf::Head::with_limit(0), b"\nbody");
     check(
         || ipp::Head::with_limit(0),
@@ -833,7 +810,7 @@ fn imf_header_only_at_eof_matches_split_message() {
         check(imf::Head::new, bytes);
         let (header, body) = imf::split_message(bytes).unwrap();
         assert!(body.is_empty());
-        assert_eq!(read(imf::Head::new(), bytes), [Ok(header)]);
+        assert_eq!(check(imf::Head::new, bytes), (vec![Ok(header)], None));
     }
 }
 
@@ -893,14 +870,8 @@ fn malformed_startup_requests_end_the_stream_once() {
 
 #[test]
 fn empty_heads_end_cleanly_without_an_item() {
-    assert!(read(imf::Head::new(), b"").is_empty());
-    assert!(read(ipp::Head::new(), b"").is_empty());
-    assert_eq!(
-        read(imf::Head::new(), b"\r\n"),
-        [Ok(imf::Header::default())]
-    );
-    assert_eq!(
-        read(imf::Head::new(), b"bad field"),
-        [Err(imf::Error::FieldName)]
-    );
+    assert_eq!(check(imf::Head::new, b""), (vec![], None));
+    assert_eq!(check(ipp::Head::new, b""), (vec![], None));
+    assert_eq!(check(imf::Head::new, b"\r\n"), (vec![Ok(imf::Header::default())], None));
+    assert_eq!(check(imf::Head::new, b"bad field"), (vec![Err(imf::Error::FieldName)], None));
 }

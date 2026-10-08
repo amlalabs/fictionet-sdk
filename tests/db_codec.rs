@@ -6,27 +6,20 @@ use fictionet::stdlib::codec::{
     Decode, Fail, Lcg, Step, Stream, Wire, finish,
 };
 use fictionet::stdlib::test_support::contract;
-use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::{git_protocol, mongodb, mysql, sftp, tds};
 
-fn round_trip<D>(make: impl Fn() -> D + Copy, expected: &[D::Item])
+fn check_frames<D>(make: impl Fn() -> D, values: &[D::Item])
 where
     D: Decode,
-    D::Item: Wire + PartialEq + Debug,
+    D::Item: Wire + Clone + PartialEq + Debug,
     D::Error: Clone + PartialEq + Debug,
 {
-    let mut bytes = Vec::new();
-    for value in expected {
-        contract::check_wire_value(value);
-        let start = bytes.len();
-        Wire::write(value, &mut bytes).unwrap();
-        contract::check_wire::<D::Item>(bytes.get(start..).unwrap());
-    }
-    contract::check_decode_with_alloc_limit(make, &bytes, 2 * make().capacity());
+    let bytes: Vec<u8> = values.iter().flat_map(contract::check_written).collect();
+    assert_eq!(
+        contract::check_decode_with_alloc_limit(&make, &bytes, 2 * make().capacity()),
+        (values.to_vec(), None)
+    );
     contract::check_decode_with_held_limit(make, &bytes, 0);
-    let (got, error) = decode_all(make, &bytes);
-    assert_eq!(error, None);
-    assert_eq!(got, expected);
 }
 
 fn header_refusal<D>(make: impl Fn() -> D + Copy, header: &[u8], error: D::Error)
@@ -35,7 +28,10 @@ where
     D::Item: PartialEq + Debug,
     D::Error: Clone + PartialEq + Debug,
 {
-    contract::check_decode_with_alloc_limit(make, header, 2 * make().capacity());
+    assert_eq!(
+        contract::check_decode_with_alloc_limit(make, header, 2 * make().capacity()),
+        (vec![], Some(Fail::Protocol(error.clone())))
+    );
     let mut stream = Stream::new(make());
     let prefix = header.len() - 1;
     assert_eq!(stream.push(&header[..prefix]), prefix);
@@ -43,16 +39,13 @@ where
     assert_eq!(stream.push(&header[prefix..]), 1);
     let failure = Fail::Protocol(error);
     assert_eq!(stream.next(), Some(Err(failure.clone())));
-    assert_eq!(stream.failed(), Some(&failure));
     assert_eq!(stream.next(), None);
-    assert!(stream.is_done());
     assert_eq!(stream.offset(), 0);
     assert_eq!(stream.held(), 0);
     assert_eq!(stream.unread(), header);
     assert_eq!(stream.push(b"body after failure"), 18);
     assert_eq!(stream.unread(), header);
     stream.end();
-    assert_eq!(stream.next(), None);
 }
 
 fn eof_at_every_prefix<D>(make: impl Fn() -> D + Copy, value: D::Item)
@@ -61,43 +54,12 @@ where
     D::Item: Wire + Clone + PartialEq + Debug,
     D::Error: Clone + PartialEq + Debug,
 {
-    let bytes = Wire::to_bytes(&value).unwrap();
-    contract::check_decode(make, bytes.get(..bytes.len() - 1).unwrap());
-    for cut in 0..=bytes.len() {
-        let prefix = bytes.get(..cut).unwrap();
-        let mut stream = Stream::new(make());
-        assert_eq!(stream.push(prefix), cut);
-        stream.end();
-        let expected = match cut {
-            0 => None,
-            n if n == bytes.len() => Some(Ok(value.clone())),
-            n => Some(Err(Fail::Truncated { unread: n })),
-        };
-        assert_eq!(stream.next(), expected, "prefix {cut}");
-        assert_eq!(stream.next(), None);
-        assert!(stream.is_done());
-        assert_eq!(stream.held(), 0);
-    }
-}
-
-fn exact_wire<M: Wire + PartialEq + Debug>(value: &M) -> Vec<u8> {
-    let bytes = Wire::to_bytes(value).unwrap();
-    assert_eq!(&M::parse(&bytes).unwrap(), value);
+    let bytes = contract::check_written(&value);
+    contract::check_truncated(make, &bytes);
+    assert_eq!(contract::check_decode_with_held_limit(make, &bytes, 0), (vec![value], None));
     for cut in 0..bytes.len() {
-        assert!(M::parse(bytes.get(..cut).unwrap()).is_err(), "prefix {cut}");
+        contract::check_decode_with_held_limit(make, &bytes[..cut], 0);
     }
-    for tail in [&[0xff][..], bytes.as_slice()] {
-        let joined = [bytes.as_slice(), tail].concat();
-        assert!(M::parse(&joined).is_err());
-    }
-    contract::check_wire::<M>(&bytes);
-    contract::check_wire_value(value);
-    bytes
-}
-
-fn refused_write<M: Wire + PartialEq + Debug>(value: &M) {
-    contract::check_refused(value);
-    contract::check_wire_value(value);
 }
 
 fn mongo_ping() -> mongodb::Message {
@@ -166,10 +128,7 @@ fn mongodb_chunked_round_trip() {
             },
         },
     ];
-    round_trip(
-        || Frames::<mongodb::Message>::with_limit(128).map(Result::unwrap),
-        &values,
-    );
+    check_frames(|| Frames::<mongodb::Message>::with_limit(128).map(Result::unwrap), &values);
 }
 
 #[test]
@@ -195,7 +154,8 @@ fn mongodb_truncated_frame_at_eof() {
 #[test]
 fn mongodb_wire_is_exact_and_transactional() {
     let value = mongo_ping();
-    let bytes = exact_wire(&value);
+    let bytes = contract::check_exact(&value);
+    assert!(<mongodb::Message as Wire>::parse(&[bytes.as_slice(), bytes.as_slice()].concat()).is_err());
     let joined = [bytes.as_slice(), &[0xff]].concat();
     assert_eq!(
         <mongodb::Message as Wire>::parse(&joined),
@@ -205,7 +165,7 @@ fn mongodb_wire_is_exact_and_transactional() {
         panic!("expected OP_MSG")
     };
     msg.flags = 1 << 20;
-    refused_write(&mongodb::Message {
+    contract::check_refused(&mongodb::Message {
         request_id: 1,
         response_to: 0,
         body: mongodb::Body::Msg(msg),
@@ -219,8 +179,8 @@ fn mongodb_wire_is_exact_and_transactional() {
         query: mongodb::Document::new(),
         fields: None,
     });
-    refused_write(&invalid);
-    refused_write(&mongodb::Message {
+    contract::check_refused(&invalid);
+    contract::check_refused(&mongodb::Message {
         request_id: 1,
         response_to: 0,
         body: mongodb::Body::Other {
@@ -280,27 +240,25 @@ fn mongodb_unknown_section_kind_ends_stream() {
 
 #[test]
 fn mysql_chunked_round_trip() {
-    round_trip(
-        || Frames::<mysql::Packet>::with_limit(32),
-        &[
-            mysql::Packet {
-                seq: 0,
-                payload: b"\x03SELECT 1".to_vec(),
-            },
-            mysql::Packet {
-                seq: 255,
-                payload: vec![],
-            },
-            mysql::Packet {
-                seq: 0,
-                payload: vec![0xff, 0, 7, 0x80],
-            },
-            mysql::Packet {
-                seq: 19,
-                payload: vec![0xa5; 32],
-            },
-        ],
-    );
+    let values = [
+        mysql::Packet {
+            seq: 0,
+            payload: b"\x03SELECT 1".to_vec(),
+        },
+        mysql::Packet {
+            seq: 255,
+            payload: vec![],
+        },
+        mysql::Packet {
+            seq: 0,
+            payload: vec![0xff, 0, 7, 0x80],
+        },
+        mysql::Packet {
+            seq: 19,
+            payload: vec![0xa5; 32],
+        },
+    ];
+    check_frames(|| Frames::<mysql::Packet>::with_limit(32), &values);
 }
 
 #[test]
@@ -334,13 +292,14 @@ fn mysql_wire_is_exact_and_transactional() {
         seq: 7,
         payload: vec![0, 1, 2],
     };
-    let bytes = exact_wire(&value);
+    let bytes = contract::check_exact(&value);
+    assert!(<mysql::Packet as Wire>::parse(&[bytes.as_slice(), bytes.as_slice()].concat()).is_err());
     let joined = [bytes.as_slice(), &[0xff]].concat();
     assert_eq!(
         <mysql::Packet as Wire>::parse(&joined),
         Err(mysql::Error::Trailing)
     );
-    refused_write(&mysql::Packet {
+    contract::check_refused(&mysql::Packet {
         seq: 7,
         payload: vec![0; mysql::MAX_PACKET_PAYLOAD + 1],
     });
@@ -395,25 +354,23 @@ fn tds_packet() -> tds::Packet {
 
 #[test]
 fn tds_chunked_round_trip() {
-    round_trip(
-        || Frames::<tds::Packet>::with_limit(32),
-        &[
-            tds_packet(),
-            tds::Packet {
-                status: 0,
-                id: 0,
-                data: vec![],
-                ..tds_packet()
-            },
-            tds::Packet {
-                packet_type: 0xff,
-                status: 0xff,
-                id: 1,
-                data: vec![0x42; 24],
-                ..tds_packet()
-            },
-        ],
-    );
+    let values = [
+        tds_packet(),
+        tds::Packet {
+            status: 0,
+            id: 0,
+            data: vec![],
+            ..tds_packet()
+        },
+        tds::Packet {
+            packet_type: 0xff,
+            status: 0xff,
+            id: 1,
+            data: vec![0x42; 24],
+            ..tds_packet()
+        },
+    ];
+    check_frames(|| Frames::<tds::Packet>::with_limit(32), &values);
 }
 
 #[test]
@@ -434,7 +391,8 @@ fn tds_truncated_frame_at_eof() {
 #[test]
 fn tds_wire_is_exact_and_transactional() {
     let value = tds_packet();
-    let bytes = exact_wire(&value);
+    let bytes = contract::check_exact(&value);
+    assert!(<tds::Packet as Wire>::parse(&[bytes.as_slice(), bytes.as_slice()].concat()).is_err());
     assert_eq!(bytes, value.to_bytes().unwrap());
     let joined = [bytes.as_slice(), &[0xff]].concat();
     assert_eq!(
@@ -445,7 +403,7 @@ fn tds_wire_is_exact_and_transactional() {
         data: vec![0; tds::MAX_PACKET - tds::HEADER_LEN + 1],
         ..tds_packet()
     };
-    refused_write(&large);
+    contract::check_refused(&large);
     let maximum = tds::Packet {
         data: vec![0; tds::MAX_PACKET - tds::HEADER_LEN],
         ..tds_packet()
@@ -482,18 +440,16 @@ fn tds_message_assembly_and_terminal_failure() {
 #[test]
 fn git_chunked_round_trip() {
     use git_protocol::Packet;
-    round_trip(
-        Frames::<git_protocol::Packet>::new,
-        &[
-            Packet::Data(b"command=ls-refs\n".to_vec()),
-            Packet::Delim,
-            Packet::Data(vec![]),
-            Packet::Data(vec![0, 0xff, 7]),
-            Packet::Flush,
-            Packet::ResponseEnd,
-            Packet::Data(b"next request\n".to_vec()),
-        ],
-    );
+    let values = [
+        Packet::Data(b"command=ls-refs\n".to_vec()),
+        Packet::Delim,
+        Packet::Data(vec![]),
+        Packet::Data(vec![0, 0xff, 7]),
+        Packet::Flush,
+        Packet::ResponseEnd,
+        Packet::Data(b"next request\n".to_vec()),
+    ];
+    check_frames(Frames::<git_protocol::Packet>::new, &values);
 }
 
 #[test]
@@ -533,7 +489,8 @@ fn git_wire_is_exact_and_transactional() {
         Packet::Data(vec![]),
         Packet::Data(vec![1; 10]),
     ] {
-        let bytes = exact_wire(&value);
+        let bytes = contract::check_exact(&value);
+        assert!(<git_protocol::Packet as Wire>::parse(&[bytes.as_slice(), bytes.as_slice()].concat()).is_err());
         assert_eq!(bytes, value.to_bytes().unwrap());
         let joined = [bytes.as_slice(), b"0000"].concat();
         assert_eq!(
@@ -548,7 +505,7 @@ fn git_wire_is_exact_and_transactional() {
         b"000aabcdef"
     );
     let large = Packet::Data(vec![0; git_protocol::MAX_DATA + 1]);
-    refused_write(&large);
+    contract::check_refused(&large);
     contract::check_wire_value(&Packet::Data(vec![0; git_protocol::MAX_DATA]));
 }
 
@@ -579,26 +536,24 @@ fn sftp_packet() -> sftp::Packet {
 
 #[test]
 fn sftp_chunked_round_trip() {
-    round_trip(
-        || Frames::<sftp::Packet>::with_limit(64),
-        &[
-            sftp::Request::Init {
-                version: sftp::VERSION,
-                extensions: vec![],
-            }
-            .to_packet().unwrap(),
-            sftp_packet(),
-            sftp::Response::status(7, sftp::Status::NoSuchFile, "No such file").to_packet().unwrap(),
-            sftp::Packet {
-                kind: 0xff,
-                body: vec![],
-            },
-            sftp::Packet {
-                kind: 0,
-                body: vec![0xff; 63],
-            },
-        ],
-    );
+    let values = [
+        sftp::Request::Init {
+            version: sftp::VERSION,
+            extensions: vec![],
+        }
+        .to_packet().unwrap(),
+        sftp_packet(),
+        sftp::Response::status(7, sftp::Status::NoSuchFile, "No such file").to_packet().unwrap(),
+        sftp::Packet {
+            kind: 0xff,
+            body: vec![],
+        },
+        sftp::Packet {
+            kind: 0,
+            body: vec![0xff; 63],
+        },
+    ];
+    check_frames(|| Frames::<sftp::Packet>::with_limit(64), &values);
 }
 
 #[test]
@@ -629,7 +584,8 @@ fn sftp_truncated_frame_at_eof() {
 #[test]
 fn sftp_wire_is_exact_and_transactional() {
     let value = sftp_packet();
-    let bytes = exact_wire(&value);
+    let bytes = contract::check_exact(&value);
+    assert!(<sftp::Packet as Wire>::parse(&[bytes.as_slice(), bytes.as_slice()].concat()).is_err());
     assert_eq!(bytes, value.to_bytes().unwrap());
     let joined = [bytes.as_slice(), &[0xff]].concat();
     assert_eq!(
@@ -640,15 +596,17 @@ fn sftp_wire_is_exact_and_transactional() {
         kind: 0xff,
         body: vec![0; sftp::MAX_PACKET],
     };
-    refused_write(&large);
+    contract::check_refused(&large);
     contract::check_wire_value(&sftp::Packet {
         kind: 0xff,
         body: vec![0; sftp::MAX_PACKET - 1],
     });
-    exact_wire(&sftp::Packet {
+    let empty = sftp::Packet {
         kind: 0,
         body: vec![],
-    });
+    };
+    let empty_bytes = contract::check_exact(&empty);
+    assert!(<sftp::Packet as Wire>::parse(&[empty_bytes.as_slice(), empty_bytes.as_slice()].concat()).is_err());
 }
 
 #[test]
@@ -788,7 +746,7 @@ fn mongodb_wire_size_limit() {
         panic!("expected raw body")
     };
     data.push(0);
-    refused_write(&value);
+    contract::check_refused(&value);
 }
 
 #[test]
@@ -859,11 +817,11 @@ fn payload_readers_refuse_trailing_bytes() {
 #[test]
 fn mysql_writers_preserve_flags_and_optional_fields() {
     use mysql::{Error, HandshakeResponse, OkPacket, capability};
-    refused_write(&HandshakeResponse::default());
+    contract::check_refused(&HandshakeResponse::default());
     for capabilities in [0, capability::SSL, capability::PROTOCOL_41] {
-        refused_write(&mysql::SslRequest { capabilities, ..mysql::SslRequest::default() });
+        contract::check_refused(&mysql::SslRequest { capabilities, ..mysql::SslRequest::default() });
     }
-    refused_write(&mysql::Handshake { auth_data: vec![1; 21], auth_plugin: b"plugin".to_vec(),
+    contract::check_refused(&mysql::Handshake { auth_data: vec![1; 21], auth_plugin: b"plugin".to_vec(),
         ..mysql::Handshake::default() });
     let base = HandshakeResponse { capabilities: capability::PROTOCOL_41, ..HandshakeResponse::default() };
     for response in [
@@ -871,7 +829,7 @@ fn mysql_writers_preserve_flags_and_optional_fields() {
         HandshakeResponse { auth_plugin: b"plugin".to_vec(), ..base.clone() },
         HandshakeResponse { attributes: vec![(b"key".to_vec(), vec![])], ..base.clone() },
         HandshakeResponse { zstd_level: 3, ..base },
-    ] { refused_write(&response); }
+    ] { contract::check_refused(&response); }
     for ok in [
         OkPacket { status: 1, ..OkPacket::default() },
         OkPacket { warnings: 1, ..OkPacket::default() },
@@ -888,9 +846,9 @@ fn tds_payload_limits_and_complete_messages() {
     let mut tokens = tds::TokenReader::new(&oversized);
     assert_eq!(tokens.next(), Some(Err(tds::Error::Limit("response past MAX_MESSAGE"))));
     assert_eq!(tokens.next(), None);
-    refused_write(&tds::Message { packet_type: 1, status: 0, spid: 0, data: vec![] });
-    refused_write(&tds::Login7 { features: Some(vec![]), ..tds::Login7::new() });
-    refused_write(&tds::Login7 { option_flags3: tds::option_flags3::EXTENSION, ..tds::Login7::new() });
+    contract::check_refused(&tds::Message { packet_type: 1, status: 0, spid: 0, data: vec![] });
+    contract::check_refused(&tds::Login7 { features: Some(vec![]), ..tds::Login7::new() });
+    contract::check_refused(&tds::Login7 { option_flags3: tds::option_flags3::EXTENSION, ..tds::Login7::new() });
     let oversized_batch = tds::SqlBatch { headers: None, text: "x".repeat(tds::MAX_MESSAGE / 2 + 1) };
     assert_eq!(oversized_batch.message(), Err(tds::Error::Unwritable));
 }
