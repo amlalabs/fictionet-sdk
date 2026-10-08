@@ -1979,6 +1979,26 @@ mod tests {
     // Encoding examples from ASHRAE 135, Clause 20.2.
 
     #[test]
+    fn review_writer_checks_preserve_variants_and_fields() {
+        let npdu = Npdu {
+            destination: None, source: None, expecting_reply: false,
+            priority: Priority::Normal,
+            body: NpduBody::Network { message_type: 0x80, vendor: None, data: vec![] },
+        };
+        assert_eq!(npdu.to_bytes(), Err(Error::Unwritable));
+        let apdu = Apdu::ConfirmedRequest {
+            segmented_response_accepted: false, max_segments: 8, max_apdu: 0,
+            invoke_id: 1, segment: None, service: 1, data: vec![],
+        };
+        assert_eq!(apdu.to_bytes(), Err(Error::Unwritable));
+        let announcement = IAm {
+            device: ObjectId { object_type: 0, instance: 1 }, max_apdu: 1024,
+            segmentation: Segmentation::NoSegmentation, vendor: 1,
+        };
+        assert_eq!(announcement.to_bytes(), Err(Error::Unwritable));
+    }
+
+    #[test]
     fn primitive_value_examples() {
         let cases = [
             ("00", Value::Null),

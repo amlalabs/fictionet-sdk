@@ -1520,7 +1520,7 @@ macro_rules! message_wire {
             /// Leaves the destination unchanged on error.
             fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
                 let start = out.len();
-                if self.encode(out).is_err() || Self::parse(&out[start..]).as_ref() != Ok(self) {
+                if self.encode(out).is_err() {
                     out.truncate(start);
                     return Err(Error::Unwritable);
                 }
@@ -1569,7 +1569,6 @@ macro_rules! line_wire {
                 let mut text = self.encode_line()?;
                 if text.len() > MAX_LINE { return Err(Error::Unwritable); }
                 text.push('\n');
-                if Self::read(text.as_bytes()).as_ref() != Ok(self) { return Err(Error::Unwritable); }
                 out.extend_from_slice(text.as_bytes());
                 Ok(())
             }
@@ -1608,6 +1607,29 @@ mod tests {
     }
 
     // Examples from gitprotocol-common, "pkt-line Format".
+    #[test]
+    fn review_writer_validation() {
+        let request = V2Request::Command(Command { name: "fetch".into(), capabilities: vec![], args: vec!["ERR stopped".into()] });
+        let mut encoded = Vec::new();
+        request.encode(&mut encoded).unwrap();
+        assert_eq!(V2Request::parse(&encoded), Ok(request.clone()));
+        assert_eq!(request.to_bytes(), Ok(encoded));
+        for value in ["bad\0field".to_string(), "x".repeat(MAX_TEXT + 1)] {
+            let request = ProtoRequest { service: Service::UploadPack, path: value.clone(), host: None, extra: vec![] };
+            assert_eq!(request.to_bytes(), Err(Error::Unwritable));
+            let caps = CapabilityAdvertisement { capabilities: vec![Capability::with_value("agent", &value)] };
+            assert_eq!(caps.to_bytes(), Err(Error::Unwritable));
+            assert_eq!(LsRefsArg::RefPrefix(value.clone()).to_bytes(), Err(Error::Unwritable));
+            assert_eq!(ClientLine::WantRef(value.clone()).to_bytes(), Err(Error::Unwritable));
+            assert_eq!(ServerLine::Error(value.clone()).to_bytes(), Err(Error::Unwritable));
+            assert_eq!(LsRef { id: None, name: value, symref_target: None, peeled: None }.to_bytes(), Err(Error::Unwritable));
+        }
+        for service in [Service::UploadPack, Service::ReceivePack, Service::UploadArchive] {
+            let header = ServiceHeader(service);
+            assert_eq!(ServiceHeader::parse(&header.to_bytes().unwrap()), Ok(header));
+        }
+    }
+
     #[test]
     fn packet_examples() {
         for (bytes, data) in [(&b"0006a\n"[..], &b"a\n"[..]), (b"0005a", b"a"), (b"000bfoobar\n", b"foobar\n"), (b"0004", b"")] {

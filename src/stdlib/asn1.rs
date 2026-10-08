@@ -2406,6 +2406,15 @@ mod tests {
     }
 
     #[test]
+    fn review_write_checked_rejects_lossy_encoding() {
+        let mut out = vec![42];
+        let result = write_checked(&256u16, |v| Ok(vec![*v as u8]),
+            |b| Ok(u16::from(b[0])), Error::Integer, &mut out);
+        assert_eq!(result, Err(Error::Integer));
+        assert_eq!(out, [42]);
+    }
+
+    #[test]
     fn boolean_example() {
         // 8.2.2: TRUE may be any nonzero byte in BER; DER uses 0xFF.
         assert_eq!(der(|w| w.boolean(true)), [0x01, 0x01, 0xff]);

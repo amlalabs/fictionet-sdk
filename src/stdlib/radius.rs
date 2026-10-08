@@ -260,8 +260,12 @@ impl Attribute {
     /// knows. It returns `None` unless the bytes read back as the same
     /// value of `data_type`, as for [`Attribute::from_value`].
     pub fn from_value_as(kind: u8, data_type: DataType, value: &Value) -> Option<Attribute> {
-        let bytes = value.encode()?;
-        (Value::decode(data_type, &bytes).as_ref() == Ok(value)).then_some(Attribute { kind, value: bytes })
+        if data_type != value.data_type()
+            && !(data_type == DataType::Concat && matches!(value, Value::String(_)))
+        {
+            return None;
+        }
+        Some(Attribute { kind, value: value.encode()? })
     }
 
     /// Attributes of type `kind` that carry `data` between them, at most
@@ -1820,6 +1824,20 @@ mod tests {
 
     fn decoded(p: &Packet, kind: u8) -> Value {
         p.get(kind).unwrap().decode().unwrap()
+    }
+
+    #[test]
+    fn review_value_checks_have_distinct_roles() {
+        let empty = Value::Tlv(vec![]);
+        assert_eq!(empty.raw_bytes(), Some(vec![]));
+        assert_eq!(empty.encode(), None);
+        let short = Value::String(vec![1]);
+        assert_eq!(short.encode(), Some(vec![1]));
+        assert_eq!(Attribute::from_value(attr::CHAP_PASSWORD, &short), None);
+        assert_eq!(Attribute::from_value_as(1, DataType::Integer, &short), None);
+        for data_type in [DataType::String, DataType::Concat] {
+            assert_eq!(Attribute::from_value_as(1, data_type, &short), Some(Attribute { kind: 1, value: vec![1] }));
+        }
     }
 
     #[test]

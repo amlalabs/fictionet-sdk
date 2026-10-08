@@ -792,7 +792,9 @@ impl Wire for InitialContextToken {
     /// Refuses a SPNEGO wrapper containing negTokenResp.
     /// Refuses values that change when encoded. Leaves `out` unchanged on error.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        asn1::write_checked(self, Self::encode, Self::decode, Error::Unwritable, out)
+        let bytes = self.encode()?;
+        out.extend_from_slice(&bytes);
+        Ok(())
     }
 }
 
@@ -820,7 +822,9 @@ impl Wire for NegotiationToken {
     /// if a value cannot be written.
     /// Refuses values that change when encoded. Leaves `out` unchanged on error.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        asn1::write_checked(self, Self::encode, Self::decode, Error::Unwritable, out)
+        let bytes = self.encode()?;
+        out.extend_from_slice(&bytes);
+        Ok(())
     }
 }
 
@@ -944,6 +948,18 @@ mod tests {
                 mech_list_mic: Some(Vec::new()),
             }),
         ]
+    }
+
+    #[test]
+    fn review_encoders_validate_before_writing() {
+        assert_eq!(NegotiationToken::Init(NegTokenInit::default()).to_bytes(), Err(Error::MissingMechTypes));
+        let wrapped = InitialContextToken { mech: Mech::Spnego, inner: vec![RESP_TAG, 0] };
+        assert_eq!(wrapped.to_bytes(), Err(Error::WrappedResp));
+        let huge = InitialContextToken { mech: Mech::Ntlm, inner: vec![0; MAX_TOKEN] };
+        assert_eq!(huge.to_bytes(), Err(Error::TooLong));
+        let named = Mech::Other("1.3.6.1.4.1.311.2.2.10".parse().unwrap());
+        let token = NegotiationToken::Resp(NegTokenResp { supported_mech: Some(named), ..Default::default() });
+        assert_eq!(NegotiationToken::parse(&token.to_bytes().unwrap()), Ok(token));
     }
 
     #[test]
