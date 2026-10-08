@@ -140,6 +140,7 @@ pub mod ascii;
 pub mod base64;
 pub mod civil;
 pub mod crc32c;
+pub mod field;
 pub mod leb128;
 pub mod head_body;
 mod buffer;

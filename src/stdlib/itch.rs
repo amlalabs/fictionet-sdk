@@ -58,6 +58,7 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+use fictionet::stdlib::codec::field;
 use fictionet::stdlib::codec::Prefixed;
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
@@ -237,58 +238,20 @@ impl Field for Timestamp {
     }
 }
 
-/// Writes `raw` with `places` implied decimal places.
-fn write_decimal(f: &mut fmt::Formatter<'_>, raw: u64, places: u32) -> fmt::Result {
-    let scale = 10u64.pow(places);
-    write!(
-        f,
-        "{}.{:0width$}",
-        raw / scale,
-        raw % scale,
-        width = places as usize
-    )
-}
-/// Reads a decimal with at most `places` decimal places into an integer
-/// scaled by `10^places`.
-fn parse_decimal(s: &str, places: u32) -> Result<u64, Error> {
-    let (whole, fraction) = s.split_once('.').unwrap_or((s, ""));
-    let digits = |t: &str| !t.is_empty() && t.bytes().all(|c| c.is_ascii_digit());
-    if !digits(whole) || (!fraction.is_empty() && !digits(fraction)) || s.ends_with('.') {
-        return Err(Error::Price);
-    }
-    let places_usize = places as usize;
-    if fraction.len() > places_usize {
-        return Err(Error::Price);
-    }
-    let whole: u64 = whole.parse().map_err(|_| Error::Price)?;
-    let mut frac: u64 = if fraction.is_empty() {
-        0
-    } else {
-        fraction.parse().map_err(|_| Error::Price)?
-    };
-    for _ in fraction.len()..places_usize {
-        frac *= 10;
-    }
-    whole
-        .checked_mul(10u64.pow(places))
-        .and_then(|w| w.checked_add(frac))
-        .ok_or(Error::Price)
-}
-
 /// A Price (4) field: four bytes with four implied decimal places. The
 /// raw value 102500 is $10.2500 ("Data Types").
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Price4(pub u32);
 impl fmt::Display for Price4 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_decimal(f, u64::from(self.0), 4)
+        field::write_decimal(f, u64::from(self.0), 4)
     }
 }
 impl FromStr for Price4 {
     type Err = Error;
     /// Reads "10.25" or "10" as dollars; refuses more than four places.
     fn from_str(s: &str) -> Result<Self, Error> {
-        u32::try_from(parse_decimal(s, 4)?)
+        u32::try_from(field::parse_decimal(s, 4).map_err(|_| Error::Price)?)
             .map(Self)
             .map_err(|_| Error::Price)
     }
@@ -309,14 +272,14 @@ impl Field for Price4 {
 pub struct Price8(pub u64);
 impl fmt::Display for Price8 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_decimal(f, self.0, 8)
+        field::write_decimal(f, self.0, 8)
     }
 }
 impl FromStr for Price8 {
     type Err = Error;
     /// Reads a decimal with at most eight places.
     fn from_str(s: &str) -> Result<Self, Error> {
-        parse_decimal(s, 8).map(Self)
+        field::parse_decimal(s, 8).map_err(|_| Error::Price).map(Self)
     }
 }
 impl Field for Price8 {

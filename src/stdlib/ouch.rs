@@ -69,6 +69,7 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+use fictionet::stdlib::codec::field;
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::Wire;
@@ -199,25 +200,7 @@ impl FromStr for Price {
     type Err = Error;
     /// Reads "10.25" or "10" as dollars; refuses more than four places.
     fn from_str(s: &str) -> Result<Self, Error> {
-        let (whole, fraction) = s.split_once('.').unwrap_or((s, ""));
-        let digits = |t: &str| !t.is_empty() && t.bytes().all(|c| c.is_ascii_digit());
-        if !digits(whole) || (s.contains('.') && !digits(fraction)) || fraction.len() > 4 {
-            return Err(Error::Price);
-        }
-        let whole: u64 = whole.parse().map_err(|_| Error::Price)?;
-        let mut frac: u64 = if fraction.is_empty() {
-            0
-        } else {
-            fraction.parse().map_err(|_| Error::Price)?
-        };
-        for _ in fraction.len()..4 {
-            frac *= 10;
-        }
-        whole
-            .checked_mul(10_000)
-            .and_then(|w| w.checked_add(frac))
-            .map(Self)
-            .ok_or(Error::Price)
+        field::parse_decimal(s, 4).map(Self).map_err(|_| Error::Price)
     }
 }
 impl Field for Price {

@@ -22,6 +22,8 @@ macro_rules! protocols {
         pub mod civil;
         #[path = "../../src/stdlib/codec/crc32c.rs"]
         pub mod crc32c;
+        #[path = "../../src/stdlib/codec/field.rs"]
+        pub mod field;
         #[path = "../../src/stdlib/codec/leb128.rs"]
         pub mod leb128;
         #[path = "../../src/stdlib/codec/interceptor.rs"]

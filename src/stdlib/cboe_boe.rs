@@ -119,6 +119,7 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+use fictionet::stdlib::codec::field;
 use fictionet::stdlib::codec::Prefixed;
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
@@ -296,28 +297,8 @@ impl FromStr for Price {
             Some(rest) => (true, rest),
             None => (false, s),
         };
-        let (whole, fraction) = digits.split_once('.').unwrap_or((digits, ""));
-        let numeric = |t: &str| !t.is_empty() && t.bytes().all(|c| c.is_ascii_digit());
-        if !numeric(whole)
-            || (!fraction.is_empty() && !numeric(fraction))
-            || digits.ends_with('.')
-            || fraction.len() > 4
-        {
-            return Err(Error::Price);
-        }
-        let whole: i64 = whole.parse().map_err(|_| Error::Price)?;
-        let mut frac: i64 = if fraction.is_empty() {
-            0
-        } else {
-            fraction.parse().map_err(|_| Error::Price)?
-        };
-        for _ in fraction.len()..4 {
-            frac *= 10;
-        }
-        let raw = whole
-            .checked_mul(10_000)
-            .and_then(|w| w.checked_add(frac))
-            .ok_or(Error::Price)?;
+        let raw = i64::try_from(field::parse_decimal(digits, 4).map_err(|_| Error::Price)?)
+            .map_err(|_| Error::Price)?;
         Ok(Self(if negative { -raw } else { raw }))
     }
 }
@@ -4197,6 +4178,18 @@ mod tests {
         assert_eq!(Text::<4>::from_bytes(*b"A\x01\0\0"), Err(Error::Field));
         assert!(Text::<4>::default().is_empty());
         assert_eq!(text::<4>("AB").as_str(), "AB");
+    }
+
+    #[test]
+    fn price_magnitude_bound() {
+        assert_eq!("922337203685477.5807".parse::<Price>(), Ok(Price(i64::MAX)));
+        assert_eq!("-922337203685477.5807".parse::<Price>(), Ok(Price(-i64::MAX)));
+        assert_eq!(Price(i64::MIN).to_string(), "-922337203685477.5808");
+        assert_eq!("-0".parse::<Price>(), Ok(Price(0)));
+        for bad in ["922337203685477.5808", "-922337203685477.5808",
+            "-9223372036854775808", "+1", "-+1"] {
+            assert_eq!(bad.parse::<Price>(), Err(Error::Price), "{bad}");
+        }
     }
 
     #[test]
