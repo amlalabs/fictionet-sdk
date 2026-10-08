@@ -620,3 +620,29 @@ fn mapped_socket_attachments_keep_their_mtu_and_skip_detached_ones() {
     // Only the barrier and the sandbox the world took were wrapped.
     assert_eq!(wrapped_rx.try_iter().collect::<Vec<_>>(), [1500, 1400]);
 }
+
+#[test]
+fn a_listened_hub_is_refused_by_a_lab_before_handing_out_an_attachment() {
+    let path = socket_path("lab");
+    let (attacher, mut attachments) = attachments();
+    let sandbox = attacher.attach("agent").unwrap();
+    let listening = listen(WorldSocket::UnixSocket(path.into()), attacher).unwrap();
+    let error = block_on(fictionet::lab(
+        fictionet::Seed::from_u64(0),
+        move |fcx| async move {
+            assert!(matches!(
+                attachments.next(&fcx).await,
+                Err(fictionet::Cancelled)
+            ));
+            assert!(fcx.is_cancelled());
+            Ok(())
+        },
+    ))
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "attachments fed by a real listener cannot be used in a lab"
+    );
+    drop(listening);
+    drop(sandbox);
+}

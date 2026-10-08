@@ -1,5 +1,6 @@
-//! The wall-clock timers behind `Cx::sleep` under `run`: one helper thread
-//! per process that waits for the earliest deadline and wakes its waker.
+//! The host wake driver for real runs: one helper thread
+//! per process that waits for each run's earliest logical deadline.
+//! Logical registrations and ordering belong to the run's clock.
 //!
 //! A browser has no threads to spare. There a JavaScript `setTimeout` is
 //! armed for the earliest deadline instead, and [`block_on`](crate::block_on)
@@ -104,18 +105,6 @@ impl Timers {
         if earliest.is_none_or(|e| deadline < e) {
             self.earlier(deadline);
         }
-    }
-
-    /// Replaces the waker of timer `id`, if it has not fired yet.
-    pub(crate) fn update(&self, id: u64, waker: &Waker) {
-        let mut state = self.state.lock().unwrap();
-        let old = match state.entries.get_mut(&id) {
-            Some((_, w)) if !w.will_wake(waker) => Some(std::mem::replace(w, waker.clone())),
-            _ => None,
-        };
-        drop(state);
-        // Dropped outside the lock: dropping a waker can run any code.
-        drop(old);
     }
 
     pub(crate) fn remove(&self, id: u64) {

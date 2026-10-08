@@ -1739,8 +1739,11 @@ async fn the_proxy_answers_502_when_the_real_site_cannot_be_reached() {
         Duration::from_secs(30),
         run(fictionet::Seed::random(), |fcx| async move {
             let (attacher, attachments) = fictionet::attachments();
-            web::Sites::new(|h| (h == "nowhere.invalid").then(|| web::Site::new(web::proxy())))
-                .serve(&fcx, attachments)?;
+            let upstream = web::proxy(&fcx)?;
+            web::Sites::new(move |h| {
+                (h == "nowhere.invalid").then(|| web::Site::new(upstream.clone()))
+            })
+            .serve(&fcx, attachments)?;
             let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
             let addr = lookup(&fcx, &m, "nowhere.invalid").await;
             let conn = m

@@ -81,6 +81,12 @@
 //! or a callback set halfway through a run first gets what the log kept,
 //! then the rest as it is recorded.
 //!
+//! Real runs write files on a helper thread with a bounded queue. Lab runs
+//! write and flush sinks synchronously on the run's thread, in event order,
+//! without queue overflow or writer scheduling affecting the log. A lab's
+//! `run.start.wall` is null; real runs record their wall date. Attach a sink
+//! before recording begins to retain events beyond the in-memory log's limits.
+//!
 //! # What it costs
 //!
 //! Recording takes the event the caller built, looks up the task that
@@ -654,6 +660,7 @@ const FILE_QUEUE_BYTES: usize = MAX_EVENT_BYTES;
 
 /// What a run's log holds.
 pub(crate) struct Store {
+    mode: crate::RunMode,
     state: Mutex<State>,
     /// Lines file sinks could not keep up with, or could not write.
     lost: Arc<AtomicU64>,
@@ -805,8 +812,9 @@ impl State {
 }
 
 impl Store {
-    pub(crate) fn new() -> Arc<Store> {
+    pub(crate) fn new(mode: crate::RunMode) -> Arc<Store> {
         Arc::new(Store {
+            mode,
             state: Mutex::new(State {
                 events: Part::new(MAX_EVENTS, MAX_EVENT_BYTES),
                 repeats: Part::new(MAX_REPEATS, MAX_REPEAT_BYTES),
@@ -1055,17 +1063,20 @@ impl EventLog {
     }
 
     /// Writes every event to `path` as JSON Lines ([`Event::to_json`]),
-    /// from a thread of its own: what the log holds now, then each event as
-    /// it is recorded. The file is created, or emptied.
+    /// with the same delivery policy as [`EventLog::to_writer`]: what the
+    /// log holds now, then each event as it is recorded. The file is created,
+    /// or emptied.
     pub fn to_file(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
         let file = std::fs::File::create(path)?;
         self.to_writer(Box::new(std::io::BufWriter::new(file)));
         Ok(())
     }
 
-    /// Writes every event to `out` as JSON Lines, from a thread of its own
+    /// Writes every event to `out` as JSON Lines. A real run uses a thread
     /// that flushes whenever it has caught up. The run's end waits for the
-    /// thread to write and flush every line.
+    /// thread to write and flush every line. In a lab, each line is written
+    /// and flushed synchronously on the recording task's thread, without a
+    /// queue or writer thread. Successful sinks lose no lines in a lab.
     ///
     /// A line is lost, and counted ([`EventLog::lost`]), when it does not
     /// fit in the thread's queue (100,000 lines or 16 MiB), or when `out`
@@ -1075,6 +1086,26 @@ impl EventLog {
     /// written since the last flush that worked, as lost. A grader throws
     /// away a sample with any line lost.
     pub fn to_writer(&self, out: Box<dyn Write + Send>) {
+        if self.store.mode == crate::RunMode::Lab {
+            let writer = Mutex::new(Some(out));
+            let lost = self.store.lost.clone();
+            self.subscribe(move |event| {
+                let mut writer = lock(&writer);
+                let failed = match writer.as_mut() {
+                    Some(out) => event.to_json().to_bytes().ok().is_none_or(|mut line| {
+                        line.push(b'\n');
+                        out.write_all(&line).and_then(|()| out.flush()).is_err()
+                    }),
+                    None => true,
+                };
+                if failed {
+                    *writer = None;
+                    lost.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+            return;
+        }
+
         let (tx, rx) = sync_channel::<Vec<u8>>(FILE_QUEUE);
         let queued = Arc::new(AtomicUsize::new(0));
         let lost = self.store.lost.clone();
@@ -1118,7 +1149,7 @@ impl EventLog {
     /// dated at the start of the run (`at` 0), and its `wall` field is the
     /// wall-clock time then, in seconds since the Unix epoch, as the run
     /// noted it when it began (`null` where there is no wall clock, as in a
-    /// browser), so a reader can put every event's `at` on a calendar.
+    /// browser or a lab), so a reader can put every event's `at` on a calendar.
     /// The `seed` field is the run's 32-byte seed as 64 lowercase hexadecimal
     /// digits. The `rng` field is `chacha20-v1`, identifying the algorithm and
     /// contiguous-byte consumption convention. `fields` add the world's own
@@ -1126,7 +1157,7 @@ impl EventLog {
     /// them from it, never from the host's clock.
     /// [`Net`](crate::stdlib::net::Net) records it when it starts serving.
     pub fn start(&self, fcx: &Cx, fields: Fields) {
-        let wall = if cfg!(target_arch = "wasm32") {
+        let wall = if cfg!(target_arch = "wasm32") || fcx.mode() == crate::RunMode::Lab {
             Value::Null
         } else {
             fcx.graph()
@@ -1246,7 +1277,7 @@ mod tests {
     /// one `events.dropped` event counting what it missed.
     #[test]
     fn the_oldest_events_go_first_and_readers_are_told() {
-        let store = Store::new();
+        let store = Store::new(crate::RunMode::Real);
         let total = MAX_EVENTS as u64 + 10;
         numbered(&store, total);
         let log = EventLog::new(store.clone());
@@ -1274,7 +1305,7 @@ mod tests {
 
     #[test]
     fn the_byte_limit_holds() {
-        let store = Store::new();
+        let store = Store::new(crate::RunMode::Real);
         let big = "x".repeat(1 << 20);
         for _ in 0..40 {
             store.push(Event::new("test", "big").summary(big.clone()));
@@ -1287,7 +1318,7 @@ mod tests {
     /// A subscriber set late gets what the log holds, then what follows.
     #[test]
     fn subscribers_replay_then_follow() {
-        let store = Store::new();
+        let store = Store::new(crate::RunMode::Real);
         numbered(&store, 3);
         let log = EventLog::new(store.clone());
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -1324,7 +1355,7 @@ mod tests {
     /// has passed.
     #[test]
     fn repeats_are_counted_once_a_window() {
-        let store = Store::new();
+        let store = Store::new(crate::RunMode::Real);
         let log = EventLog::new(store.clone());
         for port in 1..=1000 {
             refused(&store, u64::from(port / 10), "192.0.2.1", port);
@@ -1394,7 +1425,7 @@ mod tests {
     /// where repeats are gone.
     #[test]
     fn a_flood_of_repeats_never_pushes_out_other_events() {
-        let store = Store::new();
+        let store = Store::new(crate::RunMode::Real);
         let log = EventLog::new(store.clone());
         for i in 0..10u32 {
             store.push(Event::new("http", "request").field("i", i));

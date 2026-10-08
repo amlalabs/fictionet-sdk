@@ -533,7 +533,8 @@ static REAPER: Mutex<(Vec<std::sync::Weak<Graph>>, bool)> = Mutex::new((Vec::new
 /// Makes sure `graph`'s watches are forgotten once idle for a minute, even
 /// if no observer asks anything more. Called when the last subscriber of a
 /// watch leaves.
-pub(crate) fn reap_later(graph: &Arc<Graph>) {
+pub(crate) fn reap_later(graph: &Arc<Graph>) -> std::io::Result<()> {
+    graph.environment.require_real_io()?;
     let mut reaper = lock(&REAPER);
     if !reaper
         .0
@@ -542,10 +543,10 @@ pub(crate) fn reap_later(graph: &Arc<Graph>) {
     {
         reaper.0.push(Arc::downgrade(graph));
     }
-    if reaper.1 {
-        return;
+    if !reaper.1 {
+        reaper.1 = start_reaper();
     }
-    reaper.1 = start_reaper();
+    Ok(())
 }
 
 /// Starts the thread that reaps the worlds in [`REAPER`]. Returns whether
@@ -634,12 +635,36 @@ impl std::fmt::Debug for LinkHandle {
 mod tests {
     use super::*;
 
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn lab_refuses_the_observer_reaper() {
+        crate::block_on(crate::lab(
+            crate::Seed::from_u64(0),
+            move |fcx| async move {
+                assert!(
+                    reap_later(fcx.graph())
+                        .unwrap_err()
+                        .to_string()
+                        .contains("lab")
+                );
+                assert!(
+                    !lock(&REAPER)
+                        .0
+                        .iter()
+                        .any(|g| std::ptr::eq(g.as_ptr(), Arc::as_ptr(fcx.graph())))
+                );
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
+
     /// A link is copied only while a `packets` stream subscribes, and a
     /// kept watch does not keep its world alive.
     #[test]
     fn watches_copy_only_while_subscribed() {
         use crate::watch::Meter;
-        let graph = Graph::new(crate::Seed::random());
+        let graph = Graph::new(crate::Seed::random(), crate::RunMode::Real);
         let meter = Meter::new();
         graph.owns(&meter, 0, 1);
         graph.task_started(1, "world".into(), std::panic::Location::caller(), None);
@@ -669,7 +694,7 @@ mod tests {
     #[test]
     fn a_world_registry_reaches_watch_json_without_a_socket() {
         use crate::watch::Meter;
-        let graph = Graph::new(crate::Seed::random());
+        let graph = Graph::new(crate::Seed::random(), crate::RunMode::Real);
         let watched = graph.clone();
         crate::block_on(crate::run::run_with(graph, move |fcx| async move {
             let mut registry = Registry::new();
@@ -718,7 +743,7 @@ mod tests {
     #[test]
     fn idle_watches_are_forgotten_without_more_requests() {
         use crate::watch::Meter;
-        let graph = Graph::new(crate::Seed::random());
+        let graph = Graph::new(crate::Seed::random(), crate::RunMode::Real);
         let meter = Meter::new();
         graph.owns(&meter, 0, 1);
         drop(watch(&graph, meter.id).unwrap());

@@ -1,6 +1,6 @@
 # The web test: a world written with web::Sites, attach next to the
 # sandbox, the sandbox with curl and dig, and a real upstream site for
-# web::proxy(). Run it with ./run.sh, which also checks the results and
+# web::proxy(&fcx). Run it with ./run.sh, which also checks the results and
 # cleans up.
 name: fictionet-web
 

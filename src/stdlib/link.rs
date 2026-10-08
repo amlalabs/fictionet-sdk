@@ -354,26 +354,60 @@ mod tests {
 
     #[test]
     fn a_delay_drops_what_does_not_fit() {
-        block_on(run(fictionet::Seed::random(), |fcx| async move {
-            let (mut sandbox, inner) = pair();
-            let mut far = delay(&fcx, Duration::from_secs(1), inner);
-            flood(&fcx, &mut sandbox, FIT + 500).await?;
-            assert_eq!(
-                drain(&fcx, &mut far).await,
-                0,
-                "nothing leaves before the delay"
-            );
-            fcx.sleep(Duration::from_millis(1200)).await?;
-            assert_eq!(
-                drain(&fcx, &mut far).await,
-                FIT,
-                "the delay kept 32 MiB and dropped the rest"
-            );
-            // Room again, once the queue has emptied.
-            sandbox.send(Packet(vec![1; 100]));
-            assert_eq!(far.recv(&fcx).await?, Packet(vec![1; 100]));
-            Ok(())
-        }))
+        block_on(fictionet::lab(
+            fictionet::Seed::from_u64(0),
+            |fcx| async move {
+                let (mut sandbox, inner) = pair();
+                let mut far = delay(&fcx, Duration::from_secs(1), inner);
+                flood(&fcx, &mut sandbox, FIT + 500).await?;
+                assert_eq!(
+                    drain(&fcx, &mut far).await,
+                    0,
+                    "nothing leaves before the delay"
+                );
+                for _ in 0..FIT {
+                    assert_eq!(far.recv(&fcx).await?, Packet(vec![0x45; 1500]));
+                }
+                assert_eq!(fcx.now().since_start(), Duration::from_secs(1));
+                assert_eq!(
+                    drain(&fcx, &mut far).await,
+                    0,
+                    "the delay kept exactly 32 MiB and dropped the rest"
+                );
+                // Room again, once the queue has emptied.
+                sandbox.send(Packet(vec![1; 100]));
+                assert_eq!(far.recv(&fcx).await?, Packet(vec![1; 100]));
+                assert_eq!(fcx.now().since_start(), Duration::from_secs(2));
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn a_ten_packet_queue_drops_the_eleventh_packet_of_a_burst() {
+        block_on(fictionet::lab(
+            fictionet::Seed::from_u64(0),
+            |fcx| async move {
+                let (mut sandbox, inner) = pair();
+                let mut far = bottleneck(&fcx, 1_000_000, 10, inner);
+                for byte in 0..11 {
+                    sandbox.send(Packet(vec![byte; 1250]));
+                }
+                for byte in 0..10 {
+                    assert_eq!(far.recv(&fcx).await?, Packet(vec![byte; 1250]));
+                    assert_eq!(
+                        fcx.now().since_start(),
+                        Duration::from_millis(10 * (u64::from(byte) + 1))
+                    );
+                }
+                assert_eq!(drain(&fcx, &mut far).await, 0);
+                let drops = fcx.events().of("bottleneck", "drop");
+                assert_eq!(drops.len(), 1);
+                assert_eq!(drops[0].u64("count"), Some(1));
+                Ok(())
+            },
+        ))
         .unwrap();
     }
 

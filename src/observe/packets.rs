@@ -85,7 +85,7 @@ impl Drop for Subscription {
             inner.released = Instant::now();
             drop(inner);
             if let Some(graph) = self.0.graph.upgrade() {
-                super::reap_later(&graph);
+                let _ = super::reap_later(&graph);
             }
         }
     }
@@ -140,8 +140,9 @@ impl LinkWatch {
         let mut inner = lock(&self.inner);
         if self.subscribers.fetch_add(1, Ordering::SeqCst) == 0
             && let Some(meter) = self.meter.upgrade()
+            && let Some(graph) = self.graph.upgrade()
         {
-            inner.guard = Some(meter.watch());
+            inner.guard = Some(meter.watch(&graph.environment));
             inner.after = 0;
         }
         Subscription(self.clone())
@@ -209,7 +210,7 @@ impl LinkWatch {
                 inner.after = copy.seq;
                 let seq = inner.next_row;
                 inner.next_row += 1;
-                let at = copy.at.saturating_duration_since(graph.start);
+                let at = copy.at.since_start();
                 let micros = (graph.start_wall + at)
                     .duration_since(UNIX_EPOCH)
                     .map_or(0, |d| d.as_micros() as u64);

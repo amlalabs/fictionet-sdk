@@ -38,10 +38,11 @@ fn world(
         .route("/big", get(|| async { vec![b'x'; 16 << 20] }))
         .route("/upload", post(upload).layer(DefaultBodyLimit::disable()));
     let sites = web_world::sites(fcx, chain, key, app, plain)?;
+    let upstream = web::proxy(fcx)?;
     web::Sites::new(move |host: &str| {
         if host == "upstream" {
             println!("lookup {host}");
-            Some(web::Site::new(web::proxy()))
+            Some(web::Site::new(upstream.clone()))
         } else {
             sites(host)
         }

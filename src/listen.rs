@@ -93,6 +93,11 @@ impl std::error::Error for ParseWorldSocketError {}
 /// sandboxes can attach. Sandboxes already attached stay attached, and the
 /// helper thread keeps running until the last of them detaches.
 ///
+/// The attachment hub is marked as fed by a real listener. Using its
+/// [`Attachments`](crate::Attachments) in a [`lab`](crate::lab), through
+/// `get`, `next`, or `map`, fails that region before handing out an
+/// attachment. The marker remains after the listener is dropped.
+///
 /// # How packets move
 ///
 /// The helper thread does not carry packets. An [`Attachment`](crate::Attachment)
@@ -140,6 +145,7 @@ impl std::error::Error for ParseWorldSocketError {}
 /// # }
 /// ```
 pub fn listen(socket: WorldSocket, attacher: Attacher) -> std::io::Result<Listening> {
+    attacher.mark_listener()?;
     let WorldSocket::UnixSocket(path) = socket;
     let listener = bind(&path)?;
     // SAFETY: plain syscalls; each fd is owned from here.

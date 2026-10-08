@@ -408,3 +408,12 @@ fn copied_entropy(fcx: &fictionet::Cx) {
         .bytes(&source, &plan, b"copied", &mut Vec::new())
         .unwrap();
 }
+
+// Copied network drivers and proxy builders use only public run capabilities.
+fn copied_clock(fcx: &fictionet::Cx, cx: &mut std::task::Context<'_>) {
+    let mut timer = fictionet::Timer::new(fcx);
+    let _ = timer.poll_until(cx, fcx.now());
+    timer.clear();
+    let _ = fcx.mode();
+    let _ = fcx.require_real_io();
+}

@@ -449,7 +449,7 @@ fn world(graph: Option<&Graph>) -> String {
             o.bool("running", !ended)
                 .bool("ended", ended)
                 .num("started", started)
-                .secs("t", g.start.elapsed())
+                .secs("t", g.since_start())
                 .done()
         }
     }

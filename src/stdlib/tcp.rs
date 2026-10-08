@@ -1153,7 +1153,7 @@ impl Shared {
 
 /// The endpoint's one task: packets in, smoltcp, packets out, timers.
 async fn drive(fcx: &Cx, shared: &Shared, mut inner: impl Interface) {
-    let mut timer = fictionet::Timer::default();
+    let mut timer = fictionet::Timer::new(fcx);
     let mut batch: Vec<Vec<u8>> = Vec::with_capacity(64);
     let mut out: Vec<Vec<u8>> = Vec::new();
     poll_fn(|cx| {
@@ -1237,7 +1237,7 @@ async fn drive(fcx: &Cx, shared: &Shared, mut inner: impl Interface) {
         match deadline {
             None => timer.clear(),
             Some(d) => {
-                if timer.poll_until(fcx, cx, d).is_ready() {
+                if timer.poll_until(cx, d).is_ready() {
                     // A timer is due, or the region was cancelled. Come back
                     // next turn, so a timer that keeps asking to run now
                     // cannot hold the thread.

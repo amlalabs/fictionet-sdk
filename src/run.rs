@@ -102,17 +102,41 @@ where
     F: FnOnce(Cx) -> Fut + Send,
     Fut: Future<Output = Result> + Send + 'static,
 {
-    run_with(Graph::new(seed), world).await
+    run_with(Graph::new(seed, crate::RunMode::Real), world).await
 }
 
-/// [`run`], recording what happens in `graph`.
+/// Runs a closed world with virtual time, starting at zero.
+///
+/// Tasks use the same executor and seeded randomness as [`run`]. Once all
+/// runnable tasks have drained, the clock advances to the earliest live
+/// deadline and wakes equal deadlines in registration order. Real listeners,
+/// observer sessions and upstream proxies are unavailable. A world with live
+/// tasks but no runnable work or finite deadline returns a deadlock error.
+/// Infinite waits remain unarmed; virtual time cannot exceed signed
+/// microseconds. Foreign I/O and independently scheduled inputs are outside
+/// this closed-world contract. TLS key exchange draws OS randomness inside
+/// ring, and h2 expires reset streams using the host clock, so these behaviors
+/// are outside the repeatability guarantee.
+///
+/// An attachment hub fed by [`listen`](crate::listen) cannot be used in a
+/// lab. Its first `get`, `next`, or `map` fails the region with an error
+/// naming the real listener, before handing out any attachment. `get` and
+/// `next` return [`Cancelled`](crate::Cancelled) in that case.
+pub async fn lab<F, Fut>(seed: crate::Seed, world: F) -> Result
+where
+    F: FnOnce(Cx) -> Fut + Send,
+    Fut: Future<Output = Result> + Send + 'static,
+{
+    run_with(Graph::new(seed, crate::RunMode::Lab), world).await
+}
+
+/// Runs the world using the environment and recording in `graph`.
 pub(crate) async fn run_with<F, Fut>(graph: Arc<Graph>, world: F) -> Result
 where
     F: FnOnce(Cx) -> Fut + Send,
     Fut: Future<Output = Result> + Send + 'static,
 {
     let shared = Arc::new(RunShared {
-        start: graph.start,
         environment: graph.environment.clone(),
         queue: Mutex::new(Queue {
             next_id: 1,
@@ -142,8 +166,6 @@ type BoxFuture = Pin<Box<dyn Future<Output = Result> + Send>>;
 /// The part of a run that wakers and every [`Cx`] share.
 pub(crate) struct RunShared {
     pub(crate) environment: Arc<crate::entropy::RunEnvironment>,
-    /// The moment the run started: [`Instant::ZERO`](crate::time::Instant::ZERO).
-    pub(crate) start: crate::sys::Instant,
     queue: Mutex<Queue>,
     /// What the run records for observers.
     pub(crate) graph: Arc<Graph>,
@@ -417,8 +439,22 @@ impl RunState {
             });
         }
         let more = !q.ready.is_empty() || !q.incoming.is_empty() || q.wake_all;
-        drop(q);
-        if more {
+        if !more && self.shared.environment.clock.mode() == crate::RunMode::Lab {
+            // Admission and the time jump share this boundary. A spawn or
+            // wake cannot slip between checking the queue and advancing.
+            let due = match self.shared.environment.clock.advance() {
+                Ok(due) => due,
+                Err(error) => return Poll::Ready(Err(error)),
+            };
+            drop(q);
+            // Wakers may enqueue work or run arbitrary code: release both
+            // queue and clock locks before invoking any of them.
+            for waker in due {
+                waker.wake();
+            }
+            cx.waker().wake_by_ref();
+        } else if more {
+            drop(q);
             // Give the executor its turn too, then come back.
             cx.waker().wake_by_ref();
         }

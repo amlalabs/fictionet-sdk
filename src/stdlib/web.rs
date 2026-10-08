@@ -34,6 +34,8 @@
 //!     // Yours: an Arc<ServerConfig> per certificate, each issued by the world's CA.
 //!     let certs = my_certs(&args)?;
 //!
+//! #   #[cfg(feature = "tokio")]
+//!     let upstream = web::proxy(&fcx)?;
 //!     web::Sites::new(move |host: &str| match host {
 //!         "en.wikipedia.org" | "www.wikipedia.org" => Some(
 //!             web::Site::new(wiki.clone())
@@ -50,7 +52,7 @@
 //!         ),
 //! #       #[cfg(feature = "tokio")]
 //!         h if h == "github.com" || h.ends_with(".github.com") => Some(
-//!             web::Site::new(web::proxy()) // the real site, over the world's own network
+//!             web::Site::new(upstream.clone()) // the real site, over the world's own network
 //!                 .tls({ let c = certs.github.clone(); move |_| c.clone() }), // github.com and *.github.com
 //!         ),
 //!         _ => None, // NXDOMAIN: the world stays closed
@@ -115,7 +117,7 @@
 //! [`Site::new`] takes any [`tower_service::Service`] that takes an
 //! `http::Request<web::Body>` and returns an `http::Response`. An
 //! `axum::Router` is one. So is a plain async function wrapped in
-//! `tower::service_fn`. So is `web::proxy()` (feature `tokio`, on by
+//! `tower::service_fn`. So is `web::proxy(&fcx)?` (feature `tokio`, on by
 //! default), which forwards to the real site. [`Site::handler`] takes an
 //! [`httpd::Handler`] instead, such as an
 //! [`httpd::Router`], whose handlers get plain
@@ -124,7 +126,7 @@
 //!
 //! # Passing a site through to the real one
 //!
-//! A site whose handler is `web::proxy()`, such as `github.com` above, shows
+//! A site whose handler is `web::proxy(&fcx)?`, such as `github.com` above, shows
 //! the agent the real site's pages. Each request then travels over two
 //! separate connections:
 //!
@@ -471,7 +473,7 @@
 //!   connection after its request (as `nc -N` and many HTTP/1.0 scripts
 //!   do) still gets the response.
 //! - **Handler errors.** A handler that returns an error gets the client a
-//!   `500 Internal Server Error`. `proxy()` errors, where the real site
+//!   `500 Internal Server Error`. `proxy(&fcx)` errors, where the real site
 //!   could not be reached, give `502 Bad Gateway`.
 //! - **DHCP.** Leases last an hour, with renewal after 30 minutes. The
 //!   answer carries the subnet mask, and the gateway as router and DNS
@@ -854,7 +856,7 @@ impl Site {
 /// [`Site::tls`], and the real certificate stays between the world and the
 /// real site.
 ///
-/// Only names the callback hands to `proxy()` are forwarded, so the world
+/// Only names the callback hands to `proxy(&fcx)` are forwarded, so the world
 /// stays closed unless it opens a name on purpose. To change some responses
 /// and pass the rest through, wrap it in tower or axum middleware.
 ///
@@ -865,12 +867,14 @@ impl Site {
 /// real site as a plain `GET`. A world that wants WebSockets serves them
 /// itself, with a handler on the site (see [`httpd`'s upgrades](fictionet::stdlib::httpd)).
 /// If the real site cannot be reached, the agent gets `502 Bad Gateway`.
+/// Returns an error in a lab before constructing a client.
 #[cfg(feature = "tokio")]
 #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
-pub fn proxy() -> Proxy {
-    Proxy {
+pub fn proxy(fcx: &Cx) -> Result<Proxy, Error> {
+    fcx.require_real_io()?;
+    Ok(Proxy {
         client: Arc::new(proxy_client()),
-    }
+    })
 }
 
 /// The handler made by [`proxy`].
@@ -964,7 +968,7 @@ async fn forward(
         .cloned()
         .ok_or_else(|| {
             fictionet::Error::msg(
-                "web::proxy() serves only requests that web::Sites routed: there is no web::Target",
+                "web::proxy(&fcx) serves only requests that web::Sites routed: there is no web::Target",
             )
         })?;
     let (mut parts, body) = request.into_parts();

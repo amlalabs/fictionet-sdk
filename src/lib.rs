@@ -258,7 +258,7 @@
 //!
 //! | Feature | What it adds | Dependencies it adds |
 //! |---|---|---|
-//! | `tokio` (default) | `web::proxy()`, which passes requests through to the real site | `hyper-util`, `hyper-rustls` with `webpki-roots`, and hyper's client |
+//! | `tokio` (default) | `web::proxy(&fcx)`, which passes requests through to the real site | `hyper-util`, `hyper-rustls` with `webpki-roots`, and hyper's client |
 //!
 //! The `tokio` runtime crate itself is always a dependency, because hyper
 //! and h2 run on it, and so are `rustls` (with the `ring` provider), `hyper`
@@ -344,11 +344,13 @@ pub mod prelude {
 pub use attach::{AttachError, Attacher, Attachment, Attachments, attachments};
 pub use block_on::block_on;
 pub use cable::{End, PACKET_COST, pair, pair_with_limit};
+pub use clock::RunMode;
 pub use cx::{CancelWait, Cancelled, Cx, JoinError, RaceError, Task, Timer};
 pub use error::{Error, ErrorChain};
 #[cfg(not(target_arch = "wasm32"))]
 pub use listen::{Listening, ParseWorldSocketError, WorldSocket, listen};
-pub use run::run;
+pub use run::{lab, run};
+mod clock;
 pub use sys::random_bytes;
 
 use std::future::Future;

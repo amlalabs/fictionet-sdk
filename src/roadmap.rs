@@ -262,14 +262,14 @@
 //!
 //! # The lab
 //!
-//! The lab will be a second way to run a world, next to
-//! [`run`](crate::run): `fictionet::lab(seed, |fcx| world(..))`. The world
+//! The lab is a second way to run a world, next to
+//! [`run`](crate::run): [`fictionet::lab(seed, world)`](crate::lab). The world
 //! code stays the same. Only what stands behind [`Cx`](crate::Cx) changes.
-//! Its design is still open, but these are its goals:
+//! It shares the executor with real runs:
 //!
 //! - **Time is a number.** When every task is waiting, time jumps to the
 //!   earliest deadline. A test of a minute of traffic then takes
-//!   microseconds and gives the same answer every time.
+//!   little real time and gives the same answer for the same inputs.
 //! - **Randomness comes from the seed.**
 //! - **A lab run is closed.** The test plays the sandboxes, through
 //!   [`attachments`](crate::attachments), and fakes play other services.
@@ -281,7 +281,7 @@
 //!   sandboxes is scheduled with the world. Otherwise time could jump past
 //!   a timeout before the test had its turn.
 //!
-//! The stdlib's own tests need the lab. "A 1 Mbit/s link with a 10-packet
+//! The stdlib's shaping tests use the lab. "A 1 Mbit/s link with a 10-packet
 //! queue drops the 11th packet of a burst" is exact in the lab, and flaky
 //! in real time.
 //!
@@ -292,7 +292,10 @@
 //! delayed, dropped or answered, in the same order, at the same lab
 //! instants, and every `fcx.random_*` call will return the same number.
 //!
-//! It will not promise the same bytes. Anything that draws randomness from
-//! the operating system instead of `fcx` differs from run to run. The main
-//! case is TLS key exchange: see
+//! TLS key exchange draws randomness from the operating system inside
+//! ring, so TLS bytes differ from run to run. See
 //! [`tls::config_builder`](crate::stdlib::tls::config_builder).
+//!
+//! Hyper's HTTP/2 server also retains reset streams using h2's host clock.
+//! That dependency has no clock injection API, so reset-expiry behavior
+//! remains outside the lab's repeatability guarantee.

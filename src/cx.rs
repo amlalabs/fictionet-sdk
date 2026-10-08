@@ -10,7 +10,6 @@ use std::task::{Context, Poll, Waker};
 use crate::events::{Event, EventLog};
 use crate::run::RunShared;
 use crate::time::{Duration, Instant};
-use crate::timer::timers;
 use crate::watch::Group;
 
 /// The context that world code runs in.
@@ -112,9 +111,20 @@ impl Cx {
     /// The current time on the run's clock: how long ago the run started.
     ///
     /// Under [`run`](crate::run) this is real time, read from the system's
-    /// monotonic clock.
+    /// monotonic clock. Under [`lab`](crate::lab), it starts at zero and
+    /// advances only when the executor has no runnable work.
     pub fn now(&self) -> Instant {
-        Instant::from_since_start(self.run.start.elapsed())
+        self.run.environment.clock.now()
+    }
+
+    /// Returns the run's clock and real-I/O policy.
+    pub fn mode(&self) -> crate::RunMode {
+        self.run.environment.clock.mode()
+    }
+
+    /// Returns an error if this run is a lab and cannot use host I/O.
+    pub fn require_real_io(&self) -> std::io::Result<()> {
+        self.run.environment.require_real_io()
     }
 
     /// Waits until the run's clock reaches `deadline`.
@@ -126,7 +136,12 @@ impl Cx {
     pub async fn sleep_until(&self, deadline: Instant) -> Result<(), Cancelled> {
         // A deadline past what the clock can hold never comes: the sleep
         // waits until it is cancelled.
-        let deadline = self.run.start.checked_add(deadline.since_start());
+        let deadline = self
+            .run
+            .environment
+            .clock
+            .finite(deadline)
+            .then_some(deadline);
         Sleep {
             fcx: self,
             deadline,
@@ -944,7 +959,7 @@ impl Region {
 struct Sleep<'a> {
     fcx: &'a Cx,
     /// `None` is a deadline too far away to represent: it never comes.
-    deadline: Option<crate::sys::Instant>,
+    deadline: Option<Instant>,
     timer: Option<u64>,
     wait: CancelWait,
 }
@@ -958,12 +973,20 @@ impl Future for Sleep<'_> {
             return Poll::Ready(Err(Cancelled));
         }
         if let Some(deadline) = this.deadline {
-            if crate::sys::Instant::now() >= deadline {
+            if this.fcx.now() >= deadline {
                 return Poll::Ready(Ok(()));
             }
             match this.timer {
-                None => this.timer = Some(timers().add(deadline, cx.waker().clone())),
-                Some(id) => timers().update(id, cx.waker()),
+                None => {
+                    this.timer = Some(
+                        this.fcx
+                            .run
+                            .environment
+                            .clock
+                            .add(deadline, cx.waker().clone()),
+                    )
+                }
+                Some(id) => this.fcx.run.environment.clock.update(id, cx.waker()),
             }
         }
         if this.fcx.register_cancel(cx.waker(), &mut this.wait) {
@@ -976,7 +999,7 @@ impl Future for Sleep<'_> {
 impl Drop for Sleep<'_> {
     fn drop(&mut self) {
         if let Some(id) = self.timer {
-            timers().remove(id);
+            self.fcx.run.environment.clock.remove(id);
         }
     }
 }
@@ -986,50 +1009,71 @@ impl Drop for Sleep<'_> {
 /// Moving the deadline reuses the same timer entry, where dropping one
 /// [`Cx::sleep_until`] future and making another would add and remove an
 /// entry, and allocate the boxed future, each time.
-/// Create an inactive timer with [`Default::default`]. Each call to
+/// Create an inactive timer with [`Timer::new`]. Each call to
 /// [`Timer::poll_until`] sets its deadline. [`Timer::clear`] removes the
 /// deadline; dropping the timer also unregisters its cancellation waiter.
 /// Use a timer with one region.
-#[derive(Default)]
 pub struct Timer {
-    /// The wall-clock deadline of the timer entry, if there is one.
-    deadline: Option<crate::sys::Instant>,
+    fcx: Cx,
+    /// The logical deadline of the timer entry, if there is one.
+    deadline: Option<Instant>,
     entry: Option<u64>,
     wait: CancelWait,
 }
 
 impl Timer {
+    /// Creates an inactive timer owned by this context's run and region.
+    pub fn new(fcx: &Cx) -> Self {
+        Self {
+            fcx: fcx.clone(),
+            deadline: None,
+            entry: None,
+            wait: CancelWait::default(),
+        }
+    }
+
     /// Polls for `deadline` to pass: `Ready(Ok(()))` once it has. Until
-    /// then, `cx`'s waker is woken when it passes or when `fcx`'s region is
+    /// then, `cx`'s waker is woken when it passes or when the owning region is
     /// cancelled. Cancellation returns `Ready(Err(Cancelled))`, even if
-    /// the deadline has passed. A deadline beyond the system clock's range
-    /// waits only for cancellation.
+    /// the deadline has passed. `Duration::MAX` is an unarmed wait. Real
+    /// deadlines beyond the host clock's range also wait only for cancellation.
     pub fn poll_until(
         &mut self,
-        fcx: &Cx,
         cx: &mut Context<'_>,
         deadline: Instant,
     ) -> Poll<Result<(), Cancelled>> {
-        if fcx.is_cancelled() {
+        if self.fcx.is_cancelled() {
             return Poll::Ready(Err(Cancelled));
         }
         // A deadline past what the clock can hold never comes.
-        match fcx.run.start.checked_add(deadline.since_start()) {
+        match self
+            .fcx
+            .run
+            .environment
+            .clock
+            .finite(deadline)
+            .then_some(deadline)
+        {
             Some(at) => {
-                if crate::sys::Instant::now() >= at {
+                if self.fcx.now() >= at {
                     self.clear();
                     return Poll::Ready(Ok(()));
                 }
                 match self.entry {
-                    Some(id) if self.deadline == Some(at) => timers().update(id, cx.waker()),
-                    Some(id) => timers().reset(id, at, cx.waker()),
-                    None => self.entry = Some(timers().add(at, cx.waker().clone())),
+                    Some(id) if self.deadline == Some(at) => {
+                        self.fcx.run.environment.clock.update(id, cx.waker())
+                    }
+                    Some(id) => self.fcx.run.environment.clock.reset(id, at, cx.waker()),
+                    None => {
+                        self.entry =
+                            Some(self.fcx.run.environment.clock.add(at, cx.waker().clone()))
+                    }
                 }
                 self.deadline = Some(at);
             }
             None => self.clear(),
         }
-        if fcx.register_cancel(cx.waker(), &mut self.wait) {
+        if self.fcx.register_cancel(cx.waker(), &mut self.wait) {
             return Poll::Ready(Err(Cancelled));
         }
         Poll::Pending
@@ -1039,7 +1083,7 @@ impl Timer {
     /// The cancellation registration stays until the timer is dropped.
     pub fn clear(&mut self) {
         if let Some(id) = self.entry.take() {
-            timers().remove(id);
+            self.fcx.run.environment.clock.remove(id);
         }
         self.deadline = None;
     }
@@ -1091,32 +1135,28 @@ mod tests {
             first: Duration,
             then: Duration,
         ) -> Result<std::time::Duration, Cancelled> {
-            let start = std::time::Instant::now();
+            let start = fcx.now();
             let base = fcx.now();
             let mut moved = false;
             std::future::poll_fn(|cx| {
                 if !moved {
                     moved = true;
-                    assert!(timer.poll_until(fcx, cx, base + first).is_pending());
+                    assert!(timer.poll_until(cx, base + first).is_pending());
                 }
-                timer.poll_until(fcx, cx, base + then)
+                timer.poll_until(cx, base + then)
             })
             .await?;
-            Ok(start.elapsed())
+            Ok(fcx.now().since_start() - start.since_start())
         }
-        block_on(run(fictionet::Seed::random(), |fcx| async move {
-            let mut timer = Timer::default();
+        block_on(crate::lab(fictionet::Seed::from_u64(0), |fcx| async move {
+            let mut timer = Timer::new(&fcx);
             // Moved later: the old deadline does not end the wait.
             let waited = wait(&fcx, &mut timer, ms(10), ms(120)).await?;
-            assert!(
-                waited >= std::time::Duration::from_millis(120),
-                "{waited:?}"
-            );
+            assert_eq!(waited, ms(120));
             // Moved earlier: it fires at the new deadline, after it fired once
             // already under the same entry.
             let waited = wait(&fcx, &mut timer, ms(400), ms(30)).await?;
-            assert!(waited >= std::time::Duration::from_millis(30), "{waited:?}");
-            assert!(waited < std::time::Duration::from_millis(400), "{waited:?}");
+            assert_eq!(waited, ms(30));
             Ok(())
         }))
         .unwrap();

@@ -210,6 +210,8 @@ struct Hub {
 
 #[derive(Default)]
 struct HubState {
+    /// A real listener feeds this hub, even if it has since closed.
+    real_listener: bool,
     /// Names that are taken.
     names: HashSet<String>,
     /// Attachments not yet handed out, in arrival order.
@@ -224,6 +226,22 @@ struct HubState {
     /// What the run that takes these attachments tracks, so that an
     /// observer that connects to the world socket finds it.
     graph: Weak<Graph>,
+}
+
+impl HubState {
+    /// Checks the listener boundary before exposing this hub to a run.
+    fn bind(&mut self, fcx: &Cx) -> bool {
+        if self.real_listener && fcx.mode() == crate::RunMode::Lab {
+            fcx.region.fail(crate::Error::msg(
+                "attachments fed by a real listener cannot be used in a lab",
+            ));
+            return false;
+        }
+        if !std::ptr::eq(self.graph.as_ptr(), Arc::as_ptr(fcx.graph())) {
+            self.graph = Arc::downgrade(fcx.graph());
+        }
+        true
+    }
 }
 
 /// Holds a name. Dropping it frees the name.
@@ -279,6 +297,17 @@ impl Attacher {
     /// has asked for one.
     pub(crate) fn graph(&self) -> Option<Arc<Graph>> {
         self.hub.state.lock().unwrap().graph.upgrade()
+    }
+
+    /// Marks the hub before a real listener can feed it.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn mark_listener(&self) -> std::io::Result<()> {
+        let mut state = self.hub.state.lock().unwrap();
+        if let Some(graph) = state.graph.upgrade() {
+            graph.environment.require_real_io()?;
+        }
+        state.real_listener = true;
+        Ok(())
     }
 
     /// Takes `name` until the guard is dropped.
@@ -364,6 +393,9 @@ impl std::error::Error for AttachError {}
 /// Each attachment is handed out once: either by [`get`](Attachments::get),
 /// which waits for a given name, or by [`next`](Attachments::next), which
 /// takes them in arrival order. Both take a `&Cx`, like every other wait.
+/// If a real [`listen`](crate::listen) socket feeds the hub, `get`, `next`,
+/// and `map` fail a lab region with an error before handing out an
+/// attachment. `get` and `next` return [`Cancelled`] in that case.
 /// A world that serves every sandbox the same way loops over `next`:
 ///
 /// ```
@@ -471,6 +503,12 @@ impl Attachments {
         I: Interface,
     {
         let hub = Arc::new(Hub::default());
+        {
+            let mut state = self.hub.state.lock().unwrap();
+            if !state.bind(fcx) {
+                return Attachments { hub };
+            }
+        }
         let out = Attacher { hub: hub.clone() };
         let wrap = Arc::new(Mutex::new(wrap));
         fcx.spawn(move |fcx| async move {
@@ -533,8 +571,8 @@ impl Attachments {
         let mut gone = VecDeque::new();
         {
             let mut state = self.hub.state.lock().unwrap();
-            if !std::ptr::eq(state.graph.as_ptr(), Arc::as_ptr(fcx.graph())) {
-                state.graph = Arc::downgrade(fcx.graph());
+            if !state.bind(fcx) {
+                return Poll::Ready(Err(Cancelled));
             }
             if state.pending.iter().any(Attachment::detached) {
                 let (dead, live) = std::mem::take(&mut state.pending)
@@ -580,5 +618,80 @@ impl Drop for Attachments {
         if let Some(w) = feeder {
             w.wake();
         }
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_lab_get_refuses_a_listener_hub_with_a_pending_attachment() {
+        let (attacher, mut attachments) = attachments();
+        let sandbox = attacher.attach("agent").unwrap();
+        attacher.mark_listener().unwrap();
+        let error = crate::block_on(crate::lab(
+            crate::Seed::from_u64(0),
+            move |fcx| async move {
+                assert!(matches!(
+                    attachments.get(&fcx, "agent").await,
+                    Err(Cancelled)
+                ));
+                assert!(fcx.is_cancelled());
+                assert!(attacher.graph().is_none());
+                assert_eq!(attacher.hub.state.lock().unwrap().pending.len(), 1);
+                Ok(())
+            },
+        ))
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "attachments fed by a real listener cannot be used in a lab"
+        );
+        drop(sandbox);
+    }
+
+    #[test]
+    fn a_lab_next_refuses_an_empty_listener_hub() {
+        let (attacher, mut attachments) = attachments();
+        attacher.mark_listener().unwrap();
+        let error = crate::block_on(crate::lab(
+            crate::Seed::from_u64(0),
+            move |fcx| async move {
+                assert!(matches!(attachments.next(&fcx).await, Err(Cancelled)));
+                assert_eq!(fcx.now(), crate::time::Instant::ZERO);
+                Ok(())
+            },
+        ))
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "attachments fed by a real listener cannot be used in a lab"
+        );
+    }
+
+    #[test]
+    fn a_lab_map_refuses_a_listener_hub_immediately() {
+        let (attacher, attachments) = attachments();
+        let sandbox = attacher.attach("agent").unwrap();
+        attacher.mark_listener().unwrap();
+        let error = crate::block_on(crate::lab(
+            crate::Seed::from_u64(0),
+            move |fcx| async move {
+                let mut mapped = attachments.map(&fcx, |_, _| -> End {
+                    panic!("a refused attachment must not be wrapped")
+                });
+                assert!(fcx.is_cancelled());
+                assert!(matches!(mapped.next(&fcx).await, Err(Cancelled)));
+                assert!(attacher.graph().is_none());
+                Ok(())
+            },
+        ))
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "attachments fed by a real listener cannot be used in a lab"
+        );
+        drop(sandbox);
     }
 }

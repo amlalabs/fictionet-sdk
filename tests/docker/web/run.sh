@@ -14,7 +14,7 @@
 #      rejected,
 #   5. an address with no site fails at once with "no route to host",
 #   6. a site keeps its state between requests,
-#   7. web::proxy() reaches a real site on the world's network,
+#   7. web::proxy(&fcx) reaches a real site on the world's network,
 #   8. an agent that pushes hard does not break things: 300 HTTP/2 streams
 #      at once, pings in fragments, 300 open connections (past 256 are
 #      reset at once, and idle ones closed after 10 seconds), 32 large downloads
@@ -129,7 +129,7 @@ done
 if [[ $slow == 0 ]]; then pass "10 downloads of 16 MiB, none stalled"; else fail "$slow of 10 downloads took over a second"; fi
 
 # 7. The proxy.
-check "web::proxy() reaches the real upstream" '^hello from the real upstream: GET /some/path\?q=1 HTTP/1.1 $' \
+check "web::proxy(&fcx) reaches the real upstream" '^hello from the real upstream: GET /some/path\?q=1 HTTP/1.1 $' \
     agent curl -sS 'http://upstream/some/path?q=1'
 
 # 8. Pushing hard.

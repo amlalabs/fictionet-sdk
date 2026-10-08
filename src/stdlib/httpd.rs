@@ -1946,8 +1946,12 @@ mod h2 {
         let mut builder = hyper::server::conn::http2::Builder::new(Executor { fcx: fcx.clone() });
         // hyper would take a `Date` header from the host's clock: the route
         // writes the world's.
+        // Hyper still refreshes its internal date cache using SystemTime,
+        // but auto_date_header(false) prevents that value reaching the wire.
         builder.auto_date_header(false);
         builder.max_concurrent_streams(opts.limits.streams);
+        // h2 retains reset streams using its own host clock. Its public API
+        // cannot inject Cx time; that third-party limitation remains in labs.
         // hyper reads all the time on HTTP/2, so a reset ends it on its own.
         let served = builder.serve_connection(io, route);
         finish(fcx, &info, &broke, fcx.race(None, served).await)
@@ -1970,11 +1974,13 @@ mod h2 {
         let io = Io::new(fcx, conn, broke.clone(), opts.limits.write_timeout);
         let route = Route::new(fcx, handler, &info, opts);
         let mut builder = hyper::server::conn::http1::Builder::new();
+        // Hyper still refreshes its internal date cache using SystemTime,
+        // but auto_date_header(false) prevents that value reaching the wire.
         builder.auto_date_header(false);
         if cfg!(target_arch = "wasm32") {
             builder.header_read_timeout(None);
         } else {
-            builder.timer(CxTimer { fcx: fcx.clone() });
+            builder.timer(CxTimer::new(fcx.clone()));
         }
         let served = builder.serve_connection(io, route).with_upgrades();
         finish(fcx, &info, &broke, fcx.race(None, served).await)
@@ -2498,23 +2504,47 @@ mod h2 {
     #[derive(Clone)]
     struct CxTimer {
         fcx: Cx,
+        origin: std::time::Instant,
     }
 
-    impl hyper::rt::Timer for CxTimer {
-        fn sleep(&self, duration: Duration) -> Pin<Box<dyn hyper::rt::Sleep>> {
+    impl CxTimer {
+        fn new(fcx: Cx) -> Self {
+            Self {
+                fcx,
+                origin: std::time::Instant::now(),
+            }
+        }
+
+        fn at(&self, deadline: fictionet::time::Instant) -> Pin<Box<dyn hyper::rt::Sleep>> {
             let fcx = self.fcx.clone();
             Box::pin(CxSleep(Box::pin(async move {
-                // A cancelled sleep never fires: hyper's sleeps cannot say
-                // they were cancelled, and firing would run every one of
-                // its timeouts at once. The connection ends by the cancel.
-                if fcx.sleep(duration).await.is_err() {
+                // Hyper cannot represent cancellation; the connection ends it.
+                if fcx.sleep_until(deadline).await.is_err() {
                     std::future::pending::<()>().await;
                 }
             })))
         }
+    }
+
+    impl hyper::rt::Timer for CxTimer {
+        fn now(&self) -> std::time::Instant {
+            self.origin + self.fcx.now().since_start()
+        }
+
+        fn sleep(&self, duration: Duration) -> Pin<Box<dyn hyper::rt::Sleep>> {
+            let at = self
+                .fcx
+                .now()
+                .since_start()
+                .checked_add(duration)
+                .unwrap_or(Duration::MAX);
+            self.at(fictionet::time::Instant::from_since_start(at))
+        }
 
         fn sleep_until(&self, deadline: std::time::Instant) -> Pin<Box<dyn hyper::rt::Sleep>> {
-            self.sleep(deadline.saturating_duration_since(std::time::Instant::now()))
+            self.at(fictionet::time::Instant::from_since_start(
+                deadline.saturating_duration_since(self.origin),
+            ))
         }
     }
 
@@ -2540,6 +2570,33 @@ mod h2 {
     mod tests {
         use super::*;
         use hyper::rt::Timer;
+
+        #[test]
+        fn hyper_deadlines_use_the_clock_at_creation() {
+            fictionet::block_on(fictionet::lab(
+                fictionet::Seed::from_u64(0),
+                |fcx| async move {
+                    let timer = CxTimer::new(fcx.clone());
+                    let origin = timer.now();
+                    let relative = timer.sleep(Duration::from_secs(10));
+                    let absolute = timer.sleep_until(origin + Duration::from_secs(20));
+                    fcx.sleep(Duration::from_secs(5)).await?;
+                    assert_eq!(timer.now().duration_since(origin), Duration::from_secs(5));
+                    // First polling a sleep later does not shift its deadline.
+                    relative.await;
+                    assert_eq!(fcx.now().since_start(), Duration::from_secs(10));
+                    absolute.await;
+                    assert_eq!(fcx.now().since_start(), Duration::from_secs(20));
+                    let later_timer = CxTimer::new(fcx.clone());
+                    later_timer
+                        .sleep_until(later_timer.now() + Duration::from_secs(3))
+                        .await;
+                    assert_eq!(fcx.now().since_start(), Duration::from_secs(23));
+                    Ok(())
+                },
+            ))
+            .unwrap();
+        }
 
         struct StalledBody {
             input: Bytes,
@@ -2664,7 +2721,7 @@ mod h2 {
                         .await;
                     let inner = slot.lock().unwrap().take().unwrap();
                     assert!(inner.is_cancelled());
-                    let mut sleep = CxTimer { fcx: inner }.sleep(Duration::from_secs(5));
+                    let mut sleep = CxTimer::new(inner).sleep(Duration::from_secs(5));
                     let pending = |sleep: &mut Pin<Box<dyn hyper::rt::Sleep>>| {
                         sleep
                             .as_mut()

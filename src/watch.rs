@@ -21,7 +21,8 @@ use std::time::Duration;
 
 use crate::Packet;
 use crate::lock;
-use crate::sys::{Instant, SystemTime};
+use crate::sys::SystemTime;
+use crate::time::Instant;
 
 thread_local! {
     /// The id of the task this thread is polling, or 0 outside any task.
@@ -172,9 +173,14 @@ impl Meter {
     }
 
     /// Starts copying packets, or joins the viewers already watching.
-    pub(crate) fn watch(self: &Arc<Self>) -> TapGuard {
+    pub(crate) fn watch(
+        self: &Arc<Self>,
+        environment: &Arc<crate::entropy::RunEnvironment>,
+    ) -> TapGuard {
         let mut slot = lock(&self.tap);
-        let tap = slot.get_or_insert_with(|| Arc::new(Tap::new())).clone();
+        let tap = slot
+            .get_or_insert_with(|| Arc::new(Tap::new(environment.clone())))
+            .clone();
         tap.viewers.fetch_add(1, Ordering::Relaxed);
         self.tapped.store(true, Ordering::Relaxed);
         TapGuard {
@@ -241,6 +247,7 @@ pub(crate) struct Copy {
 /// `FULL_PER_WINDOW` packets, so a flood costs at most about 130 copies a
 /// window, not one per packet.
 pub(crate) struct Tap {
+    environment: Arc<crate::entropy::RunEnvironment>,
     viewers: AtomicUsize,
     state: Mutex<TapState>,
 }
@@ -255,14 +262,15 @@ struct TapState {
 }
 
 impl Tap {
-    fn new() -> Tap {
+    fn new(environment: Arc<crate::entropy::RunEnvironment>) -> Tap {
         Tap {
+            environment,
             viewers: AtomicUsize::new(0),
             state: Mutex::new(TapState {
                 copies: VecDeque::new(),
                 bytes: 0,
                 next_seq: 1,
-                window_start: Instant::now(),
+                window_start: Instant::ZERO,
                 in_window: 0,
                 skipped: 0,
             }),
@@ -270,9 +278,13 @@ impl Tap {
     }
 
     fn push(&self, side: u8, data: &[u8]) {
-        let now = Instant::now();
+        let now = self.environment.clock.now();
         let mut s = lock(&self.state);
-        if now.duration_since(s.window_start) >= WINDOW {
+        if now
+            .since_start()
+            .saturating_sub(s.window_start.since_start())
+            >= WINDOW
+        {
             s.window_start = now;
             s.in_window = 0;
         }
@@ -391,7 +403,6 @@ pub(crate) const MAX_KEYS: usize = 20_000;
 /// link, each take its lock once. Packets never do.
 pub(crate) struct Graph {
     pub(crate) environment: Arc<crate::entropy::RunEnvironment>,
-    pub(crate) start: Instant,
     pub(crate) start_wall: SystemTime,
     /// Observer sessions connected to the world. While there are none,
     /// packet copies and TLS keys are not kept.
@@ -422,18 +433,21 @@ pub(crate) struct GraphState {
 }
 
 impl Graph {
-    pub(crate) fn new(seed: crate::Seed) -> Arc<Graph> {
+    pub(crate) fn new(seed: crate::Seed, mode: crate::RunMode) -> Arc<Graph> {
         Arc::new(Graph {
-            environment: Arc::new(crate::entropy::RunEnvironment::new(seed)),
-            start: Instant::now(),
-            start_wall: SystemTime::now(),
+            environment: Arc::new(crate::entropy::RunEnvironment::new(seed, mode)),
+            start_wall: if mode == crate::RunMode::Real {
+                SystemTime::now()
+            } else {
+                crate::sys::UNIX_EPOCH
+            },
             viewers: AtomicUsize::new(0),
             next_group: AtomicU64::new(1),
             state: Mutex::new(GraphState {
                 sweep_at: 64,
                 ..GraphState::default()
             }),
-            events: crate::events::Store::new(),
+            events: crate::events::Store::new(mode),
             watches: Mutex::default(),
             protocols: Mutex::default(),
         })
@@ -449,8 +463,8 @@ impl Graph {
         self.viewers.load(Ordering::Relaxed) > 0
     }
 
-    fn since_start(&self) -> Duration {
-        self.start.elapsed()
+    pub(crate) fn since_start(&self) -> Duration {
+        self.environment.clock.now().since_start()
     }
 
     /// A new group id.
@@ -601,7 +615,7 @@ mod tests {
     fn a_watched_run_records_tasks_owners_and_counts() {
         use crate::Interface;
         use crate::prelude::*;
-        let graph = Graph::new(crate::Seed::random());
+        let graph = Graph::new(crate::Seed::random(), crate::RunMode::Real);
         let g = graph.clone();
         let (spawn_line, seen) = (Arc::new(AtomicU64::new(0)), Arc::new(Mutex::new(None)));
         let (line, s) = (spawn_line.clone(), seen.clone());
@@ -674,6 +688,29 @@ mod tests {
     }
 
     #[test]
+    fn graph_and_sampling_windows_use_lab_time() {
+        crate::block_on(crate::lab(crate::Seed::from_u64(0), |fcx| async move {
+            let meter = Meter::new();
+            let guard = meter.watch(&fcx.graph().environment);
+            for _ in 0..66 {
+                meter.sent(0, &Packet(vec![1]));
+            }
+            let before = guard.tap.since(0, 100);
+            assert_eq!(before.len(), 65);
+            assert!(before.iter().all(|copy| copy.at == Instant::ZERO));
+            fcx.sleep(WINDOW).await?;
+            assert_eq!(fcx.graph().since_start(), WINDOW);
+            meter.sent(0, &Packet(vec![2]));
+            let after = guard.tap.since(65, 100);
+            assert_eq!(after.len(), 1);
+            assert_eq!(after[0].at.since_start(), WINDOW);
+            assert_eq!(after[0].skipped, 1);
+            Ok(())
+        }))
+        .unwrap();
+    }
+
+    #[test]
     fn sampling_keeps_the_first_packets_then_thins_out() {
         let kept: Vec<u64> = (0..256).filter(|&k| keep(k)).collect();
         assert_eq!(kept.len(), 64 + 32 + 16 + 8);
@@ -685,7 +722,10 @@ mod tests {
     fn a_tap_copies_only_while_watched_and_is_bounded() {
         let meter = Meter::new();
         meter.sent(0, &Packet(vec![1; 10]));
-        let guard = meter.watch();
+        let guard = meter.watch(&Arc::new(crate::entropy::RunEnvironment::new(
+            crate::Seed::from_u64(0),
+            crate::RunMode::Real,
+        )));
         meter.sent(1, &Packet(vec![2; 10]));
         meter.sent(0, &Packet(vec![3; 10]));
         let copies = guard.tap.since(0, 100);
@@ -702,7 +742,10 @@ mod tests {
 
         // A flood within one window is sampled, and the skipped count is
         // carried by the next copy.
-        let guard = meter.watch();
+        let guard = meter.watch(&Arc::new(crate::entropy::RunEnvironment::new(
+            crate::Seed::from_u64(0),
+            crate::RunMode::Real,
+        )));
         for _ in 0..1000 {
             meter.sent(0, &Packet(vec![0; 4]));
         }
