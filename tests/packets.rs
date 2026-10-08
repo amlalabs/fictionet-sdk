@@ -595,13 +595,13 @@ fn router_keeps_running_while_the_handle_can_add_routes() {
 fn lan_forwards_unicast_and_floods_ip_group_traffic() {
     world(|fcx| async move {
         let network: Prefix = "192.168.56.0/24".parse()?;
-        let lan = lan(&fcx, network, None);
+        let lan = lan::<Box<dyn Interface>, _>(&fcx, network, |event| event);
         let (a_lan, mut a) = pair();
         let (b_lan, mut b) = pair();
         let (c_lan, mut c) = pair();
-        lan.add("192.168.56.10".parse()?, Box::new(a_lan))?;
-        lan.add("192.168.56.11".parse()?, Box::new(b_lan))?;
-        lan.add("192.168.56.22".parse()?, Box::new(c_lan))?;
+        lan.add("192.168.56.10".parse()?, Box::new(a_lan), None)?;
+        lan.add("192.168.56.11".parse()?, Box::new(b_lan), None)?;
+        lan.add("192.168.56.22".parse()?, Box::new(c_lan), None)?;
 
         // Unicast goes only to the member that owns the destination.
         a.send(Packet(v4_udp([192, 168, 56, 10], [192, 168, 56, 11], &[1])));
@@ -623,13 +623,13 @@ fn lan_forwards_unicast_and_floods_ip_group_traffic() {
 
         // Reconnecting an address replaces the old member.
         let (new_b_lan, mut new_b) = pair();
-        lan.add("192.168.56.11".parse()?, Box::new(new_b_lan))?;
+        lan.add("192.168.56.11".parse()?, Box::new(new_b_lan), None)?;
         assert_eq!(b.recv(&fcx).await, Err(RecvError::Closed));
         a.send(Packet(v4_udp([192, 168, 56, 10], [192, 168, 56, 11], &[5])));
         assert_eq!(recv_soon(&fcx, &mut new_b).await.0[28], 5);
 
         let (outside_lan, _outside) = pair();
-        assert!(lan.add("192.168.57.1".parse()?, Box::new(outside_lan)).is_err());
+        assert!(lan.add("192.168.57.1".parse()?, Box::new(outside_lan), None).is_err());
 
         drop(lan);
         drop((a, b, c, new_b));
@@ -640,11 +640,11 @@ fn lan_forwards_unicast_and_floods_ip_group_traffic() {
 #[test]
 fn lan_sends_off_subnet_unicast_to_the_gateway_or_drops_it() {
     world(|fcx| async move {
-        let lan = lan(&fcx, "192.168.56.0/24".parse()?, None);
+        let lan = lan::<Box<dyn Interface>, _>(&fcx, "192.168.56.0/24".parse()?, |event| event);
         let (a_lan, mut a) = pair();
         let (b_lan, mut b) = pair();
-        lan.add("192.168.56.10".parse()?, Box::new(a_lan))?;
-        lan.add("192.168.56.11".parse()?, Box::new(b_lan))?;
+        lan.add("192.168.56.10".parse()?, Box::new(a_lan), None)?;
+        lan.add("192.168.56.11".parse()?, Box::new(b_lan), None)?;
 
         // With no gateway, a packet for another subnet goes nowhere, and
         // the LAN carries on.
@@ -707,12 +707,12 @@ fn lan_carries_one_address_family() {
     world(|fcx| async move {
         // IPv6 on an IPv4 LAN is dropped: link-local multicast and unicast
         // alike, gateway or not. IPv4 still flows.
-        let lan4 = lan(&fcx, "192.168.56.0/24".parse()?, None);
+        let lan4 = lan::<Box<dyn Interface>, _>(&fcx, "192.168.56.0/24".parse()?, |event| event);
         let (a_lan, mut a) = pair();
         let (b_lan, mut b) = pair();
         let (gw_lan, mut gw) = pair();
-        lan4.add("192.168.56.10".parse()?, Box::new(a_lan))?;
-        lan4.add("192.168.56.11".parse()?, Box::new(b_lan))?;
+        lan4.add("192.168.56.10".parse()?, Box::new(a_lan), None)?;
+        lan4.add("192.168.56.11".parse()?, Box::new(b_lan), None)?;
         lan4.gateway(Box::new(gw_lan))?;
         a.send(Packet(v6_udp(LL_A, LLMNR6, &[1])));
         a.send(Packet(v6_udp(LL_A, B6, &[2])));
@@ -727,18 +727,18 @@ fn lan_carries_one_address_family() {
         // An IPv6 LAN forwards unicast, floods multicast, takes no IPv4
         // member and drops IPv4 packets. Link-local unicast is on the LAN,
         // so it never reaches the gateway.
-        let lan6 = lan(&fcx, "fd00::/64".parse()?, None);
+        let lan6 = lan::<Box<dyn Interface>, _>(&fcx, "fd00::/64".parse()?, |event| event);
         let fd = |host: u8| -> [u8; 16] { [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, host] };
         let (c_lan, mut c) = pair();
         let (d_lan, mut d) = pair();
         let (e_lan, mut e) = pair();
         let (gw6_lan, mut gw6) = pair();
-        lan6.add("fd00::10".parse()?, Box::new(c_lan))?;
-        lan6.add("fd00::11".parse()?, Box::new(d_lan))?;
-        lan6.add("fd00::22".parse()?, Box::new(e_lan))?;
+        lan6.add("fd00::10".parse()?, Box::new(c_lan), None)?;
+        lan6.add("fd00::11".parse()?, Box::new(d_lan), None)?;
+        lan6.add("fd00::22".parse()?, Box::new(e_lan), None)?;
         lan6.gateway(Box::new(gw6_lan))?;
         let (x_lan, _x) = pair();
-        assert!(lan6.add("192.168.56.10".parse()?, Box::new(x_lan)).is_err());
+        assert!(lan6.add("192.168.56.10".parse()?, Box::new(x_lan), None).is_err());
         c.send(Packet(v6_udp(fd(0x10), fd(0x11), &[5])));
         assert_eq!(recv_soon(&fcx, &mut d).await.0[48], 5);
         assert!(recv_within(&fcx, &mut e, ms(20)).await.is_none());
@@ -762,13 +762,13 @@ fn lan_carries_one_address_family() {
 #[test]
 fn lan_forgets_a_member_whose_interface_closed() {
     world(|fcx| async move {
-        let lan = lan(&fcx, "192.168.56.0/24".parse()?, None);
+        let lan = lan::<Box<dyn Interface>, _>(&fcx, "192.168.56.0/24".parse()?, |event| event);
         let (a_lan, mut a) = pair();
         let (b_lan, b) = pair();
         let (c_lan, mut c) = pair();
-        lan.add("192.168.56.10".parse()?, Box::new(a_lan))?;
-        lan.add("192.168.56.11".parse()?, Box::new(b_lan))?;
-        lan.add("192.168.56.22".parse()?, Box::new(c_lan))?;
+        lan.add("192.168.56.10".parse()?, Box::new(a_lan), None)?;
+        lan.add("192.168.56.11".parse()?, Box::new(b_lan), None)?;
+        lan.add("192.168.56.22".parse()?, Box::new(c_lan), None)?;
         drop(b);
         fcx.sleep(ms(20)).await?;
 
@@ -780,7 +780,7 @@ fn lan_forgets_a_member_whose_interface_closed() {
 
         // The address is free for a new member.
         let (b2_lan, mut b2) = pair();
-        lan.add("192.168.56.11".parse()?, Box::new(b2_lan))?;
+        lan.add("192.168.56.11".parse()?, Box::new(b2_lan), None)?;
         a.send(Packet(v4_udp([192, 168, 56, 10], [192, 168, 56, 11], &[3])));
         assert_eq!(recv_soon(&fcx, &mut b2).await.0[28], 3);
 
@@ -817,14 +817,14 @@ fn lan_fan_out_counts_toward_the_budget() {
     let l = log.clone();
     world(move |fcx| async move {
         let done = Arc::new(AtomicBool::new(false));
-        let lan = lan(&fcx, "10.0.0.0/24".parse()?, None);
+        let lan = lan::<Box<dyn Interface>, _>(&fcx, "10.0.0.0/24".parse()?, |event| event);
         let (sender_lan, mut sender) = pair();
-        lan.add("10.0.0.1".parse()?, Box::new(sender_lan))?;
+        lan.add("10.0.0.1".parse()?, Box::new(sender_lan), None)?;
         let mut members = Vec::new();
         for i in 0..7u8 {
             let (lan_side, far) = pair();
             let addr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 10 + i));
-            lan.add(addr, Box::new(LoggedSend { inner: lan_side, log: l.clone() }))?;
+            lan.add(addr, Box::new(LoggedSend { inner: lan_side, log: l.clone() }), None)?;
             members.push(far);
         }
         for i in 0..200u32 {
@@ -851,7 +851,7 @@ fn lan_fan_out_counts_toward_the_budget() {
 #[test]
 fn a_router_with_no_routes_and_no_handle_ends() {
     world(|fcx| async move {
-        drop(router(&fcx, Vec::new()));
+        drop(router::<End>(&fcx, Vec::new()));
         Ok(())
     });
 }
@@ -1082,12 +1082,48 @@ fn every_task_stops_when_its_region_is_cancelled() {
             let r = router(&fcx, vec![("0.0.0.0/0".parse()?, Box::new(b) as Box<dyn Interface>)]);
             let (a, b) = pair();
             keep.push(a);
-            let l = lan(&fcx, "10.0.0.0/24".parse()?, None);
-            l.add("10.0.0.2".parse()?, Box::new(b))?;
+            let l = lan::<Box<dyn Interface>, _>(&fcx, "10.0.0.0/24".parse()?, |event| event);
+            l.add("10.0.0.2".parse()?, Box::new(b), None)?;
             fcx.sleep(ms(20)).await?;
             let _keep = (keep, r, l);
             Err(fictionet::Error::msg("stop"))
         }))
     });
     assert_eq!(result.unwrap_err().to_string(), "stop");
+}
+
+#[test]
+fn lan_drop_identity_comes_from_ingress_registration() {
+    world(|fcx| async move {
+        let lan = lan(&fcx, "10.0.0.0/24".parse()?, |event| event.field("lan", "test"));
+        let identity = fictionet::events::Sandbox {
+            id: 17, name: Arc::from("member"), addr: Some(Ipv4Addr::new(10, 0, 0, 2)), addr_v6: None,
+        };
+        let (member, mut peer) = pair();
+        lan.add("10.0.0.2".parse()?, member, Some(identity.clone()))?;
+        // The packet claims another member's source address.
+        peer.send(ip::packet("10.0.0.3".parse()?, "10.0.0.99".parse()?, 253, &[]));
+        peer.send(Packet(vec![1, 2, 3]));
+        fcx.sleep(ms(20)).await?;
+        let events = fcx.events();
+        let drops = events.of("lan", "drop");
+        assert_eq!(drops.len(), 2);
+        assert!(events.of("net", "blocked").is_empty());
+        for event in &drops {
+            assert_eq!(event.conn.sandbox.as_ref(), Some(&identity));
+            assert_eq!(event.str("lan"), Some("test"));
+            assert_eq!(event.u64("count"), Some(1));
+        }
+        assert_eq!(drops[0].str("src"), Some("10.0.0.3"));
+        assert_eq!(drops[1].str("why"), Some("not an IP packet"));
+        // Replacing the interface also replaces its registered identity.
+        let (member, mut peer) = pair();
+        lan.add("10.0.0.2".parse()?, member, None)?;
+        peer.send(Packet(vec![1, 2, 3]));
+        fcx.sleep(ms(20)).await?;
+        let drops = fcx.events().of("lan", "drop");
+        assert_eq!(drops.len(), 3);
+        assert!(drops[2].conn.sandbox.is_none());
+        Ok(())
+    });
 }

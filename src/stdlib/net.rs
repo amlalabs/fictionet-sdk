@@ -125,7 +125,7 @@ use fictionet::events::{ConnInfo, Event, Fields, Level, Sandbox, opt as jopt};
 use fictionet::stdlib::route::{self, Prefix, Router};
 use fictionet::stdlib::serve::{self, Budget, Counted, ServeOptions, Service, TlsSelect};
 use fictionet::stdlib::tls::ServerConfig;
-use fictionet::stdlib::{ConnError, Connection, ConnectionExt, PortEvent, Ports, icmp, ip, tcp, udp};
+use fictionet::stdlib::{ConnError, Connection, ConnectionExt, ports::{self, Ports}, icmp, ip, tcp, udp};
 use fictionet::time::Instant;
 use fictionet::{Attachment, Attachments, Cx, End, Error, Interface, InterfaceExt, Packet};
 
@@ -629,8 +629,8 @@ impl Net {
     /// and members reach everything else through it. The LAN's first
     /// address (`.1` of a `/24`) answers DNS as the network's gateway does,
     /// for members to use. The packets the LAN drops are recorded as
-    /// `net.blocked` [repeats](fictionet::events#repeats), with `why` `Lan`
-    /// and the reason in `detail`.
+    /// `lan.drop` [repeats](fictionet::events#repeats), with the reason in `why`
+    /// and the LAN name in `lan`.
     ///
     /// [`serve`](Net::serve) fails if `prefix` overlaps the sandboxes'
     /// subnets or another LAN, or leaves no room for members.
@@ -688,7 +688,7 @@ impl Net {
         }
         let caller = fcx.clone();
         let fcx = &fcx.group(self.group.clone());
-        let router = route::router(fcx, Vec::new());
+        let router = route::router::<Box<dyn Interface>>(fcx, Vec::new());
         // Every host is one hop from the sandbox: the router is private.
         router.keep_ttl();
 
@@ -728,7 +728,7 @@ impl Net {
         start_gateway(&shared)?;
         for seg in shared.lans.values() {
             let (lan_side, side) = link();
-            seg.lan.add(seg.dns, Box::new(lan_side))?;
+            seg.lan.add(seg.dns, Box::new(lan_side), None)?;
             start_dns(&shared, &shared.fcx.group("lan gateway"), side, seg.dns)?;
         }
         {
@@ -1021,7 +1021,7 @@ struct Shared {
     resolver: Option<Arc<Resolver>>,
     subnet: Subnet,
     subnet6: Option<Subnet6>,
-    router: Router,
+    router: Router<Box<dyn Interface>>,
     world: Mutex<World>,
     leases: Mutex<Leases>,
     gateway_tcp: Mutex<Vec<tcp::Endpoint>>,
@@ -1037,7 +1037,7 @@ struct Shared {
 /// One LAN of the network ([`Net::lan`]).
 struct LanSeg {
     prefix: Prefix,
-    lan: route::Lan,
+    lan: route::Lan<Box<dyn Interface>>,
     /// Where its DNS answers: its first address.
     dns: IpAddr,
     /// Addresses members have, which hosts may not take.
@@ -1067,7 +1067,7 @@ fn overlap(a: &Prefix, b: &Prefix) -> bool {
 /// gateway, with its drops recorded. Checks them and their members.
 fn make_lans(
     fcx: &Cx,
-    router: &Router,
+    router: &Router<Box<dyn Interface>>,
     hooks: &Arc<Hooks>,
     subnet: &Subnet,
     subnet6: Option<&Subnet6>,
@@ -1088,14 +1088,18 @@ fn make_lans(
         if let Some((other, _)) = made.iter().find(|(n, l)| **n == name || overlap(&prefix, &l.prefix)) {
             return Err(fictionet::Error::msg(format!("LAN {name}: {}/{} overlaps LAN {other}", prefix.addr, prefix.len)));
         }
+        let segment = name.clone();
         let names = hooks.clone();
-        let on_drop: route::OnDrop = Arc::new(move |fcx: &Cx, packet: &Packet, why: &'static str| {
-            let src = Header::parse_truncated(&packet.0).map(|h| h.src);
-            let conn = src.map_or_else(ConnInfo::default, |a| sandbox_only(names.sandbox_at(a)));
-            let (event, detail) = blocked(BlockedWhy::Lan, &packet.0);
-            names.blocked(fcx, &conn, (event.field("detail", why), detail));
+        let lan = route::lan::<Box<dyn Interface>, _>(&fcx.group(format!("lan {name}")), prefix, move |mut event| {
+            // A packet from the gateway has no member to name. Its source
+            // passed a sandbox filter's address check, so the address
+            // names the sandbox that sent it.
+            if event.conn.sandbox.is_none() {
+                let src = event.str("src").and_then(|a| a.parse::<IpAddr>().ok());
+                event.conn.sandbox = src.and_then(|a| lock(&names.by_addr).get(&a).cloned());
+            }
+            event.field("lan", segment.clone())
         });
-        let lan = route::lan(&fcx.group(format!("lan {name}")), prefix, Some(on_drop));
         let (lan_side, router_side) = link();
         lan.gateway(Box::new(lan_side))?;
         router.add(prefix, Box::new(router_side));
@@ -1267,7 +1271,7 @@ impl Shared {
         };
         lock(&hooks.by_addr).insert(addr, me.clone());
         let member = Member { sandbox, _attached: attached.clone() };
-        let joined = seg.lan.add(addr, Box::new(member));
+        let joined = seg.lan.add(addr, Box::new(member), Some(me.clone()));
         let event = match joined {
             Ok(()) => Event::new("net", "attached").summary(format!("sandbox {name} joined LAN {lan} at {addr}")),
             Err(e) => Event::new("net", "error").level(Level::Notice).summary(format!("sandbox {name} could not join LAN {lan}: {e}")).field("error", e.to_string()),
@@ -1370,11 +1374,11 @@ struct Machine {
 impl Machine {
     /// Starts a machine at `addr`: a route, TCP and UDP with no ports open,
     /// and ping replies, in a group named after `label` and the address.
-    fn start(shared: &Arc<Shared>, addr: IpAddr, label: &str, lan: Option<&route::Lan>) -> Result<Arc<Machine>, String> {
+    fn start(shared: &Arc<Shared>, addr: IpAddr, label: &str, lan: Option<&route::Lan<Box<dyn Interface>>>) -> Result<Arc<Machine>, String> {
         let fcx = &shared.fcx.group(format!("{label} ({addr})"));
         let (router_side, side) = link();
         match lan {
-            Some(lan) => lan.add(addr, Box::new(router_side)).map_err(|e| e.to_string())?,
+            Some(lan) => lan.add(addr, Box::new(router_side), None).map_err(|e| e.to_string())?,
             None => shared.router.add(host_prefix(addr), Box::new(router_side)),
         }
         let (tcp, udp, icmp, _other) = ip::split_protocols(fcx, side);
@@ -2155,14 +2159,14 @@ async fn filter(fcx: Cx, sandbox: Attachment, shared: Arc<Shared>) -> fictionet:
     loop {
         let deadline = f.reassembly.next_expiry();
         match f.ports.next(&fcx, deadline, |_| Poll::Pending).await? {
-            PortEvent::Packet(0, packet) => match ip::version(&packet.0) {
+            ports::Event::Packet(0, packet) => match ip::version(&packet.0) {
                 Some(6) => f.sent_v6(&fcx, packet),
                 _ => f.sent_v4(&fcx, packet),
             },
-            PortEvent::Packet(_, packet) => f.ports.send(0, packet),
-            PortEvent::Closed(_) => return Ok(()),
-            PortEvent::Timer => f.reassembly.expire(fcx.now()),
-            PortEvent::Extra => {}
+            ports::Event::Packet(_, packet) => f.ports.send(0, packet),
+            ports::Event::Closed(_) => return Ok(()),
+            ports::Event::Timer => f.reassembly.expire(fcx.now()),
+            ports::Event::Extra => {}
         }
     }
 }
@@ -2191,9 +2195,6 @@ pub enum BlockedWhy {
     /// A new TCP connection past the sandbox's limit per machine, or past
     /// a service's cap. Reset.
     TooManyConnections,
-    /// A LAN dropped it; the event's `detail` says why, such as "no member
-    /// at that address".
-    Lan,
 }
 
 impl BlockedWhy {
@@ -2209,7 +2210,6 @@ impl BlockedWhy {
             BlockedWhy::NoRoute => "NoRoute",
             BlockedWhy::ClosedPort => "ClosedPort",
             BlockedWhy::TooManyConnections => "TooManyConnections",
-            BlockedWhy::Lan => "Lan",
         }
     }
 }
@@ -2243,7 +2243,7 @@ struct Filter {
     shared: Arc<Shared>,
     owner: u64,
     name: Arc<str>,
-    ports: Ports,
+    ports: Ports<Box<dyn Interface>>,
     bound: Option<Ipv4Addr>,
     bound6: Option<Ipv6Addr>,
     route4: Option<usize>,

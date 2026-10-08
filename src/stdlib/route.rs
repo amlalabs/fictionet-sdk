@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Poll, Waker};
 
 use fictionet::events::{self, Level};
-use fictionet::stdlib::{PortEvent, Ports, ip};
+use fictionet::stdlib::{ports::{self, Ports}, ip};
 use fictionet::{Cx, Error, Interface, Packet};
 
 /// An address prefix, such as `104.18.32.7/32` or `::/0`.
@@ -138,7 +138,7 @@ fn mask(addr: IpAddr, len: u8) -> IpAddr {
 /// # }
 /// ```
 ///
-/// Interfaces of different types share the list as `Box<dyn Interface>`.
+/// Interfaces of different types share the list as `I`.
 ///
 /// A route's prefix is compared with its address bits past the length
 /// cleared. A packet that is neither IPv4 nor IPv6, or too short to hold a
@@ -158,35 +158,31 @@ fn mask(addr: IpAddr, len: u8) -> IpAddr {
 /// addresses are its own, not forwarded, and keep their TTL. A router
 /// told to [`keep_ttl`](Router::keep_ttl) changes no packet.
 #[track_caller]
-pub fn router(fcx: &Cx, routes: Vec<(Prefix, Box<dyn Interface>)>) -> Router {
-    let shared = Arc::new(Mutex::new(Shared {
-        adds: routes,
-        waker: None,
-        handles_gone: false,
-        stopped: false,
-        addrs: (None, None),
-        keep_ttl: false,
-        settings_changed: false,
-    }));
-    let router = Router { handle: Arc::new(Handle { shared: shared.clone() }) };
+pub fn router<I: Interface>(fcx: &Cx, routes: Vec<(Prefix, I)>) -> Router<I> {
+    let (sender, changes) = Changes::channel(routes.into_iter().map(|(p, i)| Edit::Route(p, i)).collect());
+    let router = Router { handle: Arc::new(sender) };
     fcx.spawn_as(|| "router".into(), move |fcx| async move {
-        // However the task ends, later routes are dropped immediately.
-        let _stopped = Stopped(shared.clone());
         let mut ports = Ports::new(Vec::new());
         // Which port each prefix goes out on.
         let mut table = Table::default();
         let mut handles_gone = false;
+        let mut addrs = (None, None);
+        let mut keep_ttl = false;
         loop {
-            // Take routes and addresses given since the last turn. Packets
-            // to and from the router's own addresses are its own, not
-            // forwarded, so their TTL stays as it is.
-            let (adds, gone, addrs, keep_ttl) = {
-                let mut s = lock(&shared);
-                s.settings_changed = false;
-                (std::mem::take(&mut s.adds), s.handles_gone, s.addrs, s.keep_ttl)
-            };
+            let (edits, gone) = changes.drain();
             handles_gone = handles_gone || gone;
-            for (prefix, interface) in adds {
+            for edit in edits {
+                let (prefix, interface) = match edit {
+                    Edit::Route(prefix, interface) => (prefix, interface),
+                    Edit::Address(addr) => {
+                        match addr {
+                            IpAddr::V4(a) => addrs.0 = Some(a),
+                            IpAddr::V6(a) => addrs.1 = Some(a),
+                        }
+                        continue;
+                    }
+                    Edit::KeepTtl => { keep_ttl = true; continue; }
+                };
                 let prefix = prefix.canonical();
                 if let Some(link) = interface.observe_link() {
                     link.label(&fcx, format!("{}/{}", prefix.addr, prefix.len));
@@ -203,20 +199,10 @@ pub fn router(fcx: &Cx, routes: Vec<(Prefix, Box<dyn Interface>)>) -> Router {
                 return Ok(());
             }
             let event = ports
-                .next(&fcx, None, |cx| {
-                    let mut s = lock(&shared);
-                    if !s.adds.is_empty() || s.settings_changed || (s.handles_gone && !handles_gone) {
-                        return Poll::Ready(());
-                    }
-                    match &s.waker {
-                        Some(w) if w.will_wake(cx.waker()) => {}
-                        _ => s.waker = Some(cx.waker().clone()),
-                    }
-                    Poll::Pending
-                })
+                .next(&fcx, None, |cx| changes.poll(cx, handles_gone))
                 .await?;
             match event {
-                PortEvent::Packet(_, mut packet) => {
+                ports::Event::Packet(_, mut packet) => {
                     let Some(dst) = ip::destination(&packet.0) else { continue };
                     if !keep_ttl
                         && !is_own(addrs, dst)
@@ -230,7 +216,7 @@ pub fn router(fcx: &Cx, routes: Vec<(Prefix, Box<dyn Interface>)>) -> Router {
                         ports.send(i, packet);
                     }
                 }
-                PortEvent::Closed(i) => {
+                ports::Event::Closed(i) => {
                     if let Some(prefix) = table.by_port.get(&i) {
                         let prefix = format!("{}/{}", prefix.addr, prefix.len);
                         let event = events::Event::new("router", "route_removed").level(Level::Notice).summary(format!("{prefix}: its interface closed")).field("prefix", prefix);
@@ -238,7 +224,7 @@ pub fn router(fcx: &Cx, routes: Vec<(Prefix, Box<dyn Interface>)>) -> Router {
                     }
                     table.remove_port(i)
                 }
-                PortEvent::Extra | PortEvent::Timer => {}
+                ports::Event::Extra | ports::Event::Timer => {}
             }
         }
     });
@@ -248,10 +234,10 @@ pub fn router(fcx: &Cx, routes: Vec<(Prefix, Box<dyn Interface>)>) -> Router {
 /// Drops a packet whose TTL or hop limit ran out, records the drop, and
 /// sends the "time exceeded" answer back toward its source, when the router
 /// has an address of its family.
-fn expired(fcx: &Cx, addrs: Addrs, table: &Table, ports: &mut Ports, packet: Packet) {
+fn expired<I: Interface>(fcx: &Cx, addrs: Addrs, table: &Table, ports: &mut Ports<I>, packet: Packet) {
     let v4 = ip::version(&packet.0) == Some(4);
     let why = if v4 { "its TTL ran out" } else { "its hop limit ran out" };
-    fictionet::events::record_drop(fcx, "router", &packet, why, events::Fields::new());
+    fictionet::events::record_drop(fcx, "router", &packet, why, events::Fields::new(), |event| event);
     let (a4, a6) = addrs;
     let from = if v4 { a4.map(IpAddr::V4) } else { a6.map(IpAddr::V6) };
     let answer = from.and_then(|from| fictionet::stdlib::icmp::time_exceeded(&packet.0, from));
@@ -321,73 +307,84 @@ impl Table {
     }
 }
 
-/// What a [`Router`] handle and its task share.
-struct Shared {
-    /// Routes added and not yet taken by the task.
-    adds: Vec<(Prefix, Box<dyn Interface>)>,
-    /// The task, waiting for routes.
+/// Pending changes and the task waiting for them.
+struct Changes<C> {
+    queue: Vec<C>,
     waker: Option<Waker>,
-    /// Every handle has been dropped.
-    handles_gone: bool,
-    /// The task has ended.
+    closed: bool,
     stopped: bool,
-    /// The router's own addresses, which its ICMP answers come from.
-    addrs: Addrs,
-    /// The router does not lower TTLs ([`Router::keep_ttl`]).
-    keep_ttl: bool,
-    /// `addrs` or `keep_ttl` changed since the task last read them.
-    settings_changed: bool,
 }
 
-/// Marks the router stopped when its task ends, and drops routes added
-/// that it never took.
-struct Stopped(Arc<Mutex<Shared>>);
+struct Sender<C>(Arc<Mutex<Changes<C>>>);
+struct Receiver<C>(Arc<Mutex<Changes<C>>>);
 
-impl Drop for Stopped {
+impl<C> Changes<C> {
+    fn channel(queue: Vec<C>) -> (Sender<C>, Receiver<C>) {
+        let shared = Arc::new(Mutex::new(Self { queue, waker: None, closed: false, stopped: false }));
+        (Sender(shared.clone()), Receiver(shared))
+    }
+}
+
+impl<C> Sender<C> {
+    fn send(&self, change: C) -> Result<(), C> {
+        let waker = {
+            let mut s = lock(&self.0);
+            if s.stopped {
+                return Err(change);
+            }
+            s.queue.push(change);
+            s.waker.take()
+        };
+        if let Some(w) = waker { w.wake(); }
+        Ok(())
+    }
+}
+
+impl<C> Drop for Sender<C> {
     fn drop(&mut self) {
-        let adds = {
+        let waker = {
+            let mut s = lock(&self.0);
+            s.closed = true;
+            s.waker.take()
+        };
+        if let Some(w) = waker { w.wake(); }
+    }
+}
+
+impl<C> Receiver<C> {
+    fn drain(&self) -> (Vec<C>, bool) {
+        let mut s = lock(&self.0);
+        (std::mem::take(&mut s.queue), s.closed)
+    }
+
+    fn poll(&self, cx: &mut std::task::Context<'_>, closed: bool) -> Poll<()> {
+        let mut s = lock(&self.0);
+        if !s.queue.is_empty() || (s.closed && !closed) {
+            return Poll::Ready(());
+        }
+        match &s.waker {
+            Some(w) if w.will_wake(cx.waker()) => {}
+            _ => s.waker = Some(cx.waker().clone()),
+        }
+        Poll::Pending
+    }
+}
+
+impl<C> Drop for Receiver<C> {
+    fn drop(&mut self) {
+        let queued = {
             let mut s = lock(&self.0);
             s.stopped = true;
-            std::mem::take(&mut s.adds)
+            std::mem::take(&mut s.queue)
         };
-        drop(adds);
+        drop(queued);
     }
 }
 
-/// Dropped when the last clone of a [`Router`] is dropped.
-struct Handle {
-    shared: Arc<Mutex<Shared>>,
-}
-
-impl Drop for Handle {
-    fn drop(&mut self) {
-        let waker = {
-            let mut s = lock(&self.shared);
-            s.handles_gone = true;
-            s.waker.take()
-        };
-        if let Some(w) = waker {
-            w.wake();
-        }
-    }
-}
-
-impl Handle {
-    fn add(&self, prefix: Prefix, interface: Box<dyn Interface>) {
-        let waker = {
-            let mut s = lock(&self.shared);
-            if s.stopped {
-                drop(s);
-                drop(interface);
-                return;
-            }
-            s.adds.push((prefix, interface));
-            s.waker.take()
-        };
-        if let Some(w) = waker {
-            w.wake();
-        }
-    }
+enum Edit<I> {
+    Route(Prefix, I),
+    Address(IpAddr),
+    KeepTtl,
 }
 
 /// A handle to a running [`router`], for adding routes later.
@@ -395,12 +392,17 @@ impl Handle {
 /// Clones share the same router. Dropping a handle does not stop the
 /// router. Once every handle is dropped, no more routes can be added, and
 /// the router stops when its last route's interface closes.
-#[derive(Clone)]
-pub struct Router {
-    handle: Arc<Handle>,
+pub struct Router<I: Interface> {
+    handle: Arc<Sender<Edit<I>>>,
 }
 
-impl Router {
+impl<I: Interface> Clone for Router<I> {
+    fn clone(&self) -> Self {
+        Self { handle: self.handle.clone() }
+    }
+}
+
+impl<I: Interface> Router<I> {
     /// Adds a route. Packets for `prefix` now go out on `interface`, and
     /// packets that arrive on `interface` are forwarded like any others.
     ///
@@ -408,26 +410,15 @@ impl Router {
     /// it, and the old interface is dropped, which closes it.
     ///
     /// If the router has stopped, `interface` is dropped.
-    pub fn add(&self, prefix: Prefix, interface: Box<dyn Interface>) {
-        self.handle.add(prefix, interface);
+    pub fn add(&self, prefix: Prefix, interface: I) {
+        drop(self.handle.send(Edit::Route(prefix, interface)));
     }
 
     /// Gives the router an address of `addr`'s family, replacing the one it
     /// had. Its ICMP "time exceeded" answers come from it. A router has no
     /// address at first, and then drops expired packets without an answer.
     pub fn address(&self, addr: IpAddr) {
-        let waker = {
-            let mut s = lock(&self.handle.shared);
-            match addr {
-                IpAddr::V4(a) => s.addrs.0 = Some(a),
-                IpAddr::V6(a) => s.addrs.1 = Some(a),
-            }
-            s.settings_changed = true;
-            s.waker.take()
-        };
-        if let Some(w) = waker {
-            w.wake();
-        }
+        drop(self.handle.send(Edit::Address(addr)));
     }
 
     /// Makes the router a private one, invisible to the packets it
@@ -438,15 +429,7 @@ impl Router {
     /// use it only where every way back to it passes something that lowers
     /// the TTL itself, such as a sandbox's kernel.
     pub fn keep_ttl(&self) {
-        let waker = {
-            let mut s = lock(&self.handle.shared);
-            s.keep_ttl = true;
-            s.settings_changed = true;
-            s.waker.take()
-        };
-        if let Some(w) = waker {
-            w.wake();
-        }
+        drop(self.handle.send(Edit::KeepTtl));
     }
 }
 
@@ -475,10 +458,10 @@ impl Router {
 /// no gateway for an address outside the subnet, a packet from the gateway
 /// for such an address, a member's own address, the other address family,
 /// or not an IP packet. A member that is replaced or whose interface closes
-/// is recorded too (`lan.member_replaced`, `lan.member_removed`). `on_drop`,
-/// when given, hears every drop with its reason as well, as
-/// [`net::Net`](fictionet::stdlib::net::Net) uses to name the sandbox that
-/// sent it.
+/// is recorded too (`lan.member_replaced`, `lan.member_removed`). `enrich`
+/// adds context to each drop before recording it, as
+/// [`net::Net`](fictionet::stdlib::net::Net) uses to name the LAN.
+/// Attachment identity comes from the ingress registration.
 ///
 /// This is how virtual machines attached with `fictionet attach --type tap`
 /// share a subnet. Attach answers each VM's ARP itself and hands the LAN
@@ -496,9 +479,9 @@ impl Router {
 /// # use fictionet::{Cx, End, Interface, Result, pair};
 /// # use fictionet::stdlib::route;
 /// # fn wire(fcx: Cx, toward_sandbox: End, dc_side: End, pc_side: End) -> Result {
-/// let lan = route::lan(&fcx, "192.168.56.0/24".parse()?, None);
-/// lan.add("192.168.56.10".parse()?, Box::new(dc_side))?;
-/// lan.add("192.168.56.100".parse()?, Box::new(pc_side))?;
+/// let lan = route::lan::<Box<dyn Interface>, _>(&fcx, "192.168.56.0/24".parse()?, |event| event);
+/// lan.add("192.168.56.10".parse()?, Box::new(dc_side), None)?;
+/// lan.add("192.168.56.100".parse()?, Box::new(pc_side), None)?;
 /// let (lan_side, router_side) = pair();
 /// lan.gateway(Box::new(lan_side))?;
 /// route::router(&fcx, vec![
@@ -514,22 +497,20 @@ impl Router {
 /// is cancelled, or when every member and the gateway have closed and the
 /// last [`Lan`] handle has been dropped.
 #[track_caller]
-pub fn lan(fcx: &Cx, subnet: Prefix, on_drop: Option<OnDrop>) -> Lan {
+pub fn lan<I, F>(fcx: &Cx, subnet: Prefix, enrich: F) -> Lan<I>
+where
+    I: Interface,
+    F: Fn(events::Event) -> events::Event + Send + 'static,
+{
     let subnet = subnet.canonical();
-    let shared = Arc::new(Mutex::new(LanShared { joins: Vec::new(), waker: None, handles_gone: false, stopped: false }));
-    let lan = Lan { handle: Arc::new(LanHandle { subnet, shared: shared.clone() }) };
+    let (sender, changes) = Changes::channel(Vec::new());
+    let lan = Lan { handle: Arc::new(LanHandle { subnet, sender }) };
     fcx.spawn_as(|| "lan".into(), move |fcx| async move {
-        // However the task ends, later members are dropped immediately.
-        let _stopped = LanStopped(shared.clone());
         let mut ports = Ports::new(Vec::new());
-        let mut members = Members { on_drop, ..Members::default() };
+        let mut members = Members::new(enrich);
         let mut handles_gone = false;
         loop {
-            // Take members added since the last turn.
-            let (joins, gone) = {
-                let mut s = lock(&shared);
-                (std::mem::take(&mut s.joins), s.handles_gone)
-            };
+            let (joins, gone) = changes.drain();
             handles_gone = handles_gone || gone;
             for join in joins {
                 members.join(&fcx, &mut ports, join);
@@ -538,22 +519,12 @@ pub fn lan(fcx: &Cx, subnet: Prefix, on_drop: Option<OnDrop>) -> Lan {
                 return Ok(());
             }
             let event = ports
-                .next(&fcx, None, |cx| {
-                    let mut s = lock(&shared);
-                    if !s.joins.is_empty() || (s.handles_gone && !handles_gone) {
-                        return Poll::Ready(());
-                    }
-                    match &s.waker {
-                        Some(w) if w.will_wake(cx.waker()) => {}
-                        _ => s.waker = Some(cx.waker().clone()),
-                    }
-                    Poll::Pending
-                })
+                .next(&fcx, None, |cx| changes.poll(cx, handles_gone))
                 .await?;
             match event {
-                PortEvent::Packet(from, packet) => members.forward(&fcx, &mut ports, subnet, from, packet),
-                PortEvent::Closed(i) => members.remove_port(&fcx, i),
-                PortEvent::Extra | PortEvent::Timer => {}
+                ports::Event::Packet(from, packet) => members.forward(&fcx, &mut ports, subnet, from, packet),
+                ports::Event::Closed(i) => members.remove_port(&fcx, i),
+                ports::Event::Extra | ports::Event::Timer => {}
             }
         }
     });
@@ -591,17 +562,13 @@ fn link_local(addr: IpAddr) -> bool {
     }
 }
 
-/// Hears every packet a [`lan`] drops, with the reason.
-pub type OnDrop = Arc<dyn Fn(&Cx, &Packet, &'static str) + Send + Sync>;
-
-/// Records that the LAN dropped `packet`, and why, and tells the
-/// `on_drop` sink. Every drop goes through here, so the reporting is one
-/// piece.
-fn dropped(fcx: &Cx, on_drop: &Option<OnDrop>, packet: &Packet, why: &'static str) {
-    if let Some(f) = on_drop {
-        f(fcx, packet, why);
-    }
-    fictionet::events::record_drop(fcx, "lan", packet, why, events::Fields::new());
+/// Records one LAN drop with its ingress attachment and caller context.
+fn dropped<F>(fcx: &Cx, packet: &Packet, why: &'static str, sandbox: Option<&events::Sandbox>, enrich: &F)
+where F: Fn(events::Event) -> events::Event {
+    events::record_drop(fcx, "lan", packet, why, events::Fields::new(), |mut event| {
+        event.conn.sandbox = sandbox.cloned();
+        enrich(event)
+    });
 }
 
 /// Records a change to a LAN's members.
@@ -610,47 +577,57 @@ fn member_event(fcx: &Cx, kind: &'static str, member: String, what: &str) {
 }
 
 /// A LAN's members: which port each address goes out on, and the gateway.
-#[derive(Default)]
-struct Members {
+struct Members<F> {
     /// Address to port.
     by_addr: BTreeMap<IpAddr, usize>,
     /// Port to address.
     by_port: HashMap<usize, IpAddr>,
     /// The gateway's port.
     gateway: Option<usize>,
-    /// Hears every drop.
-    on_drop: Option<OnDrop>,
+    /// Attachment identity registered for each ingress port.
+    attachments: HashMap<usize, events::Sandbox>,
+    enrich: F,
 }
 
 /// What a [`Lan`] handle adds.
-enum Join {
-    Member(IpAddr, Box<dyn Interface>),
-    Gateway(Box<dyn Interface>),
+enum Join<I: Interface> {
+    Member(IpAddr, I, Option<events::Sandbox>),
+    Gateway(I),
 }
 
-impl Members {
+impl<F: Fn(events::Event) -> events::Event> Members<F> {
+    fn new(enrich: F) -> Self {
+        Self { by_addr: BTreeMap::new(), by_port: HashMap::new(), gateway: None, attachments: HashMap::new(), enrich }
+    }
+
     fn is_empty(&self) -> bool {
         self.by_addr.is_empty() && self.gateway.is_none()
     }
 
     /// Adds a member or the gateway. One already there is replaced, which
     /// closes its interface.
-    fn join(&mut self, fcx: &Cx, ports: &mut Ports, join: Join) {
+    fn join<I: Interface>(&mut self, fcx: &Cx, ports: &mut Ports<I>, join: Join<I>) {
         match join {
-            Join::Member(addr, interface) => {
+            Join::Member(addr, interface, attachment) => {
                 if let Some(link) = interface.observe_link() {
                     link.label(fcx, addr.to_string());
                 }
-                match self.by_addr.get(&addr).copied() {
+                let i = match self.by_addr.get(&addr).copied() {
                     Some(i) => {
                         ports.replace(i, interface);
                         member_event(fcx, "member_replaced", addr.to_string(), "a new interface took over, and the old one is closed");
+                        i
                     }
                     None => {
                         let i = ports.add(interface);
                         self.by_addr.insert(addr, i);
                         self.by_port.insert(i, addr);
+                        i
                     }
+                };
+                match attachment {
+                    Some(attachment) => { self.attachments.insert(i, attachment); }
+                    None => { self.attachments.remove(&i); }
                 }
             }
             Join::Gateway(interface) => {
@@ -670,6 +647,7 @@ impl Members {
 
     /// Forgets the member or gateway whose port closed.
     fn remove_port(&mut self, fcx: &Cx, port: usize) {
+        self.attachments.remove(&port);
         if let Some(addr) = self.by_port.remove(&port) {
             self.by_addr.remove(&addr);
             member_event(fcx, "member_removed", addr.to_string(), "its interface closed");
@@ -681,13 +659,13 @@ impl Members {
 
     /// Sends `packet`, which arrived on port `from`, where it belongs, or
     /// drops it with an event.
-    fn forward(&self, fcx: &Cx, ports: &mut Ports, subnet: Prefix, from: usize, packet: Packet) {
+    fn forward<I: Interface>(&self, fcx: &Cx, ports: &mut Ports<I>, subnet: Prefix, from: usize, packet: Packet) {
         let Some(dst) = ip::destination(&packet.0) else {
-            return dropped(fcx, &self.on_drop, &packet, "not an IP packet");
+            return dropped(fcx, &packet, "not an IP packet", self.attachments.get(&from), &self.enrich);
         };
         if dst.is_ipv4() != subnet.addr.is_ipv4() {
             let why = if dst.is_ipv4() { "IPv4 on an IPv6 LAN" } else { "IPv6 on an IPv4 LAN" };
-            return dropped(fcx, &self.on_drop, &packet, why);
+            return dropped(fcx, &packet, why, self.attachments.get(&from), &self.enrich);
         }
         if floods(subnet, dst) {
             // Every member but the sender, in address order. The gateway gets none of it.
@@ -701,82 +679,31 @@ impl Members {
             ports.spend(sent);
         } else if subnet.contains(dst) || link_local(dst) {
             match self.by_addr.get(&dst) {
-                Some(&to) if to == from => dropped(fcx, &self.on_drop, &packet, "sent to its own address"),
+                Some(&to) if to == from => dropped(fcx, &packet, "sent to its own address", self.attachments.get(&from), &self.enrich),
                 Some(&to) => ports.send(to, packet),
-                None => dropped(fcx, &self.on_drop, &packet, "no member at that address"),
+                None => dropped(fcx, &packet, "no member at that address", self.attachments.get(&from), &self.enrich),
             }
         } else {
             match self.gateway {
                 Some(to) if to != from => ports.send(to, packet),
-                Some(_) => dropped(fcx, &self.on_drop, &packet, "from the gateway, for an address outside the subnet"),
-                None => dropped(fcx, &self.on_drop, &packet, "outside the subnet, and the LAN has no gateway"),
+                Some(_) => dropped(fcx, &packet, "from the gateway, for an address outside the subnet", self.attachments.get(&from), &self.enrich),
+                None => dropped(fcx, &packet, "outside the subnet, and the LAN has no gateway", self.attachments.get(&from), &self.enrich),
             }
         }
     }
 }
 
-/// What a [`Lan`] handle and its task share.
-struct LanShared {
-    /// Members added and not yet taken by the task.
-    joins: Vec<Join>,
-    /// The task, waiting for members.
-    waker: Option<Waker>,
-    /// Every handle has been dropped.
-    handles_gone: bool,
-    /// The task has ended.
-    stopped: bool,
-}
-
-/// Marks the LAN stopped when its task ends, and drops members added that
-/// it never took.
-struct LanStopped(Arc<Mutex<LanShared>>);
-
-impl Drop for LanStopped {
-    fn drop(&mut self) {
-        let joins = {
-            let mut s = lock(&self.0);
-            s.stopped = true;
-            std::mem::take(&mut s.joins)
-        };
-        drop(joins);
-    }
-}
-
-/// Dropped when the last clone of a [`Lan`] is dropped.
-struct LanHandle {
+struct LanHandle<I: Interface> {
     subnet: Prefix,
-    shared: Arc<Mutex<LanShared>>,
+    sender: Sender<Join<I>>,
 }
 
-impl Drop for LanHandle {
-    fn drop(&mut self) {
-        let waker = {
-            let mut s = lock(&self.shared);
-            s.handles_gone = true;
-            s.waker.take()
-        };
-        if let Some(w) = waker {
-            w.wake();
-        }
-    }
-}
-
-impl LanHandle {
-    fn join(&self, join: Join) -> Result<(), Error> {
-        let waker = {
-            let mut s = lock(&self.shared);
-            if s.stopped {
-                drop(s);
-                drop(join);
-                return Err(fictionet::Error::msg("the LAN has stopped"));
-            }
-            s.joins.push(join);
-            s.waker.take()
-        };
-        if let Some(w) = waker {
-            w.wake();
-        }
-        Ok(())
+impl<I: Interface> LanHandle<I> {
+    fn join(&self, join: Join<I>) -> Result<(), Error> {
+        self.sender.send(join).map_err(|join| {
+            drop(join);
+            fictionet::Error::msg("the LAN has stopped")
+        })
     }
 }
 
@@ -785,13 +712,19 @@ impl LanHandle {
 /// Clones share the same LAN. Dropping a handle does not disconnect
 /// members. Once every handle has gone, no more members can be added, and
 /// the LAN stops when its last member and the gateway have closed.
-#[derive(Clone)]
-pub struct Lan {
-    handle: Arc<LanHandle>,
+pub struct Lan<I: Interface> {
+    handle: Arc<LanHandle<I>>,
 }
 
-impl Lan {
-    /// Adds the member at `addr`. Packets for `addr` now go out on
+impl<I: Interface> Clone for Lan<I> {
+    fn clone(&self) -> Self {
+        Self { handle: self.handle.clone() }
+    }
+}
+
+impl<I: Interface> Lan<I> {
+    /// Adds the member at `addr`, with optional ingress attachment identity.
+    /// Packets for `addr` now go out on
     /// `interface`, and packets that arrive on it are forwarded like any
     /// others.
     ///
@@ -802,7 +735,7 @@ impl Lan {
     ///
     /// Fails, and drops `interface`, if `addr` is not such an address or
     /// the LAN has stopped.
-    pub fn add(&self, addr: IpAddr, interface: Box<dyn Interface>) -> Result<(), Error> {
+    pub fn add(&self, addr: IpAddr, interface: I, attachment: Option<events::Sandbox>) -> Result<(), Error> {
         let subnet = self.handle.subnet;
         if !subnet.contains(addr) {
             return Err(fictionet::Error::msg(format!("{addr} is outside the LAN's subnet {}/{}", subnet.addr, subnet.len)));
@@ -810,7 +743,7 @@ impl Lan {
         if addr.is_unspecified() || floods(subnet, addr) {
             return Err(fictionet::Error::msg(format!("{addr} is not a unicast address, so no member can have it")));
         }
-        self.handle.join(Join::Member(addr, interface))
+        self.handle.join(Join::Member(addr, interface, attachment))
     }
 
     /// Makes `interface` the gateway: the way out of the subnet.
@@ -826,7 +759,7 @@ impl Lan {
     /// A LAN has one gateway. Calling this again replaces it, and the old
     /// interface is dropped, which closes it. Fails, and drops `interface`,
     /// if the LAN has stopped.
-    pub fn gateway(&self, interface: Box<dyn Interface>) -> Result<(), Error> {
+    pub fn gateway(&self, interface: I) -> Result<(), Error> {
         self.handle.join(Join::Gateway(interface))
     }
 }
@@ -836,6 +769,24 @@ mod tests {
     use super::*;
     use fictionet::InterfaceExt;
     use std::time::Duration;
+
+    #[test]
+    fn stopped_changes_drop_values_outside_the_lock() {
+        struct Pending(std::sync::Weak<Mutex<Changes<Pending>>>);
+        impl Drop for Pending {
+            fn drop(&mut self) {
+                if let Some(shared) = self.0.upgrade() {
+                    assert!(shared.try_lock().is_ok());
+                }
+            }
+        }
+        let (sender, receiver) = Changes::channel(Vec::new());
+        let pending = || Pending(Arc::downgrade(&sender.0));
+        assert!(sender.send(pending()).is_ok());
+        drop(receiver);
+        assert!(sender.send(pending()).is_err());
+        assert!(lock(&sender.0).queue.is_empty());
+    }
 
     /// A bare IPv4 header, protocol 253 (for experiments), no payload.
     fn v4(src: [u8; 4], dst: [u8; 4]) -> Packet {
@@ -973,14 +924,14 @@ mod tests {
         fictionet::block_on(fictionet::run(|fcx| async move {
             for _ in 0..128 {
                 let sent = Arc::new(Mutex::new(Vec::new()));
-                let mut members = Members::default();
+                let mut members = Members::new(|event| event);
                 let mut ports = Ports::new(Vec::new());
                 for n in [40, 10, 30, 20, 50] {
                     members.join(&fcx, &mut ports, Join::Member(
-                        Ipv4Addr::new(10, 0, 0, n).into(), Box::new(Receiver(n, sent.clone())),
+                        Ipv4Addr::new(10, 0, 0, n).into(), Receiver(n, sent.clone()), None,
                     ));
                 }
-                members.join(&fcx, &mut ports, Join::Gateway(Box::new(Receiver(99, sent.clone()))));
+                members.join(&fcx, &mut ports, Join::Gateway(Receiver(99, sent.clone())));
                 for dst in [[255; 4], [10, 0, 0, 255], [224, 0, 0, 1]] {
                     members.forward(&fcx, &mut ports, "10.0.0.0/24".parse()?, 2, v4([10, 0, 0, 30], dst));
                     assert_eq!(*lock(&sent), [10, 20, 40, 50]);
@@ -1022,15 +973,15 @@ mod tests {
     #[test]
     fn member_addresses_are_unicast_in_the_subnet() {
         fictionet::block_on(fictionet::run(|fcx| async move {
-            let lan = lan(&fcx, "192.168.56.0/24".parse()?, None);
+            let lan = lan::<Box<dyn Interface>, _>(&fcx, "192.168.56.0/24".parse()?, |event| event);
             for bad in ["192.168.57.1", "192.168.56.255", "255.255.255.255", "224.0.0.252", "0.0.0.0", "fd00::1"] {
                 let (end, mut far) = fictionet::pair();
-                let err = lan.add(bad.parse()?, Box::new(end)).unwrap_err().to_string();
+                let err = lan.add(bad.parse()?, Box::new(end), None).unwrap_err().to_string();
                 assert!(err.contains(bad), "{bad}: {err}");
                 assert_eq!(far.recv(&fcx).await, Err(fictionet::RecvError::Closed), "{bad}: the interface is dropped");
             }
             let (end, _far) = fictionet::pair();
-            lan.add("192.168.56.0".parse()?, Box::new(end))?;
+            lan.add("192.168.56.0".parse()?, Box::new(end), None)?;
             Ok(())
         }))
         .unwrap();
@@ -1041,11 +992,11 @@ mod tests {
     #[test]
     fn drops_and_member_changes_are_recorded() {
         fictionet::block_on(fictionet::run(|fcx| async move {
-            let lan = lan(&fcx, "192.168.56.0/24".parse()?, None);
+            let lan = lan::<Box<dyn Interface>, _>(&fcx, "192.168.56.0/24".parse()?, |event| event);
             let (a_lan, mut a) = fictionet::pair();
             let (b_lan, _b) = fictionet::pair();
-            lan.add("192.168.56.10".parse()?, Box::new(a_lan))?;
-            lan.add("192.168.56.11".parse()?, Box::new(b_lan))?;
+            lan.add("192.168.56.10".parse()?, Box::new(a_lan), None)?;
+            lan.add("192.168.56.11".parse()?, Box::new(b_lan), None)?;
             assert!(!fcx.observed());
             a.send(v4([192, 168, 56, 10], [192, 168, 56, 12]));
             a.send(v4([192, 168, 56, 10], [10, 0, 0, 1]));
@@ -1053,7 +1004,7 @@ mod tests {
             a.send(v6("fe80::1".parse()?, "ff02::1:3".parse()?));
             a.send(Packet(vec![1, 2, 3]));
             let (b2_lan, b2) = fictionet::pair();
-            lan.add("192.168.56.11".parse()?, Box::new(b2_lan))?;
+            lan.add("192.168.56.11".parse()?, Box::new(b2_lan), None)?;
             fcx.sleep(Duration::from_millis(20)).await?;
             drop(b2);
             fcx.sleep(Duration::from_millis(20)).await?;
@@ -1088,18 +1039,18 @@ mod tests {
     #[test]
     fn joining_a_stopped_lan_fails() {
         fictionet::block_on(fictionet::run(|fcx| async move {
-            let kept: Arc<Mutex<Option<Lan>>> = Arc::default();
+            let kept = Arc::new(Mutex::new(None::<Lan<Box<dyn Interface>>>));
             let k = kept.clone();
             let r = fcx
                 .region(|fcx| async move {
-                    *lock(&k) = Some(lan(&fcx, "10.0.0.0/24".parse()?, None));
+                    *lock(&k) = Some(lan(&fcx, "10.0.0.0/24".parse()?, |event| event));
                     Err(fictionet::Error::msg("stop"))
                 })
                 .await;
             assert_eq!(r.unwrap_err().to_string(), "stop");
             let lan = lock(&kept).take().unwrap();
             let (end, mut far) = fictionet::pair();
-            assert_eq!(lan.add("10.0.0.2".parse()?, Box::new(end)).unwrap_err().to_string(), "the LAN has stopped");
+            assert_eq!(lan.add("10.0.0.2".parse()?, Box::new(end), None).unwrap_err().to_string(), "the LAN has stopped");
             assert_eq!(far.recv(&fcx).await, Err(fictionet::RecvError::Closed));
             let (end, mut far) = fictionet::pair();
             assert_eq!(lan.gateway(Box::new(end)).unwrap_err().to_string(), "the LAN has stopped");

@@ -18,6 +18,8 @@ macro_rules! protocols {
         pub mod tcp;
         #[path = "../../src/stdlib/udp.rs"]
         pub mod udp;
+        #[path = "../../src/stdlib/ports.rs"]
+        pub mod ports;
         #[path = "../../src/stdlib/route.rs"]
         pub mod route;
         #[path = "../../src/stdlib/tls.rs"]

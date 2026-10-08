@@ -394,7 +394,7 @@ fn tcp_bulk(topology: Topology, flows: usize, idle: usize, per_flow: usize, opts
                 let (br, b) = pair();
                 let router = stdlib::route::router(
                     &fcx,
-                    vec![("10.0.0.1/32".parse()?, Box::new(ar)), ("10.0.0.2/32".parse()?, Box::new(br))],
+                    vec![("10.0.0.1/32".parse()?, ar), ("10.0.0.2/32".parse()?, br)],
                 );
                 let (a, u1, i1, o1) = ip::split_protocols(&fcx, a);
                 let (b, u2, i2, o2) = ip::split_protocols(&fcx, b);

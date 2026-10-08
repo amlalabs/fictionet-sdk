@@ -733,8 +733,8 @@ mod tests {
         crate::block_on(crate::run(|fcx| async move {
             let (a, b) = crate::pair();
             let (c, d) = crate::pair();
-            let router = crate::stdlib::route::router(&fcx, vec![("10.0.0.0/24".parse().unwrap(), Box::new(a))]);
-            router.add("10.0.1.0/24".parse().unwrap(), Box::new(c));
+            let router = crate::stdlib::route::router(&fcx, vec![("10.0.0.0/24".parse().unwrap(), a)]);
+            router.add("10.0.1.0/24".parse().unwrap(), c);
             assert!(!fcx.observed());
             drop(b);
             fcx.sleep(Duration::from_millis(10)).await?;

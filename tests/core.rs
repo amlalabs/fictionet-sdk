@@ -180,7 +180,7 @@ fn cancellation_ends_every_wait() {
             let (port, _other) = pair();
             let r8 = r.clone();
             fcx.spawn(move |fcx| async move {
-                let mut ports = fictionet::stdlib::Ports::new(vec![Box::new(port)]);
+                let mut ports = fictionet::stdlib::ports::Ports::new(vec![Box::new(port) as Box<dyn Interface>]);
                 let res = ports.next(&fcx, None, |_| std::task::Poll::Pending).await;
                 r8.lock().unwrap().push(format!("ports {:?}", res.err()));
                 Ok(())

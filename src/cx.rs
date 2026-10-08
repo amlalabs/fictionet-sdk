@@ -524,7 +524,7 @@ impl Cx {
 ///   [`Cx::sleep`], [`Cx::sleep_until`], [`Cx::yield_now`],
 ///   [`Attachments::get`](crate::Attachments::get),
 ///   [`Attachments::next`](crate::Attachments::next) and
-///   [`Ports::next`](crate::stdlib::Ports::next).
+///   [`Ports::next`](crate::stdlib::ports::Ports::next).
 /// - Waits with an error type of their own return its `Cancelled` variant,
 ///   which `?` makes from this value and whose
 ///   [`source`](std::error::Error::source) is this value:

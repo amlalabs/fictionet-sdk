@@ -1940,9 +1940,15 @@ fn hosts_and_members_share_a_lan_on_the_net() {
         // events say so.
         let mut u = agent.udp.bind(5000)?;
         u.send_to(b"anyone?", SocketAddr::new(Ipv4Addr::new(192, 168, 56, 99).into(), 7));
-        let drops = kept.wait(&fcx, 1, Duration::from_secs(2), |e| e.is("net", "blocked") && e.str("why") == Some("Lan")).await?;
-        assert_eq!(drops[0].str("detail"), Some("no member at that address"));
-        assert_eq!(drops[0].conn.sandbox.as_ref().map(|s| s.name.to_string()).as_deref(), Some("agent"));
+        let drops = kept.wait(&fcx, 1, Duration::from_secs(2), |e| e.is("lan", "drop") && e.str("lan") == Some("corp")).await?;
+        assert_eq!(drops[0].str("why"), Some("no member at that address"));
+        assert_eq!(drops[0].conn.sandbox.as_ref().map(|s| &*s.name), Some("agent"));
+        assert!(kept.of("net", "blocked").iter().all(|e| e.str("why") != Some("Lan")));
+        socket.send_to(b"anyone?", SocketAddr::new(Ipv4Addr::new(192, 168, 56, 99).into(), 7));
+        let drops = kept.wait(&fcx, 2, Duration::from_secs(2), |e| e.is("lan", "drop") && e.str("lan") == Some("corp")).await?;
+        assert_eq!(drops[1].conn.sandbox.as_ref().map(|s| &*s.name), Some("ws01"));
+        assert_eq!(drops[1].u64("count"), Some(1));
+        assert_eq!(drops[1].str("why"), Some("no member at that address"));
         // The VM is named in events like any sandbox.
         let joined = kept.of("net", "attached");
         assert!(joined.iter().any(|e| e.conn.sandbox.as_ref().is_some_and(|s| &*s.name == "ws01")));

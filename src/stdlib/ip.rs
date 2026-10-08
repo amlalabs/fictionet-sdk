@@ -74,7 +74,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ops::Range;
 use std::task::Poll;
 
-use fictionet::stdlib::{PortEvent as Event, Ports, icmp};
+use fictionet::stdlib::{ports::{Event, Ports}, icmp};
 use fictionet::time::{Duration, Instant};
 use fictionet::{Cx, End, Interface, Packet};
 
@@ -110,7 +110,7 @@ pub fn split_versions(fcx: &Cx, inner: impl Interface) -> (End, End, End) {
     let (v6, v6_mine) = capped();
     let (other, other_mine) = capped();
     fcx.spawn_as(|| "split_versions".into(), move |fcx| async move {
-        let ports = Ports::new(vec![Box::new(inner), Box::new(v4_mine), Box::new(v6_mine), Box::new(other_mine)]);
+        let ports = Ports::new(vec![Box::new(inner) as Box<dyn Interface>, Box::new(v4_mine), Box::new(v6_mine), Box::new(other_mine)]);
         split(fcx, ports, None, |packet| match version(&packet.0) {
             Some(4) => 1,
             Some(6) => 2,
@@ -130,7 +130,7 @@ pub fn split_versions(fcx: &Cx, inner: impl Interface) -> (End, End, End) {
 /// other port has closed.
 async fn split(
     fcx: Cx,
-    mut ports: Ports,
+    mut ports: Ports<Box<dyn Interface>>,
     mut reassembly: Option<Reassembly>,
     sort: impl Fn(&Packet) -> usize,
 ) -> fictionet::Result {
@@ -243,7 +243,7 @@ pub fn split_protocols(fcx: &Cx, inner: impl Interface) -> (End, End, End, End) 
     let (other, other_mine) = capped();
     fcx.spawn_as(|| "split_protocols".into(), move |fcx| async move {
         let ports = Ports::new(vec![
-            Box::new(inner),
+            Box::new(inner) as Box<dyn Interface>,
             Box::new(tcp_mine),
             Box::new(udp_mine),
             Box::new(icmp_mine),

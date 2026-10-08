@@ -130,7 +130,9 @@ use crate::time::Instant;
 /// with the packet's addresses and protocol (a
 /// [repeat](crate::events#repeats)). Its length, its destination port and
 /// `detail` change with each packet, so they are its detail.
-pub fn record_drop(fcx: &Cx, source: &'static str, packet: &crate::Packet, why: &'static str, detail: Fields) {
+/// `enrich` adds context to the owned event before it is recorded.
+pub fn record_drop<F>(fcx: &Cx, source: &'static str, packet: &crate::Packet, why: &'static str, detail: Fields, enrich: F)
+where F: FnOnce(Event) -> Event {
     let h = crate::stdlib::ip::Header::parse_truncated(&packet.0);
     let port = h.as_ref().and_then(|h| h.dst_port(&packet.0));
     let (src, dst) = match &h {
@@ -146,7 +148,7 @@ pub fn record_drop(fcx: &Cx, source: &'static str, packet: &crate::Packet, why: 
         .field("why", why);
     let mut all = Fields::new().with("len", packet.0.len() as u64).with("dst_port", opt(port.map(u32::from)));
     all.extend(detail);
-    fcx.record_repeat(event, all);
+    fcx.record_repeat(enrich(event), all);
 }
 
 /// How many events a run's log holds. Past this, the oldest are dropped.
