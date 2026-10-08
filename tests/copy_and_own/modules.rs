@@ -14,6 +14,14 @@ macro_rules! protocols {
         pub mod observe_tls;
         #[path = "../../src/observe/conversation.rs"]
         pub mod observe_conversation;
+        #[path = "../../src/stdlib/tcp.rs"]
+        pub mod tcp;
+        #[path = "../../src/stdlib/udp.rs"]
+        pub mod udp;
+        #[path = "../../src/stdlib/route.rs"]
+        pub mod route;
+        #[path = "../../src/stdlib/tls.rs"]
+        pub mod tls;
         #[path = "../../src/stdlib/codec/ascii.rs"]
         pub mod ascii;
         #[path = "../../src/stdlib/codec/base64.rs"]

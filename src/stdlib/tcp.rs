@@ -10,13 +10,13 @@
 //!
 //! Inside, an endpoint is one background task that runs the smoltcp TCP
 //! stack. The interface it takes comes from
-//! [`ip::split_protocols`](crate::stdlib::ip::split_protocols), which
+//! [`ip::split_protocols`](fictionet::stdlib::ip::split_protocols), which
 //! splits a machine's packets so that only TCP, and ICMP errors about it,
 //! reach this layer.
 //!
 //! This builds a machine at `104.18.32.7` and accepts connections on its
-//! port 443. The other end of the [`pair`](crate::pair) goes to a router,
-//! as the [`route`](crate::stdlib::route) page shows:
+//! port 443. The other end of the [`pair`](fictionet::pair) goes to a router,
+//! as the [`route`](fictionet::stdlib::route) page shows:
 //!
 //! ```
 //! # use fictionet::{Cx, Result, pair};
@@ -49,11 +49,11 @@ use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::tcp::{self as stcp, State as TcpState};
 use smoltcp::wire::{HardwareAddress, IpCidr};
 
-use crate::cx::CancelWait;
-use crate::stdlib::ip::{Header, protocol::TCP, set_header_checksum, strip_extension_headers, transport_checksum};
-use crate::stdlib::{ConnError, Connection};
-use crate::time::{Duration, Instant};
-use crate::{Cx, Error, Interface, Packet};
+use fictionet::CancelWait;
+use fictionet::stdlib::ip::{Header, protocol::TCP, set_header_checksum, strip_extension_headers, transport_checksum};
+use fictionet::stdlib::{ConnError, Connection};
+use fictionet::time::{Duration, Instant};
+use fictionet::{Cx, Error, Interface, Packet};
 
 /// The MTU the endpoint assumes. Segments it sends are at most the smaller
 /// of this and what the peer's MSS option allows.
@@ -101,7 +101,7 @@ const ACK_DELAY: Duration = Duration::from_millis(10);
 /// connection attempt to a port with no listener gets a RST, because that
 /// is part of TCP's job. Everything it sends goes into `inner`.
 ///
-/// The task stops when the caller's [region](crate::Cx#regions) is
+/// The task stops when the caller's [region](fictionet::Cx#regions) is
 /// cancelled or `inner` closes. The endpoint's listeners and connections
 /// then fail with [`ConnError::Closed`].
 ///
@@ -160,7 +160,7 @@ impl Options {
     /// Larger buffers cost memory only as data passes through them, but they
     /// let each connection put more packets in flight at once. Interfaces
     /// with a size limit on the way, such as those of
-    /// [`split_protocols`](crate::stdlib::ip::split_protocols), drop what
+    /// [`split_protocols`](fictionet::stdlib::ip::split_protocols), drop what
     /// does not fit, and TCP then sends it again.
     pub fn buffer(self, bytes: usize) -> Options {
         Options { buffer: bytes.clamp(MIN_BUFFER, MAX_BUFFER), ..self }
@@ -1064,7 +1064,7 @@ impl Shared {
 
 /// The endpoint's one task: packets in, smoltcp, packets out, timers.
 async fn drive(fcx: &Cx, shared: &Shared, mut inner: impl Interface) {
-    let mut timer = crate::cx::Timer::default();
+    let mut timer = fictionet::Timer::default();
     let mut batch: Vec<Vec<u8>> = Vec::with_capacity(64);
     let mut out: Vec<Vec<u8>> = Vec::new();
     poll_fn(|cx| {
@@ -1293,7 +1293,7 @@ impl Listener {
     /// Waits for the next connection.
     ///
     /// Returns early with [`ConnError::Cancelled`] if `fcx`'s
-    /// [region](crate::Cx#regions) is cancelled, and fails with
+    /// [region](fictionet::Cx#regions) is cancelled, and fails with
     /// [`ConnError::Closed`] once the endpoint has stopped.
     ///
     /// Up to 16,384 connections wait here for `accept`, counting those
@@ -1582,8 +1582,8 @@ impl Connection for TcpConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stdlib::ConnectionExt;
-    use crate::{InterfaceExt, block_on, pair, run};
+    use fictionet::stdlib::ConnectionExt;
+    use fictionet::{InterfaceExt, block_on, pair, run};
 
     /// Resident pages of every socket's buffers on `e`.
     fn resident(e: &Endpoint) -> usize {
@@ -1607,7 +1607,7 @@ mod tests {
         t[14..16].copy_from_slice(&65535u16.to_be_bytes());
         let sum = transport_checksum(src.ip(), dst.ip(), TCP, &t);
         t[16..18].copy_from_slice(&sum.to_be_bytes());
-        crate::stdlib::ip::packet(src.ip(), dst.ip(), TCP, &t)
+        fictionet::stdlib::ip::packet(src.ip(), dst.ip(), TCP, &t)
     }
 
     /// Drives the stack at one fixed time, without running its background task.
@@ -1772,7 +1772,7 @@ mod tests {
                     }
                 }
                 assert_eq!(got, expected);
-                Err::<(), crate::Error>(fictionet::Error::msg("done"))
+                Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
             }));
             assert_eq!(result.unwrap_err().to_string(), "done");
         }
@@ -1846,7 +1846,7 @@ mod tests {
             st.ingress(local.ip(), now, incoming(9, end.wrapping_add(1), 0x10, 32768));
             assert_eq!(st.get(h).state(), TcpState::Closed);
             drop(st);
-            Err::<(), crate::Error>(fictionet::Error::msg("done"))
+            Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
         }));
         assert_eq!(result.unwrap_err().to_string(), "done");
     }
@@ -1876,7 +1876,7 @@ mod tests {
                 }
             }
             assert_eq!((syn_acks, rsts), (4, 6));
-            Err::<(), crate::Error>(fictionet::Error::msg("done"))
+            Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
         }));
         assert_eq!(result.unwrap_err().to_string(), "done");
     }
@@ -1912,7 +1912,7 @@ mod tests {
             assert!(l.idle.len() <= 1, "{} spare listening sockets", l.idle.len());
             assert!(st.sockets.iter().count() <= 1);
             drop(st);
-            Err::<(), crate::Error>(fictionet::Error::msg("done"))
+            Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
         }));
         assert_eq!(result.unwrap_err().to_string(), "done");
     }
@@ -1961,7 +1961,7 @@ mod tests {
             }
             writer.join(&fcx).await?;
             assert!(got == data, "the connection that stayed open still works");
-            Err::<(), crate::Error>(fictionet::Error::msg("done"))
+            Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
         }));
         assert_eq!(result.unwrap_err().to_string(), "done");
     }
@@ -1985,7 +1985,7 @@ mod tests {
             assert_eq!(st.get(h).state(), TcpState::FinWait2, "the client never closes its side");
             assert_eq!(st.get(h).timeout(), Some(ORPHAN_TIMEOUT.into()));
             drop(st);
-            Err::<(), crate::Error>(fictionet::Error::msg("done"))
+            Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
         }));
         assert_eq!(result.unwrap_err().to_string(), "done");
     }
@@ -2020,7 +2020,7 @@ mod tests {
                 }
                 assert!(got == data, "the data came through unchanged with {size}-byte buffers");
                 writer.join(&fcx).await?;
-                Err::<(), crate::Error>(fictionet::Error::msg("done"))
+                Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
             }));
             assert_eq!(result.unwrap_err().to_string(), "done");
         }
@@ -2077,7 +2077,7 @@ mod tests {
             }
             drop((c, s));
             // Err ends the run, and with it the endpoints' drivers.
-            Err::<(), crate::Error>(fictionet::Error::msg("done"))
+            Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
         }));
         assert_eq!(result.unwrap_err().to_string(), "done");
     }

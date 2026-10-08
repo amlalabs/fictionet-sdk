@@ -73,6 +73,13 @@ use crate::timer::timers;
 /// group as one box, with the traffic that crosses its edge added up, and
 /// opens it to show what is inside.
 ///
+/// # Waiting
+///
+/// [`Cx::sleep`] and [`Cx::sleep_until`] wait on the run's clock.
+/// [`Timer`] is an owned deadline wait for manual polling.
+/// [`CancelWait`] and [`Cx::register_cancel`] register poll-time wakeups
+/// for cancellation.
+///
 /// # Stopping
 ///
 /// Stopping is cooperative. Cancelling a region does not drop its tasks.
@@ -111,6 +118,8 @@ impl Cx {
     }
 
     /// Waits until the run's clock reaches `deadline`.
+    ///
+    /// For an owned wait with a resettable deadline, use [`Timer`].
     ///
     /// Returns immediately if `deadline` has already passed. Returns early
     /// with [`Cancelled`] if this `Cx`'s [region](Cx#regions) is cancelled.
@@ -486,7 +495,9 @@ impl Cx {
     /// region in `wait`'s slot. Each wait keeps one `CancelWait` for as long
     /// as it lives, and dropping it takes the waker out of the region, so a
     /// region holds one waker per wait outside the run, no more.
-    pub(crate) fn register_cancel(&self, waker: &Waker, wait: &mut CancelWait) -> bool {
+    /// Create the token with [`CancelWait::default`] and keep it for one
+    /// region. Call this method on each poll to update its waker.
+    pub fn register_cancel(&self, waker: &Waker, wait: &mut CancelWait) -> bool {
         if crate::run::is_current_task(&self.run, waker) {
             wait.0 = None;
             return self.is_cancelled();
@@ -690,8 +701,9 @@ impl JoinState {
 
 /// One wait's place for its waker in a region, for waits polled outside the
 /// run. See [`Cx::register_cancel`]. Dropping it takes the waker out.
+/// Create an empty token with [`Default::default`] and use it with one region.
 #[derive(Default)]
-pub(crate) struct CancelWait(Option<(Arc<Region>, u64)>);
+pub struct CancelWait(Option<(Arc<Region>, u64)>);
 
 impl Drop for CancelWait {
     fn drop(&mut self) {
@@ -909,8 +921,12 @@ impl Drop for Sleep<'_> {
 /// Moving the deadline reuses the same timer entry, where dropping one
 /// [`Cx::sleep_until`] future and making another would add and remove an
 /// entry, and allocate the boxed future, each time.
+/// Create an inactive timer with [`Default::default`]. Each call to
+/// [`Timer::poll_until`] sets its deadline. [`Timer::clear`] removes the
+/// deadline; dropping the timer also unregisters its cancellation waiter.
+/// Use a timer with one region.
 #[derive(Default)]
-pub(crate) struct Timer {
+pub struct Timer {
     /// The wall-clock deadline of the timer entry, if there is one.
     deadline: Option<crate::sys::Instant>,
     entry: Option<u64>,
@@ -920,8 +936,10 @@ pub(crate) struct Timer {
 impl Timer {
     /// Polls for `deadline` to pass: `Ready(Ok(()))` once it has. Until
     /// then, `cx`'s waker is woken when it passes or when `fcx`'s region is
-    /// cancelled.
-    pub(crate) fn poll_until(&mut self, fcx: &Cx, cx: &mut Context<'_>, deadline: Instant) -> Poll<Result<(), Cancelled>> {
+    /// cancelled. Cancellation returns `Ready(Err(Cancelled))`, even if
+    /// the deadline has passed. A deadline beyond the system clock's range
+    /// waits only for cancellation.
+    pub fn poll_until(&mut self, fcx: &Cx, cx: &mut Context<'_>, deadline: Instant) -> Poll<Result<(), Cancelled>> {
         if fcx.is_cancelled() {
             return Poll::Ready(Err(Cancelled));
         }
@@ -947,8 +965,9 @@ impl Timer {
         Poll::Pending
     }
 
-    /// Stops waiting: the timer entry, if any, is removed.
-    pub(crate) fn clear(&mut self) {
+    /// Removes the deadline and its timer entry, if any.
+    /// The cancellation registration stays until the timer is dropped.
+    pub fn clear(&mut self) {
         if let Some(id) = self.entry.take() {
             timers().remove(id);
         }

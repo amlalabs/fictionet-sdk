@@ -13,7 +13,7 @@
 //! on Windows networks.
 //!
 //! To build a whole network of websites, routes and all, use
-//! [`web::Sites`](crate::stdlib::web::Sites) instead.
+//! [`web::Sites`](fictionet::stdlib::web::Sites) instead.
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -21,9 +21,9 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Poll, Waker};
 
-use crate::events::{self, Level};
-use crate::stdlib::{Event, Ports, ip};
-use crate::{Cx, Error, Interface, Packet};
+use fictionet::events::{self, Level};
+use fictionet::stdlib::{PortEvent, Ports, ip};
+use fictionet::{Cx, Error, Interface, Packet};
 
 /// An address prefix, such as `104.18.32.7/32` or `::/0`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -111,12 +111,12 @@ fn mask(addr: IpAddr, len: u8) -> IpAddr {
 /// When one route's interface closes, the router drops that route and keeps
 /// running. Packets for its prefix then match the next-best route, or are
 /// dropped. This is what a real router does when a link goes down. The
-/// router's task stops when the caller's [region](crate::Cx#regions) is
+/// router's task stops when the caller's [region](fictionet::Cx#regions) is
 /// cancelled, or when the interfaces of all its routes have closed and
 /// every [`Router`] handle has been dropped.
 ///
 /// Each route needs an interface whose other end is held by whatever lies
-/// in that direction. Make the two ends with [`pair`](crate::pair), give
+/// in that direction. Make the two ends with [`pair`](fictionet::pair), give
 /// one to the router, and build a machine on the other. Here the sandbox
 /// gets the default route, and two machines each get one address:
 ///
@@ -151,9 +151,9 @@ fn mask(addr: IpAddr, len: u8) -> IpAddr {
 /// packet that arrives with a TTL or hop limit of 0 or 1 is dropped, so a
 /// loop of routes, such as two routers whose default routes point at each
 /// other, cannot carry a packet forever. The drop is recorded as a
-/// `router.drop` [event](crate::events), a [repeat](crate::events#repeats). Once the router has an [address](Router::address) of the
+/// `router.drop` [event](fictionet::events), a [repeat](fictionet::events#repeats). Once the router has an [address](Router::address) of the
 /// packet's family, it also answers the sender with an ICMP "time
-/// exceeded" ([`icmp::time_exceeded`](crate::stdlib::icmp::time_exceeded)),
+/// exceeded" ([`icmp::time_exceeded`](fictionet::stdlib::icmp::time_exceeded)),
 /// which is what `traceroute` reads. Packets to or from the router's own
 /// addresses are its own, not forwarded, and keep their TTL. A router
 /// told to [`keep_ttl`](Router::keep_ttl) changes no packet.
@@ -189,7 +189,7 @@ pub fn router(fcx: &Cx, routes: Vec<(Prefix, Box<dyn Interface>)>) -> Router {
             for (prefix, interface) in adds {
                 let prefix = prefix.canonical();
                 if let Some(link) = interface.observe_link() {
-                    fcx.graph().label(&link.0, format!("{}/{}", prefix.addr, prefix.len));
+                    link.label(&fcx, format!("{}/{}", prefix.addr, prefix.len));
                 }
                 match table.routes.get(&prefix) {
                     Some(&i) => ports.replace(i, interface),
@@ -216,7 +216,7 @@ pub fn router(fcx: &Cx, routes: Vec<(Prefix, Box<dyn Interface>)>) -> Router {
                 })
                 .await?;
             match event {
-                Event::Packet(_, mut packet) => {
+                PortEvent::Packet(_, mut packet) => {
                     let Some(dst) = ip::destination(&packet.0) else { continue };
                     if !keep_ttl
                         && !is_own(addrs, dst)
@@ -230,7 +230,7 @@ pub fn router(fcx: &Cx, routes: Vec<(Prefix, Box<dyn Interface>)>) -> Router {
                         ports.send(i, packet);
                     }
                 }
-                Event::Closed(i) => {
+                PortEvent::Closed(i) => {
                     if let Some(prefix) = table.by_port.get(&i) {
                         let prefix = format!("{}/{}", prefix.addr, prefix.len);
                         let event = events::Event::new("router", "route_removed").level(Level::Notice).summary(format!("{prefix}: its interface closed")).field("prefix", prefix);
@@ -238,7 +238,7 @@ pub fn router(fcx: &Cx, routes: Vec<(Prefix, Box<dyn Interface>)>) -> Router {
                     }
                     table.remove_port(i)
                 }
-                Event::Extra | Event::Timer => {}
+                PortEvent::Extra | PortEvent::Timer => {}
             }
         }
     });
@@ -251,10 +251,10 @@ pub fn router(fcx: &Cx, routes: Vec<(Prefix, Box<dyn Interface>)>) -> Router {
 fn expired(fcx: &Cx, addrs: Addrs, table: &Table, ports: &mut Ports, packet: Packet) {
     let v4 = ip::version(&packet.0) == Some(4);
     let why = if v4 { "its TTL ran out" } else { "its hop limit ran out" };
-    crate::observe::record_drop(fcx, "router", &packet, why, events::Fields::new());
+    fictionet::events::record_drop(fcx, "router", &packet, why, events::Fields::new());
     let (a4, a6) = addrs;
     let from = if v4 { a4.map(IpAddr::V4) } else { a6.map(IpAddr::V6) };
-    let answer = from.and_then(|from| crate::stdlib::icmp::time_exceeded(&packet.0, from));
+    let answer = from.and_then(|from| fictionet::stdlib::icmp::time_exceeded(&packet.0, from));
     if let Some(answer) = answer
         && let Some(src) = ip::source(&packet.0)
         && let Some(i) = table.best(src)
@@ -433,7 +433,7 @@ impl Router {
     /// Makes the router a private one, invisible to the packets it
     /// forwards: from now on it leaves their TTL and hop limit as they are,
     /// and never drops a packet for running out. A network that should look
-    /// like one hop, such as [`Net`](crate::stdlib::net::Net), uses this.
+    /// like one hop, such as [`Net`](fictionet::stdlib::net::Net), uses this.
     /// Such a router can carry a packet around a loop of routes forever, so
     /// use it only where every way back to it passes something that lowers
     /// the TTL itself, such as a sandbox's kernel.
@@ -471,13 +471,13 @@ impl Router {
 /// that address, or is dropped. It never goes to the gateway.
 ///
 /// Every packet the LAN drops is recorded as a `lan.drop`
-/// [repeat](crate::events#repeats) with the reason: no member at the destination,
+/// [repeat](fictionet::events#repeats) with the reason: no member at the destination,
 /// no gateway for an address outside the subnet, a packet from the gateway
 /// for such an address, a member's own address, the other address family,
 /// or not an IP packet. A member that is replaced or whose interface closes
 /// is recorded too (`lan.member_replaced`, `lan.member_removed`). `on_drop`,
 /// when given, hears every drop with its reason as well, as
-/// [`net::Net`](crate::stdlib::net::Net) uses to name the sandbox that
+/// [`net::Net`](fictionet::stdlib::net::Net) uses to name the sandbox that
 /// sent it.
 ///
 /// This is how virtual machines attached with `fictionet attach --type tap`
@@ -510,7 +510,7 @@ impl Router {
 /// ```
 ///
 /// An address has one member: adding it again replaces and closes the old
-/// interface. The task stops when the caller's [region](crate::Cx#regions)
+/// interface. The task stops when the caller's [region](fictionet::Cx#regions)
 /// is cancelled, or when every member and the gateway have closed and the
 /// last [`Lan`] handle has been dropped.
 #[track_caller]
@@ -551,9 +551,9 @@ pub fn lan(fcx: &Cx, subnet: Prefix, on_drop: Option<OnDrop>) -> Lan {
                 })
                 .await?;
             match event {
-                Event::Packet(from, packet) => members.forward(&fcx, &mut ports, subnet, from, packet),
-                Event::Closed(i) => members.remove_port(&fcx, i),
-                Event::Extra | Event::Timer => {}
+                PortEvent::Packet(from, packet) => members.forward(&fcx, &mut ports, subnet, from, packet),
+                PortEvent::Closed(i) => members.remove_port(&fcx, i),
+                PortEvent::Extra | PortEvent::Timer => {}
             }
         }
     });
@@ -601,7 +601,7 @@ fn dropped(fcx: &Cx, on_drop: &Option<OnDrop>, packet: &Packet, why: &'static st
     if let Some(f) = on_drop {
         f(fcx, packet, why);
     }
-    crate::observe::record_drop(fcx, "lan", packet, why, events::Fields::new());
+    fictionet::events::record_drop(fcx, "lan", packet, why, events::Fields::new());
 }
 
 /// Records a change to a LAN's members.
@@ -639,7 +639,7 @@ impl Members {
         match join {
             Join::Member(addr, interface) => {
                 if let Some(link) = interface.observe_link() {
-                    fcx.graph().label(&link.0, addr.to_string());
+                    link.label(fcx, addr.to_string());
                 }
                 match self.by_addr.get(&addr).copied() {
                     Some(i) => {
@@ -655,7 +655,7 @@ impl Members {
             }
             Join::Gateway(interface) => {
                 if let Some(link) = interface.observe_link() {
-                    fcx.graph().label(&link.0, "gateway".into());
+                    link.label(fcx, "gateway".into());
                 }
                 match self.gateway {
                     Some(i) => {
@@ -834,7 +834,7 @@ impl Lan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::InterfaceExt;
+    use fictionet::InterfaceExt;
     use std::time::Duration;
 
     /// A bare IPv4 header, protocol 253 (for experiments), no payload.
@@ -854,7 +854,7 @@ mod tests {
     }
 
     /// The packet waiting on `iface`, if any, without waiting.
-    fn ready(fcx: &Cx, iface: &mut crate::End) -> Option<Packet> {
+    fn ready(fcx: &Cx, iface: &mut fictionet::End) -> Option<Packet> {
         let mut cx = std::task::Context::from_waker(Waker::noop());
         match iface.poll_recv(fcx, &mut cx) {
             Poll::Ready(Ok(p)) => Some(p),
@@ -863,7 +863,7 @@ mod tests {
     }
 
     fn ip(src: &str, dst: &str, ttl: u8) -> Packet {
-        let mut p = crate::stdlib::ip::packet(src.parse().unwrap(), dst.parse().unwrap(), 17, &[0; 8]);
+        let mut p = fictionet::stdlib::ip::packet(src.parse().unwrap(), dst.parse().unwrap(), 17, &[0; 8]);
         if p.0[0] >> 4 == 4 {
             p.0[8] = ttl;
             ip::set_header_checksum(&mut p.0[..20]);
@@ -878,11 +878,11 @@ mod tests {
     /// says so, and the sender hears "time exceeded".
     #[test]
     fn a_routing_loop_ends_when_the_ttl_runs_out() {
-        crate::block_on(crate::run(|fcx| async move {
-            let (r1_s4, mut s4) = crate::pair();
-            let (r1_s6, mut s6) = crate::pair();
-            let (r1_r2, r2_r1) = crate::pair();
-            let (r1_r2_6, r2_r1_6) = crate::pair();
+        fictionet::block_on(fictionet::run(|fcx| async move {
+            let (r1_s4, mut s4) = fictionet::pair();
+            let (r1_s6, mut s6) = fictionet::pair();
+            let (r1_r2, r2_r1) = fictionet::pair();
+            let (r1_r2_6, r2_r1_6) = fictionet::pair();
             let r1 = router(&fcx, vec![
                 ("10.0.0.2/32".parse()?, Box::new(r1_s4) as Box<dyn Interface>),
                 ("fd00::2/128".parse()?, Box::new(r1_s6)),
@@ -927,10 +927,10 @@ mod tests {
     /// holds. The router's own packets keep theirs.
     #[test]
     fn forwarding_lowers_the_ttl() {
-        crate::block_on(crate::run(|fcx| async move {
-            let (ra, mut a) = crate::pair();
-            let (rb, mut b) = crate::pair();
-            let (rg, mut g) = crate::pair();
+        fictionet::block_on(fictionet::run(|fcx| async move {
+            let (ra, mut a) = fictionet::pair();
+            let (rb, mut b) = fictionet::pair();
+            let (rg, mut g) = fictionet::pair();
             let r = router(&fcx, vec![
                 ("10.0.0.2/32".parse()?, Box::new(ra) as Box<dyn Interface>),
                 ("10.0.0.3/32".parse()?, Box::new(rb)),
@@ -961,7 +961,7 @@ mod tests {
     fn lan_floods_in_address_order() {
         struct Receiver(u8, Arc<Mutex<Vec<u8>>>);
         impl Interface for Receiver {
-            fn poll_recv(&mut self, _: &Cx, _: &mut std::task::Context<'_>) -> Poll<Result<Packet, crate::RecvError>> {
+            fn poll_recv(&mut self, _: &Cx, _: &mut std::task::Context<'_>) -> Poll<Result<Packet, fictionet::RecvError>> {
                 Poll::Pending
             }
 
@@ -970,7 +970,7 @@ mod tests {
             }
         }
 
-        crate::block_on(crate::run(|fcx| async move {
+        fictionet::block_on(fictionet::run(|fcx| async move {
             for _ in 0..128 {
                 let sent = Arc::new(Mutex::new(Vec::new()));
                 let mut members = Members::default();
@@ -1021,15 +1021,15 @@ mod tests {
 
     #[test]
     fn member_addresses_are_unicast_in_the_subnet() {
-        crate::block_on(crate::run(|fcx| async move {
+        fictionet::block_on(fictionet::run(|fcx| async move {
             let lan = lan(&fcx, "192.168.56.0/24".parse()?, None);
             for bad in ["192.168.57.1", "192.168.56.255", "255.255.255.255", "224.0.0.252", "0.0.0.0", "fd00::1"] {
-                let (end, mut far) = crate::pair();
+                let (end, mut far) = fictionet::pair();
                 let err = lan.add(bad.parse()?, Box::new(end)).unwrap_err().to_string();
                 assert!(err.contains(bad), "{bad}: {err}");
-                assert_eq!(far.recv(&fcx).await, Err(crate::RecvError::Closed), "{bad}: the interface is dropped");
+                assert_eq!(far.recv(&fcx).await, Err(fictionet::RecvError::Closed), "{bad}: the interface is dropped");
             }
-            let (end, _far) = crate::pair();
+            let (end, _far) = fictionet::pair();
             lan.add("192.168.56.0".parse()?, Box::new(end))?;
             Ok(())
         }))
@@ -1040,10 +1040,10 @@ mod tests {
     /// each with its reason, with no observer.
     #[test]
     fn drops_and_member_changes_are_recorded() {
-        crate::block_on(crate::run(|fcx| async move {
+        fictionet::block_on(fictionet::run(|fcx| async move {
             let lan = lan(&fcx, "192.168.56.0/24".parse()?, None);
-            let (a_lan, mut a) = crate::pair();
-            let (b_lan, _b) = crate::pair();
+            let (a_lan, mut a) = fictionet::pair();
+            let (b_lan, _b) = fictionet::pair();
             lan.add("192.168.56.10".parse()?, Box::new(a_lan))?;
             lan.add("192.168.56.11".parse()?, Box::new(b_lan))?;
             assert!(!fcx.observed());
@@ -1052,7 +1052,7 @@ mod tests {
             a.send(v4([192, 168, 56, 10], [192, 168, 56, 10]));
             a.send(v6("fe80::1".parse()?, "ff02::1:3".parse()?));
             a.send(Packet(vec![1, 2, 3]));
-            let (b2_lan, b2) = crate::pair();
+            let (b2_lan, b2) = fictionet::pair();
             lan.add("192.168.56.11".parse()?, Box::new(b2_lan))?;
             fcx.sleep(Duration::from_millis(20)).await?;
             drop(b2);
@@ -1087,7 +1087,7 @@ mod tests {
     /// dropped.
     #[test]
     fn joining_a_stopped_lan_fails() {
-        crate::block_on(crate::run(|fcx| async move {
+        fictionet::block_on(fictionet::run(|fcx| async move {
             let kept: Arc<Mutex<Option<Lan>>> = Arc::default();
             let k = kept.clone();
             let r = fcx
@@ -1098,12 +1098,12 @@ mod tests {
                 .await;
             assert_eq!(r.unwrap_err().to_string(), "stop");
             let lan = lock(&kept).take().unwrap();
-            let (end, mut far) = crate::pair();
+            let (end, mut far) = fictionet::pair();
             assert_eq!(lan.add("10.0.0.2".parse()?, Box::new(end)).unwrap_err().to_string(), "the LAN has stopped");
-            assert_eq!(far.recv(&fcx).await, Err(crate::RecvError::Closed));
-            let (end, mut far) = crate::pair();
+            assert_eq!(far.recv(&fcx).await, Err(fictionet::RecvError::Closed));
+            let (end, mut far) = fictionet::pair();
             assert_eq!(lan.gateway(Box::new(end)).unwrap_err().to_string(), "the LAN has stopped");
-            assert_eq!(far.recv(&fcx).await, Err(crate::RecvError::Closed));
+            assert_eq!(far.recv(&fcx).await, Err(fictionet::RecvError::Closed));
             Ok(())
         }))
         .unwrap();

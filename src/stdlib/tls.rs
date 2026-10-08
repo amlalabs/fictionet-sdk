@@ -2,10 +2,10 @@
 //!
 //! Use this module when a machine in the world serves HTTPS, or any other
 //! protocol over TLS, by hand. If the world is a set of websites,
-//! [`web::Sites`](crate::stdlib::web::Sites) does TLS for you.
+//! [`web::Sites`](fictionet::stdlib::web::Sites) does TLS for you.
 //!
 //! TLS here is middleware. It takes a [`Connection`], usually a
-//! [`TcpConnection`](crate::stdlib::tcp::TcpConnection), and gives back a
+//! [`TcpConnection`](fictionet::stdlib::tcp::TcpConnection), and gives back a
 //! `Connection` that carries the decrypted bytes.
 //!
 //! Certificates are not Fictionet's concern. The world builds an ordinary
@@ -66,8 +66,8 @@ use rustls::server::{Acceptor, ServerConnection};
 use rustls::time_provider::TimeProvider;
 use rustls::{ConfigBuilder, WantsVersions};
 
-use crate::Cx;
-use crate::stdlib::{ConnError, Connection};
+use fictionet::Cx;
+use fictionet::stdlib::{ConnError, Connection};
 
 /// The name of a TLS alert, or "unknown" for an unrecognized code.
 pub fn alert_name(code: u8) -> &'static str {
@@ -121,10 +121,10 @@ pub fn alert_name(code: u8) -> &'static str {
 ///
 /// - **Time** is `start` plus the time since the run started, from `fcx`.
 ///   `start` is the world's date and time when the run started, which the
-///   world takes from its arguments (see [No dates](crate::time#no-dates)).
+///   world takes from its arguments (see [No dates](fictionet::time#no-dates)).
 ///   So a world set in 2019 checks certificates against 2019.
 /// - **Random values**, such as the server random, session IDs and ticket
-///   keys, come from [`Cx::random_u64`](crate::Cx::random_u64).
+///   keys, come from [`Cx::random_u64`](fictionet::Cx::random_u64).
 ///
 /// Key exchange is the exception. rustls's built-in providers make each
 /// ephemeral key with the operating system's randomness, inside the
@@ -222,7 +222,7 @@ impl SecureRandom for CxRandom {
 }
 
 fn os_random(buf: &mut [u8]) -> Result<(), GetRandomFailed> {
-    crate::sys::random_bytes(buf).map_err(|_| GetRandomFailed)
+    fictionet::random_bytes(buf).map_err(|_| GetRandomFailed)
 }
 
 /// How much to read from the connection underneath in one read.
@@ -322,7 +322,7 @@ impl<C: Connection> Io<C> {
 
 /// How a handshake failed, in more detail than [`ConnError`]: what
 /// [`server_detailed`], [`ClientHello::finish_detailed`] and
-/// [`serve::accept_tls`](crate::stdlib::serve::accept_tls) return, for a
+/// [`serve::accept_tls`](fictionet::stdlib::serve::accept_tls) return, for a
 /// world that logs how each handshake ended.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -343,7 +343,7 @@ pub enum HandshakeError {
     /// The connection underneath failed. Never [`ConnError::Cancelled`]:
     /// a cancel is [`HandshakeError::Cancelled`].
     Conn(ConnError),
-    /// The [region](crate::Cx#regions) of the `Cx` passed to the call was
+    /// The [region](fictionet::Cx#regions) of the `Cx` passed to the call was
     /// cancelled while it waited.
     Cancelled,
 }
@@ -408,7 +408,7 @@ impl HandshakeError {
 /// Fails with [`ConnError::Broken`] if the client's first message is not a
 /// TLS hello, or if the client closes the connection before it sent a whole
 /// hello. An error of the connection underneath, such as
-/// [`ConnError::Cancelled`] when `fcx`'s [region](crate::Cx#regions) is
+/// [`ConnError::Cancelled`] when `fcx`'s [region](fictionet::Cx#regions) is
 /// cancelled, comes out as it is.
 pub async fn server<C: Connection>(fcx: &Cx, conn: C) -> Result<ClientHello<C>, ConnError> {
     server_detailed(fcx, conn).await.map_err(HandshakeError::into_conn)
@@ -485,7 +485,7 @@ impl<C: Connection> ClientHello<C> {
     /// alert and closes the connection. Dropping the hello instead closes the
     /// connection with no alert.
     pub async fn reject(self, fcx: &Cx) -> Result<(), ConnError> {
-        use crate::stdlib::ConnectionExt;
+        use fictionet::stdlib::ConnectionExt;
         let mut conn = self.conn;
         conn.write_all(fcx, &UNRECOGNIZED_NAME).await?;
         conn.shutdown(fcx).await
@@ -508,7 +508,7 @@ impl<C: Connection> ClientHello<C> {
         config: Arc<ServerConfig>,
     ) -> Result<TlsConnection<C>, HandshakeError> {
         let mut io = Io { conn: self.conn, inbuf: self.inbuf, out: Vec::new(), out_pos: 0, eof: false };
-        let config = crate::observe::observed_config(fcx, config, self.server_name.as_deref());
+        let config = fictionet::observe::observed_config(fcx, config, self.server_name.as_deref());
         let mut tls = match with_fcx(fcx, || self.accepted.into_connection(config)) {
             Ok(tls) => tls,
             Err((e, mut alert)) => {

@@ -37,7 +37,7 @@ pub(crate) fn pair_with_guard(guard: Option<Box<dyn Send>>) -> (End, End) {
 
 /// What a queued packet costs against a limit beyond its bytes: its place
 /// in the queue. So a flood of tiny packets is bounded too.
-pub(crate) const PACKET_COST: usize = 64;
+pub const PACKET_COST: usize = 64;
 
 /// Makes a [`pair`] whose queues each hold at most `limit` bytes, counting
 /// each packet's length plus 64 bytes. A packet sent past that is dropped,
@@ -159,7 +159,7 @@ impl Interface for End {
     }
 
     fn observe_link(&self) -> Option<crate::observe::LinkHandle> {
-        Some(crate::observe::LinkHandle(self.cable.meter.clone()))
+        Some(crate::observe::LinkHandle::new(self.cable.meter.clone()))
     }
 }
 

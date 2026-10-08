@@ -155,7 +155,7 @@ impl Interface for Attachment {
     fn observe_link(&self) -> Option<crate::observe::LinkHandle> {
         match &self.link {
             Link::Mapped { interface, .. } => interface.observe_link(),
-            _ => Some(crate::observe::LinkHandle(self.meter.clone())),
+            _ => Some(crate::observe::LinkHandle::new(self.meter.clone())),
         }
     }
 }

@@ -43,8 +43,13 @@ impl rustls::KeyLog for Recorder {
     }
 }
 
-/// `config`, logging its session keys while `fcx`'s world is observed.
-pub(crate) fn observed_config(fcx: &Cx, config: Arc<ServerConfig>, sni: Option<&str>) -> Arc<ServerConfig> {
+/// Applies TLS observation to `config` for `fcx`'s run.
+///
+/// Returns `config` unchanged when the run is not observed. Otherwise,
+/// clones it and replaces its key logger with one that records session
+/// secrets for packet decryption and `tls.keys` events. `sni` is the
+/// client's requested server name, included in those events.
+pub fn observed_config(fcx: &Cx, config: Arc<ServerConfig>, sni: Option<&str>) -> Arc<ServerConfig> {
     if !fcx.observed() {
         return config;
     }

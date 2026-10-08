@@ -14,8 +14,13 @@ pub(crate) use web_time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// Fills `buf` with random bytes from the operating system, or from the
 /// browser's `crypto.getRandomValues`.
+///
+/// This is the secure randomness source for setup outside a run, where no
+/// [`Cx`](crate::Cx) is available. Inside a run, draw randomness through
+/// `Cx`. Returns the source's error if filling fails; `buf` may then be
+/// partially filled.
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn random_bytes(mut buf: &mut [u8]) -> std::io::Result<()> {
+pub fn random_bytes(mut buf: &mut [u8]) -> std::io::Result<()> {
     while !buf.is_empty() {
         // SAFETY: the pointer and length describe `buf`.
         let n = unsafe { libc::getrandom(buf.as_mut_ptr().cast(), buf.len(), 0) };
@@ -33,7 +38,12 @@ pub(crate) fn random_bytes(mut buf: &mut [u8]) -> std::io::Result<()> {
 
 /// Fills `buf` with random bytes from the operating system, or from the
 /// browser's `crypto.getRandomValues`.
+///
+/// This is the secure randomness source for setup outside a run, where no
+/// [`Cx`](crate::Cx) is available. Inside a run, draw randomness through
+/// `Cx`. Returns the source's error if filling fails; `buf` may then be
+/// partially filled.
 #[cfg(target_arch = "wasm32")]
-pub(crate) fn random_bytes(buf: &mut [u8]) -> std::io::Result<()> {
+pub fn random_bytes(buf: &mut [u8]) -> std::io::Result<()> {
     getrandom::fill(buf).map_err(std::io::Error::other)
 }

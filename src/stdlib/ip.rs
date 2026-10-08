@@ -1,7 +1,7 @@
 //! IP: sorting packets by IP version and by the protocol they carry, and
 //! reading, checking and building IP headers.
 //!
-//! Use this module to build a [machine](crate::stdlib#what-you-build-with-it),
+//! Use this module to build a [machine](fictionet::stdlib#what-you-build-with-it),
 //! one IP address on the simulated network. A machine's packets arrive on one
 //! [`Interface`], all mixed together. [`split_protocols`] sorts them into
 //! four new interfaces: TCP, UDP, ICMP and everything else. You then hand
@@ -35,7 +35,7 @@
 //! Both splits start a background task and return immediately. A packet
 //! sent into any of the returned interfaces goes out unchanged on the
 //! interface that was split. The task stops when the caller's
-//! [region](crate::Cx#regions) is cancelled, when the interface it splits
+//! [region](fictionet::Cx#regions) is cancelled, when the interface it splits
 //! closes, or when all of the interfaces it returned have closed.
 //!
 //! # Reading and building packets
@@ -204,8 +204,8 @@ async fn split(
 /// that caused it. An error about a TCP packet goes to the TCP end, and one
 /// about a UDP packet to the UDP end, so code that reads the TCP end sees
 /// the errors about its own connections without reading the ICMP
-/// interface. The stdlib's own [`tcp::endpoint`](crate::stdlib::tcp::endpoint)
-/// and [`udp::endpoint`](crate::stdlib::udp::endpoint) drop them. Pings and
+/// interface. The stdlib's own [`tcp::endpoint`](fictionet::stdlib::tcp::endpoint)
+/// and [`udp::endpoint`](fictionet::stdlib::udp::endpoint) drop them. Pings and
 /// other ICMP messages go to the ICMP end.
 ///
 /// **Fragments are put back together first.** A fragmented packet only
@@ -264,7 +264,7 @@ pub fn split_protocols(fcx: &Cx, inner: impl Interface) -> (End, End, End, End) 
 /// to, as a protocol number: TCP, UDP, ICMP (1 for both versions' ICMP), or
 /// anything else for the last end. ICMP errors are sorted by the protocol
 /// of the packet they quote.
-pub(crate) fn protocol_end(packet: &[u8]) -> u8 {
+pub fn protocol_end(packet: &[u8]) -> u8 {
     let Some(h) = Header::parse_whole(packet) else { return protocol::NONE };
     let icmp = h.payload(packet);
     match h.protocol {
@@ -342,7 +342,7 @@ struct Partial {
 }
 
 /// Fragment reassembly, for [`split_protocols`] and for each sandbox's
-/// filter in [`net::Net`](crate::stdlib::net::Net).
+/// filter in [`net::Net`](fictionet::stdlib::net::Net).
 ///
 /// Every step costs at most a logarithm of the number of unfinished
 /// packets, since the agent decides how many there are. At most 4 MiB of
@@ -421,7 +421,7 @@ impl Reassembly {
 
     /// Takes a packet. Returns it if it is not a fragment, the whole packet
     /// if this fragment completed one, and `None` otherwise.
-    pub(crate) fn reassemble(&mut self, packet: Packet, now: Instant) -> Option<Packet> {
+    fn reassemble(&mut self, packet: Packet, now: Instant) -> Option<Packet> {
         let whole = self.push_fragment(packet, now);
         // Every path that may have added bookkeeping ends here, so the cap
         // holds after each packet.
@@ -570,7 +570,7 @@ impl Reassembly {
     /// cap is passed, the expiry index and the map disagree, or pieces
     /// overlap. For tests and fuzzing.
     #[cfg(any(test, fuzzing))]
-    pub(crate) fn check(&self) {
+    pub fn check(&self) {
         assert!(self.size <= MAX_WAITING, "{} bytes wait", self.size);
         assert_eq!(self.partial.len(), self.by_expiry.len());
         let mut size = 0;
@@ -1478,8 +1478,8 @@ mod tests {
     /// packet the agent sends there.
     #[test]
     fn an_interface_never_read_holds_at_most_its_queue() {
-        let result = crate::block_on(crate::run(|fcx| async move {
-            let (mut raw, side) = crate::pair();
+        let result = fictionet::block_on(fictionet::run(|fcx| async move {
+            let (mut raw, side) = fictionet::pair();
             let (_tcp, _udp, _icmp, other) = split_protocols(&fcx, side);
             // 20 MiB of protocol 99, which goes to `other`.
             for _ in 0..20 * 1024 {
@@ -1491,7 +1491,7 @@ mod tests {
             }
             assert!(other.queued() <= QUEUE, "{} bytes wait", other.queued());
             assert!(other.queued() > QUEUE / 2, "{} bytes wait", other.queued());
-            Err::<(), crate::Error>(fictionet::Error::msg("done"))
+            Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
         }));
         assert_eq!(result.unwrap_err().to_string(), "done");
     }

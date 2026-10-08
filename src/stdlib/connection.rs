@@ -6,7 +6,7 @@ use fictionet::{Cancelled, Cx};
 /// Anything that carries a byte stream both ways: TCP, TLS on top of TCP, a
 /// logging middleware, a test pipe.
 ///
-/// This is to byte streams what [`Interface`](crate::Interface) is to
+/// This is to byte streams what [`Interface`](fictionet::Interface) is to
 /// packets. Middleware takes a connection and returns a connection, so code
 /// that serves HTTP does not care whether TLS is underneath.
 ///
@@ -15,7 +15,7 @@ use fictionet::{Cancelled, Cx};
 /// Call [`read`](ConnectionExt::read), [`write`](ConnectionExt::write) and
 /// the rest of [`ConnectionExt`], and `.await` them. Import them with
 /// `use fictionet::prelude::*`. Every wait takes `&Cx` and returns early with
-/// [`ConnError::Cancelled`] when that `Cx`'s [region](crate::Cx#regions) is
+/// [`ConnError::Cancelled`] when that `Cx`'s [region](fictionet::Cx#regions) is
 /// cancelled.
 ///
 /// The trait itself holds only the three methods a new kind of connection
@@ -32,7 +32,7 @@ use fictionet::{Cancelled, Cx};
 ///
 /// A connection knows nothing about addresses. To see who connected, ask
 /// the TCP connection underneath:
-/// [`TcpConnection::peer_addr`](crate::stdlib::tcp::TcpConnection::peer_addr).
+/// [`TcpConnection::peer_addr`](fictionet::stdlib::tcp::TcpConnection::peer_addr).
 ///
 /// Dropping a connection closes it.
 pub trait Connection: Send + 'static {
@@ -97,7 +97,7 @@ impl Connection for Box<dyn Connection> {
 /// What every [`Connection`] can do, built on its three `poll_` methods.
 ///
 /// Implemented for every connection. Imported by
-/// [`prelude`](crate::prelude).
+/// [`prelude`](fictionet::prelude).
 pub trait ConnectionExt: Connection {
     /// Reads into `buf`. Returns how many bytes were read. `Ok(0)` means the
     /// other side will send nothing more.
@@ -163,7 +163,7 @@ pub enum ConnError {
     Closed,
     /// A layer got bytes it could not understand, such as a bad TLS record.
     Broken,
-    /// The [region](crate::Cx#regions) of the `Cx` passed to the call was
+    /// The [region](fictionet::Cx#regions) of the `Cx` passed to the call was
     /// cancelled while it waited.
     Cancelled,
 }
@@ -192,7 +192,7 @@ impl std::error::Error for ConnError {
 
 /// A connection's error as an [`std::io::Error`], for code that reads and
 /// writes through `std::io` or tokio's traits, such as
-/// [`Compat`](crate::tokio::Compat). The kind is the one std uses for the
+/// [`Compat`](fictionet::tokio::Compat). The kind is the one std uses for the
 /// same failure; the `ConnError` is the source, so
 /// `e.get_ref().and_then(|e| e.downcast_ref::<ConnError>())` gets it back.
 ///

@@ -46,7 +46,11 @@ impl Instant {
         self.since_start
     }
 
-    pub(crate) fn from_since_start(since_start: Duration) -> Instant {
+    /// Makes an instant from elapsed time since the run started.
+    ///
+    /// `Duration::MAX` is accepted as a deadline that never arrives.
+    #[inline]
+    pub fn from_since_start(since_start: Duration) -> Instant {
         Instant { since_start }
     }
 }

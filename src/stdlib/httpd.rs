@@ -14,16 +14,16 @@
 //!   `axum::Router`, run as deferred work of the connection.
 //! - [`VirtualHosts`]: picks a handler by the request's host, as a web server
 //!   with several sites at one address does, with the redirect to https and
-//!   the `421 Misdirected Request` of [`web::Sites`](crate::stdlib::web::Sites).
+//!   the `421 Misdirected Request` of [`web::Sites`](fictionet::stdlib::web::Sites).
 //!
-//! On a [`Net`](crate::stdlib::net::Net), a [`Server`] is the
+//! On a [`Net`](fictionet::stdlib::net::Net), a [`Server`] is the
 //! [`Accept`] that serves HTTP on a host's
 //! port: sites of several hosts at one address share the port as virtual
 //! hosts. [`Website`] puts a site on ports 80 and 443 the way websites
 //! are served. `Net` knows nothing of HTTP, so a copy of this file with
 //! its own handlers plugs in the same way.
 //!
-//! [`Http1`] is the [`Service`](crate::stdlib::serve::Service) that speaks
+//! [`Http1`] is the [`Service`](fictionet::stdlib::serve::Service) that speaks
 //! HTTP/1.0 and 1.1 to a client, on [`http1`]'s
 //! decoder: keep-alive, pipelining, `Expect: 100-continue`, `HEAD`, chunked
 //! responses for bodies of unknown length, and 30-second limits on each
@@ -1469,7 +1469,7 @@ pub async fn serve_connection<C: Connection + Unpin>(fcx: &Cx, conn: C, info: Co
 // ---------------------------------------------------------------------------
 // HTTP on a network
 
-/// HTTP on one port of a [`Net`](crate::stdlib::net::Net) host: an
+/// HTTP on one port of a [`Net`](fictionet::stdlib::net::Net) host: an
 /// [`Accept`] that serves the host's site for each of its DNS names.
 ///
 /// Every host at one address that serves HTTP on a port shares that port:
@@ -1579,7 +1579,7 @@ impl Accept for Server {
     }
 }
 
-/// A website on ports 80 and 443, as [`web::Sites`](crate::stdlib::web::Sites)
+/// A website on ports 80 and 443, as [`web::Sites`](fictionet::stdlib::web::Sites)
 /// serves one: with TLS, HTTPS on 443 for each of the host's names and a
 /// redirect to it on 80 (unless [`plain_http`](Self::plain_http));
 /// without, plain HTTP on 80. [`served_by`](Self::served_by) puts it on a host.

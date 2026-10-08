@@ -2,14 +2,14 @@
 //!
 //! Use this module to read and answer DNS queries in a world that runs its
 //! own DNS server. If the world is a set of websites,
-//! [`web::Sites`](crate::stdlib::web::Sites) already runs one for you.
+//! [`web::Sites`](fictionet::stdlib::web::Sites) already runs one for you.
 //!
 //! Fictionet has no DNS types of its own. A DNS message is plain data: a
 //! [`Message`](op::Message) with public `queries` and `answers` lists.
 //! World code parses it, matches on it, and builds a reply.
 //!
 //! A DNS server is a loop on a UDP socket from
-//! [`udp::endpoint`](crate::stdlib::udp::endpoint). Which names exist, and
+//! [`udp::endpoint`](fictionet::stdlib::udp::endpoint). Which names exist, and
 //! whether answers are wrong, slow or missing, is all up to world code.
 //! This server knows one name, `api.stripe.com`, and answers NXDOMAIN for
 //! every other:

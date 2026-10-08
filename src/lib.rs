@@ -339,13 +339,14 @@ pub mod prelude {
 }
 
 pub use attach::{AttachError, Attachment, Attacher, Attachments, attachments};
-pub use cable::{End, pair, pair_with_limit};
-pub use cx::{Cancelled, Cx, JoinError, RaceError, Task};
+pub use cable::{End, PACKET_COST, pair, pair_with_limit};
+pub use cx::{CancelWait, Cancelled, Cx, JoinError, RaceError, Task, Timer};
 pub use error::{Error, ErrorChain};
 pub use block_on::block_on;
 #[cfg(not(target_arch = "wasm32"))]
 pub use listen::{Listening, ParseWorldSocketError, WorldSocket, listen};
 pub use run::run;
+pub use sys::random_bytes;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -442,8 +443,7 @@ pub trait Interface: Send + 'static {
 
     /// The link this interface is one end of, for the
     /// [dashboard](crate::observe#the-dashboard). Only [`End`] and [`Attachment`] have
-    /// one.
-    #[doc(hidden)]
+    /// one. Use [`observe::LinkHandle::label`] to name the link.
     fn observe_link(&self) -> Option<observe::LinkHandle> {
         None
     }

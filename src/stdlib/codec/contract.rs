@@ -390,7 +390,7 @@ pub fn check_wire<M: Wire + PartialEq + Debug>(data: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stdlib::codec::tests::{Fault, TestError};
+    use super::super::tests::{Fault, TestError};
 
     #[test]
     #[should_panic(expected = "decoder called after Err or End")]

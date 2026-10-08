@@ -10,6 +10,12 @@ test = false
 doctest = false
 doc = false
 
+[[bin]]
+name = "fictionet-copy-stdlib"
+path = "stdlib.rs"
+test = false
+doc = false
+
 # web.rs keeps its pass-through proxy behind the SDK's `tokio` feature.
 # Declaring the feature here, off, makes `cfg(feature = "tokio")` a known
 # condition in the copied file.
@@ -32,7 +38,12 @@ http-body-util = "0.1"
 hyper = { version = "1.11.1", default-features = false, features = ["http1", "http2", "server"] }
 ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+smoltcp = { version = "0.14", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-tcp-reno", "async"] }
+tokio = { version = "1", default-features = false, features = ["rt", "time", "io-util", "sync"] }
 tower-service = "0.3.3"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+libc = "0.2.189"
 
 # The doc examples of web.rs serve axum routers, as the README's does.
 [dev-dependencies]

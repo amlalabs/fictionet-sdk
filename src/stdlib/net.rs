@@ -40,7 +40,7 @@
 //! # }
 //! ```
 //!
-//! [`web::Sites`](crate::stdlib::web::Sites) is a preset on `Net` for a
+//! [`web::Sites`](fictionet::stdlib::web::Sites) is a preset on `Net` for a
 //! world of websites, whose hosts appear as their names are looked up
 //! ([`Net::resolve`]).
 //!
@@ -75,7 +75,7 @@
 //!   machines on one Ethernet: broadcast and multicast reach every member.
 //!   The router sends the LAN's prefix to its gateway, the LAN's first
 //!   address answers DNS, and the packets the LAN drops are recorded
-//!   (as [repeats](crate::events#repeats)).
+//!   (as [repeats](fictionet::events#repeats)).
 //! - **Machines** answer pings, reset TCP to closed ports and answer UDP to
 //!   closed ports with "port unreachable". A sandbox may have 256
 //!   connections open at once to one machine
@@ -90,10 +90,10 @@
 //! - **Every link** inside the network holds at most 4 MiB of packets each
 //!   way; past that, packets are dropped, as on a congested link.
 //! - **Events.** The network records every fact in the run's
-//!   [events](crate::events): a `run.start` event first, `net` events for
+//!   [events](fictionet::events): a `run.start` event first, `net` events for
 //!   sandboxes attaching,
 //!   binding, detaching and packets dropped (`net.blocked`, counted as
-//!   [repeats](crate::events#repeats)), `dns.query`
+//!   [repeats](fictionet::events#repeats)), `dns.query`
 //!   for every DNS message, `tls.handshake` for every handshake on a TLS
 //!   port, and each service's own events. Every event names its sandbox
 //!   and, for a connection, its number (from 1, on every port of every
@@ -103,7 +103,7 @@
 //!   TLS and one without count as two), or a port
 //!   that cannot be listened on, makes [`Net::serve`] fail.
 //!
-//! The limits and rules are those [`web::Sites`](crate::stdlib::web::Sites)
+//! The limits and rules are those [`web::Sites`](fictionet::stdlib::web::Sites)
 //! documents in detail, which runs on this.
 
 use std::any::Any;

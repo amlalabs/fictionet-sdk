@@ -286,7 +286,7 @@ impl Wire for Message {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stdlib::codec::contract::{check_wire, check_wire_value};
+    use fictionet::stdlib::codec::contract::{check_wire, check_wire_value};
 
     fn discover() -> Message {
         let mut m = Message::new(BOOTREQUEST, 0x1234_5678);

@@ -31,7 +31,7 @@
 //!   for one connection, written with no I/O. [`serve::serve`] and
 //!   [`serve::listen`] run it over a connection or a listener. HTTP is one
 //!   ([`httpd`]). Every service records what it sees as
-//!   [events](crate::events) in the run's one log.
+//!   [events](fictionet::events) in the run's one log.
 //! - **Networks.** [`net::Net`] builds all of the above for you: the
 //!   sandboxes' subnet, DNS, addresses, a router, one machine per address,
 //!   and each host's services. [`web::Sites`] is a preset on it for a world
@@ -40,8 +40,8 @@
 //! Every piece is ordinary code built from the same public items, so you
 //! can wire a network by hand when `Net` does not fit. To put a link in
 //! front of every sandbox, wrap the sandboxes with
-//! [`Attachments::map`](crate::Attachments::map). The
-//! [recipes](crate::recipes) show both ways, with commands to run.
+//! [`Attachments::map`](fictionet::Attachments::map). The
+//! [recipes](fictionet::recipes) show both ways, with commands to run.
 //!
 //! # Three kinds of functions
 //!
@@ -148,8 +148,8 @@
 //! [`serve::serve`] runs it over a connection. A [`net::Host`] puts the
 //! service on a port of a machine with a name and an address. To show a
 //! protocol's items in the dashboard and in captures, implement
-//! [`Present`](crate::observe::Present) for its framer and add it to the
-//! observe [`Registry`](crate::observe::Registry). The guide
+//! [`Present`](fictionet::observe::Present) for its framer and add it to the
+//! observe [`Registry`](fictionet::observe::Registry). The guide
 //! `docs/observe-protocols.md` in the repository walks through it.
 //!
 //! ## Copy and own
@@ -179,7 +179,7 @@
 //!   [`net::Host`] port.
 //! - **Observe**: how the dashboard and captures show the protocol.
 //!   `built in` means the default observe registry decodes it, with a
-//!   presenter in [`observe`](crate::observe). Presenters live there, not
+//!   presenter in [`observe`](fictionet::observe). Presenters live there, not
 //!   in the protocol's module, so a copied module carries no observe code.
 //! - **Fuzz**: the module has a fuzz target in `fuzz/`, which CI runs.
 //! - **Copy**: the copy-and-own fixture compiles the file as a module of a
@@ -275,7 +275,7 @@
 //! | [`resp`] | RESP, the Redis protocol, versions 2 and 3: values and commands. | yes | yes |  |  |  | yes | yes |
 //! | [`rfb`] | RFB, the protocol behind VNC: the handshake and messages, and a session for either side. | yes | yes | `Client`, `Server` |  |  | yes | yes |
 //! | [`rip`] | RIP and RIPng routing messages. | yes |  |  |  |  | yes | yes |
-//! | [`route`] | Forwarding packets between interfaces by destination: the router and the LAN. |  |  |  |  |  |  |  |
+//! | [`route`] | Forwarding packets between interfaces by destination: the router and the LAN. |  |  |  |  |  |  | yes |
 //! | [`rtcp`] | RTCP control packets, compound packets and feedback messages. | yes | yes |  |  |  | yes | yes |
 //! | [`rtp`] | RTP media packets and their header extensions, told apart from RTCP. | yes |  |  |  |  | yes | yes |
 //! | [`rtsp`] | RTSP messages and interleaved data, with transport and range headers. | yes | yes |  |  |  | yes | yes |
@@ -295,15 +295,15 @@
 //! | [`ssh`] | The SSH transport layer before encryption: version exchange, binary packets and the first messages. | yes | yes |  |  |  | yes | yes |
 //! | [`stun`] | STUN messages and attributes, with a binding reply helper. | yes | yes |  |  |  | yes | yes |
 //! | [`syslog`] | Syslog messages in the RFC 5424 and RFC 3164 formats, and RFC 6587 stream framing. | yes | yes |  |  |  | yes | yes |
-//! | [`tcp`] | TCP listeners and connections for a machine on the simulated network, on smoltcp. |  |  |  |  |  | yes |  |
+//! | [`tcp`] | TCP listeners and connections for a machine on the simulated network, on smoltcp. |  |  |  |  |  | yes | yes |
 //! | [`tcp_reassembly`] | TCP capture reassembly for observers: ordered bytes, gaps and end signals. |  |  |  |  |  | yes | yes |
 //! | [`tds`] | TDS, the SQL Server protocol: packets, logins, SQL batches and response tokens. | yes | yes | `TokenReader` |  |  | yes | yes |
 //! | [`telnet`] | Telnet data and commands, option negotiation, terminal type and window size. | yes | yes | `Negotiation` |  |  | yes | yes |
 //! | [`tftp`] | TFTP packets, option negotiation, and one read transfer served. | yes | yes | `ReadTransfer` |  |  | yes | yes |
 //! | [`thrift`] | Apache Thrift messages and values in the binary and compact protocols, and the framed transport. | yes | yes |  |  |  | yes | yes |
-//! | [`tls`] | The server side of a TLS connection, played by the world with rustls. The world picks the certificate after the client hello. |  |  |  |  | built in | yes |  |
+//! | [`tls`] | The server side of a TLS connection, played by the world with rustls. The world picks the certificate after the client hello. |  |  |  |  | built in | yes | yes |
 //! | [`tpkt`] | TPKT packets, the carrier of ISO transport on TCP. | yes | yes |  |  |  | yes | yes |
-//! | [`udp`] | UDP sockets for a machine on the simulated network. |  |  |  |  |  |  |  |
+//! | [`udp`] | UDP sockets for a machine on the simulated network. |  |  |  |  |  |  | yes |
 //! | [`urlencoded_form`] | application/x-www-form-urlencoded form bodies and query strings. | yes | yes |  |  |  | yes | yes |
 //! | [`vrrp`] | VRRP virtual router advertisements, versions 2 and 3. | yes |  |  |  |  | yes | yes |
 //! | [`vxlan`] | VXLAN and VXLAN-GPE headers. | yes |  |  |  |  | yes | yes |
@@ -322,10 +322,10 @@ use std::pin::pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll, Wake, Waker};
 
-use crate::cx::CancelWait;
-use crate::time::{Duration, Instant};
-use crate::cable::PACKET_COST;
-use crate::{Cancelled, Cx, End, Interface, Packet, RecvError};
+use fictionet::CancelWait;
+use fictionet::time::{Duration, Instant};
+use fictionet::PACKET_COST;
+use fictionet::{Cancelled, Cx, End, Interface, Packet, RecvError};
 
 mod connection;
 pub mod amqp;
@@ -521,7 +521,7 @@ pub use connection::{ConnError, Connection, ConnectionExt};
 /// without end.
 ///
 /// How it works: `delay` makes two connected interfaces with
-/// [`pair`](crate::pair), returns one, and starts a task with
+/// [`pair`](fictionet::pair), returns one, and starts a task with
 /// [`Cx::spawn`] that holds the other and `inner`. The task stamps each
 /// packet with `fcx.now() + by` and puts it in a queue for its direction. Because the delay is fixed, each queue is
 /// already in the order packets leave. The task waits for whichever comes
@@ -546,7 +546,7 @@ pub fn delay(fcx: &Cx, by: Duration, inner: impl Interface) -> End {
 ///
 /// A queue limit only matters where packets wait, and packets only wait
 /// where something is slower than its input. That is why the limit comes
-/// with a rate. Interfaces made by [`pair`](crate::pair) never fill up on
+/// with a rate. Interfaces made by [`pair`](fictionet::pair) never fill up on
 /// their own.
 ///
 /// Whatever `queue` says, a direction also holds at most 32 MiB, counting
@@ -575,7 +575,7 @@ pub fn delay(fcx: &Cx, by: Duration, inner: impl Interface) -> End {
 /// packet on a 1 Mbit/s link leaves 8 ms after the link started sending it.
 /// So with `queue` 10, a burst of 11 packets loses the 11th. A rate of 0
 /// sends nothing: the queue fills and every later packet is dropped. The
-/// drops are recorded as `bottleneck.drop` [repeats](crate::events#repeats),
+/// drops are recorded as `bottleneck.drop` [repeats](fictionet::events#repeats),
 /// with how many packets were waiting (`waiting`).
 #[track_caller]
 pub fn bottleneck(fcx: &Cx, bits_per_second: u64, queue: usize, inner: impl Interface) -> End {
@@ -596,7 +596,7 @@ pub fn bottleneck(fcx: &Cx, bits_per_second: u64, queue: usize, inner: impl Inte
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Direction {
     /// Out of `inner`, toward the returned end. When `inner` is an
-    /// [`Attachment`](crate::Attachment), these are the packets the
+    /// [`Attachment`](fictionet::Attachment), these are the packets the
     /// sandbox sends.
     FromInner,
     /// Into `inner`, from the returned end. When `inner` is an
@@ -629,7 +629,7 @@ pub enum Direction {
 /// and must not block. Every task of a world shares one thread, so a slow
 /// `keep` slows the whole world. To write packets to a file, hand them to
 /// a channel that never waits, and write them on another thread. The
-/// [packet capture recipe](crate::recipes#packet-capture) does this.
+/// [packet capture recipe](fictionet::recipes#packet-capture) does this.
 ///
 /// The task stops when either interface closes, or when the caller's
 /// [region](Cx#regions) is cancelled.
@@ -644,14 +644,14 @@ where
         let mut ports = Ports::new(vec![Box::new(inner), Box::new(mine)]);
         loop {
             match ports.next(&fcx, None, |_| Poll::Pending).await? {
-                Event::Packet(i, packet) => {
+                PortEvent::Packet(i, packet) => {
                     let direction = if i == 0 { Direction::FromInner } else { Direction::ToInner };
                     if keep(&fcx, direction, &packet) {
                         ports.send(1 - i, packet);
                     }
                 }
-                Event::Timer => {}
-                Event::Closed(_) | Event::Extra => return Ok(()),
+                PortEvent::Timer => {}
+                PortEvent::Closed(_) | PortEvent::Extra => return Ok(()),
             }
         }
     });
@@ -703,7 +703,7 @@ const LINK_OUTPUT: usize = 32 << 20;
 
 /// The two ends that [`shape`] and [`filter`] make, with a size limit.
 fn link_pair() -> (End, End) {
-    crate::cable::pair_with_limit(LINK_OUTPUT)
+    fictionet::pair_with_limit(LINK_OUTPUT)
 }
 
 /// The loop behind [`delay`] and [`bottleneck`]. For each packet,
@@ -723,7 +723,7 @@ where
         loop {
             let deadline = queues.iter().filter_map(|q| q.packets.front().map(|(t, _)| *t)).min();
             match ports.next(&fcx, deadline, |_| Poll::Pending).await? {
-                Event::Packet(i, packet) => {
+                PortEvent::Packet(i, packet) => {
                     let now = fcx.now();
                     let cost = packet.0.len() + PACKET_COST;
                     let fits = queues[i].bytes + cost <= LINK_STORE;
@@ -732,10 +732,10 @@ where
                         queues[i].packets.push_back((leaves, packet));
                     } else {
                         let waiting = queues[i].packets.len();
-                        crate::observe::record_drop(&fcx, name, &packet, "the queue was full", crate::events::Fields::new().with("waiting", waiting as u64));
+                        fictionet::events::record_drop(&fcx, name, &packet, "the queue was full", fictionet::events::Fields::new().with("waiting", waiting as u64));
                     }
                 }
-                Event::Timer => {
+                PortEvent::Timer => {
                     let now = fcx.now();
                     let mut sent = 0;
                     for (i, queue) in queues.iter_mut().enumerate() {
@@ -752,7 +752,7 @@ where
                     }
                     ports.spend(sent);
                 }
-                Event::Closed(_) | Event::Extra => return Ok(()),
+                PortEvent::Closed(_) | PortEvent::Extra => return Ok(()),
             }
         }
     });
@@ -760,9 +760,7 @@ where
 }
 
 /// How many packets a stdlib task handles in a row before it yields.
-pub(crate) const BUDGET: usize = 64;
-
-pub(crate) use PortEvent as Event;
+const BUDGET: usize = 64;
 
 /// What [`Ports::next`] saw.
 #[derive(Debug)]
@@ -951,7 +949,7 @@ impl Ports {
         fcx: &Cx,
         deadline: Option<Instant>,
         mut extra: impl FnMut(&mut Context<'_>) -> Poll<()>,
-    ) -> Result<Event, Cancelled> {
+    ) -> Result<PortEvent, Cancelled> {
         if self.run >= BUDGET {
             self.run = 0;
             fcx.yield_now().await?;
@@ -961,7 +959,7 @@ impl Ports {
         }
         if let Some(d) = deadline && d <= fcx.now() {
             self.run += 1;
-            return Ok(Event::Timer);
+            return Ok(PortEvent::Timer);
         }
         let mut sleep = pin!(deadline.map(|d| fcx.sleep_until(d)));
         let mut waited = false;
@@ -969,7 +967,7 @@ impl Ports {
             // The extra source first: a router takes new routes before it
             // forwards packets sent after they were added.
             if extra(cx).is_ready() {
-                return Poll::Ready(Ok(Event::Extra));
+                return Poll::Ready(Ok(PortEvent::Extra));
             }
             // Register the task before looking at the queue, so a slot that
             // becomes ready after the queue looked empty still wakes it.
@@ -989,11 +987,11 @@ impl Ports {
                         // It may hold more. It goes to the back, after the
                         // others that are ready, so each gets its turn.
                         self.lock_ready().push(i);
-                        return Poll::Ready(Ok(Event::Packet(i, packet)));
+                        return Poll::Ready(Ok(PortEvent::Packet(i, packet)));
                     }
                     Poll::Ready(Err(RecvError::Closed)) => {
                         self.close(i);
-                        return Poll::Ready(Ok(Event::Closed(i)));
+                        return Poll::Ready(Ok(PortEvent::Closed(i)));
                     }
                     Poll::Ready(Err(RecvError::Cancelled)) => return Poll::Ready(Err(Cancelled)),
                     // Its waker puts it back in the queue when it has more.
@@ -1002,7 +1000,7 @@ impl Ports {
             }
             if let Some(sleep) = sleep.as_mut().as_pin_mut() {
                 match sleep.poll(cx) {
-                    Poll::Ready(Ok(())) => return Poll::Ready(Ok(Event::Timer)),
+                    Poll::Ready(Ok(())) => return Poll::Ready(Ok(PortEvent::Timer)),
                     Poll::Ready(Err(Cancelled)) => return Poll::Ready(Err(Cancelled)),
                     Poll::Pending => {}
                 }
@@ -1025,14 +1023,14 @@ impl Ports {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{InterfaceExt, block_on, pair, run};
+    use fictionet::{InterfaceExt, block_on, pair, run};
 
     /// How many 1,500-byte packets fit in 32 MiB, at 64 bytes more each.
     const FIT: usize = (32 << 20) / (1500 + PACKET_COST);
 
     /// Sends `n` 1,500-byte packets into `inner`'s other end, giving the
     /// link's task turns as it goes.
-    async fn flood(fcx: &Cx, into: &mut End, n: usize) -> crate::Result {
+    async fn flood(fcx: &Cx, into: &mut End, n: usize) -> fictionet::Result {
         for i in 0..n {
             into.send(Packet(vec![0x45; 1500]));
             if i % 32 == 31 {
@@ -1078,8 +1076,8 @@ mod tests {
         block_on(run(|fcx| async move {
             let (mut sandbox, inner) = pair();
             let _far = bottleneck(&fcx, 0, 10, inner);
-            fcx.record(crate::events::Event::new("http", "request"));
-            let flood = crate::events::MAX_EVENTS + 10_000;
+            fcx.record(fictionet::events::Event::new("http", "request"));
+            let flood = fictionet::events::MAX_EVENTS + 10_000;
             for i in 0..flood {
                 sandbox.send(Packet(vec![0x45; 20]));
                 if i % 32 == 31 {
@@ -1087,7 +1085,7 @@ mod tests {
                 }
             }
             fcx.sleep(Duration::from_millis(1500)).await?;
-            fcx.record(crate::events::Event::new("http", "request"));
+            fcx.record(fictionet::events::Event::new("http", "request"));
             let events = fcx.events();
             assert_eq!(events.of("http", "request").len(), 2);
             let drops = events.of("bottleneck", "drop");

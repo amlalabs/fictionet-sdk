@@ -1,7 +1,7 @@
 //! UDP: sockets for a machine on the simulated network.
 //!
 //! Use this module to give a machine UDP, for example to run a DNS server
-//! (see [`dns`](crate::stdlib::dns)). [`endpoint`] takes an [`Interface`]
+//! (see [`dns`](fictionet::stdlib::dns)). [`endpoint`] takes an [`Interface`]
 //! that carries the machine's UDP packets, and the machine's address. It returns an [`Endpoint`], on which you
 //! [`bind`](Endpoint::bind) a [`Socket`] for each port. A socket receives
 //! datagrams with [`recv`](Socket::recv) and sends them with
@@ -18,10 +18,10 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::task::{Poll, Waker};
 
-use crate::cx::CancelWait;
-use crate::stdlib::icmp;
-use crate::stdlib::ip::{self, Fields, Header, protocol};
-use crate::{Cx, Error, Interface, Packet, RecvError};
+use fictionet::CancelWait;
+use fictionet::stdlib::icmp;
+use fictionet::stdlib::ip::{self, Fields, Header, protocol};
+use fictionet::{Cx, Error, Interface, Packet, RecvError};
 
 /// How many bytes of datagrams a socket holds before it drops new ones,
 /// like a full socket buffer, counting [`DATAGRAM_COST`] more for each.
@@ -40,7 +40,7 @@ const DATAGRAM_COST: usize = 64;
 /// because that is part of UDP's job. Everything it sends goes into
 /// `inner`.
 ///
-/// The task stops when the caller's [region](crate::Cx#regions) is
+/// The task stops when the caller's [region](fictionet::Cx#regions) is
 /// cancelled or `inner` closes. The endpoint's sockets then return
 /// [`RecvError::Closed`] once their queued datagrams have been received.
 ///
@@ -194,7 +194,7 @@ impl Endpoint {
     /// Joins the multicast group `group`: datagrams sent to it reach this
     /// endpoint's sockets on their ports, as datagrams to its own address
     /// do. Delivering them is the network's job: a
-    /// [`route::lan`](crate::stdlib::route::lan) floods multicast to every
+    /// [`route::lan`](fictionet::stdlib::route::lan) floods multicast to every
     /// member.
     ///
     /// Fails if `group` is not a multicast address of the endpoint's family.
@@ -242,7 +242,7 @@ impl Socket {
     /// Waits for the next datagram. Returns its bytes and who sent it.
     ///
     /// Returns early with [`RecvError::Cancelled`] if `fcx`'s
-    /// [region](crate::Cx#regions) is cancelled, and fails with
+    /// [region](fictionet::Cx#regions) is cancelled, and fails with
     /// [`RecvError::Closed`] once the endpoint has stopped and every
     /// datagram already queued for this socket has been received.
     pub async fn recv(&mut self, fcx: &Cx) -> Result<(Vec<u8>, SocketAddr), RecvError> {
@@ -334,7 +334,7 @@ fn port_unreachable(packet: &[u8], addr: IpAddr) -> Option<Packet> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{block_on, pair, run};
+    use fictionet::{block_on, pair, run};
 
     /// A UDP datagram from 10.0.0.2 to port 53 of 10.0.0.1, with a good
     /// checksum.
@@ -357,7 +357,7 @@ mod tests {
             for _ in 0..40 {
                 raw.send(datagram(&big));
             }
-            fcx.sleep(crate::time::ms(10)).await?;
+            fcx.sleep(fictionet::time::ms(10)).await?;
             let fits = QUEUE / (big.len() + DATAGRAM_COST);
             for _ in 0..fits {
                 assert_eq!(socket.recv(&fcx).await?.0.len(), big.len());
@@ -365,7 +365,7 @@ mod tests {
             // The rest were dropped, and the room is there again.
             raw.send(datagram(b"after"));
             assert_eq!(socket.recv(&fcx).await?.0, b"after");
-            Err::<(), crate::Error>(fictionet::Error::msg("done"))
+            Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
         }));
         assert_eq!(result.unwrap_err().to_string(), "done");
     }

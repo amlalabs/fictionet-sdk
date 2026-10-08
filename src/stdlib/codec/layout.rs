@@ -126,7 +126,7 @@ macro_rules! layout {
         }
         $crate::layout!(@length $enum {$( $(#[$ldoc])* $length )?} [$($kind => $len,)*]);
         $crate::layout!(@access $enum $access [$($name),*]);
-        impl $crate::stdlib::codec::Wire for $enum {
+        impl fictionet::stdlib::codec::Wire for $enum {
             type ParseError = $error;
             type WriteError = $error;
             fn parse(b: &[u8]) -> Result<Self, $error> {
@@ -196,7 +196,7 @@ macro_rules! layout {
         }
         const _: () = assert!($prefix $(+ <$hty as $field_trait>::LEN)*
             $(+ <$ty as $field_trait>::LEN)* == $len);
-        impl $crate::stdlib::codec::Wire for $name {
+        impl fictionet::stdlib::codec::Wire for $name {
             type ParseError = $error;
             type WriteError = $error;
             fn parse(b: &[u8]) -> Result<Self, $error> {

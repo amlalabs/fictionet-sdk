@@ -492,7 +492,7 @@ use std::time::Duration;
 use crate::lock;
 use crate::watch::Graph;
 use crate::Cx;
-pub(crate) use keys::observed_config;
+pub use keys::observed_config;
 pub(crate) use packets::LinkWatch;
 
 /// How long a link's decoded packets are kept after the last observer
@@ -592,35 +592,22 @@ pub(crate) fn existing_watch(graph: &Graph, id: u64) -> Option<Arc<LinkWatch>> {
     lock(&graph.watches).get(&id).cloned()
 }
 
-/// Records that `source` dropped `packet`, and `why`, as a `drop` event
-/// with the packet's addresses and protocol (a
-/// [repeat](crate::events#repeats)). Its length, its destination port and
-/// `detail` change with each packet, so they are its detail.
-pub(crate) fn record_drop(fcx: &Cx, source: &'static str, packet: &crate::Packet, why: &'static str, detail: crate::events::Fields) {
-    use crate::events::{Event, Level, opt};
-    let h = crate::stdlib::ip::Header::parse_truncated(&packet.0);
-    let port = h.as_ref().and_then(|h| h.dst_port(&packet.0));
-    let (src, dst) = match &h {
-        Some(h) => (h.src.to_string(), h.dst.to_string()),
-        None => ("?".to_owned(), "?".to_owned()),
-    };
-    let event = Event::new(source, "drop")
-        .level(Level::Notice)
-        .summary(format!("{src} → {dst}: {why}"))
-        .field("src", opt(h.as_ref().map(|_| src)))
-        .field("dst", opt(h.as_ref().map(|_| dst)))
-        .field("protocol", opt(h.as_ref().map(|h| u32::from(h.protocol))))
-        .field("why", why);
-    let mut all = crate::events::Fields::new().with("len", packet.0.len() as u64).with("dst_port", opt(port.map(u32::from)));
-    all.extend(detail);
-    fcx.record_repeat(event, all);
-}
-
-/// A link an [`Interface`](crate::Interface) belongs to, so the stdlib can
-/// tell observers about it. Not for world code.
-#[doc(hidden)]
+/// An opaque link an [`Interface`](crate::Interface) belongs to.
+/// Use [`LinkHandle::label`] to name it for observers.
 #[derive(Clone)]
-pub struct LinkHandle(pub(crate) Arc<crate::watch::Meter>);
+pub struct LinkHandle(Arc<crate::watch::Meter>);
+
+impl LinkHandle {
+    pub(crate) fn new(meter: Arc<crate::watch::Meter>) -> Self {
+        Self(meter)
+    }
+
+    /// Names this link in `fcx`'s observation graph.
+    /// Replaces any label already set for this link in that run.
+    pub fn label(&self, fcx: &Cx, label: String) {
+        fcx.graph().label(&self.0, label);
+    }
+}
 
 impl std::fmt::Debug for LinkHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

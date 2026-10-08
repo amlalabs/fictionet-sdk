@@ -106,7 +106,7 @@
 //!   module adds none. An error that wraps another returns it from
 //!   [`source`](core::error::Error::source), and its `Display` says only its own
 //!   context, never the inner error's text, so
-//!   [`ErrorChain`](crate::ErrorChain) shows each message once.
+//!   [`ErrorChain`](fictionet::ErrorChain) shows each message once.
 //! - **N1.** A decoder that only frames a [`Wire`] value is [`Frames<T>`],
 //!   with [`Prefixed`] implemented on `T`. Other [`Decode`] types are the
 //!   plural of their item. A `Result<T, E>` item counts
@@ -128,7 +128,7 @@
 //! - **N5.** A [`Service`](super::serve::Service) is named for what it
 //!   serves, with no suffix. Its associated types are `Decoder` and
 //!   `State`.
-//! - **N6.** [`Present`](crate::observe::Present) is implemented on the
+//! - **N6.** [`Present`](fictionet::observe::Present) is implemented on the
 //!   decoder it presents.
 
 extern crate alloc;
@@ -154,7 +154,7 @@ mod work;
 mod pipe;
 mod reader;
 mod layout;
-pub use crate::layout;
+pub use fictionet::layout;
 mod recorder;
 mod stream;
 pub mod test_support;

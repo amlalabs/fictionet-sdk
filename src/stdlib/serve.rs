@@ -3,7 +3,7 @@
 //!
 //! A [`Service`] is the server side of one protocol for one connection.
 //! It gets decoded items, appends reply bytes, records facts in the
-//! run's [events](crate::events), and asks for timers. It reads no
+//! run's [events](fictionet::events), and asks for timers. It reads no
 //! clock and touches no socket, so it unit-tests with the [`Harness`]
 //! here, fuzzes with the codec's contract tools, and a world copies its
 //! file to change it. It has the shape of a FIX session: items in, bytes
@@ -76,8 +76,8 @@
 //! # }
 //! ```
 //!
-//! [`net::Net`](crate::stdlib::net::Net) does this for every host and
-//! port of a network, and [`httpd`](crate::stdlib::httpd) is HTTP as a
+//! [`net::Net`](fictionet::stdlib::net::Net) does this for every host and
+//! port of a network, and [`httpd`](fictionet::stdlib::httpd) is HTTP as a
 //! service.
 //!
 //! # What the driver promises
@@ -138,7 +138,7 @@
 //!   TLS (STARTTLS in SMTP, LDAP and Postgres); [`Upgrade::Decoder`] goes
 //!   on with a fresh decoder; [`Upgrade::Handoff`] hands the connection
 //!   and its unread bytes back in [`Served::Upgraded`], for a CONNECT
-//!   tunnel. A decoder that ends ([`Step::End`](crate::stdlib::codec::Step::End))
+//!   tunnel. A decoder that ends ([`Step::End`](fictionet::stdlib::codec::Step::End))
 //!   asks [`Service::on_decoder_end`] which.
 
 use std::collections::VecDeque;
@@ -235,7 +235,7 @@ pub trait Service: Send + 'static {
         Ok(())
     }
 
-    /// The decoder ended ([`Step::End`](crate::stdlib::codec::Step::End)):
+    /// The decoder ended ([`Step::End`](fictionet::stdlib::codec::Step::End)):
     /// the bytes after it belong to something else. [`Flow::Continue`]
     /// goes on with a fresh decoder, as [`Upgrade::Decoder`] does. The
     /// default hands the connection back ([`Upgrade::Handoff`]).
@@ -487,7 +487,7 @@ impl WakeHandle {
 }
 
 /// Bytes connections may hold, shared by every connection charged to it:
-/// one sandbox's connections in [`Net`](crate::stdlib::net::Net). Cheap to
+/// one sandbox's connections in [`Net`](fictionet::stdlib::net::Net). Cheap to
 /// clone; clones share the count.
 ///
 /// Each connection charges what it holds: its decoder's capacity and
@@ -761,7 +761,7 @@ fn due(timers: &[(Timer, Instant)], now: Instant) -> Option<usize> {
 /// it ends the run. The panic's own message says where in the code it
 /// happened; a `PanicNote` alive while it unwinds adds which service and
 /// connection, on standard error. [`serve`], [`serve_datagram`] and
-/// HTTP/2 in [`httpd`](crate::stdlib::httpd) keep one while they call
+/// HTTP/2 in [`httpd`](fictionet::stdlib::httpd) keep one while they call
 /// world code.
 pub struct PanicNote {
     service: &'static str,
@@ -982,7 +982,7 @@ pub struct ServeOptions {
     /// is drawn from, mixed with its number ([`conn_seed`]). Default 0.
     pub seed: u64,
     /// Names the sandbox each datagram came from, in its [`ConnInfo`].
-    /// [`Net`](crate::stdlib::net::Net) sets it; a connection's sandbox is
+    /// [`Net`](fictionet::stdlib::net::Net) sets it; a connection's sandbox is
     /// given with its `ConnInfo` instead.
     pub sandbox: Option<SandboxOf>,
 }

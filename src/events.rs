@@ -126,6 +126,29 @@ use crate::stdlib::codec::Wire;
 use crate::stdlib::json::{Number, Value};
 use crate::time::Instant;
 
+/// Records that `source` dropped `packet`, and `why`, as a `drop` event
+/// with the packet's addresses and protocol (a
+/// [repeat](crate::events#repeats)). Its length, its destination port and
+/// `detail` change with each packet, so they are its detail.
+pub fn record_drop(fcx: &Cx, source: &'static str, packet: &crate::Packet, why: &'static str, detail: Fields) {
+    let h = crate::stdlib::ip::Header::parse_truncated(&packet.0);
+    let port = h.as_ref().and_then(|h| h.dst_port(&packet.0));
+    let (src, dst) = match &h {
+        Some(h) => (h.src.to_string(), h.dst.to_string()),
+        None => ("?".to_owned(), "?".to_owned()),
+    };
+    let event = Event::new(source, "drop")
+        .level(Level::Notice)
+        .summary(format!("{src} → {dst}: {why}"))
+        .field("src", opt(h.as_ref().map(|_| src)))
+        .field("dst", opt(h.as_ref().map(|_| dst)))
+        .field("protocol", opt(h.as_ref().map(|h| u32::from(h.protocol))))
+        .field("why", why);
+    let mut all = Fields::new().with("len", packet.0.len() as u64).with("dst_port", opt(port.map(u32::from)));
+    all.extend(detail);
+    fcx.record_repeat(event, all);
+}
+
 /// How many events a run's log holds. Past this, the oldest are dropped.
 pub const MAX_EVENTS: usize = 50_000;
 /// How many bytes of events a run's log holds, as [`Event::size`] counts

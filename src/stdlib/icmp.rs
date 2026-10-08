@@ -23,8 +23,8 @@
 //! ```
 //!
 //! To answer pings slowly, or only some of the time, change one line of
-//! that loop: sleep with [`Cx::sleep`](crate::Cx::sleep) before sending, or
-//! skip the send when [`Cx::random_f64`](crate::Cx::random_f64) is above
+//! that loop: sleep with [`Cx::sleep`](fictionet::Cx::sleep) before sending, or
+//! skip the send when [`Cx::random_f64`](fictionet::Cx::random_f64) is above
 //! some threshold.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -40,7 +40,7 @@ use fictionet::stdlib::ip::{self, Fields, Header, protocol};
 /// the request's identifier, sequence number and data, with a TTL or hop
 /// limit of 64 and correct checksums. A request with a wrong ICMP checksum
 /// gets no reply, as from a kernel. So does a fragment: put fragments back
-/// together first, as [`split_protocols`](crate::stdlib::ip::split_protocols)
+/// together first, as [`split_protocols`](fictionet::stdlib::ip::split_protocols)
 /// does. IPv4 options and IPv6 extension headers of the request are not
 /// copied into the reply. A request with IPv6 extension headers that a host
 /// must not accept, such as an unknown option whose type says to discard
