@@ -73,8 +73,9 @@
 //! assert_eq!(Message::parse(&bytes).unwrap().status(), Some(200));
 //! ```
 
-use fictionet::stdlib::codec::ascii::{trim_ows_str as trim_ws, trim_ows as trim_frame_ws};
-use fictionet::stdlib::codec::{Decode, Ending, LineError, Lines, Step, Wire};
+use fictionet::stdlib::codec::ascii::{trim_ows_str as trim_ws};
+use fictionet::stdlib::codec::{Decode, LineError, Step, Wire};
+use fictionet::stdlib::codec::head_body::{self, Header, Scanner};
 
 /// The port SIP servers listen on, for UDP and TCP.
 pub const PORT: u16 = 5060;
@@ -253,23 +254,6 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// One header field: its name as it came (so `v` stays `v`) and its value
-/// with folded lines joined by single spaces and the ends trimmed.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Header {
-    /// The field name.
-    pub name: String,
-    /// The field value.
-    pub value: String,
-}
-
-impl Header {
-    /// A header with this name and value.
-    pub fn new(name: &str, value: &str) -> Header {
-        Header { name: name.to_string(), value: value.to_string() }
-    }
-}
-
 /// The first line of a message: a request line or a status line.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StartLine {
@@ -325,9 +309,8 @@ impl Message {
     /// This reader preserves the headers. To write a message received
     /// without Content-Length, set that header to the body length first.
     pub fn read_datagram(datagram: &[u8]) -> Result<Message, Error> {
-        let mut lines = Lines::new(MAX_LINE, Ending::Crlf);
-        let mut scanned = 0;
-        let end = scan_head(&mut lines, &mut scanned, datagram)?.ok_or(Error::Incomplete)?;
+        let mut scanner = Scanner::new(MAX_LINE, MAX_HEAD, true);
+        let end = scanner.scan_head(datagram).map_err(framing_error)?.ok_or(Error::Incomplete)?;
         let (mut message, length) = parse_head(datagram.get(..end).ok_or(Error::Incomplete)?)?;
         let rest = datagram.get(end..).ok_or(Error::Incomplete)?;
         let body = match length {
@@ -536,7 +519,7 @@ impl Message {
 /// including at EOF. The driver reports truncation and returns stream
 /// errors once.
 ///
-/// [`Lines`] scans incrementally; each head byte is scanned a fixed number
+/// [`Scanner`] scans incrementally; each head byte is scanned a fixed number
 /// of times. The driver retains the whole unit, so
 /// [`fictionet::stdlib::codec::Stream::with_next`] includes its head and body.
 /// Capacity is [`MAX_MESSAGE`]; no input bytes are held in decoder state.
@@ -556,14 +539,12 @@ impl Message {
 /// # Ok::<(), fictionet::stdlib::sip::Error>(())
 /// ```
 pub struct Messages {
-    lines: Lines,
-    scanned: usize,
-    body: Option<(usize, usize)>,
+    scanner: Scanner,
 }
 
 impl core::fmt::Debug for Messages {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Messages").field("scanned", &self.scanned).field("body", &self.body).finish_non_exhaustive()
+        f.debug_struct("Messages").field("scanner", &self.scanner).finish_non_exhaustive()
     }
 }
 
@@ -576,7 +557,7 @@ impl Default for Messages {
 impl Messages {
     /// Creates a decoder using [`MAX_LINE`], [`MAX_HEAD`], and [`MAX_BODY`].
     pub fn new() -> Self {
-        Self { lines: Lines::new(MAX_LINE, Ending::Crlf), scanned: 0, body: None }
+        Self { scanner: Scanner::new(MAX_LINE, MAX_HEAD, true) }
     }
 }
 
@@ -590,63 +571,25 @@ impl Decode for Messages {
     }
 
     fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Self::Item>, Error> {
-        if self.scanned == 0 && self.body.is_none() {
+        if self.scanner.is_start() {
             let mut skip = 0usize;
             while input.get(skip..).is_some_and(|b| b.starts_with(b"\r\n")) {
                 skip = skip.checked_add(2).ok_or(Error::TooLong)?;
             }
             if skip != 0 {
-                self.lines = Lines::new(MAX_LINE, Ending::Crlf);
+                self.scanner = Scanner::new(MAX_LINE, MAX_HEAD, true);
                 return Ok(Step::Skip(skip));
             }
         }
-        if self.body.is_none() {
-            let Some(end) = scan_head(&mut self.lines, &mut self.scanned, input)? else { return Ok(Step::Need) };
-            let head = input.get(..end).ok_or(Error::TooLong)?;
-            self.body = Some((end, frame_body_length(head)?));
-        }
-        let Some((head, length)) = self.body else { return Ok(Step::Need) };
-        let used = head.checked_add(length).ok_or(Error::TooLong)?;
-        let Some(body) = input.get(head..used) else { return Ok(Step::Need) };
+        let Some((head, used)) = self.scanner.scan(input, frame_body_length, framing_error)? else {
+            return Ok(Step::Need);
+        };
+        let body = &input[head..used];
         let message = parse_head(input.get(..head).ok_or(Error::TooLong)?).map(|(mut message, _)| {
             message.body = body.to_vec();
             message
         });
-        self.scanned = 0;
-        self.body = None;
         Ok(Step::Item(message, used))
-    }
-}
-
-// Both transports scan bounded CRLF lines before parsing the head.
-fn scan_head(lines: &mut Lines, scanned: &mut usize, input: &[u8]) -> Result<Option<usize>, Error> {
-    loop {
-        let room = MAX_HEAD.saturating_sub(*scanned);
-        let rest = input.get(*scanned..).unwrap_or_default();
-        let window = rest.get(..rest.len().min(room)).unwrap_or_default();
-        // Leave partial lines unread. The caller handles truncation.
-        let step = match lines.decode(window, false) {
-            Ok(step) => step,
-            Err(never) => match never {},
-        };
-        match step {
-            Step::Item(line, used) => {
-                match line {
-                    Err(LineError::TooLong { .. }) => return Err(Error::TooLong),
-                    Err(LineError::BareLf) => return Err(Error::LineEnding),
-                    Err(LineError::Unterminated) => return Ok(None),
-                    Ok(_) => {}
-                }
-                *scanned = scanned.checked_add(used).ok_or(Error::TooLong)?;
-                let raw = window.get(..used).unwrap_or_default();
-                // One initial CRLF alone is not a complete head.
-                if raw == b"\r\n" && *scanned > 2 {
-                    return Ok(Some(*scanned));
-                }
-            }
-            _ if window.len() >= room => return Err(Error::TooLong),
-            _ => return Ok(None),
-        }
     }
 }
 
@@ -656,61 +599,16 @@ fn scan_head(lines: &mut Lines, scanned: &mut usize, input: &[u8]) -> Result<Opt
 fn frame_body_length(head: &[u8]) -> Result<usize, Error> {
     let mut lines = head.split(|&b| b == b'\n').map(|line| line.strip_suffix(b"\r").unwrap_or(line));
     let _ = lines.next();
-    let mut length = None;
-    let mut active = false;
-    let mut value: Option<&[u8]> = None;
-    for line in lines {
-        let trimmed = trim_frame_ws(line);
-        if line.first().is_some_and(|b| *b == b' ' || *b == b'\t') {
-            if active && !trimmed.is_empty() {
-                // Unfolding two nonempty pieces inserts a space. A decimal
-                // Content-Length cannot contain that space.
-                if value.is_some() {
-                    return Err(Error::ContentLength);
-                }
-                value = Some(trimmed);
-            }
-            continue;
-        }
-        if active {
-            frame_length_value(&mut length, value.unwrap_or_default())?;
-        }
-        value = None;
-        let colon = line.iter().position(|&b| b == b':');
-        let name = colon.and_then(|n| line.get(..n)).unwrap_or(line);
-        let name = trim_frame_ws(name);
-        active = name.eq_ignore_ascii_case(b"Content-Length") || name.eq_ignore_ascii_case(b"l");
-        if !active {
-            // A recognizable length name with a missing colon or an invalid
-            // suffix must not be mistaken for an unrelated bad header.
-            let token = name.split(|b| !is_token_byte(*b)).next().unwrap_or_default();
-            if token.eq_ignore_ascii_case(b"Content-Length") || token.eq_ignore_ascii_case(b"l") {
-                return Err(Error::ContentLength);
-            }
-        }
-        if active {
-            let at = colon.ok_or(Error::ContentLength)?.checked_add(1).ok_or(Error::TooLong)?;
-            let bytes = line.get(at..).ok_or(Error::ContentLength)?;
-            let bytes = trim_frame_ws(bytes);
-            if !bytes.is_empty() {
-                value = Some(bytes);
-            }
-        }
-    }
-    if active {
-        frame_length_value(&mut length, value.unwrap_or_default())?;
-    }
-    length.ok_or(Error::MissingContentLength)
+    head_body::content_length(lines, |name| name.eq_ignore_ascii_case(b"Content-Length") || name.eq_ignore_ascii_case(b"l"),
+        parse_content_length, false, Error::ContentLength)?.ok_or(Error::MissingContentLength)
 }
 
-fn frame_length_value(length: &mut Option<usize>, bytes: &[u8]) -> Result<(), Error> {
-    let value = core::str::from_utf8(bytes).map_err(|_| Error::ContentLength)?;
-    let n = parse_content_length(value)?;
-    if length.is_some() {
-        return Err(Error::ContentLength);
+#[inline]
+fn framing_error(error: LineError) -> Error {
+    match error {
+        LineError::TooLong { .. } => Error::TooLong,
+        _ => Error::LineEnding,
     }
-    *length = Some(n);
-    Ok(())
 }
 
 fn read_wire(bytes: &[u8]) -> Result<Message, Error> {
@@ -2124,6 +2022,12 @@ wire_value!(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unexpected_line_error_is_malformed_head() {
+        assert_eq!(super::framing_error(super::LineError::Unterminated), super::Error::LineEnding);
+        assert_eq!(super::framing_error(super::LineError::BareLf), super::Error::LineEnding);
+    }
+
     use super::*;
     use fictionet::stdlib::codec::{Fail, Stream, contract};
     use fictionet::stdlib::codec::{

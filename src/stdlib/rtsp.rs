@@ -80,8 +80,9 @@
 //! assert_eq!(stream.next(), None);
 //! ```
 
-use fictionet::stdlib::codec::ascii::{self, trim_ows_str as trim_ws, trim_ows as trim_frame_ws, is_tchar as is_token_byte};
-use fictionet::stdlib::codec::{Decode, Ending, LineError, Lines, Step, Wire};
+use fictionet::stdlib::codec::ascii::{self, trim_ows_str as trim_ws, is_tchar as is_token_byte};
+use fictionet::stdlib::codec::{Decode, LineError, Step, Wire};
+use fictionet::stdlib::codec::head_body::{self, Header, Scanner};
 
 /// The TCP port RTSP servers listen on.
 pub const PORT: u16 = 554;
@@ -235,23 +236,6 @@ impl std::fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
-
-/// One header field: its name as it came and its value with folded lines
-/// joined by single spaces and the ends trimmed.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Header {
-    /// The field name.
-    pub name: String,
-    /// The field value.
-    pub value: String,
-}
-
-impl Header {
-    /// A header with this name and value.
-    pub fn new(name: &str, value: &str) -> Header {
-        Header { name: name.to_string(), value: value.to_string() }
-    }
-}
 
 /// The first line of a message: a request line or a status line.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -532,7 +516,7 @@ pub enum Frame {
 /// accepts bare LF. Partial units return [`Step::Need`], including at EOF.
 /// The driver reports truncation and returns stream errors once.
 ///
-/// [`Lines`] scans incrementally; each head byte is scanned a fixed number
+/// [`Scanner`] scans incrementally; each head byte is scanned a fixed number
 /// of times. The driver retains the whole unit, so
 /// [`fictionet::stdlib::codec::Stream::with_next`] includes its head and body.
 /// Capacity is [`MAX_MESSAGE`]; no input bytes are held in decoder state.
@@ -552,14 +536,12 @@ pub enum Frame {
 /// # Ok::<(), fictionet::stdlib::rtsp::Error>(())
 /// ```
 pub struct Frames {
-    lines: Lines,
-    scanned: usize,
-    body: Option<(usize, usize)>,
+    scanner: Scanner,
 }
 
 impl core::fmt::Debug for Frames {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Frames").field("scanned", &self.scanned).field("body", &self.body).finish_non_exhaustive()
+        f.debug_struct("Frames").field("scanner", &self.scanner).finish_non_exhaustive()
     }
 }
 
@@ -572,7 +554,7 @@ impl Default for Frames {
 impl Frames {
     /// Creates a decoder using [`MAX_LINE`], [`MAX_HEAD`], and [`MAX_BODY`].
     pub fn new() -> Self {
-        Self { lines: Lines::new(MAX_LINE, Ending::LfOrCrlf), scanned: 0, body: None }
+        Self { scanner: Scanner::new(MAX_LINE, MAX_HEAD, false) }
     }
 }
 
@@ -586,10 +568,10 @@ impl Decode for Frames {
     }
 
     fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Self::Item>, Error> {
-        if self.scanned == 0 && self.body.is_none() {
+        if self.scanner.is_start() {
             let skip = skip_crlfs(input)?;
             if skip != 0 {
-                self.lines = Lines::new(MAX_LINE, Ending::LfOrCrlf);
+                self.scanner = Scanner::new(MAX_LINE, MAX_HEAD, false);
                 return Ok(Step::Skip(skip));
             }
             if input.first() == Some(&INTERLEAVED_MARKER) {
@@ -599,42 +581,14 @@ impl Decode for Frames {
                 });
             }
         }
-        while self.body.is_none() {
-            let room = MAX_HEAD.saturating_sub(self.scanned);
-            let rest = input.get(self.scanned..).unwrap_or_default();
-            let window = rest.get(..rest.len().min(room)).unwrap_or_default();
-            // Leave partial lines unread at EOF. Stream reports truncation.
-            let step = match self.lines.decode(window, false) {
-                Ok(step) => step,
-                Err(never) => match never {},
-            };
-            match step {
-                Step::Item(line, used) => {
-                    match line {
-                        Err(LineError::TooLong { .. }) => return Err(Error::TooLong),
-                        Err(_) => return Ok(Step::Need),
-                        Ok(_) => {}
-                    }
-                    self.scanned = self.scanned.checked_add(used).ok_or(Error::TooLong)?;
-                    let raw = window.get(..used).unwrap_or_default();
-                    if raw == b"\r\n" || raw == b"\n" {
-                        let head = input.get(..self.scanned).ok_or(Error::TooLong)?;
-                        self.body = Some((self.scanned, frame_body_length(head)?));
-                    }
-                }
-                _ if window.len() >= room => return Err(Error::TooLong),
-                _ => return Ok(Step::Need),
-            }
-        }
-        let Some((head, length)) = self.body else { return Ok(Step::Need) };
-        let used = head.checked_add(length).ok_or(Error::TooLong)?;
-        let Some(body) = input.get(head..used) else { return Ok(Step::Need) };
-        let message = parse_head(input.get(..head).ok_or(Error::TooLong)?).map(|(mut message, _)| {
+        let Some((head, used)) = self.scanner.scan(input, frame_body_length, framing_error)? else {
+            return Ok(Step::Need);
+        };
+        let body = &input[head..used];
+        let message = parse_head(input.get(..head).ok_or(Error::TooLong)?).map(|mut message| {
             message.body = body.to_vec();
             message
         });
-        self.scanned = 0;
-        self.body = None;
         Ok(Step::Item(message.map(Frame::Message), used))
     }
 }
@@ -646,75 +600,25 @@ fn frame_body_length(head: &[u8]) -> Result<usize, Error> {
     let mut lines = head.split(|&b| b == b'\n').map(|line| line.strip_suffix(b"\r").unwrap_or(line));
     let first = lines.next().unwrap_or_default();
     if let Ok(text) = core::str::from_utf8(first)
-        && let Ok(start) = parse_start_line(text)
+        && let Ok((version, code, _, _)) = start_line_parts(text)
     {
-        let version = match &start {
-            StartLine::Request { version, .. } | StartLine::Status { version, .. } => *version,
-        };
         if version == Version::Rtsp20 && head.windows(2).any(|pair| pair[1] == b'\n' && pair[0] != b'\r') {
             return Err(Error::LineEnding);
         }
-        if let StartLine::Status { code, .. } = start
-            && bodyless(version, code)
-        {
+        if code.is_some_and(|code| bodyless(version, code)) {
             return Ok(0);
         }
     }
-    let mut length = None;
-    let mut active = false;
-    let mut value: Option<&[u8]> = None;
-    for line in lines {
-        let trimmed = trim_frame_ws(line);
-        if line.first().is_some_and(|b| *b == b' ' || *b == b'\t') {
-            if active && !trimmed.is_empty() {
-                // Unfolding two nonempty pieces inserts a space. A decimal
-                // Content-Length cannot contain that space.
-                if value.is_some() {
-                    return Err(Error::ContentLength);
-                }
-                value = Some(trimmed);
-            }
-            continue;
-        }
-        if active {
-            frame_length_value(&mut length, value.unwrap_or_default())?;
-        }
-        value = None;
-        let colon = line.iter().position(|&b| b == b':');
-        let name = colon.and_then(|n| line.get(..n)).unwrap_or(line);
-        let name = trim_frame_ws(name);
-        active = name.eq_ignore_ascii_case(b"Content-Length");
-        if !active {
-            // A recognizable length name with a missing colon or an invalid
-            // suffix must not be mistaken for an unrelated bad header.
-            let token = name.split(|b| !is_token_byte(*b)).next().unwrap_or_default();
-            if token.eq_ignore_ascii_case(b"Content-Length") {
-                return Err(Error::ContentLength);
-            }
-        }
-        if active {
-            let at = colon.ok_or(Error::ContentLength)?.checked_add(1).ok_or(Error::TooLong)?;
-            let bytes = line.get(at..).ok_or(Error::ContentLength)?;
-            let bytes = trim_frame_ws(bytes);
-            if !bytes.is_empty() {
-                value = Some(bytes);
-            }
-        }
-    }
-    if active {
-        frame_length_value(&mut length, value.unwrap_or_default())?;
-    }
-    Ok(length.unwrap_or(0))
+    head_body::content_length(lines, |name| name.eq_ignore_ascii_case(b"Content-Length"),
+        parse_content_length, true, Error::ContentLength).map(|length| length.unwrap_or(0))
 }
 
-fn frame_length_value(length: &mut Option<usize>, bytes: &[u8]) -> Result<(), Error> {
-    let value = core::str::from_utf8(bytes).map_err(|_| Error::ContentLength)?;
-    let n = parse_content_length(value)?;
-    if length.is_some_and(|old| old != n) {
-        return Err(Error::ContentLength);
+#[inline]
+fn framing_error(error: LineError) -> Error {
+    match error {
+        LineError::TooLong { .. } => Error::TooLong,
+        _ => Error::LineEnding,
     }
-    *length = Some(n);
-    Ok(())
 }
 
 fn read_wire(bytes: &[u8]) -> Result<Frame, Error> {
@@ -1906,10 +1810,9 @@ fn bodyless(version: Version, code: u16) -> bool {
     version == Version::Rtsp10 && (code < 200 || code == 204 || code == 304)
 }
 
-/// Reads a head that ends with an empty line: the message with no body,
-/// and the body's length. Lines end with CRLF, or in RTSP 1.0 with a bare
-/// LF too.
-fn parse_head(head: &[u8]) -> Result<(Message, usize), Error> {
+/// Reads a head after framing has checked its body length. Lines end with
+/// CRLF, or in RTSP 1.0 with a bare LF too.
+fn parse_head(head: &[u8]) -> Result<Message, Error> {
     let text = std::str::from_utf8(head).map_err(|_| Error::Utf8)?;
     let text = text.strip_suffix('\n').ok_or(Error::LineEnding)?;
     let mut bare_lf = !text.ends_with('\r');
@@ -1961,15 +1864,20 @@ fn parse_head(head: &[u8]) -> Result<(Message, usize), Error> {
     if !headers.iter().all(|h| valid_value(&h.value)) {
         return Err(Error::HeaderValue);
     }
-    let message = Message { start, headers, body: Vec::new() };
-    let length = match message.start {
-        StartLine::Status { version, code, .. } if bodyless(version, code) => 0,
-        _ => message.content_length()?.unwrap_or(0),
-    };
-    Ok((message, length))
+    Ok(Message { start, headers, body: Vec::new() })
 }
 
 fn parse_start_line(line: &str) -> Result<StartLine, Error> {
+    let (version, code, first, second) = start_line_parts(line)?;
+    Ok(match code {
+        Some(code) => StartLine::Status { version, code, reason: first.to_owned() },
+        None => StartLine::Request { version, method: first.to_owned(), uri: second.to_owned() },
+    })
+}
+
+// Validate without allocating while finding the frame boundary.
+#[inline]
+fn start_line_parts(line: &str) -> Result<(Version, Option<u16>, &str, &str), Error> {
     if line.as_bytes().get(..5).is_some_and(|p| p.eq_ignore_ascii_case(b"RTSP/")) {
         let (version, rest) = line.split_once(' ').ok_or(Error::StartLine)?;
         let version = parse_version(version)?;
@@ -1981,7 +1889,7 @@ fn parse_start_line(line: &str) -> Result<StartLine, Error> {
         if !(100..=599).contains(&code) {
             return Err(Error::StartLine);
         }
-        return Ok(StartLine::Status { version, code, reason: reason.to_string() });
+        return Ok((version, Some(code), reason, ""));
     }
     let mut parts = line.splitn(3, ' ');
     let (Some(method), Some(uri), Some(version)) = (parts.next(), parts.next(), parts.next()) else {
@@ -1991,7 +1899,7 @@ fn parse_start_line(line: &str) -> Result<StartLine, Error> {
     if !valid_method(method) || !valid_uri(uri) {
         return Err(Error::StartLine);
     }
-    Ok(StartLine::Request { method: method.to_string(), uri: uri.to_string(), version })
+    Ok((version, None, method, uri))
 }
 
 /// Reads `RTSP/1.0` or `RTSP/2.0`, ignoring leading zeros in each number
@@ -2195,6 +2103,12 @@ wire_value!(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unexpected_line_error_is_malformed_head() {
+        assert_eq!(super::framing_error(super::LineError::Unterminated), super::Error::LineEnding);
+        assert_eq!(super::framing_error(super::LineError::BareLf), super::Error::LineEnding);
+    }
+
     use super::*;
     use fictionet::stdlib::codec::{Fail, Stream, contract};
     use fictionet::stdlib::codec::{
