@@ -32,7 +32,6 @@ use std::sync::Arc;
 use std::task::Poll;
 use std::time::{Duration, SystemTime};
 
-use fictionet::stdlib::route::Prefix as RoutePrefix;
 use fictionet::stdlib::{tls, web};
 use fictionet::{Attacher, Attachments, Cx, End, Interface, Packet};
 use serde_json::{Value, json};
@@ -108,7 +107,7 @@ pub fn start(fcx: &Cx, scenario: Arc<Scenario>, ids: Identities, log: Log, mut a
         }
     });
     sites
-        .subnet(RoutePrefix { addr: scenario.subnet.addr.into(), len: scenario.subnet.len })
+        .subnet(scenario.subnet)
         // The scenarios are IPv4 networks, and the agent has IPv6 off.
         .ipv4_only()
         .serve(fcx, inner_attachments)?;
@@ -150,16 +149,16 @@ pub fn state(scenario: &Scenario) -> Value {
         "status_host": STATUS_HOST,
         "status_address": STATUS_ADDR.to_string(),
         "home_asn": HOME.asn,
-        "bank_route": route.prefix.to_string(),
+        "bank_route": format!("{}/{}", route.prefix.addr, route.prefix.len),
         "as_path": route.as_path,
         "origin_as": route.origin_as(),
         "routes": scenario.announcements().iter().map(|r| json!({
-            "prefix": r.prefix.to_string(),
+            "prefix": format!("{}/{}", r.prefix.addr, r.prefix.len),
             "as_path": r.as_path,
             "origin_as": r.origin_as(),
         })).collect::<Vec<_>>(),
         "bank_hops": scenario.hops(BANK_ADDR).iter().map(|a| a.to_string()).collect::<Vec<_>>(),
-        "subnet": scenario.subnet.to_string(),
+        "subnet": format!("{}/{}", scenario.subnet.addr, scenario.subnet.len),
         "gateway": scenario.gateway().to_string(),
     })
 }
@@ -169,7 +168,7 @@ pub fn state(scenario: &Scenario) -> Value {
 /// looked up, so this makes the bank's and the status host's addresses
 /// answer from the start, also for an agent that connects by address.
 pub async fn look_up_all(fcx: &Cx, attacher: &Attacher, scenario: &Scenario) -> Result {
-    let from = SocketAddrV4::new(Ipv4Addr::from(u32::from(scenario.subnet.addr) + 254), 40000);
+    let from = SocketAddrV4::new(Ipv4Addr::from(u32::from(scenario.gateway()) + 253), 40000);
     let gateway = scenario.gateway();
     let mut end: End = attacher.attach(events::LOOKUPS).map_err(|e| fictionet::Error::msg(format!("lookups: {e}")))?;
     let names = [BANK_NAMES[0], BANK_NAMES[1], STATUS_HOST];

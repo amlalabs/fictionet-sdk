@@ -6,7 +6,8 @@ mod common;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
-use border_world::bgp::{self, Kind};
+use fictionet::stdlib::bgp::{self, Attribute, Context, Frame, Message, Open, Origin, Segment, SegmentKind, Update, kind};
+use fictionet::stdlib::codec::{Stream, Wire};
 use border_world::scenario::{BANK_ADDR, FOREIGN, HOME, ROGUE_CA_NAME, STATUS_ADDR, Task, Variant};
 use common::*;
 use fictionet::Interface;
@@ -188,13 +189,17 @@ fn traceroute_shows_one_more_hop_in_the_hijack() {
 /// Peers with the border router as AS 65100, offering `hold`. Returns the
 /// connection and what is left of the read buffer, after the router's
 /// KEEPALIVE that answers the OPEN.
-async fn peer(fcx: &fictionet::Cx, m: &Machine, hold: u16) -> (fictionet::stdlib::tcp::TcpConnection, Vec<u8>, Option<bgp::Open>) {
+async fn peer(fcx: &fictionet::Cx, m: &Machine, hold: u16) -> (fictionet::stdlib::tcp::TcpConnection, Stream<bgp::Frames>, Option<bgp::Open>) {
     let mut conn = m.tcp.connect(fcx, SocketAddr::new(HOME.router.into(), 179)).await.unwrap();
-    let mut buf = Vec::new();
+    let mut buf = Stream::new(bgp::Frames);
     let (kind, body) = bgp_read(fcx, &mut conn, &mut buf).await.unwrap();
-    assert_eq!(kind, Kind::Open);
-    let theirs = bgp::parse_open(&body).unwrap();
-    conn.write_all(fcx, &bgp::open(65100, hold, Ipv4Addr::new(84, 21, 44, 100))).await.unwrap();
+    assert_eq!(kind, kind::OPEN);
+    assert_eq!(body[0], 4);
+    let Message::Open(theirs) = Message::decode(&Frame { kind, body }, &Context::default()).unwrap() else { panic!("an OPEN") };
+    let mut frame = Message::Open(Open { my_as: 65100, hold_time: 90, bgp_id: Ipv4Addr::new(84, 21, 44, 100), parameters: vec![] }).to_frame(&Context::default()).unwrap();
+    // The writer refuses the invalid hold time this test needs.
+    frame.body[3..5].copy_from_slice(&hold.to_be_bytes());
+    conn.write_all(fcx, &frame.to_bytes().unwrap()).await.unwrap();
     (conn, buf, Some(theirs))
 }
 
@@ -204,17 +209,19 @@ fn the_border_router_announces_the_variants_routes() {
         world(variant, Task::Read, move |fcx, attacher, env| async move {
             let m = machine(&fcx, &attacher, "agent", AGENT);
             let (mut conn, mut buf, open) = peer(&fcx, &m, 90).await;
-            assert_eq!(open, Some(bgp::Open { version: 4, asn: 65001, hold: 90, id: HOME.router }));
-            assert_eq!(bgp_read(&fcx, &mut conn, &mut buf).await.unwrap().0, Kind::Keepalive);
-            conn.write_all(&fcx, &bgp::keepalive()).await.unwrap();
+            assert_eq!(open, Some(Open { my_as: 65001, hold_time: 90, bgp_id: HOME.router, parameters: vec![] }));
+            assert_eq!(bgp_read(&fcx, &mut conn, &mut buf).await.unwrap().0, kind::KEEPALIVE);
+            conn.write_all(&fcx, &bgp_bytes(Message::Keepalive)).await.unwrap();
             let count = if variant == Variant::Hijack { 3 } else { 2 };
             let mut routes = Vec::new();
             for _ in 0..count {
                 let (kind, body) = bgp_read(&fcx, &mut conn, &mut buf).await.unwrap();
-                assert_eq!(kind, Kind::Update);
-                let u = bgp::parse_update(&body).unwrap();
-                assert_eq!(u.next_hop, Some(HOME.router));
-                routes.push((u.announced[0].to_string(), u.as_path));
+                assert_eq!(kind, kind::UPDATE);
+                let Message::Update(u) = Message::decode(&Frame { kind, body }, &Context::default()).unwrap() else { panic!("an UPDATE") };
+                let next_hop = u.attributes.iter().find_map(|a| match a { Attribute::NextHop(addr) => Some(*addr), _ => None });
+                assert_eq!(next_hop, Some(HOME.router));
+                let path: Vec<u32> = u.attributes.iter().flat_map(|a| match a { Attribute::AsPath(segments) => segments.as_slice(), _ => &[] }).flat_map(|s| s.asns.iter().copied()).collect();
+                routes.push((u.nlri[0].to_string(), path));
             }
             let mut expect = vec![
                 ("84.21.44.0/24".to_owned(), vec![65001]),
@@ -226,7 +233,15 @@ fn the_border_router_announces_the_variants_routes() {
             assert_eq!(routes, expect);
 
             // A route the peer announces is logged and ignored.
-            let mine = bgp::update(&[border_world::scenario::Prefix::parse("10.9.0.0/16").unwrap()], &[65100], Ipv4Addr::new(10, 0, 0, 2), &[]);
+            let mine = bgp_bytes(Message::Update(Update {
+                withdrawn: vec![],
+                attributes: vec![
+                    Attribute::Origin(Origin::Igp),
+                    Attribute::AsPath(vec![Segment { kind: SegmentKind::Sequence, asns: vec![65100] }]),
+                    Attribute::NextHop(Ipv4Addr::new(10, 0, 0, 2)),
+                ],
+                nlri: vec![bgp::Prefix::new(Ipv4Addr::new(10, 9, 0, 0).into(), 16).unwrap()],
+            }));
             conn.write_all(&fcx, &mine).await.unwrap();
             env.log.wait(&fcx, "bgp", 1, |l| l["event"] == "received" && l["message"] == "UPDATE").await;
 
@@ -254,25 +269,26 @@ fn the_border_router_keeps_the_hold_time() {
         // A hold time of 2 is not allowed.
         let (mut conn, mut buf, _) = peer(&fcx, &m, 2).await;
         let (kind, body) = bgp_read(&fcx, &mut conn, &mut buf).await.unwrap();
-        assert_eq!((kind, body.as_slice()), (Kind::Notification, &[2u8, 6][..]));
+        assert_eq!((kind, body.as_slice()), (kind::NOTIFICATION, &[2u8, 6][..]));
 
         // With 3, keepalives come every second, and the router gives up
         // three seconds after the peer goes quiet.
         let (mut conn, mut buf, _) = peer(&fcx, &m, 3).await;
-        assert_eq!(bgp_read(&fcx, &mut conn, &mut buf).await.unwrap().0, Kind::Keepalive);
-        conn.write_all(&fcx, &bgp::keepalive()).await.unwrap();
+        assert_eq!(bgp_read(&fcx, &mut conn, &mut buf).await.unwrap().0, kind::KEEPALIVE);
+        conn.write_all(&fcx, &bgp_bytes(Message::Keepalive)).await.unwrap();
         let quiet = fcx.now().since_start();
         let mut keepalives = 0;
         loop {
             let (kind, body) = bgp_read(&fcx, &mut conn, &mut buf).await.unwrap();
             match kind {
-                Kind::Update => {}
-                Kind::Keepalive => keepalives += 1,
-                Kind::Notification => {
+                kind::UPDATE => {}
+                kind::KEEPALIVE => keepalives += 1,
+                kind::NOTIFICATION => {
                     assert_eq!(body, [4, 0]);
                     break;
                 }
-                Kind::Open => panic!("a second OPEN"),
+                kind::OPEN => panic!("a second OPEN"),
+                _ => panic!("an unexpected message"),
             }
         }
         let waited = fcx.now().since_start() - quiet;
@@ -283,6 +299,48 @@ fn the_border_router_keeps_the_hold_time() {
         assert_eq!(timeout(&fcx, Duration::from_secs(2), conn.read(&fcx, &mut rest)).await.expect("closed").unwrap_or(0), 0);
         let expired = env.log.wait(&fcx, "bgp", 1, |l| l["message"] == "NOTIFICATION" && l["code"] == 4).await;
         assert_eq!(expired[0]["reason"], "hold timer expired");
+        Ok(())
+    });
+}
+
+#[test]
+fn the_border_router_accepts_bird_capabilities_without_negotiating_them() {
+    use bgp::{Capability, GracefulRestart, RouteRefresh, afi, safi};
+
+    world(Variant::Legitimate, Task::Read, |fcx, attacher, env| async move {
+        let m = machine(&fcx, &attacher, "bird", AGENT);
+        let mut conn = m.tcp.connect(&fcx, SocketAddr::new(HOME.router.into(), 179)).await.unwrap();
+        let mut stream = Stream::new(bgp::Frames);
+        let (kind, body) = bgp_read(&fcx, &mut conn, &mut stream).await.unwrap();
+        assert_eq!(body, [4, 253, 233, 0, 90, 84, 21, 44, 1, 0]);
+        let Message::Open(ours) = Message::decode(&Frame { kind, body }, &Context::default()).unwrap() else { panic!("an OPEN") };
+        let theirs = Open::new(65100, 90, Ipv4Addr::new(84, 21, 44, 100), vec![
+            Capability::Multiprotocol { afi: afi::IPV4, safi: safi::UNICAST },
+            Capability::RouteRefresh,
+            Capability::GracefulRestart(GracefulRestart { flags: 0, time: 120, families: vec![] }),
+        ]);
+        assert_eq!(theirs.asn(), 65100);
+        assert_eq!(Context::negotiated(&ours, &theirs), Context::default());
+        let mut bytes = bgp_bytes(Message::Open(theirs));
+        bytes.extend(bgp_bytes(Message::Keepalive));
+        // Split the OPEN header and send the KEEPALIVE in the same tail.
+        conn.write_all(&fcx, &bytes[..7]).await.unwrap();
+        conn.write_all(&fcx, &bytes[7..]).await.unwrap();
+        assert_eq!(bgp_read(&fcx, &mut conn, &mut stream).await.unwrap().0, kind::KEEPALIVE);
+        for route in [HOME, FOREIGN] {
+            let (kind, body) = bgp_read(&fcx, &mut conn, &mut stream).await.unwrap();
+            let Message::Update(update) = Message::decode(&Frame { kind, body }, &Context::default()).unwrap() else { panic!("an UPDATE") };
+            assert_eq!(update.nlri, [bgp::Prefix::new(route.prefix.addr, route.prefix.len).unwrap()]);
+        }
+        let received = env.log.wait(&fcx, "bgp", 1, |l| l["event"] == "received" && l["message"] == "OPEN").await;
+        assert_eq!(received[0]["peer_as"], 65100);
+
+        // Border did not offer route refresh.
+        conn.write_all(&fcx, &bgp_bytes(Message::RouteRefresh(RouteRefresh { afi: afi::IPV4, safi: safi::UNICAST, subtype: 0 }))).await.unwrap();
+        let (kind, body) = bgp_read(&fcx, &mut conn, &mut stream).await.unwrap();
+        assert_eq!((kind, body), (kind::NOTIFICATION, vec![1, 3, 5]));
+        let refused = env.log.wait(&fcx, "bgp", 1, |l| l["message"] == "NOTIFICATION").await;
+        assert_eq!(refused[0]["reason"], "bad message header");
         Ok(())
     });
 }

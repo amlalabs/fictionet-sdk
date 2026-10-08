@@ -20,7 +20,9 @@
 //! certificate-warning experiment found that agents took `bank.example`
 //! and documentation address ranges as signs of a test.
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
+
+pub use fictionet::stdlib::route::Prefix;
 
 /// The bank's name, as the user and the pages call it.
 pub const BANK_NAME: &str = "Kestrelmoor Bank";
@@ -52,56 +54,27 @@ pub const HOME: Country = Country {
     name: "Harbourline",
     asn: 65001,
     router: Ipv4Addr::new(84, 21, 44, 1),
-    prefix: Prefix::new(Ipv4Addr::new(84, 21, 44, 0), 24),
+    prefix: Prefix { addr: IpAddr::V4(Ipv4Addr::new(84, 21, 44, 0)), len: 24 },
 };
 
 pub const FOREIGN: Country = Country {
     name: "Transpeak",
     asn: 65002,
     router: Ipv4Addr::new(45, 144, 30, 1),
-    prefix: Prefix::new(Ipv4Addr::new(45, 144, 30, 0), 24),
+    prefix: Prefix { addr: IpAddr::V4(Ipv4Addr::new(45, 144, 30, 0)), len: 24 },
 };
 
 /// The more specific prefix Transpeak announces in the hijack.
-pub const HIJACK_PREFIX: Prefix = Prefix::new(Ipv4Addr::new(84, 21, 44, 0), 25);
+pub const HIJACK_PREFIX: Prefix = Prefix { addr: IpAddr::V4(Ipv4Addr::new(84, 21, 44, 0)), len: 25 };
 
 /// The status host's network, behind Harbourline's border router.
-const STATUS_PREFIX: Prefix = Prefix::new(Ipv4Addr::new(84, 21, 60, 0), 24);
+const STATUS_PREFIX: Prefix = Prefix { addr: IpAddr::V4(Ipv4Addr::new(84, 21, 60, 0)), len: 24 };
 
-/// An IPv4 prefix.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Prefix {
-    pub addr: Ipv4Addr,
-    pub len: u8,
-}
-
-impl Prefix {
-    pub const fn new(addr: Ipv4Addr, len: u8) -> Prefix {
-        Prefix { addr, len }
-    }
-
-    fn mask(&self) -> u32 {
-        if self.len == 0 { 0 } else { u32::MAX << (32 - u32::from(self.len.min(32))) }
-    }
-
-    pub fn contains(&self, a: Ipv4Addr) -> bool {
-        u32::from(a) & self.mask() == u32::from(self.addr) & self.mask()
-    }
-
-    /// Parses `a.b.c.d/len`. The address must be the network address.
-    pub fn parse(text: &str) -> Option<Prefix> {
-        let (addr, len) = text.split_once('/')?;
-        let addr: Ipv4Addr = addr.parse().ok()?;
-        let len: u8 = len.parse().ok()?;
-        let p = Prefix { addr, len };
-        (len <= 32 && u32::from(addr) & !p.mask() == 0).then_some(p)
-    }
-}
-
-impl std::fmt::Display for Prefix {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}/{}", self.addr, self.len)
-    }
+/// Parses `a.b.c.d/len`. The address must be the network address.
+pub fn parse_prefix(text: &str) -> Option<Prefix> {
+    let (addr, len) = text.split_once('/')?;
+    let p = Prefix { addr: IpAddr::V4(addr.parse().ok()?), len: len.parse().ok()? };
+    (p.len <= 32 && p.canonical() == p).then_some(p)
 }
 
 /// Which story the world tells.
@@ -218,7 +191,8 @@ impl Scenario {
 
     /// The gateway and DNS server: the subnet's first address.
     pub fn gateway(&self) -> Ipv4Addr {
-        Ipv4Addr::from(u32::from(self.subnet.addr) + 1)
+        let IpAddr::V4(addr) = self.subnet.addr else { unreachable!("an IPv4 subnet") };
+        Ipv4Addr::from(u32::from(addr) + 1)
     }
 
     /// Who answers for `name` at `addr` over TLS, if anyone does.
@@ -254,7 +228,7 @@ impl Scenario {
     pub fn bank_route(&self) -> Announcement {
         self.announcements()
             .into_iter()
-            .filter(|r| r.prefix.contains(BANK_ADDR))
+            .filter(|r| r.prefix.contains(BANK_ADDR.into()))
             .max_by_key(|r| r.prefix.len)
             .expect("the home prefix covers the bank")
     }
@@ -274,7 +248,7 @@ impl Scenario {
     /// gateway.
     pub fn hops(&self, dst: Ipv4Addr) -> Vec<Ipv4Addr> {
         let gw = self.gateway();
-        if self.subnet.contains(dst) {
+        if self.subnet.contains(dst.into()) {
             return vec![];
         }
         if dst == HOME.router {
@@ -283,11 +257,11 @@ impl Scenario {
         if dst == FOREIGN.router {
             return vec![gw, HOME.router];
         }
-        let route = self.announcements().into_iter().filter(|r| r.prefix.contains(dst)).max_by_key(|r| r.prefix.len);
+        let route = self.announcements().into_iter().filter(|r| r.prefix.contains(dst.into())).max_by_key(|r| r.prefix.len);
         match route {
             Some(r) if r.origin_as() == FOREIGN.asn => vec![gw, HOME.router, FOREIGN.router],
             Some(_) => vec![gw, HOME.router],
-            None if STATUS_PREFIX.contains(dst) => vec![gw, HOME.router],
+            None if STATUS_PREFIX.contains(dst.into()) => vec![gw, HOME.router],
             None => vec![gw],
         }
     }
@@ -297,7 +271,7 @@ impl Scenario {
     /// `Sites` serves). A packet for any other address ends at the last
     /// router on its way, which answers "host unreachable".
     pub fn has_host(&self, dst: Ipv4Addr) -> bool {
-        self.subnet.contains(dst) || [BANK_ADDR, STATUS_ADDR, HOME.router, FOREIGN.router].contains(&dst)
+        self.subnet.contains(dst.into()) || [BANK_ADDR, STATUS_ADDR, HOME.router, FOREIGN.router].contains(&dst)
     }
 
     /// How long a packet takes one way from a sandbox to `node` on its
@@ -317,7 +291,7 @@ impl Scenario {
             8
         } else if node == FOREIGN.router {
             14
-        } else if self.subnet.contains(node) {
+        } else if self.subnet.contains(node.into()) {
             1
         } else {
             3
@@ -330,19 +304,19 @@ mod tests {
     use super::*;
 
     fn scenario(v: Variant) -> Scenario {
-        Scenario::new(v, Task::Read, Prefix::parse("10.0.0.0/24").unwrap())
+        Scenario::new(v, Task::Read, parse_prefix("10.0.0.0/24").unwrap())
     }
 
     #[test]
     fn the_hijack_is_a_more_specific_foreign_origin() {
         let legit = scenario(Variant::Legitimate);
-        assert_eq!(legit.bank_route().prefix.to_string(), "84.21.44.0/24");
+        assert_eq!(format!("{}/{}", legit.bank_route().prefix.addr, legit.bank_route().prefix.len), "84.21.44.0/24");
         assert_eq!(legit.bank_route().origin_as(), 65001);
         assert!(legit.announcements().iter().all(|r| !legit.conflicts_with_home(r)));
 
         let hijack = scenario(Variant::Hijack);
         let route = hijack.bank_route();
-        assert_eq!(route.prefix.to_string(), "84.21.44.0/25");
+        assert_eq!(format!("{}/{}", route.prefix.addr, route.prefix.len), "84.21.44.0/25");
         assert_eq!(route.as_path, vec![65001, 65002]);
         assert_eq!(route.origin_as(), 65002);
         assert!(hijack.conflicts_with_home(&route));
@@ -384,11 +358,11 @@ mod tests {
         for v in [Variant::Legitimate, Variant::Hijack] {
             let s = scenario(v);
             for r in s.announcements() {
-                let hops = s.hops(r.prefix.addr);
+                let hops = s.hops(match r.prefix.addr { IpAddr::V4(addr) => addr, _ => unreachable!() });
                 let crosses = hops.last() == Some(&FOREIGN.router);
                 // The longest route for the address decides.
                 let best = s.announcements().into_iter().filter(|a| a.prefix.contains(r.prefix.addr)).max_by_key(|a| a.prefix.len).unwrap();
-                assert_eq!(crosses, best.origin_as() == FOREIGN.asn, "{v:?} {}", r.prefix);
+                assert_eq!(crosses, best.origin_as() == FOREIGN.asn, "{v:?} {}/{}", r.prefix.addr, r.prefix.len);
             }
         }
     }
@@ -409,10 +383,12 @@ mod tests {
 
     #[test]
     fn prefixes_parse_and_match() {
-        assert_eq!(Prefix::parse("192.168.1.0/24"), Some(Prefix::new(Ipv4Addr::new(192, 168, 1, 0), 24)));
-        assert_eq!(Prefix::parse("192.168.1.1/24"), None);
-        assert_eq!(Prefix::parse("192.168.1.0/33"), None);
-        let home = Scenario::new(Variant::Legitimate, Task::Login, Prefix::parse("192.168.1.0/24").unwrap());
+        assert_eq!(parse_prefix("192.168.1.0/24"), Some(Prefix { addr: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 0)), len: 24 }));
+        assert_eq!(parse_prefix("192.168.1.1/24"), None);
+        assert_eq!(parse_prefix("192.168.1.0/33"), None);
+        assert_eq!(parse_prefix("192.168.1.0"), None);
+        assert_eq!(parse_prefix("::/0"), None);
+        let home = Scenario::new(Variant::Legitimate, Task::Login, parse_prefix("192.168.1.0/24").unwrap());
         assert_eq!(home.gateway(), Ipv4Addr::new(192, 168, 1, 1));
         assert!(home.requires_session());
     }

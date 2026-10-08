@@ -12,10 +12,11 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::task::Poll;
 use std::time::Duration;
 
-use border_world::bgp;
+use fictionet::stdlib::bgp;
+use fictionet::stdlib::codec::{Stream, Wire};
 use border_world::certs::Ca;
 use border_world::log::Log;
-use border_world::scenario::{Prefix, Scenario, Task, Variant};
+use border_world::scenario::{parse_prefix, Scenario, Task, Variant};
 use bytes::Bytes;
 use fictionet::prelude::*;
 use fictionet::stdlib::dns::op::{Message, Query, ResponseCode};
@@ -100,7 +101,7 @@ where
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
         let result = rt.block_on(fictionet::run(move |fcx| async move {
-            let scenario = Arc::new(Scenario::new(variant, task, Prefix::parse("10.0.0.0/24").unwrap()));
+            let scenario = Arc::new(Scenario::new(variant, task, parse_prefix("10.0.0.0/24").unwrap()));
             let (ids, root) = {
                 let ca = Ca::root("Test Root CA")?;
                 (border_world::identities(&scenario, &ca)?, ca.der().clone())
@@ -267,23 +268,24 @@ pub async fn plain(fcx: &Cx, m: &Machine, addr: Ipv4Addr) -> fictionet::tokio::C
     m.tcp.connect(fcx, SocketAddr::new(addr.into(), 80)).await.unwrap().into_tokio(fcx)
 }
 
+/// Writes a message with two-octet AS numbers.
+pub fn bgp_bytes(message: bgp::Message) -> Vec<u8> {
+    message.to_frame(&bgp::Context::default()).and_then(|frame| frame.to_bytes()).unwrap()
+}
+
 /// Reads one whole BGP message: its kind and body.
-pub async fn bgp_read(fcx: &Cx, conn: &mut tcp::TcpConnection, buf: &mut Vec<u8>) -> Result<(bgp::Kind, Vec<u8>), ConnError> {
+pub async fn bgp_read(fcx: &Cx, conn: &mut tcp::TcpConnection, stream: &mut Stream<bgp::Frames>) -> Result<(u8, Vec<u8>), ConnError> {
     loop {
-        if buf.len() >= bgp::HEADER {
-            let (kind, len) = bgp::parse_header(buf).expect("a good header");
-            if buf.len() >= bgp::HEADER + len {
-                let body = buf[bgp::HEADER..bgp::HEADER + len].to_vec();
-                buf.drain(..bgp::HEADER + len);
-                return Ok((kind, body));
-            }
+        if let Some(frame) = stream.next() {
+            let frame = frame.expect("a good frame");
+            bgp::Message::decode(&frame, &bgp::Context::default()).expect("a good message");
+            return Ok((frame.kind, frame.body));
         }
-        let mut chunk = [0u8; 4096];
-        let n = conn.read(fcx, &mut chunk).await?;
+        let n = conn.read(fcx, stream.spare()).await?;
         if n == 0 {
             return Err(ConnError::Closed);
         }
-        buf.extend_from_slice(&chunk[..n]);
+        stream.commit(n);
     }
 }
 

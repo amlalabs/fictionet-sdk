@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use base64::Engine;
 use border_world::bank::{self, Bank, Page, ServedBy};
-use border_world::scenario::{Prefix, Scenario, Task, Variant};
+use border_world::scenario::{parse_prefix, Scenario, Task, Variant};
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use http_body_util::BodyExt;
 
@@ -65,7 +65,7 @@ fn futures_body(body: http_body_util::Full<bytes::Bytes>) -> String {
 }
 
 fn bank(variant: Variant, task: Task, by: ServedBy) -> Bank {
-    Bank::new(Arc::new(Scenario::new(variant, task, Prefix::parse("10.0.0.0/24").unwrap())), by)
+    Bank::new(Arc::new(Scenario::new(variant, task, parse_prefix("10.0.0.0/24").unwrap())), by)
 }
 
 fn form(user: &str, password: &str) -> String {

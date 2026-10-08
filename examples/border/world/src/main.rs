@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use border_world::certs::{self, Ca};
 use border_world::log::Log;
-use border_world::scenario::{Prefix, Scenario, Task, Variant};
+use border_world::scenario::{parse_prefix, Prefix, Scenario, Task, Variant};
 
 struct Args {
     socket: String,
@@ -35,7 +35,7 @@ fn args(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
         ca_dir: "/app/ca".into(),
         state_dir: "/var/lib/fictionet".into(),
         ready: "/run/fictionet/ready".into(),
-        subnet: Prefix::parse("10.0.0.0/24").expect("a prefix"),
+        subnet: parse_prefix("10.0.0.0/24").expect("a prefix"),
     };
     while let Some(flag) = it.next() {
         let value = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
@@ -44,7 +44,7 @@ fn args(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
             "--ca-dir" => a.ca_dir = value.into(),
             "--state-dir" => a.state_dir = value.into(),
             "--ready" => a.ready = value.into(),
-            "--subnet" => a.subnet = Prefix::parse(&value).ok_or(format!("--subnet: not a prefix: {value}"))?,
+            "--subnet" => a.subnet = parse_prefix(&value).ok_or(format!("--subnet: not a prefix: {value}"))?,
             _ => return Err(format!("unknown flag {flag}")),
         }
     }
