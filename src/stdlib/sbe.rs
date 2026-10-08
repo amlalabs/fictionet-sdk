@@ -6,8 +6,9 @@
 //! (Message Schema), and section 5 (Schema Extension Mechanism). No private
 //! schemas or licensed documents are needed.
 //!
-//! [`Schema::parse`] accepts a bounded XML subset with namespaces, comments,
-//! an XML declaration, and predefined or numeric character references.
+//! [`Schema::parse`] reads a bounded XML subset with [`stdlib::xml`](fictionet::stdlib::xml),
+//! including namespaces, comments, an XML declaration, and character references.
+//! Namespaces and whitespace follow the XML module's validation and normalization.
 //! DTDs, entity declarations, processing instructions other than the initial
 //! XML declaration, CDATA, and external includes are refused. Metadata such
 //! as descriptions and semantic types does not drive application validation.
@@ -32,6 +33,7 @@
 //! after the acting version become [`Value::Absent`] (section 5.4).
 
 use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::xml;
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 
@@ -432,280 +434,82 @@ impl XmlNode {
     }
 }
 
-struct Xml<'a> {
-    input: &'a str,
-    at: usize,
-    nodes: Vec<XmlNode>,
-}
-impl<'a> Xml<'a> {
-    fn rest(&self) -> &'a str {
-        self.input.get(self.at..).unwrap_or_default()
-    }
-    fn ws(&mut self) {
-        while self
-            .rest()
-            .as_bytes()
-            .first()
-            .is_some_and(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
-        {
-            self.at += 1;
-        }
-    }
-    fn take(&mut self, s: &str) -> bool {
-        if self.rest().starts_with(s) {
-            self.at += s.len();
-            true
-        } else {
-            false
-        }
-    }
-    fn name(&mut self) -> Result<String, Error> {
-        let start = self.at;
-        let first = self
-            .rest()
-            .as_bytes()
-            .first()
-            .copied()
-            .ok_or(Error::Xml(self.at))?;
-        if !(first.is_ascii_alphabetic() || first == b'_') {
-            return Err(Error::Xml(start));
-        }
-        while self
-            .rest()
-            .as_bytes()
-            .first()
-            .is_some_and(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'))
-        {
-            self.at += 1;
-        }
-        if self.at - start > MAX_NAME_BYTES {
-            return Err(Error::Limit("MAX_NAME_BYTES"));
-        }
-        let name = self.input.get(start..self.at).ok_or(Error::Xml(start))?;
-        if name.matches(':').count() > 1 || name.ends_with(':') {
-            return Err(Error::Xml(start));
-        }
-        Ok(name.to_owned())
-    }
-    fn comment(&mut self) -> Result<(), Error> {
-        let n = self.rest().find("-->").ok_or(Error::Xml(self.at))?;
-        let content = self.rest().get(..n).ok_or(Error::Xml(self.at))?;
-        if content.contains("--") || content.ends_with('-') {
-            return Err(Error::Xml(self.at));
-        }
-        self.at += n + 3;
-        Ok(())
-    }
-    fn element(&mut self, depth: usize) -> Result<usize, Error> {
-        if depth > MAX_XML_DEPTH {
-            return Err(Error::Limit("MAX_XML_DEPTH"));
-        }
-        if self.nodes.len() >= MAX_XML_ELEMENTS {
-            return Err(Error::Limit("MAX_XML_ELEMENTS"));
-        }
-        if !self.take("<") {
-            return Err(Error::Xml(self.at));
-        }
-        let qualified = self.name()?;
-        let tag = qualified
-            .rsplit(':')
-            .next()
-            .ok_or(Error::Xml(self.at))?
-            .to_owned();
-        let mut attrs = BTreeMap::new();
-        let empty;
-        loop {
-            let before = self.at;
-            self.ws();
-            if self.take("/>") {
-                empty = true;
-                break;
-            }
-            if self.take(">") {
-                empty = false;
-                break;
-            }
-            if before == self.at {
-                return Err(Error::Xml(self.at));
-            }
-            if attrs.len() >= MAX_XML_ATTRIBUTES {
-                return Err(Error::Limit("MAX_XML_ATTRIBUTES"));
-            }
-            let name = self.name()?;
-            self.ws();
-            if !self.take("=") {
-                return Err(Error::Xml(self.at));
-            }
-            self.ws();
-            let quote = self.rest().chars().next().ok_or(Error::Xml(self.at))?;
-            if quote != '\'' && quote != '"' {
-                return Err(Error::Xml(self.at));
-            }
-            self.at += 1;
-            let len = self.rest().find(quote).ok_or(Error::Xml(self.at))?;
-            let raw = self.rest().get(..len).ok_or(Error::Xml(self.at))?;
-            if raw.contains('<') {
-                return Err(Error::Xml(self.at));
-            }
-            let value = xml_text(raw, self.at)?;
-            self.at += len + 1;
-            if attrs.insert(name, value).is_some() {
-                return Err(Error::Xml(self.at));
-            }
-        }
-        let id = self.nodes.len();
-        self.nodes.push(XmlNode {
-            tag,
-            attrs,
-            text: String::new(),
-            children: Vec::new(),
-        });
-        if empty {
-            return Ok(id);
-        }
-        loop {
-            if self.take("</") {
-                if self.name()? != qualified {
-                    return Err(Error::Xml(self.at));
-                }
-                self.ws();
-                if !self.take(">") {
-                    return Err(Error::Xml(self.at));
-                }
-                break;
-            }
-            if self.take("<!--") {
-                self.comment()?;
-                continue;
-            }
-            if self.rest().starts_with('<') {
-                let child = self.element(depth + 1)?;
-                self.nodes
-                    .get_mut(id)
-                    .ok_or(Error::Xml(self.at))?
-                    .children
-                    .push(child);
-            } else {
-                let len = self.rest().find('<').ok_or(Error::Xml(self.at))?;
-                let raw = self.rest().get(..len).ok_or(Error::Xml(self.at))?;
-                if raw.contains("]]>") {
-                    return Err(Error::Xml(self.at));
-                }
-                let text = xml_text(raw, self.at)?;
-                self.nodes
-                    .get_mut(id)
-                    .ok_or(Error::Xml(self.at))?
-                    .text
-                    .push_str(&text);
-                self.at += len;
-            }
-        }
-        Ok(id)
-    }
-}
-
-fn xml_char(c: char) -> bool {
-    matches!(c, '\t' | '\n' | '\r' | '\u{20}'..='\u{d7ff}' | '\u{e000}'..='\u{fffd}' | '\u{10000}'..='\u{10ffff}')
-}
-fn xml_text(raw: &str, at: usize) -> Result<String, Error> {
-    let mut out = String::new();
-    let mut rest = raw;
-    while let Some(i) = rest.find('&') {
-        out.push_str(rest.get(..i).ok_or(Error::Xml(at))?);
-        rest = rest.get(i + 1..).ok_or(Error::Xml(at))?;
-        let end = rest.find(';').ok_or(Error::Xml(at))?;
-        let token = rest.get(..end).ok_or(Error::Xml(at))?;
-        let c = match token {
-            "amp" => '&',
-            "lt" => '<',
-            "gt" => '>',
-            "quot" => '"',
-            "apos" => '\'',
-            _ => {
-                let n = if let Some(hex) = token.strip_prefix("#x") {
-                    u32::from_str_radix(hex, 16).ok()
-                } else {
-                    token.strip_prefix('#').and_then(|s| s.parse::<u32>().ok())
-                };
-                n.and_then(char::from_u32)
-                    .filter(|c| xml_char(*c))
-                    .ok_or(Error::Xml(at))?
-            }
-        };
-        out.push(c);
-        rest = rest.get(end + 1..).ok_or(Error::Xml(at))?;
-    }
-    out.push_str(rest);
-    Ok(out)
-}
-
 fn parse_xml(input: &str) -> Result<Vec<XmlNode>, Error> {
     if input.len() > MAX_XML_BYTES {
         return Err(Error::Limit("MAX_XML_BYTES"));
     }
-    if !input.chars().all(xml_char) {
-        return Err(Error::Xml(0));
-    }
-    let mut xml = Xml {
-        input,
-        at: 0,
-        nodes: Vec::new(),
-    };
-    xml.take("\u{feff}");
-    if xml.take("<?xml") {
-        let before = xml.at;
-        xml.ws();
-        if before == xml.at {
-            return Err(Error::Xml(xml.at));
-        }
-        let len = xml.rest().find("?>").ok_or(Error::Xml(xml.at))?;
-        // Parse the declaration's attributes with the same bounded tokenizer.
-        let declaration = format!(
-            "<declaration {}/>",
-            xml.rest().get(..len).ok_or(Error::Xml(xml.at))?
-        );
-        let mut d = Xml {
-            input: &declaration,
-            at: 0,
-            nodes: Vec::new(),
-        };
-        d.element(1)?;
-        let node = d.nodes.first().ok_or(Error::Xml(xml.at))?;
-        if node.attr("version") != Some("1.0")
-            || node
-                .attr("encoding")
-                .is_some_and(|s| !s.eq_ignore_ascii_case("UTF-8"))
-            || node
-                .attrs
-                .keys()
-                .any(|s| !matches!(s.as_str(), "version" | "encoding" | "standalone"))
-            || node
-                .attr("standalone")
-                .is_some_and(|s| s != "yes" && s != "no")
+    let mut parser = xml::Events::new();
+    let mut pos = 0;
+    let mut nodes: Vec<XmlNode> = Vec::new();
+    let mut stack: Vec<usize> = Vec::new();
+    loop {
+        let at = pos;
+        match parser
+            .decode(input.as_bytes().get(pos..).ok_or(Error::Xml(at))?, true)
+            .map_err(|_| Error::Xml(at))?
         {
-            return Err(Error::Xml(xml.at));
+            Step::Item(event, used) => {
+                pos += used;
+                match event {
+                    xml::Event::Start(start) => {
+                        if stack.len() >= MAX_XML_DEPTH {
+                            return Err(Error::Limit("MAX_XML_DEPTH"));
+                        }
+                        if nodes.len() >= MAX_XML_ELEMENTS {
+                            return Err(Error::Limit("MAX_XML_ELEMENTS"));
+                        }
+                        if start.attributes.len() > MAX_XML_ATTRIBUTES {
+                            return Err(Error::Limit("MAX_XML_ATTRIBUTES"));
+                        }
+                        if start.name.qname().len() > MAX_NAME_BYTES {
+                            return Err(Error::Limit("MAX_NAME_BYTES"));
+                        }
+                        let mut attrs = BTreeMap::new();
+                        for attr in start.attributes {
+                            let name = attr.name.qname();
+                            if name.len() > MAX_NAME_BYTES {
+                                return Err(Error::Limit("MAX_NAME_BYTES"));
+                            }
+                            attrs.insert(name, attr.value);
+                        }
+                        let id = nodes.len();
+                        if let Some(parent) = stack.last() {
+                            nodes.get_mut(*parent).ok_or(Error::Xml(at))?.children.push(id);
+                        }
+                        nodes.push(XmlNode {
+                            tag: start.name.local,
+                            attrs,
+                            text: String::new(),
+                            children: Vec::new(),
+                        });
+                        stack.push(id);
+                    }
+                    xml::Event::End(_) => {
+                        stack.pop().ok_or(Error::Xml(at))?;
+                    }
+                    xml::Event::Text(text) => {
+                        let id = stack.last().ok_or(Error::Xml(at))?;
+                        nodes.get_mut(*id).ok_or(Error::Xml(at))?.text.push_str(&text);
+                    }
+                    xml::Event::Declaration { version, .. } => {
+                        if version != "1.0" {
+                            return Err(Error::Xml(at));
+                        }
+                    }
+                    xml::Event::Comment(_) => {}
+                    xml::Event::Doctype { .. } | xml::Event::Pi { .. } | xml::Event::CData(_) => {
+                        return Err(Error::Xml(at));
+                    }
+                }
+            }
+            Step::Skip(used) => pos += used,
+            Step::Need | Step::End => break,
         }
-        xml.at += len + 2;
     }
-    loop {
-        xml.ws();
-        if !xml.take("<!--") {
-            break;
-        }
-        xml.comment()?;
+    if pos != input.len() || !stack.is_empty() || nodes.is_empty() {
+        return Err(Error::Xml(pos));
     }
-    xml.element(1)?;
-    loop {
-        xml.ws();
-        if !xml.take("<!--") {
-            break;
-        }
-        xml.comment()?;
-    }
-    if !xml.rest().is_empty() {
-        return Err(Error::Xml(xml.at));
-    }
-    Ok(xml.nodes)
+    Ok(nodes)
 }
 
 #[derive(Clone, Debug)]
@@ -3789,6 +3593,48 @@ mod tests {
             assert_eq!(out, [0x55, 0xaa]);
             contract::check_wire_value(&bad);
         }
+    }
+
+    #[test]
+    fn xml_events_tree() {
+        let input = "\u{feff}<?xml version='1.0' encoding='utf-8' standalone='yes'?>\n\
+            <!--before--><s:x xmlns:s='urn:sbe' s:a='&amp;'> a&#32;\
+            <y/>b<!--inside--> c</s:x><!--after-->\n";
+        let nodes = parse_xml(input).expect("XML tree");
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0].tag, "x");
+        assert_eq!(nodes[0].attr("s:a"), Some("&"));
+        assert_eq!(nodes[0].attr("xmlns:s"), Some("urn:sbe"));
+        assert_eq!(nodes[0].text, " a b c");
+        assert_eq!(nodes[0].children, [1]);
+        assert_eq!(nodes[1].tag, "y");
+        for input in [
+            "<x><![CDATA[test]]></x>",
+            "<?xml version='1.1'?><x/>",
+            "<?xml version='1.0' encoding='UTF-16'?><x/>",
+            "<?xml version='1.0' standalone='maybe'?><x/>",
+            "<!--before--><?xml version='1.0'?><x/>",
+            "<!DOCTYPE x><x/>",
+            "<?bad?><x/>",
+            "<x><?bad?></x>",
+            "<x/><?bad?>",
+            "<x/><x/>",
+            "<x/>trailing",
+            "<x>",
+        ] {
+            assert!(matches!(parse_xml(input), Err(Error::Xml(_))), "{input}");
+        }
+        assert!(matches!(parse_xml("<x>&bad;</x>"), Err(Error::Xml(3))));
+        let name = "a".repeat(MAX_NAME_BYTES + 1);
+        assert!(matches!(
+            parse_xml(&format!("<x {name}='0'/>")),
+            Err(Error::Limit("MAX_NAME_BYTES"))
+        ));
+        let qualified = format!("s:{}", "a".repeat(MAX_NAME_BYTES - 1));
+        assert!(matches!(
+            parse_xml(&format!("<{qualified} xmlns:s='urn:sbe'/>")),
+            Err(Error::Limit("MAX_NAME_BYTES"))
+        ));
     }
 
     #[test]
