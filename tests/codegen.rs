@@ -377,3 +377,30 @@ fn group_counts_must_fit_the_remaining_input() {
         Err(groups::Error::Truncated)
     );
 }
+
+#[test]
+fn shared_helpers_preserve_fields_and_boxing() {
+    let value = recursive::Shared {
+        first: 0x01020304,
+        second: 0x05060708,
+        left: b"ab".to_vec(),
+        right: b"cd".to_vec(),
+        next: Some(recursive::Node {
+            value: 9,
+            children: vec![],
+            next: Some(Box::new(recursive::Node {
+                value: 10,
+                children: vec![],
+                next: None,
+            })),
+        }),
+        positive: Some(-0.0),
+        negative: Some(0.0),
+    };
+    let bytes = value.to_bytes().unwrap();
+    assert_eq!(&bytes[..12], &[1, 2, 3, 4, 8, 7, 6, 5, b'a', b'b', b'c', b'd']);
+    let parsed = recursive::Shared::parse(&bytes).unwrap();
+    assert_eq!(parsed, value);
+    assert_eq!(parsed.positive.unwrap().to_bits(), (-0.0f32).to_bits());
+    assert_eq!(parsed.negative.unwrap().to_bits(), 0.0f32.to_bits());
+}

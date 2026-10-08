@@ -32,6 +32,62 @@
           }
         }
       ]
+    },
+    {
+      "name": "Shared",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "first",
+          "type": "u32"
+        },
+        {
+          "name": "second",
+          "type": "u32",
+          "byte_order": "little"
+        },
+        {
+          "name": "left",
+          "type": {
+            "kind": "bytes",
+            "size": 2
+          }
+        },
+        {
+          "name": "right",
+          "type": {
+            "kind": "bytes",
+            "size": 2
+          }
+        },
+        {
+          "name": "next",
+          "type": {
+            "kind": "optional",
+            "item": {
+              "kind": "ref",
+              "name": "Node"
+            },
+            "flag": "u8"
+          }
+        },
+        {
+          "name": "positive",
+          "type": {
+            "kind": "optional",
+            "item": "f32",
+            "null": 0.0
+          }
+        },
+        {
+          "name": "negative",
+          "type": {
+            "kind": "optional",
+            "item": "f32",
+            "null": -0.0
+          }
+        }
+      ]
     }
   ],
   "streams": [

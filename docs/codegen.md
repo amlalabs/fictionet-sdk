@@ -373,7 +373,8 @@ unique within their scope. Any collision after mapping is refused.
 Type and stream names share a scope. `Error`, `String`, `Vec`, `Box`,
 `Option`, `Result`, `Some`, `None`, `Ok`, and `Err` are reserved there.
 Private emitted helpers use names beginning with `__`, which type mapping
-cannot produce. No silent renaming or compatibility aliases are added.
+cannot produce. Read, write, and sample helpers are shared per distinct
+wire type and boxing layout. No silent renaming or compatibility aliases are added.
 
 ## Library and new front ends
 

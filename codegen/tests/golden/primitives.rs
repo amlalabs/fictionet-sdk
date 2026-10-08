@@ -793,9 +793,11 @@ mod __wire {
 }
 
 type __Value0 = u8;
+#[inline]
 fn __read0(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value0, Error> {
     r.scalar::<u8>(le)
 }
+#[inline]
 fn __write0(w: &mut __wire::Writer, v: &__Value0, le: bool) -> Result<(), Error> {
     w.scalar(*v, le)
 }
@@ -805,9 +807,11 @@ fn __sample0(s: &mut __wire::Sampler) -> Result<__Value0, Error> {
 }
 
 type __Value1 = u16;
+#[inline]
 fn __read1(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value1, Error> {
     r.scalar::<u16>(le)
 }
+#[inline]
 fn __write1(w: &mut __wire::Writer, v: &__Value1, le: bool) -> Result<(), Error> {
     w.scalar(*v, le)
 }
@@ -817,9 +821,11 @@ fn __sample1(s: &mut __wire::Sampler) -> Result<__Value1, Error> {
 }
 
 type __Value2 = u32;
+#[inline]
 fn __read2(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value2, Error> {
     r.scalar::<u32>(le)
 }
+#[inline]
 fn __write2(w: &mut __wire::Writer, v: &__Value2, le: bool) -> Result<(), Error> {
     w.scalar(*v, le)
 }
@@ -829,9 +835,11 @@ fn __sample2(s: &mut __wire::Sampler) -> Result<__Value2, Error> {
 }
 
 type __Value3 = u64;
+#[inline]
 fn __read3(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value3, Error> {
     r.scalar::<u64>(le)
 }
+#[inline]
 fn __write3(w: &mut __wire::Writer, v: &__Value3, le: bool) -> Result<(), Error> {
     w.scalar(*v, le)
 }
@@ -841,9 +849,11 @@ fn __sample3(s: &mut __wire::Sampler) -> Result<__Value3, Error> {
 }
 
 type __Value4 = i8;
+#[inline]
 fn __read4(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value4, Error> {
     r.scalar::<i8>(le)
 }
+#[inline]
 fn __write4(w: &mut __wire::Writer, v: &__Value4, le: bool) -> Result<(), Error> {
     w.scalar(*v, le)
 }
@@ -853,9 +863,11 @@ fn __sample4(s: &mut __wire::Sampler) -> Result<__Value4, Error> {
 }
 
 type __Value5 = i16;
+#[inline]
 fn __read5(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value5, Error> {
     r.scalar::<i16>(le)
 }
+#[inline]
 fn __write5(w: &mut __wire::Writer, v: &__Value5, le: bool) -> Result<(), Error> {
     w.scalar(*v, le)
 }
@@ -865,9 +877,11 @@ fn __sample5(s: &mut __wire::Sampler) -> Result<__Value5, Error> {
 }
 
 type __Value6 = i32;
+#[inline]
 fn __read6(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value6, Error> {
     r.scalar::<i32>(le)
 }
+#[inline]
 fn __write6(w: &mut __wire::Writer, v: &__Value6, le: bool) -> Result<(), Error> {
     w.scalar(*v, le)
 }
@@ -877,9 +891,11 @@ fn __sample6(s: &mut __wire::Sampler) -> Result<__Value6, Error> {
 }
 
 type __Value7 = i64;
+#[inline]
 fn __read7(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value7, Error> {
     r.scalar::<i64>(le)
 }
+#[inline]
 fn __write7(w: &mut __wire::Writer, v: &__Value7, le: bool) -> Result<(), Error> {
     w.scalar(*v, le)
 }
@@ -889,9 +905,11 @@ fn __sample7(s: &mut __wire::Sampler) -> Result<__Value7, Error> {
 }
 
 type __Value8 = f32;
+#[inline]
 fn __read8(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value8, Error> {
     r.scalar::<f32>(le)
 }
+#[inline]
 fn __write8(w: &mut __wire::Writer, v: &__Value8, le: bool) -> Result<(), Error> {
     w.scalar(*v, le)
 }
@@ -901,9 +919,11 @@ fn __sample8(s: &mut __wire::Sampler) -> Result<__Value8, Error> {
 }
 
 type __Value9 = f64;
+#[inline]
 fn __read9(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value9, Error> {
     r.scalar::<f64>(le)
 }
+#[inline]
 fn __write9(w: &mut __wire::Writer, v: &__Value9, le: bool) -> Result<(), Error> {
     w.scalar(*v, le)
 }
@@ -913,9 +933,11 @@ fn __sample9(s: &mut __wire::Sampler) -> Result<__Value9, Error> {
 }
 
 type __Value10 = Option<u8>;
+#[inline]
 fn __read10(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value10, Error> {
     r.nullable(255u8, le)
 }
+#[inline]
 fn __write10(w: &mut __wire::Writer, v: &__Value10, le: bool) -> Result<(), Error> {
     w.nullable(v, 255u8, le)
 }
@@ -926,9 +948,11 @@ fn __sample10(s: &mut __wire::Sampler) -> Result<__Value10, Error> {
 }
 
 type __Value11 = Option<u16>;
+#[inline]
 fn __read11(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value11, Error> {
     r.nullable(65535u16, le)
 }
+#[inline]
 fn __write11(w: &mut __wire::Writer, v: &__Value11, le: bool) -> Result<(), Error> {
     w.nullable(v, 65535u16, le)
 }
@@ -939,9 +963,11 @@ fn __sample11(s: &mut __wire::Sampler) -> Result<__Value11, Error> {
 }
 
 type __Value12 = Option<u32>;
+#[inline]
 fn __read12(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value12, Error> {
     r.nullable(4294967295u32, le)
 }
+#[inline]
 fn __write12(w: &mut __wire::Writer, v: &__Value12, le: bool) -> Result<(), Error> {
     w.nullable(v, 4294967295u32, le)
 }
@@ -952,9 +978,11 @@ fn __sample12(s: &mut __wire::Sampler) -> Result<__Value12, Error> {
 }
 
 type __Value13 = Option<u64>;
+#[inline]
 fn __read13(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value13, Error> {
     r.nullable(18446744073709551615u64, le)
 }
+#[inline]
 fn __write13(w: &mut __wire::Writer, v: &__Value13, le: bool) -> Result<(), Error> {
     w.nullable(v, 18446744073709551615u64, le)
 }
@@ -965,9 +993,11 @@ fn __sample13(s: &mut __wire::Sampler) -> Result<__Value13, Error> {
 }
 
 type __Value14 = Option<i8>;
+#[inline]
 fn __read14(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value14, Error> {
     r.nullable(-128i8, le)
 }
+#[inline]
 fn __write14(w: &mut __wire::Writer, v: &__Value14, le: bool) -> Result<(), Error> {
     w.nullable(v, -128i8, le)
 }
@@ -978,9 +1008,11 @@ fn __sample14(s: &mut __wire::Sampler) -> Result<__Value14, Error> {
 }
 
 type __Value15 = Option<i16>;
+#[inline]
 fn __read15(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value15, Error> {
     r.nullable(-32768i16, le)
 }
+#[inline]
 fn __write15(w: &mut __wire::Writer, v: &__Value15, le: bool) -> Result<(), Error> {
     w.nullable(v, -32768i16, le)
 }
@@ -991,9 +1023,11 @@ fn __sample15(s: &mut __wire::Sampler) -> Result<__Value15, Error> {
 }
 
 type __Value16 = Option<i32>;
+#[inline]
 fn __read16(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value16, Error> {
     r.nullable(-2147483648i32, le)
 }
+#[inline]
 fn __write16(w: &mut __wire::Writer, v: &__Value16, le: bool) -> Result<(), Error> {
     w.nullable(v, -2147483648i32, le)
 }
@@ -1004,9 +1038,11 @@ fn __sample16(s: &mut __wire::Sampler) -> Result<__Value16, Error> {
 }
 
 type __Value17 = Option<i64>;
+#[inline]
 fn __read17(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value17, Error> {
     r.nullable(-9223372036854775808i64, le)
 }
+#[inline]
 fn __write17(w: &mut __wire::Writer, v: &__Value17, le: bool) -> Result<(), Error> {
     w.nullable(v, -9223372036854775808i64, le)
 }
@@ -1017,9 +1053,11 @@ fn __sample17(s: &mut __wire::Sampler) -> Result<__Value17, Error> {
 }
 
 type __Value18 = Option<f32>;
+#[inline]
 fn __read18(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value18, Error> {
     r.nullable(-999.0f32, le)
 }
+#[inline]
 fn __write18(w: &mut __wire::Writer, v: &__Value18, le: bool) -> Result<(), Error> {
     w.nullable(v, -999.0f32, le)
 }
@@ -1030,9 +1068,11 @@ fn __sample18(s: &mut __wire::Sampler) -> Result<__Value18, Error> {
 }
 
 type __Value19 = Option<f64>;
+#[inline]
 fn __read19(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value19, Error> {
     r.nullable(-999.0f64, le)
 }
+#[inline]
 fn __write19(w: &mut __wire::Writer, v: &__Value19, le: bool) -> Result<(), Error> {
     w.nullable(v, -999.0f64, le)
 }
@@ -1044,9 +1084,11 @@ fn __sample19(s: &mut __wire::Sampler) -> Result<__Value19, Error> {
 
 const __LIMIT20: usize = 4;
 type __Value20 = Vec<u8>;
+#[inline]
 fn __read20(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value20, Error> {
     r.bytes(0, __LIMIT20, le)
 }
+#[inline]
 fn __write20(w: &mut __wire::Writer, v: &__Value20, le: bool) -> Result<(), Error> {
     w.bytes(v, 0, __LIMIT20, le)
 }
@@ -1057,9 +1099,11 @@ fn __sample20(s: &mut __wire::Sampler) -> Result<__Value20, Error> {
 
 const __LIMIT21: usize = 3;
 type __Value21 = String;
+#[inline]
 fn __read21(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value21, Error> {
     r.text(0, __LIMIT21, le)
 }
+#[inline]
 fn __write21(w: &mut __wire::Writer, v: &__Value21, le: bool) -> Result<(), Error> {
     w.bytes(v.as_bytes(), 0, __LIMIT21, le)
 }
@@ -1070,9 +1114,11 @@ fn __sample21(s: &mut __wire::Sampler) -> Result<__Value21, Error> {
 
 const __LIMIT22: usize = 32;
 type __Value22 = Vec<u8>;
+#[inline]
 fn __read22(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value22, Error> {
     r.bytes(2, __LIMIT22, le)
 }
+#[inline]
 fn __write22(w: &mut __wire::Writer, v: &__Value22, le: bool) -> Result<(), Error> {
     w.bytes(v, 2, __LIMIT22, le)
 }
@@ -1083,9 +1129,11 @@ fn __sample22(s: &mut __wire::Sampler) -> Result<__Value22, Error> {
 
 const __LIMIT23: usize = 24;
 type __Value23 = String;
+#[inline]
 fn __read23(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value23, Error> {
     r.text(1, __LIMIT23, le)
 }
+#[inline]
 fn __write23(w: &mut __wire::Writer, v: &__Value23, le: bool) -> Result<(), Error> {
     w.bytes(v.as_bytes(), 1, __LIMIT23, le)
 }
@@ -1094,28 +1142,18 @@ fn __sample23(s: &mut __wire::Sampler) -> Result<__Value23, Error> {
     s.text(1, __LIMIT23)
 }
 
-type __Value24 = u32;
+type __Value24 = Option<__Value2>;
+#[inline]
 fn __read24(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value24, Error> {
-    r.scalar::<u32>(le)
+    r.optional(1, le, |r| __read2(r, le))
 }
+#[inline]
 fn __write24(w: &mut __wire::Writer, v: &__Value24, le: bool) -> Result<(), Error> {
-    w.scalar(*v, le)
+    w.optional(v, 1, le, |w, v| __write2(w, v, le))
 }
 #[cfg(test)]
 fn __sample24(s: &mut __wire::Sampler) -> Result<__Value24, Error> {
-    Ok(s.number() as u32)
-}
-
-type __Value25 = Option<__Value24>;
-fn __read25(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value25, Error> {
-    r.optional(1, le, |r| __read24(r, le))
-}
-fn __write25(w: &mut __wire::Writer, v: &__Value25, le: bool) -> Result<(), Error> {
-    w.optional(v, 1, le, |w, v| __write24(w, v, le))
-}
-#[cfg(test)]
-fn __sample25(s: &mut __wire::Sampler) -> Result<__Value25, Error> {
-    s.optional(__sample24)
+    s.optional(__sample2)
 }
 
 #[doc = "Wire type primitive message."]
@@ -1199,7 +1237,7 @@ impl __wire::Codec for PrimitiveMessage {
             let __field21 = __read21(r, le)?;
             let __field22 = __read22(r, le)?;
             let __field23 = __read23(r, le)?;
-            let __field25 = __read25(r, le)?;
+            let __field24 = __read24(r, le)?;
             let value = Self {
                 value_u8: __field0,
                 value_u16: __field1,
@@ -1225,7 +1263,7 @@ impl __wire::Codec for PrimitiveMessage {
                 fixed_text: __field21,
                 data: __field22,
                 text: __field23,
-                maybe: __field25,
+                maybe: __field24,
             };
             Ok(value)
         })
@@ -1281,7 +1319,7 @@ impl __wire::Codec for PrimitiveMessage {
             let value = &self.text;
             __write23(w, value, le)?;
             let value = &self.maybe;
-            __write25(w, value, le)?;
+            __write24(w, value, le)?;
             Ok(())
         })
     }
@@ -1312,7 +1350,7 @@ impl __wire::Codec for PrimitiveMessage {
             let __field21 = __sample21(s)?;
             let __field22 = __sample22(s)?;
             let __field23 = __sample23(s)?;
-            let __field25 = __sample25(s)?;
+            let __field24 = __sample24(s)?;
             let value = Self {
                 value_u8: __field0,
                 value_u16: __field1,
@@ -1338,7 +1376,7 @@ impl __wire::Codec for PrimitiveMessage {
                 fixed_text: __field21,
                 data: __field22,
                 text: __field23,
-                maybe: __field25,
+                maybe: __field24,
             };
             Ok(value)
         })

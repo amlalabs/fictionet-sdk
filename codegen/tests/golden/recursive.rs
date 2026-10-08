@@ -793,9 +793,11 @@ mod __wire {
 }
 
 type __Value0 = u32;
+#[inline]
 fn __read0(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value0, Error> {
     r.scalar::<u32>(le)
 }
+#[inline]
 fn __write0(w: &mut __wire::Writer, v: &__Value0, le: bool) -> Result<(), Error> {
     w.scalar(*v, le)
 }
@@ -805,9 +807,11 @@ fn __sample0(s: &mut __wire::Sampler) -> Result<__Value0, Error> {
 }
 
 type __Value1 = Node;
+#[inline]
 fn __read1(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value1, Error> {
     <__Value1 as __wire::Codec>::read(r, le)
 }
+#[inline]
 fn __write1(w: &mut __wire::Writer, v: &__Value1, le: bool) -> Result<(), Error> {
     __wire::Codec::encode(v, w, le)
 }
@@ -818,9 +822,11 @@ fn __sample1(s: &mut __wire::Sampler) -> Result<__Value1, Error> {
 
 const __LIMIT2: usize = 2;
 type __Value2 = Vec<__Value1>;
+#[inline]
 fn __read2(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value2, Error> {
     r.group(1, __LIMIT2, 6, le, |r| __read1(r, le))
 }
+#[inline]
 fn __write2(w: &mut __wire::Writer, v: &__Value2, le: bool) -> Result<(), Error> {
     w.group(v, 1, __LIMIT2, le, |w, v| __write1(w, v, le))
 }
@@ -830,9 +836,11 @@ fn __sample2(s: &mut __wire::Sampler) -> Result<__Value2, Error> {
 }
 
 type __Value3 = Box<Node>;
+#[inline]
 fn __read3(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value3, Error> {
     r.reference(le)
 }
+#[inline]
 fn __write3(w: &mut __wire::Writer, v: &__Value3, le: bool) -> Result<(), Error> {
     w.reference(v.as_ref(), le)
 }
@@ -842,15 +850,76 @@ fn __sample3(s: &mut __wire::Sampler) -> Result<__Value3, Error> {
 }
 
 type __Value4 = Option<__Value3>;
+#[inline]
 fn __read4(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value4, Error> {
     r.optional(1, le, |r| __read3(r, le))
 }
+#[inline]
 fn __write4(w: &mut __wire::Writer, v: &__Value4, le: bool) -> Result<(), Error> {
     w.optional(v, 1, le, |w, v| __write3(w, v, le))
 }
 #[cfg(test)]
 fn __sample4(s: &mut __wire::Sampler) -> Result<__Value4, Error> {
     s.optional(__sample3)
+}
+
+const __LIMIT5: usize = 2;
+type __Value5 = Vec<u8>;
+#[inline]
+fn __read5(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value5, Error> {
+    r.bytes(0, __LIMIT5, le)
+}
+#[inline]
+fn __write5(w: &mut __wire::Writer, v: &__Value5, le: bool) -> Result<(), Error> {
+    w.bytes(v, 0, __LIMIT5, le)
+}
+#[cfg(test)]
+fn __sample5(s: &mut __wire::Sampler) -> Result<__Value5, Error> {
+    s.bytes(0, __LIMIT5)
+}
+
+type __Value6 = Option<__Value1>;
+#[inline]
+fn __read6(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value6, Error> {
+    r.optional(1, le, |r| __read1(r, le))
+}
+#[inline]
+fn __write6(w: &mut __wire::Writer, v: &__Value6, le: bool) -> Result<(), Error> {
+    w.optional(v, 1, le, |w, v| __write1(w, v, le))
+}
+#[cfg(test)]
+fn __sample6(s: &mut __wire::Sampler) -> Result<__Value6, Error> {
+    s.optional(__sample1)
+}
+
+type __Value7 = Option<f32>;
+#[inline]
+fn __read7(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value7, Error> {
+    r.nullable(0.0f32, le)
+}
+#[inline]
+fn __write7(w: &mut __wire::Writer, v: &__Value7, le: bool) -> Result<(), Error> {
+    w.nullable(v, 0.0f32, le)
+}
+#[cfg(test)]
+fn __sample7(s: &mut __wire::Sampler) -> Result<__Value7, Error> {
+    let value = (s.number() as i32 % 1000) as f32;
+    s.nullable(value, 0.0f32)
+}
+
+type __Value8 = Option<f32>;
+#[inline]
+fn __read8(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value8, Error> {
+    r.nullable(-0.0f32, le)
+}
+#[inline]
+fn __write8(w: &mut __wire::Writer, v: &__Value8, le: bool) -> Result<(), Error> {
+    w.nullable(v, -0.0f32, le)
+}
+#[cfg(test)]
+fn __sample8(s: &mut __wire::Sampler) -> Result<__Value8, Error> {
+    let value = (s.number() as i32 % 1000) as f32;
+    s.nullable(value, -0.0f32)
 }
 
 #[doc = "Wire type Node."]
@@ -867,12 +936,12 @@ impl __wire::Codec for Node {
     fn read(r: &mut __wire::Reader<'_>, le: bool) -> Result<Self, Error> {
         r.nested(|r| {
             let __field0 = __read0(r, le)?;
-            let __field2 = __read2(r, le)?;
-            let __field4 = __read4(r, le)?;
+            let __field1 = __read2(r, le)?;
+            let __field2 = __read4(r, le)?;
             let value = Self {
                 value: __field0,
-                children: __field2,
-                next: __field4,
+                children: __field1,
+                next: __field2,
             };
             Ok(value)
         })
@@ -892,12 +961,12 @@ impl __wire::Codec for Node {
     fn sample(s: &mut __wire::Sampler) -> Result<Self, Error> {
         s.nested(|s| {
             let __field0 = __sample0(s)?;
-            let __field2 = __sample2(s)?;
-            let __field4 = __sample4(s)?;
+            let __field1 = __sample2(s)?;
+            let __field2 = __sample4(s)?;
             let value = Self {
                 value: __field0,
-                children: __field2,
-                next: __field4,
+                children: __field1,
+                next: __field2,
             };
             Ok(value)
         })
@@ -916,6 +985,110 @@ impl fictionet::stdlib::codec::Wire for Node {
 
     /// Appends one value. Errors leave out unchanged.
     /// Refuses values above the declared resource limits.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        __wire::write(self, out, false)
+    }
+}
+
+#[doc = "Wire type Shared."]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Shared {
+    #[doc = "first"]
+    pub first: u32,
+    #[doc = "second"]
+    pub second: u32,
+    #[doc = "left"]
+    pub left: Vec<u8>,
+    #[doc = "right"]
+    pub right: Vec<u8>,
+    #[doc = "next"]
+    pub next: Option<Node>,
+    #[doc = "positive"]
+    pub positive: Option<f32>,
+    #[doc = "negative"]
+    pub negative: Option<f32>,
+}
+impl __wire::Codec for Shared {
+    fn read(r: &mut __wire::Reader<'_>, le: bool) -> Result<Self, Error> {
+        r.nested(|r| {
+            let __field0 = __read0(r, le)?;
+            let __field1 = __read0(r, true)?;
+            let __field2 = __read5(r, le)?;
+            let __field3 = __read5(r, le)?;
+            let __field4 = __read6(r, le)?;
+            let __field5 = __read7(r, le)?;
+            let __field6 = __read8(r, le)?;
+            let value = Self {
+                first: __field0,
+                second: __field1,
+                left: __field2,
+                right: __field3,
+                next: __field4,
+                positive: __field5,
+                negative: __field6,
+            };
+            Ok(value)
+        })
+    }
+    fn encode(&self, w: &mut __wire::Writer, le: bool) -> Result<(), Error> {
+        w.nested(|w| {
+            let value = &self.first;
+            __write0(w, value, le)?;
+            let value = &self.second;
+            __write0(w, value, true)?;
+            let value = &self.left;
+            __write5(w, value, le)?;
+            let value = &self.right;
+            __write5(w, value, le)?;
+            let value = &self.next;
+            __write6(w, value, le)?;
+            let value = &self.positive;
+            __write7(w, value, le)?;
+            let value = &self.negative;
+            __write8(w, value, le)?;
+            Ok(())
+        })
+    }
+    #[cfg(test)]
+    fn sample(s: &mut __wire::Sampler) -> Result<Self, Error> {
+        s.nested(|s| {
+            let __field0 = __sample0(s)?;
+            let __field1 = __sample0(s)?;
+            let __field2 = __sample5(s)?;
+            let __field3 = __sample5(s)?;
+            let __field4 = __sample6(s)?;
+            let __field5 = __sample7(s)?;
+            let __field6 = __sample8(s)?;
+            let value = Self {
+                first: __field0,
+                second: __field1,
+                left: __field2,
+                right: __field3,
+                next: __field4,
+                positive: __field5,
+                negative: __field6,
+            };
+            Ok(value)
+        })
+    }
+}
+impl fictionet::stdlib::codec::Wire for Shared {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads one exact value. Refuses truncation and trailing bytes.
+    /// Refuses values above the declared resource limits.
+    /// Refuses flags other than 0 or 1.
+    /// Refuses non-finite floats.
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        __wire::parse(bytes, false)
+    }
+
+    /// Appends one value. Errors leave out unchanged.
+    /// Refuses values above the declared resource limits.
+    /// Refuses non-finite floats.
+    /// Refuses reserved nulls in Some.
+    /// Refuses wrong fixed data lengths.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         __wire::write(self, out, false)
     }
@@ -961,6 +1134,10 @@ mod generated_tests {
     fn generated_contracts() -> Result<(), Error> {
         {
             use super::Node as Value;
+            __wire::check::<Value>()?;
+        }
+        {
+            use super::Shared as Value;
             __wire::check::<Value>()?;
         }
         {

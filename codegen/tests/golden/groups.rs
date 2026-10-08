@@ -793,9 +793,11 @@ mod __wire {
 }
 
 type __Value0 = Status;
+#[inline]
 fn __read0(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value0, Error> {
     <__Value0 as __wire::Codec>::read(r, le)
 }
+#[inline]
 fn __write0(w: &mut __wire::Writer, v: &__Value0, le: bool) -> Result<(), Error> {
     __wire::Codec::encode(v, w, le)
 }
@@ -805,9 +807,11 @@ fn __sample0(s: &mut __wire::Sampler) -> Result<__Value0, Error> {
 }
 
 type __Value1 = Flags;
+#[inline]
 fn __read1(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value1, Error> {
     <__Value1 as __wire::Codec>::read(r, le)
 }
+#[inline]
 fn __write1(w: &mut __wire::Writer, v: &__Value1, le: bool) -> Result<(), Error> {
     __wire::Codec::encode(v, w, le)
 }
@@ -817,9 +821,11 @@ fn __sample1(s: &mut __wire::Sampler) -> Result<__Value1, Error> {
 }
 
 type __Value2 = i32;
+#[inline]
 fn __read2(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value2, Error> {
     r.scalar::<i32>(le)
 }
+#[inline]
 fn __write2(w: &mut __wire::Writer, v: &__Value2, le: bool) -> Result<(), Error> {
     w.scalar(*v, le)
 }
@@ -830,9 +836,11 @@ fn __sample2(s: &mut __wire::Sampler) -> Result<__Value2, Error> {
 
 const __LIMIT3: usize = 3;
 type __Value3 = Vec<__Value2>;
+#[inline]
 fn __read3(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value3, Error> {
     r.group(1, __LIMIT3, 4, le, |r| __read2(r, le))
 }
+#[inline]
 fn __write3(w: &mut __wire::Writer, v: &__Value3, le: bool) -> Result<(), Error> {
     w.group(v, 1, __LIMIT3, le, |w, v| __write2(w, v, le))
 }
@@ -843,9 +851,11 @@ fn __sample3(s: &mut __wire::Sampler) -> Result<__Value3, Error> {
 
 const __LIMIT4: usize = 3;
 type __Value4 = Vec<__Value3>;
+#[inline]
 fn __read4(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value4, Error> {
     r.group(2, __LIMIT4, 1, le, |r| __read3(r, le))
 }
+#[inline]
 fn __write4(w: &mut __wire::Writer, v: &__Value4, le: bool) -> Result<(), Error> {
     w.group(v, 2, __LIMIT4, le, |w, v| __write3(w, v, le))
 }
@@ -855,9 +865,11 @@ fn __sample4(s: &mut __wire::Sampler) -> Result<__Value4, Error> {
 }
 
 type __Value5 = Entry;
+#[inline]
 fn __read5(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value5, Error> {
     <__Value5 as __wire::Codec>::read(r, le)
 }
+#[inline]
 fn __write5(w: &mut __wire::Writer, v: &__Value5, le: bool) -> Result<(), Error> {
     __wire::Codec::encode(v, w, le)
 }
@@ -868,9 +880,11 @@ fn __sample5(s: &mut __wire::Sampler) -> Result<__Value5, Error> {
 
 const __LIMIT6: usize = 3;
 type __Value6 = Vec<__Value5>;
+#[inline]
 fn __read6(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value6, Error> {
     r.group(1, __LIMIT6, 12, le, |r| __read5(r, le))
 }
+#[inline]
 fn __write6(w: &mut __wire::Writer, v: &__Value6, le: bool) -> Result<(), Error> {
     w.group(v, 1, __LIMIT6, le, |w, v| __write5(w, v, le))
 }
@@ -881,9 +895,11 @@ fn __sample6(s: &mut __wire::Sampler) -> Result<__Value6, Error> {
 
 const __LIMIT7: usize = 12;
 type __Value7 = String;
+#[inline]
 fn __read7(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value7, Error> {
     r.text(2, __LIMIT7, le)
 }
+#[inline]
 fn __write7(w: &mut __wire::Writer, v: &__Value7, le: bool) -> Result<(), Error> {
     w.bytes(v.as_bytes(), 2, __LIMIT7, le)
 }
@@ -893,9 +909,11 @@ fn __sample7(s: &mut __wire::Sampler) -> Result<__Value7, Error> {
 }
 
 type __Value8 = Option<__Value7>;
+#[inline]
 fn __read8(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value8, Error> {
     r.optional(2, le, |r| __read7(r, le))
 }
+#[inline]
 fn __write8(w: &mut __wire::Writer, v: &__Value8, le: bool) -> Result<(), Error> {
     w.optional(v, 2, le, |w, v| __write7(w, v, le))
 }
@@ -905,9 +923,11 @@ fn __sample8(s: &mut __wire::Sampler) -> Result<__Value8, Error> {
 }
 
 type __Value9 = u8;
+#[inline]
 fn __read9(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value9, Error> {
     r.scalar::<u8>(le)
 }
+#[inline]
 fn __write9(w: &mut __wire::Writer, v: &__Value9, le: bool) -> Result<(), Error> {
     w.scalar(*v, le)
 }
@@ -918,9 +938,11 @@ fn __sample9(s: &mut __wire::Sampler) -> Result<__Value9, Error> {
 
 const __LIMIT10: usize = 255;
 type __Value10 = String;
+#[inline]
 fn __read10(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value10, Error> {
     r.text(1, __LIMIT10, le)
 }
+#[inline]
 fn __write10(w: &mut __wire::Writer, v: &__Value10, le: bool) -> Result<(), Error> {
     w.bytes(v.as_bytes(), 1, __LIMIT10, le)
 }
@@ -931,9 +953,11 @@ fn __sample10(s: &mut __wire::Sampler) -> Result<__Value10, Error> {
 
 const __LIMIT11: usize = 1048576;
 type __Value11 = Vec<__Value10>;
+#[inline]
 fn __read11(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value11, Error> {
     r.group(4, __LIMIT11, 1, le, |r| __read10(r, le))
 }
+#[inline]
 fn __write11(w: &mut __wire::Writer, v: &__Value11, le: bool) -> Result<(), Error> {
     w.group(v, 4, __LIMIT11, le, |w, v| __write10(w, v, le))
 }
@@ -1084,11 +1108,11 @@ impl __wire::Codec for Entry {
         r.nested(|r| {
             let __field0 = __read0(r, le)?;
             let __field1 = __read1(r, le)?;
-            let __field4 = __read4(r, true)?;
+            let __field2 = __read4(r, true)?;
             let value = Self {
                 status: __field0,
                 flags: __field1,
-                values: __field4,
+                values: __field2,
             };
             Ok(value)
         })
@@ -1109,11 +1133,11 @@ impl __wire::Codec for Entry {
         s.nested(|s| {
             let __field0 = __sample0(s)?;
             let __field1 = __sample1(s)?;
-            let __field4 = __sample4(s)?;
+            let __field2 = __sample4(s)?;
             let value = Self {
                 status: __field0,
                 flags: __field1,
-                values: __field4,
+                values: __field2,
             };
             Ok(value)
         })
@@ -1150,11 +1174,11 @@ pub struct Batch {
 impl __wire::Codec for Batch {
     fn read(r: &mut __wire::Reader<'_>, le: bool) -> Result<Self, Error> {
         r.nested(|r| {
-            let __field6 = __read6(r, le)?;
-            let __field8 = __read8(r, le)?;
+            let __field0 = __read6(r, le)?;
+            let __field1 = __read8(r, le)?;
             let value = Self {
-                entries: __field6,
-                label: __field8,
+                entries: __field0,
+                label: __field1,
             };
             Ok(value)
         })
@@ -1171,11 +1195,11 @@ impl __wire::Codec for Batch {
     #[cfg(test)]
     fn sample(s: &mut __wire::Sampler) -> Result<Self, Error> {
         s.nested(|s| {
-            let __field6 = __sample6(s)?;
-            let __field8 = __sample8(s)?;
+            let __field0 = __sample6(s)?;
+            let __field1 = __sample8(s)?;
             let value = Self {
-                entries: __field6,
-                label: __field8,
+                entries: __field0,
+                label: __field1,
             };
             Ok(value)
         })
@@ -1212,8 +1236,8 @@ pub struct Wire {
 impl __wire::Codec for Wire {
     fn read(r: &mut __wire::Reader<'_>, le: bool) -> Result<Self, Error> {
         r.nested(|r| {
-            let __field9 = __read9(r, le)?;
-            let value = Self { gen_: __field9 };
+            let __field0 = __read9(r, le)?;
+            let value = Self { gen_: __field0 };
             Ok(value)
         })
     }
@@ -1227,8 +1251,8 @@ impl __wire::Codec for Wire {
     #[cfg(test)]
     fn sample(s: &mut __wire::Sampler) -> Result<Self, Error> {
         s.nested(|s| {
-            let __field9 = __sample9(s)?;
-            let value = Self { gen_: __field9 };
+            let __field0 = __sample9(s)?;
+            let value = Self { gen_: __field0 };
             Ok(value)
         })
     }
@@ -1259,8 +1283,8 @@ pub struct TextBatch {
 impl __wire::Codec for TextBatch {
     fn read(r: &mut __wire::Reader<'_>, le: bool) -> Result<Self, Error> {
         r.nested(|r| {
-            let __field11 = __read11(r, le)?;
-            let value = Self { texts: __field11 };
+            let __field0 = __read11(r, le)?;
+            let value = Self { texts: __field0 };
             Ok(value)
         })
     }
@@ -1274,8 +1298,8 @@ impl __wire::Codec for TextBatch {
     #[cfg(test)]
     fn sample(s: &mut __wire::Sampler) -> Result<Self, Error> {
         s.nested(|s| {
-            let __field11 = __sample11(s)?;
-            let value = Self { texts: __field11 };
+            let __field0 = __sample11(s)?;
+            let value = Self { texts: __field0 };
             Ok(value)
         })
     }

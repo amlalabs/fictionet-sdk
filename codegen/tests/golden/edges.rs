@@ -793,9 +793,11 @@ mod __wire {
 }
 
 type __Value0 = u64;
+#[inline]
 fn __read0(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value0, Error> {
     r.scalar::<u64>(le)
 }
+#[inline]
 fn __write0(w: &mut __wire::Writer, v: &__Value0, le: bool) -> Result<(), Error> {
     w.scalar(*v, le)
 }

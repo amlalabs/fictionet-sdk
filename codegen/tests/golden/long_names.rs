@@ -793,9 +793,11 @@ mod __wire {
 }
 
 type __Value0 = Eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee;
+#[inline]
 fn __read0(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value0, Error> {
     <__Value0 as __wire::Codec>::read(r, le)
 }
+#[inline]
 fn __write0(w: &mut __wire::Writer, v: &__Value0, le: bool) -> Result<(), Error> {
     __wire::Codec::encode(v, w, le)
 }

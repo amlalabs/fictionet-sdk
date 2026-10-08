@@ -793,9 +793,11 @@ mod __wire {
 }
 
 type __Value0 = u32;
+#[inline]
 fn __read0(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value0, Error> {
     r.scalar::<u32>(le)
 }
+#[inline]
 fn __write0(w: &mut __wire::Writer, v: &__Value0, le: bool) -> Result<(), Error> {
     w.scalar(*v, le)
 }
@@ -805,9 +807,11 @@ fn __sample0(s: &mut __wire::Sampler) -> Result<__Value0, Error> {
 }
 
 type __Value1 = i32;
+#[inline]
 fn __read1(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value1, Error> {
     r.scalar::<i32>(le)
 }
+#[inline]
 fn __write1(w: &mut __wire::Writer, v: &__Value1, le: bool) -> Result<(), Error> {
     w.scalar(*v, le)
 }
@@ -817,9 +821,11 @@ fn __sample1(s: &mut __wire::Sampler) -> Result<__Value1, Error> {
 }
 
 type __Value2 = u64;
+#[inline]
 fn __read2(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value2, Error> {
     r.scalar::<u64>(le)
 }
+#[inline]
 fn __write2(w: &mut __wire::Writer, v: &__Value2, le: bool) -> Result<(), Error> {
     w.scalar(*v, le)
 }
@@ -829,9 +835,11 @@ fn __sample2(s: &mut __wire::Sampler) -> Result<__Value2, Error> {
 }
 
 type __Value3 = i64;
+#[inline]
 fn __read3(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value3, Error> {
     r.scalar::<i64>(le)
 }
+#[inline]
 fn __write3(w: &mut __wire::Writer, v: &__Value3, le: bool) -> Result<(), Error> {
     w.scalar(*v, le)
 }
@@ -841,9 +849,11 @@ fn __sample3(s: &mut __wire::Sampler) -> Result<__Value3, Error> {
 }
 
 type __Value4 = Choice;
+#[inline]
 fn __read4(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value4, Error> {
     <__Value4 as __wire::Codec>::read(r, le)
 }
+#[inline]
 fn __write4(w: &mut __wire::Writer, v: &__Value4, le: bool) -> Result<(), Error> {
     __wire::Codec::encode(v, w, le)
 }
@@ -854,9 +864,11 @@ fn __sample4(s: &mut __wire::Sampler) -> Result<__Value4, Error> {
 
 const __LIMIT5: usize = 4;
 type __Value5 = Vec<u8>;
+#[inline]
 fn __read5(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value5, Error> {
     r.bytes(0, __LIMIT5, le)
 }
+#[inline]
 fn __write5(w: &mut __wire::Writer, v: &__Value5, le: bool) -> Result<(), Error> {
     w.bytes(v, 0, __LIMIT5, le)
 }
@@ -865,53 +877,33 @@ fn __sample5(s: &mut __wire::Sampler) -> Result<__Value5, Error> {
     s.bytes(0, __LIMIT5)
 }
 
-type __Value6 = u32;
+const __LIMIT6: usize = 8;
+type __Value6 = Vec<__Value0>;
+#[inline]
 fn __read6(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value6, Error> {
-    r.scalar::<u32>(le)
+    r.group(4, __LIMIT6, 4, le, |r| __read0(r, le))
 }
+#[inline]
 fn __write6(w: &mut __wire::Writer, v: &__Value6, le: bool) -> Result<(), Error> {
-    w.scalar(*v, le)
+    w.group(v, 4, __LIMIT6, le, |w, v| __write0(w, v, le))
 }
 #[cfg(test)]
 fn __sample6(s: &mut __wire::Sampler) -> Result<__Value6, Error> {
-    Ok(s.number() as u32)
+    s.group(__LIMIT6, __sample0)
 }
 
-const __LIMIT7: usize = 8;
-type __Value7 = Vec<__Value6>;
+type __Value7 = Option<__Value2>;
+#[inline]
 fn __read7(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value7, Error> {
-    r.group(4, __LIMIT7, 4, le, |r| __read6(r, le))
+    r.optional(4, le, |r| __read2(r, le))
 }
+#[inline]
 fn __write7(w: &mut __wire::Writer, v: &__Value7, le: bool) -> Result<(), Error> {
-    w.group(v, 4, __LIMIT7, le, |w, v| __write6(w, v, le))
+    w.optional(v, 4, le, |w, v| __write2(w, v, le))
 }
 #[cfg(test)]
 fn __sample7(s: &mut __wire::Sampler) -> Result<__Value7, Error> {
-    s.group(__LIMIT7, __sample6)
-}
-
-type __Value8 = u64;
-fn __read8(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value8, Error> {
-    r.scalar::<u64>(le)
-}
-fn __write8(w: &mut __wire::Writer, v: &__Value8, le: bool) -> Result<(), Error> {
-    w.scalar(*v, le)
-}
-#[cfg(test)]
-fn __sample8(s: &mut __wire::Sampler) -> Result<__Value8, Error> {
-    Ok(s.number())
-}
-
-type __Value9 = Option<__Value8>;
-fn __read9(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value9, Error> {
-    r.optional(4, le, |r| __read8(r, le))
-}
-fn __write9(w: &mut __wire::Writer, v: &__Value9, le: bool) -> Result<(), Error> {
-    w.optional(v, 4, le, |w, v| __write8(w, v, le))
-}
-#[cfg(test)]
-fn __sample9(s: &mut __wire::Sampler) -> Result<__Value9, Error> {
-    s.optional(__sample8)
+    s.optional(__sample2)
 }
 
 #[doc = "Wire type Choice."]
@@ -1023,8 +1015,8 @@ impl __wire::Codec for Record {
             let __field3 = __read3(r, le)?;
             let __field4 = __read4(r, le)?;
             let __field5 = __read5(r, le)?;
+            let __field6 = __read6(r, le)?;
             let __field7 = __read7(r, le)?;
-            let __field9 = __read9(r, le)?;
             let value = Self {
                 unsigned: __field0,
                 signed: __field1,
@@ -1032,8 +1024,8 @@ impl __wire::Codec for Record {
                 negative: __field3,
                 choice: __field4,
                 opaque: __field5,
-                entries: __field7,
-                maybe: __field9,
+                entries: __field6,
+                maybe: __field7,
             };
             Ok(value)
         })
@@ -1053,9 +1045,9 @@ impl __wire::Codec for Record {
             let value = &self.opaque;
             __write5(w, value, le)?;
             let value = &self.entries;
-            __write7(w, value, le)?;
+            __write6(w, value, le)?;
             let value = &self.maybe;
-            __write9(w, value, le)?;
+            __write7(w, value, le)?;
             Ok(())
         })
     }
@@ -1068,8 +1060,8 @@ impl __wire::Codec for Record {
             let __field3 = __sample3(s)?;
             let __field4 = __sample4(s)?;
             let __field5 = __sample5(s)?;
+            let __field6 = __sample6(s)?;
             let __field7 = __sample7(s)?;
-            let __field9 = __sample9(s)?;
             let value = Self {
                 unsigned: __field0,
                 signed: __field1,
@@ -1077,8 +1069,8 @@ impl __wire::Codec for Record {
                 negative: __field3,
                 choice: __field4,
                 opaque: __field5,
-                entries: __field7,
-                maybe: __field9,
+                entries: __field6,
+                maybe: __field7,
             };
             Ok(value)
         })

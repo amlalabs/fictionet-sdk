@@ -793,9 +793,11 @@ mod __wire {
 }
 
 type __Value0 = Option<f32>;
+#[inline]
 fn __read0(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value0, Error> {
     r.nullable(3.4028235e38f32, le)
 }
+#[inline]
 fn __write0(w: &mut __wire::Writer, v: &__Value0, le: bool) -> Result<(), Error> {
     w.nullable(v, 3.4028235e38f32, le)
 }
@@ -806,9 +808,11 @@ fn __sample0(s: &mut __wire::Sampler) -> Result<__Value0, Error> {
 }
 
 type __Value1 = Option<f64>;
+#[inline]
 fn __read1(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value1, Error> {
     r.nullable(1.7976931348623157e308f64, le)
 }
+#[inline]
 fn __write1(w: &mut __wire::Writer, v: &__Value1, le: bool) -> Result<(), Error> {
     w.nullable(v, 1.7976931348623157e308f64, le)
 }
@@ -819,9 +823,11 @@ fn __sample1(s: &mut __wire::Sampler) -> Result<__Value1, Error> {
 }
 
 type __Value2 = Option<f32>;
+#[inline]
 fn __read2(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value2, Error> {
     r.nullable(0.1f32, le)
 }
+#[inline]
 fn __write2(w: &mut __wire::Writer, v: &__Value2, le: bool) -> Result<(), Error> {
     w.nullable(v, 0.1f32, le)
 }
@@ -832,9 +838,11 @@ fn __sample2(s: &mut __wire::Sampler) -> Result<__Value2, Error> {
 }
 
 type __Value3 = Option<f32>;
+#[inline]
 fn __read3(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value3, Error> {
     r.nullable(-0.0f32, le)
 }
+#[inline]
 fn __write3(w: &mut __wire::Writer, v: &__Value3, le: bool) -> Result<(), Error> {
     w.nullable(v, -0.0f32, le)
 }
@@ -845,9 +853,11 @@ fn __sample3(s: &mut __wire::Sampler) -> Result<__Value3, Error> {
 }
 
 type __Value4 = u8;
+#[inline]
 fn __read4(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value4, Error> {
     r.scalar::<u8>(le)
 }
+#[inline]
 fn __write4(w: &mut __wire::Writer, v: &__Value4, le: bool) -> Result<(), Error> {
     w.scalar(*v, le)
 }
@@ -857,9 +867,11 @@ fn __sample4(s: &mut __wire::Sampler) -> Result<__Value4, Error> {
 }
 
 type __Value5 = Option<__Value4>;
+#[inline]
 fn __read5(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value5, Error> {
     r.optional(8, le, |r| __read4(r, le))
 }
+#[inline]
 fn __write5(w: &mut __wire::Writer, v: &__Value5, le: bool) -> Result<(), Error> {
     w.optional(v, 8, le, |w, v| __write4(w, v, le))
 }
@@ -889,13 +901,13 @@ impl __wire::Codec for Floats {
             let __field1 = __read1(r, le)?;
             let __field2 = __read2(r, le)?;
             let __field3 = __read3(r, le)?;
-            let __field5 = __read5(r, le)?;
+            let __field4 = __read5(r, le)?;
             let value = Self {
                 small: __field0,
                 large: __field1,
                 decimal: __field2,
                 negative_zero: __field3,
-                flag: __field5,
+                flag: __field4,
             };
             Ok(value)
         })
@@ -922,13 +934,13 @@ impl __wire::Codec for Floats {
             let __field1 = __sample1(s)?;
             let __field2 = __sample2(s)?;
             let __field3 = __sample3(s)?;
-            let __field5 = __sample5(s)?;
+            let __field4 = __sample5(s)?;
             let value = Self {
                 small: __field0,
                 large: __field1,
                 decimal: __field2,
                 negative_zero: __field3,
-                flag: __field5,
+                flag: __field4,
             };
             Ok(value)
         })

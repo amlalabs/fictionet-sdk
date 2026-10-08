@@ -64,6 +64,7 @@ fn goldens_and_determinism() {
         renamed.name = format!("C:\\other\\{name}.{extension}");
         assert_eq!(source, generate(format, &[renamed], limits).unwrap().source);
         if name == "recursive" {
+            assert_eq!(source.matches("fn __read").count(), 9);
             let checked = validate(IrFrontEnd.parse(&[input], limits).unwrap(), limits).unwrap();
             assert_eq!(checked.recursive_types().collect::<Vec<_>>(), ["Node"]);
             let target = emit_fuzz(

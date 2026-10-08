@@ -796,9 +796,11 @@ const __MIN0: i64 = -9223372036854775807i64;
 const __MAX0: i64 = 9223372036854775806i64;
 const __NULL0: i64 = 9223372036854775807i64;
 type __Value0 = Option<i64>;
+#[inline]
 fn __read0(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value0, Error> {
     r.nullable_range(__NULL0, __MIN0, __MAX0, le)
 }
+#[inline]
 fn __write0(w: &mut __wire::Writer, v: &__Value0, le: bool) -> Result<(), Error> {
     w.nullable_range(v, __NULL0, __MIN0, __MAX0, le)
 }
@@ -809,9 +811,11 @@ fn __sample0(s: &mut __wire::Sampler) -> Result<__Value0, Error> {
 }
 
 type __Value1 = Price;
+#[inline]
 fn __read1(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value1, Error> {
     <__Value1 as __wire::Codec>::read(r, le)
 }
+#[inline]
 fn __write1(w: &mut __wire::Writer, v: &__Value1, le: bool) -> Result<(), Error> {
     __wire::Codec::encode(v, w, le)
 }
@@ -823,9 +827,11 @@ fn __sample1(s: &mut __wire::Sampler) -> Result<__Value1, Error> {
 const __MIN2: u8 = 1u8;
 const __MAX2: u8 = 10u8;
 type __Value2 = u8;
+#[inline]
 fn __read2(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value2, Error> {
     r.ranged(__MIN2, __MAX2, le)
 }
+#[inline]
 fn __write2(w: &mut __wire::Writer, v: &__Value2, le: bool) -> Result<(), Error> {
     w.ranged(*v, __MIN2, __MAX2, le)
 }
@@ -836,9 +842,11 @@ fn __sample2(s: &mut __wire::Sampler) -> Result<__Value2, Error> {
 
 type __Item3 = Side;
 type __Value3 = Option<__Item3>;
+#[inline]
 fn __read3(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value3, Error> {
     r.nullable_ref(0u8, le, |r| <__Item3 as __wire::Codec>::read(r, le))
 }
+#[inline]
 fn __write3(w: &mut __wire::Writer, v: &__Value3, le: bool) -> Result<(), Error> {
     w.nullable_ref(v, 0u8, le, |w, v| __wire::Codec::encode(v, w, le))
 }
@@ -850,9 +858,11 @@ fn __sample3(s: &mut __wire::Sampler) -> Result<__Value3, Error> {
 const __MIN4: u64 = 0u64;
 const __MAX4: u64 = 18446744073709551614u64;
 type __Value4 = u64;
+#[inline]
 fn __read4(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value4, Error> {
     r.ranged(__MIN4, __MAX4, le)
 }
+#[inline]
 fn __write4(w: &mut __wire::Writer, v: &__Value4, le: bool) -> Result<(), Error> {
     w.ranged(*v, __MIN4, __MAX4, le)
 }
@@ -863,9 +873,11 @@ fn __sample4(s: &mut __wire::Sampler) -> Result<__Value4, Error> {
 
 const __LIMIT5: usize = 2;
 type __Value5 = Vec<u8>;
+#[inline]
 fn __read5(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value5, Error> {
     r.bytes(0, __LIMIT5, le)
 }
+#[inline]
 fn __write5(w: &mut __wire::Writer, v: &__Value5, le: bool) -> Result<(), Error> {
     w.bytes(v, 0, __LIMIT5, le)
 }
@@ -877,6 +889,7 @@ fn __sample5(s: &mut __wire::Sampler) -> Result<__Value5, Error> {
 const __LIMIT6: usize = 8;
 type __Entry6 = Entry;
 type __Value6 = Vec<__Entry6>;
+#[inline]
 fn __read6(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value6, Error> {
     let header = r.take(4)?;
     let length = __wire::field(header, 0, 2, le, 65534)?;
@@ -891,6 +904,7 @@ fn __read6(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value6, Error> {
     }
     r.entries(count, length, |r| __Entry6::__read_block(r, le, length))
 }
+#[inline]
 fn __write6(w: &mut __wire::Writer, v: &__Value6, le: bool) -> Result<(), Error> {
     let count = u64::try_from(v.len()).map_err(|_| Error::Limit)?;
     let mut header = [0u8; 4];
@@ -906,9 +920,11 @@ fn __sample6(s: &mut __wire::Sampler) -> Result<__Value6, Error> {
 
 const __LIMIT7: usize = 32;
 type __Value7 = Vec<u8>;
+#[inline]
 fn __read7(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value7, Error> {
     r.bytes(2, __LIMIT7, le)
 }
+#[inline]
 fn __write7(w: &mut __wire::Writer, v: &__Value7, le: bool) -> Result<(), Error> {
     w.bytes(v, 2, __LIMIT7, le)
 }
@@ -1064,11 +1080,11 @@ impl __wire::Codec for Entry {
     #[cfg(test)]
     fn sample(s: &mut __wire::Sampler) -> Result<Self, Error> {
         s.nested(|s| {
-            let __field1 = __sample1(s)?;
+            let __field0 = __sample1(s)?;
             let __field2 = __sample2(s)?;
             let __field3 = __sample3(s)?;
             let value = Self {
-                price: __field1,
+                price: __field0,
                 level: __field2,
                 side: __field3,
             };
@@ -1080,13 +1096,13 @@ impl Entry {
     fn __read_block(r: &mut __wire::Reader<'_>, le: bool, length: usize) -> Result<Self, Error> {
         r.nested(|r| {
             let __start = r.block(length, 11)?;
-            let __field1 = __read1(r, le)?;
+            let __field0 = __read1(r, le)?;
             r.skip_to(__start, 9)?;
             let __field2 = __read2(r, le)?;
             let __field3 = __read3(r, le)?;
             r.skip_to(__start, length)?;
             let value = Self {
-                price: __field1,
+                price: __field0,
                 level: __field2,
                 side: __field3,
             };
@@ -1155,15 +1171,15 @@ impl __wire::Codec for Book {
     #[cfg(test)]
     fn sample(s: &mut __wire::Sampler) -> Result<Self, Error> {
         s.nested(|s| {
-            let __field4 = __sample4(s)?;
-            let __field5 = __sample5(s)?;
-            let __field6 = __sample6(s)?;
-            let __field7 = __sample7(s)?;
+            let __field0 = __sample4(s)?;
+            let __field2 = __sample5(s)?;
+            let __field3 = __sample6(s)?;
+            let __field4 = __sample7(s)?;
             let value = Self {
-                time: __field4,
-                code: __field5,
-                entries: __field6,
-                note: __field7,
+                time: __field0,
+                code: __field2,
+                entries: __field3,
+                note: __field4,
             };
             Ok(value)
         })
@@ -1173,17 +1189,17 @@ impl Book {
     fn __read_block(r: &mut __wire::Reader<'_>, le: bool, length: usize) -> Result<Self, Error> {
         r.nested(|r| {
             let __start = r.block(length, 11)?;
-            let __field4 = __read4(r, le)?;
+            let __field0 = __read4(r, le)?;
             r.skip_to(__start, 9)?;
-            let __field5 = __read5(r, le)?;
+            let __field2 = __read5(r, le)?;
             r.skip_to(__start, length)?;
-            let __field6 = __read6(r, le)?;
-            let __field7 = __read7(r, le)?;
+            let __field3 = __read6(r, le)?;
+            let __field4 = __read7(r, le)?;
             let value = Self {
-                time: __field4,
-                code: __field5,
-                entries: __field6,
-                note: __field7,
+                time: __field0,
+                code: __field2,
+                entries: __field3,
+                note: __field4,
             };
             Ok(value)
         })

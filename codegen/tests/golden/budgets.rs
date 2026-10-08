@@ -793,9 +793,11 @@ mod __wire {
 }
 
 type __Value0 = Empty;
+#[inline]
 fn __read0(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value0, Error> {
     <__Value0 as __wire::Codec>::read(r, le)
 }
+#[inline]
 fn __write0(w: &mut __wire::Writer, v: &__Value0, le: bool) -> Result<(), Error> {
     __wire::Codec::encode(v, w, le)
 }
@@ -806,9 +808,11 @@ fn __sample0(s: &mut __wire::Sampler) -> Result<__Value0, Error> {
 
 const __LIMIT1: usize = 8;
 type __Value1 = Vec<__Value0>;
+#[inline]
 fn __read1(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value1, Error> {
     r.group(1, __LIMIT1, 0, le, |r| __read0(r, le))
 }
+#[inline]
 fn __write1(w: &mut __wire::Writer, v: &__Value1, le: bool) -> Result<(), Error> {
     w.group(v, 1, __LIMIT1, le, |w, v| __write0(w, v, le))
 }
@@ -819,9 +823,11 @@ fn __sample1(s: &mut __wire::Sampler) -> Result<__Value1, Error> {
 
 const __LIMIT2: usize = 64;
 type __Value2 = Vec<u8>;
+#[inline]
 fn __read2(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value2, Error> {
     r.bytes(1, __LIMIT2, le)
 }
+#[inline]
 fn __write2(w: &mut __wire::Writer, v: &__Value2, le: bool) -> Result<(), Error> {
     w.bytes(v, 1, __LIMIT2, le)
 }
@@ -882,11 +888,11 @@ pub struct Bag {
 impl __wire::Codec for Bag {
     fn read(r: &mut __wire::Reader<'_>, le: bool) -> Result<Self, Error> {
         r.nested(|r| {
-            let __field1 = __read1(r, le)?;
-            let __field2 = __read2(r, le)?;
+            let __field0 = __read1(r, le)?;
+            let __field1 = __read2(r, le)?;
             let value = Self {
-                items: __field1,
-                data: __field2,
+                items: __field0,
+                data: __field1,
             };
             Ok(value)
         })
@@ -903,11 +909,11 @@ impl __wire::Codec for Bag {
     #[cfg(test)]
     fn sample(s: &mut __wire::Sampler) -> Result<Self, Error> {
         s.nested(|s| {
-            let __field1 = __sample1(s)?;
-            let __field2 = __sample2(s)?;
+            let __field0 = __sample1(s)?;
+            let __field1 = __sample2(s)?;
             let value = Self {
-                items: __field1,
-                data: __field2,
+                items: __field0,
+                data: __field1,
             };
             Ok(value)
         })

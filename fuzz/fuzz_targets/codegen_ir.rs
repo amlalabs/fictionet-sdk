@@ -17,6 +17,10 @@ fuzz_target!(|data: &[u8]| {
         contract::check_wire::<Value>(data);
     }
     {
+        use protocol::Shared as Value;
+        contract::check_wire::<Value>(data);
+    }
+    {
         use protocol::Nodes as Frames;
         contract::check_decode_with_alloc_limit(|| Frames, data, 2 * (protocol::MAX_MESSAGE + 6));
     }

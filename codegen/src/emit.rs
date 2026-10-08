@@ -5,7 +5,10 @@ use crate::{
     rust_identifier,
     validate::{BlockLayout, IdentifierCase},
 };
-use std::{collections::BTreeSet, fmt::Write};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt::Write,
+};
 
 impl From<std::fmt::Error> for Error {
     fn from(_: std::fmt::Error) -> Self {
@@ -143,23 +146,31 @@ struct Node<'a> {
     boxed: bool,
     minimum: usize,
 }
+// Child IDs include any boxing inherited from the owner's recursion layout.
+// Debug keys preserve signed zero, which null encodings compare by bits.
+type NodeKey = (String, bool, Option<usize>);
 fn add<'a>(
     ty: &'a Type,
     nodes: &mut Vec<Node<'a>>,
+    indices: &mut BTreeMap<NodeKey, usize>,
     owner: &str,
     checked: &ValidatedSchema,
     in_vec: bool,
 ) -> Result<usize, Error> {
     let child = match ty {
-        Type::Group { item, .. } => Some(add(item, nodes, owner, checked, true)?),
+        Type::Group { item, .. } => Some(add(item, nodes, indices, owner, checked, true)?),
         Type::Optional {
             item,
             presence: Presence::Flag(_),
-        } => Some(add(item, nodes, owner, checked, in_vec)?),
+        } => Some(add(item, nodes, indices, owner, checked, in_vec)?),
         _ => None,
     };
     let boxed =
         matches!(ty, Type::Ref(target) if !in_vec && checked.recursion.needs_box(owner, target));
+    let key = (format!("{ty:?}"), boxed, child);
+    if let Some(&index) = indices.get(&key) {
+        return Ok(index);
+    }
     let rust = match ty {
         Type::Scalar(p) | Type::Range { item: p, .. } => p.rust().into(),
         Type::Constant(_) => return Err(missing()),
@@ -190,6 +201,7 @@ fn add<'a>(
         .ok_or_else(missing)?
         .size;
     let index = nodes.len();
+    indices.insert(key, index);
     nodes.push(Node {
         ty,
         child,
@@ -579,11 +591,11 @@ fn node(
     )?;
     writeln!(
         out,
-        "fn __read{i}(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value{i}, Error> {{\n    {read}\n}}"
+        "#[inline]\nfn __read{i}(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value{i}, Error> {{\n    {read}\n}}"
     )?;
     writeln!(
         out,
-        "fn __write{i}(w: &mut __wire::Writer, v: &__Value{i}, le: bool) -> Result<(), Error> {{\n    {write}\n}}"
+        "#[inline]\nfn __write{i}(w: &mut __wire::Writer, v: &__Value{i}, le: bool) -> Result<(), Error> {{\n    {write}\n}}"
     )?;
     writeln!(
         out,
@@ -607,6 +619,7 @@ fn node(
 }
 /// Emits one self-contained Rust module using only public Fictionet APIs.
 /// Input names appear as escaped basenames in the copy-and-own header.
+/// Helpers are shared per distinct wire type and boxing layout.
 /// Declaration order is preserved. No files or processes are accessed.
 pub fn emit(checked: &ValidatedSchema, inputs: &[String]) -> Result<String, Error> {
     let mut out = Output::default();
@@ -650,6 +663,7 @@ pub fn emit(checked: &ValidatedSchema, inputs: &[String]) -> Result<String, Erro
     writeln!(out)?;
     out.write_str(include_str!("runtime.txt"))?;
     let mut nodes = Vec::new();
+    let mut indices = BTreeMap::new();
     let mut field_nodes = Vec::new();
     for t in &checked.schema.types {
         let mut ids = Vec::new();
@@ -657,7 +671,7 @@ pub fn emit(checked: &ValidatedSchema, inputs: &[String]) -> Result<String, Erro
             ids.push(if matches!(f.ty, Type::Constant(_)) {
                 None
             } else {
-                Some(add(&f.ty, &mut nodes, &t.name, checked, false)?)
+                Some(add(&f.ty, &mut nodes, &mut indices, &t.name, checked, false)?)
             });
         }
         field_nodes.push(ids);
@@ -727,7 +741,7 @@ impl Layout<'_> {
             }
             writeln!(
                 out,
-                "            let __field{id} = __read{id}(r, {})?;",
+                "            let __field{i} = __read{id}(r, {})?;",
                 field_order(f)
             )?;
         }
@@ -740,15 +754,15 @@ impl Layout<'_> {
         self.construct(out, "r")
     }
     fn sample(&self, out: &mut Output) -> Result<(), Error> {
-        for (_, _, id) in self.wire() {
-            writeln!(out, "            let __field{id} = __sample{id}(s)?;")?;
+        for (i, _, id) in self.wire() {
+            writeln!(out, "            let __field{i} = __sample{id}(s)?;")?;
         }
         self.construct(out, "s")
     }
     fn construct(&self, out: &mut Output, unused: &str) -> Result<(), Error> {
         let mut members = Vec::new();
-        for (_, f, id) in self.wire() {
-            members.push((field(&f.name)?, format!("__field{id}")));
+        for (i, f, _) in self.wire() {
+            members.push((field(&f.name)?, format!("__field{i}")));
         }
         if members.is_empty() {
             if unused == "s" || !self.uses_start() {
