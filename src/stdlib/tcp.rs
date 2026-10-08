@@ -722,7 +722,7 @@ impl State {
     /// Feeds one packet from the interface into smoltcp. Returns whether it was
     /// a TCP segment for this endpoint that carried data.
     fn ingress(&mut self, addr: IpAddr, now: smoltcp::time::Instant, packet: Vec<u8>) -> bool {
-        let Some(ip) = Header::parse_whole(&packet) else { return false };
+        let Some(mut ip) = Header::parse_whole(&packet) else { return false };
         if ip.protocol != TCP || ip.dst != addr || ip.payload.len() < 20 {
             return false;
         }
@@ -741,7 +741,7 @@ impl State {
         let src = SocketAddr::new(ip.src, u16::from_be_bytes([t[0], t[1]]));
         let dst = SocketAddr::new(ip.dst, u16::from_be_bytes([t[2], t[3]]));
         let flags = t[13];
-        let (fin, syn, rst, ack) = (flags & 1 != 0, flags & 2 != 0, flags & 4 != 0, flags & 16 != 0);
+        let (syn, rst, ack) = (flags & 2 != 0, flags & 4 != 0, flags & 16 != 0);
         let seq = u32::from_be_bytes([t[4], t[5], t[6], t[7]]);
         let mut listening = false;
         if syn && !ack && let Some(l) = self.listeners.get(&dst.port()) {
@@ -762,12 +762,18 @@ impl State {
         let handle = self.by_tuple.get(&(dst, src)).copied();
         if let Some(h) = handle {
             let c = self.conns.get_mut(&h).unwrap();
+            if data {
+                trim_payload(c, self.sockets.get::<stcp::Socket>(self.handles[&h]), &mut ip, &mut packet);
+            }
+            let t = &packet[ip.payload.clone()];
+            let fin = t[13] & 1 != 0;
+            let data_len = t.len().saturating_sub(((t[12] >> 4) as usize) * 4);
             c.rst |= rst;
             c.fin |= fin;
             if rst {
                 c.wake_gone();
             }
-            if data {
+            if data_len > 0 {
                 let end = seq.wrapping_add(data_len as u32);
                 if c.rx_end.is_none_or(|e| (end.wrapping_sub(e) as i32) > 0) {
                     c.rx_end = Some(end);
@@ -905,6 +911,30 @@ impl State {
             w.wake();
         }
     }
+}
+
+/// Every window edge smoltcp should advertise is within the receive buffer,
+/// so this drops only data outside every advertised window (RFC 9293 3.10.7.4,
+/// RFC 7323 2.4). smoltcp needs this because it shifts the unscaled SYN-ACK
+/// window by the window scale and can then accept data past its buffer.
+fn trim_payload(c: &Conn, s: &stcp::Socket<'static>, ip: &mut Header, packet: &mut Vec<u8>) {
+    let Some(irs) = c.irs else { return };
+    let t = &packet[ip.payload.clone()];
+    let off = ((t[12] >> 4) as usize) * 4;
+    if off < 20 || off > t.len() || transport_checksum(ip.src, ip.dst, TCP, t) != 0 {
+        return;
+    }
+    let seq = u32::from_be_bytes([t[4], t[5], t[6], t[7]]);
+    let edge = irs.wrapping_add(1).wrapping_add(c.read).wrapping_add(s.recv_capacity() as u32);
+    let end = seq.wrapping_add((t.len() - off) as u32);
+    if (end.wrapping_sub(edge) as i32) <= 0 {
+        return;
+    }
+    let keep = (edge.wrapping_sub(seq) as i32).max(0) as usize;
+    packet.truncate(ip.payload.start + off + keep);
+    packet[ip.payload.start + 13] &= !1;
+    ip.payload.end = packet.len();
+    fix_lengths(packet, ip.payload.start, ip.src, ip.dst);
 }
 
 /// Repairs ACK handling in smoltcp. Returns a copy and how often to feed it.
@@ -1617,6 +1647,134 @@ mod tests {
             assert_eq!(u16::from_be_bytes(p[34..36].try_into().unwrap()), expected);
             assert_eq!(c.last_fed, Some((100, expected)));
             assert_eq!(transport_checksum(peer.ip(), local.ip(), TCP, &p[20..]), 0);
+        }
+    }
+
+    #[test]
+    fn payload_trimming_preserves_checksums_and_clears_fin() {
+        for (local, peer) in [("10.0.0.1:80", "10.0.0.2:1234"), ("[fd00::1]:80", "[fd00::2]:1234")] {
+            let local: SocketAddr = local.parse().unwrap();
+            let peer: SocketAddr = peer.parse().unwrap();
+            let s = new_socket(MIN_BUFFER).0;
+            let mut c = Conn::new(local, peer, false);
+            c.irs = Some(u32::MAX - MIN_BUFFER as u32);
+            c.read = 19;
+            let edge = c.irs.unwrap().wrapping_add(1).wrapping_add(c.read).wrapping_add(s.recv_capacity() as u32);
+            for (offset, keep) in [(-10i32, 10usize), (0, 0), (10, 0), (-20, 20)] {
+                let mut p = segment(peer, local, edge.wrapping_add_signed(offset), 100, 0x11).0;
+                let tcp_at = Header::parse_whole(&p).unwrap().payload.start;
+                p.extend_from_slice(&pattern(20, 7));
+                fix_lengths(&mut p, tcp_at, peer.ip(), local.ip());
+                let original = p.clone();
+                let mut bad = p.clone();
+                bad[tcp_at + 16] ^= 1;
+                let unchanged = bad.clone();
+                let mut ip = Header::parse_whole(&bad).unwrap();
+                trim_payload(&c, &s, &mut ip, &mut bad);
+                assert_eq!(bad, unchanged, "invalid checksums must not be repaired");
+                let mut ip = Header::parse_whole(&p).unwrap();
+                trim_payload(&c, &s, &mut ip, &mut p);
+                assert_eq!(ip, Header::parse_whole(&p).unwrap());
+                assert_eq!(&p[tcp_at + 20..], &original[tcp_at + 20..tcp_at + 20 + keep]);
+                assert_eq!(p[tcp_at + 13] & 1, u8::from(keep == 20));
+                assert_eq!(transport_checksum(peer.ip(), local.ip(), TCP, &p[tcp_at..]), 0);
+                if keep == 20 {
+                    assert_eq!(p, original, "data ending at the edge must be unchanged");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scaled_syn_ack_data_crossing_buffer_end() {
+        scaled_syn_ack_buffer_end(false);
+    }
+
+    #[test]
+    fn scaled_syn_ack_data_past_buffer_end() {
+        scaled_syn_ack_buffer_end(true);
+    }
+
+    fn scaled_syn_ack_buffer_end(read_as_received: bool) {
+        for (local, peer) in [("10.0.0.1:80", "10.0.0.2:1234"), ("[fd00::1]:80", "[fd00::2]:1234")] {
+            let local: SocketAddr = local.parse().unwrap();
+            let peer: SocketAddr = peer.parse().unwrap();
+            let result = block_on(run(move |fcx| async move {
+                let (side, _raw) = pair();
+                let server = endpoint_with(&fcx, side, local.ip(), Options::default());
+                let mut listener = server.listen(local.port())?;
+                let now = smoltcp::time::Instant::from_millis(100);
+                let tcp_at = if local.is_ipv4() { 20 } else { 40 };
+                // Cross sequence number zero while filling the buffer.
+                let irs = u32::MAX - 131072;
+                let start = {
+                    let mut syn = segment(peer, local, irs, 0, 0x02).0;
+                    syn[tcp_at + 12] = 6 << 4;
+                    syn.extend_from_slice(&[1, 3, 3, 7]);
+                    fix_lengths(&mut syn, tcp_at, peer.ip(), local.ip());
+                    let mut st = server.shared.state.lock().unwrap();
+                    st.ingress(local.ip(), now, syn);
+                    let packets = egress(&mut st, now);
+                    let t = Header::parse_whole(&packets[0]).unwrap().payload(&packets[0]);
+                    assert_eq!(t[13], 0x12);
+                    let start = u32::from_be_bytes(t[4..8].try_into().unwrap()).wrapping_add(1);
+                    st.ingress(local.ip(), now, segment(peer, local, irs.wrapping_add(1), start, 0x10).0);
+                    st.housekeeping(now);
+                    egress(&mut st, now);
+                    start
+                };
+                let mut conn = listener.accept(&fcx).await?;
+                let capacity = server.shared.state.lock().unwrap().get(conn.handle).recv_capacity();
+                assert_eq!(capacity, 256 * 1024);
+                // Vary the pattern across buffer laps so overwritten bytes differ.
+                let expected: Vec<u8> = (0..(capacity + 4096).div_ceil(997))
+                    .flat_map(|i| pattern(997, i as u8)).collect();
+                let incoming = |begin: usize, end: usize| {
+                    let seq = irs.wrapping_add(1).wrapping_add(begin as u32);
+                    let mut p = segment(peer, local, seq, start, 0x10).0;
+                    p.extend_from_slice(&expected[begin..end]);
+                    fix_lengths(&mut p, tcp_at, peer.ip(), local.ip());
+                    let mut st = server.shared.state.lock().unwrap();
+                    st.ingress(local.ip(), now, p);
+                    egress(&mut st, now);
+                };
+                let ahead = if read_as_received { capacity + 37 } else { capacity - 37 };
+                incoming(ahead, ahead + 100);
+                let mut got = vec![0; expected.len()];
+                let mut read = 0;
+                let first_end = if read_as_received { expected.len() } else { ahead };
+                for begin in (0..first_end).step_by(1024) {
+                    let end = (begin + 1024).min(first_end);
+                    incoming(begin, end);
+                    if read_as_received {
+                        while read < end {
+                            let n = conn.read(&fcx, &mut got[read..end]).await?;
+                            assert!(n > 0);
+                            read += n;
+                        }
+                        assert_eq!(got[..end], expected[..end], "stream differs at offset {begin}");
+                    }
+                }
+                if !read_as_received {
+                    while read < capacity {
+                        let n = conn.read(&fcx, &mut got[read..capacity]).await?;
+                        assert!(n > 0);
+                        read += n;
+                    }
+                    assert_eq!(got[..capacity], expected[..capacity]);
+                    // Resend the trimmed tail once application reads make room.
+                    egress(&mut server.shared.state.lock().unwrap(), now);
+                    incoming(capacity, expected.len());
+                    while read < expected.len() {
+                        let n = conn.read(&fcx, &mut got[read..]).await?;
+                        assert!(n > 0);
+                        read += n;
+                    }
+                }
+                assert_eq!(got, expected);
+                Err::<(), crate::Error>(fictionet::Error::msg("done"))
+            }));
+            assert_eq!(result.unwrap_err().to_string(), "done");
         }
     }
 
